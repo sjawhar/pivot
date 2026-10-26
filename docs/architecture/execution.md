@@ -435,10 +435,10 @@ Without this flag, Pivot validates that all tracked outputs exist before running
 
 ## Deferred Commit Mode
 
-The `--no-commit` flag runs stages without writing durable state:
+The `--no-commit` flag runs stages without writing lock files or committing their outputs:
 
 ```bash
-# Run stages — outputs land on disk but no locks, cache, or StateDB updates
+# Run stages — outputs land on disk, with no lock, cache copy, generation or run-cache entry
 pivot repro --no-commit
 
 # Inspect results, then snapshot current workspace state
@@ -447,7 +447,7 @@ pivot commit
 
 ### How It Works
 
-1. `--no-commit`: stages execute and outputs are written to disk. No lock files, no cache copies, no StateDB updates. Output hashes are computed for the `StageResult` but nothing is persisted.
+1. `--no-commit`: stages execute and outputs are written to disk. No lock files, no cache copies, no generation or run-cache entries. The hashes of the files the run reads and writes are still saved in the StateDB, best-effort, as every command saves them: a file-hash entry is a cache that its own stat check validates on every read, not a lock, so a later `pivot status` reads none of those files again.
 2. `pivot commit [stage_names...]`: computes current workspace state (fingerprints code, hashes deps and outputs), writes production lock files, saves outputs to cache, and updates StateDB. Without arguments, commits all stale stages. With stage names, unconditionally commits those stages.
 
 ### Use Case

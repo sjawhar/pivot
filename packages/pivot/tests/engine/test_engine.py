@@ -1990,8 +1990,8 @@ async def test_compute_explanation_saves_the_file_hashes_it_read(
 ) -> None:
     """The explanation the engine computes for a stage it starts saves the hash of each file
     it had to read, so the next explanation reads none of them. It makes one attempt, never
-    waiting for the write lock while the run starts stages, and a `--no-commit` run saves
-    nothing."""
+    waiting for the write lock while the run starts stages, and a `--no-commit` run saves them
+    too: a hash entry is a cache its stat check validates, not part of the commit."""
     pipeline = _helper_watch_pipeline(tmp_path, monkeypatch)
     stage_name, stage_info = _helper_prepare_coordinator_skip(
         tmp_path,
@@ -2028,9 +2028,5 @@ async def test_compute_explanation_saves_the_file_hashes_it_read(
     assert explanation["will_run"] is False, explanation["reason"]
     with state_mod.StateDB(tmp_path / ".pivot", readonly=True) as state_db:
         saved = state_db.get(raw, raw.stat())
-    if no_commit:
-        assert write_back.call_count == 0
-        assert saved is None
-    else:
-        assert write_back.call_args.kwargs["timeout"] == 0
-        assert saved == cache.hash_file(raw)[0]
+    assert write_back.call_args.kwargs["timeout"] == 0
+    assert saved == cache.hash_file(raw)[0]

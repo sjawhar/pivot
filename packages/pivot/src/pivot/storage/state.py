@@ -1250,14 +1250,15 @@ def write_back_file_hashes(
 ) -> None:
     """Save the file-hash entries a read-only check computed, best-effort, in one transaction.
 
-    ``pivot status`` and every explanation call this with the hashes they had to read, so the
-    next check reads none of those files. A file-hash entry is a cache that every read
-    validates by ``stat``, and no decision depends on one being present, so a write that
-    cannot happen at once is skipped with a debug log instead of failing or holding up the
-    check: another process holding the write lock for longer than ``timeout`` (2 s, a
-    fraction of a pivot write's own 30 s; 0 makes one attempt), a database this user cannot
-    write, a read-only filesystem, a full map. With no entries it takes no lock, and a state
-    directory with no database is left without one.
+    ``pivot status``, every explanation, ``pivot diff``, ``pivot plots diff`` and the engine of
+    a ``--no-commit`` run call this with the hashes they had to read, so the next check reads
+    none of those files. A file-hash entry is a cache that every read validates by ``stat``,
+    and no decision depends on one being present, so a write that cannot happen at once is
+    skipped with a debug log instead of failing or holding up the check: another process
+    holding the write lock for longer than ``timeout`` (2 s, a fraction of a pivot write's own
+    30 s; 0 makes one attempt), a database this user cannot write, a read-only filesystem, a
+    full map. With no entries it takes no lock, and a state directory with no database is left
+    without one.
     """
     if not entries or not (state_dir / "state.lmdb").exists():
         return

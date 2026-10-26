@@ -4,8 +4,9 @@ A replica made outside pivot (hard links, copies) carries a byte copy of the sta
 whose file-hash entries name the original project's paths. A hard-linked output is the same
 inode as the original, so its entry is found by the file's identity and nothing is read. A
 copied output is a new file: the first status reads it and saves its hash, so the second
-status reads nothing. The tests drive the installed `pivot` binary and record every file of
-the replica's outputs that the process opens.
+status reads nothing. `pivot diff` and `pivot plots diff` look files up and save what they read
+the same way. The tests drive the installed `pivot` binary and record every file of the
+replica's outputs that the process opens.
 """
 
 from __future__ import annotations
@@ -306,3 +307,103 @@ def test_status_against_a_read_only_state_db_exits_0_and_leaves_it_unchanged(
             path.chmod(mode)
 
     assert _helper_dump(state_dir) == before
+
+
+# Outputs `pivot diff` compares (JSON files in a directory output) and one plot.
+_SHOW_PIPELINE = f"""\
+import json
+import pathlib
+import tempfile
+from typing import Annotated
+
+import matplotlib.figure
+
+from pivot import Pipeline, plot, stage
+
+
+@stage
+def make_tables() -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "tables"
+    for i in range({_FILES}):
+        (out / f"d{{i % 3}}").mkdir(parents=True, exist_ok=True)
+        (out / f"d{{i % 3}}" / f"t{{i:02d}}.json").write_text(json.dumps({{"row": i}}))
+    return out
+
+
+@stage
+def chart() -> Annotated[matplotlib.figure.Figure, plot]:
+    figure = matplotlib.figure.Figure()
+    figure.subplots().plot([1, 2])
+    return figure
+
+
+with Pipeline("show") as pipeline:
+    make_tables()
+    chart()
+"""
+
+
+def _helper_show_project(root: pathlib.Path) -> pathlib.Path:
+    """A project whose stages ran once, with their locks committed for `pivot diff` to read."""
+    root.mkdir(parents=True)
+    root = root.resolve()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    _ok(_pivot(root, "init"))
+    (root / "pipeline.py").write_text(_SHOW_PIPELINE)
+    (root / ".gitignore").write_text("/data/\n/plots/\n__pycache__/\n")
+    _ok(_pivot(root, "repro"))
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "run"],
+        cwd=root,
+        check=True,
+    )
+    return root
+
+
+def _helper_opens(
+    root: pathlib.Path, watched: str, tmp_path: pathlib.Path, *args: str
+) -> tuple[list[str], str]:
+    """Run `pivot <args>` in ``root``; return the files under ``root / watched`` it opened, and
+    its stdout."""
+    record = tmp_path / f"opened-{time.monotonic_ns()}.json"
+    proc = subprocess.run(
+        [sys.executable, "-c", _RECORD_OPENS, str(root / watched), str(record), _PIVOT, *args],
+        cwd=root,
+        env=_env(),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    _ok(proc)
+    return json.loads(record.read_text()), proc.stdout
+
+
+def test_a_copied_replicas_second_diff_reads_no_output(tmp_path: pathlib.Path) -> None:
+    """`pivot diff` hashes each workspace file it compares as status does: a copied output is
+    a new file, so the first diff reads it; it saves what it read, so the second reads none."""
+    root = _helper_show_project(tmp_path / "live")
+    replica = tmp_path / "replica"
+    _cp_r(root, replica)
+
+    first, out = _helper_opens(replica, "data", tmp_path, "diff", "--no-tui", ".")
+    assert "No data file changes detected." in out, out
+    assert len(first) == _FILES, "A copy is a new file"
+    second, out = _helper_opens(replica, "data", tmp_path, "diff", "--no-tui", ".")
+    assert "No data file changes detected." in out, out
+    assert second == []
+
+
+def test_a_copied_replicas_second_plots_diff_reads_no_plot(tmp_path: pathlib.Path) -> None:
+    """`pivot plots diff` hashes each plot as status does: the first call on a copy reads the
+    plot and saves its hash, so the second reads nothing."""
+    root = _helper_show_project(tmp_path / "live")
+    replica = tmp_path / "replica"
+    _cp_r(root, replica)
+
+    first, out = _helper_opens(replica, "plots", tmp_path, "plots", "diff")
+    assert "No plot changes." in out, out
+    assert [pathlib.Path(path).name for path in first] == ["chart.png"], "A copy is a new file"
+    second, out = _helper_opens(replica, "plots", tmp_path, "plots", "diff")
+    assert "No plot changes." in out, out
+    assert second == []

@@ -78,9 +78,11 @@ every link of an inode shares one change time, and two such files do not. The en
 has no ctime because a new hard link changes it, which would invalidate every hard-linked
 replica; check (2) reads both change times at lookup time instead.
 
-`pivot status` and every explanation open the database read-only, then save the hashes they
-had to read with `state.write_back_file_hashes`, best-effort, so a copied replica's second
-status reads nothing.
+`pivot status`, every explanation, `pivot diff` and `pivot plots diff` open the database
+read-only, then save the hashes they had to read with `state.write_back_file_hashes`,
+best-effort, so a copied replica's second status reads nothing. A `--no-commit` run saves the
+hashes its workers read the same way: a hash entry is a cache its stat check validates, not
+part of the commit.
 
 ## Key Insight
 

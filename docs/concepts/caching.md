@@ -163,7 +163,10 @@ finds an entry by the file's device and inode: a hard-linked output reuses the
 original's entry, after Pivot checks that the original path still names the same
 file, so `pivot status` in such a copy reads no output. A copied output is a new
 file and is read once: `pivot status` saves the hashes it computed, so the next
-`pivot status` reads none of them. That save is skipped, never an error, when
+`pivot status` reads none of them. Every command that hashes a dependency or an
+output saves its hash the same way, also those that otherwise write nothing:
+`pivot repro --no-commit`, `--dry-run` and `--explain`, `pivot verify`,
+`pivot diff` and `pivot plots diff`. That save is skipped, never an error, when
 another Pivot command holds the database's write lock or the database cannot be
 written.
 

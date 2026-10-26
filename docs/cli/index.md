@@ -99,7 +99,7 @@ pivot repro [STAGES...] [OPTIONS]
 | `--jsonl` / `--json` | Stream results as JSONL (one JSON object per line) |
 | `--show-output` | Stream stage stdout/stderr to terminal |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
-| `--no-commit` | Run stages without writing locks, cache, or StateDB |
+| `--no-commit` | Run stages without writing lock files or committing outputs (file hashes are still saved) |
 | `--resources NAME=CAPACITY` | Override a scheduler resource capacity; may be repeated |
 | `--fail-fast` | Stop on first failure (default) |
 | `--keep-going` / `-k` | Continue running stages after failures; skip only downstream dependents |
@@ -154,7 +154,7 @@ pivot run STAGES... [OPTIONS]
 | `--jsonl` / `--json` | Stream results as JSONL (one JSON object per line) |
 | `--show-output` | Stream stage stdout/stderr to terminal |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
-| `--no-commit` | Run stages without writing locks, cache, or StateDB |
+| `--no-commit` | Run stages without writing lock files or committing outputs (file hashes are still saved) |
 | `--resources NAME=CAPACITY` | Override a scheduler resource capacity; may be repeated |
 | `--fail-fast` | Stop on first failure |
 | `--keep-going` / `-k` | Continue running stages after failures |

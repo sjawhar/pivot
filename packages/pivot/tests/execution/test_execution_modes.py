@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pathlib
 import shutil
 from typing import TYPE_CHECKING, Any
 
@@ -13,7 +14,6 @@ from pivot.types import StageStatus
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    import pathlib
     from collections.abc import Callable
 
     from pivot.types import OutputMessage
@@ -129,8 +129,20 @@ def test_no_commit_produces_outputs_without_production_lock(
     production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert not production_lock.path.exists(), "Production lock should NOT be written"
 
-    # No deferred writes should be returned (no lock/cache writes to apply)
-    assert "deferred_writes" not in result, "No deferred writes in no_commit mode"
+    # Nothing to commit: the deferred writes hold only the file hashes the stage read (its
+    # input) and wrote (its output), a cache the coordinator saves best-effort
+    assert "deferred_writes" in result
+    deferred = result["deferred_writes"]
+    assert list(deferred) == ["file_hash_entries"], "Only file-hash entries in no_commit mode"
+    assert "file_hash_entries" in deferred
+    hashed = {
+        pathlib.Path(path).name: file_hash
+        for path, _, _, _, _, file_hash in deferred["file_hash_entries"]
+    }
+    assert hashed == {
+        "input.txt": cache.hash_file(tmp_path / "input.txt")[0],
+        "test_stage.txt": cache.hash_file(output_path)[0],
+    }
 
 
 def test_no_commit_does_not_write_to_cache(

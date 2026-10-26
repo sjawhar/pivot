@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import logging
 import os
 import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
-from pivot import config, loaders, project, types
+from pivot import config, loaders, project, registry, types
 from pivot.show import common
 from pivot.show import data as data_module
-from pivot.storage import cache, lock
+from pivot.storage import cache, lock, state
 from pivot.types import DataFileFormat
 
 if TYPE_CHECKING:
@@ -31,6 +32,9 @@ class _DiffOutput(TypedDict):
     in_workspace: bool
     is_directory: bool
     changed_kind: tuple[str, str] | None
+    # The StateDB of the output's stage, which holds its files' hash entries (the configured
+    # one for a path only HEAD recorded, which is never read)
+    state_dir: pathlib.Path
 
 
 class DataSelection(TypedDict):
@@ -99,12 +103,16 @@ def _diff_outputs(
             outs_by_stage[stage_name] = outs
 
     lock_data_by_stage = common.read_lock_files_from_head(list(outs_by_stage))
+    default_state_dir = config.get_state_dir()
     moved_heads = dict[str, tuple[types.HashInfo, list[str]]]()
-    current = list[tuple[types.ArtifactRef, pathlib.Path, str, types.HashInfo | None]]()
+    current = list[
+        tuple[types.ArtifactRef, pathlib.Path, str, types.HashInfo | None, pathlib.Path]
+    ]()
     paths_by_identity = dict[types.ArtifactIdentity, list[str]]()
     for stage_name, outs in outs_by_stage.items():
         lock_data = lock_data_by_stage[stage_name]
         entries = {} if lock_data is None else {entry["key"]: entry for entry in lock_data["outs"]}
+        state_dir = registry.get_stage_state_dir(stage_infos[stage_name], default_state_dir)
         for out in outs:
             output_path = store.resolve_display_path(out)
             rel_path = project.to_relative_path(output_path, proj_root)
@@ -115,10 +123,10 @@ def _diff_outputs(
             if head is not None and head_path != rel_path:
                 moved_heads.setdefault(head_path, (head, paths))
                 head = None
-            current.append((out, output_path, rel_path, head))
+            current.append((out, output_path, rel_path, head, state_dir))
 
     result = dict[str, _DiffOutput]()
-    for out, output_path, rel_path, own_head in current:
+    for out, output_path, rel_path, own_head, state_dir in current:
         moved = moved_heads.pop(rel_path, None)
         head = own_head
         if head is None and moved is not None:
@@ -147,6 +155,7 @@ def _diff_outputs(
                 in_workspace=True,
                 is_directory=is_directory,
                 changed_kind=changed_kind,
+                state_dir=state_dir,
             )
 
     for head_path, (head, moved_paths) in moved_heads.items():
@@ -162,6 +171,7 @@ def _diff_outputs(
                 in_workspace=False,
                 is_directory=head_is_directory,
                 changed_kind=None,
+                state_dir=default_state_dir,
             )
     return result, paths_by_identity
 
@@ -246,6 +256,8 @@ def _workspace_members(
     prefixes: frozenset[str] | None,
     proj_root: pathlib.Path,
     cache_dir: pathlib.Path,
+    state_db: state.StateDB | None,
+    pending: list[tuple[pathlib.Path, os.stat_result, str]],
 ) -> dict[str, tuple[str, pathlib.Path]]:
     """The selected output's comparable workspace files, each with its hash and path.
 
@@ -253,7 +265,9 @@ def _workspace_members(
     and everything below one, is not a member and is never read. The warning names only the
     left-out symlinks inside the selected members, under the output's own path. A path only
     HEAD recorded, the old path of an output that moved, has no workspace side and is never
-    read.
+    read. A file whose entry in ``state_db`` matches its stat is not read either (a directory's
+    members are looked up in one read transaction); a hash read from a file is appended to
+    ``pending``, for the caller to save.
     """
     location = proj_root / output["path"]
     if not output["in_workspace"]:
@@ -261,7 +275,7 @@ def _workspace_members(
     if not output["is_directory"]:
         if not location.exists():
             return {}
-        file_hash, _ = cache.hash_file(location)
+        file_hash, _ = cache.hash_file(location, state_db, pending=pending)
         return {output["path"]: (file_hash, location)}
     if not location.is_dir():
         return {}
@@ -270,13 +284,23 @@ def _workspace_members(
     files = list[tuple[str, os.DirEntry[str]]]()
     left_out = list[pathlib.Path]()
     cache.walk_artifact_members(os.fspath(location), "", cache_dir, files, [], left_out)
+    members = list[tuple[str, pathlib.Path, os.stat_result]]()
     for relpath, entry in files:
         file_path = pathlib.Path(entry.path)
         if not _member_selected(relpath, prefixes):
             continue
         if data_module.detect_format(file_path) is DataFileFormat.UNKNOWN:
             continue
-        file_hash, _ = cache.hash_file(file_path)
+        members.append((relpath, file_path, file_path.stat()))
+    cached = (
+        dict[pathlib.Path, str | None]()
+        if state_db is None
+        else state_db.get_many([(file_path, file_stat) for _, file_path, file_stat in members])
+    )
+    for relpath, file_path, _ in members:
+        file_hash = cached.get(file_path)
+        if file_hash is None:
+            file_hash, _ = cache.hash_file(file_path, pending=pending)
         if not cache.is_artifact_member_content(file_path, file_hash, cache_dir):
             left_out.append(file_path)
             continue
@@ -305,6 +329,11 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
     a warning and not compared, and every target that selects no CSV, JSON or JSONL file on
     either side is named in one warning. Returns None when no registered stage has an output
     `pivot diff` can compare.
+
+    Workspace files are hashed as ``pivot status`` hashes them: each output's stage StateDB is
+    read read-only (none is created), and the hashes read from files are saved afterwards with
+    one best-effort ``state.write_back_file_hashes`` per state directory, so the next diff, or
+    status, reads none of them.
     """
     from pivot.cli import helpers as cli_helpers
 
@@ -322,23 +351,40 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
     selection, unresolved = _select_outputs(
         targets, outputs, paths_by_identity, stage_infos, proj_root
     )
-    for path, prefixes in selection.items():
-        output = outputs[path]
-        if output["changed_kind"] is not None:
-            head_kind, workspace_kind = output["changed_kind"]
-            logger.warning(
-                "Output %s is %s at git HEAD and %s in the workspace, so it is not compared",
-                path,
-                head_kind,
-                workspace_kind,
-            )
-            continue
-        head_hashes.update(_head_members(output, prefixes))
-        for member, (file_hash, file_path) in _workspace_members(
-            output, prefixes, proj_root, cache_dir
-        ).items():
-            workspace_hashes[member] = file_hash
-            workspace_paths[member] = file_path
+    read_by_state_dir = dict[pathlib.Path, list[tuple[pathlib.Path, os.stat_result, str]]]()
+    with contextlib.ExitStack() as stack:
+        state_dbs = dict[pathlib.Path, state.StateDB | None]()
+        for path, prefixes in selection.items():
+            output = outputs[path]
+            if output["changed_kind"] is not None:
+                head_kind, workspace_kind = output["changed_kind"]
+                logger.warning(
+                    "Output %s is %s at git HEAD and %s in the workspace, so it is not compared",
+                    path,
+                    head_kind,
+                    workspace_kind,
+                )
+                continue
+            head_hashes.update(_head_members(output, prefixes))
+            if not output["in_workspace"]:
+                continue
+            state_dir = output["state_dir"]
+            if state_dir not in state_dbs:
+                state_dbs[state_dir] = stack.enter_context(
+                    state.open_readonly(state_dir, create=False)
+                )
+            for member, (file_hash, file_path) in _workspace_members(
+                output,
+                prefixes,
+                proj_root,
+                cache_dir,
+                state_dbs[state_dir],
+                read_by_state_dir.setdefault(state_dir, []),
+            ).items():
+                workspace_hashes[member] = file_hash
+                workspace_paths[member] = file_path
+    for state_dir, read in read_by_state_dir.items():
+        state.write_back_file_hashes(state_dir, cache.deferred_file_hash_entries(read))
 
     covered = set[str]()
     if any(path is not None for _, path in unresolved):

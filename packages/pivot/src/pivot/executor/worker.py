@@ -907,11 +907,15 @@ def _execute_stage(
                         )
                         if run_cache_skip is not None:
                             if no_commit:
+                                # Nothing is committed; the coordinator saves only the file
+                                # hashes, the dependencies read and the outputs restored.
                                 return _make_result(
                                     StageStatus.CACHED,
                                     "unchanged (run cache)",
                                     ring_buffer,
                                     input_hash=input_hash,
+                                    file_hash_entries=file_hash_entries
+                                    + run_cache_skip["file_hash_entries"],
                                 )
                             new_lock_data = LockData(
                                 code_manifest=current_fingerprint,
@@ -988,9 +992,11 @@ def _execute_stage(
                         f"{skip.UNCOVERED_IMPORT_KEY_PREFIX}{modules}": "",
                     }
                 if no_commit:
+                    read = list[tuple[pathlib.Path, os.stat_result, str]]()
                     output_hashes = _hash_output_paths(
-                        output_paths, cache_dir=_store_cache_dir(store)
+                        output_paths, cache_dir=_store_cache_dir(store), pending=read
                     )
+                    file_hash_entries.extend(cache.deferred_file_hash_entries(read))
                 else:
                     output_hashes = _commit_outputs_with_store(
                         output_paths, store, project_state_dir
@@ -1004,13 +1010,15 @@ def _execute_stage(
                             )
                         )
 
-                # For --no-commit, skip lock/cache writes entirely
+                # For --no-commit, skip lock/cache writes entirely; the coordinator saves only
+                # the file hashes, the dependencies and the outputs read.
                 if no_commit:
                     return _make_result(
                         StageStatus.RAN,
                         run_reason,
                         ring_buffer,
                         input_hash=input_hash,
+                        file_hash_entries=file_hash_entries,
                     )
 
                 # Build lock data
@@ -1750,6 +1758,7 @@ def _hash_output_paths(
     state_db: state.StateDB | None = None,
     *,
     cache_dir: pathlib.Path | None = None,
+    pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> dict[str, HashInfo]:
     output_hashes = dict[str, HashInfo]()
     for ref, path in outputs_by_ref.items():
@@ -1757,10 +1766,10 @@ def _hash_output_paths(
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
         if path.is_dir():
             output_hashes[types.identity_key(ref.identity)] = cache.hash_directory(
-                path, state_db, cache_dir=cache_dir, warn_left_out_symlinks=True
+                path, state_db, cache_dir=cache_dir, warn_left_out_symlinks=True, pending=pending
             )
         else:
-            file_hash, _ = cache.hash_file(path, state_db)
+            file_hash, _ = cache.hash_file(path, state_db, pending=pending)
             output_hashes[types.identity_key(ref.identity)] = FileHash(hash=file_hash)
     return output_hashes
 

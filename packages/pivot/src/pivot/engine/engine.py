@@ -1316,23 +1316,32 @@ class Engine:
                                     )
                                     stage_durations[stage_name] = duration_ms
 
-                                    # Apply deferred writes for RAN and CACHED stages
-                                    if (
-                                        result["status"] in (StageStatus.RAN, StageStatus.CACHED)
-                                        and not no_commit
-                                    ):
+                                    # Apply deferred writes for RAN and CACHED stages. A
+                                    # --no-commit run writes no lock, generation or run-cache
+                                    # entry, but a file-hash entry is a cache its own stat check
+                                    # validates, so it saves those, best-effort.
+                                    if result["status"] in (StageStatus.RAN, StageStatus.CACHED):
                                         stage_info = self._get_stage(stage_name)
-                                        output_paths = [
-                                            types.identity_key(out.identity)
-                                            for out in stage_info["outs"]
-                                        ]
                                         stage_state_dir = registry.get_stage_state_dir(
                                             stage_info, default_state_dir
                                         )
-                                        stage_db = _get_state_db(stage_state_dir)
-                                        executor_core.apply_deferred_writes(
-                                            stage_name, output_paths, result, stage_db
-                                        )
+                                        if not no_commit:
+                                            output_paths = [
+                                                types.identity_key(out.identity)
+                                                for out in stage_info["outs"]
+                                            ]
+                                            stage_db = _get_state_db(stage_state_dir)
+                                            executor_core.apply_deferred_writes(
+                                                stage_name, output_paths, result, stage_db
+                                            )
+                                        elif (
+                                            "deferred_writes" in result
+                                            and "file_hash_entries" in result["deferred_writes"]
+                                        ):
+                                            state_mod.write_back_file_hashes(
+                                                stage_state_dir,
+                                                result["deferred_writes"]["file_hash_entries"],
+                                            )
 
                                     # Record result
                                     results[stage_name] = executor_core.ExecutionSummary(
@@ -2184,12 +2193,9 @@ class Engine:
                 allow_missing=True,
                 file_hash_entries=file_hash_entries,
             )
-            if not worker_info["no_commit"]:
-                # One attempt, no wait: the run is starting its stages, and the worker hands
-                # the dependency hashes it reads back to the coordinator anyway.
-                state_mod.write_back_file_hashes(
-                    worker_info["state_dir"], file_hash_entries, timeout=0
-                )
+            # One attempt, no wait: the run is starting its stages, and the worker hands the
+            # dependency hashes it reads back to the coordinator anyway.
+            state_mod.write_back_file_hashes(worker_info["state_dir"], file_hash_entries, timeout=0)
             return explanation
 
         try:

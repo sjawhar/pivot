@@ -431,6 +431,33 @@ def test_run_cache_restores_an_earlier_input_version(
     assert _output_path(project).read_text() == "V2"
 
 
+def test_uncommitted_run_cache_restore_hands_back_only_its_file_hashes(
+    project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    """Under `--no-commit` a run-cache restore commits nothing, but the hashes of the
+    dependency it read and the output it restored go back to the coordinator to save: a hash
+    entry is a cache its stat check validates, not part of the commit."""
+    raw = project / "raw.txt"
+    commit = _stage_info(_upper, project, worker_env, no_commit=False)
+    for content in ("v1", "v2"):
+        raw.write_text(content)
+        assert _run_and_apply(commit, worker_env, output_queue)["status"] == StageStatus.RAN
+
+    raw.write_text("v1")
+    result = worker.execute_stage(
+        _STAGE, _stage_info(_upper, project, worker_env), worker_env, output_queue
+    )
+
+    assert (result["status"], result["reason"]) == (StageStatus.CACHED, "unchanged (run cache)")
+    assert "deferred_writes" in result
+    deferred = result["deferred_writes"]
+    assert list(deferred) == ["file_hash_entries"], "A --no-commit restore commits nothing"
+    assert "file_hash_entries" in deferred
+    output = _output_path(project)
+    hashed = {pathlib.Path(entry[0]).name: entry[5] for entry in deferred["file_hash_entries"]}
+    assert hashed == {raw.name: cache.hash_file(raw)[0], output.name: cache.hash_file(output)[0]}
+
+
 def test_unsafe_stage_never_restores_an_existing_run_cache_entry(
     project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:

@@ -19,7 +19,7 @@ import boto3
 import pytest
 import xxhash
 
-from pivot.storage import cache, state
+from pivot.storage import cache, lock, state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -173,6 +173,41 @@ def test_repro_records_the_hashes_its_skip_check_reads(tmp_path: pathlib.Path) -
 
     assert "0 ran" in out, out
     assert _helper_unrecorded(root) == [], "Every file the skip check read is recorded"
+
+
+def test_a_no_commit_run_records_file_hashes_and_commits_nothing(tmp_path: pathlib.Path) -> None:
+    """`pivot repro --no-commit` writes no lock file and no generation, dependency generation
+    or run-cache entry, and still records the hash of every file it read or wrote: a hash
+    entry is a cache its stat check validates, not part of the commit."""
+    root = (tmp_path / "project").resolve()
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    _ok(_pivot(root, "init"))
+    (root / "pipeline.py").write_text(_PIPELINE)
+
+    _ok(_pivot(root, "repro", "--no-commit"))
+
+    stages_dir = lock.get_stages_dir(root / ".pivot")
+    for stage_name in ("syn/make_tree", "syn/count"):
+        assert not lock.StageLock(stage_name, stages_dir).path.exists(), stage_name
+    with state.StateDB(root / ".pivot", readonly=True) as state_db:
+        committed = {
+            prefix: [key for key, _ in state_db.iter_prefix(prefix)]
+            for prefix in (b"gen:", b"dep:", b"runcache:")
+        }
+    assert committed == {b"gen:": [], b"dep:": [], b"runcache:": []}
+    assert _helper_unrecorded(root) == [], "Every file the run wrote and read is recorded"
+
+
+def test_commit_records_the_dependency_hashes_it_read(tmp_path: pathlib.Path) -> None:
+    """`pivot commit` reads each stage's dependencies to tell whether the stage changed, and
+    records them, also for a stage it then leaves alone as unchanged."""
+    root = _helper_project(tmp_path / "project")
+    cache.remove_output(root / ".pivot" / "state.lmdb")
+
+    _ok(_pivot(root, "commit"))
+
+    assert _helper_unrecorded(root) == [], "Every dependency file commit read is recorded"
 
 
 def _helper_s3_env(moto_services: dict[str, str]) -> dict[str, str]:

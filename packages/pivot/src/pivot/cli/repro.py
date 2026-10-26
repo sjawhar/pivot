@@ -857,7 +857,8 @@ def _run_oneshot_mode(
 @click.option(
     "--no-commit",
     is_flag=True,
-    help="Skip writing lock files. Run 'pivot commit' to finalize.",
+    help="Skip writing lock files and committing outputs; file hashes are still saved. "
+    + "Run 'pivot commit' to finalize.",
 )
 @click.option(
     "--fail-fast",

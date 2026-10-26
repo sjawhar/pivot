@@ -7,9 +7,9 @@ import os
 import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
-from pivot import project, types
+from pivot import config, project, registry, types
 from pivot.show import common
-from pivot.storage import cache
+from pivot.storage import cache, state
 from pivot.types import ChangeType, OutputFormat
 
 if TYPE_CHECKING:
@@ -74,20 +74,51 @@ def get_plot_hashes_from_head() -> dict[str, str | None]:
     )
 
 
+def plot_state_dirs() -> dict[str, pathlib.Path]:
+    """Map each plot output's workspace path to its stage's state directory, whose StateDB
+    holds the output's file-hash entry."""
+    from pivot.cli import helpers as cli_helpers
+
+    store = cli_helpers.require_workspace_store()
+    proj_root = project.get_project_root()
+    default_state_dir = config.get_state_dir()
+    state_dirs = dict[str, pathlib.Path]()
+    for stage_name, plot_outs in _plot_outs_by_stage().items():
+        stage_info = cli_helpers.get_stage(stage_name)
+        state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
+        for out in plot_outs:
+            path = project.to_relative_path(store.resolve_display_path(out), proj_root)
+            state_dirs[path] = state_dir
+    return state_dirs
+
+
 def get_plot_hashes_from_workspace(
     paths: Sequence[str],
+    state_dirs: Mapping[str, pathlib.Path] | None = None,
 ) -> dict[str, str]:
     """Compute current file hashes for plot files.
 
-    Paths are relative to project root.
+    Paths are relative to project root. Each file is hashed as ``pivot status`` hashes it: the
+    StateDB of ``state_dirs[path]`` (``plot_state_dirs``; the configured state directory for a
+    path not in it) is read read-only, none is created, and the hashes read from files are
+    saved afterwards with one best-effort ``state.write_back_file_hashes`` per state directory.
     """
     proj_root = project.get_project_root()
-    result = dict[str, str]()
+    default_state_dir = config.get_state_dir()
+    by_state_dir = dict[pathlib.Path, list[tuple[str, pathlib.Path]]]()
     for path_str in paths:
         path = proj_root / path_str
         if path.exists() and path.is_file():
-            file_hash, _ = cache.hash_file(path)
-            result[path_str] = file_hash
+            state_dir = (state_dirs or {}).get(path_str, default_state_dir)
+            by_state_dir.setdefault(state_dir, []).append((path_str, path))
+    result = dict[str, str]()
+    for state_dir, files in by_state_dir.items():
+        read = list[tuple[pathlib.Path, os.stat_result, str]]()
+        with state.open_readonly(state_dir, create=False) as state_db:
+            for path_str, path in files:
+                file_hash, _ = cache.hash_file(path, state_db, pending=read)
+                result[path_str] = file_hash
+        state.write_back_file_hashes(state_dir, cache.deferred_file_hash_entries(read))
     return result
 
 
