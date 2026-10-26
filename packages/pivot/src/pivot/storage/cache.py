@@ -833,10 +833,10 @@ def _mark_tree(cache_dir_path: pathlib.Path) -> None:
 def _tree_matches(
     cache_dir_path: pathlib.Path, output_hash: DirHash, scanned: tuple[list[str], list[str]]
 ) -> bool:
-    """Whether a whole-directory SYMLINK cache tree holds exactly the files (each regular, at its
-    recorded size and executable bit) and the directories ``output_hash`` records. ``scanned``
-    is ``_scan_entries(cache_dir_path)``. A recorded path leading outside the tree raises:
-    ``output_hash`` may come straight from a lock file."""
+    """Whether a whole-directory SYMLINK cache tree holds exactly the files (each regular,
+    matching its recorded hash, size and executable bit) and the directories ``output_hash``
+    records. ``scanned`` is ``_scan_entries(cache_dir_path)``. A recorded path leading outside
+    the tree raises: ``output_hash`` may come straight from a lock file."""
     manifest = output_hash["manifest"]
     resolved_tree = cache_dir_path.resolve()
     for entry in manifest:
@@ -854,11 +854,13 @@ def _tree_matches(
     if found_dirs - _restored_dirs(output_hash) or not found_dirs.issuperset(empty_dirs):
         return False
     for entry in manifest:
-        found_stat = os.lstat(cache_dir_path / entry["relpath"])
+        tree_file = cache_dir_path / entry["relpath"]
+        found_stat = os.lstat(tree_file)
         if (
             not stat.S_ISREG(found_stat.st_mode)
             or found_stat.st_size != entry["size"]
             or bool(found_stat.st_mode & stat.S_IXUSR) != entry["isexec"]
+            or hash_file(tree_file)[0] != entry["hash"]
         ):
             return False
     return True
@@ -919,9 +921,9 @@ def _ensure_tree_complete(
 def _repair_tree_dir_files(
     cache_dir_path: pathlib.Path, manifest: list[DirManifestEntry], cache_dir: pathlib.Path
 ) -> bool:
-    """Give a whole-directory SYMLINK cache tree every file its manifest records, at its
-    recorded size, copied from the file's own cache object. Return False, changing nothing, when
-    a file is missing or the wrong size and its object is not cached.
+    """Give a whole-directory SYMLINK cache tree every file its manifest records, copied from
+    its files' own cache objects. Return False, changing nothing, when a file is missing, has
+    the wrong content, or its object is not cached.
 
     Each repaired file is copied beside its name and renamed in, so a reader of the tree never
     sees part of one. Changing the tree in place is safe for the reason
@@ -940,7 +942,11 @@ def _repair_tree_dir_files(
         except FileNotFoundError:
             pass
         else:
-            if stat.S_ISREG(target_stat.st_mode) and target_stat.st_size == entry["size"]:
+            if (
+                stat.S_ISREG(target_stat.st_mode)
+                and target_stat.st_size == entry["size"]
+                and hash_file(target)[0] == entry["hash"]
+            ):
                 continue
         wrong.append((entry, target))
     if not wrong:

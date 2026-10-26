@@ -1059,7 +1059,7 @@ def test_get_repairs_partial_directory_cache_tree_from_remote(
     cache.get_cache_path(cache_dir, missing_hash).unlink()
     partial_tree = cache.get_cache_path(cache_dir, output_hash["hash"])
     partial_tree.mkdir(parents=True)
-    (partial_tree / "0.txt").write_text("stale")
+    (partial_tree / "0.txt").write_text("xx")
 
     proc = _pivot(
         clone,
