@@ -201,7 +201,8 @@ def test_checkout_keeps_a_sidecar_path_holding_backslashes_inside_the_project(
 ) -> None:
     """``path: ..\\..\\escaped.csv`` names one file beside its sidecar.
 
-    Read with each backslash as a separator, it climbs two directories out of the project.
+    Read with each backslash as a separator, it climbs two directories up from ``sub/``, out of
+    the project.
     """
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         (cwd / "seed.csv").write_text(_CONTENT)
