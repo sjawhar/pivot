@@ -760,9 +760,18 @@ with pipeline:
             except (ConnectionRefusedError, FileNotFoundError):
                 time.sleep(0.1)
         if response is None:
-            stdout, stderr = proc.communicate(timeout=1)
+            # A server that is alive but silent never ends `communicate`, so it is stopped
+            # first: the failure must show what it printed, not a TimeoutExpired of its own.
+            exit_code = proc.poll()
+            if exit_code is None:
+                proc.send_signal(signal.SIGTERM)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
             pytest.fail(
-                f"Serve mode did not answer status within 10s. exit: {proc.poll()}"
+                f"Serve mode did not answer status within 10s. exit: {exit_code}"
                 + f"\nstdout: {stdout.decode()}\nstderr: {stderr.decode()}"
             )
 
