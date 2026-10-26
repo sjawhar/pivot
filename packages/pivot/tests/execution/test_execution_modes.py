@@ -129,8 +129,10 @@ def test_no_commit_produces_outputs_without_production_lock(
     production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert not production_lock.path.exists(), "Production lock should NOT be written"
 
-    # No deferred writes should be returned (no lock/cache writes to apply)
-    assert "deferred_writes" not in result, "No deferred writes in no_commit mode"
+    # The only deferred write is the record of what the run wrote: no lock, no cache entry, no
+    # generation. This output is a file, so the run wrote no `*.pvt` directory member.
+    assert "deferred_writes" in result
+    assert result["deferred_writes"] == {"no_commit_record": {"pvt_members": {}}}
 
 
 def test_no_commit_does_not_write_to_cache(

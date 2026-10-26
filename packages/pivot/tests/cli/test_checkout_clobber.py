@@ -259,6 +259,9 @@ def _helper_restore_layout(root: pathlib.Path) -> tuple[pathlib.Path, types.DirH
 
 def _helper_restore_only_missing(root: pathlib.Path, v2_hash: types.DirHash) -> str:
     """Run the per-target restore `pivot checkout --only-missing` runs for data/ext."""
+    # The swap is checked for user files beneath data/ext, which needs the project root (also
+    # in the spawned child that crashes mid-restore)
+    project._project_root_cache = root
     outcome = checkout_mod._restore_path_sync(
         root / "data" / "ext",
         v2_hash,

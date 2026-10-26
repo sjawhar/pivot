@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+import functools
 import logging
 import os
 import pathlib
@@ -371,6 +372,30 @@ def _current_output_hashes(stage_target: StageTarget) -> dict[str, HashInfo]:
     return hashes
 
 
+def _stage_members(
+    proj_root: pathlib.Path,
+    path: pathlib.Path,
+    hashes: tuple[HashInfo | None, ...],
+    stage_target: StageTarget,
+) -> ownership.StageMembers:
+    """A stage output's own ``*.pvt`` members: the ones ``hashes`` and its last ``--no-commit``
+    run record."""
+    return ownership.merged_members(
+        ownership.recorded_members(path, *hashes),
+        ownership.stored_no_commit_members(
+            proj_root, [(stage_target["stage_name"], stage_target["state_dir"])]
+        ),
+    )
+
+
+def _tracked_members(path: pathlib.Path, revision_hash: HashInfo | None) -> ownership.StageMembers:
+    """A tracked path's own ``*.pvt`` content: what the revision's and the current sidecar list."""
+    current = track.read_pvt_file(track.get_pvt_path(path))
+    return ownership.recorded_members(
+        path, revision_hash, track.pvt_to_hash_info(current) if current is not None else None
+    )
+
+
 def _refuse_forced_replacements(
     proj_root: pathlib.Path,
     target_infos: list[TargetInfo],
@@ -379,34 +404,45 @@ def _refuse_forced_replacements(
 ) -> None:
     """Fail before ``--force`` replaces a path holding a user's tracked file or sidecar.
 
-    A tracked or git file restored to its own path is that file's own restore and is not
-    checked. A stage output restored to its own path is checked with the stage's own ``*.pvt``
-    members, as the revision's and the current lock record them. An ``--output`` path is
-    checked as a destination the user named.
+    Every target is checked before the first is restored. A tracked or git file restored to its
+    own path is its own restore: it may replace its own content, never another tracked file,
+    import or sidecar beneath it. A stage output restored to its own path is checked with the
+    stage's own ``*.pvt`` members, as the revision's lock, the current lock and the stage's last
+    ``--no-commit`` run record them. An ``--output`` path is checked as a destination the user
+    named.
     """
     replacements = list[ownership.Replacement]()
-    members = dict[pathlib.Path, ownership.StageMembers]()
+    members = dict[pathlib.Path, functools.partial[ownership.StageMembers]]()
     for target_info in target_infos:
-        current = (
-            _current_output_hashes(stage_targets[target_info["original_target"]])
+        stage_target = (
+            stage_targets[target_info["original_target"]]
             if target_info["target_type"] is TargetType.STAGE
-            else {}
+            else None
         )
+        current = _current_output_hashes(stage_target) if stage_target is not None else {}
         for rel_path in target_info["paths"]:
             own_path = proj_root / rel_path
             dest_path = output if output is not None else own_path
             if not (dest_path.exists() or dest_path.is_symlink()):
                 continue
+            revision_hash = target_info["hashes"].get(rel_path)
+            key = ownership.normalized(dest_path)
             if dest_path != own_path:
                 replacements.append(ownership.destination(dest_path))
-            elif target_info["target_type"] is TargetType.STAGE:
-                stage_name = stage_targets[target_info["original_target"]]["stage_name"]
-                replacements.append(ownership.stage_output(dest_path, stage_name))
-                members[ownership.normalized(dest_path)] = ownership.recorded_members(
-                    dest_path, target_info["hashes"].get(rel_path), current.get(rel_path)
+            elif stage_target is not None:
+                replacements.append(ownership.stage_output(dest_path, stage_target["stage_name"]))
+                members[key] = functools.partial(
+                    _stage_members,
+                    proj_root,
+                    dest_path,
+                    (revision_hash, current.get(rel_path)),
+                    stage_target,
                 )
+            else:
+                replacements.append(ownership.tracked_restore(dest_path))
+                members[key] = functools.partial(_tracked_members, dest_path, revision_hash)
     ownership.refuse_output_replacements(
-        proj_root, replacements, lambda path: members.get(path, {})
+        proj_root, replacements, lambda path: members[path]() if path in members else {}
     )
 
 

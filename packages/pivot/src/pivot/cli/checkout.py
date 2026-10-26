@@ -18,7 +18,7 @@ from pivot.storage import cache, lock, ownership, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Mapping
+    from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
 
 RestoreResult = Literal["restored", "skipped", "missing"]
 MAX_CONCURRENT_RESTORES = 32
@@ -103,6 +103,71 @@ def _on_disk_matches_expected(
         return False
     actual_hash, _ = cache.hash_file(path)
     return actual_hash == expected_hash["hash"]
+
+
+def _no_commit_members() -> ownership.StageMembers:
+    """The ``*.pvt`` members each stage's last ``--no-commit`` run wrote (none without stages)."""
+    if cli_decorators.get_pipeline_from_context() is None:
+        return {}
+    default_state_dir = config.get_state_dir()
+    return ownership.stored_no_commit_members(
+        project.get_project_root(),
+        [
+            (name, registry.get_stage_state_dir(cli_helpers.get_stage(name), default_state_dir))
+            for name in cli_helpers.list_stages()
+        ],
+    )
+
+
+def _ownership_refusals(
+    targets: Iterable[tuple[str, HashInfo, bool]],
+    no_commit_members: Callable[[], ownership.StageMembers] | None = None,
+) -> tuple[set[str], click.ClickException | None]:
+    """The ``(path, hash, is_stage_output)`` targets whose restore would remove a user's file,
+    and one refusal naming every such file.
+
+    A stage output is checked as the stage's replacement, with the ``*.pvt`` members the stage
+    records (the restored hash's, and ``no_commit_members``, read only if a target holds a
+    ``*.pvt``); a tracked path as its own restore, which may replace its own content and nothing
+    else beneath it. Only a path that exists is replaced. Each target is checked on its own, so
+    a target left out of the refused set removes nothing of the user's.
+    """
+    checked = list[tuple[str, ownership.Replacement]]()
+    hashes = dict[pathlib.Path, list[HashInfo]]()
+    for path_str, output_hash, is_stage_output in targets:
+        path = pathlib.Path(path_str)
+        if not (path.exists() or path.is_symlink()):
+            continue
+        replacement = (
+            ownership.stage_output(path) if is_stage_output else ownership.tracked_restore(path)
+        )
+        checked.append((path_str, replacement))
+        hashes.setdefault(ownership.normalized(path), []).append(output_hash)
+    run_members: ownership.StageMembers | None = None
+
+    def members_of(path: pathlib.Path) -> ownership.StageMembers:
+        nonlocal run_members
+        if run_members is None:
+            run_members = no_commit_members() if no_commit_members is not None else {}
+        return ownership.merged_members(
+            ownership.recorded_members(path, *hashes.get(path, [])), run_members
+        )
+
+    project_root = project.get_project_root()
+    refused = set[str]()
+    overlaps = dict[pathlib.Path, ownership.OutputOverlap]()
+    for path_str, replacement in checked:
+        found = ownership.find_output_overlaps(project_root, [replacement], members_of)
+        if found:
+            refused.add(path_str)
+            for overlap in found:
+                overlaps.setdefault(overlap["pvt_path"], overlap)
+    if not overlaps:
+        return refused, None
+    error = ownership.ownership_error(
+        project_root, sorted(overlaps.values(), key=lambda overlap: overlap["pvt_path"])
+    )
+    return refused, click.ClickException(str(error))
 
 
 def _restore_path_sync(
@@ -207,17 +272,14 @@ def _restore_path_locked(
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
                 raise ValueError(f"Unhandled checkout behavior: {behavior}")  # pyright: ignore[reportUnreachable]
 
-    # Only a restore over an existing stage output removes anything (--force, or an
-    # --only-missing swap): refuse it if a user's tracked file or sidecar is there
-    if is_stage_output and (path.exists() or path.is_symlink()):
-        try:
-            ownership.refuse_output_replacements(
-                project.get_project_root(),
-                [ownership.stage_output(path)],
-                lambda output_path: ownership.recorded_members(output_path, output_hash),
-            )
-        except exceptions.OutputOwnershipError as e:
-            raise click.ClickException(str(e)) from e
+    # --force checked every target before the first restore. An --only-missing swap replaces
+    # the directory, so it is checked here, under the restore lock, once the swap is decided.
+    # A swap removes only files the cache holds, never ones a --no-commit run wrote (that run
+    # caches nothing), so the stage's --no-commit record is not read here.
+    if behavior is not CheckoutBehavior.FORCE and (path.exists() or path.is_symlink()):
+        _, refusal = _ownership_refusals([(str(path), output_hash, is_stage_output)])
+        if refusal is not None:
+            raise refusal
     success = cache.restore_from_cache(
         path,
         output_hash,
@@ -395,26 +457,58 @@ async def _checkout_main_async(
     callback: Callable[[int, int, str], None] | None = None,
     state_dir: pathlib.Path | None = None,
 ) -> list[RestoreOutcome]:
-    """Main async checkout logic: what restoring each tracked file and stage output did."""
+    """Main async checkout logic: what restoring each tracked file and stage output did.
+
+    ``--force`` replaces every existing target, so each is checked before the first restore:
+    a target whose restore would remove a user's file is not restored, and the others are.
+    """
     if targets:
         unique_targets = _dedupe_targets(targets)
         files = _validate_and_build_files(unique_targets, tracked_files, stage_outputs)
-        return await _checkout_files_async(
-            files,
-            cache_dir,
-            checkout_modes,
-            behavior,
-            callback,
-            state_dir=state_dir,
-            # A tracked target restores its own file, never a stage output's replacement
-            stage_output_paths={path for path in stage_outputs if path not in tracked_files},
+        # A tracked target restores its own file, never a stage output's replacement
+        stage_output_paths = {path for path in stage_outputs if path not in tracked_files}
+        refused, refusal = (
+            _ownership_refusals(
+                (
+                    (path, output_hash, path in stage_output_paths)
+                    for path, output_hash in files.items()
+                ),
+                _no_commit_members,
+            )
+            if behavior is CheckoutBehavior.FORCE
+            else (set[str](), None)
+        )
+        return await _after_refusal(
+            refusal,
+            _checkout_files_async(
+                {path: h for path, h in files.items() if path not in refused},
+                cache_dir,
+                checkout_modes,
+                behavior,
+                callback,
+                state_dir=state_dir,
+                stage_output_paths=stage_output_paths,
+            ),
         )
     else:
         # Checkout all tracked files and stage outputs
         tracked_as_hashes: dict[str, HashInfo] = {
             path: track.pvt_to_hash_info(pvt) for path, pvt in tracked_files.items()
         }
-        combined_total = len(tracked_as_hashes) + len(stage_outputs)
+        refused, refusal = (
+            _ownership_refusals(
+                [
+                    *((path, h, False) for path, h in tracked_as_hashes.items()),
+                    *((path, h, True) for path, h in stage_outputs.items()),
+                ],
+                _no_commit_members,
+            )
+            if behavior is CheckoutBehavior.FORCE
+            else (set[str](), None)
+        )
+        tracked_kept = {path: h for path, h in tracked_as_hashes.items() if path not in refused}
+        outputs_kept = {path: h for path, h in stage_outputs.items() if path not in refused}
+        combined_total = len(tracked_kept) + len(outputs_kept)
         shared_completed = 0
 
         def shared_callback(_completed: int, _total: int, filename: str) -> None:
@@ -427,7 +521,7 @@ async def _checkout_main_async(
         # Run both in parallel with shared progress counter
         t1 = asyncio.create_task(
             _checkout_files_async(
-                tracked_as_hashes,
+                tracked_kept,
                 cache_dir,
                 checkout_modes,
                 behavior,
@@ -437,17 +531,30 @@ async def _checkout_main_async(
         )
         t2 = asyncio.create_task(
             _checkout_files_async(
-                stage_outputs,
+                outputs_kept,
                 cache_dir,
                 checkout_modes,
                 behavior,
                 progress_cb,
                 state_dir=state_dir,
-                stage_output_paths=stage_outputs.keys(),
+                stage_output_paths=outputs_kept.keys(),
             )
         )
-        tracked, outputs = await asyncio.gather(t1, t2)
+        tracked, outputs = await _after_refusal(refusal, asyncio.gather(t1, t2))
         return tracked + outputs
+
+
+async def _after_refusal[T](refusal: click.ClickException | None, restores: Awaitable[T]) -> T:
+    """Await the restores an ownership check allowed, then report its refusal with any errors."""
+    try:
+        done = await restores
+    except click.ClickException as e:
+        if refusal is None:
+            raise
+        raise click.ClickException(f"{refusal.message}\n{e.message}") from e
+    if refusal is not None:
+        raise refusal
+    return done
 
 
 def _print_summary(outcomes: list[RestoreOutcome], quiet: bool) -> bool:

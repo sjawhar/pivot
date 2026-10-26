@@ -1323,10 +1323,25 @@ class Engine:
                                     )
                                     stage_durations[stage_name] = duration_ms
 
-                                    # Apply deferred writes for RAN and CACHED stages
+                                    # Apply deferred writes for RAN and CACHED stages. Under
+                                    # --no-commit only the record of what ran is kept;
+                                    # nothing else is persisted.
+                                    deferred = (
+                                        result["deferred_writes"]
+                                        if "deferred_writes" in result
+                                        else None
+                                    )
+                                    if no_commit and deferred is not None:
+                                        deferred = (
+                                            DeferredWrites(
+                                                no_commit_record=deferred["no_commit_record"]
+                                            )
+                                            if "no_commit_record" in deferred
+                                            else None
+                                        )
                                     if (
                                         result["status"] in (StageStatus.RAN, StageStatus.CACHED)
-                                        and not no_commit
+                                        and deferred is not None
                                     ):
                                         stage_info = self._get_stage(stage_name)
                                         output_paths = [
@@ -1337,8 +1352,8 @@ class Engine:
                                             stage_info, default_state_dir
                                         )
                                         stage_db = _get_state_db(stage_state_dir)
-                                        executor_core.apply_deferred_writes(
-                                            stage_name, output_paths, result, stage_db
+                                        stage_db.apply_deferred_writes(
+                                            stage_name, output_paths, deferred
                                         )
 
                                     # Record result
@@ -1993,6 +2008,9 @@ class Engine:
                 state_db,
                 state_dir=state_dir,
                 file_hash_entries=restored_entries,
+                no_commit_members=ownership.no_commit_members(
+                    project.get_project_root(), state_db.get_no_commit_record(stage_name)
+                ),
             )
             if restored and restored_entries:
                 with state_mod.StateDB(stage_state_dir) as writable_db:

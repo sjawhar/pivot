@@ -1075,6 +1075,50 @@ def test_apply_deferred_writes_path_too_long_output(tmp_path: pathlib.Path) -> N
         db.apply_deferred_writes("stage", [long_output], deferred)
 
 
+def test_no_commit_record_is_kept_until_a_lock_clears_it(tmp_path: pathlib.Path) -> None:
+    """A --no-commit run's record replaces the stage's earlier one and stays until a deferred
+    write for a written lock clears it; other stages have none."""
+    first: DeferredWrites = {"no_commit_record": {"pvt_members": {"data/s/a.pvt": "aaa"}}}
+    second: DeferredWrites = {"no_commit_record": {"pvt_members": {}}}
+    cleared: DeferredWrites = {"clear_no_commit_record": True}
+
+    with state.StateDB(tmp_path) as db:
+        assert db.get_no_commit_record("s") is None
+        db.apply_deferred_writes("s", [], first)
+        assert db.get_no_commit_record("s") == {"pvt_members": {"data/s/a.pvt": "aaa"}}
+        assert db.get_no_commit_record("other") is None
+        db.apply_deferred_writes("s", [], {"dep_generations": {"dep": 1}})
+        assert db.get_no_commit_record("s") == {"pvt_members": {"data/s/a.pvt": "aaa"}}
+        db.apply_deferred_writes("s", [], second)
+        assert db.get_no_commit_record("s") == {"pvt_members": {}}
+        db.apply_deferred_writes("s", [], cleared)
+        assert db.get_no_commit_record("s") is None
+        db.apply_deferred_writes("s", [], cleared)
+        assert db.get_no_commit_record("s") is None
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        pytest.param(b"\xff not json", id="not-json"),
+        pytest.param(b"[1, 2]", id="not-an-object"),
+        pytest.param(b'{"pvt_members": {"data/s/a.pvt": 1}}', id="hash-not-a-string"),
+        pytest.param(b'{"pvt_members": ["data/s/a.pvt"]}', id="members-not-a-mapping"),
+    ],
+)
+def test_unreadable_no_commit_record_reads_as_none(tmp_path: pathlib.Path, stored: bytes) -> None:
+    """A record this Pivot cannot read lists no member, so nothing is claimed through it."""
+    with state.StateDB(tmp_path):
+        pass
+    env = lmdb.open(str(tmp_path / "state.lmdb"))
+    with env.begin(write=True) as txn:
+        txn.put(b"nocommit:s", stored)
+    env.close()
+
+    with state.StateDB(tmp_path, readonly=True) as db:
+        assert db.get_no_commit_record("s") is None
+
+
 # -----------------------------------------------------------------------------
 # AST hash cache tests
 # -----------------------------------------------------------------------------

@@ -297,6 +297,7 @@ StateDB is an LMDB-backed key-value store for all pipeline state. Keys use prefi
 | `runcache:` | Run cache entries (stage name + input hash) |
 | `run:` | Run history manifests |
 | `remote:` | Remote index entries |
+| `nocommit:` | What a `--no-commit` run of a stage wrote: its `*.pvt` directory members (path → content hash), until a lock is written |
 
 **Path handling strategies:** Hash keys use `resolve()` (follows symlinks) so that symlinked files deduplicate to the same cache entry. Generation keys use `normpath()` (preserves symlinks) so that logical path identity is maintained for dependency tracking.
 
@@ -436,7 +437,7 @@ Without this flag, Pivot validates that all tracked outputs exist before running
 The `--no-commit` flag runs stages without writing durable state:
 
 ```bash
-# Run stages — outputs land on disk but no locks, cache, or StateDB updates
+# Run stages — outputs land on disk; no locks, no cache, only a record of what each stage wrote
 pivot repro --no-commit
 
 # Inspect results, then snapshot current workspace state
@@ -445,8 +446,8 @@ pivot commit
 
 ### How It Works
 
-1. `--no-commit`: stages execute and outputs are written to disk. No lock files, no cache copies, no StateDB updates. Output hashes are computed for the `StageResult` but nothing is persisted.
-2. `pivot commit [stage_names...]`: computes current workspace state (fingerprints code, hashes deps and outputs), writes production lock files, saves outputs to cache, and updates StateDB. Without arguments, commits all stale stages. With stage names, unconditionally commits those stages.
+1. `--no-commit`: stages execute and outputs are written to disk. No lock files and no cache copies are written. StateDB keeps one record per stage that ran (`nocommit:<stage>`): the `*.pvt` files it wrote in its directory outputs, with their content hashes. Until a lock is written, each such file that still holds what the run wrote is the stage's own: a later run or restore replaces it, and `status` does not warn about it.
+2. `pivot commit [stage_names...]`: computes current workspace state (fingerprints code, hashes deps and outputs), writes production lock files, saves outputs to cache, and updates StateDB. Without arguments, commits all stale stages. With stage names, unconditionally commits those stages. It takes as the stage's own only the `*.pvt` files its lock lists, or that its `--no-commit` record lists and that are unchanged since; it refuses, naming it, any other `.pvt` in an output, which may be a user's sidecar. A written lock removes the record.
 
 ### Use Case
 

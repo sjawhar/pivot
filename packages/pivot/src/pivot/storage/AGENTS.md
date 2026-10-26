@@ -35,6 +35,7 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 | `remote:` | Remote index entries |
 | `remote_url:` | Remote URL tracking for change detection |
 | `fp:` | AST fingerprint/hash cache entries |
+| `nocommit:` | What a `--no-commit` run of a stage wrote (`stage` → its `*.pvt` directory members, path → content hash); a written lock removes it |
 
 **When adding new state types**, define a new prefix constant and document it here.
 
@@ -113,30 +114,44 @@ When multiple `pivot` processes share the same StateDB:
 - Pivot replaces only what it owns. A tracked file, an imported file and their `.pvt` sidecars
   are the user's, even when one sits inside a stage output.
 - Every path that removes or replaces a stage output in the workspace calls
-  `ownership.refuse_output_replacements` before it removes anything and raises
-  `OutputOwnershipError` naming each file. A stage's output write checks all of the stage's
-  outputs first (`worker._write_outputs_with_store` → `WorkspaceStore.refuse_output_replacements`),
-  then each one again in `WorkspaceStore.prepare_output` just before clearing it. Also checked:
+  `ownership.refuse_output_replacements` (or `find_output_overlaps`) before it removes anything
+  and raises `OutputOwnershipError` naming each file. A stage's output write checks all of the
+  stage's outputs first (`worker._write_outputs_with_store` →
+  `WorkspaceStore.refuse_output_replacements`), then each one again in
+  `WorkspaceStore.prepare_output` just before clearing it. Also checked:
   `WorkspaceStore.restore_from_cache` (generation, lock and run-cache restores),
   `WorkspaceStore.commit` (the stage's own commit and `pivot commit`), an incremental output's
-  restore, `pivot checkout` and `pivot pull` (in `_restore_path_locked`, only when a restore
-  replaces an existing stage output: `--force`, or an `--only-missing` swap), `pivot get --force`
-  and the presentation layer. Add the call to any new path that removes an output.
-- `pivot get --force` of a tracked or git file to its own path is that file's own restore and is
-  not checked; a stage output restored to its own path is; an `--output` path (relative to the
-  working directory) is checked as a destination the user named.
-- The check looks only where a replacement reaches: the sidecar beside the output and beside each
-  directory above it (one that does not parse counts; one that parses counts when it names that
-  path), and every `*.pvt` under a real output directory. It never walks the project, so it does
-  not see a `.pvt` outside an output whose `path` field names a file inside it. Pivot never writes
-  one (`track`, `import` and `update` write the data file's own name), and catching a hand-edited
-  one would need a project-wide walk on every output write.
+  restore, `pivot checkout` and `pivot pull`, `pivot get --force` and the presentation layer. Add
+  the call to any new path that removes an output.
+- A forced restore of a tracked or git path to its own place (`checkout --force`, `pull --force`,
+  `get --force`) may replace that path's own content and nothing else: it is checked as an
+  `ownership.tracked_restore`, which looks only beneath the path (not at its own sidecar or the
+  sidecars above it) and refuses for every other tracked file, import or sidecar there. A stage
+  output restored to its own path is checked as a stage output; an `--output` path (relative to
+  the working directory) as a destination the user named.
+- A command checks every target before it restores the first. `get --force` refuses all of them
+  if one is refused. `checkout --force` and `pull --force` check each target on its own and leave
+  each refused one as it is (`checkout._ownership_refusals`): a target that is not refused removes
+  nothing of the user's, so those are restored, and the command then fails naming every refused
+  file. An `--only-missing` swap is checked in `_restore_path_locked`, under the restore lock,
+  once the swap is decided; default checkout and `--only-missing` without a swap replace nothing.
+- The check looks only where a replacement reaches: for a stage output or destination, the
+  sidecar beside it and beside each directory above it (one that does not parse counts; one that
+  parses counts when it names that path), and every `*.pvt` under a real directory. It never walks
+  the project, so it does not see a `.pvt` outside an output whose `path` field names a file inside
+  it. Pivot never writes one (`track`, `import` and `update` write the data file's own name), and
+  catching a hand-edited one would need a project-wide walk on every output write.
 - A stage may return a directory member named `*.pvt`. One is the stage's own when the stage
-  records it (`ownership.StageMembers`): the lock's output hash, the hash a restore writes, or this
-  run's return value. At a recorded path, a `.pvt` that does not parse is the stage's, and one that
-  parses is the stage's only if its content is a recorded one; a `.pvt` at any other path is the
-  user's. A commit records what is on disk, so it also gives the stage every `.pvt` that does not
-  parse. `status` and the engine read the lock for this only when an output holds a `*.pvt`.
+  records it (`ownership.StageMembers`): the lock's output hash, the hash a restore writes, this
+  run's return value, or the record its last `--no-commit` run left (`nocommit:<stage>`,
+  `ownership.no_commit_members`, a file counted only while it holds what that run wrote, since the
+  record outlives a run that leaves the lock's outputs in place). At a recorded path, a `.pvt`
+  that does not parse is the stage's, and one that parses is the stage's only if its content is a
+  recorded one; a `.pvt` at any other path is the user's. `pivot commit` passes the members the
+  lock and the `--no-commit` record list and nothing else, so it refuses, naming it, a `.pvt` that
+  does not parse at any other path: were it to claim that file, the lock would list it and the
+  next forced run would delete it. `status` and the engine read the lock and the record for this
+  only when an output holds a `*.pvt`.
 - The check runs when a command starts replacing an output, not again just before each removal,
   for a restore, a symlink-mode commit, checkout, `get --force` and presentation; a sidecar created
   inside an output during that window is not seen. That is acceptable because `track` and

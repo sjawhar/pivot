@@ -12,7 +12,7 @@ import pathlib
 
 from pivot import config, exceptions, parameters, project, registry, run_history, skip, types
 from pivot.executor import worker
-from pivot.storage import lock
+from pivot.storage import lock, ownership
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import ArtifactTag, DeferredWrites, HashInfo, LockData
@@ -136,6 +136,12 @@ def commit_stages(
                 previous_lock["code_manifest"] if previous_lock is not None else None, fingerprint
             )
             reusable = skip.uncovered_import_reason(code_manifest) is None
+            # The stage's own *.pvt files are the ones its lock or its last --no-commit run
+            # records. Every other *.pvt in an output is a user's: the commit refuses before it
+            # would claim one, so a later run cannot delete it as the stage's.
+            run_members = ownership.no_commit_members(
+                project_root, stage_db.get_no_commit_record(stage_name)
+            )
 
             # 5. If not force and no explicit stages, check lock — skip if unchanged
             if not force and stage_names is None and previous_lock is not None:
@@ -164,6 +170,15 @@ def commit_stages(
                         out_path,
                         state_dir=default_state_dir,
                         warn_left_out_symlinks=warn_left_out_symlinks,
+                        members=ownership.merged_members(
+                            ownership.recorded_members(
+                                out_path,
+                                previous_lock["output_hashes"].get(out.identity)
+                                if previous_lock is not None
+                                else None,
+                            ),
+                            run_members,
+                        ),
                     )
                     file_hash_entries.extend(worker.output_file_hash_entries(out_path, hash_info))
                     output_hashes_by_key[identity_key] = hash_info
@@ -213,7 +228,7 @@ def commit_stages(
             # An unsafe fingerprint may match a run whose captured values differed, and a carried
             # uncovered-import mark means the outputs came from code the fingerprint misses: never
             # file either. A carried mark also removes any entry an earlier run filed at this key.
-            deferred = DeferredWrites()
+            deferred = DeferredWrites(clear_no_commit_record=True)
             if dep_gen_map:
                 deferred["dep_generations"] = dep_gen_map
             if reusable and not stage_info["unsafe_fingerprint"]:

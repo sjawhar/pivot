@@ -4,24 +4,29 @@ A stage output is Pivot's to replace. A tracked file, an imported file and their
 sidecars are the user's. ``track`` and ``import`` refuse a new path inside any pipeline's
 declared output (``discovery.declared_outputs``). A project can still hold one from before that
 check, so every write, restore or commit that replaces an output first looks for sidecars where
-the replacement reaches and fails, naming them, before anything is removed.
+the replacement reaches and fails, naming them, before anything is removed. A forced restore of a
+tracked path replaces that path's own content and nothing else: it fails the same way before it
+would remove another tracked file, import or sidecar beneath it.
 
 A stage may return a directory member named ``*.pvt``. Such a file is the stage's when the stage
-records it (``StageMembers``): a sidecar Pivot cannot parse at a recorded path, or a file whose
-content the stage recorded there. Every other ``*.pvt`` under an output is the user's.
+records it (``StageMembers``): its lock, or the record its last ``--no-commit`` run left
+(``nocommit:<stage>``), lists it at that path, and it is a sidecar Pivot cannot parse or a file
+whose content the stage recorded there. Every other ``*.pvt`` under an output is the user's, for
+``pivot commit`` too.
 """
 
 from __future__ import annotations
 
+import enum
 import os
 import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
 from pivot import exceptions, project, types
-from pivot.storage import cache, lock, track
+from pivot.storage import cache, lock, state, track
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
     from pivot.registry import RegistryStageInfo
     from pivot.storage.store import WorkspaceStore
@@ -31,14 +36,24 @@ if TYPE_CHECKING:
 type StageMembers = dict[pathlib.Path, frozenset[str] | None]
 
 
+class ReplacementKind(enum.StrEnum):
+    """What a replaced path is: it decides where the check looks and how a refusal reads."""
+
+    STAGE_OUTPUT = "stage_output"
+    """A stage output: everything beneath it, and the sidecar for it and for each parent."""
+    TRACKED = "tracked"
+    """A tracked or git path restored to its own place: only what lies beneath it."""
+    DESTINATION = "destination"
+    """A path the user named (``pivot get --output``)."""
+
+
 class Replacement(TypedDict):
     """A path Pivot is about to remove or replace."""
 
     path: pathlib.Path
     stage: str | None
     """The stage whose output ``path`` is, when the caller knows it."""
-    destination: bool
-    """True for a path the user named (``pivot get --output``), not a stage output."""
+    kind: ReplacementKind
 
 
 class DeclaredOutput(TypedDict):
@@ -58,11 +73,15 @@ class OutputOverlap(TypedDict):
 
 
 def stage_output(path: pathlib.Path, stage: str | None = None) -> Replacement:
-    return Replacement(path=path, stage=stage, destination=False)
+    return Replacement(path=path, stage=stage, kind=ReplacementKind.STAGE_OUTPUT)
+
+
+def tracked_restore(path: pathlib.Path) -> Replacement:
+    return Replacement(path=path, stage=None, kind=ReplacementKind.TRACKED)
 
 
 def destination(path: pathlib.Path) -> Replacement:
-    return Replacement(path=path, stage=None, destination=True)
+    return Replacement(path=path, stage=None, kind=ReplacementKind.DESTINATION)
 
 
 def normalized(path: pathlib.Path) -> pathlib.Path:
@@ -81,6 +100,61 @@ def recorded_members(output_path: pathlib.Path, *hashes: types.HashInfo | None) 
             if entry["relpath"].endswith(".pvt"):
                 found.setdefault(root / entry["relpath"], set[str]()).add(entry["hash"])
     return {path: frozenset(recorded) for path, recorded in found.items()}
+
+
+def no_commit_members(
+    project_root: pathlib.Path, record: types.NoCommitRecord | None
+) -> StageMembers:
+    """The ``*.pvt`` members a stage's last ``--no-commit`` run wrote that still hold what it
+    wrote, each with that content hash.
+
+    A record outlives a run that leaves the lock's outputs in place, so a member counts only
+    while its content is the run's: a user's file put at that path later stays the user's.
+    """
+    if record is None or "pvt_members" not in record:
+        return {}
+    root = normalized(project_root)
+    members = dict[pathlib.Path, frozenset[str] | None]()
+    for relpath, content_hash in record["pvt_members"].items():
+        path = root / relpath
+        if path.is_file() and cache.hash_file(path)[0] == content_hash:
+            members[path] = frozenset([content_hash])
+    return members
+
+
+def stored_no_commit_members(
+    project_root: pathlib.Path, stages: Iterable[tuple[str, pathlib.Path]]
+) -> StageMembers:
+    """``no_commit_members`` of these ``(stage, state_dir)`` pairs, from each stage's StateDB.
+
+    Opens each state directory's StateDB once, read-only, and never creates one.
+    """
+    names_by_dir = dict[pathlib.Path, list[str]]()
+    for stage_name, state_dir in stages:
+        names_by_dir.setdefault(state_dir, []).append(stage_name)
+    found = list[StageMembers]()
+    for state_dir, names in names_by_dir.items():
+        if not (state_dir / "state.lmdb").exists():
+            continue
+        with state.StateDB(state_dir, readonly=True) as state_db:
+            found.extend(
+                no_commit_members(project_root, state_db.get_no_commit_record(name))
+                for name in names
+            )
+    return merged_members(*found)
+
+
+def merged_members(*sources: StageMembers) -> StageMembers:
+    """Every member any source lists, with every hash recorded for it (None: any content)."""
+    merged = dict[pathlib.Path, frozenset[str] | None]()
+    for source in sources:
+        for path, recorded in source.items():
+            if path not in merged:
+                merged[path] = recorded
+                continue
+            current = merged[path]
+            merged[path] = None if current is None or recorded is None else current | recorded
+    return merged
 
 
 def _same_location(path_a: pathlib.Path, path_b: pathlib.Path) -> bool:
@@ -105,13 +179,10 @@ def paths_overlap(path_a: pathlib.Path, path_b: pathlib.Path) -> bool:
 
 
 def _is_stage_member(
-    pvt_path: pathlib.Path,
-    data: track.PvtData | None,
-    members: StageMembers,
-    claim_unparsed: bool,
+    pvt_path: pathlib.Path, data: track.PvtData | None, members: StageMembers
 ) -> bool:
     if pvt_path not in members:
-        return claim_unparsed and data is None
+        return False
     recorded = members[pvt_path]
     return recorded is None or data is None or cache.hash_file(pvt_path)[0] in recorded
 
@@ -120,18 +191,16 @@ def find_output_overlaps(
     project_root: pathlib.Path,
     replacements: Sequence[Replacement],
     members_of: Callable[[pathlib.Path], StageMembers] | None = None,
-    *,
-    claim_unparsed: bool = False,
 ) -> list[OutputOverlap]:
     """Find the ``.pvt`` sidecars that replacing each path would remove or orphan.
 
-    Looks only where a replacement reaches. At the path and at each directory above it up to the
-    project root, the sidecar Pivot would write for that path counts unless it parses and names
-    another path. Under a path that is a real directory (removing a symlink removes nothing it
-    points to), every ``*.pvt`` file counts unless it is one of the stage's own members:
-    ``members_of`` maps a replaced path to them and is called only for a path that holds a
-    ``*.pvt``. ``claim_unparsed`` (a commit, which records what is on disk as the stage's output)
-    also gives the stage every ``*.pvt`` under the path that Pivot cannot parse.
+    Looks only where a replacement reaches. For a stage output or a destination, at the path and
+    at each directory above it up to the project root, the sidecar Pivot would write for that
+    path counts unless it parses and names another path; a tracked path's own restore leaves its
+    own sidecar and those above it as they are. Under a path that is a real directory (removing a
+    symlink removes nothing it points to), every ``*.pvt`` file counts unless it is one of the
+    path's own members: ``members_of`` maps a replaced path to them and is called only for a path
+    that holds a ``*.pvt``.
 
     It never walks the rest of the project, so it does not see a hand-edited ``.pvt`` elsewhere
     whose ``path`` names a file inside an output; Pivot never writes one.
@@ -141,7 +210,7 @@ def find_output_overlaps(
     checked = set[pathlib.Path]()
     for replacement in replacements:
         output_path = normalized(replacement["path"])
-        current = output_path
+        current = output_path if replacement["kind"] is not ReplacementKind.TRACKED else root
         while current != root and current.is_relative_to(root) and current not in checked:
             checked.add(current)
             pvt_path = track.get_pvt_path(current)
@@ -166,7 +235,7 @@ def find_output_overlaps(
                 data = track.read_pvt_file(pvt_path)
                 if members is None:
                     members = members_of(output_path) if members_of is not None else {}
-                if _is_stage_member(pvt_path, data, members, claim_unparsed):
+                if _is_stage_member(pvt_path, data, members):
                     continue
                 found[pvt_path] = OutputOverlap(
                     tracked_path=None if data is None else pvt_path.parent / data["path"],
@@ -183,11 +252,15 @@ def _display(path: pathlib.Path, project_root: pathlib.Path) -> str:
 
 def _label(replacement: Replacement, project_root: pathlib.Path) -> str:
     path = _display(replacement["path"], project_root)
-    if replacement["destination"]:
-        return f"destination '{path}'"
-    if replacement["stage"] is None:
-        return f"stage output '{path}'"
-    return f"output '{path}' of stage '{replacement['stage']}'"
+    match replacement["kind"]:
+        case ReplacementKind.DESTINATION:
+            return f"destination '{path}'"
+        case ReplacementKind.TRACKED:
+            return f"restored path '{path}'"
+        case ReplacementKind.STAGE_OUTPUT:
+            if replacement["stage"] is None:
+                return f"stage output '{path}'"
+            return f"output '{path}' of stage '{replacement['stage']}'"
 
 
 def _relation(path: pathlib.Path, replaced: pathlib.Path) -> str:
@@ -220,28 +293,38 @@ def refuse_output_replacements(
     project_root: pathlib.Path,
     replacements: Sequence[Replacement],
     members_of: Callable[[pathlib.Path], StageMembers] | None = None,
-    *,
-    claim_unparsed: bool = False,
 ) -> None:
     """Fail, naming each one, before replacing these paths would remove a user's sidecar."""
-    overlaps = find_output_overlaps(
-        project_root, replacements, members_of, claim_unparsed=claim_unparsed
-    )
-    if not overlaps:
-        return
+    overlaps = find_output_overlaps(project_root, replacements, members_of)
+    if overlaps:
+        raise ownership_error(project_root, overlaps)
+
+
+def ownership_error(
+    project_root: pathlib.Path, overlaps: Sequence[OutputOverlap]
+) -> exceptions.OutputOwnershipError:
+    """The refusal naming each overlap; its first and last lines fit the kinds of path replaced."""
     details = "\n".join(f"  - {_describe(overlap, project_root)}" for overlap in overlaps)
-    if all(overlap["replacement"]["destination"] for overlap in overlaps):
-        raise exceptions.OutputOwnershipError(
-            "Refusing to replace a path that holds user-owned files:\n"
-            + details
-            + "\nChoose another --output path, or move each tracked path and its sidecar first."
+    kinds = {overlap["replacement"]["kind"] for overlap in overlaps}
+    if kinds == {ReplacementKind.DESTINATION}:
+        header = "Refusing to replace a path that holds user-owned files:"
+        remedy = "Choose another --output path, or move each tracked path and its sidecar first."
+    elif kinds == {ReplacementKind.TRACKED}:
+        header = "Refusing to restore a path over other user-owned files beneath it:"
+        remedy = "Move each tracked path and its sidecar out of the restored path, then rerun."
+    elif kinds == {ReplacementKind.STAGE_OUTPUT}:
+        header = "Refusing to replace a stage output that holds user-owned files:"
+        remedy = (
+            "Move each tracked path and its sidecar outside every stage output (for example "
+            + "under data/raw/), then rerun."
         )
-    raise exceptions.OutputOwnershipError(
-        "Refusing to replace a stage output that holds user-owned files:\n"
-        + details
-        + "\nMove each tracked path and its sidecar outside every stage output (for example "
-        + "under data/raw/), then rerun."
-    )
+    else:
+        header = "Refusing to replace paths that hold user-owned files:"
+        remedy = (
+            "Move each tracked path and its sidecar outside every stage output and every "
+            + "restored path (for example under data/raw/), then rerun."
+        )
+    return exceptions.OutputOwnershipError(f"{header}\n{details}\n{remedy}")
 
 
 def find_declared_overlap(
@@ -288,23 +371,27 @@ def saved_input_warnings(
 ) -> list[str]:
     """One warning per user sidecar already inside or beside an output these stages write.
 
-    A stage's own ``*.pvt`` members, as its lock records them, draw no warning. A lock is read only
-    for an output that holds a ``*.pvt``, so a project with none pays one walk per directory output.
+    A stage's own ``*.pvt`` members, as its lock or its last ``--no-commit`` run records them,
+    draw no warning. Both are read only for an output that holds a ``*.pvt``, so a project with
+    none pays one walk per directory output.
     """
     replacements = list[Replacement]()
     owners = dict[pathlib.Path, tuple[str, types.ArtifactIdentity, pathlib.Path]]()
     for stage_name, stage_info in stages.items():
-        stages_dir = lock.get_stages_dir(stage_info["state_dir"] or default_state_dir)
+        state_dir = stage_info["state_dir"] or default_state_dir
         for out in stage_info["outs"]:
             path = normalized(workspace.resolve_display_path(out))
             replacements.append(stage_output(path, stage_name))
-            owners[path] = (stage_name, out.identity, stages_dir)
+            owners[path] = (stage_name, out.identity, state_dir)
 
     def members_of(output_path: pathlib.Path) -> StageMembers:
-        stage_name, identity, stages_dir = owners[output_path]
-        lock_data = lock.StageLock(stage_name, stages_dir).read()
+        stage_name, identity, state_dir = owners[output_path]
+        lock_data = lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).read()
         recorded = None if lock_data is None else lock_data["output_hashes"].get(identity)
-        return recorded_members(output_path, recorded)
+        return merged_members(
+            recorded_members(output_path, recorded),
+            stored_no_commit_members(project_root, [(stage_name, state_dir)]),
+        )
 
     return [
         _warning(overlap, project_root)
