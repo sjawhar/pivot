@@ -89,6 +89,38 @@ def test_a_name_round_trips_and_the_listing_stays_utf8(name: str, field: bytes) 
     assert listing.decode(data) == listing.DirListing(files=files, empty_dirs=empty)
 
 
+_NAME_SEGMENTS = st.text(
+    alphabet=st.characters(codec=None, exclude_characters="/\x00", exclude_categories=("Cs",))
+    | st.sampled_from([os.fsdecode(b"\xff"), os.fsdecode(b"\x80"), "\udcfe", " ", '"', "\\"]),
+    min_size=1,
+    max_size=6,
+).filter(lambda segment: segment not in (".", ".."))
+
+
+@hypothesis.given(
+    names=st.lists(
+        st.lists(_NAME_SEGMENTS, min_size=1, max_size=3).map("/".join),
+        min_size=1,
+        max_size=8,
+        unique=True,
+    )
+)
+def test_encode_writes_every_name_as_its_quoted_field_in_path_byte_order(
+    names: list[str],
+) -> None:
+    """The fast path for plain UTF-8 names and the general path agree: each line's field is
+    `_field` of the path's bytes, and lines sort by those bytes."""
+    files = _helper_files(*((name, _A, 1, False) for name in names))
+
+    data = listing.encode(listing.DirListing(files=files, empty_dirs=[]))
+
+    expected = b"".join(
+        f"{_A} 1 - {listing._field(raw)}\n".encode()
+        for raw in sorted(os.fsencode(name) for name in names)
+    )
+    assert data == expected
+
+
 @pytest.mark.parametrize(
     "data",
     [

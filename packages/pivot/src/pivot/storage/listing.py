@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import operator
 import os
 import re
 from typing import TYPE_CHECKING, NewType, TypedDict, cast
@@ -48,6 +49,10 @@ _SIZE = re.compile(r"0|[1-9][0-9]*")
 _ENC_KEEP = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.@-")
 _NAMED_ESCAPES = {"\\": "\\\\", '"': '\\"', "\t": "\\t", "\n": "\\n", "\r": "\\r"}
 _UNESCAPES = {"\\": 0x5C, '"': 0x22, "t": 0x09, "n": 0x0A, "r": 0x0D}
+# A path field written as is: no control byte, DEL or backslash, no leading quote or space, no
+# trailing space. Checked by the regex engine, not byte by byte in Python, since hashing a
+# directory encodes every member's path.
+_PLAIN = re.compile(rb'(?![" ])[^\x00-\x1f\x7f\\]*(?<! )')
 
 
 class DirListing(TypedDict):
@@ -84,23 +89,13 @@ def record_of(listing: DirListing, data: bytes) -> DirHash:
     )
 
 
-def _is_plain(raw: bytes, text: str) -> bool:
-    return (
-        not any(byte < 0x20 or byte == 0x7F or byte == 0x5C for byte in raw)
-        and not text.startswith(('"', " "))
-        and not text.endswith(" ")
-    )
-
-
 def _field(raw: bytes) -> str:
     """The path field for a path whose bytes are ``raw``."""
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        pass
-    else:
-        if _is_plain(raw, text):
-            return text
+    if _PLAIN.fullmatch(raw):
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
     out = ['"']
     for char in raw.decode("utf-8", "surrogateescape"):
         code = ord(char)
@@ -116,17 +111,45 @@ def _field(raw: bytes) -> str:
     return "".join(out)
 
 
+# In the NUL-joined paths of a listing: a byte that forces a path to be quoted, a leading quote
+# or space, or a trailing space. NUL never occurs in a path.
+_NEEDS_QUOTING = re.compile(r'[\x01-\x1f\x7f\\]|(?:\A|\x00)[" ]| (?:\x00|\Z)')
+
+
+def _all_plain(paths: list[str]) -> bool:
+    """Whether every path is valid UTF-8 needing no quotes, checked in two C passes over all
+    of them: for these, sorting by ``str`` is sorting by UTF-8 bytes."""
+    joined = "\0".join(paths)
+    try:
+        joined.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return _NEEDS_QUOTING.search(joined) is None
+
+
 def encode(listing: DirListing) -> bytes:
     """The listing's bytes: one line per file and per empty directory, sorted by path bytes."""
+    files = listing["files"]
+    empty_dirs = listing["empty_dirs"]
+    keys = [entry["relpath"] for entry in files]
+    keys.extend(f"{relpath}/" for relpath in empty_dirs)
+    if _all_plain(keys):
+        plain = [
+            (key, f"{entry['hash']} {entry['size']} {'x' if entry['isexec'] else '-'} {key}\n")
+            for key, entry in zip(keys, files, strict=False)
+        ]
+        plain.extend((key, f"- - - {key}\n") for key in keys[len(files) :])
+        plain.sort(key=operator.itemgetter(0))
+        return "".join(line for _, line in plain).encode("utf-8")
     lines = list[tuple[bytes, str]]()
-    for entry in listing["files"]:
+    for entry in files:
         raw = os.fsencode(entry["relpath"])
         flag = "x" if entry["isexec"] else "-"
         lines.append((raw, f"{entry['hash']} {entry['size']} {flag} {_field(raw)}\n"))
-    for relpath in listing["empty_dirs"]:
+    for relpath in empty_dirs:
         raw = os.fsencode(relpath) + b"/"
         lines.append((raw, f"- - - {_field(raw)}\n"))
-    lines.sort(key=lambda line: line[0])
+    lines.sort(key=operator.itemgetter(0))
     return "".join(line for _, line in lines).encode("utf-8")
 
 

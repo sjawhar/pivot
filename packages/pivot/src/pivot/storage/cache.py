@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import logging
 import mmap
+import operator
 import os
 import pathlib
 import posixpath
@@ -385,7 +386,11 @@ def hash_directory(
     dirs = list[str]()
     left_out = list[pathlib.Path]()
     walk_artifact_members(os.fspath(path), "", cache_dir, files, dirs, left_out)
-    files.sort(key=lambda found: os.fsencode(found[0]))
+    try:  # UTF-8 keeps code point order, so a str sort is the listing's byte order
+        "\0".join(relpath for relpath, _ in files).encode("utf-8")
+        files.sort(key=operator.itemgetter(0))
+    except UnicodeEncodeError:
+        files.sort(key=lambda found: os.fsencode(found[0]))
 
     stats = list[tuple[str, os.DirEntry[str], os.stat_result]]()
     for relpath, entry in files:
