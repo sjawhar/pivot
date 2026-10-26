@@ -249,6 +249,38 @@ def test_pipeline_status_saves_each_stages_reads_in_its_own_state_dir(
     assert write_back.call_count == 2
 
 
+def test_pipeline_status_saves_stages_sharing_a_state_dir_in_one_write(
+    set_project_root: pathlib.Path,
+    test_pipeline: Pipeline,
+    mocker: MockerFixture,
+) -> None:
+    """Stages whose explanations read one state directory share its write-back: a status
+    takes each directory's write lock once, not once per stage."""
+    (set_project_root / ".git").mkdir(exist_ok=True)
+    (set_project_root / "input.txt").write_text("data")
+    _helper_register_two_stages()
+    all_stages = test_pipeline.snapshot()
+    mocker.patch.object(
+        explain, "get_stage_explanation", side_effect=_helper_explain_reading_one_file
+    )
+    write_back = mocker.patch.object(state_mod, "write_back_file_hashes")
+
+    status.get_pipeline_status(
+        None, single_stage=False, all_stages=all_stages, pipeline=test_pipeline
+    )
+
+    state_dir = registry.get_stage_state_dir(all_stages["test/stage_a"], config.get_state_dir())
+    assert registry.get_stage_state_dir(all_stages["test/stage_b"], config.get_state_dir()) == (
+        state_dir
+    )
+    write_back.assert_called_once()
+    assert write_back.call_args.args[0] == state_dir
+    assert sorted(write_back.call_args.args[1]) == [
+        ("/read-by/test/stage_a", 1, 2, 3, 4, "0" * 16),
+        ("/read-by/test/stage_b", 1, 2, 3, 4, "0" * 16),
+    ]
+
+
 # =============================================================================
 # Tracked Files Status Tests
 # =============================================================================

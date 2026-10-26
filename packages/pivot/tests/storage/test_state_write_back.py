@@ -3,6 +3,7 @@ cannot write still serves reads (Dispatch BET-263)."""
 
 from __future__ import annotations
 
+import contextlib
 import multiprocessing
 import os
 import pathlib
@@ -14,7 +15,10 @@ import pytest
 from pivot.storage import cache, state
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
     from multiprocessing.synchronize import Event
+
+    import lmdb
 
     from pivot.types import FileHashEntry
 
@@ -96,6 +100,100 @@ def test_write_back_leaves_out_entries_the_cache_cannot_hold(tmp_path: pathlib.P
     with state.StateDB(state_dir, readonly=True) as state_db:
         assert state_db.get(kept, kept.stat()) == cache.hash_file(kept)[0]
         assert state_db.get(old, old.stat()) is None
+
+
+def test_write_back_leaves_out_an_mtime_after_2554(tmp_path: pathlib.Path) -> None:
+    """An mtime the unsigned field cannot hold is left out at either end: before 1970, and
+    after 2554, which a filesystem with 64-bit seconds (tmpfs, btrfs) reaches. The write-back
+    is a cache, so it may never fail its caller."""
+    kept = tmp_path / "kept.txt"
+    kept.write_text("kept")
+    state_dir = _helper_new_state_dir(tmp_path)
+    path, _, size, dev, inode, file_hash = _helper_entries(kept)[0]
+    far_future = (f"{path}.future", 32_000_000_000_000_000_000, size, dev, inode + 1, file_hash)
+
+    state.write_back_file_hashes(state_dir, [far_future, *_helper_entries(kept)])
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        assert state_db.get(kept, kept.stat()) == cache.hash_file(kept)[0]
+
+
+class _RecordingTxn:
+    """A write transaction that notes the key of each put, in order."""
+
+    _txn: lmdb.Transaction
+    _puts: list[bytes]
+
+    def __init__(self, txn: lmdb.Transaction, puts: list[bytes]) -> None:
+        self._txn = txn
+        self._puts = puts
+
+    def get(self, key: bytes) -> bytes | None:
+        return self._txn.get(key)
+
+    def put(self, key: bytes, value: bytes) -> bool:
+        self._puts.append(key)
+        return self._txn.put(key, value)
+
+    def delete(self, key: bytes) -> bool:
+        return self._txn.delete(key)
+
+
+def _helper_record_write_transactions(monkeypatch: pytest.MonkeyPatch) -> list[list[bytes]]:
+    """Make every StateDB write transaction note its puts; return the keys, one list per
+    transaction."""
+    transactions = list[list[bytes]]()
+    real = state.StateDB._write_transaction
+
+    @contextlib.contextmanager
+    def _recording(self: state.StateDB, timeout: float = 30.0) -> Generator[_RecordingTxn]:
+        with real(self, timeout) as txn:
+            puts = list[bytes]()
+            transactions.append(puts)
+            yield _RecordingTxn(txn, puts)
+
+    monkeypatch.setattr(state.StateDB, "_write_transaction", _recording)
+    return transactions
+
+
+def _helper_three_files(tmp_path: pathlib.Path) -> list[pathlib.Path]:
+    paths = [tmp_path / f"{name}.txt" for name in ("a", "b", "c")]
+    for path in paths:
+        path.write_text(path.stem)
+    return paths
+
+
+def test_write_back_saves_its_batch_in_one_transaction(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write-back takes the write lock once for its whole batch, not once per file."""
+    paths = _helper_three_files(tmp_path)
+    state_dir = _helper_new_state_dir(tmp_path)
+    transactions = _helper_record_write_transactions(monkeypatch)
+
+    state.write_back_file_hashes(state_dir, [e for p in paths for e in _helper_entries(p)])
+
+    assert len(transactions) == 1
+    assert sorted(key for key in transactions[0] if key.startswith(b"hash:")) == sorted(
+        b"hash:" + os.fsencode(path) for path in paths
+    )
+
+
+def test_a_write_puts_every_hash_entry_before_the_first_index_entry(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batch's index entries are written after all its hash entries, so the pages of a
+    large write hold one kind of entry each, and a status whose lookups all hit by path reads
+    no index page from disk. Written the other way round, the index pages fall between the
+    hash pages, and a cold status reads them too."""
+    paths = _helper_three_files(tmp_path)
+    state_dir = _helper_new_state_dir(tmp_path)
+    transactions = _helper_record_write_transactions(monkeypatch)
+
+    state.write_back_file_hashes(state_dir, [e for p in paths for e in _helper_entries(p)])
+
+    puts = [key for transaction in transactions for key in transaction]
+    assert [key.split(b":", 1)[0] for key in puts] == [b"hash"] * 3 + [b"inode"] * 3
 
 
 def _helper_read_only(state_dir: pathlib.Path, *, lock_writable: bool) -> dict[pathlib.Path, int]:

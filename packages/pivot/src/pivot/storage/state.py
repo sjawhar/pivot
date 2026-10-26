@@ -308,10 +308,10 @@ def _put_file_hashes(txn: lmdb.Transaction, entries: Iterable[FileHashEntry]) ->
     The index entries are written after all the hash entries, so in a large write the pages
     of each lie together in the file, and a status whose lookups all hit by path reads no
     index page from disk. An entry this cache cannot hold is left out: a key too long for
-    LMDB, or an mtime before 1970, which the unsigned field cannot store. The cache only saves
-    a later read, so neither may fail the caller. When a path's previous entry named another
-    inode, that inode's index entry is deleted if it still points there, so the index never
-    outgrows the entries.
+    LMDB, or an mtime outside what the unsigned 64-bit field can store, before 1970 or after
+    2554 (tmpfs and btrfs keep such times). The cache only saves a later read, so no such
+    entry may fail the caller. When a path's previous entry named another inode, that inode's
+    index entry is deleted if it still points there, so the index never outgrows the entries.
     """
     index = list[tuple[bytes, bytes]]()
     for path, mtime_ns, size, dev, inode, hash_hex in entries:
@@ -319,8 +319,8 @@ def _put_file_hashes(txn: lmdb.Transaction, entries: Iterable[FileHashEntry]) ->
         if len(key) > _MAX_KEY_SIZE:
             logger.debug("Not caching the hash of %s: path too long", path)
             continue
-        if mtime_ns < 0:
-            logger.debug("Not caching the hash of %s: mtime before 1970", path)
+        if not 0 <= mtime_ns <= 0xFFFF_FFFF_FFFF_FFFF:
+            logger.debug("Not caching the hash of %s: mtime outside 1970-2554", path)
             continue
         previous = txn.get(key)
         if previous is not None and len(previous) >= _FILE_HASH_STAT.size:

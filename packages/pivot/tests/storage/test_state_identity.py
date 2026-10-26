@@ -4,7 +4,7 @@ never weaker than the path match it stands in for (Dispatch BET-263)."""
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -189,6 +189,35 @@ def test_a_recorded_path_that_now_names_another_inode_vouches_for_nothing(
         assert state_db.get_many([(new, reused)]) == {new: None}
 
 
+def test_a_recorded_path_that_now_names_another_devices_inode_vouches_for_nothing(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Check (2) compares the device as well as the inode number: a recorded path that now
+    names the same inode number on another filesystem (a mount over its directory, a volume
+    remounted in a container) is another file, so it vouches for nothing."""
+    state_dir = tmp_path / ".pivot"
+    live = _helper_file(tmp_path / "live" / "f.txt", b"content")
+    _helper_record(state_dir, live)
+    recorded = live.stat()
+    other = _helper_file(tmp_path / "new" / "g.txt", b"CONTENT")
+    reused = _helper_stat(
+        other.stat(), ino=recorded.st_ino, dev=recorded.st_dev, mtime_ns=recorded.st_mtime_ns
+    )
+    real_stat = os.stat
+
+    def _stat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        result = real_stat(path, *args, **kwargs)
+        if os.fsdecode(path) == str(live):
+            return _helper_stat(result, ino=recorded.st_ino, dev=recorded.st_dev + 1)
+        return result
+
+    monkeypatch.setattr(os, "stat", _stat)
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        assert state_db.get(other, reused) is None
+        assert state_db.get_many([(other, reused)]) == {other: None}
+
+
 def test_rewriting_a_path_drops_its_old_inodes_index_entry(tmp_path: pathlib.Path) -> None:
     """When a path's entry moves to a new inode, the old inode's index entry goes too, so the
     index never holds more entries than the path entries it points at."""
@@ -206,3 +235,64 @@ def test_rewriting_a_path_drops_its_old_inodes_index_entry(tmp_path: pathlib.Pat
     assert len(index) == 1
     assert old.st_ino != new.st_ino
     assert list(index.values()) == [b"hash:" + os.fsencode(path)]
+
+
+def test_one_inode_number_on_two_devices_keeps_an_index_entry_for_each(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The index key holds the device as well as the inode number: an entry for the recorded
+    inode number on another filesystem takes nothing from the recorded file, whose hard link
+    is still served by identity."""
+    state_dir = tmp_path / ".pivot"
+    live = _helper_file(tmp_path / "live" / "f.txt", b"content")
+    live_hash = _helper_record(state_dir, live)
+    recorded = live.stat()
+    elsewhere = str(tmp_path / "mnt" / "f.txt")
+    with state.StateDB(state_dir) as state_db:
+        state_db.save_file_hash_entries(
+            [
+                (
+                    elsewhere,
+                    recorded.st_mtime_ns,
+                    recorded.st_size,
+                    recorded.st_dev + 1,
+                    recorded.st_ino,
+                    "0" * 16,
+                )
+            ]
+        )
+    link = tmp_path / "replica" / "f.txt"
+    link.parent.mkdir()
+    os.link(live, link)
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        index = dict(state_db.iter_prefix(b"inode:"))
+        assert state_db.get(link, link.stat()) == live_hash
+    assert sorted(index.values()) == sorted(
+        [b"hash:" + os.fsencode(live), b"hash:" + os.fsencode(elsewhere)]
+    )
+
+
+def test_rewriting_a_path_keeps_its_old_inodes_index_entry_that_names_another_link(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A path that moves to a new inode deletes the old inode's index entry only when that
+    entry points at the path itself: one that points at another link of the old inode stays,
+    so a further link of it is still served by identity."""
+    state_dir = tmp_path / ".pivot"
+    live = _helper_file(tmp_path / "live" / "f.txt", b"content")
+    live_hash = _helper_record(state_dir, live)
+    link = tmp_path / "replica" / "f.txt"
+    link.parent.mkdir()
+    os.link(live, link)
+    with state.StateDB(state_dir) as state_db:
+        state_db.save_many([(link, link.stat(), live_hash)])
+    replacement = _helper_file(tmp_path / "live" / "f.new", b"rewritten")
+    os.replace(replacement, live)
+    _helper_record(state_dir, live)
+    another = tmp_path / "another" / "f.txt"
+    another.parent.mkdir()
+    os.link(link, another)
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        assert state_db.get(another, another.stat()) == live_hash
