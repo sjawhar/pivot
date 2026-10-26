@@ -362,6 +362,21 @@ def test_trailing_backslash_is_part_of_a_file_name(tmp_path: pathlib.Path) -> No
     assert not filter_instance.is_ignored("tmp\\")
 
 
+def test_pattern_ending_in_a_lone_backslash_is_skipped_as_in_gitignore(
+    tmp_path: pathlib.Path, caplog: LogCaptureFixture
+) -> None:
+    """gitignore never matches a pattern ending in a lone backslash; Pivot skips it and warns."""
+    pivotignore = tmp_path / ".pivotignore"
+    pivotignore.write_text("build\\\n")
+
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+    with caplog.at_level("WARNING"):
+        ignored = filter_instance.is_ignored("build/x.txt")
+
+    assert not ignored
+    assert "Invalid pattern on line 1 of .pivotignore: 'build\\'" in caplog.text
+
+
 def test_gitignore_backslash_escapes_cover_project_and_user_patterns(
     tmp_path: pathlib.Path,
 ) -> None:

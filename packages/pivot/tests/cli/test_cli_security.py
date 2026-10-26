@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from conftest import isolated_pivot_dir
 from pivot import cli, exceptions
 from pivot.storage import cache, track
 
@@ -75,25 +76,36 @@ manifest:
         )
 
 
-def test_track_path_traversal_with_encoded_dots(
-    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param("..%2foutside.txt", id="url-encoded-slash"),
+        pytest.param("..%252foutside.txt", id="double-encoded-slash"),
+        pytest.param("..\\outside.txt", id="backslash"),
+    ],
+)
+def test_track_keeps_a_name_spelled_like_a_step_up_inside_the_project(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, name: str
 ) -> None:
-    """Rejects paths trying to bypass traversal detection."""
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        pathlib.Path(".git").mkdir()
-        pathlib.Path(".pivot").mkdir()
+    """A name that only spells ``../outside.txt`` is a file in the project.
 
-        # Try various bypass attempts
-        bypass_attempts = [
-            "..%2f",  # URL encoded
-            "..%252f",  # Double encoded
-            "..\\",  # a backslash is part of the name: "..\outside.txt" is a missing file here
-        ]
+    Pivot decodes no ``%`` escape, and a backslash is part of a name, so ``track`` takes the
+    file in the project, writes its ``.pvt`` beside it, and writes nothing next to the project,
+    where ``outside.txt`` waits for a reading that steps out.
+    """
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / name).write_text("inside\n")
+        (cwd.parent / "outside.txt").write_text("outside\n")
+        beside_project = sorted(cwd.parent.iterdir())
 
-        for attempt in bypass_attempts:
-            result = runner.invoke(cli.cli, ["track", f"{attempt}outside.txt"])
-            # Should be rejected (either not found or traversal detected)
-            assert result.exit_code != 0
+        result = runner.invoke(cli.cli, ["track", name])
+        sidecar = track.read_pvt_file(cwd / f"{name}.pvt")
+        beside_project_after = sorted(cwd.parent.iterdir())
+
+    assert result.exit_code == 0, result.output
+    assert sidecar is not None
+    assert sidecar["path"] == name
+    assert beside_project_after == beside_project, "track wrote outside the project"
 
 
 # =============================================================================

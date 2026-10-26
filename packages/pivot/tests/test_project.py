@@ -22,12 +22,13 @@ def test_normalize_path_with_custom_base(tmp_path: pathlib.Path) -> None:
     [
         pytest.param("foo\\bar", ("foo\\bar",), id="backslash-in-a-name"),
         pytest.param("foo\\bar/baz", ("foo\\bar", "baz"), id="split-only-on-forward-slash"),
+        pytest.param("C:./x", ("C:.", "x"), id="drive-like-first-segment"),
     ],
 )
 def test_normalize_path_keeps_a_backslash_in_a_name(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, path: str, parts: tuple[str, ...]
 ) -> None:
-    """Pivot is POSIX only: a backslash is part of a name, never a separator."""
+    """Pivot is POSIX only: a backslash is part of a name, and ``C:`` names no drive."""
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
     result = project.normalize_path(path)
