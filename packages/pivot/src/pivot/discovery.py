@@ -4,6 +4,7 @@ import _imp
 import contextlib
 import dataclasses
 import importlib
+import importlib.abc
 import importlib.machinery
 import importlib.util
 import logging
@@ -12,7 +13,7 @@ import pathlib
 import py_compile
 import sys
 import types as _stdlib_types
-from typing import TYPE_CHECKING, Final, override
+from typing import TYPE_CHECKING, Final, cast, override
 
 import cloudpickle
 
@@ -20,7 +21,7 @@ from pivot import exceptions, fingerprint, loaded_source, metrics, project, type
 from pivot.registry import PipelineLike
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
     from importlib.abc import PathEntryFinder
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,11 @@ class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
             self._source_read = data
         return data
 
+    @property
+    def recorded_source(self) -> bytes | None:
+        """The bytes this loader compiled or validated the checked-hash bytecode against."""
+        return self._source_read
+
     @override
     def get_code(self, fullname: str) -> _stdlib_types.CodeType | None:
         source = self.get_filename(fullname)
@@ -126,6 +132,135 @@ class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
         if _imp.check_hash_based_pycs == "never":
             return self.source_to_code(self.get_data(source), source)
         return super().get_code(fullname)
+
+
+class _RecordingLoader(importlib.abc.Loader):
+    """Wrap a non-Pivot loader so Pivot captures user source before `exec_module` runs it."""
+
+    _loader: importlib.abc.Loader
+
+    def __init__(self, loader: importlib.abc.Loader) -> None:
+        self._loader = loader
+
+    @override
+    def create_module(
+        self, spec: importlib.machinery.ModuleSpec
+    ) -> _stdlib_types.ModuleType | None:
+        create = getattr(self._loader, "create_module", None)
+        return None if create is None else create(spec)
+
+    @override
+    def exec_module(self, module: _stdlib_types.ModuleType) -> None:
+        spec = getattr(module, "__spec__", None)
+        origin = getattr(spec, "origin", None)
+        # CPython's exact SourceFileLoader accepts a timestamp-valid old pyc. Use the checked-hash
+        # loader Pivot uses for every other user `.py`: these are the bytes it actually executes.
+        # A subclass can execute transformed or virtual source; never substitute it with a
+        # filesystem loader, and record it unreadable unless another recorder captured it.
+        if type(self._loader) is importlib.machinery.SourceFileLoader and isinstance(origin, str):
+            loader = _ProjectSourceLoader(module.__name__, origin)
+            loader.exec_module(module)
+            data = loader.recorded_source
+        else:
+            data = (
+                loaded_source.loader_source(self._loader, origin, module.__name__)
+                if type(self._loader) is not importlib.machinery.SourceFileLoader
+                and isinstance(origin, str)
+                else None
+            )
+            self._loader.exec_module(module)
+        loaded_source.record_loaded_module(module, data)
+
+    def __getattr__(self, name: str) -> object:
+        try:
+            loader = object.__getattribute__(self, "_loader")
+        except AttributeError as exc:
+            raise AttributeError(name) from exc
+        return getattr(loader, name)
+
+
+class _RecordingFinder(importlib.abc.MetaPathFinder):
+    """A meta-path front wrapper that replaces a found loader with `_RecordingLoader`."""
+
+    @override
+    def find_spec(
+        self,
+        fullname: str,
+        path: Sequence[str] | None = None,
+        target: _stdlib_types.ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        for finder in tuple(sys.meta_path):
+            if finder is self:
+                continue
+            find_spec = getattr(finder, "find_spec", None)
+            if find_spec is None:
+                continue
+            spec = find_spec(fullname, path, target)
+            if spec is not None:
+                if (
+                    spec.loader is not None
+                    and isinstance(spec.origin, str)
+                    and _should_record_origin(spec.origin)
+                    and not isinstance(spec.loader, (_ProjectSourceLoader, _RecordingLoader))
+                ):
+                    spec.loader = _RecordingLoader(cast("importlib.abc.Loader", spec.loader))
+                return spec
+        return None
+
+
+_recording_finder = _RecordingFinder()
+_original_spec_from_file_location = importlib.util.spec_from_file_location
+_wrapped_spec_from_file_location: object | None = None
+
+
+def _should_record_origin(origin: str) -> bool:
+    """Whether the recording finder should wrap this origin's loader."""
+    try:
+        return not fingerprint.is_library_path(pathlib.Path(origin).resolve())
+    except OSError:
+        return True
+
+
+def _install_module_recorder() -> None:
+    """Install the module recorder for the current import session."""
+    global _wrapped_spec_from_file_location
+    if _recording_finder in sys.meta_path:
+        return
+
+    def spec_from_file_location(
+        name: str,
+        location: str | os.PathLike[str] | None = None,
+        *,
+        loader: importlib.abc.Loader | None = None,
+        submodule_search_locations: list[str] | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        spec = _original_spec_from_file_location(
+            name,
+            location,
+            loader=loader,
+            submodule_search_locations=submodule_search_locations,
+        )
+        if (
+            spec is not None
+            and spec.loader is not None
+            and isinstance(spec.origin, str)
+            and _should_record_origin(spec.origin)
+            and not isinstance(spec.loader, (_ProjectSourceLoader, _RecordingLoader))
+        ):
+            spec.loader = _RecordingLoader(spec.loader)
+        return spec
+
+    _wrapped_spec_from_file_location = spec_from_file_location
+    sys.meta_path.insert(0, _recording_finder)
+    importlib.util.spec_from_file_location = spec_from_file_location
+
+
+def _uninstall_module_recorder() -> None:
+    """Remove the module recorder when the import session ends."""
+    if _recording_finder in sys.meta_path:
+        sys.meta_path.remove(_recording_finder)
+    if importlib.util.spec_from_file_location is _wrapped_spec_from_file_location:
+        importlib.util.spec_from_file_location = _original_spec_from_file_location
 
 
 _project_finder_for = importlib.machinery.FileFinder.path_hook(
@@ -177,6 +312,7 @@ def _forget_user_code_finders(root: pathlib.Path) -> None:
 
 def _install_path_hook(root: pathlib.Path) -> Callable[[str], PathEntryFinder]:
     """Import user code through ``_ProjectSourceLoader`` from now on; return the hook."""
+    _install_module_recorder()
     path_hook = _project_path_hook(root)
     sys.path_hooks.insert(0, path_hook)
     _forget_user_code_finders(root)
@@ -227,8 +363,8 @@ def _end_import_session(session: _ImportSession) -> None:
         sys.path_hooks.remove(session.path_hook)
     _forget_user_code_finders(session.root)
     importlib.invalidate_caches()
-    # The modules this session removed are no longer the code any stage runs.
     loaded_source.prune()
+    _uninstall_module_recorder()
 
 
 def _start_import_session(root: pathlib.Path) -> _ImportSession:
@@ -568,6 +704,7 @@ def _load_pipeline_from_module(
             session.owned_modules[module_name] = module
             spec.loader.exec_module(module)
         _track_root_modules(session)
+        loaded_source.record_user_modules()
         module_dict = vars(module)
 
         pipeline_obj = module_dict.get("pipeline")

@@ -16,6 +16,7 @@ import dataclasses
 import importlib
 import importlib._bootstrap as importlib_bootstrap
 import importlib.util
+import inspect
 import logging
 import os
 import pathlib
@@ -65,6 +66,7 @@ from pivot.types import (
     HashInfo,
     LockData,
     LogMessage,
+    NoCommitRecord,
     OutputMessage,
     OutputMessageKind,
     StageResult,
@@ -75,7 +77,6 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Mapping, Sequence
-    from inspect import Signature
     from multiprocessing import Queue
     from types import ModuleType, TracebackType
 
@@ -136,6 +137,7 @@ _stage_imports_lock = threading.Lock()
 _covered_import_state = _CoveredImportState()
 _original_import = builtins.__import__
 _original_import_module = importlib.import_module
+_original_reload = importlib.reload
 _original_start_new_thread = _thread.start_new_thread
 _original_start_joinable_thread = _thread.start_joinable_thread
 _replaced_thread_starts: dict[tuple[ModuleType, str], object] = {}
@@ -347,7 +349,12 @@ def _tracked_import(
 ) -> object:
     tracked = _stage_imports
     if tracked is None:
-        return _original_import(name, globals, locals, fromlist or (), level)
+        result = _original_import(name, globals, locals, fromlist or (), level)
+        if not level:
+            # Unpickling a stage imports the modules it refers to before the stage starts. Record
+            # each user module as this worker loaded it, whatever loader that was.
+            loaded_source.record_modules(_package_chain(name))
+        return result
     package = _import_package(globals) if level else None
     absolute: str | None = name
     if level:
@@ -361,14 +368,19 @@ def _tracked_import(
     with _covered_import(tracked, absolute, items):
         result = _original_import(name, globals, locals, fromlist or (), level)
     if absolute is not None:
-        _record_stage_import(_package_chain(absolute) + [f"{absolute}.{item}" for item in items])
+        names = _package_chain(absolute) + [f"{absolute}.{item}" for item in items]
+        loaded_source.record_modules(names)
+        _record_stage_import(names)
     return result
 
 
 def _tracked_import_module(name: str, package: str | None = None) -> object:
     tracked = _stage_imports
     if tracked is None:
-        return _original_import_module(name, package)
+        result = _original_import_module(name, package)
+        if not name.startswith("."):
+            loaded_source.record_modules(_package_chain(name))
+        return result
     try:
         absolute = importlib.util.resolve_name(name, package) if name.startswith(".") else name
     except (ImportError, ValueError):
@@ -376,7 +388,17 @@ def _tracked_import_module(name: str, package: str | None = None) -> object:
     with _covered_import(tracked, absolute, []):
         result = _original_import_module(name, package)
     if absolute is not None:
+        loaded_source.record_modules(_package_chain(absolute))
         _record_stage_import(_package_chain(absolute))
+    return result
+
+
+def _tracked_reload(module: ModuleType) -> ModuleType:
+    """Reload `module`; the discovery recorder wraps the reload's loader and refreshes its record."""
+    result = _original_reload(module)
+    tracked = _stage_imports
+    if tracked is not None:
+        _record_stage_import([result.__name__])
     return result
 
 
@@ -386,16 +408,18 @@ def install_import_hooks() -> None:
     The worker initializer (`executor.core._init_worker`) calls this; nothing else in Pivot's
     own process installs it. The hooks record nothing while no stage is running.
     """
-    global _original_import, _original_import_module, _hooks_installed
+    global _original_import, _original_import_module, _original_reload, _hooks_installed
     global _original_start_new_thread, _original_start_joinable_thread
     if _hooks_installed:
         return
     _original_import = builtins.__import__
     _original_import_module = importlib.import_module
+    _original_reload = importlib.reload
     _original_start_new_thread = _thread.start_new_thread
     _original_start_joinable_thread = _thread.start_joinable_thread
     builtins.__import__ = _tracked_import
     importlib.import_module = _tracked_import_module
+    importlib.reload = _tracked_reload
     for (module, name), hook in _THREAD_START_HOOKS.items():
         _replaced_thread_starts[module, name] = vars(module)[name]
         vars(module)[name] = hook
@@ -406,6 +430,7 @@ def _uninstall_import_hooks() -> None:
     global _hooks_installed
     builtins.__import__ = _original_import
     importlib.import_module = _original_import_module
+    importlib.reload = _original_reload
     for (module, name), original in _replaced_thread_starts.items():
         vars(module)[name] = original
     _replaced_thread_starts.clear()
@@ -464,6 +489,53 @@ def _track_stage_imports(covered: frozenset[str]) -> Generator[_StageImports]:
         )
         if installed_here:
             _uninstall_import_hooks()
+
+
+def _untrusted_modules(
+    stage_info: WorkerStageInfo,
+    fingerprint_manifest: dict[str, str],
+    stage_imports: _StageImports,
+    project_root: pathlib.Path,
+) -> tuple[list[str], list[str]]:
+    """The user modules this stage used whose code it cannot vouch for: (edited, unreadable).
+
+    What it used: the modules its manifest hashes, the module that defines the stage, and the
+    modules it imported while it ran. A `@no_fingerprint` stage's code is its declared files, so
+    for it the modules loaded from those files count instead of its imports.
+    """
+    loaded_source.record_user_modules()
+    manifest = fingerprint_manifest
+    if stage_info["no_fingerprint"]:
+        used = set[str]()
+        files = set[str]()
+        for key in fingerprint_manifest:
+            if not key.startswith("file:"):
+                continue
+            candidate = pathlib.Path(key.removeprefix("file:"))
+            path = candidate if candidate.is_absolute() else project_root / candidate
+            if path.is_relative_to(project_root):
+                files.add(os.path.realpath(path))
+        used.update(loaded_source.modules_from_files(files))
+        manifest = {}
+    else:
+        used = set[str]()
+        stage_func = inspect.unwrap(stage_info["func"])
+        stage_file = inspect.getsourcefile(stage_func)
+        if (
+            loaded_source.coordinator_records(stage_func.__module__)
+            or isinstance(stage_file, str)
+            and pathlib.Path(stage_file).resolve().is_relative_to(project_root)
+        ):
+            used.add(stage_func.__module__)
+        used.update(stage_imports.imported)
+        used.update(stage_imports.new_outside_window)
+        used.update(stage_imports.added_in_window)
+    return loaded_source.check_stage(
+        manifest,
+        used,
+        stage_info["loaded_sources_token"],
+        stage_info["loaded_sources"] if "loaded_sources" in stage_info else None,
+    )
 
 
 # How long a stopped worker's running stage may take to unwind before the worker exits.
@@ -687,7 +759,7 @@ class WorkerStageInfo(TypedDict):
     deps: dict[str, types.ArtifactRef]
     outs: list[types.ArtifactRef]
     store_spec: store_mod.StoreSpec
-    signature: Signature | None
+    signature: inspect.Signature | None
     params: stage_def.StageParams | None
     variant: str | None
     overrides: parameters.ParamsOverrides
@@ -973,11 +1045,13 @@ def _execute_stage(
                     set[str]() if stage_info["no_fingerprint"] else stage_imports.uncovered()
                 )
                 lock_manifest = current_fingerprint
+                # Under --no-commit no lock is written now: `pivot commit` writes this run's
+                # manifest, marks included, when it records these same outputs.
+                commit_note = (
+                    " `pivot commit` keeps that when it records these outputs." if no_commit else ""
+                )
                 if uncovered:
                     modules = ", ".join(sorted(uncovered))
-                    commit_note = (
-                        " `pivot commit` will record these outputs as current." if no_commit else ""
-                    )
                     logger.warning(
                         "Stage '%s' imported user modules its fingerprint does not cover: %s. "
                         + "Its result will not be reused; the next run reruns it.%s Fix: import "
@@ -992,25 +1066,38 @@ def _execute_stage(
                         **current_fingerprint,
                         f"{skip.UNCOVERED_IMPORT_KEY_PREFIX}{modules}": "",
                     }
-                # A module the worker imported from its file (one not sent by value: outside the
-                # project root, or imported by a stage body) holds the file as the worker read it.
-                # If the coordinator loaded other content, the fingerprint describes other code.
-                edited = loaded_source.edited_modules(
-                    stage_info["loaded_sources_token"],
-                    stage_info["loaded_sources"] if "loaded_sources" in stage_info else None,
+                edited, unreadable = _untrusted_modules(
+                    stage_info, current_fingerprint, stage_imports, project_root
                 )
                 if edited:
                     edited_modules = ", ".join(edited)
                     logger.warning(
                         "Stage '%s' imported user modules that changed after pivot loaded them: "
                         + "%s. Its fingerprint records the code pivot loaded, so its result will "
-                        + "not be reused. Start pivot again to load the changed code.",
+                        + "not be reused; the next run reruns it.%s A watch or server session "
+                        + "loads a changed module outside the project root when pivot starts "
+                        + "again.",
                         stage_name,
                         edited_modules,
+                        commit_note,
                     )
                     lock_manifest = {
                         **lock_manifest,
                         f"{skip.EDITED_SOURCE_KEY_PREFIX}{edited_modules}": "",
+                    }
+                if unreadable:
+                    unreadable_modules = ", ".join(unreadable)
+                    logger.warning(
+                        "Stage '%s' uses user modules whose source pivot cannot read: %s. Pivot "
+                        + "cannot tell which code ran, so its result is never reused; every run "
+                        + "reruns it.%s Fix: load the modules from .py source files.",
+                        stage_name,
+                        unreadable_modules,
+                        commit_note,
+                    )
+                    lock_manifest = {
+                        **lock_manifest,
+                        f"{skip.UNREADABLE_SOURCE_KEY_PREFIX}{unreadable_modules}": "",
                     }
                 if no_commit:
                     output_hashes = _hash_output_paths(
@@ -1027,13 +1114,24 @@ def _execute_stage(
                             )
                         )
 
-                # For --no-commit, skip lock/cache writes entirely
+                # For --no-commit, write no lock and no cache entry. Leave the record of what
+                # ran, which `pivot commit` writes if the outputs are still these.
                 if no_commit:
-                    return _make_result(
-                        StageStatus.RAN,
-                        run_reason,
-                        ring_buffer,
+                    return StageResult(
+                        status=StageStatus.RAN,
+                        reason=run_reason,
                         input_hash=input_hash,
+                        output_lines=ring_buffer.snapshot(),
+                        metrics=metrics.get_entries(),
+                        deferred_writes=DeferredWrites(
+                            no_commit_record=NoCommitRecord(
+                                code_manifest=lock_manifest,
+                                output_hashes={
+                                    key: hash_info["hash"]
+                                    for key, hash_info in sorted(output_hashes.items())
+                                },
+                            )
+                        ),
                     )
 
                 # Build lock data
@@ -1055,7 +1153,7 @@ def _execute_stage(
                         output_hashes,
                         production_lock,
                         state_db,
-                        reusable=not uncovered and not edited,
+                        reusable=not uncovered and not edited and not unreadable,
                         file_hash_entries=file_hash_entries,
                     )
                     return StageResult(
@@ -2168,7 +2266,8 @@ def _build_deferred_writes(
     and deletes any entry at its input hash; its lock carries a key no fingerprint has and
     `skip.check_stage` never consults the run cache for it, so no tier skips it.
     """
-    result: DeferredWrites = {}
+    # A lock written now supersedes any record a --no-commit run left for `pivot commit`.
+    result: DeferredWrites = {"clear_no_commit_record": True}
 
     if increment_outputs:
         result["increment_outputs"] = True

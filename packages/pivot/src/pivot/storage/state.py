@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import logging
 import os
 import pathlib
@@ -22,7 +23,7 @@ if TYPE_CHECKING:
 
     from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
-    from pivot.types import DeferredWrites
+    from pivot.types import DeferredWrites, NoCommitRecord
 
 # Key prefixes for different entry types
 _HASH_PREFIX = b"hash:"  # File hash entries
@@ -34,6 +35,7 @@ _RUN_PREFIX = b"run:"  # Run history entries
 _RUNCACHE_PREFIX = b"runcache:"  # Run cache entries for skip detection
 _FP_PREFIX = b"fp:"  # AST fingerprint/hash cache entries
 _SM_PREFIX = b"sm:"  # Stage manifest cache entries
+_NOCOMMIT_PREFIX = b"nocommit:"  # What a --no-commit run of a stage ran, for `pivot commit`
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024
@@ -255,6 +257,13 @@ def _make_key_output_generation(identity: str) -> bytes:
 
 def _make_key_dep_generation(stage_name: str, dep_identity: str) -> bytes:
     return _DEP_PREFIX + f"{stage_name}:{dep_identity}".encode()
+
+
+def _is_str_dict(value: object) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(key, str) and isinstance(item, str)
+        for key, item in typing.cast("dict[object, object]", value).items()
+    )
 
 
 class InvalidAstHashKeyError(Exception):
@@ -909,6 +918,27 @@ class StateDB:
             return None
         return run_history.deserialize_run_cache_entry(value)
 
+    def get_no_commit_record(self, stage_name: str) -> NoCommitRecord | None:
+        """The record a `--no-commit` run of `stage_name` left, or None (absent or unreadable)."""
+        self._check_closed()
+        with self._read_transaction() as txn:
+            value = txn.get(_NOCOMMIT_PREFIX + stage_name.encode())
+        if value is None:
+            return None
+        try:
+            data: object = json.loads(value)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        record = typing.cast("dict[str, object]", data)
+        manifest = record.get("code_manifest")
+        outputs = record.get("output_hashes")
+        if not _is_str_dict(manifest) or not _is_str_dict(outputs):
+            return None
+        checked = typing.cast("object", {"code_manifest": manifest, "output_hashes": outputs})
+        return typing.cast("NoCommitRecord", checked)
+
     def prune_run_cache(self, valid_run_ids: set[str]) -> int:
         """Remove run cache entries that reference runs not in valid_run_ids.
 
@@ -1036,6 +1066,11 @@ class StateDB:
                         value = _pack_value(mtime_ns, size, inode, hash_hex)
                         txn.put(key, value)
 
+                nocommit_key = _NOCOMMIT_PREFIX + stage_name.encode()
+                if "no_commit_record" in deferred:
+                    txn.put(nocommit_key, json.dumps(deferred["no_commit_record"]).encode())
+                elif "clear_no_commit_record" in deferred and deferred["clear_no_commit_record"]:
+                    txn.delete(nocommit_key)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
 

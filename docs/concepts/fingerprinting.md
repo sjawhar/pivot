@@ -145,10 +145,10 @@ and a thread native code starts outside `_thread`:
   with `pipeline.input`;
 - a module created without a source file (CPython's `pyexpat.errors`,
   Cython's `_cython_3_3_0`): it has no source to fingerprint;
-- `pivot repro --no-commit` followed by `pivot commit`: no lock exists to carry
-  the mark, so `pivot commit` records the outputs on disk against the static
-  fingerprint, as it records any output; run `pivot repro` without
-  `--no-commit` for a stage that imports dynamically;
+- `pivot repro --no-commit` followed by `pivot commit` of outputs edited by
+  hand after that run: `pivot commit` records them against the static
+  fingerprint, the "trust me" path. Outputs the run wrote, unchanged since, are
+  recorded with the manifest the run recorded, the mark included;
 - a result cached by an earlier Pivot version: if its static fingerprint is
   unchanged, it may be reused because `_CACHE_SCHEMA_VERSION` keys only the
   state.lmdb caches, not the lock. A stage whose static walk reaches a user
@@ -269,18 +269,40 @@ that code. A stage's fingerprint describes the code that Pivot loaded, not the
 file as it is when the stage starts. If you edit a stage or a helper while the
 run continues (in an editor, or from an upstream stage), the stages of that run
 use the loaded version, and their locks record it. The next run loads your edit
-and reruns the stages it changes.
+and reruns the stages it changes. This holds for every user module, whatever
+loaded it: a module under the project root, one on `PYTHONPATH`, an editable
+install's finder, a zip on `sys.path`, or `importlib.util.spec_from_file_location`.
 
 A worker imports some modules from their files itself: a module outside the
 project root (on `PYTHONPATH`, or a package installed from a source checkout),
 a stage's module under the root in a `src` layout, and a module that a stage
-imports in its body. If the worker imports such a file after you edit it, the
-stage runs your edit, which its fingerprint does not describe. The stage then
-logs a warning that names the module ("imported user modules that changed after
-pivot loaded them"), and Pivot does not reuse its result: the next run reruns
-the stage ("Previous run imported modules edited after pivot loaded them").
-`pivot repro --watch` loads an edit under the project root again; to load an
-edit outside the root, start Pivot again.
+imports in its body. If the worker imports such a file after you edit it, a
+stage that uses the module (its code reaches the module's functions, classes or
+values, or it imports the module while it runs) runs your edit, which its
+fingerprint does not describe. That stage logs a warning that names the module
+("imported user modules that changed after pivot loaded them"), and Pivot does
+not reuse its result: the next run reruns it ("Previous run imported modules
+edited after pivot loaded them"). A stage on the same worker that does not use
+the module is not affected. A helper recorded by name only
+(`fingerprint_by_name`) is not a use of its module's code. `pivot repro --watch`
+loads an edit under the project root again. A module outside the root is loaded
+once by the watch or server process, so its edit is loaded when Pivot starts
+again; until then a worker that imports it after the edit runs the edit, and
+the stages that use it warn and rerun on every run.
+
+A user module whose source Pivot cannot read (a sourceless `.pyc`, or a module
+from a loader that gives no source) is never trusted: Pivot cannot tell which
+code a worker holds. A stage that uses it warns once per run ("uses user
+modules whose source pivot cannot read"), reruns on every run, and never files
+or reuses a run-cache entry. Load such modules from `.py` source files.
+
+Under `pivot repro --no-commit` no lock is written. The run records, for
+`pivot commit`, the manifest each stage's lock would have held, warnings' marks
+included, and the outputs it wrote. `pivot commit` writes that manifest when the
+outputs on disk are still those, so a stage that ran loaded or edited code
+reruns on the next run, as it would without `--no-commit`. Outputs edited by
+hand since that run are recorded against the code on disk now, the "trust me"
+path.
 
 ## @pivot.no_fingerprint()
 

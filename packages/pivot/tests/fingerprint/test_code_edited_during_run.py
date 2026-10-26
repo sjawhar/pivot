@@ -9,9 +9,12 @@ the next run never reports an output that edited code would change as cached.
 import json
 import os
 import pathlib
+import py_compile
+import shutil
 import subprocess
 import sys
 import textwrap
+import zipfile
 from typing import cast
 
 import pytest
@@ -294,3 +297,352 @@ def test_unedited_project_is_cached_on_the_next_run(
     second = _repro_json(project, pythonpath)
     assert set(second) == {"p/first", "p/body_import", "p/use_plain"}, second
     assert {status for status, _ in second.values()} == {"cached"}, second
+
+
+_EDIT_USE_THEN_UNRELATED = """\
+import pathlib
+
+import helpers
+from pivot import Pipeline, stage
+
+HELPERS = {helpers_file!r}
+
+
+@stage
+def edit_helper(seed: str) -> str:
+    path = pathlib.Path(HELPERS)
+    path.write_text(path.read_text().replace("-v1", "-v2"))
+    return "ready"
+
+
+@stage
+def use_plain(ready: str) -> str:
+    return helpers.plain()
+
+
+@stage
+def unrelated(value: str) -> str:
+    return "unrelated-fixed"
+
+
+with Pipeline("p") as pipeline:
+    unrelated(use_plain(edit_helper(pipeline.input("seed.txt"))))
+"""
+
+
+def test_stage_that_never_touches_the_edited_module_is_not_marked(tmp_path: pathlib.Path) -> None:
+    """One worker imports the edited PYTHONPATH helper for `use_plain`, then runs `unrelated`,
+    which never touches helpers. Only `use_plain` ran code its fingerprint does not describe:
+    `unrelated` must not warn that it imported helpers, must not carry the mark, and must be
+    cached on the next run, as it is at main."""
+    project, pythonpath = _project(tmp_path, _EDIT_USE_THEN_UNRELATED, helpers_in_root=False)
+    _run(project, "config", "set", "core.max_workers", "1", pythonpath=pythonpath)
+
+    first = _repro(project, pythonpath)
+    assert f"Stage 'p/use_plain' {_EDITED}: helpers." in first, first
+    assert f"Stage 'p/unrelated' {_EDITED}" not in first, first
+    assert "edited-source:" not in _lock(project, "unrelated")
+
+    second = _repro_json(project, pythonpath)
+    assert second["p/use_plain"][0] == "ran", second
+    assert second["p/unrelated"][0] == "cached", second
+
+
+def test_no_commit_then_commit_does_not_cache_the_loaded_helper_output(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot repro --no-commit` runs `use_plain` with the helper discovery loaded (plain-v1)
+    after `edit_helper` edited helpers.py. `pivot commit` must not then record that output
+    against the edited file: the next run reruns the stage, as it does without --no-commit,
+    instead of reporting plain-v1 as cached while helpers.py returns plain-v2."""
+    project, _ = _project(tmp_path, _EDIT_THEN_USE)
+
+    _run(project, "repro", "--no-commit")
+    assert _output(project, "use_plain") == "plain-v1", "the worker runs the loaded helper"
+
+    # A fix may refuse the commit for this stage instead of recording it; both are sound.
+    subprocess.run(
+        [str(_PIVOT), "commit"],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "PYTHONPATH")},
+    )
+
+    after = _repro_json(project)
+    assert after["p/use_plain"][0] != "cached", after
+    assert _output(project, "use_plain") == "plain-v2"
+
+
+def test_no_commit_record_commits_the_loaded_manifest_when_outputs_match(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A successful `pivot commit` writes the manifest the matching no-commit run left: v1 for
+    `helpers.plain`, not the v2 file it sees in its fresh process. The next repro then reruns."""
+    project, _ = _project(tmp_path, _EDIT_THEN_USE)
+
+    _run(project, "repro", "--no-commit")
+    _run(project, "commit")
+
+    assert "func:helpers.plain: 09b7aba4b5d8001a" in _lock(project, "use_plain")
+    after = _repro_json(project)
+    assert after["p/use_plain"] == ("ran", "Code changed"), after
+
+
+def test_no_commit_then_commit_keeps_the_edited_source_mark(tmp_path: pathlib.Path) -> None:
+    """The worker imported the out-of-root helper after its edit. `pivot commit` records the
+    outputs with the manifest that run left, the mark included, so the next run reruns, and the
+    warning says what `pivot commit` does instead of claiming nothing reuses the result."""
+    project, pythonpath = _project(tmp_path, _EDIT_THEN_USE, helpers_in_root=False)
+
+    result = _run(project, "repro", "--no-commit", pythonpath=pythonpath)
+    printed = " ".join((result.stdout + result.stderr).split())
+    assert f"Stage 'p/use_plain' {_EDITED}: helpers." in printed, printed
+    assert "`pivot commit` keeps that when it records these outputs." in printed, printed
+
+    _run(project, "commit", pythonpath=pythonpath)
+    assert "edited-source:helpers" in _lock(project, "use_plain")
+
+    after = _repro_json(project, pythonpath)
+    assert after["p/use_plain"] == (
+        "ran",
+        "Previous run imported modules edited after pivot loaded them: helpers",
+    ), after
+
+
+def test_commit_of_outputs_edited_after_a_no_commit_run_trusts_the_user(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot commit` is the "trust me" path: when the outputs on disk are not the ones the
+    --no-commit run wrote (the user edited them), it records them against the current code."""
+    project, _ = _project(tmp_path, _EDIT_THEN_USE)
+    _run(project, "repro", "--no-commit")
+    (project / "data" / "p" / "use_plain.txt").write_text("plain-hand-edited")
+
+    _run(project, "commit")
+
+    after = _repro_json(project)
+    assert after["p/use_plain"][0] == "cached", after
+    assert _output(project, "use_plain") == "plain-hand-edited"
+
+
+def test_no_commit_warning_does_not_say_the_result_will_not_be_reused(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Under --no-commit no lock is written, and `pivot commit` records the outputs on disk as
+    current. The edited-source warning must not tell the user the result "will not be reused";
+    like the uncovered-import warning, it must say what `pivot commit` will do."""
+    project, pythonpath = _project(tmp_path, _EDIT_THEN_USE, helpers_in_root=False)
+
+    result = _run(project, "repro", "--no-commit", pythonpath=pythonpath)
+    printed = " ".join((result.stdout + result.stderr).split())
+    assert f"Stage 'p/use_plain' {_EDITED}: helpers." in printed, printed
+    assert "will not be reused" not in printed or "pivot commit" in printed, printed
+
+
+def test_marked_run_files_no_run_cache_entry(tmp_path: pathlib.Path) -> None:
+    """Run 1 runs the edited out-of-root helper (plain-v2) under the v1 fingerprint and marks
+    its lock. After the user restores v1, the run cache must not hand back plain-v2."""
+    project, pythonpath = _project(tmp_path, _EDIT_THEN_USE, helpers_in_root=False)
+    assert pythonpath is not None
+    _repro(project, pythonpath)
+    assert _output(project, "use_plain") == "plain-v2"
+    _repro(project, pythonpath)
+
+    (pythonpath / "helpers.py").write_text(_HELPERS)
+    third = _repro_json(project, pythonpath)
+
+    assert third["p/use_plain"][0] == "ran", third
+    assert _output(project, "use_plain") == "plain-v1"
+
+
+_EDGE_TAIL = """
+@stage
+def edit_helper(first: str) -> str:
+    {edit}
+    return "ready"
+
+
+@stage
+def use_plain(ready: str) -> str:
+    return helpers.plain()
+
+
+with Pipeline("p") as pipeline:
+    use_plain(edit_helper(early(pipeline.input("seed.txt"))))
+"""
+
+
+def _edge_project(
+    tmp_path: pathlib.Path, header: str, early: str, edit: str, pythonpath: pathlib.Path | None
+) -> pathlib.Path:
+    """A project whose stage `use_plain` calls a helper loaded some other way than through
+    discovery's loader; `edit_helper` changes the helper after discovery loaded it."""
+    project = tmp_path / "project"
+    (project / "data" / "raw").mkdir(parents=True, exist_ok=True)
+    (project / "data" / "raw" / "seed.txt").write_text("seed\n")
+    (project / "pipeline.py").write_text(header + early + _EDGE_TAIL.format(edit=edit))
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    _run(project, "init", pythonpath=pythonpath)
+    return project
+
+
+_EARLY_OTHER = "\n\n@stage\ndef early(seed: str) -> str:\n    return helpers.other()\n\n"
+_EARLY_SEED = "\n\n@stage\ndef early(seed: str) -> str:\n    return seed\n\n"
+
+
+def _assert_loaded_code_recorded(project: pathlib.Path, pythonpath: pathlib.Path | None) -> None:
+    """Run 1 ran the loaded helper (plain-v1) and its lock records that code; the next run sees
+    the edit and reruns."""
+    _repro(project, pythonpath)
+    assert _output(project, "use_plain") == "plain-v1"
+    second = _repro_json(project, pythonpath)
+    assert second["p/use_plain"] == ("ran", "Code changed"), second
+    assert _output(project, "use_plain") == "plain-v2"
+
+
+def test_helper_from_a_meta_path_finder_edited_mid_run_is_not_cached_stale(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An editable install's finder (setuptools' flat layout) loads the helper with CPython's
+    loader; one worker imports it before the edit. The coordinator records it from that loader."""
+    hooked = tmp_path / "hooked"
+    hooked.mkdir()
+    helper = hooked / "helpers.py"
+    helper.write_text(_HELPERS)
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(
+        "import importlib.abc\nimport importlib.util\nimport sys\n\n\n"
+        + "class _Finder(importlib.abc.MetaPathFinder):\n"
+        + "    def find_spec(self, fullname, path=None, target=None):\n"
+        + "        if fullname == 'helpers':\n"
+        + f"            return importlib.util.spec_from_file_location(fullname, {str(helper)!r})\n"
+        + "        return None\n\n\nsys.meta_path.append(_Finder())\n"
+    )
+    project = _edge_project(
+        tmp_path,
+        "import pathlib\n\nimport helpers\nfrom pivot import Pipeline, stage\n",
+        _EARLY_OTHER,
+        f"p = pathlib.Path({str(helper)!r}); p.write_text(p.read_text().replace('-v1', '-v2'))",
+        site,
+    )
+    _run(project, "config", "set", "core.max_workers", "1", pythonpath=site)
+
+    _assert_loaded_code_recorded(project, site)
+
+
+def test_in_root_helper_loaded_by_spec_from_file_location_is_not_cached_stale(
+    tmp_path: pathlib.Path,
+) -> None:
+    helper = tmp_path / "project" / "helpers.py"
+    helper.parent.mkdir(parents=True)
+    helper.write_text(_HELPERS)
+    header = (
+        "import importlib.util\nimport pathlib\nimport sys\n\nfrom pivot import Pipeline, stage\n\n"
+        + '_spec = importlib.util.spec_from_file_location("helpers", '
+        + 'pathlib.Path(__file__).parent / "helpers.py")\n'
+        + "helpers = importlib.util.module_from_spec(_spec)\n"
+        + 'sys.modules["helpers"] = helpers\n'
+        + "_spec.loader.exec_module(helpers)\n"
+    )
+    project = _edge_project(
+        tmp_path,
+        header,
+        _EARLY_SEED,
+        f"p = pathlib.Path({str(helper)!r}); p.write_text(p.read_text().replace('-v1', '-v2'))",
+        None,
+    )
+
+    _assert_loaded_code_recorded(project, None)
+
+
+def test_helper_in_a_zip_edited_mid_run_is_not_cached_stale(tmp_path: pathlib.Path) -> None:
+    """A zip on PYTHONPATH; one worker imports the helper before the edit rewrites the zip."""
+    archive = tmp_path / "ext" / "helpers.zip"
+    archive.parent.mkdir()
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("helpers.py", _HELPERS)
+    edit = (
+        f"z = zipfile.ZipFile({str(archive)!r}); t = z.read('helpers.py').decode(); z.close(); "
+        + f"z = zipfile.ZipFile({str(archive)!r}, 'w'); "
+        + "z.writestr('helpers.py', t.replace('-v1', '-v2')); z.close()"
+    )
+    early = (
+        "\n\n@stage\ndef early(seed: str) -> str:\n    import helpers\n\n"
+        + "    return helpers.__name__\n\n"
+    )
+    project = _edge_project(
+        tmp_path,
+        "import zipfile\n\nimport helpers\nfrom pivot import Pipeline, stage\n",
+        early,
+        edit,
+        archive,
+    )
+    _run(project, "config", "set", "core.max_workers", "1", pythonpath=archive)
+
+    _assert_loaded_code_recorded(project, archive)
+
+
+def test_stage_using_a_sourceless_module_is_never_reused(tmp_path: pathlib.Path) -> None:
+    """A `.pyc` with no source on PYTHONPATH, replaced mid-run: no one can read which code ran,
+    so the stage warns, its lock is marked, it reruns on every run, and the run cache never
+    restores its output, even after the user restores the first version."""
+    ext = tmp_path / "ext"
+    ext.mkdir()
+    built = tmp_path / "built"
+    built.mkdir()
+    for version in ("v1", "v2"):
+        source = built / f"helpers_{version}.py"
+        source.write_text(_HELPERS.replace("-v1", f"-{version}"))
+        py_compile.compile(
+            str(source),
+            cfile=str(built / f"helpers_{version}.pyc"),
+            dfile=str(ext / "helpers.py"),
+            doraise=True,
+        )
+    helper = ext / "helpers.pyc"
+    shutil.copy(built / "helpers_v1.pyc", helper)
+    project = _edge_project(
+        tmp_path,
+        "import shutil\n\nimport helpers\nfrom pivot import Pipeline, stage\n",
+        _EARLY_SEED,
+        f"shutil.copy({str(built / 'helpers_v2.pyc')!r}, {str(helper)!r})",
+        ext,
+    )
+    unreadable = "uses user modules whose source pivot cannot read: helpers."
+
+    first = _repro(project, ext)
+    assert f"Stage 'p/use_plain' {unreadable}" in first, first
+    assert "unreadable-source:helpers" in _lock(project, "use_plain")
+    second = _repro_json(project, ext)
+    assert second["p/use_plain"] == (
+        "ran",
+        "Previous run used modules whose source pivot cannot read: helpers",
+    ), second
+
+    shutil.copy(built / "helpers_v1.pyc", helper)
+    third = _repro_json(project, ext)
+    assert third["p/use_plain"][0] == "ran", third
+    assert _output(project, "use_plain") == "plain-v1"
+
+
+def test_new_package_shadowing_the_helper_mid_run_is_compared_by_name(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`edit_helper` adds `helpers/__init__.py` beside the out-of-root `helpers.py`, so the
+    worker imports another file for the same module name. The stage ran other code: it is
+    marked and reruns."""
+    pipeline = _EDIT_THEN_USE.replace(
+        'path = pathlib.Path(HELPERS)\n    path.write_text(path.read_text().replace("-v1", "-v2"))',
+        'package = pathlib.Path(HELPERS).parent / "helpers"\n    package.mkdir()\n'
+        + '    (package / "__init__.py").write_text(\'def plain():\\n    return "plain-pkg"\\n\')',
+    )
+    project, pythonpath = _project(tmp_path, pipeline, helpers_in_root=False)
+
+    first = _repro(project, pythonpath)
+    assert _output(project, "use_plain") == "plain-pkg"
+    assert f"Stage 'p/use_plain' {_EDITED}: helpers." in first, first
+    second = _repro_json(project, pythonpath)
+    assert second["p/use_plain"][0] == "ran", second

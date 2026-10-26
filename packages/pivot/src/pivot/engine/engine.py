@@ -1316,10 +1316,25 @@ class Engine:
                                     )
                                     stage_durations[stage_name] = duration_ms
 
-                                    # Apply deferred writes for RAN and CACHED stages
+                                    # Apply deferred writes for RAN and CACHED stages. Under
+                                    # --no-commit only the record of what ran is kept, for
+                                    # `pivot commit`; nothing else is persisted.
+                                    deferred = (
+                                        result["deferred_writes"]
+                                        if "deferred_writes" in result
+                                        else None
+                                    )
+                                    if no_commit and deferred is not None:
+                                        deferred = (
+                                            DeferredWrites(
+                                                no_commit_record=deferred["no_commit_record"]
+                                            )
+                                            if "no_commit_record" in deferred
+                                            else None
+                                        )
                                     if (
                                         result["status"] in (StageStatus.RAN, StageStatus.CACHED)
-                                        and not no_commit
+                                        and deferred is not None
                                     ):
                                         stage_info = self._get_stage(stage_name)
                                         output_paths = [
@@ -1330,8 +1345,8 @@ class Engine:
                                             stage_info, default_state_dir
                                         )
                                         stage_db = _get_state_db(stage_state_dir)
-                                        executor_core.apply_deferred_writes(
-                                            stage_name, output_paths, result, stage_db
+                                        stage_db.apply_deferred_writes(
+                                            stage_name, output_paths, deferred
                                         )
 
                                     # Record result

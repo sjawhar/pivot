@@ -6,6 +6,7 @@ import importlib
 import importlib.machinery
 import importlib.util
 import json
+import linecache
 import os
 import pathlib
 import py_compile
@@ -18,7 +19,7 @@ import cloudpickle
 import pytest
 
 import pivot_tui
-from pivot import discovery, fingerprint, project
+from pivot import discovery, fingerprint, loaded_source, project
 from tests import conftest
 
 if TYPE_CHECKING:
@@ -528,6 +529,42 @@ def test_stage_fingerprint_is_of_the_helper_source_discovery_loaded(
     assert as_alpha != as_bravo, "the fingerprint tracks the helper's body"
 
     assert discover_and_fingerprint(alpha, then_edit_to=bravo) == as_alpha
+
+
+def test_a_later_discovery_forgets_the_earlier_projects_loaded_source(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Discovering project B ends project A's import session: A's recorded source and the
+    `linecache` lines pinned for it go, so a later load of A's edited helper outside a session is
+    fingerprinted from the edited text, not the text A's session compiled."""
+    for name in ("a", "b"):
+        root = tmp_path / name
+        (root / ".pivot").mkdir(parents=True)
+        (root / f"pinned_{name}.py").write_text('def value():\n    return "v1"\n')
+        (root / "pipeline.py").write_text(
+            f"import pinned_{name}\nfrom pivot.compose import Pipeline, stage\n\n\n@stage\n"
+            + f"def s() -> str:\n    return pinned_{name}.value()\n\n\n"
+            + f'with Pipeline("{name}") as pipeline:\n    s()\n'
+        )
+    helper = (tmp_path / "a" / "pinned_a.py").resolve()
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path / "a")
+    first = discovery.discover_pipeline(project_root=tmp_path / "a")
+    assert first is not None
+    first.ensure_fingerprint("a/s")
+    assert loaded_source.digest(str(helper)) is not None
+    assert str(helper) in linecache.cache, "fingerprinting pinned the loaded lines"
+
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path / "b")
+    assert discovery.discover_pipeline(project_root=tmp_path / "b") is not None
+
+    assert loaded_source.digest(str(helper)) is None
+    assert str(helper) not in linecache.cache
+    helper.write_text('def value():\n    return "v2, edited"\n')
+    spec = importlib.util.spec_from_file_location("pinned_a_again", helper)
+    assert spec is not None and spec.loader is not None
+    edited = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(edited)
+    assert "v2, edited" in loaded_source.getsource(edited.value)
 
 
 _MODULES_BY_KIND = {

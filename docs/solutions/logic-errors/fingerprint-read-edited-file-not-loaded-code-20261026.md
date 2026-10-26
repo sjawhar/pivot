@@ -44,16 +44,22 @@ Record the bytes each user module was compiled from, and fingerprint those:
 
 - `discovery._ProjectSourceLoader.get_code` captures the source bytes its own `get_data` read (the
   bytes the checked-hash bytecode was validated against, or compiled from) and calls
-  `loaded_source.record`.
+  `loaded_source.record`. Every other user-code module is recorded from its own loader at the end
+  of discovery and at each import a worker's hooks see (editable-install finders, zip importers,
+  `spec_from_file_location`). A module whose loader gives no source is recorded as unreadable.
 - `loaded_source.getsource` puts the recorded lines into `linecache` as an entry without an mtime
   (CPython's form for loader-supplied source, which `checkcache` leaves alone) and calls
-  `inspect.getsource`. It restores the entry if something cleared `linecache`.
+  `inspect.getsource`. It restores the entry if something cleared `linecache`; `prune` removes it
+  with the record when an import session ends.
 - `fingerprint._source_digest` and a `@no_fingerprint` stage's `file:` hash use the recorded
   digest, so the `fp:`/`sm:` caches stay keyed by the content they hashed.
-- Workers record what they import too. Each worker gets the coordinator's digests once, in its
-  loky initializer arguments, and each stage carries their token; a stage that imported a module
-  whose content differs gets an `edited-source:` lock key (not reusable, next run reruns it) and
-  one warning.
+- Workers record what they import too. Each worker gets the coordinator's records once, in its
+  loky initializer arguments, and each stage carries their token. A stage that used a module (its
+  manifest hashes the module's code, or it imported it) whose record differs gets an
+  `edited-source:` lock key and one warning; one that used an unreadable module gets
+  `unreadable-source:` and reruns every run.
+- A `--no-commit` run records the manifest its lock would have held; `pivot commit` writes it while
+  the outputs on disk are still the ones that run wrote.
 
 The recorded lines are split exactly as `linecache.updatecache` splits a file, so an unedited
 project keeps every recorded fingerprint.
@@ -61,7 +67,11 @@ project keeps every recorded fingerprint.
 ## Prevention
 
 - A fingerprint must be computed from the same snapshot of code that the worker executes. Any
-  read of a source file at fingerprint time is a second snapshot.
+  read of a source file at fingerprint time is a second snapshot, and so is a commit that
+  fingerprints the code again after the run.
 - `inspect.getsource` is not a pure function of the function object: it reads the file system.
+- The rule is about the module, not the loader that imported it: a fix inside one loader misses
+  every other way a module is imported.
+- Check per stage, not per worker: a worker's other stages did not use the module.
 - Test code-change detection with the edit made *after* the import and *before* the fingerprint,
   and with the stage order that leaves the function unhashed until after the edit.

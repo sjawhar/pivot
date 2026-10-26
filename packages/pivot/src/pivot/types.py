@@ -149,6 +149,17 @@ class OnError(enum.StrEnum):
     KEEP_GOING = "keep_going"
 
 
+class NoCommitRecord(TypedDict):
+    """What a `--no-commit` run of a stage ran and wrote, kept for `pivot commit`.
+
+    `code_manifest` is the manifest the run's lock would have held, rerun marks included.
+    `pivot commit` writes it when the outputs on disk still have these hashes.
+    """
+
+    code_manifest: dict[str, str]
+    output_hashes: dict[str, str]  # output identity key -> content hash
+
+
 class DeferredWrites(TypedDict, total=False):
     """Deferred StateDB writes from worker for coordinator to apply.
 
@@ -163,6 +174,8 @@ class DeferredWrites(TypedDict, total=False):
     run_cache_delete_input_hash: str
     increment_outputs: bool  # True → increment output generations; False/absent → skip
     file_hash_entries: list[tuple[str, int, int, int, str]]  # (path, mtime_ns, size, inode, hash)
+    no_commit_record: NoCommitRecord  # a --no-commit run's record for `pivot commit`
+    clear_no_commit_record: bool  # a lock was written: drop the stage's --no-commit record
 
 
 class StageResult(TypedDict):

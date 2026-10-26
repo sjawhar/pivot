@@ -160,6 +160,15 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Out-of-root helper a worker imports after the edit | ✅ (warns, not reused) | `test_code_edited_during_run.py::test_out_of_root_helper_imported_after_its_edit_is_not_reused` |
 | No edit: nothing warns, every stage cached | ✅ | `test_code_edited_during_run.py::test_unedited_project_is_cached_on_the_next_run` |
 | Loaded source survives `linecache` clearing and matches `linecache`'s line split | ✅ | `test_loaded_source.py` |
+| A stage that never used the edited module is not marked (one worker; CLI and a long-lived engine) | ✅ (cached next run) | `test_code_edited_during_run.py::test_stage_that_never_touches_the_edited_module_is_not_marked`, `integration/test_warm_workers.py::test_server_runs_do_not_rerun_a_stage_that_never_used_an_edited_helper`, `test_loaded_source.py::test_a_stage_uses_modules_its_manifest_hashes_or_it_imported` |
+| A helper loaded by a meta-path finder, `spec_from_file_location` or a zip importer | ✅ (reruns next run) | `test_code_edited_during_run.py::test_helper_from_a_meta_path_finder_edited_mid_run_is_not_cached_stale`, `::test_in_root_helper_loaded_by_spec_from_file_location_is_not_cached_stale`, `::test_helper_in_a_zip_edited_mid_run_is_not_cached_stale` |
+| A sourceless module | ✅ (warns, reruns every run, no run cache) | `test_code_edited_during_run.py::test_stage_using_a_sourceless_module_is_never_reused`, `test_loaded_source.py::test_a_sourceless_module_is_recorded_as_unreadable` |
+| A new package shadowing the module mid-run (same name, other file) | ✅ (warns, not reused) | `test_code_edited_during_run.py::test_new_package_shadowing_the_helper_mid_run_is_compared_by_name` |
+| A marked run files no run-cache entry | ✅ | `test_code_edited_during_run.py::test_marked_run_files_no_run_cache_entry` |
+| `--no-commit`, then `pivot commit` of unchanged outputs, records the code the run ran (marks included) | ✅ (reruns next run) | `test_code_edited_during_run.py::test_no_commit_then_commit_does_not_cache_the_loaded_helper_output`, `::test_no_commit_then_commit_keeps_the_edited_source_mark`, `::test_no_commit_warning_does_not_say_the_result_will_not_be_reused`, `test_fingerprint_gaps.py::test_runtime_dynamic_import_under_no_commit_warns_that_commit_keeps_the_mark` |
+| `pivot commit` of outputs edited by hand after a `--no-commit` run trusts the user | ✅ (cached next run) | `test_code_edited_during_run.py::test_commit_of_outputs_edited_after_a_no_commit_run_trusts_the_user` |
+| A later discovery drops the earlier project's records and `linecache` pins | ✅ | `test_discovery.py::test_a_later_discovery_forgets_the_earlier_projects_loaded_source`, `test_loaded_source.py::test_prune_forgets_modules_no_longer_loaded_and_their_linecache_lines` |
+| Workers get the records once; a pool whose workers hold other records is replaced | ✅ | `test_loaded_source.py::test_a_stage_carries_digests_only_after_the_record_changed`, `engine/test_worker_pool.py::test_start_replaces_workers_that_started_with_other_loaded_source_records` |
 
 ---
 

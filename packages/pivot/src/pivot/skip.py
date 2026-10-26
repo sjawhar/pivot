@@ -23,14 +23,17 @@ from pivot.types import (
 
 # A lock's code manifest carries one of these prefixes, followed by module names, when its run
 # executed user code its fingerprint does not describe: modules it imported that the fingerprint
-# does not cover, or modules it imported as edited after the pivot process that fingerprinted the
-# stage loaded them. No fingerprint has such a key, so the lock never matches and the stage reruns.
+# does not cover, modules it used that changed after the pivot process that fingerprinted the
+# stage loaded them, or modules whose source pivot cannot read. No fingerprint has such a key, so
+# the lock never matches and the stage reruns.
 UNCOVERED_IMPORT_KEY_PREFIX = "uncovered-import:"
 EDITED_SOURCE_KEY_PREFIX = "edited-source:"
+UNREADABLE_SOURCE_KEY_PREFIX = "unreadable-source:"
 
 _RERUN_MARK_REASONS = {
     UNCOVERED_IMPORT_KEY_PREFIX: "Previous run imported modules its fingerprint does not cover",
     EDITED_SOURCE_KEY_PREFIX: "Previous run imported modules edited after pivot loaded them",
+    UNREADABLE_SOURCE_KEY_PREFIX: "Previous run used modules whose source pivot cannot read",
 }
 
 
@@ -46,6 +49,11 @@ def rerun_mark_reason(manifest: dict[str, str]) -> str | None:
             if key.startswith(prefix):
                 return f"{reason}: {key.removeprefix(prefix)}"
     return None
+
+
+def strip_rerun_marks(manifest: dict[str, str]) -> dict[str, str]:
+    """`manifest` without its rerun marks: the static fingerprint a run-cache input hash uses."""
+    return {key: value for key, value in manifest.items() if not _is_rerun_mark(key)}
 
 
 def carry_rerun_marks(

@@ -235,6 +235,8 @@ pivot commit [STAGES...] [OPTIONS]
 
 Without arguments, commits all stale stages. With stage names, unconditionally commits those stages.
 
+The code a lock records depends on where the outputs came from. If they are the outputs a `pivot repro --no-commit` run wrote, unchanged since, the lock records the code that run ran, so an edit made while it ran, or since, still reruns the stage. Otherwise (outputs edited by hand, or written another way) the lock records the code on disk now: the "trust me" path.
+
 **Options:**
 
 | Option | Description |
