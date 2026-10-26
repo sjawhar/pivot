@@ -63,6 +63,7 @@ from pivot import (
     registry,
 )
 from pivot import fingerprint as fingerprint_mod
+from pivot import state_dir as state_dir_mod
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
@@ -194,38 +195,40 @@ def get_pipeline_explanations(
 ) -> list[StageExplanation]:
     _t = metrics.start()
     try:
-        tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
-        if graph is None:
-            graph = engine_graph.build_graph(all_stages)
-        stage_graph = engine_graph.get_stage_dag(graph)
-        execution_order = engine_graph.get_execution_order(
-            stage_graph, stages, single_stage=single_stage
-        )
+        # One state-directory record for the query, started with the pipeline's directories.
+        with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
+            tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
+            if graph is None:
+                graph = engine_graph.build_graph(all_stages)
+            stage_graph = engine_graph.get_stage_dag(graph)
+            execution_order = engine_graph.get_execution_order(
+                stage_graph, stages, single_stage=single_stage
+            )
 
-        if not execution_order:
-            return []
+            if not execution_order:
+                return []
 
-        with fingerprint_mod.fingerprint_pass():
-            for stage_name in execution_order:
-                pipeline.ensure_fingerprint(stage_name)
-        overrides = parameters.load_params_yaml(pipeline)
+            with fingerprint_mod.fingerprint_pass():
+                for stage_name in execution_order:
+                    pipeline.ensure_fingerprint(stage_name)
+            overrides = parameters.load_params_yaml(pipeline)
 
-        store = _make_workspace_store(pipeline)
-        explanations_by_name = _get_explanations_in_parallel(
-            execution_order,
-            overrides,
-            all_stages=all_stages,
-            force=force,
-            allow_missing=allow_missing,
-            tracked_files=tracked_files,
-            tracked_trie=tracked_trie,
-            store=store,
-        )
+            store = _make_workspace_store(pipeline)
+            explanations_by_name = _get_explanations_in_parallel(
+                execution_order,
+                overrides,
+                all_stages=all_stages,
+                force=force,
+                allow_missing=allow_missing,
+                tracked_files=tracked_files,
+                tracked_trie=tracked_trie,
+                store=store,
+            )
 
-        # Preserve original order for staleness propagation
-        explanations = [explanations_by_name[name] for name in execution_order]
+            # Preserve original order for staleness propagation
+            explanations = [explanations_by_name[name] for name in execution_order]
 
-        return _compute_explanations_with_upstream(explanations, stage_graph)
+            return _compute_explanations_with_upstream(explanations, stage_graph)
     finally:
         metrics.end("status.get_pipeline_explanations", _t)
 
@@ -286,39 +289,41 @@ def get_pipeline_status(
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
     _t = metrics.start()
     try:
-        tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
-        if graph is None:
-            graph = engine_graph.build_graph(all_stages)
-        stage_graph = engine_graph.get_stage_dag(graph)
-        execution_order = engine_graph.get_execution_order(
-            stage_graph, stages, single_stage=single_stage
-        )
+        # One state-directory record for the query, started with the pipeline's directories.
+        with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
+            tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
+            if graph is None:
+                graph = engine_graph.build_graph(all_stages)
+            stage_graph = engine_graph.get_stage_dag(graph)
+            execution_order = engine_graph.get_execution_order(
+                stage_graph, stages, single_stage=single_stage
+            )
 
-        if not execution_order:
-            return [], stage_graph
+            if not execution_order:
+                return [], stage_graph
 
-        with fingerprint_mod.fingerprint_pass():
-            for stage_name in execution_order:
-                pipeline.ensure_fingerprint(stage_name)
-        overrides = parameters.load_params_yaml(pipeline)
+            with fingerprint_mod.fingerprint_pass():
+                for stage_name in execution_order:
+                    pipeline.ensure_fingerprint(stage_name)
+            overrides = parameters.load_params_yaml(pipeline)
 
-        store = _make_workspace_store(pipeline)
-        explanations_by_name = _get_explanations_in_parallel(
-            execution_order,
-            overrides,
-            all_stages=all_stages,
-            allow_missing=allow_missing,
-            tracked_files=tracked_files,
-            tracked_trie=tracked_trie,
-            store=store,
-        )
+            store = _make_workspace_store(pipeline)
+            explanations_by_name = _get_explanations_in_parallel(
+                execution_order,
+                overrides,
+                all_stages=all_stages,
+                allow_missing=allow_missing,
+                tracked_files=tracked_files,
+                tracked_trie=tracked_trie,
+                store=store,
+            )
 
-        # Preserve original order for staleness propagation
-        explanations = [explanations_by_name[name] for name in execution_order]
+            # Preserve original order for staleness propagation
+            explanations = [explanations_by_name[name] for name in execution_order]
 
-        # Reuse the shared upstream computation logic
-        enriched = _compute_explanations_with_upstream(explanations, stage_graph)
-        return _explanations_to_status(enriched), stage_graph
+            # Reuse the shared upstream computation logic
+            enriched = _compute_explanations_with_upstream(explanations, stage_graph)
+            return _explanations_to_status(enriched), stage_graph
     finally:
         metrics.end("status.get_pipeline_status", _t)
 

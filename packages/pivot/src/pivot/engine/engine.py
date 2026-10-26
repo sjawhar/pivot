@@ -867,13 +867,15 @@ class Engine:
         """Execute a run in a background task within the run task group.
 
         Handles ACTIVE→IDLE transitions, restart coalescing, and deferred reloads. The run
-        holds a state-directory record unless an invocation already holds one, so a library
-        caller's run reads ``core.state_dir`` once, before its first stage, and every entry
-        the run produces is filed under the directory the run writes its locks and its run
-        manifest to.
+        holds a state-directory record unless an invocation already holds one. It starts with
+        the directories the pipeline resolved when it loaded, which its stages' locks are
+        recorded in, so a library caller's run keeps its locks, its run manifest and every
+        cache entry it produces in one directory, whatever a stage of the run, or the caller
+        since the load, writes to ``core.state_dir``.
         """
+        pipeline_state_dirs = None if self._pipeline is None else self._pipeline.resolved_state_dirs
         try:
-            with state_dir_mod.run_invocation():
+            with state_dir_mod.entry_invocation(pipeline_state_dirs):
                 self._require_pipeline()
 
                 await self._orchestrate_execution(

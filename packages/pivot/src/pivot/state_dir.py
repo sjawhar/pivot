@@ -11,7 +11,7 @@ import logging
 import os
 import pathlib
 import typing
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 
 from pivot import config_files, exceptions, project
 
@@ -40,21 +40,14 @@ class StateDirInvocation(typing.TypedDict):
     reported: StateDirWarnings | None
 
 
-# Set by the CLI callback for one CLI invocation, by a worker for one stage, and by an engine
-# run that no invocation covers (``run_invocation``). Outside one (shell completion, a library
-# caller between runs), every lookup reads the config and nothing is reported.
+# Set by the CLI callback for one CLI invocation, by a worker for one stage, and by a library
+# entry point that no invocation covers (``entry_invocation``): an engine run, a pipeline's load
+# and each of its fingerprints, discovery. Outside one (shell completion, a low-level call such
+# as ``fingerprint.get_stage_fingerprint`` by hand), every lookup reads and resolves the config
+# again and nothing is reported.
 _invocation = contextvars.ContextVar[StateDirInvocation | None](
     "state_dir_invocation", default=None
 )
-
-# What a lookup outside an invocation last resolved for a project root. The key is the project
-# root, and an entry answers only while the exact bytes of `<root>/.pivot/config.yaml` equal the
-# bytes that answer was parsed from. Each such lookup reads the file again, so an edit by this
-# process or by another one is seen on the next lookup; no timestamp, size or inode is trusted.
-# `clear_state_dir_cache` empties it, which `config.io.clear_config_cache` does at the start of
-# each CLI invocation and after `config set` or `config unset`. A lookup inside an invocation or
-# an engine run never reads or writes it: the record answers there.
-_resolved_outside_invocation = dict[pathlib.Path, tuple[bytes, pathlib.Path]]()
 
 
 def _reported() -> StateDirWarnings | None:
@@ -96,18 +89,6 @@ def resolve_state_dir_value(root: pathlib.Path, value: str) -> pathlib.Path:
     return pathlib.Path(os.path.realpath(root / value))
 
 
-def _config_file_content(config_path: pathlib.Path) -> bytes | None:
-    """The config file's bytes, or None when this call cannot read them.
-
-    Only the resolution cache uses them. A file this call cannot read is left to the parser,
-    which reports the problem as it always did.
-    """
-    try:
-        return config_path.read_bytes()
-    except OSError:
-        return None
-
-
 def state_dir_for(root: pathlib.Path) -> pathlib.Path:
     """Return the state directory configured for ``root``.
 
@@ -115,22 +96,15 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
     to one project, so a global value is ignored, and reported once per invocation when the CLI
     enabled that. A configured value is resolved with ``resolve_state_dir_value``; absent
     configuration keeps state in ``<root>/.pivot``. The ``.pivot`` marker and its configuration
-    always remain at the project root. Within one invocation or engine run, each root's config
-    is read once and the record answers. Outside one, every call reads the file's bytes; it
-    reuses an earlier answer only for the same root and identical bytes, and otherwise parses
-    the file. An unreadable file is always passed to the parser, which reports it.
+    always remain at the project root. Within one invocation (``begin_invocation``,
+    ``entry_invocation``), each root's config is read and resolved once and the record answers;
+    outside one, every call reads and resolves it again.
     """
     invocation = _invocation.get()
     if invocation is not None and (cached := invocation["resolved"].get(root)) is not None:
         return cached
 
     config_path = root / ".pivot" / "config.yaml"
-    content = None if invocation is not None else _config_file_content(config_path)
-    if content is not None:
-        remembered = _resolved_outside_invocation.get(root)
-        if remembered is not None and remembered[0] == content:
-            return remembered[1]
-
     present, configured = config_files.read_config_file_value(config_path, "core.state_dir")
     if configured is None:
         state_dir = root / ".pivot"
@@ -144,8 +118,6 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
     warn_if_global_state_dir_ignored(root, shadowed=present)
     if invocation is not None:
         invocation["resolved"][root] = state_dir
-    elif content is not None:
-        _resolved_outside_invocation[root] = (content, state_dir)
     return state_dir
 
 
@@ -330,31 +302,36 @@ def end_invocation(token: contextvars.Token[StateDirInvocation | None]) -> None:
 
 
 @contextlib.contextmanager
-def run_invocation() -> Iterator[None]:
-    """Hold one engine run's record, when no invocation already holds one.
+def entry_invocation(
+    state_dirs: Mapping[pathlib.Path, pathlib.Path] | None = None,
+) -> Iterator[Mapping[pathlib.Path, pathlib.Path]]:
+    """Hold one library entry point's record for its whole call, when no invocation holds one.
 
-    A run decides its state directory before its first stage and writes its locks, its run
-    manifest and its stages' cache entries there. The engine fingerprints a stage when it
-    dispatches it, so without a record a library caller's later stages would read a
-    ``core.state_dir`` that an earlier stage of the same run edited, and file their entries
-    under it. Within the run the record answers every lookup, in the threads that fingerprint
-    at dispatch as well, because they copy this context. A CLI invocation already holds the
-    value for the whole command, and this leaves that record alone. The run reports nothing: a
-    library caller's warnings are silent outside a run too.
+    A library caller has no CLI invocation. Each public entry point that produces cache entries
+    or writes state (an engine run, discovery, a pipeline's load, ``Pipeline.ensure_fingerprint``)
+    holds this record, so every lookup in the call, in the threads that copy this context as
+    well, reads the record: each root's ``core.state_dir`` is read and resolved once per call,
+    as the kernel opens it then, and an edit of the value during the call moves nothing. The
+    record starts with ``state_dirs``; a pipeline passes the directories it resolved when it was
+    loaded, so its fingerprints and its runs use the directory its stages' locks are in. A CLI
+    invocation, or an entry point already in progress, holds the record for the whole call, and
+    this leaves it alone. The record reports nothing: a library caller's warnings stay silent.
+
+    Yields the record's resolved directories by project root, so the caller can keep them.
     """
-    if _invocation.get() is not None:
-        yield
+    invocation = _invocation.get()
+    if invocation is not None:
+        yield invocation["resolved"]
         return
-    token = begin_invocation(report=False)
+    token = begin_invocation(report=False, state_dirs=dict(state_dirs or {}))
     try:
-        yield
+        yield typing.cast("StateDirInvocation", _invocation.get())["resolved"]
     finally:
         end_invocation(token)
 
 
 def clear_state_dir_cache() -> None:
-    """Forget every resolved state directory, so the next lookup parses the config again."""
-    _resolved_outside_invocation.clear()
+    """Forget this invocation's resolved state directories, so the next lookup reads the config."""
     invocation = _invocation.get()
     if invocation is not None:
         invocation["resolved"].clear()

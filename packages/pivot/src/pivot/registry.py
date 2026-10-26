@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 import pygtrie
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 from pivot import exceptions, fingerprint, project, stage_def, types
 from pivot.storage import cache
@@ -207,6 +207,9 @@ class PipelineLike(Protocol):
 
     @property
     def state_dir(self) -> pathlib.Path: ...
+
+    @property
+    def resolved_state_dirs(self) -> Mapping[pathlib.Path, pathlib.Path]: ...
 
     @property
     def input_bindings(self) -> dict[str, str]: ...

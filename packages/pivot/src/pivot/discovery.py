@@ -448,7 +448,18 @@ def discover_pipeline(
 
     Raises:
         DiscoveryError: If discovery fails, or if both config types exist
+
+    One state-directory record covers the whole discovery (``state_dir.entry_invocation``):
+    the exclusion of the state directory, the pipeline's load, the cache entries the import
+    produces and the check of its stages all read one resolution of ``core.state_dir``.
     """
+    with state_dir_mod.entry_invocation():
+        return _discover_pipeline(project_root, all_pipelines=all_pipelines)
+
+
+def _discover_pipeline(
+    project_root: pathlib.Path | None, *, all_pipelines: bool
+) -> PipelineLike | None:
     _t = metrics.start()
     session: _ImportSession | None = None
     loaded = False

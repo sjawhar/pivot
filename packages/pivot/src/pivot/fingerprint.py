@@ -297,17 +297,20 @@ class FunctionIdentity(TypedDict):
 def _producing_state_dir() -> pathlib.Path | None:
     """The state directory a cache entry produced now belongs to, or None when it has none.
 
-    The rule for every cache here: a pending entry belongs to the state directory of the run
+    The rule for every cache here: a pending entry belongs to the state directory of the call
     that produced it, and a flush writes it there and never resolves a directory again.
 
     Read where the entry is produced, never where it is written. A CLI invocation resolves its
     state directory once and every producer of that invocation, the engine thread of a TUI
-    session included, reads that one. A library caller has no invocation, so an engine run
-    holds a record of its own (``state_dir.run_invocation``): a stage that edits
-    ``core.state_dir`` while the run is dispatching later stages moves no entry of that run.
-    Only a producer outside any run, such as a library caller that fingerprints stages itself,
-    reads the configured value as it is now. An unreadable or unusable configuration leaves the
-    entry unfiled, and the caches are best effort, so it is dropped.
+    session included, reads that one. A library caller has no invocation, so each library entry
+    point that produces entries holds a record of its own (``state_dir.entry_invocation``):
+    an engine run, discovery, a pipeline's load and each ``Pipeline.ensure_fingerprint``. A
+    pipeline's fingerprints and runs start from the directory it resolved when it loaded, so a
+    ``core.state_dir`` edited afterwards, by a stage or by the caller, moves none of its
+    entries. Only a low-level call outside every entry point (``get_stage_fingerprint`` or
+    ``get_stage_fingerprint_cached`` by hand) reads and resolves the configuration again for
+    each entry: correct, and slow. An unreadable or unusable configuration leaves the entry
+    unfiled, and the caches are best effort, so it is dropped.
     """
     try:
         from pivot.config import io

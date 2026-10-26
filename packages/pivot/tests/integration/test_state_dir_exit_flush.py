@@ -8,10 +8,12 @@ program did next. Neither reads `core.state_dir` again, so a value edited in bet
 nothing: the session's entries stay in `s1`, the library's in `libstate`, and the edited
 directory is never created.
 
-A run reads the value once, before its first stage, and holds it: the CLI invocation holds it
-for a command, and an engine run with no invocation around it holds it for the run
-(`state_dir.run_invocation`). So a stage that edits `core.state_dir` moves no entry of its own
-run either, including the stages the engine fingerprints only once that stage has finished.
+Every library entry point holds one state-directory record for its call
+(`state_dir.entry_invocation`), and a pipeline's fingerprints and runs start it from the
+directory the pipeline resolved when it loaded. So a stage that edits `core.state_dir` moves no
+entry of its own run, including the stages the engine fingerprints only once that stage has
+finished; a caller who edits the value keeps a loaded pipeline in one directory, and a pipeline
+loaded after the edit uses the new one.
 """
 
 from __future__ import annotations
@@ -142,7 +144,27 @@ if __name__ == "__main__":
     main()
 """
 
-_TWO_RUNS_CALLER = """\
+_RUNS_AFTER_A_NEW_LOAD_CALLER = """\
+import os
+import pathlib
+import sys
+
+
+def main() -> None:
+    os.chdir(sys.argv[1])
+
+    from pivot import discovery, executor
+
+    executor.run(pipeline=discovery.discover_pipeline())
+    pathlib.Path(".pivot/config.yaml").write_text("core:\\n  state_dir: otherstate\\n")
+    executor.run(pipeline=discovery.discover_pipeline())
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+_REUSED_PIPELINE_CALLER = """\
 import os
 import pathlib
 import sys
@@ -389,28 +411,47 @@ def test_a_library_run_of_a_longer_chain_keeps_every_entry_in_its_own_state_dir(
     assert counts == {b"fp:": 6, b"sm:": 3, b"run:": 1}, (counts, ran.stdout + ran.stderr)
 
 
-def test_a_library_caller_sees_a_value_edited_between_two_runs(tmp_path: pathlib.Path) -> None:
-    """Each engine run starts its own record, so the second run reads the edited value."""
+def test_a_pipeline_loaded_again_after_an_edit_runs_in_the_new_state_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Each load resolves the value once, so the second pipeline's locks and run go there."""
     home, root = _project(tmp_path, "libstate")
 
-    ran = _run_library_caller(tmp_path, home, root, _TWO_RUNS_CALLER)
+    ran = _run_library_caller(tmp_path, home, root, _RUNS_AFTER_A_NEW_LOAD_CALLER)
 
     assert ran.returncode == 0, ran.stdout + ran.stderr
     assert _cached_keys(root / "libstate", b"run:") == 1, ran.stdout + ran.stderr
     assert _cached_keys(root / "otherstate", b"run:") == 1, ran.stdout + ran.stderr
+    assert (root / "otherstate" / "stages" / "test" / "process.lock").is_file(), ran.stderr
 
 
-def test_direct_fingerprinting_sees_a_value_edited_between_two_stages(
+def test_a_reused_pipeline_keeps_its_state_dir_after_an_edit(tmp_path: pathlib.Path) -> None:
+    """A loaded pipeline's runs keep the directory its stages' locks are recorded in, so its
+    second run writes its locks, its run manifest and its caches where its first run did."""
+    home, root = _project(tmp_path, "libstate")
+
+    ran = _run_library_caller(tmp_path, home, root, _REUSED_PIPELINE_CALLER)
+
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert not (root / "otherstate").exists(), sorted(
+        p.relative_to(root).as_posix() for p in (root / "otherstate").rglob("*")
+    )
+    assert _cached_keys(root / "libstate", b"run:") == 2, ran.stdout + ran.stderr
+
+
+def test_direct_fingerprints_of_one_pipeline_use_the_state_dir_it_loaded_with(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Outside a run, the resolution memory answers only for the bytes it parsed."""
+    """`Pipeline.ensure_fingerprint` of two stages, with the value edited between them: both
+    stages file their entries under the directory the pipeline resolved when it loaded."""
     home, root = _project(tmp_path, "libstate")
     (root / "pipeline.py").write_text(_TWO_INDEPENDENT_STAGES)
 
     ran = _run_library_caller(tmp_path, home, root, _DIRECT_FINGERPRINT_CALLER)
 
     assert ran.returncode == 0, ran.stdout + ran.stderr
-    assert _cached_keys(root / "libstate", b"sm:") == 1, ran.stdout + ran.stderr
-    assert _cached_keys(root / "otherstate", b"sm:") == 1, ran.stdout + ran.stderr
-    assert _cached_keys(root / "libstate", b"fp:") == 2, ran.stdout + ran.stderr
-    assert _cached_keys(root / "otherstate", b"fp:") == 2, ran.stdout + ran.stderr
+    assert not (root / "otherstate").exists(), sorted(
+        p.relative_to(root).as_posix() for p in (root / "otherstate").rglob("*")
+    )
+    assert _cached_keys(root / "libstate", b"sm:") == 2, ran.stdout + ran.stderr
+    assert _cached_keys(root / "libstate", b"fp:") == 4, ran.stdout + ran.stderr

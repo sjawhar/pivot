@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import collections.abc
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from networkx import DiGraph
 
@@ -521,6 +521,7 @@ class Pipeline:
     _previous_markers: list[_PreviousOutputMarker]
     _constructing: bool
     _loaded_pipelines: set[str]
+    _resolved_state_dirs: dict[pathlib.Path, pathlib.Path]
 
     def __init__(self, name: str, *, root: pathlib.Path | None = None) -> None:
         reason = lock.stage_name_error(name)
@@ -539,6 +540,7 @@ class Pipeline:
         self._included_stages = dict[str, registry.RegistryStageInfo]()
         self._constructing = False
         self._loaded_pipelines = {name}
+        self._resolved_state_dirs = dict[pathlib.Path, pathlib.Path]()
 
         if root is not None:
             self._root = root.resolve()
@@ -556,6 +558,18 @@ class Pipeline:
     @property
     def state_dir(self) -> pathlib.Path:
         return state_dir_mod.ensure_state_dir(self._root)
+
+    @property
+    def resolved_state_dirs(self) -> Mapping[pathlib.Path, pathlib.Path]:
+        """The state directory of each project root, as this pipeline resolved it when it loaded.
+
+        These are the directories its stages' locks are recorded in. Its fingerprints and its
+        runs start their state-directory record with them (``state_dir.entry_invocation``), so
+        a ``core.state_dir`` edited after the load leaves this pipeline in one directory; a
+        caller who wants the new one loads the pipeline again. A root whose configuration could
+        not be used at load is absent, and each entry point reads that configuration afresh.
+        """
+        return self._resolved_state_dirs
 
     def _stage_state_dir(self) -> pathlib.Path:
         """The state directory recorded on this pipeline's stages; loading never creates it.
@@ -596,7 +610,8 @@ class Pipeline:
 
     def ensure_fingerprint(self, name: str) -> dict[str, str]:
         self._require_materialized()
-        return self._registry.ensure_fingerprint(name)
+        with state_dir_mod.entry_invocation(self._resolved_state_dirs):
+            return self._registry.ensure_fingerprint(name)
 
     def build_dag(self) -> DiGraph[str]:
         self._require_materialized()
@@ -651,6 +666,8 @@ class Pipeline:
         if not self._constructing:
             self._check_inputs_against_outputs(self._registry)
         self._loaded_pipelines.update(other.loaded_pipelines)
+        for root, state_dir in other.resolved_state_dirs.items():
+            self._resolved_state_dirs.setdefault(root, state_dir)
         self._registry.invalidate_dag_cache()
 
     def __enter__(self) -> Pipeline:
@@ -675,13 +692,19 @@ class Pipeline:
     def _materialize_stages(self) -> None:
         new_registry = registry.StageRegistry()
         closure = self._upstream_closure()
-        # One lookup per project root: outside a CLI invocation each lookup reads the config.
-        stage_state_dirs = {self._root: self._stage_state_dir()}
+        # One record for the load: each project root's state directory is read and resolved
+        # once, recorded on its stages, and kept for this pipeline's fingerprints and runs.
+        with state_dir_mod.entry_invocation() as resolved:
+            stage_state_dirs = {self._root: self._stage_state_dir()}
+            for foreign_pipeline, _ in closure:
+                if foreign_pipeline._root not in stage_state_dirs:
+                    stage_state_dirs[foreign_pipeline._root] = foreign_pipeline._stage_state_dir()
+            resolved_state_dirs = {
+                root: resolved[root] for root in stage_state_dirs if root in resolved
+            }
 
         for foreign_pipeline, foreign_node in closure:
             qualified_name = f"{foreign_pipeline._name}/{foreign_node.name}"
-            if foreign_pipeline._root not in stage_state_dirs:
-                stage_state_dirs[foreign_pipeline._root] = foreign_pipeline._stage_state_dir()
             stage_info = _emit_stage_info(
                 foreign_node, qualified_name, stage_state_dirs[foreign_pipeline._root]
             )
@@ -708,6 +731,9 @@ class Pipeline:
 
         # Atomic swap — if any step above raises, self._registry is unchanged
         self._registry = new_registry
+        for root, state_dir in self._resolved_state_dirs.items():
+            resolved_state_dirs.setdefault(root, state_dir)
+        self._resolved_state_dirs = resolved_state_dirs
 
     def _check_inputs_against_outputs(self, reg: registry.StageRegistry) -> None:
         """Refuse an input named like a stage, or whose path overlaps a registered output.

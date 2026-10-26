@@ -4,7 +4,7 @@ import pathlib
 import pydantic
 import pytest
 
-from pivot import config, project
+from pivot import config, config_files, project
 from pivot import state_dir as state_dir_mod
 from pivot.config import io as config_io
 from pivot.exceptions import ConfigError
@@ -185,7 +185,8 @@ def test_state_dir_for_reads_the_project_configuration(project_root: pathlib.Pat
 def test_state_dir_lookup_outside_invocation_reads_changed_bytes_with_same_timestamp(
     project_root: pathlib.Path,
 ) -> None:
-    """The lookup memory answers only for identical bytes; size and mtime prove nothing."""
+    """Outside a state-directory record every lookup reads the file again; neither its size
+    nor its mtime is trusted."""
     config_file = project_root / ".pivot" / "config.yaml"
     config_file.write_text("core:\n  state_dir: alpha\n")
     stat = config_file.stat()
@@ -197,6 +198,38 @@ def test_state_dir_lookup_outside_invocation_reads_changed_bytes_with_same_times
     assert config_file.stat().st_size == stat.st_size
     assert config_file.stat().st_mtime_ns == stat.st_mtime_ns
     assert state_dir_mod.state_dir_for(project_root) == project_root / "betaa"
+
+
+def test_state_dir_lookup_outside_invocation_never_reuses_an_answer_from_other_bytes(
+    project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config rewritten while a lookup reads it decides that lookup only.
+
+    The first lookup's parse sees the file rewritten (`betaa`), and the file then returns to
+    its first bytes (`alpha`). Nothing outside a record remembers an answer, so the next lookup
+    reads `alpha` again; an answer filed under the bytes read before the rewrite would be
+    `betaa`.
+    """
+    config_file = project_root / ".pivot" / "config.yaml"
+    first = "core:\n  state_dir: alpha\n"
+    config_file.write_text(first)
+    read = config_files.read_config_file_value
+    rewrites = ["core:\n  state_dir: betaa\n"]
+
+    def _read_while_the_file_is_rewritten(path: pathlib.Path, key: str) -> tuple[bool, object]:
+        if not rewrites:
+            return read(path, key)
+        path.write_text(rewrites.pop())
+        try:
+            return read(path, key)
+        finally:
+            path.write_text(first)
+
+    monkeypatch.setattr(config_files, "read_config_file_value", _read_while_the_file_is_rewritten)
+
+    assert state_dir_mod.state_dir_for(project_root) == project_root / "betaa"
+    assert config_file.read_text() == first
+    assert state_dir_mod.state_dir_for(project_root) == project_root / "alpha"
 
 
 # --- Error handling tests ---
