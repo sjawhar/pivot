@@ -15,7 +15,7 @@ from pivot.cli import helpers as cli_helpers
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import listing, lock, track
-from pivot.types import HashInfo, PipelineStatus, PipelineStatusInfo, is_dir_hash
+from pivot.types import HashInfo, LockData, PipelineStatus, PipelineStatusInfo, is_dir_hash
 
 if TYPE_CHECKING:
     from pivot.remote import protocol
@@ -148,9 +148,11 @@ def _get_stage_lock_hashes(
             )
 
     # Key deps by workspace path: upstream stage outputs at their output path,
-    # raw inputs at their input binding (data/raw/<name> by default).
+    # raw inputs at their input binding (data/raw/<name> by default). A producer's listing is
+    # read beside the producer's own lock, which alone says whether that file is its listing.
     all_stages = cli_helpers.get_all_stages()
     dep_refs = {ref.identity: ref for ref in stage_info["deps"].values()}
+    producer_locks = dict[str, LockData | None]()
     dep_hashes = dict[str, str]()
     for identity, hash_info in lock_data["dep_hashes"].items():
         ref = dep_refs.get(identity)
@@ -163,10 +165,21 @@ def _get_stage_lock_hashes(
                 registry.get_stage_state_dir(all_stages[identity.producer], default_state_dir)
             )
             committed = listing.output_listing_path(producer_dir, identity)
+            if is_dir_hash(hash_info):
+                if identity.producer not in producer_locks:
+                    producer_locks[identity.producer] = lock.StageLock(
+                        identity.producer, producer_dir
+                    ).read(cache_dir=files_dir)
+                producer_lock = producer_locks[identity.producer]
+                if producer_lock is not None:
+                    committed = lock.committed_listing(producer_lock, committed)
         else:
             dep_path = workspace_store.checkout(ref)
-            committed = listing.input_listing_path(
-                stage_lock.stages_dir, workspace_store.input_relpath(ref)
+            committed = lock.committed_listing(
+                lock_data,
+                listing.input_listing_path(
+                    stage_lock.stages_dir, workspace_store.input_relpath(ref)
+                ),
             )
             if is_dir_hash(hash_info):
                 data_path = project.normalize_path(dep_path)
@@ -174,12 +187,7 @@ def _get_stage_lock_hashes(
                     data_path, track.read_pvt_file(track.get_pvt_path(data_path)), files_dir
                 )
         dep_hashes.update(
-            _object_hashes(
-                project.to_relative_path(dep_path),
-                hash_info,
-                lock.committed_listing(lock_data, committed),
-                files_dir,
-            )
+            _object_hashes(project.to_relative_path(dep_path), hash_info, committed, files_dir)
         )
 
     return output_hashes, dep_hashes

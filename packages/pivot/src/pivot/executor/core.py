@@ -665,16 +665,42 @@ def check_uncached_incremental_outputs(
 
     for stage_name in execution_order:
         stage_info = all_stages[stage_name]
+        incremental = [
+            out for out in stage_info["outs"] if out.tag is types.ArtifactTag.INCREMENTAL
+        ]
+        if not incremental:
+            continue
         stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         lock_data = stage_lock.read(cache_dir=cache_dir)
         output_hashes = lock_data["output_hashes"] if lock_data else {}
 
-        for out in stage_info["outs"]:
-            if out.tag is not types.ArtifactTag.INCREMENTAL:
-                continue
+        for out in incremental:
             out_path = workspace.resolve_display_path(out)
             if out_path.exists() and out.identity not in output_hashes:
                 uncached.append((stage_name, str(out_path)))
 
     return uncached
+
+
+def check_restarted_incremental_outputs(
+    execution_order: list[str],
+    all_stages: dict[str, RegistryStageInfo],
+) -> list[str]:
+    """Why each stage in ``execution_order`` whose lock an older pivot rewrote over this
+    pivot's, for a stage with an incremental output, is refused (``lock.restarted_listings``)."""
+    refused = list[str]()
+    default_state_dir = config.get_state_dir()
+    cache_dir = config.get_cache_dir() / "files"
+    for stage_name in execution_order:
+        stage_info = all_stages[stage_name]
+        if not any(out.tag is types.ArtifactTag.INCREMENTAL for out in stage_info["outs"]):
+            continue
+        stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
+        restarted = lock.restarted_listings(
+            stage_lock, stage_lock.read(cache_dir=cache_dir), stage_info["outs"]
+        )
+        if restarted:
+            refused.append(f"{stage_name}: {lock.restarted_reason(stage_lock, restarted)}")
+    return refused

@@ -70,7 +70,8 @@ class OutputHashEntry(TypedDict):
 # Part of every run-cache key this pivot files under (compute_input_hash). An older pivot reads a
 # run-cache output that lists no files inline as one file, so it would restore a directory's
 # listing in the directory's place; keyed apart, it never finds an entry this pivot wrote. This
-# pivot still looks an entry up under the unmarked key an older pivot filed it under, and reads
+# pivot still looks an entry up under the unmarked key an older pivot filed it under, with each
+# directory dependency hashed as that pivot hashes it (worker.older_pivot_input_hash), and reads
 # it in memory (worker._try_skip_via_run_cache_with_store), so an upgrade reruns nothing the run
 # cache restored before it.
 _DIRECTORY_RECORD = "listing"

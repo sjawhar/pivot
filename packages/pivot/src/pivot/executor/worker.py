@@ -911,13 +911,14 @@ def _execute_stage(
                             store,
                             state_db,
                             state_dir=project_state_dir,
-                            legacy_input_hash=run_history.stage_input_hash(
+                            legacy_input_hash=older_pivot_input_hash(
                                 current_fingerprint,
                                 current_params,
                                 stage_info["deps"].values(),
                                 _to_identity_hashes(dep_hashes),
                                 stage_outs,
-                                marked=False,
+                                hashed_dirs,
+                                store_cache_dir(store),
                             ),
                         )
                         if run_cache_skip is not None:
@@ -2156,6 +2157,37 @@ def input_listing_paths(
     }
 
 
+def older_pivot_input_hash(
+    code_manifest: dict[str, str],
+    params: dict[str, object],
+    deps: collections_abc.Iterable[types.ArtifactRef],
+    dep_hashes: Mapping[types.ArtifactIdentity, HashInfo],
+    outs: collections_abc.Iterable[types.ArtifactRef],
+    hashed_dirs: Mapping[str, listing.HashedDirectory],
+    cache_dir: pathlib.Path | None,
+) -> str | None:
+    """The run-cache key an older pivot files the same run under: unmarked
+    (``run_history.compute_input_hash``), with each directory dependency hashed as that pivot
+    hashes it (``listing.legacy_digest`` of its members: this run's listing in ``hashed_dirs``,
+    else the cache's object). None when a directory's members cannot be read here; that run's
+    entry is then not found, and the stage reruns once."""
+    legacy = dict[types.ArtifactIdentity, HashInfo]()
+    for identity, hash_info in dep_hashes.items():
+        if not is_dir_hash(hash_info):
+            legacy[identity] = hash_info
+            continue
+        hashed = hashed_dirs.get(hash_info["hash"])
+        if hashed is not None:
+            members = hashed["listing"]
+        else:
+            try:
+                members = listing.read(None, hash_info, cache_dir)
+            except (exceptions.ListingMissingError, exceptions.CorruptListingError):
+                return None
+        legacy[identity] = FileHash(hash=listing.legacy_digest(members))
+    return run_history.stage_input_hash(code_manifest, params, deps, legacy, outs, marked=False)
+
+
 def _commit_lock_and_build_deferred(
     stage_info: WorkerStageInfo,
     lock_data: LockData,
@@ -2190,13 +2222,14 @@ def _commit_lock_and_build_deferred(
         reusable=reusable,
         legacy_input_hash=None
         if reusable
-        else run_history.stage_input_hash(
+        else older_pivot_input_hash(
             stage_info["fingerprint"],
             lock_data["params"],
             stage_info["deps"].values(),
             lock_data["dep_hashes"],
             stage_info["outs"],
-            marked=False,
+            hashed_dirs,
+            store_cache_dir(store),
         ),
         file_hash_entries=file_hash_entries,
         increment_outputs=increment_outputs,

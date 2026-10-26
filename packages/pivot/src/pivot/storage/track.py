@@ -100,6 +100,22 @@ def _warn_old_format(pvt_path: pathlib.Path) -> None:
     )
 
 
+@functools.cache
+def _warn_stale_listing(pvt_path: pathlib.Path) -> None:
+    """Warn once per process for each directory .pvt an older pivot wrote over this pivot's,
+    leaving this pivot's ``.pvt.listing`` beside it, naming that file and the command that
+    removes it."""
+    stale = os.path.relpath(listing.tracked_listing_path(pvt_path))
+    logger.warning(
+        "%s was written by an older pivot, with its files listed inside it, and pivot reads "
+        + "that list; %s beside it is a listing this pivot wrote before, which no .pvt "
+        + "records now. Remove it with `git rm %s`",
+        os.path.relpath(pvt_path),
+        stale,
+        shlex.quote(stale),
+    )
+
+
 def parse_pvt(data: object) -> tuple[PvtData, listing.DirListing | None] | None:
     """A parsed .pvt's data, or None if invalid or insecure.
 
@@ -169,7 +185,8 @@ def write_pvt_file(pvt_path: pathlib.Path, data: PvtData) -> None:
 
 def _load_pvt(pvt_path: pathlib.Path) -> tuple[PvtData, listing.DirListing | None] | None:
     """A .pvt file's data and, for an older pivot's directory .pvt, its inline listing (with
-    one warning per process saying how to convert it); None if missing, invalid, or insecure.
+    one warning per process saying how to convert it, or how to remove a stale ``.pvt.listing``
+    beside it); None if missing, invalid, or insecure.
     """
     try:
         with open(pvt_path) as f:
@@ -178,7 +195,10 @@ def _load_pvt(pvt_path: pathlib.Path) -> tuple[PvtData, listing.DirListing | Non
         return None
     parsed = parse_pvt(data)
     if parsed is not None and parsed[1] is not None:
-        _warn_old_format(pvt_path)
+        if listing.tracked_listing_path(pvt_path).exists():
+            _warn_stale_listing(pvt_path)
+        else:
+            _warn_old_format(pvt_path)
     return parsed
 
 
@@ -254,18 +274,17 @@ def tracked_members(
     *,
     strict: bool = False,
 ) -> listing.DirListing:
-    """A tracked directory's listing: its committed ``<path>.pvt.listing``; else, for a .pvt an
-    older pivot wrote, the listing it holds inline; else the cache's object at its hash
-    (``listing.read``, which ``strict`` passes on). Raises ``CorruptListingError`` or
+    """A tracked directory's listing: for a .pvt an older pivot wrote, the listing it holds
+    inline (a ``<path>.pvt.listing`` beside it is a stale one of this pivot's, and is named in
+    a warning, not read); else its committed ``<path>.pvt.listing``, or the cache's object at
+    its hash (``listing.read``, which ``strict`` passes on). Raises ``CorruptListingError`` or
     ``ListingMissingError``."""
     from pivot.types import is_dir_hash
 
     record = pvt_to_hash_info(pvt_data)
     assert is_dir_hash(record), "only a tracked directory has a listing"
     pvt_path = get_pvt_path(data_path)
-    committed = listing.tracked_listing_path(pvt_path)
-    if not committed.exists():
-        parsed = _load_pvt(pvt_path)
-        if parsed is not None and parsed[1] is not None and parsed[0]["hash"] == record["hash"]:
-            return parsed[1]
-    return listing.read(committed, record, cache_dir, strict=strict)
+    parsed = _load_pvt(pvt_path)
+    if parsed is not None and parsed[1] is not None and parsed[0]["hash"] == record["hash"]:
+        return parsed[1]
+    return listing.read(listing.tracked_listing_path(pvt_path), record, cache_dir, strict=strict)

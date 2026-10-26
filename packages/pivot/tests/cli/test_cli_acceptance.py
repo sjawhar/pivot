@@ -80,7 +80,7 @@ def _helper_output_listing(
     records."""
     stages = root / ".pivot" / "stages"
     lock_data = yaml.safe_load((stages / f"{stage}.lock").read_text())
-    (out,) = [entry for entry in lock_data["outs"] if entry["key"] == key]
+    (out,) = [entry for entry in lock_data["records"]["outs"] if entry["key"] == key]
     record = types.DirHash(hash=out["listing"], size=out["size"], nfiles=out["nfiles"])
     return listing.read(stages / f"{stage}={key or ''}.listing", record, None)
 
@@ -1226,7 +1226,9 @@ def _helper_rewrite_lock_as_pivot_033(
         json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     data = yaml.safe_load(lock_path.read_text())
+    records = data.pop("records")
     data["schema_version"] = 2
+    data["deps"], data["outs"] = records["deps"], records["outs"]
     changed = 0
     for entry in [*data["deps"], *data["outs"]]:
         if "nfiles" not in entry:
@@ -2828,7 +2830,9 @@ def _helper_commit_output_listing(
     (stages / f"{stage}=.listing").write_bytes(data)
     lock_path = stages / f"{stage}.lock"
     lock_data = yaml.safe_load(lock_path.read_text())
-    lock_data["outs"][0].update(listing=xxhash.xxh64(data).hexdigest(), size=size, nfiles=nfiles)
+    lock_data["records"]["outs"][0].update(
+        listing=xxhash.xxh64(data).hexdigest(), size=size, nfiles=nfiles
+    )
     lock_path.write_text(yaml.safe_dump(lock_data, sort_keys=False))
     _commit(root, "hostile listing")
 
@@ -2946,7 +2950,7 @@ def _run_recorded_name_project(
     )
     first = _ok(_pivot(root, "repro"))
     lock_data = yaml.safe_load((root / ".pivot" / "stages" / "d" / "make.lock").read_text())
-    assert lock_data["outs"][0]["path"] == output
+    assert lock_data["records"]["outs"][0]["path"] == output
     members = _helper_output_listing(root, "d/make")
     assert sorted(entry["relpath"] for entry in members["files"]) == sorted(["plain.csv", name])
     status = _ok(_pivot(root, "status"))
@@ -4030,7 +4034,7 @@ def test_diff_keeps_one_head_entry_for_a_path_two_locks_record(
             lock_path.unlink()
             continue
         lock_data = yaml.safe_load(lock_path.read_text())
-        lock_data["outs"][0]["path"] = head_path
+        lock_data.get("records", lock_data)["outs"][0]["path"] = head_path
         lock_path.write_text(yaml.safe_dump(lock_data, sort_keys=False))
     _commit(root, "hand-edited locks")
     (root / "data" / "raw" / "rows.csv").write_text("v\n1\n2\n3\n")

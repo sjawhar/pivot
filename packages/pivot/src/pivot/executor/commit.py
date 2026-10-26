@@ -251,16 +251,18 @@ def commit_stages(
                         output_hashes=output_entries,
                     )
             if not reusable:
+                older_key = worker.older_pivot_input_hash(
+                    fingerprint,
+                    current_params,
+                    stage_info["deps"].values(),
+                    dep_hashes_by_identity,
+                    stage_outs,
+                    hashed_dirs,
+                    store.cache_dir,
+                )
                 deferred["run_cache_delete_input_hashes"] = [
                     input_hash,
-                    run_history.stage_input_hash(
-                        fingerprint,
-                        current_params,
-                        stage_info["deps"].values(),
-                        dep_hashes_by_identity,
-                        stage_outs,
-                        marked=False,
-                    ),
+                    *([] if older_key is None else [older_key]),
                 ]
             if file_hash_entries:
                 deferred["file_hash_entries"] = file_hash_entries

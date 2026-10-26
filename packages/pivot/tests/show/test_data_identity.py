@@ -98,14 +98,18 @@ def _directory_head(listing_bytes: bytes, *, size: int, nfiles: int) -> dict[str
             "code_manifest": {},
             "params": {},
             "deps": [],
-            "outs": [
-                {
-                    "key": None,
-                    "listing": listing.digest(listing_bytes),
-                    "size": size,
-                    "nfiles": nfiles,
-                }
-            ],
+            "outs": [],
+            "records": {
+                "deps": [],
+                "outs": [
+                    {
+                        "key": None,
+                        "listing": listing.digest(listing_bytes),
+                        "size": size,
+                        "nfiles": nfiles,
+                    }
+                ],
+            },
         }
     )
     return {_LOCK_PATH: lock_content.encode(), _LISTING_PATH: listing_bytes}

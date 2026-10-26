@@ -1194,6 +1194,18 @@ class Engine:
                     + "files first."
                 )
 
+        # Refuse an incremental stage whose lock an older pivot rewrote over this pivot's: that
+        # pivot may have restarted the output from empty. `--force` accepts its lock on purpose.
+        if not force:
+            restarted = executor_core.check_restarted_incremental_outputs(
+                execution_order, self._get_all_stages()
+            )
+            if restarted:
+                raise pivot_exceptions.RestartedIncrementalOutputError(
+                    "Pivot will not run these stages:\n"
+                    + "\n".join(f"  - {reason}" for reason in restarted)
+                )
+
         # The pool never needs more workers than stages that can run at once, but the cpu
         # resource capacity is the configured worker count, whatever this run schedules.
         cpu_capacity = executor_core.configured_worker_count(max_workers) if parallel else 1

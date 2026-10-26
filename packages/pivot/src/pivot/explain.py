@@ -228,6 +228,20 @@ def get_stage_explanation(
             dep_changes=[],
             upstream_stale=[],
         )
+    if not force:
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
+        restarted = lock.restarted_listings(stage_lock, lock_data, outs)
+        if restarted:
+            return StageExplanation(
+                stage_name=stage_name,
+                will_run=True,
+                is_forced=False,
+                reason=f"Refused: {lock.restarted_reason(stage_lock, restarted)}",
+                code_changes=[],
+                param_changes=[],
+                dep_changes=[],
+                upstream_stale=[],
+            )
 
     try:
         current_params = parameters.get_effective_params(params_instance, stage_name, overrides)

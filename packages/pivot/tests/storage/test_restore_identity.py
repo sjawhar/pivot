@@ -47,16 +47,20 @@ def test_resolve_targets_stage_matches_lock_entries_by_identity_key(
         "code_manifest": {"func:main": "abc123"},
         "params": {},
         "deps": [],
-        "outs": [
-            {"key": None, "hash": "1111111111111111", "tag": "data"},
-            {
-                "key": "model",
-                "tag": "data",
-                "listing": directory_record["hash"],
-                "size": directory_record["size"],
-                "nfiles": directory_record["nfiles"],
-            },
-        ],
+        "outs": [],
+        "records": {
+            "deps": [],
+            "outs": [
+                {"key": None, "hash": "1111111111111111", "tag": "data"},
+                {
+                    "key": "model",
+                    "tag": "data",
+                    "listing": directory_record["hash"],
+                    "size": directory_record["size"],
+                    "nfiles": directory_record["nfiles"],
+                },
+            ],
+        },
     }
     (stages_dir / "train.lock").write_text(yaml.dump(lock_content))
     listing.write(

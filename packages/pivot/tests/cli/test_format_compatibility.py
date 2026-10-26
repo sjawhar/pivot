@@ -123,7 +123,7 @@ def _project(root: pathlib.Path, pivot: tuple[str, ...] = (_PIVOT,)) -> pathlib.
 # =============================================================================
 
 
-@pytest.mark.parametrize("version", ["0.5.10", "0.5.9", "0.5.2"])
+@pytest.mark.parametrize("version", ["0.5.11", "0.5.10", "0.5.9", "0.5.2"])
 def test_older_pivot_never_restores_a_listing_as_a_file(tmp_path: pathlib.Path, version: str):
     """A project this pivot wrote, opened by an older release (a downgrade, or a teammate who
     has not upgraded), must be refused or decided afresh, never answered wrongly. Today the

@@ -736,15 +736,19 @@ def test_restore_stage_directory_output_from_listing_beside_lock(
         "code_manifest": {"func:main": "abc123"},
         "params": {},
         "deps": [],
-        "outs": [
-            {
-                "key": None,
-                "listing": record["hash"],
-                "size": record["size"],
-                "nfiles": record["nfiles"],
-                "path": "data/train",
-            }
-        ],
+        "outs": [],
+        "records": {
+            "deps": [],
+            "outs": [
+                {
+                    "key": None,
+                    "listing": record["hash"],
+                    "size": record["size"],
+                    "nfiles": record["nfiles"],
+                    "path": "data/train",
+                }
+            ],
+        },
     }
     (stages_dir / "train.lock").write_text(yaml.dump(lock_content))
     listing.write(

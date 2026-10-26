@@ -108,6 +108,25 @@ def _tracking_file_collision(
     return None
 
 
+def _foreign_listing(
+    listing_path: pathlib.Path, recorded: track_mod.PvtData | None, new_data: bytes | None
+) -> bool:
+    """Whether something stands at ``listing_path`` that pivot did not write for this target:
+    anything but a file holding the listing of the directory its .pvt records (``recorded``) or
+    the bytes about to be written there (``new_data``)."""
+    if not os.path.lexists(listing_path):
+        return False
+    if listing_path.is_symlink() or not listing_path.is_file():
+        return True
+    try:
+        data = listing_path.read_bytes()
+    except OSError:
+        return True
+    if data == new_data:
+        return False
+    return recorded is None or "nfiles" not in recorded or listing.digest(data) != recorded["hash"]
+
+
 def _track_single_path(
     path_str: str,
     cache_dir: pathlib.Path,
@@ -221,11 +240,19 @@ def _track_single_path(
             size=file_size,
         )
 
+    # Pivot writes or removes only a listing it wrote for this target.
+    if _foreign_listing(listing_path, existing_tracked.get(abs_path_str), listing_data):
+        shown = project.to_relative_path(listing_path, project_root)
+        raise click.ClickException(
+            f"Cannot track '{path_str}': '{shown}' is in the way, and it is not a listing pivot "
+            + "wrote for it; move it aside (pivot never overwrites or removes a file it did not "
+            + "write)"
+        )
     # Write the .pvt after its listing, so no .pvt names a listing not yet written.
     if listing_data is not None:
         listing.write(listing_path, listing_data)
     else:
-        listing_path.unlink(missing_ok=True)  # a directory tracked here before
+        listing_path.unlink(missing_ok=True)  # the listing of a directory tracked here before
     track_mod.write_pvt_file(pvt_path, pvt_data)
     written = [pvt_path] if listing_data is None else [pvt_path, listing_path]
 

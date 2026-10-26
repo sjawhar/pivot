@@ -152,8 +152,10 @@ and a thread native code starts outside `_thread`:
 - a result cached by an earlier Pivot version: if its static fingerprint is
   unchanged, it may be reused, from its lock, which Pivot reads as it is, or
   from its run-cache entry, which Pivot finds under the key that version filed
-  it under, because `_CACHE_SCHEMA_VERSION` keys only the fingerprint caches in
-  state.lmdb, not the lock or the run cache. A stage whose static walk reaches
+  it under (each directory the stage reads whole hashed from its listing the
+  way that version hashed it), because `_CACHE_SCHEMA_VERSION` keys only the
+  fingerprint caches in state.lmdb, not the lock or the run cache. A stage whose
+  static walk reaches
   a user class method or a user module gains entries in its manifest, so it
   reruns once as Code changed after the upgrade. That accepted one-time rerun
   writes

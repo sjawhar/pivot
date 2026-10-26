@@ -3,7 +3,8 @@
 StageLock provides persistent lock files (.lock) for change detection,
 storing fingerprints, params, and hashes to detect when re-runs are needed.
 A lock records a directory by its listing's hash, its total size and its file count
-(``listing``, ``size``, ``nfiles``); the directory's listing is committed beside the lock
+(``listing``, ``size``, ``nfiles``), and then keeps all its entries under ``records``
+(``_RECORDS_KEY``); the directory's listing is committed beside the lock
 (``storage/listing.py``), and ``StageLock.write`` writes both. A lock an older pivot wrote is
 read as it is (``StageLock.read``).
 
@@ -20,6 +21,7 @@ import os
 import pathlib
 import posixpath
 import re
+import shlex
 from typing import TYPE_CHECKING, NamedTuple, cast, override
 
 import yaml
@@ -28,6 +30,8 @@ from pivot import exceptions, path_policy, yaml_config
 from pivot.storage import cache, listing
 from pivot.types import (
     ArtifactIdentity,
+    ArtifactRef,
+    ArtifactTag,
     DepEntry,
     DirHash,
     FileHash,
@@ -55,8 +59,14 @@ _LOCK_SUFFIX = ".lock"
 _DIR_HASH_KEY = "listing"
 """The key a lock entry records a directory's hash under; a file's is ``hash``. Every released
 pivot reads an entry that has a ``hash`` and no inline ``manifest`` as one file, and would
-restore a directory's listing in the directory's place; finding no ``hash``, it refuses the
-lock instead, and decides the stage afresh."""
+restore a directory's listing in the directory's place, so no directory record has a ``hash``."""
+_RECORDS_KEY = "records"
+"""Where a lock that records a directory keeps its ``deps`` and ``outs``, leaving the top-level
+``deps`` and ``outs`` empty. Every released pivot (0.5.2 … 0.5.11 read alike) validates those
+empty lists as a lock that records nothing: it reruns an ordinary stage from its inputs, and for a
+stage with an incremental output it stops with "Cache missing for incremental output" instead of
+restarting that output from empty, which it would do for a lock it read as missing. A lock that
+records only files keeps them at the top level, where those pivots read them as before."""
 
 SCHEMA_VERSION = 3
 STAGES_REL_PATH = ".pivot/stages"
@@ -141,10 +151,12 @@ def _is_str_mapping(value: object, *, str_values: bool) -> bool:
     return not str_values or all(isinstance(item, str) for item in mapping.values())
 
 
-def _entry_error(raw: object, field: str, list_key: str) -> str | UnsafeLockPath | None:
+def _entry_error(
+    raw: object, field: str, list_key: str, *, listed: bool
+) -> str | UnsafeLockPath | None:
     """Check one ``deps`` or ``outs`` entry as a lock file holds it: a file's hash under
     ``hash``, a directory's under ``listing`` (``_DIR_HASH_KEY``) beside its size and file
-    count."""
+    count. A directory entry stands only under ``records`` (``listed``, ``_RECORDS_KEY``)."""
     if not isinstance(raw, dict):
         return field
     entry = cast("dict[str, object]", raw)
@@ -152,6 +164,8 @@ def _entry_error(raw: object, field: str, list_key: str) -> str | UnsafeLockPath
     # from stages never executed locally (e.g. pulled with incomplete state); a hand-edited
     # short or non-hex one would otherwise fail every restore instead of meaning stale.
     if _DIR_HASH_KEY in entry:
+        if not listed:
+            return f"{field}.{_DIR_HASH_KEY}"
         if "hash" in entry:
             return f"{field}.hash"
         if not cache.is_valid_hash(entry[_DIR_HASH_KEY]):
@@ -201,42 +215,74 @@ def lock_data_error(data: object) -> str | UnsafeLockPath | None:
         return "code_manifest"
     if not _is_str_mapping(document["params"], str_values=False):
         return "params"
+    records: dict[object, object] = document
+    prefix = ""
+    if _RECORDS_KEY in document:
+        for list_key in ("deps", "outs"):
+            if document[list_key] != []:
+                return list_key
+        raw_records = document[_RECORDS_KEY]
+        if not isinstance(raw_records, dict):
+            return _RECORDS_KEY
+        records = cast("dict[object, object]", raw_records)
+        if records.keys() != {"deps", "outs"}:
+            return _RECORDS_KEY
+        prefix = f"{_RECORDS_KEY}."
     for list_key in ("deps", "outs"):
-        entries = document[list_key]
+        entries = records[list_key]
         if not isinstance(entries, list):
-            return list_key
+            return f"{prefix}{list_key}"
         for index, raw in enumerate(cast("list[object]", entries)):
-            error = _entry_error(raw, f"{list_key}[{index}]", list_key)
+            error = _entry_error(raw, f"{prefix}{list_key}[{index}]", list_key, listed=bool(prefix))
             if error is not None:
                 return error
     return None
 
 
 def _from_document(document: object) -> StorageLockData:
-    """A lock file's data, ``lock_data_error`` having passed it, with each directory's hash
-    under ``hash`` as ``StorageLockData`` holds it."""
+    """A lock file's data, ``lock_data_error`` having passed it, with its entries where
+    ``StorageLockData`` holds them (``deps`` and ``outs``) and each directory's hash under
+    ``hash``."""
     data = dict(cast("dict[str, object]", document))
+    records = cast("dict[str, object]", data.pop(_RECORDS_KEY, None) or data)
     for list_key in ("deps", "outs"):
         data[list_key] = [
             {("hash" if key == _DIR_HASH_KEY else key): value for key, value in entry.items()}
-            for entry in cast("list[dict[str, object]]", data[list_key])
+            for entry in cast("list[dict[str, object]]", records[list_key])
         ]
     return cast("StorageLockData", cast("object", data))
 
 
+def _shaped(document: dict[str, object]) -> dict[str, object]:
+    """``document``, whose entries stand in its ``deps`` and ``outs``, as its lock file holds
+    it: under ``records`` when one of them records a directory (``_RECORDS_KEY``)."""
+    entries = [*cast("list[object]", document["deps"]), *cast("list[object]", document["outs"])]
+    if not any(isinstance(entry, dict) and _DIR_HASH_KEY in entry for entry in entries):
+        return document
+    return {
+        **document,
+        "deps": [],
+        "outs": [],
+        _RECORDS_KEY: {"deps": document["deps"], "outs": document["outs"]},
+    }
+
+
 def _to_document(data: StorageLockData) -> dict[str, object]:
-    """``data`` as its lock file holds it: each directory's hash under ``listing``."""
+    """``data`` as its lock file holds it: each directory's hash under ``listing``, and every
+    entry under ``records`` when one records a directory (``_shaped``)."""
 
     def entry(item: DepEntry | OutEntry) -> dict[str, object]:
         if "nfiles" not in item:
             return dict(item)
         return {(_DIR_HASH_KEY if key == "hash" else key): value for key, value in item.items()}
 
-    return {
-        **data,
-        "deps": [entry(item) for item in data["deps"]],
-        "outs": [entry(item) for item in data["outs"]],
-    }
+    return _shaped(
+        {
+            **data,
+            "deps": [entry(item) for item in data["deps"]],
+            "outs": [entry(item) for item in data["outs"]],
+        }
+    )
 
 
 def _schema_version(data: object) -> int | None:
@@ -335,7 +381,7 @@ def _convert_old(data: object) -> _ConvertedLock | None:
             if list_key == "outs" and (key is None or isinstance(key, str)):
                 output_listings[key] = members
         document[list_key] = converted
-    return _ConvertedLock(document, output_listings, listing_bytes)
+    return _ConvertedLock(_shaped(document), output_listings, listing_bytes)
 
 
 def parse_committed(document: object) -> CommittedLock | UnsafeLockPath | None:
@@ -705,6 +751,45 @@ def committed_listing(lock_data: LockData, path: pathlib.Path) -> pathlib.Path |
     listing file beside it is another lock's (a newer pivot's, before an older one reran the
     stage), and would be refused or warned about though nothing is wrong."""
     return None if "older_format" in lock_data else path
+
+
+def restarted_listings(
+    stage_lock: StageLock, lock_data: LockData | None, outs: Iterable[ArtifactRef]
+) -> list[pathlib.Path]:
+    """The output listings this pivot wrote that still stand beside ``lock_data``, a lock an
+    older pivot rewrote (``older_format``), for a stage with an incremental output; empty for
+    any other stage or lock.
+
+    Such a listing proves this pivot wrote the stage's lock before the older pivot rewrote it.
+    A released pivot stops instead of restarting an incremental output from this pivot's lock
+    (``_RECORDS_KEY``), but one that read the lock as missing (the lock removed by hand, or a
+    release that predates those checks) starts that output from empty: its lock is not to be
+    taken as the stage's history (``restarted_reason``).
+    """
+    if lock_data is None or "older_format" not in lock_data:
+        return []
+    refs = list(outs)
+    if not any(ref.tag is ArtifactTag.INCREMENTAL for ref in refs):
+        return []
+    return [
+        path for ref in refs if (path := stage_lock.output_listing_path(ref.identity)).is_file()
+    ]
+
+
+def restarted_reason(stage_lock: StageLock, listings: list[pathlib.Path]) -> str:
+    """Why pivot refuses a stage ``restarted_listings`` names, and the two ways to settle it."""
+    lock_shown = shlex.quote(os.path.relpath(stage_lock.path))
+    listings_shown = " ".join(shlex.quote(os.path.relpath(path)) for path in listings)
+    stage = shlex.quote(stage_lock.stage_name)
+    return (
+        f"an older pivot rewrote {lock_shown} after this pivot wrote it ({listings_shown}, "
+        + "which this pivot wrote beside it, is still there), and the stage keeps an "
+        + "incremental output, so that pivot may have restarted the output from empty. Restore "
+        + "the output from the commit before the older pivot's (`git checkout <commit> -- "
+        + f"{lock_shown} {listings_shown}`, then `pivot checkout --force {stage}`), or rerun "
+        + f"the stage from what that lock records, on purpose, with `pivot repro --force {stage}`. "
+        + "Everyone who works on a project upgrades pivot together"
+    )
 
 
 def find_orphaned_locks(

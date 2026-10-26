@@ -456,6 +456,11 @@ _OUT: dict[str, object] = {"key": "o", "hash": "fedcba9876543210"}
 _DIR_OUT: dict[str, object] = {"key": "o", "listing": "fedcba9876543210", "size": 1, "nfiles": 1}
 
 
+def _listed(*outs: dict[str, object]) -> dict[str, object]:
+    """A lock document's ``records``, where a lock that records a directory keeps its entries."""
+    return {"records": {"deps": [], "outs": list(outs)}}
+
+
 @pytest.mark.parametrize(
     ("field", "document"),
     [
@@ -489,33 +494,33 @@ _DIR_OUT: dict[str, object] = {"key": "o", "listing": "fedcba9876543210", "size"
             id="traversal-out-hash",
         ),
         pytest.param(
-            "outs[0].nfiles",
-            {"outs": [{**_DIR_OUT, "nfiles": "1"}]},
+            "records.outs[0].nfiles",
+            _listed({**_DIR_OUT, "nfiles": "1"}),
             id="string-directory-file-count",
         ),
         pytest.param(
-            "outs[0].nfiles",
-            {"outs": [{**_DIR_OUT, "nfiles": True}]},
+            "records.outs[0].nfiles",
+            _listed({**_DIR_OUT, "nfiles": True}),
             id="bool-directory-file-count",
         ),
         pytest.param(
-            "outs[0].nfiles",
-            {"outs": [{**_DIR_OUT, "nfiles": -1}]},
+            "records.outs[0].nfiles",
+            _listed({**_DIR_OUT, "nfiles": -1}),
             id="negative-directory-file-count",
         ),
         pytest.param(
-            "outs[0].size",
-            {"outs": [{**_DIR_OUT, "size": "1"}]},
+            "records.outs[0].size",
+            _listed({**_DIR_OUT, "size": "1"}),
             id="string-directory-size",
         ),
         pytest.param(
-            "outs[0].size",
-            {"outs": [{**_DIR_OUT, "size": -1}]},
+            "records.outs[0].size",
+            _listed({**_DIR_OUT, "size": -1}),
             id="negative-directory-size",
         ),
         pytest.param(
-            "outs[0].size",
-            {"outs": [{"key": "o", "listing": "fedcba9876543210", "nfiles": 1}]},
+            "records.outs[0].size",
+            _listed({"key": "o", "listing": "fedcba9876543210", "nfiles": 1}),
             id="directory-missing-size",
         ),
         pytest.param(
@@ -524,14 +529,25 @@ _DIR_OUT: dict[str, object] = {"key": "o", "listing": "fedcba9876543210", "size"
             id="directory-under-the-file-hash-key",
         ),
         pytest.param(
-            "outs[0].hash",
-            {"outs": [{**_DIR_OUT, "hash": "fedcba9876543210"}]},
+            "records.outs[0].hash",
+            _listed({**_DIR_OUT, "hash": "fedcba9876543210"}),
             id="directory-with-a-file-hash",
         ),
         pytest.param(
-            "outs[0].listing",
-            {"outs": [{**_DIR_OUT, "listing": "abc"}]},
+            "records.outs[0].listing",
+            _listed({**_DIR_OUT, "listing": "abc"}),
             id="short-directory-hash",
+        ),
+        pytest.param("outs[0].listing", {"outs": [_DIR_OUT]}, id="directory-outside-records"),
+        pytest.param(
+            "deps", {"deps": [_DEP], **_listed(_DIR_OUT)}, id="records-beside-top-level-entries"
+        ),
+        pytest.param("records", {"records": {"outs": [_DIR_OUT]}}, id="records-without-deps"),
+        pytest.param("records", {"records": [_DIR_OUT]}, id="records-not-a-mapping"),
+        pytest.param(
+            "records.deps[0].producer",
+            {"records": {"deps": [{**_DEP, "producer": None}], "outs": [_DIR_OUT]}},
+            id="records-null-producer",
         ),
     ],
 )
@@ -775,11 +791,15 @@ def test_lock_read_accepts_every_written_field(tmp_path: Path) -> None:
         "schema_version": lock.SCHEMA_VERSION,
         "code_manifest": {"self:stage": "h"},
         "params": {"lr": 0.1, "nested": {"a": [1, 2]}},
-        "deps": [{**_DEP, "display": "data/raw/a.csv", "size": 3}],
-        "outs": [
-            {"key": None, "listing": "fedcba9876543210", "size": 1, "nfiles": 1},
-            {**_OUT, "key": "m", "tag": "metric", "size": 4},
-        ],
+        "deps": [],
+        "outs": [],
+        "records": {
+            "deps": [{**_DEP, "display": "data/raw/a.csv", "size": 3}],
+            "outs": [
+                {"key": None, "listing": "fedcba9876543210", "size": 1, "nfiles": 1},
+                {**_OUT, "key": "m", "tag": "metric", "size": 4},
+            ],
+        },
         "merkle_id": "abc",
     }
     stage_lock.path.write_text(yaml.safe_dump(document))
@@ -884,17 +904,21 @@ def test_lock_read_ignores_display_fields(set_project_root: Path) -> None:
                 "schema_version": lock.SCHEMA_VERSION,
                 "code_manifest": {"self:dir_out_stage": "fingerprint"},
                 "params": {},
-                "deps": [{**_DEP, "producer": "input", "display": "data/raw/input.csv"}],
-                "outs": [
-                    {
-                        "key": "results",
-                        "listing": "0e0e0e0e0e0e0e0e",
-                        "size": 100,
-                        "nfiles": 1,
-                        "tag": "directory",
-                        "display": "results/",
-                    }
-                ],
+                "deps": [],
+                "outs": [],
+                "records": {
+                    "deps": [{**_DEP, "producer": "input", "display": "data/raw/input.csv"}],
+                    "outs": [
+                        {
+                            "key": "results",
+                            "listing": "0e0e0e0e0e0e0e0e",
+                            "size": 100,
+                            "nfiles": 1,
+                            "tag": "directory",
+                            "display": "results/",
+                        }
+                    ],
+                },
             }
         )
     )
@@ -1085,12 +1109,47 @@ def test_written_lock_records_directory_size_file_count_and_listing(tmp_path: Pa
     assert written == [output_listing, stage_lock.path]
     assert document["schema_version"] == lock.SCHEMA_VERSION
     record = hashed["record"]
-    assert document["outs"] == [
-        {"key": None, "listing": record["hash"], "size": record["size"], "nfiles": record["nfiles"]}
-    ]
-    assert "manifest" not in document["outs"][0]
-    assert "empty_dirs" not in document["outs"][0]
+    assert document["deps"] == [] and document["outs"] == []
+    assert document["records"] == {
+        "deps": [],
+        "outs": [
+            {
+                "key": None,
+                "listing": record["hash"],
+                "size": record["size"],
+                "nfiles": record["nfiles"],
+            }
+        ],
+    }
     assert listing.read(output_listing, hashed["record"], None) == hashed["listing"]
+
+
+def test_a_lock_that_records_only_files_keeps_them_where_older_pivots_read_them(
+    tmp_path: Path,
+) -> None:
+    """Only a lock that records a directory moves its entries under ``records``; a released
+    pivot reads a file-only lock's ``deps`` and ``outs`` as before."""
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={_id("p/a"): FileHash(hash="0123456789abcdef")},
+            output_hashes={_id("p/stage", "o"): FileHash(hash="fedcba9876543210")},
+        )
+    )
+
+    document = yaml.safe_load(stage_lock.path.read_text())
+
+    assert "records" not in document
+    assert document["deps"] == [{"producer": "p/a", "key": None, "hash": "0123456789abcdef"}]
+    assert document["outs"] == [{"key": "o", "hash": "fedcba9876543210"}]
+    assert stage_lock.read() == LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={_id("p/a"): FileHash(hash="0123456789abcdef")},
+        output_hashes={_id("p/stage", "o"): FileHash(hash="fedcba9876543210")},
+    )
 
 
 def test_lock_keeps_its_old_listing_when_lock_serialization_fails(

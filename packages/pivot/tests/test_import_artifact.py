@@ -20,14 +20,17 @@ if TYPE_CHECKING:
 
 
 def _lock_bytes(*, outs: list[dict[str, object]]) -> bytes:
-    """Build a schema-v3 remote lock with identity-addressed outputs."""
-    data = {
+    """Build a schema-v3 remote lock with identity-addressed outputs, its entries under
+    ``records`` when one records a directory, as pivot writes it."""
+    data: dict[str, object] = {
         "schema_version": 3,
         "code_manifest": {"stage": "hash"},
         "params": {},
         "deps": [],
         "outs": outs,
     }
+    if any("listing" in out for out in outs):
+        data.update({"outs": [], "records": {"deps": [], "outs": outs}})
     return yaml.safe_dump(data).encode()
 
 

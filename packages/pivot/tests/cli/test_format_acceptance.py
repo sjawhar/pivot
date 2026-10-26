@@ -84,8 +84,11 @@ def _lock(root: pathlib.Path, stage: str) -> dict[str, object]:
 def _helper_entry(
     root: pathlib.Path, stage: str, field: str, name: str | None
 ) -> dict[str, object]:
-    """The lock ``deps`` entry produced by ``name``, or the ``outs`` entry keyed ``name``."""
-    entries: list[dict[str, object]] = _lock(root, stage)[field]  # pyright: ignore[reportAssignmentType] - parsed YAML
+    """The lock ``deps`` entry produced by ``name``, or the ``outs`` entry keyed ``name`` (under
+    ``records`` when the lock records a directory)."""
+    document = _lock(root, stage)
+    records: dict[str, object] = document.get("records", document)  # pyright: ignore[reportAssignmentType] - parsed YAML
+    entries: list[dict[str, object]] = records[field]  # pyright: ignore[reportAssignmentType] - parsed YAML
     match = "producer" if field == "deps" else "key"
     return next(entry for entry in entries if entry[match] == name)
 
@@ -326,6 +329,7 @@ def _helper_rewrite_as_schema_2(lock_path: pathlib.Path) -> None:
     inline (its old hash is any valid one: this pivot computes the record from the list). The
     caller removes the listing files, which no older pivot wrote."""
     data = yaml.safe_load(lock_path.read_text())
+    data.update(data.pop("records", {}))
     data["schema_version"] = 2
     stages_dir = lock_path.parent
     for entry in data["deps"] + data["outs"]:
@@ -824,6 +828,7 @@ def test_get_restores_a_directory_from_a_revision_whose_lock_an_older_pivot_wrot
     root = _helper_tree_project(tmp_path)
     lock_path = root / ".pivot" / "stages" / "t" / "copy.lock"
     data = yaml.safe_load(lock_path.read_text())
+    data.update(data.pop("records", {}))
     data["schema_version"] = 2
     data["deps"] = [_helper_old_directory_entry(entry) for entry in data["deps"]]
     data["outs"] = [_helper_old_directory_entry(entry) for entry in data["outs"]]

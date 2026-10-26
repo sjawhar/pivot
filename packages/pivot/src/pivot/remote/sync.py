@@ -83,11 +83,13 @@ def _output_blobs(
     stages_dir: pathlib.Path,
     identity: types.ArtifactIdentity,
     files_dir: pathlib.Path,
-    lock_data: LockData,
+    lock_data: LockData | None,
 ) -> set[str]:
     """The cache objects of a stage output, a directory's listing read beside its lock (unless
-    ``lock_data``, the lock that records it, is an older pivot's: ``lock.committed_listing``)."""
-    committed = lock.committed_listing(lock_data, listing.output_listing_path(stages_dir, identity))
+    ``lock_data``, the producer's lock, is an older pivot's: ``lock.committed_listing``)."""
+    committed = listing.output_listing_path(stages_dir, identity)
+    if lock_data is not None:
+        committed = lock.committed_listing(lock_data, committed)
     return _blob_hashes(
         hash_info, lambda record: listing.read(committed, record, files_dir), files_dir
     )
@@ -256,19 +258,29 @@ def get_target_hashes(
                             # Only deps whose blobs pivot caches (and so pushes) can be fetched:
                             # upstream stage outputs and `pivot track` inputs. Raw inputs
                             # committed to git and `pivot import` inputs are never in the remote.
+                            # A producer's listing is read beside its own lock (_output_blobs).
+                            producer_locks = dict[str, LockData | None]()
                             for dep_identity, dep_hash in lock_data["dep_hashes"].items():
                                 producer_info = all_stages.get(dep_identity.producer)
                                 if producer_info is not None:
                                     if _is_cached_stage_output(dep_identity, producer_info):
+                                        producer = dep_identity.producer
                                         producer_stages_dir = lock.get_stages_dir(
                                             registry.get_stage_state_dir(producer_info, state_dir)
                                         )
+                                        if (
+                                            types.is_dir_hash(dep_hash)
+                                            and producer not in producer_locks
+                                        ):
+                                            producer_locks[producer] = lock.StageLock(
+                                                producer, producer_stages_dir
+                                            ).read(cache_dir=files_dir)
                                         hashes |= _output_blobs(
                                             dep_hash,
                                             producer_stages_dir,
                                             dep_identity,
                                             files_dir,
-                                            lock_data,
+                                            producer_locks.get(producer),
                                         )
                                     continue
                                 if tracked_blobs is None:

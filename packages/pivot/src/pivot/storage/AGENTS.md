@@ -123,9 +123,15 @@ When multiple `pivot` processes share the same StateDB:
 
 - A lock records a directory as `{listing, size, nfiles}` on disk (`StorageLockData` holds the
   listing's hash under `hash`, as for a file; `lock._from_document`/`_to_document` convert). The
-  key is not `hash` so that every released pivot, which reads an entry with a `hash` and no
-  inline `manifest` as one file, refuses the lock instead of restoring a listing as a file.
-  Run-cache keys hold `run_history._DIRECTORY_RECORD` for the same reason.
+  key is not `hash` because every released pivot reads an entry with a `hash` and no inline
+  `manifest` as one file. A lock that records a directory keeps every entry under `records`
+  and leaves `deps` and `outs` empty (`lock._shaped`): released pivots read that as a lock that
+  records nothing, rerun an ordinary stage, and stop at an incremental one instead of
+  restarting it from empty. Run-cache keys hold `run_history._DIRECTORY_RECORD` for the same
+  reason; an older pivot's entry is looked up under `worker.older_pivot_input_hash`.
+- A stage with an incremental output whose lock an older pivot rewrote while this pivot's
+  output listing is still beside it is refused (`lock.restarted_listings`): `status`/`verify`
+  through `explain.get_stage_explanation`, `repro` in `engine` before it schedules anything.
 - `StageLock.write` writes each directory output's listing (`listing.output_listing_path`) and
   each directory input's (`listing.input_listing_path`) before the lock, leaving a file that
   already holds the bytes untouched. It is the one writer of lock and listing files (Task 2.2

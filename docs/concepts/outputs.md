@@ -150,11 +150,15 @@ A stage that reads the whole directory records it the same way, so its lock
 changes the same lines. Each listing is also kept in the cache, at the
 directory's hash, and pushed and pulled with it.
 
-Pivot 0.5.10 and earlier read a directory record that lists no files inside it
-as one file's hash. Finding no `hash` in a `listing` record, they treat the lock
-as missing and run its stage again, rather than write the listing where the
-directory belongs; run-cache entries are kept apart from theirs for the same
-reason.
+A lock that records a directory keeps its entries under `records`, and leaves
+its top-level `deps` and `outs` empty; a lock that records only files keeps them
+at the top level. Pivot 0.5.11 and earlier read the top-level lists alone, and
+would read a directory record that lists no files inside it as one file's hash.
+Finding empty lists instead, they treat the lock as one that records nothing:
+they run an ordinary stage again from its inputs, and stop at a stage with an
+incremental output ("Cache missing for incremental output", exit 1) rather than
+restart that output from empty. Run-cache entries are kept apart from theirs for
+the same reason.
 
 | Directory | Listing file |
 |---|---|
@@ -201,6 +205,32 @@ written in this format, with its listing files. A lock a newer Pivot wrote is
 read as missing. A directory `.pvt` an earlier Pivot wrote is read as it is, its
 inline file list standing in for the listing, with one warning; `pivot track
 --force <path>` converts it.
+
+**A team upgrades together.** Everyone who works on a project upgrades Pivot
+together. A release before this
+format, given a project this Pivot wrote, restores no output of a stage whose
+lock records a directory and no tracked directory (it skips a directory `.pvt`
+it cannot read): in a fresh clone, `pivot checkout` and `pivot pull` leave them
+absent, and `pivot repro` reruns those stages from their inputs and stops at
+each stage with an incremental output; in an existing workspace, `pivot repro`
+stops at an incremental output already on disk ("incremental output files exist
+but are not in cache"). Its `pivot track` of a tracked directory writes its own
+`.pvt` there without `--force`.
+
+This Pivot then reads what it left. A lock it rewrote is read as it is (above),
+and the listing this Pivot wrote beside that lock is not read. A `.pvt` it
+rewrote is read from its own file list; the `<path>.pvt.listing` beside it is
+named in one warning, and `git rm <path>.pvt.listing` removes it. One case is
+refused: when an older release started a stage with an incremental output from
+empty (its lock removed by hand, as its message offers), this Pivot's listing of
+that output is still beside the lock it wrote, and `pivot status` reports the
+stage, `pivot verify` fails it and `pivot repro` refuses it, each naming the
+lock and the listing. Restore the output from the commit before the older
+release's (`git checkout <commit> -- <lock> <listing>`, then `pivot checkout
+--force <stage>`), or rerun the stage from what that lock records, on purpose,
+with `pivot repro --force <stage>`. An incremental file output leaves no listing
+beside its lock, so a restart of it cannot be told from an ordinary run and is
+read as it is.
 
 A symlink inside a directory artifact is not stored: it is left out of the
 listing and does not come back on restore. When a stage writes the artifact,

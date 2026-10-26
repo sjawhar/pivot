@@ -229,6 +229,12 @@ class UncachedIncrementalOutputError(CacheError):
     """Raised when an incremental output exists without a cache entry."""
 
 
+class RestartedIncrementalOutputError(CacheError):
+    """Raised when an older pivot rewrote the lock this pivot wrote for a stage with an
+    incremental output (``lock.restarted_listings``): that pivot may have restarted the output
+    from empty."""
+
+
 class CacheModeCollisionError(CacheError):
     """A HARDLINK/SYMLINK checkout shares the cache object's own permissions and found it
     already recorded with the wrong executable bit, with no COPY fallback available.

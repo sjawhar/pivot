@@ -24,6 +24,7 @@ UTF-8; an empty directory's ``/`` goes inside the quotes. The listing is always 
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import operator
 import os
@@ -87,6 +88,27 @@ def record_of(listing: DirListing, data: bytes) -> DirHash:
         size=sum(entry["size"] for entry in listing["files"]),
         nfiles=len(listing["files"]),
     )
+
+
+def legacy_digest(listing: DirListing) -> str:
+    """The hash an older pivot gives a directory with these members (0.3.4 up to this format):
+    the xxhash64 of the JSON of its files sorted by path, beside its empty directories when it
+    has any. An older pivot keys a run-cache entry by it (``worker.older_pivot_input_hash``)."""
+    manifest = sorted(
+        (
+            {
+                "hash": entry["hash"],
+                "isexec": entry["isexec"],
+                "relpath": entry["relpath"],
+                "size": entry["size"],
+            }
+            for entry in listing["files"]
+        ),
+        key=operator.itemgetter("relpath"),
+    )
+    empty_dirs = sorted(listing["empty_dirs"])
+    hashed: object = {"empty_dirs": empty_dirs, "manifest": manifest} if empty_dirs else manifest
+    return digest(json.dumps(hashed, sort_keys=True, separators=(",", ":")).encode())
 
 
 def _field(raw: bytes) -> str:
