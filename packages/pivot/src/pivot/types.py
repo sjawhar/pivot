@@ -150,10 +150,13 @@ class OnError(enum.StrEnum):
 
 
 class NoCommitRecord(TypedDict):
-    """What a `--no-commit` run of a stage ran and wrote, kept for `pivot commit`.
+    """What a `--no-commit` run of a stage ran and wrote, kept for `pivot commit` under the
+    StateDB key `nocommit:<stage>`.
 
     `code_manifest` is the manifest the run's lock would have held, rerun marks included.
-    `pivot commit` writes it when the outputs on disk still have these hashes.
+    `pivot commit` writes it when the outputs on disk still have these hashes. The shape is open:
+    another field joins as an optional key, and `StateDB.get_no_commit_record` ignores keys it
+    does not know, so a record a later Pivot wrote still reads.
     """
 
     code_manifest: dict[str, str]

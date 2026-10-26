@@ -515,14 +515,18 @@ def test_editing_immutable_capture_changes_fingerprint(
 ) -> None:
     fingerprint._getclosurevars_cache.clear()
     original = fingerprint.get_stage_fingerprint(func)
+    try:
+        monkeypatch.setattr(sys.modules[__name__], variable, same)
+        fingerprint._getclosurevars_cache.clear()
+        assert fingerprint.get_stage_fingerprint(func) == original, "an equal value is not a change"
 
-    monkeypatch.setattr(sys.modules[__name__], variable, same)
-    fingerprint._getclosurevars_cache.clear()
-    assert fingerprint.get_stage_fingerprint(func) == original, "an equal value is not a change"
-
-    monkeypatch.setattr(sys.modules[__name__], variable, edited)
-    fingerprint._getclosurevars_cache.clear()
-    assert fingerprint.get_stage_fingerprint(func) != original
+        monkeypatch.setattr(sys.modules[__name__], variable, edited)
+        fingerprint._getclosurevars_cache.clear()
+        assert fingerprint.get_stage_fingerprint(func) != original
+    finally:
+        # The cache holds the edited value's closure; a later test in this process fingerprints
+        # `func` after monkeypatch puts the module's value back.
+        fingerprint._getclosurevars_cache.clear()
 
 
 def test_common_function_and_class_references_are_allowed() -> None:

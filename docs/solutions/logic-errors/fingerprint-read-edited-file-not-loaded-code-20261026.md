@@ -60,6 +60,17 @@ Record the bytes each user module was compiled from, and fingerprint those:
   `unreadable-source:` and reruns every run.
 - A `--no-commit` run records the manifest its lock would have held; `pivot commit` writes it while
   the outputs on disk are still the ones that run wrote.
+- A user module imported before Pivot installs its recorder (by `sitecustomize` or a `.pth` import
+  line, in the coordinator and in every worker) was compiled before any recorder could see it.
+  `loaded_source.record_unseen_modules`, at the end of discovery and in each worker's initializer,
+  reads its file and records it only where the file and its cached bytecode show they hold the
+  module's code: CPython's own source file loader imported it, the file's change time is older than
+  the process, and the bytecode the loader may have run instead compiles to the same code. Any
+  other such module is recorded as unreadable, with the reason, which a stage that uses it logs
+  once per process.
+- The path hook and the module recorder are installed only while a discovery imports; a worker
+  keeps its own for its life. Left installed after discovery, the recorder recorded modules that
+  a later caller (or a later test) loaded, and changed what that caller fingerprinted.
 
 The recorded lines are split exactly as `linecache.updatecache` splits a file, so an unedited
 project keeps every recorded fingerprint.
@@ -75,3 +86,11 @@ project keeps every recorded fingerprint.
 - Check per stage, not per worker: a worker's other stages did not use the module.
 - Test code-change detection with the edit made *after* the import and *before* the fingerprint,
   and with the stage order that leaves the function unhashed until after the edit.
+- "Every module is recorded" includes modules that exist before Pivot runs any code. Check what
+  `sys.modules` holds when the recorder starts, and decide for each module whether its file can
+  be shown to hold its code; never fall back to reading the file silently.
+- A process-wide hook (`sys.meta_path`, `sys.path_hooks`, a `linecache` pin, a patched
+  `importlib.util` function) must end with the session that installed it, in the tests too: one
+  pytest-xdist worker runs many tests in one process, so a leaked hook makes the suite pass or
+  fail by schedule. The suite's `restore_import_machinery` fixture restores them after each test
+  and ends the discovery session the test started.

@@ -271,7 +271,8 @@ run continues (in an editor, or from an upstream stage), the stages of that run
 use the loaded version, and their locks record it. The next run loads your edit
 and reruns the stages it changes. This holds for every user module, whatever
 loaded it: a module under the project root, one on `PYTHONPATH`, an editable
-install's finder, a zip on `sys.path`, or `importlib.util.spec_from_file_location`.
+install's finder, a zip on `sys.path`, `importlib.util.spec_from_file_location`,
+or `sitecustomize` before Pivot started (see below).
 
 A worker imports some modules from their files itself: a module outside the
 project root (on `PYTHONPATH`, or a package installed from a source checkout),
@@ -295,6 +296,19 @@ from a loader that gives no source) is never trusted: Pivot cannot tell which
 code a worker holds. A stage that uses it warns once per run ("uses user
 modules whose source pivot cannot read"), reruns on every run, and never files
 or reuses a run-cache entry. Load such modules from `.py` source files.
+
+A module imported before Pivot starts, by `sitecustomize` or a `.pth` import
+line (in the `pivot` process and in every worker), was loaded before Pivot
+could record its source. Pivot reads its file when it discovers the pipeline,
+and each worker when it starts, and trusts that text only when the file and
+its cached bytecode show it is the module's code: CPython's own loader imported
+it, and neither the file nor the bytecode it may have run changed after the
+process started. Otherwise Pivot treats the module as one whose source it
+cannot read, and the first stage that uses it in each process also logs why
+("Pivot did not see user module '…' compile"). That happens when the file
+changes while Pivot starts, in a process that loaded a module and then edited
+it, and for a module a custom loader imported. Import such modules from the
+pipeline or a stage instead.
 
 Under `pivot repro --no-commit` no lock is written. The run records, for
 `pivot commit`, the manifest each stage's lock would have held, warnings' marks

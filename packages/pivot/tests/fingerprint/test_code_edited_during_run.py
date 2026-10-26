@@ -13,13 +13,17 @@ import py_compile
 import shutil
 import subprocess
 import sys
+import sysconfig
 import textwrap
 import zipfile
+from collections.abc import Sequence
 from typing import cast
 
 import pytest
 
 _PIVOT = pathlib.Path(sys.executable).parent / "pivot"
+# The command that runs pivot: the installed CLI unless a test names another interpreter.
+_PIVOT_COMMAND = (str(_PIVOT),)
 _EDITED = "imported user modules that changed after pivot loaded them"
 _HELPERS = 'def plain():\n    return "plain-v1"\n\n\ndef other():\n    return "other-v1"\n'
 
@@ -74,7 +78,10 @@ with Pipeline("p") as pipeline:
 
 
 def _run(
-    project: pathlib.Path, *args: str, pythonpath: pathlib.Path | None = None
+    project: pathlib.Path,
+    *args: str,
+    pythonpath: pathlib.Path | None = None,
+    pivot: Sequence[str] = _PIVOT_COMMAND,
 ) -> subprocess.CompletedProcess[str]:
     env = {
         key: value
@@ -85,23 +92,31 @@ def _run(
     if pythonpath is not None:
         env["PYTHONPATH"] = str(pythonpath)
     result = subprocess.run(
-        [str(_PIVOT), *args], cwd=project, env=env, capture_output=True, text=True, timeout=300
+        [*pivot, *args], cwd=project, env=env, capture_output=True, text=True, timeout=300
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return result
 
 
-def _repro(project: pathlib.Path, pythonpath: pathlib.Path | None = None) -> str:
+def _repro(
+    project: pathlib.Path,
+    pythonpath: pathlib.Path | None = None,
+    *,
+    pivot: Sequence[str] = _PIVOT_COMMAND,
+) -> str:
     """Run `pivot repro`; return what it printed, warnings included, on one line."""
-    result = _run(project, "repro", pythonpath=pythonpath)
+    result = _run(project, "repro", pythonpath=pythonpath, pivot=pivot)
     return " ".join((result.stdout + result.stderr).split())
 
 
 def _repro_json(
-    project: pathlib.Path, pythonpath: pathlib.Path | None = None
+    project: pathlib.Path,
+    pythonpath: pathlib.Path | None = None,
+    *,
+    pivot: Sequence[str] = _PIVOT_COMMAND,
 ) -> dict[str, tuple[str, str]]:
     """Run `pivot repro --json`; return each stage's (status, reason)."""
-    result = _run(project, "repro", "--json", pythonpath=pythonpath)
+    result = _run(project, "repro", "--json", pythonpath=pythonpath, pivot=pivot)
     stages = dict[str, tuple[str, str]]()
     for line in result.stdout.splitlines():
         try:
@@ -646,3 +661,264 @@ def test_new_package_shadowing_the_helper_mid_run_is_compared_by_name(
     assert f"Stage 'p/use_plain' {_EDITED}: helpers." in first, first
     second = _repro_json(project, pythonpath)
     assert second["p/use_plain"][0] == "ran", second
+
+
+@pytest.mark.parametrize("helpers_in_root", [True, False], ids=["in-root", "out-of-root"])
+def test_helper_imported_before_discovery_edited_mid_run_is_not_cached_stale(
+    tmp_path: pathlib.Path, helpers_in_root: bool
+) -> None:
+    """`sitecustomize` imports the helper when each interpreter starts, before Pivot installs
+    its recorder (a `.pth` import line does the same). `edit_helper` then edits it mid-run, and
+    `use_plain` runs the helper its worker loaded at start (plain-v1). The next run must not
+    report that output as cached while helpers.py returns plain-v2."""
+    project, pythonpath = _project(tmp_path, _EDIT_THEN_USE, helpers_in_root=helpers_in_root)
+    helpers_dir = project if pythonpath is None else pythonpath
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(
+        f"import sys\nsys.path.insert(0, {str(helpers_dir)!r})\nimport helpers\n"
+        + f"sys.path.remove({str(helpers_dir)!r})\n"
+    )
+    _run(project, "config", "set", "core.max_workers", "1", pythonpath=site)
+
+    _repro(project, site)
+    second = _repro_json(project, site)
+
+    assert second["p/use_plain"][0] != "cached" or _output(project, "use_plain") == "plain-v2", (
+        second,
+        _output(project, "use_plain"),
+    )
+
+
+def _venv_with_pth(tmp_path: pathlib.Path, line: str) -> list[str]:
+    """A virtual environment over this one whose site-packages holds a `.pth` file with the
+    import line `line`, which `site` runs when each of its interpreters starts, a worker's
+    included. Returns its `pivot` command."""
+    venv = tmp_path / "venv"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True)
+    python = venv / "bin" / "python"
+    site_packages = subprocess.run(
+        [str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    parent = sysconfig.get_path("purelib")
+    (pathlib.Path(site_packages) / "_parent.pth").write_text(
+        f"import site; site.addsitedir({parent!r})\n"
+    )
+    (pathlib.Path(site_packages) / "preload.pth").write_text(f"{line}\n")
+    return [str(python), "-c", "from pivot.cli import _console_main; _console_main()"]
+
+
+@pytest.mark.parametrize("helpers_in_root", [True, False], ids=["in-root", "out-of-root"])
+def test_helper_a_pth_line_imports_at_startup_edited_mid_run_is_not_cached_stale(
+    tmp_path: pathlib.Path, helpers_in_root: bool
+) -> None:
+    """A `.pth` import line in site-packages imports the helper when each interpreter starts,
+    the coordinator and every worker, before Pivot installs its recorder. `edit_helper` edits it
+    mid-run: the next run must not report `use_plain`'s plain-v1 as cached."""
+    project, pythonpath = _project(tmp_path, _EDIT_THEN_USE, helpers_in_root=helpers_in_root)
+    helpers_dir = str(project if pythonpath is None else pythonpath)
+    pivot = _venv_with_pth(
+        tmp_path,
+        f"import sys; sys.path.insert(0, {helpers_dir!r}); import helpers; "
+        + f"sys.path.remove({helpers_dir!r})",
+    )
+    _run(project, "config", "set", "core.max_workers", "1", pivot=pivot)
+
+    _repro(project, pivot=pivot)
+    second = _repro_json(project, pivot=pivot)
+
+    assert second["p/use_plain"][0] != "cached" or _output(project, "use_plain") == "plain-v2", (
+        second,
+        _output(project, "use_plain"),
+    )
+
+
+def test_helper_imported_before_discovery_and_left_unchanged_is_reused(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A helper `sitecustomize` imports before Pivot installs its recorder, unchanged since the
+    run started: its file and bytecode show it holds the file's code, so Pivot records it, warns
+    about nothing, and reuses the stage that uses it."""
+    pipeline = (
+        "import helpers\nfrom pivot import Pipeline, stage\n\n\n@stage\n"
+        + "def use_plain(seed: str) -> str:\n    return helpers.plain()\n\n\n"
+        + 'with Pipeline("p") as pipeline:\n    use_plain(pipeline.input("seed.txt"))\n'
+    )
+    project, _ = _project(tmp_path, pipeline)
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(
+        f"import sys\nsys.path.insert(0, {str(project)!r})\nimport helpers\n"
+        + f"sys.path.remove({str(project)!r})\n"
+    )
+    _run(project, "config", "set", "core.max_workers", "1", pythonpath=site)
+
+    first = _repro(project, site)
+    second = _repro_json(project, site)
+
+    assert "did not see user module" not in first, first
+    assert "unreadable-source:" not in _lock(project, "use_plain")
+    assert second["p/use_plain"][0] == "cached", second
+
+
+def test_helper_imported_before_discovery_and_edited_before_it_is_never_reused(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`sitecustomize` imports the helper, then edits it, before Pivot starts: no file Pivot can
+    read shows which code the module holds, so a stage that uses it warns why and is never
+    reused."""
+    pipeline = (
+        "import helpers\nfrom pivot import Pipeline, stage\n\n\n@stage\n"
+        + "def use_plain(seed: str) -> str:\n    return helpers.plain()\n\n\n"
+        + 'with Pipeline("p") as pipeline:\n    use_plain(pipeline.input("seed.txt"))\n'
+    )
+    project, _ = _project(tmp_path, pipeline)
+    helpers_file = project / "helpers.py"
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(
+        f"import pathlib\nimport sys\nsys.path.insert(0, {str(project)!r})\nimport helpers\n"
+        + f"sys.path.remove({str(project)!r})\n"
+        + f"pathlib.Path({str(helpers_file)!r}).write_text({_HELPERS!r})\n"
+    )
+    _run(project, "config", "set", "core.max_workers", "1", pythonpath=site)
+
+    first = _repro(project, site)
+    second = _repro_json(project, site)
+
+    assert "Pivot did not see user module 'helpers' compile" in first, first
+    assert "because its file changed after this process started" in first, first
+    assert "unreadable-source:helpers" in _lock(project, "use_plain")
+    assert second["p/use_plain"][0] == "ran", second
+
+
+def test_a_lock_a_later_run_writes_retires_the_no_commit_record(tmp_path: pathlib.Path) -> None:
+    """A normal run after `pivot repro --no-commit` writes a lock, which supersedes the record the
+    --no-commit run left. The user then puts that run's output (plain-v1) back by hand and runs
+    `pivot commit`: the lock is current, so commit leaves it and the next run restores the
+    output the lock records. A record left behind would make commit match it against plain-v1
+    and write that old run's manifest (helper v1), and the next run would rerun the stage."""
+    project, _ = _project(tmp_path, _EDIT_THEN_USE)
+    _run(project, "repro", "--no-commit")
+    assert _output(project, "use_plain") == "plain-v1"
+    _repro(project)
+    assert _output(project, "use_plain") == "plain-v2"
+    output = project / "data" / "p" / "use_plain.txt"
+    output.unlink()  # a committed output is read-only
+    output.write_text("plain-v1")
+
+    _run(project, "commit")
+
+    assert "func:helpers.plain: 09b7aba4b5d8001a" not in _lock(project, "use_plain")
+    after = _repro_json(project)
+    assert after["p/use_plain"][0] == "cached", after
+    assert _output(project, "use_plain") == "plain-v2"
+
+
+_EXT_STAGE = (
+    'from pivot import stage\n\n\n@stage\ndef use_ext(ready: str) -> str:\n    return "ext-v1"\n'
+)
+
+
+def test_stage_defined_out_of_root_edited_mid_run_is_never_cached_stale(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A stage defined in a module on PYTHONPATH reaches the worker by reference, and `edit_ext`
+    edits that module mid-run. Whichever version the worker ran, no later run, before or after
+    the file is put back, reports the stage cached with another version's output."""
+    ext = tmp_path / "ext"
+    ext.mkdir()
+    ext_file = ext / "stages_ext.py"
+    ext_file.write_text(_EXT_STAGE)
+    project = tmp_path / "project"
+    (project / "data" / "raw").mkdir(parents=True)
+    (project / "data" / "raw" / "seed.txt").write_text("seed\n")
+    (project / "pipeline.py").write_text(
+        "import pathlib\n\nfrom pivot import Pipeline, stage\nfrom stages_ext import use_ext\n\n"
+        + f"EXT = {str(ext_file)!r}\n\n\n@stage\ndef edit_ext(seed: str) -> str:\n"
+        + "    path = pathlib.Path(EXT)\n"
+        + "    path.write_text(path.read_text().replace('-v1', '-v2'))\n    return 'ready'\n\n\n"
+        + 'with Pipeline("p") as pipeline:\n    use_ext(edit_ext(pipeline.input("seed.txt")))\n'
+    )
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    _run(project, "init", pythonpath=ext)
+    _run(project, "config", "set", "core.max_workers", "1", pythonpath=ext)
+    _repro(project, ext)
+
+    for on_disk in ("ext-v2", "ext-v1"):
+        if on_disk == "ext-v1":
+            ext_file.write_text(_EXT_STAGE)
+        status = _repro_json(project, ext)["p/use_ext"][0]
+        assert status != "cached" or _output(project, "use_ext") == on_disk, (
+            on_disk,
+            status,
+            _output(project, "use_ext"),
+        )
+
+
+_REEXPORT_THEN_IMPORT = """\
+import pathlib
+
+import helpers
+from pivot import Pipeline, stage
+
+HELPERS = {helpers_file!r}
+
+
+@stage
+def edit_helper(seed: str) -> str:
+    path = pathlib.Path(HELPERS)
+    path.write_text(path.read_text().replace("plain_a as", "plain_b as"))
+    return "ready"
+
+
+@stage
+def early(ready: str) -> str:
+    import helpers
+
+    return helpers.__name__
+
+
+@stage
+def use_plain(name: str) -> str:
+    import helpers
+
+    return helpers.plain()
+
+
+with Pipeline("p") as pipeline:
+    use_plain(early(edit_helper(pipeline.input("seed.txt"))))
+"""
+
+
+def test_module_a_stage_imports_while_it_runs_edited_mid_run_is_marked(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`helpers` re-exports `impl.plain_a` as `plain`; `edit_helper` makes it re-export
+    `plain_b`. On one worker `early` imports the edited `helpers` first, so when `use_plain`
+    imports it at run time it is already loaded, and `use_plain` runs plain-b. The module it
+    imported while it ran counts as used, so its lock is marked; unmarked, putting the file back
+    would make the lock match again and serve plain-b as cached."""
+    project, pythonpath = _project(tmp_path, _REEXPORT_THEN_IMPORT, helpers_in_root=False)
+    assert pythonpath is not None
+    helpers_file = pythonpath / "helpers.py"
+    reexport = "from impl import plain_a as plain\n"
+    helpers_file.write_text(reexport)
+    (pythonpath / "impl.py").write_text(
+        'def plain_a():\n    return "plain-a"\n\n\ndef plain_b():\n    return "plain-b"\n'
+    )
+    _run(project, "config", "set", "core.max_workers", "1", pythonpath=pythonpath)
+
+    first = _repro(project, pythonpath)
+    assert _output(project, "use_plain") == "plain-b", "the stage ran the edited re-export"
+    assert f"Stage 'p/use_plain' {_EDITED}: helpers." in first, first
+
+    helpers_file.write_text(reexport)
+    second = _repro_json(project, pythonpath)
+    assert second["p/use_plain"][0] != "cached" or _output(project, "use_plain") == "plain-a", (
+        second,
+        _output(project, "use_plain"),
+    )

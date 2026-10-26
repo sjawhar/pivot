@@ -36,6 +36,9 @@ class DiscoveryError(Exception):
 # Import machinery is process-global. This session record is the narrow ownership boundary:
 # a new public discovery/load restores only modules and sys.path entries that the prior session
 # displaced or inserted, while the active pipeline stays importable for fingerprinting/workers.
+# The session's import hooks (its path hook and the module recorder) are installed only while a
+# discovery imports: a discovery that returns, or fails, leaves CPython's import machinery as it
+# found it.
 _MISSING_MODULE = object()
 
 # A cached bytecode file's flags word (PEP 552): bit 0 marks it hash-based, bit 1 has every
@@ -222,7 +225,7 @@ def _should_record_origin(origin: str) -> bool:
 
 
 def _install_module_recorder() -> None:
-    """Install the module recorder for the current import session."""
+    """Install the module recorder: while a discovery imports, or for a worker's life."""
     global _wrapped_spec_from_file_location
     if _recording_finder in sys.meta_path:
         return
@@ -256,7 +259,7 @@ def _install_module_recorder() -> None:
 
 
 def _uninstall_module_recorder() -> None:
-    """Remove the module recorder when the import session ends."""
+    """Remove the module recorder when a discovery returns."""
     if _recording_finder in sys.meta_path:
         sys.meta_path.remove(_recording_finder)
     if importlib.util.spec_from_file_location is _wrapped_spec_from_file_location:
@@ -340,6 +343,16 @@ class _ImportSession:
 _import_session: _ImportSession | None = None
 
 
+def _remove_import_hooks(session: _ImportSession) -> None:
+    """Give imports CPython's machinery back: drop the session's path hook, the finders it cached
+    and the module recorder. The session's modules, sys.path entry and records stay."""
+    if session.path_hook in sys.path_hooks:
+        sys.path_hooks.remove(session.path_hook)
+    _forget_user_code_finders(session.root)
+    importlib.invalidate_caches()
+    _uninstall_module_recorder()
+
+
 def _end_import_session(session: _ImportSession) -> None:
     """Remove session-owned imports and restore modules/sys.path displaced for it."""
     for module_name, module in session.owned_modules.items():
@@ -359,12 +372,16 @@ def _end_import_session(session: _ImportSession) -> None:
         sys.path.remove(session.path_entry)
     for index, entry in session.caller_path_entries:
         sys.path.insert(min(index, len(sys.path)), entry)
-    if session.path_hook in sys.path_hooks:
-        sys.path_hooks.remove(session.path_hook)
-    _forget_user_code_finders(session.root)
-    importlib.invalidate_caches()
+    _remove_import_hooks(session)
     loaded_source.prune()
-    _uninstall_module_recorder()
+
+
+def _close_import_session(session: _ImportSession) -> None:
+    """End ``session``, and forget it when it is the current one."""
+    global _import_session
+    _end_import_session(session)
+    if _import_session is session:
+        _import_session = None
 
 
 def _start_import_session(root: pathlib.Path) -> _ImportSession:
@@ -391,7 +408,7 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
         root_str,
         caller_path_entries,
         preexisting_root_modules,
-        # User code imports through _ProjectSourceLoader while the session lasts.
+        # User code imports through _ProjectSourceLoader while the discovery imports.
         _install_path_hook(root),
         file_under_root,
         preexisting_pickle_by_value_modules=cloudpickle.list_registry_pickle_by_value(),
@@ -405,12 +422,13 @@ def import_session_root() -> pathlib.Path | None:
 
 
 def install_user_code_loader(root: str) -> None:
-    """Import user code through ``_ProjectSourceLoader`` in this process from now on, as the
-    import session for ``root`` does: the initializer of each worker (``executor.core``).
+    """Import user code through ``_ProjectSourceLoader`` in this process from now on, as a
+    discovery for ``root`` does while it imports: the initializer of each worker
+    (``executor.core``), for the worker's life.
 
     A worker imports user code by name: a stage's module that discovery could not send by
     value (one outside the root, or under it in a ``src`` layout) and any module a stage body
-    imports. The session's loader is installed only in the process that discovered.
+    imports.
     """
     _install_path_hook(pathlib.Path(root))
 
@@ -659,10 +677,11 @@ def discover_pipeline(
         loaded = result is not None
         return result
     finally:
-        if session is not None and not loaded:
-            _end_import_session(session)
-            if _import_session is session:
-                globals()["_import_session"] = None
+        if session is not None:
+            if loaded:
+                _remove_import_hooks(session)
+            else:
+                _close_import_session(session)
         metrics.end("discovery.total", _t)
 
 
@@ -705,6 +724,7 @@ def _load_pipeline_from_module(
             spec.loader.exec_module(module)
         _track_root_modules(session)
         loaded_source.record_user_modules()
+        loaded_source.record_unseen_modules()
         module_dict = vars(module)
 
         pipeline_obj = module_dict.get("pipeline")
@@ -740,10 +760,11 @@ def _load_pipeline_from_module(
             pickle_by_value_before,
         )
         if owns_session:
-            _end_import_session(session)
-            if _import_session is session:
-                globals()["_import_session"] = None
+            _close_import_session(session)
         raise
+    finally:
+        if owns_session:
+            _remove_import_hooks(session)
 
 
 def _discover_all_pipelines(root: pathlib.Path, session: _ImportSession) -> PipelineLike | None:
@@ -889,22 +910,22 @@ def load_pipeline_from_path(path: pathlib.Path) -> PipelineLike | None:
     session = _start_import_session(import_root)
     loaded = False
     try:
-        pipeline = _load_pipeline_from_module(resolved_path, session)
-    except DiscoveryError as e:
-        logger.warning(f"Pipeline discovery issue in {path}: {e}")
-        pipeline = None
-    except Exception as e:
-        logger.debug(f"Failed to load pipeline from {path}: {e}")
-        pipeline = None
-    try:
+        try:
+            pipeline = _load_pipeline_from_module(resolved_path, session)
+        except DiscoveryError as e:
+            logger.warning(f"Pipeline discovery issue in {path}: {e}")
+            pipeline = None
+        except Exception as e:
+            logger.debug(f"Failed to load pipeline from {path}: {e}")
+            pipeline = None
         if pipeline is not None:
             _require_project_state(pipeline, project_root)
         loaded = pipeline is not None
         return pipeline
     finally:
-        if not loaded:
-            _end_import_session(session)
-            if _import_session is session:
-                globals()["_import_session"] = None
+        if loaded:
+            _remove_import_hooks(session)
+        else:
+            _close_import_session(session)
         fingerprint.flush_ast_hash_cache()
         fingerprint.flush_manifest_cache()

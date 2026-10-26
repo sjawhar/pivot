@@ -13,25 +13,36 @@ bytes it compiles; every other user-code module (an editable install's finder, a
 `sys.path`, `importlib.util.spec_from_file_location`, a sourceless `.pyc`) is recorded from its
 loader when it appears (`record_modules`, `record_user_modules`). A user module whose loader gives
 no source is recorded as unreadable: Pivot cannot tell which code it holds, so a stage that uses
-it is never trusted.
+it is never trusted. A user module no recorder saw compile, because it was imported before the
+recorder was installed (by `sitecustomize`, a `.pth` import line or the program that runs Pivot),
+is recorded from its file only where Pivot can show the file holds the code it was compiled from,
+and as unreadable otherwise (`record_unseen_modules`).
 
 Import machinery and `linecache` are process-global, so this record is too. A module loaded again
-(a watch reload) replaces its entry, and `prune` drops the entries, and the `linecache` lines, of
-modules no longer loaded. A worker gets the coordinator's records once, when it starts
+(a watch reload) replaces its entry, and `prune`, at the end of an import session, drops the
+entries, and the `linecache` lines, of modules no longer loaded and of modules no recorder saw
+compile. A worker gets the coordinator's records once, when it starts
 (`digests_for_workers`, `set_coordinator`); a stage carries their `token`, and all of them only
 when the coordinator's record changed after the workers started (`digests_for_stage`).
 """
 
 from __future__ import annotations
 
+import _imp
+import importlib.machinery
+import importlib.util
 import inspect
 import io
 import json
 import linecache
+import logging
+import marshal
 import os
 import sys
+import time
 import tokenize
 import types
+import warnings
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import xxhash
@@ -43,11 +54,14 @@ from pivot import fingerprint
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
 
+logger = logging.getLogger(__name__)
+
 
 class _Loaded(NamedTuple):
     """One user module's source when this process loaded it.
 
     `data` and `digest` are None for a module whose loader gives no source: it is unreadable.
+    `reason` says why a module no recorder saw compile is unreadable (`record_unseen_modules`).
     """
 
     filename: str  # the name the compiled code carries (`co_filename`, the module's `__file__`)
@@ -55,6 +69,7 @@ class _Loaded(NamedTuple):
     module: str
     data: bytes | None
     digest: str | None
+    reason: str | None = None
 
 
 # Every recorded module with source, by the name its code carries and by its resolved path.
@@ -71,10 +86,29 @@ _token: str | None = None
 _coordinator: tuple[str, dict[str, str]] | None = None
 # The `token()` of the records last given to starting workers (`digests_for_workers`).
 _sent_token: str | None = None
+# The modules `record_unseen_modules` recorded; `prune` forgets them when the session ends.
+_unseen = set[str]()
+# The unreadable modules whose reason this process has logged (`check_stage`).
+_warned = set[str]()
+# Whether this process was forked without exec from one that imported this module: it holds
+# modules its parent loaded before this process started (`_note_fork`).
+_forked = False
 
 # Manifest key kinds whose entry hashes code or a value of a user module. `ext:` records a
 # function by name only (its body is not hashed), and `module:` only marks an import as covered.
 _CODE_KINDS = frozenset({"func", "class", "const", "default", "schema", "partial", "loader"})
+
+# A file's change time is stamped from a clock that can trail the change by one kernel tick (at
+# most 10 ms), so a change this close before the process started counts as after it.
+_CHANGE_TIME_SLACK_NS = 50_000_000
+
+
+def _note_fork() -> None:
+    global _forked
+    _forked = True
+
+
+os.register_at_fork(after_in_child=_note_fork)
 
 
 def record(filename: str, module: str, data: bytes) -> None:
@@ -94,47 +128,40 @@ def record_loaded_module(module: types.ModuleType, data: bytes | None) -> None:
     if not fingerprint.is_user_code(module):
         return
     name = module.__name__
-    filename = vars(module).get("__file__")
-    spec = vars(module).get("__spec__")
-    if not isinstance(filename, str):
-        filename = getattr(spec, "origin", None)
-    if not isinstance(filename, str):
+    filename = _module_file(module)
+    if filename is None:
         return
     _recorded_objects[name] = module
     path = os.path.realpath(filename)
     _store(_Loaded(filename, path, name, data, None if data is None else _hash(data)))
 
 
-def record_modules(names: Iterable[str], *, refresh: bool = False) -> None:
-    """Record user modules that appear to have been loaded through the recorder but whose source
-    the recorder did not capture (the unpickling path, ``importlib.reload``). Modules the
-    recorder already captured are recorded with source. Modules loaded before the recorder was
-    installed are left unrecorded: fingerprinting reads their file directly, as on main.
+def record_modules(names: Iterable[str]) -> None:
+    """Bring the record up to date with `sys.modules` for `names`. A module object that took the
+    place of a recorded module from the same file (a module that puts a ModuleType subclass
+    under its own name while it loads) keeps that record. A module loaded through the recorder
+    whose source the recorder did not capture (the unpickling path, ``importlib.reload``) is
+    unreadable. A module any other loader loaded is left to `record_unseen_modules`.
     """
     for name in names:
         module = sys.modules.get(name)
-        if not isinstance(module, types.ModuleType) or (
-            not refresh and _recorded_objects.get(name) is module
-        ):
+        if not isinstance(module, types.ModuleType) or _recorded_objects.get(name) is module:
             continue
-        _recorded_objects[name] = module
-        if not fingerprint.is_user_code(module):
-            continue
-        filename = vars(module).get("__file__")
-        spec = vars(module).get("__spec__")
-        if not isinstance(filename, str):
-            filename = getattr(spec, "origin", None)
-        if not isinstance(filename, str):
+        filename = _module_file(module) if fingerprint.is_user_code(module) else None
+        if filename is None:
+            _recorded_objects[name] = module
             continue
         existing = _by_module.get(name)
-        if existing is not None and existing.path == os.path.realpath(filename) and not refresh:
+        if existing is not None and existing.path == os.path.realpath(filename):
+            _recorded_objects[name] = module
             continue
-        # Only record a module whose loader is the recorder wrapper (its type name, to avoid a
-        # circular import that the import hook would loop on). A module whose loader is anything
-        # else was loaded before the recorder was installed and is not our concern.
-        loader = getattr(spec, "loader", None)
-        if not refresh and type(loader).__name__ != "_RecordingLoader":
+        # The recorder wrapper is known by its type name, to avoid a circular import that the
+        # import hook would loop on. A module another loader loaded stays unread here, so that
+        # `record_unseen_modules` still judges it.
+        loader = getattr(vars(module).get("__spec__"), "loader", None)
+        if type(loader).__name__ != "_RecordingLoader":
             continue
+        _recorded_objects[name] = module
         _store(_Loaded(filename, os.path.realpath(filename), name, None, None))
 
 
@@ -143,14 +170,53 @@ def record_user_modules() -> None:
     record_modules(list(sys.modules))
 
 
+def record_unseen_modules() -> None:
+    """Record every loaded user module that no recorder saw compile: one imported before Pivot
+    installed its recorder, by `sitecustomize`, a `.pth` import line or the program that runs
+    Pivot, or by a loader the recorder does not wrap.
+
+    Its record holds its file's bytes where they are shown to be the bytes it was compiled from
+    (`_verified_source`). Otherwise it is unreadable, with the reason, so a stage that uses it is
+    never reused, and `check_stage` logs the reason once per process. Discovery calls this once
+    it has imported the project, and a worker when it starts; `prune` forgets these records when
+    the import session ends, so the next discovery judges the modules again.
+    """
+    started = _process_start_ns()
+    for name in list(sys.modules):
+        module = sys.modules.get(name)
+        if not isinstance(module, types.ModuleType) or _recorded_objects.get(name) is module:
+            continue
+        filename = _module_file(module) if fingerprint.is_user_code(module) else None
+        _recorded_objects[name] = module
+        if filename is None:
+            continue
+        data, reason = _verified_source(module, filename, started)
+        _store(
+            _Loaded(
+                filename,
+                os.path.realpath(filename),
+                name,
+                data,
+                None if data is None else _hash(data),
+                reason,
+            )
+        )
+        _unseen.add(name)
+
+
 def prune() -> None:
     """Forget every module that is no longer the one `sys.modules` holds under its name, as after
-    an import session removed the modules it imported, with the `linecache` lines pinned for it."""
+    an import session removed the modules it imported, and every module `record_unseen_modules`
+    recorded, with the `linecache` lines pinned for them."""
     global _token
     for name, loaded in list(_by_module.items()):
         module = sys.modules.get(name)
         module_file = getattr(module, "__file__", None)
-        if isinstance(module_file, str) and os.path.realpath(module_file) == loaded.path:
+        if (
+            name not in _unseen
+            and isinstance(module_file, str)
+            and os.path.realpath(module_file) == loaded.path
+        ):
             continue
         del _by_module[name]
         _recorded_objects.pop(name, None)
@@ -161,6 +227,7 @@ def prune() -> None:
         if entry is not None and linecache.cache.get(loaded.filename) is entry:
             del linecache.cache[loaded.filename]
         _token = None
+    _unseen.clear()
 
 
 def digest(file: str) -> str | None:
@@ -173,7 +240,7 @@ def digest(file: str) -> str | None:
 
 def digests() -> dict[str, str]:
     """Every recorded user module by name: its resolved path and digest, the digest empty for an
-    unreadable module."""
+    unreadable module, followed by the reason for one no recorder saw compile."""
     return {name: _record_text(loaded) for name, loaded in _by_module.items()}
 
 
@@ -243,7 +310,7 @@ def modules_from_files(paths: set[str]) -> set[str]:
     names = {name for name, loaded in _by_module.items() if loaded.path in paths}
     if _coordinator is not None:
         names.update(
-            name for name, text in _coordinator[1].items() if text.rpartition("\0")[0] in paths
+            name for name, text in _coordinator[1].items() if _record_fields(text)[0] in paths
         )
     return names
 
@@ -264,7 +331,8 @@ def check_stage(
     Edited: this process holds a record for the module (path and content) that differs from
     the coordinator's, so the stage ran code its fingerprint does not describe. A different file
     for the same name (a new package shadowing a module) differs too. Unreadable: either side has
-    no source for the module, so no one can tell which code ran.
+    no source for the module, so no one can tell which code ran. For a module no recorder saw
+    compile (`record_unseen_modules`), the reason is logged once per process.
 
     The coordinator's records are the ones the worker started with, or `coordinator_digests` when
     the stage carries them. When neither matches `coordinator_token`, nothing can be compared, so
@@ -295,6 +363,7 @@ def check_stage(
         if _coordinator is None:
             if own is not None and own.digest is None:
                 unreadable.append(name)
+                _warn_unseen(name, own.reason)
             continue
         # A direct executor can receive a preloaded test or library function without discovery
         # ever sending a module record to its workers. It has no coordinator snapshot to compare;
@@ -304,11 +373,31 @@ def check_stage(
             if records_stale and own is not None:
                 edited.append(name)
             continue
-        if (own is not None and own.digest is None) or _record_is_unreadable(wanted):
+        if own is not None and own.digest is None:
             unreadable.append(name)
+            _warn_unseen(name, own.reason)
+        elif _record_is_unreadable(wanted):
+            unreadable.append(name)
+            _warn_unseen(name, _record_fields(wanted)[2])
         elif own is not None and _record_text(own) != wanted:
             edited.append(name)
     return edited, unreadable
+
+
+def _warn_unseen(name: str, reason: str | None) -> None:
+    """Log, once per process, why a module no recorder saw compile cannot be trusted."""
+    if not reason or name in _warned:
+        return
+    _warned.add(name)
+    logger.warning(
+        "Pivot did not see user module '%s' compile: it was imported before pivot installed its "
+        + "recorder (by sitecustomize, a .pth file or the program that runs pivot), or by a "
+        + "loader the recorder does not wrap. Pivot cannot show that its file holds the code it "
+        + "runs, because %s, so a stage that uses it is never reused. Fix: import it from the "
+        + "pipeline or from a stage instead.",
+        name,
+        reason,
+    )
 
 
 def _manifest_modules(manifest: Mapping[str, str], known: set[str]) -> set[str]:
@@ -329,6 +418,7 @@ def _manifest_modules(manifest: Mapping[str, str], known: set[str]) -> set[str]:
 
 def _store(loaded: _Loaded) -> None:
     global _token
+    _unseen.discard(loaded.module)
     previous = _by_module.get(loaded.module)
     if previous is not None:
         for key in (previous.filename, previous.path):
@@ -373,11 +463,154 @@ def _hash(data: bytes) -> str:
 
 
 def _record_text(loaded: _Loaded) -> str:
-    return f"{loaded.path}\0{loaded.digest or ''}"
+    text = f"{loaded.path}\0{loaded.digest or ''}"
+    return text if loaded.reason is None else f"{text}\0{loaded.reason}"
+
+
+def _record_fields(text: str) -> tuple[str, str, str]:
+    """A record's resolved path, digest (empty for an unreadable module) and reason (empty unless
+    no recorder saw the module compile)."""
+    path, _, rest = text.partition("\0")
+    digest, _, reason = rest.partition("\0")
+    return path, digest, reason
 
 
 def _record_is_unreadable(text: str) -> bool:
-    return not text.rpartition("\0")[2]
+    return not _record_fields(text)[1]
+
+
+def _module_file(module: types.ModuleType) -> str | None:
+    """The file a module's code came from: its `__file__`, else its spec's origin."""
+    filename = vars(module).get("__file__")
+    if not isinstance(filename, str):
+        filename = getattr(vars(module).get("__spec__"), "origin", None)
+    return filename if isinstance(filename, str) else None
+
+
+def _process_start_ns() -> int | None:
+    """When this process started, in wall-clock nanoseconds and never later than it did, or None
+    if the system does not say, or this process was forked from one that imported this module:
+    its modules were loaded before it started.
+
+    Linux gives the start in clock ticks since boot; read against the boot clock, it lands within
+    one tick before the true start. psutil reads it elsewhere.
+    """
+    if _forked:
+        return None
+    if sys.platform != "linux":
+        import psutil
+
+        try:
+            return int(psutil.Process().create_time() * 1_000_000_000)
+        except psutil.Error:
+            return None
+    try:
+        with open("/proc/self/stat") as stat:
+            fields = stat.read().rpartition(")")[2].split()
+        boot_ns = int(fields[19]) * 1_000_000_000 // os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+    return time.time_ns() - (time.clock_gettime_ns(time.CLOCK_BOOTTIME) - boot_ns)
+
+
+def _verified_source(
+    module: types.ModuleType, filename: str, started: int | None
+) -> tuple[bytes | None, str | None]:
+    """`filename`'s bytes if they are the bytes `module` was compiled from, else None and why
+    Pivot cannot show that.
+
+    No recorder saw the module compile, so its file is read now. Those bytes are its code when
+    CPython's source file loader imported it (a plain `sys.path` import), the file has not
+    changed since this process started (its change time, which no tool can set back, is older),
+    so every import in this process read these bytes, and the bytecode that loader may have run
+    instead is the code of these bytes (`_bytecode_reason`).
+    """
+    spec = vars(module).get("__spec__")
+    loader = getattr(spec, "loader", None) or vars(module).get("__loader__")
+    if type(loader) is not importlib.machinery.SourceFileLoader:
+        return None, f"its loader ({type(loader).__qualname__}) is not CPython's source file loader"
+    if started is None:
+        return None, "pivot cannot tell when this process loaded it"
+    since = started - _CHANGE_TIME_SLACK_NS
+    try:
+        with open(filename, "rb") as file:
+            data = file.read()
+            source = os.fstat(file.fileno())
+        link = os.lstat(filename)
+    except OSError as error:
+        return None, f"its file cannot be read ({error.strerror})"
+    if max(source.st_ctime_ns, link.st_ctime_ns) >= since or len(data) != source.st_size:
+        return None, "its file changed after this process started"
+    reason = _bytecode_reason(filename, data, source, since)
+    return (data, None) if reason is None else (None, reason)
+
+
+def _bytecode_reason(filename: str, data: bytes, source: os.stat_result, since: int) -> str | None:
+    """Why the bytecode CPython's source file loader may have run for `filename` might not be the
+    code of `data`, the file's bytes since before `since`; None when it is, or was not run.
+
+    The loader runs the cached file when it accepts it for the source (`_bytecode_accepted`) and
+    compiles the source otherwise. A cached file that has not changed since `since` is the one
+    the import saw, so it must be rejected for this source or be the code of `data`. A cached
+    file written since then replaced the one the import saw. CPython's import writes mtime-checked
+    bytecode only after rejecting the file it found for the source, which this process saw too,
+    so it then compiled the source as well; such a file must also be the code of `data`. Any other
+    replacement could have followed an import that ran stale bytecode. With no cached file, and
+    none removed from its directory since `since`, the import compiled the source.
+    """
+    try:
+        cached = importlib.util.cache_from_source(filename)
+    except NotImplementedError:  # this interpreter caches no bytecode
+        return None
+    try:
+        with open(cached, "rb") as file:
+            bytecode = file.read()
+            changed = os.fstat(file.fileno()).st_ctime_ns >= since
+    except FileNotFoundError:
+        try:
+            removed = os.stat(os.path.dirname(cached)).st_ctime_ns >= since
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            return f"its bytecode directory cannot be read ({error.strerror})"
+        return "its bytecode directory changed after this process started" if removed else None
+    except OSError as error:
+        return f"its bytecode file cannot be read ({error.strerror})"
+    accepted = _bytecode_accepted(bytecode, data, source)
+    if not changed and not accepted:
+        return None
+    if accepted and (not changed or bytecode[4:8] == bytes(4)):
+        # Compiling here must not repeat the module's SyntaxWarnings: its import showed them.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                compiled = compile(data, filename, "exec", dont_inherit=True)
+                if marshal.loads(bytecode[16:]) == compiled:
+                    return None
+            except (EOFError, TypeError, ValueError, SyntaxError):
+                pass
+    if changed:
+        return "its bytecode file changed after this process started"
+    return "its cached bytecode is not the code of its file"
+
+
+def _bytecode_accepted(bytecode: bytes, data: bytes, source: os.stat_result) -> bool:
+    """Whether CPython's source file loader runs `bytecode` for a source file with this content
+    and status rather than compiling it, as `SourceLoader.get_code` decides (PEP 552)."""
+    if len(bytecode) < 16 or bytecode[:4] != importlib.util.MAGIC_NUMBER:
+        return False
+    flags = int.from_bytes(bytecode[4:8], "little")
+    if flags == 0:
+        return bytecode[8:16] == (int(source.st_mtime) & 0xFFFFFFFF).to_bytes(4, "little") + (
+            source.st_size & 0xFFFFFFFF
+        ).to_bytes(4, "little")
+    if flags & ~0b11:
+        return False
+    if _imp.check_hash_based_pycs == "never" or (
+        _imp.check_hash_based_pycs == "default" and not flags & 0b10
+    ):
+        return True
+    return bytecode[8:16] == importlib.util.source_hash(data)
 
 
 def _token_of(records: Mapping[str, str]) -> str:

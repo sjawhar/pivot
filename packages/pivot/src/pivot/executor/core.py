@@ -190,7 +190,7 @@ def _get_executor(
     """Return Pivot's reusable executor without resizing warm workers between runs.
 
     Every worker starts with ``_init_worker``. While a discovery's import session lasts, it
-    also imports user code as that session does (``discovery.install_user_code_loader``), so a
+    also imports user code as that discovery did (``discovery.install_user_code_loader``), so a
     worker never runs an edited module's previous code; loky replaces a live pool whose
     initializer arguments differ.
     """
@@ -256,11 +256,14 @@ def _init_worker(
     """Loky worker initializer: stop the worker when it is told to or ``parent_pid`` dies
     (``worker.unwind_when_stopped``), record the user modules each stage imports
     (``worker.install_import_hooks``), keep the digests of the user code the coordinator loaded
-    (``loaded_source.set_coordinator``), and import user code through discovery's checked loader
-    when a discovery's import session for ``user_code_root`` lasts."""
+    (``loaded_source.set_coordinator``), record the user modules the worker imported before this
+    ran, as ``sitecustomize`` or a ``.pth`` file does (``loaded_source.record_unseen_modules``),
+    and import user code through discovery's checked loader when a discovery's import session for
+    ``user_code_root`` lasts."""
     worker.unwind_when_stopped(parent_pid)
     worker.install_import_hooks()
     loaded_source.set_coordinator(coordinator_sources)
+    loaded_source.record_unseen_modules()
     if user_code_root is not None:
         discovery.install_user_code_loader(user_code_root)
 

@@ -239,6 +239,46 @@ stage returns. That covers an editable install's meta-path finder, a zip on `sys
 on the module's `.py` origin, else its `get_source`. A module whose loader gives neither (a
 sourceless `.pyc`, an extension module) is recorded as unreadable.
 
+A user module that no recorder saw compile was imported before discovery installed the recorder:
+by `sitecustomize` or a `.pth` import line (in the coordinator, and in each worker before its
+initializer runs), by the program that runs Pivot, or by a finder ahead of the recorder.
+`loaded_source.record_unseen_modules` runs at the end of discovery and in `core._init_worker`, and
+judges each such module (`loaded_source._verified_source`). It records the module's file when
+those bytes are shown to be the bytes the module was compiled from:
+
+- its loader is CPython's own `SourceFileLoader` (a subclass may run transformed text);
+- the file's change time (`st_ctime`, which no tool can set back) is older than the process
+  start, read on Linux from `/proc/self/stat` against the boot clock, which lands within one tick
+  before the true start (psutil elsewhere), less 50 ms for the kernel's coarse file timestamps.
+  Every import in the process then read these bytes;
+- the bytecode that loader may have run instead is the code of these bytes. A cached file that
+  has not changed since the start is the one the import saw: either CPython's check rejects it
+  for this source, or its code (`marshal`) equals the source compiled now, which catches the
+  edit that keeps the size within the second its predecessor was cached. A cached file written
+  since the start must be mtime-checked bytecode of these bytes: CPython's import writes that
+  only after rejecting the file it found for this same source. With no cached file, its directory
+  must not have changed since the start.
+
+Otherwise the module is recorded as unreadable, with the reason in its record
+(`path\0\0reason`), and `check_stage` logs the reason once per process when a stage uses it, in
+addition to the stage's own warning. The cases that fall there: a file edited after the process
+started (an edit during startup, or a module a long-lived process loaded and then edited), a
+module loaded by any other loader, stale or replaced bytecode, a cached file that cannot be read,
+a platform that does not report the process start, and a process forked without exec after it
+imported Pivot (`os.register_at_fork`), whose modules its parent loaded before it started. Each
+costs the same as a sourceless module: the stages that use it rerun on every run in that process
+and file no run-cache entry.
+One case is not detected: a process forked without exec from a parent that imported the module
+before it imported Pivot. Start Pivot in a process of its own, as the `pivot` command and its
+workers are. These records belong to the import session: `loaded_source.prune` drops them when
+it ends, so the next discovery judges the modules again.
+
+Discovery's path hook and the module recorder are installed only while a discovery imports;
+`discovery._remove_import_hooks` gives CPython's machinery back when it returns, fails or is
+interrupted. The session itself (its modules, its `sys.path` entry and its records) lasts until
+the next discovery ends it. A worker installs its own loader and recorder for its life
+(`discovery.install_user_code_loader`).
+
 Fingerprinting reads the recorded bytes, not the file: `loaded_source.getsource` puts their lines
 into `linecache` as an entry without an mtime, which `linecache.checkcache` leaves alone, before
 it calls `inspect.getsource`; `fingerprint._source_digest`, which keys the `fp:` and `sm:` caches,
@@ -267,7 +307,8 @@ concern. Records compare by module name, path and digest, so a new package that 
 mid-run differs too. A stage sent with a token other than the one its worker started with, and
 without the records, cannot be compared, so every module it used that the worker loaded counts.
 When an import session ends, the entries of the modules it removed are dropped, with the
-`linecache` lines pinned for them (`loaded_source.prune`).
+`linecache` lines pinned for them, and so are those `record_unseen_modules` made
+(`loaded_source.prune`).
 
 A difference means the stage ran code its fingerprint does not describe: the stage succeeds, logs
 one warning naming the modules, and its lock carries an `edited-source:<modules>` key no

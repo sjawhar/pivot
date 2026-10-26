@@ -2,13 +2,17 @@
 
 import importlib
 import importlib.abc
+import importlib.machinery
 import importlib.util
 import inspect
 import linecache
+import logging
 import os
 import pathlib
 import py_compile
+import subprocess
 import sys
+import time
 import types
 import uuid
 import zipfile
@@ -19,6 +23,7 @@ import xxhash
 
 from pivot import discovery, loaded_source
 from pivot.executor import core as executor_core
+from pivot.executor import worker
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +36,8 @@ def _isolated_record(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(loaded_source, "_token", None)
     monkeypatch.setattr(loaded_source, "_coordinator", None)
     monkeypatch.setattr(loaded_source, "_sent_token", None)
+    monkeypatch.setattr(loaded_source, "_unseen", set[str]())
+    monkeypatch.setattr(loaded_source, "_warned", set[str]())
 
 
 def _load(path: pathlib.Path, text: str, monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
@@ -350,3 +357,351 @@ def test_a_stage_carries_digests_only_after_the_record_changed(
     _load(tmp_path / "two.py", "VALUE = 2\n", monkeypatch)
 
     assert loaded_source.digests_for_stage() == loaded_source.digests()
+
+
+class _TransformingLoader(importlib.machinery.SourceFileLoader):
+    """A source loader subclass, as a tool that rewrites source before compiling it has."""
+
+
+def _import_before_recorder(
+    path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> types.ModuleType:
+    """Import `path` as a plain `sys.path` import does, with CPython's source file loader and no
+    recorder installed: what `sitecustomize` or a `.pth` import line does before Pivot starts."""
+    name = f"unseen_{uuid.uuid4().hex}"
+    spec = discovery._original_spec_from_file_location(name, path)
+    assert spec is not None and type(spec.loader) is importlib.machinery.SourceFileLoader
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _started_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Have this process start now, so every file written before counts as unchanged since."""
+    started = time.time_ns() + loaded_source._CHANGE_TIME_SLACK_NS
+    monkeypatch.setattr(loaded_source, "_process_start_ns", lambda: started)
+
+
+def _reason(name: str) -> str:
+    return loaded_source._record_fields(loaded_source.digests()[name])[2]
+
+
+def test_a_module_imported_before_the_recorder_is_recorded_from_its_unchanged_file(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A module imported before Pivot installed its recorder, whose file and bytecode have not
+    changed since the process started, is recorded from its file: those bytes are the ones it was
+    compiled from, and fingerprinting keeps reading them after an edit."""
+    path = tmp_path / "preloaded.py"
+    data = b'def value():\n    return "v1"\n'
+    path.write_bytes(data)
+    module = _import_before_recorder(path, monkeypatch)
+    _started_now(monkeypatch)
+
+    loaded_source.record_unseen_modules()
+    path.write_text('def value():\n    return "v2, edited"\n')
+
+    assert loaded_source.digests()[module.__name__] == _text(path, data)
+    assert '"v1"' in loaded_source.getsource(module.value)
+
+
+def test_a_module_whose_file_changed_since_the_process_started_is_unreadable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The file was written after this process started, as an edit during a run's startup is, so
+    Pivot cannot show the module holds the file's code: it is unreadable, a stage that uses it is
+    never reused, and the reason is logged once per process, not once per stage."""
+    path = tmp_path / "preloaded.py"
+    path.write_text('def value():\n    return "v1"\n')
+    module = _import_before_recorder(path, monkeypatch)
+    name = module.__name__
+
+    loaded_source.record_unseen_modules()
+
+    assert loaded_source.digests()[name] == (
+        f"{path.resolve()}\0\0its file changed after this process started"
+    )
+    assert loaded_source.digest(str(path)) is None
+    with caplog.at_level(logging.WARNING, logger="pivot.loaded_source"):
+        for _ in range(2):
+            assert loaded_source.check_stage({f"func:{name}.value": "h"}, set(), "", None) == (
+                [],
+                [name],
+            )
+    warnings = [r.getMessage() for r in caplog.records if r.name == "pivot.loaded_source"]
+    assert len(warnings) == 1, warnings
+    assert f"user module '{name}' compile" in warnings[0]
+    assert "because its file changed after this process started" in warnings[0]
+
+
+def test_a_module_another_loader_loaded_before_the_recorder_is_unreadable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only CPython's own source file loader is known to run its file's text; a subclass may
+    transform it, so its file says nothing about the module's code."""
+    path = tmp_path / "transformed.py"
+    path.write_text("VALUE = 1\n")
+    name = f"transformed_{uuid.uuid4().hex}"
+    monkeypatch.setitem(sys.modules, name, types.ModuleType(name))  # removed after the test
+    _import_with(name, _TransformingLoader(name, str(path)), str(path))
+    _started_now(monkeypatch)
+
+    loaded_source.record_unseen_modules()
+
+    assert _reason(name) == "its loader (_TransformingLoader) is not CPython's source file loader"
+
+
+def test_stale_bytecode_the_import_ran_makes_the_module_unreadable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CPython checks mtime-checked bytecode by the source's size and whole-second mtime, so an
+    edit that keeps both imports the earlier code. The file then does not hold the module's code,
+    though Python's own check accepts the bytecode for it."""
+    path = tmp_path / "stale.py"
+    path.write_text('def value():\n    return "alpha"\n')
+    py_compile.compile(str(path), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    old = path.stat()
+    path.write_text('def value():\n    return "bravo"\n')
+    os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
+    module = _import_before_recorder(path, monkeypatch)
+    assert module.value() == "alpha", "the import ran the earlier bytecode"
+    _started_now(monkeypatch)
+
+    loaded_source.record_unseen_modules()
+
+    assert _reason(module.__name__) == "its cached bytecode is not the code of its file"
+
+
+@pytest.mark.parametrize(
+    ("mode", "trusted"),
+    [
+        pytest.param(py_compile.PycInvalidationMode.TIMESTAMP, True, id="mtime-checked"),
+        pytest.param(py_compile.PycInvalidationMode.CHECKED_HASH, False, id="checked-hash"),
+    ],
+)
+def test_bytecode_written_after_the_process_started(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: py_compile.PycInvalidationMode,
+    trusted: bool,
+) -> None:
+    """Bytecode written since the process started replaced the file the import saw. CPython's
+    import writes mtime-checked bytecode only after rejecting the earlier file for this same
+    source, so the module was then compiled from its file; another writer (Pivot's own loader
+    writes checked-hash bytecode) may have replaced bytecode the import ran."""
+    path = tmp_path / "rewritten.py"
+    data = b'def value():\n    return "v1"\n'
+    path.write_bytes(data)
+    time.sleep(2 * loaded_source._CHANGE_TIME_SLACK_NS / 1e9)
+    started = time.time_ns()
+    monkeypatch.setattr(loaded_source, "_process_start_ns", lambda: started)
+    py_compile.compile(str(path), invalidation_mode=mode)
+    module = _import_before_recorder(path, monkeypatch)
+
+    loaded_source.record_unseen_modules()
+
+    assert loaded_source.digests()[module.__name__] == (
+        _text(path, data)
+        if trusted
+        else f"{path.resolve()}\0\0its bytecode file changed after this process started"
+    )
+
+
+def test_a_module_imported_without_bytecode_is_recorded_unless_bytecode_was_removed(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no bytecode file, and none removed since the process started, the import compiled
+    the file. Bytecode removed since then may be what the import ran."""
+    kept = tmp_path / "kept" / "nobytecode.py"
+    kept.parent.mkdir()
+    kept.write_text("VALUE = 1\n")
+    removed = tmp_path / "removed" / "nobytecode.py"
+    removed.parent.mkdir()
+    removed.write_text("VALUE = 1\n")
+    py_compile.compile(str(removed), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    time.sleep(2 * loaded_source._CHANGE_TIME_SLACK_NS / 1e9)
+    started = time.time_ns()
+    monkeypatch.setattr(loaded_source, "_process_start_ns", lambda: started)
+    pathlib.Path(importlib.util.cache_from_source(str(removed))).unlink()
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    kept_module = _import_before_recorder(kept, monkeypatch)
+    removed_module = _import_before_recorder(removed, monkeypatch)
+
+    loaded_source.record_unseen_modules()
+
+    assert loaded_source.digests()[kept_module.__name__] == _text(kept, b"VALUE = 1\n")
+    assert _reason(removed_module.__name__) == (
+        "its bytecode directory changed after this process started"
+    )
+
+
+def test_prune_forgets_what_record_unseen_modules_recorded(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A module no recorder saw compile is judged at each discovery: the end of an import
+    session forgets its record, though the module stays loaded."""
+    path = tmp_path / "preloaded.py"
+    path.write_text("VALUE = 1\n")
+    module = _import_before_recorder(path, monkeypatch)
+    _started_now(monkeypatch)
+    loaded_source.record_unseen_modules()
+    assert module.__name__ in loaded_source.digests()
+
+    loaded_source.prune()
+
+    assert module.__name__ not in loaded_source.digests()
+    loaded_source.record_unseen_modules()
+    assert module.__name__ in loaded_source.digests(), "the next discovery records it again"
+
+
+def test_a_worker_logs_the_coordinators_reason_for_an_unseen_module(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The coordinator's record of a module it could not vouch for carries the reason, so the
+    worker whose stage uses the module says why the stage is not reused."""
+    name = "coordinator_only"
+    records = {name: f"{tmp_path / 'm.py'}\0\0its file changed after this process started"}
+    loaded_source.set_coordinator(records)
+
+    with caplog.at_level(logging.WARNING, logger="pivot.loaded_source"):
+        checked = loaded_source.check_stage(
+            {f"func:{name}.value": "h"}, set(), loaded_source._token_of(records), None
+        )
+
+    assert checked == ([], [name])
+    assert f"user module '{name}' compile" in caplog.text
+    assert "because its file changed after this process started" in caplog.text
+
+
+def test_process_start_is_never_after_the_process_started() -> None:
+    """A file changed after the process started must not count as unchanged since: the start
+    Pivot reads may be early, never late."""
+    before = time.time_ns()
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import time\nnow = time.time_ns()\nfrom pivot import loaded_source\n"
+            + "print(now, loaded_source._process_start_ns())",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    now, started = (int(field) for field in done.stdout.split())
+
+    assert before - loaded_source._CHANGE_TIME_SLACK_NS <= started <= now
+
+
+def test_a_forked_process_cannot_vouch_for_modules_its_parent_loaded() -> None:
+    """A process forked without exec holds the modules its parent imported before it started,
+    so its own start time says nothing about when they were compiled."""
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os\nfrom pivot import loaded_source\n"
+            + "assert loaded_source._process_start_ns() is not None\n"
+            + "pid = os.fork()\n"
+            + "if pid == 0:\n"
+            + "    os._exit(0 if loaded_source._process_start_ns() is None else 1)\n"
+            + "_, status = os.waitpid(pid, 0)\n"
+            + "raise SystemExit(os.waitstatus_to_exitcode(status))\n",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+
+
+def test_a_worker_judges_the_modules_it_imported_before_its_initializer(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A worker imports what `sitecustomize` or a `.pth` line imports before loky runs its
+    initializer, so `core._init_worker` judges those modules by discovery's rule: one whose file
+    changed after the worker started is unreadable there, with the reason. Run in a child
+    process, which the initializer's import hooks and signal handlers may change."""
+    path = tmp_path / "worker_preloaded.py"
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import os, pathlib, sys\nsys.path.insert(0, {str(tmp_path)!r})\n"
+            + f"pathlib.Path({str(path)!r}).write_text('VALUE = 1\\n')\n"
+            + "import worker_preloaded\nfrom pivot import loaded_source\n"
+            + "from pivot.executor import core\ncore._init_worker(os.getppid(), None, {})\n"
+            + "print(repr(loaded_source.digests()['worker_preloaded']))\n",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == repr(
+        f"{path.resolve()}\0\0its file changed after this process started"
+    )
+
+
+def _stage_info(func: object, coordinator: dict[str, str]) -> worker.WorkerStageInfo:
+    """The fields of a stage `worker._untrusted_modules` reads, sent with `coordinator`'s token."""
+    fields = cast(
+        "object",
+        {
+            "func": func,
+            "no_fingerprint": False,
+            "loaded_sources_token": loaded_source._token_of(coordinator),
+        },
+    )
+    return cast("worker.WorkerStageInfo", fields)
+
+
+def test_a_stage_checks_the_module_that_defines_it(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stage defined outside the project root reaches a worker by reference, so the worker
+    imports its module by name. Its manifest hashes its body under `self:`, which names no
+    module, so the module that defines it is what tells the worker that it holds other code than
+    the coordinator fingerprinted."""
+    path = tmp_path / "stage_module.py"
+    module = _load(path, "def stage():\n    return 'v2'\n", monkeypatch)
+    coordinator = {module.__name__: f"{path.resolve()}\0{'0' * 16}"}
+    loaded_source.set_coordinator(coordinator)
+
+    edited, _ = worker._untrusted_modules(
+        _stage_info(module.stage, coordinator),
+        {"self:stage": "h"},
+        worker._StageImports(covered=frozenset()),
+        tmp_path / "project",
+    )
+
+    assert edited == [module.__name__]
+
+
+def test_a_stage_checks_the_modules_it_imported_while_it_ran(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A module the stage imported while it ran, already loaded in the worker, is used even when
+    the stage's manifest hashes none of its code: the worker holding another version than the
+    coordinator makes the stage untrusted."""
+    stage_path = tmp_path / "stage_module.py"
+    stage_module = _load(stage_path, "def stage():\n    return 1\n", monkeypatch)
+    imported_path = tmp_path / "imported_module.py"
+    imported = _load(imported_path, "VALUE = 2\n", monkeypatch)
+    coordinator = {
+        stage_module.__name__: _text(stage_path, b"def stage():\n    return 1\n"),
+        imported.__name__: f"{imported_path.resolve()}\0{'0' * 16}",
+    }
+    loaded_source.set_coordinator(coordinator)
+
+    edited, _ = worker._untrusted_modules(
+        _stage_info(stage_module.stage, coordinator),
+        {},
+        worker._StageImports(covered=frozenset(), imported={imported.__name__}),
+        tmp_path,
+    )
+
+    assert edited == [imported.__name__]
