@@ -35,8 +35,19 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 | `remote:` | Remote index entries |
 | `remote_url:` | Remote URL tracking for change detection |
 | `fp:` | AST fingerprint/hash cache entries |
+| `pvtdir:` | `.pvt` walk memo: a directory's subdirectory and `.pvt` names under its stamp, by project-relative path (`track.py`) |
+| `pvtroot` | The project root the `pvtdir:` entries were listed under |
 
 **When adding new state types**, define a new prefix constant and document it here.
+
+## The `.pvt` Walk Memo
+
+`track.discover_pvt_files` must find every `.pvt` that `os.walk` over the project finds. Never prune it by directory name or by stage output: `track` and `import` accept paths under `.git`, `.pivot` and other pipelines' outputs. The memo makes an unchanged directory cost one `lstat` instead of a listing:
+
+- A listing is reused only when the directory's stamp (`st_dev`, `st_ino`, `st_mtime_ns`, `st_ctime_ns`) matches, its mtime and ctime are at least 2 s before the walk (a later change in the same timestamp tick would leave the stamp unchanged), and its mount type is on the allowlist read from `/proc/self/mountinfo`. A device mountinfo does not list (a btrfs subvolume reports its own) counts as btrfs only when the deepest mount holding the directory is btrfs.
+- It holds names only. Every `.pvt` found is read on every walk, since rewriting a file does not change its directory.
+- Only the repro/run pre-flight (`executor/core.py` `verify_tracked_files`) writes it. Every other caller only reads it; reading never creates the database, and a memo that cannot be read means every directory is listed.
+- The validity argument assumes the wall clock does not step back past a recorded stamp: on a filesystem with one-second timestamps, a change made while the clock was stepped back can keep its directory's stamp.
 
 ## LMDB Specifics
 

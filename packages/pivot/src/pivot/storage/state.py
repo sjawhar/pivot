@@ -34,6 +34,8 @@ _RUN_PREFIX = b"run:"  # Run history entries
 _RUNCACHE_PREFIX = b"runcache:"  # Run cache entries for skip detection
 _FP_PREFIX = b"fp:"  # AST fingerprint/hash cache entries
 _SM_PREFIX = b"sm:"  # Stage manifest cache entries
+_PVT_DIR_PREFIX = b"pvtdir:"  # .pvt walk memo: one directory's listing, by project-relative path
+_PVT_ROOT_KEY = b"pvtroot"  # The project root the pvtdir: entries were listed under
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024
@@ -53,6 +55,13 @@ class _SharedEnv(typing.TypedDict):
     env: lmdb.Environment | None
     identity: tuple[int, int, int, int]
     users: int
+
+
+class PvtDirMemo(typing.TypedDict):
+    """The .pvt walk's directory memo; ``storage/track.py`` owns the listing format."""
+
+    root: str | None  # Project root the listings were taken under; None when none is recorded
+    dirs: dict[str, bytes]  # Project-relative directory path ("" is the root) -> packed listing
 
 
 _FORK_DRAIN_TIMEOUT = 1.0
@@ -622,6 +631,57 @@ class StateDB:
                         break
                     results.append((bytes(key), bytes(value)))
         return results
+
+    # -------------------------------------------------------------------------
+    # .pvt walk directory memo (storage/track.py)
+    # -------------------------------------------------------------------------
+
+    def read_pvt_dir_memo(self) -> PvtDirMemo:
+        """Return the .pvt walk memo: its project root and every recorded directory listing."""
+        self._check_closed()
+        dirs = dict[str, bytes]()
+        with self._read_transaction() as txn:
+            root = txn.get(_PVT_ROOT_KEY)
+            cursor = txn.cursor()
+            if cursor.set_range(_PVT_DIR_PREFIX):
+                for key, value in cursor:
+                    if not key.startswith(_PVT_DIR_PREFIX):
+                        break
+                    dirs[os.fsdecode(key[len(_PVT_DIR_PREFIX) :])] = value
+        return PvtDirMemo(root=None if root is None else os.fsdecode(root), dirs=dirs)
+
+    def update_pvt_dir_memo(
+        self, previous: PvtDirMemo, root: str, dirs: dict[str, bytes], *, timeout: float
+    ) -> None:
+        """Make the memo hold exactly ``dirs``, listed under ``root``.
+
+        ``previous`` is the memo as read before the walk; only entries that differ from it are
+        written, and nothing is when none do. A path too long for an LMDB key is not recorded,
+        so the walk lists that directory every time. ``timeout`` bounds the wait for the write
+        lock, since the memo is worth less than the time a busy database would cost.
+        """
+        self._check_closed()
+        self._check_write_allowed()
+        puts = list[tuple[bytes, bytes]]()
+        for rel, listing in dirs.items():
+            key = _PVT_DIR_PREFIX + os.fsencode(rel)
+            if len(key) <= _MAX_KEY_SIZE and previous["dirs"].get(rel) != listing:
+                puts.append((key, listing))
+        deletes = [
+            _PVT_DIR_PREFIX + os.fsencode(rel) for rel in previous["dirs"] if rel not in dirs
+        ]
+        if previous["root"] == root and not puts and not deletes:
+            return
+        try:
+            with self._write_transaction(timeout=timeout) as txn:
+                if previous["root"] != root:
+                    txn.put(_PVT_ROOT_KEY, os.fsencode(root))
+                for key, listing in puts:
+                    txn.put(key, listing)
+                for key in deletes:
+                    txn.delete(key)
+        except lmdb.MapFullError as e:
+            raise DatabaseFullError(_DB_FULL_MSG) from e
 
     # -------------------------------------------------------------------------
     # Generation tracking for O(1) skip detection
