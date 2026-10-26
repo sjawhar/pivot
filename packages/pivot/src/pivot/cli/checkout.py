@@ -273,6 +273,7 @@ def _restore_path_locked(
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
                 raise ValueError(f"Unhandled checkout behavior: {behavior}")  # pyright: ignore[reportUnreachable]
 
+    restored = list[tuple[pathlib.Path, os.stat_result, str]]()
     success = cache.restore_from_cache(
         path,
         output_hash,
@@ -281,11 +282,12 @@ def _restore_path_locked(
         state_dir=state_dir,
         lock_token=lock_token,
         members=members,
+        recorded=restored,
     )
     if not success:
         return RestoreOutcome("missing", path.name, missing_files=total)
 
-    _save_file_hashes(hash_state_dir, cache.known_file_hashes(path, output_hash, members))
+    _save_file_hashes(hash_state_dir, restored)
     return RestoreOutcome("restored", path.name, restored_files=total)
 
 

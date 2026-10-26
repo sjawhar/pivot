@@ -154,7 +154,7 @@ def commit_stages(
             output_hashes_by_key = dict[str, HashInfo]()
             output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
             output_paths_by_identity = dict[types.ArtifactIdentity, str]()
-            file_hash_entries = list[tuple[str, int, int, int, str]]()
+            file_hash_entries = list[types.FileHashEntry]()
             outputs_missing = False
             for out in stage_outs:
                 identity_key = types.identity_key(out.identity)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pathlib
 from typing import TypedDict
 
@@ -8,7 +9,7 @@ import click
 from pivot import config, git, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
-from pivot.storage import cache, listing
+from pivot.storage import cache, listing, state
 from pivot.storage import track as track_mod
 
 
@@ -88,11 +89,13 @@ def _track_single_path(
     force: bool,
     *,
     warn_left_out_symlinks: bool,
+    read: list[tuple[pathlib.Path, os.stat_result, str]],
 ) -> TrackResult:
     """Track a single file or directory.
 
     ``warn_left_out_symlinks`` logs the warning naming the symlinks a tracked directory leaves
     out; the caller turns it off under ``--quiet``, like this command's other warning.
+    ``read`` receives the hash of each file read, for the caller to record in the StateDB.
 
     Returns:
         TrackResult with optional warning and the tracked path for the caller to handle output.
@@ -166,7 +169,7 @@ def _track_single_path(
     listing_data: bytes | None = None
     if path.is_dir():
         hashed = cache.hash_directory(
-            path, cache_dir=cache_dir, warn_left_out_symlinks=warn_left_out_symlinks
+            path, cache_dir=cache_dir, warn_left_out_symlinks=warn_left_out_symlinks, pending=read
         )
         for entry in hashed["listing"]["files"]:
             file_path = path / entry["relpath"]
@@ -183,8 +186,8 @@ def _track_single_path(
             nfiles=record["nfiles"],
         )
     else:
-        file_hash, _ = cache.hash_file(path)
-        file_size = path.stat().st_size
+        file_hash, file_stat = cache.hash_file(path, pending=read)
+        file_size = file_stat.st_size
         file_cache_path = cache.get_cache_path(cache_dir, file_hash)
         cache.copy_to_cache(path, file_cache_path)
 
@@ -239,6 +242,7 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
     # Discover existing .pvt files
     existing_tracked = track_mod.discover_pvt_files(project_root)
 
+    read = list[tuple[pathlib.Path, os.stat_result, str]]()
     for path_str in paths:
         result = _track_single_path(
             path_str,
@@ -247,8 +251,13 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
             existing_tracked,
             force,
             warn_left_out_symlinks=not quiet,
+            read=read,
         )
         if not quiet:
             if result["warning"]:
                 click.echo(result["warning"], err=True)
             click.echo(f"Tracked: {result['tracked_path']}")
+    # The hashes read to track, so the next status reads none of these files.
+    if read:
+        with state.StateDB(config.get_state_dir()) as state_db:
+            state_db.save_many(read)

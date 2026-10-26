@@ -1965,7 +1965,7 @@ class Engine:
         deps = stage_info["deps"]
         listing_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
 
-        def _save_file_hashes(entries: list[tuple[str, int, int, int, str]]) -> None:
+        def _save_file_hashes(entries: list[types.FileHashEntry]) -> None:
             """Record the file hashes this check read or restored, so the next one reads none."""
             if entries:
                 with state_mod.StateDB(stage_state_dir) as writable_db:
@@ -1974,7 +1974,7 @@ class Engine:
                     )
 
         def _use_outputs(state_db: state_mod.StateDB) -> _SkipOutcome:
-            file_hash_entries = list[tuple[str, int, int, int, str]]()
+            file_hash_entries = list[types.FileHashEntry]()
             if not restore:
                 checked = worker.restore_outputs_to_hashes(
                     store,
@@ -1998,6 +1998,7 @@ class Engine:
                 state_db,
                 state_dir=state_dir,
                 listing_lock=listing_lock,
+                file_hash_entries=file_hash_entries,
             )
             _save_file_hashes(file_hash_entries)
             return _SkipOutcome.SKIPPED if restored else _SkipOutcome.RUN
@@ -2446,8 +2447,9 @@ class Engine:
         ignored = git.ignored_paths(project_root, sorted(set(written)))
         if ignored:
             _logger.warning(
-                "git ignores %s, which pivot just wrote and which must be committed; add "
-                + "`!/stages/**` to .pivot/.gitignore",
+                "git ignores %s, which pivot just wrote and which must be committed: add "
+                + "`!/stages/**` to .pivot/.gitignore and make sure no other pattern ignores "
+                + ".pivot/ itself, or `git add -f` them",
                 ", ".join(project.to_relative_path(path, project_root) for path in ignored),
             )
 

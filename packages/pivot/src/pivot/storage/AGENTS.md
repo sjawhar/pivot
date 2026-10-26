@@ -18,11 +18,12 @@ Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not 
 
 ## File-Hash Write-Back
 
-Every command that writes the workspace records the hash of each file it reads, commits or restores, so `pivot status --explain` (read-only; it writes nothing) finds a matching entry and reads no file:
+Every command that writes the workspace records the hash of each file it reads, commits or restores, so `pivot status --explain` (read-only; it writes nothing) finds a matching entry and reads no file. The one exception is a run with `--no-commit`, which by design writes no lock, cache or StateDB entry. A new command that writes or reads workspace files must record them the same way:
 
 - `hash_file(..., pending=...)` and `hash_directory(..., pending=...)` append `(path, stat, hash)` for each file they had to read instead of saving it; a caller with a writable StateDB saves them with one `save_many`.
-- Workers open StateDB read-only. They collect entries for the dependencies and outputs they read, the outputs they commit and the outputs they restore in `DeferredWrites.file_hash_entries` (`(path, mtime_ns, size, inode, hash)` tuples, from `cache.deferred_file_hash_entries`), and the coordinator writes them after the stage. The coordinator's own skip check writes what it reads and restores.
-- `pivot checkout`, `pivot pull` and `pivot get` record each file they restore (`cache.known_file_hashes`) in the StateDB of the output's stage state directory.
+- A restore records each file with the stat of what it staged, taken before the rename puts it in place (the same inode): `cache.restore_from_cache(..., recorded=...)`, `cache.atomic_write_file`'s return value. A write that lands after the rename then changes the stat, so the entry does not vouch for it.
+- Workers open StateDB read-only. They hand back, in `DeferredWrites.file_hash_entries` (`(path, mtime_ns, size, dev, inode, hash)` tuples, `types.FileHashEntry`, from `cache.deferred_file_hash_entries`), the dependencies and outputs they read to decide (also when the stage is cached by lock comparison), the outputs they commit and the outputs they restore; the coordinator writes them after the stage. The coordinator's own skip check writes what it reads and restores.
+- `pivot checkout` (every mode, also the files `--only-missing` keeps or restores and the existing files it compares), `pivot pull`, `pivot get` (from the cache, from git or from the remote), `pivot import`, `pivot update`, `pivot track` and repro's restore of missing tracked files (`--checkout-missing`) record what they write or read. Stage outputs go in the StateDB of the output's stage state directory, which explanations read; everything else in the configured state directory.
 
 ## StateDB Key Prefixes
 
@@ -30,7 +31,7 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 
 | Prefix | Purpose |
 |--------|---------|
-| `hash:` | File content hashes (keyed by the absolute path as given, `os.fsencode(os.path.abspath(path))`; the value's `(mtime_ns, size, inode)` comes from `stat()`, which follows symlinks) |
+| `hash:` | File content hashes (keyed by the absolute path as given, `os.fsencode(os.path.abspath(path))`; the value's `(mtime_ns, size, dev, inode)` comes from `stat()`, which follows symlinks. No ctime: a new hard link changes it, so every hardlink checkout or hard-linked replica would invalidate its entries) |
 | `gen:` | Output generation counters (keyed by artifact identity, `stage` or `stage:key`) |
 | `dep:` | Stage dependency generations (`stage:dep_identity` → generation; one file of a directory output records its directory's identity) |
 | `runcache:` | Run cache entries (`stage:input_hash` → output hashes) |

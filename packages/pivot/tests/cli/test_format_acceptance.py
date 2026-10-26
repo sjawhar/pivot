@@ -18,8 +18,6 @@ import boto3
 import xxhash
 import yaml
 
-from pivot.storage import listing
-
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 _A = xxhash.xxh64(b"a").hexdigest()
 _RUN = xxhash.xxh64(b"#!/bin/sh\n").hexdigest()
@@ -641,34 +639,38 @@ with Pipeline("k") as pipeline:
 """
 
 
+# The members of `_helper_write_tree` as pivot 0.5.9 listed them inline in a lock or `.pvt`.
+_TREE_MANIFEST: list[dict[str, object]] = [
+    {"relpath": "a.txt", "hash": _A, "size": 1, "isexec": False},
+    {"relpath": "bin/run.sh", "hash": _RUN, "size": 10, "isexec": True},
+]
+_TREE_EMPTY_DIRS = ["empty"]
+_TREE_HASH_0_5_9 = xxhash.xxh64(
+    json.dumps(
+        {"empty_dirs": _TREE_EMPTY_DIRS, "manifest": _TREE_MANIFEST},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+).hexdigest()
+
+
 def _helper_rewrite_pvt_as_0_5_9(root: pathlib.Path, rel: str) -> str:
-    """Rewrite a tracked directory's .pvt the way pivot 0.5.9 wrote it, and return its text:
-    the files listed inline and hashed as JSON, with no .pvt.listing file beside it and no
-    listing object in the cache."""
+    """Rewrite the .pvt of a tracked `_helper_write_tree` the way pivot 0.5.9 wrote it, and
+    return its text: the files listed inline and hashed as JSON, with no .pvt.listing file
+    beside it and no listing object in the cache."""
     pvt_path = root / f"{rel}.pvt"
-    listing_path = root / f"{rel}.pvt{listing.SUFFIX}"
     data = yaml.safe_load(pvt_path.read_text())
-    members = listing.decode(listing_path.read_bytes())
-    manifest = [dict(entry) for entry in members["files"]]
-    hashed: object = (
-        {"empty_dirs": members["empty_dirs"], "manifest": manifest}
-        if members["empty_dirs"]
-        else manifest
-    )
     old = {
         "path": data["path"],
-        "hash": xxhash.xxh64(
-            json.dumps(hashed, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest(),
+        "hash": _TREE_HASH_0_5_9,
         "size": data["size"],
-        "num_files": len(manifest),
-        "manifest": manifest,
+        "num_files": len(_TREE_MANIFEST),
+        "manifest": _TREE_MANIFEST,
+        "empty_dirs": _TREE_EMPTY_DIRS,
     }
-    if members["empty_dirs"]:
-        old["empty_dirs"] = members["empty_dirs"]
     text = yaml.safe_dump(old, sort_keys=False)
     pvt_path.write_text(text)
-    listing_path.unlink()
+    (root / f"{rel}.pvt.listing").unlink()
     listing_object = root / ".pivot" / "cache" / "files" / data["hash"][:2] / data["hash"][2:]
     listing_object.unlink()
     return text
@@ -702,7 +704,7 @@ def test_a_directory_tracked_by_the_previous_release_is_seen_with_its_files_and_
     _helper_assert_tree(corpus)
     assert yaml.safe_load((root / "data" / "k" / "count.yaml").read_text()) == {"files": 2}
     assert (root / "data" / "raw" / "corpus.pvt").read_text() == old_text, "never rewritten"
-    assert not (root / "data" / "raw" / f"corpus.pvt{listing.SUFFIX}").exists()
+    assert not (root / "data" / "raw" / "corpus.pvt.listing").exists()
 
 
 # =============================================================================
@@ -710,23 +712,13 @@ def test_a_directory_tracked_by_the_previous_release_is_seen_with_its_files_and_
 # =============================================================================
 
 
-def _helper_old_directory_entry(entry: dict[str, object], data: bytes) -> dict[str, object]:
-    """A schema-3 directory entry as pivot 0.5.9 wrote it: its files listed inline and the
-    directory hashed as JSON."""
-    members = listing.decode(data)
-    manifest = [dict(member) for member in members["files"]]
-    hashed: object = (
-        {"empty_dirs": members["empty_dirs"], "manifest": manifest}
-        if members["empty_dirs"]
-        else manifest
-    )
+def _helper_old_directory_entry(entry: dict[str, object]) -> dict[str, object]:
+    """A schema-3 entry for a `_helper_write_tree` directory as pivot 0.5.9 wrote it: its
+    files listed inline and the directory hashed as JSON."""
     old = {k: v for k, v in entry.items() if k not in ("size", "nfiles")}
-    old["hash"] = xxhash.xxh64(
-        json.dumps(hashed, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    old["manifest"] = manifest
-    if members["empty_dirs"]:
-        old["empty_dirs"] = members["empty_dirs"]
+    old["hash"] = _TREE_HASH_0_5_9
+    old["manifest"] = _TREE_MANIFEST
+    old["empty_dirs"] = _TREE_EMPTY_DIRS
     return old
 
 
@@ -739,14 +731,8 @@ def test_get_restores_a_directory_from_a_revision_whose_lock_an_older_pivot_wrot
     lock_path = root / ".pivot" / "stages" / "t" / "copy.lock"
     data = yaml.safe_load(lock_path.read_text())
     data["schema_version"] = 2
-    data["deps"] = [
-        _helper_old_directory_entry(entry, (root / _INPUT_LISTING).read_bytes())
-        for entry in data["deps"]
-    ]
-    data["outs"] = [
-        _helper_old_directory_entry(entry, (root / _OUTPUT_LISTING).read_bytes())
-        for entry in data["outs"]
-    ]
+    data["deps"] = [_helper_old_directory_entry(entry) for entry in data["deps"]]
+    data["outs"] = [_helper_old_directory_entry(entry) for entry in data["outs"]]
     lock_path.write_text(yaml.safe_dump(data, sort_keys=False))
     (root / _OUTPUT_LISTING).unlink()
     (root / ".gitignore").write_text("/data/t/\n__pycache__/\n")

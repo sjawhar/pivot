@@ -11,10 +11,11 @@ import yaml
 
 from pivot import exceptions, project, types
 from pivot.cli import checkout
-from pivot.storage import cache, listing, lock, restore, track
+from pivot.storage import cache, listing, lock, restore, state, track
 from pivot.types import DirHash, DirManifestEntry, FileHash
 
 if TYPE_CHECKING:
+    import os
     import pathlib
     from multiprocessing.synchronize import Event
 
@@ -104,11 +105,11 @@ def _hold_checkout_restore(
         executable: bool = False,
         staging_path: pathlib.Path | None = None,
         keep_existing_copy: bool = False,
-    ) -> None:
+    ) -> os.stat_result:
         _ = staging_path
         started.set()
         assert release.wait(10)
-        original_checkout(
+        return original_checkout(
             target,
             source,
             checkout_modes,
@@ -1355,7 +1356,7 @@ def test_restore_file_from_remote_hash_mismatch(
 def test_restore_file_from_remote_success(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Remote content is restored and cached successfully."""
+    """Remote content is restored, cached, and its hash recorded for the next status."""
     repo_path, commit = git_repo
 
     # Set up directories
@@ -1394,3 +1395,7 @@ def test_restore_file_from_remote_success(
 
     assert success
     assert output_path.read_bytes() == content
+    with state.StateDB(repo_path / ".pivot", readonly=True) as state_db:
+        assert state_db.get(output_path, output_path.stat()) == file_hash, (
+            "The fetched file's hash is recorded"
+        )

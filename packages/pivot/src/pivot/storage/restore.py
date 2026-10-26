@@ -250,8 +250,9 @@ def _verify_content_hash(content: bytes, expected_hash: str) -> bool:
     return actual_hash == expected_hash
 
 
-def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> None:
-    """Atomically replace a cache-miss target under the cache restore lock."""
+def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> os.stat_result:
+    """Atomically replace a cache-miss target under the cache restore lock; return the written
+    file's stat, taken before it replaced the target."""
 
     def write_content(fd: int) -> None:
         with os.fdopen(fd, "wb") as file:
@@ -261,7 +262,16 @@ def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> None:
         staging_path = (
             cache.restore_staging_path(dest_path, lock_token) if lock_token is not None else None
         )
-        cache.atomic_write_file(dest_path, write_content, staging_path=staging_path)
+        return cache.atomic_write_file(dest_path, write_content, staging_path=staging_path)
+
+
+def _record_file_hashes(
+    state_dir: pathlib.Path | None, entries: list[tuple[pathlib.Path, os.stat_result, str]]
+) -> None:
+    """Record the hashes of files ``get`` wrote, so the next status, explanation or run looks
+    them up instead of reading the files."""
+    with state.StateDB(state_dir or config.get_state_dir()) as state_db:
+        state_db.save_many(entries)
 
 
 def restore_file(
@@ -306,6 +316,7 @@ def restore_file(
             should_try_cache = cached_path.exists()
 
         if should_try_cache:
+            restored = list[tuple[pathlib.Path, os.stat_result, str]]()
             try:
                 success = cache.restore_from_cache(
                     dest_path,
@@ -314,13 +325,13 @@ def restore_file(
                     checkout_modes=checkout_modes,
                     state_dir=config.get_state_dir(),
                     members=members,
+                    recorded=restored,
                 )
             except OSError as e:
                 logger.debug(f"Cache restore failed for {rel_path}: {e}")
                 success = False
             if success:
-                with state.StateDB(hash_state_dir or config.get_state_dir()) as state_db:
-                    state_db.save_many(cache.known_file_hashes(dest_path, output_hash, members))
+                _record_file_hashes(hash_state_dir, restored)
                 return RestoreResult(
                     status=RestoreStatus.RESTORED,
                     path=path_str,
@@ -331,18 +342,21 @@ def restore_file(
     content = git.read_file_from_revision(rel_path, rev)
     if content is not None:
         try:
-            _write_fallback_content(dest_path, content)
-            return RestoreResult(
-                status=RestoreStatus.RESTORED,
-                path=path_str,
-                message=f"Restored: {dest_path} (from git)",
-            )
+            written = _write_fallback_content(dest_path, content)
         except OSError as e:
             return RestoreResult(
                 status=RestoreStatus.ERROR,
                 path=path_str,
                 message=f"Error: {dest_path} - failed to write from git: {e}",
             )
+        _record_file_hashes(
+            hash_state_dir, [(dest_path, written, xxhash.xxh64(content).hexdigest())]
+        )
+        return RestoreResult(
+            status=RestoreStatus.RESTORED,
+            path=path_str,
+            message=f"Restored: {dest_path} (from git)",
+        )
 
     # Strategy 3: Try remote fallback (if hash available)
     if output_hash is not None and not is_dir_hash(output_hash):
@@ -360,7 +374,7 @@ def restore_file(
                     ),
                 )
             try:
-                _write_fallback_content(dest_path, remote_content)
+                written = _write_fallback_content(dest_path, remote_content)
             except OSError as e:
                 return RestoreResult(
                     status=RestoreStatus.ERROR,
@@ -377,8 +391,7 @@ def restore_file(
                     _ = cache.publish_cache_object(staged, cached_path)
             except OSError:
                 pass  # Caching failure is non-fatal
-            with state.StateDB(hash_state_dir or config.get_state_dir()) as state_db:
-                state_db.save_many([(dest_path, dest_path.stat(), file_hash)])
+            _record_file_hashes(hash_state_dir, [(dest_path, written, file_hash)])
             return RestoreResult(
                 status=RestoreStatus.RESTORED,
                 path=path_str,

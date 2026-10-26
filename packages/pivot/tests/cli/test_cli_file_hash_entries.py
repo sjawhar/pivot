@@ -1,8 +1,9 @@
 """Every command that leaves a stage output on disk records each file's hash in the StateDB.
 
 `pivot status --explain` and `status.get_pipeline_explanations` open the StateDB read-only and
-look each file up by its (mtime_ns, size, inode). A file with no matching entry is read again on
-every call (Dispatch BET-237), so each command that writes or checks an output records it.
+look each file up by its (mtime_ns, size, device, inode). A file with no matching entry is read
+again on every call (Dispatch BET-237), so each command that writes or checks an output records
+it.
 The tests drive the installed `pivot` binary, as a user does.
 """
 
@@ -175,16 +176,19 @@ def test_repro_records_the_hashes_its_skip_check_reads(tmp_path: pathlib.Path) -
     assert _helper_unrecorded(root) == [], "Every file the skip check read is recorded"
 
 
-def test_pull_into_a_fresh_clone_records_every_file_hash(
-    tmp_path: pathlib.Path, moto_services: dict[str, str]
-) -> None:
-    """`pivot pull` into a clone that has never run the pipeline records each file it writes."""
-    env = _env(
+def _helper_s3_env(moto_services: dict[str, str]) -> dict[str, str]:
+    return _env(
         AWS_ENDPOINT_URL=moto_services["s3"],
         AWS_ACCESS_KEY_ID="x",
         AWS_SECRET_ACCESS_KEY="x",
         AWS_DEFAULT_REGION="us-east-1",
     )
+
+
+def _helper_push_to_new_bucket(
+    root: pathlib.Path, moto_services: dict[str, str], env: dict[str, str]
+) -> None:
+    """Point the project's default remote at a new moto bucket and push its cache there."""
     bucket = f"hash-entries-{uuid.uuid4().hex[:8]}"
     s3 = boto3.client(
         "s3",
@@ -194,10 +198,18 @@ def test_pull_into_a_fresh_clone_records_every_file_hash(
         aws_secret_access_key="x",
     )
     s3.create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+    _ok(_pivot(root, "config", "set", "remotes.origin", f"s3://{bucket}/cache", env=env))
+    _ok(_pivot(root, "config", "set", "default_remote", "origin", env=env))
+    _ok(_pivot(root, "push", env=env))
+
+
+def test_pull_into_a_fresh_clone_records_every_file_hash(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """`pivot pull` into a clone that has never run the pipeline records each file it writes."""
+    env = _helper_s3_env(moto_services)
     src = _helper_project(tmp_path / "src", env)
-    _ok(_pivot(src, "config", "set", "remotes.origin", f"s3://{bucket}/cache", env=env))
-    _ok(_pivot(src, "config", "set", "default_remote", "origin", env=env))
-    _ok(_pivot(src, "push", env=env))
+    _helper_push_to_new_bucket(src, moto_services, env)
     _helper_commit(src, "remote")
     clone = (tmp_path / "clone").resolve()
     subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
@@ -206,3 +218,131 @@ def test_pull_into_a_fresh_clone_records_every_file_hash(
 
     assert _helper_unrecorded(clone) == [], "Every pulled file's hash is recorded"
     assert "0 will run" in _ok(_pivot(clone, "status", "--explain", env=env))
+
+
+def test_checkout_of_an_existing_output_records_what_it_read(tmp_path: pathlib.Path) -> None:
+    """Checkout reads an output already on disk to tell whether it matches its lock, and
+    records what it read, so the next explanation reads none of it."""
+    root = _helper_project(tmp_path / "project")
+    cache.remove_output(root / ".pivot" / "state.lmdb")
+
+    out = _ok(_pivot(root, "checkout"))
+
+    assert "Skipped" in out, out
+    assert _helper_unrecorded(root) == [], "Every file checkout compared is recorded"
+
+
+def test_checkout_records_in_the_stage_state_directory_explain_reads(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With ``core.state_dir`` set elsewhere, a stage still keeps its state in ``.pivot``,
+    and explanations look its outputs up there, so that is where checkout records them."""
+    root = _helper_project(tmp_path / "project")
+    _ok(_pivot(root, "config", "set", "core.state_dir", ".state"))
+    _helper_delete_output(root)
+
+    _ok(_pivot(root, "checkout", "--checkout-mode", "copy"))
+
+    assert _helper_unrecorded(root) == [], "Every restored file's hash is in the stage StateDB"
+
+
+# One stage reading one raw input and writing one file: nothing else reads its output, so only
+# the stage's own skip check can record it.
+_INPUT_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def shout(raw: str) -> str:
+    return raw.upper()
+
+
+with Pipeline("inp") as pipeline:
+    shout(pipeline.input("words.txt", t=str))
+"""
+_INPUT = pathlib.Path("data", "raw", "words.txt")
+_SHOUT = pathlib.Path("data", "inp", "shout.txt")
+
+
+def _helper_input_project(root: pathlib.Path, env: dict[str, str] | None = None) -> pathlib.Path:
+    root.mkdir(parents=True)
+    root = root.resolve()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    _ok(_pivot(root, "init", env=env))
+    (root / "pipeline.py").write_text(_INPUT_PIPELINE)
+    (root / ".gitignore").write_text("/data/\n__pycache__/\n")
+    (root / _INPUT).parent.mkdir(parents=True)
+    (root / _INPUT).write_text("hello\n")
+    _ok(_pivot(root, "repro", env=env))
+    _helper_commit(root, "run")
+    return root
+
+
+def _helper_recorded(root: pathlib.Path, path: pathlib.Path) -> bool:
+    """Whether the project's StateDB holds ``path``'s content hash at its current stat."""
+    with state.StateDB(root / ".pivot", readonly=True) as state_db:
+        found = state_db.get(path, path.stat())
+    return found == xxhash.xxh64(path.read_bytes()).hexdigest()
+
+
+def test_coordinator_skip_check_records_the_dependency_and_output_it_read(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With no file hash recorded, repro's skip check reads the stage's input to compare it
+    with the lock, then its output to check it is intact; it records both."""
+    root = _helper_input_project(tmp_path / "project")
+    cache.remove_output(root / ".pivot" / "state.lmdb")
+
+    out = _ok(_pivot(root, "repro"))
+
+    assert "0 ran" in out, out
+    assert _helper_recorded(root, root / _INPUT), "The dependency read to decide is recorded"
+    assert _helper_recorded(root, root / _SHOUT), "The output checked is recorded"
+
+
+def test_coordinator_restore_records_the_output_it_restored(tmp_path: pathlib.Path) -> None:
+    """A skip check that finds the output gone restores it from the cache under a write lock,
+    and records the restored file."""
+    root = _helper_input_project(tmp_path / "project")
+    cache.remove_output(root / ".pivot" / "state.lmdb")
+    (root / _SHOUT).unlink()
+
+    out = _ok(_pivot(root, "repro"))
+
+    assert "0 ran" in out, out
+    assert (root / _SHOUT).read_text() == "HELLO\n"
+    assert _helper_recorded(root, root / _SHOUT), "The restored output is recorded"
+
+
+def test_get_from_git_records_the_file_it_wrote(tmp_path: pathlib.Path) -> None:
+    """`pivot get` of a file git holds writes it from the revision and records it."""
+    root = _helper_input_project(tmp_path / "project")
+    notes = root / "notes.txt"
+    notes.write_text("committed notes\n")
+    _helper_commit(root, "notes")
+    notes.unlink()
+
+    out = _ok(_pivot(root, "get", "--rev", "HEAD", "notes.txt"))
+
+    assert "(from git)" in out, out
+    assert _helper_recorded(root, notes), "The file written from git is recorded"
+
+
+def test_track_and_repro_checkout_missing_record_the_tracked_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot track` records the hash it read, and repro's restore of a missing tracked file
+    (``--checkout-missing``) records the file it restored."""
+    root = _helper_input_project(tmp_path / "project")
+    tracked = root / "notes.txt"
+    tracked.write_text("tracked notes\n")
+
+    _ok(_pivot(root, "track", "notes.txt"))
+    assert _helper_recorded(root, tracked), "track records the hash it read"
+
+    tracked.unlink()
+    cache.remove_output(root / ".pivot" / "state.lmdb")
+    _ok(_pivot(root, "repro", "--checkout-missing"))
+
+    assert tracked.read_text() == "tracked notes\n"
+    assert _helper_recorded(root, tracked), "The restored tracked file is recorded"

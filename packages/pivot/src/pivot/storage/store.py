@@ -289,7 +289,10 @@ class WorkspaceStore:
         state_dir: pathlib.Path | None = None,
         checkout_modes: list[config.CheckoutMode] | None = None,
         members: listing.DirListing | None = None,
+        recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
     ) -> bool:
+        """Restore ``ref`` from the cache; ``recorded`` is as ``cache.restore_from_cache``
+        says."""
         if self._cache_dir is None:
             return False
         if ref.tag is types.ArtifactTag.METRIC:
@@ -302,6 +305,7 @@ class WorkspaceStore:
             checkout_modes=checkout_modes if checkout_modes is not None else self._checkout_modes,
             state_dir=state_dir,
             members=members,
+            recorded=recorded,
         )
 
     def hash_artifact(

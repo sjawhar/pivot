@@ -60,6 +60,7 @@ from pivot.storage import store as store_mod
 from pivot.types import (
     DeferredWrites,
     FileHash,
+    FileHashEntry,
     HashInfo,
     LockData,
     LogMessage,
@@ -709,7 +710,7 @@ def _make_result(
     reason: str,
     ring_buffer: _OutputRingBuffer,
     input_hash: str | None = None,
-    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
 ) -> StageResult:
     """Build StageResult with collected metrics for cross-process transfer."""
     result = StageResult(
@@ -817,7 +818,7 @@ def _execute_stage(
                                 lock_data["dep_hashes"],
                                 stage_outs,
                             )
-                            restored_entries = list[tuple[str, int, int, int, str]]()
+                            restored_entries = list[FileHashEntry]()
                             restoration = restore_outputs_to_hashes(
                                 store,
                                 stage_outs,
@@ -826,6 +827,7 @@ def _execute_stage(
                                 state_dir=project_state_dir,
                                 listing_lock=production_lock,
                                 report_changes=True,
+                                file_hash_entries=restored_entries,
                             )
                             if restoration.available:
                                 return _make_result(
@@ -874,7 +876,7 @@ def _execute_stage(
                         run_reason = "forced"
 
                     if skip_reason is not None and lock_data is not None:
-                        restored_entries = list[tuple[str, int, int, int, str]]()
+                        restored_entries = list[FileHashEntry]()
                         restoration = restore_outputs_to_hashes(
                             store,
                             stage_outs,
@@ -883,14 +885,16 @@ def _execute_stage(
                             state_dir=project_state_dir,
                             listing_lock=production_lock,
                             report_changes=True,
+                            file_hash_entries=restored_entries,
                         )
                         if restoration.available:
+                            # The dependencies read to decide, and the outputs read or restored
                             return _make_result(
                                 StageStatus.CACHED,
                                 skip_reason,
                                 ring_buffer,
                                 input_hash=input_hash,
-                                file_hash_entries=restored_entries,
+                                file_hash_entries=file_hash_entries + restored_entries,
                             )
                         run_reason = _OUTPUTS_UNUSABLE
 
@@ -1176,7 +1180,7 @@ def restore_outputs_to_hashes(
     listing_lock: lock.StageLock | None = None,
     restore: bool = True,
     report_changes: Literal[False] = False,
-    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
 ) -> bool: ...
 
 
@@ -1191,7 +1195,7 @@ def restore_outputs_to_hashes(
     listing_lock: lock.StageLock | None = None,
     restore: bool = True,
     report_changes: Literal[True],
-    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
 ) -> OutputRestoreResult: ...
 
 
@@ -1205,7 +1209,7 @@ def restore_outputs_to_hashes(
     listing_lock: lock.StageLock | None = None,
     restore: bool = True,
     report_changes: bool = False,
-    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
 ) -> bool | OutputRestoreResult:
     """Verify outputs match recorded hashes and restore cacheable mismatches.
 
@@ -1257,16 +1261,17 @@ def restore_outputs_to_hashes(
                     to_restore.append(ref)
                     if not restore:
                         continue
+                    restored = list[tuple[pathlib.Path, os.stat_result, str]]()
                     if store.restore_from_cache(
-                        ref, expected_hash, state_dir=state_dir, members=members
+                        ref,
+                        expected_hash,
+                        state_dir=state_dir,
+                        members=members,
+                        recorded=restored,
                     ):
                         outputs_restored = True
                         if file_hash_entries is not None:
-                            file_hash_entries.extend(
-                                cache.deferred_file_hash_entries(
-                                    cache.known_file_hashes(output_path, expected_hash, members)
-                                )
-                            )
+                            file_hash_entries.extend(cache.deferred_file_hash_entries(restored))
                         continue
             unavailable.append(ref)
             if restore:
@@ -1939,7 +1944,7 @@ def hash_dependencies(
     state_db: state.StateDB | None = None,
     *,
     hashed_dirs: dict[str, listing.HashedDirectory] | None = None,
-) -> tuple[dict[str, HashInfo], list[str], list[str], list[tuple[str, int, int, int, str]]]:
+) -> tuple[dict[str, HashInfo], list[str], list[str], list[FileHashEntry]]:
     """Hash all dependencies and collect file-hash cache write-backs.
 
     With a read-only (or no) ``state_db``, the write-backs are the StateDB file-hash entries of
@@ -2109,7 +2114,7 @@ def _commit_lock_and_build_deferred(
     store: store_mod.Store,
     hashed_dirs: Mapping[str, listing.HashedDirectory],
     reusable: bool = True,
-    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
     increment_outputs: bool = True,
 ) -> DeferredWrites:
     """Commit lock file and build deferred writes for StateDB.
@@ -2142,7 +2147,7 @@ def _build_deferred_writes(
     state_db: state.StateDB,
     *,
     reusable: bool = True,
-    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
     increment_outputs: bool = True,
 ) -> DeferredWrites:
     """Build deferred writes for coordinator to apply.
@@ -2207,7 +2212,7 @@ class RunCacheSkipResult(TypedDict):
 
     output_hashes: dict[str, HashInfo]
     outputs_restored: bool
-    file_hash_entries: list[tuple[str, int, int, int, str]]
+    file_hash_entries: list[FileHashEntry]
 
 
 def _try_skip_via_run_cache_with_store(
@@ -2236,7 +2241,7 @@ def _try_skip_via_run_cache_with_store(
         return None
     identity_hashes = _to_identity_hashes(output_hashes)
 
-    restored_entries = list[tuple[str, int, int, int, str]]()
+    restored_entries = list[FileHashEntry]()
     restoration = restore_outputs_to_hashes(
         store,
         stage_outs,
