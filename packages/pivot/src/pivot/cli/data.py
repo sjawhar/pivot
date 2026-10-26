@@ -150,7 +150,7 @@ def diff(
     "-o",
     type=click.Path(path_type=pathlib.Path),
     default=None,
-    help="Output path for single file target (incompatible with multiple targets or stage names)",
+    help="Output path when the targets name a single file (one target with one output)",
 )
 @click.option(
     "--checkout-mode",

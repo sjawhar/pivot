@@ -11,6 +11,8 @@ import json
 import os
 import pathlib
 import py_compile
+import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1177,6 +1179,280 @@ def test_get_reports_prior_cache_restore_when_remote_is_unconfigured(
     assert "first.txt (from cache)" in out
     assert (root / "first.txt").read_text() == "first\n"
     assert "No remotes configured." in out
+
+
+_BAD_S3_ENVS = [
+    pytest.param({"AWS_PROFILE": "pivot-test-no-such-profile"}, id="missing-profile"),
+    pytest.param(
+        {"AWS_ENDPOINT_URL": "not-a-url", "AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "x"},
+        id="invalid-endpoint",
+    ),
+]
+
+
+def _bad_s3_env(tmp_path: pathlib.Path, extra: dict[str, str]) -> dict[str, str]:
+    """An environment in which pivot cannot set up S3 access for the reason ``extra`` gives, with
+    no AWS config or profile from the host to fall back to."""
+    empty = tmp_path / "empty-aws-config"
+    empty.write_text("")
+    env = {k: v for k, v in _env().items() if k not in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE")}
+    env.update(
+        AWS_CONFIG_FILE=str(empty),
+        AWS_SHARED_CREDENTIALS_FILE=str(empty),
+        AWS_DEFAULT_REGION="us-east-1",
+        **extra,
+    )
+    return env
+
+
+def _tracked_pair_with_second_uncached(tmp_path: pathlib.Path) -> pathlib.Path:
+    """A project with an S3 remote, tracking first.txt and second.txt, both deleted from the
+    workspace and second.txt also deleted from the cache."""
+    root = _project(
+        tmp_path,
+        {
+            ".gitignore": "first.txt\nsecond.txt\n",
+            "first.txt": "first\n",
+            "second.txt": "second\n",
+        },
+    )
+    _ok(_pivot(root, "config", "set", "remotes.origin", "s3://bucket-a/cache"))
+    _ok(_pivot(root, "track", "first.txt", "second.txt"))
+    second_hash, _ = cache.hash_file(root / "second.txt")
+    _commit(root, "track files")
+    (root / "first.txt").unlink()
+    (root / "second.txt").unlink()
+    cache.get_cache_path(root / ".pivot" / "cache" / "files", second_hash).unlink()
+    return root
+
+
+@pytest.mark.parametrize("bad_env", _BAD_S3_ENVS)
+def test_get_reports_prior_cache_restore_when_the_remote_backend_cannot_start(
+    tmp_path: pathlib.Path, bad_env: dict[str, str]
+) -> None:
+    """A remote whose S3 client cannot start fails only the target that needs it: the earlier
+    cache restore is still reported."""
+    root = _tracked_pair_with_second_uncached(tmp_path)
+
+    proc = _pivot(
+        root, "get", "--rev", "HEAD", "first.txt", "second.txt", env=_bad_s3_env(tmp_path, bad_env)
+    )
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "first.txt (from cache)" in out, out
+    assert (root / "first.txt").read_text() == "first\n"
+    assert "second.txt - failed to download from remote" in out, out
+    assert "Cannot set up S3 access for s3://bucket-a/cache" in out, out
+    assert not (root / "second.txt").exists()
+
+
+@pytest.mark.parametrize("bad_env", _BAD_S3_ENVS)
+def test_pull_reports_a_remote_backend_that_cannot_start_as_a_remote_error(
+    tmp_path: pathlib.Path, bad_env: dict[str, str]
+) -> None:
+    """pull shows an S3 client that cannot start as a pivot remote error with its tip, not as
+    the raw botocore exception."""
+    root = _tracked_pair_with_second_uncached(tmp_path)
+
+    proc = _pivot(root, "pull", "second.txt", env=_bad_s3_env(tmp_path, bad_env))
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "Cannot set up S3 access for s3://bucket-a/cache" in out, out
+    assert "Tip: Check network connection and remote credentials" in out, out
+    assert not (root / "second.txt").exists()
+
+
+def test_symlink_checkout_repairs_stale_bytes_in_a_complete_unmarked_tree(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An unmarked SYMLINK cache tree that holds every recorded file at its recorded size, one
+    with stale bytes, is checked by content before a restore links it into the workspace."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIROUT_PIPELINE,
+            "data/raw/t.csv": "a,b\n5,6\n7,8\n",
+            ".gitignore": "/data/d/\n__pycache__/\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    output_hash = yaml.safe_load((root / ".pivot" / "stages" / "d" / "shards.lock").read_text())[
+        "outs"
+    ][0]
+    cache_dir = root / ".pivot" / "cache" / "files"
+    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+    assert not tree.exists(), "hardlink mode should build no tree"
+    tree.mkdir(parents=True)
+    for entry in output_hash["manifest"]:
+        (tree / entry["relpath"]).write_bytes(
+            cache.get_cache_path(cache_dir, entry["hash"]).read_bytes()
+        )
+    (tree / "0.txt").write_text("xx")  # stale, the size of "11"
+    shards = root / "data" / "d" / "shards.dat"
+    shutil.rmtree(shards)
+
+    proc = _pivot(root, "checkout", "--checkout-mode", "symlink", "d/shards")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (shards / "0.txt").read_text() == "11"
+    assert (shards / "1.txt").read_text() == "15"
+
+
+def test_symlink_checkout_through_an_unrepairable_stale_tree_writes_nothing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An unmarked SYMLINK tree with a stale member whose own cache object is gone cannot be
+    repaired: checkout fails and leaves the workspace without the output, rather than linking
+    the stale bytes."""
+    root = _project(
+        tmp_path,
+        {
+            "pipeline.py": _DIROUT_PIPELINE,
+            "data/raw/t.csv": "a,b\n5,6\n7,8\n",
+            ".gitignore": "/data/d/\n__pycache__/\n",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    output_hash = yaml.safe_load((root / ".pivot" / "stages" / "d" / "shards.lock").read_text())[
+        "outs"
+    ][0]
+    cache_dir = root / ".pivot" / "cache" / "files"
+    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+    tree.mkdir(parents=True)
+    for entry in output_hash["manifest"]:
+        (tree / entry["relpath"]).write_bytes(
+            cache.get_cache_path(cache_dir, entry["hash"]).read_bytes()
+        )
+    (tree / "0.txt").write_text("xx")  # stale, the size of "11"
+    stale_entry = next(e for e in output_hash["manifest"] if e["relpath"] == "0.txt")
+    cache.get_cache_path(cache_dir, stale_entry["hash"]).unlink()
+    shards = root / "data" / "d" / "shards.dat"
+    shutil.rmtree(shards)
+
+    proc = _pivot(root, "checkout", "--checkout-mode", "symlink", "d/shards")
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert not shards.exists() and not shards.is_symlink()
+
+
+_ALIVE_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def alive() -> str:
+    return "alive"
+
+
+with Pipeline("a") as pipeline:
+    alive()
+"""
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param(("status", "--remote"), id="status"),
+        pytest.param(("verify", "--allow-missing"), id="verify"),
+        pytest.param(("pull",), id="pull"),
+        pytest.param(("get", "--rev", "HEAD", "a/alive"), id="get"),
+    ],
+)
+def test_multi_remote_advice_names_an_option_the_command_takes(
+    tmp_path: pathlib.Path, args: tuple[str, ...]
+) -> None:
+    """With two remotes and no default, every command that reports it tells the user how to
+    pick a remote, and each command the advice names takes the option it names."""
+    root = _project(tmp_path, {"pipeline.py": _ALIVE_PIPELINE, ".gitignore": "/data/\n"})
+    _ok(_pivot(root, "repro"))
+    _commit(root, "alive")
+    (root / "data" / "a" / "alive.txt").unlink()
+    for obj in list((root / ".pivot" / "cache" / "files").rglob("*")):
+        if obj.is_file() and not obj.name.startswith("."):
+            obj.unlink()  # `get` must reach its remote fallback
+    _ok(_pivot(root, "config", "set", "remotes.origin", "s3://bucket-a/cache"))
+    _ok(_pivot(root, "config", "set", "remotes.backup", "s3://bucket-b/cache"))
+
+    proc = _pivot(root, *args)
+    out = " ".join((proc.stdout + proc.stderr).split())
+
+    assert proc.returncode != 0, out
+    assert "multiple remotes configured" in out, out
+    assert "pivot config set default_remote <name>" in out, out
+    advice = re.search(r"Pass (--[\w-]+) <name> to (.+?), or run", out)
+    assert advice is not None, out
+    option = advice.group(1)
+    for command in re.split(r", | or ", advice.group(2)):
+        help_text = " ".join(_ok(_pivot(root, command, "--help")).split())
+        assert f"{option} TEXT" in help_text, (
+            f"the advice names `pivot {command} {option} <name>`, which it does not take:\n{out}"
+        )
+
+
+_DEMO_TRAIN_PIPELINE = """\
+import pandas as pd
+
+from pivot import Pipeline, stage
+
+
+@stage
+def train() -> pd.DataFrame:
+    return pd.DataFrame({"score": [0.25, 0.75]})
+
+
+with Pipeline("demo") as pipeline:
+    train()
+"""
+
+
+def test_documented_get_from_a_specific_remote_example_runs(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """docs/cli/index.md's `pivot get` example "Get from a specific remote" works as written in
+    a project where demo/train writes data/demo/train.jsonl, the path Pivot gives it."""
+    docs = (pathlib.Path(__file__).parents[4] / "docs" / "cli" / "index.md").read_text()
+    example = re.search(r"# Get from a specific remote\n(pivot get [^\n]+)\n", docs)
+    assert example is not None, "the example is gone from docs/cli/index.md"
+    argv = shlex.split(example.group(1))[1:]
+
+    endpoint = moto_services["s3"]
+    env = _env(
+        AWS_ENDPOINT_URL=endpoint,
+        AWS_ACCESS_KEY_ID="x",
+        AWS_SECRET_ACCESS_KEY="x",
+        AWS_DEFAULT_REGION="us-east-1",
+    )
+    bucket = f"docs-{uuid.uuid4().hex[:8]}"
+    boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",
+    ).create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+    root = _project(tmp_path, {"pipeline.py": _DEMO_TRAIN_PIPELINE, ".gitignore": "/data/\n"})
+    _ok(_pivot(root, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    _ok(_pivot(root, "repro", env=env))
+    output = root / "data" / "demo" / "train.jsonl"
+    assert output.exists(), "demo/train's output path changed; update this test's premise"
+    expected = output.read_bytes()
+    _ok(_pivot(root, "push", env=env))
+    _commit(root, "train")
+    rev = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    output.unlink()
+    for obj in list((root / ".pivot" / "cache" / "files").rglob("*")):
+        if obj.is_file() and not obj.name.startswith("."):
+            obj.unlink()
+
+    argv = [rev if arg == "abc123" else arg for arg in argv]
+    proc = _pivot(root, *argv, env=env)
+
+    assert proc.returncode == 0, f"pivot {' '.join(argv)}\n{proc.stdout}{proc.stderr}"
+    assert output.read_bytes() == expected
 
 
 def test_pull_replaces_directory_output_after_teammate_rerun(

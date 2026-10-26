@@ -415,6 +415,8 @@ def restore_targets_from_revision(
 
     results = list[RestoreResult]()
     if remote_factory is not None:
+        # Resolves the remote and builds its backend once per call, not once per target that
+        # misses the cache
         remote_factory = functools.cache(remote_factory)
 
     for target_info in target_infos:

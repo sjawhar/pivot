@@ -59,15 +59,17 @@ exception). A backend passes its client context and per-object coroutines; check
 such as GCS's upload verification, belong in those coroutines, not in `batch.py`.
 
 - **S3Remote** uses `aioboto3.Session()` — one session per instance, one client per method call;
-  batch methods share that client across concurrent tasks.
+  batch methods share that client across concurrent tasks. A session or client that cannot
+  start (a missing AWS profile when the session is made, an invalid `AWS_ENDPOINT_URL` when the
+  client opens) raises one `RemoteConnectionError` before any transfer; missing credentials
+  still fail each request, so a batch reports each item failed.
 - **GCSRemote** opens one `aiohttp.ClientSession` per method call, shared by a batch's concurrent
   transfers, and fetches the token before the first request, so missing credentials raise one
-  `RemoteConnectionError` before any transfer (S3 batches instead report each item failed). It
-  passes its own `aiohttp.ClientTimeout` (no total deadline, `remote.connect_timeout` to connect)
-  to every storage request it makes, because gcloud-aio's defaults are whole-request deadlines of
-  10-30s, too short for large objects. Only the token request keeps gcloud-aio's fixed 10s total,
-  because its public API exposes no timeout for it. It retries transient failures
-  `remote.retries` times.
+  `RemoteConnectionError` before any transfer. It passes its own `aiohttp.ClientTimeout` (no
+  total deadline, `remote.connect_timeout` to connect) to every storage request it makes, because
+  gcloud-aio's defaults are whole-request deadlines of 10-30s, too short for large objects. Only
+  the token request keeps gcloud-aio's fixed 10s total, because its public API exposes no timeout
+  for it. It retries transient failures `remote.retries` times.
 - **Every GCS upload is one simple upload (`uploadType=media`), at any size**, streamed from disk
   in one POST. Never pass `force_resumable_upload=True`: each retry reopens the file from byte 0,
   so a resumable session would resume nothing, and gcloud-aio's own retry of a failed resumable

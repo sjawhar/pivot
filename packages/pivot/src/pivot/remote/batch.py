@@ -66,7 +66,9 @@ async def bulk_exists[C](
 
     Raises:
         RemoteError: A hash is not a valid cache hash (before any request).
-        Exception: Whatever ``open_client`` raises, unchanged (for GCS, unusable credentials).
+        Exception: Whatever ``open_client`` raises, unchanged (``RemoteConnectionError`` when a
+            backend cannot set up access: GCS unusable credentials, an S3 client that cannot
+            start).
         RemoteConnectionError: An existence check or listing failed; the message starts with
             ``label`` (the backend's name).
     """

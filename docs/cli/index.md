@@ -433,7 +433,7 @@ pivot get TARGETS... --rev REVISION [OPTIONS]
 
 **Arguments:**
 
-- `TARGETS` - File paths or stage names (required)
+- `TARGETS` - Stage names (`demo/train`, or `demo/train:key` for one output), or paths of tracked (`.pvt`) or git-tracked files (required). A stage output's workspace path, such as `data/demo/train.jsonl`, works only if git tracks that file; name the stage instead.
 
 **Options:**
 
@@ -448,17 +448,17 @@ pivot get TARGETS... --rev REVISION [OPTIONS]
 **Examples:**
 
 ```bash
-# Get file from specific commit
-pivot get data/demo/train.jsonl --rev abc123
+# Get a stage's outputs from a specific commit
+pivot get demo/train --rev abc123
 
 # Get stage output from branch
 pivot get demo/train --rev feature-branch
 
-# Get with custom output path
-pivot get data/demo/train.jsonl --rev v1.0 --output old_train.jsonl
+# Get a stage's single output to a custom path
+pivot get demo/train --rev v1.0 --output old_train.jsonl
 
 # Get from a specific remote
-pivot get data/demo/train.jsonl --rev abc123 --remote origin
+pivot get demo/train --rev abc123 --remote origin
 ```
 
 ---

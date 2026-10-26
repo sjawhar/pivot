@@ -203,7 +203,13 @@ class S3Remote:
             )
         self._bucket = bucket
         self._prefix = prefix.rstrip("/") + "/" if prefix else ""
-        self._session = aioboto3.Session()
+        try:
+            # Reads the AWS profile, so AWS_PROFILE naming a missing profile fails here
+            self._session = aioboto3.Session()
+        except Exception as e:  # no session means no S3 access at all
+            raise exceptions.RemoteConnectionError(
+                f"Cannot set up S3 access for {self.url}: {e}"
+            ) from e
 
     @property
     def bucket(self) -> str:
@@ -220,9 +226,25 @@ class S3Remote:
             return f"s3://{self._bucket}/{self._prefix.rstrip('/')}"
         return f"s3://{self._bucket}"
 
-    def _client(self) -> contextlib.AbstractAsyncContextManager[S3Client]:
-        """An S3 client from the instance's session, for one method call."""
-        return self._session.client("s3", config=_get_s3_config())
+    @contextlib.asynccontextmanager
+    async def _client(self) -> AsyncIterator[S3Client]:
+        """An S3 client from the instance's session, for one method call.
+
+        A client that cannot start (an invalid AWS_ENDPOINT_URL, for example) raises
+        ``RemoteConnectionError``, as the GCS backend does, so a caller that reports each file's
+        result keeps reporting them.
+        """
+        client_config = _get_s3_config()
+        async with contextlib.AsyncExitStack() as stack:
+            try:
+                s3 = await stack.enter_async_context(
+                    self._session.client("s3", config=client_config)
+                )
+            except Exception as e:  # no client means no S3 access at all
+                raise exceptions.RemoteConnectionError(
+                    f"Cannot set up S3 access for {self.url}: {e}"
+                ) from e
+            yield s3
 
     async def _head_exists(self, s3: S3Client, hash_: str, error: str) -> bool:
         """HEAD the cache object ``hash_``; other failures raise ``S3 <error>: <cause>``."""
