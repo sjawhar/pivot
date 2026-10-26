@@ -443,17 +443,22 @@ def make_dirs(path: pathlib.Path) -> None:
 
     When ``path`` lies inside the current project's configured state directory, that directory
     is first created through ``ensure_state_dir``, so it gets its ``.gitignore`` before anything
-    is written inside it. Outside a project, or outside its state directory, this only creates
-    ``path``.
+    is written inside it. The decision is made on the path the kernel will open
+    (``os.path.realpath``), which is how the configured value itself is resolved
+    (``resolve_state_dir_value``), so one destination gets one answer however it is spelled: a
+    ``..`` segment, a relative path from a subdirectory of the project, or a path through a
+    symbolic link to the project. Outside a project, or outside its state directory, this only
+    creates ``path``.
     """
     if not path.is_dir():
         try:
             root = project.get_project_root()
             state_dir = state_dir_or_default(root)
+            resolved = pathlib.Path(os.path.realpath(path))
         except (exceptions.ProjectNotInitializedError, OSError):
             pass
         else:
-            if state_dir != root / ".pivot" and path.absolute().is_relative_to(state_dir):
+            if state_dir != root / ".pivot" and resolved.is_relative_to(state_dir):
                 ensure_state_dir(root)
     path.mkdir(parents=True, exist_ok=True)
 
