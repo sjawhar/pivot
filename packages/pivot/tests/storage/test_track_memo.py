@@ -31,7 +31,6 @@ _REAL_TIME_NS = time.time_ns
 _NS_PER_S = 1_000_000_000
 _PAST_SETTLE_WINDOW_NS = 10_000_000_000
 _INSIDE_SETTLE_WINDOW_NS = 1_000_000_000
-_WRITE_TIMEOUT_S = 5.0
 
 # A change this long after a walk carries a later timestamp than the walk saw, on any kernel
 # timestamp tick (one jiffy, at most 10 ms). The walk's settle window guarantees that gap in real
@@ -353,7 +352,12 @@ def test_preflight_with_no_tracked_file_creates_no_state_database(
 def test_preflight_with_no_tracked_file_and_a_read_only_database_succeeds(
     memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A read-only state database and nothing tracked: the pre-flight returns, as main does."""
+    """A read-only state database and nothing tracked: the pre-flight returns, as main does.
+
+    The memo read fails here (a read-only StateDB still opens the environment writable) and that
+    failure is skipped, so this pins the read side's LMDB error handling; the early return
+    before any write is pinned by ``..._creates_no_state_database``.
+    """
     _helper_build_untracked_tree(memo_project)
     lmdb_dir = _helper_create_state_database()
     _helper_settle(monkeypatch)
@@ -1039,20 +1043,24 @@ def test_unreadable_directory_is_skipped_as_os_walk_skips_it(
     _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
 
 
+# Where the listing format puts the subdirectory count: after the version byte and the stamp.
+_COUNT_AT = track._LISTING_HEADER - track._SUBDIR_COUNT.size
+
+
 def _helper_truncated(listing: bytes) -> bytes:
-    return listing[:35]
+    return listing[: track._LISTING_HEADER - 2]
 
 
 def _helper_count_too_large(listing: bytes) -> bytes:
-    return listing[:33] + (999).to_bytes(4, "big") + listing[37:]
+    return listing[:_COUNT_AT] + track._SUBDIR_COUNT.pack(999) + listing[track._LISTING_HEADER :]
 
 
 def _helper_name_with_slash(listing: bytes) -> bytes:
-    return listing[:33] + (1).to_bytes(4, "big") + b"../../elsewhere\0x.csv.pvt"
+    return listing[:_COUNT_AT] + track._SUBDIR_COUNT.pack(1) + b"../../elsewhere\0x.csv.pvt"
 
 
 def _helper_empty_name(listing: bytes) -> bytes:
-    return listing[:33] + (0).to_bytes(4, "big") + b"x.csv.pvt\0\0new.csv.pvt"
+    return listing[:_COUNT_AT] + track._SUBDIR_COUNT.pack(0) + b"x.csv.pvt\0\0new.csv.pvt"
 
 
 @pytest.mark.parametrize(
@@ -1077,7 +1085,7 @@ def test_malformed_recorded_listing_is_listed_again(
         memo = state_db.read_pvt_dir_memo()
         assert memo["root"] is not None
         broken = {**memo["dirs"], "a/b": corrupt(memo["dirs"]["a/b"])}
-        state_db.update_pvt_dir_memo(memo, memo["root"], broken, timeout=_WRITE_TIMEOUT_S)
+        state_db.update_pvt_dir_memo(memo, memo["root"], broken)
 
     _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
     _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
@@ -1097,11 +1105,14 @@ def test_dotdot_in_a_recorded_listing_never_leaves_the_project(
         memo = state_db.read_pvt_dir_memo()
         assert memo["root"] is not None
         listing = memo["dirs"][""]
-        count = int.from_bytes(listing[33:37], "big")
-        poisoned = listing[:33] + (count + 1).to_bytes(4, "big") + b"..\0" + listing[37:]
-        state_db.update_pvt_dir_memo(
-            memo, memo["root"], {**memo["dirs"], "": poisoned}, timeout=_WRITE_TIMEOUT_S
+        (count,) = track._SUBDIR_COUNT.unpack_from(listing, _COUNT_AT)
+        poisoned = (
+            listing[:_COUNT_AT]
+            + track._SUBDIR_COUNT.pack(count + 1)
+            + b"..\0"
+            + listing[track._LISTING_HEADER :]
         )
+        state_db.update_pvt_dir_memo(memo, memo["root"], {**memo["dirs"], "": poisoned})
 
     _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
 
@@ -1116,15 +1127,11 @@ def test_update_pvt_dir_memo_records_root_and_replaces_entries(tmp_path: pathlib
         empty = state_db.read_pvt_dir_memo()
         assert empty == state.PvtDirMemo(root=None, dirs={})
 
-        state_db.update_pvt_dir_memo(
-            empty, "/p", {"": b"root", "a": b"a1", "a/b": b"ab"}, timeout=_WRITE_TIMEOUT_S
-        )
+        state_db.update_pvt_dir_memo(empty, "/p", {"": b"root", "a": b"a1", "a/b": b"ab"})
         first = state_db.read_pvt_dir_memo()
         assert first == state.PvtDirMemo(root="/p", dirs={"": b"root", "a": b"a1", "a/b": b"ab"})
 
-        state_db.update_pvt_dir_memo(
-            first, "/q", {"": b"root", "a": b"a2", "c": b"c"}, timeout=_WRITE_TIMEOUT_S
-        )
+        state_db.update_pvt_dir_memo(first, "/q", {"": b"root", "a": b"a2", "c": b"c"})
         assert state_db.read_pvt_dir_memo() == state.PvtDirMemo(
             root="/q", dirs={"": b"root", "a": b"a2", "c": b"c"}
         ), "changed entries are replaced and unvisited ones deleted"
@@ -1135,9 +1142,6 @@ def test_update_pvt_dir_memo_skips_paths_too_long_for_a_key(tmp_path: pathlib.Pa
     long_rel = "/".join(["d" * 100] * 6)
     with state.StateDB(tmp_path / "state") as state_db:
         state_db.update_pvt_dir_memo(
-            state_db.read_pvt_dir_memo(),
-            "/p",
-            {"": b"root", long_rel: b"long"},
-            timeout=_WRITE_TIMEOUT_S,
+            state_db.read_pvt_dir_memo(), "/p", {"": b"root", long_rel: b"long"}
         )
         assert state_db.read_pvt_dir_memo()["dirs"] == {"": b"root"}

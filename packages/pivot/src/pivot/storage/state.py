@@ -650,15 +650,12 @@ class StateDB:
                     dirs[os.fsdecode(key[len(_PVT_DIR_PREFIX) :])] = value
         return PvtDirMemo(root=None if root is None else os.fsdecode(root), dirs=dirs)
 
-    def update_pvt_dir_memo(
-        self, previous: PvtDirMemo, root: str, dirs: dict[str, bytes], *, timeout: float
-    ) -> None:
+    def update_pvt_dir_memo(self, previous: PvtDirMemo, root: str, dirs: dict[str, bytes]) -> None:
         """Make the memo hold exactly ``dirs``, listed under ``root``.
 
         ``previous`` is the memo as read before the walk; only entries that differ from it are
         written, and nothing is when none do. A path too long for an LMDB key is not recorded,
-        so the walk lists that directory every time. ``timeout`` bounds the wait for the write
-        lock, since the memo is worth less than the time a busy database would cost.
+        so the walk lists that directory every time.
         """
         self._check_closed()
         self._check_write_allowed()
@@ -673,7 +670,7 @@ class StateDB:
         if previous["root"] == root and not puts and not deletes:
             return
         try:
-            with self._write_transaction(timeout=timeout) as txn:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
                 if previous["root"] != root:
                     txn.put(_PVT_ROOT_KEY, os.fsencode(root))
                 for key, listing in puts:

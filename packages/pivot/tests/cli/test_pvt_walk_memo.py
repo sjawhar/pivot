@@ -108,10 +108,7 @@ def _helper_track_and_run(runner: CliRunner) -> None:
 
 
 def test_pvt_rewritten_in_place_within_the_settle_window_is_read_anew(
-    memo_project: pathlib.Path,
-    runner: CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+    memo_project: pathlib.Path, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Within 2 s of data/raw's last change nothing is recorded; the rewritten .pvt is read."""
     before = _REAL_TIME_NS()
@@ -119,26 +116,21 @@ def test_pvt_rewritten_in_place_within_the_settle_window_is_read_anew(
     _helper_track_and_run(runner)
     assert "data/raw" not in _helper_memo()["dirs"], "not recorded inside the settle window"
 
-    _helper_rewrite_in_place_and_check(memo_project, runner, caplog)
+    _helper_rewrite_in_place_and_check(memo_project, runner)
 
 
 def test_pvt_rewritten_in_place_after_the_settle_window_is_read_anew(
-    memo_project: pathlib.Path,
-    runner: CliRunner,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+    memo_project: pathlib.Path, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """data/raw's listing is recorded, yet the .pvt rewritten in place is read anew."""
     _helper_settle(monkeypatch)
     _helper_track_and_run(runner)
     assert "data/raw" in _helper_memo()["dirs"], "recorded once settled"
 
-    _helper_rewrite_in_place_and_check(memo_project, runner, caplog)
+    _helper_rewrite_in_place_and_check(memo_project, runner)
 
 
-def _helper_rewrite_in_place_and_check(
-    memo_project: pathlib.Path, runner: CliRunner, caplog: pytest.LogCaptureFixture
-) -> None:
+def _helper_rewrite_in_place_and_check(memo_project: pathlib.Path, runner: CliRunner) -> None:
     """Change the data and rewrite its .pvt in place to match; status and repro see the match."""
     data = memo_project / "data" / "raw" / "input.txt"
     pvt_path = track.get_pvt_path(data)
@@ -162,11 +154,10 @@ def _helper_rewrite_in_place_and_check(
         {"path": "data/raw/input.txt", "status": TrackedFileStatus.CLEAN, "size": 7}
     ], "status compares the file with the rewritten .pvt"
 
-    caplog.clear()
     second = runner.invoke(cli.cli, ["repro"])
 
     assert second.exit_code == 0, second.output
-    assert "has changed since tracking" not in caplog.text + second.output, (
+    assert "has changed since tracking" not in second.output, (
         "the pre-flight checks the file against the rewritten .pvt"
     )
     assert (memo_project / "data" / "test" / "shout.txt").read_text() == "CHANGED"

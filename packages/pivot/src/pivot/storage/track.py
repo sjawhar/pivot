@@ -164,6 +164,7 @@ def get_data_path(pvt_path: pathlib.Path) -> pathlib.Path:
 _MEMO_SETTLE_NS = 2_000_000_000
 _NS_PER_S = 1_000_000_000
 _MEMO_FS_TYPES = frozenset({b"ext2", b"ext3", b"ext4", b"xfs", b"btrfs", b"tmpfs", b"f2fs", b"zfs"})
+# The memo write's wait for the write lock: the memo is worth less than a busy database's time.
 _MEMO_WRITE_TIMEOUT_S = 1.0
 _MEMO_DB_ERRORS = (exceptions.PivotError, state.StateDBError, RuntimeError, OSError, lmdb.Error)
 _MOUNTINFO = pathlib.Path("/proc/self/mountinfo")
@@ -172,6 +173,20 @@ _LISTING_VERSION = b"\x01"
 _STAMP = struct.Struct(">QQqq")  # st_dev, st_ino, st_mtime_ns, st_ctime_ns
 _SUBDIR_COUNT = struct.Struct(">I")
 _LISTING_HEADER = len(_LISTING_VERSION) + _STAMP.size + _SUBDIR_COUNT.size
+
+
+def _times_trusted(dir_stat: os.stat_result, settled_before: int) -> bool:
+    """Whether a directory's mtime and ctime let its stamp vouch for a recorded listing.
+
+    Both are settled (before ``settled_before``, the walk start less ``_MEMO_SETTLE_NS``) and not
+    both whole seconds, as the comment above argues.
+    """
+    mtime_ns, ctime_ns = dir_stat.st_mtime_ns, dir_stat.st_ctime_ns
+    return (
+        mtime_ns < settled_before
+        and ctime_ns < settled_before
+        and (mtime_ns % _NS_PER_S != 0 or ctime_ns % _NS_PER_S != 0)
+    )
 
 
 class _Mounts(TypedDict):
@@ -275,9 +290,8 @@ def _walk(
 
     Visits the directories ``os.walk(root, followlinks=False)`` visits for the user who recorded
     the memo, with one stat each. A directory is listed unless ``memo`` holds a listing under its
-    current stamp, its filesystem is on the allowlist, its mtime and ctime are settled, and they
-    are not both whole seconds. With ``record``, the second result holds the listing of every
-    directory that may be recorded.
+    current stamp, its filesystem is on the allowlist and ``_times_trusted`` accepts its times.
+    With ``record``, the second result holds the listing of every directory that may be recorded.
     """
     mounts = _read_mounts()
     allowed_devices = dict[int, bool]()
@@ -299,12 +313,7 @@ def _walk(
         if device not in allowed_devices:
             real_path = os.path.join(real_root, rel) if rel else real_root
             allowed_devices[device] = _device_allowed(mounts, device, real_path)
-        memoizable = (
-            allowed_devices[device]
-            and dir_stat.st_mtime_ns < settled_before
-            and dir_stat.st_ctime_ns < settled_before
-            and (dir_stat.st_mtime_ns % _NS_PER_S != 0 or dir_stat.st_ctime_ns % _NS_PER_S != 0)
-        )
+        memoizable = allowed_devices[device] and _times_trusted(dir_stat, settled_before)
         stamp = _STAMP.pack(device, dir_stat.st_ino, dir_stat.st_mtime_ns, dir_stat.st_ctime_ns)
         recorded = memo.get(rel) if memoizable else None
         names = None
@@ -400,12 +409,11 @@ def discover_pvt_files_and_update_memo(root: pathlib.Path) -> dict[str, PvtData]
     if not found and previous is None:
         return found
     try:
-        with state.StateDB(config.get_state_dir()) as state_db:
+        with state.StateDB(config.get_state_dir(), write_timeout=_MEMO_WRITE_TIMEOUT_S) as state_db:
             state_db.update_pvt_dir_memo(
                 previous if previous is not None else state.PvtDirMemo(root=None, dirs={}),
                 _memo_root(root),
                 listings,
-                timeout=_MEMO_WRITE_TIMEOUT_S,
             )
     except _MEMO_DB_ERRORS as e:
         logger.debug(f"Could not record the .pvt walk memo: {e}")
