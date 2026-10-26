@@ -595,15 +595,15 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     """
     from pivot import metrics
 
+    tracked_files = track.discover_pvt_files_and_update_memo(project_root)
+    if not tracked_files:
+        return
+
+    _t = metrics.start()
     missing = list[str]()
     cache_dir = config.get_cache_dir() / "files"
 
     with state_mod.StateDB(config.get_state_dir()) as state_db:
-        tracked_files = track.discover_pvt_files_and_update_memo(project_root, state_db)
-        if not tracked_files:
-            return
-
-        _t = metrics.start()
         for data_path, track_data in tracked_files.items():
             path = pathlib.Path(data_path)
 

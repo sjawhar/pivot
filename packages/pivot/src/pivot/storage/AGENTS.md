@@ -44,10 +44,10 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 
 `track.discover_pvt_files` must find every `.pvt` that `os.walk` over the project finds. Never prune it by directory name or by stage output: `track` and `import` accept paths under `.git`, `.pivot` and other pipelines' outputs. The memo makes an unchanged directory cost one `lstat` instead of a listing:
 
-- A listing is reused only when the directory's stamp (`st_dev`, `st_ino`, `st_mtime_ns`, `st_ctime_ns`) matches, its mtime and ctime are at least 2 s before the walk (a later change in the same timestamp tick would leave the stamp unchanged), and its mount type is on the allowlist read from `/proc/self/mountinfo`. A device mountinfo does not list (a btrfs subvolume reports its own) counts as btrfs only when the deepest mount holding the directory is btrfs.
+- A listing is reused only when the directory's stamp (`st_dev`, `st_ino`, `st_mtime_ns`, `st_ctime_ns`) matches, its mtime and ctime are at least 2 s before the walk start (a later change in the same timestamp tick would leave the stamp unchanged), its mtime and ctime are not both whole seconds (on a one-second-timestamp filesystem a clock stepped back into a recorded second would keep the stamp; such filesystems are always listed), and its mount type is on the allowlist read from `/proc/self/mountinfo`. A device mountinfo does not list (a btrfs subvolume reports its own) counts as btrfs only when the deepest mount holding the directory is btrfs.
 - It holds names only. Every `.pvt` found is read on every walk, since rewriting a file does not change its directory.
-- Only the repro/run pre-flight (`executor/core.py` `verify_tracked_files`) writes it. Every other caller only reads it; reading never creates the database, and a memo that cannot be read means every directory is listed.
-- The validity argument assumes the wall clock does not step back past a recorded stamp: on a filesystem with one-second timestamps, a change made while the clock was stepped back can keep its directory's stamp.
+- Only the repro/run pre-flight (`executor/core.py` `verify_tracked_files`) writes it. It reads the memo, walks, and returns as main does when nothing is tracked; it records the memo then only into a database that already exists. Every other caller only reads it. Reading the memo never creates the database, and a memo that cannot be read means every directory is listed.
+- A reused listing is what the user who recorded it could list: a reader who cannot list that directory still gets its recorded names.
 
 ## LMDB Specifics
 

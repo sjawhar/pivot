@@ -19,6 +19,7 @@ import pytest
 
 from pivot import config, exceptions, project
 from pivot.config import io as config_io
+from pivot.executor import core as executor_core
 from pivot.storage import cache, state, track
 
 if TYPE_CHECKING:
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
 _REAL_TIME_NS = time.time_ns
+_NS_PER_S = 1_000_000_000
 _PAST_SETTLE_WINDOW_NS = 10_000_000_000
 _INSIDE_SETTLE_WINDOW_NS = 1_000_000_000
 _WRITE_TIMEOUT_S = 5.0
@@ -123,8 +125,7 @@ def _helper_relative_directories(root: pathlib.Path) -> set[str]:
 
 def _helper_preflight(root: pathlib.Path) -> dict[str, track.PvtData]:
     """The repro/run pre-flight's walk, the memo's one writer."""
-    with state.StateDB(config.get_state_dir()) as state_db:
-        return track.discover_pvt_files_and_update_memo(root, state_db)
+    return track.discover_pvt_files_and_update_memo(root)
 
 
 def _helper_record(root: pathlib.Path) -> None:
@@ -269,6 +270,121 @@ def test_preflight_does_not_wait_on_a_busy_database_for_the_memo(
     assert took < 10.0, f"the memo write gave up quickly, not after the 30 s default ({took:.1f} s)"
     _helper_assert_matches_main(found, memo_project)
     assert _helper_memo() == before, "nothing was recorded while the lock was held"
+
+
+def test_preflight_survives_a_write_lock_it_cannot_open(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The memo write is optional: a write lock the pre-flight cannot open (OSError) is skipped."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    lock = config.get_state_dir() / "state.lmdb" / "pivot-write.lock"
+    _helper_track(memo_project / "a" / "b" / "after.csv", "after\n")
+    lock.chmod(0)
+    try:
+        found = _helper_preflight(memo_project)
+    finally:
+        lock.chmod(0o644)
+
+    _helper_assert_matches_main(found, memo_project)
+
+
+def test_preflight_skips_a_memo_write_the_database_refuses(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The database turns read-only between the memo read and its write: the write's LMDB error
+    is skipped and the pre-flight returns what main finds."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    _helper_track(memo_project / "a" / "b" / "after.csv", "after\n")
+    lmdb_dir = config.get_state_dir() / "state.lmdb"
+    files = list(lmdb_dir.iterdir())
+    real_walk = track._walk
+
+    def _walk_then_lock(
+        root: pathlib.Path, memo: dict[str, bytes], *, record: bool
+    ) -> tuple[list[pathlib.Path], dict[str, bytes]]:
+        result = real_walk(root, memo, record=record)
+        for path in files:
+            path.chmod(0o444)
+        lmdb_dir.chmod(0o555)
+        return result
+
+    monkeypatch.setattr(track, "_walk", _walk_then_lock)
+    try:
+        found = _helper_preflight(memo_project)
+    finally:
+        lmdb_dir.chmod(0o755)
+        for path in files:
+            path.chmod(0o644)
+
+    _helper_assert_matches_main(found, memo_project)
+
+
+def _helper_build_untracked_tree(root: pathlib.Path) -> None:
+    """A project with directories and files but no .pvt anywhere."""
+    for rel in ("a/b/x.csv", "c/y.csv", "data/out/part-0.csv", "data/out/part-1.csv"):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{rel}\n")
+
+
+def _helper_create_state_database() -> pathlib.Path:
+    """A state database some earlier pivot write made (data file and write lock present)."""
+    with state.StateDB(config.get_state_dir()) as state_db:
+        state_db.put_raw(b"probe", b"1")
+    return config.get_state_dir() / "state.lmdb"
+
+
+def test_preflight_with_no_tracked_file_creates_no_state_database(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """As on main, a pre-flight that finds no tracked file never opens, so never creates, it."""
+    _helper_build_untracked_tree(memo_project)
+    _helper_settle(monkeypatch)
+
+    executor_core.verify_tracked_files(memo_project)
+
+    assert not (config.get_state_dir() / "state.lmdb").exists()
+
+
+def test_preflight_with_no_tracked_file_and_a_read_only_database_succeeds(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only state database and nothing tracked: the pre-flight returns, as main does."""
+    _helper_build_untracked_tree(memo_project)
+    lmdb_dir = _helper_create_state_database()
+    _helper_settle(monkeypatch)
+    files = list(lmdb_dir.iterdir())
+    for path in files:
+        path.chmod(0o444)
+    lmdb_dir.chmod(0o555)
+    try:
+        executor_core.verify_tracked_files(memo_project)
+    finally:
+        lmdb_dir.chmod(0o755)
+        for path in files:
+            path.chmod(0o644)
+
+
+def test_preflight_with_no_tracked_file_records_into_an_existing_database(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """A project with nothing tracked still gets the memo when its state database exists: the
+    second pre-flight lists no directory."""
+    _helper_build_untracked_tree(memo_project)
+    _helper_create_state_database()
+    _helper_settle(monkeypatch)
+
+    executor_core.verify_tracked_files(memo_project)
+    listed = mocker.spy(os, "scandir")
+    executor_core.verify_tracked_files(memo_project)
+    listings = listed.call_count
+
+    assert listings == 0, "the second pre-flight lists no directory"
+    assert set(_helper_memo()["dirs"]) == _helper_relative_directories(memo_project)
 
 
 # =============================================================================
@@ -427,28 +543,30 @@ def test_memo_walk_matches_main_across_random_changes(
 # =============================================================================
 
 
-def _helper_freeze_directory_times(
-    monkeypatch: pytest.MonkeyPatch, root: pathlib.Path, frozen_ns: int
+def _helper_report_directory_times(
+    monkeypatch: pytest.MonkeyPatch,
+    root: pathlib.Path,
+    times: Callable[[os.stat_result], tuple[int, int]],
 ) -> None:
-    """Simulate a filesystem whose timestamp tick has not advanced since ``frozen_ns``.
+    """Report every directory under ``root`` with the (mtime_ns, ctime_ns) that ``times`` gives.
 
-    Every directory under ``root`` reports that mtime and ctime however it changes, so a change
-    in the same tick as a recorded listing leaves the directory's stamp as it was.
+    Simulates a filesystem's timestamp tick or a stepped clock without root.
     """
     prefix = os.fspath(root)
 
-    def _frozen(result: os.stat_result) -> os.stat_result:
+    def _with(result: os.stat_result) -> os.stat_result:
+        mtime_ns, ctime_ns = times(result)
         fields = list(result)
-        fields[8] = fields[9] = frozen_ns // 1_000_000_000
+        fields[8], fields[9] = mtime_ns // _NS_PER_S, ctime_ns // _NS_PER_S
         return os.stat_result(
             fields,
             {
                 "st_atime": result.st_atime,
-                "st_mtime": frozen_ns / 1e9,
-                "st_ctime": frozen_ns / 1e9,
+                "st_mtime": mtime_ns / 1e9,
+                "st_ctime": ctime_ns / 1e9,
                 "st_atime_ns": result.st_atime_ns,
-                "st_mtime_ns": frozen_ns,
-                "st_ctime_ns": frozen_ns,
+                "st_mtime_ns": mtime_ns,
+                "st_ctime_ns": ctime_ns,
                 "st_blksize": result.st_blksize,
                 "st_blocks": result.st_blocks,
                 "st_rdev": result.st_rdev,
@@ -459,12 +577,29 @@ def _helper_freeze_directory_times(
         def _stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
             result = real(path, *args, **kwargs)
             inside = isinstance(path, str | os.PathLike) and os.fsdecode(path).startswith(prefix)
-            return _frozen(result) if inside and stat.S_ISDIR(result.st_mode) else result
+            return _with(result) if inside and stat.S_ISDIR(result.st_mode) else result
 
         return _stat
 
     monkeypatch.setattr(os, "stat", _wrap(os.stat))
     monkeypatch.setattr(os, "lstat", _wrap(os.lstat))
+
+
+def _helper_freeze_directory_times(
+    monkeypatch: pytest.MonkeyPatch, root: pathlib.Path, frozen_ns: int
+) -> None:
+    """Simulate a filesystem whose timestamp tick has not advanced since ``frozen_ns``.
+
+    Every directory under ``root`` reports that mtime and ctime however it changes, so a change
+    in the same tick as a recorded listing leaves the directory's stamp as it was.
+    """
+    _helper_report_directory_times(monkeypatch, root, lambda _result: (frozen_ns, frozen_ns))
+
+
+def _helper_tick_now() -> int:
+    """The current time as a nanosecond tick that is never a whole second (whole seconds are
+    never trusted)."""
+    return _REAL_TIME_NS() | 1
 
 
 def test_directory_changed_within_the_settle_window_is_not_memoized(
@@ -476,7 +611,7 @@ def test_directory_changed_within_the_settle_window_is_not_memoized(
     window keeps a recorded listing from hiding the new .pvt.
     """
     _helper_build_tree(memo_project)
-    frozen_ns = _REAL_TIME_NS()
+    frozen_ns = _helper_tick_now()
     _helper_freeze_directory_times(monkeypatch, memo_project, frozen_ns)
     monkeypatch.setattr(time, "time_ns", lambda: frozen_ns + _INSIDE_SETTLE_WINDOW_NS)
 
@@ -494,7 +629,7 @@ def test_recorded_directory_inside_the_settle_window_is_listed_again(
 ) -> None:
     """A recorded stamp less than 2 s old at the walk (the clock went back) is not trusted."""
     _helper_build_tree(memo_project)
-    frozen_ns = _REAL_TIME_NS()
+    frozen_ns = _helper_tick_now()
     _helper_freeze_directory_times(monkeypatch, memo_project, frozen_ns)
     monkeypatch.setattr(time, "time_ns", lambda: frozen_ns + _PAST_SETTLE_WINDOW_NS)
     _helper_preflight(memo_project)
@@ -507,6 +642,103 @@ def test_recorded_directory_inside_the_settle_window_is_listed_again(
     _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
 
 
+def test_settle_needs_the_ctime_when_a_restore_sets_the_mtime_back(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Within one frozen tick, a restore adds a .pvt and sets its directory's mtime back (as tar
+    and rsync -t do), the pre-flight runs, and a second restore in that tick does the same. The
+    mtime looks settled; only the ctime half of the settle check keeps the listing unrecorded."""
+    _helper_build_tree(memo_project)
+    frozen_ns = _helper_tick_now()
+    restored_mtime_ns = frozen_ns - 100 * _NS_PER_S
+    _helper_report_directory_times(
+        monkeypatch,
+        memo_project,
+        lambda result: (min(result.st_mtime_ns, frozen_ns), frozen_ns)
+        if result.st_mtime_ns < frozen_ns - 50 * _NS_PER_S
+        else (frozen_ns, frozen_ns),
+    )
+    monkeypatch.setattr(time, "time_ns", lambda: frozen_ns + _INSIDE_SETTLE_WINDOW_NS)
+    directory = memo_project / "a" / "b"
+
+    _helper_track(directory / "one.csv", "one\n")
+    os.utime(directory, ns=(restored_mtime_ns, restored_mtime_ns))
+    _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
+    _helper_track(directory / "two.csv", "two\n")
+    os.utime(directory, ns=(restored_mtime_ns, restored_mtime_ns))
+
+    _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+
+
+def test_settle_window_counts_from_the_walk_start_on_a_long_walk(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A walk that takes over 3 s, within one frozen tick: the root is listed, then changes in
+    the same tick. Settled measured from the walk's end would record the root's first listing
+    under the unchanged stamp; measured from its start, the root is never recorded."""
+    _helper_build_tree(memo_project)
+    _helper_freeze_directory_times(monkeypatch, memo_project, _helper_tick_now())
+    real_list = track._list_directory
+    injected = list[str]()
+
+    def _slow_list(path: str) -> tuple[list[str], list[str]] | None:
+        names = real_list(path)
+        if path == os.fspath(memo_project) and not injected:
+            injected.append(path)
+            _helper_track(memo_project / "late.csv", "late\n")
+        time.sleep(0.35)
+        return names
+
+    monkeypatch.setattr(track, "_list_directory", _slow_list)
+    start = time.monotonic()
+    _helper_preflight(memo_project)
+    took = time.monotonic() - start
+    monkeypatch.setattr(track, "_list_directory", real_list)
+
+    assert took > 3.0, f"the walk took longer than the settle window ({took:.1f} s)"
+    _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+
+
+def test_clock_stepped_back_into_a_recorded_second_hides_nothing(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One-second timestamps (ext2, ext3, ext4 with 128-byte inodes) and a wall clock stepped back.
+
+    The pre-flight sees a/b under a whole-second stamp. The clock steps back into that second
+    and a .pvt is added to a/b; on such a filesystem its mtime and ctime land in the same second,
+    so a/b's stamp is unchanged. A whole-second stamp is never trusted, so a/b is listed and the
+    new .pvt is found.
+    """
+    _helper_build_tree(memo_project)
+    clock = {"back_ns": 0}
+
+    def _seconds(ns: int) -> int:
+        return (ns - clock["back_ns"]) // _NS_PER_S * _NS_PER_S
+
+    _helper_report_directory_times(
+        monkeypatch,
+        memo_project,
+        lambda result: (_seconds(result.st_mtime_ns), _seconds(result.st_ctime_ns)),
+    )
+    monkeypatch.setattr(
+        time, "time_ns", lambda: _REAL_TIME_NS() - clock["back_ns"] + _PAST_SETTLE_WINDOW_NS
+    )
+    _helper_record(memo_project)
+    directory = memo_project / "a" / "b"
+    seen_second = os.stat(directory).st_ctime_ns
+
+    clock["back_ns"] = _REAL_TIME_NS() - (seen_second + 300_000_000)
+    _helper_add_pvt(memo_project)
+
+    assert (os.stat(directory).st_mtime_ns, os.stat(directory).st_ctime_ns) == (
+        seen_second,
+        seen_second,
+    ), "the add landed in the second the pre-flight saw"
+    _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+    _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
+    _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+
+
 # =============================================================================
 # Filesystems
 # =============================================================================
@@ -516,6 +748,7 @@ def test_recorded_directory_inside_the_settle_window_is_listed_again(
     "fstype",
     [
         pytest.param("nfs4", id="nfs"),
+        pytest.param("nfs", id="nfs-version-3"),
         pytest.param("overlay", id="overlayfs"),
         pytest.param("fuse.sshfs", id="fuse"),
         pytest.param("9p", id="unknown-type"),
@@ -542,6 +775,40 @@ def test_filesystem_off_the_allowlist_is_always_listed(
     listings = listed.call_count
 
     assert listings == len(_helper_directories(memo_project)), "every directory is listed"
+    _helper_assert_matches_main(found, memo_project)
+
+
+def test_without_mountinfo_no_directory_is_trusted(
+    memo_project: pathlib.Path, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No /proc/self/mountinfo (not Linux, or /proc not mounted): every directory is listed."""
+    monkeypatch.setattr(track, "_MOUNTINFO", tmp_path / "no-such-mountinfo")
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+
+    assert _helper_memo()["dirs"] == {}, "nothing is recorded without mountinfo"
+    _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+
+
+def test_whole_second_mtime_alone_still_uses_the_memo(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """A directory whose mtime alone is a whole second (an archive with one-second times
+    restored it) keeps a nanosecond ctime, so its listing is still recorded and reused."""
+    _helper_build_tree(memo_project)
+    whole_second_ns = (_REAL_TIME_NS() - 100 * _NS_PER_S) // _NS_PER_S * _NS_PER_S
+    os.utime(memo_project / "a" / "b", ns=(whole_second_ns, whole_second_ns))
+    assert (memo_project / "a" / "b").stat().st_ctime_ns % _NS_PER_S != 0
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+
+    listed = mocker.spy(os, "scandir")
+    found = track.discover_pvt_files(memo_project)
+    listings = listed.call_count
+
+    assert "a/b" in _helper_memo()["dirs"], "a/b is recorded"
+    assert listings == 0, "and reused"
     _helper_assert_matches_main(found, memo_project)
 
 
@@ -815,6 +1082,28 @@ def test_malformed_recorded_listing_is_listed_again(
     _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
     _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
     assert _helper_memo()["dirs"]["a/b"] != broken["a/b"], "the pre-flight records it again"
+
+
+def test_dotdot_in_a_recorded_listing_never_leaves_the_project(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recorded root listing naming '..' as a subdirectory is malformed: the walk must not
+    climb out of the project and read the sidecars beside it."""
+    _helper_build_tree(memo_project)
+    _helper_track(memo_project.parent / "outside" / "o.csv", "outside\n")
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    with state.StateDB(config.get_state_dir()) as state_db:
+        memo = state_db.read_pvt_dir_memo()
+        assert memo["root"] is not None
+        listing = memo["dirs"][""]
+        count = int.from_bytes(listing[33:37], "big")
+        poisoned = listing[:33] + (count + 1).to_bytes(4, "big") + b"..\0" + listing[37:]
+        state_db.update_pvt_dir_memo(
+            memo, memo["root"], {**memo["dirs"], "": poisoned}, timeout=_WRITE_TIMEOUT_S
+        )
+
+    _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
 
 
 # =============================================================================
