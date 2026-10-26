@@ -952,13 +952,46 @@ _JSON_STATUS_OPTIONS = (
 )
 
 
-@pytest.mark.parametrize("remote_configured", [False, True], ids=["no-remote", "remote"])
+_JSON_STATUS_OPTION_SETS = [
+    list[str](options)
+    for size in range(len(_JSON_STATUS_OPTIONS) + 1)
+    for options in itertools.combinations(_JSON_STATUS_OPTIONS, size)
+]
+
+
+def _option_set_id(options: list[str]) -> str:
+    return "+".join(o.removeprefix("--") for o in options) or "plain"
+
+
+def _setup_project_with_import_update(
+    mock_discovery: compose.Pipeline, mocker: MockerFixture
+) -> None:
+    """A stale stage, a tracked file and an import whose source has a newer commit."""
+    _register_process(mock_discovery)
+    _write_tracked_file("content")
+    _write_import_pvt()
+    mocker.patch.object(
+        import_artifact,
+        "check_for_update",
+        new=AsyncMock(
+            return_value=import_artifact.UpdateCheck(
+                available=True, current_rev="abc123def456", latest_rev="def456abc789"
+            )
+        ),
+    )
+
+
 @pytest.mark.parametrize(
-    "options",
+    ("options", "remote_configured"),
     [
-        pytest.param(list(options), id="+".join(o.removeprefix("--") for o in options) or "plain")
-        for size in range(len(_JSON_STATUS_OPTIONS) + 1)
-        for options in itertools.combinations(_JSON_STATUS_OPTIONS, size)
+        pytest.param(
+            options,
+            remote_configured,
+            id=f"{_option_set_id(options)}-{'remote' if remote_configured else 'no-remote'}",
+        )
+        for remote_configured in (False, True)
+        for options in _JSON_STATUS_OPTION_SETS
+        if remote_configured or "--remote-only" not in options
     ],
 )
 def test_status_json_is_one_document_for_every_option_combination(
@@ -973,18 +1006,7 @@ def test_status_json_is_one_document_for_every_option_combination(
     The project has a stale stage, a tracked file and an import with an update, so each option
     has something to report: import status is a field of the document, and notes go to stderr.
     """
-    _register_process(mock_discovery)
-    _write_tracked_file("content")
-    _write_import_pvt()
-    mocker.patch.object(
-        import_artifact,
-        "check_for_update",
-        new=AsyncMock(
-            return_value=import_artifact.UpdateCheck(
-                available=True, current_rev="abc123def456", latest_rev="def456abc789"
-            )
-        ),
-    )
+    _setup_project_with_import_update(mock_discovery, mocker)
     if remote_configured:
         pathlib.Path(".pivot", "config.yaml").write_text("remotes:\n  origin: s3://bucket/c\n")
         mocker.patch.object(
@@ -998,13 +1020,32 @@ def test_status_json_is_one_document_for_every_option_combination(
 
     result = runner.invoke(cli.cli, ["status", *options, "--json"])
 
-    if "--remote-only" in options and not remote_configured:
-        assert result.exit_code == 1, result.output
-        assert result.stdout == "", "a failed run writes nothing to standard output"
-        return
     assert result.exit_code == 0, result.output
     data = json.loads(result.stdout)
     assert ("imports" in data) == ("--check-imports" in options), result.stdout
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param(options, id=_option_set_id(options))
+        for options in _JSON_STATUS_OPTION_SETS
+        if "--remote-only" in options
+    ],
+)
+def test_status_remote_only_json_without_remotes_writes_nothing_to_stdout(
+    runner: click.testing.CliRunner,
+    mock_discovery: compose.Pipeline,
+    mocker: MockerFixture,
+    options: list[str],
+) -> None:
+    """--remote-only --json with no remote configured fails with nothing on standard output."""
+    _setup_project_with_import_update(mock_discovery, mocker)
+
+    result = runner.invoke(cli.cli, ["status", *options, "--json"])
+
+    assert result.exit_code == 1, result.output
+    assert result.stdout == "", "a failed run writes nothing to standard output"
 
 
 # =============================================================================
