@@ -269,7 +269,8 @@ def _workspace_members(
     result = dict[str, tuple[str, pathlib.Path]]()
     files = list[tuple[str, os.DirEntry[str]]]()
     left_out = list[pathlib.Path]()
-    cache.walk_artifact_members(os.fspath(location), "", cache_dir, files, [], left_out)
+    cache_root = os.path.realpath(cache_dir)
+    cache.walk_artifact_members(os.fspath(location), "", cache_root, files, [], left_out)
     for relpath, entry in files:
         file_path = pathlib.Path(entry.path)
         if not _member_selected(relpath, prefixes):
@@ -277,7 +278,7 @@ def _workspace_members(
         if data_module.detect_format(file_path) is DataFileFormat.UNKNOWN:
             continue
         file_hash, _ = cache.hash_file(file_path)
-        if not cache.is_artifact_member_content(file_path, file_hash, cache_dir):
+        if not cache.is_artifact_member_content(file_path, file_hash, cache_root):
             left_out.append(file_path)
             continue
         result[f"{output['path']}/{relpath}"] = (file_hash, file_path)

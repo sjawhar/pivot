@@ -229,32 +229,106 @@ def deferred_file_hash_entries(
     return deferred
 
 
-def _cache_object_key(path: pathlib.Path, cache_dir: pathlib.Path | None) -> str | None:
-    """Return the cache key a symlink resolves to, if its target is an object in ``cache_dir``.
+def _resolve_link(link: str | os.PathLike[str], cache_root: str) -> str:
+    """Return ``os.path.realpath(link)`` for the symlink ``link``; raise OSError when ``link`` is
+    not a symlink or is gone. ``cache_root`` is ``os.path.realpath`` of the cache's object root.
 
-    Cache objects live at ``<cache_dir>/XX/YYYY...`` named by their content hash; a file-by-file
-    symlink checkout restores each directory member as a link to one. A link anywhere else,
-    even to a hash-named file, is a user symlink.
+    realpath lstats every component of the link's path and of its target, in Python: at 180,000
+    links that was most of the time a status took after a symlink checkout. A checkout link
+    holds ``<cache_root>/XX/NAME``, the object's real path (``_stage_checkout``). Every
+    component of ``cache_root`` is already real, so for that text realpath returns the text
+    itself unless ``XX`` or ``NAME`` is a symlink: two lstats prove the answer. Testing the
+    prefix alone would not: a link whose text lies in the cache still leaves it when ``XX`` or
+    ``NAME`` is a symlink out of it. Any other text (relative, with ``..``, a link to another
+    link, a path outside the cache) is resolved in full, so the answer is realpath's for every
+    link. The link is read again on every call; only ``cache_root`` is resolved once per walk
+    or restore, so a cache directory re-pointed between commands is seen by the next one.
     """
-    if cache_dir is None:
+    target = os.readlink(link)
+    prefix = os.path.join(cache_root, "")
+    if target.startswith(prefix):
+        prefix_dir, sep, name = target[len(prefix) :].partition("/")
+        if (
+            sep
+            and prefix_dir not in ("", ".", "..")
+            and name not in ("", ".", "..")
+            and "/" not in name
+            and not os.path.islink(prefix + prefix_dir)
+            and not os.path.islink(target)
+        ):
+            return target
+    return os.path.realpath(link)
+
+
+def _links_to_object(link: pathlib.Path, cache_path: pathlib.Path, cache_root: str) -> bool:
+    """Whether the symlink ``link`` resolves where the object path ``cache_path`` resolves, as
+    ``link.resolve() == cache_path.resolve()`` answers. ``cache_path`` is
+    ``get_cache_path(cache_dir, key)`` and ``cache_root`` is ``os.path.realpath(cache_dir)``.
+
+    A link whose text is ``<cache_root>/XX/YYYY...``, the text a checkout writes, resolves
+    wherever ``cache_path`` does, symlinks inside the cache included, so one readlink settles
+    it. Any other link is resolved in full.
+    """
+    try:
+        if os.readlink(link) == os.path.join(cache_root, cache_path.parent.name, cache_path.name):
+            return True
+    except OSError:
+        pass
+    return link.resolve() == cache_path.resolve()
+
+
+def _symlink_cache_key(path: str | os.PathLike[str], cache_root: str) -> str | None:
+    """Return ``XX + YYYY...`` when the symlink ``path`` resolves to ``<cache_root>/XX/YYYY...``
+    with 16 characters in all, else None (``path`` is not a symlink, or resolves elsewhere).
+    ``cache_root`` is ``os.path.realpath`` of the directory holding the objects.
+    """
+    try:
+        target = _resolve_link(path, cache_root)
+    except (OSError, ValueError):
         return None
-    key = _get_symlink_cache_hash(path, cache_dir)
-    if key is None or not is_valid_hash(key) or not path.is_file():
+    prefix = os.path.join(cache_root, "")
+    if not target.startswith(prefix):
+        return None
+    parts = target[len(prefix) :].split("/")
+    if len(parts) != 2:
+        return None
+    key = parts[0] + parts[1]
+    return key if len(key) == XXHASH64_HEX_LENGTH else None
+
+
+def _cache_object_key(path: str | os.PathLike[str], cache_root: str | None) -> str | None:
+    """Return the key of the cache object the symlink ``path`` stands for, or None.
+
+    A symlink is the cache object ``K`` when following it, through every link on the way, ends at
+    a regular file whose real path is ``<cache_root>/K[:2]/K[2:]``, and ``K`` is a cache key. So
+    a link to a link to the object, and a relative link, count, as they did when this resolved
+    the whole path with ``resolve()``; ``_resolve_link`` gives the same answer cheaply for the
+    link a checkout writes. A link that ends outside the cache (its first step inside it or not),
+    at another name in it, at a directory, at nothing, or in a loop is a user symlink, even when
+    it ends at a file named like a hash. A file-by-file symlink checkout restores each directory
+    member as a link to its object. ``cache_root`` is ``os.path.realpath`` of the cache's object
+    root (``<cache.dir>/files``), resolved once by the caller, or None for no cache.
+    """
+    if cache_root is None:
+        return None
+    key = _symlink_cache_key(path, cache_root)
+    if key is None or not is_valid_hash(key) or not os.path.isfile(path):
         return None
     return key
 
 
-def is_artifact_member_content(
-    path: pathlib.Path, file_hash: str, cache_dir: pathlib.Path | None
-) -> bool:
-    """Whether a candidate member has the content its cache-object symlink names."""
-    return not path.is_symlink() or file_hash == _cache_object_key(path, cache_dir)
+def is_artifact_member_content(path: pathlib.Path, file_hash: str, cache_root: str | None) -> bool:
+    """Whether a candidate member has the content its cache-object symlink names.
+
+    ``cache_root`` is ``os.path.realpath`` of the cache's object root, or None for no cache.
+    """
+    return not path.is_symlink() or file_hash == _cache_object_key(path, cache_root)
 
 
 def walk_artifact_members(
     directory: str,
     prefix: str,
-    cache_dir: pathlib.Path | None,
+    cache_root: str | None,
     files: list[tuple[str, os.DirEntry[str]]],
     dirs: list[str],
     left_out: list[pathlib.Path],
@@ -264,16 +338,18 @@ def walk_artifact_members(
     A declared directory artifact is hashed and cached whole: no name is ignored, so a change
     to any file in a directory input reruns its consumers, and every file in a directory output
     survives cache and restore. Ignore rules belong to code fingerprinting and watch mode.
-    A symlink to an object in ``cache_dir`` (left by a symlink checkout) counts as the file it
-    points to; any other symlink, a symlinked directory included, is not stored and is appended
-    to ``left_out``. The walk never follows a symlink, so every regular file it collects lies
-    inside the directory. PermissionError propagates: a partial hash would be wrong.
+    A symlink to an object in the cache (left by a symlink checkout; see ``_cache_object_key``)
+    counts as the file it points to; any other symlink, a symlinked directory included, is not
+    stored and is appended to ``left_out``. The walk never follows a symlink, so every regular
+    file it collects lies inside the directory. PermissionError propagates: a partial hash would
+    be wrong.
 
     Args:
         directory: Directory to scan
         prefix: Relpath of ``directory`` under the artifact root, with a trailing ``/``
             (empty at the root)
-        cache_dir: Cache object root whose links count as content, or None for no cache
+        cache_root: ``os.path.realpath`` of the cache object root whose links count as content,
+            resolved once for the whole walk, or None for no cache
         files: Collects (relpath, entry) for every stored file
         dirs: Collects the relpath of every directory under the root
         left_out: Collects the symlinks that are not part of the artifact
@@ -282,7 +358,7 @@ def walk_artifact_members(
         for entry in entries:
             relpath = prefix + entry.name
             if entry.is_symlink():
-                if _cache_object_key(pathlib.Path(entry.path), cache_dir) is not None:
+                if _cache_object_key(entry.path, cache_root) is not None:
                     files.append((relpath, entry))
                 else:
                     left_out.append(pathlib.Path(entry.path))
@@ -290,7 +366,7 @@ def walk_artifact_members(
                 files.append((relpath, entry))
             elif entry.is_dir():
                 dirs.append(relpath)
-                walk_artifact_members(entry.path, relpath + "/", cache_dir, files, dirs, left_out)
+                walk_artifact_members(entry.path, relpath + "/", cache_root, files, dirs, left_out)
 
 
 def _parent_dirs(relpaths: Iterable[str]) -> set[str]:
@@ -379,7 +455,8 @@ def hash_directory(
     files = list[tuple[str, os.DirEntry[str]]]()
     dirs = list[str]()
     left_out = list[pathlib.Path]()
-    walk_artifact_members(os.fspath(path), "", cache_dir, files, dirs, left_out)
+    cache_root = None if cache_dir is None else os.path.realpath(cache_dir)
+    walk_artifact_members(os.fspath(path), "", cache_root, files, dirs, left_out)
     files.sort(key=operator.itemgetter(0))
 
     stats = list[tuple[str, os.DirEntry[str], os.stat_result]]()
@@ -410,7 +487,7 @@ def hash_directory(
             if read is not None:
                 read.append((pathlib.Path(entry.path), file_stat, file_hash))
         if entry.is_symlink() and not is_artifact_member_content(
-            pathlib.Path(entry.path), file_hash, cache_dir
+            pathlib.Path(entry.path), file_hash, cache_root
         ):
             left_out.append(pathlib.Path(entry.path))
             continue
@@ -575,23 +652,16 @@ def _cleanup_fresh_restore_orphans(path: pathlib.Path, token: str) -> None:
 
 
 def _get_symlink_cache_hash(path: pathlib.Path, cache_dir: pathlib.Path) -> str | None:
-    """Extract hash from symlink target if it points to cache, else None."""
-    if not path.is_symlink():
-        return None
+    """Extract hash from symlink target if it points to cache, else None.
+
+    For a caller that checks one path: it resolves ``cache_dir`` itself. A caller that checks
+    many links resolves the cache directory once and calls ``_symlink_cache_key``.
+    """
     try:
-        target = path.resolve()
-        cache_resolved = cache_dir.resolve()
-        if not target.is_relative_to(cache_resolved):
-            return None
-        rel = target.relative_to(cache_resolved)
-        if len(rel.parts) != 2:
-            return None
-        reconstructed = rel.parts[0] + rel.parts[1]
-        if len(reconstructed) != XXHASH64_HEX_LENGTH:
-            return None
-        return reconstructed
-    except (OSError, ValueError):
-        return None  # Includes ELOOP for circular symlinks
+        cache_root = os.path.realpath(cache_dir)
+    except OSError:  # a relative cache_dir under a working directory that is gone
+        return None
+    return _symlink_cache_key(path, cache_root)
 
 
 # link() errors on filesystems without hard links: vfat, exFAT, many SMB and FUSE mounts
@@ -778,16 +848,36 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bo
 FALLBACK_ERRNO = _NO_HARDLINK_ERRNO | {errno.EXDEV, errno.EACCES}
 
 
+def _object_realpath(cache_path: pathlib.Path, cache_root: str | None) -> str:
+    """Return ``os.path.realpath(cache_path)`` for ``cache_path = get_cache_path(cache_dir, key)``.
+
+    ``cache_root`` is ``os.path.realpath(cache_dir)``, resolved once by a caller restoring many
+    files, or None. The object's path under ``cache_root`` is already real unless its
+    two-character directory or its own name is a symlink (see ``_resolve_link``), so two lstats
+    replace realpath's walk of every component.
+    """
+    if cache_root is not None:
+        real = os.path.join(cache_root, cache_path.parent.name, cache_path.name)
+        if not os.path.islink(os.path.dirname(real)) and not os.path.islink(real):
+            return real
+    return os.path.realpath(cache_path)
+
+
 def _stage_checkout(
     tmp_path: pathlib.Path,
     cache_path: pathlib.Path,
     checkout_mode: CheckoutMode,
     *,
     executable: bool | None,
+    cache_root: str | None = None,
 ) -> None:
-    """Create the link or copy of cache_path at tmp_path."""
+    """Create the link or copy of cache_path at tmp_path.
+
+    A symlink holds the object's real path, so it still works from wherever the workspace is
+    reached and the cache-object check settles it from its text (``_resolve_link``).
+    """
     if checkout_mode == CheckoutMode.SYMLINK:
-        tmp_path.symlink_to(cache_path.resolve())
+        tmp_path.symlink_to(_object_realpath(cache_path, cache_root))
     elif checkout_mode == CheckoutMode.HARDLINK:
         os.link(cache_path, tmp_path)
     else:
@@ -802,12 +892,15 @@ def _checkout_from_cache(
     *,
     executable: bool | None = None,
     staging_path: pathlib.Path | None = None,
+    cache_root: str | None = None,
 ) -> None:
     """Create link or copy at path atomically, so readers never see a partial file.
 
     Args:
         staging_path: Where to build the link or copy before renaming it over path.
             Defaults to a fresh random name beside path.
+        cache_root: ``os.path.realpath`` of the cache directory holding ``cache_path``, from a
+            caller restoring many files, so a symlink's target is not resolved per file.
     """
     # Idempotency: skip if already correctly linked
     if checkout_mode == CheckoutMode.SYMLINK and path.is_symlink():
@@ -822,7 +915,9 @@ def _checkout_from_cache(
     tmp_path = staging_path or path.parent / f"{_RESTORE_TEMP_PREFIX}{secrets.token_hex(8)}"
     try:
         try:
-            _stage_checkout(tmp_path, cache_path, checkout_mode, executable=executable)
+            _stage_checkout(
+                tmp_path, cache_path, checkout_mode, executable=executable, cache_root=cache_root
+            )
         except PermissionError:
             # A read-only parent. Replacing an existing entry needs it writable anyway,
             # so make it writable as _clear_path does (never chmod the file: it may be
@@ -831,7 +926,9 @@ def _checkout_from_cache(
             if parent_mode & stat.S_IWUSR or not (path.exists() or path.is_symlink()):
                 raise
             os.chmod(path.parent, parent_mode | stat.S_IWUSR)
-            _stage_checkout(tmp_path, cache_path, checkout_mode, executable=executable)
+            _stage_checkout(
+                tmp_path, cache_path, checkout_mode, executable=executable, cache_root=cache_root
+            )
         try:
             tmp_path.replace(path)
         except IsADirectoryError:
@@ -1121,6 +1218,7 @@ def _checkout_with_fallback(
     staging_path: pathlib.Path | None = None,
     keep_existing_copy: bool = False,
     display_path: pathlib.Path | None = None,
+    cache_root: str | None = None,
 ) -> None:
     """Try each link mode in order until one succeeds.
 
@@ -1148,6 +1246,10 @@ def _checkout_with_fallback(
     ``display_path`` names the file in a raised error when ``path`` is a restore-only staging
     location (a caller checking out into a scratch directory before an atomic swap); it
     defaults to ``path`` for every other caller.
+
+    ``cache_root`` is ``os.path.realpath`` of the cache directory holding ``cache_path``, from a
+    caller restoring many files: a symlink then names the object's real path without resolving
+    it per file (``_object_realpath``). None resolves it.
     """
     if not checkout_modes:
         raise ValueError("checkout_modes cannot be empty")
@@ -1172,7 +1274,12 @@ def _checkout_with_fallback(
                 continue
         try:
             _checkout_from_cache(
-                path, cache_path, mode, executable=executable, staging_path=staging_path
+                path,
+                cache_path,
+                mode,
+                executable=executable,
+                staging_path=staging_path,
+                cache_root=cache_root,
             )
             return
         except OSError as e:
@@ -1354,13 +1461,15 @@ def _publish_tree(
     """
     manifest = output_hash["manifest"]
 
+    cache_root = os.path.realpath(cache_dir)
+
     def _user_symlinks(directory: str, names: list[str]) -> list[str]:
         # Not stored (see walk_artifact_members); copytree would copy each target.
         return [
             name
             for name in names
             if (link := pathlib.Path(directory, name)).is_symlink()
-            and _cache_object_key(link, cache_dir) is None
+            and _cache_object_key(link, cache_root) is None
         ]
 
     cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1630,6 +1739,7 @@ def _restore_directory_from_cache(
     backup_restore_failed = False
     try:
         resolved_temp = temp_path.resolve()
+        cache_root = os.path.realpath(cache_dir)
         for file_count, entry in enumerate(output_hash["manifest"], start=1):
             file_cache_path = get_cache_path(cache_dir, entry["hash"])
             file_path = temp_path / entry["relpath"]
@@ -1644,6 +1754,7 @@ def _restore_directory_from_cache(
                 checkout_modes,
                 executable=entry["isexec"],
                 display_path=path / entry["relpath"],
+                cache_root=cache_root,
             )
             if file_count % 100 == 0:
                 try:
@@ -1778,6 +1889,7 @@ def restore_missing_in_directory(
     """
     lexical_base = pathlib.Path(os.path.abspath(path))
     resolved_base = path.resolve()
+    cache_root = os.path.realpath(cache_dir)
     expected_paths = set[str]()
     missing = list[tuple[DirManifestEntry, pathlib.Path, pathlib.Path]]()
     # relpath -> hash of the content on disk (None when it cannot be in the cache)
@@ -1799,13 +1911,13 @@ def restore_missing_in_directory(
                 raise exceptions.SecurityValidationError(
                     f"Manifest contains path traversal: {relpath!r}"
                 )
-            if file_path.resolve() == file_cache_path.resolve():
+            if _links_to_object(file_path, file_cache_path, cache_root):
                 if not file_cache_path.exists():
                     missing.append((entry, file_path, file_cache_path))
                 elif pending is not None:
                     pending.append((file_path, file_path.stat(), entry["hash"]))
             else:
-                changed[relpath] = _get_symlink_cache_hash(file_path, cache_dir)
+                changed[relpath] = _symlink_cache_key(file_path, cache_root)
             continue
         if file_path.exists():
             if not file_path.is_file():
@@ -1840,7 +1952,7 @@ def restore_missing_in_directory(
             continue
         extra_path = path / relpath
         if extra_path.is_symlink():
-            changed[relpath] = _get_symlink_cache_hash(extra_path, cache_dir)
+            changed[relpath] = _symlink_cache_key(extra_path, cache_root)
         else:
             changed[relpath], _ = hash_file(extra_path, state_db, pending=pending)
     # A hash pivot 0.3.3 recorded lists no empty directories, so on disk none of them is extra.
@@ -1863,7 +1975,11 @@ def restore_missing_in_directory(
     for entry, file_path, file_cache_path in missing:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         _checkout_with_fallback(
-            file_path, file_cache_path, checkout_modes, executable=entry["isexec"]
+            file_path,
+            file_cache_path,
+            checkout_modes,
+            executable=entry["isexec"],
+            cache_root=cache_root,
         )
         if pending is not None:
             pending.append((file_path, file_path.stat(), entry["hash"]))
