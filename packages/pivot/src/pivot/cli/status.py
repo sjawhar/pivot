@@ -17,7 +17,8 @@ from pivot.remote import config as remote_config
 from pivot.types import (
     ExplainOutput,
     ExplainStageJson,
-    ImportStatusJson,
+    ImportCheckStatus,
+    ImportStatusInfo,
     PipelineStatus,
     PipelineStatusInfo,
     RemoteSyncInfo,
@@ -148,7 +149,7 @@ def status(
         except exceptions.RemoteError as e:
             raise click.ClickException(f"Remote error: {e}") from e
 
-    import_statuses = list[status_mod.ImportStatusInfo]()
+    import_statuses = list[ImportStatusInfo]()
     if check_imports:
         import_statuses = status_mod.get_import_status(project_root)
 
@@ -200,7 +201,7 @@ def status(
         return
 
     if output_json:
-        imports = [_import_status_json(info) for info in import_statuses] if check_imports else None
+        imports = import_statuses if check_imports else None
         if explain:
             _output_explain_json(
                 pipeline_explanations,
@@ -247,28 +248,11 @@ def status(
             _print_import_section(import_statuses)
 
 
-def _import_status_json(info: status_mod.ImportStatusInfo) -> ImportStatusJson:
-    match info.status:
-        case status_mod.ImportCheckStatus.UP_TO_DATE:
-            json_status = "up_to_date"
-        case status_mod.ImportCheckStatus.UPDATE_AVAILABLE:
-            json_status = "update_available"
-        case status_mod.ImportCheckStatus.ERROR:
-            json_status = "error"
-    return ImportStatusJson(
-        path=info.path,
-        status=json_status,
-        current_rev=info.current_rev or None,
-        latest_rev=info.latest_rev or None,
-        error=info.error or None,
-    )
-
-
 def _output_json(
     pipeline_status: list[PipelineStatusInfo],
     tracked_status: list[TrackedFileInfo],
     remote_status: RemoteSyncInfo | None,
-    imports: list[ImportStatusJson] | None,
+    imports: list[ImportStatusInfo] | None,
     suggestions: list[str],
     show_stages: bool,
     show_tracked: bool,
@@ -299,7 +283,7 @@ def _output_explain_json(
     explanations: list[StageExplanation],
     tracked_status: list[TrackedFileInfo],
     remote_status: RemoteSyncInfo | None,
-    imports: list[ImportStatusJson] | None,
+    imports: list[ImportStatusInfo] | None,
     suggestions: list[str],
     show_stages: bool,
     show_tracked: bool,
@@ -482,20 +466,20 @@ def _print_remote_section(remote_status: RemoteSyncInfo) -> None:
     click.echo(f"  \u2193 {remote_status['pull_count']} to pull")
 
 
-def _print_import_section(import_statuses: list[status_mod.ImportStatusInfo]) -> None:
+def _print_import_section(import_statuses: list[ImportStatusInfo]) -> None:
     """Print import status section."""
     click.echo()
     click.echo("Imports")
 
     for info in import_statuses:
-        if info.status is status_mod.ImportCheckStatus.UPDATE_AVAILABLE:
+        if info["status"] is ImportCheckStatus.UPDATE_AVAILABLE:
             click.echo(
-                f"  \u26a0 {info.path}: update available ({info.current_rev}.. \u2192 {info.latest_rev}..)"
+                f"  \u26a0 {info['path']}: update available ({info['current_rev']}.. \u2192 {info['latest_rev']}..)"
             )
-        elif info.status is status_mod.ImportCheckStatus.ERROR:
-            click.echo(f"  \u2717 {info.path}: check failed ({info.error})")
+        elif info["status"] is ImportCheckStatus.ERROR:
+            click.echo(f"  \u2717 {info['path']}: check failed ({info['error']})")
         else:
-            click.echo(f"  \u2713 {info.path}: up to date")
+            click.echo(f"  \u2713 {info['path']}: up to date")
 
 
 def _print_suggestions_section(suggestions: list[str]) -> None:

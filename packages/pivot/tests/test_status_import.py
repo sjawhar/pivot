@@ -12,8 +12,8 @@ import pytest
 
 from conftest import isolated_pivot_dir
 from pivot import cli, import_artifact, status
-from pivot.status import ImportCheckStatus
 from pivot.storage import track
+from pivot.types import ImportCheckStatus
 
 if TYPE_CHECKING:
     import click.testing
@@ -61,9 +61,9 @@ def test_status_import_update_available(tmp_path: pathlib.Path, mocker: MockerFi
     results = status.get_import_status(tmp_path)
 
     assert len(results) == 1, "Should have one import result"
-    assert results[0].status is ImportCheckStatus.UPDATE_AVAILABLE
-    assert results[0].current_rev == "abc123de"
-    assert results[0].latest_rev == "def456ab"
+    assert results[0]["status"] is ImportCheckStatus.UPDATE_AVAILABLE
+    assert results[0]["current_rev"] == "abc123de"
+    assert results[0]["latest_rev"] == "def456ab"
 
 
 def test_status_import_up_to_date(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
@@ -102,7 +102,7 @@ def test_status_import_up_to_date(tmp_path: pathlib.Path, mocker: MockerFixture)
     results = status.get_import_status(tmp_path)
 
     assert len(results) == 1, "Should have one import result"
-    assert results[0].status is ImportCheckStatus.UP_TO_DATE
+    assert results[0]["status"] is ImportCheckStatus.UP_TO_DATE
 
 
 def test_status_import_network_error(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
@@ -135,8 +135,9 @@ def test_status_import_network_error(tmp_path: pathlib.Path, mocker: MockerFixtu
     results = status.get_import_status(tmp_path)
 
     assert len(results) == 1, "Should have one import result"
-    assert results[0].status is ImportCheckStatus.ERROR
-    assert "Network unreachable" in results[0].error
+    assert results[0]["status"] is ImportCheckStatus.ERROR
+    assert results[0]["error"] is not None
+    assert "Network unreachable" in results[0]["error"]
 
 
 def test_status_import_empty_error_names_type_in_warning(
@@ -171,7 +172,7 @@ def test_status_import_empty_error_names_type_in_warning(
     with caplog.at_level(logging.WARNING, logger="pivot.status"):
         results = status.get_import_status(tmp_path)
 
-    assert results[0].error == "TimeoutError"
+    assert results[0]["error"] == "TimeoutError"
     assert [record.getMessage() for record in caplog.records] == [
         "Failed to check import models/model.pkl: TimeoutError"
     ]
@@ -435,12 +436,7 @@ def test_status_check_imports_json_holds_import_status(
         autospec=True,
         return_value={str(project_root / "models" / "model.pkl"): pvt_data},
     )
-    check_mock = (
-        AsyncMock(side_effect=check)
-        if isinstance(check, Exception)
-        else AsyncMock(return_value=check)
-    )
-    mocker.patch.object(import_artifact, "check_for_update", new=check_mock)
+    mocker.patch.object(import_artifact, "check_for_update", new=AsyncMock(side_effect=[check]))
 
     result = runner.invoke(cli.cli, ["status", "--check-imports", "--json"])
 

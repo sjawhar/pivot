@@ -43,7 +43,6 @@ Example::
 from __future__ import annotations
 
 import asyncio
-import enum
 import logging
 import pathlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -71,6 +70,8 @@ from pivot.storage import store as store_mod
 from pivot.types import (
     CodeChange,
     DepChange,
+    ImportCheckStatus,
+    ImportStatusInfo,
     ParamChange,
     PipelineStatus,
     PipelineStatusInfo,
@@ -489,36 +490,6 @@ def get_suggestions(
     return suggestions
 
 
-class ImportCheckStatus(enum.Enum):
-    UP_TO_DATE = "up to date"
-    UPDATE_AVAILABLE = "update available"
-    ERROR = "error"
-
-
-class ImportStatusInfo:
-    __slots__: tuple[str, ...] = ("path", "status", "current_rev", "latest_rev", "error")
-
-    path: str
-    status: ImportCheckStatus
-    current_rev: str
-    latest_rev: str
-    error: str
-
-    def __init__(
-        self,
-        path: str,
-        status: ImportCheckStatus,
-        current_rev: str = "",
-        latest_rev: str = "",
-        error: str = "",
-    ) -> None:
-        self.path = path
-        self.status = status
-        self.current_rev = current_rev
-        self.latest_rev = latest_rev
-        self.error = error
-
-
 async def _check_imports_batch(
     import_pvts: dict[str, track.PvtData],
     project_root: pathlib.Path,
@@ -542,7 +513,13 @@ async def _check_imports_batch(
             error = str(check_or_exc) or type(check_or_exc).__name__
             logger.warning("Failed to check import %s: %s", rel_path, error)
             results.append(
-                ImportStatusInfo(path=rel_path, status=ImportCheckStatus.ERROR, error=error)
+                ImportStatusInfo(
+                    path=rel_path,
+                    status=ImportCheckStatus.ERROR,
+                    current_rev=None,
+                    latest_rev=None,
+                    error=error,
+                )
             )
         else:
             check = cast("import_artifact.UpdateCheck", check_or_exc)
@@ -553,10 +530,19 @@ async def _check_imports_batch(
                         status=ImportCheckStatus.UPDATE_AVAILABLE,
                         current_rev=check["current_rev"][:8],
                         latest_rev=check["latest_rev"][:8],
+                        error=None,
                     )
                 )
             else:
-                results.append(ImportStatusInfo(path=rel_path, status=ImportCheckStatus.UP_TO_DATE))
+                results.append(
+                    ImportStatusInfo(
+                        path=rel_path,
+                        status=ImportCheckStatus.UP_TO_DATE,
+                        current_rev=None,
+                        latest_rev=None,
+                        error=None,
+                    )
+                )
     return results
 
 

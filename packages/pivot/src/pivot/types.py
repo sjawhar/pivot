@@ -579,6 +579,14 @@ class TrackedFileStatus(enum.StrEnum):
     MISSING = "missing"
 
 
+class ImportCheckStatus(enum.StrEnum):
+    """Update check result for an imported artifact."""
+
+    UP_TO_DATE = "up_to_date"
+    UPDATE_AVAILABLE = "update_available"
+    ERROR = "error"
+
+
 class PipelineStatusInfo(TypedDict):
     """Status info for a single stage in pivot status output."""
 
@@ -605,15 +613,16 @@ class RemoteSyncInfo(TypedDict):
     pull_count: int
 
 
-class ImportStatusJson(TypedDict):
-    """One imported artifact's update check, for status --check-imports --json output.
+class ImportStatusInfo(TypedDict):
+    """One imported artifact's update check, for pivot status --check-imports output.
 
     The revisions are the first 8 characters of each commit. A field that does not apply to
-    the status is null: both revisions for up_to_date and error, error for the others.
+    the status is None (null in JSON): both revisions for up_to_date and error, error for the
+    others.
     """
 
     path: str
-    status: Literal["up_to_date", "update_available", "error"]
+    status: ImportCheckStatus
     current_rev: str | None
     latest_rev: str | None
     error: str | None
@@ -625,7 +634,7 @@ class StatusOutput(TypedDict, total=False):
     stages: list[PipelineStatusInfo]
     tracked_files: list[TrackedFileInfo]
     remote: RemoteSyncInfo
-    imports: list[ImportStatusJson]
+    imports: list[ImportStatusInfo]
     suggestions: list[str]
 
 
@@ -667,7 +676,7 @@ class ExplainOutput(TypedDict, total=False):
     stages: list[ExplainStageJson]
     tracked_files: list[TrackedFileInfo]
     remote: RemoteSyncInfo
-    imports: list[ImportStatusJson]
+    imports: list[ImportStatusInfo]
     suggestions: list[str]
 
 
