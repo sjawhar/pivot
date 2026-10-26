@@ -17,6 +17,8 @@ from pivot.remote import config as remote_config
 from pivot.types import (
     ExplainOutput,
     ExplainStageJson,
+    ImportCheckStatus,
+    ImportStatusInfo,
     PipelineStatus,
     PipelineStatusInfo,
     RemoteSyncInfo,
@@ -34,12 +36,21 @@ from pivot.types import (
 @click.option(
     "--explain", "-e", is_flag=True, help="Show detailed breakdown of why stages would run"
 )
-@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+@click.option(
+    "--json",
+    "output_json",
+    is_flag=True,
+    help="Output as JSON. Writes one document to stdout; notes go to stderr.",
+)
 @click.option("--stages-only", is_flag=True, help="Show only pipeline status")
 @click.option("--tracked-only", is_flag=True, help="Show only tracked files")
 @click.option("--remote-only", is_flag=True, help="Show only remote status")
 @click.option("--remote", "-r", is_flag=True, help="Include remote sync status")
-@click.option("--check-imports", is_flag=True, help="Check for import updates (requires network)")
+@click.option(
+    "--check-imports",
+    is_flag=True,
+    help="Check for import updates (requires network). JSON adds an imports field.",
+)
 @click.pass_context
 def status(
     ctx: click.Context,
@@ -133,11 +144,12 @@ def status(
                 raise click.ClickException(
                     "No remotes configured. Use `pivot config set remotes.<name> <url>`."
                 ) from None
-            click.echo("No remotes configured")
+            if not quiet:
+                click.echo("No remotes configured", err=output_json)
         except exceptions.RemoteError as e:
             raise click.ClickException(f"Remote error: {e}") from e
 
-    import_statuses = list[status_mod.ImportStatusInfo]()
+    import_statuses = list[ImportStatusInfo]()
     if check_imports:
         import_statuses = status_mod.get_import_status(project_root)
 
@@ -189,11 +201,13 @@ def status(
         return
 
     if output_json:
+        imports = import_statuses if check_imports else None
         if explain:
             _output_explain_json(
                 pipeline_explanations,
                 tracked_status,
                 remote_status,
+                imports,
                 suggestions,
                 show_stages,
                 show_tracked,
@@ -204,6 +218,7 @@ def status(
                 pipeline_status,
                 tracked_status,
                 remote_status,
+                imports,
                 suggestions,
                 show_stages,
                 show_tracked,
@@ -229,14 +244,15 @@ def status(
                 show_tracked,
             )
 
-    if import_statuses:
-        _print_import_section(import_statuses)
+        if import_statuses:
+            _print_import_section(import_statuses)
 
 
 def _output_json(
     pipeline_status: list[PipelineStatusInfo],
     tracked_status: list[TrackedFileInfo],
     remote_status: RemoteSyncInfo | None,
+    imports: list[ImportStatusInfo] | None,
     suggestions: list[str],
     show_stages: bool,
     show_tracked: bool,
@@ -254,6 +270,9 @@ def _output_json(
     if show_remote and remote_status:
         data["remote"] = remote_status
 
+    if imports is not None:
+        data["imports"] = imports
+
     if suggestions:
         data["suggestions"] = suggestions
 
@@ -264,6 +283,7 @@ def _output_explain_json(
     explanations: list[StageExplanation],
     tracked_status: list[TrackedFileInfo],
     remote_status: RemoteSyncInfo | None,
+    imports: list[ImportStatusInfo] | None,
     suggestions: list[str],
     show_stages: bool,
     show_tracked: bool,
@@ -295,6 +315,9 @@ def _output_explain_json(
 
     if show_remote and remote_status:
         data["remote"] = remote_status
+
+    if imports is not None:
+        data["imports"] = imports
 
     if suggestions:
         data["suggestions"] = suggestions
@@ -443,20 +466,20 @@ def _print_remote_section(remote_status: RemoteSyncInfo) -> None:
     click.echo(f"  \u2193 {remote_status['pull_count']} to pull")
 
 
-def _print_import_section(import_statuses: list[status_mod.ImportStatusInfo]) -> None:
+def _print_import_section(import_statuses: list[ImportStatusInfo]) -> None:
     """Print import status section."""
     click.echo()
     click.echo("Imports")
 
     for info in import_statuses:
-        if info.status is status_mod.ImportCheckStatus.UPDATE_AVAILABLE:
+        if info["status"] is ImportCheckStatus.UPDATE_AVAILABLE:
             click.echo(
-                f"  \u26a0 {info.path}: update available ({info.current_rev}.. \u2192 {info.latest_rev}..)"
+                f"  \u26a0 {info['path']}: update available ({info['current_rev']}.. \u2192 {info['latest_rev']}..)"
             )
-        elif info.status is status_mod.ImportCheckStatus.ERROR:
-            click.echo(f"  \u2717 {info.path}: check failed ({info.error})")
+        elif info["status"] is ImportCheckStatus.ERROR:
+            click.echo(f"  \u2717 {info['path']}: check failed ({info['error']})")
         else:
-            click.echo(f"  \u2713 {info.path}: up to date")
+            click.echo(f"  \u2713 {info['path']}: up to date")
 
 
 def _print_suggestions_section(suggestions: list[str]) -> None:
