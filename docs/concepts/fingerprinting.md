@@ -310,18 +310,28 @@ A stage that calls a marked helper does not rerun when the helper's body
 changes. It reruns once when the helper moves to another module, when the
 helper gets a new name, or when someone removes the mark.
 
-The decorator accepts a module-level function, and a `functools.wraps` or
-`contextlib.contextmanager` wrapper of one. It refuses a class, a method, a
-lambda, a nested function, a `functools.partial`, a helper that imports a
-user module in its body, and a helper that uses `importlib.import_module` or
-`__import__`. Import the module at the top of the helper's file instead.
+The decorator accepts a module-level function, and a `functools.wraps`,
+`contextlib.contextmanager` or class-based wrapper of one (an instance that
+`functools.update_wrapper` made). It refuses a class, a method, a lambda, a
+nested function, a `functools.partial`, a helper that imports a user module in
+its body, and a helper that uses `importlib.import_module` or `__import__`.
+Import the module at the top of the helper's file instead.
 
 The fingerprint walk never reads the body of a marked function. A decorator
-above the mark is user code: Pivot adds the decorator's own code to the
+above the mark is user code: Pivot adds a function decorator's own code to the
 fingerprint and records the marked function inside it by name. This is also
 true when `functools.cache` wraps that decorator. A library wrapper directly
 above the mark (`functools.cache`, `functools.lru_cache`,
 `contextlib.contextmanager`) keeps the record by name.
+
+Pivot refuses a class-based decorator above the mark, however the stage
+reaches the helper (a call, a class member, a partial argument, a default, a
+pydantic `default_factory`). Pivot cannot fingerprint the code and state of a
+class instance, and the mark records only the function below it.
+`core.unsafe_fingerprinting` does not turn this refusal into a warning. To
+clear it, put `@fingerprint_by_name` above the class-based decorator, so Pivot
+records the whole helper by name; or replace the class with a function
+decorator built with `functools.wraps`; or remove the mark.
 
 Without a mark below it, Pivot fingerprints a `functools.wraps` decorator as
 in earlier versions. It follows `__wrapped__` to the wrapped function, so it

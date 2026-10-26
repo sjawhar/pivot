@@ -651,6 +651,7 @@ class _ValueKind(enum.Enum):
 
     PARTIAL = "partial"
     REFUSED = "refused"
+    CLASS_ABOVE_MARK = "class_above_mark"
     USER = "user"
     EXTERNAL = "external"
     MODULE = "module"
@@ -677,10 +678,21 @@ def _immutable_value_text(value: Any) -> str | None:
 
 
 def _value_kind(value: Any) -> _ValueKind:
-    """Classify a value a walked function reads; the walk and a cache hit share this."""
+    """Classify a value a walked function reads; the walk and a cache hit share this.
+
+    A value on a `__wrapped__` chain that holds a `@fingerprint_by_name` mark takes the mark
+    decision (`_mark_decision`) first: a user class instance above the mark is
+    CLASS_ABOVE_MARK, and an object the walk records by name is EXTERNAL, also when it is a
+    marked instance of a class-based decorator.
+    """
+    mark = _mark_decision(value)
+    if mark is _MarkDecision.REFUSED:
+        return _ValueKind.CLASS_ABOVE_MARK
     # functools.partial and partialmethod fail is_user_code() (module is functools/stdlib).
     if isinstance(value, (functools.partial, functools.partialmethod)):
         return _ValueKind.PARTIAL
+    if mark is _MarkDecision.BY_NAME and not _carries_instance(value):
+        return _ValueKind.EXTERNAL
     if _is_callable_instance(value) or _is_user_class_instance(value) or _carries_instance(value):
         return _ValueKind.REFUSED
     if callable(value):
@@ -1436,12 +1448,15 @@ def _written_in_user_source(function: types.FunctionType) -> bool:
 def _user_member_value(value: Any) -> Any:
     """Return a class member that needs tracking, or `_UNREAD` when library machinery owns it.
 
-    A member the walk records by name (`_recorded_by_name`) is returned before any unwrap, so
-    a marked `@contextmanager` or `@functools.cache` helper held as a class attribute keeps its
-    name in the manifest. Each unwrap below stops at a user decorator above a mark, or at the
-    mark (`_stop_at_mark`).
+    A member on a chain that holds a mark takes the mark decision (`_mark_decision`) before
+    any unwrap. A member recorded by name, such as a marked `@contextmanager` or
+    `@functools.cache` helper held as a class attribute, is returned, so its name is in the
+    manifest. A member with a user class instance above the mark is returned too, so the walk
+    refuses it rather than dropping it. Each unwrap below stops at a user decorator above a
+    mark, or at the mark (`_stop_at_mark`), and a marked object it reaches is returned.
     """
-    if _recorded_by_name(value):
+    decision = _mark_decision(value)
+    if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
         return value
     if isinstance(value, functools.partial):
         return cast("Any", value)
@@ -1449,6 +1464,8 @@ def _user_member_value(value: Any) -> Any:
         if _written_in_user_source(value):
             return value
         unwrapped = inspect.unwrap(value, stop=_stop_at_mark)
+        if fingerprinted_by_name(unwrapped):
+            return unwrapped
         if unwrapped is not value and inspect.isfunction(unwrapped):
             return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
         return _UNREAD
@@ -1458,6 +1475,8 @@ def _user_member_value(value: Any) -> Any:
         return value
     if callable(value):
         unwrapped = inspect.unwrap(value, stop=_stop_at_mark)
+        if fingerprinted_by_name(unwrapped):
+            return unwrapped
         if unwrapped is not value and inspect.isfunction(unwrapped):
             return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
     if hasattr(value, "__get__") and _is_user_class_instance(value):
@@ -2128,6 +2147,8 @@ def _process_captured_value(
             manifest[f"const:{binding_ref}"] = text
         case _ValueKind.REFUSED:
             _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
+        case _ValueKind.CLASS_ABOVE_MARK:
+            _refuse_class_above_mark(value)
         case _ValueKind.EXTERNAL:
             # A library function or class is named by where it is defined; its code is not
             # hashed, but rebinding the name to another one must change the manifest.
@@ -2382,11 +2403,15 @@ def _process_partial_dependency(
 
     underlying = partial_obj.func
     _record_read(partial_obj, "pf")
-    if _value_kind(underlying) is _ValueKind.REFUSED:
+    kind = _value_kind(underlying)
+    if kind is _ValueKind.REFUSED:
         with _walking("pf"):
             _check_non_scalar_capture(
                 f"{binding_ref}.func", underlying, _current_stage_name.get() or "<unknown>"
             )
+    elif kind is _ValueKind.CLASS_ABOVE_MARK:
+        with _walking("pf"):
+            _refuse_class_above_mark(underlying)
     elif callable(underlying) and is_user_code(underlying):
         callable_ref = _callable_ref(underlying, f"{binding_ref}.func")
         with _walking("pf"):
@@ -2444,7 +2469,10 @@ def _process_bound_values(
     globals, closure values, defaults, and the non-scalar refusal. An instance of a user
     class with `__call__`, or a method bound to an instance (`Scaler(3).apply`,
     `default_rng(SEED).normal`), is refused, as it is when a stage reads one: what it reads
-    from its instance is not walked, and its repr does not record that state.
+    from its instance is not walked, and its repr does not record that state. A callable on a
+    chain that holds a mark takes the mark decision (`_mark_decision`) before any unwrap: one
+    recorded by name is left to the binding's canonical form, and one with a user class
+    instance above the mark is refused.
     """
     if isinstance(value, functools.partial):
         partial_obj = cast("functools.partial[Any]", value)
@@ -2477,13 +2505,16 @@ def _process_bound_values(
                 _hash_pydantic_schema(
                     cast("type[_PydanticModelProtocol]", value), manifest, visited
                 )
-    elif callable(value) and (_is_user_class_instance(value) or _carries_instance(value)):
+    elif not callable(value):
+        return
+    elif (decision := _mark_decision(value)) is _MarkDecision.REFUSED:
+        _refuse_class_above_mark(value)
+    elif decision is _MarkDecision.BY_NAME and not _carries_instance(value):
+        # The binding's canonical form names it (`_canonicalize_value_for_hash`).
+        return
+    elif _is_user_class_instance(value) or _carries_instance(value):
         _check_non_scalar_capture(binding_ref, value, _current_stage_name.get() or "<unknown>")
-    elif (
-        callable(value)
-        and inspect.isfunction(inspect.unwrap(value, stop=_stop_at_mark))
-        and is_user_code(value)
-    ):
+    elif inspect.isfunction(inspect.unwrap(value, stop=_stop_at_mark)) and is_user_code(value):
         _process_callable_dependency(binding_ref, value, manifest, visited)
 
 
@@ -2767,6 +2798,10 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
             _canonicalize_value_for_hash(partial_value.args, inner),
             _canonicalize_value_for_hash(partial_value.keywords, inner),
         ]
+    if _mark_decision(value) is _MarkDecision.BY_NAME and not _carries_instance(value):
+        # A marked instance of a class-based decorator, held as a partial argument or a
+        # default, is named like a marked function: its own `__dict__` is not dumped.
+        return ["external", _library_name(value)]
     if isinstance(value, dict):
         mapping = cast("dict[Any, Any]", value)
         inner = (*active, id(mapping))
@@ -2959,9 +2994,14 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
             _active_source_map.setdefault(rel_path, digest)
     _t = metrics.start()
     try:
-        # 0. A function the walk records by name (`_recorded_by_name`) gets a hash of that
-        # name. Its body is not read.
-        if _recorded_by_name(func):
+        # 0. The mark decision (`_mark_decision`): an object the walk records by name gets a
+        # hash of that name, and its body is not read. A chain with a user class instance
+        # above the mark is refused (a default factory, a loader method or a function identity
+        # reaches the hash without the walk's value classification).
+        decision = _mark_decision(func)
+        if decision is _MarkDecision.REFUSED:
+            _refuse_class_above_mark(func)
+        if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
             return _by_name_hash(func)
 
         # 1. Check in-memory WeakKeyDictionary cache first (fastest)
@@ -3187,12 +3227,12 @@ def fingerprinted_by_name(obj: Any) -> bool:
 def _recorded_by_name(obj: Any) -> bool:
     """Whether the walk records `obj` by its module and qualified name for a mark.
 
-    That is a marked function, a method bound to one, and a library wrapper object without
+    That is a marked object (a function, or an instance of a class-based decorator that
+    `@fingerprint_by_name` marked), a method bound to one, and a library wrapper object without
     Python code of its own (functools.cache, lru_cache) whose `__wrapped__` chain reaches a
-    marked function through such wrappers only. Behind such a wrapper the source read and the
-    walk stop at the marked function (`_stop_at_mark`), so the wrapper gets the record of the
-    marked function. A Python function on the chain (a functools.wraps decorator) or an
-    instance of a user class is user code: the walk records its code.
+    marked object through such wrappers only. A Python function on the chain (a functools.wraps
+    decorator) or an instance of a user class above the mark is user code: `_mark_decision`
+    fingerprints the function by its own code and refuses the instance.
     """
     if fingerprinted_by_name(obj):
         return True
@@ -3214,31 +3254,126 @@ def _recorded_by_name(obj: Any) -> bool:
             return False
         if fingerprinted_by_name(current):
             return True
+        if _is_user_class_instance(current):
+            return False
         if inspect.isfunction(current) or isinstance(current, (type, types.ModuleType)):
             return False
         seen.add(id(current))
 
 
+class _MarkDecision(enum.Enum):
+    """What the walk does with an object on a `__wrapped__` chain that holds a mark."""
+
+    BY_NAME = "by_name"  # the marked object, or library wrappers over it: recorded by name
+    OWN_CODE = "own_code"  # a user function above the mark: fingerprinted by its own code
+    REFUSED = "refused"  # a user class instance above the mark: refused
+
+
+def _mark_decision(obj: Any) -> _MarkDecision | None:
+    """The one decision for an object whose `__wrapped__` chain holds a `@fingerprint_by_name`
+    mark, or None when the chain holds no mark.
+
+    Every path that reads a value (a global, closure cell, default, class member, module
+    attribute, partial function or argument, loader field, default factory) asks it before it
+    unwraps, so no path drops an object on such a chain without a decision. Without a mark the
+    answer is None and the walk is main's.
+    """
+    if isinstance(obj, (type, types.ModuleType)):
+        return None
+    target = obj.__func__ if inspect.ismethod(obj) else obj
+    try:
+        namespace: Mapping[str, Any] = object.__getattribute__(target, "__dict__")
+    except AttributeError:
+        return None
+    if namespace.get(_BY_NAME_MARK) is not target and "__wrapped__" not in namespace:
+        return None
+    if _recorded_by_name(obj):
+        return _MarkDecision.BY_NAME
+    if _class_above_mark(target) is not None:
+        return _MarkDecision.REFUSED
+    if _mark_below(target) is not None:
+        return _MarkDecision.OWN_CODE
+    return None
+
+
+def _class_above_mark(obj: Any) -> Any:
+    """The first user class instance on `obj`'s `__wrapped__` chain, `obj` included, that is
+    above a marked object, or None."""
+    found: Any = None
+    seen = set[int]()
+    current: Any = obj
+    while current is not None and id(current) not in seen:
+        if fingerprinted_by_name(current):
+            return found
+        if found is None and _is_user_class_instance(current):
+            found = current
+        seen.add(id(current))
+        try:
+            namespace: Mapping[str, Any] = object.__getattribute__(current, "__dict__")
+        except AttributeError:
+            return None
+        current = namespace.get("__wrapped__")
+    return None
+
+
+def _refuse_class_above_mark(value: Any) -> None:
+    """Refuse `value`, on whose chain a user class instance is above a mark, naming both.
+
+    The mark records only the object below the instance, and no fingerprint records a class
+    instance's code and state, so an edit to the class would go unseen. Unsafe fingerprinting
+    does not suppress this refusal: the fixes are local to the helper.
+    """
+    instance = _class_above_mark(value.__func__ if inspect.ismethod(value) else value)
+    marked = _mark_below(instance)
+    decorator = _definition_ref(type(instance))
+    helper = _definition_ref(marked) if marked is not None else _definition_ref(instance)
+    stage = _current_stage_name.get()
+    prefix = f"Stage '{stage}': " if stage else ""
+    message = (
+        f"{prefix}the class-based decorator '{decorator}' is above '{helper}', which is marked "
+        + "@fingerprint_by_name.\n"
+        + f"The mark records '{helper}' by name only, and Pivot cannot fingerprint the code and "
+        + f"state of a class-based decorator, so an edit to '{decorator}' would leave the stage "
+        + "cached with an old output.\n"
+        + "Fix one of:\n"
+        + "  - put @fingerprint_by_name above the class-based decorator, so Pivot records the "
+        + "whole helper by name;\n"
+        + "  - replace the class with a function decorator built with functools.wraps, which "
+        + "Pivot fingerprints by its own code;\n"
+        + "  - remove @fingerprint_by_name."
+    )
+    errors = _capture_errors.get()
+    if errors is None:
+        raise exceptions.StageDefinitionError(message)
+    errors.append(message)
+
+
 def _mark_below(obj: Any) -> Any:
-    """The first marked function on `obj`'s `__wrapped__` chain below `obj`, or None."""
+    """The first marked object on `obj`'s `__wrapped__` chain below `obj`, or None."""
     if isinstance(obj, type) or not hasattr(obj, "__wrapped__"):
         return None
     below = inspect.unwrap(obj.__wrapped__, stop=fingerprinted_by_name)
     return below if fingerprinted_by_name(below) else None
 
 
-def _stop_at_mark(obj: Any) -> bool:
-    """Where an unwrap that leads to code stops: a marked function, or a user decorator above one.
+def _user_decorator_above_mark(obj: Any) -> bool:
+    """Whether `obj` is user code with a marked object below it on its wrapper chain."""
+    if _mark_below(obj) is None:
+        return False
+    return (inspect.isfunction(obj) and _written_in_user_source(obj)) or _is_user_class_instance(
+        obj
+    )
 
-    A user decorator is a function compiled from user source (a `functools.wraps` wrapper)
-    with a marked function below it. The mark covers only the marked function, so the walk
-    reads such a decorator's own code where it would otherwise follow `__wrapped__` into the
-    mark. A library wrapper (a `contextlib.contextmanager` helper, `functools.cache`) is not a
+
+def _stop_at_mark(obj: Any) -> bool:
+    """Where an unwrap that leads to code stops: a marked object, or user code above one.
+
+    The mark covers only the marked object. The walk reads the own code of a user function
+    above it, and `_mark_decision` refuses a user class instance above it, so no unwrap passes
+    either. A library wrapper (a `contextlib.contextmanager` helper, `functools.cache`) is not a
     stop. Without a mark on the chain nothing stops, and the unwrap goes to the end, as on main.
     """
-    if fingerprinted_by_name(obj):
-        return True
-    return inspect.isfunction(obj) and _mark_below(obj) is not None and _written_in_user_source(obj)
+    return fingerprinted_by_name(obj) or _user_decorator_above_mark(obj)
 
 
 def _source_object(func: Any) -> Any:
@@ -3246,11 +3381,14 @@ def _source_object(func: Any) -> Any:
 
     `inspect.getsource` follows `__wrapped__` to the end of the chain with no stop. Without a
     mark on the chain this returns that end, so the read is the one main makes. With a mark,
-    the unwrap stops at `_stop_at_mark`: for a user decorator above the mark this returns the
-    decorator's code object, whose own lines `inspect.getsource` reads (a code object has no
+    `_mark_decision` decides: an object recorded by name, or a chain with a user class instance
+    above the mark (which the walk refuses), gives None. Otherwise the unwrap stops at
+    `_stop_at_mark`: for a user function decorator above the mark this returns the decorator's
+    code object, whose own lines `inspect.getsource` reads (a code object has no
     `__wrapped__`); for the mark itself it returns None. No source read reaches a marked body.
     """
-    if _recorded_by_name(func):
+    decision = _mark_decision(func)
+    if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
         return None
     target = inspect.unwrap(func, stop=_stop_at_mark)
     if fingerprinted_by_name(target):
