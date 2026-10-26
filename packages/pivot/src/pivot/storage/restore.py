@@ -233,22 +233,6 @@ def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> None:
         cache.atomic_write_file(dest_path, write_content, staging_path=staging_path)
 
 
-def _restore_from_cache(
-    dest_path: pathlib.Path,
-    output_hash: HashInfo,
-    cache_dir: pathlib.Path,
-    checkout_modes: list[cache.CheckoutMode],
-) -> bool:
-    """Restore an output from cache."""
-    return cache.restore_from_cache(
-        dest_path,
-        output_hash,
-        cache_dir / "files",
-        checkout_modes=checkout_modes,
-        state_dir=config.get_state_dir(),
-    )
-
-
 def restore_file(
     rel_path: str,
     output_hash: HashInfo | None,
@@ -261,6 +245,7 @@ def restore_file(
 ) -> RestoreResult:
     """Restore a single file from revision and return its result."""
     path_str = str(dest_path)
+    files_dir = cache_dir / "files"
 
     if dest_path.exists() and not force:
         return RestoreResult(
@@ -279,16 +264,17 @@ def restore_file(
         should_try_cache = True
         if "manifest" not in output_hash:
             file_hash = output_hash["hash"]
-            cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
+            cached_path = cache.get_cache_path(files_dir, file_hash)
             should_try_cache = cached_path.exists()
 
         if should_try_cache:
             try:
-                success = _restore_from_cache(
+                success = cache.restore_from_cache(
                     dest_path,
                     output_hash,
-                    cache_dir,
-                    checkout_modes,
+                    files_dir,
+                    checkout_modes=checkout_modes,
+                    state_dir=config.get_state_dir(),
                 )
                 if success:
                     return RestoreResult(
@@ -318,18 +304,14 @@ def restore_file(
 
     # Strategy 3: Download missing cache objects from the configured remote, then restore.
     if output_hash is not None and remote_factory is not None:
-        missing_hashes = cache.missing_cache_objects(
-            output_hash,
-            cache_dir / "files",
-            checkout_modes,
-        )
+        missing_hashes = cache.missing_cache_objects(output_hash, files_dir, checkout_modes)
         if missing_hashes:
             try:
                 remote_storage = remote_factory()
                 download_results = asyncio.run(
                     remote_storage.download_batch(
                         [
-                            (file_hash, cache.get_cache_path(cache_dir / "files", file_hash))
+                            (file_hash, cache.get_cache_path(files_dir, file_hash))
                             for file_hash in missing_hashes
                         ],
                         readonly=True,
@@ -350,11 +332,12 @@ def restore_file(
                         message=f"Error: {dest_path} - failed to download from remote: {error}",
                     )
         try:
-            success = _restore_from_cache(
+            success = cache.restore_from_cache(
                 dest_path,
                 output_hash,
-                cache_dir,
-                checkout_modes,
+                files_dir,
+                checkout_modes=checkout_modes,
+                state_dir=config.get_state_dir(),
             )
         except OSError as e:
             return RestoreResult(

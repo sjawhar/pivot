@@ -922,8 +922,8 @@ def _repair_tree_dir_files(
     cache_dir_path: pathlib.Path, manifest: list[DirManifestEntry], cache_dir: pathlib.Path
 ) -> bool:
     """Give a whole-directory SYMLINK cache tree every file its manifest records, copied from
-    its files' own cache objects. Return False, changing nothing, when a file is missing, has
-    the wrong content, or its object is not cached.
+    its files' own cache objects. Return False, changing nothing, when a file is missing or
+    holds the wrong content and its own cache object is absent.
 
     Each repaired file is copied beside its name and renamed in, so a reader of the tree never
     sees part of one. Changing the tree in place is safe for the reason
