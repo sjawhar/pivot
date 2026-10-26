@@ -317,11 +317,13 @@ user module in its body, and a helper that uses `importlib.import_module` or
 `__import__`. Import the module at the top of the helper's file instead.
 
 The fingerprint walk never reads the body of a marked function. A decorator
-above the mark is user code: Pivot adds the decorator's own code to the
+above the mark is user code: Pivot adds a function decorator's own code to the
 fingerprint and records the marked function inside it by name. This is also
 true when `functools.cache` wraps that decorator. A library wrapper directly
 above the mark (`functools.cache`, `functools.lru_cache`,
-`contextlib.contextmanager`) keeps the record by name.
+`contextlib.contextmanager`) keeps the record by name. Pivot refuses a
+class-based decorator above the mark when a library wrapper wraps it, because
+the decorator instance can carry state Pivot cannot fingerprint soundly.
 
 Without a mark below it, Pivot fingerprints a `functools.wraps` decorator as
 in earlier versions. It follows `__wrapped__` to the wrapped function, so it

@@ -3212,6 +3212,8 @@ def _recorded_by_name(obj: Any) -> bool:
         current = namespace.get("__wrapped__")
         if current is None or id(current) in seen:
             return False
+        if _is_user_class_instance(current):
+            return False
         if fingerprinted_by_name(current):
             return True
         if inspect.isfunction(current) or isinstance(current, (type, types.ModuleType)):
@@ -3227,18 +3229,25 @@ def _mark_below(obj: Any) -> Any:
     return below if fingerprinted_by_name(below) else None
 
 
-def _stop_at_mark(obj: Any) -> bool:
-    """Where an unwrap that leads to code stops: a marked function, or a user decorator above one.
+def _user_decorator_above_mark(obj: Any) -> bool:
+    """Whether `obj` is user code with a marked function below it on its wrapper chain."""
+    if _mark_below(obj) is None:
+        return False
+    return (inspect.isfunction(obj) and _written_in_user_source(obj)) or _is_user_class_instance(
+        obj
+    )
 
-    A user decorator is a function compiled from user source (a `functools.wraps` wrapper)
-    with a marked function below it. The mark covers only the marked function, so the walk
-    reads such a decorator's own code where it would otherwise follow `__wrapped__` into the
-    mark. A library wrapper (a `contextlib.contextmanager` helper, `functools.cache`) is not a
-    stop. Without a mark on the chain nothing stops, and the unwrap goes to the end, as on main.
+
+def _stop_at_mark(obj: Any) -> bool:
+    """Where an unwrap that leads to code stops: a marked function or user decorator above one.
+
+    The mark covers only the marked function. The walk reads the own code of a user function
+    above it. A user class instance has state that no fingerprint can capture soundly, so the
+    caller refuses it. A library wrapper (a `contextlib.contextmanager` helper,
+    `functools.cache`) is not a stop. Without a mark on the chain nothing stops, and the unwrap
+    goes to the end, as on main.
     """
-    if fingerprinted_by_name(obj):
-        return True
-    return inspect.isfunction(obj) and _mark_below(obj) is not None and _written_in_user_source(obj)
+    return fingerprinted_by_name(obj) or _user_decorator_above_mark(obj)
 
 
 def _source_object(func: Any) -> Any:
@@ -3246,14 +3255,22 @@ def _source_object(func: Any) -> Any:
 
     `inspect.getsource` follows `__wrapped__` to the end of the chain with no stop. Without a
     mark on the chain this returns that end, so the read is the one main makes. With a mark,
-    the unwrap stops at `_stop_at_mark`: for a user decorator above the mark this returns the
-    decorator's code object, whose own lines `inspect.getsource` reads (a code object has no
-    `__wrapped__`); for the mark itself it returns None. No source read reaches a marked body.
+    the unwrap stops at `_stop_at_mark`: for a user function decorator above the mark this
+    returns the decorator's code object, whose own lines `inspect.getsource` reads. A code object
+    has no `__wrapped__`. For a user class instance it reports the unsafe capture. For the mark
+    itself it returns None. No source read reaches a marked body.
     """
     if _recorded_by_name(func):
         return None
     target = inspect.unwrap(func, stop=_stop_at_mark)
     if fingerprinted_by_name(target):
+        return None
+    if _user_decorator_above_mark(target) and _is_user_class_instance(target):
+        _check_non_scalar_capture(
+            getattr(target, "__qualname__", type(target).__qualname__),
+            target,
+            _current_stage_name.get() or getattr(func, "__name__", "<unknown>"),
+        )
         return None
     if _stop_at_mark(target):
         return target.__code__

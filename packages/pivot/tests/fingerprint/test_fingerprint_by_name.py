@@ -2460,3 +2460,151 @@ def test_the_mark_leaves_the_pickle_by_value_decision_of_its_module_unchanged(
         ("outroot", "marked"): False,
         ("outroot", "plain"): False,
     }, found
+
+
+# ---------------------------------------------------------------------------------------------
+# A class-based decorator above the mark, behind `functools.cache`, is user code.
+# ---------------------------------------------------------------------------------------------
+
+_R4A_DECO = """\
+import functools
+
+
+class Traced:
+    def __init__(self, fn):
+        self.fn = fn
+        functools.update_wrapper(self, fn)
+
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs) * 2
+"""
+
+_R4A_HELPER = """\
+import functools
+
+from pivot import fingerprint_by_name
+from rk4_a_deco import Traced
+
+
+{top}@Traced
+@fingerprint_by_name
+def helper() -> int:
+    return 5
+"""
+
+_R4A_STAGE = "import rk4_a_h as h\n\n\ndef my_stage():\n    return h.helper()\n"
+_R4A_MODULES = ("rk4_a_deco", "rk4_a_h", "rk4_a_s")
+
+
+@pytest.mark.parametrize(
+    "top",
+    ["@functools.cache\n", "@functools.lru_cache(maxsize=8)\n"],
+    ids=["cache", "lru_cache"],
+)
+def test_a_class_decorator_above_the_mark_behind_a_cache_is_fingerprinted_or_refused(
+    module_dir: pathlib.Path, top: str
+) -> None:
+    """A decorator above the mark is user code, and its own code is in the fingerprint, also
+    when `functools.cache` wraps it. Here the decorator is a user class, and its own code is
+    `Traced.__call__`. Pivot either puts that code in the fingerprint, so an edit to it changes
+    the stage fingerprint, or refuses the stage as a non-scalar capture. It never records the
+    chain by name: then the edit leaves the stage cached with the old output."""
+    _write(module_dir / "rk4_a_deco.py", _R4A_DECO)
+    _write(module_dir / "rk4_a_h.py", _R4A_HELPER.format(top=top))
+    _write(module_dir / "rk4_a_s.py", _R4A_STAGE)
+    try:
+        first = fingerprint.get_stage_fingerprint(_fresh(*_R4A_MODULES).my_stage)
+    except exceptions.StageDefinitionError as refused:
+        assert "Traced" in str(refused), refused
+        return
+
+    _edit(module_dir / "rk4_a_deco.py", "* 2\n", "* 30\n")
+    second = fingerprint.get_stage_fingerprint(_fresh(*_R4A_MODULES).my_stage)
+    assert second != first, first
+
+
+# ---------------------------------------------------------------------------------------------
+# A mark on a `functools.wraps` wrapper keeps that wrapper's own code out of every fingerprint.
+# ---------------------------------------------------------------------------------------------
+
+_LOCK_HELPER = """\
+import functools
+
+from pivot import fingerprint_by_name
+
+
+def traced(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _impl():
+    return "v1"
+
+
+process_start = fingerprint_by_name(traced(_impl))
+"""
+
+_LOCK_STAGES = {
+    "partial_and_default": """\
+import functools
+
+from rk4_lock_h import process_start
+
+
+def _apply(fn):
+    return fn()
+
+
+RUNNER = functools.partial(_apply, process_start)
+
+
+def my_stage(start=process_start):
+    return RUNNER() + start()
+""",
+    "default_factory": """\
+import pydantic
+
+from pivot import StageParams
+from rk4_lock_h import process_start
+
+
+class P(StageParams):
+    tag: str = pydantic.Field(default_factory=process_start)
+
+
+def my_stage(params: P) -> str:
+    return params.tag
+""",
+}
+
+
+@pytest.mark.parametrize("stage", list(_LOCK_STAGES))
+def test_a_mark_on_a_wraps_wrapper_keeps_the_fingerprint_when_its_own_code_changes(
+    module_dir: pathlib.Path, stage: str
+) -> None:
+    """The mark covers the object it is applied to. When that object is a `functools.wraps`
+    wrapper, the wrapper's own code is marked. An edit to it keeps the stage fingerprint and
+    manifest-cache key for a partial argument and a default, and for a pydantic
+    `default_factory`."""
+    _write(module_dir / "rk4_lock_h.py", _LOCK_HELPER)
+    _write(module_dir / "rk4_lock_s.py", _LOCK_STAGES[stage])
+    names = ("rk4_lock_h", "rk4_lock_s")
+    my_stage = _fresh(*names).my_stage
+    first = fingerprint.get_stage_fingerprint(my_stage)
+    first_key = fingerprint._make_manifest_cache_key("lock/s", my_stage)
+
+    _edit(
+        module_dir / "rk4_lock_h.py",
+        "        return fn(*args, **kwargs)\n",
+        "        return fn(*args, **kwargs) + ''\n",
+    )
+    my_stage = _fresh(*names).my_stage
+    second = fingerprint.get_stage_fingerprint(my_stage)
+    assert second == first, sorted(
+        key for key in set(first) | set(second) if first.get(key) != second.get(key)
+    )
+    assert fingerprint._make_manifest_cache_key("lock/s", my_stage) == first_key
