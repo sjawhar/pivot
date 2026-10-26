@@ -20,6 +20,7 @@ from pivot.types import TrackedFileStatus
 
 if TYPE_CHECKING:
     import pathlib
+    from collections.abc import Generator
 
     from click.testing import CliRunner
 
@@ -32,6 +33,15 @@ def shout(raw: str) -> str:
     return raw.upper()
 
 
+@pytest.fixture(autouse=True)
+def _listable_modes() -> Generator[None]:
+    """Make new directories 0o755 whatever the user's umask: the memo records only directories
+    every account may read and search."""
+    previous = os.umask(0o022)
+    yield
+    os.umask(previous)
+
+
 @pytest.fixture
 def memo_project(
     mock_discovery: compose.Pipeline,
@@ -40,6 +50,7 @@ def memo_project(
 ) -> pathlib.Path:
     """A project whose stage reads ``data/raw/input.txt``, on a filesystem the memo trusts."""
     root = mock_discovery.root
+    root.chmod(0o755)  # pytest makes tmp_path private; the memo records no private directory
     raw_dir = root / "data" / "raw"
     raw_dir.mkdir(parents=True)
     (raw_dir / "input.txt").write_text("original")

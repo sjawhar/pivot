@@ -6,6 +6,8 @@ change, cold and warm, the memo walk must find exactly what main finds, in main'
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import fcntl
 import os
 import pathlib
@@ -23,7 +25,7 @@ from pivot.executor import core as executor_core
 from pivot.storage import cache, state, track
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator, Iterator
 
     from pytest_mock import MockerFixture
 
@@ -36,6 +38,15 @@ _INSIDE_SETTLE_WINDOW_NS = 1_000_000_000
 # timestamp tick (one jiffy, at most 10 ms). The walk's settle window guarantees that gap in real
 # use; a test that moves the clock past the window waits the tick itself.
 _ONE_TICK_S = 0.05
+
+
+@pytest.fixture(autouse=True)
+def _listable_modes() -> Generator[None]:
+    """Make new directories 0o755 whatever the user's umask: the memo records only directories
+    every account may read and search."""
+    previous = os.umask(0o022)
+    yield
+    os.umask(previous)
 
 
 @pytest.fixture
@@ -685,7 +696,7 @@ def test_settle_window_counts_from_the_walk_start_on_a_long_walk(
     real_list = track._list_directory
     injected = list[str]()
 
-    def _slow_list(path: str) -> tuple[list[str], list[str]] | None:
+    def _slow_list(path: str) -> tuple[list[str], list[str], bool] | None:
         names = real_list(path)
         if path == os.fspath(memo_project) and not injected:
             injected.append(path)
@@ -1115,6 +1126,178 @@ def test_dotdot_in_a_recorded_listing_never_leaves_the_project(
         state_db.update_pvt_dir_memo(memo, memo["root"], {**memo["dirs"], "": poisoned})
 
     _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+
+
+# =============================================================================
+# Listings the memo never records
+# =============================================================================
+
+
+class _UnclassifiableEntry:
+    """A DirEntry whose type cannot be read, as is_dir behaves without d_type and without x."""
+
+    name: str
+
+    def __init__(self, entry: os.DirEntry[str]) -> None:
+        self.name = entry.name
+
+    def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        raise PermissionError(errno.EACCES, "Permission denied", self.name)
+
+
+def _helper_scandir_without_types(
+    monkeypatch: pytest.MonkeyPatch, directory: pathlib.Path, name: str
+) -> None:
+    """os.scandir, except that the type of ``name`` in ``directory`` cannot be read."""
+    real_scandir = os.scandir
+
+    def _scandir(path: str) -> object:
+        listing = real_scandir(path)
+        if os.path.normpath(path) != os.path.normpath(directory):
+            return listing
+
+        @contextlib.contextmanager
+        def _wrapped() -> Iterator[list[object]]:
+            with listing as entries:
+                yield [_UnclassifiableEntry(e) if e.name == name else e for e in entries]
+
+        return _wrapped()
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+
+
+def test_listing_with_an_unclassifiable_entry_is_not_reused(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a filesystem whose listings carry no entry type (XFS with ftype=0, ext4 without the
+    filetype feature), is_dir needs an lstat, which an account that may read P but not search it
+    cannot make: P/sub counts as no subdirectory, as in os.walk. Such a listing is never
+    recorded, so a later walk with full rights still finds P/sub."""
+    _helper_track(memo_project / "top.csv", "top\n")
+    _helper_track(memo_project / "P" / "sub" / "x.csv", "x\n")
+    _helper_settle(monkeypatch)
+
+    with monkeypatch.context() as patch:
+        _helper_scandir_without_types(patch, memo_project / "P", "sub")
+        _helper_preflight(memo_project)
+
+    assert "P" not in _helper_memo()["dirs"], "the listing with an untyped entry is not recorded"
+    _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+
+
+@pytest.mark.parametrize("seconds", [10_413_792_000], ids=["year-2300"])
+def test_directory_mtime_past_2262_is_walked(memo_project: pathlib.Path, seconds: int) -> None:
+    """ext4 and XFS keep mtimes past 2262, which a signed 64-bit nanosecond count cannot hold:
+    both walks list such a directory instead of failing."""
+    _helper_track(memo_project / "top.csv", "top\n")
+    odd = memo_project / "odd"
+    odd.mkdir()
+    os.utime(odd, ns=(0, seconds * _NS_PER_S))
+    assert odd.stat().st_mtime_ns > 2**63 - 1
+
+    _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+    _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
+
+
+_BEFORE_1677_NS = -(2**63) - 1
+_AFTER_2262_NS = 2**63 + 1
+_CLOCK_IN_2400_NS = 13_569_465_600 * _NS_PER_S
+
+
+def _helper_mtime_before_1677(result: os.stat_result) -> tuple[int, int]:
+    return _BEFORE_1677_NS, result.st_ctime_ns
+
+
+def _helper_ctime_before_1677(result: os.stat_result) -> tuple[int, int]:
+    return result.st_mtime_ns, _BEFORE_1677_NS
+
+
+def _helper_mtime_after_2262(result: os.stat_result) -> tuple[int, int]:
+    return _AFTER_2262_NS, result.st_ctime_ns
+
+
+def _helper_ctime_after_2262(result: os.stat_result) -> tuple[int, int]:
+    return result.st_mtime_ns, _AFTER_2262_NS
+
+
+@pytest.mark.parametrize(
+    ("times", "clock_ns"),
+    [
+        pytest.param(_helper_mtime_before_1677, None, id="mtime-before-1677"),
+        pytest.param(_helper_ctime_before_1677, None, id="ctime-before-1677"),
+        pytest.param(
+            _helper_mtime_after_2262, _CLOCK_IN_2400_NS, id="mtime-after-2262-and-the-clock-later"
+        ),
+        pytest.param(
+            _helper_ctime_after_2262, _CLOCK_IN_2400_NS, id="ctime-after-2262-and-the-clock-later"
+        ),
+    ],
+)
+def test_directory_time_outside_the_stamp_is_listed_every_walk(
+    memo_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    times: Callable[[os.stat_result], tuple[int, int]],
+    clock_ns: int | None,
+) -> None:
+    """tmpfs and btrfs keep times before 1677 too. A time the stamp cannot hold is never trusted,
+    even when it is settled, so its directory is listed every walk and never recorded."""
+    _helper_track(memo_project / "top.csv", "top\n")
+    _helper_track(memo_project / "odd" / "inside.csv", "inside\n")
+    _helper_report_directory_times(monkeypatch, memo_project / "odd", times)
+    if clock_ns is None:
+        _helper_settle(monkeypatch)
+    else:
+        monkeypatch.setattr(time, "time_ns", lambda: clock_ns)
+
+    _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+    _helper_record(memo_project)
+    _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+
+    memo = _helper_memo()
+    assert "odd" not in memo["dirs"], "a time outside the stamp is never recorded"
+    assert "" in memo["dirs"], "the other directories still are"
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        pytest.param(0o700, id="private"),
+        pytest.param(0o750, id="others-may-not-list"),
+        pytest.param(0o711, id="others-may-search-but-not-read"),
+        pytest.param(0o754, id="others-may-read-but-not-search"),
+        pytest.param(0o705, id="group-may-not-list"),
+    ],
+)
+def test_directory_some_account_may_not_list_never_reaches_the_memo(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, mode: int
+) -> None:
+    """Other accounts can read the state database, so it holds no name that an account able to
+    reach the project could not list itself. A directory not every account may read and search
+    is listed every walk, as is everything below it (a recorded path names each directory above),
+    and the tracked file under it is found by listing."""
+    _helper_build_tree(memo_project)
+    private = memo_project / "private"
+    (private / "q3-layoff-list" / "names").mkdir(parents=True)
+    _helper_track(private / "held.csv", "held\n")
+    private.chmod(mode)
+    _helper_settle(monkeypatch)
+
+    _helper_record(memo_project)
+    memo = _helper_memo()
+    listed = mocker.spy(os, "scandir")
+    warm = track.discover_pvt_files(memo_project)
+    listed_paths = {os.fspath(call.args[0]) for call in listed.call_args_list if call.args}
+    database = (config.get_state_dir() / "state.lmdb" / "data.mdb").read_bytes()
+
+    assert [rel for rel in memo["dirs"] if rel == "private" or rel.startswith("private/")] == []
+    assert [rel for rel, listing in memo["dirs"].items() if b"q3-layoff-list" in listing] == []
+    assert b"q3-layoff-list" not in database, "no name from inside it reaches the state database"
+    assert "a/b" in memo["dirs"], "directories every account may list are still recorded"
+    assert {os.fspath(private), os.fspath(private / "q3-layoff-list")} <= listed_paths, (
+        "it and the directories below it are listed on every walk"
+    )
+    _helper_assert_matches_main(warm, memo_project)
+    assert str(private / "held.csv") in warm, "the .pvt under it is found by listing"
 
 
 # =============================================================================

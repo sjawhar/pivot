@@ -157,13 +157,26 @@ def get_data_path(pvt_path: pathlib.Path) -> pathlib.Path:
 # mtime and ctime are both whole seconds is never trusted either: on a filesystem with one-second
 # timestamps (ext2, ext3, ext4 with 128-byte inodes), a wall clock stepped back into a recorded
 # second would let a later change keep its directory's stamp. Such a filesystem is then always
-# listed; a nanosecond one loses the memo for about one directory in 10^9. The memo holds names
-# only, never a .pvt's content (rewriting a file does not change its directory), and is trusted
-# only on filesystems that keep directory times this way. A reused listing is what the user who
-# recorded it could list: a reader who cannot list that directory still gets its recorded names.
+# listed; a nanosecond one loses the memo for about one directory in 10^9. A time the stamp's
+# signed 64-bit nanoseconds cannot hold (before 1677 or after 2262) is never trusted, so such a
+# directory is listed every time. The memo holds names only, never a .pvt's content (rewriting a
+# file does not change its directory), and is trusted only on filesystems that keep directory
+# times this way.
+#
+# Other accounts can read the state database, so the memo holds only names that every account
+# able to reach the project could list itself: a directory is recorded only when it and every
+# directory above it up to the project root let owner, group and others read and search them
+# (the recorded path holds a name from each of those directories). Any other directory, a
+# mode-700 one say, is listed every time, as on main, so a .pvt under it is found by listing,
+# never from the memo. Only mode bits are read, not POSIX ACLs: an account an ACL entry denies
+# can still read a recorded name. A chmod changes the ctime, so a directory made private no
+# longer matches its stamp. A listing in which an entry's type could not be read (the lstat a
+# filesystem without d_type needs failed) is never recorded: that entry is not descended, as in
+# os.walk, and a walk that can read its type must not reuse that.
 _MEMO_SETTLE_NS = 2_000_000_000
 _NS_PER_S = 1_000_000_000
 _MEMO_FS_TYPES = frozenset({b"ext2", b"ext3", b"ext4", b"xfs", b"btrfs", b"tmpfs", b"f2fs", b"zfs"})
+_EVERYONE_LISTS = 0o555  # read and search for owner, group and others
 # The memo write's wait for the write lock: the memo is worth less than a busy database's time.
 _MEMO_WRITE_TIMEOUT_S = 1.0
 _MEMO_DB_ERRORS = (exceptions.PivotError, state.StateDBError, RuntimeError, OSError, lmdb.Error)
@@ -171,6 +184,7 @@ _MOUNTINFO = pathlib.Path("/proc/self/mountinfo")
 _MOUNTINFO_ESCAPE = re.compile(rb"\\([0-7]{3})")
 _LISTING_VERSION = b"\x01"
 _STAMP = struct.Struct(">QQqq")  # st_dev, st_ino, st_mtime_ns, st_ctime_ns
+_STAMP_TIMES = range(-(2**63), 2**63)  # the times _STAMP's signed 64-bit fields hold
 _SUBDIR_COUNT = struct.Struct(">I")
 _LISTING_HEADER = len(_LISTING_VERSION) + _STAMP.size + _SUBDIR_COUNT.size
 
@@ -178,14 +192,16 @@ _LISTING_HEADER = len(_LISTING_VERSION) + _STAMP.size + _SUBDIR_COUNT.size
 def _times_trusted(dir_stat: os.stat_result, settled_before: int) -> bool:
     """Whether a directory's mtime and ctime let its stamp vouch for a recorded listing.
 
-    Both are settled (before ``settled_before``, the walk start less ``_MEMO_SETTLE_NS``) and not
-    both whole seconds, as the comment above argues.
+    Both are settled (before ``settled_before``, the walk start less ``_MEMO_SETTLE_NS``), not
+    both whole seconds, and within ``_STAMP_TIMES``, as the comment above argues.
     """
     mtime_ns, ctime_ns = dir_stat.st_mtime_ns, dir_stat.st_ctime_ns
     return (
         mtime_ns < settled_before
         and ctime_ns < settled_before
         and (mtime_ns % _NS_PER_S != 0 or ctime_ns % _NS_PER_S != 0)
+        and mtime_ns in _STAMP_TIMES
+        and ctime_ns in _STAMP_TIMES
     )
 
 
@@ -240,14 +256,17 @@ def _device_allowed(mounts: _Mounts, device: int, real_path: str) -> bool:
     return False
 
 
-def _list_directory(path: str) -> tuple[list[str], list[str]] | None:
+def _list_directory(path: str) -> tuple[list[str], list[str], bool] | None:
     """List a directory the way ``os.walk(followlinks=False)`` descends it.
 
     Returns its real subdirectories (not symlinks) and every name ending in ``.pvt``, both in
-    listing order, or None when it cannot be listed (``os.walk`` skips it).
+    listing order, and whether every entry's type could be read (an entry whose type cannot be
+    read is not a subdirectory, as in ``os.walk``). None when it cannot be listed (``os.walk``
+    skips it).
     """
     subdirs = list[str]()
     pvt_names = list[str]()
+    typed = True
     try:
         with os.scandir(path) as entries:
             for entry in entries:
@@ -258,11 +277,12 @@ def _list_directory(path: str) -> tuple[list[str], list[str]] | None:
                     is_dir = entry.is_dir(follow_symlinks=False)
                 except OSError:
                     is_dir = False
+                    typed = False
                 if is_dir:
                     subdirs.append(name)
     except OSError:
         return None
-    return subdirs, pvt_names
+    return subdirs, pvt_names, typed
 
 
 def _pack_listing(stamp: bytes, subdirs: list[str], pvt_names: list[str]) -> bytes:
@@ -288,10 +308,11 @@ def _walk(
 ) -> tuple[list[pathlib.Path], dict[str, bytes]]:
     """Return every .pvt candidate under root, in ``os.walk`` order, and the listings to record.
 
-    Visits the directories ``os.walk(root, followlinks=False)`` visits for the user who recorded
-    the memo, with one stat each. A directory is listed unless ``memo`` holds a listing under its
-    current stamp, its filesystem is on the allowlist and ``_times_trusted`` accepts its times.
-    With ``record``, the second result holds the listing of every directory that may be recorded.
+    Visits the directories ``os.walk(root, followlinks=False)`` visits, with one stat each. A
+    directory is listed unless ``memo`` holds a listing under its current stamp, its filesystem is
+    on the allowlist, its mode bits and those above it let every account that can reach the
+    project list it, and ``_times_trusted`` accepts its times. With ``record``, the second result
+    holds the listing of every such directory whose entries' types could all be read.
     """
     mounts = _read_mounts()
     allowed_devices = dict[int, bool]()
@@ -306,24 +327,34 @@ def _walk(
     if not stat.S_ISDIR(root_stat.st_mode):
         return candidates, listings
 
-    stack = [(os.fspath(root), "", root_stat)]
+    stack = [(os.fspath(root), "", root_stat, True)]
     while stack:
-        path, rel, dir_stat = stack.pop()
+        path, rel, dir_stat, above_listable = stack.pop()
         device = dir_stat.st_dev
         if device not in allowed_devices:
             real_path = os.path.join(real_root, rel) if rel else real_root
             allowed_devices[device] = _device_allowed(mounts, device, real_path)
-        memoizable = allowed_devices[device] and _times_trusted(dir_stat, settled_before)
-        stamp = _STAMP.pack(device, dir_stat.st_ino, dir_stat.st_mtime_ns, dir_stat.st_ctime_ns)
+        # Every account that can reach the project may list this directory and those above it.
+        listable = above_listable and dir_stat.st_mode & _EVERYONE_LISTS == _EVERYONE_LISTS
+        memoizable = (
+            allowed_devices[device] and listable and _times_trusted(dir_stat, settled_before)
+        )
+        stamp = (
+            _STAMP.pack(device, dir_stat.st_ino, dir_stat.st_mtime_ns, dir_stat.st_ctime_ns)
+            if memoizable
+            else b""
+        )
         recorded = memo.get(rel) if memoizable else None
         names = None
         if recorded is not None and recorded.startswith(_LISTING_VERSION + stamp):
             names = _unpack_listing(recorded)
         if names is None:
-            names = _list_directory(path)
-            if names is None:
+            listed = _list_directory(path)
+            if listed is None:
                 continue
-            recorded = _pack_listing(stamp, *names) if memoizable and record else None
+            subdirs, pvt_names, typed = listed
+            names = subdirs, pvt_names
+            recorded = _pack_listing(stamp, *names) if memoizable and typed and record else None
         if record and recorded is not None:
             listings[rel] = recorded
 
@@ -336,7 +367,7 @@ def _walk(
             except OSError:
                 continue
             if stat.S_ISDIR(child_stat.st_mode):  # a symlink or file now: not descended
-                stack.append((child, os.path.join(rel, name), child_stat))
+                stack.append((child, os.path.join(rel, name), child_stat, listable))
     return candidates, listings
 
 
@@ -396,12 +427,13 @@ def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
 def discover_pvt_files_and_update_memo(root: pathlib.Path) -> dict[str, PvtData]:
     """``discover_pvt_files`` for the repro/run pre-flight, the memo's one writer.
 
-    Records the listing of every settled directory on an allowlisted filesystem, and drops the
-    listings of directories the walk no longer visits. With no tracked file found, it records
-    only into a state database that already exists, so it never creates one. A memo that cannot
-    be recorded (another pivot writer holds the lock longer than ``_MEMO_WRITE_TIMEOUT_S``, or
-    the database is read-only, full or failing) is skipped. A writer that bypasses pivot's lock
-    can hold the memo write until it commits.
+    Records the listing of every directory ``_walk`` may record (settled, on an allowlisted
+    filesystem, listable by every account that can reach the project, every entry's type read)
+    and drops every other listing. With no tracked file found, it records only into a state
+    database that already exists, so it never creates one. A memo that cannot be recorded
+    (another pivot writer holds the lock longer than ``_MEMO_WRITE_TIMEOUT_S``, or the database
+    is read-only, full or failing) is skipped. A writer that bypasses pivot's lock can hold the
+    memo write until it commits.
     """
     previous = _read_stored_memo()
     candidates, listings = _walk(root, _trusted_listings(previous, root), record=True)
