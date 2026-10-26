@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import itertools
 import json
 import pathlib
 from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock
 
 import boto3
 import pytest
 import yaml
 
 from conftest import isolated_pivot_dir
-from pivot import cli, compose
+from pivot import cli, compose, import_artifact
 from pivot import status as status_mod
 from pivot.storage import cache, track
 from pivot.types import RemoteSyncInfo
@@ -308,6 +310,27 @@ def _write_tracked_file(content: str) -> None:
     file_hash, _ = cache.hash_file(data_file)
     pvt_data = track.PvtData(path="data.txt", hash=file_hash, size=len(content))
     track.write_pvt_file(pathlib.Path("data.txt.pvt"), pvt_data)
+
+
+def _write_import_pvt() -> None:
+    """Write total.txt and the .pvt that `pivot import` records for it."""
+    data_file = pathlib.Path("total.txt")
+    data_file.write_text("v1\n")
+    file_hash, _ = cache.hash_file(data_file)
+    pvt_data = track.PvtData(
+        path="total.txt",
+        hash=file_hash,
+        size=3,
+        source=track.ImportSource(
+            repo="https://github.com/org/repo",
+            rev="main",
+            rev_lock="abc123def456",
+            stage="smoke/total",
+            path="smoke/total",
+            remote="s3://bucket/cache",
+        ),
+    )
+    track.write_pvt_file(pathlib.Path("total.txt.pvt"), pvt_data)
 
 
 # =============================================================================
@@ -794,8 +817,50 @@ def test_status_remote_without_remotes_still_shows_local_sections(
         result = runner.invoke(cli.cli, ["status", "--remote"])
 
     assert result.exit_code == 0, result.output
-    assert "No remotes configured" in result.output
-    assert "Tracked Files" in result.output
+    assert "No remotes configured" in result.stdout
+    assert "Tracked Files" in result.stdout
+    assert "No remotes configured" not in result.stderr
+
+
+def test_status_remote_json_without_remotes_notes_it_on_stderr(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--remote --json keeps standard output to the JSON document; the note goes to stderr."""
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path("pipeline.py").write_text(_EMPTY_PIPELINE)
+
+        result = runner.invoke(cli.cli, ["status", "--remote", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert "remote" not in json.loads(result.stdout), result.stdout
+    assert "No remotes configured" in result.stderr
+
+
+def test_status_quiet_remote_json_without_remotes_writes_only_json(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--quiet --remote --json omits the missing-remote note and preserves one JSON document."""
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path("pipeline.py").write_text(_EMPTY_PIPELINE)
+
+        result = runner.invoke(cli.cli, ["--quiet", "status", "--remote", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert "remote" not in json.loads(result.stdout), result.stdout
+
+
+def test_status_quiet_remote_without_remotes_prints_nothing(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--quiet leaves out the missing-remote note, as it leaves out every section."""
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path("pipeline.py").write_text(_EMPTY_PIPELINE)
+
+        result = runner.invoke(cli.cli, ["--quiet", "status", "--remote"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output == ""
 
 
 # =============================================================================
@@ -875,6 +940,112 @@ def test_status_json_includes_suggestions(
     data = json.loads(result.output)
     assert "suggestions" in data
     assert any("pivot repro" in s for s in data["suggestions"])
+
+
+_JSON_STATUS_OPTIONS = (
+    "--check-imports",
+    "--remote",
+    "--explain",
+    "--stages-only",
+    "--tracked-only",
+    "--remote-only",
+)
+
+
+_JSON_STATUS_OPTION_SETS = [
+    list[str](options)
+    for size in range(len(_JSON_STATUS_OPTIONS) + 1)
+    for options in itertools.combinations(_JSON_STATUS_OPTIONS, size)
+]
+
+
+def _option_set_id(options: list[str]) -> str:
+    return "+".join(o.removeprefix("--") for o in options) or "plain"
+
+
+def _setup_project_with_import_update(
+    mock_discovery: compose.Pipeline, mocker: MockerFixture
+) -> None:
+    """A stale stage, a tracked file and an import whose source has a newer commit."""
+    _register_process(mock_discovery)
+    _write_tracked_file("content")
+    _write_import_pvt()
+    mocker.patch.object(
+        import_artifact,
+        "check_for_update",
+        new=AsyncMock(
+            return_value=import_artifact.UpdateCheck(
+                available=True, current_rev="abc123def456", latest_rev="def456abc789"
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("options", "remote_configured"),
+    [
+        pytest.param(
+            options,
+            remote_configured,
+            id=f"{_option_set_id(options)}-{'remote' if remote_configured else 'no-remote'}",
+        )
+        for remote_configured in (False, True)
+        for options in _JSON_STATUS_OPTION_SETS
+        if remote_configured or "--remote-only" not in options
+    ],
+)
+def test_status_json_is_one_document_for_every_option_combination(
+    runner: click.testing.CliRunner,
+    mock_discovery: compose.Pipeline,
+    mocker: MockerFixture,
+    options: list[str],
+    remote_configured: bool,
+) -> None:
+    """With --json, standard output is exactly one JSON document, whatever else is asked for.
+
+    The project has a stale stage, a tracked file and an import with an update, so each option
+    has something to report: import status is a field of the document, and notes go to stderr.
+    """
+    _setup_project_with_import_update(mock_discovery, mocker)
+    if remote_configured:
+        pathlib.Path(".pivot", "config.yaml").write_text("remotes:\n  origin: s3://bucket/c\n")
+        mocker.patch.object(
+            status_mod,
+            "get_remote_status",
+            autospec=True,
+            return_value=RemoteSyncInfo(
+                name="origin", url="s3://bucket/c", push_count=1, pull_count=0
+            ),
+        )
+
+    result = runner.invoke(cli.cli, ["status", *options, "--json"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert ("imports" in data) == ("--check-imports" in options), result.stdout
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param(options, id=_option_set_id(options))
+        for options in _JSON_STATUS_OPTION_SETS
+        if "--remote-only" in options
+    ],
+)
+def test_status_remote_only_json_without_remotes_writes_nothing_to_stdout(
+    runner: click.testing.CliRunner,
+    mock_discovery: compose.Pipeline,
+    mocker: MockerFixture,
+    options: list[str],
+) -> None:
+    """--remote-only --json with no remote configured fails with nothing on standard output."""
+    _setup_project_with_import_update(mock_discovery, mocker)
+
+    result = runner.invoke(cli.cli, ["status", *options, "--json"])
+
+    assert result.exit_code == 1, result.output
+    assert result.stdout == "", "a failed run writes nothing to standard output"
 
 
 # =============================================================================
