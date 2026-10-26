@@ -346,3 +346,22 @@ def test_track_and_repro_checkout_missing_record_the_tracked_file(
 
     assert tracked.read_text() == "tracked notes\n"
     assert _helper_recorded(root, tracked), "The restored tracked file is recorded"
+
+
+def test_track_of_a_directory_records_every_file_it_read(tmp_path: pathlib.Path) -> None:
+    """`pivot track` of a directory records the hash of each file it read, so the next status
+    reads none of them."""
+    root = _helper_input_project(tmp_path / "project")
+    tracked = root / "data" / "tracked"
+    (tracked / "sub").mkdir(parents=True)
+    for index in range(3):
+        (tracked / f"t{index}.txt").write_text(f"tracked {index}\n")
+    (tracked / "sub" / "deep.txt").write_text("deep\n")
+
+    _ok(_pivot(root, "track", "data/tracked"))
+
+    files = sorted(path for path in tracked.rglob("*") if path.is_file())
+    assert len(files) == 4, f"The tracked directory holds every file: {files}"
+    assert [path for path in files if not _helper_recorded(root, path)] == [], (
+        "track records the hash of every file of the directory it read"
+    )
