@@ -130,7 +130,7 @@ def atomic_write_file(
         write_fn(fd)
         fd_closed = True  # write_fn took ownership via os.fdopen
         os.chmod(tmp, mode)
-        written = tmp.stat()
+        written = _fstat_staged(tmp)
         tmp.replace(dest)
     except BaseException:
         _clear_path(tmp)
@@ -781,6 +781,19 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bo
 FALLBACK_ERRNO = _NO_HARDLINK_ERRNO | {errno.EXDEV, errno.EACCES}
 
 
+def _fstat_staged(path: pathlib.Path) -> os.stat_result:
+    """Stat a staged file through an open descriptor before its rename exposes it.
+
+    Following a staged symlink is intentional: the stat must describe the cache object the
+    final workspace path will resolve to.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return os.fstat(fd)
+    finally:
+        os.close(fd)
+
+
 def _stage_checkout(
     tmp_path: pathlib.Path,
     cache_path: pathlib.Path,
@@ -840,7 +853,7 @@ def _checkout_from_cache(
                 raise
             os.chmod(path.parent, parent_mode | stat.S_IWUSR)
             _stage_checkout(tmp_path, cache_path, checkout_mode, executable=executable)
-        staged = tmp_path.stat()
+        staged = _fstat_staged(tmp_path)
         try:
             tmp_path.replace(path)
         except IsADirectoryError:
