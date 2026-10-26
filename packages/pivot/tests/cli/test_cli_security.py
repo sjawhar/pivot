@@ -87,7 +87,7 @@ def test_track_path_traversal_with_encoded_dots(
         bypass_attempts = [
             "..%2f",  # URL encoded
             "..%252f",  # Double encoded
-            "..\\",  # Windows style
+            "..\\",  # a backslash is part of the name: "..\outside.txt" is a missing file here
         ]
 
         for attempt in bypass_attempts:

@@ -110,6 +110,20 @@ def test_affected_stages_deduplicates() -> None:
     assert affected == ["stage_a"], "should deduplicate"
 
 
+def test_affected_stages_keep_a_backslash_in_a_name_apart_from_a_separator() -> None:
+    """A change to ``a\\b.csv`` (one file name) does not affect the consumer of ``a/b.csv``."""
+    graph, artifact_paths = _helper_build_graph(
+        {
+            "use_name": {"deps": ["/data/a\\b.csv"], "outs": ["/data/name.out"]},
+            "use_nested": {"deps": ["/data/a/b.csv"], "outs": ["/data/nested.out"]},
+        }
+    )
+    coord = WatchCoordinator(graph, artifact_paths)
+
+    assert coord.get_affected_stages([pathlib.Path("/data/a\\b.csv")]) == ["use_name"]
+    assert coord.get_affected_stages([pathlib.Path("/data/a/b.csv")]) == ["use_nested"]
+
+
 def test_affected_output_path_does_not_resolve_to_an_input(
     tmp_path: pathlib.Path,
 ) -> None:

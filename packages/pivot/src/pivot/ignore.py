@@ -291,8 +291,6 @@ class IgnoreFilter:
 
             for line_num, line in enumerate(content.splitlines(), start=1):
                 line = line.rstrip("\r\n")
-                # Normalize Windows path separators in patterns
-                line = line.replace("\\", "/")
                 # Normalize Unicode to NFC (consistent with path normalization)
                 line = unicodedata.normalize("NFC", line)
 
@@ -320,15 +318,15 @@ class IgnoreFilter:
         return patterns, pattern_infos, mtime
 
     def _normalize_path(self, path: str | pathlib.Path) -> str:
-        """Normalize path: forward slashes, Unicode NFC, relative to project root."""
+        """Normalize path: Unicode NFC, relative to project root (a backslash stays in a name)."""
         path_obj = path if isinstance(path, pathlib.Path) else pathlib.Path(path)
-        path_str = str(path_obj).replace("\\", "/")
+        path_str = str(path_obj)
 
         # Convert absolute paths to relative (for watch mode which receives absolute paths)
         if self._project_root is not None and path_obj.is_absolute():
             try:
                 rel_path = path_obj.relative_to(self._project_root)
-                path_str = str(rel_path).replace("\\", "/")
+                path_str = str(rel_path)
             except ValueError:
                 pass  # Path not under project root, use as-is
 
@@ -358,6 +356,6 @@ class IgnoreFilter:
                 return path_obj.is_dir()
         except OSError:
             pass
-        # Check original path for trailing slash (pathlib strips it during normalization)
+        # Check original path for a trailing slash (pathlib strips it during normalization)
         original = path if isinstance(path, str) else str(path)
-        return original.endswith("/") or original.endswith("\\")
+        return original.endswith("/")

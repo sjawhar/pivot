@@ -17,26 +17,31 @@ def test_normalize_path_with_custom_base(tmp_path: pathlib.Path) -> None:
     assert result == custom_base / "foo" / "bar.txt"
 
 
-def test_normalize_path_windows_backslash(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("path", "parts"),
+    [
+        pytest.param("foo\\bar", ("foo\\bar",), id="backslash-in-a-name"),
+        pytest.param("foo\\bar/baz", ("foo\\bar", "baz"), id="split-only-on-forward-slash"),
+    ],
+)
+def test_normalize_path_keeps_a_backslash_in_a_name(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, path: str, parts: tuple[str, ...]
 ) -> None:
-    """Windows backslash paths are normalized to POSIX: foo\\bar -> foo/bar."""
+    """Pivot is POSIX only: a backslash is part of a name, never a separator."""
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
 
-    result = project.normalize_path("foo\\bar")
+    result = project.normalize_path(path)
 
-    assert result == tmp_path / "foo" / "bar"
+    assert result == tmp_path.joinpath(*parts)
 
 
-def test_normalize_path_mixed_separators(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Mixed separators are normalized: foo\\bar/baz -> foo/bar/baz."""
-    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+def test_normalize_path_keeps_a_backslash_in_an_absolute_path(tmp_path: pathlib.Path) -> None:
+    """A backslash in an absolute path, the project root's included, is kept."""
+    absolute = tmp_path / "project\\root" / "f.csv"
 
-    result = project.normalize_path("foo\\bar/baz")
+    result = project.normalize_path(str(absolute), base=tmp_path / "elsewhere")
 
-    assert result == tmp_path / "foo" / "bar" / "baz"
+    assert result == absolute
 
 
 def test_normalize_path_preserves_symlinks(tmp_path: pathlib.Path) -> None:

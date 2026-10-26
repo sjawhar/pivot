@@ -320,31 +320,46 @@ def test_uses_trailing_slash_for_nonexistent(tmp_path: pathlib.Path) -> None:
 
 
 # =============================================================================
-# Windows Path Normalization Tests
+# Backslashes (POSIX names, gitignore escapes)
 # =============================================================================
 
 
-def test_normalizes_input_paths(tmp_path: pathlib.Path) -> None:
-    """Should normalize backslashes in input paths to forward slashes."""
+def test_backslash_in_a_path_is_part_of_its_name(tmp_path: pathlib.Path) -> None:
+    """A backslash in a checked path is part of a name, never a separator (Pivot is POSIX)."""
     pivotignore = tmp_path / ".pivotignore"
     pivotignore.write_text("data/temp/*.log\n")
 
     filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
 
-    # Both separators should work
     assert filter_instance.is_ignored("data/temp/app.log")
-    assert filter_instance.is_ignored("data\\temp\\app.log")
+    assert not filter_instance.is_ignored("data\\temp\\app.log")
+    assert not filter_instance.is_ignored(str(tmp_path / "data\\temp\\app.log"))
 
 
-def test_normalizes_patterns(tmp_path: pathlib.Path) -> None:
-    """Should normalize backslashes in patterns to forward slashes."""
+def test_backslash_in_a_pattern_escapes_the_next_character_as_in_gitignore(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A pattern's backslash escapes the character after it, as in a .gitignore."""
     pivotignore = tmp_path / ".pivotignore"
-    # User might write Windows-style patterns
-    pivotignore.write_text("data\\temp\\*.log\n")
+    pivotignore.write_text("a\\\\b.csv\n\\#notes.txt\n")
 
     filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
 
-    assert filter_instance.is_ignored("data/temp/app.log")
+    assert filter_instance.is_ignored("a\\b.csv")
+    assert not filter_instance.is_ignored("a/b.csv")
+    assert filter_instance.is_ignored("#notes.txt")
+    assert filter_instance.is_ignored("sub/#notes.txt")
+
+
+def test_trailing_backslash_is_part_of_a_file_name(tmp_path: pathlib.Path) -> None:
+    """A name ending in a backslash is a file, not a directory written with a separator."""
+    pivotignore = tmp_path / ".pivotignore"
+    pivotignore.write_text("tmp*/\n")
+
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+
+    assert filter_instance.is_ignored("tmp/")
+    assert not filter_instance.is_ignored("tmp\\")
 
 
 def test_normalizes_unicode_nfc(tmp_path: pathlib.Path) -> None:
