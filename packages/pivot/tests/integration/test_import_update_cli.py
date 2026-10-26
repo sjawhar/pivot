@@ -8,6 +8,7 @@ in a separate consumer project.
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import shutil
@@ -756,3 +757,30 @@ def test_import_and_update_record_the_hash_of_the_file_they_write(
     assert result.exit_code == 0, result.output
 
     assert _helper_recorded_hash(consumer, data_path) == xxhash.xxh64(b"version two").hexdigest()
+
+
+# =============================================================================
+# status
+# =============================================================================
+
+
+def test_status_check_imports_json_reports_the_update_in_one_document(
+    runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
+) -> None:
+    """`status --check-imports --json` writes one JSON document that holds the import's check."""
+    v1 = _helper_publish(source, bucket, "smoke/total", b"v1", "v1")
+    _helper_import(runner, source, "smoke/total", "total.txt")
+    v2 = _helper_publish(source, bucket, "smoke/total", b"v2", "v2")
+
+    result = runner.invoke(cli.cli, ["status", "--check-imports", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["imports"] == [
+        {
+            "path": "total.txt",
+            "status": "update_available",
+            "current_rev": v1[:8],
+            "latest_rev": v2[:8],
+            "error": None,
+        }
+    ], result.stdout
