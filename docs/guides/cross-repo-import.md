@@ -40,6 +40,11 @@ pivot import <repo_url> <artifact> --out <path> [options]
 
 Always pass `--out`: the downloaded file is an input for your own pipeline, so put it under `data/raw/` (or `data/external/`) and read it with `pipeline.input()`.
 
+Pivot refuses a **new** import destination inside a declared stage output in any pipeline in the
+project. Keep imports under an input directory such as `data/raw/`; a stage output belongs to the
+stage that declares it. If an import was already saved there before this check, `--force` warns
+and updates it in place; move its data and `.pvt` sidecar outside the output before it runs.
+
 ### Basic Example
 
 ```bash

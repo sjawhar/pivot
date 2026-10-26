@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import pathlib
 import queue
 from typing import TYPE_CHECKING, cast
 
@@ -9,11 +10,10 @@ import yaml
 
 from pivot import exceptions, project
 from pivot.cli import checkout
-from pivot.storage import cache, restore
+from pivot.storage import cache, restore, track
 from pivot.types import FileHash
 
 if TYPE_CHECKING:
-    import pathlib
     from multiprocessing.synchronize import Event
 
     from conftest import GitRepo
@@ -492,6 +492,114 @@ def test_restore_targets_from_revision_output_with_stage(
     assert success
     assert messages == [f"Restored: {output_path} (from cache)"]
     assert output_path.read_text() == "stage output"
+
+
+@pytest.mark.parametrize(
+    "output_arg",
+    [
+        pytest.param(None, id="workspace-output"),
+        pytest.param(pathlib.Path("restored-tree"), id="output-flag"),
+    ],
+)
+def test_restore_targets_from_revision_force_refuses_output_holding_tracked_file(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, output_arg: pathlib.Path | None
+) -> None:
+    """`pivot get --force` refuses before it removes a tracked file in a stage output or an
+    explicit relative `--output` destination."""
+    repo_path, commit = git_repo
+    cache_dir = repo_path / ".pivot" / "cache"
+    source = repo_path / "cached-stage-output"
+    source.mkdir()
+    (source / "generated.txt").write_text("generated")
+    output_hash = cache.save_to_cache(
+        source, cache_dir / "files", checkout_mode=cache.CheckoutMode.COPY
+    )
+    assert "manifest" in output_hash
+    (repo_path / ".pivot" / "stages").mkdir(parents=True)
+    lock_content = {
+        "code_manifest": {"func:main": "abc123"},
+        "params": {},
+        "deps": [],
+        "outs": [
+            {
+                "key": None,
+                "hash": output_hash["hash"],
+                "manifest": output_hash["manifest"],
+                "path": "data/b/tree",
+            }
+        ],
+    }
+    (repo_path / ".pivot" / "stages" / "tree.lock").write_text(yaml.dump(lock_content))
+    sha = commit("add lock")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    destination = (
+        repo_path / output_arg if output_arg is not None else repo_path / "data" / "b" / "tree"
+    )
+    tracked = destination / "saved.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("user input")
+    pvt_path = track.get_pvt_path(tracked)
+    track.write_pvt_file(
+        pvt_path, track.PvtData(path="saved.txt", hash="abc1230000000000", size=10)
+    )
+
+    with pytest.raises(exceptions.PivotError, match=r"saved\.txt\.pvt"):
+        restore.restore_targets_from_revision(
+            targets=["tree"],
+            rev=sha[:7],
+            output=output_arg,
+            cache_dir=cache_dir,
+            stage_targets={
+                "tree": restore.StageTarget(
+                    stage_name="tree", state_dir=repo_path / ".pivot", paths_by_key={}
+                )
+            },
+            checkout_modes=[cache.CheckoutMode.COPY],
+            force=True,
+        )
+
+    assert tracked.read_text() == "user input"
+    assert pvt_path.exists()
+
+
+def test_restore_file_target_force_relative_output_refuses_tracked_directory(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative `pivot get --force -o` cannot replace a directory holding tracked input."""
+    repo_path, commit = git_repo
+    source = repo_path / "source.txt"
+    source.write_text("source data")
+    source_hash = cache.save_to_cache(
+        source, repo_path / ".pivot" / "cache" / "files", checkout_mode=cache.CheckoutMode.COPY
+    )
+    track.write_pvt_file(
+        track.get_pvt_path(source),
+        track.PvtData(path="source.txt", hash=source_hash["hash"], size=len("source data")),
+    )
+    sha = commit("add tracked source")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    destination = repo_path / "data" / "b" / "tree"
+    saved = destination / "saved.txt"
+    saved.parent.mkdir(parents=True)
+    saved.write_text("user input")
+    saved_pvt = track.get_pvt_path(saved)
+    track.write_pvt_file(
+        saved_pvt, track.PvtData(path="saved.txt", hash="abc1230000000000", size=10)
+    )
+
+    with pytest.raises(exceptions.PivotError, match=r"saved\.txt\.pvt"):
+        restore.restore_targets_from_revision(
+            targets=["source.txt"],
+            rev=sha[:7],
+            output=pathlib.Path("data/b/tree"),
+            cache_dir=repo_path / ".pivot" / "cache",
+            stage_targets={},
+            checkout_modes=[cache.CheckoutMode.COPY],
+            force=True,
+        )
+
+    assert saved.read_text() == "user input"
+    assert saved_pvt.exists()
 
 
 # =============================================================================

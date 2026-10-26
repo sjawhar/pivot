@@ -14,7 +14,7 @@ from pivot.cli import decorators as cli_decorators
 from pivot.cli import errors as cli_errors
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
-from pivot.storage import cache, lock, state, track
+from pivot.storage import cache, lock, ownership, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
@@ -374,6 +374,10 @@ async def _checkout_main_async(
     if targets:
         unique_targets = _dedupe_targets(targets)
         files = _validate_and_build_files(unique_targets, tracked_files, stage_outputs)
+        ownership.refuse_output_replacements(
+            project.get_project_root(),
+            [pathlib.Path(path) for path in files if path in stage_outputs],
+        )
         return await _checkout_files_async(
             files,
             cache_dir,
@@ -384,6 +388,10 @@ async def _checkout_main_async(
         )
     else:
         # Checkout all tracked files and stage outputs
+        ownership.refuse_output_replacements(
+            project.get_project_root(),
+            [pathlib.Path(path) for path in stage_outputs],
+        )
         tracked_as_hashes: dict[str, HashInfo] = {
             path: track.pvt_to_hash_info(pvt) for path, pvt in tracked_files.items()
         }

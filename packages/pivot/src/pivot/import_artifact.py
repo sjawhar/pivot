@@ -13,10 +13,10 @@ from typing import TYPE_CHECKING, TypedDict, cast
 import aiohttp
 import yaml
 
-from pivot import exceptions, project, types
+from pivot import discovery, exceptions, project, types
 from pivot.remote import config as remote_config
 from pivot.remote import git_archive, github, protocol
-from pivot.storage import cache, track
+from pivot.storage import cache, ownership, track
 from pivot.storage import lock as storage_lock
 
 if TYPE_CHECKING:
@@ -437,6 +437,25 @@ async def import_artifact(
         raise exceptions.PivotError(f"'{data_path}' already exists. Use --force to overwrite.")
     if pvt_path.exists() and not force:
         raise exceptions.PivotError(f"'{pvt_path}' already exists. Use --force to overwrite.")
+
+    # Any pipeline's output, loaded or not: running it would remove the import and its sidecar
+    resolved_destination = data_path.resolve()
+    for output, resolved_output in discovery.declared_outputs(project_root).items():
+        if not ownership.paths_overlap(resolved_destination, resolved_output):
+            continue
+        overlap = f"'{data_path}' overlaps with stage output '{output}'"
+        if not pvt_path.exists():
+            raise exceptions.OutputOwnershipError(
+                f"Cannot import to {overlap}. "
+                + "Import to a path outside every stage output, such as data/raw/."
+            )
+        # An import made there before this check existed: update it, and warn, as status does
+        logger.warning(
+            "%s. Move it and its .pvt sidecar outside the output (for example under data/raw/); "
+            + "until then Pivot refuses to replace that output.",
+            overlap,
+        )
+        break
 
     if force and data_path.exists() and data_path.is_dir():
         raise exceptions.PivotError("Cannot overwrite directory with import")

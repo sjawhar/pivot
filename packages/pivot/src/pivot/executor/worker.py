@@ -1044,6 +1044,7 @@ def _execute_stage(
             exceptions.CacheRestoreError,
             exceptions.StageDefinitionError,
             exceptions.InvalidPathError,
+            exceptions.OutputOwnershipError,
         ) as exc:
             return _make_result(
                 StageStatus.FAILED, exc.format_user_message(), ring_buffer, input_hash=input_hash
@@ -1554,6 +1555,7 @@ def _write_outputs_with_store(
     store: store_mod.Store,
     project_root: pathlib.Path,
     dependency_paths: collections_abc.Collection[pathlib.Path] = (),
+    previous_output_hashes: dict[types.ArtifactIdentity, HashInfo] | None = None,
 ) -> dict[types.ArtifactRef, pathlib.Path]:
     """Write a stage's outputs once every one of them has passed its checks.
 
@@ -1564,13 +1566,53 @@ def _write_outputs_with_store(
         ref: _check_output_value(ref, value, project_root, dependency_paths)
         for ref, value in output_values.items()
     }
-    return {ref: _write_output_with_store(ref, value, store) for ref, value in checked.items()}
+    ignored_pvt_by_ref = dict[types.ArtifactRef, set[pathlib.Path]]()
+    if isinstance(store, store_mod.WorkspaceStore):
+        for ref, value in checked.items():
+            if ref.tag is not types.ArtifactTag.DIRECTORY:
+                continue
+            expected_hash = (
+                previous_output_hashes.get(ref.identity)
+                if previous_output_hashes is not None
+                else None
+            )
+            previous_members = (
+                {entry["relpath"]: entry["hash"] for entry in expected_hash["manifest"]}
+                if expected_hash is not None and "manifest" in expected_hash
+                else {}
+            )
+            for relpath, _ in cast("list[tuple[str, Any]]", value):
+                if not relpath.endswith(".pvt"):
+                    continue
+                candidate = store.resolve_display_path(ref) / relpath
+                if not candidate.exists() or (
+                    relpath in previous_members
+                    and cache.hash_file(candidate)[0] == previous_members[relpath]
+                ):
+                    ignored_pvt_by_ref.setdefault(ref, set[pathlib.Path]()).add(candidate)
+        ignored_pvt_paths = set[pathlib.Path]()
+        for paths in ignored_pvt_by_ref.values():
+            ignored_pvt_paths.update(paths)
+        # Check all workspace outputs first, so an ownership refusal changes none of the stage's
+        # previous outputs. Each output is prepared immediately before its writer runs, preserving
+        # sibling outputs if that writer raises.
+        store.refuse_output_replacements(checked, ignored_pvt_paths)
+    return {
+        ref: _write_output_with_store(ref, value, store, ignored_pvt_by_ref.get(ref))
+        for ref, value in checked.items()
+    }
 
 
 def _write_output_with_store(
-    ref: types.ArtifactRef, value: Any, store: store_mod.Store
+    ref: types.ArtifactRef,
+    value: Any,
+    store: store_mod.Store,
+    ignored_pvt_paths: set[pathlib.Path] | None = None,
 ) -> pathlib.Path:
-    output_path = store.prepare_output(ref)
+    if isinstance(store, store_mod.WorkspaceStore):
+        output_path = store.prepare_output(ref, ignored_pvt_paths=ignored_pvt_paths)
+    else:
+        output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
 
     output_label = (
@@ -1681,6 +1723,7 @@ def _prepare_incremental_inputs(
                 + "to reset this incremental output."
             )
         output_path = store.resolve_display_path(ref)
+        store.refuse_output_replacements([ref])
         cache.remove_output(output_path)
         if not store.restore_from_cache(
             ref,
@@ -1752,7 +1795,13 @@ def _run_stage_function_with_store(
         _raise_if_stopped()
 
         output_values = _resolve_output_values(result, outs, stage_name)
-        return _write_outputs_with_store(output_values, store, project_root, dependency_paths)
+        return _write_outputs_with_store(
+            output_values,
+            store,
+            project_root,
+            dependency_paths,
+            lock_data["output_hashes"] if lock_data is not None else None,
+        )
 
 
 def _hash_output_paths(

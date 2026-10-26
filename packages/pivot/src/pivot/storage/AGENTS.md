@@ -108,6 +108,29 @@ When multiple `pivot` processes share the same StateDB:
   restore goes file by file, a commit fails. `<tree>.layout-checked`, the mark pivot 0.3.4 also
   gave partial trees, is not trusted.
 
+## Output Ownership
+
+- Pivot replaces only what it owns. A tracked file, an imported file and their `.pvt` sidecars
+  are the user's, even when one sits inside a stage output.
+- Every path that removes or replaces a stage output in the workspace calls
+  `ownership.refuse_output_replacements` (through `WorkspaceStore.refuse_output_replacements`
+  inside the store) before it removes anything: a stage's output write
+  (`WorkspaceStore.prepare_outputs`, all of a stage's outputs at once), a restore, a commit, an
+  incremental output's restore, `pivot checkout`, `pivot get --force` (including `-o`) and the
+  presentation layer. It raises `OutputOwnershipError` naming each file. Add the call to any new
+  path that removes an output.
+- The check looks only where a replacement reaches: every `*.pvt` under a real output directory,
+  parsed or not, and the sidecars of the output and of each directory above it. A stage that
+  explicitly returns a directory member named `.pvt` gives its exact path to the store as a
+  generated member, so that member can be committed; every other `.pvt` is protected. The check
+  never walks the project. So it does not see a `.pvt` outside an output whose `path` field names
+  a file inside it. Pivot never writes one (`track`, `import` and `update` write the data file's
+  own name), and catching a hand-edited one would need a project-wide walk on every output write.
+- `track` and `import` load every pipeline (`discovery.declared_outputs`, as `--all` discovers
+  them) and refuse a new path overlapping any declared output. Re-tracking (`track --force`) or
+  re-importing (`import --force`) a path already saved there warns and updates it in place.
+  `status` and the engine warn, once per run, about a sidecar already inside an output they load.
+
 ## Path Storage
 
 All paths stored in the database must be **relative** to ensure portability across machines and correct cache behavior.

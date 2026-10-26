@@ -18,6 +18,7 @@ import cloudpickle
 
 from pivot import exceptions, fingerprint, metrics, project, types
 from pivot.registry import PipelineLike
+from pivot.storage import store as store_mod
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -420,6 +421,7 @@ def discover_pipeline(
     project_root: pathlib.Path | None = None,
     *,
     all_pipelines: bool = False,
+    strict_all: bool = False,
 ) -> PipelineLike | None:
     """Discover and return Pipeline from pipeline.py.
 
@@ -438,7 +440,8 @@ def discover_pipeline(
     Args:
         project_root: Override project root (default: auto-detect)
         all_pipelines: If True, discover and combine all pipelines in project.
-
+        strict_all: If True, fail instead of skipping an un-loadable pipeline when discovering
+            all pipelines.
     Returns:
         Pipeline instance, or None if nothing found
 
@@ -457,7 +460,7 @@ def discover_pipeline(
         session = _start_import_session(root)
 
         if all_pipelines:
-            result = _discover_all_pipelines(root, session)
+            result = _discover_all_pipelines(root, session, strict=strict_all)
             if result is not None:
                 _require_project_state(result, root)
             loaded = result is not None
@@ -580,8 +583,9 @@ def _load_pipeline_from_module(
         raise
 
 
-def _discover_all_pipelines(root: pathlib.Path, session: _ImportSession) -> PipelineLike | None:
-    """Discover all pipelines and combine into one import session."""
+def _discover_all_pipelines(
+    root: pathlib.Path, session: _ImportSession, *, strict: bool = False
+) -> PipelineLike | None:
     from pivot.compose import Pipeline
 
     config_paths = glob_all_pipelines(root)
@@ -594,12 +598,18 @@ def _discover_all_pipelines(root: pathlib.Path, session: _ImportSession) -> Pipe
         try:
             pipeline = _load_pipeline_from_module(path, session)
         except SystemExit as e:
+            if strict:
+                raise DiscoveryError(f"Pipeline {path} called sys.exit({e.code})") from e
             logger.warning(f"--all: pipeline {path} called sys.exit({e.code}), skipping")
             continue
         except Exception as e:
+            if strict:
+                raise DiscoveryError(f"Failed to load pipeline from {path}: {e}") from e
             logger.warning(f"--all: failed to load pipeline from {path}, skipping ({e})")
             continue
         if pipeline is None:
+            if strict:
+                raise DiscoveryError(f"Pipeline {path} does not define a 'pipeline' variable")
             logger.warning(f"--all: failed to load pipeline from {path}, skipping")
             continue
         # A pipeline name names .pivot/stages/<name>/ and data/<name>/, so two files
@@ -704,6 +714,49 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
         results.append(by_dir[directory][0])
 
     return results
+
+
+def declared_outputs(project_root: pathlib.Path) -> dict[str, pathlib.Path]:
+    """Map every output declared by every pipeline in the project to its resolved path.
+
+    Pipelines are discovered as ``--all`` discovers them, so an output of a pipeline the command
+    did not load still counts: ``track`` and ``import`` refuse a path overlapping any of them.
+    Keys are the normalized workspace paths; values are resolved, to catch a path that reaches an
+    output through a symlink.
+
+    Raises:
+        exceptions.ValidationError: Naming every output path that cannot be resolved, or the
+            reason discovery failed.
+    """
+    try:
+        pipeline = discover_pipeline(project_root=project_root, all_pipelines=True, strict_all=True)
+    except DiscoveryError as exc:
+        raise exceptions.ValidationError(str(exc)) from exc
+    if pipeline is None:
+        return {}
+
+    workspace = store_mod.WorkspaceStore(
+        project_root=project_root,
+        pipeline_name=pipeline.name,
+        input_bindings=pipeline.input_bindings,
+    )
+    normalized = {
+        str(workspace.resolve_display_path(out))
+        for stage_name in pipeline.list_stages()
+        for out in pipeline.get_stage(stage_name)["outs"]
+    }
+    resolved = dict[str, pathlib.Path]()
+    errors = list[str]()
+    for path in sorted(normalized):
+        try:
+            resolved[path] = project.resolve_path_for_comparison(path, "stage output")
+        except (PermissionError, RuntimeError, OSError) as exc:
+            errors.append(f"  - {path}: {exc}")
+    if errors:
+        raise exceptions.ValidationError(
+            "Cannot resolve stage outputs (fix these first):\n" + "\n".join(errors)
+        )
+    return resolved
 
 
 def load_pipeline_from_path(path: pathlib.Path) -> PipelineLike | None:

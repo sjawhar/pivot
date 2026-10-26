@@ -11,7 +11,7 @@ import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
 from pivot.remote import storage as remote
-from pivot.storage import cache, lock, track
+from pivot.storage import cache, lock, ownership, track
 from pivot.types import HashInfo
 
 if TYPE_CHECKING:
@@ -382,12 +382,30 @@ def restore_targets_from_revision(
         if len(target_infos[0]["paths"]) != 1:
             raise exceptions.GetError("--output/-o can only be used with a single output")
 
+    # Only --force replaces an existing stage output; check the complete replacement set first,
+    # including an explicitly named `pivot get --output` destination.
+    if force:
+        ownership.refuse_output_replacements(
+            proj_root,
+            [
+                project.normalize_path(output, base=proj_root)
+                if output is not None
+                else proj_root / path
+                for target_info in target_infos
+                for path in target_info["paths"]
+            ],
+        )
+
     results = list[RestoreResult]()
 
     for target_info in target_infos:
         for rel_path in target_info["paths"]:
             output_hash = target_info["hashes"].get(rel_path)
-            dest_path = output if output is not None else proj_root / rel_path
+            dest_path = (
+                project.normalize_path(output, base=proj_root)
+                if output is not None
+                else proj_root / rel_path
+            )
 
             result = restore_file(
                 rel_path=rel_path,

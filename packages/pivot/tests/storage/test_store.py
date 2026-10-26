@@ -9,8 +9,8 @@ from typing import cast
 
 import pytest
 
-from pivot import config, loaders, types
-from pivot.storage import store
+from pivot import config, exceptions, loaders, types
+from pivot.storage import cache, store, track
 
 
 def _helper_ref(
@@ -352,3 +352,91 @@ def test_store_spec_cache_round_trip(tmp_path: pathlib.Path) -> None:
     round_trip = pickle.loads(pickle.dumps(spec))
     rebuilt = store.store_from_spec(round_trip)
     assert isinstance(rebuilt, store.CacheStore)
+
+
+@pytest.mark.parametrize("mode", list(config.CheckoutMode))
+def test_workspace_store_refuses_replacing_tracked_file_inside_directory_output(
+    tmp_path: pathlib.Path, mode: config.CheckoutMode
+) -> None:
+    """Writing, restoring or committing a directory output leaves a tracked child and its
+    sidecar where they are, in every checkout mode."""
+    output_ref = _helper_ref(
+        "b/tree",
+        None,
+        types.ArtifactTag.DIRECTORY,
+        cast("loaders.Reader[object]", loaders.PathOnly()),
+    )
+    workspace_store = store.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="b",
+        input_bindings={},
+        cache_dir=tmp_path / "cache" / "files",
+        checkout_modes=[mode],
+    )
+    output_path = workspace_store.prepare_output(output_ref)
+    (output_path / "generated.txt").write_text("generated")
+    output_hash = workspace_store.commit(output_ref, output_path)
+    cache.remove_output(output_path)
+    tracked_path = output_path / "saved.txt"
+    tracked_path.parent.mkdir(parents=True)
+    tracked_path.write_text("user input")
+    sidecar_path = track.get_pvt_path(tracked_path)
+    track.write_pvt_file(
+        sidecar_path,
+        track.PvtData(path="saved.txt", hash="abc1230000000000", size=10),
+    )
+
+    with pytest.raises(exceptions.PivotError, match="user-owned"):
+        workspace_store.restore_from_cache(output_ref, output_hash)
+
+    assert tracked_path.read_text() == "user input"
+    assert sidecar_path.exists()
+
+    with pytest.raises(exceptions.PivotError, match="user-owned"):
+        workspace_store.prepare_output(output_ref)
+
+    assert tracked_path.read_text() == "user input"
+    assert sidecar_path.exists()
+
+    # `pivot commit` of an output that holds a tracked file links it into the cache: refused
+    with pytest.raises(exceptions.PivotError, match="user-owned"):
+        workspace_store.commit(output_ref, output_path)
+
+    assert not output_path.is_symlink()
+    assert tracked_path.read_text() == "user input"
+    assert sidecar_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("sidecar_path", "tracked_path"),
+    [
+        pytest.param("data/b/tree.pvt", "data/b/tree", id="output"),
+        pytest.param("data/b.pvt", "data/b", id="parent"),
+    ],
+)
+def test_workspace_store_refuses_output_or_parent_tracked_sidecar(
+    tmp_path: pathlib.Path, sidecar_path: str, tracked_path: str
+) -> None:
+    """The sidecar beside an output, or beside a directory holding it, blocks replacement."""
+    output_ref = _helper_ref(
+        "b/tree",
+        None,
+        types.ArtifactTag.DIRECTORY,
+        cast("loaders.Reader[object]", loaders.PathOnly()),
+    )
+    workspace_store = store.WorkspaceStore(tmp_path, "b", {})
+    sidecar = tmp_path / sidecar_path
+    sidecar.parent.mkdir(parents=True)
+    track.write_pvt_file(
+        sidecar,
+        track.PvtData(
+            path=pathlib.Path(tracked_path).name,
+            hash="abc1230000000000",
+            size=1,
+        ),
+    )
+
+    with pytest.raises(exceptions.PivotError, match=sidecar.name):
+        workspace_store.prepare_output(output_ref)
+
+    assert sidecar.exists()

@@ -13,6 +13,7 @@ import pathlib  # noqa: TCH003 - used at runtime for path operations
 from typing import TYPE_CHECKING
 
 from pivot import compose, types
+from pivot.storage import ownership
 from pivot.storage import store as store_mod
 
 if TYPE_CHECKING:
@@ -46,19 +47,20 @@ def present(
         input_bindings={},
     )
 
-    created = 0
+    links = dict[pathlib.Path, pathlib.Path]()
     for _stage_name, info in stages.items():
         for out in info["outs"]:
             ref_path = _ref_path(refs_dir, out)
-            if not ref_path.exists() and not ref_path.is_symlink():
-                continue
+            if ref_path.exists() or ref_path.is_symlink():
+                links[ws.resolve_display_path(out)] = ref_path
 
-            display_path = ws.resolve_display_path(out)
-            _ensure_symlink(display_path, ref_path)
-            created += 1
+    # Replacing a display path removes what is there: refuse before any is replaced
+    ownership.refuse_output_replacements(project_root, list(links))
+    for display_path, ref_path in links.items():
+        _ensure_symlink(display_path, ref_path)
 
-    if created:
-        logger.debug("Presentation layer: created %d symlinks", created)
+    if links:
+        logger.debug("Presentation layer: created %d symlinks", len(links))
 
 
 def _ref_path(refs_dir: pathlib.Path, ref: types.ArtifactRef) -> pathlib.Path:

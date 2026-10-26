@@ -14,6 +14,7 @@ from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
+from pivot.storage import ownership
 from pivot.types import (
     ExplainOutput,
     ExplainStageJson,
@@ -63,6 +64,16 @@ def status(
         stages_list = cli_helpers.resolve_stage_names(stages_list)
 
     project_root = project.get_project_root()
+    if pipeline is not None and not quiet:
+        # Warn, refusing nothing, about a tracked file saved in an output before track refused it
+        workspace = cli_helpers.require_workspace_store()
+        output_paths = [
+            workspace.resolve_display_path(out)
+            for stage_info in cli_helpers.get_all_stages().values()
+            for out in stage_info["outs"]
+        ]
+        for warning in ownership.saved_input_warnings(project_root, output_paths):
+            click.echo(warning, err=True)
     resolved_cache_dir = config.get_cache_dir()
 
     show_all = not (stages_only or tracked_only or remote_only)

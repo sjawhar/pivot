@@ -7,7 +7,7 @@ import tempfile
 from typing import TYPE_CHECKING, Protocol, TypedDict, runtime_checkable
 
 from pivot import config, stage_def, types
-from pivot.storage import cache
+from pivot.storage import cache, ownership
 from pivot.storage import state as state_mod
 
 if TYPE_CHECKING:
@@ -144,6 +144,7 @@ class WorkspaceStore:
     _pipeline_name: str
     _input_bindings: dict[str, str]
     _path_map: dict[str, types.ArtifactIdentity]
+    _ignored_pvt_paths_by_output: dict[str, set[pathlib.Path]]
     _cache_dir: pathlib.Path | None
     _checkout_modes: list[config.CheckoutMode] | None
 
@@ -160,6 +161,7 @@ class WorkspaceStore:
         self._pipeline_name = pipeline_name
         self._input_bindings = input_bindings.copy()
         self._path_map = {}
+        self._ignored_pvt_paths_by_output = {}
         self._cache_dir = cache_dir.resolve() if cache_dir is not None else None
         self._checkout_modes = checkout_modes
 
@@ -203,7 +205,25 @@ class WorkspaceStore:
     def checkout(self, ref: types.ArtifactRef) -> pathlib.Path:
         return self._resolve_path(ref)
 
-    def prepare_output(self, ref: types.ArtifactRef) -> pathlib.Path:
+    def refuse_output_replacements(
+        self,
+        refs: Iterable[types.ArtifactRef],
+        ignored_pvt_paths: set[pathlib.Path] | None = None,
+    ) -> None:
+        """Fail before replacing these outputs removes a tracked path or `.pvt` sidecar."""
+        ownership.refuse_output_replacements(
+            self._project_root,
+            [self._resolve_output_path(ref) for ref in refs],
+            ignored_pvt_paths,
+        )
+
+    def prepare_output(
+        self, ref: types.ArtifactRef, *, ignored_pvt_paths: set[pathlib.Path] | None = None
+    ) -> pathlib.Path:
+        output_path = self._resolve_output_path(ref)
+        ignored = ignored_pvt_paths or set[pathlib.Path]()
+        self.refuse_output_replacements([ref], ignored)
+        self._ignored_pvt_paths_by_output[str(output_path)] = ignored
         path = self._resolve_path(ref)
         if ref.tag == types.ArtifactTag.DIRECTORY:
             cache.remove_output(path)
@@ -238,6 +258,12 @@ class WorkspaceStore:
             file_hash, _ = cache.hash_file(path, None)
             output_hash = types.FileHash(hash=file_hash)
         if self._cache_dir is not None and ref.tag is not types.ArtifactTag.METRIC:
+            # A freshly prepared stage output can legitimately produce a `.pvt`-named member;
+            # every other sidecar remains protected immediately before cache linking.
+            ignored = self._ignored_pvt_paths_by_output.pop(
+                str(self._resolve_output_path(ref)), None
+            )
+            self.refuse_output_replacements([ref], ignored)
             cache.store_hashed_output(
                 path,
                 output_hash,
@@ -259,6 +285,7 @@ class WorkspaceStore:
             return False
         if ref.tag is types.ArtifactTag.METRIC:
             return False
+        self.refuse_output_replacements([ref])
         output_path = self._resolve_output_path(ref)
         return cache.restore_from_cache(
             output_path,

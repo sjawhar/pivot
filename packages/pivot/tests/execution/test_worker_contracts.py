@@ -38,7 +38,7 @@ import pytest
 from pivot import exceptions, loaders, stage_def, types
 from pivot import project as pivot_project
 from pivot.executor import worker
-from pivot.storage import artifact_lock, cache, lock, state
+from pivot.storage import artifact_lock, cache, lock, state, track
 from pivot.storage import store as store_mod
 from pivot.types import (
     FileHash,
@@ -1232,6 +1232,16 @@ def test_output_the_writer_never_created_fails_the_stage(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _WriterRaises(loaders.Writer[object]):
+    """A writer whose exception must not clear later sibling outputs."""
+
+    @override
+    def save(self, data: object, path: pathlib.Path) -> None:
+        _ = data, path
+        raise RuntimeError("writer failed")
+
+
 def test_unreadable_state_database_fails_the_stage_without_a_run_cache_key(
     project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
@@ -1530,6 +1540,85 @@ def test_incremental_input_that_cannot_be_restored_names_the_fix(
         f"Cache missing for incremental output '{_STAGE}:a'. Run 'pivot pull' to restore it, "
         + f"or remove '{lock_path}' and rerun to reset this incremental output."
     )
+
+
+def _helper_track_in_place(path: pathlib.Path, content: str) -> pathlib.Path:
+    """Write ``path`` and its `.pvt` sidecar, as `pivot track` leaves them; return the sidecar."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    pvt_path = track.get_pvt_path(path)
+    track.write_pvt_file(
+        pvt_path,
+        track.PvtData(path=path.name, hash=cache.hash_file(path)[0], size=len(content)),
+    )
+    return pvt_path
+
+
+def test_incremental_restore_keeps_a_tracked_file_at_the_output_path(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Restoring the previous incremental output refuses before it removes a tracked file."""
+    store = store_mod.WorkspaceStore(tmp_path, "skip", {}, cache_dir=tmp_path / "cache")
+    ref = _incremental("a", cast("loaders.Loader[object, object]", loaders.Text()))
+    output_path = store.resolve_display_path(ref)
+    pvt_path = _helper_track_in_place(output_path, "user input")
+    lock_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={ref.identity: FileHash(hash="0123456789abcdef")},
+    )
+
+    with pytest.raises(exceptions.PivotError, match=r"skip/consume/a\.txt\.pvt"):
+        worker._prepare_incremental_inputs(
+            _STAGE, [ref], {"prev": ref.identity}, lock_data, store, tmp_path, tmp_path
+        )
+
+    assert output_path.read_text() == "user input"
+    assert pvt_path.exists()
+
+
+def test_output_write_refuses_every_output_before_removing_any(tmp_path: pathlib.Path) -> None:
+    """One output holding a tracked file fails the stage before any of its outputs is removed."""
+    store = store_mod.WorkspaceStore(tmp_path, "skip", {}, cache_dir=tmp_path / "cache")
+    first = _ref(_STAGE, "first")
+    tree = _ref(
+        _STAGE,
+        "tree",
+        tag=types.ArtifactTag.DIRECTORY,
+        loader=cast("loaders.Loader[object, object]", loaders.Text()),
+    )
+    first_path = store.resolve_display_path(first)
+    first_path.parent.mkdir(parents=True, exist_ok=True)
+    first_path.write_text("previous run")
+    tracked = store.resolve_display_path(tree) / "saved.txt"
+    pvt_path = _helper_track_in_place(tracked, "user input")
+
+    with pytest.raises(exceptions.PivotError, match=r"saved\.txt\.pvt"):
+        worker._write_outputs_with_store(
+            {first: "new run", tree: {"generated.txt": "generated"}}, store, tmp_path
+        )
+
+    assert first_path.read_text() == "previous run"
+    assert tracked.read_text() == "user input"
+    assert pvt_path.exists()
+
+
+def test_writer_failure_keeps_later_sibling_output_unchanged(tmp_path: pathlib.Path) -> None:
+    """A writer exception must not clear a sibling output before that sibling's writer runs."""
+    store = store_mod.WorkspaceStore(tmp_path, "skip", {}, cache_dir=tmp_path / "cache")
+    failing = _ref(_STAGE, "failing", loader=_WriterRaises())
+    later = _ref(_STAGE, "later")
+    later_path = store.resolve_display_path(later)
+    later_path.parent.mkdir(parents=True, exist_ok=True)
+    later_path.write_text("previous sibling output")
+
+    with pytest.raises(RuntimeError, match="writer failed"):
+        worker._write_outputs_with_store(
+            {failing: "new failing output", later: "new later output"}, store, tmp_path
+        )
+
+    assert later_path.read_text() == "previous sibling output"
 
 
 # =============================================================================

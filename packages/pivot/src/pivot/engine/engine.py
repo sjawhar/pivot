@@ -59,6 +59,7 @@ from pivot.engine.types import (
 )
 from pivot.executor import core as executor_core
 from pivot.executor import worker
+from pivot.storage import ownership
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -1105,6 +1106,15 @@ class Engine:
             pipeline_name=pipeline.name,
             input_bindings=pipeline.input_bindings,
         )
+        # Warn once per run about a tracked file saved inside one of these outputs before track
+        # refused that; the store fails the stage before it would remove the file
+        output_paths = [
+            store.resolve_display_path(out)
+            for stage_info in all_stages.values()
+            for out in stage_info["outs"]
+        ]
+        for warning in ownership.saved_input_warnings(project_root, output_paths):
+            _logger.warning(warning)
         runnable, dep_errors = engine_graph.get_runnable_stages(
             all_stages, store, all_pipelines=self._all_pipelines, on_error=on_error
         )

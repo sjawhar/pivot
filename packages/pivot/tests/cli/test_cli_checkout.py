@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import pathlib
@@ -11,7 +12,8 @@ import xxhash
 import yaml
 
 from conftest import isolated_pivot_dir
-from pivot import cli
+from pivot import cli, exceptions, types
+from pivot.cli import checkout as checkout_mod
 from pivot.storage import cache, lock, track
 
 if TYPE_CHECKING:
@@ -1197,3 +1199,41 @@ def test_verbose_traceback_on_unhandled_error(
         assert "RuntimeError" in result.output, "Should show exception repr"
         assert "boom" in result.output, "Should show exception message"
         assert "Traceback" in result.output, "Should include traceback with --verbose"
+
+
+@pytest.mark.parametrize("targets", [(), ("data/b/tree",)], ids=["all", "target"])
+def test_checkout_refuses_stage_output_with_tracked_child(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, targets: tuple[str, ...]
+) -> None:
+    """Checkout preflights all stage outputs before force restoration can remove tracked input."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        output_path = root / "data" / "b" / "tree"
+        tracked_path = output_path / "saved.txt"
+        tracked_path.parent.mkdir(parents=True)
+        tracked_path.write_text("user input")
+        sidecar_path = track.get_pvt_path(tracked_path)
+        track.write_pvt_file(
+            sidecar_path,
+            track.PvtData(path="saved.txt", hash="abc1230000000000", size=10),
+        )
+
+        with pytest.raises(exceptions.PivotError, match="user-owned"):
+            asyncio.run(
+                checkout_mod._checkout_main_async(
+                    targets,
+                    {},
+                    {
+                        str(output_path): types.DirHash(
+                            hash="abc1230000000000",
+                            manifest=[],
+                        )
+                    },
+                    root / ".pivot" / "cache" / "files",
+                    [cache.CheckoutMode.COPY],
+                    checkout_mod.CheckoutBehavior.FORCE,
+                    state_dir=root / ".pivot",
+                )
+            )
+
+        assert tracked_path.read_text() == "user input"
+        assert sidecar_path.exists()

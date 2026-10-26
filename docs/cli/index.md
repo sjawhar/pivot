@@ -395,6 +395,17 @@ pivot track PATHS... [OPTIONS]
 
 Creates `.pvt` manifest files for tracking files outside of stage outputs.
 
+`pivot track` loads every pipeline in the project and refuses a new path that overlaps a
+declared output of any of them, including pipelines this directory does not select. A file
+tracked or imported inside an output before this check stays where it is: `pivot status` and
+`pivot repro` (with `--all` for another pipeline's output) warn once per run naming it, `pivot
+track --force` updates it in place with the same warning, and any stage write, restore, commit or
+checkout that would remove a tracked or imported file and its `.pvt` sidecar fails before changing
+anything. A stage that explicitly returns a directory member named `.pvt` can write that member;
+every other `.pvt` under the output is protected. Move the file and its `.pvt` sidecar outside the
+output (for example under `data/raw/`). The check finds a sidecar beside its file, where Pivot
+writes it; a hand-edited `.pvt` elsewhere whose `path` points into an output is not protected.
+
 ---
 
 ### `pivot checkout`
@@ -420,6 +431,9 @@ pivot checkout [TARGETS...] [OPTIONS]
 
 Checkout summaries count restored, skipped, and missing **files**. Each file in a directory output
 counts separately.
+
+Checkout refuses before it replaces a stage output that contains a tracked file or `.pvt`
+sidecar, even with `--force`.
 
 ---
 
@@ -754,6 +768,11 @@ pivot import https://github.com/org/data prep/split:test --out data/raw/test.csv
 ```
 
 The imported file is tracked by a `.pvt` sidecar next to it; read it in a pipeline with `pipeline.input("model.pkl")`.
+
+An import loads every pipeline in the project and refuses a **new** destination that overlaps a
+declared stage output, whether or not that pipeline is currently selected. Use an input location
+such as `data/raw/` instead. An import made there before this check can be updated with `--force`;
+Pivot warns but leaves its data and `.pvt` sidecar in place until you move them outside the output.
 
 ---
 
