@@ -44,7 +44,7 @@ class VerifyOutput(TypedDict):
 def _object_hashes(
     path: str,
     hash_info: HashInfo,
-    committed: pathlib.Path,
+    committed: pathlib.Path | None,
     files_dir: pathlib.Path,
 ) -> dict[str, str]:
     """The cache objects an output or dependency at ``path`` needs, by workspace path.
@@ -140,7 +140,10 @@ def _get_stage_lock_hashes(
                 resolved_path = identity_key
             output_hashes.update(
                 _object_hashes(
-                    resolved_path, hash_info, stage_lock.output_listing_path(identity), files_dir
+                    resolved_path,
+                    hash_info,
+                    lock.committed_listing(lock_data, stage_lock.output_listing_path(identity)),
+                    files_dir,
                 )
             )
 
@@ -171,7 +174,12 @@ def _get_stage_lock_hashes(
                     data_path, track.read_pvt_file(track.get_pvt_path(data_path)), files_dir
                 )
         dep_hashes.update(
-            _object_hashes(project.to_relative_path(dep_path), hash_info, committed, files_dir)
+            _object_hashes(
+                project.to_relative_path(dep_path),
+                hash_info,
+                lock.committed_listing(lock_data, committed),
+                files_dir,
+            )
         )
 
     return output_hashes, dep_hashes

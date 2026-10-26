@@ -110,6 +110,9 @@ def producer_output_hashes(
         if record is None or not types.is_dir_hash(record) or directory.producer not in stages_dirs:
             continue
         committed = listing.output_listing_path(stages_dirs[directory.producer], directory)
+        producer_lock = locks.get(directory.producer)
+        if producer_lock is not None:
+            committed = lock.committed_listing(producer_lock, committed)
         try:
             members = listing.read(committed, record, cache_dir)
         except exceptions.ListingMissingError:
@@ -332,7 +335,9 @@ def get_stage_explanation(
                 lock_data["output_hashes"],
                 state_db,
                 state_dir=state_dir,
-                listing_lock=lock.StageLock(stage_name, lock.get_stages_dir(state_dir)),
+                listing_lock=None
+                if "older_format" in lock_data
+                else lock.StageLock(stage_name, lock.get_stages_dir(state_dir)),
                 restore=False,
                 report_changes=True,
             )

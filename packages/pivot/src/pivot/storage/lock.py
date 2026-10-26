@@ -569,7 +569,10 @@ class StageLock:
                         listing.store_object(cache_dir, directory_hash, listing_data)
                     except OSError as e:
                         logger.debug("Could not cache a listing %s holds: %s", self.path, e)
-        return _convert_from_storage_format(_from_document(data), stage_name=self.stage_name)
+        result = _convert_from_storage_format(_from_document(data), stage_name=self.stage_name)
+        if converted is not None:
+            result["older_format"] = True
+        return result
 
     def _warn_format(self, *, older: bool) -> None:
         try:
@@ -693,6 +696,15 @@ class StageLock:
         cache.atomic_write_file(self.path, write_yaml)
         written.append(self.path)
         return written
+
+
+def committed_listing(lock_data: LockData, path: pathlib.Path) -> pathlib.Path | None:
+    """``path``, the committed listing file of a directory ``lock_data`` records, for a reader
+    to pass to ``listing.read``; None for a lock an older pivot wrote (``older_format``). Such a
+    lock listed each directory inline, and ``StageLock.read`` put that listing in the cache; a
+    listing file beside it is another lock's (a newer pivot's, before an older one reran the
+    stage), and would be refused or warned about though nothing is wrong."""
+    return None if "older_format" in lock_data else path
 
 
 def find_orphaned_locks(

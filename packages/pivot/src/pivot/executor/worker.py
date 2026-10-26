@@ -827,7 +827,9 @@ def _execute_stage(
                                 lock_data["output_hashes"],
                                 state_db,
                                 state_dir=project_state_dir,
-                                listing_lock=production_lock,
+                                listing_lock=None
+                                if "older_format" in lock_data
+                                else production_lock,
                                 report_changes=True,
                                 file_hash_entries=restored_entries,
                             )
@@ -885,7 +887,7 @@ def _execute_stage(
                             lock_data["output_hashes"],
                             state_db,
                             state_dir=project_state_dir,
-                            listing_lock=production_lock,
+                            listing_lock=None if "older_format" in lock_data else production_lock,
                             report_changes=True,
                             file_hash_entries=restored_entries,
                         )
@@ -1307,7 +1309,7 @@ def restore_outputs_to_hashes(
                     except exceptions.CorruptListingError as e:
                         # The output cannot be restored from this listing: the stage runs,
                         # which rewrites it.
-                        logger.warning("%s", e)
+                        logger.warning("%s. %s", e, e.REMEDY)
                 if (
                     members is not None
                     and actual_listing is not None

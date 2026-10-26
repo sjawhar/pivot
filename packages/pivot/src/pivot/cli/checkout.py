@@ -103,7 +103,10 @@ def _get_stage_output_info(
                 read_members = None
                 if is_dir_hash(out_hash):
                     read_members = functools.partial(
-                        listing.read, stage_lock.output_listing_path(identity), out_hash, cache_dir
+                        listing.read,
+                        lock.committed_listing(lock_data, stage_lock.output_listing_path(identity)),
+                        out_hash,
+                        cache_dir,
                     )
                 result[resolved] = Expected(out_hash, read_members)
                 state_dirs[resolved] = stage_state_dir

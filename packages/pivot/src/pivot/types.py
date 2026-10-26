@@ -411,6 +411,10 @@ class LockData(TypedDict):
     dep_hashes: dict[ArtifactIdentity, HashInfo]
     output_hashes: dict[ArtifactIdentity, HashInfo]
     output_paths: NotRequired[dict[ArtifactIdentity, str]]
+    # Present for a lock an older pivot wrote: its directories' listings were inline and are in
+    # the cache only (``StageLock.read``); a listing file beside it is another lock's
+    # (``lock.committed_listing``).
+    older_format: NotRequired[bool]
 
 
 class OutputMessageKind(enum.StrEnum):

@@ -157,6 +157,37 @@ def test_older_pivot_never_restores_a_listing_as_a_file(tmp_path: pathlib.Path, 
             )
 
 
+def test_a_lock_an_older_pivot_rewrote_is_read_without_the_listing_left_beside_it(
+    tmp_path: pathlib.Path,
+):
+    """This pivot writes a project; a teammate on pivot 0.5.10 (main's lock reader) clones it,
+    changes an input and reruns, writing locks in its format and leaving this pivot's listing
+    file beside the directory stage's lock stale. That file is not the old lock's listing:
+    `verify` passes, as the base's does, `repro` is cached, and no command warns about it."""
+    src = _project(tmp_path / "src")
+    _ok(_run(src, _PIVOT, "repro"))
+    _git(src, "add", "-A")
+    _git(src, "commit", "-qm", "head wrote this")
+    root = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(src), str(root))
+    (root / "data/raw/t.csv").write_text("a\n1\n20\n3\n4\n")
+    _ok(_run(root, *_released("0.5.10"), "repro"))
+    split_lock = yaml.safe_load((root / ".pivot/stages/p/split.lock").read_text())
+    assert split_lock["schema_version"] == 2, split_lock
+    assert (root / ".pivot/stages/p/split=parts.listing").is_file()
+
+    verified = _run(root, _PIVOT, "verify")
+    repro = _run(root, _PIVOT, "repro")
+
+    for proc in (verified, repro):
+        out = proc.stdout + proc.stderr
+        assert proc.returncode == 0, out
+        assert "does not hash" not in out and "split=parts.listing" not in out, out
+    assert "Verification passed" in verified.stdout, verified.stdout
+    assert "0 ran" in repro.stdout + repro.stderr, repro.stdout + repro.stderr
+    assert "20" in (root / _PARTS / "train.csv").read_text(), "the output 0.5.10 wrote stays"
+
+
 # =============================================================================
 # D2: `pivot status` refuses a whole fresh clone over one committed listing
 # =============================================================================

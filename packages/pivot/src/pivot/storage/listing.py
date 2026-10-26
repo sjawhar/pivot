@@ -439,6 +439,12 @@ def _resolve(
     )
 
 
+_DIRECTORY_IN_THE_WAY = (
+    "a directory where pivot keeps a listing file; move anything in it aside and remove it "
+    + "before anything else (a stage run refuses it, and `git checkout` deletes what it holds)"
+)
+
+
 def _read_located(
     committed: pathlib.Path | None,
     record: DirHash,
@@ -456,6 +462,8 @@ def _read_located(
             found = committed.read_bytes()
         except FileNotFoundError:
             pass
+        except IsADirectoryError:
+            problem = exceptions.CorruptListingError(f"{committed}: {_DIRECTORY_IN_THE_WAY}")
         except OSError as e:
             problem = exceptions.CorruptListingError(
                 f"{committed}: cannot be read ({e.strerror or e})"
@@ -532,8 +540,7 @@ def write(path: pathlib.Path, data: bytes) -> None:
             path.rmdir()
         except OSError as e:
             raise exceptions.CorruptListingError(
-                f"{path}: a directory where pivot writes a listing file; remove it "
-                + f"({e.strerror or e})"
+                f"{path}: {_DIRECTORY_IN_THE_WAY} ({e.strerror or e})"
             ) from e
     except OSError:
         pass

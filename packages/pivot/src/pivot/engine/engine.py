@@ -1995,7 +1995,7 @@ class Engine:
                     lock_data["output_hashes"],
                     state_db,
                     state_dir=state_dir,
-                    listing_lock=listing_lock,
+                    listing_lock=None if "older_format" in lock_data else listing_lock,
                     restore=False,
                     report_changes=True,
                     file_hash_entries=file_hash_entries,
@@ -2010,7 +2010,7 @@ class Engine:
                 lock_data["output_hashes"],
                 state_db,
                 state_dir=state_dir,
-                listing_lock=listing_lock,
+                listing_lock=None if "older_format" in lock_data else listing_lock,
                 file_hash_entries=file_hash_entries,
             )
             _save_file_hashes(file_hash_entries)

@@ -1131,7 +1131,7 @@ def test_a_listing_path_that_is_a_directory_is_named_and_replaced_by_a_stage_run
 
     named = verified.stdout + verified.stderr
     assert verified.returncode == 1, named
-    assert str(_OUTPUT_LISTING) in named and "cannot be read" in named, named
+    assert str(_OUTPUT_LISTING) in named and "move anything in it aside" in named, named
     assert "pivot repro --force <stage>" in named and "Traceback" not in named, named
     assert forced.returncode == 0, forced.stdout + forced.stderr
     assert "Traceback" not in forced.stdout + forced.stderr

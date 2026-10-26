@@ -11,7 +11,7 @@ from pivot.remote import config as remote_config
 from pivot.remote import protocol
 from pivot.storage import cache, listing, lock, track
 from pivot.storage import store as store_mod
-from pivot.types import HashInfo, RemoteStatus, TransferSummary, is_dir_hash
+from pivot.types import HashInfo, LockData, RemoteStatus, TransferSummary, is_dir_hash
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -83,14 +83,13 @@ def _output_blobs(
     stages_dir: pathlib.Path,
     identity: types.ArtifactIdentity,
     files_dir: pathlib.Path,
+    lock_data: LockData,
 ) -> set[str]:
-    """The cache objects of a stage output, a directory's listing read beside its lock."""
+    """The cache objects of a stage output, a directory's listing read beside its lock (unless
+    ``lock_data``, the lock that records it, is an older pivot's: ``lock.committed_listing``)."""
+    committed = lock.committed_listing(lock_data, listing.output_listing_path(stages_dir, identity))
     return _blob_hashes(
-        hash_info,
-        lambda record: listing.read(
-            listing.output_listing_path(stages_dir, identity), record, files_dir
-        ),
-        files_dir,
+        hash_info, lambda record: listing.read(committed, record, files_dir), files_dir
     )
 
 
@@ -127,7 +126,7 @@ def _get_file_hash_from_stages(
             for out_path, out_hash in lock_data["output_hashes"].items():
                 identity_key = types.identity_key(out_path)
                 if identity_key == target_identity_key and identity_key not in non_cached_paths:
-                    return _output_blobs(out_hash, stages_dir, out_path, files_dir)
+                    return _output_blobs(out_hash, stages_dir, out_path, files_dir, lock_data)
         return None
 
     from pivot.cli import helpers as cli_helpers
@@ -157,7 +156,7 @@ def _get_file_hash_from_stages(
         for out_path, out_hash in lock_data["output_hashes"].items():
             identity_key = types.identity_key(out_path)
             if identity_key == target_identity_key and identity_key not in non_cached_paths:
-                return _output_blobs(out_hash, stages_dir, out_path, files_dir)
+                return _output_blobs(out_hash, stages_dir, out_path, files_dir, lock_data)
 
     return None
 
@@ -251,7 +250,7 @@ def get_target_hashes(
                         for out_path, out_hash in lock_data["output_hashes"].items():
                             if types.identity_key(out_path) not in non_cached_paths:
                                 hashes |= _output_blobs(
-                                    out_hash, stage_lock.stages_dir, out_path, files_dir
+                                    out_hash, stage_lock.stages_dir, out_path, files_dir, lock_data
                                 )
                         if include_deps:
                             # Only deps whose blobs pivot caches (and so pushes) can be fetched:
@@ -265,7 +264,11 @@ def get_target_hashes(
                                             registry.get_stage_state_dir(producer_info, state_dir)
                                         )
                                         hashes |= _output_blobs(
-                                            dep_hash, producer_stages_dir, dep_identity, files_dir
+                                            dep_hash,
+                                            producer_stages_dir,
+                                            dep_identity,
+                                            files_dir,
+                                            lock_data,
                                         )
                                     continue
                                 if tracked_blobs is None:
