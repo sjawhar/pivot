@@ -5,10 +5,10 @@ from typing import TypedDict
 
 import click
 
-from pivot import config, project
+from pivot import config, git, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
-from pivot.storage import cache
+from pivot.storage import cache, listing
 from pivot.storage import track as track_mod
 
 
@@ -118,6 +118,13 @@ def _track_single_path(
     if not path.exists():
         raise click.ClickException(f"Path not found: {path_str}")
 
+    # A .pvt or listing file beside a tracked path would collide with the files tracking writes
+    if path.name.endswith((".pvt", ".pvt" + listing.SUFFIX)):
+        raise click.ClickException(
+            f"Cannot track '{path_str}': a name ending in '.pvt' or '.pvt{listing.SUFFIX}' is "
+            + "the name of the file pivot writes to record a tracked path; rename it"
+        )
+
     # Check if tracking file inside symlinked directory
     warning: str | None = None
     project_root = project.get_project_root()
@@ -152,44 +159,57 @@ def _track_single_path(
     pvt_path = track_mod.get_pvt_path(path)
     if abs_path_str in existing_tracked and not force:
         raise click.ClickException(f"'{path_str}' is already tracked. Use --force to update.")
+    track_mod.validate_pvt_path_name(path.name)
 
     # Hash and cache
+    listing_path = listing.tracked_listing_path(pvt_path)
+    listing_data: bytes | None = None
     if path.is_dir():
-        dir_hash = cache.hash_directory(
+        hashed = cache.hash_directory(
             path, cache_dir=cache_dir, warn_left_out_symlinks=warn_left_out_symlinks
         )
-        manifest = dir_hash["manifest"]
-        total_size = sum(e["size"] for e in manifest)
-        num_files = len(manifest)
-
-        for entry in manifest:
+        for entry in hashed["listing"]["files"]:
             file_path = path / entry["relpath"]
             file_cache_path = cache.get_cache_path(cache_dir, entry["hash"])
             cache.copy_to_cache(file_path, file_cache_path, executable=entry["isexec"])
+        record = hashed["record"]
+        listing_data = hashed["data"]
+        listing.store_object(cache_dir, record["hash"], listing_data)
 
-        pvt_data: track_mod.PvtData = {
-            "path": path.name,
-            "hash": dir_hash["hash"],
-            "size": total_size,
-            "num_files": num_files,
-            "manifest": manifest,
-        }
-        if "empty_dirs" in dir_hash:
-            pvt_data["empty_dirs"] = dir_hash["empty_dirs"]
+        pvt_data = track_mod.PvtData(
+            path=path.name,
+            hash=record["hash"],
+            size=record["size"],
+            nfiles=record["nfiles"],
+        )
     else:
         file_hash, _ = cache.hash_file(path)
         file_size = path.stat().st_size
         file_cache_path = cache.get_cache_path(cache_dir, file_hash)
         cache.copy_to_cache(path, file_cache_path)
 
-        pvt_data = {
-            "path": path.name,
-            "hash": file_hash,
-            "size": file_size,
-        }
+        pvt_data = track_mod.PvtData(
+            path=path.name,
+            hash=file_hash,
+            size=file_size,
+        )
 
-    # Write .pvt file
+    # Write the .pvt after its listing, so no .pvt names a listing not yet written.
+    if listing_data is not None:
+        listing.write(listing_path, listing_data)
+    else:
+        listing_path.unlink(missing_ok=True)  # a directory tracked here before
     track_mod.write_pvt_file(pvt_path, pvt_data)
+    written = [pvt_path] if listing_data is None else [pvt_path, listing_path]
+
+    ignored = git.ignored_paths(project_root, written)
+    if ignored:
+        names = ", ".join(str(ignored_path.relative_to(project_root)) for ignored_path in ignored)
+        ignored_warning = (
+            f"Warning: git ignores {names}; commit {'it' if len(ignored) == 1 else 'them'} "
+            + "with the data path's other tracking files (un-ignore them, or `git add -f`)"
+        )
+        warning = ignored_warning if warning is None else f"{warning}\n{ignored_warning}"
 
     # Update existing_tracked for subsequent paths
     existing_tracked[abs_path_str] = pvt_data

@@ -391,9 +391,13 @@ pivot track PATHS... [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--force` / `-f` | Overwrite existing .pvt files |
+| `--force` / `-f` | Overwrite existing `.pvt` files and a directory's `.pvt.listing` file |
 
-Creates `.pvt` manifest files for tracking files outside of stage outputs.
+Creates a `.pvt` sidecar for a file. For a directory it also creates
+`<path>.pvt.listing`, the committed listing of its files and empty directories;
+commit both files. `track` refuses targets ending in `.pvt` or `.pvt.listing`,
+which would collide with these sidecars. It warns when git ignores either
+sidecar.
 
 ---
 

@@ -7,7 +7,7 @@ from typing import Any
 
 from pivot import loaders, types
 from pivot.executor import worker
-from pivot.storage import cache, lock
+from pivot.storage import cache, listing, lock
 
 
 def _incremental_tag() -> types.ArtifactTag:
@@ -292,7 +292,8 @@ def test_incremental_directory_restores_a_writable_copy_without_mutating_the_cac
             params={},
             dep_hashes={},
             output_hashes={output.identity: output_hash},
-        )
+        ),
+        cache_dir=worker_env,
     )
 
     result = worker.execute_stage(
@@ -307,9 +308,10 @@ def test_incremental_directory_restores_a_writable_copy_without_mutating_the_cac
     assert output_path.joinpath("nested", "existing.txt").read_text() == "nested seed updated"
     assert output_path.joinpath("nested", "next.txt").read_text() == "next"
     assert types.is_dir_hash(output_hash)
+    members = listing.read(None, output_hash, worker_env)
     cache_files = {
         entry["relpath"]: cache.get_cache_path(worker_env, entry["hash"])
-        for entry in output_hash["manifest"]
+        for entry in members["files"]
     }
     assert cache_files["seed.txt"].read_text() == "seed"
     assert cache_files["nested/existing.txt"].read_text() == "nested seed"
@@ -336,7 +338,8 @@ def test_incremental_directory_copy_restore_preserves_executable_mode(
             params={},
             dep_hashes={},
             output_hashes={output.identity: output_hash},
-        )
+        ),
+        cache_dir=worker_env,
     )
 
     result = worker.execute_stage(

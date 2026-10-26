@@ -12,9 +12,9 @@ from typing import TYPE_CHECKING
 
 import pydantic
 
-from pivot import parameters, project, registry, skip, types
+from pivot import exceptions, parameters, project, registry, skip, types
 from pivot.executor import worker
-from pivot.storage import lock, state, track
+from pivot.storage import listing, lock, state, track
 from pivot.storage import store as store_mod
 from pivot.types import (
     ArtifactIdentity,
@@ -25,7 +25,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
     from pathlib import Path
 
     import pygtrie
@@ -65,29 +65,53 @@ def read_locks(
     """Read each named stage's lock once; None for a stage that has not run."""
     locks = dict[str, LockData | None]()
     for stage_name in stage_names:
-        state_dir = registry.get_stage_state_dir(all_stages[stage_name], default_state_dir)
-        locks[stage_name] = lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).read()
+        locks[stage_name] = lock.StageLock(
+            stage_name, stages_dir(all_stages[stage_name], default_state_dir)
+        ).read()
     return locks
 
 
-def producer_output_hashes(
-    locks: Iterable[LockData | None],
-) -> dict[ArtifactIdentity, HashInfo]:
-    """Merge the locked output hashes of already-read producer locks.
+def stages_dir(
+    stage_info: registry.RegistryStageInfo, default_state_dir: pathlib.Path
+) -> pathlib.Path:
+    """The directory that holds a stage's lock and its outputs' listings."""
+    return lock.get_stages_dir(registry.get_stage_state_dir(stage_info, default_state_dir))
 
-    Each file of a directory output is also listed under its own identity (the directory's
-    key with the file's path appended), so a stage that reads one file finds its hash.
+
+def producer_output_hashes(
+    locks: Mapping[str, LockData | None],
+    deps: Iterable[types.ArtifactRef],
+    stages_dirs: Mapping[str, pathlib.Path],
+    cache_dir: pathlib.Path | None,
+) -> dict[ArtifactIdentity, HashInfo]:
+    """Merge the locked output hashes of already-read producer locks (by stage name).
+
+    A dependency in ``deps`` on one file of a directory output finds that file's hash in the
+    directory's listing: its producer's committed listing file (in ``stages_dirs``), else the
+    cache's object. A listing is read only for such a dependency, once per directory, so a
+    fresh clone needs no pull. A directory whose listing neither holds leaves its files to be
+    hashed on disk; a listing that does not hash to its record raises CorruptListingError.
     """
     hashes = dict[ArtifactIdentity, HashInfo]()
-    for lock_data in locks:
-        if lock_data is None:
+    for lock_data in locks.values():
+        if lock_data is not None:
+            hashes.update(lock_data["output_hashes"])
+    wanted = dict[ArtifactIdentity, set[ArtifactIdentity]]()
+    for ref in deps:
+        if ref.directory is not None:
+            wanted.setdefault(ref.directory, set[ArtifactIdentity]()).add(ref.identity)
+    for directory, files in wanted.items():
+        record = hashes.get(directory)
+        if record is None or not types.is_dir_hash(record) or directory.producer not in stages_dirs:
             continue
-        for identity, hash_info in lock_data["output_hashes"].items():
-            hashes[identity] = hash_info
-            if not types.is_dir_hash(hash_info):
-                continue
-            for entry in hash_info["manifest"]:
-                file_identity = types.directory_file_identity(identity, entry["relpath"])
+        committed = listing.output_listing_path(stages_dirs[directory.producer], directory)
+        try:
+            members = listing.read(committed, record, cache_dir)
+        except exceptions.ListingMissingError:
+            continue
+        for entry in members["files"]:
+            file_identity = types.directory_file_identity(directory, entry["relpath"])
+            if file_identity in files:
                 hashes[file_identity] = types.FileHash(hash=entry["hash"])
     return hashes
 
@@ -116,11 +140,12 @@ def _find_tracked_hash(
     dep: Path,
     tracked_files: dict[str, track.PvtData],
     tracked_trie: pygtrie.Trie[str],
+    cache_dir: pathlib.Path | None,
 ) -> HashInfo | None:
     """Find hash for dep from tracked files data.
 
-    Returns HashInfo if dep is tracked (exact match or inside tracked directory),
-    None otherwise.
+    Returns HashInfo if dep is tracked (exact match or inside tracked directory, found in its
+    listing), None otherwise.
     """
     tracked_path = _find_tracked_ancestor(dep, tracked_trie)
     if not tracked_path:
@@ -132,16 +157,20 @@ def _find_tracked_hash(
     if dep == tracked_path:
         return track.pvt_to_hash_info(pvt_data)
 
-    # Nested path - find in manifest
-    if "manifest" not in pvt_data:
+    # Nested path - find in the directory's listing
+    if "nfiles" not in pvt_data:
         return None  # Single file .pvt can't contain nested paths
+    try:
+        members = track.tracked_members(tracked_path, pvt_data, cache_dir)
+    except exceptions.ListingMissingError:
+        return None
 
     relpath = str(dep.relative_to(tracked_path))
-    for entry in pvt_data["manifest"]:
+    for entry in members["files"]:
         if entry["relpath"] == relpath:
-            return {"hash": entry["hash"]}
+            return types.FileHash(hash=entry["hash"])
 
-    return None  # Path not found in manifest
+    return None  # Path not found in the listing
 
 
 def _state_db_exists(state_dir: pathlib.Path) -> bool:
@@ -231,6 +260,7 @@ def get_stage_explanation(
                         project.normalize_path(store.checkout(ref)),
                         tracked_files,
                         tracked_trie,
+                        store.cache_dir,
                     )
                 fallback_hash = tracked_hash or lock_data["dep_hashes"].get(ref.identity)
                 if fallback_hash is None:
@@ -272,7 +302,6 @@ def get_stage_explanation(
             force=force,
         )
         unavailable = list[types.ArtifactRef]()
-        empty_dirs_unrecorded = list[types.ArtifactRef]()
         if not allow_missing:
             restoration = worker.restore_outputs_to_hashes(
                 store,
@@ -280,21 +309,17 @@ def get_stage_explanation(
                 lock_data["output_hashes"],
                 state_db,
                 state_dir=state_dir,
+                listing_lock=lock.StageLock(stage_name, lock.get_stages_dir(state_dir)),
                 restore=False,
                 report_changes=True,
             )
             unavailable = restoration.unavailable
-            empty_dirs_unrecorded = restoration.empty_dirs_unrecorded
-        if not decision["changed"] and (unavailable or empty_dirs_unrecorded):
+        if not decision["changed"] and unavailable:
             return StageExplanation(
                 stage_name=stage_name,
                 will_run=True,
                 is_forced=force,
-                reason=(
-                    _unavailable_outputs_reason(store, unavailable)
-                    if unavailable
-                    else worker.empty_dirs_unrecorded_reason(empty_dirs_unrecorded)
-                ),
+                reason=_unavailable_outputs_reason(store, unavailable),
                 code_changes=[],
                 param_changes=[],
                 dep_changes=[],

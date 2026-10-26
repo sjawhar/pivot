@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import functools
 import os
 import pathlib
 from typing import TYPE_CHECKING, Literal, NamedTuple
@@ -15,7 +16,7 @@ from pivot.cli import decorators as cli_decorators
 from pivot.cli import errors as cli_errors
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
-from pivot.storage import cache, lock, state, track
+from pivot.storage import cache, listing, lock, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
@@ -28,7 +29,7 @@ MAX_CONCURRENT_RESTORES = 32
 class RestoreOutcome(NamedTuple):
     """What restoring one tracked file or stage output did, counted in files.
 
-    A directory counts each file of its manifest; a partial in-place restore counts the files
+    A directory counts each file of its listing; a partial in-place restore counts the files
     it wrote as restored, the ones already on disk as skipped and the ones it could not get
     from the cache as missing.
     """
@@ -40,8 +41,16 @@ class RestoreOutcome(NamedTuple):
     missing_files: int = 0
 
 
+class Expected(NamedTuple):
+    """What a tracked path or stage output should hold: its recorded hash and, for a directory,
+    how to read its listing (the committed listing file, else the cache's object)."""
+
+    output_hash: HashInfo
+    read_members: Callable[[], listing.DirListing] | None = None
+
+
 def _file_count(output_hash: HashInfo) -> int:
-    return len(output_hash["manifest"]) if is_dir_hash(output_hash) else 1
+    return output_hash["nfiles"] if is_dir_hash(output_hash) else 1
 
 
 class CheckoutBehavior(enum.StrEnum):
@@ -52,8 +61,10 @@ class CheckoutBehavior(enum.StrEnum):
     FORCE = "force"  # Overwrite existing files (--force)
 
 
-def _get_stage_output_info() -> tuple[dict[str, HashInfo], dict[str, pathlib.Path]]:
-    """Get output hash info from lock files for cached stage outputs only.
+def _get_stage_output_info(
+    cache_dir: pathlib.Path,
+) -> tuple[dict[str, Expected], dict[str, pathlib.Path]]:
+    """Get what each cached stage output should hold, from lock files and their listings.
 
     Non-cached outputs (e.g. Metric with cache=False) are excluded —
     they are git-tracked and not Pivot's responsibility to restore.
@@ -62,7 +73,7 @@ def _get_stage_output_info() -> tuple[dict[str, HashInfo], dict[str, pathlib.Pat
     output's stage state_dir, whose StateDB holds the file hashes the stage's runs and
     ``pivot status`` look up.
     """
-    result = dict[str, HashInfo]()
+    result = dict[str, Expected]()
     state_dirs = dict[str, pathlib.Path]()
     store = cli_helpers.get_workspace_store()
     if store is None:
@@ -86,10 +97,25 @@ def _get_stage_output_info() -> tuple[dict[str, HashInfo], dict[str, pathlib.Pat
                 if ref is None:
                     continue
                 resolved = str(store.resolve_display_path(ref))
-                result[resolved] = out_hash
+                read_members = None
+                if is_dir_hash(out_hash):
+                    read_members = functools.partial(
+                        listing.read, stage_lock.output_listing_path(identity), out_hash, cache_dir
+                    )
+                result[resolved] = Expected(out_hash, read_members)
                 state_dirs[resolved] = stage_state_dir
 
     return result, state_dirs
+
+
+def _tracked_expected(data_path: str, pvt_data: track.PvtData, cache_dir: pathlib.Path) -> Expected:
+    output_hash = track.pvt_to_hash_info(pvt_data)
+    read_members = None
+    if is_dir_hash(output_hash):
+        read_members = functools.partial(
+            track.tracked_members, pathlib.Path(data_path), pvt_data, cache_dir
+        )
+    return Expected(output_hash, read_members)
 
 
 def _hash_cache(
@@ -124,11 +150,7 @@ def _on_disk_matches_expected(
         if not path.is_dir():
             return False
         actual = cache.hash_directory(path, state_db, cache_dir=cache_dir, pending=pending)
-        # A hash pivot 0.3.3 recorded lists no empty directories, and repro still honors it.
-        # When only empty directories differ, checkout would change no file, so it matches.
-        return actual["hash"] == expected_hash["hash"] or (
-            "empty_dirs" not in expected_hash and actual["manifest"] == expected_hash["manifest"]
-        )
+        return actual["record"]["hash"] == expected_hash["hash"]
     if not path.is_file():
         return False
     actual_hash, _ = cache.hash_file(path, state_db, pending=pending)
@@ -137,7 +159,7 @@ def _on_disk_matches_expected(
 
 def _restore_path_sync(
     path: pathlib.Path,
-    output_hash: HashInfo,
+    expected: Expected,
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
@@ -158,11 +180,13 @@ def _restore_path_sync(
         click.ClickException: For immediate failures (path traversal, unknown target,
             "already exists" without --force). Cache misses return ("missing", name)
             instead of raising.
+        exceptions.CorruptListingError: A directory's listing does not hash to its record;
+            nothing is written.
     """
     with cache.restore_lock(path, state_dir) as lock_token:
         return _restore_path_locked(
             path,
-            output_hash,
+            expected,
             cache_dir,
             checkout_modes,
             behavior,
@@ -174,7 +198,7 @@ def _restore_path_sync(
 
 def _restore_path_locked(
     path: pathlib.Path,
-    output_hash: HashInfo,
+    expected: Expected,
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
@@ -183,7 +207,14 @@ def _restore_path_locked(
     hash_state_dir: pathlib.Path | None,
 ) -> RestoreOutcome:
     """Body of _restore_path_sync; the caller holds the restore lock for path."""
+    output_hash = expected.output_hash
     total = _file_count(output_hash)
+    members: listing.DirListing | None = None
+    if expected.read_members is not None:
+        try:
+            members = expected.read_members()
+        except exceptions.ListingMissingError:
+            return RestoreOutcome("missing", path.name, missing_files=total)
     if path.exists():
         match behavior:
             case CheckoutBehavior.ERROR:
@@ -203,12 +234,12 @@ def _restore_path_locked(
                 # Existing real directories can fill missing files in place, or swap to the
                 # target when every differing or extra file is pivot's own cached output.
                 # Never overwrite content the cache lacks (a local change).
-                if not is_dir_hash(output_hash) or path.is_symlink() or not path.is_dir():
+                if members is None or path.is_symlink() or not path.is_dir():
                     return RestoreOutcome("skipped", path.name, skipped_files=total)
                 settled = list[tuple[pathlib.Path, os.stat_result, str]]()
                 with _hash_cache(hash_state_dir) as state_db:
                     outcome = cache.restore_missing_in_directory(
-                        path, output_hash, cache_dir, checkout_modes, state_db, settled
+                        path, members, cache_dir, checkout_modes, state_db, settled
                     )
                 _save_file_hashes(hash_state_dir, settled)
                 if outcome["local_changes"]:
@@ -231,7 +262,9 @@ def _restore_path_locked(
                         skipped_files=total - outcome["restored"],
                     )
             case CheckoutBehavior.FORCE:
-                missing = cache.missing_cache_objects(output_hash, cache_dir, checkout_modes)
+                missing = cache.missing_cache_objects(
+                    output_hash, members, cache_dir, checkout_modes
+                )
                 if missing:
                     raise click.ClickException(
                         f"Cannot overwrite '{path.name}': cache object missing: {', '.join(missing)}. "
@@ -247,16 +280,17 @@ def _restore_path_locked(
         checkout_modes=checkout_modes,
         state_dir=state_dir,
         lock_token=lock_token,
+        members=members,
     )
     if not success:
         return RestoreOutcome("missing", path.name, missing_files=total)
 
-    _save_file_hashes(hash_state_dir, cache.known_file_hashes(path, output_hash))
+    _save_file_hashes(hash_state_dir, cache.known_file_hashes(path, output_hash, members))
     return RestoreOutcome("restored", path.name, restored_files=total)
 
 
 async def _checkout_files_async(
-    files: Mapping[str, HashInfo],
+    files: Mapping[str, Expected],
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
@@ -276,14 +310,14 @@ async def _checkout_files_async(
     outcomes = list[RestoreOutcome]()
     immediate_errors = list[click.ClickException]()
 
-    async def restore_one(abs_path_str: str, output_hash: HashInfo) -> None:
+    async def restore_one(abs_path_str: str, expected: Expected) -> None:
         path = pathlib.Path(abs_path_str)
         try:
             async with semaphore:
                 outcome = await asyncio.to_thread(
                     _restore_path_sync,
                     path,
-                    output_hash,
+                    expected,
                     cache_dir,
                     checkout_modes,
                     behavior,
@@ -351,8 +385,9 @@ def _dedupe_targets(targets: tuple[str, ...]) -> list[str]:
 def _validate_and_build_files(
     targets: list[str],
     tracked_files: dict[str, track.PvtData],
-    stage_outputs: dict[str, HashInfo],
-) -> dict[str, HashInfo]:
+    stage_outputs: dict[str, Expected],
+    cache_dir: pathlib.Path,
+) -> dict[str, Expected]:
     """Validate targets and build files dict for checkout.
 
     Targets should already have .pvt suffixes converted by _dedupe_targets().
@@ -360,7 +395,7 @@ def _validate_and_build_files(
     Raises:
         click.ClickException: For path traversal or unknown targets.
     """
-    files = dict[str, HashInfo]()
+    files = dict[str, Expected]()
     all_stages = _all_stages_in_context()
 
     for target in targets:
@@ -392,8 +427,9 @@ def _validate_and_build_files(
 
         # Check if it's a tracked file
         if abs_path_str in tracked_files:
-            pvt_data = tracked_files[abs_path_str]
-            files[abs_path_str] = track.pvt_to_hash_info(pvt_data)
+            files[abs_path_str] = _tracked_expected(
+                abs_path_str, tracked_files[abs_path_str], cache_dir
+            )
             continue
 
         # Check if it's a stage output
@@ -413,7 +449,7 @@ def _validate_and_build_files(
 async def _checkout_main_async(
     targets: tuple[str, ...],
     tracked_files: dict[str, track.PvtData],
-    stage_outputs: dict[str, HashInfo],
+    stage_outputs: dict[str, Expected],
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
@@ -427,7 +463,7 @@ async def _checkout_main_async(
     """
     if targets:
         unique_targets = _dedupe_targets(targets)
-        files = _validate_and_build_files(unique_targets, tracked_files, stage_outputs)
+        files = _validate_and_build_files(unique_targets, tracked_files, stage_outputs, cache_dir)
         return await _checkout_files_async(
             files,
             cache_dir,
@@ -439,10 +475,10 @@ async def _checkout_main_async(
         )
     else:
         # Checkout all tracked files and stage outputs
-        tracked_as_hashes: dict[str, HashInfo] = {
-            path: track.pvt_to_hash_info(pvt) for path, pvt in tracked_files.items()
+        tracked_expected = {
+            path: _tracked_expected(path, pvt, cache_dir) for path, pvt in tracked_files.items()
         }
-        combined_total = len(tracked_as_hashes) + len(stage_outputs)
+        combined_total = len(tracked_expected) + len(stage_outputs)
         shared_completed = 0
 
         def shared_callback(_completed: int, _total: int, filename: str) -> None:
@@ -455,7 +491,7 @@ async def _checkout_main_async(
         # Run both in parallel with shared progress counter
         t1 = asyncio.create_task(
             _checkout_files_async(
-                tracked_as_hashes,
+                tracked_expected,
                 cache_dir,
                 checkout_modes,
                 behavior,
@@ -564,10 +600,10 @@ def checkout(
 
     # Get stage output info from lock files (cached outputs only)
     pipeline = cli_decorators.get_pipeline_from_context()
-    stage_outputs = dict[str, HashInfo]()
+    stage_outputs = dict[str, Expected]()
     output_state_dirs = dict[str, pathlib.Path]()
     if pipeline is not None:
-        stage_outputs, output_state_dirs = _get_stage_output_info()
+        stage_outputs, output_state_dirs = _get_stage_output_info(cache_dir)
 
     state_dir = config.get_state_dir()
 

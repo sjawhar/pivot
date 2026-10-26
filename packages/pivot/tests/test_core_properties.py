@@ -17,13 +17,12 @@ from pivot import compose, exceptions, loaders, run_history
 from pivot.engine import graph as engine_graph
 from pivot.engine.scheduler import Scheduler
 from pivot.registry import RegistryStageInfo
-from pivot.storage import lock
+from pivot.storage import listing, lock
 from pivot.types import (
     ArtifactIdentity,
     ArtifactRef,
     ArtifactTag,
     DepEntry,
-    DirHash,
     DirManifestEntry,
     FileHash,
     HashInfo,
@@ -44,7 +43,7 @@ _identities = st.builds(ArtifactIdentity, _producers, _keys)
 
 
 # =============================================================================
-# Lock files: schema v2 round trip and malformed input
+# Lock files: schema v3 round trip and malformed input
 # =============================================================================
 
 _manifest_entries = st.builds(
@@ -54,8 +53,10 @@ _manifest_entries = st.builds(
     size=st.integers(min_value=0, max_value=2**40),
     isexec=st.booleans(),
 )
-_hash_infos: st.SearchStrategy[HashInfo] = st.builds(FileHash, hash=_hashes) | st.builds(
-    DirHash, hash=_hashes, manifest=st.lists(_manifest_entries, max_size=3)
+_directory_listings: st.SearchStrategy[listing.DirListing] = st.builds(
+    listing.DirListing,
+    files=st.lists(_manifest_entries, max_size=3, unique_by=lambda entry: entry["relpath"]),
+    empty_dirs=st.just([]),
 )
 _param_values = st.recursive(
     st.none() | st.booleans() | st.integers() | st.floats(allow_nan=False) | st.text(),
@@ -65,27 +66,59 @@ _param_values = st.recursive(
 )
 
 
+def _hashed_directory(members: listing.DirListing) -> listing.HashedDirectory:
+    data = listing.encode(members)
+    return listing.HashedDirectory(
+        record=listing.record_of(members, data),
+        listing=members,
+        data=data,
+    )
+
+
 @st.composite
-def _lock_data(draw: st.DrawFn) -> tuple[str, LockData]:
+def _hash_info_and_listing(
+    draw: st.DrawFn,
+) -> tuple[HashInfo, listing.HashedDirectory | None]:
+    if draw(st.booleans()):
+        return FileHash(hash=draw(_hashes)), None
+    hashed = _hashed_directory(draw(_directory_listings))
+    return hashed["record"], hashed
+
+
+@st.composite
+def _lock_data(draw: st.DrawFn) -> tuple[str, LockData, dict[str, listing.HashedDirectory]]:
     stage_name = draw(_producers)
+    hashed_dirs = dict[str, listing.HashedDirectory]()
+
+    def take_hash() -> HashInfo:
+        hash_info, hashed = draw(_hash_info_and_listing())
+        if hashed is not None:
+            hashed_dirs[hashed["record"]["hash"]] = hashed
+        return hash_info
+
     out_keys = draw(st.lists(_keys, max_size=3, unique=True))
     data = LockData(
         code_manifest=draw(st.dictionaries(st.text(min_size=1), _hashes, max_size=4)),
         params=draw(st.dictionaries(st.text(min_size=1), _param_values, max_size=4)),
-        dep_hashes=draw(st.dictionaries(_identities, _hash_infos, max_size=4)),
-        output_hashes={ArtifactIdentity(stage_name, key): draw(_hash_infos) for key in out_keys},
+        dep_hashes={
+            identity: take_hash()
+            for identity in draw(st.lists(_identities, max_size=4, unique=True))
+        },
+        output_hashes={ArtifactIdentity(stage_name, key): take_hash() for key in out_keys},
     )
-    return stage_name, data
+    return stage_name, data, hashed_dirs
 
 
 @_SETTINGS
 @hypothesis.given(_lock_data())
-def test_lock_write_then_read_returns_the_written_data(case: tuple[str, LockData]) -> None:
-    stage_name, data = case
+def test_lock_write_then_read_returns_the_written_data(
+    case: tuple[str, LockData, dict[str, listing.HashedDirectory]],
+) -> None:
+    stage_name, data, hashed_dirs = case
     with tempfile.TemporaryDirectory() as tmp:
         stage_lock = lock.StageLock(stage_name, pathlib.Path(tmp))
         stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
-        stage_lock.write(data)
+        stage_lock.write(data, hashed_dirs=hashed_dirs)
         assert stage_lock.read() == data
 
 
@@ -98,23 +131,29 @@ def test_lock_write_never_produces_a_lock_read_refuses(relpath: str, empty_dir: 
     """Write and read apply one rule to recorded names: whatever a directory output records,
     the write either refuses it or writes a lock that reads back as written."""
     identity = ArtifactIdentity("p/stage", "o")
-    output = DirHash(
-        hash="0123456789abcdef",
-        manifest=[DirManifestEntry(relpath=relpath, hash="00112233445566ff", size=1, isexec=False)],
+    members = listing.DirListing(
+        files=[
+            DirManifestEntry(
+                relpath=relpath,
+                hash="00112233445566ff",
+                size=1,
+                isexec=False,
+            )
+        ],
+        empty_dirs=[] if empty_dir is None else [empty_dir],
     )
-    if empty_dir is not None:
-        output["empty_dirs"] = [empty_dir]
+    hashed = _hashed_directory(members)
     data = LockData(
         code_manifest={},
         params={},
         dep_hashes={},
-        output_hashes={identity: output},
+        output_hashes={identity: hashed["record"]},
         output_paths={identity: "data/p/stage/o"},
     )
     with tempfile.TemporaryDirectory() as tmp:
         stage_lock = lock.StageLock("p/stage", pathlib.Path(tmp))
         try:
-            stage_lock.write(data)
+            stage_lock.write(data, hashed_dirs={hashed["record"]["hash"]: hashed})
         except exceptions.InvalidPathError:
             assert not stage_lock.path.exists()
             return

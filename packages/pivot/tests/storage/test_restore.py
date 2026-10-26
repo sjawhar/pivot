@@ -2,21 +2,84 @@ from __future__ import annotations
 
 import multiprocessing
 import queue
+import re
 from typing import TYPE_CHECKING, cast
 
 import pytest
+import xxhash
 import yaml
 
-from pivot import exceptions, project
+from pivot import exceptions, project, types
 from pivot.cli import checkout
-from pivot.storage import cache, restore
-from pivot.types import FileHash
+from pivot.storage import cache, listing, lock, restore, track
+from pivot.types import DirHash, DirManifestEntry, FileHash
 
 if TYPE_CHECKING:
     import pathlib
     from multiprocessing.synchronize import Event
 
     from conftest import GitRepo
+
+# A directory with a nested file and an empty directory, as its listing records it.
+_DIR_CONTENTS = {"a.txt": b"file 1 content", "sub/b.txt": b"file 2 content"}
+_DIR_EMPTY = ["empty"]
+
+
+def _cache_directory_files(
+    cache_files: pathlib.Path, contents: dict[str, bytes], empty_dirs: list[str]
+) -> listing.HashedDirectory:
+    """Put each file of a directory in the cache and return the directory as hashed.
+
+    The directory's listing is not stored: a test commits it or caches it as it needs.
+    """
+    files = list[DirManifestEntry]()
+    for relpath, content in contents.items():
+        file_hash = xxhash.xxh64(content).hexdigest()
+        cache_path = cache.get_cache_path(cache_files, file_hash)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(content)
+        files.append(
+            DirManifestEntry(relpath=relpath, hash=file_hash, size=len(content), isexec=False)
+        )
+    members = listing.DirListing(files=files, empty_dirs=empty_dirs)
+    data = listing.encode(members)
+    return listing.HashedDirectory(
+        record=listing.record_of(members, data), listing=members, data=data
+    )
+
+
+def _write_directory_pvt(pvt_path: pathlib.Path, record: DirHash) -> pathlib.Path:
+    """Write a tracked directory's ``.pvt`` (its record only, no listing file)."""
+    track.write_pvt_file(
+        pvt_path,
+        track.PvtData(
+            path=pvt_path.name.removesuffix(".pvt"),
+            hash=record["hash"],
+            size=record["size"],
+            nfiles=record["nfiles"],
+        ),
+    )
+    return pvt_path
+
+
+def _restore_data_directory(
+    repo_path: pathlib.Path, rev: str, output_path: pathlib.Path, *, force: bool = False
+) -> tuple[list[str], bool]:
+    """Restore tracked directory ``data`` at ``rev`` to ``output_path`` from the repo's cache."""
+    return restore.restore_targets_from_revision(
+        targets=["data"],
+        rev=rev,
+        output=output_path,
+        cache_dir=repo_path / ".pivot" / "cache",
+        stage_targets={},
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=force,
+    )
+
+
+def _tree(root: pathlib.Path) -> list[str]:
+    """Every file and directory under ``root``, as sorted POSIX relpaths."""
+    return sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
 
 
 def _hold_checkout_restore(
@@ -57,7 +120,7 @@ def _hold_checkout_restore(
     try:
         outcome = checkout._restore_path_sync(
             path,
-            output_hash,
+            checkout.Expected(output_hash),
             cache_dir,
             [cache.CheckoutMode.COPY],
             checkout.CheckoutBehavior.FORCE,
@@ -97,6 +160,7 @@ def _get_while_checkout_restores(
 def test_parse_lock_data_from_bytes_valid() -> None:
     """Parses valid lock file content."""
     content = b"""
+schema_version: 3
 code_manifest:
   func:main: abc123
 params:
@@ -112,8 +176,8 @@ outs:
     result = restore._parse_lock_data_from_bytes(content)
 
     assert result is not None
-    assert "outs" in result
-    out_entry = cast("dict[str, object]", cast("object", result["outs"][0]))
+    assert result.listings == {}
+    out_entry = cast("dict[str, object]", cast("object", result.data["outs"][0]))
     assert out_entry == {"key": None, "hash": "0789000000000000"}
 
 
@@ -130,12 +194,80 @@ def test_parse_lock_data_from_bytes_invalid() -> None:
 def test_parse_lock_data_from_bytes_missing_outs() -> None:
     """Returns None when outs key is missing."""
     content = b"""
+schema_version: 3
 code_manifest:
   func:main: abc123
 """
     result = restore._parse_lock_data_from_bytes(content)
 
     assert result is None
+
+
+def test_parse_lock_data_from_bytes_reads_an_older_schema_whole() -> None:
+    """A past revision keeps the lock format an older pivot wrote: its directory entry, which
+    listed the files inline, becomes this format's record, and the inline files its listing."""
+    content = b"""
+schema_version: 2
+code_manifest:
+  func:main: abc123
+params: {}
+deps: []
+outs:
+  - key: null
+    hash: 0789000000000000
+    path: data/p/out
+    manifest:
+      - relpath: a.txt
+        hash: "1111111111111111"
+        size: 14
+        isexec: false
+    empty_dirs: [logs]
+"""
+    result = restore._parse_lock_data_from_bytes(content)
+
+    assert result is not None
+    members = listing.DirListing(
+        files=[
+            types.DirManifestEntry(relpath="a.txt", hash="1111111111111111", size=14, isexec=False)
+        ],
+        empty_dirs=["logs"],
+    )
+    assert result.listings == {None: members}
+    assert result.data["schema_version"] == 3
+    assert result.data["outs"] == [
+        {
+            "key": None,
+            "hash": listing.digest(listing.encode(members)),
+            "path": "data/p/out",
+            "size": 14,
+            "nfiles": 1,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "relpath",
+    [pytest.param("../escape.txt", id="traversal"), pytest.param("/etc/passwd", id="absolute")],
+)
+def test_parse_lock_data_from_bytes_refuses_an_older_inline_listing_outside_its_directory(
+    relpath: str,
+) -> None:
+    content = f"""
+schema_version: 2
+code_manifest: {{}}
+params: {{}}
+deps: []
+outs:
+  - key: null
+    hash: 0789000000000000
+    manifest:
+      - relpath: {relpath}
+        hash: "1111111111111111"
+        size: 14
+        isexec: false
+""".encode()
+
+    assert restore._parse_lock_data_from_bytes(content) is None
 
 
 # =============================================================================
@@ -152,9 +284,82 @@ size: 1024
 """
     result = restore._parse_pvt_data_from_bytes(content)
 
+    assert result == ({"path": "data.csv", "hash": "abc123", "size": 1024}, None), (
+        "A file .pvt has no listing"
+    )
+
+
+def test_parse_pvt_data_from_bytes_directory_record() -> None:
+    """A directory .pvt holds only its record; its members are in its listing file."""
+    content = b"""
+path: data
+hash: 0123456789abcdef
+size: 28
+nfiles: 2
+"""
+    result = restore._parse_pvt_data_from_bytes(content)
+
+    assert result == (
+        {"path": "data", "hash": "0123456789abcdef", "size": 28, "nfiles": 2},
+        None,
+    ), "A directory .pvt's listing is read from <path>.pvt.listing, not the .pvt"
+
+
+def test_parse_pvt_data_from_bytes_older_inline_listing() -> None:
+    """An older pivot's directory .pvt is read as the record of the listing it holds inline."""
+    members = listing.DirListing(
+        files=[
+            DirManifestEntry(relpath="a.txt", hash="1111111111111111", size=14, isexec=False),
+            DirManifestEntry(relpath="sub/b.txt", hash="2222222222222222", size=14, isexec=True),
+        ],
+        empty_dirs=["empty"],
+    )
+    old_document = {
+        "path": "data",
+        "hash": "aaaaaaaaaaaaaaaa",
+        "size": 28,
+        "num_files": 2,
+        "manifest": members["files"],
+        "empty_dirs": members["empty_dirs"],
+    }
+
+    result = restore._parse_pvt_data_from_bytes(yaml.dump(old_document).encode())
+
     assert result is not None
-    assert result["path"] == "data.csv"
-    assert result["hash"] == "abc123"
+    data, inline = result
+    assert inline == members
+    assert data == {
+        "path": "data",
+        "hash": listing.digest(listing.encode(members)),
+        "size": 28,
+        "nfiles": 2,
+    }, "The record is the inline listing's, not the hash the older pivot wrote"
+
+
+@pytest.mark.parametrize(
+    ("relpath", "empty_dir"),
+    [
+        pytest.param("../outside.txt", "empty", id="file-in-parent"),
+        pytest.param("/etc/passwd", "empty", id="absolute-file"),
+        pytest.param("a.txt", "../outside", id="empty-dir-in-parent"),
+    ],
+)
+def test_parse_pvt_data_from_bytes_older_inline_listing_outside_directory(
+    relpath: str, empty_dir: str
+) -> None:
+    """Returns None for an older pivot's directory .pvt naming a path outside the directory."""
+    old_document = {
+        "path": "data",
+        "hash": "aaaaaaaaaaaaaaaa",
+        "size": 14,
+        "num_files": 1,
+        "manifest": [{"relpath": relpath, "hash": "1111111111111111", "size": 14}],
+        "empty_dirs": [empty_dir],
+    }
+
+    result = restore._parse_pvt_data_from_bytes(yaml.dump(old_document).encode())
+
+    assert result is None
 
 
 def test_parse_pvt_data_from_bytes_path_traversal() -> None:
@@ -179,6 +384,22 @@ path: data.csv
     assert result is None
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(b"path: 5\nhash: abc123\nsize: 1\n", id="path-not-a-string"),
+        pytest.param(b"path: data.csv\nhash: 7\nsize: 1\n", id="hash-not-a-string"),
+        pytest.param(b"path: data.csv\nhash: abc123\nsize: '1'\n", id="size-not-an-int"),
+        pytest.param(b"path: data.csv\nhash: abc123\nsize: -1\n", id="negative-size"),
+        pytest.param(b"path: data\nhash: abc123\nsize: 1\nnfiles: -1\n", id="negative-nfiles"),
+        pytest.param(b"hash: abc123\nsize: 1\nmanifest: []\n", id="older-without-path"),
+    ],
+)
+def test_parse_pvt_data_from_bytes_wrong_field_types(content: bytes) -> None:
+    """Returns None, not a crash, when a field holds the wrong type."""
+    assert restore._parse_pvt_data_from_bytes(content) is None
+
+
 # =============================================================================
 # resolve_targets Tests
 # =============================================================================
@@ -191,6 +412,7 @@ def test_resolve_targets_as_stage(git_repo: GitRepo, monkeypatch: pytest.MonkeyP
     # Create lock file for stage
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
     lock_content = {
+        "schema_version": lock.SCHEMA_VERSION,
         "code_manifest": {"func:main": "abc123"},
         "params": {},
         "deps": [],
@@ -459,6 +681,7 @@ def test_restore_targets_from_revision_output_with_stage(
     )
     (repo_path / ".pivot" / "stages").mkdir(parents=True)
     lock_content = {
+        "schema_version": lock.SCHEMA_VERSION,
         "code_manifest": {"func:main": "abc123"},
         "params": {},
         "deps": [],
@@ -492,6 +715,66 @@ def test_restore_targets_from_revision_output_with_stage(
     assert success
     assert messages == [f"Restored: {output_path} (from cache)"]
     assert output_path.read_text() == "stage output"
+
+
+def test_restore_stage_directory_output_from_listing_beside_lock(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stage's directory output is restored from the listing committed beside its lock: the
+    lock records only the directory's hash, size and file count, and the cache holds no listing.
+    """
+    repo_path, commit = git_repo
+    cache_dir = repo_path / ".pivot" / "cache"
+    hashed = _cache_directory_files(cache_dir / "files", _DIR_CONTENTS, _DIR_EMPTY)
+    record = hashed["record"]
+    state_dir = repo_path / ".pivot"
+    stages_dir = lock.get_stages_dir(state_dir)
+    stages_dir.mkdir(parents=True)
+    lock_content = {
+        "schema_version": lock.SCHEMA_VERSION,
+        "code_manifest": {"func:main": "abc123"},
+        "params": {},
+        "deps": [],
+        "outs": [
+            {
+                "key": None,
+                "hash": record["hash"],
+                "size": record["size"],
+                "nfiles": record["nfiles"],
+                "path": "data/train",
+            }
+        ],
+    }
+    (stages_dir / "train.lock").write_text(yaml.dump(lock_content))
+    listing.write(
+        listing.output_listing_path(stages_dir, types.ArtifactIdentity("train", None)),
+        hashed["data"],
+    )
+    sha = commit("add lock and listing")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    output_path = repo_path / "data" / "train"
+
+    messages, success = restore.restore_targets_from_revision(
+        targets=["train"],
+        rev=sha[:7],
+        output=None,
+        cache_dir=cache_dir,
+        stage_targets={
+            "train": restore.StageTarget(
+                stage_name="train", state_dir=state_dir, paths_by_key={None: "data/train"}
+            )
+        },
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+    )
+
+    assert success, f"Expected success, got messages: {messages}"
+    assert messages == [f"Restored: {output_path} (from cache)"]
+    assert _tree(output_path) == ["a.txt", "empty", "sub", "sub/b.txt"]
+    assert (output_path / "sub" / "b.txt").read_bytes() == b"file 2 content"
+    assert cache.hash_directory(output_path)["record"] == record, (
+        "The restored directory should hash to the record its lock holds"
+    )
 
 
 # =============================================================================
@@ -659,22 +942,262 @@ def test_restore_file_force_keeps_existing_output_until_cache_swap(
     assert target.read_text() == "cached content"
 
 
-def test_parse_pvt_data_with_manifest() -> None:
-    """Parses pvt file with manifest field."""
-    content = b"""
-path: data/
-hash: abc123
-size: 1024
-manifest:
-  a.txt: def456
-  b.txt: ghi789
-"""
-    result = restore._parse_pvt_data_from_bytes(content)
+# =============================================================================
+# Directory restore Tests
+# =============================================================================
 
-    assert result is not None
-    assert result["path"] == "data/"
-    assert result["hash"] == "abc123"
-    assert "manifest" in result
+
+def test_restore_directory_from_committed_listing(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tracked directory is restored from the listing committed beside its .pvt; the cache
+    holds the directory's files but no listing object."""
+    repo_path, commit = git_repo
+    hashed = _cache_directory_files(
+        repo_path / ".pivot" / "cache" / "files", _DIR_CONTENTS, _DIR_EMPTY
+    )
+    pvt_path = _write_directory_pvt(repo_path / "data.pvt", hashed["record"])
+    listing.write(listing.tracked_listing_path(pvt_path), hashed["data"])
+    sha = commit("track data")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    output_path = repo_path / "restored_data"
+
+    messages, success = _restore_data_directory(repo_path, sha[:7], output_path)
+
+    assert success, f"Expected success, got messages: {messages}"
+    assert messages == [f"Restored: {output_path} (from cache)"]
+    assert _tree(output_path) == ["a.txt", "empty", "sub", "sub/b.txt"]
+    assert (output_path / "a.txt").read_bytes() == b"file 1 content"
+    assert cache.hash_directory(output_path)["record"] == hashed["record"], (
+        "The restored directory should hash to the record its .pvt holds"
+    )
+
+
+def test_restore_directory_from_cache_listing_object(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory whose listing file the revision lacks is restored from the cache's listing
+    object at the directory's hash."""
+    repo_path, commit = git_repo
+    cache_files = repo_path / ".pivot" / "cache" / "files"
+    hashed = _cache_directory_files(cache_files, _DIR_CONTENTS, _DIR_EMPTY)
+    _write_directory_pvt(repo_path / "data.pvt", hashed["record"])
+    listing.store_object(cache_files, hashed["record"]["hash"], hashed["data"])
+    sha = commit("track data without its listing file")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    output_path = repo_path / "restored_data"
+
+    messages, success = _restore_data_directory(repo_path, sha[:7], output_path)
+
+    assert success, f"Expected success, got messages: {messages}"
+    assert messages == [f"Restored: {output_path} (from cache)"]
+    assert _tree(output_path) == ["a.txt", "empty", "sub", "sub/b.txt"]
+    assert cache.hash_directory(output_path)["record"] == hashed["record"], (
+        "The restored directory should hash to the record its .pvt holds"
+    )
+
+
+def test_restore_directory_from_older_inline_pvt(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older pivot's directory .pvt, its files listed inline, is restored from that list;
+    the restore leaves the .pvt as it is and writes no listing file."""
+    repo_path, commit = git_repo
+    hashed = _cache_directory_files(
+        repo_path / ".pivot" / "cache" / "files", _DIR_CONTENTS, _DIR_EMPTY
+    )
+    old_document = {
+        "path": "data",
+        "hash": "aaaaaaaaaaaaaaaa",
+        "size": 28,
+        "num_files": 2,
+        "manifest": hashed["listing"]["files"],
+        "empty_dirs": hashed["listing"]["empty_dirs"],
+    }
+    pvt_path = repo_path / "data.pvt"
+    pvt_path.write_text(yaml.dump(old_document))
+    old_bytes = pvt_path.read_bytes()
+    sha = commit("track data with an older pivot")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    output_path = repo_path / "restored_data"
+
+    messages, success = _restore_data_directory(repo_path, sha[:7], output_path)
+
+    assert success, f"Expected success, got messages: {messages}"
+    assert messages == [f"Restored: {output_path} (from cache)"]
+    assert cache.hash_directory(output_path)["record"] == hashed["record"], (
+        "The restored directory should hold exactly what the inline list records"
+    )
+    assert pvt_path.read_bytes() == old_bytes, "A restore never rewrites an older .pvt"
+    assert not listing.tracked_listing_path(pvt_path).exists(), (
+        "A restore never converts an older .pvt to a listing file"
+    )
+
+
+def test_restore_directory_without_listing_fails(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory whose listing is neither committed nor cached is not restored, though every
+    file it holds is cached."""
+    repo_path, commit = git_repo
+    hashed = _cache_directory_files(
+        repo_path / ".pivot" / "cache" / "files", _DIR_CONTENTS, _DIR_EMPTY
+    )
+    _write_directory_pvt(repo_path / "data.pvt", hashed["record"])
+    sha = commit("track data without its listing file")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    output_path = repo_path / "restored_data"
+
+    messages, success = _restore_data_directory(repo_path, sha[:7], output_path)
+
+    assert not success
+    assert any("not in local cache" in msg for msg in messages), (
+        f"Should report the directory missing, got: {messages}"
+    )
+    assert not output_path.exists(), "Nothing should be written without a listing"
+
+
+def test_restore_directory_refuses_committed_listing_not_matching_its_hash(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed listing whose bytes do not hash to the .pvt's directory hash is refused,
+    though the cache holds the right listing, and nothing is written."""
+    repo_path, commit = git_repo
+    cache_files = repo_path / ".pivot" / "cache" / "files"
+    hashed = _cache_directory_files(cache_files, _DIR_CONTENTS, _DIR_EMPTY)
+    pvt_path = _write_directory_pvt(repo_path / "data.pvt", hashed["record"])
+    edited = hashed["data"].replace(b" 14 - a.txt\n", b" 15 - a.txt\n")
+    assert edited != hashed["data"]
+    listing.write(listing.tracked_listing_path(pvt_path), edited)
+    listing.store_object(cache_files, hashed["record"]["hash"], hashed["data"])
+    sha = commit("track data with an edited listing")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    output_path = repo_path / "restored_data"
+
+    with pytest.raises(
+        exceptions.CorruptListingError,
+        match=re.escape(f"data.pvt.listing at revision {sha[:7]}: its bytes hash to"),
+    ):
+        _restore_data_directory(repo_path, sha[:7], output_path)
+
+    assert not output_path.exists(), "Nothing should be written from a corrupt listing"
+
+
+def test_restore_directory_refuses_corrupt_cache_listing_object(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cache listing object whose bytes do not hash to the directory's hash is refused,
+    naming the object, and nothing is written."""
+    repo_path, commit = git_repo
+    cache_files = repo_path / ".pivot" / "cache" / "files"
+    hashed = _cache_directory_files(cache_files, _DIR_CONTENTS, _DIR_EMPTY)
+    _write_directory_pvt(repo_path / "data.pvt", hashed["record"])
+    sha = commit("track data without its listing file")
+    cached_listing = cache.get_cache_path(cache_files, hashed["record"]["hash"])
+    cached_listing.parent.mkdir(parents=True, exist_ok=True)
+    cached_listing.write_bytes(hashed["data"].replace(b" 14 - a.txt\n", b" 15 - a.txt\n"))
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    output_path = repo_path / "restored_data"
+
+    with pytest.raises(
+        exceptions.CorruptListingError, match=re.escape(f"{cached_listing}: its bytes hash to")
+    ):
+        _restore_data_directory(repo_path, sha[:7], output_path)
+
+    assert not output_path.exists(), "Nothing should be written from a corrupt listing"
+
+
+def test_restore_directory_refuses_listing_disagreeing_with_record(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A listing that hashes to the .pvt's directory hash but lists a file count other than the
+    one the .pvt records is refused, and nothing is written."""
+    repo_path, commit = git_repo
+    hashed = _cache_directory_files(
+        repo_path / ".pivot" / "cache" / "files", _DIR_CONTENTS, _DIR_EMPTY
+    )
+    record = hashed["record"]
+    pvt_path = _write_directory_pvt(
+        repo_path / "data.pvt",
+        DirHash(hash=record["hash"], size=record["size"], nfiles=record["nfiles"] + 1),
+    )
+    listing.write(listing.tracked_listing_path(pvt_path), hashed["data"])
+    sha = commit("track data with an edited .pvt")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    output_path = repo_path / "restored_data"
+
+    with pytest.raises(
+        exceptions.CorruptListingError,
+        match=re.escape("lists 2 files of 28 bytes, but its lock or .pvt records 3 files"),
+    ):
+        _restore_data_directory(repo_path, sha[:7], output_path)
+
+    assert not output_path.exists(), "Nothing should be written from a corrupt listing"
+
+
+@pytest.mark.parametrize(
+    ("member", "error"),
+    [
+        pytest.param("../outside.txt", "an empty, '.' or '..' segment", id="parent-segment"),
+        pytest.param("/outside.txt", "an absolute path", id="absolute"),
+    ],
+)
+def test_restore_directory_refuses_listing_naming_path_outside_it(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, member: str, error: str
+) -> None:
+    """A listing naming a file outside its directory is refused before anything is written,
+    though its bytes hash to the directory hash the .pvt records."""
+    repo_path, commit = git_repo
+    content = b"outside content"
+    file_hash = xxhash.xxh64(content).hexdigest()
+    cache_path = cache.get_cache_path(repo_path / ".pivot" / "cache" / "files", file_hash)
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_bytes(content)
+    data = f"{file_hash} {len(content)} - {member}\n".encode()
+    pvt_path = _write_directory_pvt(
+        repo_path / "data.pvt", DirHash(hash=listing.digest(data), size=len(content), nfiles=1)
+    )
+    listing.write(listing.tracked_listing_path(pvt_path), data)
+    sha = commit("track data with a listing naming an outside path")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    output_path = repo_path / "restored_data"
+
+    with pytest.raises(exceptions.CorruptListingError, match=re.escape(error)):
+        _restore_data_directory(repo_path, sha[:7], output_path)
+
+    assert not (repo_path / "outside.txt").exists(), "No file should be written outside"
+    assert not output_path.exists(), "Nothing should be written from an unsafe listing"
+
+
+def test_restore_directory_force_replaces_existing_directory_with_listed_members(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forced restore swaps in exactly the listed members for an existing directory, leaving
+    no temporary or backup copy beside it."""
+    repo_path, commit = git_repo
+    hashed = _cache_directory_files(
+        repo_path / ".pivot" / "cache" / "files", _DIR_CONTENTS, _DIR_EMPTY
+    )
+    pvt_path = _write_directory_pvt(repo_path / "data.pvt", hashed["record"])
+    listing.write(listing.tracked_listing_path(pvt_path), hashed["data"])
+    sha = commit("track data")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    output_path = repo_path / "restored_data"
+    output_path.mkdir()
+    (output_path / "a.txt").write_text("local edit")
+    (output_path / "stale.txt").write_text("not listed")
+    siblings = sorted(path.name for path in repo_path.iterdir())
+
+    messages, success = _restore_data_directory(repo_path, sha[:7], output_path, force=True)
+
+    assert success, f"Expected success, got messages: {messages}"
+    assert _tree(output_path) == ["a.txt", "empty", "sub", "sub/b.txt"]
+    assert cache.hash_directory(output_path)["record"] == hashed["record"], (
+        "The restored directory should hold exactly what its listing records"
+    )
+    assert sorted(path.name for path in repo_path.iterdir()) == siblings, (
+        "No temporary or backup copy should be left beside the directory"
+    )
 
 
 # =============================================================================
@@ -682,63 +1205,10 @@ manifest:
 # =============================================================================
 
 
-def test_restore_directory_from_cache_with_manifest(
-    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Restores directory from cache when manifest files are present (not tree hash)."""
-    repo_path, commit = git_repo
-
-    # Set up cache directory
-    cache_dir = repo_path / ".pivot" / "cache"
-    (cache_dir / "files").mkdir(parents=True)
-
-    # Create cached files (individual file hashes, NOT the tree hash)
-    file1_hash = "1111111111111111"
-    file2_hash = "2222222222222222"
-    cache.get_cache_path(cache_dir / "files", file1_hash).parent.mkdir(parents=True, exist_ok=True)
-    cache.get_cache_path(cache_dir / "files", file1_hash).write_bytes(b"file 1 content")
-    cache.get_cache_path(cache_dir / "files", file2_hash).parent.mkdir(parents=True, exist_ok=True)
-    cache.get_cache_path(cache_dir / "files", file2_hash).write_bytes(b"file 2 content")
-
-    # Create a .pvt file for a directory with manifest
-    # Tree hash is different from file hashes - it's a hash of the manifest JSON
-    tree_hash = "aaaaaaaaaaaaaaaa"
-    manifest = [
-        {"relpath": "a.txt", "hash": file1_hash, "size": 14, "isexec": False},
-        {"relpath": "b.txt", "hash": file2_hash, "size": 14, "isexec": False},
-    ]
-    pvt_content = {"path": "data/", "hash": tree_hash, "size": 28, "manifest": manifest}
-    (repo_path / "data.pvt").write_text(yaml.dump(pvt_content))
-
-    sha = commit("add pvt file")
-
-    monkeypatch.setattr(project, "_project_root_cache", repo_path)
-
-    output_path = repo_path / "restored_data"
-
-    messages, success = restore.restore_targets_from_revision(
-        targets=["data"],
-        rev=sha[:7],
-        output=output_path,
-        cache_dir=cache_dir,
-        stage_targets={},
-        checkout_modes=[cache.CheckoutMode.COPY],
-        force=False,
-    )
-
-    assert success, f"Expected success, got messages: {messages}"
-    assert len(messages) == 1
-    assert "from cache" in messages[0]
-    assert (output_path / "a.txt").read_bytes() == b"file 1 content"
-    assert (output_path / "b.txt").read_bytes() == b"file 2 content"
-
-
 def test_restore_file_from_remote_caches_with_readonly_permissions(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Files cached from remote have read-only (0o444) permissions."""
-    import xxhash
-
     repo_path, commit = git_repo
 
     # Set up directories
@@ -792,8 +1262,6 @@ def test_restore_file_from_remote_keeps_an_object_already_cached(
 ) -> None:
     """Caching remote content never replaces an object a concurrent commit published first:
     a checkout may be linking or symlinking it, and its executable bit belongs to it."""
-    import xxhash
-
     repo_path, commit = git_repo
     cache_dir = repo_path / ".pivot" / "cache"
     content = b"#!/bin/sh\necho from remote\n"
@@ -835,8 +1303,6 @@ def test_restore_file_from_remote_hash_mismatch(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Remote content with hash mismatch is rejected and returns error."""
-    import xxhash
-
     repo_path, commit = git_repo
 
     # Set up directories
@@ -890,8 +1356,6 @@ def test_restore_file_from_remote_success(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Remote content is restored and cached successfully."""
-    import xxhash
-
     repo_path, commit = git_repo
 
     # Set up directories

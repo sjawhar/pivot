@@ -9,20 +9,28 @@ fast as possible.
 
 Every output file is hashed with `xxhash64` and stored under
 `.pivot/cache/files/<hash[:2]>/<hash[2:]>` (a two-level directory structure
-using the first two hex characters as a prefix). The per-stage lock file
-records each output's content hash.
+using the first two hex characters as a prefix). A directory has one cache
+object at its directory hash too: its text listing. The directory's whole-tree
+symlink checkout, when configured, is separate under
+`.pivot/cache/trees/<hash[:2]>/<hash[2:]>`; it cannot collide with a file or
+listing object. The per-stage lock records a file's hash, or a directory's
+listing hash, total size and file count.
 
 ```
 .pivot/
   cache/
     files/
       a1/
-        b2c3d4e5f6g7h8     # cached file (content-addressed)
+        b2c3d4e5f6g7h8     # cached file or a directory listing
         .pivot_cache.lock  # lock file pivot keeps in each prefix directory
       ...
+    trees/
+      a1/
+        b2c3d4e5f6g7h8     # a complete directory for symlink checkout
   stages/
     demo/
       clean.lock           # lock file for stage "demo/clean"
+      clean=.listing       # listing for clean's directory output, if any
       train.lock           # lock file for stage "demo/train"
   state.lmdb/              # LMDB database
 ```

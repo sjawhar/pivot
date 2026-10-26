@@ -14,12 +14,10 @@ from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
-from pivot.storage import lock
+from pivot.storage import listing, lock
 from pivot.types import HashInfo, PipelineStatus, PipelineStatusInfo, is_dir_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from pivot.remote import protocol
 
 
@@ -42,41 +40,52 @@ class VerifyOutput(TypedDict):
     stages: list[StageVerifyInfo]
 
 
-def _extract_file_hashes(hash_infos: Mapping[str, HashInfo]) -> dict[str, str]:
-    """Extract individual file hashes from a hash_info dict.
+def _object_hashes(
+    path: str,
+    hash_info: HashInfo,
+    committed: pathlib.Path,
+    files_dir: pathlib.Path,
+    *,
+    shared_input: bool = False,
+) -> dict[str, str]:
+    """The cache objects an output or dependency at ``path`` needs, by workspace path.
 
-    Tree hashes (directory hashes) are computed, not cached - only individual
-    file hashes are stored in the cache. For directories with manifests,
-    extracts each manifest entry's hash.
+    A directory needs its listing object (keyed by the directory's path) and each file's
+    object, named by its listing (``committed``, else the cache's object). A shared input
+    listing may have moved on since this lock was written, so it falls back to this lock's
+    immutable cache object when the committed file's hash differs.
     """
-    result = dict[str, str]()
-    for path, hash_info in hash_infos.items():
-        if is_dir_hash(hash_info):
-            for entry in hash_info["manifest"]:
-                entry_path = str(pathlib.Path(path) / entry["relpath"])
-                result[entry_path] = entry["hash"]
-        else:
-            result[path] = hash_info["hash"]
+    result = {path: hash_info["hash"]}
+    if not is_dir_hash(hash_info):
+        return result
+    try:
+        members = listing.read(committed, hash_info, files_dir, fallback_on_mismatch=shared_input)
+    except exceptions.ListingMissingError:
+        return result
+    for entry in members["files"]:
+        result[str(pathlib.Path(path) / entry["relpath"])] = entry["hash"]
     return result
 
 
 def _get_stage_lock_hashes(
     stage_name: str,
 ) -> tuple[dict[str, str], dict[str, str]]:
-    """Get output and dep file hashes from a stage's lock file.
+    """Get output and dep cache-object hashes from a stage's lock file and listings.
 
     Returns (output_hashes, dep_hashes) where each is {path: hash}.
 
-    For both outputs and deps, includes manifest entry hashes for directories.
+    For both outputs and deps, a directory contributes its listing object and its files.
     Non-cached outputs (e.g. Metric with cache=False) are excluded —
     they are git-tracked, not in cache.
     """
     stage_info = cli_helpers.get_stage(stage_name)
-    state_dir = registry.get_stage_state_dir(stage_info, config.get_state_dir())
+    default_state_dir = config.get_state_dir()
+    state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
     stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
     lock_data = stage_lock.read()
     if lock_data is None:
         return {}, {}
+    files_dir = config.get_cache_dir() / "files"
 
     # Filter non-cached outputs — they're git-tracked, not in cache
     workspace_store = cli_helpers.get_workspace_store()
@@ -86,7 +95,7 @@ def _get_stage_lock_hashes(
         for identity_key, out in output_refs.items()
         if out.tag is not types.ArtifactTag.METRIC
     }
-    cached_output_hashes: dict[str, HashInfo] = {}
+    output_hashes = dict[str, str]()
     for identity, hash_info in lock_data["output_hashes"].items():
         identity_key = types.identity_key(identity)
         if identity_key in cached_identity_keys:
@@ -95,29 +104,44 @@ def _get_stage_lock_hashes(
                 resolved_path = project.to_relative_path(display_path)
             else:
                 resolved_path = identity_key
-            cached_output_hashes[resolved_path] = hash_info
+            output_hashes.update(
+                _object_hashes(
+                    resolved_path, hash_info, stage_lock.output_listing_path(identity), files_dir
+                )
+            )
 
     # Key deps by workspace path: upstream stage outputs at their output path,
     # raw inputs at their input binding (data/raw/<name> by default).
-    stage_names = set(cli_helpers.list_stages())
+    all_stages = cli_helpers.get_all_stages()
     dep_refs = {ref.identity: ref for ref in stage_info["deps"].values()}
-    dep_hashes = dict[str, HashInfo]()
+    dep_hashes = dict[str, str]()
     for identity, hash_info in lock_data["dep_hashes"].items():
         ref = dep_refs.get(identity)
         if workspace_store is None or ref is None:
-            dep_hashes[types.identity_key(identity)] = hash_info
+            dep_hashes[types.identity_key(identity)] = hash_info["hash"]
             continue
-        dep_path = (
-            workspace_store.resolve_display_path(ref)
-            if identity.producer in stage_names
-            else workspace_store.checkout(ref)
+        if identity.producer in all_stages:
+            dep_path = workspace_store.resolve_display_path(ref)
+            producer_dir = lock.get_stages_dir(
+                registry.get_stage_state_dir(all_stages[identity.producer], default_state_dir)
+            )
+            committed = listing.output_listing_path(producer_dir, identity)
+        else:
+            dep_path = workspace_store.checkout(ref)
+            committed = listing.input_listing_path(
+                stage_lock.stages_dir, workspace_store.input_relpath(ref)
+            )
+        dep_hashes.update(
+            _object_hashes(
+                project.to_relative_path(dep_path),
+                hash_info,
+                committed,
+                files_dir,
+                shared_input=identity.producer not in all_stages,
+            )
         )
-        dep_hashes[project.to_relative_path(dep_path)] = hash_info
 
-    return (
-        _extract_file_hashes(cached_output_hashes),
-        _extract_file_hashes(dep_hashes),
-    )
+    return output_hashes, dep_hashes
 
 
 def _get_stage_missing_workspace_files(

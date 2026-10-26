@@ -60,7 +60,7 @@ model = pipeline.input("model.pkl")
 
 1. Pivot resolves the git ref to a commit SHA
 2. Reads the source repo's `.pivot/config.yaml` to find its remote storage URL
-3. Reads the source lock files to find the artifact and its content hash
+3. Reads the source lock files to find the artifact and its content hash; for one file of a directory output, reads that output's committed listing
 4. Downloads the file from the source's remote, S3 or GCS (hash-verified)
 5. Creates a `.pvt` file tracking the import source
 

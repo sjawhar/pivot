@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 from conftest import isolated_pivot_dir
 from pivot import cli, compose, config
-from pivot.storage import cache, track
+from pivot.storage import cache, listing, track
 
 if TYPE_CHECKING:
     import pathlib
@@ -78,7 +78,7 @@ def test_track_directory(
     mock_discovery: compose.Pipeline,
     runner: click.testing.CliRunner,
 ) -> None:
-    """Track directory creates .pvt file with manifest."""
+    """Track a directory as a compact .pvt record with an adjacent listing."""
     data_dir = mock_discovery.root / "data_dir"
     data_dir.mkdir()
     (data_dir / "file1.txt").write_text("content1")
@@ -91,12 +91,20 @@ def test_track_directory(
 
     pvt_path = mock_discovery.root / "data_dir.pvt"
     assert pvt_path.exists()
+    listing_path = listing.tracked_listing_path(pvt_path)
+    assert listing_path.exists()
 
-    # Read and verify .pvt content includes manifest
     pvt_data = track.read_pvt_file(pvt_path)
     assert pvt_data is not None
-    assert "manifest" in pvt_data
-    assert pvt_data.get("num_files") == 2
+    members_data = listing_path.read_bytes()
+    members = listing.decode(members_data)
+    record = listing.record_of(members, members_data)
+    assert set(pvt_data) == {"path", "hash", "size", "nfiles"}
+    assert pvt_data["path"] == "data_dir"
+    assert pvt_data["hash"] == record["hash"]
+    assert pvt_data["size"] == record["size"]
+    assert "nfiles" in pvt_data and pvt_data["nfiles"] == record["nfiles"] == 2
+    assert [entry["relpath"] for entry in members["files"]] == ["file1.txt", "file2.txt"]
 
 
 def test_track_force_overwrites(
@@ -147,8 +155,11 @@ def test_track_force_keeps_a_non_executable_object_and_checkout_copies_the_scrip
     assert result.exit_code == 0, result.output
 
     pvt_data = track.read_pvt_file(mock_discovery.root / "tools.pvt")
-    assert pvt_data is not None and "manifest" in pvt_data
-    entry_hash = next(e["hash"] for e in pvt_data["manifest"] if e["relpath"] == "run.sh")
+    assert pvt_data is not None and "nfiles" in pvt_data and pvt_data["nfiles"] == 1
+    members = listing.decode(
+        listing.tracked_listing_path(mock_discovery.root / "tools.pvt").read_bytes()
+    )
+    entry_hash = next(entry["hash"] for entry in members["files"] if entry["relpath"] == "run.sh")
 
     # Simulate an object an older pivot cached non-executable for the same bytes.
     cache_dir = config.get_cache_dir() / "files"

@@ -10,7 +10,7 @@ from pivot import cli, config, loaders, project, types
 from pivot.cli import checkout as checkout_mod
 from pivot.cli import helpers as cli_helpers
 from pivot.registry import PipelineLike, RegistryStageInfo
-from pivot.storage import cache, lock, store, track
+from pivot.storage import cache, listing, lock, store, track
 
 if TYPE_CHECKING:
     import click.testing
@@ -84,7 +84,8 @@ def _helper_write_lock(
             params={},
             dep_hashes={},
             output_hashes=output_hashes,
-        )
+        ),
+        cache_dir=config.get_cache_dir() / "files",
     )
 
 
@@ -99,16 +100,37 @@ def _helper_cache_file(path: pathlib.Path, content: str) -> types.HashInfo:
     return output_hash
 
 
-def _helper_cache_directory(path: pathlib.Path) -> types.HashInfo:
+def _helper_cache_directory(path: pathlib.Path) -> types.DirHash:
     cache_dir = config.get_cache_dir() / "files"
     cache_dir.mkdir(parents=True, exist_ok=True)
     path.mkdir(parents=True, exist_ok=True)
     (path / "part-1.txt").write_text("first")
     (path / "part-2.txt").write_text("second")
     output_hash = cache.save_to_cache(path, cache_dir, checkout_mode=config.CheckoutMode.COPY)
+    assert types.is_dir_hash(output_hash)
     if path.exists():
         cache.remove_output(path)
     return output_hash
+
+
+def _helper_directory_output(
+    pipeline: PipelineLike,
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    """Cache and lock stage `bundle`'s directory output; return it, its listing and cache object."""
+    store_instance = cli_helpers.get_workspace_store()
+    assert store_instance is not None
+    ref = _helper_ref("bundle", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
+    _helper_register_stage(pipeline, "bundle", [ref])
+    output_path = store_instance.resolve_display_path(ref)
+    output_hash = _helper_cache_directory(output_path)
+    _helper_write_lock("bundle", pipeline.state_dir, {ref.identity: output_hash})
+    committed = lock.StageLock(
+        "bundle", lock.get_stages_dir(pipeline.state_dir)
+    ).output_listing_path(ref.identity)
+    cache_object = cache.get_cache_path(config.get_cache_dir() / "files", output_hash["hash"])
+    assert committed.read_bytes() == cache_object.read_bytes()
+    assert listing.digest(committed.read_bytes()) == output_hash["hash"]
+    return output_path, committed, cache_object
 
 
 def test_get_stage_output_info_uses_store_paths(mock_discovery: PipelineLike) -> None:
@@ -120,10 +142,10 @@ def test_get_stage_output_info_uses_store_paths(mock_discovery: PipelineLike) ->
     output_hash = types.FileHash(hash="a" * 16)
     _helper_write_lock("train", mock_discovery.state_dir, {ref.identity: output_hash})
 
-    hashes, state_dirs = checkout_mod._get_stage_output_info()
+    hashes, state_dirs = checkout_mod._get_stage_output_info(config.get_cache_dir() / "files")
     expected_path = str(store_instance.resolve_display_path(ref))
 
-    assert hashes == {expected_path: output_hash}
+    assert hashes == {expected_path: checkout_mod.Expected(output_hash)}
     assert state_dirs == {expected_path: mock_discovery.state_dir}, (
         "Each output's file hashes live in its stage's state directory"
     )
@@ -218,15 +240,7 @@ def test_checkout_unknown_identity_target_raises(
 def test_checkout_directory_output_restores_contents(
     mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
-    store_instance = cli_helpers.get_workspace_store()
-    assert store_instance is not None
-
-    ref = _helper_ref("bundle", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
-    _helper_register_stage(mock_discovery, "bundle", [ref])
-
-    output_path = store_instance.resolve_display_path(ref)
-    output_hash = _helper_cache_directory(output_path)
-    _helper_write_lock("bundle", mock_discovery.state_dir, {ref.identity: output_hash})
+    output_path, _, _ = _helper_directory_output(mock_discovery)
 
     result = runner.invoke(cli.cli, ["checkout", "bundle"])
 
@@ -234,6 +248,33 @@ def test_checkout_directory_output_restores_contents(
     assert output_path.exists()
     assert (output_path / "part-1.txt").read_text() == "first"
     assert (output_path / "part-2.txt").read_text() == "second"
+
+
+def test_checkout_directory_output_reads_committed_listing_without_cache_listing(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
+) -> None:
+    output_path, _, cache_object = _helper_directory_output(mock_discovery)
+    cache_object.unlink()
+
+    result = runner.invoke(cli.cli, ["checkout", "bundle"])
+
+    assert result.exit_code == 0, result.output
+    assert (output_path / "part-1.txt").read_text() == "first"
+    assert (output_path / "part-2.txt").read_text() == "second"
+
+
+def test_checkout_directory_output_refuses_corrupt_committed_listing(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
+) -> None:
+    output_path, committed, _ = _helper_directory_output(mock_discovery)
+    committed.write_bytes(committed.read_bytes().replace(b" 5 - part-1.txt", b" 6 - part-1.txt"))
+
+    result = runner.invoke(cli.cli, ["checkout", "bundle"])
+
+    assert result.exit_code != 0
+    assert str(committed) in result.output
+    assert "not to the directory hash" in result.output
+    assert not output_path.exists()
 
 
 def test_checkout_all_uses_merged_pipeline_paths(

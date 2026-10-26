@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 from pivot import exceptions
-from pivot.storage import lock
+from pivot.storage import listing, lock
 from pivot.types import (
     ArtifactIdentity,
     DepEntry,
@@ -31,6 +31,20 @@ if TYPE_CHECKING:
 
 def _id(producer: str, key: str | None = None) -> ArtifactIdentity:
     return ArtifactIdentity(producer, key)
+
+
+def _hashed_directory(
+    files: list[DirManifestEntry], empty_dirs: list[str] | None = None
+) -> listing.HashedDirectory:
+    """A directory record with the listing bytes its lock must write."""
+    members = listing.DirListing(
+        files=files,
+        empty_dirs=empty_dirs if empty_dirs is not None else list[str](),
+    )
+    data = listing.encode(members)
+    return listing.HashedDirectory(
+        record=listing.record_of(members, data), listing=members, data=data
+    )
 
 
 def test_lock_file_creation(tmp_path: Path) -> None:
@@ -335,8 +349,9 @@ def test_read_empty_file_returns_none(tmp_path: Path) -> None:
 
 
 def test_is_lock_data_accepts_missing_dep_generations() -> None:
-    """Lock data without dep_generations is valid."""
+    """A current-schema lock without dep_generations is valid."""
     data: StorageLockData = {
+        "schema_version": lock.SCHEMA_VERSION,
         "code_manifest": {},
         "params": {},
         "deps": [],
@@ -347,11 +362,12 @@ def test_is_lock_data_accepts_missing_dep_generations() -> None:
 
 
 def test_read_lock_with_dep_generations_ignored(tmp_path: Path) -> None:
-    """Legacy lock files with dep_generations are still readable."""
+    """Current-schema locks ignore the legacy dep_generations field."""
     stage_lock = lock.StageLock("legacy", tmp_path)
     stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
     stage_lock.path.write_text(
-        "code_manifest: {}\nparams: {}\ndeps: []\nouts: []\ndep_generations: {}\n"
+        f"schema_version: {lock.SCHEMA_VERSION}\n"
+        + "code_manifest: {}\nparams: {}\ndeps: []\nouts: []\ndep_generations: {}\n"
     )
 
     result = stage_lock.read()
@@ -361,11 +377,12 @@ def test_read_lock_with_dep_generations_ignored(tmp_path: Path) -> None:
 
 
 def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
-    """Lock files with extra keys (forward compatibility) are accepted."""
+    """Current-schema lock files ignore unknown top-level keys."""
     stage_lock = lock.StageLock("future", tmp_path)
     stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
     stage_lock.path.write_text(
-        "code_manifest: {}\nparams: {}\ndeps: []\nouts: []\n"
+        f"schema_version: {lock.SCHEMA_VERSION}\n"
+        + "code_manifest: {}\nparams: {}\ndeps: []\nouts: []\n"
         + "future_key: some_value\nanother_new_field: 123\n"
     )
 
@@ -381,6 +398,7 @@ def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
     [
         pytest.param(
             {
+                "schema_version": lock.SCHEMA_VERSION,
                 "code_manifest": {},
                 "params": {},
                 "deps": [{"producer": ["p/a"], "key": None, "hash": "0123456789abcdef"}],
@@ -390,6 +408,7 @@ def test_read_lock_with_extra_keys_accepted(tmp_path: Path) -> None:
         ),
         pytest.param(
             {
+                "schema_version": lock.SCHEMA_VERSION,
                 "code_manifest": {},
                 "params": {},
                 "deps": [],
@@ -421,19 +440,20 @@ def test_lock_read_treats_non_mapping_manifest_or_params_as_missing(
 ) -> None:
     stage_lock = lock.StageLock("p/stage", tmp_path)
     stage_lock.path.parent.mkdir(parents=True)
-    document = {"code_manifest": code_manifest, "params": params, "deps": [], "outs": []}
+    document = {
+        "schema_version": lock.SCHEMA_VERSION,
+        "code_manifest": code_manifest,
+        "params": params,
+        "deps": [],
+        "outs": [],
+    }
     stage_lock.path.write_text(yaml.safe_dump(document))
     assert stage_lock.read() is None
 
 
 _DEP: dict[str, object] = {"producer": "p/a", "key": None, "hash": "0123456789abcdef"}
 _OUT: dict[str, object] = {"key": "o", "hash": "fedcba9876543210"}
-_MANIFEST_ENTRY: dict[str, object] = {
-    "relpath": "f.txt",
-    "hash": "00112233445566ff",
-    "size": 1,
-    "isexec": False,
-}
+_DIR_OUT: dict[str, object] = {**_OUT, "size": 1, "nfiles": 1}
 
 
 @pytest.mark.parametrize(
@@ -469,86 +489,35 @@ _MANIFEST_ENTRY: dict[str, object] = {
             id="traversal-out-hash",
         ),
         pytest.param(
-            "outs[0].manifest",
-            {"outs": [{**_OUT, "manifest": dict[str, object]()}]},
-            id="mapping-manifest",
+            "outs[0].nfiles",
+            {"outs": [{**_DIR_OUT, "nfiles": "1"}]},
+            id="string-directory-file-count",
         ),
         pytest.param(
-            "outs[0].manifest[0].size",
-            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "size": "1"}]}]},
-            id="string-manifest-size",
+            "outs[0].nfiles",
+            {"outs": [{**_DIR_OUT, "nfiles": True}]},
+            id="bool-directory-file-count",
         ),
         pytest.param(
-            "outs[0].manifest[0].relpath",
-            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": None}]}]},
-            id="null-manifest-relpath",
+            "outs[0].nfiles",
+            {"outs": [{**_DIR_OUT, "nfiles": -1}]},
+            id="negative-directory-file-count",
         ),
         pytest.param(
-            "outs[0].manifest[0].relpath",
-            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": "../escaped.csv"}]}]},
-            id="traversal-manifest-relpath",
+            "outs[0].size",
+            {"outs": [{**_DIR_OUT, "size": "1"}]},
+            id="string-directory-size",
         ),
         pytest.param(
-            "outs[0].manifest[0].relpath",
-            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": "/abs.csv"}]}]},
-            id="absolute-manifest-relpath",
+            "outs[0].size",
+            {"outs": [{**_DIR_OUT, "size": -1}]},
+            id="negative-directory-size",
         ),
         pytest.param(
-            "deps[0].manifest[0].relpath",
-            {"deps": [{**_DEP, "manifest": [{**_MANIFEST_ENTRY, "relpath": "a/../b.csv"}]}]},
-            id="inner-traversal-dep-manifest-relpath",
+            "outs[0].size",
+            {"outs": [{**_OUT, "nfiles": 1}]},
+            id="directory-missing-size",
         ),
-        pytest.param(
-            "outs[0].manifest[0].relpath",
-            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": "nul\0.csv"}]}]},
-            id="nul-manifest-relpath",
-        ),
-        pytest.param(
-            "outs[0].manifest[0].relpath",
-            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": "back\\slash.csv"}]}]},
-            id="backslash-manifest-relpath",
-        ),
-        pytest.param(
-            "outs[0].manifest[0].relpath",
-            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": "a//b.csv"}]}]},
-            id="empty-segment-manifest-relpath",
-        ),
-        pytest.param(
-            "outs[0].manifest[0].relpath",
-            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "relpath": "a/./b.csv"}]}]},
-            id="dot-segment-manifest-relpath",
-        ),
-        pytest.param(
-            "outs[0].manifest[0].hash",
-            {"outs": [{**_OUT, "manifest": [{**_MANIFEST_ENTRY, "hash": "abc"}]}]},
-            id="short-manifest-hash",
-        ),
-        pytest.param(
-            "outs[0].empty_dirs",
-            {"outs": [{**_OUT, "manifest": [_MANIFEST_ENTRY], "empty_dirs": "build"}]},
-            id="string-empty-dirs",
-        ),
-        pytest.param(
-            "outs[0].empty_dirs[0]",
-            {"outs": [{**_OUT, "manifest": [_MANIFEST_ENTRY], "empty_dirs": ["../escaped"]}]},
-            id="traversal-empty-dir",
-        ),
-        pytest.param(
-            "outs[0].empty_dirs[0]",
-            {"outs": [{**_OUT, "manifest": [_MANIFEST_ENTRY], "empty_dirs": ["/abs"]}]},
-            id="absolute-empty-dir",
-        ),
-        pytest.param(
-            "deps[0].empty_dirs[0]",
-            {"deps": [{**_DEP, "manifest": [_MANIFEST_ENTRY], "empty_dirs": [3]}]},
-            id="int-empty-dir",
-        ),
-        pytest.param(
-            "outs[0].empty_dirs",
-            {"outs": [{**_OUT, "empty_dirs": ["build"]}]},
-            id="empty-dirs-without-manifest",
-        ),
-        pytest.param("schema_version", {"schema_version": "2"}, id="string-schema-version"),
     ],
 )
 def test_lock_read_treats_invalid_fields_as_missing_and_names_them(
@@ -557,10 +526,16 @@ def test_lock_read_treats_invalid_fields_as_missing_and_names_them(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Every field is type-checked once; the debug log names the field that failed."""
+    """Every current-schema field is type-checked once; the debug log names a rejected field."""
     stage_lock = lock.StageLock("p/stage", tmp_path)
     stage_lock.path.parent.mkdir(parents=True)
-    base: dict[str, object] = {"code_manifest": {}, "params": {}, "deps": [], "outs": []}
+    base: dict[str, object] = {
+        "schema_version": lock.SCHEMA_VERSION,
+        "code_manifest": {},
+        "params": {},
+        "deps": [],
+        "outs": [],
+    }
     stage_lock.path.write_text(yaml.safe_dump({**base, **document}))
 
     with caplog.at_level(logging.DEBUG, logger="pivot.storage.lock"):
@@ -569,45 +544,50 @@ def test_lock_read_treats_invalid_fields_as_missing_and_names_them(
     assert any(field in record.getMessage() for record in caplog.records), caplog.text
 
 
-def test_lock_read_warns_naming_the_lock_and_its_unsafe_manifest_path(
+def test_old_schema_lock_warns_and_reads_missing(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A lock recording a manifest path that leaves its directory is treated as missing, and
-    the warning names the lock and the path."""
+    """An old lock is stale and names its path in the migration warning."""
     stage_lock = lock.StageLock("p/stage", tmp_path)
     stage_lock.path.parent.mkdir(parents=True)
-    entry = {**_MANIFEST_ENTRY, "relpath": "../../secret.csv"}
-    document = {
-        "code_manifest": {},
-        "params": {},
-        "deps": [],
-        "outs": [{**_OUT, "manifest": [entry]}],
-    }
-    stage_lock.path.write_text(yaml.safe_dump(document))
+    stage_lock.path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 2,
+                "code_manifest": {"self:stage": "h"},
+                "params": {},
+                "deps": [],
+                "outs": [],
+            }
+        )
+    )
 
     with caplog.at_level(logging.WARNING, logger="pivot.storage.lock"):
         assert stage_lock.read() is None
 
     (record,) = caplog.records
     assert str(stage_lock.path) in record.getMessage()
-    assert "outs[0].manifest[0].relpath: '../../secret.csv'" in record.getMessage()
+    assert "was written by an older pivot; pivot reads it as missing" in record.getMessage()
 
 
-def _directory_lock_data(relpath: str, *, empty_dir: str | None = None) -> LockData:
-    """A lock whose directory output records one member at ``relpath``."""
+def _directory_lock_data(
+    relpath: str, *, empty_dir: str | None = None
+) -> tuple[LockData, dict[str, listing.HashedDirectory]]:
+    """A directory output record and the listing bytes its lock writes."""
     identity = _id("p/stage", "o")
-    output = DirHash(
-        hash="fedcba9876543210",
-        manifest=[DirManifestEntry(relpath=relpath, hash="00112233445566ff", size=1, isexec=False)],
+    hashed = _hashed_directory(
+        [DirManifestEntry(relpath=relpath, hash="00112233445566ff", size=1, isexec=False)],
+        [empty_dir] if empty_dir is not None else None,
     )
-    if empty_dir is not None:
-        output["empty_dirs"] = [empty_dir]
-    return LockData(
-        code_manifest={"self:stage": "h"},
-        params={},
-        dep_hashes={},
-        output_hashes={identity: output},
-        output_paths={identity: "data/p/stage/o"},
+    return (
+        LockData(
+            code_manifest={"self:stage": "h"},
+            params={},
+            dep_hashes={},
+            output_hashes={identity: hashed["record"]},
+            output_paths={identity: "data/p/stage/o"},
+        ),
+        {hashed["record"]["hash"]: hashed},
     )
 
 
@@ -629,10 +609,10 @@ def test_lock_records_and_reads_a_member_name_with_any_non_control_character(
     """A space separator or format character is part of an ordinary file name (a macOS
     screenshot holds U+202F): the lock records it without a warning and reads it back."""
     stage_lock = lock.StageLock("p/stage", tmp_path)
-    data = _directory_lock_data(relpath)
+    data, hashed_dirs = _directory_lock_data(relpath)
 
     with caplog.at_level(logging.WARNING, logger="pivot.storage.lock"):
-        stage_lock.write(data)
+        stage_lock.write(data, hashed_dirs=hashed_dirs)
         assert stage_lock.read() == data
 
     assert caplog.records == [], caplog.text
@@ -654,10 +634,10 @@ def test_lock_records_a_control_character_name_with_one_warning_and_reads_it_bac
     """A control character is recorded and read back, as on 0.5.2, with one warning that names
     the file under its output's path and says a later release will refuse it."""
     stage_lock = lock.StageLock("p/stage", tmp_path)
-    data = _directory_lock_data(relpath)
+    data, hashed_dirs = _directory_lock_data(relpath)
 
     with caplog.at_level(logging.WARNING, logger="pivot.storage.lock"):
-        stage_lock.write(data)
+        stage_lock.write(data, hashed_dirs=hashed_dirs)
         assert stage_lock.read() == data
 
     (record,) = caplog.records
@@ -672,9 +652,10 @@ def test_lock_write_names_every_control_character_name_in_one_warning(
 ) -> None:
     """A member and an empty directory with control characters share one warning."""
     stage_lock = lock.StageLock("p/stage", tmp_path)
+    data, hashed_dirs = _directory_lock_data("a\tb.csv", empty_dir="e\x1bmpty")
 
     with caplog.at_level(logging.WARNING, logger="pivot.storage.lock"):
-        stage_lock.write(_directory_lock_data("a\tb.csv", empty_dir="e\x1bmpty"))
+        stage_lock.write(data, hashed_dirs=hashed_dirs)
 
     (record,) = caplog.records
     assert record.getMessage() == (
@@ -699,11 +680,12 @@ def test_lock_write_refuses_a_name_read_would_refuse_and_leaves_the_old_lock(
     """Pivot never writes a lock its own read refuses: the write names the file and why, and
     the lock already on disk is kept."""
     stage_lock = lock.StageLock("p/stage", tmp_path)
-    previous = _directory_lock_data("plain.csv")
-    stage_lock.write(previous)
+    previous, previous_dirs = _directory_lock_data("plain.csv")
+    stage_lock.write(previous, hashed_dirs=previous_dirs)
+    rejected, rejected_dirs = _directory_lock_data(relpath)
 
     with pytest.raises(exceptions.InvalidPathError) as excinfo:
-        stage_lock.write(_directory_lock_data(relpath))
+        stage_lock.write(rejected, hashed_dirs=rejected_dirs)
 
     shown = posixpath.join("data/p/stage/o", relpath)
     assert str(excinfo.value) == (f"Stage 'p/stage' cannot record {shown!r}: {reason}; rename it")
@@ -713,11 +695,9 @@ def test_lock_write_refuses_a_name_read_would_refuse_and_leaves_the_old_lock(
 def test_lock_write_names_a_dependency_member_with_its_dependency(tmp_path: Path) -> None:
     """A directory dependency's member is named with the dependency it belongs to."""
     stage_lock = lock.StageLock("p/stage", tmp_path)
-    dep = DirHash(
-        hash="0123456789abcdef",
-        manifest=[
-            DirManifestEntry(relpath="b\\s.csv", hash="00112233445566ff", size=1, isexec=False)
-        ],
+    identity = _id("p/a", "parts")
+    hashed = _hashed_directory(
+        [DirManifestEntry(relpath="b\\s.csv", hash="00112233445566ff", size=1, isexec=False)]
     )
 
     with pytest.raises(exceptions.InvalidPathError) as excinfo:
@@ -725,9 +705,11 @@ def test_lock_write_names_a_dependency_member_with_its_dependency(tmp_path: Path
             LockData(
                 code_manifest={},
                 params={},
-                dep_hashes={_id("p/a", "parts"): dep},
+                dep_hashes={identity: hashed["record"]},
                 output_hashes={},
-            )
+            ),
+            hashed_dirs={hashed["record"]["hash"]: hashed},
+            input_paths={identity: "data/raw/parts"},
         )
 
     assert str(excinfo.value) == (
@@ -737,17 +719,16 @@ def test_lock_write_names_a_dependency_member_with_its_dependency(tmp_path: Path
 
 
 def test_lock_read_accepts_every_written_field(tmp_path: Path) -> None:
-    """The validator accepts each optional field the writer produces, and ignores fields older
-    locks carry (`display`, `tag`, `size`, `merkle_id`)."""
+    """The current schema accepts directory records and ignores unrelated old fields."""
     stage_lock = lock.StageLock("p/stage", tmp_path)
     stage_lock.path.parent.mkdir(parents=True)
     document = {
-        "schema_version": 2,
+        "schema_version": lock.SCHEMA_VERSION,
         "code_manifest": {"self:stage": "h"},
         "params": {"lr": 0.1, "nested": {"a": [1, 2]}},
         "deps": [{**_DEP, "display": "data/raw/a.csv", "size": 3}],
         "outs": [
-            {**_OUT, "key": None, "manifest": [_MANIFEST_ENTRY]},
+            {**_OUT, "key": None, "size": 1, "nfiles": 1},
             {**_OUT, "key": "m", "tag": "metric", "size": 4},
         ],
         "merkle_id": "abc",
@@ -758,7 +739,9 @@ def test_lock_read_accepts_every_written_field(tmp_path: Path) -> None:
 
     assert result is not None
     assert result["params"] == {"lr": 0.1, "nested": {"a": [1, 2]}}
-    assert sorted(result) == ["code_manifest", "dep_hashes", "output_hashes", "params"]
+    assert result["output_hashes"][_id("p/stage")] == DirHash(
+        hash="fedcba9876543210", size=1, nfiles=1
+    )
 
 
 def test_written_lock_outs_record_key_and_hash_only(tmp_path: Path) -> None:
@@ -775,6 +758,7 @@ def test_written_lock_outs_record_key_and_hash_only(tmp_path: Path) -> None:
 
     document = yaml.safe_load(stage_lock.path.read_text())
 
+    assert document["schema_version"] == lock.SCHEMA_VERSION
     assert document["outs"] == [{"key": "m", "hash": "fedcba9876543210"}]
     assert document["deps"] == [{"producer": "raw.csv", "key": None, "hash": "0123456789abcdef"}]
     assert stage_lock.read() is not None
@@ -805,14 +789,16 @@ def test_written_lock_records_project_relative_output_path(tmp_path: Path) -> No
     assert parsed["output_paths"] == {identity: "data/p/stage/m.txt"}
 
 
-def test_lock_rejects_absolute_output_path(tmp_path: Path) -> None:
-    """An output lock path is project-relative, not an absolute filesystem path."""
+def test_lock_rejects_absolute_output_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A current-schema output path is validated and named in its warning."""
     stage_lock = lock.StageLock("p/stage", tmp_path)
     stage_lock.path.parent.mkdir(parents=True)
     stage_lock.path.write_text(
         yaml.safe_dump(
             {
-                "schema_version": 2,
+                "schema_version": lock.SCHEMA_VERSION,
                 "code_manifest": {"self:stage": "h"},
                 "params": {},
                 "deps": [],
@@ -821,29 +807,15 @@ def test_lock_rejects_absolute_output_path(tmp_path: Path) -> None:
         )
     )
 
-    assert stage_lock.read() is None
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.lock"):
+        assert stage_lock.read() is None
 
-
-def test_older_v2_lock_with_out_tag_and_display_still_parses(tmp_path: Path) -> None:
-    """Locks written before `tag` and `display` were dropped stay valid: extra keys are ignored."""
-    stage_lock = lock.StageLock("p/stage", tmp_path)
-    stage_lock.path.parent.mkdir(parents=True)
-    stage_lock.path.write_text(
-        yaml.safe_dump(
-            {
-                "schema_version": 2,
-                "code_manifest": {"self:stage": "h"},
-                "params": {},
-                "deps": [{**_DEP, "display": "data/raw/a.csv"}],
-                "outs": [{**_OUT, "tag": "data", "display": "data/p/stage/o.csv"}],
-            }
-        )
+    (record,) = caplog.records
+    assert str(stage_lock.path) in record.getMessage()
+    assert (
+        "outs[0].path: '/tmp/output.txt' is not a project-relative POSIX path"
+        in record.getMessage()
     )
-
-    result = stage_lock.read()
-
-    assert result is not None
-    assert result["output_hashes"] == {_id("p/stage", "o"): {"hash": "fedcba9876543210"}}
 
 
 # ==============================================================================
@@ -852,43 +824,39 @@ def test_older_v2_lock_with_out_tag_and_display_still_parses(tmp_path: Path) -> 
 
 
 def test_lock_read_ignores_display_fields(set_project_root: Path) -> None:
-    """Display fields should be ignored on read (write-only schema field)."""
+    """Current-schema lock reads ignore display fields outside the directory record."""
     cache_dir = set_project_root / ".cache"
     stage_lock = lock.StageLock("dir_out_stage", cache_dir)
 
     stage_lock.path.parent.mkdir(parents=True, exist_ok=True)
     stage_lock.path.write_text(
-        "code_manifest: {self:dir_out_stage: fingerprint}\n"
-        + "params: {}\n"
-        + "schema_version: 2\n"
-        + "deps:\n"
-        + "  - producer: input\n"
-        + "    key: null\n"
-        + "    hash: d0d0d0d0d0d0d0d0\n"
-        + "    display: data/raw/input.csv\n"
-        + "outs:\n"
-        + "  - key: results\n"
-        + "    hash: 0e0e0e0e0e0e0e0e\n"
-        + "    tag: directory\n"
-        + "    display: results/\n"
-        + "    manifest:\n"
-        + "      - relpath: task_a.json\n"
-        + "        hash: a0a0a0a0a0a0a0a0\n"
-        + "        size: 100\n"
-        + "        isexec: false\n"
+        yaml.safe_dump(
+            {
+                "schema_version": lock.SCHEMA_VERSION,
+                "code_manifest": {"self:dir_out_stage": "fingerprint"},
+                "params": {},
+                "deps": [{**_DEP, "producer": "input", "display": "data/raw/input.csv"}],
+                "outs": [
+                    {
+                        **_OUT,
+                        "key": "results",
+                        "hash": "0e0e0e0e0e0e0e0e",
+                        "size": 100,
+                        "nfiles": 1,
+                        "tag": "directory",
+                        "display": "results/",
+                    }
+                ],
+            }
+        )
     )
 
     result = stage_lock.read()
 
     assert result is not None
-    assert result["dep_hashes"] == {_id("input"): {"hash": "d0d0d0d0d0d0d0d0"}}
+    assert result["dep_hashes"] == {_id("input"): {"hash": "0123456789abcdef"}}
     assert result["output_hashes"] == {
-        _id("dir_out_stage", "results"): DirHash(
-            hash="0e0e0e0e0e0e0e0e",
-            manifest=[
-                {"relpath": "task_a.json", "hash": "a0a0a0a0a0a0a0a0", "size": 100, "isexec": False}
-            ],
-        )
+        _id("dir_out_stage", "results"): DirHash(hash="0e0e0e0e0e0e0e0e", size=100, nfiles=1)
     }
 
 
@@ -959,82 +927,133 @@ def test_lock_roundtrip_identity_keys(tmp_path: Path) -> None:
     assert loaded["output_hashes"][_id("train", "metrics")]["hash"] == "dddddddddddddddd"
 
 
-def test_lock_roundtrip_dir_hash_with_identity_keys(tmp_path: Path) -> None:
-    """DirHash manifests survive roundtrip with ArtifactIdentity keys."""
-    dep_hashes: dict[ArtifactIdentity, HashInfo] = {
-        _id("data_dir"): DirHash(
-            hash="aaaaaaaaaaaaaaa0",
-            manifest=[
-                {"relpath": "a.csv", "hash": "1111111111111111", "size": 100, "isexec": False}
-            ],
-        )
-    }
+def test_lock_roundtrip_dir_record_with_identity_keys(tmp_path: Path) -> None:
+    """A directory lock keeps its record and writes its dependency listing."""
+    identity = _id("data_dir")
+    hashed = _hashed_directory(
+        [DirManifestEntry(relpath="a.csv", hash="1111111111111111", size=100, isexec=False)]
+    )
     data = LockData(
         code_manifest={},
         params={},
-        dep_hashes=dep_hashes,
+        dep_hashes={identity: hashed["record"]},
         output_hashes={},
     )
     stage_lock = lock.StageLock("consume", tmp_path)
-    stage_lock.write(data)
+    input_path = "data/raw/data_dir"
+    input_listing = listing.input_listing_path(tmp_path, input_path)
+    files_dir = tmp_path / "cache" / "files"
+    stage_lock.write(
+        data,
+        hashed_dirs={hashed["record"]["hash"]: hashed},
+        input_paths={identity: input_path},
+        cache_dir=files_dir,
+    )
     loaded = stage_lock.read()
 
     assert loaded is not None
-    info = loaded["dep_hashes"][_id("data_dir")]
-    assert info["hash"] == "aaaaaaaaaaaaaaa0"
-    assert "manifest" in info
+    assert loaded["dep_hashes"][identity] == hashed["record"]
+    assert listing.read(input_listing, hashed["record"], None) == hashed["listing"]
+    assert listing.read(None, hashed["record"], files_dir) == hashed["listing"]
 
 
-def test_lock_roundtrip_keeps_empty_dirs(tmp_path: Path) -> None:
-    """A directory's empty directories survive a lock write and read, for deps and outs."""
-    dir_hash = DirHash(
-        hash="aaaaaaaaaaaaaaa0",
-        manifest=[{"relpath": "a.csv", "hash": "1111111111111111", "size": 100, "isexec": False}],
-        empty_dirs=["bundle/classifier_source", "logs"],
+def test_lock_writes_listings_for_directory_deps_and_outs_before_the_lock(tmp_path: Path) -> None:
+    """Directory members and empty dirs live in listings, written before their lock."""
+    dep_identity = _id("upstream")
+    out_identity = _id("consume")
+    hashed = _hashed_directory(
+        [DirManifestEntry(relpath="a.csv", hash="1111111111111111", size=100, isexec=False)],
+        ["bundle/classifier_source", "logs"],
     )
     data = LockData(
         code_manifest={},
         params={},
-        dep_hashes={_id("upstream"): dir_hash},
-        output_hashes={_id("consume"): dir_hash},
+        dep_hashes={dep_identity: hashed["record"]},
+        output_hashes={out_identity: hashed["record"]},
     )
     stage_lock = lock.StageLock("consume", tmp_path)
-    stage_lock.write(data)
+    input_path = "data/raw/upstream"
+    output_listing = stage_lock.output_listing_path(out_identity)
+    input_listing = listing.input_listing_path(tmp_path, input_path)
 
+    written = stage_lock.write(
+        data,
+        hashed_dirs={hashed["record"]["hash"]: hashed},
+        input_paths={dep_identity: input_path},
+    )
     loaded = stage_lock.read()
 
+    assert written == [output_listing, input_listing, stage_lock.path]
     assert loaded is not None
-    assert loaded["dep_hashes"][_id("upstream")] == dir_hash
-    assert loaded["output_hashes"][_id("consume")] == dir_hash
+    assert loaded["dep_hashes"][dep_identity] == hashed["record"]
+    assert loaded["output_hashes"][out_identity] == hashed["record"]
+    assert listing.read(output_listing, hashed["record"], None) == hashed["listing"]
+    assert listing.read(input_listing, hashed["record"], None) == hashed["listing"]
 
 
-def test_written_lock_records_no_empty_dirs_field_for_directory_without_any(
-    tmp_path: Path,
-) -> None:
-    """A directory with no empty directories is written exactly as before the field existed."""
-    manifest_entry = DirManifestEntry(
-        relpath="a.csv", hash="1111111111111111", size=100, isexec=False
-    )
+def test_written_lock_records_directory_size_file_count_and_listing(tmp_path: Path) -> None:
+    """A directory output records only its hash, total size, and file count in its lock."""
+    entry = DirManifestEntry(relpath="a.csv", hash="1111111111111111", size=100, isexec=False)
+    hashed = _hashed_directory([entry])
+    identity = _id("p/stage")
     stage_lock = lock.StageLock("p/stage", tmp_path)
-    stage_lock.write(
+    output_listing = stage_lock.output_listing_path(identity)
+    written = stage_lock.write(
         LockData(
             code_manifest={},
             params={},
             dep_hashes={},
-            output_hashes={
-                _id("p/stage"): DirHash(hash="aaaaaaaaaaaaaaa0", manifest=[manifest_entry])
-            },
-        )
+            output_hashes={identity: hashed["record"]},
+        ),
+        hashed_dirs={hashed["record"]["hash"]: hashed},
     )
 
     document = yaml.safe_load(stage_lock.path.read_text())
 
-    assert document["outs"] == [
-        {"key": None, "hash": "aaaaaaaaaaaaaaa0", "manifest": [manifest_entry]}
-    ]
+    assert written == [output_listing, stage_lock.path]
+    assert document["schema_version"] == lock.SCHEMA_VERSION
+    assert document["outs"] == [{"key": None, **hashed["record"]}]
+    assert "manifest" not in document["outs"][0]
+    assert "empty_dirs" not in document["outs"][0]
+    assert listing.read(output_listing, hashed["record"], None) == hashed["listing"]
 
 
-_ENTRY_MANIFEST = [DirManifestEntry(relpath="a.txt", hash="0123456789abcdef", size=1, isexec=False)]
+def test_lock_keeps_its_old_listing_when_lock_serialization_fails(
+    tmp_path: Path, mocker: MockerFixture
+) -> None:
+    identity = _id("p/stage")
+    previous = _hashed_directory(
+        [DirManifestEntry(relpath="old.csv", hash="1111111111111111", size=1, isexec=False)]
+    )
+    replacement = _hashed_directory(
+        [DirManifestEntry(relpath="new.csv", hash="2222222222222222", size=1, isexec=False)]
+    )
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    old_data = LockData(
+        code_manifest={},
+        params={},
+        dep_hashes={},
+        output_hashes={identity: previous["record"]},
+    )
+    stage_lock.write(old_data, hashed_dirs={previous["record"]["hash"]: previous})
+
+    mocker.patch("yaml.dump", side_effect=RuntimeError("dump failed"), autospec=True)
+    with pytest.raises(RuntimeError, match="dump failed"):
+        stage_lock.write(
+            LockData(
+                code_manifest={},
+                params={},
+                dep_hashes={},
+                output_hashes={identity: replacement["record"]},
+            ),
+            hashed_dirs={replacement["record"]["hash"]: replacement},
+        )
+
+    assert stage_lock.read() == old_data
+    assert (
+        listing.read(stage_lock.output_listing_path(identity), previous["record"], None)
+        == previous["listing"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -1046,31 +1065,26 @@ _ENTRY_MANIFEST = [DirManifestEntry(relpath="a.txt", hash="0123456789abcdef", si
             id="file",
         ),
         pytest.param(
-            OutEntry(key=None, hash="fedcba9876543210", manifest=_ENTRY_MANIFEST),
-            DirHash(hash="fedcba9876543210", manifest=_ENTRY_MANIFEST),
+            OutEntry(key=None, hash="fedcba9876543210", size=1),
+            FileHash(hash="fedcba9876543210"),
+            id="file-with-size",
+        ),
+        pytest.param(
+            OutEntry(key=None, hash="fedcba9876543210", size=1, nfiles=1),
+            DirHash(hash="fedcba9876543210", size=1, nfiles=1),
             id="directory",
         ),
         pytest.param(
-            DepEntry(
-                producer="p/a",
-                key=None,
-                hash="fedcba9876543210",
-                manifest=_ENTRY_MANIFEST,
-                empty_dirs=["logs"],
-            ),
-            DirHash(hash="fedcba9876543210", manifest=_ENTRY_MANIFEST, empty_dirs=["logs"]),
-            id="directory-with-empty-dirs",
-        ),
-        pytest.param(
-            OutEntry(key=None, hash="fedcba9876543210", manifest=_ENTRY_MANIFEST, empty_dirs=[]),
-            DirHash(hash="fedcba9876543210", manifest=_ENTRY_MANIFEST),
-            id="empty-empty-dirs-dropped",
+            DepEntry(producer="p/a", key=None, hash="fedcba9876543210", size=0, nfiles=0),
+            DirHash(hash="fedcba9876543210", size=0, nfiles=0),
+            id="empty-directory",
         ),
     ],
 )
-def test_entry_hash_info(entry: DepEntry | OutEntry, expected: HashInfo) -> None:
-    """A lock entry converts to the hash it records; an empty empty_dirs list is no list, so the
-    result compares equal to a freshly computed hash of the same directory."""
+def test_entry_hash_info_uses_file_count_to_identify_a_directory(
+    entry: DepEntry | OutEntry, expected: HashInfo
+) -> None:
+    """Only nfiles identifies a directory entry; its members are in its listing."""
     assert lock.entry_hash_info(entry) == expected
 
 
@@ -1115,3 +1129,53 @@ def test_find_orphaned_locks_nested_directories(tmp_path: Path) -> None:
 
     orphans = lock.find_orphaned_locks(stages_dir, {"base/base_train", "base/base_test"})
     assert orphans == ["old_root_stage"]
+
+
+# =============================================================================
+# Locks read from git history or another repository
+# =============================================================================
+
+
+def _helper_old_lock(**outs_entry: object) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "code_manifest": {"self:f": "abc"},
+        "params": {},
+        "deps": [{"producer": "src", "key": None, "hash": "0123456789abcdef"}],
+        "outs": [{"key": None, "hash": "fedcba9876543210", **outs_entry}],
+    }
+
+
+def test_parse_committed_reads_this_format_with_no_inline_listings() -> None:
+    document: dict[str, object] = {**_helper_old_lock(), "schema_version": lock.SCHEMA_VERSION}
+
+    parsed = lock.parse_committed(document)
+
+    assert isinstance(parsed, lock.CommittedLock)
+    assert parsed.data == document
+    assert parsed.listings == {}
+
+
+def test_parse_committed_reads_an_older_lock_keeping_its_file_entries() -> None:
+    parsed = lock.parse_committed(_helper_old_lock(path="data/p/out.txt"))
+
+    assert isinstance(parsed, lock.CommittedLock)
+    assert parsed.data["schema_version"] == lock.SCHEMA_VERSION
+    assert parsed.data["outs"] == [
+        {"key": None, "hash": "fedcba9876543210", "path": "data/p/out.txt"}
+    ]
+    assert parsed.data["deps"] == [{"producer": "src", "key": None, "hash": "0123456789abcdef"}]
+
+
+def test_parse_committed_names_an_unsafe_path_in_an_older_lock() -> None:
+    parsed = lock.parse_committed(_helper_old_lock(path="../outside"))
+
+    assert isinstance(parsed, lock.UnsafeLockPath)
+
+
+def test_parse_committed_refuses_a_malformed_older_inline_listing() -> None:
+    parsed = lock.parse_committed(
+        _helper_old_lock(manifest=[{"relpath": "a", "hash": "short", "size": 1, "isexec": False}])
+    )
+
+    assert parsed is None

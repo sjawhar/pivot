@@ -141,8 +141,8 @@ Per-stage lock files (`.pivot/stages/<name>.lock`) enable fast, parallel writes.
 
 - **Code manifest** - Hashes of the stage function and its transitive dependencies
 - **Parameters** - Current parameter values
-- **Dependency hashes** - Content hashes of input files (with manifests for directories)
-- **Output hashes** - Content hashes of output files
+- **Dependency hashes** - Content hashes of input files; a directory has its listing hash, total size and file count
+- **Output hashes** - Content hashes of output files; a directory's members are in a committed listing beside the lock
 
 Lock files use relative paths for portability across machines.
 
@@ -163,13 +163,16 @@ Lock files use relative paths for portability across machines.
 ```
 .pivot/
 ├── cache/
-│   └── files/           # Content-addressable storage
-│       ├── ab/
-│       │   └── cdef...  # Files keyed by xxhash64
-│       └── ...
-├── stages/              # Per-stage lock files, one directory per pipeline
+│   ├── files/           # Content-addressable files and directory listing objects
+│   │   ├── ab/
+│   │   │   └── cdef...  # Files or listings keyed by xxhash64
+│   │   └── ...
+│   └── trees/           # Complete directory trees for symlink checkout
+│       └── ab/cdef...
+├── stages/              # Per-stage lock and directory-listing files
 │   └── demo/
 │       ├── preprocess.lock
+│       ├── preprocess=.listing
 │       └── train.lock
 ├── config.yaml          # Remote configuration
 └── state.lmdb/          # LMDB database (hash cache, generations, run cache, remote index)

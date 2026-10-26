@@ -2,25 +2,47 @@
 
 from __future__ import annotations
 
+import logging
 import pathlib
-from typing import ClassVar
+import shutil
+from typing import TYPE_CHECKING, Annotated, ClassVar, TypedDict
 
 import pydantic
 import pygtrie
 import pytest
 
-from pivot import StageParams, compose, executor, explain, loaders, project, skip, status
-from pivot.storage import lock
+from pivot import (
+    StageParams,
+    cli,
+    compose,
+    config,
+    exceptions,
+    executor,
+    explain,
+    loaders,
+    project,
+    skip,
+    status,
+)
+from pivot.storage import listing, lock, track
 from pivot.storage import store as store_mod
-from pivot.storage.track import PvtData
 from pivot.types import (
     ArtifactIdentity,
     ArtifactRef,
     ArtifactTag,
+    DirHash,
     HashInfo,
     LockData,
     StageExplanation,
 )
+
+if TYPE_CHECKING:
+    import click.testing
+
+# xxhash64 of the bytes each fixture file holds, worked out by hand from the bytes.
+_BETA_HASH = "f5ee2990398e98c4"  # b"beta"
+_A_CSV_HASH = "c104cf7901c31c75"  # b"a\n1\n"
+_B_CSV_HASH = "7700509cbd39f780"  # b"b\n2\n"
 
 
 class _UpstreamParams(StageParams):
@@ -35,6 +57,16 @@ def _upstream_stage_a(input_file: str, params: _UpstreamParams) -> str:
 @compose.stage
 def _upstream_stage_b(a_output: str) -> str:
     return a_output
+
+
+@compose.stage
+def _directory_producer() -> Annotated[dict[str, str], compose.directory]:
+    return {"a.txt": "alpha", "sub/b.txt": "beta"}
+
+
+@compose.stage
+def _one_file_consumer(part: str) -> str:
+    return part.upper()
 
 
 def _build_upstream_pipeline(root: pathlib.Path, value: int) -> compose.Pipeline:
@@ -82,8 +114,8 @@ def test_get_stage_explanation_with_allow_missing_stale_pvt(
     data_path = tmp_path / "data.csv"
     normalized_path = str(project.normalize_path(data_path))
     dep = _input_ref("data.csv")
-    tracked_files: dict[str, PvtData] = {
-        normalized_path: PvtData(path="data.csv", hash="2222222222222222", size=100)
+    tracked_files: dict[str, track.PvtData] = {
+        normalized_path: track.PvtData(path="data.csv", hash="2222222222222222", size=100)
     }
     tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
     tracked_trie[pathlib.Path(normalized_path).parts] = normalized_path
@@ -316,21 +348,11 @@ def test_diff_deps_change(
     assert changes[0]["change_type"] == expected_type
 
 
-def test_diff_deps_directory_with_manifest() -> None:
-    """Handles directory dependencies with manifests."""
+def test_diff_deps_directory_compares_listing_hashes() -> None:
+    """A directory dependency changes when the hash of its listing changes."""
     identity = ArtifactIdentity("data_dir", None)
-    old: dict[ArtifactIdentity, HashInfo] = {
-        identity: {
-            "hash": "tree_abc",
-            "manifest": [{"relpath": "a.csv", "hash": "h1", "size": 10, "isexec": False}],
-        }
-    }
-    new: dict[ArtifactIdentity, HashInfo] = {
-        identity: {
-            "hash": "tree_def",
-            "manifest": [{"relpath": "a.csv", "hash": "h2", "size": 10, "isexec": False}],
-        }
-    }
+    old: dict[ArtifactIdentity, HashInfo] = {identity: DirHash(hash="tree_abc", size=10, nfiles=1)}
+    new: dict[ArtifactIdentity, HashInfo] = {identity: DirHash(hash="tree_def", size=10, nfiles=1)}
 
     changes = skip.diff_dep_hashes(old, new)
 
@@ -840,48 +862,229 @@ def test_get_pipeline_explanations_upstream_propagation(
     )
 
 
+# =============================================================================
+# A producer's directory output: a consumer's one file, hashed from the producer's listing
+# =============================================================================
+
+
+class _ProducedDirectory(TypedDict):
+    """What status hands explain for a run producer whose directory output is gone."""
+
+    locks: dict[str, LockData | None]
+    deps: list[ArtifactRef]
+    stages_dirs: dict[str, pathlib.Path]
+    file_identity: ArtifactIdentity
+    committed_listing: pathlib.Path
+    cache_dir: pathlib.Path
+
+
+def _run_directory_pipeline(root: pathlib.Path) -> _ProducedDirectory:
+    """Run a directory producer and a consumer of its file ``sub/b.txt``, then delete the
+    directory, as a fresh clone has it before ``pivot pull``: no file is left to hash."""
+    with compose.Pipeline("test", root=root) as pipeline:
+        _one_file_consumer(_directory_producer()["sub/b.txt"])
+    executor.run(pipeline=pipeline)
+    shutil.rmtree(root / "data" / "test" / "_directory_producer")
+    all_stages = pipeline.snapshot()
+    state_dir = config.get_state_dir()
+    (dep,) = all_stages["test/_one_file_consumer"]["deps"].values()
+    assert dep.directory is not None, "the consumer reads one file of the directory output"
+    stages_dirs = {name: explain.stages_dir(info, state_dir) for name, info in all_stages.items()}
+    return _ProducedDirectory(
+        locks=explain.read_locks(all_stages, all_stages, state_dir),
+        deps=[dep],
+        stages_dirs=stages_dirs,
+        file_identity=dep.identity,
+        committed_listing=listing.output_listing_path(
+            stages_dirs["test/_directory_producer"], dep.directory
+        ),
+        cache_dir=config.get_cache_dir() / "files",
+    )
+
+
+def test_producer_output_hashes_reads_a_file_hash_from_the_committed_listing(
+    mock_discovery: compose.Pipeline,
+) -> None:
+    """With the directory gone and no cache, the producer's committed listing gives the hash of
+    the file a consumer reads, and adds no file nothing reads."""
+    produced = _run_directory_pipeline(mock_discovery.root)
+
+    hashes = explain.producer_output_hashes(
+        produced["locks"], produced["deps"], produced["stages_dirs"], None
+    )
+
+    assert hashes[produced["file_identity"]] == {"hash": _BETA_HASH}
+    assert ArtifactIdentity("test/_directory_producer", "a.txt") not in hashes, (
+        "a file no dependency reads is not added"
+    )
+
+
+def test_producer_output_hashes_reads_the_cache_object_without_a_committed_listing(
+    mock_discovery: compose.Pipeline,
+) -> None:
+    """A listing missing from the commit is read from the cache object at the directory hash."""
+    produced = _run_directory_pipeline(mock_discovery.root)
+    produced["committed_listing"].unlink()
+
+    hashes = explain.producer_output_hashes(
+        produced["locks"], produced["deps"], produced["stages_dirs"], produced["cache_dir"]
+    )
+
+    assert hashes[produced["file_identity"]] == {"hash": _BETA_HASH}
+
+
+def test_producer_output_hashes_leaves_the_file_to_hash_when_no_listing_exists(
+    mock_discovery: compose.Pipeline,
+) -> None:
+    """With neither the committed listing nor a cache, the file is left for explain to hash."""
+    produced = _run_directory_pipeline(mock_discovery.root)
+    produced["committed_listing"].unlink()
+    shutil.rmtree(produced["cache_dir"])
+
+    hashes = explain.producer_output_hashes(
+        produced["locks"], produced["deps"], produced["stages_dirs"], produced["cache_dir"]
+    )
+
+    assert produced["file_identity"] not in hashes
+
+
+def test_producer_output_hashes_refuses_a_committed_listing_edited_after_the_run(
+    mock_discovery: compose.Pipeline,
+) -> None:
+    """A committed listing whose bytes no longer hash to the lock's record is refused."""
+    produced = _run_directory_pipeline(mock_discovery.root)
+    committed = produced["committed_listing"]
+    committed.write_bytes(committed.read_bytes().replace(_BETA_HASH.encode(), b"0" * 16))
+
+    with pytest.raises(exceptions.CorruptListingError, match="its bytes hash to"):
+        explain.producer_output_hashes(
+            produced["locks"], produced["deps"], produced["stages_dirs"], produced["cache_dir"]
+        )
+
+
 # Removed: annotation-style pipeline re-registration is not part of the compositional API.
+
+
+# =============================================================================
+# A tracked directory: a member's hash from the directory's listing
+# =============================================================================
+
+# corpus.pvt as pivot 0.5.9 wrote it: its files inline, its hash over their JSON.
+_OLD_CORPUS_PVT = f"""\
+path: corpus
+hash: 9f3a1c2b4d5e6f70
+size: 8
+num_files: 2
+manifest:
+- relpath: a.csv
+  hash: {_A_CSV_HASH}
+  size: 4
+  isexec: false
+- relpath: sub/b.csv
+  hash: {_B_CSV_HASH}
+  size: 4
+  isexec: false
+"""
+
+
+class _TrackedCorpus(TypedDict):
+    """What ``pivot status --allow-missing`` hands explain for the tracked ``corpus``."""
+
+    tracked_files: dict[str, track.PvtData]
+    tracked_trie: pygtrie.Trie[str]
+    corpus: pathlib.Path
+    cache_dir: pathlib.Path
+
+
+def _discover_corpus(root: pathlib.Path) -> _TrackedCorpus:
+    """Discover the tracked paths under ``root`` as ``pivot status --allow-missing`` does."""
+    tracked_files, tracked_trie = status._discover_tracked_files(allow_missing=True)
+    assert tracked_files is not None and tracked_trie is not None
+    return _TrackedCorpus(
+        tracked_files=tracked_files,
+        tracked_trie=tracked_trie,
+        corpus=project.normalize_path(root / "corpus"),
+        cache_dir=config.get_cache_dir() / "files",
+    )
+
+
+def _track_corpus(root: pathlib.Path, runner: click.testing.CliRunner) -> _TrackedCorpus:
+    """``pivot track corpus`` over a.csv and sub/b.csv, then delete the directory, as a fresh
+    clone has it before ``pivot pull``: only a listing can give a member's hash."""
+    corpus = root / "corpus"
+    (corpus / "sub").mkdir(parents=True)
+    (corpus / "a.csv").write_bytes(b"a\n1\n")
+    (corpus / "sub" / "b.csv").write_bytes(b"b\n2\n")
+    result = runner.invoke(cli.cli, ["track", "corpus"])
+    assert result.exit_code == 0, result.output
+    shutil.rmtree(corpus)
+    return _discover_corpus(root)
 
 
 def test_find_tracked_hash_exact_match() -> None:
     """Finds the hash for an exact tracked-file match."""
-    tracked_files: dict[str, PvtData] = {
-        "/project/data.csv": PvtData(path="data.csv", hash="abc123", size=100)
+    tracked_files: dict[str, track.PvtData] = {
+        "/project/data.csv": track.PvtData(path="data.csv", hash="abc123", size=100)
     }
     tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
     tracked_trie[("/", "project", "data.csv")] = "/project/data.csv"
 
     result = explain._find_tracked_hash(
-        pathlib.Path("/project/data.csv"), tracked_files, tracked_trie
+        pathlib.Path("/project/data.csv"), tracked_files, tracked_trie, None
     )
 
     assert result is not None
     assert result["hash"] == "abc123"
 
 
-def test_find_tracked_hash_inside_directory() -> None:
-    """Finds a manifest entry for a file inside a tracked directory."""
-    tracked_files: dict[str, PvtData] = {
-        "/project/data": PvtData(
-            path="data",
-            hash="tree_hash",
-            size=200,
-            num_files=2,
-            manifest=[
-                {"relpath": "file1.csv", "hash": "hash1", "size": 100, "isexec": False},
-                {"relpath": "subdir/file2.csv", "hash": "hash2", "size": 100, "isexec": False},
-            ],
-        )
-    }
-    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
-    tracked_trie[("/", "project", "data")] = "/project/data"
+def test_find_tracked_hash_reads_a_member_from_the_committed_listing(
+    mock_discovery: compose.Pipeline, runner: click.testing.CliRunner
+) -> None:
+    """With the directory gone and no cache, ``corpus.pvt.listing`` gives a member's hash."""
+    tracked = _track_corpus(mock_discovery.root, runner)
 
     result = explain._find_tracked_hash(
-        pathlib.Path("/project/data/subdir/file2.csv"), tracked_files, tracked_trie
+        tracked["corpus"] / "sub" / "b.csv", tracked["tracked_files"], tracked["tracked_trie"], None
     )
 
-    assert result is not None
-    assert result["hash"] == "hash2"
+    assert result == {"hash": _B_CSV_HASH}
+
+
+def test_find_tracked_hash_reads_a_member_from_the_cache_without_a_committed_listing(
+    mock_discovery: compose.Pipeline, runner: click.testing.CliRunner
+) -> None:
+    """A listing missing from the commit is read from the cache object at the directory hash."""
+    tracked = _track_corpus(mock_discovery.root, runner)
+    (mock_discovery.root / "corpus.pvt.listing").unlink()
+
+    result = explain._find_tracked_hash(
+        tracked["corpus"] / "sub" / "b.csv",
+        tracked["tracked_files"],
+        tracked["tracked_trie"],
+        tracked["cache_dir"],
+    )
+
+    assert result == {"hash": _B_CSV_HASH}
+
+
+def test_find_tracked_hash_has_no_hash_for_a_member_when_no_listing_exists(
+    mock_discovery: compose.Pipeline, runner: click.testing.CliRunner
+) -> None:
+    """With neither the committed listing nor a cache, a member has no tracked hash, so explain
+    falls back to the stage lock's hash."""
+    tracked = _track_corpus(mock_discovery.root, runner)
+    (mock_discovery.root / "corpus.pvt.listing").unlink()
+    shutil.rmtree(tracked["cache_dir"])
+
+    assert (
+        explain._find_tracked_hash(
+            tracked["corpus"] / "sub" / "b.csv",
+            tracked["tracked_files"],
+            tracked["tracked_trie"],
+            tracked["cache_dir"],
+        )
+        is None
+    )
 
 
 def test_find_tracked_hash_not_tracked() -> None:
@@ -891,35 +1094,71 @@ def test_find_tracked_hash_not_tracked() -> None:
             pathlib.Path("/project/untracked.csv"),
             {},
             pygtrie.Trie(),
+            None,
         )
         is None
     )
 
 
-def test_find_tracked_hash_not_in_manifest() -> None:
-    """Returns None for an unlisted file inside a tracked directory."""
-    tracked_files: dict[str, PvtData] = {
-        "/project/data": PvtData(
-            path="data",
-            hash="tree_hash",
-            size=100,
-            num_files=1,
-            manifest=[
-                {"relpath": "file1.csv", "hash": "hash1", "size": 100, "isexec": False},
-            ],
-        )
-    }
-    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
-    tracked_trie[("/", "project", "data")] = "/project/data"
+def test_find_tracked_hash_not_in_listing(
+    mock_discovery: compose.Pipeline, runner: click.testing.CliRunner
+) -> None:
+    """Returns None for a file inside a tracked directory that its listing does not hold."""
+    tracked = _track_corpus(mock_discovery.root, runner)
 
     assert (
         explain._find_tracked_hash(
-            pathlib.Path("/project/data/not_in_manifest.csv"),
-            tracked_files,
-            tracked_trie,
+            tracked["corpus"] / "sub" / "c.csv",
+            tracked["tracked_files"],
+            tracked["tracked_trie"],
+            tracked["cache_dir"],
         )
         is None
     )
+
+
+def test_find_tracked_hash_refuses_a_committed_listing_edited_after_tracking(
+    mock_discovery: compose.Pipeline, runner: click.testing.CliRunner
+) -> None:
+    """A committed listing whose bytes no longer hash to the .pvt's record is refused, naming it."""
+    tracked = _track_corpus(mock_discovery.root, runner)
+    committed = mock_discovery.root / "corpus.pvt.listing"
+    committed.write_bytes(
+        committed.read_bytes().replace(_B_CSV_HASH.encode(), _A_CSV_HASH.encode())
+    )
+
+    with pytest.raises(exceptions.CorruptListingError, match=r"corpus\.pvt\.listing: its bytes"):
+        explain._find_tracked_hash(
+            tracked["corpus"] / "sub" / "b.csv",
+            tracked["tracked_files"],
+            tracked["tracked_trie"],
+            tracked["cache_dir"],
+        )
+
+
+def test_find_tracked_hash_reads_a_member_from_an_old_directory_pvt_with_one_warning(
+    mock_discovery: compose.Pipeline, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A directory .pvt the previous release wrote lists its files inline: explain reads a
+    member from it, warns once with the command that converts it, and rewrites nothing."""
+    pvt_path = mock_discovery.root / "corpus.pvt"
+    pvt_path.write_text(_OLD_CORPUS_PVT)
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.track"):
+        tracked = _discover_corpus(mock_discovery.root)
+        result = explain._find_tracked_hash(
+            tracked["corpus"] / "sub" / "b.csv",
+            tracked["tracked_files"],
+            tracked["tracked_trie"],
+            tracked["cache_dir"],
+        )
+
+    assert result == {"hash": _B_CSV_HASH}
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 1, warnings
+    assert str(pvt_path) in warnings[0] and "pivot track --force" in warnings[0], warnings
+    assert pvt_path.read_text() == _OLD_CORPUS_PVT, "an old .pvt is never rewritten"
+    assert not (mock_discovery.root / "corpus.pvt.listing").exists(), "explain writes no listing"
 
 
 def test_get_stage_explanation_with_allow_missing_uses_pvt_hash(
@@ -939,8 +1178,8 @@ def test_get_stage_explanation_with_allow_missing_uses_pvt_hash(
         {"self:pvt_stage": "abc"},
         dep_hashes={dep.identity: {"hash": "1234123412341234"}},
     )
-    tracked_files: dict[str, PvtData] = {
-        normalized_path: PvtData(path="data.csv", hash="1234123412341234", size=100)
+    tracked_files: dict[str, track.PvtData] = {
+        normalized_path: track.PvtData(path="data.csv", hash="1234123412341234", size=100)
     }
     tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
     tracked_trie[pathlib.Path(normalized_path).parts] = normalized_path

@@ -10,11 +10,68 @@ import xxhash
 from pivot.storage import cache, state
 from pivot.types import DirHash
 
-# Digests `cache.hash_directory` gave for `_helper_write_parity_tree` at 5f8e39c8 (release
-# 0.3.10): with the cache root passed, and with no cache (the cache-object link left out).
-_PINNED_HASH_WITH_CACHE = "57f87df41ea09bcc"
-_PINNED_HASH_NO_CACHE = "b0b0ad43a83da3c9"
-_PINNED_EMPTY_DIRS = ["empty/deep/deeper", "empty2", "links"]
+# The listing bytes and their xxh64 values for `_helper_write_parity_tree`. A directory's
+# identity is the xxh64 of these bytes, not the pre-0.3.11 recursive manifest digest.
+_EXPECTED_HASH_WITH_CACHE = "8dfdfb86c4134c7b"
+_EXPECTED_LISTING_WITH_CACHE = (
+    b'6d05f87c11460591 8 - " leading.txt"\n'
+    b"c59f4514175f2079 6 - A.txt\n"
+    b"021fa084edda38d7 5 - a-b.txt\n"
+    b"ffebe8ef91f98782 4 - a.b.txt\n"
+    b"48a9425c39957584 7 - a/b.txt\n"
+    b"f6f209378be35c10 5 - a0.txt\n"
+    b'364082a8cb2e4e95 10 - "back\\\\slash.txt"\n'
+    b"68534a48b7bf5f4d 2048 - big.bin\n"
+    b"6e7eefe6528f4ff6 4 - cafe\xcc\x81.txt\n"
+    b"e7390d0e4d278775 4 - caf\xc3\xa9.txt\n"
+    b"90420ee47cbc226b 6 - emoji-\xf0\x9f\x99\x82.txt\n"
+    b"- - - empty/deep/deeper/\n"
+    b"- - - empty2/\n"
+    b"9aab28278308abe2 24 - from-cache.bin\n"
+    b"39dc54237ecf0c8c 15 - group-exec-only\n"
+    b"38f9f4673d2638f1 7 - it's.txt\n"
+    b"- - - links/\n"
+    b'9da1861a5eecb30f 8 - "new\\nline.txt"\n'
+    b"760e5d8ccd4ca44e 6 - plain.txt\n"
+    b"3bd7f94a57a5dbde 6 x run.sh\n"
+    b'197b33186f96a274 4 - "tab\\tname.txt"\n'
+    b'0fe05254166a9936 9 - "trailing.txt "\n'
+    b"52b56604f19cba92 9 x user-exec\n"
+    b'a8313c064255ffca 7 - with "double" quotes.txt\n'
+    b"ef46db3751d8e999 0 - zero.bin\n"
+    b"8b9b330095727779 4 - \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e.txt\n"
+    b'b9ade7de3b62f0d8 10 - "\\377\\376.bin"\n'
+)
+_EXPECTED_HASH_NO_CACHE = "7d079989ceba3e25"
+_EXPECTED_LISTING_NO_CACHE = (
+    b'6d05f87c11460591 8 - " leading.txt"\n'
+    b"c59f4514175f2079 6 - A.txt\n"
+    b"021fa084edda38d7 5 - a-b.txt\n"
+    b"ffebe8ef91f98782 4 - a.b.txt\n"
+    b"48a9425c39957584 7 - a/b.txt\n"
+    b"f6f209378be35c10 5 - a0.txt\n"
+    b'364082a8cb2e4e95 10 - "back\\\\slash.txt"\n'
+    b"68534a48b7bf5f4d 2048 - big.bin\n"
+    b"6e7eefe6528f4ff6 4 - cafe\xcc\x81.txt\n"
+    b"e7390d0e4d278775 4 - caf\xc3\xa9.txt\n"
+    b"90420ee47cbc226b 6 - emoji-\xf0\x9f\x99\x82.txt\n"
+    b"- - - empty/deep/deeper/\n"
+    b"- - - empty2/\n"
+    b"39dc54237ecf0c8c 15 - group-exec-only\n"
+    b"38f9f4673d2638f1 7 - it's.txt\n"
+    b"- - - links/\n"
+    b'9da1861a5eecb30f 8 - "new\\nline.txt"\n'
+    b"760e5d8ccd4ca44e 6 - plain.txt\n"
+    b"3bd7f94a57a5dbde 6 x run.sh\n"
+    b'197b33186f96a274 4 - "tab\\tname.txt"\n'
+    b'0fe05254166a9936 9 - "trailing.txt "\n'
+    b"52b56604f19cba92 9 x user-exec\n"
+    b'a8313c064255ffca 7 - with "double" quotes.txt\n'
+    b"ef46db3751d8e999 0 - zero.bin\n"
+    b"8b9b330095727779 4 - \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e.txt\n"
+    b'b9ade7de3b62f0d8 10 - "\\377\\376.bin"\n'
+)
+_EXPECTED_EMPTY_DIRS = ["empty/deep/deeper", "empty2", "links"]
 _CACHED_CONTENT = b"bytes held in the cache\n"
 
 # Names that JSON escapes, that sort differently by whole path than directory by directory, or
@@ -80,31 +137,41 @@ def _helper_parity_tree(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.P
 
 @pytest.mark.parametrize("mmap_threshold", [cache.MMAP_THRESHOLD, 1024], ids=["read", "mmap"])
 @pytest.mark.parametrize(
-    ("with_cache", "expected_hash"),
+    ("with_cache", "expected_listing", "expected_hash", "expected_size", "expected_nfiles"),
     [
-        pytest.param(True, _PINNED_HASH_WITH_CACHE, id="cache-root"),
-        pytest.param(False, _PINNED_HASH_NO_CACHE, id="no-cache"),
+        pytest.param(
+            True, _EXPECTED_LISTING_WITH_CACHE, _EXPECTED_HASH_WITH_CACHE, 2216, 24, id="cache-root"
+        ),
+        pytest.param(
+            False, _EXPECTED_LISTING_NO_CACHE, _EXPECTED_HASH_NO_CACHE, 2192, 23, id="no-cache"
+        ),
     ],
 )
-def test_hash_directory_digest_matches_0_3_10(
+def test_hash_directory_record_matches_listing_bytes(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     mmap_threshold: int,
     with_cache: bool,
+    expected_listing: bytes,
     expected_hash: str,
+    expected_size: int,
+    expected_nfiles: int,
 ) -> None:
-    """A directory hashes to the digest 0.3.10 recorded for it, so no lock entry changes."""
+    """A directory record is the xxh64 and metadata of its canonical listing bytes."""
     monkeypatch.setattr(cache, "MMAP_THRESHOLD", mmap_threshold)
     root, cache_dir = _helper_parity_tree(tmp_path)
 
     result = cache.hash_directory(root, cache_dir=cache_dir if with_cache else None)
 
-    assert result["hash"] == expected_hash
-    assert "empty_dirs" in result
-    assert result["empty_dirs"] == _PINNED_EMPTY_DIRS
-    relpaths = [entry["relpath"] for entry in result["manifest"]]
+    assert result["data"] == expected_listing
+    assert xxhash.xxh64(expected_listing).hexdigest() == expected_hash
+    assert result["record"] == DirHash(
+        hash=expected_hash, size=expected_size, nfiles=expected_nfiles
+    )
+    assert result["listing"]["empty_dirs"] == _EXPECTED_EMPTY_DIRS
+    relpaths = [entry["relpath"] for entry in result["listing"]["files"]]
     assert ("from-cache.bin" in relpaths) is with_cache
-    assert relpaths == sorted(relpaths), "The manifest is sorted by whole relative path"
+    assert relpaths == sorted(relpaths), "The listing is sorted by whole relative path"
 
 
 def test_hash_directory_gives_the_same_digest_through_the_state_db(tmp_path: pathlib.Path) -> None:
@@ -152,8 +219,9 @@ def _helper_floor_seconds(files: list[pathlib.Path]) -> float:
 
 
 def test_hash_directory_costs_little_more_than_reading_its_files(tmp_path: pathlib.Path) -> None:
-    """Warm, a directory of 2,000 small files hashes within 3 times the cost of reading and
-    hashing each file: per-file path resolution and repeated stats are what made it slower."""
+    """Warm, a directory of 2,000 small files hashes within 4 times the cost of reading and
+    hashing each file. The required canonical listing adds byte-sorted path encoding and one
+    final allocation; path resolution and repeated stats must not add more work than that."""
     root = tmp_path / "many"
     files = list[pathlib.Path]()
     for index in range(2_000):
@@ -171,7 +239,7 @@ def test_hash_directory_costs_little_more_than_reading_its_files(tmp_path: pathl
         cache.hash_directory(root)
         elapsed.append(time.perf_counter() - start)
 
-    assert min(elapsed) < 3 * floor, (
+    assert min(elapsed) < 4 * floor, (
         f"hash_directory took {min(elapsed):.4f}s for 2,000 files against {floor:.4f}s to read "
         + "and hash them"
     )
@@ -190,7 +258,7 @@ def test_hash_directory_hashes_a_name_that_is_not_utf8_through_the_state_db(
     with state.StateDB(tmp_path / "state") as db:
         result = cache.hash_directory(root, db)
 
-    assert result == DirHash(hash=expected["hash"], manifest=expected["manifest"])
+    assert result == expected
 
 
 def test_hash_directory_reads_nothing_through_a_symlinked_directory(

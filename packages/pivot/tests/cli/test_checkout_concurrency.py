@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import multiprocessing
 import os
 import pathlib
@@ -9,8 +10,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pivot.cli import checkout as checkout_mod
-from pivot.storage import cache
-from pivot.types import HashInfo
+from pivot.storage import cache, listing
+from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
     from threading import Barrier
@@ -22,6 +23,15 @@ _FILE_LINES = 20_000
 
 def _helper_file_content(i: int) -> str:
     return f"file {i}\n" * _FILE_LINES
+
+
+def _helper_expected(output_hash: HashInfo, cache_dir: pathlib.Path) -> checkout_mod.Expected:
+    """What checkout expects at an output, reading a directory's listing from the cache."""
+    if not is_dir_hash(output_hash):
+        return checkout_mod.Expected(output_hash)
+    return checkout_mod.Expected(
+        output_hash, functools.partial(listing.read, None, output_hash, cache_dir)
+    )
 
 
 def _helper_cache_outputs(root: pathlib.Path) -> dict[str, HashInfo]:
@@ -64,7 +74,7 @@ def _helper_checkout_all_at_barrier(
             pool.submit(
                 checkout_mod._restore_path_sync,
                 pathlib.Path(path),
-                output_hash,
+                _helper_expected(output_hash, cache_dir),
                 cache_dir,
                 checkout_modes,
                 behavior,
@@ -130,7 +140,7 @@ def test_checkout_recovers_fresh_crash_orphans_under_outer_lock(tmp_path: pathli
 
     outcome = checkout_mod._restore_path_sync(
         target,
-        output_hash,
+        _helper_expected(output_hash, cache_dir),
         cache_dir,
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.SKIP_EXISTING,
@@ -155,7 +165,7 @@ def _helper_checkout_file_crash_before_replace(
     pathlib.Path.replace = _replace_and_crash  # pyright: ignore[reportAttributeAccessIssue]
     _ = checkout_mod._restore_path_sync(
         path,
-        output_hash,
+        _helper_expected(output_hash, cache_dir),
         cache_dir,
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.FORCE,
@@ -187,7 +197,7 @@ def test_file_checkout_removes_staging_file_left_by_killed_checkout(
 
     outcome = checkout_mod._restore_path_sync(
         target,
-        output_hash,
+        _helper_expected(output_hash, cache_dir),
         cache_dir,
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.FORCE,
@@ -220,7 +230,7 @@ def test_file_checkout_computes_restore_token_once(
 
     outcome = checkout_mod._restore_path_sync(
         target,
-        output_hash,
+        _helper_expected(output_hash, cache_dir),
         cache_dir,
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.FORCE,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import multiprocessing
 import os
 import pathlib
@@ -11,7 +12,7 @@ from typing import TYPE_CHECKING
 from pivot import cli, config, project, types
 from pivot.cli import checkout as checkout_mod
 from pivot.remote import storage as remote_storage
-from pivot.storage import cache, state, track
+from pivot.storage import cache, listing, state, track
 
 if TYPE_CHECKING:
     import click.testing
@@ -46,8 +47,22 @@ def test_pull_only_missing_accepts_existing_cache_file_symlinks(
     assert (data_dir / "b.txt").is_symlink()
 
 
+def _helper_write_tracked_directory(data_dir: pathlib.Path, record: types.HashInfo) -> None:
+    """Write data_dir's .pvt and committed .pvt.listing for a cached directory (as `pivot track`)."""
+    assert types.is_dir_hash(record)
+    pvt_path = track.get_pvt_path(data_dir)
+    data = listing.read_bytes(None, record, config.get_cache_dir() / "files")
+    listing.write(listing.tracked_listing_path(pvt_path), data)
+    track.write_pvt_file(
+        pvt_path,
+        track.PvtData(
+            path=data_dir.name, hash=record["hash"], size=record["size"], nfiles=record["nfiles"]
+        ),
+    )
+
+
 def _helper_track_directory(root: pathlib.Path) -> pathlib.Path:
-    """Create data/ext with two files, cache them, and write data/ext.pvt (as `pivot track`)."""
+    """Create data/ext with two files, cache them, and track them as `pivot track` does."""
     data_dir = root / "data" / "ext"
     data_dir.mkdir(parents=True)
     (data_dir / "a.txt").write_text("one\n")
@@ -55,17 +70,7 @@ def _helper_track_directory(root: pathlib.Path) -> pathlib.Path:
     output_hash = cache.save_to_cache(
         data_dir, config.get_cache_dir() / "files", checkout_mode=config.CheckoutMode.COPY
     )
-    assert "manifest" in output_hash
-    track.write_pvt_file(
-        track.get_pvt_path(data_dir),
-        track.PvtData(
-            path="ext",
-            hash=output_hash["hash"],
-            size=8,
-            num_files=2,
-            manifest=output_hash["manifest"],
-        ),
-    )
+    _helper_write_tracked_directory(data_dir, output_hash)
     return data_dir
 
 
@@ -73,7 +78,7 @@ def _helper_cache_directory(
     path: pathlib.Path,
     contents: dict[str, str],
     checkout_mode: config.CheckoutMode = config.CheckoutMode.COPY,
-) -> track.PvtData:
+) -> types.DirHash:
     path.mkdir(parents=True)
     for relpath, content in contents.items():
         file_path = path / relpath
@@ -82,14 +87,10 @@ def _helper_cache_directory(
     output_hash = cache.save_to_cache(
         path, config.get_cache_dir() / "files", checkout_mode=checkout_mode
     )
-    assert "manifest" in output_hash
-    return track.PvtData(
-        path="ext",
-        hash=output_hash["hash"],
-        size=sum(len(content) for content in contents.values()),
-        num_files=len(contents),
-        manifest=output_hash["manifest"],
-    )
+    assert types.is_dir_hash(output_hash)
+    assert output_hash["nfiles"] == len(contents)
+    assert output_hash["size"] == sum(len(content) for content in contents.values())
+    return output_hash
 
 
 def test_checkout_only_missing_accepts_existing_cache_file_symlinks(
@@ -117,11 +118,11 @@ def test_pull_replaces_directory_whose_differing_files_are_all_cached(
     """Changed and extra files that hold cached content are pivot's own output: pull replaces them."""
     root = project.get_project_root()
     data_dir = _helper_track_directory(root)
-    new_pvt_data = _helper_cache_directory(
+    new_record = _helper_cache_directory(
         root / "new-ext",
         {"a.txt": "one updated\n", "c.txt": "three\n"},
     )
-    track.write_pvt_file(track.get_pvt_path(data_dir), new_pvt_data)
+    _helper_write_tracked_directory(data_dir, new_record)
 
     mocker.patch(
         "pivot.remote.sync.create_remote_from_name",
@@ -150,11 +151,11 @@ def test_checkout_only_missing_replaces_directory_of_cached_file_symlinks(
     restored = runner.invoke(cli.cli, ["checkout", "--checkout-mode", "symlink", "data/ext"])
     assert restored.exit_code == 0, restored.output
     assert (data_dir / "b.txt").is_symlink()
-    new_pvt_data = _helper_cache_directory(
+    new_record = _helper_cache_directory(
         root / "new-ext",
         {"a.txt": "one updated\n", "c.txt": "three\n"},
     )
-    track.write_pvt_file(track.get_pvt_path(data_dir), new_pvt_data)
+    _helper_write_tracked_directory(data_dir, new_record)
 
     result = runner.invoke(
         cli.cli, ["checkout", "--only-missing", "--checkout-mode", "symlink", "data/ext"]
@@ -171,11 +172,11 @@ def test_checkout_only_missing_refuses_update_when_a_file_holds_an_uncached_edit
     """One edit the cache lacks blocks the update; only that file is named, nothing is restored."""
     root = project.get_project_root()
     data_dir = _helper_track_directory(root)
-    new_pvt_data = _helper_cache_directory(
+    new_record = _helper_cache_directory(
         root / "new-ext",
         {"a.txt": "one updated\n", "c.txt": "three\n"},
     )
-    track.write_pvt_file(track.get_pvt_path(data_dir), new_pvt_data)
+    _helper_write_tracked_directory(data_dir, new_record)
     (data_dir / "b.txt").write_text("two EDITED\n")
 
     result = runner.invoke(cli.cli, ["checkout", "--only-missing", "data/ext"])
@@ -193,11 +194,11 @@ def test_checkout_only_missing_refuses_untracked_entries_when_replacing_director
     """Every directory entry is part of an artifact; untracked extras block replacement."""
     root = project.get_project_root()
     data_dir = _helper_track_directory(root)
-    new_pvt_data = _helper_cache_directory(
+    new_record = _helper_cache_directory(
         root / "new-ext",
         {"a.txt": "one updated\n", "c.txt": "three\n"},
     )
-    track.write_pvt_file(track.get_pvt_path(data_dir), new_pvt_data)
+    _helper_write_tracked_directory(data_dir, new_record)
     (data_dir / "build").mkdir()
     (data_dir / "build" / "x.o").write_text("object\n")
     (data_dir / ".a.txt.swp").write_text("swap\n")
@@ -220,12 +221,12 @@ def test_checkout_only_missing_symlink_mode_refuses_untracked_editor_swap_file(
     """An editor swap file is an untracked directory entry, not a file to carry forward."""
     root = project.get_project_root()
     data_dir = _helper_track_directory(root)
-    new_pvt_data = _helper_cache_directory(
+    new_record = _helper_cache_directory(
         root / "new-ext",
         {"a.txt": "one updated\n", "c.txt": "three\n"},
         checkout_mode=config.CheckoutMode.SYMLINK,
     )
-    track.write_pvt_file(track.get_pvt_path(data_dir), new_pvt_data)
+    _helper_write_tracked_directory(data_dir, new_record)
     (data_dir / ".a.txt.swp").write_text("swap\n")
 
     result = runner.invoke(
@@ -248,7 +249,7 @@ def _helper_restore_layout(root: pathlib.Path) -> tuple[pathlib.Path, types.DirH
     (v2 / "a.txt").write_text("one updated\n")
     (v2 / "c.txt").write_text("three\n")
     v2_hash = cache.save_to_cache(v2, cache_dir, checkout_mode=config.CheckoutMode.COPY)
-    assert "manifest" in v2_hash
+    assert types.is_dir_hash(v2_hash)
     ext = root / "data" / "ext"
     ext.mkdir(parents=True)
     (ext / "a.txt").write_text("one\n")
@@ -259,10 +260,11 @@ def _helper_restore_layout(root: pathlib.Path) -> tuple[pathlib.Path, types.DirH
 
 def _helper_restore_only_missing(root: pathlib.Path, v2_hash: types.DirHash) -> str:
     """Run the per-target restore `pivot checkout --only-missing` runs for data/ext."""
+    cache_dir = root / ".pivot" / "cache" / "files"
     outcome = checkout_mod._restore_path_sync(
         root / "data" / "ext",
-        v2_hash,
-        root / ".pivot" / "cache" / "files",
+        checkout_mod.Expected(v2_hash, functools.partial(listing.read, None, v2_hash, cache_dir)),
+        cache_dir,
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.SKIP_EXISTING,
         root / ".pivot",
@@ -354,10 +356,10 @@ def test_checkout_only_missing_reads_no_content_of_unchanged_hardlinked_director
 ) -> None:
     """A workspace file that is a hardlink to its target blob is unchanged without a read."""
     data_dir = project.get_project_root() / "data" / "ext"
-    pvt_data = _helper_cache_directory(
+    record = _helper_cache_directory(
         data_dir, {"a.txt": "one\n", "b.txt": "two\n"}, checkout_mode=config.CheckoutMode.HARDLINK
     )
-    track.write_pvt_file(track.get_pvt_path(data_dir), pvt_data)
+    _helper_write_tracked_directory(data_dir, record)
     assert (data_dir / "a.txt").stat().st_nlink == 2
     hash_file = mocker.spy(cache, "hash_file")
 
@@ -432,6 +434,24 @@ def test_checkout_default_refuses_edited_directory_and_force_overwrites(
     assert (data_dir / "a.txt").read_text() == "one\n"
 
 
+def test_checkout_force_refuses_committed_listing_that_does_not_match_pvt(
+    mock_discovery: PipelineLike, runner: click.testing.CliRunner
+) -> None:
+    """A committed listing whose bytes differ from the .pvt hash is refused before any write."""
+    data_dir = _helper_track_directory(project.get_project_root())
+    (data_dir / "a.txt").write_text("one EDITED\n")
+    committed = listing.tracked_listing_path(track.get_pvt_path(data_dir))
+    committed.write_bytes(committed.read_bytes().replace(b" 4 - b.txt", b" 5 - b.txt"))
+
+    result = runner.invoke(cli.cli, ["checkout", "--force", "data/ext"])
+
+    assert result.exit_code != 0
+    assert str(committed) in result.output
+    assert "not to the directory hash" in result.output
+    assert (data_dir / "a.txt").read_text() == "one EDITED\n"
+    assert (data_dir / "b.txt").read_text() == "two\n"
+
+
 def test_checkout_only_missing_reports_extra_symlink_in_directory(
     mock_discovery: PipelineLike, runner: click.testing.CliRunner
 ) -> None:
@@ -465,20 +485,25 @@ def test_checkout_only_missing_rejects_symlink_parent_inside_ignored_directory(
     source.write_text("new")
     file_hash, _ = cache.hash_file(source)
     cache.copy_to_cache(source, cache.get_cache_path(config.get_cache_dir() / "files", file_hash))
-    manifest_entry = types.DirManifestEntry(
-        relpath=".pivot/escape/new.txt",
-        hash=file_hash,
-        size=3,
-        isexec=False,
+    members = listing.DirListing(
+        files=[
+            types.DirManifestEntry(
+                relpath=".pivot/escape/new.txt",
+                hash=file_hash,
+                size=3,
+                isexec=False,
+            )
+        ],
+        empty_dirs=[],
     )
+    data = listing.encode(members)
+    record = listing.record_of(members, data)
+    pvt_path = track.get_pvt_path(data_dir)
+    listing.write(listing.tracked_listing_path(pvt_path), data)
     track.write_pvt_file(
-        track.get_pvt_path(data_dir),
+        pvt_path,
         track.PvtData(
-            path="ext",
-            hash="aaaaaaaaaaaaaaaa",
-            size=3,
-            num_files=1,
-            manifest=[manifest_entry],
+            path="ext", hash=record["hash"], size=record["size"], nfiles=record["nfiles"]
         ),
     )
 

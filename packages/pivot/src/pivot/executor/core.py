@@ -566,11 +566,18 @@ def _restore_tracked_file(
     track_data: track.PvtData,
     cache_dir: pathlib.Path,
 ) -> bool:
-    """Restore a tracked file from cache.
+    """Restore a tracked file or directory from cache.
 
-    Returns True if successfully restored, False if not in cache.
+    Returns True if successfully restored, False if not in cache. A directory is restored from
+    its committed listing file, else the cache's listing object.
     """
     output_hash = track.pvt_to_hash_info(track_data)
+    members = None
+    if types.is_dir_hash(output_hash):
+        try:
+            members = track.tracked_members(path, track_data, cache_dir)
+        except exceptions.ListingMissingError:
+            return False
 
     # Use default checkout modes (hardlink with copy fallback)
     checkout_modes = config.get_checkout_mode_order()
@@ -580,6 +587,7 @@ def _restore_tracked_file(
         cache_dir,
         checkout_modes=checkout_modes,
         state_dir=config.get_state_dir(),
+        members=members,
     )
 
 
@@ -626,7 +634,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                 elif path.is_dir():
                     current_hash = cache.hash_directory(
                         path, state_db, cache_dir=cache_dir, pending=pending
-                    )["hash"]
+                    )["record"]["hash"]
                 else:
                     # Path doesn't exist
                     raise FileNotFoundError(data_path)
@@ -669,7 +677,11 @@ def check_uncached_incremental_outputs(
         stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         lock_data = stage_lock.read()
-        output_hashes = lock_data["output_hashes"] if lock_data else {}
+        # A lock an older pivot wrote reads as missing; its incremental output still carries
+        # over once (worker._prior_outputs), so it is recorded, not uncached.
+        output_hashes = (
+            lock_data["output_hashes"] if lock_data else stage_lock.read_old_format_file_outputs()
+        )
 
         for out in stage_info["outs"]:
             if out.tag is not types.ArtifactTag.INCREMENTAL:

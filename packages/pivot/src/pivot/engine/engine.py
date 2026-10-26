@@ -1500,6 +1500,7 @@ class Engine:
             ended_at=ended_at,
             retention=retention,
         )
+        self._warn_ignored_committed_files(results, all_stages, project_root)
 
         # Materialize presentation symlinks for successful stages
         from pivot.storage import presentation
@@ -1959,8 +1960,10 @@ class Engine:
         """
         from pivot import run_history
         from pivot import skip as skip_mod
+        from pivot.storage import lock
 
         deps = stage_info["deps"]
+        listing_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
 
         def _save_file_hashes(entries: list[tuple[str, int, int, int, str]]) -> None:
             """Record the file hashes this check read or restored, so the next one reads none."""
@@ -1979,6 +1982,7 @@ class Engine:
                     lock_data["output_hashes"],
                     state_db,
                     state_dir=state_dir,
+                    listing_lock=listing_lock,
                     restore=False,
                     report_changes=True,
                     file_hash_entries=file_hash_entries,
@@ -1993,7 +1997,7 @@ class Engine:
                 lock_data["output_hashes"],
                 state_db,
                 state_dir=state_dir,
-                file_hash_entries=file_hash_entries,
+                listing_lock=listing_lock,
             )
             _save_file_hashes(file_hash_entries)
             return _SkipOutcome.SKIPPED if restored else _SkipOutcome.RUN
@@ -2408,6 +2412,44 @@ class Engine:
         with state_mod.StateDB(config.get_state_dir()) as state_db:
             state_db.write_run(manifest)
             state_db.prune_runs(retention)
+
+    def _warn_ignored_committed_files(
+        self,
+        results: dict[str, executor_core.ExecutionSummary],
+        all_stages: dict[str, RegistryStageInfo],
+        project_root: pathlib.Path,
+    ) -> None:
+        """Warn once per run when git ignores a lock or listing file this run wrote.
+
+        A project made before `pivot init` wrote `!/stages/**` into `.pivot/.gitignore` can
+        hide them under a root pattern such as `lib/` or `build/`.
+        """
+        from pivot import git
+        from pivot.storage import listing, lock
+
+        default_state_dir = config.get_state_dir()
+        written = list[pathlib.Path]()
+        for name, summary in results.items():
+            if summary["status"] != StageStatus.RAN:
+                continue
+            stage_info = all_stages.get(name)
+            if stage_info is None:
+                continue
+            stages_dir = lock.get_stages_dir(
+                registry.get_stage_state_dir(stage_info, default_state_dir)
+            )
+            candidates = [lock.StageLock(name, stages_dir).path]
+            for out in stage_info["outs"]:
+                with contextlib.suppress(exceptions.InvalidPathError):
+                    candidates.append(listing.output_listing_path(stages_dir, out.identity))
+            written.extend(path for path in candidates if path.exists())
+        ignored = git.ignored_paths(project_root, sorted(set(written)))
+        if ignored:
+            _logger.warning(
+                "git ignores %s, which pivot just wrote and which must be committed; add "
+                + "`!/stages/**` to .pivot/.gitignore",
+                ", ".join(project.to_relative_path(path, project_root) for path in ignored),
+            )
 
     # =========================================================================
     # Event Handlers

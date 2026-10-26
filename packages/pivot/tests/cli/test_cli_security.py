@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import cli, exceptions
-from pivot.storage import cache, track
+from pivot import cli, exceptions, types
+from pivot.storage import cache, listing, track
 
 if TYPE_CHECKING:
     import click.testing
@@ -41,23 +41,24 @@ def test_track_null_byte_in_path_rejected(
 def test_checkout_manifest_path_traversal_rejected(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Manifest with ../ in relpath rejected during checkout."""
+    """A directory listing with ../ is rejected during checkout."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         cache_dir = pathlib.Path(".pivot") / "cache" / "files"
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create a malicious pvt file with path traversal in manifest
-        malicious_pvt = """path: data_dir
-hash: abc123
-num_files: 1
-manifest:
-  - relpath: ../outside.txt
-    hash: def456
-    size: 10
-"""
-        pathlib.Path("data_dir.pvt").write_text(malicious_pvt)
+        # A malicious sidecar has a valid record hash but an unsafe member path.
+        malicious_listing = b"f" * 16 + b" 10 - ../outside.txt\n"
+        pvt_path = pathlib.Path("data_dir.pvt")
+        pvt_data = track.PvtData(
+            path="data_dir",
+            hash=listing.digest(malicious_listing),
+            size=10,
+            nfiles=1,
+        )
+        track.write_pvt_file(pvt_path, pvt_data)
+        listing.tracked_listing_path(pvt_path).write_bytes(malicious_listing)
 
         result = runner.invoke(cli.cli, ["checkout", "data_dir"])
 
@@ -66,7 +67,7 @@ manifest:
         assert not (tmp_path.parent / "outside.txt").exists(), (
             "Path traversal should not create files outside project"
         )
-        # Command should also indicate failure for malicious manifest
+        # Command should also indicate failure for a malicious directory listing.
         assert (
             result.exit_code != 0
             or "error" in result.output.lower()
@@ -179,33 +180,37 @@ def test_cache_path_structure(tmp_path: pathlib.Path) -> None:
 # =============================================================================
 
 
-def test_pvt_file_large_yaml_handled(tmp_path: pathlib.Path) -> None:
-    """Large .pvt files don't cause excessive memory usage."""
-    # Create a .pvt file with many entries (but not a YAML bomb)
-    # This tests that we handle large-but-valid files
+def test_pvt_listing_large_file_handled(tmp_path: pathlib.Path) -> None:
+    """A large tracked-directory listing parses without an oversized .pvt file."""
     pvt_path = tmp_path / "large.pvt"
-
-    # Generate a large manifest (100 entries - smaller for test speed)
-    manifest_entries = "\n".join(
-        [f"  - relpath: file_{i:04d}.txt\n    hash: {'a' * 16}\n    size: 100" for i in range(100)]
+    members = listing.DirListing(
+        files=[
+            types.DirManifestEntry(
+                relpath=f"file_{index:04d}.txt",
+                hash="a" * 16,
+                size=100,
+                isexec=False,
+            )
+            for index in range(100)
+        ],
+        empty_dirs=[],
     )
+    members_data = listing.encode(members)
+    record = listing.record_of(members, members_data)
+    pvt_data = track.PvtData(
+        path="large",
+        hash=record["hash"],
+        size=record["size"],
+        nfiles=record["nfiles"],
+    )
+    track.write_pvt_file(pvt_path, pvt_data)
+    listing.write(listing.tracked_listing_path(pvt_path), members_data)
 
-    pvt_content = f"""path: large_dir
-hash: {"b" * 16}
-size: 10000
-num_files: 100
-manifest:
-{manifest_entries}
-"""
-    pvt_path.write_text(pvt_content)
-
-    # Should parse without hanging or excessive memory
     result = track.read_pvt_file(pvt_path)
 
-    # Should have parsed successfully
-    assert result is not None
-    assert "num_files" in result and result["num_files"] == 100
-    assert "manifest" in result and len(result["manifest"]) == 100
+    assert result is not None and result == pvt_data
+    restored_members = track.tracked_members(tmp_path / "large", result, None)
+    assert len(restored_members["files"]) == 100
 
 
 def test_pvt_file_yaml_invalid_type_rejected(tmp_path: pathlib.Path) -> None:
@@ -255,7 +260,7 @@ def test_directory_track_creates_pvt_file(
     runner: click.testing.CliRunner,
     mock_discovery: PipelineLike,
 ) -> None:
-    """Track on directory creates .pvt file with manifest."""
+    """Track on a directory writes its compact record and sidecar listing."""
     # Create directory with files
     data_dir = pathlib.Path("data_dir")
     data_dir.mkdir()
@@ -266,13 +271,20 @@ def test_directory_track_creates_pvt_file(
 
     assert result.exit_code == 0
 
-    # Check pvt file was created
+    # Check pvt file and adjacent listing were created.
     pvt_path = pathlib.Path("data_dir.pvt")
     assert pvt_path.exists()
+    listing_path = listing.tracked_listing_path(pvt_path)
+    assert listing_path.exists()
 
-    # Read and verify structure
     pvt_data = track.read_pvt_file(pvt_path)
     assert pvt_data is not None
+    members_data = listing_path.read_bytes()
+    members = listing.decode(members_data)
+    record = listing.record_of(members, members_data)
+    assert set(pvt_data) == {"path", "hash", "size", "nfiles"}
     assert pvt_data["path"] == "data_dir"
-    assert "manifest" in pvt_data
-    assert "num_files" in pvt_data and pvt_data["num_files"] == 2
+    assert pvt_data["hash"] == record["hash"]
+    assert pvt_data["size"] == record["size"]
+    assert "nfiles" in pvt_data and pvt_data["nfiles"] == record["nfiles"] == 2
+    assert [entry["relpath"] for entry in members["files"]] == ["file1.txt", "file2.txt"]

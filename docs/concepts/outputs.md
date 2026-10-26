@@ -133,37 +133,44 @@ ignore, such as `__pycache__/`, `build/`, `.git/` or `*.pyc`. Editing any of
 them changes the directory hash, and all of them return on restore.
 
 Empty directories are part of a directory artifact too: adding or removing one
-changes the directory hash, and every one the hash records comes back on
-restore, so an artifact restored from a hash Pivot 0.3.4 or later recorded
-holds the same directories as the one the stage built, in every checkout mode.
+changes the directory hash, and every one the artifact held comes back on
+restore, in every checkout mode.
 
-A directory hash Pivot 0.3.3 or earlier recorded lists no empty directories,
-and neither does any hash of a directory that had none. The two look the same,
-so Pivot cannot tell whether such a directory had any. Restoring an output from
-such a lock where none is on disk (in a fresh clone, with `pivot checkout`, or
-with `pivot repro` after the output was deleted) leaves its empty directories
-out, and the stage stays cached.
+### Listing files
 
-When an output on disk holds the files such a lock records plus empty
-directories it does not, `pivot repro` does not restore the output to the lock,
-which would delete them. `pivot status` shows the stage stale ("Output holds
-empty directories its lock does not record"), and `pivot repro` runs it, or
-takes its outputs from a run-cache entry that records the directories, so its
-lock records them from then on. An empty directory you add inside such an
-output yourself makes the stage run once, and the output the stage builds
-replaces yours, without that directory. `pivot checkout` leaves such an output
-as it is; `pivot checkout --force` is the exception that restores it to the
-lock, deleting its empty directories, and the stage stays cached.
+A lock file records a directory by its hash, its total size and its file count
+(`hash`, `size`, `nfiles`). The directory's members are in its *listing*, a text
+file committed beside the lock: one line per file
+(`<hash> <size> <x|-> <path>`, `x` when its owner may execute it) and one per
+deepest empty directory (`- - - <path>/`), sorted by path. The directory hash is
+the hash of the listing's bytes, so a change to one file of a 1,000-file output
+is one changed line in its listing and one in its lock. Each listing is also
+kept in the cache, at the directory's hash, and pushed and pulled with it.
 
-An output that lacks the empty directories its stage makes matches its old lock
-and stays cached, whether it was restored from that lock as above or Pivot
-0.3.4 or 0.3.5 deleted them (those versions restored such an output to its old
-lock). To repair it, re-run the stages that write the directories (`pivot run
---force <stage>`, then `pivot repro`) so their locks record them. To re-record
-a tracked directory, run `pivot track --force <path>`.
+| Directory | Listing file |
+|---|---|
+| A stage output | `.pivot/stages/<stage>=<key>.listing`, beside the stage's lock (`<stage>=.listing` for a stage's single output) |
+| A directory the pipeline declares as an input | `.pivot/stages/=inputs/<path>.listing`, one per project |
+| A tracked directory | `<path>.pvt.listing`, beside its `.pvt` |
+
+In a file name, every byte of the key or path other than a letter, digit, `_`,
+`.`, `@` or `-` is written `%XX`. Commit listing files with the lock files.
+`pivot init` writes `!/stages/**` into `.pivot/.gitignore`, so a root
+`.gitignore` pattern such as `lib/` or `build/` cannot hide them; `pivot repro`
+warns, naming each one, when git ignores a lock or listing file it just wrote,
+and `pivot track` does the same for a `.pvt` and its listing. A command that
+reads a listing refuses one whose bytes do not hash to the recorded directory
+hash, naming the file.
+
+A lock file an earlier Pivot wrote (one that lists a directory's files inside
+it) is read as missing, with one warning naming it: its stage is decided afresh
+and its lock rewritten. An incremental stage's output carries over from it once.
+A directory `.pvt` an earlier Pivot wrote is read as it is, its inline file list
+standing in for the listing, with one warning; `pivot track --force <path>`
+converts it.
 
 A symlink inside a directory artifact is not stored: it is left out of the
-manifest and does not come back on restore. When a stage writes the artifact,
+listing and does not come back on restore. When a stage writes the artifact,
 or `pivot track` records it, Pivot logs one warning naming each symlink it
 left out, for example `Directory artifact data/p/bundle.dat leaves out symlink
 link.txt`; replace the link with a real file or directory. A later release

@@ -7,11 +7,20 @@ import tempfile
 from typing import TYPE_CHECKING, Protocol, TypedDict, runtime_checkable
 
 from pivot import config, stage_def, types
-from pivot.storage import cache
+from pivot.storage import cache, listing
 from pivot.storage import state as state_mod
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterable
+
+
+def _record(
+    hashed: listing.HashedDirectory, hashed_dirs: dict[str, listing.HashedDirectory] | None
+) -> types.DirHash:
+    """A hashed directory's record, the directory kept in ``hashed_dirs`` (by hash) if given."""
+    if hashed_dirs is not None:
+        hashed_dirs[hashed["record"]["hash"]] = hashed
+    return hashed["record"]
 
 
 @runtime_checkable
@@ -20,7 +29,13 @@ class Store(Protocol):
 
     def prepare_output(self, ref: types.ArtifactRef) -> pathlib.Path: ...
 
-    def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> types.HashInfo: ...
+    def commit(
+        self,
+        ref: types.ArtifactRef,
+        path: pathlib.Path,
+        *,
+        hashed_dirs: dict[str, listing.HashedDirectory] | None = None,
+    ) -> types.HashInfo: ...
 
     def hash_artifact(
         self,
@@ -28,6 +43,7 @@ class Store(Protocol):
         state_db: state_mod.StateDB | None = None,
         *,
         pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
+        hashed_dirs: dict[str, listing.HashedDirectory] | None = None,
     ) -> types.HashInfo: ...
 
     def exists(self, ref: types.ArtifactRef) -> bool: ...
@@ -71,11 +87,12 @@ class CacheStore:
 
         with self._state_db() as db:
             if ref_path.is_dir():
-                ref_hash = cache.hash_directory(ref_path, db)["hash"]
+                ref_hash = cache.hash_directory(ref_path, db)["record"]["hash"]
+                cache_path = cache.tree_path(self._cache_dir, ref_hash)
             else:
                 ref_hash, _ = cache.hash_file(ref_path, db)
+                cache_path = cache.get_cache_path(self._cache_dir, ref_hash)
 
-        cache_path = cache.get_cache_path(self._cache_dir, ref_hash)
         if not cache_path.exists():
             raise FileNotFoundError(cache_path)
         return cache_path
@@ -95,6 +112,7 @@ class CacheStore:
         path: pathlib.Path,
         *,
         state_dir: pathlib.Path | None = None,
+        hashed_dirs: dict[str, listing.HashedDirectory] | None = None,
     ) -> types.HashInfo:
         _ = state_dir
         with self._state_db() as db:
@@ -103,9 +121,14 @@ class CacheStore:
                 self._cache_dir,
                 state_db=db,
                 checkout_mode=config.CheckoutMode.SYMLINK,
+                hashed_dirs=hashed_dirs,
             )
 
-        cache_path = cache.get_cache_path(self._cache_dir, output_hash["hash"])
+        cache_path = (
+            cache.tree_path(self._cache_dir, output_hash["hash"])
+            if types.is_dir_hash(output_hash)
+            else cache.get_cache_path(self._cache_dir, output_hash["hash"])
+        )
         ref_path = self._ref_path(ref)
         cache.remove_output(ref_path)
         ref_path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,21 +141,16 @@ class CacheStore:
         state_db: state_mod.StateDB | None = None,
         *,
         pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
+        hashed_dirs: dict[str, listing.HashedDirectory] | None = None,
     ) -> types.HashInfo:
         ref_path = self._ref_path(ref)
         if not ref_path.exists() and not ref_path.is_symlink():
             raise FileNotFoundError(ref_path)
 
-        if state_db is not None:
+        with contextlib.ExitStack() as stack:
+            db = state_db if state_db is not None else stack.enter_context(self._state_db())
             if ref_path.is_dir():
-                return cache.hash_directory(ref_path, state_db, pending=pending)
-            file_hash, _ = cache.hash_file(ref_path, state_db, pending=pending)
-            return types.FileHash(hash=file_hash)
-
-        with self._state_db() as db:
-            if ref_path.is_dir():
-                return cache.hash_directory(ref_path, db, pending=pending)
-
+                return _record(cache.hash_directory(ref_path, db, pending=pending), hashed_dirs)
             file_hash, _ = cache.hash_file(ref_path, db, pending=pending)
             return types.FileHash(hash=file_hash)
 
@@ -228,15 +246,17 @@ class WorkspaceStore:
         *,
         state_dir: pathlib.Path | None = None,
         warn_left_out_symlinks: bool = True,
+        hashed_dirs: dict[str, listing.HashedDirectory] | None = None,
     ) -> types.HashInfo:
         """Hash a written output once and, unless it is a metric, place it in the cache.
 
         ``warn_left_out_symlinks`` logs the warning naming the symlinks a directory output
-        leaves out; a quiet command turns it off.
+        leaves out; a quiet command turns it off. ``hashed_dirs`` receives a hashed directory by
+        its hash, so the lock writer has its listing.
         """
-        output_hash: types.HashInfo
+        hashed: types.FileHash | listing.HashedDirectory
         if path.is_dir():
-            output_hash = cache.hash_directory(
+            hashed = cache.hash_directory(
                 path,
                 None,
                 cache_dir=self._cache_dir,
@@ -244,16 +264,22 @@ class WorkspaceStore:
             )
         else:
             file_hash, _ = cache.hash_file(path, None)
-            output_hash = types.FileHash(hash=file_hash)
+            hashed = types.FileHash(hash=file_hash)
         if self._cache_dir is not None and ref.tag is not types.ArtifactTag.METRIC:
             cache.store_hashed_output(
                 path,
-                output_hash,
+                hashed,
                 self._cache_dir,
                 self._checkout_modes,
                 state_dir=state_dir,
             )
-        return output_hash
+        return _record(hashed, hashed_dirs) if "listing" in hashed else hashed
+
+    def cached_listing(self, output_hash: types.DirHash) -> listing.DirListing | None:
+        """The listing this store's cache holds for a directory, or None."""
+        if self._cache_dir is None:
+            return None
+        return cache.cached_listing(self._cache_dir, output_hash)
 
     def restore_from_cache(
         self,
@@ -262,6 +288,7 @@ class WorkspaceStore:
         *,
         state_dir: pathlib.Path | None = None,
         checkout_modes: list[config.CheckoutMode] | None = None,
+        members: listing.DirListing | None = None,
     ) -> bool:
         if self._cache_dir is None:
             return False
@@ -274,6 +301,7 @@ class WorkspaceStore:
             self._cache_dir,
             checkout_modes=checkout_modes if checkout_modes is not None else self._checkout_modes,
             state_dir=state_dir,
+            members=members,
         )
 
     def hash_artifact(
@@ -282,21 +310,41 @@ class WorkspaceStore:
         state_db: state_mod.StateDB | None = None,
         *,
         pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
+        hashed_dirs: dict[str, listing.HashedDirectory] | None = None,
     ) -> types.HashInfo:
         path = self._resolve_path(ref)
         if ref.directory is None and (ref.tag == types.ArtifactTag.DIRECTORY or path.is_dir()):
-            return cache.hash_directory(path, state_db, cache_dir=self._cache_dir, pending=pending)
+            hashed = cache.hash_directory(
+                path, state_db, cache_dir=self._cache_dir, pending=pending
+            )
+            return _record(hashed, hashed_dirs)
         file_hash, _ = cache.hash_file(path, state_db, pending=pending)
         return types.FileHash(hash=file_hash)
 
-    def cache_contains(self, ref: types.ArtifactRef, output_hash: types.HashInfo) -> bool:
-        """Return whether this output can be restored from the local cache."""
+    def input_relpath(self, ref: types.ArtifactRef) -> str:
+        """A pipeline input's path relative to the project root, POSIX form: the name of its
+        listing file when it is a directory."""
+        relpath = os.path.relpath(self._resolve_input_path(ref), self._project_root)
+        return pathlib.PurePath(relpath).as_posix()
+
+    def cache_contains(
+        self,
+        ref: types.ArtifactRef,
+        output_hash: types.HashInfo,
+        members: listing.DirListing | None = None,
+    ) -> bool:
+        """Return whether this output can be restored from the local cache.
+
+        ``members`` is a directory's listing; None reads the cache's listing object.
+        """
         if self._cache_dir is None or ref.tag is types.ArtifactTag.METRIC:
             return False
         if types.is_dir_hash(output_hash):
-            return all(
+            if members is None:
+                members = self.cached_listing(output_hash)
+            return members is not None and all(
                 cache.get_cache_path(self._cache_dir, entry["hash"]).exists()
-                for entry in output_hash["manifest"]
+                for entry in members["files"]
             )
         return cache.get_cache_path(self._cache_dir, output_hash["hash"]).exists()
 

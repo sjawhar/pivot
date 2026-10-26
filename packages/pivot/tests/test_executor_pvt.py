@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import pathlib  # noqa: TC003 - compose resolves postponed stage annotations at runtime
+import shutil
 from typing import TYPE_CHECKING
 
 import pytest
+import xxhash
 
 from pivot import cli, exceptions, executor, project
-from pivot.storage import track
+from pivot.storage import cache, track
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -169,18 +171,17 @@ def test_tracked_directory_change_triggers_rerun(
 def test_run_fails_when_tracked_directory_missing(
     test_pipeline: Pipeline, pipeline_dir: pathlib.Path
 ) -> None:
-    """A missing tracked directory raises the tracked-file restore error."""
+    """A missing tracked directory, recorded by its .pvt and .pvt.listing, raises the
+    tracked-file restore error."""
+    listing_data = b"0123456789abcdef 500 - a.jpg\nfedcba9876543210 500 - b.jpg\n"
+    (pipeline_dir / "images.pvt.listing").write_bytes(listing_data)
     track.write_pvt_file(
         pipeline_dir / "images.pvt",
         {
             "path": "images",
-            "hash": "abc123",
+            "hash": xxhash.xxh64(listing_data).hexdigest(),
             "size": 1000,
-            "num_files": 2,
-            "manifest": [
-                {"relpath": "a.jpg", "hash": "h1", "size": 500, "isexec": False},
-                {"relpath": "b.jpg", "hash": "h2", "size": 500, "isexec": False},
-            ],
+            "nfiles": 2,
         },
     )
     helpers.register_test_stage(_process_images, name="process", deps={"images": "images"})
@@ -241,6 +242,31 @@ def test_checkout_missing_restores_tracked_input_before_running(
     assert results["test/process"]["status"] == "ran"
     assert data_file.read_text() == "cached data", "the tracked input is back in the workspace"
     assert _output("process").read_text() == "CACHED DATA"
+
+
+def test_checkout_missing_restores_tracked_directory_from_its_listing_file(
+    test_pipeline: Pipeline, pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
+) -> None:
+    """run(checkout_missing=True) restores a deleted tracked directory from the cache, taking
+    its members from the committed .pvt.listing when the cache holds no listing object."""
+    data_dir = pipeline_dir / "images"
+    data_dir.mkdir()
+    (data_dir / "a.jpg").write_bytes(b"image1")
+    (data_dir / "b.jpg").write_bytes(b"image2")
+    assert runner.invoke(cli.cli, ["track", "images"]).exit_code == 0
+    pvt_data = track.read_pvt_file(pipeline_dir / "images.pvt")
+    assert pvt_data is not None
+    cache_dir = pipeline_dir / ".pivot" / "cache" / "files"
+    cache.get_cache_path(cache_dir, pvt_data["hash"]).unlink()
+    shutil.rmtree(data_dir)
+    helpers.register_test_stage(_count_images, name="count_images", deps={"images": "images"})
+
+    results = executor.run(pipeline=test_pipeline, checkout_missing=True)
+
+    assert results["test/count_images"]["status"] == "ran"
+    assert (data_dir / "a.jpg").read_bytes() == b"image1", "a.jpg is back in the workspace"
+    assert (data_dir / "b.jpg").read_bytes() == b"image2", "b.jpg is back in the workspace"
+    assert _output("count_images").read_text() == "2"
 
 
 def test_checkout_missing_reports_tracked_input_absent_from_cache(

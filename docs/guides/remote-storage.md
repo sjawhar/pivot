@@ -141,11 +141,14 @@ pivot checkout --only-missing
 
 | Data | Pushed/Pulled | Version controlled |
 |------|---------------|-------------------|
-| Cache files (`.pivot/cache/files/`) | Yes | No (`.gitignore`) |
-| Lock files (`.pivot/stages/<pipeline>/*.lock`) | No | Yes (commit these) |
+| Cache files and directory listing objects (`.pivot/cache/files/`) | Yes | No (`.gitignore`) |
+| Lock files and directory listings (`.pivot/stages/**/*.lock`, `.pivot/stages/**/*.listing`) | No | Yes (commit both) |
 | Config (`.pivot/config.yaml`) | No | Yes (commit this) |
 
-**Lock files are the bridge.** They map each stage output to its content hash. Push uploads the files referenced by those hashes; pull downloads them. Always commit lock files to version control so other machines know what to pull.
+**Lock files and listings are the bridge.** A lock maps each stage output to a content hash; a
+directory's members are in its committed listing file. Push uploads the listing object and the
+files it names; pull downloads them. Always commit lock files and their listing files so other
+machines know what to pull.
 
 Pulling a stage also fetches the outputs of the upstream stages it depends on, and any dependency tracked with `pivot track`. It never fetches raw inputs committed to git (`data/raw/...`), metric outputs (git carries both), or files brought in with `pivot import`: those come from the source repo's remote, and `pivot update` refreshes them.
 

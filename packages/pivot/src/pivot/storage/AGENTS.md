@@ -104,13 +104,27 @@ When multiple `pivot` processes share the same StateDB:
 - A lock file in the cache is created writable by whoever can write its directory, since NFS
   takes an exclusive lock only on a file opened for writing; one this user cannot write is
   opened read-only. Lock files are never deleted.
-- A whole-directory SYMLINK tree is built under a temporary name beside its cache name, renamed
+- A whole-directory SYMLINK tree lives at `<cache root>/trees/XX/YYYY...` (`cache.tree_path`),
+  named by the directory hash. It is built under a temporary name beside its name, renamed
   into place, checked, then marked (`<tree>.verified`), because a restore symlinks to a tree as
   soon as its name exists. A restore or commit checks an unmarked tree (exact files, sizes,
   executable bits and directories) under the tree's exclusive `<tree>.lock`, repairs it in place
   from the files' own cache objects, then marks it. A tree it cannot repair is not used: a
-  restore goes file by file, a commit fails. `<tree>.layout-checked`, the mark pivot 0.3.4 also
-  gave partial trees, is not trusted.
+  restore goes file by file, a commit fails.
+- The object at a directory's hash under `files/` is its listing (`listing.store_object`),
+  read-only like every object. `listing.read` takes a committed listing file first and this
+  object second, and refuses bytes that do not hash to the recorded directory hash.
+
+## Lock and Listing Files
+
+- A lock records a directory as `{hash, size, nfiles}`; `StageLock.write` writes each directory
+  output's listing (`listing.output_listing_path`) and each directory input's
+  (`listing.input_listing_path`) before the lock, leaving a file that already holds the bytes
+  untouched. It is the one writer of lock and listing files (Task 2.2 of the BET-36 plan moves
+  that call to the coordinator).
+- A lock whose `schema_version` is not `lock.SCHEMA_VERSION` reads as missing, with one warning
+  per process; `StageLock.read_old_format_file_outputs` gives an incremental stage its prior
+  file outputs from such a lock once.
 
 ## Path Storage
 

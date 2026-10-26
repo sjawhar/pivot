@@ -37,9 +37,15 @@ def _make_import_source(
 
 
 def _lock_bytes(*, outs: list[dict[str, object]]) -> bytes:
-    """Build a schema-v2 remote lock with identity-addressed outputs."""
+    """Build a schema-3 remote lock with identity-addressed outputs."""
     return yaml.safe_dump(
-        {"code_manifest": {"stage": "hash"}, "params": {}, "deps": [], "outs": outs}
+        {
+            "schema_version": 3,
+            "code_manifest": {"stage": "hash"},
+            "params": {},
+            "deps": [],
+            "outs": outs,
+        }
     ).encode()
 
 

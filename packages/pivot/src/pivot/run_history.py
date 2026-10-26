@@ -4,13 +4,12 @@ import datetime
 import hashlib
 import json
 import uuid
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
 
 from pivot.types import (
     ArtifactTag,
     DepEntry,
     DirHash,
-    DirManifestEntry,
     FileHash,
     HashInfo,
     StageStatus,
@@ -59,32 +58,37 @@ class RunCacheEntry(TypedDict):
 
 
 class OutputHashEntry(TypedDict):
-    """Single output hash entry in run cache."""
+    """Single output hash entry in run cache. A directory carries ``size`` and ``nfiles``; its
+    listing is the cache object at its hash."""
 
     path: str
     hash: str
-    manifest: NotRequired[list[DirManifestEntry]]
-    empty_dirs: NotRequired[list[str]]
+    size: NotRequired[int]
+    nfiles: NotRequired[int]
 
 
 def output_hash_to_entry(path: str, oh: HashInfo) -> OutputHashEntry:
     """Convert internal HashInfo to serializable OutputHashEntry."""
     entry = OutputHashEntry(path=path, hash=oh["hash"])
     if is_dir_hash(oh):
-        entry["manifest"] = oh["manifest"]
-        if "empty_dirs" in oh:
-            entry["empty_dirs"] = oh["empty_dirs"]
+        entry["size"] = oh["size"]
+        entry["nfiles"] = oh["nfiles"]
     return entry
 
 
-def entry_to_output_hash(entry: OutputHashEntry) -> FileHash | DirHash:
-    """Convert serialized OutputHashEntry back to internal HashInfo."""
-    # Null check guards against corrupted JSON where manifest could be null
-    if "manifest" in entry and entry["manifest"] is not None:  # pyright: ignore[reportUnnecessaryComparison]
-        dir_hash = DirHash(hash=entry["hash"], manifest=entry["manifest"])
-        if "empty_dirs" in entry and entry["empty_dirs"]:
-            dir_hash["empty_dirs"] = entry["empty_dirs"]
-        return dir_hash
+def entry_to_output_hash(entry: OutputHashEntry) -> FileHash | DirHash | None:
+    """Convert serialized OutputHashEntry back to internal HashInfo.
+
+    None for an entry an older pivot filed for a directory, with its files listed inline: its
+    hash is not a directory hash this pivot computes, so the entry cannot be used. None too for
+    a directory entry without its size, which no pivot writes.
+    """
+    if "manifest" in cast("Mapping[str, object]", entry):
+        return None
+    if "nfiles" in entry:
+        if "size" not in entry:
+            return None
+        return DirHash(hash=entry["hash"], size=entry["size"], nfiles=entry["nfiles"])
     return FileHash(hash=entry["hash"])
 
 

@@ -1,9 +1,45 @@
+import logging
 import pathlib
 
 import pytest
+import xxhash
+import yaml
 
-from pivot.exceptions import SecurityValidationError
-from pivot.storage import track
+from pivot import exceptions, types
+from pivot.storage import listing, track
+
+_A = xxhash.xxh64(b"a").hexdigest()
+_RUN = xxhash.xxh64(b"#!/bin/sh\n").hexdigest()
+# A directory holding a.txt, an executable bin/run.sh and an empty directory: its listing file,
+# its members, and the record its .pvt holds (the listing's hash, total size and file count).
+_LISTING = f"{_A} 1 - a.txt\n{_RUN} 10 x bin/run.sh\n- - - empty/\n".encode()
+_DIR_HASH = xxhash.xxh64(_LISTING).hexdigest()
+_MEMBERS = listing.DirListing(
+    files=[
+        types.DirManifestEntry(relpath="a.txt", hash=_A, size=1, isexec=False),
+        types.DirManifestEntry(relpath="bin/run.sh", hash=_RUN, size=10, isexec=True),
+    ],
+    empty_dirs=["empty"],
+)
+_RECORD = track.PvtData(path="images", hash=_DIR_HASH, size=11, nfiles=2)
+# The same directory's .pvt as pivot 0.5.9 wrote it: its files inline, its hash over their JSON.
+_OLD_PVT = f"""\
+path: images
+hash: 9f3a1c2b4d5e6f70
+size: 11
+num_files: 2
+manifest:
+- relpath: a.txt
+  hash: {_A}
+  size: 1
+  isexec: false
+- relpath: bin/run.sh
+  hash: {_RUN}
+  size: 10
+  isexec: true
+empty_dirs:
+- empty
+"""
 
 # write_pvt_file / read_pvt_file
 
@@ -45,29 +81,20 @@ def test_write_pvt_file_atomic_no_partial_on_error(tmp_path: pathlib.Path) -> No
     assert len(tmp_files) == 0, f"Temporary files remain: {tmp_files}"
 
 
-def test_pvt_file_for_directory_with_manifest(tmp_path: pathlib.Path) -> None:
-    """Directory .pvt files include manifest and num_files."""
+def test_directory_pvt_file_holds_only_its_listing_record(tmp_path: pathlib.Path) -> None:
+    """A directory .pvt records the directory as a lock does: its listing's hash, total size and
+    file count. Its files are in the listing file beside it, not in the .pvt."""
     pvt_path = tmp_path / "images.pvt"
-    data: track.PvtData = {
+
+    track.write_pvt_file(pvt_path, _RECORD)
+
+    assert yaml.safe_load(pvt_path.read_text()) == {
         "path": "images",
-        "hash": "tree_hash_123",
-        "size": 5120,
-        "num_files": 2,
-        "manifest": [
-            {"relpath": "cat.jpg", "hash": "aaa111", "size": 2048, "isexec": False},
-            {"relpath": "dog.jpg", "hash": "bbb222", "size": 3072, "isexec": False},
-        ],
+        "hash": _DIR_HASH,
+        "size": 11,
+        "nfiles": 2,
     }
-
-    track.write_pvt_file(pvt_path, data)
-    result = track.read_pvt_file(pvt_path)
-
-    assert result == data
-    assert result is not None
-    assert result.get("num_files") == 2
-    manifest = result.get("manifest")
-    assert manifest is not None
-    assert len(manifest) == 2
+    assert track.read_pvt_file(pvt_path) == _RECORD
 
 
 # read_pvt_file error handling
@@ -132,6 +159,16 @@ def test_read_pvt_file_missing_required_fields_returns_none(
     result = track.read_pvt_file(pvt_path)
 
     assert result is None
+
+
+@pytest.mark.parametrize("nfiles", ["two", "true"])
+def test_read_pvt_file_refuses_a_file_count_that_is_not_an_integer(
+    tmp_path: pathlib.Path, nfiles: str
+) -> None:
+    pvt_path = tmp_path / "images.pvt"
+    pvt_path.write_text(f"path: images\nhash: {_DIR_HASH}\nsize: 11\nnfiles: {nfiles}\n")
+
+    assert track.read_pvt_file(pvt_path) is None
 
 
 # get_pvt_path
@@ -258,32 +295,35 @@ def test_discover_pvt_files_skips_invalid(tmp_path: pathlib.Path) -> None:
     assert str(tmp_path / "valid.csv") in result
 
 
-def test_discover_pvt_files_with_directory_manifest(tmp_path: pathlib.Path) -> None:
-    """Directory .pvt files with manifest are discovered correctly."""
-    track.write_pvt_file(
-        tmp_path / "images.pvt",
-        {
-            "path": "images",
-            "hash": "tree_hash",
-            "size": 5000,
-            "num_files": 3,
-            "manifest": [
-                {"relpath": "a.jpg", "hash": "h1", "size": 1000, "isexec": False},
-                {"relpath": "b.jpg", "hash": "h2", "size": 2000, "isexec": False},
-                {"relpath": "c.jpg", "hash": "h3", "size": 2000, "isexec": False},
-            ],
-        },
-    )
+def test_discover_pvt_files_finds_a_directory_by_its_listing_record(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The listing file beside a directory's .pvt is not itself discovered as a .pvt."""
+    track.write_pvt_file(tmp_path / "images.pvt", _RECORD)
+    (tmp_path / "images.pvt.listing").write_bytes(_LISTING)
 
     result = track.discover_pvt_files(tmp_path)
 
-    assert len(result) == 1
-    images_path = str(tmp_path / "images")
-    assert images_path in result
-    assert result[images_path].get("num_files") == 3
-    manifest = result[images_path].get("manifest")
-    assert manifest is not None
-    assert len(manifest) == 3
+    assert result == {str(tmp_path / "images"): _RECORD}
+
+
+def test_discover_pvt_files_reads_an_old_directory_pvt_with_one_warning_and_keeps_it(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An old directory .pvt is discovered as its listing's record, not skipped as invalid, and
+    the file is left as it was."""
+    pvt_path = tmp_path / "images.pvt"
+    pvt_path.write_text(_OLD_PVT)
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.track"):
+        result = track.discover_pvt_files(tmp_path)
+
+    assert result == {str(tmp_path / "images"): _RECORD}
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 1, warnings
+    assert str(pvt_path) in warnings[0] and "pivot track --force" in warnings[0], warnings
+    assert pvt_path.read_text() == _OLD_PVT, "an old .pvt is never rewritten"
+    assert [path.name for path in tmp_path.iterdir()] == ["images.pvt"]
 
 
 # Validation
@@ -298,5 +338,118 @@ def test_write_pvt_file_rejects_path_traversal(tmp_path: pathlib.Path) -> None:
         "size": 666,
     }
 
-    with pytest.raises(SecurityValidationError, match=r"path traversal|\.\."):
+    with pytest.raises(exceptions.SecurityValidationError, match=r"path traversal|\.\."):
         track.write_pvt_file(pvt_path, data)
+
+
+# pvt_to_hash_info
+
+
+@pytest.mark.parametrize(
+    ("pvt_data", "expected"),
+    [
+        pytest.param(
+            track.PvtData(path="data.csv", hash="abc123", size=3), {"hash": "abc123"}, id="file"
+        ),
+        pytest.param(_RECORD, {"hash": _DIR_HASH, "size": 11, "nfiles": 2}, id="directory"),
+    ],
+)
+def test_pvt_to_hash_info_records_a_file_by_hash_and_a_directory_by_its_listing_record(
+    pvt_data: track.PvtData, expected: dict[str, object]
+) -> None:
+    assert track.pvt_to_hash_info(pvt_data) == expected
+
+
+# tracked_members
+
+
+def test_tracked_members_are_read_from_the_listing_file_beside_the_pvt(
+    tmp_path: pathlib.Path,
+) -> None:
+    track.write_pvt_file(tmp_path / "images.pvt", _RECORD)
+    (tmp_path / "images.pvt.listing").write_bytes(_LISTING)
+
+    assert track.tracked_members(tmp_path / "images", _RECORD, cache_dir=None) == _MEMBERS
+
+
+def test_tracked_members_fall_back_to_the_cache_object_at_the_directory_hash(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Without the .pvt.listing file, the listing is the cache object `pivot track` stored at
+    the directory's hash."""
+    cache_dir = tmp_path / "cache"
+    cache_object = cache_dir / _DIR_HASH[:2] / _DIR_HASH[2:]
+    cache_object.parent.mkdir(parents=True)
+    cache_object.write_bytes(_LISTING)
+    track.write_pvt_file(tmp_path / "images.pvt", _RECORD)
+
+    assert track.tracked_members(tmp_path / "images", _RECORD, cache_dir) == _MEMBERS
+
+
+def test_tracked_members_refuse_a_listing_file_that_does_not_hash_to_the_pvt(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A hand-edited listing file is refused, naming it, rather than trusted."""
+    track.write_pvt_file(tmp_path / "images.pvt", _RECORD)
+    (tmp_path / "images.pvt.listing").write_bytes(_LISTING.replace(b"a.txt", b"b.txt"))
+
+    with pytest.raises(exceptions.CorruptListingError, match=r"images\.pvt\.listing"):
+        track.tracked_members(tmp_path / "images", _RECORD, cache_dir=None)
+
+
+# Directory .pvt files an older pivot wrote, with the directory's files inline
+
+
+def test_read_pvt_file_reads_an_old_directory_pvt_as_its_listing_record_warning_once(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """It reads as the record of the listing its inline files make; one warning names the .pvt
+    and how to convert it. The .pvt is never rewritten and no listing file is written beside it."""
+    pvt_path = tmp_path / "images.pvt"
+    pvt_path.write_text(_OLD_PVT)
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.track"):
+        first = track.read_pvt_file(pvt_path)
+        second = track.read_pvt_file(pvt_path)
+
+    assert first == second == _RECORD
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 1, warnings
+    assert str(pvt_path) in warnings[0] and "pivot track --force" in warnings[0], warnings
+    assert pvt_path.read_text() == _OLD_PVT, "an old .pvt is never rewritten"
+    assert [path.name for path in tmp_path.iterdir()] == ["images.pvt"]
+
+
+def test_tracked_members_of_an_old_directory_pvt_are_the_files_it_lists(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With no listing file and no cache, the old .pvt's inline files are the members."""
+    pvt_path = tmp_path / "images.pvt"
+    pvt_path.write_text(_OLD_PVT)
+    pvt_data = track.read_pvt_file(pvt_path)
+    assert pvt_data is not None
+
+    assert track.tracked_members(tmp_path / "images", pvt_data, cache_dir=None) == _MEMBERS
+    assert pvt_path.read_text() == _OLD_PVT, "an old .pvt is never rewritten"
+
+
+_OLD_ENTRY = f"\n- relpath: a.txt\n  hash: {_A}\n  size: 1\n  isexec: false"
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        pytest.param(_OLD_ENTRY.replace("a.txt", "../outside.txt"), id="traversal"),
+        pytest.param(_OLD_ENTRY.replace(_A, "not-a-hash"), id="bad-hash"),
+        pytest.param(_OLD_ENTRY * 2, id="duplicate-path"),
+    ],
+)
+def test_read_pvt_file_refuses_an_old_directory_pvt_whose_files_are_unsafe_or_malformed(
+    tmp_path: pathlib.Path, manifest: str
+) -> None:
+    pvt_path = tmp_path / "images.pvt"
+    pvt_path.write_text(
+        f"path: images\nhash: 9f3a1c2b4d5e6f70\nsize: 1\nnum_files: 1\nmanifest:{manifest}\n"
+    )
+
+    assert track.read_pvt_file(pvt_path) is None

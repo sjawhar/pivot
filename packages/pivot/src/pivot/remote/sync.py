@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from pivot import config, exceptions, metrics, names, project, registry, types
 from pivot.remote import config as remote_config
 from pivot.remote import protocol
-from pivot.storage import cache, lock, track
+from pivot.storage import cache, listing, lock, track
 from pivot.storage import store as store_mod
 from pivot.types import HashInfo, RemoteStatus, TransferSummary, is_dir_hash
 
@@ -43,83 +43,75 @@ def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
                 for hash_entry in hash_entries:
                     if hash_entry.is_file():
                         full_hash = prefix_entry.name + hash_entry.name
-                        if len(full_hash) == cache.XXHASH64_HEX_LENGTH:
+                        if cache.is_valid_hash(full_hash):
                             hashes.add(full_hash)
 
     metrics.end("sync.get_local_cache_hashes", _t)
     return hashes
 
 
-def _extract_file_hashes_from_hash_info(hash_info: HashInfo) -> set[str]:
-    """Extract hashes that correspond to cached file blobs only.
+def _blob_hashes(
+    hash_info: HashInfo,
+    read_members: Callable[[types.DirHash], listing.DirListing],
+    files_dir: pathlib.Path,
+) -> set[str]:
+    """The cache objects that store an output: a file's object, or a directory's listing object
+    and its files' objects.
 
-    For directories, returns only manifest entry hashes (not the tree hash).
+    ``read_members`` reads a directory's listing (its committed listing file, else the cache's
+    object). A listing the local cache lacks is stored from the committed file, so push sends
+    it. A directory whose listing neither holds gives its listing object alone: a pull fetches
+    it first, then names the files.
     """
-    if is_dir_hash(hash_info):
-        return {entry["hash"] for entry in hash_info["manifest"]}
-    return {hash_info["hash"]}
+    if not is_dir_hash(hash_info):
+        return {hash_info["hash"]}
+    try:
+        members = read_members(hash_info)
+    except exceptions.ListingMissingError:
+        return {hash_info["hash"]}
+    listing.store_object(files_dir, hash_info["hash"], listing.encode(members))
+    return {hash_info["hash"], *(entry["hash"] for entry in members["files"])}
 
 
-def get_stage_output_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> set[str]:
-    """Extract output hashes from lock files for specific stages.
-
-    Only includes hashes for outputs with cache=True.
-    """
-    hashes = set[str]()
-    from pivot.cli import helpers as cli_helpers
-
-    for stage_name in stage_names:
-        try:
-            stage_info = cli_helpers.get_stage(stage_name)
-        except KeyError:
-            logger.warning(f"Stage {stage_name} not found in registry, skipping")
-            continue
-        non_cached_paths = {
-            types.identity_key(out.identity)
-            for out in stage_info["outs"]
-            if out.tag is types.ArtifactTag.METRIC
-        }
-
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
-        lock_data = stage_lock.read()
-        if lock_data is None:
-            logger.warning(f"No lock file for stage '{stage_name}'")
-            continue
-
-        for out_path, output_hash in lock_data["output_hashes"].items():
-            if types.identity_key(out_path) not in non_cached_paths:
-                hashes |= _extract_file_hashes_from_hash_info(output_hash)
-
-    return hashes
+def _output_blobs(
+    hash_info: HashInfo,
+    stages_dir: pathlib.Path,
+    identity: types.ArtifactIdentity,
+    files_dir: pathlib.Path,
+) -> set[str]:
+    """The cache objects of a stage output, a directory's listing read beside its lock."""
+    return _blob_hashes(
+        hash_info,
+        lambda record: listing.read(
+            listing.output_listing_path(stages_dir, identity), record, files_dir
+        ),
+        files_dir,
+    )
 
 
-def get_stage_dep_hashes(state_dir: pathlib.Path, stage_names: list[str]) -> set[str]:
-    """Extract dependency hashes from lock files for specific stages."""
-    hashes = set[str]()
-
-    for stage_name in stage_names:
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
-        lock_data = stage_lock.read()
-        if lock_data is None:
-            continue
-
-        for dep_hash in lock_data["dep_hashes"].values():
-            hashes |= _extract_file_hashes_from_hash_info(dep_hash)
-
-    return hashes
+def _tracked_blobs(
+    data_path: pathlib.Path, pvt_data: track.PvtData, files_dir: pathlib.Path
+) -> set[str]:
+    """The cache objects of a tracked file or directory."""
+    return _blob_hashes(
+        track.pvt_to_hash_info(pvt_data),
+        lambda _record: track.tracked_members(data_path, pvt_data, files_dir),
+        files_dir,
+    )
 
 
 def _get_file_hash_from_stages(
     target_identity_key: str,
     state_dir: pathlib.Path,
+    files_dir: pathlib.Path,
     all_stages: dict[str, RegistryStageInfo] | None = None,
-) -> HashInfo | None:
-    """Look up a file's hash from stage lock files."""
+) -> set[str] | None:
+    """The cache objects of a stage output named by its identity key, from the lock files."""
     if all_stages is not None:
         for stage_name, stage_info in all_stages.items():
             stage_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
-            stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
-            lock_data = stage_lock.read()
+            stages_dir = lock.get_stages_dir(stage_state_dir)
+            lock_data = lock.StageLock(stage_name, stages_dir).read()
             if lock_data is None:
                 continue
             non_cached_paths = {
@@ -130,7 +122,7 @@ def _get_file_hash_from_stages(
             for out_path, out_hash in lock_data["output_hashes"].items():
                 identity_key = types.identity_key(out_path)
                 if identity_key == target_identity_key and identity_key not in non_cached_paths:
-                    return out_hash
+                    return _output_blobs(out_hash, stages_dir, out_path, files_dir)
         return None
 
     from pivot.cli import helpers as cli_helpers
@@ -160,13 +152,15 @@ def _get_file_hash_from_stages(
         for out_path, out_hash in lock_data["output_hashes"].items():
             identity_key = types.identity_key(out_path)
             if identity_key == target_identity_key and identity_key not in non_cached_paths:
-                return out_hash
+                return _output_blobs(out_hash, stages_dir, out_path, files_dir)
 
     return None
 
 
-def _get_file_hash_from_pvt(rel_path: str, proj_root: pathlib.Path) -> HashInfo | None:
-    """Look up a file's hash from .pvt tracking file."""
+def _get_file_hash_from_pvt(
+    rel_path: str, proj_root: pathlib.Path, files_dir: pathlib.Path
+) -> set[str] | None:
+    """The cache objects of a path tracked by a .pvt file."""
     pvt_path = proj_root / (rel_path + ".pvt")
     if not pvt_path.exists():
         return None
@@ -175,21 +169,21 @@ def _get_file_hash_from_pvt(rel_path: str, proj_root: pathlib.Path) -> HashInfo 
     if track_data is None:
         return None
 
-    return track.pvt_to_hash_info(track_data)
+    return _tracked_blobs(proj_root / rel_path, track_data, files_dir)
 
 
-def _get_tracked_hashes(proj_root: pathlib.Path) -> set[str]:
-    """Blob hashes of every `pivot track`-ed file or directory in the project.
+def _get_tracked_blobs(proj_root: pathlib.Path, files_dir: pathlib.Path) -> dict[str, set[str]]:
+    """The cache objects of every `pivot track`-ed file or directory, by its recorded hash.
 
     Imports are left out: `pivot import` writes the file straight to the workspace, so its
     blob never enters the local cache and push never sends it to this project's remote.
     """
-    hashes = set[str]()
-    for pvt_data in track.discover_pvt_files(proj_root).values():
+    blobs = dict[str, set[str]]()
+    for data_path, pvt_data in track.discover_pvt_files(proj_root).items():
         if track.is_import(pvt_data):
             continue
-        hashes |= _extract_file_hashes_from_hash_info(track.pvt_to_hash_info(pvt_data))
-    return hashes
+        blobs[pvt_data["hash"]] = _tracked_blobs(pathlib.Path(data_path), pvt_data, files_dir)
+    return blobs
 
 
 def _is_cached_stage_output(
@@ -207,14 +201,20 @@ def get_target_hashes(
     state_dir: pathlib.Path,
     include_deps: bool = False,
     all_stages: dict[str, RegistryStageInfo] | None = None,
+    cache_dir: pathlib.Path | None = None,
 ) -> set[str]:
-    """Resolve targets (stage names or file paths) to cache hashes."""
+    """Resolve targets (stage names or file paths) to cache hashes.
+
+    A directory resolves to its listing object and its files' objects. ``cache_dir`` is the
+    cache root (``config.get_cache_dir()`` when None).
+    """
     _t = metrics.start()
     proj_root = project.get_project_root()
+    files_dir = (cache_dir if cache_dir is not None else config.get_cache_dir()) / "files"
     hashes = set[str]()
     output_identities: dict[str, types.ArtifactIdentity] | None = None
     unresolved = list[str]()
-    tracked_hashes: set[str] | None = None
+    tracked_blobs: dict[str, set[str]] | None = None
 
     for target in targets:
         original_target = target
@@ -245,31 +245,35 @@ def get_target_hashes(
                     if lock_data is not None:
                         for out_path, out_hash in lock_data["output_hashes"].items():
                             if types.identity_key(out_path) not in non_cached_paths:
-                                hashes |= _extract_file_hashes_from_hash_info(out_hash)
+                                hashes |= _output_blobs(
+                                    out_hash, stage_lock.stages_dir, out_path, files_dir
+                                )
                         if include_deps:
                             # Only deps whose blobs pivot caches (and so pushes) can be fetched:
                             # upstream stage outputs and `pivot track` inputs. Raw inputs
                             # committed to git and `pivot import` inputs are never in the remote.
                             for dep_identity, dep_hash in lock_data["dep_hashes"].items():
-                                dep_blobs = _extract_file_hashes_from_hash_info(dep_hash)
                                 producer_info = all_stages.get(dep_identity.producer)
                                 if producer_info is not None:
                                     if _is_cached_stage_output(dep_identity, producer_info):
-                                        hashes |= dep_blobs
+                                        producer_stages_dir = lock.get_stages_dir(
+                                            registry.get_stage_state_dir(producer_info, state_dir)
+                                        )
+                                        hashes |= _output_blobs(
+                                            dep_hash, producer_stages_dir, dep_identity, files_dir
+                                        )
                                     continue
-                                if tracked_hashes is None:
-                                    tracked_hashes = _get_tracked_hashes(proj_root)
-                                hashes |= dep_blobs & tracked_hashes
+                                if tracked_blobs is None:
+                                    tracked_blobs = _get_tracked_blobs(proj_root, files_dir)
+                                hashes |= tracked_blobs.get(dep_hash["hash"], set[str]())
                         continue
             else:
                 resolved_identity = types.ArtifactIdentity(stage_name, target_identity.key)
-                out_hash = _get_file_hash_from_stages(
-                    types.identity_key(resolved_identity),
-                    state_dir,
-                    all_stages,
+                out_blobs = _get_file_hash_from_stages(
+                    types.identity_key(resolved_identity), state_dir, files_dir, all_stages
                 )
-                if out_hash is not None:
-                    hashes |= _extract_file_hashes_from_hash_info(out_hash)
+                if out_blobs is not None:
+                    hashes |= out_blobs
                     continue
 
             unresolved.append(original_target)
@@ -294,16 +298,16 @@ def get_target_hashes(
                 )
             target_identity = output_identities.get(rel_path, target_identity)
 
-        out_hash = _get_file_hash_from_stages(
-            types.identity_key(target_identity), state_dir, all_stages
+        out_blobs = _get_file_hash_from_stages(
+            types.identity_key(target_identity), state_dir, files_dir, all_stages
         )
-        if out_hash is not None:
-            hashes |= _extract_file_hashes_from_hash_info(out_hash)
+        if out_blobs is not None:
+            hashes |= out_blobs
             continue
 
-        pvt_hash = _get_file_hash_from_pvt(rel_path, proj_root)
-        if pvt_hash is not None:
-            hashes |= _extract_file_hashes_from_hash_info(pvt_hash)
+        pvt_blobs = _get_file_hash_from_pvt(rel_path, proj_root, files_dir)
+        if pvt_blobs is not None:
+            hashes |= pvt_blobs
             continue
 
         unresolved.append(target)
@@ -388,7 +392,7 @@ async def _push_async(
 
     if targets:
         local_hashes = get_target_hashes(
-            targets, state_dir, include_deps=False, all_stages=all_stages
+            targets, state_dir, include_deps=False, all_stages=all_stages, cache_dir=cache_dir
         )
     else:
         local_hashes = get_local_cache_hashes(cache_dir)
@@ -478,7 +482,7 @@ async def _pull_async(
 
     if targets:
         needed_hashes = get_target_hashes(
-            targets, state_dir, include_deps=True, all_stages=all_stages
+            targets, state_dir, include_deps=True, all_stages=all_stages, cache_dir=cache_dir
         )
     else:
         needed_hashes = await remote.list_hashes()
@@ -501,6 +505,23 @@ async def _pull_async(
         items.append((hash_, cache_path))
 
     results = await remote.download_batch(items, concurrency=jobs, callback=callback, readonly=True)
+    downloaded = set(missing_locally)
+    if targets and any(r["success"] for r in results):
+        # A directory whose listing was neither committed nor cached named only its listing
+        # object; with the listing now cached, its files can be named and fetched.
+        named_now = get_target_hashes(
+            targets, state_dir, include_deps=True, all_stages=all_stages, cache_dir=cache_dir
+        )
+        second = sorted(named_now - needed_hashes - get_local_cache_hashes(cache_dir))
+        if second:
+            needed_hashes |= named_now
+            downloaded.update(second)
+            results += await remote.download_batch(
+                [(hash_, cache.get_cache_path(files_dir, hash_)) for hash_ in second],
+                concurrency=jobs,
+                callback=callback,
+                readonly=True,
+            )
 
     transferred = [r for r in results if r["success"]]
     failed = [r for r in results if not r["success"]]
@@ -511,7 +532,7 @@ async def _pull_async(
     metrics.end("sync.pull_async", _t)
     return TransferSummary(
         transferred=len(transferred),
-        skipped=len(needed_hashes) - len(missing_locally),
+        skipped=len(needed_hashes - downloaded),
         failed=len(failed),
         errors=errors,
     )

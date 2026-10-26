@@ -252,6 +252,26 @@ class CacheModeCollisionError(CacheError):
         )
 
 
+class CorruptListingError(CacheError):
+    """A directory listing is malformed, or its bytes do not hash to the directory hash its
+    lock or ``.pvt`` records. The message names the file."""
+
+    @override
+    def get_suggestion(self) -> str:
+        return (
+            "Restore the listing file from git (`git checkout -- <file>`), or rerun the stage "
+            "that wrote it (`pivot repro --force <stage>`, `pivot track --force <path>`)"
+        )
+
+
+class ListingMissingError(CacheError):
+    """Neither the committed listing file nor the cache holds a directory's listing."""
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Commit the listing file beside its lock or .pvt, or run 'pivot pull'"
+
+
 class ParamsError(PivotError):
     """Raised when parameter validation or loading fails."""
 

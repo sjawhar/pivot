@@ -279,7 +279,7 @@ pivot status --explain      # why each stage would run
 pivot repro --dry-run       # validate the DAG without running
 ```
 
-Commit `pipeline.py`, `data/raw/` inputs you own, and `.pivot/stages/` (lock files). `pivot init` already ignores `.pivot/cache/` and `.pivot/state.lmdb/`.
+Commit `pipeline.py`, `data/raw/` inputs you own, and `.pivot/stages/` (lock and directory-listing files). A tracked directory also needs its `<path>.pvt.listing` beside its `.pvt`. `pivot init` already ignores `.pivot/cache/` and `.pivot/state.lmdb/`.
 
 ## Common errors
 

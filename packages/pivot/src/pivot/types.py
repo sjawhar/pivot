@@ -186,9 +186,9 @@ class StageResult(TypedDict):
 #
 #   FileHash          Simple {hash: str} for individual files.
 #
-#   DirHash           Tree hash with manifest listing all files, plus the directory's
-#                     empty directories. The manifest enables incremental sync (only
-#                     transfer changed files).
+#   DirHash           A directory as a lock records it: the hash of its listing, its total
+#                     size and its file count. The members live in the listing
+#                     (storage/listing.py), committed beside the lock and kept in the cache.
 #
 #   HashInfo          Union type for hashes (files or directories).
 #
@@ -201,34 +201,29 @@ class FileHash(TypedDict):
 
 
 class DirManifestEntry(TypedDict):
-    """Entry in directory manifest."""
+    """One file of a directory listing."""
 
-    relpath: str
+    relpath: str  # os.fsdecode form: a byte that is not UTF-8 is a surrogate escape
     hash: str
     size: int
     isexec: bool
 
 
 class DirHash(TypedDict):
-    """Hash info for a directory with full manifest.
-
-    ``empty_dirs`` lists the directories that hold no stored file and no other directory, as
-    relpaths, sorted. Restoring the files recreates their parents and these recreate every
-    other directory, so a restored directory has exactly the directories the hashed one had.
-    The key is present only when the list is non-empty.
-    """
+    """A directory: the hash of its listing (``storage/listing.py``), the sum of its files'
+    sizes, and its file count."""
 
     hash: str
-    manifest: list[DirManifestEntry]
-    empty_dirs: NotRequired[list[str]]
+    size: int
+    nfiles: int
 
 
 HashInfo = FileHash | DirHash
 
 
 def is_dir_hash(h: HashInfo) -> TypeGuard[DirHash]:
-    """Type guard to narrow HashInfo to DirHash based on manifest presence."""
-    return "manifest" in h
+    """Type guard to narrow HashInfo to DirHash."""
+    return "nfiles" in h
 
 
 MetricValue = str | int | float | bool | None
@@ -371,32 +366,29 @@ def validate_artifact_identity(identity: ArtifactIdentity) -> None:
 
 
 class DepEntry(TypedDict):
-    """Entry in deps list for lock file storage."""
+    """Entry in deps list for lock file storage. A directory carries ``size`` and ``nfiles``."""
 
     producer: str
     key: str | None
     hash: str
     size: NotRequired[int]
-    manifest: NotRequired[list[DirManifestEntry]]
-    empty_dirs: NotRequired[list[str]]
+    nfiles: NotRequired[int]
 
 
 class OutEntry(TypedDict):
-    """Entry in outs list for lock file storage."""
+    """Entry in outs list for lock file storage. A directory carries ``size`` and ``nfiles``."""
 
     key: str | None
     hash: str
     path: NotRequired[str]
     size: NotRequired[int]
-    manifest: NotRequired[list[DirManifestEntry]]
-    empty_dirs: NotRequired[list[str]]
+    nfiles: NotRequired[int]
 
 
 class StorageLockData(TypedDict):
     """Storage format for lock files (list-based, relative paths)."""
 
-    # Schema version for forward compatibility (missing = v0, current = v1)
-    schema_version: NotRequired[int]
+    schema_version: int
     code_manifest: dict[str, str]
     params: dict[str, Any]
     deps: list[DepEntry]

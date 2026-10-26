@@ -22,9 +22,9 @@ logger = logging.getLogger(__name__)
 def _parse_lock_contents(
     stage_names: Sequence[str],
     lock_contents: dict[str, bytes],
-) -> dict[str, StorageLockData | None]:
-    """Parse lock file contents into StorageLockData."""
-    result = dict[str, StorageLockData | None]()
+) -> dict[str, lock.CommittedLock | None]:
+    """Parse committed lock file contents, an older pivot's format included."""
+    result = dict[str, lock.CommittedLock | None]()
     for stage_name in stage_names:
         lock_path = f"{lock.STAGES_REL_PATH}/{stage_name}.lock"
         content = lock_contents.get(lock_path)
@@ -39,22 +39,17 @@ def _parse_lock_contents(
             result[stage_name] = None
             continue
 
-        if not lock.is_lock_data(data):
-            error = lock.lock_data_error(data)
-            assert error is not None
-            if isinstance(error, lock.UnsafeLockPath):
-                raise exceptions.SecurityValidationError(f"Refusing lock file {lock_path}: {error}")
-            result[stage_name] = None
-            continue
-
-        result[stage_name] = data
+        parsed = lock.parse_committed(data)
+        if isinstance(parsed, lock.UnsafeLockPath):
+            raise exceptions.SecurityValidationError(f"Refusing lock file {lock_path}: {parsed}")
+        result[stage_name] = parsed
 
     return result
 
 
 def read_lock_files_from_head(
     stage_names: Sequence[str],
-) -> dict[str, StorageLockData | None]:
+) -> dict[str, lock.CommittedLock | None]:
     """Batch read and parse lock files from git HEAD."""
     if not stage_names:
         return {}
@@ -86,8 +81,10 @@ def output_hashes_from_head(
     lock_data_map = read_lock_files_from_head(list(outs_by_stage))
     result = dict[str, str | None]()
     for stage_name, outs in outs_by_stage.items():
-        lock_data = lock_data_map[stage_name]
-        hashes = {} if lock_data is None else extract_output_hashes_from_lock(lock_data, stage_name)
+        committed = lock_data_map[stage_name]
+        hashes = (
+            {} if committed is None else extract_output_hashes_from_lock(committed.data, stage_name)
+        )
         for out in outs:
             rel_path = project.to_relative_path(store.resolve_display_path(out), proj_root)
             result[rel_path] = hashes.get(types.identity_key(out.identity))

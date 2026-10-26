@@ -16,13 +16,13 @@ import yaml
 from pivot import exceptions, project, types
 from pivot.remote import config as remote_config
 from pivot.remote import git_archive, github, protocol
-from pivot.storage import cache, track
+from pivot.storage import cache, listing, track
 from pivot.storage import lock as storage_lock
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pivot.types import DirManifestEntry, OutEntry, StorageLockData
+    from pivot.types import OutEntry
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +235,9 @@ async def read_remote_lock_file(
     token: str | None,
     *,
     session: aiohttp.ClientSession | None = None,
-) -> StorageLockData | None:
+) -> storage_lock.CommittedLock | None:
+    """A remote stage's lock at ``rev``, an older pivot's format included (a repository's past
+    revisions keep the format they were written in)."""
     path = f".pivot/stages/{stage_name}.lock"
     raw = await _read_remote_file(repo_url, path, rev, token, session=session)
     if raw is None:
@@ -245,31 +247,47 @@ async def read_remote_lock_file(
     except yaml.YAMLError:
         logger.warning("Failed to parse lock file for stage '%s'", stage_name)
         return None
-    if not storage_lock.is_lock_data(data):
+    parsed = storage_lock.parse_committed(data)
+    if not isinstance(parsed, storage_lock.CommittedLock):
         logger.warning("Invalid lock file structure for stage '%s'", stage_name)
         return None
-    return data
+    return parsed
 
 
 def _entry_size(entry: OutEntry, identity: str) -> int:
     if "size" in entry:
         return int(entry["size"])
-    if "manifest" in entry:
-        return sum(int(m["size"]) for m in entry["manifest"])
     logger.warning("Lock entry '%s' has no size information", identity)
     return 0
 
 
-def _iter_manifest_paths(
-    identity: types.ArtifactIdentity, entry: OutEntry
-) -> list[tuple[str, DirManifestEntry]]:
-    """Each file of a directory output, named as a stage depending on it names it."""
-    if "manifest" not in entry:
-        return []
-    return [
-        (types.identity_key(types.directory_file_identity(identity, m["relpath"])), m)
-        for m in entry["manifest"]
-    ]
+def _directory_file_relpath(identity: types.ArtifactIdentity, path: str) -> str | None:
+    """The path of the file ``path`` names inside directory output ``identity``, or None."""
+    prefix = (
+        f"{identity.producer}:" if identity.key is None else f"{identity.producer}:{identity.key}/"
+    )
+    return path.removeprefix(prefix) if path.startswith(prefix) and path != prefix else None
+
+
+async def _read_remote_listing(
+    repo_url: str,
+    identity: types.ArtifactIdentity,
+    record: types.DirHash,
+    rev: str,
+    token: str | None,
+    *,
+    session: aiohttp.ClientSession | None = None,
+) -> listing.DirListing | None:
+    """A remote directory output's committed listing file, checked against its lock's
+    ``record``; None when the repository has no such file."""
+    rel_path = listing.output_listing_path(
+        pathlib.Path(storage_lock.STAGES_REL_PATH), identity
+    ).as_posix()
+    raw = await _read_remote_file(repo_url, rel_path, rev, token, session=session)
+    if raw is None:
+        return None
+    source = f"{rel_path} at {rev}"
+    return listing.parse(listing.check(raw, record, source), record, source)
 
 
 def _renamed_message(old_name: str, directory: str, relpath: str, new_name: str) -> str:
@@ -338,18 +356,17 @@ async def _resolve_remote_path_with_session(
     available = set[str]()
     renamed: str | None = None
 
-    for stage, lock_data in zip(stage_names, lock_datas, strict=True):
-        if lock_data is None:
+    for stage, committed in zip(stage_names, lock_datas, strict=True):
+        if committed is None:
             continue
-        for entry in lock_data["outs"]:
+        for entry in committed.data["outs"]:
             entry_identity = types.ArtifactIdentity(stage, entry["key"])
             identity = types.identity_key(entry_identity)
-            manifest_paths = _iter_manifest_paths(entry_identity, entry)
+            hash_info = storage_lock.entry_hash_info(entry)
             available.add(identity)
-            available.update(full_path for full_path, _ in manifest_paths)
 
             if identity == path:
-                if "manifest" in entry:
+                if types.is_dir_hash(hash_info):
                     file_example = types.identity_key(
                         types.directory_file_identity(entry_identity, "{filename}")
                     )
@@ -361,19 +378,34 @@ async def _resolve_remote_path_with_session(
                     raise exceptions.PivotError(message)
                 matches.append((stage, path, entry["hash"], _entry_size(entry, identity)))
                 continue
+            if not types.is_dir_hash(hash_info):
+                continue
 
-            for full_path, manifest_entry in manifest_paths:
-                if full_path == path:
-                    matches.append(
-                        (
-                            stage,
-                            path,
-                            manifest_entry["hash"],
-                            int(manifest_entry["size"]),
-                        )
-                    )
-                elif f"{identity}/{manifest_entry['relpath']}" == path:
-                    renamed = _renamed_message(path, identity, manifest_entry["relpath"], full_path)
+            # One file of a directory output, read from the directory's committed listing; a
+            # path of the old form `stage/relpath` is named in a rename message.
+            relpath = _directory_file_relpath(entry_identity, path)
+            old_relpath = (
+                path.removeprefix(f"{identity}/") if path.startswith(f"{identity}/") else None
+            )
+            if relpath is None and old_relpath is None:
+                continue
+            members = committed.listings.get(entry["key"]) or await _read_remote_listing(
+                repo_url, entry_identity, hash_info, rev_lock, token, session=gh_session
+            )
+            if members is None:
+                raise exceptions.ListingMissingError(
+                    f"Cannot import {path!r}: remote directory output {identity!r} has no "
+                    + "committed listing file"
+                )
+            for member in members["files"]:
+                full_path = types.identity_key(
+                    types.directory_file_identity(entry_identity, member["relpath"])
+                )
+                available.add(full_path)
+                if member["relpath"] == relpath:
+                    matches.append((stage, path, member["hash"], int(member["size"])))
+                elif member["relpath"] == old_relpath:
+                    renamed = _renamed_message(path, identity, member["relpath"], full_path)
 
     if not matches and renamed is not None:
         raise exceptions.PivotError(renamed)

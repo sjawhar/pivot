@@ -79,9 +79,10 @@ def get_params_from_head(
     )
 
     for stage_name in stage_list:
-        lock_data = lock_data_map.get(stage_name)
-        if lock_data is None:
+        committed = lock_data_map.get(stage_name)
+        if committed is None:
             continue
+        lock_data = committed.data
 
         if "params" not in lock_data:
             continue

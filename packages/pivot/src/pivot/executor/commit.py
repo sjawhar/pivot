@@ -12,7 +12,7 @@ import pathlib
 
 from pivot import config, exceptions, parameters, project, registry, run_history, skip, types
 from pivot.executor import worker
-from pivot.storage import cache, lock
+from pivot.storage import cache, listing, lock
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import ArtifactTag, DeferredWrites, HashInfo, LockData
@@ -95,8 +95,9 @@ def commit_stages(
             )
 
             # 3. Hash deps (pass state_db for hash caching)
+            hashed_dirs = dict[str, listing.HashedDirectory]()
             dep_hashes, missing, unreadable, _ = worker.hash_dependencies(
-                stage_info["deps"], store, stage_db
+                stage_info["deps"], store, stage_db, hashed_dirs=hashed_dirs
             )
             if missing:
                 logger.error(
@@ -164,10 +165,17 @@ def commit_stages(
                         out_path,
                         state_dir=default_state_dir,
                         warn_left_out_symlinks=warn_left_out_symlinks,
+                        hashed_dirs=hashed_dirs,
                     )
                     file_hash_entries.extend(
                         cache.deferred_file_hash_entries(
-                            cache.known_file_hashes(out_path, hash_info)
+                            cache.known_file_hashes(
+                                out_path,
+                                hash_info,
+                                hashed_dirs[hash_info["hash"]]["listing"]
+                                if types.is_dir_hash(hash_info)
+                                else None,
+                            )
                         )
                     )
                     output_hashes_by_key[identity_key] = hash_info
@@ -203,7 +211,12 @@ def commit_stages(
                 output_paths=output_paths_by_identity,
             )
             try:
-                production_lock.write(new_lock_data)
+                production_lock.write(
+                    new_lock_data,
+                    hashed_dirs=hashed_dirs,
+                    input_paths=worker.input_listing_paths(stage_info["deps"], store),
+                    cache_dir=store.cache_dir,
+                )
             except exceptions.InvalidPathError as exc:
                 logger.error("%s — skipping", exc)
                 failed.append(stage_name)

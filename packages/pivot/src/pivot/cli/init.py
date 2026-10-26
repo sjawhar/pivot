@@ -31,6 +31,9 @@ _GITIGNORE_CONTENT = """\
 
 # Key for secret params' digests in lock files; never commit it
 /secret.key
+
+# Keep lock and listing files committed under a root pattern such as `lib/` or `build/`
+!/stages/**
 """
 
 

@@ -8,113 +8,124 @@ from pivot.registry import RegistryStageInfo
 from pivot.remote import storage as remote_storage
 from pivot.remote import sync
 from pivot.storage import cache as cache_mod
-from pivot.storage import lock, store, track
+from pivot.storage import listing, lock, store, track
 from pivot.storage import state as state_mod
-from pivot.types import DirHash, DirManifestEntry, FileHash, LockData, TransferResult
+from pivot.types import DirManifestEntry, FileHash, LockData, TransferResult
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
 
 # =============================================================================
-# Unit tests for _extract_file_hashes_from_hash_info
+# Directory transfer fixtures
 # =============================================================================
 
 
-def test_extract_file_hashes_from_file_hash() -> None:
-    """FileHash returns its hash as the only element."""
-    fh = FileHash(hash="abcdef1234567890")
-    result = sync._extract_file_hashes_from_hash_info(fh)
-    assert result == {"abcdef1234567890"}
-
-
-def test_extract_file_hashes_from_dir_hash_excludes_tree_hash() -> None:
-    """DirHash returns only manifest file hashes, not the tree hash."""
-    dh = DirHash(
-        hash="aaaaaaaaaaaaaaaa",  # tree hash — must be excluded
-        manifest=[
-            DirManifestEntry(relpath="a.csv", hash="1111111111111111", size=100, isexec=False),
-            DirManifestEntry(relpath="b.csv", hash="2222222222222222", size=200, isexec=False),
+def _helper_hashed_directory(file_hashes: list[str]) -> listing.HashedDirectory:
+    """Build a directory record together with the listing its hash names."""
+    members = listing.DirListing(
+        files=[
+            DirManifestEntry(relpath=f"file{i}.csv", hash=file_hash, size=100, isexec=False)
+            for i, file_hash in enumerate(file_hashes)
         ],
+        empty_dirs=[],
     )
-    result = sync._extract_file_hashes_from_hash_info(dh)
-    assert result == {"1111111111111111", "2222222222222222"}
-    assert "aaaaaaaaaaaaaaaa" not in result
-
-
-def test_extract_file_hashes_from_dir_hash_empty_manifest() -> None:
-    """DirHash with empty manifest returns empty set (tree hash excluded)."""
-    dh = DirHash(hash="aaaaaaaaaaaaaaaa", manifest=[])
-    result = sync._extract_file_hashes_from_hash_info(dh)
-    assert result == set()
-
-
-# =============================================================================
-# Integration tests for get_stage_output_hashes / get_stage_dep_hashes
-# =============================================================================
+    data = listing.encode(members)
+    return listing.HashedDirectory(
+        record=listing.record_of(members, data),
+        listing=members,
+        data=data,
+    )
 
 
 def _write_lock_with_dir_output(
     stages_dir: pathlib.Path,
-    stage_name: str,
-    tree_hash: str,
+    identity: types.ArtifactIdentity,
     file_hashes: list[str],
+) -> listing.HashedDirectory:
+    """Write a directory output record and the listing held beside its lock."""
+    hashed = _helper_hashed_directory(file_hashes)
+    lock.StageLock(identity.producer, stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={identity: hashed["record"]},
+        ),
+        hashed_dirs={hashed["record"]["hash"]: hashed},
+    )
+    return hashed
+
+
+def _helper_stage_info() -> RegistryStageInfo:
+    """Return the fields target transfer resolution needs for one stage."""
+    return RegistryStageInfo(  # pyright: ignore[reportCallIssue] - partial for test
+        state_dir=None,
+        outs=[],
+        incremental_inputs={},
+        input_paths={},
+    )
+
+
+# =============================================================================
+# Targeted directory transfer resolution
+# =============================================================================
+
+
+def test_get_target_hashes_directory_output_includes_listing_and_files(
+    set_project_root: pathlib.Path,
 ) -> None:
-    """Helper: write a lock file with a directory output containing a tree hash."""
-    manifest = [
-        DirManifestEntry(relpath=f"file{i}.csv", hash=h, size=100, isexec=False)
-        for i, h in enumerate(file_hashes)
-    ]
-    dir_hash = DirHash(hash=tree_hash, manifest=manifest)
-    lock_data = LockData(
-        code_manifest={},
-        params={},
-        dep_hashes={},
-        output_hashes={types.ArtifactIdentity(stage_name, "output_dir"): dir_hash},
-    )
-    stage_lock = lock.StageLock(stage_name, stages_dir)
-    stage_lock.write(lock_data)
-
-
-def test_get_stage_output_hashes_excludes_tree_hash(set_project_root: pathlib.Path) -> None:
-    """get_stage_output_hashes returns file hashes only, not tree hashes."""
+    """A targeted directory names its listing object and every listed file object."""
     state_dir = set_project_root / ".pivot"
     stages_dir = lock.get_stages_dir(state_dir)
-    stages_dir.mkdir(parents=True, exist_ok=True)
-
-    tree_hash = "aaaaaaaaaaaaaaaa"
     file_hashes = ["1111111111111111", "2222222222222222"]
-    _write_lock_with_dir_output(stages_dir, "my_stage", tree_hash, file_hashes)
+    hashed = _write_lock_with_dir_output(
+        stages_dir, types.ArtifactIdentity("my_stage", "output_dir"), file_hashes
+    )
 
-    result = sync.get_stage_output_hashes(state_dir, ["my_stage"])
+    result = sync.get_target_hashes(
+        ["my_stage"],
+        state_dir,
+        all_stages={"my_stage": _helper_stage_info()},
+        cache_dir=state_dir / "cache",
+    )
 
-    assert "1111111111111111" in result
-    assert "2222222222222222" in result
-    assert tree_hash not in result
+    assert result == {hashed["record"]["hash"], *file_hashes}
 
 
-def test_get_stage_dep_hashes_excludes_tree_hash(set_project_root: pathlib.Path) -> None:
-    """get_stage_dep_hashes returns file hashes only, not tree hashes."""
+def test_get_target_hashes_directory_dependency_includes_listing_and_files(
+    set_project_root: pathlib.Path,
+) -> None:
+    """A target's directory dependency names its listing object and every listed file."""
     state_dir = set_project_root / ".pivot"
     stages_dir = lock.get_stages_dir(state_dir)
-    stages_dir.mkdir(parents=True, exist_ok=True)
+    dep_file_hashes = ["3333333333333333"]
+    dep_identity = types.ArtifactIdentity("upstream", None)
+    dependency = _write_lock_with_dir_output(stages_dir, dep_identity, dep_file_hashes)
 
-    dep_manifest = [
-        DirManifestEntry(relpath="dep.csv", hash="3333333333333333", size=50, isexec=False),
-    ]
-    dep_hash = DirHash(hash="bbbbbbbbbbbbbbbb", manifest=dep_manifest)
-    lock_data = LockData(
-        code_manifest={},
-        params={},
-        dep_hashes={types.ArtifactIdentity("input_dir", None): dep_hash},
-        output_hashes={},
+    output_hash = "4444444444444444"
+    lock.StageLock("my_stage", stages_dir).write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={dep_identity: dependency["record"]},
+            output_hashes={
+                types.ArtifactIdentity("my_stage", None): FileHash(hash=output_hash),
+            },
+        )
     )
-    stage_lock = lock.StageLock("my_stage", stages_dir)
-    stage_lock.write(lock_data)
 
-    result = sync.get_stage_dep_hashes(state_dir, ["my_stage"])
+    result = sync.get_target_hashes(
+        ["my_stage"],
+        state_dir,
+        include_deps=True,
+        all_stages={
+            "my_stage": _helper_stage_info(),
+            "upstream": _helper_stage_info(),
+        },
+        cache_dir=state_dir / "cache",
+    )
 
-    assert "3333333333333333" in result
-    assert "bbbbbbbbbbbbbbbb" not in result
+    assert result == {output_hash, dependency["record"]["hash"], *dep_file_hashes}
 
 
 # =============================================================================
@@ -237,7 +248,7 @@ async def test_push_skips_directory_cache_paths(
     file_cache.parent.mkdir(parents=True)
     file_cache.write_text("file content")
 
-    # Create a directory cache entry (simulating SYMLINK mode tree hash)
+    # Create a directory at a cache key; the cache stores directory trees elsewhere.
     dir_hash = "aaaaaaaaaaaaaaaa"
     dir_cache = files_dir / dir_hash[:2] / dir_hash[2:]
     dir_cache.mkdir(parents=True)

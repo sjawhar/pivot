@@ -1,8 +1,9 @@
 """`pivot import` and `pivot update` against a real local git source repo and a moto S3 remote.
 
-The source repo holds only what a Pivot project commits (``.pivot/config.yaml`` and stage lock
-files); the remote holds the content-addressed files those locks point at. Every command runs
-through the CLI in a separate consumer project.
+The source repo holds only what a Pivot project commits (``.pivot/config.yaml``, stage lock
+files, and the listing of each directory output beside its lock); the remote holds the
+content-addressed files those locks and listings point at. Every command runs through the CLI
+in a separate consumer project.
 """
 
 from __future__ import annotations
@@ -22,11 +23,11 @@ import yaml
 import conftest
 from pivot import cli, project, types
 from pivot.remote import keys
-from pivot.storage import lock, track
+from pivot.storage import listing, lock, track
 
 if TYPE_CHECKING:
     import pathlib
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     import click.testing
 
@@ -82,8 +83,15 @@ class _Source:
     def write_config(self, remote_url: str) -> None:
         self.write(".pivot/config.yaml", yaml.safe_dump({"remotes": {"origin": remote_url}}))
 
-    def write_lock(self, stage_name: str, outputs: Mapping[str | None, types.HashInfo]) -> None:
-        """Write the lock file Pivot records for a stage with these outputs."""
+    def write_lock(
+        self,
+        stage_name: str,
+        outputs: Mapping[str | None, types.HashInfo],
+        *,
+        directories: Sequence[listing.HashedDirectory] = (),
+    ) -> None:
+        """Write the lock file Pivot records for a stage with these outputs, and beside it the
+        listing of each directory output, taken from ``directories``."""
         lock.StageLock(stage_name, lock.get_stages_dir(self.root / ".pivot")).write(
             types.LockData(
                 code_manifest={"self:stage": "0123456789abcdef"},
@@ -93,7 +101,8 @@ class _Source:
                     types.ArtifactIdentity(stage_name, key): hash_info
                     for key, hash_info in outputs.items()
                 },
-            )
+            ),
+            hashed_dirs={directory["record"]["hash"]: directory for directory in directories},
         )
 
     def commit(self, message: str) -> str:
@@ -146,18 +155,28 @@ def _helper_rev_lock(data_path: pathlib.Path) -> str:
     return pvt_data["source"]["rev_lock"]
 
 
+def _helper_directory(bucket: _Bucket, files: Mapping[str, bytes]) -> listing.HashedDirectory:
+    """Upload these files and return the directory that holds them: its lock record and listing."""
+    members = listing.DirListing(
+        files=[
+            types.DirManifestEntry(
+                relpath=relpath, hash=bucket.put(content), size=len(content), isexec=False
+            )
+            for relpath, content in sorted(files.items())
+        ],
+        empty_dirs=[],
+    )
+    data = listing.encode(members)
+    return listing.HashedDirectory(
+        record=listing.record_of(members, data), listing=members, data=data
+    )
+
+
 def _helper_publish_directory(source: _Source, bucket: _Bucket, files: dict[str, bytes]) -> str:
     """Point smoke/images, a return value tagged directory, at these files; commit; return HEAD."""
     source.write_config(bucket.url)
-    manifest = [
-        types.DirManifestEntry(
-            relpath=relpath, hash=bucket.put(content), size=len(content), isexec=False
-        )
-        for relpath, content in sorted(files.items())
-    ]
-    source.write_lock(
-        "smoke/images", {None: types.DirHash(hash="0123456789abcdef", manifest=manifest)}
-    )
+    hashed = _helper_directory(bucket, files)
+    source.write_lock("smoke/images", {None: hashed["record"]}, directories=[hashed])
     return source.commit("directory output")
 
 
@@ -214,24 +233,13 @@ def test_import_file_inside_directory_output(
     artifact: str,
     hint: str,
 ) -> None:
-    """A directory output is imported one file at a time, by the name `pivot list` gives it."""
+    """A directory output is imported one file at a time, by the name `pivot list` gives it;
+    the file is found in the listing the source commits beside the stage's lock."""
     content = b"a,b\n1,2\n"
-    file_hash = bucket.put(content)
     stage_name = artifact.partition(":")[0]
+    hashed = _helper_directory(bucket, {"part/a.csv": content})
     source.write_config(bucket.url)
-    source.write_lock(
-        stage_name,
-        {
-            key: types.DirHash(
-                hash="0123456789abcdef",
-                manifest=[
-                    types.DirManifestEntry(
-                        relpath="part/a.csv", hash=file_hash, size=len(content), isexec=False
-                    )
-                ],
-            )
-        },
-    )
+    source.write_lock(stage_name, {key: hashed["record"]}, directories=[hashed])
     source.commit("directory output")
     directory = types.identity_key(types.ArtifactIdentity(stage_name, key))
 
@@ -272,19 +280,13 @@ def test_import_without_out_writes_a_path_without_a_colon(
 ) -> None:
     """The default path is the artifact's name with `/` for `:`."""
     content = b"a,b\n1,2\n"
-    file_hash = bucket.put(content)
-    output: types.HashInfo = types.FileHash(hash=file_hash)
-    if member is not None:
-        output = types.DirHash(
-            hash="0123456789abcdef",
-            manifest=[
-                types.DirManifestEntry(
-                    relpath=member, hash=file_hash, size=len(content), isexec=False
-                )
-            ],
-        )
+    stage_name = artifact.partition(":")[0]
     source.write_config(bucket.url)
-    source.write_lock(artifact.partition(":")[0], {lock_key: output})
+    if member is None:
+        source.write_lock(stage_name, {lock_key: types.FileHash(hash=bucket.put(content))})
+    else:
+        hashed = _helper_directory(bucket, {member: content})
+        source.write_lock(stage_name, {lock_key: hashed["record"]}, directories=[hashed])
     source.commit("output")
 
     result = runner.invoke(cli.cli, ["import", str(source.root), artifact])
@@ -446,19 +448,11 @@ def test_import_refuses_name_of_two_outputs(
 ) -> None:
     """A lock with field ``images/a.csv`` beside directory field ``images`` names one file twice."""
     source.write_config(bucket.url)
+    images = _helper_directory(bucket, {"a.csv": b"1"})
     source.write_lock(
         "smoke/build",
-        {
-            "images": types.DirHash(
-                hash="0123456789abcdef",
-                manifest=[
-                    types.DirManifestEntry(
-                        relpath="a.csv", hash="1111111111111111", size=1, isexec=False
-                    )
-                ],
-            ),
-            "images/a.csv": types.FileHash(hash="2222222222222222"),
-        },
+        {"images": images["record"], "images/a.csv": types.FileHash(hash="2222222222222222")},
+        directories=[images],
     )
     source.commit("colliding identities")
 

@@ -26,8 +26,8 @@ import pytest
 import xxhash
 import yaml
 
-from pivot import loaders
-from pivot.storage import cache
+from pivot import loaders, types
+from pivot.storage import cache, listing
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -70,6 +70,26 @@ def _ok(proc: subprocess.CompletedProcess[str]) -> str:
     out = proc.stdout + proc.stderr
     assert proc.returncode == 0, out
     return out
+
+
+def _helper_output_listing(
+    root: pathlib.Path, stage: str, key: str | None = None
+) -> listing.DirListing:
+    """The committed listing of ``stage``'s directory output ``key``, read from the file beside
+    its lock (never the cache) and checked against the hash, size and file count the lock
+    records."""
+    stages = root / ".pivot" / "stages"
+    lock_data = yaml.safe_load((stages / f"{stage}.lock").read_text())
+    (out,) = [entry for entry in lock_data["outs"] if entry["key"] == key]
+    record = types.DirHash(hash=out["hash"], size=out["size"], nfiles=out["nfiles"])
+    return listing.read(stages / f"{stage}={key or ''}.listing", record, None)
+
+
+def _helper_tracked_listing(root: pathlib.Path, rel_path: str) -> listing.DirListing:
+    """The committed ``<path>.pvt.listing`` of a tracked directory, checked against its .pvt."""
+    pvt = yaml.safe_load((root / f"{rel_path}.pvt").read_text())
+    record = types.DirHash(hash=pvt["hash"], size=pvt["size"], nfiles=pvt["nfiles"])
+    return listing.read(root / f"{rel_path}.pvt.listing", record, None)
 
 
 # A raw input and a metric dependency are both local; neither is ever in the remote.
@@ -170,10 +190,8 @@ def test_repro_warns_about_a_symlink_left_out_of_a_directory_artifact(
         + "replace it with a real file or directory"
     )
     assert warning in " ".join(out.split()), out
-    lock_data = yaml.safe_load(
-        (root / ".pivot" / "stages" / "directory" / "assemble.lock").read_text()
-    )
-    assert [entry["relpath"] for entry in lock_data["outs"][0]["manifest"]] == ["target.txt"]
+    members = _helper_output_listing(root, "directory/assemble")
+    assert [entry["relpath"] for entry in members["files"]] == ["target.txt"]
 
     shutil.rmtree(output)
     assert "0 ran, 1 cached" in _ok(_pivot(root, "repro"))
@@ -195,8 +213,8 @@ def test_track_warns_about_a_symlink_left_out_of_a_tracked_directory(
         + "(a symlink inside a directory artifact is not stored); "
         + "replace it with a real file or directory"
     ) in " ".join(out.split()), out
-    pvt = yaml.safe_load((root / "data" / "tracked.pvt").read_text())
-    assert [entry["relpath"] for entry in pvt["manifest"]] == ["keep.txt"]
+    members = _helper_tracked_listing(root, "data/tracked")
+    assert [entry["relpath"] for entry in members["files"]] == ["keep.txt"]
 
 
 def test_quiet_track_and_commit_do_not_print_the_left_out_symlink_warning(
@@ -495,26 +513,31 @@ def test_runtime_files_pivot_creates_are_git_ignored(tmp_path: pathlib.Path) -> 
 def test_stage_locks_of_pipelines_named_like_runtime_dirs_stay_committable(
     tmp_path: pathlib.Path,
 ) -> None:
-    """`.pivot/.gitignore` entries are anchored: a pipeline named `cache` or `locks` keeps its locks."""
+    """`.pivot/.gitignore` entries are anchored: a pipeline named `cache` or `locks` keeps its
+    lock and listing files."""
     root = _project(tmp_path, {})
-    lock_files = [
+    committed = [
         ".pivot/stages/cache/train.lock",
+        ".pivot/stages/cache/train=.listing",
         ".pivot/stages/locks/train.lock",
+        ".pivot/stages/locks/train=.listing",
         ".pivot/stages/state.lmdb/train.lock",
+        ".pivot/stages/state.lmdb/train=.listing",
     ]
-    for rel in lock_files:
+    for rel in committed:
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
         (root / rel).write_text("{}")
 
+    # Without --verbose: with it, git counts a match of the `!/stages/**` negation as ignored.
     check = subprocess.run(
-        ["git", "check-ignore", "--verbose", *lock_files],
+        ["git", "check-ignore", *committed],
         cwd=root,
         capture_output=True,
         text=True,
         check=False,
     )
 
-    assert check.returncode == 1, f"lock files ignored:\n{check.stdout}"
+    assert check.returncode == 1, f"files ignored:\n{check.stdout}"
 
 
 _METRIC_ONLY_PIPELINE = """\
@@ -1093,16 +1116,15 @@ def test_pull_keeps_cache_derived_directory_file_symlinks_as_artifact_members(
     }
     assert {relpath: (output / relpath).read_text() for relpath in expected} == expected
     assert all((output / relpath).is_symlink() for relpath in expected)
-    lock_data = yaml.safe_load((clone / ".pivot" / "stages" / "dir" / "assemble.lock").read_text())
-    assert len(lock_data["outs"][0]["manifest"]) == len(expected)
+    members = _helper_output_listing(clone, "dir/assemble")
+    assert sorted(entry["relpath"] for entry in members["files"]) == sorted(expected)
 
     assert "1 cached" in _ok(_pivot(clone, "status", env=env))
     assert "0 ran, 1 cached" in _ok(_pivot(clone, "repro", env=env))
     assert "Verification passed" in _ok(_pivot(clone, "verify", env=env))
     assert "leaves out symlink" not in _ok(_pivot(clone, "commit", "dir/assemble", env=env))
 
-    lock_data = yaml.safe_load((clone / ".pivot" / "stages" / "dir" / "assemble.lock").read_text())
-    assert len(lock_data["outs"][0]["manifest"]) == len(expected)
+    assert _helper_output_listing(clone, "dir/assemble") == members
     assert "1 cached" in _ok(_pivot(clone, "status", env=env))
 
 
@@ -1177,6 +1199,9 @@ def test_pull_restores_empty_dirs_of_directory_output(
     tree = pathlib.Path("data", "empty", "make", "tree.dat")
     packed = pathlib.Path("data", "empty", "pack.json")
     assert sorted(p.name for p in (src / tree).iterdir()) == ["bundle", "keep.txt", "logs"]
+    members = _helper_output_listing(src, "empty/make", "tree")
+    assert [entry["relpath"] for entry in members["files"]] == ["keep.txt"]
+    assert members["empty_dirs"] == ["bundle/classifier_source", "logs"]
 
     clone = tmp_path / "clone"
     subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
@@ -1192,68 +1217,67 @@ def test_pull_restores_empty_dirs_of_directory_output(
 
 
 def _helper_rewrite_lock_as_pivot_033(
-    lock_path: pathlib.Path, tree: pathlib.Path, scratch: pathlib.Path
+    lock_path: pathlib.Path, files: list[types.DirManifestEntry]
 ) -> int:
-    """Rewrite every directory hash of ``tree`` in a lock the way pivot before 0.3.4 recorded
-    it: the hash of its files alone (a copy of them without the empty directories), with no
-    ``empty_dirs``. Return how many entries changed."""
-    files_only = scratch / "files-only"
-    shutil.copytree(tree, files_only)
-    for directory in sorted(files_only.rglob("*"), reverse=True):
-        if directory.is_dir() and not any(directory.iterdir()):
-            directory.rmdir()
-    old = cache.hash_directory(files_only)
-    assert "empty_dirs" not in old
+    """Rewrite a lock the way pivot 0.3.3 wrote it: schema version 2, and each directory entry
+    listing ``files`` inline, without the empty directories, under the hash 0.3.3 gave them
+    (the xxhash64 of their sorted-key compact JSON). Return how many entries changed."""
+    old_hash = xxhash.xxh64(
+        json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     data = yaml.safe_load(lock_path.read_text())
+    data["schema_version"] = 2
     changed = 0
     for entry in [*data["deps"], *data["outs"]]:
-        if "empty_dirs" not in entry:
+        if "nfiles" not in entry:
             continue
-        assert entry["manifest"] == old["manifest"]
-        entry["hash"] = old["hash"]
-        del entry["empty_dirs"]
+        del entry["size"], entry["nfiles"]
+        entry["hash"] = old_hash
+        entry["manifest"] = [dict(file) for file in files]
         changed += 1
     lock_path.write_text(yaml.safe_dump(data, sort_keys=False))
     return changed
 
 
 @pytest.mark.parametrize("state", ["run-cache-kept", "state-cleared"])
-def test_repro_keeps_empty_dirs_a_pivot_033_lock_does_not_record(
+def test_repro_rebuilds_a_pivot_033_lock_and_keeps_the_empty_dirs_it_did_not_record(
     tmp_path: pathlib.Path, state: str
 ) -> None:
-    """A directory output whose lock pivot before 0.3.4 wrote, and whose tree on disk holds
-    empty directories that lock cannot record, is not restored to the lock, which would delete
-    the directories while every stage stayed cached. The stage runs (or takes its outputs from
-    a run-cache entry that records the directories), both locks come back byte for byte as a
-    fresh build writes them, and the consumer reads the tree a fresh build makes."""
+    """A directory output whose lock pivot 0.3.3 wrote lists only its files, while its tree on
+    disk holds empty directories. Pivot warns that each such lock is from an older pivot and
+    reads it as missing, so no stage stays cached on it and no restore deletes the directories.
+    The stage runs (or takes its outputs from a run-cache entry that records the directories),
+    both locks and the committed listing come back byte for byte as a fresh build writes them,
+    and the consumer reads the tree a fresh build makes."""
     (tmp_path / "project").mkdir()
     root = _project(tmp_path / "project", {"pipeline.py": _EMPTY_DIRS_PIPELINE})
     _ok(_pivot(root, "repro"))
     tree = root / "data" / "empty" / "make" / "tree.dat"
     packed = (root / "data" / "empty" / "pack.json").read_text()
     stages = root / ".pivot" / "stages" / "empty"
-    fresh_locks = {name: (stages / name).read_bytes() for name in ("make.lock", "pack.lock")}
-    scratch = tmp_path / "scratch"
-    assert _helper_rewrite_lock_as_pivot_033(stages / "make.lock", tree, scratch / "make") == 1
-    assert _helper_rewrite_lock_as_pivot_033(stages / "pack.lock", tree, scratch / "pack") == 1
+    committed = ("make.lock", "pack.lock", "make=tree.listing")
+    fresh = {name: (stages / name).read_bytes() for name in committed}
+    members = _helper_output_listing(root, "empty/make", "tree")
+    assert members["empty_dirs"] == ["bundle/classifier_source", "logs"]
+    assert _helper_rewrite_lock_as_pivot_033(stages / "make.lock", members["files"]) == 1
+    assert _helper_rewrite_lock_as_pivot_033(stages / "pack.lock", members["files"]) == 1
+    (stages / "make=tree.listing").unlink()  # pivot 0.3.3 wrote no listing file
     if state == "state-cleared":
         shutil.rmtree(root / ".pivot" / "state.lmdb")
 
     status_proc = _pivot(root, "status", "--explain", "--json")
     _ok(status_proc)
-    status = json.loads(status_proc.stdout)
-    make = next(s for s in status["stages"] if s["name"] == "empty/make")
-    assert make["status"] == "stale"
-    assert make["reason"].startswith("Output holds empty directories its lock does not record")
+    status = {s["name"]: s["status"] for s in json.loads(status_proc.stdout)["stages"]}
+    assert status == {"empty/make": "stale", "empty/pack": "stale"}, status
+    warning = "was written by an older pivot; pivot reads it as missing"
+    assert " ".join(status_proc.stderr.split()).count(warning) == 2, status_proc.stderr
 
     _ok(_pivot(root, "repro"))
 
     assert (tree / "bundle" / "classifier_source").is_dir()
     assert (tree / "logs").is_dir()
     assert (root / "data" / "empty" / "pack.json").read_text() == packed
-    assert {name: (stages / name).read_bytes() for name in fresh_locks} == fresh_locks
-    make_out = yaml.safe_load((stages / "make.lock").read_text())["outs"][0]
-    assert make_out["empty_dirs"] == ["bundle/classifier_source", "logs"]
+    assert {name: (stages / name).read_bytes() for name in committed} == fresh
     assert "0 ran, 2 cached" in _ok(_pivot(root, "repro"))
 
 
@@ -1268,8 +1292,8 @@ def test_tracked_directory_checked_out_as_symlinks_stays_clean(tmp_path: pathlib
     assert "1 clean" in _ok(_pivot(root, "status", "--tracked-only"))
     assert "leaves out symlink" not in _ok(_pivot(root, "track", "--force", "data/tracked"))
 
-    pvt = yaml.safe_load((root / "data" / "tracked.pvt").read_text())
-    assert sorted(entry["relpath"] for entry in pvt["manifest"]) == ["keep.txt", "nested/f.txt"]
+    members = _helper_tracked_listing(root, "data/tracked")
+    assert sorted(entry["relpath"] for entry in members["files"]) == ["keep.txt", "nested/f.txt"]
 
 
 def test_only_links_into_the_configured_cache_count_as_directory_content(
@@ -1298,8 +1322,9 @@ def test_only_links_into_the_configured_cache_count_as_directory_content(
         out.split()
     ), out
     pvt_path = root / "data" / "tracked.pvt"
-    manifest = yaml.safe_load(pvt_path.read_text())["manifest"]
-    assert sorted(entry["relpath"] for entry in manifest) == ["keep.txt", "nested/f.txt"]
+    pvt = pvt_path.read_text()
+    members = _helper_tracked_listing(root, "data/tracked")
+    assert sorted(entry["relpath"] for entry in members["files"]) == ["keep.txt", "nested/f.txt"]
 
     # A real symlink checkout through the symlinked custom cache root is still content.
     shutil.rmtree(tracked)
@@ -1308,7 +1333,8 @@ def test_only_links_into_the_configured_cache_count_as_directory_content(
     assert "1 clean" in _ok(_pivot(root, "status", "--tracked-only"))
     _ok(_pivot(root, "checkout", "data/tracked"))  # existing links match: skipped, not an error
     assert "leaves out symlink" not in _ok(_pivot(root, "track", "--force", "data/tracked"))
-    assert yaml.safe_load(pvt_path.read_text())["manifest"] == manifest
+    assert pvt_path.read_text() == pvt
+    assert _helper_tracked_listing(root, "data/tracked") == members
 
 
 _PARAM_PIPELINE = """\
@@ -2316,10 +2342,10 @@ def test_checkout_counts_the_files_it_restores(tmp_path: pathlib.Path) -> None:
     assert "Skipped 4 file(s) (already exist)" in skipped, skipped
 
 
-def _helper_drop_cached_file(root: pathlib.Path, lock_path: str, relpath: str) -> None:
+def _helper_drop_cached_file(root: pathlib.Path, stage: str, relpath: str) -> None:
     """Delete the cache blob of one file of a directory output."""
-    lock_data = yaml.safe_load((root / ".pivot" / "stages" / lock_path).read_text())
-    (entry,) = [e for e in lock_data["outs"][0]["manifest"] if e["relpath"] == relpath]
+    members = _helper_output_listing(root, stage)["files"]
+    (entry,) = [e for e in members if e["relpath"] == relpath]
     (root / ".pivot" / "cache" / "files" / entry["hash"][:2] / entry["hash"][2:]).unlink()
 
 
@@ -2330,7 +2356,7 @@ def test_checkout_counts_the_files_of_a_missing_directory_output(tmp_path: pathl
     _ok(_pivot(root, "track", "notes.txt"))
     shutil.rmtree(root / "data" / "n" / "split")
     for relpath in ("a.txt", "b.txt", "sub/c.txt"):
-        _helper_drop_cached_file(root, "n/split.lock", relpath)
+        _helper_drop_cached_file(root, "n/split", relpath)
 
     proc = _pivot(root, "checkout")
 
@@ -2347,7 +2373,7 @@ def test_checkout_only_missing_counts_present_files_when_a_blob_is_gone(
     root = _project(tmp_path, {"pipeline.py": _THREE_FILES_PIPELINE})
     _ok(_pivot(root, "repro"))
     (root / "data" / "n" / "split" / "a.txt").unlink()
-    _helper_drop_cached_file(root, "n/split.lock", "a.txt")
+    _helper_drop_cached_file(root, "n/split", "a.txt")
 
     proc = _pivot(root, "checkout", "--only-missing")
 
@@ -2786,10 +2812,25 @@ def test_diff_names_a_fix_that_compares_the_entry_without_touching_the_workspace
     assert workspace_after == workspace_before
 
 
-def test_diff_rejects_manifest_path_traversal_before_reading_outside_project(
+def _helper_commit_output_listing(
+    root: pathlib.Path, stage: str, data: bytes, *, size: int, nfiles: int
+) -> None:
+    """Replace the committed listing of ``stage``'s directory output with ``data``, point its
+    lock's record at it (hash, size and file count) and commit both, as a hostile commit would."""
+    stages = root / ".pivot" / "stages"
+    (stages / f"{stage}=.listing").write_bytes(data)
+    lock_path = stages / f"{stage}.lock"
+    lock_data = yaml.safe_load(lock_path.read_text())
+    lock_data["outs"][0].update(hash=xxhash.xxh64(data).hexdigest(), size=size, nfiles=nfiles)
+    lock_path.write_text(yaml.safe_dump(lock_data, sort_keys=False))
+    _commit(root, "hostile listing")
+
+
+def test_diff_rejects_listing_path_traversal_before_reading_outside_project(
     tmp_path: pathlib.Path,
 ) -> None:
-    """`pivot diff` refuses a committed directory manifest path outside its project."""
+    """`pivot diff` refuses a committed directory listing whose path leaves the project, naming
+    the listing file and line, and never reads the file that path names."""
     root = _project(
         tmp_path,
         {
@@ -2802,20 +2843,10 @@ def test_diff_rejects_manifest_path_traversal_before_reading_outside_project(
 
     secret = tmp_path.parent / f"{tmp_path.name}-secret.csv"
     secret.write_text("TOP_SECRET_VALUE\n1\n")
-    malicious_relpath = f"../../../../{secret.name}"
+    size = secret.stat().st_size
     try:
-        lock_path = root / ".pivot" / "stages" / "d" / "split.lock"
-        lock_data = yaml.safe_load(lock_path.read_text())
-        lock_data["outs"][0]["manifest"] = [
-            {
-                "relpath": malicious_relpath,
-                "hash": "a" * 16,
-                "size": secret.stat().st_size,
-                "isexec": False,
-            }
-        ]
-        lock_path.write_text(yaml.safe_dump(lock_data, sort_keys=False))
-        _commit(root, "malicious lock")
+        line = f"{'a' * 16} {size} - ../../../../{secret.name}\n"
+        _helper_commit_output_listing(root, "d/split", line.encode(), size=size, nfiles=1)
 
         result = _pivot(root, "diff", "--json", "d/split")
     finally:
@@ -2823,13 +2854,13 @@ def test_diff_rejects_manifest_path_traversal_before_reading_outside_project(
 
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
-    assert ".pivot/stages/d/split.lock" in output
-    assert malicious_relpath in output
+    assert ".pivot/stages/d/split=.listing" in output, output
+    assert "line 1: an empty, '.' or '..' segment" in " ".join(output.split()), output
     assert "TOP_SECRET_VALUE" not in output
 
 
-def test_diff_refuses_a_manifest_path_with_a_null_byte(tmp_path: pathlib.Path) -> None:
-    """`pivot diff` names and refuses a committed manifest path containing a null byte."""
+def test_diff_refuses_a_listing_path_with_a_null_byte(tmp_path: pathlib.Path) -> None:
+    """`pivot diff` names and refuses a committed listing path containing a null byte."""
     root = _project(
         tmp_path,
         {
@@ -2840,20 +2871,15 @@ def test_diff_refuses_a_manifest_path_with_a_null_byte(tmp_path: pathlib.Path) -
     _ok(_pivot(root, "repro"))
     _commit(root, "first run")
 
-    lock_path = root / ".pivot" / "stages" / "d" / "split.lock"
-    lock_data = yaml.safe_load(lock_path.read_text())
-    lock_data["outs"][0]["manifest"] = [
-        {"relpath": "nul\0.csv", "hash": "a" * 16, "size": 20, "isexec": False}
-    ]
-    lock_path.write_text(yaml.safe_dump(lock_data, sort_keys=False))
-    _commit(root, "malicious lock")
+    line = f'{"a" * 16} 20 - "nul\\000.csv"\n'
+    _helper_commit_output_listing(root, "d/split", line.encode(), size=20, nfiles=1)
 
     result = _pivot(root, "diff", "--json", "d/split")
 
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
-    assert ".pivot/stages/d/split.lock" in output
-    assert "not a project-relative POSIX path" in output
+    assert ".pivot/stages/d/split=.listing" in output, output
+    assert "line 1: a NUL byte" in " ".join(output.split()), output
 
 
 _RECORDED_NAME_DIRECTORY_PIPELINE = """\
@@ -2914,9 +2940,8 @@ def _run_recorded_name_project(
     first = _ok(_pivot(root, "repro"))
     lock_data = yaml.safe_load((root / ".pivot" / "stages" / "d" / "make.lock").read_text())
     assert lock_data["outs"][0]["path"] == output
-    assert sorted(entry["relpath"] for entry in lock_data["outs"][0]["manifest"]) == sorted(
-        ["plain.csv", name]
-    )
+    members = _helper_output_listing(root, "d/make")
+    assert sorted(entry["relpath"] for entry in members["files"]) == sorted(["plain.csv", name])
     status = _ok(_pivot(root, "status"))
     assert "1 stages: 1 cached, 0 stale" in status, status
     _commit(root, "first run")
@@ -3016,7 +3041,7 @@ def test_a_member_name_with_a_backslash_fails_the_stage_and_records_nothing(
     tmp_path: pathlib.Path,
 ) -> None:
     """A lock never records a name its read refuses: a backslash fails the run and `pivot
-    commit`, naming the file, and writes no lock."""
+    commit`, naming the file, and writes no lock or listing."""
     root = _project(
         tmp_path,
         {
@@ -3025,6 +3050,7 @@ def test_a_member_name_with_a_backslash_fails_the_stage_and_records_nothing(
         },
     )
     lock_path = root / ".pivot" / "stages" / "d" / "make.lock"
+    listing_path = root / ".pivot" / "stages" / "d" / "make=.listing"
     refusal = (
         "Stage 'd/make' cannot record 'data/d/make.dat/b\\\\s.csv': it contains a backslash; "
         + "rename it"
@@ -3034,12 +3060,14 @@ def test_a_member_name_with_a_backslash_fails_the_stage_and_records_nothing(
     assert run.returncode == 1, run.stdout + run.stderr
     assert refusal in " ".join((run.stdout + run.stderr).split()), run.stdout + run.stderr
     assert not lock_path.exists()
+    assert not listing_path.exists()
 
     _ok(_pivot(root, "repro", "--no-commit"))
     commit = _pivot(root, "commit", "d/make")
     assert commit.returncode == 1, commit.stdout + commit.stderr
     assert f"{refusal} — skipping" in " ".join(commit.stderr.split()), commit.stderr
     assert not lock_path.exists()
+    assert not listing_path.exists()
 
 
 _EXTERNAL_CACHE_DIFF_PIPELINE = """\
@@ -3527,7 +3555,7 @@ def test_checkout_takes_an_absolute_target_typed_through_a_symlink_to_the_projec
 @pytest.mark.parametrize(
     ("command", "line"),
     [
-        ("push", "Would push 2 file(s) to 'origin'"),
+        ("push", "Would push 3 file(s) to 'origin'"),
         ("fetch", "Would fetch 2 file(s) from 'origin'"),
         ("pull", "Would pull 2 file(s) from 'origin'"),
     ],
@@ -3543,7 +3571,8 @@ def test_remote_commands_take_an_absolute_target_typed_through_a_symlink_to_the_
     _ok(_pivot(root, "repro"))
     _ok(_pivot(root, "config", "set", "remotes.origin", "s3://unused-bucket/cache"))
     _ok(_pivot(root, "config", "set", "default_remote", "origin"))
-    # With the local cache gone, fetch and pull have both of the output's files to name.
+    # Push names the directory's listing object and both of its files. With the local cache
+    # gone, fetch and pull name both files: the listing is stored again from its committed file.
     shutil.rmtree(root / ".pivot" / "cache" / "files")
     env = _env(AWS_ENDPOINT_URL="http://127.0.0.1:9", AWS_DEFAULT_REGION="us-east-1")
 

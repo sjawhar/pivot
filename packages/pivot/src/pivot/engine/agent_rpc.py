@@ -350,14 +350,22 @@ class AgentRpcHandler:
                     locks = explain_mod.read_locks(
                         [stage, *producers], all_stages, config_io.get_state_dir()
                     )
-                    producer_hashes = explain_mod.producer_output_hashes(
-                        locks[producer] for producer in producers
-                    )
                     store = store_mod.WorkspaceStore(
                         project_root=project.get_project_root(),
                         pipeline_name=pipeline.name,
                         input_bindings=pipeline.input_bindings,
                         cache_dir=config_io.get_cache_dir() / "files",
+                    )
+                    producer_hashes = explain_mod.producer_output_hashes(
+                        {producer: locks[producer] for producer in producers},
+                        reg_info["deps"].values(),
+                        {
+                            producer: explain_mod.stages_dir(
+                                all_stages[producer], config_io.get_state_dir()
+                            )
+                            for producer in producers
+                        },
+                        store.cache_dir,
                     )
                     return explain_mod.get_stage_explanation(
                         stage_name=stage,
