@@ -6,7 +6,6 @@ showing specific code, param, and dependency changes.
 
 from __future__ import annotations
 
-import contextlib
 import pathlib
 from typing import TYPE_CHECKING
 
@@ -18,6 +17,7 @@ from pivot.storage import lock, state, track
 from pivot.storage import store as store_mod
 from pivot.types import (
     ArtifactIdentity,
+    FileHashEntry,
     HashInfo,
     LockData,
     StageExplanation,
@@ -144,11 +144,6 @@ def _find_tracked_hash(
     return None  # Path not found in manifest
 
 
-def _state_db_exists(state_dir: pathlib.Path) -> bool:
-    """Return True when the LMDB directory already exists."""
-    return (state_dir / "state.lmdb").exists()
-
-
 def get_stage_explanation(
     stage_name: str,
     fingerprint: dict[str, str],
@@ -165,6 +160,7 @@ def get_stage_explanation(
     tracked_files: dict[str, track.PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
     producer_hashes: dict[ArtifactIdentity, HashInfo] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run.
 
@@ -172,6 +168,10 @@ def get_stage_explanation(
     not run). A stage is stale when repro will rewrite its lock by running it or restoring
     from the run cache; it is cached when its lock already matches and repro at most
     restores outputs.
+
+    The explanation reads the state database and writes nothing. ``file_hash_entries``, when
+    given, receives the file-hash entry of every file whose content it read, for the caller
+    to save with ``state.write_back_file_hashes``.
     """
     if lock_data is None:
         return StageExplanation(
@@ -201,19 +201,16 @@ def get_stage_explanation(
             upstream_stale=[],
         )
 
-    state_context: contextlib.AbstractContextManager[state.StateDB | None]
-    if _state_db_exists(state_dir):
-        state_context = state.StateDB(state_dir, readonly=True)
-    else:
-        state_context = contextlib.nullcontext(None)
-    with state_context as state_db:
+    with state.open_readonly(state_dir, create=False) as state_db:
         known_hashes = producer_hashes or {}
         pending_deps = {name: ref for name, ref in deps.items() if ref.identity not in known_hashes}
-        str_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(
+        str_hashes, missing_deps, unreadable_deps, dep_entries = worker.hash_dependencies(
             pending_deps,
             store,
             state_db,
         )
+        if file_hash_entries is not None:
+            file_hash_entries.extend(dep_entries)
         dep_hashes = _to_identity_keyed(str_hashes)
         for ref in deps.values():
             if ref.identity in known_hashes:
@@ -282,6 +279,7 @@ def get_stage_explanation(
                 state_dir=state_dir,
                 restore=False,
                 report_changes=True,
+                file_hash_entries=file_hash_entries,
             )
             unavailable = restoration.unavailable
             empty_dirs_unrecorded = restoration.empty_dirs_unrecorded

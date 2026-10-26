@@ -50,7 +50,7 @@ Documented learnings from bugs, design decisions, and implementation patterns. C
 |----------|------|---------|
 | [Atomic Writes: Track FD Closure](2026-02-01-atomic-writes-track-fd-closure.md) | 2026-02-01 | File descriptor leak with mkstemp() atomic writes |
 | [LMDB: Extend StateDB with Prefixes](2026-02-01-lmdb-extend-with-prefixes.md) | 2026-02-01 | Consolidate state into LMDB with key prefixes |
-| [StateDB Key Strategies](2026-02-01-statedb-path-strategies.md) | 2026-02-01 | The absolute path for file hashes (the stat in the entry decides), the artifact identity for generations |
+| [StateDB Key Strategies](2026-02-01-statedb-path-strategies.md) | 2026-02-01 | The absolute path for file hashes (the stat in the entry decides), an identity index for replicas, the artifact identity for generations |
 | [Incremental outputs restore with COPY mode](2026-02-01-incremental-out-uses-copy-mode.md) | 2026-02-01 | COPY mode prevents cache corruption for incremental outputs |
 
 ## Architecture & Design

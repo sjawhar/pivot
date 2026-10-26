@@ -11,6 +11,9 @@ class MapFullError(Error):
 class BadValsizeError(Error):
     """Raised when a key or value is too large."""
 
+class ReadonlyError(Error):
+    """Raised when the environment or its files cannot be written (EACCES)."""
+
 class Cursor:
     """LMDB cursor for iterating over key-value pairs."""
 
@@ -30,6 +33,7 @@ class Environment:
     def close(self) -> None: ...
     def stat(self) -> dict[str, int]: ...
     def info(self) -> dict[str, int]: ...
+    def flags(self) -> dict[str, bool]: ...
 
 class Transaction:
     """LMDB transaction."""

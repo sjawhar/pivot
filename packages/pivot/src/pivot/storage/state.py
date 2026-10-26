@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import logging
 import os
@@ -22,10 +23,11 @@ if TYPE_CHECKING:
 
     from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
-    from pivot.types import DeferredWrites
+    from pivot.types import DeferredWrites, FileHashEntry
 
 # Key prefixes for different entry types
 _HASH_PREFIX = b"hash:"  # File hash entries
+_INODE_PREFIX = b"inode:"  # File identity (st_dev, st_ino) -> its latest hash: key
 _GEN_PREFIX = b"gen:"  # Output generation counters (identity-based)
 _DEP_PREFIX = b"dep:"  # Stage dependency generations (identity-based)
 _REMOTE_PREFIX = b"remote:"  # Remote index entries
@@ -45,6 +47,9 @@ _MAX_KEY_SIZE = 511
 _DB_FULL_MSG = (
     f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
 )
+
+# How long a best-effort write-back waits for another process's write lock
+_WRITE_BACK_TIMEOUT = 2.0
 
 
 class _SharedEnv(typing.TypedDict):
@@ -122,8 +127,28 @@ _inherited_env_paths = set[pathlib.Path]()
 
 
 def _open_env(lmdb_path: pathlib.Path) -> lmdb.Environment:
-    """Open a writable environment shared by readonly and writable StateDBs."""
-    return lmdb.open(str(lmdb_path), map_size=_MAP_SIZE, max_spare_txns=0)
+    """Open the environment shared by readonly and writable StateDBs.
+
+    It is writable when the database's files are. A database whose data file this process
+    cannot write is opened read-only, with LMDB's lock file, so its readers stay registered
+    against any writer; ``StateDB`` refuses it to a writer. A lock file this process cannot
+    write as well (another user's database, a read-only filesystem) raises PermissionError:
+    LMDB would open without it there, and a reader no writer can see is not protected from
+    one, so the caller reads files instead (``open_readonly``). Any other failure (a damaged
+    or missing database) raises as LMDB reports it.
+    """
+    try:
+        return lmdb.open(str(lmdb_path), map_size=_MAP_SIZE, max_spare_txns=0)
+    except lmdb.Error:
+        data_path = lmdb_path / "data.mdb"
+        if not data_path.is_file() or os.access(data_path, os.W_OK):
+            raise
+        lock_path = lmdb_path / "lock.mdb"
+        if not os.access(lock_path, os.W_OK):
+            raise PermissionError(
+                errno.EACCES, "state database lock file is not writable", str(lock_path)
+            ) from None
+        return lmdb.open(str(lmdb_path), map_size=_MAP_SIZE, max_spare_txns=0, readonly=True)
 
 
 def _env_identity(lmdb_path: pathlib.Path) -> tuple[int, int, int, int] | None:
@@ -234,7 +259,7 @@ class DatabaseFullError(StateDBError):
     """Raised when the state database reaches its size limit."""
 
 
-def _make_key_file_hash(path: pathlib.Path) -> bytes:
+def _make_key_file_hash(path: str | os.PathLike[str]) -> bytes:
     """Create the LMDB key for a file-hash entry: the absolute path as given, as bytes.
 
     Symlinks are not followed: the entry's value holds the (mtime_ns, size, device, inode) of
@@ -244,6 +269,91 @@ def _make_key_file_hash(path: pathlib.Path) -> bytes:
     Contrast with _make_key_output_generation(), which keys an artifact identity.
     """
     return _HASH_PREFIX + os.fsencode(os.path.abspath(path))
+
+
+def _make_key_file_identity(dev: int, inode: int) -> bytes:
+    """Create the key of the identity index: a file's device and inode number.
+
+    A file-hash entry is keyed by the path the file was read at, so a replica of a project
+    (`cp -al`, or a copy that hard-links pivot's read-only outputs) finds no entry for its own
+    paths, though its files are the very inodes the copied entries describe. The index maps
+    each inode to the key of the file-hash entry last written for it (a hint for one path per
+    inode), and a lookup that misses by path follows it.
+
+    The identity lookup is never weaker than the path lookup. It serves another path's entry
+    only when (1) that entry matches this file's stat exactly as a path lookup there would
+    (mtime_ns, size, device, inode) and (2) that path, stat'ed now, still names this file's
+    device and inode. A path lookup at that path would then serve the same hash, and the two
+    paths name one inode, so one content. In particular:
+
+    - A hard link (`cp -al`, `os.link`) is the same inode: served without reading it.
+    - A copy is a new inode, with no index entry: read, as before.
+    - Inode reuse: once a recorded file is deleted, the filesystem may give its number to a
+      new file, and a copy that keeps mtimes (`cp -a`, `rsync -a`, `shutil.copy2`) can give
+      that file the recorded size and mtime as well. The recorded path then names nothing,
+      or another inode, so (2) refuses it.
+    - Another filesystem: the device is part of the key, of the entry and of check (2).
+    - A bind mount shows one filesystem, with one device number, at two places, so its two
+      paths are two links to one inode: served while the recorded path still names it.
+
+    The index is only a hint: an index entry that is stale or wrong fails (1) or (2) and
+    serves nothing. Check (2) is a ``stat``, never a read of the file.
+    """
+    return _INODE_PREFIX + struct.pack(">QQ", dev, inode)
+
+
+def _put_file_hashes(txn: lmdb.Transaction, entries: Iterable[FileHashEntry]) -> None:
+    """Write file-hash entries, then point the identity index at each.
+
+    The index entries are written after all the hash entries, so in a large write the pages
+    of each lie together in the file, and a status whose lookups all hit by path reads no
+    index page from disk. An entry this cache cannot hold is left out: a key too long for
+    LMDB, or an mtime before 1970, which the unsigned field cannot store. The cache only saves
+    a later read, so neither may fail the caller. When a path's previous entry named another
+    inode, that inode's index entry is deleted if it still points there, so the index never
+    outgrows the entries.
+    """
+    index = list[tuple[bytes, bytes]]()
+    for path, mtime_ns, size, dev, inode, hash_hex in entries:
+        key = _make_key_file_hash(path)
+        if len(key) > _MAX_KEY_SIZE:
+            logger.debug("Not caching the hash of %s: path too long", path)
+            continue
+        if mtime_ns < 0:
+            logger.debug("Not caching the hash of %s: mtime before 1970", path)
+            continue
+        previous = txn.get(key)
+        if previous is not None and len(previous) >= _FILE_HASH_STAT.size:
+            _, _, old_dev, old_inode, _ = _unpack_value(previous)
+            old_index = _make_key_file_identity(old_dev, old_inode)
+            if (old_dev, old_inode) != (dev, inode) and txn.get(old_index) == key:
+                txn.delete(old_index)
+        txn.put(key, _pack_value(mtime_ns, size, dev, inode, hash_hex))
+        index.append((_make_key_file_identity(dev, inode), key))
+    for index_key, key in index:
+        txn.put(index_key, key)
+
+
+def _names_inode(path: bytes, fs_stat: os.stat_result) -> bool:
+    """Whether ``path`` exists now and is the file ``fs_stat`` describes (device and inode)."""
+    try:
+        current = os.stat(path)
+    except OSError:
+        return False
+    return current.st_ino == fs_stat.st_ino and current.st_dev == fs_stat.st_dev
+
+
+def _identity_candidate(
+    txn: lmdb.Transaction, key: bytes, fs_stat: os.stat_result
+) -> tuple[bytes, str] | None:
+    """The path and hash of another path's entry that the identity index offers for a file
+    whose own entry (at ``key``) did not match: check (1) of ``_make_key_file_identity``. The
+    caller still has to confirm check (2), with ``_names_inode``, outside the transaction."""
+    other_key = txn.get(_make_key_file_identity(fs_stat.st_dev, fs_stat.st_ino))
+    if other_key is None or other_key == key:
+        return None
+    other_hash = _match_cached_hash(txn.get(other_key), fs_stat)
+    return None if other_hash is None else (other_key[len(_HASH_PREFIX) :], other_hash)
 
 
 def _make_key_output_generation(identity: str) -> bytes:
@@ -342,9 +452,10 @@ class StateDB:
     a process. Separate processes open independent environments and LMDB's
     file locks provide MVCC isolation between them. Readonly StateDB instances
     enforce that restriction at the StateDB boundary; the shared environment is
-    writable so a later writer can use it safely. Forking closes shared
-    environments before the child is created, so both processes reopen their
-    own environment lazily.
+    writable when the database's files are, so a later writer can use it safely,
+    and read-only otherwise (``_open_env``), when a writable StateDB raises
+    StateDBError at once. Forking closes shared environments before the child
+    is created, so both processes reopen their own environment lazily.
     """
 
     _shared: _SharedEnv
@@ -366,6 +477,10 @@ class StateDB:
 
         with _fork_gate.transaction():
             self._shared = _acquire_shared_env(lmdb_path)
+            env = self._shared["env"]
+            if not readonly and env is not None and env.flags()["readonly"]:
+                _release_shared_env(lmdb_path, self._shared)
+                raise StateDBError(f"State database {lmdb_path} cannot be written by this user")
         self._lmdb_path = lmdb_path
         self._owner_pid = os.getpid()
         self._closed = False
@@ -445,24 +560,43 @@ class StateDB:
         return self._readonly
 
     def get(self, path: pathlib.Path, fs_stat: os.stat_result) -> str | None:
-        """Return cached hash if file metadata matches, else None."""
+        """Return cached hash if file metadata matches, else None (see ``get_many``)."""
         self._check_closed()
+        key = _make_key_file_hash(path)
         with self._read_transaction() as txn:
-            value = txn.get(_make_key_file_hash(path))
-        return _match_cached_hash(value, fs_stat)
+            found = _match_cached_hash(txn.get(key), fs_stat)
+            candidate = None if found is not None else _identity_candidate(txn, key, fs_stat)
+        if candidate is not None and _names_inode(candidate[0], fs_stat):
+            return candidate[1]
+        return found
 
     def get_many(
         self, items: list[tuple[pathlib.Path, os.stat_result]]
     ) -> dict[pathlib.Path, str | None]:
-        """Batch query for multiple files."""
+        """Batch query for multiple files.
+
+        A file whose own path has no matching entry is looked up by its identity, the entry
+        of another path that names the same inode (``_make_key_file_identity`` says when that
+        entry is served). The transaction holds only the database reads; the ``stat`` that
+        confirms each identity match comes after it.
+        """
         self._check_closed()
         if not items:
             return {}
         results = dict[pathlib.Path, str | None]()
+        by_identity = list[tuple[pathlib.Path, os.stat_result, bytes, str]]()
         with self._read_transaction() as txn:
             for path, fs_stat in items:
-                value = txn.get(_make_key_file_hash(path))
-                results[path] = _match_cached_hash(value, fs_stat)
+                key = _make_key_file_hash(path)
+                found = _match_cached_hash(txn.get(key), fs_stat)
+                results[path] = found
+                if found is None:
+                    candidate = _identity_candidate(txn, key, fs_stat)
+                    if candidate is not None:
+                        by_identity.append((path, fs_stat, *candidate))
+        for path, fs_stat, other_path, other_hash in by_identity:
+            if _names_inode(other_path, fs_stat):
+                results[path] = other_hash
         return results
 
     def save(self, path: pathlib.Path, fs_stat: os.stat_result, file_hash: str) -> None:
@@ -470,28 +604,26 @@ class StateDB:
         self.save_many([(path, fs_stat, file_hash)])
 
     def save_many(self, entries: Iterable[tuple[pathlib.Path, os.stat_result, str]]) -> None:
-        """Batch save multiple entries atomically.
+        """Save multiple entries atomically; ``_put_file_hashes`` says which it leaves out."""
+        self.save_file_hash_entries(
+            (
+                os.fspath(path),
+                fs_stat.st_mtime_ns,
+                fs_stat.st_size,
+                fs_stat.st_dev,
+                fs_stat.st_ino,
+                file_hash,
+            )
+            for path, fs_stat, file_hash in entries
+        )
 
-        An entry whose key exceeds LMDB's limit is left out: this cache only saves a later
-        hash, so a path too long for it must not fail the caller.
-        """
+    def save_file_hash_entries(self, entries: Iterable[FileHashEntry]) -> None:
+        """Save ``DeferredWrites`` file-hash entries in one write transaction."""
         self._check_closed()
         self._check_write_allowed()
         try:
             with self._write_transaction(timeout=self._write_timeout) as txn:
-                for path, fs_stat, file_hash in entries:
-                    key = _make_key_file_hash(path)
-                    if len(key) > _MAX_KEY_SIZE:
-                        logger.debug("Not caching the hash of %s: path too long", path)
-                        continue
-                    value = _pack_value(
-                        fs_stat.st_mtime_ns,
-                        fs_stat.st_size,
-                        fs_stat.st_dev,
-                        fs_stat.st_ino,
-                        file_hash,
-                    )
-                    txn.put(key, value)
+                _put_file_hashes(txn, entries)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
 
@@ -1030,17 +1162,9 @@ class StateDB:
                         + f"{stage_name}:{deferred['run_cache_delete_input_hash']}".encode()
                     )
 
-                # File hash entries; one whose key exceeds LMDB's limit is left out, as
-                # save_many leaves it out: this cache only saves a later hash.
+                # File hash entries; ``_put_file_hashes`` says which it leaves out.
                 if "file_hash_entries" in deferred:
-                    for path_str, mtime_ns, size, dev, inode, hash_hex in deferred[
-                        "file_hash_entries"
-                    ]:
-                        key = _make_key_file_hash(pathlib.Path(path_str))
-                        if len(key) > _MAX_KEY_SIZE:
-                            logger.debug("Not caching the hash of %s: path too long", path_str)
-                            continue
-                        txn.put(key, _pack_value(mtime_ns, size, dev, inode, hash_hex))
+                    _put_file_hashes(txn, deferred["file_hash_entries"])
 
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
@@ -1077,3 +1201,57 @@ class StateDB:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+@contextlib.contextmanager
+def open_readonly(state_dir: pathlib.Path, *, create: bool = True) -> Generator[StateDB | None]:
+    """Open the state database to read it, yielding None where this user cannot read it safely.
+
+    A database whose lock file this user cannot write cannot register a reader against a
+    writer (``_open_env``), so its cache is not used: the caller reads files instead, as it
+    would with no database. Only that permission case yields None; a damaged database still
+    raises. Opening creates a database where there is none, unless ``create`` is False.
+    """
+    if not create and not (state_dir / "state.lmdb").exists():
+        yield None
+        return
+    try:
+        state_db = StateDB(state_dir, readonly=True)
+    except (PermissionError, lmdb.ReadonlyError) as error:
+        logger.debug("Reading files without the state database in %s: %s", state_dir, error)
+        yield None
+        return
+    except OSError as error:
+        if error.errno != errno.EROFS:
+            raise
+        logger.debug("Reading files without the state database in %s: %s", state_dir, error)
+        yield None
+        return
+    with state_db:
+        yield state_db
+
+
+def write_back_file_hashes(
+    state_dir: pathlib.Path,
+    entries: list[FileHashEntry],
+    *,
+    timeout: float = _WRITE_BACK_TIMEOUT,
+) -> None:
+    """Save the file-hash entries a read-only check computed, best-effort, in one transaction.
+
+    ``pivot status`` and every explanation call this with the hashes they had to read, so the
+    next check reads none of those files. A file-hash entry is a cache that every read
+    validates by ``stat``, and no decision depends on one being present, so a write that
+    cannot happen at once is skipped with a debug log instead of failing or holding up the
+    check: another process holding the write lock for longer than ``timeout`` (2 s, a
+    fraction of a pivot write's own 30 s; 0 makes one attempt), a database this user cannot
+    write, a read-only filesystem, a full map. With no entries it takes no lock, and a state
+    directory with no database is left without one.
+    """
+    if not entries or not (state_dir / "state.lmdb").exists():
+        return
+    try:
+        with StateDB(state_dir, write_timeout=timeout) as state_db:
+            state_db.save_file_hash_entries(entries)
+    except (exceptions.PivotDBWriteTimeoutError, StateDBError, lmdb.Error, OSError) as error:
+        logger.debug("Not saving %d file hashes in %s: %s", len(entries), state_dir, error)

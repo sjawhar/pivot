@@ -17,6 +17,7 @@ from pivot import explain as explain_mod
 from pivot import registry as registry_mod
 from pivot.config import io as config_io
 from pivot.engine.types import CancelRequested, EngineState, OutputEvent, RunRequested
+from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import DataDiffResult, OnError, StageExplanation
 
@@ -359,21 +360,26 @@ class AgentRpcHandler:
                         input_bindings=pipeline.input_bindings,
                         cache_dir=config_io.get_cache_dir() / "files",
                     )
-                    return explain_mod.get_stage_explanation(
+                    state_dir = registry_mod.get_stage_state_dir(
+                        reg_info, config_io.get_state_dir()
+                    )
+                    read = list[types.FileHashEntry]()
+                    explanation = explain_mod.get_stage_explanation(
                         stage_name=stage,
                         fingerprint=fingerprint,
                         deps=reg_info["deps"],
                         outs=list(reg_info["outs"]),
                         params_instance=reg_info["params"],
                         overrides=overrides,
-                        state_dir=registry_mod.get_stage_state_dir(
-                            reg_info, config_io.get_state_dir()
-                        ),
+                        state_dir=state_dir,
                         store=store,
                         lock_data=locks[stage],
                         allow_missing=True,
                         producer_hashes=producer_hashes,
+                        file_hash_entries=read,
                     )
+                    state_mod.write_back_file_hashes(state_dir, read)
+                    return explanation
 
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
             case "commit":

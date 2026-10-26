@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import exceptions, executor, explain, status
+from pivot import config, exceptions, executor, explain, registry, status
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import cache, track
@@ -200,6 +200,55 @@ def test_pipeline_status_uses_per_stage_state_dir(
     ), f"state_dir not set to custom path; call_args={call_kwargs}"
 
 
+def _helper_explain_reading_one_file(*args: object, **kwargs: object) -> StageExplanation:
+    """A stand-in explanation that reports one file read, named after the stage."""
+    stage_name = str(args[0])
+    entries = kwargs["file_hash_entries"]
+    assert isinstance(entries, list)
+    entries.append((f"/read-by/{stage_name}", 1, 2, 3, 4, "0" * 16))
+    return StageExplanation(
+        stage_name=stage_name,
+        will_run=False,
+        is_forced=False,
+        reason="",
+        code_changes=[],
+        param_changes=[],
+        dep_changes=[],
+        upstream_stale=[],
+    )
+
+
+def test_pipeline_status_saves_each_stages_reads_in_its_own_state_dir(
+    set_project_root: pathlib.Path,
+    test_pipeline: Pipeline,
+    mocker: MockerFixture,
+) -> None:
+    """Status saves what each explanation read after all of them finish, in one write per
+    state directory, the directory the stage's explanations read."""
+    (set_project_root / ".git").mkdir(exist_ok=True)
+    (set_project_root / "input.txt").write_text("data")
+    _helper_register_two_stages()
+    all_stages = test_pipeline.snapshot()
+    custom_state_dir = set_project_root / "custom" / ".pivot"
+    all_stages["test/stage_b"]["state_dir"] = custom_state_dir
+    mocker.patch.object(
+        explain, "get_stage_explanation", side_effect=_helper_explain_reading_one_file
+    )
+    write_back = mocker.patch.object(state_mod, "write_back_file_hashes")
+
+    status.get_pipeline_status(
+        None, single_stage=False, all_stages=all_stages, pipeline=test_pipeline
+    )
+
+    stage_a_dir = registry.get_stage_state_dir(all_stages["test/stage_a"], config.get_state_dir())
+    assert stage_a_dir != custom_state_dir
+    assert {call.args[0]: call.args[1] for call in write_back.call_args_list} == {
+        stage_a_dir: [("/read-by/test/stage_a", 1, 2, 3, 4, "0" * 16)],
+        custom_state_dir: [("/read-by/test/stage_b", 1, 2, 3, 4, "0" * 16)],
+    }
+    assert write_back.call_count == 2
+
+
 # =============================================================================
 # Tracked Files Status Tests
 # =============================================================================
@@ -221,6 +270,39 @@ def test_tracked_files_clean(set_project_root: pathlib.Path) -> None:
     assert len(results) == 1
     assert results[0]["path"] == "data.txt"
     assert results[0]["status"] == "clean"
+
+
+def test_tracked_files_status_saves_the_hashes_it_read(
+    set_project_root: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """The tracked-files check saves the hash of each file it read, a tracked directory's
+    files included, so the next check reads none of them."""
+    (set_project_root / ".git").mkdir(exist_ok=True)
+    data_file = set_project_root / "data.txt"
+    data_file.write_text("content")
+    track.write_pvt_file(
+        set_project_root / "data.txt.pvt",
+        track.PvtData(path="data.txt", hash=cache.hash_file(data_file)[0], size=7),
+    )
+    data_dir = set_project_root / "data"
+    data_dir.mkdir()
+    (data_dir / "a.txt").write_text("a")
+    (data_dir / "b.txt").write_text("b")
+    dir_hash = cache.hash_directory(data_dir)
+    track.write_pvt_file(
+        set_project_root / "data.pvt",
+        track.PvtData(
+            path="data", hash=dir_hash["hash"], size=2, num_files=2, manifest=dir_hash["manifest"]
+        ),
+    )
+
+    first = status.get_tracked_files_status(set_project_root)
+    reads = mocker.spy(cache, "_hash_contents")
+    second = status.get_tracked_files_status(set_project_root)
+
+    assert [entry["status"] for entry in first] == ["clean", "clean"]
+    assert second == first
+    assert reads.call_count == 0, "Every file the first check read was saved"
 
 
 def test_tracked_files_modified(set_project_root: pathlib.Path) -> None:

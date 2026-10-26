@@ -72,6 +72,7 @@ from pivot.storage import store as store_mod
 from pivot.types import (
     CodeChange,
     DepChange,
+    FileHashEntry,
     ParamChange,
     PipelineStatus,
     PipelineStatusInfo,
@@ -120,12 +121,18 @@ def _get_explanations_in_parallel(
     tracked_files: dict[str, PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
 ) -> dict[str, StageExplanation]:
-    """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
+    """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing).
+
+    The hashes the explanations had to read are saved afterwards, one write per state
+    directory, so the next status reads none of those files.
+    """
     default_state_dir = config.get_state_dir()
     max_workers = min(8, len(execution_order))
     locks = explain.read_locks(execution_order, all_stages, default_state_dir)
     producer_hashes = explain.producer_output_hashes(locks.values())
     explanations_by_name = dict[str, StageExplanation]()
+    # One list per stage, kept with its state directory: the explanations run in threads.
+    read = list[tuple[pathlib.Path, list[FileHashEntry]]]()
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = dict[Future[StageExplanation], str]()
@@ -133,6 +140,8 @@ def _get_explanations_in_parallel(
             stage_info = all_stages[stage_name]
             fingerprint = cast("dict[str, str]", stage_info["fingerprint"])
             stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
+            entries = list[FileHashEntry]()
+            read.append((stage_state_dir, entries))
             future = pool.submit(
                 explain.get_stage_explanation,
                 stage_name,
@@ -149,6 +158,7 @@ def _get_explanations_in_parallel(
                 tracked_files=tracked_files,
                 tracked_trie=tracked_trie,
                 producer_hashes=producer_hashes,
+                file_hash_entries=entries,
             )
             futures[future] = stage_name
 
@@ -169,6 +179,11 @@ def _get_explanations_in_parallel(
                     upstream_stale=[],
                 )
 
+    read_by_state_dir = dict[pathlib.Path, list[FileHashEntry]]()
+    for state_dir, entries in read:
+        read_by_state_dir.setdefault(state_dir, []).extend(entries)
+    for state_dir, entries in read_by_state_dir.items():
+        state_mod.write_back_file_hashes(state_dir, entries)
     return explanations_by_name
 
 
@@ -348,10 +363,11 @@ def get_tracked_files_status(
     total = len(tracked)
     results = list[TrackedFileInfo]()
 
-    # Use state_db for hash caching (mtime-based)
+    # Use state_db for hash caching (stat-based); what is read is saved best-effort below.
     cache_dir = config.get_cache_dir() / "files"
+    state_dir = config.get_state_dir()
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
-    with state_mod.StateDB(config.get_state_dir()) as state_db:
+    with state_mod.open_readonly(state_dir) as state_db:
         for i, (abs_path_str, track_data) in enumerate(sorted(tracked.items()), 1):
             path = pathlib.Path(abs_path_str)
             rel_path = str(path.relative_to(project_root))
@@ -386,8 +402,7 @@ def get_tracked_files_status(
             )
             if on_progress is not None:
                 on_progress(i, total)
-        if pending:
-            state_db.save_many(pending)
+    state_mod.write_back_file_hashes(state_dir, cache.deferred_file_hash_entries(pending))
 
     return results
 

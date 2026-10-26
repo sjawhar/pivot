@@ -2169,7 +2169,8 @@ class Engine:
             lock_data = lock.StageLock(
                 stage_name, lock.get_stages_dir(worker_info["state_dir"])
             ).read()
-            return explain_mod.get_stage_explanation(
+            read = list[types.FileHashEntry]()
+            explanation = explain_mod.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=worker_info["fingerprint"],
                 deps=stage_info["deps"],
@@ -2181,7 +2182,13 @@ class Engine:
                 lock_data=lock_data,
                 force=force,
                 allow_missing=True,
+                file_hash_entries=read,
             )
+            if not worker_info["no_commit"]:
+                # One attempt, no wait: the run is starting its stages, and the worker hands
+                # the dependency hashes it reads back to the coordinator anyway.
+                state_mod.write_back_file_hashes(worker_info["state_dir"], read, timeout=0)
+            return explanation
 
         try:
             return await anyio.to_thread.run_sync(_compute)

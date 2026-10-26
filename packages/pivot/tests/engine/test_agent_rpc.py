@@ -6,16 +6,18 @@ import contextlib
 import functools
 import json
 import os
+import shutil
 import socket
 import threading
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock
 
 import anyio
 import anyio.to_thread
 import pytest
 
+from pivot import executor
 from pivot.compose import Pipeline
 from pivot.engine.agent_rpc import (
     AgentRpcHandler,
@@ -28,12 +30,21 @@ from pivot.engine.agent_rpc import (
 )
 from pivot.engine.engine import Engine
 from pivot.engine.types import EventSource, InputEvent, OutputEvent, StageStarted
-from pivot.types import ChangeType, DataDiffResult
+from pivot.storage import cache, state
+from pivot.types import ChangeType, DataDiffResult, StageExplanation
 from tests import helpers
+
+if TYPE_CHECKING:
+    from pivot.registry import PipelineLike
 
 
 def _helper_valid_stage() -> dict[str, int]:
     return {"value": 1}
+
+
+def _helper_explained_stage(input_file: str) -> str:
+    _ = input_file
+    return "explained"
 
 
 _diff_expected: DataDiffResult | None = None
@@ -1809,6 +1820,39 @@ async def test_handler_commit_uses_the_engine_pipeline(
         result = cast("CommitResult", await AgentRpcHandler(engine=eng).handle_query("commit"))
 
     assert result["committed"] + result["failed"] == ["test/valid_stage"]
+
+
+def test_handler_explain_saves_the_file_hashes_it_read(
+    set_project_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    test_pipeline: PipelineLike,
+) -> None:
+    """An explanation over RPC saves the hash of each file it had to read, so the next
+    explanation reads none of them."""
+    monkeypatch.chdir(set_project_root)
+    (set_project_root / ".git").mkdir(exist_ok=True)
+    data = set_project_root / "input.txt"
+    data.write_text("data")
+    helpers.register_test_stage(
+        _helper_explained_stage, name="explained", deps={"input_file": "input.txt"}
+    )
+    executor.run(pipeline=test_pipeline)
+    # A copy of the input in its place: the same content, a new inode, so no entry matches.
+    copy = data.with_name("input.copy")
+    shutil.copy2(data, copy)
+    copy.replace(data)
+
+    async def _explain() -> QueryResult:
+        async with Engine(pipeline=test_pipeline) as eng:
+            return await AgentRpcHandler(engine=eng).handle_query(
+                "explain", {"stage": "test/explained"}
+            )
+
+    explanation = anyio.run(_explain)
+
+    assert cast("StageExplanation", explanation)["will_run"] is False
+    with state.StateDB(set_project_root / ".pivot", readonly=True) as state_db:
+        assert state_db.get(data, data.stat()) == cache.hash_file(data)[0]
 
 
 @pytest.mark.anyio

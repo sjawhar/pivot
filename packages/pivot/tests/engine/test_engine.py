@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+import shutil
 import time
 from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock
@@ -38,6 +39,8 @@ from pivot.storage import store as store_mod
 from pivot.types import FileHash, LockData, OnError, StageStatus, identity_key
 
 if TYPE_CHECKING:
+    from pytest_mock import MockerFixture
+
     from pivot.registry import RegistryStageInfo
 
 
@@ -1975,3 +1978,59 @@ async def test_coordinator_tier2_skip_when_generation_unavailable(
     assert results[stage_name]["status"] == StageStatus.CACHED
     assert results[stage_name]["reason"] == "unchanged"
     pool.submit.assert_not_called()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("no_commit", [False, True], ids=["commit", "no-commit"])
+async def test_compute_explanation_saves_the_file_hashes_it_read(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    no_commit: bool,
+) -> None:
+    """The explanation the engine computes for a stage it starts saves the hash of each file
+    it had to read, so the next explanation reads none of them. It makes one attempt, never
+    waiting for the write lock while the run starts stages, and a `--no-commit` run saves
+    nothing."""
+    pipeline = _helper_watch_pipeline(tmp_path, monkeypatch)
+    stage_name, stage_info = _helper_prepare_coordinator_skip(
+        tmp_path,
+        pipeline,
+        record_generations=False,
+    )
+    raw = tmp_path / "data" / "raw" / "raw.json"
+    # A copy of the input in its place: the same content, a new inode, so no entry matches.
+    copy = raw.with_name("raw.copy")
+    shutil.copy2(raw, copy)
+    copy.replace(raw)
+    cache_dir = tmp_path / ".pivot" / "cache"
+    (cache_dir / "files").mkdir(parents=True)
+    overrides = parameters.ParamsOverrides()
+    worker_info = executor_core.prepare_worker_info(
+        stage_info,
+        pipeline,
+        overrides,
+        "run-test",
+        False,
+        no_commit,
+        tmp_path,
+        default_state_dir=tmp_path / ".pivot",
+        store_spec=_helper_store_spec(cache_dir, tmp_path),
+    )
+    write_back = mocker.spy(state_mod, "write_back_file_hashes")
+
+    async with Engine(pipeline=pipeline) as engine:
+        explanation = await engine._compute_explanation(
+            stage_name, worker_info, stage_info, overrides, False
+        )
+
+    assert explanation is not None
+    assert explanation["will_run"] is False, explanation["reason"]
+    with state_mod.StateDB(tmp_path / ".pivot", readonly=True) as state_db:
+        saved = state_db.get(raw, raw.stat())
+    if no_commit:
+        assert write_back.call_count == 0
+        assert saved is None
+    else:
+        assert write_back.call_args.kwargs["timeout"] == 0
+        assert saved == cache.hash_file(raw)[0]

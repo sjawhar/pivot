@@ -1,9 +1,8 @@
 """Every command that leaves a stage output on disk records each file's hash in the StateDB.
 
-`pivot status --explain` and `status.get_pipeline_explanations` open the StateDB read-only and
-look each file up by its (mtime_ns, size, device, inode). A file with no matching entry is read
-again on every call (Dispatch BET-237), so each command that writes or checks an output records
-it.
+`pivot status --explain` and `status.get_pipeline_explanations` look each file up by its
+(mtime_ns, size, device, inode). A file with no matching entry is read, which on 180,000 files
+costs minutes (Dispatch BET-237), so each command that writes or checks an output records it.
 The tests drive the installed `pivot` binary, as a user does.
 """
 

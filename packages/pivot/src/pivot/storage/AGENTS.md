@@ -18,12 +18,14 @@ Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not 
 
 ## File-Hash Write-Back
 
-Every command that writes the workspace records the hash of each file it reads, commits or restores, so `pivot status --explain` (read-only; it writes nothing) finds a matching entry and reads no file. The one exception is a run with `--no-commit`, which by design writes no lock, cache or StateDB entry. A new command that writes or reads workspace files must record them the same way:
+Every command that writes the workspace records the hash of each file it reads, commits or restores, so `pivot status --explain` finds a matching entry and reads no file. The one exception is a run with `--no-commit`, which by design writes no lock, cache or StateDB entry. A new command that writes or reads workspace files must record them the same way:
 
 - `hash_file(..., pending=...)` and `hash_directory(..., pending=...)` append `(path, stat, hash)` for each file they had to read instead of saving it; a caller with a writable StateDB saves them with one `save_many`.
 - A restore records each file with the stat of what it staged, taken before the rename puts it in place (the same inode): `cache.restore_from_cache(..., recorded=...)`, `cache.atomic_write_file`'s return value. A write that lands after the rename then changes the stat, so the entry does not vouch for it.
 - Workers open StateDB read-only. They hand back, in `DeferredWrites.file_hash_entries` (`(path, mtime_ns, size, dev, inode, hash)` tuples, `types.FileHashEntry`, from `cache.deferred_file_hash_entries`), the dependencies and outputs they read to decide (also when the stage is cached by lock comparison), the outputs they commit and the outputs they restore; the coordinator writes them after the stage. The coordinator's own skip check writes what it reads and restores.
 - `pivot checkout` (every mode, also the files `--only-missing` keeps or restores and the existing files it compares), `pivot pull`, `pivot get` (from the cache, from git or from the remote), `pivot import`, `pivot update`, `pivot track` and repro's restore of missing tracked files (`--checkout-missing`) record what they write or read. Stage outputs go in the StateDB of the output's stage state directory, which explanations read; everything else in the configured state directory.
+- `pivot status` and every explanation (`explain.get_stage_explanation`, whose callers are status, the engine and the RPC server) read the StateDB read-only and save the hashes they had to read afterwards, one write per state directory, with `state.write_back_file_hashes`. That write is best-effort: a write lock another process holds for longer than 2 s (the engine makes one attempt, and none in a `--no-commit` run), a database this user cannot write, a read-only filesystem or a full map skips it with a debug log, never a failure. It never creates a database. A database whose data file this user cannot write opens read-only with LMDB's lock file, and a writable `StateDB` on it raises `StateDBError`; when the lock file cannot be written (another user's, a read-only filesystem), `state.open_readonly` yields None and the files are read instead.
+- Every write of a `hash:` entry also writes the identity index (`inode:`), after all the batch's `hash:` entries so their pages lie together, and drops the path's old inode's index entry. A lookup that misses by path follows it: a replica made outside pivot that hard-links pivot's read-only outputs finds them without reading them. BET's replica copies `.pivot/state.lmdb`, so its entries name the original's paths; `cp -al` hard-links it, so the copy and the original share one database. `_make_key_file_identity` states why that lookup is never weaker than the path lookup.
 
 ## StateDB Key Prefixes
 
@@ -32,6 +34,7 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 | Prefix | Purpose |
 |--------|---------|
 | `hash:` | File content hashes (keyed by the absolute path as given, `os.fsencode(os.path.abspath(path))`; the value's `(mtime_ns, size, dev, inode)` comes from `stat()`, which follows symlinks. No ctime: a new hard link changes it, so every hardlink checkout or hard-linked replica would invalidate its entries) |
+| `inode:` | Identity index: `(st_dev, st_ino)` → the `hash:` key last written for that inode. A hint; a lookup serves that entry only if it matches the file's stat and its path still names the same device and inode |
 | `gen:` | Output generation counters (keyed by artifact identity, `stage` or `stage:key`) |
 | `dep:` | Stage dependency generations (`stage:dep_identity` → generation; one file of a directory output records its directory's identity) |
 | `runcache:` | Run cache entries (`stage:input_hash` → output hashes) |
@@ -115,6 +118,6 @@ When multiple `pivot` processes share the same StateDB:
 
 ## Path Storage
 
-All paths stored in the database must be **relative** to ensure portability across machines and correct cache behavior.
+Generation, dependency and run-cache keys hold artifact identities and project-relative paths, so they mean the same thing on every machine. File-hash keys and the identity index hold absolute paths on purpose: an entry describes one file on this machine, checked by its `stat`.
 
 See `docs/solutions/2026-02-01-statedb-path-strategies.md` for path handling patterns.
