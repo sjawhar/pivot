@@ -325,9 +325,10 @@ def _put_file_hashes(txn: lmdb.Transaction, entries: Iterable[FileHashEntry]) ->
         previous = txn.get(key)
         if previous is not None and len(previous) >= _FILE_HASH_STAT.size:
             _, _, old_dev, old_inode, _ = _unpack_value(previous)
-            old_index = _make_key_file_identity(old_dev, old_inode)
-            if (old_dev, old_inode) != (dev, inode) and txn.get(old_index) == key:
-                txn.delete(old_index)
+            if (old_dev, old_inode) != (dev, inode):
+                old_index = _make_key_file_identity(old_dev, old_inode)
+                if txn.get(old_index) == key:
+                    txn.delete(old_index)
         txn.put(key, _pack_value(mtime_ns, size, dev, inode, hash_hex))
         index.append((_make_key_file_identity(dev, inode), key))
     for index_key, key in index:
@@ -340,7 +341,7 @@ def _names_inode(path: bytes, fs_stat: os.stat_result) -> bool:
         current = os.stat(path)
     except OSError:
         return False
-    return current.st_ino == fs_stat.st_ino and current.st_dev == fs_stat.st_dev
+    return os.path.samestat(current, fs_stat)
 
 
 def _identity_candidate(
@@ -561,14 +562,7 @@ class StateDB:
 
     def get(self, path: pathlib.Path, fs_stat: os.stat_result) -> str | None:
         """Return cached hash if file metadata matches, else None (see ``get_many``)."""
-        self._check_closed()
-        key = _make_key_file_hash(path)
-        with self._read_transaction() as txn:
-            found = _match_cached_hash(txn.get(key), fs_stat)
-            candidate = None if found is not None else _identity_candidate(txn, key, fs_stat)
-        if candidate is not None and _names_inode(candidate[0], fs_stat):
-            return candidate[1]
-        return found
+        return self.get_many([(path, fs_stat)])[path]
 
     def get_many(
         self, items: list[tuple[pathlib.Path, os.stat_result]]

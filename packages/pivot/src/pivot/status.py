@@ -121,18 +121,13 @@ def _get_explanations_in_parallel(
     tracked_files: dict[str, PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
 ) -> dict[str, StageExplanation]:
-    """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing).
-
-    The hashes the explanations had to read are saved afterwards, one write per state
-    directory, so the next status reads none of those files.
-    """
+    """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
     default_state_dir = config.get_state_dir()
     max_workers = min(8, len(execution_order))
     locks = explain.read_locks(execution_order, all_stages, default_state_dir)
     producer_hashes = explain.producer_output_hashes(locks.values())
     explanations_by_name = dict[str, StageExplanation]()
-    # One list per stage, kept with its state directory: the explanations run in threads.
-    read = list[tuple[pathlib.Path, list[FileHashEntry]]]()
+    entries_per_stage = list[tuple[pathlib.Path, list[FileHashEntry]]]()
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = dict[Future[StageExplanation], str]()
@@ -141,7 +136,7 @@ def _get_explanations_in_parallel(
             fingerprint = cast("dict[str, str]", stage_info["fingerprint"])
             stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
             entries = list[FileHashEntry]()
-            read.append((stage_state_dir, entries))
+            entries_per_stage.append((stage_state_dir, entries))
             future = pool.submit(
                 explain.get_stage_explanation,
                 stage_name,
@@ -179,10 +174,10 @@ def _get_explanations_in_parallel(
                     upstream_stale=[],
                 )
 
-    read_by_state_dir = dict[pathlib.Path, list[FileHashEntry]]()
-    for state_dir, entries in read:
-        read_by_state_dir.setdefault(state_dir, []).extend(entries)
-    for state_dir, entries in read_by_state_dir.items():
+    entries_by_state_dir = dict[pathlib.Path, list[FileHashEntry]]()
+    for state_dir, entries in entries_per_stage:
+        entries_by_state_dir.setdefault(state_dir, []).extend(entries)
+    for state_dir, entries in entries_by_state_dir.items():
         state_mod.write_back_file_hashes(state_dir, entries)
     return explanations_by_name
 
@@ -363,7 +358,6 @@ def get_tracked_files_status(
     total = len(tracked)
     results = list[TrackedFileInfo]()
 
-    # Use state_db for hash caching (stat-based); what is read is saved best-effort below.
     cache_dir = config.get_cache_dir() / "files"
     state_dir = config.get_state_dir()
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()

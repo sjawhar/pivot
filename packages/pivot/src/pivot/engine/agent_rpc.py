@@ -363,7 +363,7 @@ class AgentRpcHandler:
                     state_dir = registry_mod.get_stage_state_dir(
                         reg_info, config_io.get_state_dir()
                     )
-                    read = list[types.FileHashEntry]()
+                    file_hash_entries = list[types.FileHashEntry]()
                     explanation = explain_mod.get_stage_explanation(
                         stage_name=stage,
                         fingerprint=fingerprint,
@@ -376,9 +376,9 @@ class AgentRpcHandler:
                         lock_data=locks[stage],
                         allow_missing=True,
                         producer_hashes=producer_hashes,
-                        file_hash_entries=read,
+                        file_hash_entries=file_hash_entries,
                     )
-                    state_mod.write_back_file_hashes(state_dir, read)
+                    state_mod.write_back_file_hashes(state_dir, file_hash_entries)
                     return explanation
 
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
