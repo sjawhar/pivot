@@ -235,13 +235,14 @@ class DatabaseFullError(StateDBError):
 
 
 def _make_key_file_hash(path: pathlib.Path) -> bytes:
-    """Create LMDB key for file hash entry (follows symlinks for physical deduplication).
+    """Create the LMDB key for a file-hash entry: the absolute path as given, as bytes.
 
-    Uses resolve() to follow symlinks because hash caching is about physical file identity.
-    Multiple symlinks pointing to the same file should share one cached hash.
-    Contrast with _make_key_output_generation() which preserves symlinks for logical path tracking.
+    Symlinks are not followed: the entry's value holds the (mtime_ns, size, inode) of
+    ``path.stat()``, which follows them, so an entry read through a retargeted link no longer
+    matches and the file is hashed again. ``os.fsencode`` keeps names that are not UTF-8.
+    Contrast with _make_key_output_generation(), which keys an artifact identity.
     """
-    return _HASH_PREFIX + str(path.resolve()).encode()
+    return _HASH_PREFIX + os.fsencode(os.path.abspath(path))
 
 
 def file_hash_key_fits(path: pathlib.Path) -> bool:
@@ -467,8 +468,12 @@ class StateDB:
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
 
-    def save_many(self, entries: list[tuple[pathlib.Path, os.stat_result, str]]) -> None:
-        """Batch save multiple entries atomically."""
+    def save_many(self, entries: Iterable[tuple[pathlib.Path, os.stat_result, str]]) -> None:
+        """Batch save multiple entries atomically.
+
+        An entry whose key exceeds LMDB's limit is left out: this cache only saves a later
+        hash, so a path too long for it must not fail the caller.
+        """
         self._check_closed()
         self._check_write_allowed()
         try:
@@ -476,9 +481,8 @@ class StateDB:
                 for path, fs_stat, file_hash in entries:
                     key = _make_key_file_hash(path)
                     if len(key) > _MAX_KEY_SIZE:
-                        raise PathTooLongError(
-                            f"Path too long for state cache ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path}"
-                        )
+                        logger.debug("Not caching the hash of %s: path too long", path)
+                        continue
                     value = _pack_value(
                         fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash
                     )

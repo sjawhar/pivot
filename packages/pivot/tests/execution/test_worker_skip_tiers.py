@@ -556,28 +556,33 @@ def test_hash_dependencies_reports_unreadable_dependency(
     assert (hashes, missing, unreadable, entries) == ({}, [], ["raw"], [])
 
 
-def test_hash_dependencies_records_stat_write_backs_for_files_only(
-    project: pathlib.Path, state_db: state.StateDB
+def test_hash_dependencies_records_stat_write_backs_for_each_file_it_read(
+    project: pathlib.Path,
 ) -> None:
+    """A read-only check hands back an entry for each file it read, the files of a directory
+    dependency included, so the next check reads none of them; never one for a directory.
+    Workers hash with a read-only StateDB, as here."""
     store = _workspace(project, {"raw": "raw.txt", "tree": "tree"})
     (project / "raw.txt").write_text("file")
     (project / "tree").mkdir()
     (project / "tree" / "a.txt").write_text("a")
 
-    hashes, missing, unreadable, entries = worker.hash_dependencies(
-        {
-            "data": _ref("raw", tag=types.ArtifactTag.INPUT),
-            "tree": _ref("tree", tag=types.ArtifactTag.INPUT),
-        },
-        store,
-        state_db,
-    )
+    with state.StateDB(project / ".pivot", readonly=True) as readonly_db:
+        hashes, missing, unreadable, entries = worker.hash_dependencies(
+            {
+                "data": _ref("raw", tag=types.ArtifactTag.INPUT),
+                "tree": _ref("tree", tag=types.ArtifactTag.INPUT),
+            },
+            store,
+            readonly_db,
+        )
 
     assert (missing, unreadable) == ([], [])
     assert types.is_dir_hash(hashes["tree"])
-    assert [entry[0] for entry in entries] == [str(project / "raw.txt")], (
-        "the file-hash cache must only learn about files"
-    )
+    assert [entry[0] for entry in entries] == [
+        str(project / "raw.txt"),
+        str(project / "tree" / "a.txt"),
+    ], "the file-hash cache learns each file read, never a directory"
 
 
 # =============================================================================

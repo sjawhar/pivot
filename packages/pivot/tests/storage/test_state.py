@@ -297,8 +297,8 @@ def test_state_path_too_long_error(tmp_path: pathlib.Path) -> None:
     assert "511" in str(exc_info.value)
 
 
-def test_state_path_too_long_error_save_many(tmp_path: pathlib.Path) -> None:
-    """PathTooLongError raised in save_many for paths exceeding limit."""
+def test_state_save_many_skips_a_path_too_long_for_a_key(tmp_path: pathlib.Path) -> None:
+    """save_many leaves out an entry whose key exceeds LMDB's limit and saves the rest."""
     db_path = tmp_path
     nested = tmp_path
     for i in range(12):
@@ -306,10 +306,15 @@ def test_state_path_too_long_error_save_many(tmp_path: pathlib.Path) -> None:
     nested.mkdir(parents=True)
     long_path = nested / "file.txt"
     long_path.write_text("content")
-    file_stat = long_path.stat()
+    short_path = tmp_path / "short.txt"
+    short_path.write_text("short")
 
-    with state.StateDB(db_path) as db, pytest.raises(state.PathTooLongError):
-        db.save_many([(long_path, file_stat, "hash123")])
+    with state.StateDB(db_path) as db:
+        db.save_many(
+            [(long_path, long_path.stat(), "hash123"), (short_path, short_path.stat(), "hash456")]
+        )
+        assert db.get(long_path, long_path.stat()) is None, "Too long to cache"
+        assert db.get(short_path, short_path.stat()) == "hash456", "The rest is saved"
 
 
 def test_state_raises_after_close(tmp_path: pathlib.Path) -> None:

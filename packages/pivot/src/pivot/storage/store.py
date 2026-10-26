@@ -23,7 +23,11 @@ class Store(Protocol):
     def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> types.HashInfo: ...
 
     def hash_artifact(
-        self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
+        self,
+        ref: types.ArtifactRef,
+        state_db: state_mod.StateDB | None = None,
+        *,
+        pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
     ) -> types.HashInfo: ...
 
     def exists(self, ref: types.ArtifactRef) -> bool: ...
@@ -109,7 +113,11 @@ class CacheStore:
         return output_hash
 
     def hash_artifact(
-        self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
+        self,
+        ref: types.ArtifactRef,
+        state_db: state_mod.StateDB | None = None,
+        *,
+        pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
     ) -> types.HashInfo:
         ref_path = self._ref_path(ref)
         if not ref_path.exists() and not ref_path.is_symlink():
@@ -117,15 +125,15 @@ class CacheStore:
 
         if state_db is not None:
             if ref_path.is_dir():
-                return cache.hash_directory(ref_path, state_db)
-            file_hash, _ = cache.hash_file(ref_path, state_db)
+                return cache.hash_directory(ref_path, state_db, pending=pending)
+            file_hash, _ = cache.hash_file(ref_path, state_db, pending=pending)
             return types.FileHash(hash=file_hash)
 
         with self._state_db() as db:
             if ref_path.is_dir():
-                return cache.hash_directory(ref_path, db)
+                return cache.hash_directory(ref_path, db, pending=pending)
 
-            file_hash, _ = cache.hash_file(ref_path, db)
+            file_hash, _ = cache.hash_file(ref_path, db, pending=pending)
             return types.FileHash(hash=file_hash)
 
     def exists(self, ref: types.ArtifactRef) -> bool:
@@ -269,12 +277,16 @@ class WorkspaceStore:
         )
 
     def hash_artifact(
-        self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
+        self,
+        ref: types.ArtifactRef,
+        state_db: state_mod.StateDB | None = None,
+        *,
+        pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
     ) -> types.HashInfo:
         path = self._resolve_path(ref)
         if ref.directory is None and (ref.tag == types.ArtifactTag.DIRECTORY or path.is_dir()):
-            return cache.hash_directory(path, state_db, cache_dir=self._cache_dir)
-        file_hash, _ = cache.hash_file(path, state_db)
+            return cache.hash_directory(path, state_db, cache_dir=self._cache_dir, pending=pending)
+        file_hash, _ = cache.hash_file(path, state_db, pending=pending)
         return types.FileHash(hash=file_hash)
 
     def cache_contains(self, ref: types.ArtifactRef, output_hash: types.HashInfo) -> bool:

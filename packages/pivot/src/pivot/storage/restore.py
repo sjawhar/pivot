@@ -11,7 +11,7 @@ import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
 from pivot.remote import storage as remote
-from pivot.storage import cache, lock, track
+from pivot.storage import cache, lock, state, track
 from pivot.types import HashInfo
 
 if TYPE_CHECKING:
@@ -246,8 +246,14 @@ def restore_file(
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
+    hash_state_dir: pathlib.Path | None = None,
 ) -> RestoreResult:
-    """Restore a single file from revision. Returns result with status."""
+    """Restore a single file from revision. Returns result with status.
+
+    A restore whose content has a known hash records each file's hash in the StateDB of
+    ``hash_state_dir`` (the configured state directory when None; a stage output's own state
+    directory), so the next status, explanation or run looks it up instead of reading it.
+    """
     path_str = str(dest_path)
 
     if dest_path.exists() and not force:
@@ -279,14 +285,17 @@ def restore_file(
                     checkout_modes=checkout_modes,
                     state_dir=config.get_state_dir(),
                 )
-                if success:
-                    return RestoreResult(
-                        status=RestoreStatus.RESTORED,
-                        path=path_str,
-                        message=f"Restored: {dest_path} (from cache)",
-                    )
             except OSError as e:
                 logger.debug(f"Cache restore failed for {rel_path}: {e}")
+                success = False
+            if success:
+                with state.StateDB(hash_state_dir or config.get_state_dir()) as state_db:
+                    state_db.save_many(cache.known_file_hashes(dest_path, output_hash))
+                return RestoreResult(
+                    status=RestoreStatus.RESTORED,
+                    path=path_str,
+                    message=f"Restored: {dest_path} (from cache)",
+                )
 
     # Strategy 2: Try git fallback
     content = git.read_file_from_revision(rel_path, rev)
@@ -338,6 +347,8 @@ def restore_file(
                     _ = cache.publish_cache_object(staged, cached_path)
             except OSError:
                 pass  # Caching failure is non-fatal
+            with state.StateDB(hash_state_dir or config.get_state_dir()) as state_db:
+                state_db.save_many([(dest_path, dest_path.stat(), file_hash)])
             return RestoreResult(
                 status=RestoreStatus.RESTORED,
                 path=path_str,
@@ -385,6 +396,11 @@ def restore_targets_from_revision(
     results = list[RestoreResult]()
 
     for target_info in target_infos:
+        hash_state_dir = (
+            stage_targets[target_info["original_target"]]["state_dir"]
+            if target_info["target_type"] is TargetType.STAGE
+            else None
+        )
         for rel_path in target_info["paths"]:
             output_hash = target_info["hashes"].get(rel_path)
             dest_path = output if output is not None else proj_root / rel_path
@@ -397,6 +413,7 @@ def restore_targets_from_revision(
                 cache_dir=cache_dir,
                 checkout_modes=checkout_modes,
                 force=force,
+                hash_state_dir=hash_state_dir,
             )
             results.append(result)
 

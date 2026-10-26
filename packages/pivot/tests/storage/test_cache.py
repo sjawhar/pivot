@@ -397,20 +397,14 @@ def test_hash_directory_handles_deleted_file(
     to_delete = test_dir / "delete.txt"
     to_delete.write_text("delete")
 
-    original_hash_file = cache.hash_file
-    call_count = 0
+    original_hash_contents = cache._hash_contents
 
-    def hash_file_with_delete(
-        path: pathlib.Path, state_db: state.StateDB | None = None
-    ) -> tuple[str, os.stat_result]:
-        nonlocal call_count
-        call_count += 1
-        if path.name == "delete.txt":
+    def hash_contents_after_delete(path: str | os.PathLike[str], size: int) -> str:
+        if os.fspath(path) == os.fspath(to_delete):
             to_delete.unlink()
-            raise FileNotFoundError()
-        return original_hash_file(path, state_db)
+        return original_hash_contents(path, size)
 
-    monkeypatch.setattr(cache, "hash_file", hash_file_with_delete)
+    monkeypatch.setattr(cache, "_hash_contents", hash_contents_after_delete)
 
     manifest = cache.hash_directory(test_dir)["manifest"]
     assert len(manifest) == 1

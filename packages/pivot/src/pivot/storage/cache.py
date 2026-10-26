@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import mmap
+import operator
 import os
 import pathlib
 import posixpath
@@ -21,14 +22,13 @@ import xxhash
 
 from pivot import exceptions, metrics
 from pivot.config import CheckoutMode as CheckoutMode
+from pivot.storage import state as state_mod
 from pivot.types import DirHash, DirManifestEntry, FileHash, HashInfo, is_dir_hash
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable
-
-    from pivot.storage import state as state_mod
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for hashing
 MMAP_THRESHOLD = 10 * 1024 * 1024  # 10MB - use mmap for files larger than this
@@ -41,9 +41,13 @@ _RESTORE_TEMP_MAX_AGE = 3600  # 1 hour
 
 
 def _restore_target_token(target_path: pathlib.Path) -> str:
-    """Return a stable token identifying the logical workspace target."""
+    """Return a stable token identifying the logical workspace target.
+
+    ``os.fsencode`` keeps a name that is not UTF-8; for every UTF-8 path it gives the bytes
+    ``str.encode`` did, so no existing token changes.
+    """
     logical_path = target_path.parent.resolve() / target_path.name
-    return hashlib.sha256(str(logical_path).encode()).hexdigest()[:32]
+    return hashlib.sha256(os.fsencode(logical_path)).hexdigest()[:32]
 
 
 def restore_staging_path(path: pathlib.Path, token: str | None = None) -> pathlib.Path:
@@ -132,10 +136,32 @@ def atomic_write_file(
                 os.close(fd)
 
 
+def _hash_contents(path: str | os.PathLike[str], size: int) -> str:
+    """Return the xxhash64 hex digest of the file at ``path``, whose size is ``size``."""
+    with open(path, "rb", buffering=0) as f:
+        if size >= MMAP_THRESHOLD:
+            try:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    return xxhash.xxh64(mm).hexdigest()
+            except (ValueError, OSError):
+                pass  # mmap fails on an empty file or some network filesystems: read instead
+        hasher = xxhash.xxh64()
+        while chunk := f.read(CHUNK_SIZE):
+            hasher.update(chunk)
+        return hasher.hexdigest()
+
+
 def hash_file(
-    path: pathlib.Path, state_db: state_mod.StateDB | None = None
+    path: pathlib.Path,
+    state_db: state_mod.StateDB | None = None,
+    *,
+    pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> tuple[str, os.stat_result]:
     """Compute xxhash64 of file contents, using state cache if available.
+
+    A hash read from the file is saved to a writable ``state_db`` at once, unless ``pending``
+    is given: then ``(path, stat, hash)`` is appended to it instead, for the caller to save in
+    one transaction, or, when ``state_db`` is read-only, to hand to a process that can write.
 
     Returns:
         Tuple of (file_hash, file_stat) where file_hash is the xxhash64 hex digest
@@ -149,26 +175,58 @@ def hash_file(
             return cached, file_stat
 
     _t = metrics.start()
-    hasher = xxhash.xxh64()
-    with open(path, "rb") as f:
-        if file_stat.st_size >= MMAP_THRESHOLD:
-            try:
-                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    hasher.update(mm)
-            except (ValueError, OSError):
-                # Fall back to buffered read if mmap fails (empty file, network FS, etc.)
-                while chunk := f.read(CHUNK_SIZE):
-                    hasher.update(chunk)
-        else:
-            while chunk := f.read(CHUNK_SIZE):
-                hasher.update(chunk)
-    file_hash = hasher.hexdigest()
+    file_hash = _hash_contents(path, file_stat.st_size)
     metrics.end("cache.hash_file", _t)
 
-    if state_db is not None and not state_db.readonly:
+    if pending is not None:
+        pending.append((path, file_stat, file_hash))
+    elif state_db is not None and not state_db.readonly:
         state_db.save(path, file_stat, file_hash)
 
     return file_hash, file_stat
+
+
+def known_file_hashes(
+    path: pathlib.Path, output_hash: HashInfo
+) -> list[tuple[pathlib.Path, os.stat_result, str]]:
+    """StateDB file-hash entries for an output on disk whose hash is already known.
+
+    Stats each file (each manifest entry, for a directory) and pairs it with its known hash;
+    nothing is read. Call it once the output has its final inode: a hardlink checkout
+    replaces the file the stage wrote, and a restore replaces whatever was there.
+    """
+    if is_dir_hash(output_hash):
+        files = [(path / entry["relpath"], entry["hash"]) for entry in output_hash["manifest"]]
+    else:
+        files = [(path, output_hash["hash"])]
+    return [(file_path, file_path.stat(), file_hash) for file_path, file_hash in files]
+
+
+def deferred_file_hash_entries(
+    entries: Iterable[tuple[pathlib.Path, os.stat_result, str]],
+) -> list[tuple[str, int, int, int, str]]:
+    """``entries`` as ``DeferredWrites`` file-hash entries, for a process that cannot write the
+    StateDB to hand to one that can.
+
+    Each path is made absolute here, so the writer keys it the same from any working
+    directory. An entry whose StateDB key exceeds LMDB's limit is left out: this cache only
+    saves a later hash, so it must not fail the stage.
+    """
+    deferred = list[tuple[str, int, int, int, str]]()
+    for path, file_stat, file_hash in entries:
+        if not state_mod.file_hash_key_fits(path):
+            logger.debug("Not caching the hash of %s: path too long", path)
+            continue
+        deferred.append(
+            (
+                os.path.abspath(path),
+                file_stat.st_mtime_ns,
+                file_stat.st_size,
+                file_stat.st_ino,
+                file_hash,
+            )
+        )
+    return deferred
 
 
 def _cache_object_key(path: pathlib.Path, cache_dir: pathlib.Path | None) -> str | None:
@@ -186,13 +244,6 @@ def _cache_object_key(path: pathlib.Path, cache_dir: pathlib.Path | None) -> str
     return key
 
 
-def _is_artifact_file_member(path: pathlib.Path, cache_dir: pathlib.Path | None) -> bool:
-    """Whether ``path`` is a regular artifact member or a checkout symlink to its cache object."""
-    return path.is_file() and (
-        not path.is_symlink() or _cache_object_key(path, cache_dir) is not None
-    )
-
-
 def is_artifact_member_content(
     path: pathlib.Path, file_hash: str, cache_dir: pathlib.Path | None
 ) -> bool:
@@ -200,42 +251,46 @@ def is_artifact_member_content(
     return not path.is_symlink() or file_hash == _cache_object_key(path, cache_dir)
 
 
-def scandir_artifact_members(
-    path: pathlib.Path,
+def walk_artifact_members(
+    directory: str,
+    prefix: str,
     cache_dir: pathlib.Path | None,
+    files: list[tuple[str, os.DirEntry[str]]],
+    dirs: list[str],
     left_out: list[pathlib.Path],
-    dirs: list[pathlib.Path],
-) -> Generator[os.DirEntry[str]]:
-    """Yield every file under `path` recursively, using os.scandir() for efficiency.
+) -> None:
+    """Collect every stored file under ``directory`` with its relpath, ``prefix`` + its name.
 
     A declared directory artifact is hashed and cached whole: no name is ignored, so a change
     to any file in a directory input reruns its consumers, and every file in a directory output
     survives cache and restore. Ignore rules belong to code fingerprinting and watch mode.
     A symlink to an object in ``cache_dir`` (left by a symlink checkout) counts as the file it
-    points to; any other symlink is not stored and is appended to ``left_out``.
-    DirEntry objects cache stat results, avoiding redundant syscalls.
-    PermissionError propagates to caller - partial hashes would be incorrect.
+    points to; any other symlink, a symlinked directory included, is not stored and is appended
+    to ``left_out``. The walk never follows a symlink, so every regular file it collects lies
+    inside the directory. PermissionError propagates: a partial hash would be wrong.
 
     Args:
-        path: Directory to scan
+        directory: Directory to scan
+        prefix: Relpath of ``directory`` under the artifact root, with a trailing ``/``
+            (empty at the root)
         cache_dir: Cache object root whose links count as content, or None for no cache
+        files: Collects (relpath, entry) for every stored file
+        dirs: Collects the relpath of every directory under the root
         left_out: Collects the symlinks that are not part of the artifact
-        dirs: Collects every directory under ``path`` (symlinked directories are not followed)
     """
-    with os.scandir(path) as entries:
+    with os.scandir(directory) as entries:
         for entry in entries:
+            relpath = prefix + entry.name
             if entry.is_symlink():
-                if _is_artifact_file_member(pathlib.Path(entry.path), cache_dir):
-                    yield entry
+                if _cache_object_key(pathlib.Path(entry.path), cache_dir) is not None:
+                    files.append((relpath, entry))
                 else:
                     left_out.append(pathlib.Path(entry.path))
             elif entry.is_file():
-                yield entry
+                files.append((relpath, entry))
             elif entry.is_dir():
-                dirs.append(pathlib.Path(entry.path))
-                yield from scandir_artifact_members(
-                    pathlib.Path(entry.path), cache_dir, left_out, dirs
-                )
+                dirs.append(relpath)
+                walk_artifact_members(entry.path, relpath + "/", cache_dir, files, dirs, left_out)
 
 
 def _parent_dirs(relpaths: Iterable[str]) -> set[str]:
@@ -291,6 +346,7 @@ def hash_directory(
     *,
     cache_dir: pathlib.Path | None = None,
     warn_left_out_symlinks: bool = False,
+    pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> DirHash:
     """Compute the tree hash of a directory, returning it with the manifest.
 
@@ -302,10 +358,11 @@ def hash_directory(
     - A symlink to an object in ``cache_dir`` is hashed by its target's content under its own
       relpath; the content must match the object's name
     - Any other symlink inside the directory is left out of the manifest
-    - Base path may be symlinked (resolved for consistency)
+    - Base path may be a symlink; the walk below it follows none
 
-    Note: For portability, paths are stored as normalized (symlinks preserved)
-    in lock files, but resolved here for consistent hashing.
+    With a ``state_db``, every file's cached hash is looked up in one read transaction. The
+    hashes read from files are saved to a writable ``state_db`` in one write transaction, unless
+    ``pending`` is given: then they are appended to it, as ``hash_file`` does.
 
     Args:
         path: Directory to hash
@@ -315,43 +372,65 @@ def hash_directory(
             None means no cache, and then no symlink is content.
         warn_left_out_symlinks: Log one warning naming the symlinks left out. Set where a
             manifest is recorded (a stage output, a tracked directory), not on every re-hash.
+        pending: Receives ``(path, stat, hash)`` for each file whose hash was read, instead of
+            ``state_db``.
     """
     _t = metrics.start()
-    manifest = list[DirManifestEntry]()
+    files = list[tuple[str, os.DirEntry[str]]]()
+    dirs = list[str]()
     left_out = list[pathlib.Path]()
-    dirs = list[pathlib.Path]()
-    resolved_base = path.resolve()
+    walk_artifact_members(os.fspath(path), "", cache_dir, files, dirs, left_out)
+    files.sort(key=operator.itemgetter(0))
 
-    for entry in sorted(
-        scandir_artifact_members(path, cache_dir, left_out, dirs), key=lambda e: e.path
-    ):
-        file_path = pathlib.Path(entry.path)
-        # Verify a regular file is still within the directory (paranoid check). A cache-object
-        # link resolves into the cache by design.
-        if not entry.is_symlink() and not file_path.resolve().is_relative_to(resolved_base):
-            continue
+    stats = list[tuple[str, os.DirEntry[str], os.stat_result]]()
+    for relpath, entry in files:
         try:
-            rel = file_path.relative_to(path)
-            file_stat = entry.stat(follow_symlinks=True)
-            file_hash, _ = hash_file(file_path, state_db)
-            if not is_artifact_member_content(file_path, file_hash, cache_dir):
-                left_out.append(file_path)
-                continue
-            manifest_entry: DirManifestEntry = {
-                "relpath": str(rel),
-                "hash": file_hash,
-                "size": file_stat.st_size,
-                "isexec": bool(file_stat.st_mode & stat.S_IXUSR),
-            }
-            manifest.append(manifest_entry)
+            stats.append((relpath, entry, entry.stat()))
         except FileNotFoundError:
             continue  # File deleted between scan and hash
+
+    cached: list[str | None]
+    if state_db is not None:
+        lookups = [(pathlib.Path(entry.path), file_stat) for _, entry, file_stat in stats]
+        found = state_db.get_many(lookups)
+        cached = [found[file_path] for file_path, _ in lookups]
+    else:
+        cached = [None] * len(stats)
+
+    # The hashes read below go to the caller's ``pending``, or are saved here in one write.
+    saving = pending is None and state_db is not None and not state_db.readonly
+    read = list[tuple[pathlib.Path, os.stat_result, str]]() if saving else pending
+    manifest = list[DirManifestEntry]()
+    for (relpath, entry, file_stat), file_hash in zip(stats, cached, strict=True):
+        if file_hash is None:
+            try:
+                file_hash = _hash_contents(entry.path, file_stat.st_size)
+            except FileNotFoundError:
+                continue  # File deleted between scan and hash
+            if read is not None:
+                read.append((pathlib.Path(entry.path), file_stat, file_hash))
+        if entry.is_symlink() and not is_artifact_member_content(
+            pathlib.Path(entry.path), file_hash, cache_dir
+        ):
+            left_out.append(pathlib.Path(entry.path))
+            continue
+        manifest.append(
+            DirManifestEntry(
+                relpath=relpath,
+                hash=file_hash,
+                size=file_stat.st_size,
+                isexec=bool(file_stat.st_mode & stat.S_IXUSR),
+            )
+        )
+
+    if saving and read and state_db is not None:
+        state_db.save_many(read)
 
     if left_out and warn_left_out_symlinks:
         log_left_out_symlinks(path, left_out)
 
     # A deepest empty directory holds no stored file and no other directory.
-    found_dirs = {str(directory.relative_to(path)) for directory in dirs}
+    found_dirs = set(dirs)
     file_dirs = {posixpath.dirname(entry["relpath"]) for entry in manifest}
     has_child = {posixpath.dirname(directory) for directory in found_dirs}
     empty_dirs = sorted(found_dirs - file_dirs - has_child)
@@ -1276,7 +1355,7 @@ def _publish_tree(
     manifest = output_hash["manifest"]
 
     def _user_symlinks(directory: str, names: list[str]) -> list[str]:
-        # Not stored (see scandir_artifact_members); copytree would copy each target.
+        # Not stored (see walk_artifact_members); copytree would copy each target.
         return [
             name
             for name in names
@@ -1679,6 +1758,7 @@ def restore_missing_in_directory(
     cache_dir: pathlib.Path,
     checkout_modes: list[CheckoutMode],
     state_db: state_mod.StateDB | None = None,
+    pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> MissingRestore:
     """Restore missing target files and empty directories without overwriting local changes.
 
@@ -1691,6 +1771,10 @@ def restore_missing_in_directory(
     A retained file is read only when nothing else proves its content: a symlink to the
     target's cache path, a hardlink to the target's cache blob, or a matching ``state_db``
     entry each settle it without a read.
+
+    ``pending``, when given, receives the StateDB file-hash entry of every file whose content
+    this settled without a matching ``state_db`` entry, and of every file it restored, for the
+    caller to save.
     """
     lexical_base = pathlib.Path(os.path.abspath(path))
     resolved_base = path.resolve()
@@ -1718,6 +1802,8 @@ def restore_missing_in_directory(
             if file_path.resolve() == file_cache_path.resolve():
                 if not file_cache_path.exists():
                     missing.append((entry, file_path, file_cache_path))
+                elif pending is not None:
+                    pending.append((file_path, file_path.stat(), entry["hash"]))
             else:
                 changed[relpath] = _get_symlink_cache_hash(file_path, cache_dir)
             continue
@@ -1725,9 +1811,12 @@ def restore_missing_in_directory(
             if not file_path.is_file():
                 changed[relpath] = None
                 continue
-            if _is_same_file(file_path.stat(), file_cache_path):
+            file_stat = file_path.stat()
+            if _is_same_file(file_stat, file_cache_path):
+                if pending is not None:
+                    pending.append((file_path, file_stat, entry["hash"]))
                 continue
-            file_hash, _ = hash_file(file_path, state_db)
+            file_hash, _ = hash_file(file_path, state_db, pending=pending)
             if file_hash != entry["hash"]:
                 changed[relpath] = file_hash
             continue
@@ -1753,7 +1842,7 @@ def restore_missing_in_directory(
         if extra_path.is_symlink():
             changed[relpath] = _get_symlink_cache_hash(extra_path, cache_dir)
         else:
-            changed[relpath], _ = hash_file(extra_path, state_db)
+            changed[relpath], _ = hash_file(extra_path, state_db, pending=pending)
     # A hash pivot 0.3.3 recorded lists no empty directories, so on disk none of them is extra.
     extra_dirs = (
         set(dirs) - _restored_dirs(output_hash) if "empty_dirs" in output_hash else set[str]()
@@ -1776,6 +1865,8 @@ def restore_missing_in_directory(
         _checkout_with_fallback(
             file_path, file_cache_path, checkout_modes, executable=entry["isexec"]
         )
+        if pending is not None:
+            pending.append((file_path, file_path.stat(), entry["hash"]))
     for dir_path in missing_dirs:
         dir_path.mkdir(parents=True, exist_ok=True)
 

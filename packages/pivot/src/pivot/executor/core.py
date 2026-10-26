@@ -614,6 +614,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     missing = list[str]()
     cache_dir = config.get_cache_dir() / "files"
 
+    pending = list[tuple[pathlib.Path, os.stat_result, str]]()
     with state_mod.StateDB(config.get_state_dir()) as state_db:
         for data_path, track_data in tracked_files.items():
             path = pathlib.Path(data_path)
@@ -621,9 +622,11 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
             # Try to hash the file - handles race conditions where file disappears
             try:
                 if path.is_file():
-                    current_hash, _ = cache.hash_file(path, state_db)
+                    current_hash, _ = cache.hash_file(path, state_db, pending=pending)
                 elif path.is_dir():
-                    current_hash = cache.hash_directory(path, state_db, cache_dir=cache_dir)["hash"]
+                    current_hash = cache.hash_directory(
+                        path, state_db, cache_dir=cache_dir, pending=pending
+                    )["hash"]
                 else:
                     # Path doesn't exist
                     raise FileNotFoundError(data_path)
@@ -644,6 +647,8 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                     f"Tracked file '{data_path}' has changed since tracking. "
                     + f"Run 'pivot track --force {track_data['path']}' to update."
                 )
+        if pending:
+            state_db.save_many(pending)
 
     metrics.end("core.verify_tracked_files", _t)
     if missing:

@@ -16,9 +16,13 @@ For status and explain, a stage is stale when repro will rewrite its lock by run
 
 Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not in lock files. Workers compute them via `compute_dep_generation_map()` and return them in `DeferredWrites`. The coordinator applies them via `apply_deferred_writes()`. Old lock files that may have contained `dep_generations` are handled gracefully (field ignored on read).
 
-## File-Hash Write-Back (DeferredWrites)
+## File-Hash Write-Back
 
-Workers open StateDB in readonly mode. Dependency hashing produces file hash entries that should be cached for future O(1) lookups. These are collected in `DeferredWrites.file_hash_entries` (a list of `(path, mtime_ns, size, inode, hash)` tuples) and written back to StateDB by the coordinator after stage completion.
+Every command that writes the workspace records the hash of each file it reads, commits or restores, so `pivot status --explain` (read-only; it writes nothing) finds a matching entry and reads no file:
+
+- `hash_file(..., pending=...)` and `hash_directory(..., pending=...)` append `(path, stat, hash)` for each file they had to read instead of saving it; a caller with a writable StateDB saves them with one `save_many`.
+- Workers open StateDB read-only. They collect entries for the dependencies and outputs they read, the outputs they commit and the outputs they restore in `DeferredWrites.file_hash_entries` (`(path, mtime_ns, size, inode, hash)` tuples, from `cache.deferred_file_hash_entries`), and the coordinator writes them after the stage. The coordinator's own skip check writes what it reads and restores.
+- `pivot checkout`, `pivot pull` and `pivot get` record each file they restore (`cache.known_file_hashes`) in the StateDB of the output's stage state directory.
 
 ## StateDB Key Prefixes
 
@@ -26,7 +30,7 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 
 | Prefix | Purpose |
 |--------|---------|
-| `hash:` | File content hashes (keyed by resolved/physical path) |
+| `hash:` | File content hashes (keyed by the absolute path as given, `os.fsencode(os.path.abspath(path))`; the value's `(mtime_ns, size, inode)` comes from `stat()`, which follows symlinks) |
 | `gen:` | Output generation counters (keyed by artifact identity, `stage` or `stage:key`) |
 | `dep:` | Stage dependency generations (`stage:dep_identity` → generation; one file of a directory output records its directory's identity) |
 | `runcache:` | Run cache entries (`stage:input_hash` → output hashes) |
