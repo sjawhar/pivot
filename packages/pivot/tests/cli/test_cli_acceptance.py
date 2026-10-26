@@ -1244,11 +1244,12 @@ def test_repro_rebuilds_a_pivot_033_lock_and_keeps_the_empty_dirs_it_did_not_rec
     tmp_path: pathlib.Path, state: str
 ) -> None:
     """A directory output whose lock pivot 0.3.3 wrote lists only its files, while its tree on
-    disk holds empty directories. Pivot warns that each such lock is from an older pivot and
-    reads it as missing, so no stage stays cached on it and no restore deletes the directories.
-    The stage runs (or takes its outputs from a run-cache entry that records the directories),
-    both locks and the committed listing come back byte for byte as a fresh build writes them,
-    and the consumer reads the tree a fresh build makes."""
+    disk holds empty directories. Pivot reads each such lock as it is, warning once that it is
+    from an older pivot; the output is not restored to the lock, which would delete the
+    directories while every stage stayed cached. The stage runs (or takes its outputs from a
+    run-cache entry that records the directories), both locks and the committed listing come
+    back byte for byte as a fresh build writes them, and the consumer reads the tree a fresh
+    build makes."""
     (tmp_path / "project").mkdir()
     root = _project(tmp_path / "project", {"pipeline.py": _EMPTY_DIRS_PIPELINE})
     _ok(_pivot(root, "repro"))
@@ -1267,9 +1268,15 @@ def test_repro_rebuilds_a_pivot_033_lock_and_keeps_the_empty_dirs_it_did_not_rec
 
     status_proc = _pivot(root, "status", "--explain", "--json")
     _ok(status_proc)
-    status = {s["name"]: s["status"] for s in json.loads(status_proc.stdout)["stages"]}
-    assert status == {"empty/make": "stale", "empty/pack": "stale"}, status
-    warning = "was written by an older pivot; pivot reads it as missing"
+    status = {s["name"]: s for s in json.loads(status_proc.stdout)["stages"]}
+    assert {name: s["status"] for name, s in status.items()} == {
+        "empty/make": "stale",
+        "empty/pack": "stale",
+    }, status
+    assert status["empty/make"]["reason"].startswith(
+        "Output holds empty directories its lock does not record"
+    ), status
+    warning = "was written by an older pivot; pivot reads it as it is"
     assert " ".join(status_proc.stderr.split()).count(warning) == 2, status_proc.stderr
 
     _ok(_pivot(root, "repro"))

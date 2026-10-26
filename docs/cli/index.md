@@ -338,6 +338,11 @@ Checks that all stages are cached (code, params, deps match lock files) and outp
 For a directory output, `pivot verify` also checks that the workspace path is a directory. A file
 at that path fails verification.
 
+Every committed listing file a stage's lock records, its outputs' and its directory inputs', must
+hash to its record; one that does not fails that stage, naming the file and how to put it right.
+With no stage named, `pivot verify` also checks each tracked directory's `<path>.pvt.listing`
+against its `.pvt`, whether or not a stage reads it, and fails naming that path.
+
 **Arguments:**
 
 - `STAGES` - Stage names to verify (optional, verifies all if not specified)

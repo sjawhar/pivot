@@ -259,6 +259,7 @@ def test_restore_reports_matching_outputs_available_without_writing(
         available=True,
         outputs_restored=False,
         unavailable=[],
+        empty_dirs_unrecorded=[],
         to_restore=[],
     )
 
@@ -276,6 +277,7 @@ def test_restore_verifies_directory_output(project: pathlib.Path, state_db: stat
         available=True,
         outputs_restored=False,
         unavailable=[],
+        empty_dirs_unrecorded=[],
         to_restore=[],
     )
 
@@ -320,6 +322,7 @@ def test_restore_uses_committed_listing_when_its_cache_object_is_missing(
         available=True,
         outputs_restored=True,
         unavailable=[],
+        empty_dirs_unrecorded=[],
         to_restore=[ref],
     )
     assert (directory / "a.txt").read_text() == "a"
@@ -339,6 +342,7 @@ def test_restore_brings_back_deleted_output_from_cache(
         available=True,
         outputs_restored=True,
         unavailable=[],
+        empty_dirs_unrecorded=[],
         to_restore=[ref],
     )
     assert path.read_text() == "cached out"
@@ -358,6 +362,7 @@ def test_restore_reports_output_without_recorded_hash_unavailable(
         available=False,
         outputs_restored=False,
         unavailable=[unrecorded],
+        empty_dirs_unrecorded=[],
         to_restore=[],
     )
 
@@ -378,6 +383,7 @@ def test_restore_reports_output_missing_from_cache_unavailable(
         available=False,
         outputs_restored=False,
         unavailable=[ref],
+        empty_dirs_unrecorded=[],
         to_restore=[],
     )
     assert not path.exists()
@@ -402,6 +408,7 @@ def test_restore_reports_failed_restore_unavailable(
         available=False,
         outputs_restored=False,
         unavailable=[ref],
+        empty_dirs_unrecorded=[],
         to_restore=[ref],
     )
 
@@ -436,12 +443,14 @@ def test_check_lists_every_unavailable_output_and_writes_nothing(
         available=False,
         outputs_restored=False,
         unavailable=[unrecorded, uncached],
+        empty_dirs_unrecorded=[],
         to_restore=[restorable],
     )
     assert restored == worker.OutputRestoreResult(
         available=False,
         outputs_restored=False,
         unavailable=[unrecorded],
+        empty_dirs_unrecorded=[],
         to_restore=[],
     )
     assert not restorable_path.exists()
@@ -472,9 +481,97 @@ def test_restore_keeps_checking_outputs_after_restoring_one(
         available=False,
         outputs_restored=True,
         unavailable=[uncached],
+        empty_dirs_unrecorded=[],
         to_restore=[restorable],
     )
     assert restorable_path.read_text() == "cached"
+
+
+def _old_lock_tree(
+    project: pathlib.Path, store: store_mod.WorkspaceStore, ref: types.ArtifactRef
+) -> tuple[pathlib.Path, DirHash]:
+    """A cached directory output holding an empty directory, and the record of the listing an
+    old lock gives it when it lists the files alone (pivot before 0.3.4), as ``StageLock.read``
+    converts it: the listing of a copy without the empty directory, put in the cache."""
+    directory = store.prepare_output(ref)
+    (directory / "a.txt").write_text("a")
+    (directory / "logs").mkdir()
+    store.commit(ref, directory)
+    files_only = project / "files-only"
+    files_only.mkdir()
+    (files_only / "a.txt").write_text("a")
+    hashed = cache.hash_directory(files_only, None)
+    assert hashed["listing"]["empty_dirs"] == []
+    listing.store_object(
+        project / ".pivot" / "cache" / "files", hashed["record"]["hash"], hashed["data"]
+    )
+    return directory, hashed["record"]
+
+
+@pytest.mark.parametrize("restore", [True, False], ids=["restore", "check"])
+def test_old_lock_without_empty_dirs_makes_the_stage_run_instead_of_stripping_them(
+    project: pathlib.Path, state_db: state.StateDB, restore: bool
+) -> None:
+    """An output holding every file its lock lists plus an empty directory that a lock written
+    before pivot 0.3.4 cannot record is not restored to that lock: the restore would delete the
+    directory. The output is reported unusable, so the stage runs and records it."""
+    store = _workspace(project, {})
+    ref = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
+    directory, old_record = _old_lock_tree(project, store, ref)
+    members = store.cached_listing(old_record)
+    assert members is not None and store.cache_contains(ref, old_record, members), (
+        "a restore would be possible"
+    )
+
+    result = worker.restore_outputs_to_hashes(
+        store, [ref], {ref.identity: old_record}, state_db, restore=restore, report_changes=True
+    )
+
+    assert result == worker.OutputRestoreResult(
+        available=False,
+        outputs_restored=False,
+        unavailable=[],
+        empty_dirs_unrecorded=[ref],
+        to_restore=[],
+    )
+    assert (directory / "logs").is_dir()
+
+
+def test_old_lock_still_restores_a_directory_whose_files_changed(
+    project: pathlib.Path, state_db: state.StateDB
+) -> None:
+    """An output whose files differ from its old lock's is restored from the cache as before."""
+    store = _workspace(project, {})
+    ref = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
+    directory, old_record = _old_lock_tree(project, store, ref)
+    (directory / "a.txt").unlink()
+    (directory / "a.txt").write_text("edited")
+
+    result = _restore(store, [ref], {ref.identity: old_record}, state_db)
+
+    assert result == worker.OutputRestoreResult(
+        available=True,
+        outputs_restored=True,
+        unavailable=[],
+        empty_dirs_unrecorded=[],
+        to_restore=[ref],
+    )
+    assert (directory / "a.txt").read_text() == "a"
+
+
+def test_unrecorded_empty_dirs_only_needs_matching_files_and_no_recorded_empty_dirs() -> None:
+    files = [types.DirManifestEntry(relpath="a.txt", hash="1" * 16, size=1, isexec=False)]
+    old = listing.DirListing(files=files, empty_dirs=[])
+    with_dirs = listing.DirListing(files=files, empty_dirs=["logs"])
+    other_files = listing.DirListing(
+        files=[types.DirManifestEntry(relpath="b.txt", hash="1" * 16, size=1, isexec=False)],
+        empty_dirs=["logs"],
+    )
+
+    assert worker.unrecorded_empty_dirs_only(old, with_dirs)
+    assert not worker.unrecorded_empty_dirs_only(with_dirs, old), "a newer lock is authoritative"
+    assert not worker.unrecorded_empty_dirs_only(old, other_files), "the files differ"
+    assert not worker.unrecorded_empty_dirs_only(old, old)
 
 
 def test_restore_on_cache_store_reports_whether_every_output_is_stored(

@@ -516,11 +516,26 @@ def read_found(
 
 
 def write(path: pathlib.Path, data: bytes) -> None:
-    """Write a committed listing file atomically, leaving one that holds ``data`` untouched."""
+    """Write a committed listing file atomically, leaving one that holds ``data`` untouched.
+
+    No listing name is ever a directory of pivot's (a stage name holds no ``=``), so an empty
+    directory at ``path`` is replaced; one that holds anything is refused, naming it
+    (CorruptListingError). A file that cannot be read is replaced.
+    """
     try:
         if path.read_bytes() == data:
             return
     except FileNotFoundError:
+        pass
+    except IsADirectoryError:
+        try:
+            path.rmdir()
+        except OSError as e:
+            raise exceptions.CorruptListingError(
+                f"{path}: a directory where pivot writes a listing file; remove it "
+                + f"({e.strerror or e})"
+            ) from e
+    except OSError:
         pass
 
     def write_bytes(fd: int) -> None:

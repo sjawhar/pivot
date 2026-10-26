@@ -464,7 +464,7 @@ def _explain_with_outputs(
         path = store.resolve_display_path(ref)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("value: 1\n")
-        output_hashes[ref.identity] = executor.worker.hash_output(path)
+        output_hashes[ref.identity] = executor.worker.hash_output(path)[0]
     manifest = {"self:summarize": "abc123"}
     lock.StageLock("s", lock.get_stages_dir(state_dir)).write(
         LockData(code_manifest=manifest, params={}, dep_hashes={}, output_hashes=output_hashes)
@@ -948,21 +948,30 @@ def test_producer_output_hashes_leaves_the_file_to_hash_when_no_listing_exists(
     assert produced["file_identity"] not in hashes
 
 
-def test_producer_output_hashes_refuses_an_edited_committed_listing_the_cache_cannot_replace(
+def test_producer_output_hashes_reports_an_edited_committed_listing_the_cache_cannot_replace(
     mock_discovery: compose.Pipeline,
 ) -> None:
-    """A committed listing whose bytes no longer hash to the lock's record is refused when the
-    cache holds no object at that record's hash to read instead."""
+    """A committed listing whose bytes no longer hash to the lock's record, with no cache object
+    at that record's hash to read instead, is the consumer's problem, not every stage's: its
+    file is left to be hashed on disk and ``unreadable`` says why, naming the listing."""
     produced = _run_directory_pipeline(mock_discovery.root)
     committed = produced["committed_listing"]
     original = committed.read_bytes()
     committed.write_bytes(original.replace(_BETA_HASH.encode(), b"0" * 16))
     cache.get_cache_path(produced["cache_dir"], listing.digest(original)).unlink()
+    unreadable = dict[ArtifactIdentity, str]()
 
-    with pytest.raises(exceptions.CorruptListingError, match="its bytes hash to"):
-        explain.producer_output_hashes(
-            produced["locks"], produced["deps"], produced["stages_dirs"], produced["cache_dir"]
-        )
+    hashes = explain.producer_output_hashes(
+        produced["locks"],
+        produced["deps"],
+        produced["stages_dirs"],
+        produced["cache_dir"],
+        unreadable,
+    )
+
+    assert produced["file_identity"] not in hashes
+    assert str(committed) in unreadable[produced["file_identity"]]
+    assert "its bytes hash to" in unreadable[produced["file_identity"]]
 
 
 # Removed: annotation-style pipeline re-registration is not part of the compositional API.

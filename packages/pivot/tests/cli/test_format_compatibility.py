@@ -1,13 +1,14 @@
 """Red tests from the PR #523 tester gate (head 282d7462): each pins one defect found by driving
-the installed `pivot` CLI.
+the installed `pivot` CLI; and an upgrade from a released pivot's run cache.
 
-D1 needs uv (``PIVOT_TEST_UV``, as CI names it, else on PATH) and network access to PyPI: it
-runs released pivots (0.5.10 and 0.5.9 share main's lock reader; 0.5.2 the one before) against
-a project this pivot wrote.
+D1 and the run-cache upgrade need uv (``PIVOT_TEST_UV``, as CI names it, else on PATH) and
+network access to PyPI: they run released pivots (0.5.10 and 0.5.9 share main's lock reader;
+0.5.2 the one before) against a project this pivot wrote, or that 0.5.10 wrote.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import shutil
@@ -93,10 +94,17 @@ def _git(cwd: pathlib.Path, *args: str) -> str:
     return _ok(_run(cwd, "git", "-c", "user.email=t@t", "-c", "user.name=t", *args))
 
 
-def _project(root: pathlib.Path) -> pathlib.Path:
+def _released(version: str) -> list[str]:
+    """The command that runs released pivot ``version``."""
+    uv = os.environ.get("PIVOT_TEST_UV") or shutil.which("uv")
+    assert uv is not None, "this test runs released pivots with `uv tool run`"
+    return [uv, "tool", "run", "--quiet", "--from", f"pivot=={version}", "pivot"]
+
+
+def _project(root: pathlib.Path, pivot: tuple[str, ...] = (_PIVOT,)) -> pathlib.Path:
     root.mkdir(parents=True)
     _git(root, "init", "-q", "-b", "main")
-    _ok(_run(root, _PIVOT, "init"))
+    _ok(_run(root, *pivot, "init"))
     (root / "pipeline.py").write_text(_PIPELINE)
     corpus = root / "data/raw/corpus"
     (corpus / "bin").mkdir(parents=True)
@@ -121,9 +129,7 @@ def test_older_pivot_never_restores_a_listing_as_a_file(tmp_path: pathlib.Path, 
     has not upgraded), must be refused or decided afresh, never answered wrongly. Today the
     older release reads `{hash, size, nfiles}` as a one-file hash and writes the directory's
     listing bytes as a regular file where the directory output belongs, exit 0."""
-    uv = os.environ.get("PIVOT_TEST_UV") or shutil.which("uv")
-    assert uv is not None, "this test runs released pivots with `uv tool run`"
-    old = [uv, "tool", "run", "--quiet", "--from", f"pivot=={version}", "pivot"]
+    old = _released(version)
     root = _project(tmp_path / "src")
     _ok(_run(root, _PIVOT, "repro"))
     _git(root, "add", "-A")
@@ -209,3 +215,32 @@ def test_docs_say_every_old_lock_is_read_as_missing(tmp_path: pathlib.Path):
         "docs/concepts/outputs.md says only an old lock that lists a directory's files is read "
         + "as missing; every lock with another schema_version is"
     )
+
+
+# =============================================================================
+# An older pivot's run-cache entry restores after an upgrade
+# =============================================================================
+
+
+def test_a_run_cache_entry_an_older_pivot_filed_restores_after_an_upgrade(tmp_path: pathlib.Path):
+    """Pivot 0.5.10 files a run-cache entry under the key without this pivot's directory marker,
+    listing a directory output's files inline. After an upgrade, an input put back to a value the
+    old pivot ran restores that stage from the old entry instead of running it."""
+    old = _released("0.5.10")
+    root = _project(tmp_path / "src", tuple(old))
+    raw = root / "data/raw/t.csv"
+    first_raw = raw.read_text()
+    _ok(_run(root, *old, "repro"))
+    first_parts = {path.name: path.read_bytes() for path in (root / _PARTS).iterdir()}
+    raw.write_text("a\n1\n20\n3\n4\n")
+    _ok(_run(root, *old, "repro"))
+    raw.write_text(first_raw)
+
+    repro = _run(root, _PIVOT, "repro", "--jsonl")
+
+    assert repro.returncode == 0, repro.stdout + repro.stderr
+    events = [json.loads(line) for line in repro.stdout.splitlines()]
+    split = next(e for e in events if e["type"] == "stage_complete" and e["stage"] == "p/split")
+    assert (split["status"], split["reason"]) == ("cached", "unchanged (run cache)"), split
+    assert {path.name: path.read_bytes() for path in (root / _PARTS).iterdir()} == first_parts
+    assert "Verification passed" in _ok(_run(root, _PIVOT, "verify"))

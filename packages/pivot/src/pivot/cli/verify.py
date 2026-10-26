@@ -25,7 +25,8 @@ VerifyStatus = Literal["passed", "failed"]
 
 
 class StageVerifyInfo(TypedDict):
-    """Verification info for a single stage."""
+    """Verification info for a single stage, or for a tracked directory whose committed listing
+    verify refuses (named by its path)."""
 
     name: str
     status: VerifyStatus
@@ -65,16 +66,38 @@ def _object_hashes(
     return result
 
 
-def _check_tracked_listing(data_path: pathlib.Path, files_dir: pathlib.Path) -> None:
+def _check_tracked_listing(
+    data_path: pathlib.Path, pvt_data: track.PvtData | None, files_dir: pathlib.Path
+) -> None:
     """Refuse a tracked directory's committed ``.pvt.listing`` that does not hash to its
-    ``.pvt``'s record or cannot be read (CorruptListingError, naming it)."""
-    pvt_data = track.read_pvt_file(track.get_pvt_path(data_path))
+    ``.pvt``'s record (``pvt_data``) or cannot be read (CorruptListingError, naming it)."""
     if pvt_data is None or "nfiles" not in pvt_data:
         return
     try:
         track.tracked_members(data_path, pvt_data, files_dir, strict=True)
     except exceptions.ListingMissingError:
         return
+
+
+def _tracked_listing_failures(files_dir: pathlib.Path) -> list[StageVerifyInfo]:
+    """A failed result, named by its path, for each tracked directory in the project whose
+    committed ``.pvt.listing`` cannot be used (``_check_tracked_listing``), whether or not a
+    stage reads it: a fresh clone would have no cache to restore it from."""
+    project_root = project.get_project_root()
+    failures = list[StageVerifyInfo]()
+    for path, pvt_data in sorted(track.discover_pvt_files(project_root).items()):
+        try:
+            _check_tracked_listing(pathlib.Path(path), pvt_data, files_dir)
+        except exceptions.CorruptListingError as e:
+            failures.append(
+                StageVerifyInfo(
+                    name=project.to_relative_path(path, project_root),
+                    status="failed",
+                    reason=f"{e}. {e.REMEDY}",
+                    missing_files=[],
+                )
+            )
+    return failures
 
 
 def _get_stage_lock_hashes(
@@ -143,7 +166,10 @@ def _get_stage_lock_hashes(
                 stage_lock.stages_dir, workspace_store.input_relpath(ref)
             )
             if is_dir_hash(hash_info):
-                _check_tracked_listing(project.normalize_path(dep_path), files_dir)
+                data_path = project.normalize_path(dep_path)
+                _check_tracked_listing(
+                    data_path, track.read_pvt_file(track.get_pvt_path(data_path)), files_dir
+                )
         dep_hashes.update(
             _object_hashes(project.to_relative_path(dep_path), hash_info, committed, files_dir)
         )
@@ -423,7 +449,8 @@ def verify(
     """Verify pipeline was reproduced and outputs are available.
 
     Checks that all stages are cached (code, params, deps match lock files)
-    and output files exist locally or on remote.
+    and output files exist locally or on remote. With no stage named, it also
+    checks that every tracked directory's committed listing hashes to its .pvt.
 
     With --allow-missing, both stage dependencies and outputs are verified
     to exist on the remote cache, enabling CI verification without local data.
@@ -462,6 +489,10 @@ def verify(
 
     # Verify stages
     passed, results = _verify_stages(pipeline_status, cache_dir, allow_missing)
+    if stages_list is None:
+        tracked_failures = _tracked_listing_failures(cache_dir / "files")
+        results.extend(tracked_failures)
+        passed = passed and not tracked_failures
 
     # Output results
     if output_json:

@@ -809,7 +809,7 @@ def test_a_directory_tracked_by_the_previous_release_is_seen_with_its_files_and_
 def _helper_old_directory_entry(entry: dict[str, object]) -> dict[str, object]:
     """A schema-3 entry for a `_helper_write_tree` directory as pivot 0.5.9 wrote it: its
     files listed inline and the directory hashed as JSON."""
-    old = {k: v for k, v in entry.items() if k not in ("size", "nfiles")}
+    old = {k: v for k, v in entry.items() if k not in ("listing", "size", "nfiles")}
     old["hash"] = _TREE_HASH_0_5_9
     old["manifest"] = _TREE_MANIFEST
     old["empty_dirs"] = _TREE_EMPTY_DIRS
@@ -838,3 +838,307 @@ def test_get_restores_a_directory_from_a_revision_whose_lock_an_older_pivot_wrot
 
     assert got.returncode == 0, got.stdout + got.stderr
     _helper_assert_tree(out_dir)
+
+
+# =============================================================================
+# Git: merges, a lock put back without its listing, ignored files, stale listings
+# =============================================================================
+
+_WORDS_PIPELINE = """\
+from typing import Annotated, TypedDict
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+class Parts(TypedDict):
+    parts: Annotated[dict[str, str], directory, loaders.Text()]
+
+
+@stage
+def explode(raw: str) -> Parts:
+    pairs = (word.split("=", 1) for word in raw.split())
+    return {"parts": {f"{name}.txt": value for name, value in pairs}}
+
+
+@stage
+def first(a: str) -> str:
+    return a.upper()
+
+
+with Pipeline("w") as pipeline:
+    first(explode(pipeline.input("words.txt"))["parts"]["a.txt"])
+"""
+_WORDS = "a=1\nb=2\nc=3\nd=4\ne=5\n"
+_EXPLODE_LOCK = pathlib.Path(".pivot/stages/w/explode.lock")
+_PARTS_LISTING = pathlib.Path(".pivot/stages/w/explode=parts.listing")
+_PARTS_DIR = pathlib.Path("data/w/explode/parts")
+
+
+def _helper_words_project(root: pathlib.Path) -> pathlib.Path:
+    """A directory output (``explode``), its one-file consumer (``first``), not yet run."""
+    return _project(
+        root,
+        {
+            "pipeline.py": _WORDS_PIPELINE,
+            "data/raw/words.txt": _WORDS,
+            ".gitignore": "/data/w/\n__pycache__/\n",
+        },
+    )
+
+
+def _helper_set_words(root: pathlib.Path, old: str, new: str) -> None:
+    (root / "data" / "raw" / "words.txt").write_text(_WORDS.replace(old, new))
+
+
+def test_init_writes_a_gitattributes_rule_so_git_never_merges_a_listing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A listing's bytes must hash to its record, so git must never merge one line by line. An
+    existing .gitattributes keeps its lines and gains the rule once."""
+    root = _project(tmp_path / "new", {})
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=existing, check=True)
+    (existing / ".gitattributes").write_text("*.csv text")
+
+    _ok(_pivot(existing, "init"))
+    _ok(_pivot(existing, "init", "--force"))
+
+    assert "*.listing -merge" in (root / ".gitattributes").read_text().splitlines()
+    attribute = _ok(_git(root, "check-attr", "merge", "--", str(_PARTS_LISTING)))
+    assert attribute.strip().endswith("merge: unset"), attribute
+    lines = (existing / ".gitattributes").read_text().splitlines()
+    assert lines[0] == "*.csv text", lines
+    assert lines.count("*.listing -merge") == 1, lines
+
+
+def test_a_merge_that_changed_one_directory_on_both_sides_conflicts_and_resolves_from_one_side(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Two branches change different files of one directory output. Git conflicts on the
+    listing beside its lock instead of merging it line by line into bytes that hash to neither
+    side's record. Taking both from one side verifies, and so does settling the inputs and
+    running `pivot repro`, as docs/concepts/outputs.md says."""
+    root = _helper_words_project(tmp_path / "merged")
+    _ok(_pivot(root, "repro"))
+    _commit(root, "base")
+    _ok(_git(root, "checkout", "-q", "-b", "x"))
+    _helper_set_words(root, "a=1", "a=11")
+    _ok(_pivot(root, "repro"))
+    _commit(root, "x")
+    theirs = (root / _PARTS_LISTING).read_bytes()
+    _ok(_git(root, "checkout", "-q", "-b", "y", "HEAD~1"))
+    _helper_set_words(root, "e=5", "e=55")
+    _ok(_pivot(root, "repro"))
+    _commit(root, "y")
+
+    merge = _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "merge", "-q", "x")
+    unmerged = _git(root, "diff", "--name-only", "--diff-filter=U").stdout.split()
+    settled = tmp_path / "settled"
+    shutil.copytree(root, settled, symlinks=True)
+
+    assert merge.returncode != 0, merge.stdout + merge.stderr
+    assert sorted(unmerged) == [str(_EXPLODE_LOCK), str(_PARTS_LISTING)], unmerged
+
+    _ok(_git(root, "checkout", "--theirs", "--", ".pivot/stages"))
+    _ok(_git(root, "checkout", "x", "--", "data/raw/words.txt"))
+    assert (root / _PARTS_LISTING).read_bytes() == theirs
+    _ok(_pivot(root, "checkout", "--force"))
+    assert "Verification passed" in _ok(_pivot(root, "verify"))
+    _commit(root, "merge x, taking its side")
+
+    _ok(_pivot(settled, "repro"))
+    assert "Verification passed" in _ok(_pivot(settled, "verify"))
+    assert (settled / _PARTS_DIR / "a.txt").read_text() == "11"
+    assert (settled / _PARTS_DIR / "e.txt").read_text() == "55"
+    _commit(settled, "merge x, rerun")
+
+
+def test_a_clone_whose_lock_was_put_back_reports_that_stage_and_fetches_its_listing(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """A lock checked out from an older revision without its listing, in a clone whose cache
+    holds only the current revision's objects. The listing is its stage's problem: `status` and
+    `repro --dry-run` report every stage, the consumer's reason naming the file, and a targeted
+    `fetch` and `checkout --force` get that revision's listing and files from the remote."""
+    env, bucket = _helper_s3_env(moto_services["s3"])
+    src = _helper_words_project(tmp_path / "src")
+    _ok(_pivot(src, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    _ok(_pivot(src, "config", "set", "default_remote", "origin"))
+    _ok(_pivot(src, "repro", env=env))
+    _ok(_pivot(src, "push", env=env))
+    _commit(src, "a")
+    first = _ok(_git(src, "rev-parse", "HEAD")).strip()
+    _helper_set_words(src, "b=2", "b=20")
+    _ok(_pivot(src, "repro", env=env))
+    _ok(_pivot(src, "push", env=env))
+    _commit(src, "b")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
+    _ok(_pivot(clone, "fetch", "w/explode", env=env))
+    _ok(_git(clone, "checkout", first, "--", str(_EXPLODE_LOCK)))
+
+    status = _ok(_pivot(clone, "status", env=env))
+    explained = _pivot(clone, "status", "--explain", "--json", env=env)
+    dry_run = _ok(_pivot(clone, "repro", "--dry-run", env=env))
+
+    assert "w/explode" in status and "w/first" in status, status
+    assert explained.returncode == 0, explained.stdout + explained.stderr
+    by_name = {stage["name"]: stage for stage in json.loads(explained.stdout)["stages"]}
+    assert by_name["w/explode"]["will_run"] and by_name["w/first"]["will_run"], by_name
+    assert str(_PARTS_LISTING) in by_name["w/first"]["reason"], by_name["w/first"]
+    assert "w/explode" in dry_run, dry_run
+
+    _ok(_pivot(clone, "fetch", "w/explode", env=env))
+    _ok(_pivot(clone, "checkout", "--force", "w/explode", env=env))
+    assert (clone / _PARTS_DIR / "b.txt").read_text() == "2", "the restored output is a's"
+
+
+def test_a_committed_stale_listing_names_remedies_that_put_it_right(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A lock and its input put back without the listing, committed, then cloned: git's own copy
+    of the listing is stale, so `git checkout -- <file>` changes nothing. `verify` refuses it
+    and names remedies; `repro` reads the cache's copy; each named remedy makes `verify` pass."""
+    src = _helper_words_project(tmp_path / "src")
+    _ok(_pivot(src, "repro"))
+    _commit(src, "c1")
+    first = _ok(_git(src, "rev-parse", "HEAD")).strip()
+    _helper_set_words(src, "b=2", "b=20")
+    _ok(_pivot(src, "repro"))
+    _commit(src, "c2")
+    _ok(_git(src, "checkout", first, "--", str(_EXPLODE_LOCK), "data/raw/words.txt"))
+    _commit(src, "put back explode's lock and input without its listing")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
+    shutil.copytree(src / ".pivot" / "cache", clone / ".pivot" / "cache")
+
+    refused = _pivot(clone, "verify")
+    repro = _ok(_pivot(clone, "repro"))
+    still_refused = _pivot(clone, "verify")
+    by_git = tmp_path / "by-git"
+    shutil.copytree(clone, by_git, symlinks=True)
+    _ok(_git(by_git, "checkout", first, "--", str(_PARTS_LISTING)))
+    _ok(_pivot(clone, "repro", "--force", "w/explode"))
+
+    for proc in (refused, still_refused):
+        out = proc.stdout + proc.stderr
+        assert proc.returncode == 1, out
+        assert str(_PARTS_LISTING) in out and "Traceback" not in out, out
+        assert "pivot repro --force <stage>" in out and "git checkout <the revision" in out, out
+    assert "0 ran" in repro and str(_PARTS_LISTING) in repro, repro
+    assert "Verification passed" in _ok(_pivot(by_git, "verify"))
+    assert "Verification passed" in _ok(_pivot(clone, "verify"))
+    assert (clone / _PARTS_DIR / "b.txt").read_text() == "2"
+
+
+def test_repro_warns_when_git_ignores_a_lock_a_run_cache_restore_wrote(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A stage restored from its run cache rewrites its lock as a run does, so `repro` names
+    that lock when git ignores it (a project made before `!/stages/**`, a root `p/` pattern)."""
+    root = _project(
+        tmp_path, {"pipeline.py": _PLAIN_PIPELINE, "data/raw/in.txt": "abc", ".gitignore": "p/\n"}
+    )
+    gitignore = root / ".pivot" / ".gitignore"
+    gitignore.write_text(gitignore.read_text().replace("!/stages/**\n", ""))
+    _ok(_pivot(root, "repro"))
+    output = root / str(_helper_entry(root, "p/upper", "outs", None)["path"])
+    lock_path = root / ".pivot" / "stages" / "p" / "upper.lock"
+    lock_path.unlink()
+    output.unlink()
+
+    repro = _ok(_pivot(root, "repro"))
+
+    assert "0 ran, 1 cached" in repro, repro
+    assert lock_path.is_file() and output.read_text() == "ABC"
+    assert "git ignores .pivot/stages/p/upper.lock" in repro, repro
+
+
+def test_verify_refuses_a_stale_input_or_tracked_listing_naming_it(tmp_path: pathlib.Path) -> None:
+    """`pivot verify` refuses every committed listing that does not hash to its record, a
+    pipeline input's and a tracked directory's (read by no stage) included, naming it and a
+    remedy, and never with a traceback."""
+    root = _helper_tree_project(tmp_path)
+    _helper_write_tree(root / "assets")
+    _ok(_pivot(root, "track", "assets"))
+    assert "Verification passed" in _ok(_pivot(root, "verify"))
+
+    for committed in (_INPUT_LISTING, pathlib.Path("assets.pvt.listing")):
+        good = (root / committed).read_bytes()
+        (root / committed).write_bytes(good.splitlines(keepends=True)[0])
+        verified = _pivot(root, "verify")
+        (root / committed).write_bytes(good)
+
+        out = verified.stdout + verified.stderr
+        assert verified.returncode == 1, out
+        assert str(committed) in out and "its bytes hash to" in out, out
+        assert "pivot track --force <path>" in out and "Traceback" not in out, out
+    assert "Verification passed" in _ok(_pivot(root, "verify"))
+
+
+def test_ci_verify_in_a_fresh_clone_refuses_a_committed_stale_input_listing(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """The documented CI form, `verify --allow-missing` in a fresh clone, fails the stage whose
+    committed input listing does not hash to its record, naming it, instead of an uncaught
+    error. The input is committed with git, so it holds no empty directory git would drop."""
+    env, bucket = _helper_s3_env(moto_services["s3"])
+    src = _project(
+        tmp_path / "src", {"pipeline.py": _TREE_PIPELINE, ".gitignore": "/data/t/\n__pycache__/\n"}
+    )
+    corpus = src / "data" / "raw" / "corpus"
+    (corpus / "bin").mkdir(parents=True)
+    (corpus / "a.txt").write_bytes(b"a")
+    (corpus / "bin" / "run.sh").write_bytes(b"#!/bin/sh\n")
+    _ok(_pivot(src, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    _ok(_pivot(src, "config", "set", "default_remote", "origin"))
+    _ok(_pivot(src, "repro", env=env))
+    _ok(_pivot(src, "push", env=env))
+    good = (src / _INPUT_LISTING).read_bytes()
+    (src / _INPUT_LISTING).write_bytes(good.splitlines(keepends=True)[0])
+    _commit(src, "an input listing that does not hash to its record")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
+
+    verified = _pivot(clone, "verify", "--allow-missing", env=env)
+
+    out = verified.stdout + verified.stderr
+    assert verified.returncode == 1, out
+    assert "t/copy: failed" in out and str(_INPUT_LISTING) in out, out
+    assert "Traceback" not in out and "Error:" not in out, out
+
+
+def test_a_listing_path_that_is_a_directory_is_named_and_replaced_by_a_stage_run(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A committed listing path that cannot be read (here a directory) is refused by `pivot
+    verify`, naming it; `pivot repro --force <stage>`, the remedy it names, writes the listing in
+    place of an empty directory, and refuses one that holds anything, naming it, without a
+    traceback."""
+    root = _helper_tree_project(tmp_path)
+    listing_file = root / _OUTPUT_LISTING
+    good = listing_file.read_bytes()
+    listing_file.unlink()
+    listing_file.mkdir()
+
+    verified = _pivot(root, "verify")
+    forced = _pivot(root, "repro", "--force", "t/copy")
+    listing_file.unlink()
+    listing_file.mkdir()
+    (listing_file / "x").write_text("x")
+    refused = _pivot(root, "repro", "--force", "t/copy")
+
+    named = verified.stdout + verified.stderr
+    assert verified.returncode == 1, named
+    assert str(_OUTPUT_LISTING) in named and "cannot be read" in named, named
+    assert "pivot repro --force <stage>" in named and "Traceback" not in named, named
+    assert forced.returncode == 0, forced.stdout + forced.stderr
+    assert "Traceback" not in forced.stdout + forced.stderr
+    out = refused.stdout + refused.stderr
+    assert refused.returncode == 1, out
+    assert str(_OUTPUT_LISTING) in out and "remove it" in out and "Traceback" not in out, out
+    shutil.rmtree(listing_file)
+    _ok(_pivot(root, "repro", "--force", "t/copy"))
+    assert listing_file.read_bytes() == good
+    assert "Verification passed" in _ok(_pivot(root, "verify"))

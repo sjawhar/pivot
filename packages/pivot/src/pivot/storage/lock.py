@@ -221,8 +221,7 @@ def _from_document(document: object) -> StorageLockData:
             {("hash" if key == _DIR_HASH_KEY else key): value for key, value in entry.items()}
             for entry in cast("list[dict[str, object]]", data[list_key])
         ]
-    renamed: object = data
-    return cast("StorageLockData", renamed)
+    return cast("StorageLockData", cast("object", data))
 
 
 def _to_document(data: StorageLockData) -> dict[str, object]:

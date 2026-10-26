@@ -1058,11 +1058,12 @@ def test_restore_directory_without_listing_fails(
     assert not output_path.exists(), "Nothing should be written without a listing"
 
 
-def test_restore_directory_refuses_committed_listing_not_matching_its_hash(
-    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+def test_restore_directory_reads_the_cache_copy_of_a_committed_listing_not_matching_its_hash(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A committed listing whose bytes do not hash to the .pvt's directory hash is refused,
-    though the cache holds the right listing, and nothing is written."""
+    """A committed listing whose bytes do not hash to the .pvt's directory hash is passed over
+    for the cache's copy at that hash, with one warning naming the file at the revision: the
+    one read rule every reader follows."""
     repo_path, commit = git_repo
     cache_files = repo_path / ".pivot" / "cache" / "files"
     hashed = _cache_directory_files(cache_files, _DIR_CONTENTS, _DIR_EMPTY)
@@ -1071,6 +1072,35 @@ def test_restore_directory_refuses_committed_listing_not_matching_its_hash(
     assert edited != hashed["data"]
     listing.write(listing.tracked_listing_path(pvt_path), edited)
     listing.store_object(cache_files, hashed["record"]["hash"], hashed["data"])
+    sha = commit("track data with an edited listing")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    output_path = repo_path / "restored_data"
+
+    _, success = _restore_data_directory(repo_path, sha[:7], output_path)
+
+    assert success
+    assert _tree(output_path) == ["a.txt", "empty", "sub", "sub/b.txt"]
+    assert (output_path / "a.txt").read_bytes() == _DIR_CONTENTS["a.txt"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any(
+        f"data.pvt.listing at revision {sha[:7]}: its bytes hash to" in m
+        and "using the cache's copy" in m
+        for m in warnings
+    ), warnings
+
+
+def test_restore_directory_refuses_committed_listing_not_matching_its_hash_without_cache_copy(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no cache object at the .pvt's directory hash to read instead, a committed listing
+    that does not hash to it is refused, naming the file at the revision, and nothing is
+    written."""
+    repo_path, commit = git_repo
+    cache_files = repo_path / ".pivot" / "cache" / "files"
+    hashed = _cache_directory_files(cache_files, _DIR_CONTENTS, _DIR_EMPTY)
+    pvt_path = _write_directory_pvt(repo_path / "data.pvt", hashed["record"])
+    edited = hashed["data"].replace(b" 14 - a.txt\n", b" 15 - a.txt\n")
+    listing.write(listing.tracked_listing_path(pvt_path), edited)
     sha = commit("track data with an edited listing")
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
     output_path = repo_path / "restored_data"

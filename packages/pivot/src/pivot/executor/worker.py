@@ -839,7 +839,7 @@ def _execute_stage(
                                     input_hash=input_hash,
                                     file_hash_entries=restored_entries,
                                 )
-                            outputs_unusable = _OUTPUTS_UNUSABLE
+                            outputs_unusable = _outputs_unusable_reason(restoration)
 
                     hashed_dirs = dict[str, listing.HashedDirectory]()
                     dep_hashes, missing, unreadable, file_hash_entries = hash_dependencies(
@@ -898,7 +898,7 @@ def _execute_stage(
                                 input_hash=input_hash,
                                 file_hash_entries=file_hash_entries + restored_entries,
                             )
-                        run_reason = _OUTPUTS_UNUSABLE
+                        run_reason = _outputs_unusable_reason(restoration)
 
                     # Check run cache for previously executed configuration (skip if forcing)
                     if run_reason and not stage_info["force"] and run_cache_allowed:
@@ -1068,6 +1068,7 @@ def _execute_stage(
         except (
             exceptions.OutputMissingError,
             exceptions.CacheRestoreError,
+            exceptions.CorruptListingError,
             exceptions.StageDefinitionError,
             exceptions.InvalidPathError,
         ) as exc:
@@ -1162,9 +1163,12 @@ class OutputRestoreResult(NamedTuple):
     """Whether output restoration succeeded and wrote workspace bytes.
 
     ``unavailable`` lists outputs that neither match their locked hash nor can be restored
-    from the cache. ``to_restore`` lists outputs that differ from their locked hash and that
-    the cache holds: a restore writes them from the cache, a check only names them, so a check
-    whose result is available with nothing to restore writes nothing when restored. A check
+    from the cache. ``empty_dirs_unrecorded`` lists outputs that hold every file their locked
+    listing records plus empty directories it records none of (``unrecorded_empty_dirs_only``):
+    restoring such an output would delete the directories, so the stage runs instead.
+    ``to_restore`` lists outputs that differ from their locked hash and that the cache holds:
+    a restore writes them from the cache, a check only names them, so a check whose result is
+    available with nothing to restore writes nothing when restored. A check
     (``restore=False``) lists every such output; a restore stops at the first unusable one,
     since the stage must run anyway.
     """
@@ -1172,11 +1176,41 @@ class OutputRestoreResult(NamedTuple):
     available: bool
     outputs_restored: bool
     unavailable: list[types.ArtifactRef]
+    empty_dirs_unrecorded: list[types.ArtifactRef]
     to_restore: list[types.ArtifactRef]
 
 
-# The reason a stage whose lock is current runs because its outputs could not be used.
-_OUTPUTS_UNUSABLE = "outputs missing from cache"
+def unrecorded_empty_dirs_only(expected: listing.DirListing, actual: listing.DirListing) -> bool:
+    """Whether a directory output holding ``actual`` is ``expected``'s files plus empty
+    directories, where ``expected`` records none.
+
+    Pivot before 0.3.4 listed a directory's files alone, and a lock pivot 0.3.4 or later wrote
+    for a directory with no empty directories looks the same; pivot reads such a lock as it is
+    (``StageLock.read``), its listing recording no empty directories. Restoring an output to it
+    deletes the empty directories on disk, and the stages that read the output then hash the
+    stripped tree to the old value and stay cached, though a fresh build of a stage that makes
+    the directories would hold them. Running the stage instead costs one run where the
+    directories were only added by hand; that run rebuilds the output without them.
+    """
+    return (
+        not expected["empty_dirs"]
+        and bool(actual["empty_dirs"])
+        and actual["files"] == expected["files"]
+    )
+
+
+def empty_dirs_unrecorded_reason(refs: list[types.ArtifactRef]) -> str:
+    """Say why a stage whose lock is current must run: ``refs`` are its outputs whose lock does
+    not record the empty directories they hold."""
+    keys = ", ".join(types.identity_key(ref.identity) for ref in refs)
+    return f"Output holds empty directories its lock does not record: {keys}"
+
+
+def _outputs_unusable_reason(restoration: OutputRestoreResult) -> str:
+    """The reason a stage whose lock is current runs because its outputs could not be used."""
+    if restoration.empty_dirs_unrecorded:
+        return empty_dirs_unrecorded_reason(restoration.empty_dirs_unrecorded)
+    return "outputs missing from cache"
 
 
 @overload
@@ -1230,6 +1264,7 @@ def restore_outputs_to_hashes(
     without reading it.
     """
     unavailable = list[types.ArtifactRef]()
+    empty_dirs_unrecorded = list[types.ArtifactRef]()
     to_restore = list[types.ArtifactRef]()
     outputs_restored = False
     if not isinstance(store, store_mod.WorkspaceStore):
@@ -1240,15 +1275,17 @@ def restore_outputs_to_hashes(
             if expected_hash is not None:
                 output_path = store.resolve_display_path(ref)
                 read = list[tuple[pathlib.Path, os.stat_result, str]]()
+                actual_hash: HashInfo | None
+                actual_listing: listing.DirListing | None
                 try:
-                    actual_hash = hash_output(
+                    actual_hash, actual_listing = hash_output(
                         output_path,
                         state_db,
                         cache_dir=store.cache_dir,
                         pending=None if file_hash_entries is None else read,
                     )
                 except OSError:
-                    actual_hash = None
+                    actual_hash, actual_listing = None, None
                 if file_hash_entries is not None:
                     file_hash_entries.extend(cache.deferred_file_hash_entries(read))
                 if actual_hash == expected_hash:
@@ -1271,6 +1308,15 @@ def restore_outputs_to_hashes(
                         # The output cannot be restored from this listing: the stage runs,
                         # which rewrites it.
                         logger.warning("%s", e)
+                if (
+                    members is not None
+                    and actual_listing is not None
+                    and unrecorded_empty_dirs_only(members, actual_listing)
+                ):
+                    empty_dirs_unrecorded.append(ref)
+                    if restore:
+                        break
+                    continue
                 if (members is not None or not is_dir_hash(expected_hash)) and (
                     store.cache_contains(ref, expected_hash, members)
                 ):
@@ -1292,12 +1338,13 @@ def restore_outputs_to_hashes(
             unavailable.append(ref)
             if restore:
                 break
-    available = not unavailable
+    available = not unavailable and not empty_dirs_unrecorded
     if report_changes:
         return OutputRestoreResult(
             available=available,
             outputs_restored=outputs_restored,
             unavailable=unavailable,
+            empty_dirs_unrecorded=empty_dirs_unrecorded,
             to_restore=to_restore,
         )
     return available
@@ -1345,16 +1392,18 @@ def hash_output(
     *,
     cache_dir: pathlib.Path | None = None,
     pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
-) -> HashInfo:
-    """Compute output hash without saving to cache.
+) -> tuple[HashInfo, listing.DirListing | None]:
+    """Compute output hash without saving to cache, with a directory's listing (None for a
+    file).
 
     ``cache_dir`` is the cache object root whose symlinks count as directory content.
     ``pending`` receives the file-hash entry of each file read, as ``cache.hash_file`` says.
     """
     if path.is_dir():
-        return cache.hash_directory(path, state_db, cache_dir=cache_dir, pending=pending)["record"]
+        hashed = cache.hash_directory(path, state_db, cache_dir=cache_dir, pending=pending)
+        return hashed["record"], hashed["listing"]
     file_hash, _ = cache.hash_file(path, state_db, pending=pending)
-    return FileHash(hash=file_hash)
+    return FileHash(hash=file_hash), None
 
 
 def lock_output_paths(
