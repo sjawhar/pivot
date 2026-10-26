@@ -14,6 +14,7 @@ import aiohttp
 import yaml
 
 from pivot import exceptions, project, types
+from pivot import state_dir as state_dir_mod
 from pivot.config import io as config_io
 from pivot.remote import config as remote_config
 from pivot.remote import git_archive, github, protocol
@@ -554,8 +555,11 @@ async def import_artifact(
     if force and data_path.exists() and data_path.is_dir():
         raise exceptions.PivotError("Cannot overwrite directory with import")
 
-    pvt_path.parent.mkdir(parents=True, exist_ok=True)
-    data_path.parent.mkdir(parents=True, exist_ok=True)
+    # A destination inside a configured state directory that does not exist yet is created
+    # through the common creator, so that directory gets its ignore file before the import
+    # writes the `.pvt` file or the data under it.
+    state_dir_mod.make_dirs(pvt_path.parent)
+    state_dir_mod.make_dirs(data_path.parent)
 
     downloaded = False
     file_size = resolved["size"]

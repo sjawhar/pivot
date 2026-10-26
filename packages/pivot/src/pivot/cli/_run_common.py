@@ -19,6 +19,7 @@ import anyio
 import click
 
 from pivot import discovery
+from pivot import state_dir as state_dir_mod
 from pivot.cli import decorators as cli_decorators
 from pivot.engine import engine, sinks
 from pivot.executor import core as executor_core
@@ -286,7 +287,12 @@ def validate_tui_log(
     tui_flag: bool,
     dry_run: bool = False,
 ) -> pathlib.Path | None:
-    """Validate --tui-log option and resolve path if valid."""
+    """Validate --tui-log option and resolve path if valid.
+
+    A log inside a configured state directory that does not exist yet is the first thing
+    written there, so its parent comes from the common creator, which makes that directory
+    with its ignore file.
+    """
     if not tui_log:
         return None
     if as_json:
@@ -298,7 +304,7 @@ def validate_tui_log(
     # Validate path upfront (fail fast)
     resolved = tui_log.expanduser().resolve()
     try:
-        resolved.parent.mkdir(parents=True, exist_ok=True)
+        state_dir_mod.make_dirs(resolved.parent)
         resolved.touch()  # Verify writable
     except OSError as e:
         raise click.ClickException(f"Cannot write to {resolved}: {e}") from e
