@@ -235,13 +235,14 @@ Tier 3:   │  Check run cache       │──── Hit? ─────▶ SKI
 
 ### Dependency Hash Lookup
 
-Before skip checks, dependency hashes are looked up via StateDB. Each cached hash entry stores file metadata:
+Before skip checks, dependency hashes are looked up via StateDB. Each cached hash entry stores file metadata from a `stat()` that follows symlinks:
 
 - `mtime_ns` - Modification time in nanoseconds
 - `size` - File size in bytes
+- `dev` - The device of the filesystem that holds the file
 - `inode` - Filesystem inode number
 
-When all three match the current file's `stat()` result, the cached hash is returned in O(1) without re-reading the file. The inode check detects file replacement (delete + create with same name), which keeps mtime/size but changes inode. Only files with changed metadata require actual hashing.
+When all four match the current file's `stat()` result, the cached hash is returned in O(1) without re-reading the file. The inode check detects file replacement (delete + create with same name), which keeps mtime/size but changes inode. The device check detects a path that now reaches another filesystem (a directory symlink re-pointed at another mount), where an inode number can repeat. The entry holds no ctime: a new hard link changes it, so every hardlink checkout would invalidate the entries of the files it links. Only files with changed metadata require actual hashing.
 
 ### Tier 1: Generation Check (O(1))
 
@@ -263,7 +264,7 @@ A dependency on one file of a directory output follows its directory's counter, 
 
 This provides instant O(1) skip detection when nothing has changed.
 
-**File metadata verification:** In addition to generation comparison, Tier 1 optionally verifies that cached file hashes still match the current file metadata (mtime, size, inode). This catches external modifications that generation tracking alone wouldn't detect—for example, if an external tool modified a dependency file without going through Pivot.
+**File metadata verification:** In addition to generation comparison, Tier 1 optionally verifies that cached file hashes still match the current file metadata (mtime_ns, size, device, inode). This catches external modifications that generation tracking alone wouldn't detect—for example, if an external tool modified a dependency file without going through Pivot.
 
 ### Tier 2: Lock File Comparison
 
@@ -291,14 +292,14 @@ StateDB is an LMDB-backed key-value store for all pipeline state. Keys use prefi
 
 | Prefix | Purpose |
 |--------|---------|
-| `hash:` | File hash cache (uses resolved paths, follows symlinks for deduplication) |
-| `gen:` | Output generation counters (uses normalized paths, preserves symlinks) |
+| `hash:` | File hash cache (the absolute path as given, no symlink followed; the entry holds `stat()`'s mtime_ns, size, device and inode) |
+| `gen:` | Output generation counters (the artifact identity, `stage` or `stage:key`) |
 | `dep:` | Stage dependency generations (stage name + dep path) |
 | `runcache:` | Run cache entries (stage name + input hash) |
 | `run:` | Run history manifests |
 | `remote:` | Remote index entries |
 
-**Path handling strategies:** Hash keys use `resolve()` (follows symlinks) so that symlinked files deduplicate to the same cache entry. Generation keys use `normpath()` (preserves symlinks) so that logical path identity is maintained for dependency tracking.
+**Key strategies:** A file-hash key is the absolute path as given (`os.fsencode(os.path.abspath(path))`): building it costs no system call, and the entry's `(mtime_ns, size, device, inode)`, from a `stat()` that follows symlinks, decides whether a cached hash still applies, so a link re-pointed at another file no longer matches. Generation keys use the artifact identity, so they stay the same wherever an output's path points.
 
 ### Multi-process safety
 
