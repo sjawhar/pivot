@@ -18,14 +18,30 @@ _PIVOT = pathlib.Path(sys.executable).parent / "pivot"
 _RUN_PY = pathlib.Path(run.__file__)
 
 
-def _helper_repro_pid(harness: subprocess.Popen[bytes]) -> int:
+def _helper_repro_session(harness: subprocess.Popen[bytes]) -> int:
+    """Return the session of run.py's `pivot repro` child: the only session this test kills.
+
+    run.measure() starts each command with start_new_session=True, so the session's id is the pid
+    of that child. A child that exits between the listing and the reads, such as the `pivot init`
+    that gen.write_project() runs, is skipped.
+    """
     deadline = time.monotonic() + 60
     children = pathlib.Path(f"/proc/{harness.pid}/task/{harness.pid}/children")
     while time.monotonic() < deadline:
-        for raw_pid in children.read_text().split():
-            args = pathlib.Path(f"/proc/{raw_pid}/cmdline").read_bytes().split(b"\0")
-            if b"repro" in args:
-                return int(raw_pid)
+        exit_code = harness.poll()
+        assert exit_code is None, f"run.py exited ({exit_code}) before the test found pivot repro"
+        for pid in map(int, children.read_text().split()):
+            try:
+                args = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                # After the command name: state, ppid, pgrp, session.
+                fields = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if b"repro" in args and int(fields[1]) == harness.pid:
+                assert int(fields[3]) == pid, (
+                    f"pivot repro (pid {pid}) is in session {fields[3]}, not a session of its own"
+                )
+                return pid
         time.sleep(0.05)
     raise AssertionError("run.py never started pivot repro")
 
@@ -37,10 +53,6 @@ def _helper_wait_for_members(sid: int) -> list[int]:
         time.sleep(0.05)
         members = run.session_members(sid)
     return members
-
-
-def _helper_session(pid: int) -> int:
-    return int(pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[3])
 
 
 def _helper_wait_for_stop(harness: subprocess.Popen[bytes]) -> None:
@@ -94,9 +106,9 @@ def test_real_pivot_second_signal_keeps_graceful_cleanup(
     argv += ["--reps", "1", "--work", str(tmp_path / "work"), "--out-dir", str(tmp_path / "out")]
     before = set(pathlib.Path("/dev/shm").glob("sem.loky-*"))
     harness = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    sid = 0
+    sid: int | None = None
     try:
-        sid = _helper_session(_helper_repro_pid(harness))
+        sid = _helper_repro_session(harness)
         assert len(_helper_wait_for_members(sid)) >= 4, "pivot did not start its worker session"
         harness.send_signal(first)
         time.sleep(delay_s)
@@ -112,10 +124,11 @@ def test_real_pivot_second_signal_keeps_graceful_cleanup(
         if harness.poll() is None:
             harness.kill()
             harness.wait()
-        run_test_helpers.kill_session(sid)
-        for path in _helper_semaphores(sid) - before:
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
+        if sid is not None:
+            run_test_helpers.kill_session(sid)
+            for path in _helper_semaphores(sid) - before:
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
 
 
 def test_real_pivot_pending_stop_signals_keep_graceful_cleanup(tmp_path: pathlib.Path) -> None:
@@ -123,9 +136,9 @@ def test_real_pivot_pending_stop_signals_keep_graceful_cleanup(tmp_path: pathlib
     argv += ["--reps", "1", "--work", str(tmp_path / "work"), "--out-dir", str(tmp_path / "out")]
     before = set(pathlib.Path("/dev/shm").glob("sem.loky-*"))
     harness = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    sid = 0
+    sid: int | None = None
     try:
-        sid = _helper_session(_helper_repro_pid(harness))
+        sid = _helper_repro_session(harness)
         assert len(_helper_wait_for_members(sid)) >= 4, "pivot did not start its worker session"
         harness.send_signal(signal.SIGSTOP)
         _helper_wait_for_stop(harness)
@@ -147,7 +160,8 @@ def test_real_pivot_pending_stop_signals_keep_graceful_cleanup(tmp_path: pathlib
         if harness.poll() is None:
             harness.kill()
             harness.wait()
-        run_test_helpers.kill_session(sid)
-        for path in _helper_semaphores(sid) - before:
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
+        if sid is not None:
+            run_test_helpers.kill_session(sid)
+            for path in _helper_semaphores(sid) - before:
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()

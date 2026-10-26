@@ -133,15 +133,15 @@ def test_normalize_cli_targets_no_pipeline_all_treated_as_paths(
     ), "Without pipeline, all targets should be treated as paths"
 
 
-def test_normalize_cli_targets_backslash_path_normalized(
+def test_normalize_cli_targets_keeps_a_backslash_in_a_name(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project_dir = _helper_setup_project(tmp_path, monkeypatch)
 
     result = remote_mod._normalize_cli_targets(("data\\foo.csv",))
 
-    assert result == (str(project_dir / "data" / "foo.csv"),), (
-        "Backslash paths should be normalized to POSIX"
+    assert result == (str(project_dir / "data\\foo.csv"),), (
+        "A backslash is part of the file name on POSIX, not a separator"
     )
 
 
