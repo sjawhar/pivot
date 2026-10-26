@@ -650,8 +650,10 @@ class StateDB:
                     dirs[os.fsdecode(key[len(_PVT_DIR_PREFIX) :])] = value
         return PvtDirMemo(root=None if root is None else os.fsdecode(root), dirs=dirs)
 
-    def update_pvt_dir_memo(self, previous: PvtDirMemo, root: str, dirs: dict[str, bytes]) -> None:
-        """Make the memo hold exactly ``dirs``, listed under ``root``.
+    def update_pvt_dir_memo(
+        self, previous: PvtDirMemo, root: str | None, dirs: dict[str, bytes]
+    ) -> None:
+        """Make the memo hold exactly ``dirs``, listed under ``root`` (None: no root recorded).
 
         ``previous`` is the memo as read before the walk; only entries that differ from it are
         written, and nothing is when none do. A path too long for an LMDB key is not recorded,
@@ -671,7 +673,9 @@ class StateDB:
             return
         try:
             with self._write_transaction(timeout=self._write_timeout) as txn:
-                if previous["root"] != root:
+                if previous["root"] != root and root is None:
+                    txn.delete(_PVT_ROOT_KEY)
+                elif previous["root"] != root and root is not None:
                     txn.put(_PVT_ROOT_KEY, os.fsencode(root))
                 for key, listing in puts:
                     txn.put(key, listing)

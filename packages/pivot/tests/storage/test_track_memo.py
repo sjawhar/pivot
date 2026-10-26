@@ -1074,6 +1074,11 @@ def _helper_empty_name(listing: bytes) -> bytes:
     return listing[:_COUNT_AT] + track._SUBDIR_COUNT.pack(0) + b"x.csv.pvt\0\0new.csv.pvt"
 
 
+def _helper_earlier_version(listing: bytes) -> bytes:
+    """A listing as an earlier build of the memo wrote it, which may omit a subdirectory."""
+    return b"\x01" + listing[len(track._LISTING_VERSION) :]
+
+
 @pytest.mark.parametrize(
     "corrupt",
     [
@@ -1081,6 +1086,7 @@ def _helper_empty_name(listing: bytes) -> bytes:
         pytest.param(_helper_count_too_large, id="subdirectory-count-too-large"),
         pytest.param(_helper_name_with_slash, id="name-with-a-slash"),
         pytest.param(_helper_empty_name, id="empty-name"),
+        pytest.param(_helper_earlier_version, id="earlier-listing-version"),
     ],
 )
 def test_malformed_recorded_listing_is_listed_again(
@@ -1300,6 +1306,73 @@ def test_directory_some_account_may_not_list_never_reaches_the_memo(
     assert str(private / "held.csv") in warm, "the .pvt under it is found by listing"
 
 
+def _helper_listable_above(monkeypatch: pytest.MonkeyPatch, directory: pathlib.Path) -> None:
+    """Report every directory above ``directory`` as mode 755, so only the test's own directories
+    decide (pytest's base directory is private)."""
+    above = {os.fspath(parent) for parent in pathlib.Path(os.path.realpath(directory)).parents}
+    real_lstat = os.lstat
+
+    def _lstat(path: str | os.PathLike[str], *, dir_fd: int | None = None) -> os.stat_result:
+        result = real_lstat(path, dir_fd=dir_fd)
+        if os.fspath(path) in above:
+            return os.stat_result((stat.S_IFDIR | 0o755, *tuple(result)[1:]))
+        return result
+
+    monkeypatch.setattr(os, "lstat", _lstat)
+
+
+@pytest.mark.parametrize(
+    ("home_mode", "state_inside", "recorded"),
+    [
+        pytest.param(0o700, False, False, id="outside-and-the-project-under-a-private-directory"),
+        pytest.param(0o755, False, True, id="outside-and-every-directory-above-listable"),
+        pytest.param(
+            0o705, False, False, id="outside-and-the-group-may-not-list-a-directory-above"
+        ),
+        pytest.param(0o700, True, True, id="inside-and-the-project-under-a-private-directory"),
+    ],
+)
+def test_state_directory_outside_the_project_needs_every_directory_above_listable(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    home_mode: int,
+    state_inside: bool,
+    recorded: bool,
+) -> None:
+    """An account that cannot reach the project can read a state directory outside it
+    (``core.state_dir``). The memo then records a name only when every directory from / down to
+    the project root lets every account read and search it; otherwise it records nothing. With the
+    state directory inside the project, a reader has reached the root, so the directories above
+    it do not count."""
+    home = tmp_path / "home"
+    root = home / "project"
+    (root / ".pivot").mkdir(parents=True)
+    state_dir = root / ".pivot" if state_inside else tmp_path / "state"
+    if not state_inside:
+        (root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: {state_dir}\n")
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    config_io.clear_config_cache()
+    _helper_mountinfo(monkeypatch, tmp_path / "mountinfo", root, "ext4")
+    _helper_build_tree(root)
+    (root / "notes" / "q3-layoff-list").mkdir(parents=True)
+    home.chmod(home_mode)
+    _helper_listable_above(monkeypatch, home)
+    _helper_settle(monkeypatch)
+    assert config.get_state_dir() == state_dir
+
+    _helper_record(root)
+    memo = _helper_memo()
+    database = (state_dir / "state.lmdb" / "data.mdb").read_bytes()
+
+    _helper_assert_matches_main(track.discover_pvt_files(root), root)
+    if recorded:
+        assert memo["root"] == str(root.resolve())
+        assert "notes/q3-layoff-list" in memo["dirs"], "the memo is recorded"
+    else:
+        assert memo == state.PvtDirMemo(root=None, dirs={}), "nothing is recorded"
+        assert b"q3-layoff-list" not in database, "no untracked name reaches the state database"
+
+
 # =============================================================================
 # State database
 # =============================================================================
@@ -1318,6 +1391,14 @@ def test_update_pvt_dir_memo_records_root_and_replaces_entries(tmp_path: pathlib
         assert state_db.read_pvt_dir_memo() == state.PvtDirMemo(
             root="/q", dirs={"": b"root", "a": b"a2", "c": b"c"}
         ), "changed entries are replaced and unvisited ones deleted"
+
+
+def test_update_pvt_dir_memo_with_no_root_empties_the_memo(tmp_path: pathlib.Path) -> None:
+    with state.StateDB(tmp_path / "state") as state_db:
+        state_db.update_pvt_dir_memo(state_db.read_pvt_dir_memo(), "/p", {"": b"root", "a": b"a"})
+        state_db.update_pvt_dir_memo(state_db.read_pvt_dir_memo(), None, {})
+
+        assert state_db.read_pvt_dir_memo() == state.PvtDirMemo(root=None, dirs={})
 
 
 def test_update_pvt_dir_memo_skips_paths_too_long_for_a_key(tmp_path: pathlib.Path) -> None:

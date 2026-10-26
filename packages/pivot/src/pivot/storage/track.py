@@ -164,15 +164,17 @@ def get_data_path(pvt_path: pathlib.Path) -> pathlib.Path:
 # times this way.
 #
 # Other accounts can read the state database, so the memo holds only names that every account
-# able to reach the project could list itself: a directory is recorded only when it and every
-# directory above it up to the project root let owner, group and others read and search them
-# (the recorded path holds a name from each of those directories). Any other directory, a
-# mode-700 one say, is listed every time, as on main, so a .pvt under it is found by listing,
-# never from the memo. Only mode bits are read, not POSIX ACLs: an account an ACL entry denies
-# can still read a recorded name. A chmod changes the ctime, so a directory made private no
-# longer matches its stamp. A listing in which an entry's type could not be read (the lstat a
-# filesystem without d_type needs failed) is never recorded: that entry is not descended, as in
-# os.walk, and a walk that can read its type must not reuse that.
+# able to read the database could list itself. When the state directory is inside the project, an
+# account that reads it has reached the project root, so a directory is recorded only when it and
+# every directory above it up to the project root let owner, group and others read and search
+# them (the recorded path holds a name from each of those directories). When the state directory
+# is outside the project, every directory from / down to the project root must allow that too, or
+# nothing is recorded. Any other directory, a mode-700 one say, is listed every time, so a .pvt
+# under it is found by listing, never from the memo. Only mode bits are read, not POSIX ACLs: an
+# account an ACL entry denies can still read a recorded name. A chmod changes the ctime, so a
+# directory made private no longer matches its stamp. A listing in which an entry's type could
+# not be read (the lstat a filesystem without d_type needs failed) is never recorded: that entry
+# is not descended, as in os.walk, and a walk that can read its type must not reuse that.
 _MEMO_SETTLE_NS = 2_000_000_000
 _NS_PER_S = 1_000_000_000
 _MEMO_FS_TYPES = frozenset({b"ext2", b"ext3", b"ext4", b"xfs", b"btrfs", b"tmpfs", b"f2fs", b"zfs"})
@@ -182,7 +184,7 @@ _MEMO_WRITE_TIMEOUT_S = 1.0
 _MEMO_DB_ERRORS = (exceptions.PivotError, state.StateDBError, RuntimeError, OSError, lmdb.Error)
 _MOUNTINFO = pathlib.Path("/proc/self/mountinfo")
 _MOUNTINFO_ESCAPE = re.compile(rb"\\([0-7]{3})")
-_LISTING_VERSION = b"\x01"
+_LISTING_VERSION = b"\x02"  # a version-1 listing may omit a subdirectory, so it is never reused
 _STAMP = struct.Struct(">QQqq")  # st_dev, st_ino, st_mtime_ns, st_ctime_ns
 _STAMP_TIMES = range(-(2**63), 2**63)  # the times _STAMP's signed 64-bit fields hold
 _SUBDIR_COUNT = struct.Struct(">I")
@@ -334,7 +336,6 @@ def _walk(
         if device not in allowed_devices:
             real_path = os.path.join(real_root, rel) if rel else real_root
             allowed_devices[device] = _device_allowed(mounts, device, real_path)
-        # Every account that can reach the project may list this directory and those above it.
         listable = above_listable and dir_stat.st_mode & _EVERYONE_LISTS == _EVERYONE_LISTS
         memoizable = (
             allowed_devices[device] and listable and _times_trusted(dir_stat, settled_before)
@@ -413,6 +414,27 @@ def _trusted_listings(memo: state.PvtDirMemo | None, root: pathlib.Path) -> dict
     return memo["dirs"] if memo is not None and memo["root"] == _memo_root(root) else {}
 
 
+def _readers_reach_the_project(real_root: str) -> bool:
+    """Whether every account that can read the state database could reach the project root.
+
+    True when the state directory's real path is inside the project, since reading it means
+    passing through the root. Otherwise true only when every directory from ``/`` down to the
+    root's parent lets owner, group and others read and search it; ``_walk`` checks the root's own
+    mode. A state directory that cannot be resolved, or a directory that cannot be stat'ed, counts
+    as not reachable.
+    """
+    try:
+        state_dir = os.path.realpath(config.get_state_dir())
+        if os.path.commonpath([state_dir, real_root]) == real_root:
+            return True
+        return all(
+            os.lstat(above).st_mode & _EVERYONE_LISTS == _EVERYONE_LISTS
+            for above in pathlib.PurePath(real_root).parents
+        )
+    except (exceptions.PivotError, OSError):
+        return False
+
+
 def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
     """Find all .pvt files under root, return {data_path: PvtData}.
 
@@ -427,16 +449,18 @@ def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
 def discover_pvt_files_and_update_memo(root: pathlib.Path) -> dict[str, PvtData]:
     """``discover_pvt_files`` for the repro/run pre-flight, the memo's one writer.
 
-    Records the listing of every directory ``_walk`` may record (settled, on an allowlisted
-    filesystem, listable by every account that can reach the project, every entry's type read)
-    and drops every other listing. With no tracked file found, it records only into a state
-    database that already exists, so it never creates one. A memo that cannot be recorded
-    (another pivot writer holds the lock longer than ``_MEMO_WRITE_TIMEOUT_S``, or the database
-    is read-only, full or failing) is skipped. A writer that bypasses pivot's lock can hold the
-    memo write until it commits.
+    Records the listing of every directory ``_walk`` may record and drops every other listing.
+    When an account that cannot reach the project could read the state database
+    (``_readers_reach_the_project``), it records nothing and empties the memo. With no tracked
+    file found, it records only into a state database that already exists, so it never creates
+    one. A memo that cannot be recorded (another pivot writer holds the lock longer than
+    ``_MEMO_WRITE_TIMEOUT_S``, or the database is read-only, full or failing) is skipped. A writer
+    that bypasses pivot's lock can hold the memo write until it commits.
     """
     previous = _read_stored_memo()
-    candidates, listings = _walk(root, _trusted_listings(previous, root), record=True)
+    real_root = _memo_root(root)
+    record = _readers_reach_the_project(real_root)
+    candidates, listings = _walk(root, _trusted_listings(previous, root), record=record)
     found = _read_pvt_files(candidates)
     if not found and previous is None:
         return found
@@ -444,7 +468,7 @@ def discover_pvt_files_and_update_memo(root: pathlib.Path) -> dict[str, PvtData]
         with state.StateDB(config.get_state_dir(), write_timeout=_MEMO_WRITE_TIMEOUT_S) as state_db:
             state_db.update_pvt_dir_memo(
                 previous if previous is not None else state.PvtDirMemo(root=None, dirs={}),
-                _memo_root(root),
+                real_root if record else None,
                 listings,
             )
     except _MEMO_DB_ERRORS as e:
