@@ -33,16 +33,19 @@ class StateDirWarnings(typing.TypedDict):
 
 
 # One project root's ``core.state_dir`` as a record resolved it: the directory the value names
-# (``<root>/.pivot`` when it is unset), or the error that says why the value cannot be used.
+# (``<root>/.pivot`` when it is unset), or the error that says why it cannot be used. A value
+# that names a path which cannot become a directory this process writes is kept as
+# ``StateDirTargetError``, decided with the value: the stages keep their state in ``.pivot``.
 type StateDirResolution = pathlib.Path | exceptions.ConfigError | UnicodeDecodeError
 
 
 class StateDirInvocation(typing.TypedDict):
     """One invocation's state-directory record: what it resolved, and what it reported."""
 
-    # Each project root's resolution, read from its config once per invocation. Everything
-    # derived from a state directory is derived from this where it is used, the default cache
-    # ``<state dir>/cache`` included (``config.io.locate_cache_dir``).
+    # Each project root's resolution, read from its config once per invocation, the check that
+    # the path it names can be used included. Everything derived from a state directory is
+    # derived from this where it is used, the default cache ``<state dir>/cache`` included
+    # (``config.io.locate_cache_dir``).
     resolved: dict[pathlib.Path, StateDirResolution]
     # The directory ``locate_state_dir`` answers for a root whose ``core.state_dir`` is ``''``:
     # the fallback ``state_dir_or_default`` decided for it, once per invocation.
@@ -53,8 +56,9 @@ class StateDirInvocation(typing.TypedDict):
 
 # Set by the CLI callback for one CLI invocation, by a worker for one stage, and by a library
 # entry point that no invocation covers (``entry_invocation``): an engine run, a pipeline's load
-# and each of its fingerprints, discovery. Outside one (shell completion, a low-level call such
-# as ``fingerprint.get_stage_fingerprint`` by hand), every lookup reads and resolves the config
+# and each of its fingerprints, discovery, and each ``fingerprint.get_stage_fingerprint_cached``
+# call. Outside one (shell completion, a low-level call such as
+# ``fingerprint.get_stage_fingerprint`` by hand), every lookup reads and resolves the config
 # again and nothing is reported. Nothing else in the process remembers a resolution or anything
 # derived from one.
 _invocation = contextvars.ContextVar[StateDirInvocation | None](
@@ -110,13 +114,16 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
     configuration keeps state in ``<root>/.pivot``. The ``.pivot`` marker and its configuration
     always remain at the project root. A value that cannot be used raises: ``ConfigError``
     (``EmptyStateDirError`` for ``''``), or ``UnicodeDecodeError`` for a config that is not
-    UTF-8. Within one invocation (``begin_invocation``, ``entry_invocation``), each root's config
-    is read and resolved once and the record keeps the outcome, an error included, so every
-    later lookup answers or raises from it; outside one, every call reads and resolves it again.
+    UTF-8. A path that cannot become a directory answers as ``_unusable_target`` says. Within
+    one invocation (``begin_invocation``, ``entry_invocation``), each root's config is read and
+    resolved once and the record keeps the outcome, an error included, so every later lookup
+    answers or raises from it; outside one, every call reads and resolves it again.
     """
     resolution = _resolution(root)
     if isinstance(resolution, pathlib.Path):
         return resolution
+    if isinstance(resolution, exceptions.StateDirTargetError):
+        return _unusable_target(root, resolution)
     # A fresh copy each time, so lookups never share one exception's traceback or context.
     raise copy.copy(resolution)
 
@@ -148,15 +155,23 @@ def _resolve_state_dir(root: pathlib.Path) -> StateDirResolution:
     else:
         return exceptions.ConfigError(f"core.state_dir in {config_path} must be a path")
 
+    if state_dir != root / ".pivot":
+        target_problem = state_dir_target_problem(state_dir)
+        if target_problem is not None:
+            # An unusable local state directory owns the one warning, as an unusable value does.
+            return exceptions.StateDirTargetError(
+                f"{target_problem} (core.state_dir in {config_path})", state_dir
+            )
     warn_if_global_state_dir_ignored(root, shadowed=present)
     return state_dir
 
 
 def resolved_state_dir(root: pathlib.Path, resolution: StateDirResolution) -> pathlib.Path:
-    """The directory one resolution keeps ``root``'s state in.
+    """The directory one resolution keeps ``root``'s state in, as ``state_dir_or_default`` does.
 
-    The directory the value names, or the default ``<root>/.pivot`` when the value cannot be
-    used, as ``state_dir_or_default`` decides it without checking that the directory is writable.
+    The directory the value names, or the default ``<root>/.pivot`` when the value, or the path
+    it names, cannot be used: the directory a pipeline loaded with this resolution records on
+    its stages.
     """
     return resolution if isinstance(resolution, pathlib.Path) else root / ".pivot"
 
@@ -166,9 +181,10 @@ def state_dir_or_default(root: pathlib.Path, *, warn: bool = True) -> pathlib.Pa
 
     The configured directory when ``<root>/.pivot/config.yaml`` can be read, its
     ``core.state_dir`` is a path, and that path is or can become a directory this process
-    writes (``state_dir_target_problem``). Otherwise the default ``<root>/.pivot``. Callers
-    that merely display stored configuration pass ``warn=False``; a command that reads or writes
-    state uses the warning-enabled resolver and then fails where 0.5.2 failed.
+    writes (``state_dir_target_problem``), as the record found them when it resolved the value.
+    Otherwise the default ``<root>/.pivot``. Callers that merely display stored configuration
+    pass ``warn=False``; a command that reads or writes state uses the warning-enabled resolver
+    and then fails where 0.5.2 failed.
     """
     return _state_dir_or_default(root, _resolution(root), warn=warn)
 
@@ -176,25 +192,37 @@ def state_dir_or_default(root: pathlib.Path, *, warn: bool = True) -> pathlib.Pa
 def _state_dir_or_default(
     root: pathlib.Path, resolution: StateDirResolution, *, warn: bool
 ) -> pathlib.Path:
+    if isinstance(resolution, pathlib.Path):
+        return resolution
     config_path = root / ".pivot" / "config.yaml"
     reason = "The state directory is unknown"
     if isinstance(resolution, UnicodeDecodeError):
         problem = f"{config_path} is not valid UTF-8: {resolution}"
-    elif isinstance(resolution, exceptions.ConfigError):
-        problem = str(resolution)
     else:
-        if resolution == root / ".pivot":
-            return resolution
-        target_problem = state_dir_target_problem(resolution)
-        if target_problem is None:
-            return resolution
-        problem = f"{target_problem} (core.state_dir in {config_path})"
-        reason = "The state directory cannot be used"
+        problem = str(resolution)
+        if isinstance(resolution, exceptions.StateDirTargetError):
+            reason = "The state directory cannot be used"
     reported = _reported()
     if warn and reported is not None and config_path not in reported["unusable"]:
         reported["unusable"].add(config_path)
         logger.warning(f"{problem}. {reason}; Pivot uses the default .pivot.")
     return root / ".pivot"
+
+
+def _unusable_target(
+    root: pathlib.Path, resolution: exceptions.StateDirTargetError
+) -> pathlib.Path:
+    """The state directory of a command that needs one, when the record found the path unusable.
+
+    The record's stages keep their state in ``<root>/.pivot``. While the configured path still
+    cannot be used, the command gets it and fails where it opens it, as 0.5.2 did. Once it can
+    be, the command gets ``.pivot``, where those stages keep their state. So a pipeline loaded
+    while the path could not be used never splits its state: it fails as 0.5.2 did, or it runs
+    in ``.pivot``.
+    """
+    if state_dir_target_problem(resolution.path) is None:
+        return root / ".pivot"
+    return resolution.path
 
 
 def ensure_state_dir_or_default(root: pathlib.Path) -> pathlib.Path:
@@ -250,6 +278,8 @@ def legacy_state_dir_for(state_dir: pathlib.Path) -> pathlib.Path | None:
     except exceptions.ProjectNotInitializedError:
         return None
     configured = _resolution(root)
+    if isinstance(configured, exceptions.StateDirTargetError):
+        configured = configured.path
     if not isinstance(configured, pathlib.Path):
         return None
     legacy = root / ".pivot"
@@ -273,7 +303,13 @@ def legacy_cache_files_dir_for(cache_files_dir: pathlib.Path) -> pathlib.Path | 
 
 
 def report_legacy_state_dir(state_dir: pathlib.Path) -> None:
-    """Warn once per invocation that reads fall back to the 0.5.2 state layout for ``state_dir``."""
+    """Warn once per invocation that reads fall back to ``.pivot`` for ``state_dir``.
+
+    ``.pivot`` holds stage locks or cache objects while ``core.state_dir`` names another
+    directory. Pivot 0.5.2 kept them there, and so does a run while ``core.state_dir`` cannot
+    be used (``''``, or a path that cannot become a directory). The files cannot tell the two
+    apart, so the notice names both and says what to do in each case.
+    """
     reported = _reported()
     if reported is None or state_dir in reported["legacy"]:
         return
@@ -289,7 +325,7 @@ def report_legacy_state_dir(state_dir: pathlib.Path) -> None:
     else:
         move = f"git mv .pivot/stages {target}"
     logger.warning(
-        "core.state_dir is %s, but Pivot 0.5.2 stored locks and cache in %s. Pivot reads missing locks and cache entries there; move the locks with `%s`.",
+        "core.state_dir is %s, but %s holds stage locks or cache objects of this project: Pivot 0.5.2 kept them there, and so does a run while core.state_dir cannot be used (an empty value, or a path that is not a writable directory). Pivot reads missing locks and cache entries there; move the locks with `%s`, or delete them if such a run made them.",
         state_dir,
         legacy,
         move,
@@ -356,15 +392,16 @@ def entry_invocation(
     """Hold one library entry point's record for its whole call, when no invocation holds one.
 
     A library caller has no CLI invocation. Each public entry point that produces cache entries
-    or writes state (an engine run, discovery, a pipeline's load, ``Pipeline.ensure_fingerprint``)
-    holds this record, so every lookup in the call, in the threads that copy this context as
-    well, reads the record: each root's ``core.state_dir`` is read and resolved once per call,
-    as the kernel opens it then, and an edit of the value during the call moves nothing. The
-    record starts with ``state_dirs``; a pipeline passes the resolutions it made when it was
-    loaded, a value it could not use included, so its fingerprints and its runs use the
-    directory its stages' locks are in and read no config. A CLI invocation, or an entry point
-    already in progress, holds the record for the whole call, and this leaves it alone. The
-    record reports nothing: a library caller's warnings stay silent.
+    or writes state (an engine run, discovery, a pipeline's load, ``Pipeline.ensure_fingerprint``,
+    ``fingerprint.get_stage_fingerprint_cached``) holds this record, so every lookup in the
+    call, in the threads that copy this context as well, reads the record: each root's
+    ``core.state_dir`` is read and resolved once per call, as the kernel opens it then, the
+    check that the path can be a directory included, and an edit of the value during the call
+    moves nothing. The record starts with ``state_dirs``; a pipeline passes the resolutions it
+    made when it was loaded, a value or a path it could not use included, so its fingerprints
+    and its runs use the directory its stages' locks are in and read no config. A CLI
+    invocation, or an entry point already in progress, holds the record for the whole call, and
+    this leaves it alone. The record reports nothing: a library caller's warnings stay silent.
 
     Yields the record's resolutions by project root, so the caller can keep them.
     """
@@ -510,12 +547,15 @@ def locate_state_dir(root: pathlib.Path) -> pathlib.Path:
     """Return an initialized project's state directory without creating anything.
 
     An empty hand-edited ``core.state_dir`` falls back to ``<root>/.pivot`` through
-    ``state_dir_or_default``, decided once per invocation and kept in its record. Other invalid
-    config values still raise ``ConfigError``.
+    ``state_dir_or_default``, decided once per invocation and kept in its record. A path that
+    cannot become a directory answers as ``_unusable_target`` says. Other invalid config values
+    still raise ``ConfigError``.
     """
     resolution = _resolution(root)
     if isinstance(resolution, pathlib.Path):
         return resolution
+    if isinstance(resolution, exceptions.StateDirTargetError):
+        return _unusable_target(root, resolution)
     if not isinstance(resolution, exceptions.EmptyStateDirError):
         raise copy.copy(resolution)
     invocation = _invocation.get()

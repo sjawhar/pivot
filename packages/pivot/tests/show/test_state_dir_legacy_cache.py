@@ -48,7 +48,7 @@ def test_data_cache_reader_uses_legacy_cache_object(
     assert restored is not None
     assert restored.read_text() == "id,value\n1,old\n"
     restored.unlink()
-    assert "Pivot 0.5.2 stored locks and cache" in caplog.text
+    assert "holds stage locks or cache objects of this project" in caplog.text
 
 
 def test_metrics_cache_reader_uses_legacy_cache_object(
@@ -60,7 +60,7 @@ def test_metrics_cache_reader_uses_legacy_cache_object(
     found = metrics.collect_metrics_from_head(["metrics/test.json"], {"metrics/test.json": _HASH})
 
     assert found == {"metrics/test.json": {"score": 1}}
-    assert "Pivot 0.5.2 stored locks and cache" in caplog.text
+    assert "holds stage locks or cache objects of this project" in caplog.text
 
 
 def test_legacy_cache_scan_reports_the_migration_warning(
@@ -72,7 +72,7 @@ def test_legacy_cache_scan_reports_the_migration_warning(
     hashes = sync.get_local_cache_hashes(set_project_root / "altstate" / "cache")
 
     assert hashes == {_HASH}
-    assert "Pivot 0.5.2 stored locks and cache" in caplog.text
+    assert "holds stage locks or cache objects of this project" in caplog.text
 
 
 def test_current_cache_scan_stays_silent(
@@ -86,7 +86,7 @@ def test_current_cache_scan_stays_silent(
     hashes = sync.get_local_cache_hashes(set_project_root / "altstate" / "cache")
 
     assert hashes == {_HASH}
-    assert "Pivot 0.5.2 stored locks and cache" not in caplog.text
+    assert "holds stage locks or cache objects of this project" not in caplog.text
 
 
 def test_cache_object_resolver_rejects_a_primary_symlink(

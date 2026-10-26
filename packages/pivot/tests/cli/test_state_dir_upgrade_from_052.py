@@ -57,7 +57,7 @@ def test_uses_legacy_locks_and_cache_after_state_dir_is_configured(tmp_path: pat
 
     verify = helpers.run_pivot(root, home, "verify")
     assert verify.returncode == 0, verify.stdout + verify.stderr
-    assert "Pivot 0.5.2 stored locks and cache" in verify.stderr
+    assert "holds stage locks or cache objects of this project" in verify.stderr
 
     output = root / "data" / "test" / "process.txt"
     output.unlink()
@@ -91,7 +91,7 @@ with Pipeline("test") as pipeline:
 """
 
 
-_WARNING = "Pivot 0.5.2 stored locks and cache"
+_WARNING = "holds stage locks or cache objects of this project"
 
 
 # name -> core.state_dir value ({outside} is a directory beside the project).
@@ -252,7 +252,7 @@ def test_data_diff_reads_a_legacy_cache_object(tmp_path: pathlib.Path) -> None:
     assert diff.returncode == 0, diff.stdout + diff.stderr
     assert "Rows: 1 -> 1" in diff.stdout
     assert "~1 modified" in diff.stdout
-    assert diff.stderr.count("Pivot 0.5.2 stored locks and cache") == 1, diff.stderr
+    assert diff.stderr.count(_WARNING) == 1, diff.stderr
 
 
 def test_metrics_diff_reads_a_legacy_cache_object(tmp_path: pathlib.Path) -> None:
@@ -289,7 +289,7 @@ def test_metrics_diff_reads_a_legacy_cache_object(tmp_path: pathlib.Path) -> Non
     assert diff.returncode == 0, diff.stdout + diff.stderr
     assert "modified" in diff.stdout.lower(), diff.stdout
     assert "added" not in diff.stdout.lower(), diff.stdout
-    assert diff.stderr.count("Pivot 0.5.2 stored locks and cache") == 1, diff.stderr
+    assert diff.stderr.count(_WARNING) == 1, diff.stderr
 
 
 def test_metrics_diff_does_not_read_a_symlinked_legacy_cache_object(
@@ -355,7 +355,7 @@ def test_push_dry_run_warns_for_a_legacy_cache(
 
     assert result.exit_code == 0, result.output
     assert "Would push 1 file(s) to 'origin'" in result.output
-    assert result.output.count("Pivot 0.5.2 stored locks and cache") == 1
+    assert result.output.count(_WARNING) == 1
 
 
 def test_push_dry_run_stays_silent_for_a_current_cache(
@@ -378,4 +378,4 @@ def test_push_dry_run_stays_silent_for_a_current_cache(
 
     assert result.exit_code == 0, result.output
     assert "Would push 1 file(s) to 'origin'" in result.output
-    assert "Pivot 0.5.2 stored locks and cache" not in result.output
+    assert _WARNING not in result.output

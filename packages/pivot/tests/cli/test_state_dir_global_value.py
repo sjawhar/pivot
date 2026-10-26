@@ -341,13 +341,15 @@ def test_config_list_global_marks_the_global_state_dir_ignored(
     assert rows == ["core.state_dir = globalstate (global, ignored)"], result.stdout
 
 
-# An unusable local state directory owns the one warning.
+# An unusable local state directory owns the one warning: a value that cannot be used, or a path
+# that cannot become a directory (`afile` is a regular file).
 
 _CASES = {
     "empty": "''",
     "integer": "5",
     "list": "[a, b]",
     "mapping": "{x: 1}",
+    "regular-file": "afile",
 }
 
 
@@ -364,6 +366,7 @@ def test_unusable_local_state_dir_suppresses_the_global_state_dir_notice(
     assert helpers.run_cli(root, home, "git", "init", "-q").returncode == 0
     assert helpers.run_pivot(root, home, "init").returncode == 0
     (root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: {value}\n")
+    (root / "afile").write_text("not a directory\n")
     (root / "pipeline.py").write_text("from pivot import Pipeline\n\npipeline = Pipeline('test')\n")
 
     listed = helpers.run_pivot(root, home, "list")

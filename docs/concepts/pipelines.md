@@ -148,10 +148,14 @@ error names the first difference and the source files. A pipeline cannot include
 itself.
 
 A pipeline resolves `core.state_dir` when it loads, and its stages, runs and
-caches all use that directory. So `include()` refuses a pipeline loaded before an
-edit of `core.state_dir` (or of a symbolic link it names) into one loaded after
-it: the error names both directories. Load both pipelines after the edit. The
-pipelines of one `pivot` command, or of one discovery, always share one directory.
+caches all use that directory. That includes the fallback to `.pivot` when the
+value, or the path it names, cannot be used: a pipeline loaded while the path
+was a regular file keeps `.pivot` after the file is removed. So `include()`
+refuses a pipeline loaded before an edit of `core.state_dir` (or of a symbolic
+link it names, or of whether the path it names can be used) into one loaded
+after it: the error names both directories. Load both pipelines after the
+change. The pipelines of one `pivot` command, or of one discovery, always share
+one directory.
 
 ## State and Cache Layout
 
@@ -176,10 +180,12 @@ write. Every state-using command that Pivot 0.5.2 ran keeps its exit code and us
 is a hand-edited empty value: `show` returns 0 because it reads the retained `.pivot` run
 history, and `history` reports that same history. `--quiet` silences the warning.
 
-When a project created by Pivot 0.5.2 sets `core.state_dir`, Pivot reads a stage lock missing
-from the configured directory, and its cached objects, from `.pivot` until the state is moved.
-Pivot warns once per command and directs new writes to the configured state directory; move the
-tracked locks with `git mv .pivot/stages "<state dir>/stages"`.
+When `core.state_dir` names another directory but `.pivot` holds stage locks or cache objects,
+Pivot reads a stage lock missing from the configured directory, and its cached objects, from
+`.pivot`. Pivot 0.5.2 kept them there, and so does a run while `core.state_dir` cannot be used
+(an empty value, or a path that is not a writable directory). Pivot warns once per command and
+directs new writes to the configured state directory. Move the tracked locks with
+`git mv .pivot/stages "<state dir>/stages"`, or delete them if such a run made them.
 
 ```
 <project_root>/

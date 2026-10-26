@@ -137,8 +137,8 @@ def test_include_refuses_a_pipeline_loaded_before_a_state_dir_edit(
     s2 = os.path.realpath(root / "s2")
     assert (
         "Pipeline 'pb' cannot include 'pa': 'pb' keeps the state of the project at "
-        + f"{os.path.realpath(root)} in {s2}, and 'pa' in {s1}. core.state_dir changed between "
-        + "their loads; load both pipelines after the edit."
+        + f"{os.path.realpath(root)} in {s2}, and 'pa' in {s1}. core.state_dir, or the path it "
+        + "names, changed between their loads; load both pipelines after the change."
     ) in output, output
     assert not (root / "s1" / "stages").exists(), output
     assert not (root / "s2" / "stages").exists(), output

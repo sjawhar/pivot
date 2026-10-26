@@ -5,7 +5,9 @@ A state-directory record keeps the outcome of each project root's resolution, a 
 included: `''` falls back to `.pivot`, and `5` names no path. A pipeline keeps the outcome it
 loaded with as well, so each of its entry points answers every cache entry from the record. The
 program counts the parses of `.pivot/config.yaml` and of the global config in one cold run, for
-a pipeline of 2 and of 6 independent stages.
+a pipeline of 2 and of 6 independent stages. A `fingerprint.get_stage_fingerprint_cached` call
+made by hand, outside every entry point, holds a record of its own, so on a warm cache it reads
+the configuration once per call, not once per cache lookup.
 """
 
 from __future__ import annotations
@@ -53,6 +55,17 @@ def main() -> None:
             pivot.cli.main()
         except SystemExit as e:
             code = e.code or 0
+    elif mode == "by-hand":
+        from pivot import discovery, fingerprint
+
+        pipeline = discovery.discover_pipeline()
+        for name in pipeline.list_stages():
+            pipeline.ensure_fingerprint(name)
+        fingerprint.flush_and_close()
+        fingerprint._hash_function_ast_cache.clear()
+        parses[0] = 0
+        for name in pipeline.list_stages():
+            fingerprint.get_stage_fingerprint_cached(name, pipeline.get_stage(name)["func"])
     else:
         from pivot import discovery
 
@@ -124,3 +137,12 @@ def test_config_parses_do_not_grow_with_the_stage_count(
 
     assert few["code"] == many["code"], (few, many)
     assert many["parses"] == few["parses"], (few, many)
+
+
+@pytest.mark.parametrize("stages", [2, 6])
+def test_a_cached_fingerprint_by_hand_reads_the_config_once_per_call(
+    tmp_path: pathlib.Path, stages: int
+) -> None:
+    counted = _count(tmp_path, "s1", "by-hand", stages=stages)
+
+    assert counted["parses"] == stages, counted

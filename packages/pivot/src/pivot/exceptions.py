@@ -376,6 +376,24 @@ class EmptyStateDirError(ConfigError):
     """Raised when a project config's ``core.state_dir`` is the empty string."""
 
 
+class StateDirTargetError(ConfigError):
+    """``core.state_dir`` names a path that cannot become a directory this process writes.
+
+    A state-directory record keeps it as the root's resolution, decided once with the value:
+    the stages keep their state in ``.pivot``. ``path`` is the directory the value names.
+    """
+
+    path: pathlib.Path
+
+    def __init__(self, message: str, path: pathlib.Path) -> None:
+        super().__init__(message)
+        self.path = path
+
+    @override
+    def __reduce__(self) -> tuple[type, tuple[str, pathlib.Path]]:
+        return (self.__class__, (str(self), self.path))
+
+
 class ConfigValidationError(ConfigError):
     """Raised when config value fails validation."""
 

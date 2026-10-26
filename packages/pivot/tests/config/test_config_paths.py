@@ -273,6 +273,31 @@ def test_a_record_keeps_an_unusable_value_and_reads_the_config_once(
     assert reads == [project_root / ".pivot" / "config.yaml"]
 
 
+def test_a_record_keeps_the_fallback_for_a_path_that_cannot_be_a_directory(
+    project_root: pathlib.Path,
+) -> None:
+    """A record decides once that the configured path cannot become a directory: its stages'
+    directory stays `.pivot` after the path becomes usable, and a command that needs the
+    configured directory gets the path only while it still cannot be used, then `.pivot`."""
+    (project_root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: s1\n")
+    (project_root / "s1").write_text("a regular file\n")
+    default = project_root / ".pivot"
+    token = state_dir_mod.begin_invocation(report=False)
+    try:
+        assert state_dir_mod.state_dir_or_default(project_root) == default
+        assert state_dir_mod.locate_state_dir(project_root) == project_root / "s1"
+        (project_root / "s1").unlink()
+        assert state_dir_mod.state_dir_or_default(project_root) == default
+        assert state_dir_mod.locate_state_dir(project_root) == default
+        assert state_dir_mod.ensure_state_dir(project_root) == default
+        assert state_dir_mod.state_dir_for(project_root) == default
+    finally:
+        state_dir_mod.end_invocation(token)
+
+    assert not (project_root / "s1").exists()
+    assert state_dir_mod.state_dir_or_default(project_root) == project_root / "s1"
+
+
 # --- Error handling tests ---
 
 

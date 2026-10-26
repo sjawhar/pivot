@@ -306,16 +306,18 @@ def _producing_state_dir() -> pathlib.Path | None:
     state directory once and every producer of that invocation, the engine thread of a TUI
     session included, reads that one. A library caller has no invocation, so each library entry
     point that produces entries holds a record of its own (``state_dir.entry_invocation``):
-    an engine run, discovery, a pipeline's load and each ``Pipeline.ensure_fingerprint``. A
-    pipeline's fingerprints and runs start from the resolution it made when it loaded, an
-    unusable value included, so a ``core.state_dir`` edited afterwards, by a stage or by the
-    caller, moves none of its entries, and the record answers every entry without reading the
-    configuration. Only a low-level call outside every entry point (``get_stage_fingerprint``
-    or ``get_stage_fingerprint_cached`` by hand) reads and resolves the configuration again for
-    each entry: correct, and slow. An unreadable or unusable value (other than ``''``, which
+    an engine run, discovery, a pipeline's load, each ``Pipeline.ensure_fingerprint`` and each
+    ``get_stage_fingerprint_cached`` call. A pipeline's fingerprints and runs start from the
+    resolution it made when it loaded, an unusable value included, so a ``core.state_dir``
+    edited afterwards, by a stage or by the caller, moves none of its entries, and the record
+    answers every entry without reading the configuration. Only ``get_stage_fingerprint``
+    called by hand, outside every entry point, reads and resolves the configuration again for
+    each lookup: correct, and slow. An unreadable or unusable value (other than ``''``, which
     falls back to ``.pivot``) leaves the entry unfiled, and the caches are best effort, so it
-    is dropped. Nothing is created here: the StateDB that reads or writes the entries creates
-    the directory (``state_dir.make_state_dir``).
+    is dropped; for a path that cannot become a directory the entry goes where
+    ``state_dir.locate_state_dir`` says, never into that path once it can be used. Nothing is
+    created here: the StateDB that reads or writes the entries creates the directory
+    (``state_dir.make_state_dir``).
     """
     from pivot import project, state_dir
 
@@ -1131,57 +1133,61 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
     """Like get_stage_fingerprint, but with manifest-level caching.
 
     A hit skips the walk; `_try_manifest_cache_hit` says what it checks. On a miss the walk
-    records every live value it reads, and the result is queued for `flush_and_close`.
+    records every live value it reads, and the result is queued for `flush_and_close`. The call
+    holds one state-directory record (``state_dir.entry_invocation``), so one made by hand,
+    outside every entry point, reads ``core.state_dir`` once, not at each cache lookup.
     """
+    from pivot import state_dir as state_dir_mod
+
     _t = metrics.start()
+    with state_dir_mod.entry_invocation():
+        # Try cache hit
+        cached = _try_manifest_cache_hit(stage_name, func)
+        if cached is not None:
+            metrics.count("fingerprint.manifest_cache.hit")
+            metrics.end("fingerprint.get_stage_fingerprint_cached", _t)
+            return cached
 
-    # Try cache hit
-    cached = _try_manifest_cache_hit(stage_name, func)
-    if cached is not None:
-        metrics.count("fingerprint.manifest_cache.hit")
-        metrics.end("fingerprint.get_stage_fingerprint_cached", _t)
-        return cached
-
-    metrics.count("fingerprint.manifest_cache.miss")
-    errors = _capture_errors.get()
-    errors_before = len(errors) if errors is not None else 0
-    unsafe_token = _unsafe_capture_warning.set(False)
-    reads = list[tuple[tuple[str, ...], str]]()
-    reads_token = _recorded_reads.set(reads)
-    path_token = _walk_path.set(())
-    try:
-        # Compute with source tracking
-        token = _current_stage_name.set(stage_name)
+        metrics.count("fingerprint.manifest_cache.miss")
+        errors = _capture_errors.get()
+        errors_before = len(errors) if errors is not None else 0
+        unsafe_token = _unsafe_capture_warning.set(False)
+        reads = list[tuple[tuple[str, ...], str]]()
+        reads_token = _recorded_reads.set(reads)
+        path_token = _walk_path.set(())
         try:
-            with _collecting_sources() as source_map:
-                manifest = get_stage_fingerprint(func)
+            # Compute with source tracking
+            token = _current_stage_name.set(stage_name)
+            try:
+                with _collecting_sources() as source_map:
+                    manifest = get_stage_fingerprint(func)
+            finally:
+                _current_stage_name.reset(token)
+
+            # Inside a stage_fingerprint_scope, refusals are raised later; never cache them.
+            refused = errors is not None and len(errors) > errors_before
+            state_dir = None if _unsafe_capture_warning.get() or refused else _producing_state_dir()
+            if state_dir is not None:
+                _record_project_modules(source_map)
+                key = _make_manifest_cache_key(stage_name, func)
+                value = json.dumps(
+                    {
+                        "m": manifest,
+                        "s": source_map,
+                        "r": [[list(path), read_token] for path, read_token in reads],
+                    },
+                    separators=(",", ":"),
+                ).encode()
+                _pending_manifest_writes.setdefault(state_dir, list[tuple[bytes, bytes]]()).append(
+                    (key, value)
+                )
+
+            return manifest
         finally:
-            _current_stage_name.reset(token)
-
-        # Inside a stage_fingerprint_scope, refusals are raised later; never cache them.
-        refused = errors is not None and len(errors) > errors_before
-        state_dir = None if _unsafe_capture_warning.get() or refused else _producing_state_dir()
-        if state_dir is not None:
-            _record_project_modules(source_map)
-            key = _make_manifest_cache_key(stage_name, func)
-            value = json.dumps(
-                {
-                    "m": manifest,
-                    "s": source_map,
-                    "r": [[list(path), read_token] for path, read_token in reads],
-                },
-                separators=(",", ":"),
-            ).encode()
-            _pending_manifest_writes.setdefault(state_dir, list[tuple[bytes, bytes]]()).append(
-                (key, value)
-            )
-
-        return manifest
-    finally:
-        _walk_path.reset(path_token)
-        _recorded_reads.reset(reads_token)
-        _unsafe_capture_warning.reset(unsafe_token)
-        metrics.end("fingerprint.get_stage_fingerprint_cached", _t)
+            _walk_path.reset(path_token)
+            _recorded_reads.reset(reads_token)
+            _unsafe_capture_warning.reset(unsafe_token)
+            metrics.end("fingerprint.get_stage_fingerprint_cached", _t)
 
 
 def _collect_nested_code_globals(code: types.CodeType) -> set[str]:

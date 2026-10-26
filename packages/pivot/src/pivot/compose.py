@@ -420,12 +420,13 @@ def _require_one_state_dir(
 ) -> None:
     """Refuse to combine pipelines that keep one project's state in two directories.
 
-    Each pipeline resolves ``core.state_dir`` when it loads and records the result on its
-    stages. When the value, or a link it names, changed between two loads, a run of the
-    combined pipeline would put some stages' locks in one directory and its run record and
-    caches in the other. Inside one discovery or one CLI invocation every pipeline loads under
-    one record and resolves one directory, so ``--all`` and ``repro`` of several pipeline files
-    are unaffected.
+    Each pipeline resolves ``core.state_dir`` when it loads, the ``.pivot`` fallback for a value
+    or a path it names that cannot be used included, and records the outcome on its stages.
+    When the value, a link it names, or whether the path it names can be used changed between
+    two loads, a run of the combined pipeline would put some stages' locks in one directory and
+    its run record and caches in the other. So the outcomes are compared, not the values.
+    Inside one discovery or one CLI invocation every pipeline loads under one record and
+    resolves one directory, so ``--all`` and ``repro`` of several pipeline files are unaffected.
     """
     held_dir = state_dir_mod.resolved_state_dir(root, held)
     incoming_dir = state_dir_mod.resolved_state_dir(root, incoming)
@@ -434,7 +435,8 @@ def _require_one_state_dir(
     raise exceptions.PipelineConfigError(
         f"Pipeline '{including}' cannot include '{included}': '{holder}' keeps the state of "
         + f"the project at {root} in {held_dir}, and '{included}' in {incoming_dir}. "
-        + "core.state_dir changed between their loads; load both pipelines after the edit."
+        + "core.state_dir, or the path it names, changed between their loads; load both "
+        + "pipelines after the change."
     )
 
 
@@ -597,21 +599,25 @@ class Pipeline:
     def resolved_state_dirs(self) -> Mapping[pathlib.Path, state_dir_mod.StateDirResolution]:
         """Each project root's ``core.state_dir``, as this pipeline resolved it when it loaded.
 
-        Its stages' locks are recorded in these directories. Its fingerprints and its runs
-        start their state-directory record with them (``state_dir.entry_invocation``), so a
-        ``core.state_dir`` edited after the load leaves this pipeline in one directory; a caller
-        who wants the new one loads the pipeline again. A value that could not be used is kept
-        as its error, so the entry points fall back to ``.pivot`` (or fail) as at the load,
-        without reading the configuration again. Read-only: ``include()`` alone adds to it.
+        Its stages' locks are recorded in these directories (``state_dir.resolved_state_dir``).
+        Its fingerprints and its runs start their state-directory record with them
+        (``state_dir.entry_invocation``), so a ``core.state_dir`` edited after the load leaves
+        this pipeline in one directory; a caller who wants the new one loads the pipeline again.
+        A value that could not be used, or a path that could not become a directory, is kept as
+        its error, so the entry points fall back to ``.pivot`` (or fail) as at the load, without
+        reading the configuration again, also when the path becomes usable after the load.
+        Read-only: ``include()`` alone adds to it.
         """
         return _stdlib_types.MappingProxyType(self._resolved_state_dirs)
 
     def _stage_state_dir(self) -> pathlib.Path:
         """The state directory recorded on this pipeline's stages; loading never creates it.
 
-        While the project config cannot be read or its ``core.state_dir`` cannot be used, the
-        stages keep 0.5.2's ``.pivot`` (``state_dir.state_dir_or_default``), so listing them runs
-        as it did there; commands that use the configured directory fail on it themselves.
+        While the project config cannot be read, its ``core.state_dir`` cannot be used, or the
+        path it names cannot become a directory, the stages keep 0.5.2's ``.pivot``
+        (``state_dir.state_dir_or_default``), so listing them runs as it did there; commands
+        that use the configured directory fail on it themselves. The outcome is the load's
+        record's, which the pipeline keeps (``resolved_state_dirs``).
         """
         return state_dir_mod.state_dir_or_default(self._root)
 
