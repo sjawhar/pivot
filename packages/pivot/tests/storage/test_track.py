@@ -286,6 +286,39 @@ def test_discover_pvt_files_with_directory_manifest(tmp_path: pathlib.Path) -> N
     assert len(manifest) == 3
 
 
+def test_discover_pvt_files_keeps_a_backslash_in_the_data_path(tmp_path: pathlib.Path) -> None:
+    """A backslash in a directory or file name stays in the key: it is never a separator."""
+    (tmp_path / "dir\\with\\backslash").mkdir()
+    track.write_pvt_file(
+        tmp_path / "dir\\with\\backslash" / "f.csv.pvt",
+        track.PvtData(path="f.csv", hash="hash1", size=1),
+    )
+    track.write_pvt_file(
+        tmp_path / "a\\b.csv.pvt", track.PvtData(path="a\\b.csv", hash="hash2", size=1)
+    )
+
+    result = track.discover_pvt_files(tmp_path)
+
+    assert sorted(result) == sorted(
+        [str(tmp_path / "dir\\with\\backslash" / "f.csv"), str(tmp_path / "a\\b.csv")]
+    )
+
+
+def test_discover_pvt_files_never_reads_a_backslash_as_a_step_out_of_the_root(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``..\\..\\escaped.csv`` is one name beside its sidecar, not two steps up."""
+    (tmp_path / "sub").mkdir()
+    track.write_pvt_file(
+        tmp_path / "sub" / "x.pvt",
+        track.PvtData(path="..\\..\\escaped.csv", hash="hash1", size=1),
+    )
+
+    result = track.discover_pvt_files(tmp_path)
+
+    assert list(result) == [str(tmp_path / "sub" / "..\\..\\escaped.csv")]
+
+
 # Validation
 
 
