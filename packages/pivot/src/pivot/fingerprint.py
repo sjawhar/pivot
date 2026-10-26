@@ -777,7 +777,7 @@ def _read_step(owner: Any, step: str) -> Any:
                 module = _body_import_module(arg)
                 return _UNREAD if module is None else module
             case "u":
-                return inspect.unwrap(owner, stop=_stop_at_mark)
+                return unwrap(owner, stop=_stop_at_mark)
             case "pf":
                 return owner.func
             case "pa":
@@ -1270,7 +1270,7 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
         # getclosurevars rejects it. The function it wraps reads the module values, so walk
         # that function's globals, nonlocals and defaults instead. The unwrap stops at a user
         # decorator above a mark, which the walk enters, or at the mark, which it does not.
-        unwrapped = inspect.unwrap(func, stop=_stop_at_mark)
+        unwrapped = unwrap(func, stop=_stop_at_mark)
         if unwrapped is not func and inspect.isfunction(unwrapped):
             _record_read(func, "u")
             if not fingerprinted_by_name(unwrapped):
@@ -1463,7 +1463,7 @@ def _user_member_value(value: Any) -> Any:
     if inspect.isfunction(value):
         if _written_in_user_source(value):
             return value
-        unwrapped = inspect.unwrap(value, stop=_stop_at_mark)
+        unwrapped = unwrap(value, stop=_stop_at_mark)
         if fingerprinted_by_name(unwrapped):
             return unwrapped
         if unwrapped is not value and inspect.isfunction(unwrapped):
@@ -1474,7 +1474,7 @@ def _user_member_value(value: Any) -> Any:
     if _is_callable_instance(value) or _carries_instance(value):
         return value
     if callable(value):
-        unwrapped = inspect.unwrap(value, stop=_stop_at_mark)
+        unwrapped = unwrap(value, stop=_stop_at_mark)
         if fingerprinted_by_name(unwrapped):
             return unwrapped
         if unwrapped is not value and inspect.isfunction(unwrapped):
@@ -2515,7 +2515,7 @@ def _process_bound_values(
         return
     elif _is_user_class_instance(value) or _carries_instance(value):
         _check_non_scalar_capture(binding_ref, value, _current_stage_name.get() or "<unknown>")
-    elif inspect.isfunction(inspect.unwrap(value, stop=_stop_at_mark)) and is_user_code(value):
+    elif inspect.isfunction(unwrap(value, stop=_stop_at_mark)) and is_user_code(value):
         _process_callable_dependency(binding_ref, value, manifest, visited)
 
 
@@ -2554,7 +2554,8 @@ def _resolved_type_hints(func: Callable[..., Any]) -> dict[str, Any]:
         hints = None  # Not in cache and can't be cached
 
     if hints is None:
-        marked = _mark_below(func)
+        # The walk enters no marked function, so a mark on `func`'s chain is below it.
+        marked = _mark_on_chain(func)
         if marked is not None and getattr(func, "__annotations__", None) is getattr(
             marked, "__annotations__", None
         ):
@@ -3234,6 +3235,43 @@ def fingerprinted_by_name(obj: Any) -> bool:
         return False
 
 
+def wrapper_chain(obj: Any, stop: Callable[[Any], bool] | None = None) -> Iterator[Any]:
+    """Yield `obj`, then each object its `__wrapped__` chain reaches, in order.
+
+    Every read of a `__wrapped__` chain in pivot goes through this, so each path sees the chain
+    `inspect.unwrap` sees. It follows the chain as `inspect.unwrap` does: by attribute access,
+    so a `__wrapped__` kept in a slot or a property counts as one in an instance `__dict__`; a
+    class ends the chain; `stop` ends it at the first object it accepts; and its loop guard, by
+    object identity and the recursion limit, ends the chain before an object it has already
+    yielded. `inspect.unwrap` raises ValueError at a loop, and so does `unwrap`; a decision about
+    the chain (`_mark_decision`) takes a loop as the chain's end, so a looped chain without a
+    mark on it is decided as main decides it.
+    """
+    memo = {id(obj): obj}
+    limit = sys.getrecursionlimit()
+    current = obj
+    yield current
+    while not isinstance(current, type) and hasattr(current, "__wrapped__"):
+        if stop is not None and stop(current):
+            return
+        current = current.__wrapped__
+        if id(current) in memo or len(memo) >= limit:
+            return
+        memo[id(current)] = current
+        yield current
+
+
+def unwrap(obj: Any, stop: Callable[[Any], bool] | None = None) -> Any:
+    """`inspect.unwrap(obj, stop=stop)`, through `wrapper_chain`: the last object on `obj`'s
+    `__wrapped__` chain, or the first one `stop` accepts. A loop raises ValueError, as it does
+    in `inspect.unwrap`."""
+    *_, end = wrapper_chain(obj, stop)
+    looped = not isinstance(end, type) and hasattr(end, "__wrapped__")
+    if looped and (stop is None or not stop(end)):
+        raise ValueError(f"wrapper loop when unwrapping {obj!r}")
+    return end
+
+
 def _recorded_by_name(obj: Any) -> bool:
     """Whether the walk records `obj` by its module and qualified name for a mark.
 
@@ -3252,23 +3290,16 @@ def _recorded_by_name(obj: Any) -> bool:
         return False
     if is_user_code(type(obj)):
         return False
-    seen = {id(obj)}
-    current: object = obj
-    while True:
-        try:
-            namespace: Mapping[str, Any] = object.__getattribute__(current, "__dict__")
-        except AttributeError:
-            return False
-        current = namespace.get("__wrapped__")
-        if current is None or id(current) in seen:
-            return False
+    below = wrapper_chain(obj)
+    next(below)  # `obj` itself
+    for current in below:
         if fingerprinted_by_name(current):
             return True
         if _is_user_class_instance(current):
             return False
         if inspect.isfunction(current) or isinstance(current, (type, types.ModuleType)):
             return False
-        seen.add(id(current))
+    return False
 
 
 class _MarkDecision(enum.Enum):
@@ -3285,44 +3316,31 @@ def _mark_decision(obj: Any) -> _MarkDecision | None:
 
     Every path that reads a value (a global, closure cell, default, class member, module
     attribute, partial function or argument, loader field, default factory) asks it before it
-    unwraps, so no path drops an object on such a chain without a decision. Without a mark the
-    answer is None and the walk is main's.
+    unwraps, so no path drops an object on such a chain without a decision. The decision and
+    every unwrap read the chain through `wrapper_chain`, so they see the same objects. Without a
+    mark the answer is None and the walk is main's.
     """
     if isinstance(obj, (type, types.ModuleType)):
         return None
     target = obj.__func__ if inspect.ismethod(obj) else obj
-    try:
-        namespace: Mapping[str, Any] = object.__getattribute__(target, "__dict__")
-    except AttributeError:
-        return None
-    if namespace.get(_BY_NAME_MARK) is not target and "__wrapped__" not in namespace:
+    if _mark_on_chain(target) is None:
         return None
     if _recorded_by_name(obj):
         return _MarkDecision.BY_NAME
     if _class_above_mark(target) is not None:
         return _MarkDecision.REFUSED
-    if _mark_below(target) is not None:
-        return _MarkDecision.OWN_CODE
-    return None
+    return _MarkDecision.OWN_CODE
 
 
 def _class_above_mark(obj: Any) -> Any:
-    """The first user class instance on `obj`'s `__wrapped__` chain, `obj` included, that is
-    above a marked object, or None."""
+    """The first user class instance on `obj`'s `__wrapped__` chain (`wrapper_chain`), `obj`
+    included, that is above a marked object, or None."""
     found: Any = None
-    seen = set[int]()
-    current: Any = obj
-    while current is not None and id(current) not in seen:
+    for current in wrapper_chain(obj):
         if fingerprinted_by_name(current):
             return found
         if found is None and _is_user_class_instance(current):
             found = current
-        seen.add(id(current))
-        try:
-            namespace: Mapping[str, Any] = object.__getattribute__(current, "__dict__")
-        except AttributeError:
-            return None
-        current = namespace.get("__wrapped__")
     return None
 
 
@@ -3334,7 +3352,7 @@ def _refuse_class_above_mark(value: Any) -> None:
     does not suppress this refusal: the fixes are local to the helper.
     """
     instance = _class_above_mark(value.__func__ if inspect.ismethod(value) else value)
-    marked = _mark_below(instance)
+    marked = _mark_on_chain(instance)  # below the instance: `_class_above_mark` stops at a mark
     decorator = _definition_ref(type(instance))
     helper = _definition_ref(marked) if marked is not None else _definition_ref(instance)
     stage = _current_stage_name.get()
@@ -3349,8 +3367,7 @@ def _refuse_class_above_mark(value: Any) -> None:
         + "  - put @fingerprint_by_name above the class-based decorator, so Pivot records the "
         + "whole helper by name;\n"
         + "  - replace the class with a function decorator built with functools.wraps, which "
-        + "Pivot fingerprints by its own code;\n"
-        + "  - remove @fingerprint_by_name."
+        + "Pivot fingerprints by its own code."
     )
     errors = _capture_errors.get()
     if errors is None:
@@ -3358,21 +3375,10 @@ def _refuse_class_above_mark(value: Any) -> None:
     errors.append(message)
 
 
-def _mark_below(obj: Any) -> Any:
-    """The first marked object on `obj`'s `__wrapped__` chain below `obj`, or None."""
-    if isinstance(obj, type) or not hasattr(obj, "__wrapped__"):
-        return None
-    below = inspect.unwrap(obj.__wrapped__, stop=fingerprinted_by_name)
-    return below if fingerprinted_by_name(below) else None
-
-
-def _user_decorator_above_mark(obj: Any) -> bool:
-    """Whether `obj` is user code with a marked object below it on its wrapper chain."""
-    if _mark_below(obj) is None:
-        return False
-    return (inspect.isfunction(obj) and _written_in_user_source(obj)) or _is_user_class_instance(
-        obj
-    )
+def _mark_on_chain(obj: Any) -> Any:
+    """The first marked object on `obj`'s `__wrapped__` chain (`wrapper_chain`), `obj` included,
+    or None."""
+    return next((current for current in wrapper_chain(obj) if fingerprinted_by_name(current)), None)
 
 
 def _stop_at_mark(obj: Any) -> bool:
@@ -3382,8 +3388,15 @@ def _stop_at_mark(obj: Any) -> bool:
     above it, and `_mark_decision` refuses a user class instance above it, so no unwrap passes
     either. A library wrapper (a `contextlib.contextmanager` helper, `functools.cache`) is not a
     stop. Without a mark on the chain nothing stops, and the unwrap goes to the end, as on main.
+    Each unwrap with this stop is `unwrap`, which reads the chain as `_mark_decision` does.
     """
-    return fingerprinted_by_name(obj) or _user_decorator_above_mark(obj)
+    if _mark_on_chain(obj) is None:
+        return False
+    return (
+        fingerprinted_by_name(obj)
+        or (inspect.isfunction(obj) and _written_in_user_source(obj))
+        or _is_user_class_instance(obj)
+    )
 
 
 def _source_object(func: Any) -> Any:
@@ -3400,7 +3413,7 @@ def _source_object(func: Any) -> Any:
     decision = _mark_decision(func)
     if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
         return None
-    target = inspect.unwrap(func, stop=_stop_at_mark)
+    target = unwrap(func, stop=_stop_at_mark)
     if fingerprinted_by_name(target):
         return None
     if _stop_at_mark(target):

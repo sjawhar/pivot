@@ -11,6 +11,7 @@ import json
 import linecache
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -44,7 +45,7 @@ def module_dir(tmp_path: pathlib.Path):
         name
         for name in sys.modules
         if name.startswith(
-            ("fbn_", "fbn2_", "fbnhelp_", "fbnstage_", "rk_", "rk4_", "rk5_", "rk6_")
+            ("fbn_", "fbn2_", "fbnhelp_", "fbnstage_", "rk_", "rk4_", "rk5_", "rk6_", "rk7_")
         )
     ]
     for name in to_remove:
@@ -2766,6 +2767,12 @@ _R6_FORMS = {
 }
 
 
+# A fix the refusal lists must work when a user follows it. Removing the mark does not: without
+# it a library wrapper over the class is accepted with the class's `__call__` unseen (BET-253),
+# and a bare class-based decorator gets main's non-scalar refusal.
+_REMOVE_FIX = re.compile(r"remov\w*[^\n]*fingerprint_by_name|remov\w* the mark", re.IGNORECASE)
+
+
 @pytest.mark.parametrize("form", list(_R6_FORMS))
 @pytest.mark.parametrize("shape", list(_R6_SHAPES))
 def test_get_stage_fingerprint_refuses_a_class_decorator_above_the_mark_in_every_stage_form(
@@ -2774,8 +2781,9 @@ def test_get_stage_fingerprint_refuses_a_class_decorator_above_the_mark_in_every
     """`get_stage_fingerprint` alone refuses a user class instance above the mark, with or
     without a library wrapper over it, and with a function decorator on either side of it,
     however the stage reaches the helper, a pydantic `default_factory` and a partial's function
-    included. The message names the class and the mark and gives the fixes that work, not the
-    advice of the non-scalar refusal (StageParams, unsafe fingerprinting)."""
+    included. The message names the class and the mark and gives the two fixes that work, not
+    removing the mark and not the advice of the non-scalar refusal (StageParams, unsafe
+    fingerprinting)."""
     decorators, verb, cls = _R6_SHAPES[shape]
     _write(module_dir / "rk5_deco.py", _R5_DECO)
     _write(module_dir / "rk5_h.py", _R5_HELPER.format(decorators=decorators, verb=verb))
@@ -2789,6 +2797,7 @@ def test_get_stage_fingerprint_refuses_a_class_decorator_above_the_mark_in_every
     assert "functools.wraps" in message, message
     assert "StageParams" not in message, message
     assert "PIVOT_UNSAFE_FINGERPRINTING" not in message, message
+    assert not _REMOVE_FIX.search(message), message
 
 
 def test_unsafe_fingerprinting_does_not_suppress_the_refusal_of_a_class_above_the_mark(
@@ -2874,8 +2883,9 @@ def test_the_mark_above_a_class_based_decorator_records_the_whole_helper_by_name
 def test_without_the_mark_a_cache_over_a_class_decorator_is_not_refused(
     module_dir: pathlib.Path, shape: str
 ) -> None:
-    """The refusal's last fix, removing the mark, gives main's decision for the same chain:
-    a library wrapper over a class-based decorator with no mark below is not refused."""
+    """Without the mark, a library wrapper over a class-based decorator gets main's decision for
+    the same chain: it is not refused (and main does not see the class's `__call__` under the
+    cache, BET-253), which is why the refusal does not list removing the mark as a fix."""
     decorators, verb, _edit_pair, _cls = _R5_SHAPES[shape]
     _write(module_dir / "rk5_deco.py", _R5_DECO)
     _write(
@@ -3048,3 +3058,404 @@ def test_get_stage_fingerprint_given_the_refused_chain_itself_refuses_it(
     message = str(refused.value)
     assert f"rk5_deco.{cls}" in message, message
     assert "@fingerprint_by_name" in message, message
+
+
+# ---------------------------------------------------------------------------------------------
+# Every read of a `__wrapped__` chain goes through `fingerprint.wrapper_chain`, which reads the
+# chain as `inspect.unwrap` does. A class-based decorator that keeps `__wrapped__` in a slot or
+# a property is then the user class instance above the mark that it is, and is refused.
+# ---------------------------------------------------------------------------------------------
+
+# Three class-based decorators whose `__wrapped__` is not in the instance `__dict__`. Each is a
+# user class instance above the mark: `inspect.unwrap` follows its `__wrapped__` to the mark.
+# SlotDictTraced uses `functools.update_wrapper`, which stores `__wrapped__` in the slot.
+_R7_DECO = """\
+import functools
+
+
+class PropTraced:
+    def __init__(self, fn):
+        self.fn = fn
+
+    @property
+    def __wrapped__(self):
+        return self.fn
+
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs) * 3
+
+
+class SlotTraced:
+    __slots__ = ("fn", "__wrapped__")
+
+    def __init__(self, fn):
+        self.fn = fn
+        self.__wrapped__ = fn
+
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs) * 4
+
+
+class SlotDictTraced:
+    __slots__ = ("__wrapped__", "__dict__")
+
+    def __init__(self, fn):
+        functools.update_wrapper(self, fn)
+
+    def __call__(self, *args, **kwargs):
+        return self.__wrapped__(*args, **kwargs) * 6
+"""
+_R7_CALL_EDITS = {
+    "PropTraced": ("kwargs) * 3\n", "kwargs) * 30\n"),
+    "SlotTraced": ("kwargs) * 4\n", "kwargs) * 40\n"),
+    "SlotDictTraced": ("kwargs) * 6\n", "kwargs) * 60\n"),
+}
+_R7_HELPER = """\
+import functools
+
+from pivot import fingerprint_by_name
+from rk6_deco import PropTraced, SlotDictTraced, SlotTraced
+
+
+{decorators}@fingerprint_by_name
+def helper(*_args):
+    return 5
+"""
+_R7_HOLDER = "import rk6_h as h\n\n\nclass Holder:\n    held = h.helper\n\n\n"
+_R7_FORMS = {
+    "called": "import rk6_h as h\n\n\ndef my_stage():\n    return h.helper()\n",
+    "class_member_named": _R7_HOLDER + "def my_stage():\n    return Holder.held()\n",
+    "class_member_unnamed": _R7_HOLDER
+    + "def my_stage():\n    holder = Holder()\n    return holder.held()\n",
+    "partial_argument": (
+        "import functools\n\nimport rk6_h as h\n\n\ndef _apply(fn):\n    return fn()\n\n\n"
+        "RUNNER = functools.partial(_apply, h.helper)\n\n\ndef my_stage():\n    return RUNNER()\n"
+    ),
+    "partial_function": (
+        "import functools\n\nimport rk6_h as h\n\n\nRUNNER = functools.partial(h.helper)\n\n\n"
+        "def my_stage():\n    return RUNNER()\n"
+    ),
+    "default_argument": "import rk6_h as h\n\n\ndef my_stage(start=h.helper):\n    return start()\n",
+    "closure_cell": (
+        "import rk6_h as h\n\n\ndef _make():\n    fn = h.helper\n\n    def inner():\n"
+        "        return fn()\n\n    return inner\n\n\nRUNNER = _make()\n\n\n"
+        "def my_stage():\n    return RUNNER()\n"
+    ),
+    "dataclass_default": (
+        "import dataclasses\n\nimport rk6_h as h\n\n\n@dataclasses.dataclass\nclass Cfg:\n"
+        "    fn: object = h.helper\n\n\ndef my_stage():\n    return Cfg().fn()\n"
+    ),
+}
+_R7_MODULES = ("rk6_deco", "rk6_h", "rk6_s")
+_R7_WRAPPED = {
+    "cache_PropTraced": ("@functools.cache\n@PropTraced\n", "PropTraced"),
+    "lru_cache_PropTraced": ("@functools.lru_cache(maxsize=8)\n@PropTraced\n", "PropTraced"),
+    "cache_SlotTraced": ("@functools.cache\n@SlotTraced\n", "SlotTraced"),
+    "cache_SlotDictTraced": ("@functools.cache\n@SlotDictTraced\n", "SlotDictTraced"),
+}
+
+
+@pytest.mark.parametrize("form", list(_R7_FORMS))
+@pytest.mark.parametrize("shape", list(_R7_WRAPPED))
+def test_a_class_decorator_with_a_property_or_slot_wrapped_above_the_mark_is_refused(
+    module_dir: pathlib.Path, shape: str, form: str
+) -> None:
+    """A user class instance above the mark is refused however its `__wrapped__` is stored and
+    however the stage reaches the helper. If it is not refused, the class's own code is in the
+    fingerprint: the fingerprint is the same on a second import of unchanged files (an object
+    address in a repr is not a fingerprint of code), and an edit to `__call__` changes it. No
+    other exception escapes."""
+    decorators, cls = _R7_WRAPPED[shape]
+    _write(module_dir / "rk6_deco.py", _R7_DECO)
+    _write(module_dir / "rk6_h.py", _R7_HELPER.format(decorators=decorators))
+    _write(module_dir / "rk6_s.py", _R7_FORMS[form])
+    try:
+        first = fingerprint.get_stage_fingerprint(_fresh(*_R7_MODULES).my_stage)
+    except exceptions.StageDefinitionError as refused:
+        assert cls in str(refused), refused
+        return
+
+    again = fingerprint.get_stage_fingerprint(_fresh(*_R7_MODULES).my_stage)
+    assert again == first, (first, again)
+    _edit(module_dir / "rk6_deco.py", *_R7_CALL_EDITS[cls])
+    second = fingerprint.get_stage_fingerprint(_fresh(*_R7_MODULES).my_stage)
+    assert second != first, first
+
+
+@pytest.mark.parametrize("form", list(_R7_FORMS))
+@pytest.mark.parametrize("shape", list(_R7_WRAPPED))
+def test_a_property_or_slot_class_decorator_above_the_mark_gets_the_class_above_mark_refusal(
+    module_dir: pathlib.Path, shape: str, form: str
+) -> None:
+    """With every chain read through `wrapper_chain`, the mark decision sees these instances as
+    it sees one that keeps `__wrapped__` in its `__dict__`: every form gets the class-above-mark
+    refusal, which names the class and the mark and gives the two fixes."""
+    decorators, cls = _R7_WRAPPED[shape]
+    _write(module_dir / "rk6_deco.py", _R7_DECO)
+    _write(module_dir / "rk6_h.py", _R7_HELPER.format(decorators=decorators))
+    _write(module_dir / "rk6_s.py", _R7_FORMS[form])
+    with pytest.raises(exceptions.StageDefinitionError) as refused:
+        fingerprint.get_stage_fingerprint(_fresh(*_R7_MODULES).my_stage)
+    message = str(refused.value)
+    assert f"the class-based decorator 'rk6_deco.{cls}' is above 'rk6_h.helper'" in message
+    assert "functools.wraps" in message, message
+    assert not _REMOVE_FIX.search(message), message
+
+
+@pytest.mark.parametrize(
+    ("decorators", "cls"),
+    [
+        ("@PropTraced\n", "PropTraced"),
+        ("@SlotTraced\n", "SlotTraced"),
+        ("@SlotDictTraced\n", "SlotDictTraced"),
+        ("@functools.cache\n@PropTraced\n", "PropTraced"),
+        ("@functools.cache\n@SlotTraced\n", "SlotTraced"),
+        ("@functools.cache\n@SlotDictTraced\n", "SlotDictTraced"),
+    ],
+    ids=[
+        "PropTraced",
+        "SlotTraced",
+        "SlotDictTraced",
+        "cache_PropTraced",
+        "cache_SlotTraced",
+        "cache_SlotDictTraced",
+    ],
+)
+def test_the_refusal_of_a_property_or_slot_class_decorator_above_the_mark_names_the_mark(
+    module_dir: pathlib.Path, decorators: str, cls: str
+) -> None:
+    """The refusal names the class and `@fingerprint_by_name`, as it does for a class-based
+    decorator that keeps `__wrapped__` in its `__dict__`."""
+    _write(module_dir / "rk6_deco.py", _R7_DECO)
+    _write(module_dir / "rk6_h.py", _R7_HELPER.format(decorators=decorators))
+    _write(module_dir / "rk6_s.py", _R7_FORMS["called"])
+    with pytest.raises(exceptions.StageDefinitionError) as refused:
+        fingerprint.get_stage_fingerprint(_fresh(*_R7_MODULES).my_stage)
+    message = str(refused.value)
+    assert cls in message, message
+    assert "fingerprint_by_name" in message, message
+
+
+_R7_DECO_B = """\
+import functools
+
+
+class Traced:
+    def __init__(self, fn):
+        self.fn = fn
+        functools.update_wrapper(self, fn)
+
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs) * 2
+
+
+class TracedGen:
+    def __init__(self, fn):
+        self.fn = fn
+        functools.update_wrapper(self, fn)
+
+    def __call__(self, *args, **kwargs):
+        for value in self.fn(*args, **kwargs):
+            yield value * 3
+"""
+_R7_HELPER_B = """\
+import contextlib
+import functools
+
+from pivot import fingerprint_by_name
+from rk6_bdeco import Traced, TracedGen
+
+
+{decorators}{mark}def helper(*_args):
+    {verb} 5
+"""
+_R7_SHAPES_B = {
+    "cache": ("@functools.cache\n@Traced\n", "return", ("kwargs) * 2\n", "kwargs) * 20\n")),
+    "lru_cache": (
+        "@functools.lru_cache(maxsize=8)\n@Traced\n",
+        "return",
+        ("kwargs) * 2\n", "kwargs) * 20\n"),
+    ),
+    "bare": ("@Traced\n", "return", ("kwargs) * 2\n", "kwargs) * 20\n")),
+    "contextmanager": (
+        "@contextlib.contextmanager\n@TracedGen\n",
+        "yield",
+        ("value * 3\n", "value * 30\n"),
+    ),
+}
+_R7_STAGE_B = {
+    "return": "import rk6_bh as h\n\n\ndef my_stage():\n    return h.helper()\n",
+    "yield": (
+        "import rk6_bh as h\n\n\ndef my_stage():\n    with h.helper() as value:\n"
+        "        return value\n"
+    ),
+}
+_R7_MODULES_B = ("rk6_bdeco", "rk6_bh", "rk6_bs")
+
+
+@pytest.mark.parametrize("shape", list(_R7_SHAPES_B))
+def test_removing_the_mark_is_listed_as_a_fix_only_where_it_clears_the_stated_hazard(
+    module_dir: pathlib.Path, shape: str
+) -> None:
+    """Each fix the refusal lists works when a user follows it. Removing the mark is a fix only
+    if, without the mark, Pivot accepts the stage and an edit to the class-based decorator's
+    `__call__` changes the fingerprint (the hazard the message names is gone)."""
+    decorators, verb, (old, new) = _R7_SHAPES_B[shape]
+    _write(module_dir / "rk6_bdeco.py", _R7_DECO_B)
+    _write(
+        module_dir / "rk6_bh.py",
+        _R7_HELPER_B.format(decorators=decorators, mark="@fingerprint_by_name\n", verb=verb),
+    )
+    _write(module_dir / "rk6_bs.py", _R7_STAGE_B[verb])
+    with pytest.raises(exceptions.StageDefinitionError) as refused:
+        fingerprint.get_stage_fingerprint(_fresh(*_R7_MODULES_B).my_stage)
+    message = str(refused.value)
+    if not _REMOVE_FIX.search(message):
+        return
+
+    _write(module_dir / "rk6_bh.py", _R7_HELPER_B.format(decorators=decorators, mark="", verb=verb))
+    try:
+        first = fingerprint.get_stage_fingerprint(_fresh(*_R7_MODULES_B).my_stage)
+    except exceptions.StageDefinitionError as still_refused:
+        pytest.fail(f"the message lists removing the mark, and then:\n{still_refused}\n\n{message}")
+    _edit(module_dir / "rk6_bdeco.py", old, new)
+    second = fingerprint.get_stage_fingerprint(_fresh(*_R7_MODULES_B).my_stage)
+    assert second != first, f"edit to __call__ unseen after removing the mark:\n{message}"
+
+
+@typing.final
+class _PropWrapped:
+    def __init__(self, fn: object) -> None:
+        self.fn = fn
+
+    @property
+    def __wrapped__(self) -> object:
+        return self.fn
+
+
+@typing.final
+class _SlotWrapped:
+    __slots__ = ("__wrapped__",)
+
+    def __init__(self, fn: object) -> None:
+        self.__wrapped__ = fn
+
+
+@typing.final
+class _ClassWithWrapped:
+    __wrapped__ = len
+
+
+def _function_chain() -> tuple[object, object]:
+    """`outer` wraps `middle`, which wraps `inner`, each with `functools.wraps`."""
+
+    def inner() -> int:
+        return 1
+
+    @functools.wraps(inner)
+    def middle() -> int:
+        return inner()
+
+    @functools.wraps(middle)
+    def outer() -> int:
+        return middle()
+
+    return outer, middle
+
+
+def _linked(count: int, *, loop: bool) -> object:
+    """The first of `count` objects, each wrapping the next; with `loop`, the last wraps the
+    first."""
+    nodes = [types.SimpleNamespace() for _ in range(count)]
+    for node, below in zip(nodes, nodes[1:], strict=False):
+        node.__wrapped__ = below
+    if loop:
+        nodes[-1].__wrapped__ = nodes[0]
+    return nodes[0]
+
+
+def _stopped_in_the_middle() -> tuple[object, typing.Any]:
+    outer, middle = _function_chain()
+
+    def at_middle(current: object) -> bool:
+        return current is middle
+
+    return outer, at_middle
+
+
+_R7_CHAINS = {
+    "functions": lambda: (_function_chain()[0], None),
+    "stop_in_the_middle": _stopped_in_the_middle,
+    "property": lambda: (_PropWrapped(_PropWrapped(len)), None),
+    "slot": lambda: (_SlotWrapped(_SlotWrapped(len)), None),
+    "class_ends_the_chain": lambda: (types.SimpleNamespace(__wrapped__=_ClassWithWrapped), None),
+    "wrapped_none": lambda: (types.SimpleNamespace(__wrapped__=None), None),
+    "self_loop": lambda: (_linked(1, loop=True), None),
+    "two_object_loop": lambda: (_linked(2, loop=True), None),
+    "longer_than_the_recursion_limit": lambda: (
+        _linked(sys.getrecursionlimit() + 5, loop=False),
+        None,
+    ),
+}
+
+
+def _inspect_chain(obj: object, stop: typing.Any) -> tuple[list[object], object]:
+    """The objects `inspect.unwrap(obj, stop=stop)` passes, in order, and its result, or
+    ValueError where it raises."""
+    seen = list[object]()
+
+    def record(current: object) -> bool:
+        seen.append(current)
+        return stop is not None and bool(stop(current))
+
+    try:
+        end = inspect.unwrap(obj, stop=record)
+    except ValueError:
+        return seen, ValueError
+    if not seen or seen[-1] is not end:
+        seen.append(end)
+    return seen, end
+
+
+@pytest.mark.parametrize("chain", list(_R7_CHAINS))
+def test_wrapper_chain_and_unwrap_read_a_chain_as_inspect_unwrap_does(chain: str) -> None:
+    """The one helper that reads `__wrapped__` chains passes the objects `inspect.unwrap`
+    passes: by attribute access (a slot or a property counts), ending at a class, at what `stop`
+    accepts, and before a repeated object or past the recursion limit. `unwrap` returns what
+    `inspect.unwrap` returns and raises ValueError where it raises."""
+    obj, stop = _R7_CHAINS[chain]()
+    seen, end = _inspect_chain(obj, stop)
+    walked = [id(item) for item in fingerprint.wrapper_chain(obj, stop)]
+    assert walked == [id(item) for item in seen]
+    if end is ValueError:
+        with pytest.raises(ValueError, match="wrapper loop"):
+            fingerprint.unwrap(obj, stop)
+    else:
+        assert fingerprint.unwrap(obj, stop) is end
+
+
+_R7_LOOP_STAGE = """\
+class Looped:
+    pass
+
+
+LOOPED = Looped()
+LOOPED.__wrapped__ = LOOPED
+
+
+def my_stage():
+    return LOOPED
+"""
+
+
+def test_a_looped_chain_without_a_mark_is_decided_as_main_decides_it(
+    module_dir: pathlib.Path,
+) -> None:
+    """A value whose `__wrapped__` chain loops, with no mark on it, gets main's non-scalar
+    refusal. The mark decision takes the loop as the chain's end and gives no answer, where
+    `inspect.unwrap` would raise ValueError, so the mark machinery adds no error main lacks."""
+    _write(module_dir / "rk7_loop.py", _R7_LOOP_STAGE)
+    stage = _fresh("rk7_loop").my_stage
+    assert fingerprint._mark_decision(sys.modules["rk7_loop"].LOOPED) is None
+    with pytest.raises(exceptions.StageDefinitionError, match="captures non-scalar variable"):
+        fingerprint.get_stage_fingerprint(stage)

@@ -332,12 +332,12 @@ def _compute_file_fingerprint(func: Callable[..., Any], code_deps: list[str]) ->
 
     Returns dict with keys like ``file:path/to/module.py`` -> hash.
     Includes the stage function's source file and each of ``code_deps``.
-    Uses ``inspect.unwrap`` to handle stacked decorators.
+    Uses ``fingerprint.unwrap`` (``inspect.unwrap``'s reading) to handle stacked decorators.
     """
     result = dict[str, str]()
 
     # Unwrap decorators so inspect.getfile returns the actual stage source
-    unwrapped = inspect.unwrap(func)
+    unwrapped = fingerprint.unwrap(func)
     source_file = pathlib.Path(inspect.getfile(unwrapped))
     file_hash, _ = cache.hash_file(source_file)
     rel_path = project.to_relative_path(source_file)

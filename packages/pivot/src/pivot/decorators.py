@@ -48,14 +48,15 @@ def fingerprint_by_name[F: Callable[..., object]](func: F) -> F:
     records the marked function inside it by name, also when `functools.cache` wraps that
     decorator. A library wrapper directly above the mark (`functools.cache`,
     `functools.lru_cache`, `contextlib.contextmanager`) keeps the record by name. Pivot
-    refuses a class-based decorator above the mark, however the stage reaches the helper,
+    refuses a class-based decorator above the mark, however the stage reaches the helper and
+    however the decorator keeps `__wrapped__` (in its `__dict__`, a slot or a property),
     because the decorator instance can carry state Pivot cannot fingerprint soundly. Unsafe
     fingerprinting does not suppress that refusal. To clear it, put the mark above the
     class-based decorator (the decorator accepts an instance that `functools.update_wrapper`
-    made), use a `functools.wraps` function decorator, or remove the mark. Without a mark
-    below it, a `functools.wraps` decorator is fingerprinted as in earlier versions: Pivot
-    does not see what its own lines read through a module (`settings.FACTOR`), or its body
-    when `functools.cache` wraps it.
+    made), or use a `functools.wraps` function decorator. Without a mark below it, a
+    `functools.wraps` decorator is fingerprinted as in earlier versions: Pivot does not see what
+    its own lines read through a module (`settings.FACTOR`), or its body when `functools.cache`
+    wraps it.
 
     A stage cannot carry the mark: Pipeline refuses a stage with the mark
     anywhere on its `__wrapped__` chain.
@@ -85,7 +86,9 @@ def _validate_fingerprint_by_name_target(func: object) -> None:
             f"not {type(func).__name__} ({inner_name})"
         )
         raise TypeError(msg)
-    unwrapped = inspect.unwrap(func)
+    from pivot import fingerprint as _fp
+
+    unwrapped = _fp.unwrap(func)
     if not isinstance(unwrapped, types.FunctionType):
         raise TypeError(f"@fingerprint_by_name requires a function, got {type(func).__name__}")
     qualname = getattr(unwrapped, "__qualname__", "")

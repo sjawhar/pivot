@@ -326,12 +326,13 @@ above the mark (`functools.cache`, `functools.lru_cache`,
 
 Pivot refuses a class-based decorator above the mark, however the stage
 reaches the helper (a call, a class member, a partial argument, a default, a
-pydantic `default_factory`). Pivot cannot fingerprint the code and state of a
-class instance, and the mark records only the function below it.
+pydantic `default_factory`) and however the decorator keeps `__wrapped__` (in
+its `__dict__`, a slot or a property). Pivot cannot fingerprint the code and
+state of a class instance, and the mark records only the function below it.
 `core.unsafe_fingerprinting` does not turn this refusal into a warning. To
 clear it, put `@fingerprint_by_name` above the class-based decorator, so Pivot
-records the whole helper by name; or replace the class with a function
-decorator built with `functools.wraps`; or remove the mark.
+records the whole helper by name, or replace the class with a function
+decorator built with `functools.wraps`.
 
 Without a mark below it, Pivot fingerprints a `functools.wraps` decorator as
 in earlier versions. It follows `__wrapped__` to the wrapped function, so it
