@@ -251,7 +251,17 @@ def commit_stages(
                         output_hashes=output_entries,
                     )
             if not reusable:
-                deferred["run_cache_delete_input_hash"] = input_hash
+                deferred["run_cache_delete_input_hashes"] = [
+                    input_hash,
+                    run_history.stage_input_hash(
+                        fingerprint,
+                        current_params,
+                        stage_info["deps"].values(),
+                        dep_hashes_by_identity,
+                        stage_outs,
+                        marked=False,
+                    ),
+                ]
             if file_hash_entries:
                 deferred["file_hash_entries"] = file_hash_entries
 

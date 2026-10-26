@@ -1024,11 +1024,9 @@ class StateDB:
                         + f"{stage_name}:{deferred['run_cache_input_hash']}".encode()
                     )
                     txn.put(key, run_history.serialize_to_bytes(deferred["run_cache_entry"]))
-                if "run_cache_delete_input_hash" in deferred:
-                    txn.delete(
-                        _RUNCACHE_PREFIX
-                        + f"{stage_name}:{deferred['run_cache_delete_input_hash']}".encode()
-                    )
+                if "run_cache_delete_input_hashes" in deferred:
+                    for delete_hash in deferred["run_cache_delete_input_hashes"]:
+                        txn.delete(_RUNCACHE_PREFIX + f"{stage_name}:{delete_hash}".encode())
 
                 # File hash entries; one whose key exceeds LMDB's limit is left out, as
                 # save_many leaves it out: this cache only saves a later hash.

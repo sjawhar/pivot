@@ -81,7 +81,7 @@ def _helper_output_listing(
     stages = root / ".pivot" / "stages"
     lock_data = yaml.safe_load((stages / f"{stage}.lock").read_text())
     (out,) = [entry for entry in lock_data["outs"] if entry["key"] == key]
-    record = types.DirHash(hash=out["hash"], size=out["size"], nfiles=out["nfiles"])
+    record = types.DirHash(hash=out["listing"], size=out["size"], nfiles=out["nfiles"])
     return listing.read(stages / f"{stage}={key or ''}.listing", record, None)
 
 
@@ -1231,7 +1231,7 @@ def _helper_rewrite_lock_as_pivot_033(
     for entry in [*data["deps"], *data["outs"]]:
         if "nfiles" not in entry:
             continue
-        del entry["size"], entry["nfiles"]
+        del entry["size"], entry["nfiles"], entry["listing"]
         entry["hash"] = old_hash
         entry["manifest"] = [dict(file) for file in files]
         changed += 1
@@ -2821,7 +2821,7 @@ def _helper_commit_output_listing(
     (stages / f"{stage}=.listing").write_bytes(data)
     lock_path = stages / f"{stage}.lock"
     lock_data = yaml.safe_load(lock_path.read_text())
-    lock_data["outs"][0].update(hash=xxhash.xxh64(data).hexdigest(), size=size, nfiles=nfiles)
+    lock_data["outs"][0].update(listing=xxhash.xxh64(data).hexdigest(), size=size, nfiles=nfiles)
     lock_path.write_text(yaml.safe_dump(lock_data, sort_keys=False))
     _commit(root, "hostile listing")
 

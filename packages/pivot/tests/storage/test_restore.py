@@ -739,7 +739,7 @@ def test_restore_stage_directory_output_from_listing_beside_lock(
         "outs": [
             {
                 "key": None,
-                "hash": record["hash"],
+                "listing": record["hash"],
                 "size": record["size"],
                 "nfiles": record["nfiles"],
                 "path": "data/train",

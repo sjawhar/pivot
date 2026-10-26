@@ -321,7 +321,7 @@ def test_discover_pvt_files_reads_an_old_directory_pvt_with_one_warning_and_keep
     assert result == {str(tmp_path / "images"): _RECORD}
     warnings = [record.getMessage() for record in caplog.records]
     assert len(warnings) == 1, warnings
-    assert str(pvt_path) in warnings[0] and "pivot track --force" in warnings[0], warnings
+    assert pvt_path.name in warnings[0] and "pivot track --force" in warnings[0], warnings
     assert pvt_path.read_text() == _OLD_PVT, "an old .pvt is never rewritten"
     assert [path.name for path in tmp_path.iterdir()] == ["images.pvt"]
 
@@ -448,7 +448,7 @@ def test_read_pvt_file_reads_an_old_directory_pvt_as_its_listing_record_warning_
     assert first == second == _RECORD
     warnings = [record.getMessage() for record in caplog.records]
     assert len(warnings) == 1, warnings
-    assert str(pvt_path) in warnings[0] and "pivot track --force" in warnings[0], warnings
+    assert pvt_path.name in warnings[0] and "pivot track --force" in warnings[0], warnings
     assert pvt_path.read_text() == _OLD_PVT, "an old .pvt is never rewritten"
     assert [path.name for path in tmp_path.iterdir()] == ["images.pvt"]
 

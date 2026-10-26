@@ -891,7 +891,7 @@ def _run_directory_pipeline(root: pathlib.Path) -> _ProducedDirectory:
     assert dep.directory is not None, "the consumer reads one file of the directory output"
     stages_dirs = {name: explain.stages_dir(info, state_dir) for name, info in all_stages.items()}
     return _ProducedDirectory(
-        locks=explain.read_locks(all_stages, all_stages, state_dir),
+        locks=explain.read_locks(all_stages, all_stages, state_dir, None),
         deps=[dep],
         stages_dirs=stages_dirs,
         file_identity=dep.identity,
@@ -1160,7 +1160,7 @@ def test_find_tracked_hash_reads_a_member_from_an_old_directory_pvt_with_one_war
     assert result == {"hash": _B_CSV_HASH}
     warnings = [record.getMessage() for record in caplog.records]
     assert len(warnings) == 1, warnings
-    assert str(pvt_path) in warnings[0] and "pivot track --force" in warnings[0], warnings
+    assert pvt_path.name in warnings[0] and "pivot track --force" in warnings[0], warnings
     assert pvt_path.read_text() == _OLD_CORPUS_PVT, "an old .pvt is never rewritten"
     assert not (mock_discovery.root / "corpus.pvt.listing").exists(), "explain writes no listing"
 

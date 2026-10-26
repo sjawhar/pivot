@@ -101,7 +101,7 @@ def _directory_head(listing_bytes: bytes, *, size: int, nfiles: int) -> dict[str
             "outs": [
                 {
                     "key": None,
-                    "hash": listing.digest(listing_bytes),
+                    "listing": listing.digest(listing_bytes),
                     "size": size,
                     "nfiles": nfiles,
                 }

@@ -909,6 +909,14 @@ def _execute_stage(
                             store,
                             state_db,
                             state_dir=project_state_dir,
+                            legacy_input_hash=run_history.stage_input_hash(
+                                current_fingerprint,
+                                current_params,
+                                stage_info["deps"].values(),
+                                _to_identity_hashes(dep_hashes),
+                                stage_outs,
+                                marked=False,
+                            ),
                         )
                         if run_cache_skip is not None:
                             if no_commit:
@@ -2129,6 +2137,16 @@ def _commit_lock_and_build_deferred(
         output_hashes,
         state_db,
         reusable=reusable,
+        legacy_input_hash=None
+        if reusable
+        else run_history.stage_input_hash(
+            stage_info["fingerprint"],
+            lock_data["params"],
+            stage_info["deps"].values(),
+            lock_data["dep_hashes"],
+            stage_info["outs"],
+            marked=False,
+        ),
         file_hash_entries=file_hash_entries,
         increment_outputs=increment_outputs,
     )
@@ -2141,14 +2159,16 @@ def _build_deferred_writes(
     state_db: state.StateDB,
     *,
     reusable: bool = True,
+    legacy_input_hash: str | None = None,
     file_hash_entries: list[FileHashEntry] | None = None,
     increment_outputs: bool = True,
 ) -> DeferredWrites:
     """Build deferred writes for coordinator to apply.
 
     A result that is not ``reusable`` (its run imported user modules its fingerprint does not
-    cover) files no run-cache entry and deletes any entry at its input hash; its lock carries a
-    key no fingerprint has and `skip.check_stage` never consults the run cache for it, so no tier
+    cover) files no run-cache entry and deletes any entry at its input hash and at
+    ``legacy_input_hash``, the unmarked key an older pivot files under; its lock carries a key
+    no fingerprint has and `skip.check_stage` never consults the run cache for it, so no tier
     skips it.
     """
     result: DeferredWrites = {}
@@ -2188,7 +2208,10 @@ def _build_deferred_writes(
                 output_hashes=output_entries,
             )
     if not reusable:
-        result["run_cache_delete_input_hash"] = input_hash
+        result["run_cache_delete_input_hashes"] = [
+            input_hash,
+            *([] if legacy_input_hash is None else [legacy_input_hash]),
+        ]
 
     if file_hash_entries:
         result["file_hash_entries"] = file_hash_entries
@@ -2209,6 +2232,25 @@ class RunCacheSkipResult(TypedDict):
     file_hash_entries: list[FileHashEntry]
 
 
+def _run_cache_output_hash(
+    output: run_history.OutputHashEntry, cache_dir: pathlib.Path | None
+) -> HashInfo | None:
+    """A run-cache output entry's hash. An entry an older pivot filed for a directory lists its
+    files inline: it becomes the record of its listing, which is put in ``cache_dir`` for the
+    restore to read, as ``StageLock.read`` does for an older pivot's lock. None when such an
+    entry is malformed or there is no cache."""
+    raw = cast("Mapping[str, object]", output)
+    if "manifest" not in raw:
+        return run_history.entry_to_output_hash(output)
+    members = listing.from_inline(raw["manifest"], raw.get("empty_dirs", []))
+    if members is None or cache_dir is None:
+        return None
+    data = listing.encode(members)
+    record = listing.record_of(members, data)
+    listing.store_object(cache_dir, record["hash"], data)
+    return record
+
+
 def _try_skip_via_run_cache_with_store(
     stage_name: str,
     input_hash: str,
@@ -2217,16 +2259,21 @@ def _try_skip_via_run_cache_with_store(
     state_db: state.StateDB,
     *,
     state_dir: pathlib.Path,
+    legacy_input_hash: str | None = None,
 ) -> RunCacheSkipResult | None:
-    """Restore all cached outputs from a matching run-cache entry."""
+    """Restore all cached outputs from a matching run-cache entry: the one at ``input_hash``,
+    else the one an older pivot filed at ``legacy_input_hash`` (its unmarked key,
+    ``run_history.compute_input_hash``), read in memory (``_run_cache_output_hash``)."""
     if any(out.tag is types.ArtifactTag.METRIC for out in stage_outs):
         return None
     entry = state_db.lookup_run_cache(stage_name, input_hash)
+    if entry is None and legacy_input_hash is not None:
+        entry = state_db.lookup_run_cache(stage_name, legacy_input_hash)
     if entry is None:
         return None
     output_hashes = dict[str, HashInfo]()
     for output in entry["output_hashes"]:
-        output_hash = run_history.entry_to_output_hash(output)
+        output_hash = _run_cache_output_hash(output, store_cache_dir(store))
         if output_hash is None:
             return None
         output_hashes[output["path"]] = output_hash

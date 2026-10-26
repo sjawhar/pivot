@@ -358,7 +358,7 @@ def test_is_lock_data_accepts_missing_dep_generations() -> None:
         "outs": [],
     }
 
-    assert lock.is_lock_data(data)
+    assert lock.lock_data_error(data) is None
 
 
 def test_read_lock_with_dep_generations_ignored(tmp_path: Path) -> None:
@@ -453,7 +453,7 @@ def test_lock_read_treats_non_mapping_manifest_or_params_as_missing(
 
 _DEP: dict[str, object] = {"producer": "p/a", "key": None, "hash": "0123456789abcdef"}
 _OUT: dict[str, object] = {"key": "o", "hash": "fedcba9876543210"}
-_DIR_OUT: dict[str, object] = {**_OUT, "size": 1, "nfiles": 1}
+_DIR_OUT: dict[str, object] = {"key": "o", "listing": "fedcba9876543210", "size": 1, "nfiles": 1}
 
 
 @pytest.mark.parametrize(
@@ -515,8 +515,23 @@ _DIR_OUT: dict[str, object] = {**_OUT, "size": 1, "nfiles": 1}
         ),
         pytest.param(
             "outs[0].size",
-            {"outs": [{**_OUT, "nfiles": 1}]},
+            {"outs": [{"key": "o", "listing": "fedcba9876543210", "nfiles": 1}]},
             id="directory-missing-size",
+        ),
+        pytest.param(
+            "outs[0].nfiles",
+            {"outs": [{**_OUT, "size": 1, "nfiles": 1}]},
+            id="directory-under-the-file-hash-key",
+        ),
+        pytest.param(
+            "outs[0].hash",
+            {"outs": [{**_DIR_OUT, "hash": "fedcba9876543210"}]},
+            id="directory-with-a-file-hash",
+        ),
+        pytest.param(
+            "outs[0].listing",
+            {"outs": [{**_DIR_OUT, "listing": "abc"}]},
+            id="short-directory-hash",
         ),
     ],
 )
@@ -544,30 +559,64 @@ def test_lock_read_treats_invalid_fields_as_missing_and_names_them(
     assert any(field in record.getMessage() for record in caplog.records), caplog.text
 
 
-def test_old_schema_lock_warns_and_reads_missing(
+def test_old_schema_lock_is_read_as_it_is_with_one_warning_naming_it(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """An old lock is stale and names its path in the migration warning."""
-    stage_lock = lock.StageLock("p/stage", tmp_path)
+    """An older pivot's lock is read in place: its inline listing becomes the record of its
+    listing, which goes into the cache; one warning names the file."""
+    stage_lock = lock.StageLock("p/stage", tmp_path / "stages")
     stage_lock.path.parent.mkdir(parents=True)
+    files = [{"relpath": "a.txt", "hash": "0123456789abcdef", "size": 3, "isexec": False}]
+    old_dir = {"key": None, "hash": "aaaaaaaaaaaaaaaa", "manifest": files, "empty_dirs": ["e"]}
     stage_lock.path.write_text(
         yaml.safe_dump(
             {
                 "schema_version": 2,
                 "code_manifest": {"self:stage": "h"},
                 "params": {},
-                "deps": [],
-                "outs": [],
+                "deps": [{**_DEP}],
+                "outs": [old_dir, {**_OUT}],
             }
+        )
+    )
+    cache_dir = tmp_path / "cache"
+    members = listing.DirListing(
+        files=[DirManifestEntry(relpath="a.txt", hash="0123456789abcdef", size=3, isexec=False)],
+        empty_dirs=["e"],
+    )
+    record = listing.record_of(members, listing.encode(members))
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.lock"):
+        first = stage_lock.read(cache_dir=cache_dir)
+        second = stage_lock.read(cache_dir=cache_dir)
+
+    assert first is not None and first == second
+    assert first["output_hashes"] == {
+        _id("p/stage"): record,
+        _id("p/stage", "o"): {"hash": "fedcba9876543210"},
+    }
+    assert first["dep_hashes"] == {_id("p/a"): {"hash": "0123456789abcdef"}}
+    assert listing.read(None, record, cache_dir) == members
+    (warning,) = caplog.records
+    assert str(stage_lock.path) in warning.getMessage()
+    assert "was written by an older pivot; pivot reads it as it is" in warning.getMessage()
+
+
+def test_a_lock_from_a_newer_pivot_reads_as_missing_with_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    stage_lock.path.parent.mkdir(parents=True)
+    stage_lock.path.write_text(
+        yaml.safe_dump(
+            {"schema_version": 99, "code_manifest": {}, "params": {}, "deps": [], "outs": []}
         )
     )
 
     with caplog.at_level(logging.WARNING, logger="pivot.storage.lock"):
         assert stage_lock.read() is None
 
-    (record,) = caplog.records
-    assert str(stage_lock.path) in record.getMessage()
-    assert "was written by an older pivot; pivot reads it as missing" in record.getMessage()
+    assert "was written by a newer pivot" in caplog.text
 
 
 def _directory_lock_data(
@@ -728,7 +777,7 @@ def test_lock_read_accepts_every_written_field(tmp_path: Path) -> None:
         "params": {"lr": 0.1, "nested": {"a": [1, 2]}},
         "deps": [{**_DEP, "display": "data/raw/a.csv", "size": 3}],
         "outs": [
-            {**_OUT, "key": None, "size": 1, "nfiles": 1},
+            {"key": None, "listing": "fedcba9876543210", "size": 1, "nfiles": 1},
             {**_OUT, "key": "m", "tag": "metric", "size": 4},
         ],
         "merkle_id": "abc",
@@ -838,9 +887,8 @@ def test_lock_read_ignores_display_fields(set_project_root: Path) -> None:
                 "deps": [{**_DEP, "producer": "input", "display": "data/raw/input.csv"}],
                 "outs": [
                     {
-                        **_OUT,
                         "key": "results",
-                        "hash": "0e0e0e0e0e0e0e0e",
+                        "listing": "0e0e0e0e0e0e0e0e",
                         "size": 100,
                         "nfiles": 1,
                         "tag": "directory",
@@ -1036,7 +1084,10 @@ def test_written_lock_records_directory_size_file_count_and_listing(tmp_path: Pa
 
     assert written == [output_listing, stage_lock.path]
     assert document["schema_version"] == lock.SCHEMA_VERSION
-    assert document["outs"] == [{"key": None, **hashed["record"]}]
+    record = hashed["record"]
+    assert document["outs"] == [
+        {"key": None, "listing": record["hash"], "size": record["size"], "nfiles": record["nfiles"]}
+    ]
     assert "manifest" not in document["outs"][0]
     assert "empty_dirs" not in document["outs"][0]
     assert listing.read(output_listing, hashed["record"], None) == hashed["listing"]

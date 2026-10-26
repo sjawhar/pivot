@@ -18,6 +18,8 @@ import boto3
 import xxhash
 import yaml
 
+from pivot.storage import listing
+
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 _A = xxhash.xxh64(b"a").hexdigest()
 _RUN = xxhash.xxh64(b"#!/bin/sh\n").hexdigest()
@@ -154,7 +156,7 @@ def test_a_directory_is_recorded_by_hash_with_one_committed_listing_per_director
 ) -> None:
     root = _helper_tree_project(tmp_path)
     tree_hash = xxhash.xxh64(_TREE_LISTING).hexdigest()
-    record = {"hash": tree_hash, "size": 11, "nfiles": 2}
+    record = {"listing": tree_hash, "size": 11, "nfiles": 2}
 
     assert _helper_entry(root, "t/copy", "deps", "corpus") == {
         "producer": "corpus",
@@ -194,7 +196,7 @@ def test_a_hand_edited_listing_is_refused_naming_it(tmp_path: pathlib.Path) -> N
     from_cache = _pivot(root, "checkout")
     restored = out_dir.is_dir()
     shutil.rmtree(out_dir)
-    tree_hash = str(out["hash"])
+    tree_hash = str(out["listing"])
     (root / ".pivot" / "cache" / "files" / tree_hash[:2] / tree_hash[2:]).unlink()
     refused = _pivot(root, "checkout")
 
@@ -320,32 +322,68 @@ with Pipeline("p") as pipeline:
 
 
 def _helper_rewrite_as_schema_2(lock_path: pathlib.Path) -> None:
-    """Rewrite a lock the way pivot 0.5.9 wrote it: schema 2."""
+    """Rewrite a lock the way pivot 0.5.9 wrote it: schema 2, each directory listing its files
+    inline (its old hash is any valid one: this pivot computes the record from the list). The
+    caller removes the listing files, which no older pivot wrote."""
     data = yaml.safe_load(lock_path.read_text())
     data["schema_version"] = 2
+    stages_dir = lock_path.parent
+    for entry in data["deps"] + data["outs"]:
+        if "listing" not in entry:
+            continue
+        record_hash = entry.pop("listing")
+        del entry["nfiles"], entry["size"]
+        listing_files = [
+            path
+            for path in stages_dir.parent.rglob("*.listing")
+            if xxhash.xxh64(path.read_bytes()).hexdigest() == record_hash
+        ]
+        members = listing.decode(listing_files[0].read_bytes())
+        entry["hash"] = "0123456789abcdef"
+        entry["manifest"] = [dict(file) for file in members["files"]]
+        entry["empty_dirs"] = members["empty_dirs"]
     lock_path.write_text(yaml.safe_dump(data, sort_keys=False))
 
 
-def test_an_ordinary_old_lock_warns_once_is_decided_afresh_and_is_rewritten(
-    tmp_path: pathlib.Path,
-) -> None:
+def test_an_old_file_lock_is_read_as_it_is_with_one_warning(tmp_path: pathlib.Path) -> None:
+    """An old lock is read in place: nothing reruns because of its format, and the next write of
+    its stage's lock is in this format."""
     root = _project(tmp_path, {"pipeline.py": _PLAIN_PIPELINE, "data/raw/in.txt": "abc"})
     _ok(_pivot(root, "repro"))
     lock_path = root / ".pivot" / "stages" / "p" / "upper.lock"
     _helper_rewrite_as_schema_2(lock_path)
 
-    status = _pivot(root, "status")
-    assert status.returncode == 0, status.stdout + status.stderr
-    assert status.stderr.count(_OLD_FORMAT) == 1, status.stderr
-    assert "p/upper.lock" in status.stderr, status.stderr
+    status = _ok(_pivot(root, "status"))
+    assert status.count(_OLD_FORMAT) == 1, status
+    assert "p/upper.lock" in status, status
+    assert "No previous run" not in _ok(_pivot(root, "status", "--explain")), status
+    repro = _ok(_pivot(root, "repro"))
+    assert "0 ran, 1 cached" in repro, repro
+    assert "Verification passed" in _ok(_pivot(root, "verify"))
+    assert yaml.safe_load(lock_path.read_text())["schema_version"] == 2
 
-    repro = _pivot(root, "repro")
-    assert repro.returncode == 0, repro.stdout + repro.stderr
-    assert (repro.stdout + repro.stderr).count(_OLD_FORMAT) == 1, repro.stdout + repro.stderr
-    summary = repro.stdout + repro.stderr
-    assert "1 ran, 0 cached" in summary or "0 ran, 1 cached" in summary, summary
+    (root / "data" / "raw" / "in.txt").write_text("abcd")
+    assert "1 ran" in _ok(_pivot(root, "repro"))
     assert yaml.safe_load(lock_path.read_text())["schema_version"] == 3
     assert _OLD_FORMAT not in _ok(_pivot(root, "status"))
+
+
+def test_checkout_and_verify_read_an_old_lock_that_lists_a_directory(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A directory an old lock lists inline is restored, verified and cached like any other."""
+    root = _helper_tree_project(tmp_path)
+    for stage in ("copy", "count"):
+        _helper_rewrite_as_schema_2(root / ".pivot" / "stages" / "t" / f"{stage}.lock")
+    for path in (root / ".pivot" / "stages").rglob("*.listing"):
+        path.unlink()
+    shutil.rmtree(root / "data" / "t")
+
+    checkout = _ok(_pivot(root, "checkout"))
+    assert checkout.count(_OLD_FORMAT) == 2, checkout
+    _helper_assert_tree(root / "data" / "t" / "copy" / "tree.dat")
+    assert "Verification passed" in _ok(_pivot(root, "verify"))
+    assert "0 ran, 2 cached" in _ok(_pivot(root, "repro"))
 
 
 _INCREMENTAL_PIPELINE = """\
@@ -364,28 +402,24 @@ with Pipeline("p") as pipeline:
 """
 
 
-def test_an_incremental_old_lock_warns_carries_its_output_over_once_and_is_rewritten(
+def test_an_incremental_old_lock_stays_cached_and_carries_its_output_on(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Rerunning an incremental stage from nothing would drop its accumulated output, so its
-    old lock still supplies the prior output, once."""
+    """An incremental stage whose inputs did not change is not run again (which would append
+    its input a second time); its next run continues from the output the old lock records."""
     root = _project(tmp_path, {"pipeline.py": _INCREMENTAL_PIPELINE, "data/raw/in.txt": "abc"})
     _ok(_pivot(root, "repro"))
     lock_path = root / ".pivot" / "stages" / "p" / "grow.lock"
     output = root / str(_helper_entry(root, "p/grow", "outs", None)["path"])
-    assert output.read_text() == "abc"
     _helper_rewrite_as_schema_2(lock_path)
 
-    status = _pivot(root, "status")
-    assert status.returncode == 0, status.stdout + status.stderr
-    assert status.stderr.count(_OLD_FORMAT) == 1, status.stderr
+    repro = _ok(_pivot(root, "repro"))
+    assert repro.count(_OLD_FORMAT) == 1, repro
+    assert output.read_text() == "abc", "an unchanged incremental stage must not run again"
 
-    repro = _pivot(root, "repro")
-    out = repro.stdout + repro.stderr
-    assert repro.returncode == 0, out
-    assert out.count(_OLD_FORMAT) == 1, out
-    assert "p/grow.lock" in out, out
-    assert output.read_text() == "abcabc", "the incremental output must carry over"
+    (root / "data" / "raw" / "in.txt").write_text("de")
+    _ok(_pivot(root, "repro"))
+    assert output.read_text() == "abcde"
     assert yaml.safe_load(lock_path.read_text())["schema_version"] == 3
 
 

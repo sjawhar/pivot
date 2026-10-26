@@ -164,8 +164,9 @@ class DeferredWrites(TypedDict, total=False):
     dep_generations: dict[str, int]  # {dep_path: generation}
     run_cache_input_hash: str
     run_cache_entry: RunCacheEntry
-    # A run the stage-import check flagged: delete any run-cache entry at this input hash.
-    run_cache_delete_input_hash: str
+    # A run the stage-import check flagged: delete any run-cache entry at these input hashes (its
+    # key, and the unmarked key an older pivot files under, run_history.compute_input_hash).
+    run_cache_delete_input_hashes: list[str]
     increment_outputs: bool  # True → increment output generations; False/absent → skip
     file_hash_entries: list[FileHashEntry]
 

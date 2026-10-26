@@ -4,7 +4,7 @@ import datetime
 import hashlib
 import json
 import uuid
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
 
 from pivot.types import (
     ArtifactTag,
@@ -67,10 +67,12 @@ class OutputHashEntry(TypedDict):
     nfiles: NotRequired[int]
 
 
-# Part of every run-cache key (compute_input_hash). An older pivot reads a run-cache output that
-# lists no files inline as one file, so it would restore a directory's listing in the
-# directory's place; keyed apart, it never finds an entry this pivot wrote, nor this pivot one
-# an older pivot wrote.
+# Part of every run-cache key this pivot files under (compute_input_hash). An older pivot reads a
+# run-cache output that lists no files inline as one file, so it would restore a directory's
+# listing in the directory's place; keyed apart, it never finds an entry this pivot wrote. This
+# pivot still looks an entry up under the unmarked key an older pivot filed it under, and reads
+# it in memory (worker._try_skip_via_run_cache_with_store), so an upgrade reruns nothing the run
+# cache restored before it.
 _DIRECTORY_RECORD = "listing"
 
 
@@ -84,8 +86,11 @@ def output_hash_to_entry(path: str, oh: HashInfo) -> OutputHashEntry:
 
 
 def entry_to_output_hash(entry: OutputHashEntry) -> FileHash | DirHash | None:
-    """Convert serialized OutputHashEntry back to internal HashInfo; None for a directory entry
-    without its size, which no pivot writes."""
+    """Convert serialized OutputHashEntry back to internal HashInfo; None for an entry an older
+    pivot filed for a directory, which lists its files inline (the caller converts it), and for
+    a directory entry without its size, which no pivot writes."""
+    if "manifest" in cast("Mapping[str, object]", entry):
+        return None
     if "nfiles" in entry:
         if "size" not in entry:
             return None
@@ -105,20 +110,24 @@ def compute_input_hash(
     params: dict[str, object],
     deps: list[DepEntry],
     out_specs: list[tuple[str, bool]],
+    *,
+    marked: bool = True,
 ) -> str:
     """Compute input hash for run cache key.
 
     Hash is computed from code manifest, params, dependency hashes, and output specs.
     Output specs include both path and cache flag to ensure cache invalidation when
-    an output's cache property changes (e.g., Out -> Metric).
+    an output's cache property changes (e.g., Out -> Metric). Unless ``marked`` is False, the
+    key also holds ``_DIRECTORY_RECORD``; unmarked, it is the key an older pivot files under.
     """
-    data = {
+    data: dict[str, object] = {
         "code_manifest": code_manifest,
         "params": params,
         "deps": sorted([(d["producer"], d["key"], d["hash"]) for d in deps]),
         "out_specs": sorted(out_specs),
-        "directories": _DIRECTORY_RECORD,
     }
+    if marked:
+        data["directories"] = _DIRECTORY_RECORD
     content = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
@@ -129,8 +138,10 @@ def stage_input_hash(
     deps: Iterable[ArtifactRef],
     dep_hashes: Mapping[ArtifactIdentity, HashInfo],
     outs: Iterable[ArtifactRef],
+    *,
+    marked: bool = True,
 ) -> str:
-    """Compute a stage's run-cache key from its registered deps and outs.
+    """Compute a stage's run-cache key from its registered deps and outs (``compute_input_hash``).
 
     One entry per distinct dependency artifact, so a stage that reads one artifact through
     several parameters gets the same key from every caller (worker, coordinator, commit).
@@ -140,7 +151,7 @@ def stage_input_hash(
         for identity in {ref.identity for ref in deps}
     ]
     out_specs = [(identity_key(ref.identity), ref.tag is not ArtifactTag.METRIC) for ref in outs]
-    return compute_input_hash(code_manifest, params, dep_entries, out_specs)
+    return compute_input_hash(code_manifest, params, dep_entries, out_specs, marked=marked)
 
 
 def serialize_to_bytes(data: RunManifest | RunCacheEntry) -> bytes:

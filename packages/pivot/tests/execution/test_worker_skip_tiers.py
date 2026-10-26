@@ -623,10 +623,11 @@ def test_run_cache_key_marks_metric_outputs_uncacheable(
     )
 
 
-def test_run_cache_ignores_legacy_inline_directory_manifest(
+def test_run_cache_reads_an_older_pivots_entry_under_its_unmarked_key(
     project: pathlib.Path, state_db: state.StateDB
 ) -> None:
-    """A legacy entry cannot name the listing a directory restore requires."""
+    """An entry an older pivot filed lists a directory's files inline, under the key without
+    the directory marker; it is read in memory, so an upgrade reruns nothing it restored."""
     store = _workspace(project, {})
     ref = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
     directory = store.prepare_output(ref)
@@ -662,18 +663,31 @@ def test_run_cache_ignores_legacy_inline_directory_manifest(
         types.DeferredWrites(run_cache_input_hash="legacy-manifest", run_cache_entry=legacy_entry),
     )
 
-    assert (
-        worker._try_skip_via_run_cache_with_store(
-            _STAGE,
-            "legacy-manifest",
-            [ref],
-            store,
-            state_db,
-            state_dir=project / ".pivot",
-        )
-        is None
+    result = worker._try_skip_via_run_cache_with_store(
+        _STAGE,
+        "marked-key-miss",
+        [ref],
+        store,
+        state_db,
+        state_dir=project / ".pivot",
+        legacy_input_hash="legacy-manifest",
     )
-    assert not directory.exists()
+
+    assert result is not None
+    assert result["output_hashes"] == {types.identity_key(ref.identity): output_hash}
+    assert (directory / "a.txt").read_text() == "a"
+
+
+def test_run_cache_keys_differ_from_an_older_pivots_so_it_never_misreads_one() -> None:
+    """Pivot 0.5.10 and earlier read a run-cache directory entry that lists no files inline as
+    one file; every entry this pivot files is under a key they never compute."""
+    deps = [DepEntry(producer="raw", key=None, hash="0123456789abcdef")]
+    out_specs = [(f"{_STAGE}:table", True)]
+
+    marked = run_history.compute_input_hash(dict(_FINGERPRINT), {}, deps, out_specs)
+    unmarked = run_history.compute_input_hash(dict(_FINGERPRINT), {}, deps, out_specs, marked=False)
+
+    assert marked != unmarked
 
 
 def test_completed_run_asks_coordinator_to_bump_output_generations(

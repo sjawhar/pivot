@@ -477,7 +477,7 @@ async def test_import_artifact_imports_one_file_from_remote_directory_listing(
             {
                 "key": key,
                 "tag": "directory",
-                "hash": xxhash.xxh64(listing_bytes).hexdigest(),
+                "listing": xxhash.xxh64(listing_bytes).hexdigest(),
                 "size": len(selected) + len(other),
                 "nfiles": 2,
             }
