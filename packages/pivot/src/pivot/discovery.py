@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Final, override
 
 import cloudpickle
 
-from pivot import exceptions, fingerprint, metrics, project, types
+from pivot import exceptions, fingerprint, loaded_source, metrics, project, types
 from pivot.registry import PipelineLike
 
 if TYPE_CHECKING:
@@ -74,13 +74,40 @@ class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
     A file whose resolved path is a library's (``fingerprint.is_library_path``: pivot's own
     packages included), as a library package symlinked into the project root, loads as CPython
     loads it, and its bytecode is left alone.
+
+    Every other file's code comes from source bytes this loader read, and it records those bytes
+    (``loaded_source.record``): a stage's fingerprint describes that code, which a worker receives
+    by value, even when the file is edited after the import.
     """
+
+    # The bytes the last ``get_data`` call read from this loader's source file.
+    _source_read: bytes | None = None
+
+    @override
+    def get_data(self, path: str) -> bytes:
+        data = super().get_data(path)
+        if path == self.path:
+            self._source_read = data
+        return data
 
     @override
     def get_code(self, fullname: str) -> _stdlib_types.CodeType | None:
         source = self.get_filename(fullname)
         if fingerprint.is_library_path(pathlib.Path(source).resolve()):
             return super().get_code(fullname)
+        self._source_read = None
+        code = self._user_code(fullname, source)
+        data = self._source_read
+        if data is None:
+            # The import accepted bytecode without reading the source: another process replaced
+            # the checked cache with one no import checks. Compile the source this loader reads.
+            data = self.get_data(source)
+            code = self.source_to_code(data, source)
+        loaded_source.record(source, fullname, data)
+        return code
+
+    def _user_code(self, fullname: str, source: str) -> _stdlib_types.CodeType | None:
+        """Compile ``source``, or load bytecode checked against the source bytes it reads."""
         cached = importlib.util.cache_from_source(source)
         if not _is_checked_hash_pyc(cached):
             if sys.dont_write_bytecode:
@@ -200,6 +227,8 @@ def _end_import_session(session: _ImportSession) -> None:
         sys.path_hooks.remove(session.path_hook)
     _forget_user_code_finders(session.root)
     importlib.invalidate_caches()
+    # The modules this session removed are no longer the code any stage runs.
+    loaded_source.prune()
 
 
 def _start_import_session(root: pathlib.Path) -> _ImportSession:

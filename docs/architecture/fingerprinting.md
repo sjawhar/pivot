@@ -180,7 +180,7 @@ and no run-cache entry is filed. A marked lock is never satisfied from the run c
 run-cache entry at its own input hash, so an entry an earlier run filed (0.5.2, or `pivot commit`)
 cannot restore an output the check never saw. `pivot commit` carries that key into the lock it
 writes when the static fingerprint is otherwise unchanged, files no run-cache entry for it, and
-deletes any entry at its input hash (`skip.carry_uncovered_import`). `pivot verify` reports a
+deletes any entry at its input hash (`skip.carry_rerun_marks`). `pivot verify` reports a
 marked stage as failed, with the uncovered-import reason, until it reruns without an uncovered
 import. Under `--no-commit` the warning adds that `pivot commit` will record the outputs as
 current. A user class reached only through a loaded input (an object in a
@@ -217,6 +217,48 @@ a thread native code starts outside `_thread`. Each has a remedy:
 | A module created without a source file (CPython's `pyexpat.errors`, Cython's `_cython_3_3_0`) | It has no source to fingerprint; a change to it is a change to the library or interpreter that created it |
 | `pivot repro --no-commit`, then `pivot commit` | No lock exists to carry the mark, so `pivot commit` records the outputs on disk against the static fingerprint, as it does for any output; run `pivot repro` without `--no-commit` for such a stage |
 | A result cached by an earlier Pivot version | If its static fingerprint is unchanged, it may be reused: `_CACHE_SCHEMA_VERSION` keys only the state.lmdb caches, not the lock. A stage whose static walk reaches a user class method or a user module gains entries in its manifest, so it reruns once as Code changed after the upgrade. That accepted one-time rerun writes the current manifest; later runs reuse it until code or inputs change. Run `pivot repro --force <stage>` once to re-check a stage you know imports dynamically. Upgrading from 0.5.6 or earlier, every stage with outputs reruns once as Code changed, because each output's tag (`out:<key>:tag`) joined the manifest; that run is checked, so it marks a stage that imports dynamically |
+
+### Code Edited After Discovery
+
+A stage's fingerprint describes the code its worker runs, and that code is the code discovery
+loaded, not the files as they are when the stage starts. Discovery pickles `pipeline.py` and the
+other modules under the project root by value, so a worker runs the functions the coordinator
+compiled when it imported them. Fingerprinting reads source through `inspect.getsource`, which
+reads `linecache`, and `linecache` reads a file again when its size or mtime changes. Outside
+watch mode a stage is fingerprinted when it is ready to run, so a file edited after discovery (by
+an upstream stage, or in an editor while the run continues) would be hashed as edited while the
+worker ran the loaded version, and the next run would report the old output as cached.
+
+So `discovery._ProjectSourceLoader` records the bytes each user module was compiled from
+(`loaded_source.record`), in the coordinator and in every worker. Fingerprinting reads those bytes,
+not the file: `loaded_source.getsource` puts their lines into `linecache` as an entry without an
+mtime, which `linecache.checkcache` leaves alone, before it calls `inspect.getsource`;
+`fingerprint._source_digest`, which keys the `fp:` and `sm:` caches, returns their digest; and a
+`@no_fingerprint` stage's `file:` hash is their digest. A file pivot did not load a module from
+(a `code_deps` entry that is not a module, or a module imported before discovery) is read from
+disk, as before. The lines are split as `linecache` splits a file (`tokenize.open`, universal
+newlines, a final newline added), so an unedited project keeps its recorded fingerprints.
+
+A worker imports some user modules itself, from their files: a stage's module discovery does not
+send by value (outside the root, or under it in a `src` layout), a module outside the root that
+one sent by value refers to, and any module a stage body imports. Such a module holds the file as
+the worker read it, which may be before or after an edit. Each worker gets the coordinator's
+digests (`loaded_source.digests()`) once, in its initializer arguments (`core._init_worker`), and
+each stage carries only their token (`WorkerStageInfo.loaded_sources_token`). Loky replaces a pool
+whose initializer arguments differ, and `WorkerPool.start` replaces workers that started with
+another token. After the stage function returns, the worker compares the digests with what it
+loaded itself (`loaded_source.edited_modules`); a stage sent with a token other than the one its
+worker started with cannot be compared, so every module that worker loaded itself counts. When
+an import session ends, the entries of the modules it removed are dropped (`loaded_source.prune`).
+A difference
+means the stage ran code its fingerprint does not describe: the stage succeeds, logs one warning
+naming the modules, and its lock carries an `edited-source:<modules>` key no fingerprint matches,
+so the next run reruns it ("Previous run imported modules edited after pivot loaded them"). That
+mark behaves as the `uncovered-import:` mark does: no run-cache entry is filed or used, and
+`pivot commit` carries it (`skip.rerun_mark_reason`, `skip.carry_rerun_marks`). A warm worker that
+imported the module before the edit holds the version the coordinator loaded, so its stages are
+not marked. A watch reload imports the modules under the root again; a module outside the root is
+loaded once per pivot process, so its edit is loaded when pivot starts again.
 
 ### Module-Level Instances
 

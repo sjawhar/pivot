@@ -494,6 +494,42 @@ def test_never_checked_mode_still_replaces_bytecode_another_tool_cached(
     assert other_process.stdout.strip() == "bravo"
 
 
+def test_stage_fingerprint_is_of_the_helper_source_discovery_loaded(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stage's fingerprint describes its helper as discovery loaded it, the code a worker
+    receives by value, even when the helper file is edited before the fingerprint is computed."""
+    root = tmp_path / "project"
+    root.mkdir()
+    helper = root / "edited_helper.py"
+    alpha = 'def value() -> str:\n    return "alpha"\n'
+    bravo = 'def value() -> str:\n    return "bravo, edited after discovery"\n'
+    (root / "pipeline.py").write_text(
+        "import edited_helper\n"
+        + "from pivot.compose import Pipeline, stage\n\n\n"
+        + "@stage\n"
+        + "def build() -> str:\n"
+        + "    return edited_helper.value()\n\n\n"
+        + 'with Pipeline("project") as pipeline:\n'
+        + "    build()\n"
+    )
+    monkeypatch.setattr(project, "_project_root_cache", root)
+
+    def discover_and_fingerprint(text: str, *, then_edit_to: str | None = None) -> dict[str, str]:
+        helper.write_text(text)
+        pipeline = discovery.discover_pipeline(project_root=root)
+        assert pipeline is not None
+        if then_edit_to is not None:
+            helper.write_text(then_edit_to)
+        return pipeline.ensure_fingerprint("project/build")
+
+    as_alpha = discover_and_fingerprint(alpha)
+    as_bravo = discover_and_fingerprint(bravo)
+    assert as_alpha != as_bravo, "the fingerprint tracks the helper's body"
+
+    assert discover_and_fingerprint(alpha, then_edit_to=bravo) == as_alpha
+
+
 _MODULES_BY_KIND = {
     "nested package": "pkg.sub.mod",
     "namespace package": "nspkg.inner.leaf",

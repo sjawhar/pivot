@@ -18,7 +18,7 @@ import loky
 import loky.backend.resource_tracker
 import loky.reusable_executor
 
-from pivot import config, discovery, exceptions, parameters, project, registry, types
+from pivot import config, discovery, exceptions, loaded_source, parameters, project, registry, types
 from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
@@ -136,14 +136,23 @@ def is_executor_usable(
 def _requested_reusable_executor_kwargs(
     idle_timeout_s: float | None, user_code_root: pathlib.Path | None
 ) -> dict[str, object]:
-    """Return the constructor arguments loky compares to decide whether to reuse its executor."""
+    """Return the constructor arguments loky compares to decide whether to reuse its executor.
+
+    The initializer arguments carry the digests of the user code this process loaded
+    (``loaded_source.digests()``): each worker gets them once, when it starts, and loky replaces
+    a pool whose workers started with other digests.
+    """
     return {
         "context": None,
         "timeout": idle_timeout_s,
         "job_reducers": None,
         "result_reducers": None,
         "initializer": _init_worker,
-        "initargs": (os.getpid(), None if user_code_root is None else str(user_code_root)),
+        "initargs": (
+            os.getpid(),
+            None if user_code_root is None else str(user_code_root),
+            loaded_source.digests_for_workers(),
+        ),
         "env": None,
     }
 
@@ -199,7 +208,7 @@ def _get_executor(
         kill_workers=kill_workers,
         reuse=False if kill_workers else "auto",
         initializer=_init_worker,
-        initargs=(os.getpid(), None if root is None else str(root)),
+        initargs=typing.cast("tuple[object, ...]", requested_kwargs["initargs"]),
     )
 
 
@@ -241,13 +250,17 @@ def idle_worker_count(pool: loky.ProcessPoolExecutor) -> int:
     return max(0, len(pool._processes) - len(pool._pending_work_items))
 
 
-def _init_worker(parent_pid: int, user_code_root: str | None) -> None:
+def _init_worker(
+    parent_pid: int, user_code_root: str | None, coordinator_sources: dict[str, str]
+) -> None:
     """Loky worker initializer: stop the worker when it is told to or ``parent_pid`` dies
     (``worker.unwind_when_stopped``), record the user modules each stage imports
-    (``worker.install_import_hooks``), and import user code through discovery's checked loader
+    (``worker.install_import_hooks``), keep the digests of the user code the coordinator loaded
+    (``loaded_source.set_coordinator``), and import user code through discovery's checked loader
     when a discovery's import session for ``user_code_root`` lasts."""
     worker.unwind_when_stopped(parent_pid)
     worker.install_import_hooks()
+    loaded_source.set_coordinator(coordinator_sources)
     if user_code_root is not None:
         discovery.install_user_code_loader(user_code_root)
 
@@ -519,7 +532,7 @@ def prepare_worker_info(
 
     # The fingerprint is computed first: it sets `unsafe_fingerprint`.
     fingerprint = pipeline.ensure_fingerprint(stage_info["name"])
-    return worker.WorkerStageInfo(
+    info = worker.WorkerStageInfo(
         func=stage_info["func"],
         fingerprint=fingerprint,
         deps=stage_info["deps"],
@@ -540,7 +553,12 @@ def prepare_worker_info(
         collection_params=stage_info["collection_params"],
         unsafe_fingerprint=stage_info["unsafe_fingerprint"],
         no_fingerprint=stage_info["no_fingerprint"],
+        loaded_sources_token=loaded_source.token(),
     )
+    # The workers started with other digests: the coordinator loaded user code since then.
+    if (digests := loaded_source.digests_for_stage()) is not None:
+        info["loaded_sources"] = digests
+    return info
 
 
 def apply_deferred_writes(

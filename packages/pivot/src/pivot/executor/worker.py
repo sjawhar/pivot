@@ -33,6 +33,7 @@ from typing import (
     Literal,
     NamedTuple,
     NoReturn,
+    NotRequired,
     TypedDict,
     cast,
     overload,
@@ -46,6 +47,7 @@ from pivot import (
     config,
     exceptions,
     fingerprint,
+    loaded_source,
     loaders,
     metrics,
     parameters,
@@ -702,6 +704,11 @@ class WorkerStageInfo(TypedDict):
     unsafe_fingerprint: bool
     # The stage is `@no_fingerprint`: its declared files are its code, so imports are not checked.
     no_fingerprint: bool
+    # `loaded_source.token()` of the user code the coordinator loaded when it sent the stage. The
+    # worker got those digests once, when it started (`core._init_worker`); `loaded_sources`
+    # carries them again only when the coordinator loaded code after that.
+    loaded_sources_token: str
+    loaded_sources: NotRequired[dict[str, str]]
 
 
 def _make_result(
@@ -985,6 +992,26 @@ def _execute_stage(
                         **current_fingerprint,
                         f"{skip.UNCOVERED_IMPORT_KEY_PREFIX}{modules}": "",
                     }
+                # A module the worker imported from its file (one not sent by value: outside the
+                # project root, or imported by a stage body) holds the file as the worker read it.
+                # If the coordinator loaded other content, the fingerprint describes other code.
+                edited = loaded_source.edited_modules(
+                    stage_info["loaded_sources_token"],
+                    stage_info["loaded_sources"] if "loaded_sources" in stage_info else None,
+                )
+                if edited:
+                    edited_modules = ", ".join(edited)
+                    logger.warning(
+                        "Stage '%s' imported user modules that changed after pivot loaded them: "
+                        + "%s. Its fingerprint records the code pivot loaded, so its result will "
+                        + "not be reused. Start pivot again to load the changed code.",
+                        stage_name,
+                        edited_modules,
+                    )
+                    lock_manifest = {
+                        **lock_manifest,
+                        f"{skip.EDITED_SOURCE_KEY_PREFIX}{edited_modules}": "",
+                    }
                 if no_commit:
                     output_hashes = _hash_output_paths(
                         output_paths, cache_dir=_store_cache_dir(store)
@@ -1028,7 +1055,7 @@ def _execute_stage(
                         output_hashes,
                         production_lock,
                         state_db,
-                        reusable=not uncovered,
+                        reusable=not uncovered and not edited,
                         file_hash_entries=file_hash_entries,
                     )
                     return StageResult(
@@ -2137,9 +2164,9 @@ def _build_deferred_writes(
     """Build deferred writes for coordinator to apply.
 
     A result that is not ``reusable`` (its run imported user modules its fingerprint does not
-    cover) files no run-cache entry and deletes any entry at its input hash; its lock carries a
-    key no fingerprint has and `skip.check_stage` never consults the run cache for it, so no tier
-    skips it.
+    cover, or modules that changed after the coordinator loaded them) files no run-cache entry
+    and deletes any entry at its input hash; its lock carries a key no fingerprint has and
+    `skip.check_stage` never consults the run cache for it, so no tier skips it.
     """
     result: DeferredWrites = {}
 
@@ -2153,7 +2180,7 @@ def _build_deferred_writes(
 
     # Incremental outputs continue from the latest lock state and never use the run cache.
     # An unsafe fingerprint may match a run whose captured values differed; a non-reusable
-    # result imported code its fingerprint does not cover. Never file either. A non-reusable run
+    # result ran code its fingerprint does not describe. Never file either. A non-reusable run
     # also removes any entry an earlier run filed at its key, which the check never saw.
     if reusable and not stage_info["unsafe_fingerprint"]:
         outs = stage_info["outs"]

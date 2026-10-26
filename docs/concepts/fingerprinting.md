@@ -51,9 +51,9 @@ For each stage function, Pivot:
 6. **Hashes Pydantic schemas** — `model_json_schema()` captures field
    types, defaults, and validators
 
-The manifest is stored in the per-stage lock file. On the next run, the
-worker recomputes the manifest and compares it key-by-key against the
-locked version. Any difference triggers re-execution.
+The manifest is stored in the per-stage lock file. On the next run, Pivot
+computes the manifest again and compares it key-by-key against the locked
+version. Any difference triggers re-execution.
 
 While a stage runs, its worker records the user modules it imports through
 Python's `__import__` and `importlib.import_module` entry points, including a
@@ -261,6 +261,26 @@ track. Use direct attribute access and static imports instead. Other dynamic
 import spellings (`__import__`, an alias of `import_module`, `exec`) are not
 refused: a user module one of them loads while the stage runs makes its result
 not reusable, as described above, and a library module costs nothing.
+
+### Code Edited While Pivot Runs
+
+Pivot loads your code once, when it discovers `pipeline.py`, and the run uses
+that code. A stage's fingerprint describes the code that Pivot loaded, not the
+file as it is when the stage starts. If you edit a stage or a helper while the
+run continues (in an editor, or from an upstream stage), the stages of that run
+use the loaded version, and their locks record it. The next run loads your edit
+and reruns the stages it changes.
+
+A worker imports some modules from their files itself: a module outside the
+project root (on `PYTHONPATH`, or a package installed from a source checkout),
+a stage's module under the root in a `src` layout, and a module that a stage
+imports in its body. If the worker imports such a file after you edit it, the
+stage runs your edit, which its fingerprint does not describe. The stage then
+logs a warning that names the module ("imported user modules that changed after
+pivot loaded them"), and Pivot does not reuse its result: the next run reruns
+the stage ("Previous run imported modules edited after pivot loaded them").
+`pivot repro --watch` loads an edit under the project root again; to load an
+edit outside the root, start Pivot again.
 
 ## @pivot.no_fingerprint()
 

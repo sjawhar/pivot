@@ -147,8 +147,19 @@ This document exhaustively catalogs what code changes are and are not detected b
 | Import from a thread an earlier stage left running | ✅ (not reused) | `test_fingerprint_gaps.py::test_import_from_a_thread_outliving_its_stage_does_not_fail_the_next_stage` |
 | `@no_fingerprint(code_deps=...)` stage importing a user module | ✅ (not checked; `code_deps` tracked) | `test_runtime_import_contract.py::test_d1_no_fingerprint_stage_with_body_import_is_reused` |
 | User loader `load`/`save` importing a loaded module (`dep:`/`out:` module keys) | ✅ | `test_runtime_import_contract.py::test_d2_user_loader_body_import_of_loaded_module_is_covered`, `test_fingerprint.py::test_covered_user_modules_reads_every_module_key_form` |
-| `pivot commit` after a flagged `repro` keeps the stage stale | ✅ | `test_runtime_import_contract.py::test_d3_commit_after_a_flagged_committing_repro_is_described`, `core/test_skip.py::test_carry_uncovered_import_keeps_marker_when_static_fingerprint_is_unchanged` |
+| `pivot commit` after a flagged `repro` keeps the stage stale | ✅ | `test_runtime_import_contract.py::test_d3_commit_after_a_flagged_committing_repro_is_described`, `core/test_skip.py::test_carry_rerun_marks_keeps_marker_when_static_fingerprint_is_unchanged` |
 | Following the warning's fix clears it | ✅ | `test_fingerprint_gaps.py::test_following_the_uncovered_import_warning_fix_clears_it`, `test_runtime_import_contract.py::test_d4_uncovered_import_warning_names_a_fix_that_applies` |
+
+### 4.1 Code Edited After Discovery
+
+| Change Type | Detected? | Test Reference |
+| ----------- | --------- | -------------- |
+| In-root helper edited by an upstream stage (worker runs the loaded helper; lock records it) | ✅ (reruns next run) | `test_code_edited_during_run.py::test_in_root_helper_edited_by_an_upstream_stage_is_not_cached_stale`, `test_discovery.py::test_stage_fingerprint_is_of_the_helper_source_discovery_loaded` |
+| A stage's own source edited by an upstream stage, AST and `@no_fingerprint` | ✅ (reruns next run) | `test_code_edited_during_run.py::test_stage_edited_by_an_upstream_stage_is_not_cached_stale` |
+| Out-of-root helper a warm worker imported before the edit | ✅ (reruns next run) | `test_code_edited_during_run.py::test_out_of_root_helper_a_warm_worker_holds_is_not_cached_stale` |
+| Out-of-root helper a worker imports after the edit | ✅ (warns, not reused) | `test_code_edited_during_run.py::test_out_of_root_helper_imported_after_its_edit_is_not_reused` |
+| No edit: nothing warns, every stage cached | ✅ | `test_code_edited_during_run.py::test_unedited_project_is_cached_on_the_next_run` |
+| Loaded source survives `linecache` clearing and matches `linecache`'s line split | ✅ | `test_loaded_source.py` |
 
 ---
 

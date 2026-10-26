@@ -130,12 +130,12 @@ def commit_stages(
             out_paths = [types.identity_key(out.identity) for out in stage_outs]
             production_lock = lock.StageLock(stage_name, stages_dir)
             previous_lock = production_lock.read()
-            # A run that imported code the fingerprint misses marked its lock; committing the
-            # same outputs keeps that mark, so the stage is still not reusable.
-            code_manifest = skip.carry_uncovered_import(
+            # A run that executed code the fingerprint does not describe marked its lock;
+            # committing the same outputs keeps that mark, so the stage is still not reusable.
+            code_manifest = skip.carry_rerun_marks(
                 previous_lock["code_manifest"] if previous_lock is not None else None, fingerprint
             )
-            reusable = skip.uncovered_import_reason(code_manifest) is None
+            reusable = skip.rerun_mark_reason(code_manifest) is None
 
             # 5. If not force and no explicit stages, check lock — skip if unchanged
             if not force and stage_names is None and previous_lock is not None:
@@ -211,7 +211,7 @@ def commit_stages(
             dep_gen_map = worker.compute_dep_generation_map(stage_info["deps"], stage_db)
 
             # An unsafe fingerprint may match a run whose captured values differed, and a carried
-            # uncovered-import mark means the outputs came from code the fingerprint misses: never
+            # rerun mark means the outputs came from code the fingerprint does not describe: never
             # file either. A carried mark also removes any entry an earlier run filed at this key.
             deferred = DeferredWrites()
             if dep_gen_map:
