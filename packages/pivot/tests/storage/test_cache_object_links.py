@@ -17,13 +17,15 @@ from typing import TYPE_CHECKING
 import pytest
 import xxhash
 
+from pivot.show import selection
 from pivot.storage import cache, state
-from pivot.types import is_dir_hash
+from pivot.types import DirHash, is_dir_hash
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
     _Maker = Callable[[pathlib.Path, pathlib.Path, pathlib.Path, bytes], None]
+    _LoopBack = Callable[[pathlib.Path, pathlib.Path], None]
 
 _CONTENT = b"bytes held in the cache\n"
 _NOT_HEX = "zz" + "z" * 14
@@ -494,3 +496,222 @@ def test_a_cache_directory_repointed_between_commands_is_resolved_again(
     assert _helper_resolved_key(link, cache_dir) is None
     assert link.resolve() != own.resolve()
     assert not cache._links_to_object(link, own, os.path.realpath(cache_dir))
+
+
+def test_a_member_link_ending_in_a_loop_inside_the_cache_is_left_out(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A link holding its object's real path, where the object's name and another name beside it
+    link to each other, ends in a loop inside the cache: it is no object, so the walk leaves it
+    out. (The ``loop`` case above loops outside the cache, where the prefix test refuses it
+    before the loop matters.)"""
+    cache_dir = tmp_path / "cache" / "files"
+    root = tmp_path / "tree"
+    root.mkdir()
+    obj = _helper_object(cache_dir, _CONTENT)
+    (root / "member.bin").symlink_to(obj.resolve())
+    other = obj.parent / ("f" * len(obj.name))
+    obj.unlink()
+    obj.symlink_to(other)
+    other.symlink_to(obj)
+
+    assert cache.hash_directory(root, cache_dir=cache_dir)["manifest"] == []
+    assert _helper_resolved_key(root / "member.bin", cache_dir) is None, "resolve() refused it"
+
+
+def test_the_cache_root_is_a_path_boundary_not_a_string_prefix(tmp_path: pathlib.Path) -> None:
+    """A link to ``<cache_root>XX/NAME``, a file in a directory beside the cache's object root
+    whose name is the root's name followed by two characters, is outside the cache although its
+    text starts with the root's text: the cache is tested by path components, as
+    ``is_relative_to`` tested it."""
+    cache_dir = tmp_path / "cache" / "files"
+    root = tmp_path / "tree"
+    root.mkdir()
+    obj = _helper_object(cache_dir, _CONTENT)
+    sibling = pathlib.Path(os.path.realpath(cache_dir) + obj.parent.name, obj.name)
+    sibling.parent.mkdir()
+    sibling.write_bytes(_CONTENT)
+    (root / "member.bin").symlink_to(sibling)
+
+    assert cache.hash_directory(root, cache_dir=cache_dir)["manifest"] == []
+    assert _helper_resolved_key(root / "member.bin", cache_dir) is None, "resolve() refused it"
+
+
+def test_link_text_with_dotdot_under_the_cache_root_is_resolved_in_full(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``<cache_root>/XX/../XX/NAME`` ends at the object, so it counts, as resolve() said: only
+    the text ``<cache_root>/XX/NAME`` itself is taken as the link's real path; text with more
+    components after the cache root is resolved in full."""
+    cache_dir = tmp_path / "cache" / "files"
+    root = tmp_path / "tree"
+    root.mkdir()
+    obj = _helper_object(cache_dir, _CONTENT)
+    prefix = obj.parent.name
+    (root / "member.bin").symlink_to(
+        f"{os.path.realpath(cache_dir)}/{prefix}/../{prefix}/{obj.name}"
+    )
+
+    result = cache.hash_directory(root, cache_dir=cache_dir)
+
+    assert [(e["relpath"], e["hash"]) for e in result["manifest"]] == [
+        ("member.bin", _helper_key(_CONTENT))
+    ]
+    assert _helper_resolved_key(root / "member.bin", cache_dir) == _helper_key(_CONTENT)
+
+
+def _helper_cache_through_symlink(tmp_path: pathlib.Path) -> pathlib.Path:
+    """The cache's object root, reached through a symlinked cache directory."""
+    real = tmp_path / "real-cache"
+    (real / "files").mkdir(parents=True)
+    alias = tmp_path / "cache-alias"
+    alias.symlink_to(real, target_is_directory=True)
+    return alias / "files"
+
+
+def _helper_symlink_checkout(
+    tmp_path: pathlib.Path, cache_dir: pathlib.Path, restored: pathlib.Path, suffix: str = ".txt"
+) -> DirHash:
+    """Three files saved by hardlink, then restored at ``restored`` file by file as symlinks."""
+    source = tmp_path / "source"
+    source.mkdir()
+    for index in range(3):
+        (source / f"f{index}{suffix}").write_text(f'{{"i": {index}}}\n')
+    output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK)
+    assert is_dir_hash(output_hash)
+    restored.parent.mkdir(parents=True, exist_ok=True)
+    assert cache.restore_from_cache(
+        restored, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK
+    )
+    assert all(member.is_symlink() for member in restored.iterdir())
+    return output_hash
+
+
+# Each loop-back maker replaces a part of the cache object's path ``obj`` with a symlink back to
+# ``member``, the member link that names the object, so following the member returns to it.
+
+
+def _object_name_back_to(member: pathlib.Path, obj: pathlib.Path) -> None:
+    """member -> object name -> member."""
+    os.chmod(obj.parent, 0o755)
+    obj.unlink()
+    obj.symlink_to(member)
+
+
+def _prefix_directory_back_to(member: pathlib.Path, obj: pathlib.Path) -> None:
+    """member -> two-character directory -> member."""
+    prefix = obj.parent
+    os.chmod(prefix, 0o755)
+    prefix.rename(prefix.parent.parent / "moved-prefix")
+    prefix.symlink_to(member)
+
+
+_LOOP_BACK = [
+    pytest.param(_object_name_back_to, id="object-name"),
+    pytest.param(_prefix_directory_back_to, id="prefix-directory"),
+]
+
+
+@pytest.mark.parametrize("loop_back", _LOOP_BACK)
+def test_links_to_object_answers_as_resolve_for_a_member_looping_through_its_object(
+    tmp_path: pathlib.Path, loop_back: _LoopBack
+) -> None:
+    """A member link holding its object's real path, the text a checkout writes, whose object
+    name or two-character directory links back to the member, does not resolve where the
+    object's path does: resolve() stops at a different link in each. The text settles it only
+    when neither is a symlink, so ``_links_to_object`` gives resolve()'s answer."""
+    cache_dir = tmp_path / "cache" / "files"
+    restored = tmp_path / "restored"
+    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    looped = output_hash["manifest"][0]
+    member = restored / looped["relpath"]
+    obj = cache.get_cache_path(cache_dir, looped["hash"])
+    loop_back(member, obj)
+    cache_root = os.path.realpath(cache_dir)
+
+    assert os.readlink(member) == os.path.join(cache_root, obj.parent.name, obj.name)
+    assert member.resolve() != obj.resolve(), "resolve() stops at a different link in each"
+    assert not cache._links_to_object(member, obj, cache_root)
+
+
+@pytest.mark.parametrize("loop_back", _LOOP_BACK)
+def test_only_missing_calls_a_member_looping_through_its_object_a_local_change(
+    tmp_path: pathlib.Path, loop_back: _LoopBack
+) -> None:
+    """``checkout --only-missing``: a member link holding its object's real path, whose object
+    name or two-character directory links back to that member, does not link to its object, so
+    it is a local change the cache cannot restore, and the missing member is not restored over
+    it."""
+    cache_dir = tmp_path / "cache" / "files"
+    restored = tmp_path / "restored"
+    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    looped, deleted = output_hash["manifest"][0], output_hash["manifest"][1]
+    loop_back(restored / looped["relpath"], cache.get_cache_path(cache_dir, looped["hash"]))
+    (restored / deleted["relpath"]).unlink()
+
+    result = cache.restore_missing_in_directory(
+        restored, output_hash, cache_dir, [cache.CheckoutMode.SYMLINK]
+    )
+
+    assert result == cache.MissingRestore(
+        restored=0, missing=0, local_changes=[looped["relpath"]], replace=False
+    )
+    assert not (restored / deleted["relpath"]).is_symlink(), "nothing is written"
+
+
+def test_only_missing_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Path) -> None:
+    """``checkout --only-missing`` with the cache reached through a symlink: a missing member is
+    restored as a link to its object's real path, and a member re-pointed at another cached
+    object is a change the cache holds, so the directory may be replaced."""
+    cache_dir = _helper_cache_through_symlink(tmp_path)
+    restored = tmp_path / "restored"
+    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    first, second, third = output_hash["manifest"]
+
+    (restored / third["relpath"]).unlink()
+    result = cache.restore_missing_in_directory(
+        restored, output_hash, cache_dir, [cache.CheckoutMode.SYMLINK]
+    )
+    assert result == cache.MissingRestore(restored=1, missing=0, local_changes=[], replace=False)
+    third_object = cache.get_cache_path(cache_dir, third["hash"])
+    assert os.readlink(restored / third["relpath"]) == os.fspath(third_object.resolve())
+
+    member = restored / first["relpath"]
+    member.unlink()
+    member.symlink_to(cache.get_cache_path(cache_dir, second["hash"]).resolve())
+    result = cache.restore_missing_in_directory(
+        restored, output_hash, cache_dir, [cache.CheckoutMode.SYMLINK]
+    )
+    assert result == cache.MissingRestore(restored=0, missing=0, local_changes=[], replace=True)
+
+
+def test_diff_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Path) -> None:
+    """``pivot diff`` walks a directory output's workspace members with the record-time walker;
+    with the cache reached through a symlink, a symlink checkout's member links are members."""
+    cache_dir = _helper_cache_through_symlink(tmp_path)
+    proj = tmp_path / "proj"
+    output_hash = _helper_symlink_checkout(
+        tmp_path, cache_dir, proj / "data" / "out", suffix=".jsonl"
+    )
+    output = selection._DiffOutput(
+        path="data/out", head=output_hash, in_workspace=True, is_directory=True, changed_kind=None
+    )
+
+    members = selection._workspace_members(output, None, proj, cache_dir)
+
+    assert sorted(members) == [f"data/out/{e['relpath']}" for e in output_hash["manifest"]]
+
+
+def test_publish_tree_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Path) -> None:
+    """Publishing a file-by-file symlink checkout as the whole-directory SYMLINK tree, with the
+    cache reached through a symlink: every member link counts, so the tree is complete and
+    marked at once, not left empty for the next commit or restore to repair from the objects."""
+    cache_dir = _helper_cache_through_symlink(tmp_path)
+    restored = tmp_path / "restored"
+    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+
+    cache._publish_tree(restored, tree, output_hash, cache_dir)
+
+    assert sorted(p.name for p in tree.iterdir()) == [e["relpath"] for e in output_hash["manifest"]]
+    assert tree.with_name(f"{tree.name}.verified").exists()

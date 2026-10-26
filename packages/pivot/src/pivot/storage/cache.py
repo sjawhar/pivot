@@ -268,12 +268,19 @@ def _links_to_object(link: pathlib.Path, cache_path: pathlib.Path, cache_root: s
     ``link.resolve() == cache_path.resolve()`` answers. ``cache_path`` is
     ``get_cache_path(cache_dir, key)`` and ``cache_root`` is ``os.path.realpath(cache_dir)``.
 
-    A link whose text is ``<cache_root>/XX/YYYY...``, the text a checkout writes, resolves
-    wherever ``cache_path`` does, symlinks inside the cache included, so one readlink settles
-    it. Any other link is resolved in full.
+    A link whose text is ``<cache_root>/XX/YYYY...``, the text a checkout writes, resolves to
+    that text, as ``cache_path`` does, when neither ``XX`` nor ``YYYY...`` is a symlink: one
+    readlink and two lstats settle it, the condition ``_resolve_link`` uses. When either is a
+    symlink the two can resolve apart (an object name linked back to the member stops each
+    resolve() at a different link), so that link, like any other, is resolved in full.
     """
+    real = os.path.join(cache_root, cache_path.parent.name, cache_path.name)
     try:
-        if os.readlink(link) == os.path.join(cache_root, cache_path.parent.name, cache_path.name):
+        if (
+            os.readlink(link) == real
+            and not os.path.islink(os.path.dirname(real))
+            and not os.path.islink(real)
+        ):
             return True
     except OSError:
         pass
