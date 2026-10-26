@@ -280,13 +280,15 @@ def _make_key_file_identity(dev: int, inode: int) -> bytes:
     each inode to the key of the file-hash entry last written for it (a hint for one path per
     inode), and a lookup that misses by path follows it.
 
-    The identity lookup is never weaker than the path lookup. It serves another path's entry
-    only when (1) that entry matches this file's stat exactly as a path lookup there would
-    (mtime_ns, size, device, inode) and (2) that path, stat'ed now, still names this file's
-    device and inode. A path lookup at that path would then serve the same hash, and the two
-    paths name one inode, so one content. In particular:
+    The identity lookup is never weaker than a path lookup at the recorded path. It serves
+    another path's entry only when (1) that entry matches this file's stat exactly as a path
+    lookup there would (mtime_ns, size, device, inode) and (2) that path, stat'ed now, still
+    names this file: the same device and inode, and the same change time. A path lookup at
+    that path would then serve the same hash, and the two paths name one inode, so one
+    content. In particular:
 
-    - A hard link (`cp -al`, `os.link`) is the same inode: served without reading it.
+    - A hard link (`cp -al`, `os.link`) is the same inode, and every link of an inode shares
+      its change time: served without reading it.
     - A copy is a new inode, with no index entry: read, as before.
     - Inode reuse: once a recorded file is deleted, the filesystem may give its number to a
       new file, and a copy that keeps mtimes (`cp -a`, `rsync -a`, `shutil.copy2`) can give
@@ -295,9 +297,20 @@ def _make_key_file_identity(dev: int, inode: int) -> bytes:
     - Another filesystem: the device is part of the key, of the entry and of check (2).
     - A bind mount shows one filesystem, with one device number, at two places, so its two
       paths are two links to one inode: served while the recorded path still names it.
+    - Two live files with one (st_dev, st_ino). The argument above assumes the pair names one
+      live file, as POSIX requires, but a filesystem can break that: mergerfs with
+      `inodecalc=passthrough` shows each branch's inode number under the mount's one device.
+      Two such files keep their own change times, so (2) refuses one for the other, also
+      when `touch -r` or a timestamp-keeping copy gives them one size and mtime. Serving one
+      for the other would take the two to agree on size, mtime and change time to the
+      nanosecond, changes within one timestamp tick, the coincidence the stat match of one
+      path already accepts for a file rewritten within one tick.
 
-    The index is only a hint: an index entry that is stale or wrong fails (1) or (2) and
-    serves nothing. Check (2) is a ``stat``, never a read of the file.
+    Both change times in (2) are read at lookup time, from what should be one inode, so a hard
+    link made before the lookup, which changes the inode's change time, invalidates nothing;
+    the entry itself holds no change time (``_FILE_HASH_STAT``) for that reason. The index is
+    only a hint: an index entry that is stale or wrong fails (1) or (2) and serves nothing.
+    Check (2) is a ``stat``, never a read of the file.
     """
     return _INODE_PREFIX + struct.pack(">QQ", dev, inode)
 
@@ -338,12 +351,14 @@ def _put_file_hashes(txn: lmdb.Transaction, entries: Iterable[FileHashEntry]) ->
 
 
 def _names_inode(path: bytes, fs_stat: os.stat_result) -> bool:
-    """Whether ``path`` exists now and is the file ``fs_stat`` describes (device and inode)."""
+    """Whether ``path`` exists now and is the file ``fs_stat`` describes: the same device and
+    inode, and the same change time, which every link of one inode shares and two live files
+    that a filesystem shows with one (st_dev, st_ino) do not (``_make_key_file_identity``)."""
     try:
         current = os.stat(path)
     except OSError:
         return False
-    return os.path.samestat(current, fs_stat)
+    return os.path.samestat(current, fs_stat) and current.st_ctime_ns == fs_stat.st_ctime_ns
 
 
 def _identity_candidate(

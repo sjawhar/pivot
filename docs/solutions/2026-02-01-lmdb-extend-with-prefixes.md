@@ -66,8 +66,9 @@ def _make_key_dep_generation(stage_name: str, dep_path: str) -> bytes:
 Every `hash:` write updates its `inode:` hint in the same transaction. A path
 lookup that misses may follow the hint, but serves the other path's entry only
 after the entry matches the file's stat and that path still names the same
-device and inode. The hint therefore saves a hard-linked replica from reading
-its outputs without making a stale path entry authoritative.
+device and inode with the same change time. The hint therefore saves a
+hard-linked replica from reading its outputs without making a stale path entry
+authoritative.
 
 Atomic multi-type updates happen in a single transaction:
 

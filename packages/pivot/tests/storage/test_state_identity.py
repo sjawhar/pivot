@@ -1,5 +1,5 @@
 """A file-hash entry is also found by the file's identity, (st_dev, st_ino), and that match is
-never weaker than the path match it stands in for (Dispatch BET-263)."""
+never weaker than a path match at the recorded path (Dispatch BET-263)."""
 
 from __future__ import annotations
 
@@ -37,9 +37,11 @@ def _helper_stat(
     dev: int,
     size: int | None = None,
     mtime_ns: int | None = None,
+    ctime_ns: int | None = None,
 ) -> os.stat_result:
-    """``real`` with another inode number and device (and optionally size and mtime): what pivot
-    sees of a file whose inode number the filesystem took back from a deleted file."""
+    """``real`` with another inode number and device (and optionally size, mtime and change
+    time): what pivot sees of a file whose inode number the filesystem took back from a deleted
+    file."""
     fields = list(real)
     fields[1] = ino
     fields[2] = dev
@@ -50,7 +52,7 @@ def _helper_stat(
         {
             "st_atime_ns": real.st_atime_ns,
             "st_mtime_ns": real.st_mtime_ns if mtime_ns is None else mtime_ns,
-            "st_ctime_ns": real.st_ctime_ns,
+            "st_ctime_ns": real.st_ctime_ns if ctime_ns is None else ctime_ns,
         },
     )
 
@@ -172,7 +174,8 @@ def test_a_recorded_path_that_now_names_another_inode_vouches_for_nothing(
 ) -> None:
     """The recorded path was replaced by a new file while the old inode lived on elsewhere: a
     file that then gets the old inode number, size and mtime is refused, because the recorded
-    path names another inode."""
+    path names another inode. Its change time is the recorded path's, so only the inode number
+    tells them apart."""
     state_dir = tmp_path / ".pivot"
     live = _helper_file(tmp_path / "live" / "f.txt", b"content")
     _helper_record(state_dir, live)
@@ -183,7 +186,13 @@ def test_a_recorded_path_that_now_names_another_inode_vouches_for_nothing(
     os.replace(replacement, live)
     keep.unlink()
     new = _helper_file(tmp_path / "new" / "g.txt", b"CONTENT")
-    reused = _helper_stat(new.stat(), ino=old.st_ino, dev=old.st_dev, mtime_ns=old.st_mtime_ns)
+    reused = _helper_stat(
+        new.stat(),
+        ino=old.st_ino,
+        dev=old.st_dev,
+        mtime_ns=old.st_mtime_ns,
+        ctime_ns=live.stat().st_ctime_ns,
+    )
 
     with state.StateDB(state_dir, readonly=True) as state_db:
         assert state_db.get(new, reused) is None
@@ -195,14 +204,19 @@ def test_a_recorded_path_that_now_names_another_devices_inode_vouches_for_nothin
 ) -> None:
     """Check (2) compares the device as well as the inode number: a recorded path that now
     names the same inode number on another filesystem (a mount over its directory, a volume
-    remounted in a container) is another file, so it vouches for nothing."""
+    remounted in a container) is another file, so it vouches for nothing. Its change time is
+    the recorded path's, so only the device tells them apart."""
     state_dir = tmp_path / ".pivot"
     live = _helper_file(tmp_path / "live" / "f.txt", b"content")
     _helper_record(state_dir, live)
     recorded = live.stat()
     other = _helper_file(tmp_path / "new" / "g.txt", b"CONTENT")
     reused = _helper_stat(
-        other.stat(), ino=recorded.st_ino, dev=recorded.st_dev, mtime_ns=recorded.st_mtime_ns
+        other.stat(),
+        ino=recorded.st_ino,
+        dev=recorded.st_dev,
+        mtime_ns=recorded.st_mtime_ns,
+        ctime_ns=recorded.st_ctime_ns,
     )
     real_stat = os.stat
 
@@ -217,6 +231,43 @@ def test_a_recorded_path_that_now_names_another_devices_inode_vouches_for_nothin
     with state.StateDB(state_dir, readonly=True) as state_db:
         assert state_db.get(other, reused) is None
         assert state_db.get_many([(other, reused)]) == {other: None}
+
+
+def test_another_live_file_with_the_recorded_identity_is_not_served(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Two live files can show one (st_dev, st_ino): mergerfs with `inodecalc=passthrough`
+    reports each branch's inode number under the mount's one device. The recorded path then
+    names the same device and inode as the file looked up, and check (2) must still refuse it:
+    it is another file, with its own change time, so its hash is not this file's."""
+    state_dir = tmp_path / ".pivot"
+    recorded_path = tmp_path / "branch1" / "a.txt"
+    recorded_path.parent.mkdir()
+    recorded_path.write_bytes(b"hello world\n")
+    with state.StateDB(state_dir) as state_db:
+        recorded_hash, _ = cache.hash_file(recorded_path, state_db)
+    recorded = recorded_path.stat()
+    other = tmp_path / "branch2" / "b.txt"
+    other.parent.mkdir()
+    other.write_bytes(b"HELLO WORLD\n")
+    # What such a filesystem shows of the other file, after `touch -r a.txt b.txt`: the recorded
+    # file's device, inode number, size and mtime, and a change time of its own.
+    fields = list(other.stat())
+    fields[1], fields[2] = recorded.st_ino, recorded.st_dev
+    shown = os.stat_result(
+        fields,
+        {
+            "st_atime_ns": recorded.st_atime_ns,
+            "st_mtime_ns": recorded.st_mtime_ns,
+            "st_ctime_ns": recorded.st_ctime_ns + 1,
+        },
+    )
+    assert shown.st_size == recorded.st_size
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        served = state_db.get(other, shown)
+    assert served != recorded_hash, "another file's hash was served for b.txt"
+    assert served is None
 
 
 def test_rewriting_a_path_drops_its_old_inodes_index_entry(tmp_path: pathlib.Path) -> None:

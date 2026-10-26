@@ -67,12 +67,16 @@ describe, yet a lookup by the replica's path misses, so on BET's 180,000-file re
 Every write of a `hash:` entry also writes `inode:<st_dev><st_ino>` → that entry's key, and a
 lookup that misses by path follows it. The other path's entry is served only when it matches
 the file's stat (mtime_ns, size, device, inode) and that path, stat'ed now, still names the
-same device and inode: then a lookup at that path would serve the same hash, and both paths
-name one inode. The second check is what keeps a reused inode number from being served: a
-copy that keeps mtimes (`cp -a`, `rsync -a`, `shutil.copy2`) can give a new file the number,
-size and mtime of a deleted one, but the deleted file's path names nothing any more. The
-entry has no ctime because a new hard link changes it, which would invalidate every
-hard-linked replica.
+same device and inode with the same change time: then a lookup at that path would serve the
+same hash, and both paths name one inode, so the identity lookup is never weaker than a path
+lookup at the recorded path. The second check is what keeps a reused inode number from being
+served: a copy that keeps mtimes (`cp -a`, `rsync -a`, `shutil.copy2`) can give a new file the
+number, size and mtime of a deleted one, but the deleted file's path names nothing any more.
+Its change time is for filesystems that show two live files with one device and inode number
+(mergerfs with `inodecalc=passthrough` reports each branch's inode number under one device):
+every link of an inode shares one change time, and two such files do not. The entry itself
+has no ctime because a new hard link changes it, which would invalidate every hard-linked
+replica; check (2) reads both change times at lookup time instead.
 
 `pivot status` and every explanation open the database read-only, then save the hashes they
 had to read with `state.write_back_file_hashes`, best-effort, so a copied replica's second
