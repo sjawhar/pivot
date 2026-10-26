@@ -163,11 +163,25 @@ discovery's checked loader):
   that detached from that tree is not reached.
 
 `WorkerPool.hard_cancel` (an Engine leaving on an exception, such as Ctrl-C) takes the workers
-out of the executor's `_processes` first, for the reason above, then sends each SIGTERM, waits up
-to the same grace, and SIGKILLs any worker left with its descendants (by pid: loky's process
-object has no `kill()`). Once `_processes` is cleared, only `executor.shutdown` wakes loky's
-manager thread, so `hard_cancel` calls it in a `finally`: a coordinator whose manager thread is
-left waiting never exits. Start any new long-lived child process with one of these initializers.
+out of the executor's `_processes` first, for the reason above, then sends each worker's main
+thread SIGTERM (`worker.terminate`), waits up to the same grace, and SIGKILLs any worker left with
+its descendants (by pid: loky's process object has no `kill()`). Once `_processes` is cleared,
+only `executor.shutdown` wakes loky's manager thread, so `hard_cancel` calls it in a `finally`: a
+coordinator whose manager thread is left waiting never exits. Start any new long-lived child
+process with one of these initializers.
+
+The SIGTERM goes to the main thread (`tgkill`), not to the process (`os.kill`), because the stage
+runs there and Python runs a signal handler only there. A worker has other threads: NumPy, which
+Pivot imports, starts an OpenBLAS thread for each CPU but one. Linux gives a signal sent to a
+process to its main thread only while that thread is on a CPU or has no signal pending
+(`complete_signal` in the kernel's `kernel/signal.c`). After Ctrl-C has woken the main thread
+and load keeps it waiting for a CPU, Linux gives the SIGTERM to an OpenBLAS thread, which takes
+the Ctrl-C as well. CPython's C handler there only marks both signals for the main thread, which
+then finds no signal and goes back into the call it was blocked in, such as `time.sleep`: the
+stage never stops, and the SIGKILL after the grace cuts its cleanup off. A signal sent to one
+thread can wake only that thread. glibc has `tgkill` from 2.30; where the C library has none
+(macOS, musl), `os.kill` sends it, and macOS gives a signal sent to a process to its first thread
+that does not block it, the main thread.
 
 ## Key Insight
 

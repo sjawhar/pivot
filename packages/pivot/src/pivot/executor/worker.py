@@ -12,6 +12,7 @@ import codecs
 import collections
 import collections.abc as collections_abc
 import contextlib
+import ctypes
 import dataclasses
 import importlib
 import importlib._bootstrap as importlib_bootstrap
@@ -497,6 +498,34 @@ class _StopState:
 
 _stop = _StopState()
 
+# glibc has tgkill from version 2.30; macOS's C library and musl have none.
+_tgkill = getattr(ctypes.CDLL(None, use_errno=True), "tgkill", None)
+
+
+def terminate(pid: int) -> None:
+    """Send worker ``pid`` SIGTERM (``_stop_worker``) at its main thread, where its stage runs.
+
+    A signal sent to a process (``os.kill``) can reach any of its threads. Linux gives it to
+    the main thread only while that thread is on a CPU or has no signal pending. Once Ctrl-C
+    has woken the main thread and load keeps it waiting for a CPU, Linux gives SIGTERM to
+    another thread, such as one of the OpenBLAS threads NumPy starts on import, and that thread
+    takes the Ctrl-C too. CPython's handler there only marks the signals for the main thread,
+    which finds no signal when it runs and goes back to sleep: the stage never stops, and Pivot
+    kills the worker after ``TERMINATION_GRACE_S`` with the stage's cleanup not run. tgkill
+    sends the signal to one thread, which alone can take it.
+
+    Without tgkill, ``os.kill`` sends it. macOS gives a signal sent to a process to the first
+    of its threads that does not block it, the main thread; on Linux with musl or a glibc older
+    than 2.30, the race above remains.
+    """
+    if _tgkill is None:
+        os.kill(pid, signal.SIGTERM)
+        return
+    # A process's main thread has the process's id as its thread id.
+    if _tgkill(pid, pid, signal.SIGTERM) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
 
 def kill_descendants(pid: int) -> None:
     """SIGKILL every live descendant of process ``pid``. A process that detached from that
@@ -570,14 +599,14 @@ def _raise_if_stopped() -> None:
 def unwind_when_stopped(parent_pid: int) -> None:
     """Loky worker initializer: stop this worker when it is told to or its parent dies.
 
-    SIGTERM (``WorkerPool.hard_cancel``) or SIGINT (Ctrl-C at a terminal) raises
-    ``WorkerTerminated`` in the running stage, so its cleanup runs (stopping the processes or
-    containers it started); after SIGTERM the worker then exits. When the Pivot process that
-    started the worker dies, as when it is SIGKILLed, a watchdog thread sends this worker's
-    main thread SIGTERM (a signal to that thread interrupts a blocking call there) and exits
-    the worker after ``TERMINATION_GRACE_S`` itself, in case the stage replaced the SIGTERM
-    handler or is blocked where no signal reaches it. Every exit first kills the processes
-    still descended from the worker.
+    SIGTERM (``WorkerPool.hard_cancel``, sent at the main thread by ``terminate``) or SIGINT
+    (Ctrl-C at a terminal) raises ``WorkerTerminated`` in the running stage, so its cleanup runs
+    (stopping the processes or containers it started); after SIGTERM the worker then exits.
+    When the Pivot process that started the worker dies, as when it is SIGKILLed, a watchdog
+    thread sends this worker's main thread SIGTERM (a signal to that thread interrupts a
+    blocking call there) and exits the worker after ``TERMINATION_GRACE_S`` itself, in case the
+    stage replaced the SIGTERM handler or is blocked where no signal reaches it. Every exit
+    first kills the processes still descended from the worker.
 
     A SIGINT the worker inherited as ignored (pivot run as a background job of a
     non-interactive shell) stays ignored, as it does for pivot itself.
