@@ -43,7 +43,9 @@ def module_dir(tmp_path: pathlib.Path):
     to_remove = [
         name
         for name in sys.modules
-        if name.startswith(("fbn_", "fbn2_", "fbnhelp_", "fbnstage_", "rk_"))
+        if name.startswith(
+            ("fbn_", "fbn2_", "fbnhelp_", "fbnstage_", "rk_", "rk4_", "rk5_", "rk6_")
+        )
     ]
     for name in to_remove:
         del sys.modules[name]
@@ -2608,3 +2610,441 @@ def test_a_mark_on_a_wraps_wrapper_keeps_the_fingerprint_when_its_own_code_chang
         key for key in set(first) | set(second) if first.get(key) != second.get(key)
     )
     assert fingerprint._make_manifest_cache_key("lock/s", my_stage) == first_key
+
+
+# ---------------------------------------------------------------------------------------------
+# A class-based decorator above the mark is refused however the stage reaches it: one decision
+# (`_mark_decision`) for every path that reads a value, so no path drops it.
+# ---------------------------------------------------------------------------------------------
+
+_R5_DECO = """\
+import functools
+
+
+class Traced:
+    def __init__(self, fn):
+        self.fn = fn
+        functools.update_wrapper(self, fn)
+
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs) * 2
+
+
+class TracedGen:
+    def __init__(self, fn):
+        self.fn = fn
+        functools.update_wrapper(self, fn)
+
+    def __call__(self, *args, **kwargs):
+        for value in self.fn(*args, **kwargs):
+            yield value * 3
+
+
+def traced(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return wrapper
+"""
+
+_R5_HELPER = """\
+import contextlib
+import functools
+
+from pivot import fingerprint_by_name
+from rk5_deco import Traced, TracedGen, traced
+
+
+{decorators}@fingerprint_by_name
+def helper(*_args):
+    {verb} 5
+"""
+
+# Decorator lines above the mark, the helper's verb, the edit to the class's __call__, the class.
+_R5_SHAPES = {
+    "cache": (
+        "@functools.cache\n@Traced\n",
+        "return",
+        ("kwargs) * 2\n", "kwargs) * 20\n"),
+        "Traced",
+    ),
+    "lru_cache": (
+        "@functools.lru_cache(maxsize=8)\n@Traced\n",
+        "return",
+        ("kwargs) * 2\n", "kwargs) * 20\n"),
+        "Traced",
+    ),
+    "contextmanager": (
+        "@contextlib.contextmanager\n@TracedGen\n",
+        "yield",
+        ("value * 3\n", "value * 30\n"),
+        "TracedGen",
+    ),
+    "cache_over_class_over_function": (
+        "@functools.cache\n@Traced\n@traced\n",
+        "return",
+        ("kwargs) * 2\n", "kwargs) * 20\n"),
+        "Traced",
+    ),
+}
+
+_R5_HOLDER = "import rk5_h as h\n\n\nclass Holder:\n    held = h.helper\n\n\n"
+_R5_FORMS = {
+    "called": "import rk5_h as h\n\n\ndef my_stage():\n    return h.helper()\n",
+    "class_member_named": _R5_HOLDER + "def my_stage():\n    return Holder.held()\n",
+    "class_member_unnamed": _R5_HOLDER
+    + "def my_stage():\n    holder = Holder()\n    return holder.held()\n",
+    "partial_argument": (
+        "import functools\n\nimport rk5_h as h\n\n\ndef _apply(fn):\n    return fn()\n\n\n"
+        "RUNNER = functools.partial(_apply, h.helper)\n\n\ndef my_stage():\n    return RUNNER()\n"
+    ),
+    "default_argument": "import rk5_h as h\n\n\ndef my_stage(start=h.helper):\n    return start()\n",
+}
+_R5_MODULES = ("rk5_deco", "rk5_h", "rk5_s")
+
+
+@pytest.mark.parametrize("form", list(_R5_FORMS))
+@pytest.mark.parametrize("shape", list(_R5_SHAPES))
+def test_a_class_decorator_above_the_mark_is_never_left_out_of_the_fingerprint(
+    module_dir: pathlib.Path, shape: str, form: str
+) -> None:
+    """A class-based decorator above the mark under a library wrapper is refused, or its own
+    code is in the fingerprint, however the stage reaches the helper: called, as a named or
+    an unnamed class member, as a partial argument or as a default. It is never left out of
+    both, which would leave the stage cached with an old output after an edit to the class's
+    `__call__`."""
+    decorators, verb, (old, new), cls = _R5_SHAPES[shape]
+    _write(module_dir / "rk5_deco.py", _R5_DECO)
+    _write(module_dir / "rk5_h.py", _R5_HELPER.format(decorators=decorators, verb=verb))
+    _write(module_dir / "rk5_s.py", _R5_FORMS[form])
+    try:
+        first = fingerprint.get_stage_fingerprint(_fresh(*_R5_MODULES).my_stage)
+    except exceptions.StageDefinitionError as refused:
+        assert cls in str(refused), refused
+        return
+
+    _edit(module_dir / "rk5_deco.py", old, new)
+    second = fingerprint.get_stage_fingerprint(_fresh(*_R5_MODULES).my_stage)
+    assert second != first, first
+
+
+@pytest.mark.parametrize("shape", ["cache", "lru_cache"])
+def test_the_refusal_of_a_class_decorator_above_the_mark_names_the_class_and_the_mark(
+    module_dir: pathlib.Path, shape: str
+) -> None:
+    """The refusal exists only because of the mark, so it names the class-based decorator and
+    `@fingerprint_by_name`: the user knows what to change."""
+    decorators, verb, _edit_pair, cls = _R5_SHAPES[shape]
+    _write(module_dir / "rk5_deco.py", _R5_DECO)
+    _write(module_dir / "rk5_h.py", _R5_HELPER.format(decorators=decorators, verb=verb))
+    _write(module_dir / "rk5_s.py", _R5_FORMS["called"])
+    with pytest.raises(exceptions.StageDefinitionError) as refused:
+        fingerprint.get_stage_fingerprint(_fresh(*_R5_MODULES).my_stage)
+    message = str(refused.value)
+    assert cls in message, message
+    assert "fingerprint_by_name" in message, message
+
+
+_R6_SHAPES = {
+    **{name: (lines, verb, cls) for name, (lines, verb, _edit_pair, cls) in _R5_SHAPES.items()},
+    "cache_over_function_over_class": ("@functools.cache\n@traced\n@Traced\n", "return", "Traced"),
+    "class_alone": ("@Traced\n", "return", "Traced"),
+}
+
+_R6_FORMS = {
+    **_R5_FORMS,
+    "default_factory": (
+        "import typing\n\nimport pydantic\n\nimport rk5_h as h\nfrom pivot import StageParams\n\n\n"
+        "class P(StageParams):\n    tag: typing.Any = pydantic.Field(default_factory=h.helper)\n\n\n"
+        "def my_stage(params: P):\n    return params.tag\n"
+    ),
+    "partial_function": (
+        "import functools\n\nimport rk5_h as h\n\n\nRUNNER = functools.partial(h.helper)\n\n\n"
+        "def my_stage():\n    return RUNNER()\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("form", list(_R6_FORMS))
+@pytest.mark.parametrize("shape", list(_R6_SHAPES))
+def test_get_stage_fingerprint_refuses_a_class_decorator_above_the_mark_in_every_stage_form(
+    module_dir: pathlib.Path, shape: str, form: str
+) -> None:
+    """`get_stage_fingerprint` alone refuses a user class instance above the mark, with or
+    without a library wrapper over it, and with a function decorator on either side of it,
+    however the stage reaches the helper, a pydantic `default_factory` and a partial's function
+    included. The message names the class and the mark and gives the fixes that work, not the
+    advice of the non-scalar refusal (StageParams, unsafe fingerprinting)."""
+    decorators, verb, cls = _R6_SHAPES[shape]
+    _write(module_dir / "rk5_deco.py", _R5_DECO)
+    _write(module_dir / "rk5_h.py", _R5_HELPER.format(decorators=decorators, verb=verb))
+    _write(module_dir / "rk5_s.py", _R6_FORMS[form])
+    with pytest.raises(exceptions.StageDefinitionError) as refused:
+        fingerprint.get_stage_fingerprint(_fresh(*_R5_MODULES).my_stage)
+    message = str(refused.value)
+    assert f"rk5_deco.{cls}" in message, message
+    assert "rk5_h.helper" in message, message
+    assert "@fingerprint_by_name" in message, message
+    assert "functools.wraps" in message, message
+    assert "StageParams" not in message, message
+    assert "PIVOT_UNSAFE_FINGERPRINTING" not in message, message
+
+
+def test_unsafe_fingerprinting_does_not_suppress_the_refusal_of_a_class_above_the_mark(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unsafe fingerprinting turns a non-scalar refusal into a warning. It does not turn this
+    refusal into one: nothing would then record the class's code, and the stage would be
+    cached with an old output after an edit to it."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
+    decorators, verb, _edit_pair, _cls = _R5_SHAPES["cache"]
+    _write(module_dir / "rk5_deco.py", _R5_DECO)
+    _write(module_dir / "rk5_h.py", _R5_HELPER.format(decorators=decorators, verb=verb))
+    _write(module_dir / "rk5_s.py", _R5_FORMS["called"])
+    with pytest.raises(exceptions.StageDefinitionError, match="fingerprint_by_name"):
+        fingerprint.get_stage_fingerprint(_fresh(*_R5_MODULES).my_stage)
+
+
+_R6_FIX_HELPER = """\
+import contextlib
+import functools
+
+from pivot import fingerprint_by_name
+from rk5_deco import Traced, TracedGen
+
+
+{decorators}def helper(*_args):
+    {verb} 5
+"""
+
+# The refusal's first fix: the mark above the class-based decorator, so the whole helper is
+# recorded by name. Decorator lines, the helper's verb, the edit to the class's __call__.
+_R6_FIX_SHAPES = {
+    "cache_over_marked_class": (
+        "@functools.cache\n@fingerprint_by_name\n@Traced\n",
+        "return",
+        ("kwargs) * 2\n", "kwargs) * 20\n"),
+    ),
+    "marked_class": (
+        "@fingerprint_by_name\n@Traced\n",
+        "return",
+        ("kwargs) * 2\n", "kwargs) * 20\n"),
+    ),
+    "contextmanager_over_marked_class": (
+        "@contextlib.contextmanager\n@fingerprint_by_name\n@TracedGen\n",
+        "yield",
+        ("value * 3\n", "value * 30\n"),
+    ),
+}
+
+
+@pytest.mark.parametrize("form", list(_R6_FORMS))
+@pytest.mark.parametrize("shape", list(_R6_FIX_SHAPES))
+def test_the_mark_above_a_class_based_decorator_records_the_whole_helper_by_name(
+    module_dir: pathlib.Path, shape: str, form: str
+) -> None:
+    """The refusal's first fix works in every stage form: with `@fingerprint_by_name` above the
+    class-based decorator, Pivot accepts the stage and records the helper by name, so an edit
+    to the class's `__call__` or to the helper's body keeps the stage fingerprint. Where the
+    stage reads the helper as a value, the manifest names it."""
+    decorators, verb, (old, new) = _R6_FIX_SHAPES[shape]
+    _write(module_dir / "rk5_deco.py", _R5_DECO)
+    _write(module_dir / "rk5_h.py", _R6_FIX_HELPER.format(decorators=decorators, verb=verb))
+    _write(module_dir / "rk5_s.py", _R6_FORMS[form])
+    first = fingerprint.get_stage_fingerprint(_fresh(*_R5_MODULES).my_stage)
+    if form in ("called", "class_member_named", "class_member_unnamed", "default_argument"):
+        named = {value for key, value in first.items() if key.startswith("ext:")}
+        assert "rk5_h.helper" in named, first
+
+    _edit(module_dir / "rk5_deco.py", old, new)
+    second = fingerprint.get_stage_fingerprint(_fresh(*_R5_MODULES).my_stage)
+    assert second == first, sorted(
+        key for key in set(first) | set(second) if first.get(key) != second.get(key)
+    )
+
+    _edit(module_dir / "rk5_h.py", f"    {verb} 5\n", f"    {verb} 2 + 3\n")
+    third = fingerprint.get_stage_fingerprint(_fresh(*_R5_MODULES).my_stage)
+    assert third == first, sorted(
+        key for key in set(first) | set(third) if first.get(key) != third.get(key)
+    )
+
+
+@pytest.mark.parametrize("shape", ["cache", "lru_cache"])
+def test_without_the_mark_a_cache_over_a_class_decorator_is_not_refused(
+    module_dir: pathlib.Path, shape: str
+) -> None:
+    """The refusal's last fix, removing the mark, gives main's decision for the same chain:
+    a library wrapper over a class-based decorator with no mark below is not refused."""
+    decorators, verb, _edit_pair, _cls = _R5_SHAPES[shape]
+    _write(module_dir / "rk5_deco.py", _R5_DECO)
+    _write(
+        module_dir / "rk5_h.py",
+        _R5_HELPER.format(decorators=decorators, verb=verb).replace("@fingerprint_by_name\n", ""),
+    )
+    _write(module_dir / "rk5_s.py", _R5_FORMS["called"])
+    fingerprint.get_stage_fingerprint(_fresh(*_R5_MODULES).my_stage)
+
+
+@pytest.mark.parametrize("shape", ["cache", "lru_cache", "contextmanager"])
+def test_the_canonical_form_refuses_a_class_decorator_above_the_mark(
+    module_dir: pathlib.Path, shape: str
+) -> None:
+    """A loader field reaches the canonical form without the walk's value classification. The
+    canonical form takes the mark decision before it names a library callable, so a library
+    wrapper over a class-based decorator over the mark is refused there too, rather than named
+    by the wrapper alone with the class's code left out."""
+    decorators, verb, _edit_pair, cls = _R5_SHAPES[shape]
+    _write(module_dir / "rk5_deco.py", _R5_DECO)
+    _write(module_dir / "rk5_h.py", _R5_HELPER.format(decorators=decorators, verb=verb))
+    helper = _fresh("rk5_deco", "rk5_h").helper
+    with pytest.raises(exceptions.StageDefinitionError, match=f"rk5_deco.{cls}"):
+        fingerprint._canonicalize_value_for_hash({"field": helper})
+
+
+_R6_DUMP_HELPER = """\
+from pivot import fingerprint_by_name
+from rk5_deco import Traced
+
+
+class TracedDump(Traced):
+    def model_dump(self):
+        return {"wrapped": self.fn.__qualname__}
+
+
+@TracedDump
+@fingerprint_by_name
+def helper(*_args):
+    return 5
+"""
+
+
+@pytest.mark.parametrize("form", ["partial_argument", "default_argument"])
+def test_a_class_decorator_above_the_mark_with_model_dump_is_refused(
+    module_dir: pathlib.Path, form: str
+) -> None:
+    """The canonical form takes the mark decision before it dumps a value with `model_dump`.
+    A class-based decorator that defines `model_dump` would otherwise be canonicalized as its
+    dump, which records neither its code nor the state its `__call__` reads, and a partial
+    argument holding it would be accepted with the class left out."""
+    _write(module_dir / "rk5_deco.py", _R5_DECO)
+    _write(module_dir / "rk5_h.py", _R6_DUMP_HELPER)
+    _write(module_dir / "rk5_s.py", _R5_FORMS[form])
+    with pytest.raises(exceptions.StageDefinitionError, match="rk5_h.TracedDump"):
+        fingerprint.get_stage_fingerprint(_fresh(*_R5_MODULES).my_stage)
+
+
+_R6_LIBRARY = """\
+class Memo:
+    def __init__(self, fn):
+        self.__wrapped__ = fn
+
+    def __call__(self, *args, **kwargs):
+        return self.__wrapped__(*args, **kwargs)
+"""
+
+_R6_LIBRARY_HELPER = """\
+from pivot import fingerprint_by_name
+from rk5_deco import Traced
+from rk6_lib import Memo
+
+
+@Memo
+@Traced
+@fingerprint_by_name
+def helper(*_args):
+    return 5
+"""
+
+
+@pytest.mark.parametrize("form", list(_R6_FORMS))
+def test_a_library_wrapper_over_a_class_decorator_over_the_mark_is_refused(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch, form: str
+) -> None:
+    """A library's class-based wrapper that sets `__wrapped__` keeps its own module, so it is
+    not user code. Over a class-based decorator over the mark the chain is still refused
+    however the stage reaches it, a partial's function included, rather than named as a
+    library callable with the class's code left out. Without the mark, main refuses the
+    wrapper as a callable instance, so the mark must not relax that refusal."""
+    library = module_dir / "site-packages"
+    _write(library / "rk6_lib.py", _R6_LIBRARY)
+    monkeypatch.syspath_prepend(str(library))
+    _write(module_dir / "rk5_deco.py", _R5_DECO)
+    _write(module_dir / "rk5_h.py", _R6_LIBRARY_HELPER)
+    _write(module_dir / "rk5_s.py", _R6_FORMS[form])
+    stage = _fresh("rk6_lib", *_R5_MODULES).my_stage
+    assert not fingerprint.is_user_code(sys.modules["rk6_lib"].Memo)
+    with pytest.raises(exceptions.StageDefinitionError) as refused:
+        fingerprint.get_stage_fingerprint(stage)
+    message = str(refused.value)
+    assert "rk5_deco.Traced" in message, message
+    assert "rk5_h.helper" in message, message
+
+
+_R6_BOUND_HELPER = """\
+from pivot import fingerprint_by_name
+
+
+@fingerprint_by_name
+def member(cls):
+    return cls.__name__
+
+
+class Helpers:
+    run = classmethod(member)
+"""
+
+_R6_BOUND_STAGE = """\
+from {module} import Helpers
+
+
+class Holder:
+    held = Helpers.run
+
+
+def my_stage():
+    holder = Holder()
+    return holder.held()
+"""
+
+
+def test_a_marked_function_bound_to_a_class_and_held_by_a_class_is_recorded_by_name(
+    module_dir: pathlib.Path,
+) -> None:
+    """A class attribute holds a marked function bound to a class (`Helpers.run`, a
+    classmethod), and the stage reads the holder without naming the member. The member takes
+    the mark decision, which records the bound method by name, so the member is in the manifest
+    and a move of the helper to another module changes the stage fingerprint. An unwrap of the
+    bound method finds no `__wrapped__` and would drop it."""
+    _write(module_dir / "rk6_bound1.py", _R6_BOUND_HELPER)
+    _write(module_dir / "rk6_bound_s.py", _R6_BOUND_STAGE.format(module="rk6_bound1"))
+    first = fingerprint.get_stage_fingerprint(_fresh("rk6_bound1", "rk6_bound_s").my_stage)
+    entry = "ext:rk6_bound_s.Holder.held"
+    assert first[entry] == "rk6_bound1.member[rk6_bound1.Helpers]", first
+
+    _write(module_dir / "rk6_bound2.py", _R6_BOUND_HELPER)
+    _write(module_dir / "rk6_bound_s.py", _R6_BOUND_STAGE.format(module="rk6_bound2"))
+    # The rewritten stage file keeps its size and mtime second, so drop its bytecode.
+    shutil.rmtree(module_dir / "__pycache__", ignore_errors=True)
+    second = fingerprint.get_stage_fingerprint(_fresh("rk6_bound2", "rk6_bound_s").my_stage)
+    assert second[entry] == "rk6_bound2.member[rk6_bound2.Helpers]", second
+    assert first != second, "a move of the marked member kept the stage fingerprint"
+
+
+@pytest.mark.parametrize("shape", list(_R6_SHAPES))
+def test_get_stage_fingerprint_given_the_refused_chain_itself_refuses_it(
+    module_dir: pathlib.Path, shape: str
+) -> None:
+    """Given the helper itself, a chain with a user class instance above the mark,
+    `get_stage_fingerprint` refuses it with the class-above-mark message. The source reads
+    (`_source_object`) take the mark decision first, so none of them stops at the instance and
+    asks it for a code object it does not have."""
+    decorators, verb, cls = _R6_SHAPES[shape]
+    _write(module_dir / "rk5_deco.py", _R5_DECO)
+    _write(module_dir / "rk5_h.py", _R5_HELPER.format(decorators=decorators, verb=verb))
+    helper = _fresh("rk5_deco", "rk5_h").helper
+    with pytest.raises(exceptions.StageDefinitionError) as refused:
+        fingerprint.get_stage_fingerprint(helper)
+    message = str(refused.value)
+    assert f"rk5_deco.{cls}" in message, message
+    assert "@fingerprint_by_name" in message, message

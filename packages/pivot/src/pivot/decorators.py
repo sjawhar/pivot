@@ -48,8 +48,11 @@ def fingerprint_by_name[F: Callable[..., object]](func: F) -> F:
     records the marked function inside it by name, also when `functools.cache` wraps that
     decorator. A library wrapper directly above the mark (`functools.cache`,
     `functools.lru_cache`, `contextlib.contextmanager`) keeps the record by name. Pivot
-    refuses a class-based decorator above the mark when a library wrapper wraps it, because
-    the decorator instance can carry state Pivot cannot fingerprint soundly. Without a mark
+    refuses a class-based decorator above the mark, however the stage reaches the helper,
+    because the decorator instance can carry state Pivot cannot fingerprint soundly. Unsafe
+    fingerprinting does not suppress that refusal. To clear it, put the mark above the
+    class-based decorator (the decorator accepts an instance that `functools.update_wrapper`
+    made), use a `functools.wraps` function decorator, or remove the mark. Without a mark
     below it, a `functools.wraps` decorator is fingerprinted as in earlier versions: Pivot
     does not see what its own lines read through a module (`settings.FACTOR`), or its body
     when `functools.cache` wraps it.
