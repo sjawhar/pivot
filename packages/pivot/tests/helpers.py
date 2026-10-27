@@ -1,4 +1,5 @@
-"""Test helpers for building pipelines with the compositional API."""
+"""Test helpers shared by test modules: pipelines built with the compositional API, sockets, and
+venvs that CI-only tests install with uv."""
 
 # pyright: reportMissingImports=false, reportImplicitRelativeImport=false
 
@@ -16,6 +17,7 @@ import typing
 from typing import TYPE_CHECKING, Any
 
 import anyio
+import pytest
 
 from pivot import compose, exceptions, project, stage_def
 from pivot import names as stage_names
@@ -101,6 +103,42 @@ async def wait_for_socket(socket_path: pathlib.Path, timeout: float = 5.0) -> No
         await anyio.sleep(0.05)
     msg = f"Socket {socket_path} not created and connectable within {timeout}s"
     raise TimeoutError(msg)
+
+
+def clean_env() -> dict[str, str]:
+    """Return ``os.environ`` without the workspace's ``VIRTUAL_ENV*`` and ``PYTHONPATH*``."""
+    return {k: v for k, v in os.environ.items() if not k.startswith(("VIRTUAL_ENV", "PYTHONPATH"))}
+
+
+def uv_executable() -> str:
+    """The uv executable ``PIVOT_TEST_UV`` names. CI runs the suite without uv on PATH and sets
+    it; a test that needs uv runs only in CI (``CI`` set), and fails here if it is unset."""
+    uv = os.environ.get("PIVOT_TEST_UV", "")
+    if not (pathlib.Path(uv).is_file() and os.access(uv, os.X_OK)):
+        pytest.fail(f"PIVOT_TEST_UV must name the uv executable; it is {uv!r}", pytrace=False)
+    return uv
+
+
+def venv_pivot(venv: pathlib.Path, *specs: str) -> str:
+    """Make a Python 3.13 venv at ``venv`` with ``uv_executable()``, install ``specs`` into it
+    (a wheel path, ``pivot==<version>``, other requirements), and return its ``pivot``."""
+    uv = uv_executable()
+    commands = (
+        [uv, "venv", "--python", "3.13", str(venv)],
+        [uv, "pip", "install", "--python", str(venv / "bin" / "python"), *specs],
+    )
+    for command in commands:
+        ran = subprocess.run(
+            command,
+            cwd=venv.parent,
+            env=clean_env(),
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        assert ran.returncode == 0, ran.stdout + ran.stderr
+    return str(venv / "bin" / "pivot")
 
 
 # Default pipeline for register_test_stage(). The conftest fixture

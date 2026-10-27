@@ -81,11 +81,20 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def _cannot_connect(exc: BaseException) -> bool:
+    """Whether ``exc`` means no connection to the server could be made: a DNS failure, refused,
+    no route, a proxy or TLS failure (``ClientConnectorError``), or a connect timeout. No request
+    reached the server, so every request to it fails the same way."""
+    return isinstance(exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError))
+
+
 def _remote_error(
     exc: aiohttp.ClientError | TimeoutError, action: str, location: str
 ) -> exceptions.RemoteConnectionError:
     """An actionable error for a failed GCS request to ``action`` (read/list/write) ``location``.
 
+    ``RemoteUnreachableError`` when no connection could be made (``_cannot_connect``); any other
+    failure, an HTTP status or a reply that broke off included, is this request's error.
     Raise it ``from None``, so a traceback does not print the client exception either.
     """
     if isinstance(exc, aiohttp.ClientResponseError):
@@ -98,10 +107,12 @@ def _remote_error(
         return exceptions.RemoteConnectionError(
             f"GCS {action} error for {location}: {_describe(exc)}"
         )
-    return exceptions.RemoteConnectionError(
-        f"Cannot reach Google Cloud Storage to {action} {location}: {_describe(exc)}. "
-        + "Check network connectivity."
-    )
+    if _cannot_connect(exc):
+        return exceptions.RemoteUnreachableError(
+            f"Cannot reach Google Cloud Storage to {action} {location}: {_describe(exc)}. "
+            + "Check network connectivity."
+        )
+    return exceptions.RemoteConnectionError(f"GCS {action} error for {location}: {_describe(exc)}")
 
 
 def _emulated() -> bool:
@@ -202,10 +213,18 @@ class GCSRemote:
 
     @contextlib.asynccontextmanager
     async def _client(self) -> AsyncIterator[Storage]:
-        """A gcloud-aio-storage client on one aiohttp session, with credentials in hand."""
+        """A gcloud-aio-storage client on one aiohttp session, with credentials in hand.
+
+        A token request that cannot connect or times out (gcloud-aio-auth tries it 5 times)
+        raises ``RemoteUnreachableError``: with credentials in hand, Google cannot be reached.
+        Without a credentials file gcloud-aio asks the GCE metadata server instead, whose name
+        does not resolve off GCE, so there the same failure means missing credentials.
+        """
         from gcloud.aio import storage as gcloud_storage
+        from gcloud.aio.auth import token as gcloud_token
 
         async with aiohttp.ClientSession(timeout=self._timeout) as session:
+            client: Storage | None = None
             try:
                 # Reads GOOGLE_APPLICATION_CREDENTIALS, so a missing or bad key file fails here
                 client = gcloud_storage.Storage(session=session)
@@ -217,13 +236,23 @@ class GCSRemote:
                 if not _emulated():
                     await client.token.get()
             except Exception as e:  # any failure here leaves no usable credentials
+                if (
+                    client is not None
+                    and client.token.token_type is not gcloud_token.Type.GCE_METADATA
+                    and (_cannot_connect(e) or isinstance(e, TimeoutError))
+                ):
+                    raise exceptions.RemoteUnreachableError(
+                        f"Cannot reach Google to get a Cloud Storage token: {_describe(e)}. "
+                        + "Check network connectivity."
+                    ) from None
                 raise exceptions.RemoteConnectionError(
                     f"{_AUTH_ERROR_MESSAGE} Getting a token failed: {_describe(e)}"
                 ) from None
             yield client
 
     async def _with_retries[T](self, request: Callable[[], Awaitable[T]]) -> T:
-        """Run ``request``, retrying transient failures up to ``remote.retries`` times."""
+        """Run ``request``, retrying transient failures up to ``remote.retries`` times: a
+        retryable status, a connection or reply that failed or broke off, a timeout."""
         attempt = 0
         while True:
             try:
@@ -231,7 +260,12 @@ class GCSRemote:
             except aiohttp.ClientResponseError as e:
                 if e.status not in _RETRYABLE_STATUSES or attempt >= self._retries:
                     raise
-            except (aiohttp.ClientConnectionError, TimeoutError, _UploadNotStoredError):
+            except (
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientPayloadError,
+                TimeoutError,
+                _UploadNotStoredError,
+            ):
                 if attempt >= self._retries:
                     raise
             delay = random.uniform(0, min(_RETRY_MAX_DELAY, _RETRY_BASE_DELAY * 2**attempt))
@@ -326,15 +360,28 @@ class GCSRemote:
     async def _download_verified(
         self, client: Storage, key: str, dest: Path, expected_hash: str
     ) -> None:
-        """Stream ``key`` into the existing file ``dest`` and check its xxh64 digest."""
-        try:
-            stream = await self._with_retries(
-                lambda: client.download_stream(
-                    self._bucket,
-                    key,
-                    timeout=self._timeout,  # pyright: ignore[reportArgumentType] - gcloud-aio passes an aiohttp.ClientTimeout through
-                )
+        """Stream ``key`` into the existing file ``dest`` and check its xxh64 digest.
+
+        The request and its body are one attempt, so a body that breaks off or stalls is retried
+        like a failed request, rewriting ``dest`` from its start.
+        """
+
+        async def attempt() -> str:
+            stream = await client.download_stream(
+                self._bucket,
+                key,
+                timeout=self._timeout,  # pyright: ignore[reportArgumentType] - gcloud-aio passes an aiohttp.ClientTimeout through
             )
+            async with stream:
+                fd = os.open(dest, os.O_WRONLY | os.O_TRUNC)
+                try:
+                    return await _stream_download_to_fd(stream, fd)
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+
+        try:
+            actual_hash = await self._with_retries(attempt)
         except aiohttp.ClientResponseError as e:
             if e.status == 404:
                 raise exceptions.RemoteError(
@@ -343,15 +390,6 @@ class GCSRemote:
             raise _remote_error(e, "read", self._location(key)) from None
         except (aiohttp.ClientError, TimeoutError) as e:
             raise _remote_error(e, "read", self._location(key)) from None
-        fd = os.open(dest, os.O_WRONLY | os.O_TRUNC)
-        try:
-            async with stream:
-                actual_hash = await _stream_download_to_fd(stream, fd)
-        except aiohttp.ClientError as e:  # the body broke off mid-download
-            raise _remote_error(e, "read", self._location(key)) from None
-        finally:
-            with contextlib.suppress(OSError):
-                os.close(fd)
         keys.check_digest(expected_hash, actual_hash, self._location(key))
 
     async def exists(self, cache_hash: str) -> bool:
