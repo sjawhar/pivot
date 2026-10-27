@@ -17,6 +17,8 @@ import shutil
 import subprocess
 import sys
 
+import pytest
+
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
 _PIPELINE = """\
@@ -123,17 +125,26 @@ def _helper_unreadable(tmp_path: pathlib.Path, link: pathlib.Path) -> dict[str, 
     return env
 
 
-def _helper_refused(proc: subprocess.CompletedProcess[str], link: pathlib.Path) -> str:
-    """The command exited 1 with one error naming ``link`` and what to do, and nothing else."""
+def _helper_reported(
+    proc: subprocess.CompletedProcess[str], link: pathlib.Path, returncode: int
+) -> str:
+    """The command exited ``returncode`` and printed one message naming ``link`` and what to
+    do, once, and no exception class, traceback or ``Exit(``."""
     out = proc.stdout + proc.stderr
-    assert proc.returncode == 1, out
+    assert proc.returncode == returncode, out
     assert "Error in sitecustomize" not in out, out
     # Without whitespace, so a line wrapped by the console still matches.
     flat = "".join(out.split())
+    assert flat.count("Cannotreadsymlink") == 1, out
     assert "".join(f"Cannot read symlink '{link}':".split()) in flat, out
     assert "readable,orremovethelink." in flat, out
     assert _EXCEPTION_TEXT.search(out) is None, out
     return out
+
+
+def _helper_refused(proc: subprocess.CompletedProcess[str], link: pathlib.Path) -> str:
+    """The command exited 1 with one error naming ``link`` and what to do, and nothing else."""
+    return _helper_reported(proc, link, 1)
 
 
 def test_repro_fails_the_stage_and_keeps_an_unreadable_user_symlink(
@@ -209,10 +220,36 @@ def test_diff_refuses_an_unreadable_checkout_link(tmp_path: pathlib.Path) -> Non
     )
 
 
+@pytest.mark.parametrize(
+    ("args", "returncode"),
+    [
+        pytest.param(("status",), 0, id="status"),
+        pytest.param(("verify",), 1, id="verify"),
+        pytest.param(("repro", "--dry-run"), 0, id="repro-dry-run"),
+    ],
+)
+def test_report_commands_give_an_unreadable_link_once(
+    tmp_path: pathlib.Path, args: tuple[str, ...], returncode: int
+) -> None:
+    """``pivot status``, ``pivot verify`` and ``pivot repro --dry-run`` give the link's message
+    once, as the reason of the stage whose output holds it, not also as a warning that the
+    stage's explanation failed. ``status`` and ``--dry-run`` are reports and exit 0; ``verify``
+    fails."""
+    root = _helper_project(tmp_path)
+    link = root / "data" / "p" / "big" / "f0.txt"
+
+    out = _helper_reported(
+        _pivot(root, *args, env=_helper_unreadable(tmp_path, link)), link, returncode
+    )
+
+    assert "Failed to get explanation" not in out, out
+
+
 def test_tracked_directory_commands_refuse_an_unreadable_link(tmp_path: pathlib.Path) -> None:
     """A tracked directory with the link: ``pivot track --force`` does not record the directory
-    without it, ``pivot status --tracked-only`` does not call it modified, and ``pivot repro``
-    stops before any stage runs. Each refuses naming the link."""
+    without it, ``pivot status`` (with or without ``--tracked-only``) does not call it modified,
+    and ``pivot run`` and ``pivot repro`` stop before any stage runs. Each refuses naming the
+    link."""
     root = _helper_project(tmp_path)
     link = root / "raw" / "t0.txt"
     pvt = root / "raw.pvt"
@@ -221,6 +258,8 @@ def test_tracked_directory_commands_refuse_an_unreadable_link(tmp_path: pathlib.
 
     _helper_refused(_pivot(root, "track", "--force", "raw", env=env), link)
     _helper_refused(_pivot(root, "status", "--tracked-only", env=env), link)
+    _helper_refused(_pivot(root, "status", env=env), link)
+    _helper_refused(_pivot(root, "run", "p/big", env=env), link)
     _helper_refused(_pivot(root, "repro", env=env), link)
 
     assert pvt.read_bytes() == pvt_before
