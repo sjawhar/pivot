@@ -182,12 +182,15 @@ def gc_cmd(
     project_root = project.get_project_root()
     # Reads the register as earlier runs left it: this project's own entry, written by every
     # other command, would otherwise make an unrecorded cache look recorded.
-    cache_dir = config.get_cache_dir(register=False)
+    cache_dir = config.get_cache_dir()
     object_root = cache_dir / gc.OBJECTS_DIR
     state_dir = config.get_state_dir()
 
-    scopes, gone = gc.resolve_scopes(cache_dir, project_root, state_dir, project_paths)
-    gc.register_project(cache_dir, project_root, state_dir)
+    scopes, gone = gc.resolve_scopes(
+        cache_dir, project_root, state_dir, project_paths, dry_run=dry_run
+    )
+    if not dry_run:
+        gc.register_project(cache_dir, project_root, state_dir)
     if gone:
         _echo(gc.dropped_note(gone), to_stderr=notes_to_stderr)
 
@@ -245,13 +248,23 @@ def gc_cmd(
             roots = gc.collect_roots(
                 scopes, cache_dir, prune_state_dir=state_dir, valid_run_ids=valid_run_ids
             )
-            if roots["unparseable"]:
+            keep_all = bool(roots["unreadable"] or roots["outward_dirs"])
+            if roots["unreadable"]:
                 _echo(
-                    "Warning: could not parse "
-                    + ", ".join(roots["unparseable"])
+                    "Warning: could not read "
+                    + ", ".join(roots["unreadable"])
                     + " as a stage lock; keeping every cache object, because a lock pivot "
                     + "cannot read may name any of them. Nothing was removed. Fix the lock and "
                     + "re-run.",
+                    to_stderr=True,
+                )
+            if roots["outward_dirs"]:
+                _echo(
+                    "Warning: could not follow symlinked directories that leave the project: "
+                    + ", ".join(roots["outward_dirs"])
+                    + ". The records under them are invisible, so this run keeps every cache "
+                    + "object and removes nothing. Move the directory inside the project, or "
+                    + "point the link at a path inside the project. Nothing was removed.",
                     to_stderr=True,
                 )
             plan = gc.build_plan(
@@ -262,7 +275,7 @@ def gc_cmd(
             # removes and `kept` is what would survive.
             removed = gc.ObjectCount(objects=len(plan["doomed"]), bytes=plan["doomed_bytes"])
             if dry_run:
-                if would_prune and not roots["unparseable"]:
+                if would_prune and not keep_all:
                     _echo(
                         f"Would prune {would_prune:,} runs beyond the retention of {retention} "
                         + "(core.run_history_retention).",
@@ -275,7 +288,7 @@ def gc_cmd(
                     _confirm(plan, object_root, assume_yes=assume_yes)
                 # Confirmed and not refused. Prune first so the deletions' re-read of the records
                 # sees the dropped rows; a run that could not parse a record prunes nothing.
-                if not roots["unparseable"]:
+                if not keep_all:
                     pruned = _apply_prune(state_dir, retention)
                     if pruned:
                         _echo(

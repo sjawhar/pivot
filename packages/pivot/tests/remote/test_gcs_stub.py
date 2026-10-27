@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import socket
 import traceback
 import tracemalloc
 import types
@@ -29,9 +30,9 @@ from aiohttp import web
 from gcloud.aio.auth import token as gcloud_token
 from gcloud.aio.storage import storage as gcloud_storage_impl
 
-from pivot import config, exceptions
+from pivot import config, exceptions, project
 from pivot.remote import gcs, sync
-from pivot.storage import cache, state
+from pivot.storage import cache, restore, state
 
 if TYPE_CHECKING:
     import pathlib
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
 
     from pytest_mock import MockerFixture
 
+    from conftest import GitRepo
     from pivot.types import TransferResult
 
     Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
@@ -375,7 +377,7 @@ _Operation = "Callable[[gcs.GCSRemote, pathlib.Path], Awaitable[object]]"
             "media",
             _cut_off,
             _download_file,
-            "Cannot reach Google Cloud Storage to read",
+            f"GCS read error for gs://{_BUCKET}/p/files/ab/cdef1234567890: ",
             id="media-cut-off",
         ),
     ],
@@ -423,7 +425,8 @@ async def test_refused_request_reports_status_and_reason_but_never_the_token(
 async def test_refused_impersonation_names_the_status_and_googles_reason(
     google: _Google, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The refusal itself is still explained: the impersonation endpoint's status and message."""
+    """The refusal itself is still explained: the impersonation endpoint's status and message.
+    Refused credentials are not an unreachable remote: the next target tries again."""
     _impersonating(google, tmp_path, monkeypatch)
 
     with pytest.raises(exceptions.RemoteConnectionError) as exc_info:
@@ -432,6 +435,7 @@ async def test_refused_impersonation_names_the_status_and_googles_reason(
     assert str(exc_info.value).endswith(
         "Getting a token failed: HTTP 403: Permission 'iam.serviceAccounts.getAccessToken' denied"
     )
+    assert not isinstance(exc_info.value, exceptions.RemoteUnreachableError)
 
 
 class _ShiftedDatetime:
@@ -782,3 +786,162 @@ async def test_upload_retried_after_a_short_object_succeeds_when_the_retry_is_st
 
     assert results == [{"hash": _HASH, "success": True}]
     assert google.counts["simple"] == 2
+
+
+# -----------------------------------------------------------------------------
+# One object's failure is that object's; only a remote no connection reaches is unreachable
+# -----------------------------------------------------------------------------
+
+
+def _refused_url() -> str:
+    """The URL of a local port nothing listens on, so a connection to it is refused at once."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
+
+
+async def test_download_whose_body_breaks_off_is_downloaded_again_from_its_start(
+    google: _Google, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """A body that breaks off is retried like a failed request: the retry writes the object whole
+    over the partial download, and the download counts."""
+    mocker.patch.object(config, "get_remote_retries", return_value=1)
+    body = os.urandom(1000)
+    content_hash = xxhash.xxh64(body).hexdigest()
+
+    async def cut_off_once(request: web.Request) -> web.StreamResponse:
+        if google.counts["media"] == 1:
+            return await _cut_off(request)
+        return web.Response(body=body)
+
+    google.routes["media"] = cut_off_once
+
+    results = await gcs.GCSRemote(f"gs://{_BUCKET}/p").download_batch(
+        [(content_hash, tmp_path / "dest")], readonly=True
+    )
+
+    assert results == [{"hash": content_hash, "success": True}]
+    assert google.counts["media"] == 2
+    assert (tmp_path / "dest").read_bytes() == body
+
+
+async def test_download_whose_body_keeps_breaking_off_fails_only_that_object(
+    google: _Google, tmp_path: pathlib.Path
+) -> None:
+    """A body that breaks off on every attempt is that object's failed transfer: the remote
+    answered, so the result does not say the remote could not be reached."""
+    google.routes["media"] = _cut_off
+
+    results = await gcs.GCSRemote(f"gs://{_BUCKET}/p").download_batch(
+        [(_HASH, tmp_path / "dest")], readonly=True
+    )
+
+    assert [r["success"] for r in results] == [False]
+    assert "connection_failed" not in results[0], results
+    error = results[0]["error"] if "error" in results[0] else ""
+    assert error.startswith(f"GCS read error for gs://{_BUCKET}/p/files/ab/cdef1234567890: "), error
+
+
+async def test_download_from_a_host_that_refuses_connections_is_unreachable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """A connection that cannot be made, after remote.retries retries, marks the transfer, so get
+    stops using the remote: every object would fail the same way."""
+    monkeypatch.setenv("STORAGE_EMULATOR_HOST", _refused_url())
+    mocker.patch.object(config, "get_remote_retries", return_value=0)
+
+    results = await gcs.GCSRemote(f"gs://{_BUCKET}/p").download_batch(
+        [(_HASH, tmp_path / "dest")], readonly=True
+    )
+
+    assert [(r["success"], r.get("connection_failed")) for r in results] == [(False, True)]
+    error = results[0]["error"] if "error" in results[0] else ""
+    assert error.startswith(
+        f"Cannot reach Google Cloud Storage to read gs://{_BUCKET}/p/files/ab/cdef1234567890: "
+    ), error
+
+
+async def test_token_endpoint_that_cannot_be_reached_is_an_unreachable_remote(
+    google: _Google, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a credentials file in hand, a token request that cannot connect means Google cannot
+    be reached: every target would fail the same way, so get stops using the remote."""
+    credentials = tmp_path / "unreachable-token-endpoint.json"
+    credentials.write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "token_uri": f"{_refused_url()}/token",
+                "client_id": "client",
+                "client_secret": "secret",
+                "refresh_token": "refresh",
+            }
+        )
+    )
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(credentials))
+
+    with pytest.raises(exceptions.RemoteUnreachableError) as exc_info:
+        await gcs.GCSRemote(f"gs://{_BUCKET}/p").download_batch([(_HASH, tmp_path / "dest")])
+
+    assert str(exc_info.value).startswith("Cannot reach Google to get a Cloud Storage token: ")
+
+
+async def test_no_credentials_is_a_credentials_error_though_the_metadata_server_is_unreachable(
+    google: _Google, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a credentials file gcloud-aio asks the GCE metadata server, whose name does not
+    resolve off GCE; that failure names the credentials and does not end get's remote step."""
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(gcloud_token, "GCE_ENDPOINT_TOKEN", f"{_refused_url()}/token")
+
+    with pytest.raises(exceptions.RemoteConnectionError, match=_LOGIN) as exc_info:
+        await gcs.GCSRemote(f"gs://{_BUCKET}/p").download_batch([(_HASH, tmp_path / "dest")])
+
+    assert not isinstance(exc_info.value, exceptions.RemoteUnreachableError)
+
+
+@pytest.mark.parametrize("failure", [_forbidden, _cut_off], ids=["403", "body-cut-off"])
+async def test_get_keeps_using_gcs_after_one_object_fails(
+    google: _Google, git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, failure: Handler
+) -> None:
+    """a.csv's object fails on a remote that answers (a 403, or a body that breaks off on every
+    attempt): a.csv fails, and get still downloads b.csv and c.csv from the remote."""
+    repo_path, commit = git_repo
+    contents = {"a.csv": b"aaa\n", "b.csv": b"bbb\n", "c.csv": b"ccc\n"}
+    hashes = {name: xxhash.xxh64(body).hexdigest() for name, body in contents.items()}
+    for name, content_hash in hashes.items():
+        (repo_path / f"{name}.pvt").write_text(f"path: {name}\nhash: '{content_hash}'\nsize: 4\n")
+    sha = commit("track three files")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    (repo_path / ".pivot" / "cache" / "files").mkdir(parents=True, exist_ok=True)
+
+    async def media(request: web.Request) -> web.StreamResponse:
+        name = request.match_info["name"]
+        if name.endswith(hashes["a.csv"][2:]):
+            return await failure(request)
+        served = next(contents[n] for n, h in hashes.items() if name.endswith(h[2:]))
+        return web.Response(body=served)
+
+    google.routes["media"] = media
+    remote = gcs.GCSRemote(f"gs://{_BUCKET}/p")
+
+    messages, success = await asyncio.to_thread(
+        restore.restore_targets_from_revision,
+        targets=list(contents),
+        rev=sha[:7],
+        output=None,
+        cache_dir=repo_path / ".pivot" / "cache",
+        stage_targets={},
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+        remote_factory=lambda: remote,
+    )
+
+    assert not success, messages
+    assert "a.csv - failed to download from remote: " in messages[0], messages
+    restored = [(repo_path / name).read_bytes() for name in ("b.csv", "c.csv")]
+    assert restored == [b"bbb\n", b"ccc\n"], messages
+    assert google.counts["media"] == 3, "each target asked the remote for its own object"

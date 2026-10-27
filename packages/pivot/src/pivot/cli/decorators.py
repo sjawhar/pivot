@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 import os
@@ -8,7 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import click
 
-from pivot import discovery, exceptions, metrics
+from pivot import config, discovery, exceptions, metrics
 from pivot.cli import errors
 
 logger = logging.getLogger(__name__)
@@ -121,6 +122,12 @@ def pivot_command(
                 # Store all_pipelines flag so Engine can use it for watch mode reload
                 if use_all:
                     _store_all_pipelines_in_context(use_all)
+                # Record this project as a user of its cache (the register), so a collection
+                # run in another project that shares the cache keeps this one's objects. gc
+                # handles registration itself (after its register-read) and does not discover.
+                if auto_discover:
+                    with contextlib.suppress(Exception):
+                        config.register_cache_use()
                 return func(*args, **kwargs)
             finally:
                 metrics.end("cli.total", _t_total)
@@ -173,6 +180,15 @@ resources_option = click.option(
     help="Set a scheduler resource capacity. May be repeated.",
 )
 """The ``--resources`` option of every command that runs stages, parsed to ``dict[str, int]``."""
+
+checkout_mode_option = click.option(
+    "--checkout-mode",
+    type=click.Choice(["symlink", "hardlink", "copy"]),
+    default=None,
+    help="Checkout mode (default: cache.checkout_mode, else hardlink, symlink, copy)",
+)
+"""The ``--checkout-mode`` option of every command that restores outputs: ``checkout``, ``get`` and
+``pull``. None means the configured order."""
 
 
 def store_pipeline_in_context(pipeline: PipelineLike) -> None:
