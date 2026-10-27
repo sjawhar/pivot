@@ -3461,6 +3461,24 @@ def test_make_writable_and_retry_handles_directory(tmp_path: pathlib.Path) -> No
             os.chmod(ro_dir, 0o755)
 
 
+def test_make_writable_and_retry_reraises_the_real_error_for_os_open(
+    tmp_path: pathlib.Path,
+) -> None:
+    """shutil.rmtree's fd walk hands os.open to the handler for a directory it cannot enter.
+    Retrying it as func(path) would omit the flags argument and raise TypeError; the handler
+    raises the real OSError instead, so a caller sees why the removal failed."""
+    unreadable = tmp_path / "noread"
+    unreadable.mkdir()
+    os.chmod(unreadable, 0o000)
+    original = PermissionError("cannot open directory")
+    try:
+        with pytest.raises(OSError) as excinfo:
+            cache._make_writable_and_retry(os.open, str(unreadable), original)  # pyright: ignore[reportArgumentType] - shutil.rmtree hands os.open here at runtime; the test exercises that mismatch
+        assert excinfo.value is original
+    finally:
+        os.chmod(unreadable, 0o755)
+
+
 # === Path Traversal Security Tests ===
 
 

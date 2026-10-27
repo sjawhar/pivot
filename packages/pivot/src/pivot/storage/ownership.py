@@ -70,13 +70,33 @@ class DeclaredOutput(TypedDict):
     stage: str
 
 
-class OutputOverlap(TypedDict):
+class SidecarOverlap(TypedDict):
     """A ``.pvt`` sidecar that replacing ``replacement`` would remove or orphan."""
 
     tracked_path: pathlib.Path | None
     """The path the sidecar tracks; None when Pivot cannot parse the sidecar."""
     pvt_path: pathlib.Path
     replacement: Replacement
+
+
+class UnreadableOverlap(TypedDict):
+    """A directory beneath ``replacement`` Pivot cannot read, so it cannot prove no tracked file
+    hides inside it. A blocking overlap: Pivot refuses rather than delete what it cannot see."""
+
+    unreadable_dir: pathlib.Path
+    replacement: Replacement
+
+
+# A path a replacement must not remove: a user ``.pvt`` sidecar, or a directory Pivot could not
+# read and so cannot clear of user files.
+type OutputOverlap = SidecarOverlap | UnreadableOverlap
+
+
+def overlap_path(overlap: OutputOverlap) -> pathlib.Path:
+    """The path an overlap names: its ``.pvt`` sidecar, or the directory Pivot could not read."""
+    if "unreadable_dir" in overlap:
+        return overlap["unreadable_dir"]
+    return overlap["pvt_path"]
 
 
 def stage_output(path: pathlib.Path, stage: str | None = None) -> Replacement:
@@ -254,7 +274,8 @@ def find_output_overlaps(
     replacements: Sequence[Replacement],
     members_of: Callable[[pathlib.Path], StageMembers] | None = None,
 ) -> list[OutputOverlap]:
-    """Find the ``.pvt`` sidecars that replacing each path would remove or orphan.
+    """Find what replacing each path would remove or orphan: a user ``.pvt`` sidecar, or a
+    directory Pivot cannot read.
 
     Looks only where a replacement reaches. For a stage output or a destination, at the path and
     at each directory above it up to the project root, the sidecar Pivot would write for that
@@ -263,6 +284,10 @@ def find_output_overlaps(
     symlink removes nothing it points to), every ``*.pvt`` file counts unless it is one of the
     path's own members: ``members_of`` maps a replaced path to them and is called only for a path
     that holds a ``*.pvt``.
+
+    A directory under such a path that Pivot cannot read blocks the replacement too (``os.walk``
+    reports it through ``onerror``): Pivot cannot prove no tracked file hides inside, so it
+    refuses rather than skip it.
 
     It never walks the rest of the project, so it does not see a hand-edited ``.pvt`` elsewhere
     whose ``path`` names a file inside an output; Pivot never writes one.
@@ -279,7 +304,7 @@ def find_output_overlaps(
             if pvt_path.is_file() or pvt_path.is_symlink():
                 data = track.read_pvt_file(pvt_path)
                 if data is None or pvt_path.parent / data["path"] == current:
-                    found[pvt_path] = OutputOverlap(
+                    found[pvt_path] = SidecarOverlap(
                         tracked_path=None if data is None else current,
                         pvt_path=pvt_path,
                         replacement=replacement,
@@ -289,7 +314,8 @@ def find_output_overlaps(
         if not output_path.is_dir() or output_path.is_symlink():
             continue
         members: StageMembers | None = None
-        for dirpath, _dirnames, filenames in os.walk(output_path):
+        unreadable = list[OSError]()
+        for dirpath, _dirnames, filenames in os.walk(output_path, onerror=unreadable.append):
             for name in filenames:
                 if not name.endswith(".pvt"):
                     continue
@@ -299,12 +325,20 @@ def find_output_overlaps(
                     members = members_of(output_path) if members_of is not None else {}
                 if _is_stage_member(pvt_path, data, members):
                     continue
-                found[pvt_path] = OutputOverlap(
+                found[pvt_path] = SidecarOverlap(
                     tracked_path=None if data is None else pvt_path.parent / data["path"],
                     pvt_path=pvt_path,
                     replacement=replacement,
                 )
-    return sorted(found.values(), key=lambda overlap: overlap["pvt_path"])
+        # A directory os.walk could not enter may hide a tracked file; block it, never skip it.
+        for error in unreadable:
+            if error.filename is None:
+                continue
+            blocked = pathlib.Path(error.filename)
+            found.setdefault(
+                blocked, UnreadableOverlap(unreadable_dir=blocked, replacement=replacement)
+            )
+    return sorted(found.values(), key=overlap_path)
 
 
 def _display(path: pathlib.Path, project_root: pathlib.Path) -> str:
@@ -336,6 +370,13 @@ def _relation(path: pathlib.Path, replaced: pathlib.Path) -> str:
 def _describe(overlap: OutputOverlap, project_root: pathlib.Path) -> str:
     label = _label(overlap["replacement"], project_root)
     replaced = normalized(overlap["replacement"]["path"])
+    if "unreadable_dir" in overlap:
+        directory = _display(overlap["unreadable_dir"], project_root)
+        relation = _relation(normalized(overlap["unreadable_dir"]), replaced)
+        return (
+            f"directory '{directory}', which Pivot cannot read, {relation} {label}; "
+            + "Pivot cannot tell whether a tracked file is inside it"
+        )
     pvt = _display(overlap["pvt_path"], project_root)
     tracked_path = overlap["tracked_path"]
     if tracked_path is not None:
@@ -418,7 +459,10 @@ def find_declared_overlap(
 
 
 def _warning(overlap: OutputOverlap, project_root: pathlib.Path) -> str:
-    moved = "the tracked path and its sidecar" if overlap["tracked_path"] is not None else "it"
+    if "unreadable_dir" in overlap:
+        moved = "it"
+    else:
+        moved = "the tracked path and its sidecar" if overlap["tracked_path"] is not None else "it"
     return (
         f"Warning: {_describe(overlap, project_root)}. Move {moved} outside every stage output "
         + "(for example under data/raw/); until then Pivot refuses to replace that output."

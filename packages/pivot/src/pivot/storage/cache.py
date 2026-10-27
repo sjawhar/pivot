@@ -420,6 +420,13 @@ def _make_writable_and_retry(func: Callable[[str], object], path: str, exc: Base
         if chmod_exc.errno not in (errno.ENOENT, errno.EPERM):
             raise exc from chmod_exc
 
+    if func is os.open:
+        # shutil.rmtree's fd walk hands os.open here when it cannot open a directory
+        # (os.open(name, flags, dir_fd=...)); retrying it as func(path) omits the flags argument
+        # and raises TypeError. A restore refuses an unreadable directory before any delete
+        # reaches rmtree, so this is unreachable there; raise the real error if another caller
+        # lands here, never a TypeError.
+        raise exc
     func(path)
 
 

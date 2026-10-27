@@ -158,7 +158,7 @@ def _ownership_refusal(
     for replacement in checked:
         found = ownership.find_output_overlaps(project_root, [replacement], members_of)
         for overlap in found:
-            key = (overlap["pvt_path"], ownership.normalized(replacement["path"]))
+            key = (ownership.overlap_path(overlap), ownership.normalized(replacement["path"]))
             overlaps.setdefault(key, overlap)
     if not overlaps:
         return None

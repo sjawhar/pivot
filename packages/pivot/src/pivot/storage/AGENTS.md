@@ -144,6 +144,9 @@ When multiple `pivot` processes share the same StateDB:
   the project, so it does not see a `.pvt` outside an output whose `path` field names a file inside
   it. Pivot never writes one (`track`, `import` and `update` write the data file's own name), and
   catching a hand-edited one would need a project-wide walk on every output write.
+- A directory under a replacement that Pivot cannot read is a blocking overlap
+  (`ownership.UnreadableOverlap`): `os.walk` reports it through `onerror`, and Pivot refuses,
+  naming it, rather than skip it, because a tracked file may hide inside where it cannot look.
 - A stage may return a directory member named `*.pvt`. One is the stage's own when the stage
   records it (`ownership.StageMembers`): the lock's output hash, the hash a restore writes, this
   run's return value, or the stage's `nocommit:<stage>` record (`ownership.no_commit_members`, a

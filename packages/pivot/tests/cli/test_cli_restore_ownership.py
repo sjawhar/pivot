@@ -7,18 +7,22 @@ that writes one. A forced checkout checks every target before it changes any.
 
 from __future__ import annotations
 
+import contextlib
+import stat
 from typing import TYPE_CHECKING
 
 import pytest
 
 from conftest import isolated_pivot_dir
-from pivot import cli, project
+from pivot import cli, project, types
+from pivot.remote import storage as remote_storage
 from pivot.storage import track
 
 if TYPE_CHECKING:
     import pathlib
 
     from click.testing import CliRunner
+    from pytest_mock import MockerFixture
 
     from conftest import GitRepo
 
@@ -246,4 +250,126 @@ def test_forced_checkout_all_changes_nothing_when_it_refuses_a_target(
         assert result.exit_code != 0, result.output
         assert saved.read_text() == "saved"
         assert track.get_pvt_path(saved).is_file()
+        assert raw.read_text() == "local edit", result.output
+
+
+@contextlib.contextmanager
+def _unreadable(path: pathlib.Path):
+    """Make ``path`` mode 0 for the body, then restore it so tmp cleanup can remove it."""
+    original = path.stat().st_mode
+    path.chmod(0)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            path.chmod(original | stat.S_IRWXU)
+
+
+def test_forced_get_keeps_a_tracked_file_under_an_unreadable_directory(
+    runner: CliRunner, git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`pivot get --rev R b/tree --force` restores R's output over the current output path. A
+    subdirectory the user locked to mode 0 may hide a tracked file, so Pivot refuses, names the
+    directory it cannot read, and keeps the file."""
+    repo_path, commit = git_repo
+    (repo_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.chdir(repo_path)
+    (repo_path / "pipeline.py").write_text(_DIRECTORY_OUTPUT_PIPELINE)
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+    sha = commit("tree output")
+    # Track a file inside the output while the stage is not registered (main allowed it).
+    (repo_path / "pipeline.py").write_text(_A_PIPELINE)
+    secret_dir = repo_path / "data" / "b" / "tree" / "sekret"
+    secret_dir.mkdir(parents=True)
+    tracked = secret_dir / "h.txt"
+    tracked.write_text("user secret bytes")
+    assert runner.invoke(cli.cli, ["track", str(tracked.relative_to(repo_path))]).exit_code == 0
+    sidecar = track.get_pvt_path(tracked)
+    assert sidecar.is_file()
+    (repo_path / "pipeline.py").write_text(_DIRECTORY_OUTPUT_PIPELINE)
+
+    with _unreadable(secret_dir):
+        result = runner.invoke(cli.cli, ["get", "--rev", sha[:7], "b/tree", "--force"])
+
+    assert tracked.is_file(), result.output
+    assert tracked.read_text() == "user secret bytes"
+    assert sidecar.is_file()
+    assert result.exit_code != 0, result.output
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(["pull", "b/tree", "--force"], id="pull-stage-force"),
+        pytest.param(["pull", "--force"], id="pull-all-force"),
+    ],
+)
+def test_forced_pull_keeps_a_tracked_file_under_an_unreadable_directory(
+    runner: CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture, command: list[str]
+) -> None:
+    """`pivot pull --force` fetches, then restores through checkout. A subdirectory the user
+    locked to mode 0 may hide a tracked file, so the checkout step refuses and keeps it."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_DIRECTORY_OUTPUT_PIPELINE)
+        assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+        (root / "pipeline.py").write_text(_A_PIPELINE)
+        secret_dir = root / "data" / "b" / "tree" / "sekret"
+        secret_dir.mkdir(parents=True)
+        tracked = secret_dir / "h.txt"
+        tracked.write_text("user secret bytes")
+        assert runner.invoke(cli.cli, ["track", str(tracked.relative_to(root))]).exit_code == 0
+        sidecar = track.get_pvt_path(tracked)
+        assert sidecar.is_file()
+        (root / "pipeline.py").write_text(_DIRECTORY_OUTPUT_PIPELINE)
+        # The cache already holds the output, so the fetch step is a no-op; only the checkout
+        # step runs, and that is where the ownership check must refuse.
+        mocker.patch(
+            "pivot.remote.sync.create_remote_from_name",
+            return_value=(mocker.Mock(spec=remote_storage.S3Remote), "origin"),
+        )
+        mocker.patch(
+            "pivot.remote.sync.pull",
+            return_value=types.TransferSummary(transferred=0, skipped=0, failed=0, errors=[]),
+        )
+
+        with _unreadable(secret_dir):
+            result = runner.invoke(cli.cli, command)
+
+        assert tracked.is_file(), result.output
+        assert tracked.read_text() == "user secret bytes"
+        assert sidecar.is_file()
+        assert result.exit_code != 0, result.output
+
+
+def test_forced_checkout_all_leaves_a_sibling_untouched_when_a_directory_is_unreadable(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """`checkout --all --force` refuses a stage output when a subdirectory inside it is unreadable
+    (it may hide a tracked file). A command that refuses removes nothing: a sibling target, a
+    tracked file with a local edit, keeps that edit."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_DIRECTORY_OUTPUT_PIPELINE)
+        assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+        # Both tracked while no pipeline declared data/b/tree (main's track allowed it).
+        (root / "pipeline.py").write_text(_A_PIPELINE)
+        secret_dir = root / "data" / "b" / "tree" / "sekret"
+        secret_dir.mkdir(parents=True)
+        tracked = secret_dir / "h.txt"
+        tracked.write_text("user secret bytes")
+        raw = root / "data" / "raw" / "in.txt"
+        raw.parent.mkdir(parents=True)
+        raw.write_text("raw v1")
+        result = runner.invoke(cli.cli, ["track", "data/b/tree/sekret/h.txt", "data/raw/in.txt"])
+        assert result.exit_code == 0, result.output
+        (root / "pipeline.py").write_text(_DIRECTORY_OUTPUT_PIPELINE)
+        raw.unlink()
+        raw.write_text("local edit")
+
+        with _unreadable(secret_dir):
+            result = runner.invoke(cli.cli, ["checkout", "--all", "--force"])
+
+        assert result.exit_code != 0, result.output
+        assert tracked.read_text() == "user secret bytes"
+        assert track.get_pvt_path(tracked).is_file()
         assert raw.read_text() == "local edit", result.output

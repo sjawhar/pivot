@@ -459,7 +459,8 @@ outputs, so a tracked file or sidecar at one of their paths refuses it too. Only
 `--only-missing` directory swap replace an existing path. `--force` checks every target before it
 changes any: if it refuses one, it changes nothing and exits 1, naming every refused target and
 the files that block it. `pivot pull --force` restores the same way. An `--only-missing` swap is
-checked when it is decided.
+checked when it is decided. A directory inside an output that Pivot cannot read refuses the
+restore too, naming that directory: a tracked file may hide inside where Pivot cannot look.
 
 ---
 
