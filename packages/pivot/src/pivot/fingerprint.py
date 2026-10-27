@@ -190,8 +190,13 @@ _schema_hash_cache: weakref.WeakKeyDictionary[type, str] = weakref.WeakKeyDictio
 # Workers (via ProcessPoolExecutor) have their own memory space and don't share this
 # state - any pending writes in workers are lost, which is fine since workers use
 # readonly StateDB and fingerprinting should complete during discovery.
+# `_state_db` is the readonly StateDB the persistent caches read, opened for `_state_db_dir`, the
+# state directory of project root `_state_db_root`. It follows the state directory
+# (`_get_state_db`), so a process that moves to another project reads that project's caches; it
+# is None after a failed open, not retried for that directory.
 _state_db: "StateDB | None" = None
-_state_db_init_attempted: bool = False
+_state_db_dir: pathlib.Path | None = None
+_state_db_root: pathlib.Path | None = None
 
 
 class _PendingCacheWrites(TypedDict):
@@ -305,11 +310,13 @@ class FunctionIdentity(TypedDict):
 
 
 def _close_state_db() -> None:
-    """Close the readonly StateDB on process exit."""
-    global _state_db
+    """Close the readonly StateDB the persistent caches read."""
+    global _state_db, _state_db_dir, _state_db_root
     if _state_db is not None:
         _state_db.close()
-        _state_db = None
+    _state_db = None
+    _state_db_dir = None
+    _state_db_root = None
 
 
 atexit.register(_close_state_db)
@@ -327,22 +334,37 @@ def _flush_pending_caches() -> None:  # pyright: ignore[reportUnusedFunction] - 
 
 
 def _get_state_db() -> "StateDB | None":
-    """Get readonly StateDB for fingerprint caching (graceful degradation).
+    """Get the current state directory's readonly StateDB for fingerprint caching (graceful
+    degradation).
+
+    The handle is reopened when the state directory changes, as when a process moves to another
+    project, so a lookup reads only the current project's caches. A failed open is not retried
+    for the same directory. The state directory is computed again only when the project root
+    changes: its other input, the merged config, is read once per process
+    (`io.get_merged_config`), and an identity check keeps each lookup cheap.
 
     Not thread-safe, but fingerprinting runs single-threaded per process
     (see comment at line 33). Workers use separate memory spaces.
     """
-    global _state_db, _state_db_init_attempted
-    if _state_db is not None:
-        return _state_db
-    if _state_db_init_attempted:
-        return None  # Already tried and failed
-    _state_db_init_attempted = True
+    global _state_db, _state_db_dir, _state_db_root
     try:
+        from pivot import project
+
+        root = project.get_project_root()
+        if root is _state_db_root:
+            return _state_db
+
         from pivot.config import io
         from pivot.storage import state
 
-        _state_db = state.StateDB(io.get_state_dir(), readonly=True)
+        state_dir = io.get_state_dir()
+        if state_dir == _state_db_dir:
+            _state_db_root = root
+            return _state_db
+        _close_state_db()
+        _state_db_dir = state_dir
+        _state_db_root = root
+        _state_db = state.StateDB(state_dir, readonly=True)
         return _state_db
     except Exception:
         # OSError (filesystem), ImportError (module), lmdb.Error, etc.
