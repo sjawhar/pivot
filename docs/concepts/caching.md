@@ -37,10 +37,16 @@ listing hash, total size and file count.
 
 Each prefix directory also holds a `.pivot_cache.lock` file, and while a file
 or directory is being cached a `.pivot_tmp_*` entry; in `symlink` checkout
-mode, each cached directory tree has a `<hash>.verified` marker and may have
-a `<hash>.lock` file beside it. Pivot keeps the lock files and removes the
+mode, each cached directory tree has a `<hash>.content-checked` marker and may
+have a `<hash>.lock` file beside it. Pivot keeps the lock files and removes the
 `.pivot_tmp_*` entries a killed process leaves (at most once an hour per
-prefix directory). Do not delete these files while pivot runs.
+prefix directory). Do not delete these files while pivot runs. A tree that
+pivot 0.5.11 or older marked `<hash>.verified` is checked by content again,
+then marked anew. A user who cannot write the cache cannot mark it, so pivot
+checks the tree on each of their symlink restores and commits, and their
+symlink commit through a stale one fails. One
+`pivot checkout --checkout-mode symlink` through the tree by a user who can
+write the cache ends this.
 
 A cache several machines share (a `cache.dir` on a network filesystem) needs
 file locks that work across those machines: NFSv4, or NFSv3 with its lock

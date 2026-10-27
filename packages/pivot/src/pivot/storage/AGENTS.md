@@ -18,7 +18,7 @@ Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not 
 
 ## File-Hash Write-Back
 
-Every command that writes the workspace records the hash of each file it reads, commits or restores, so `pivot status --explain` (read-only; it writes nothing) finds a matching entry and reads no file. The one exception is a run with `--no-commit`, which by design writes no lock, cache or StateDB entry. A new command that writes or reads workspace files must record them the same way:
+Every command that writes the workspace records the hash of each file it reads, commits or restores, so `pivot status --explain` and `pivot verify` (both read-only; they write nothing and go through the same explanation path) find a matching entry and read no file. The one exception is a run with `--no-commit`, which by design writes no lock, cache or StateDB entry. A new command that writes or reads workspace files must record them the same way:
 
 - `hash_file(..., pending=...)` and `hash_directory(..., pending=...)` append `(path, stat, hash)` for each file they had to read instead of saving it; a caller with a writable StateDB saves them with one `save_many`.
 - A restore records each file with the stat of what it staged, taken before the rename puts it in place (the same inode): `cache.restore_from_cache(..., recorded=...)`, `cache.atomic_write_file`'s return value. A write that lands after the rename then changes the stat, so the entry does not vouch for it.
@@ -107,11 +107,20 @@ When multiple `pivot` processes share the same StateDB:
   opened read-only. Lock files are never deleted.
 - A whole-directory SYMLINK tree lives at `<cache root>/trees/XX/YYYY...` (`cache.tree_path`),
   named by the directory hash. It is built under a temporary name beside its name, renamed
-  into place, checked, then marked (`<tree>.verified`), because a restore symlinks to a tree as
-  soon as its name exists. A restore or commit checks an unmarked tree (exact files, sizes,
-  executable bits and directories) under the tree's exclusive `<tree>.lock`, repairs it in place
-  from the files' own cache objects, then marks it. A tree it cannot repair is not used: a
-  restore goes file by file, a commit fails.
+  into place, checked, then marked (`<tree>.content-checked`), because a restore symlinks to a
+  tree as soon as its name exists. A restore or commit checks every unmarked tree member's path,
+  content hash, size and executable bit, plus its directories, under the tree's exclusive
+  `<tree>.lock`; it repairs mismatches in place from the files' own cache objects, then marks the
+  tree. A tree it cannot check or repair (a file's object is absent, or this user cannot read or
+  write the tree) is not used: a restore goes file by file, a commit fails. Only
+  `<tree>.content-checked` is trusted: `<tree>.layout-checked` (pivot 0.3.4, partial trees
+  included) and `<tree>.verified` (pivot 0.3.5 to 0.5.11, sizes only) are older marks that never
+  checked content, so such a tree is checked again and the old mark removed. The mark is only
+  written where this user can write the tree's prefix directory: for a user who cannot, every
+  symlink restore or commit checks an old-marked tree again, and a symlink commit through a
+  stale one fails, until a user who can write the cache runs one
+  `pivot checkout --checkout-mode symlink` through it. That cost is the price of not trusting a
+  size-only mark.
 - The object at a directory's hash under `files/` is its listing (`listing.store_object`),
   read-only like every object. Every listing read follows one rule (`listing._resolve`): a
   committed listing (workspace file, or a file at a git revision) that hashes to the recorded
@@ -124,18 +133,23 @@ When multiple `pivot` processes share the same StateDB:
 - A lock records a directory as `{listing, size, nfiles}` on disk (`StorageLockData` holds the
   listing's hash under `hash`, as for a file; `lock._from_document`/`_to_document` convert). The
   key is not `hash` because every released pivot reads an entry with a `hash` and no inline
-  `manifest` as one file. A lock that records a directory keeps every entry under `records`
-  and leaves `deps` and `outs` empty (`lock._shaped`): released pivots read that as a lock that
-  records nothing, rerun an ordinary stage, and stop at an incremental one instead of
-  restarting it from empty. Run-cache keys hold `run_history._DIRECTORY_RECORD` for the same
-  reason; an older pivot's entry is looked up under `worker.older_pivot_input_hash`.
-- A stage with an incremental output whose lock an older pivot rewrote while this pivot's
-  output listing is still beside it is refused (`lock.restarted_listings`): `status`/`verify`
-  through `explain.get_stage_explanation`, `repro` in `engine` before it schedules anything.
-- `StageLock.write` writes each directory output's listing (`listing.output_listing_path`) and
-  each directory input's (`listing.input_listing_path`) before the lock, leaving a file that
-  already holds the bytes untouched. It is the one writer of lock and listing files (Task 2.2
-  of the BET-36 plan moves that call to the coordinator).
+  `manifest` as one file. A lock that records a directory keeps every entry under `records` and
+  leaves `deps` and `outs` empty (`lock._shaped`): released pivots read that as a lock that
+  records nothing, rerun an ordinary stage, and stop at an incremental one instead of restarting
+  it from empty. Run-cache keys hold `run_history._DIRECTORY_RECORD` for the same reason; an
+  older pivot's entry is looked up under `worker.older_pivot_input_hash`.
+- A stage with an incremental output commits a restart proof beside its lock
+  (`lock.restart_proof_path`, a `.incremental` file this pivot owns). No released pivot writes
+  one, so this file — or, for a directory output, this pivot's committed output listing — beside
+  a lock an older pivot wrote is proof this pivot wrote the lock first and the older pivot
+  replaced it, which may have restarted the output from empty. Such a stage is refused
+  (`lock.restart_proofs`): `status`/`verify` through `explain.get_stage_explanation`, `repro`
+  in `engine` before it schedules anything.
+- `StageLock.write` writes each directory output's listing (`listing.output_listing_path`),
+  each directory input's (`listing.input_listing_path`) and, for an incremental stage, the
+  restart proof before the lock, leaving a file that already holds the bytes untouched. It is
+  the one writer of lock, listing and restart-proof files (Task 2.2 of the BET-36 plan moves
+  that call to the coordinator).
 - A lock whose `schema_version` is below `lock.SCHEMA_VERSION` (an older pivot's, listing a
   directory's files inline) is read as it is, with one warning per process: `StageLock.read`
   converts each inline listing to its record and stores the listing in the cache it is given,

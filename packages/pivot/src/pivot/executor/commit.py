@@ -218,6 +218,7 @@ def commit_stages(
                         stage_info["deps"], store, new_lock_data["dep_hashes"]
                     ),
                     cache_dir=store.cache_dir,
+                    outs=stage_outs,
                 )
             except exceptions.InvalidPathError as exc:
                 logger.error("%s — skipping", exc)

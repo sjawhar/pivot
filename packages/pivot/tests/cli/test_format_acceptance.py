@@ -327,7 +327,8 @@ with Pipeline("p") as pipeline:
 def _helper_rewrite_as_schema_2(lock_path: pathlib.Path) -> None:
     """Rewrite a lock the way pivot 0.5.9 wrote it: schema 2, each directory listing its files
     inline (its old hash is any valid one: this pivot computes the record from the list). The
-    caller removes the listing files, which no older pivot wrote."""
+    caller removes the listing files, which no older pivot wrote; the stage's restart proof,
+    which no older pivot writes either, is removed here."""
     data = yaml.safe_load(lock_path.read_text())
     data.update(data.pop("records", {}))
     data["schema_version"] = 2
@@ -347,6 +348,7 @@ def _helper_rewrite_as_schema_2(lock_path: pathlib.Path) -> None:
         entry["manifest"] = [dict(file) for file in members["files"]]
         entry["empty_dirs"] = members["empty_dirs"]
     lock_path.write_text(yaml.safe_dump(data, sort_keys=False))
+    lock_path.with_suffix(".incremental").unlink(missing_ok=True)
 
 
 def test_an_old_file_lock_is_read_as_it_is_with_one_warning(tmp_path: pathlib.Path) -> None:

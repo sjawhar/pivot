@@ -688,7 +688,7 @@ def check_restarted_incremental_outputs(
     all_stages: dict[str, RegistryStageInfo],
 ) -> list[str]:
     """Why each stage in ``execution_order`` whose lock an older pivot rewrote over this
-    pivot's, for a stage with an incremental output, is refused (``lock.restarted_listings``)."""
+    pivot's, for a stage with an incremental output, is refused (``lock.restart_proofs``)."""
     refused = list[str]()
     default_state_dir = config.get_state_dir()
     cache_dir = config.get_cache_dir() / "files"
@@ -698,7 +698,7 @@ def check_restarted_incremental_outputs(
             continue
         stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
-        restarted = lock.restarted_listings(
+        restarted = lock.restart_proofs(
             stage_lock, stage_lock.read(cache_dir=cache_dir), stage_info["outs"]
         )
         if restarted:

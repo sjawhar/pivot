@@ -5,8 +5,10 @@ storing fingerprints, params, and hashes to detect when re-runs are needed.
 A lock records a directory by its listing's hash, its total size and its file count
 (``listing``, ``size``, ``nfiles``), and then keeps all its entries under ``records``
 (``_RECORDS_KEY``); the directory's listing is committed beside the lock
-(``storage/listing.py``), and ``StageLock.write`` writes both. A lock an older pivot wrote is
-read as it is (``StageLock.read``).
+(``storage/listing.py``), and ``StageLock.write`` writes both. A stage that keeps an
+incremental output commits a restart proof beside its lock (``restart_proof_path``), so an
+older pivot's rewrite of that lock is caught (``restart_proofs``). A lock an older pivot wrote
+is read as it is (``StageLock.read``).
 
 For runtime mutual exclusion during concurrent execution, see
 ``pivot.storage.artifact_lock`` which uses flock-based artifact locks.
@@ -63,10 +65,22 @@ restore a directory's listing in the directory's place, so no directory record h
 _RECORDS_KEY = "records"
 """Where a lock that records a directory keeps its ``deps`` and ``outs``, leaving the top-level
 ``deps`` and ``outs`` empty. Every released pivot (0.5.2 … 0.5.11 read alike) validates those
-empty lists as a lock that records nothing: it reruns an ordinary stage from its inputs, and for a
-stage with an incremental output it stops with "Cache missing for incremental output" instead of
-restarting that output from empty, which it would do for a lock it read as missing. A lock that
-records only files keeps them at the top level, where those pivots read them as before."""
+empty lists as a lock that records nothing: it reruns an ordinary stage from its inputs, and for
+a stage with an incremental output it stops with "Cache missing for incremental output" instead
+of restarting that output from empty, which it would do for a lock it read as missing. A lock
+that records only files keeps them at the top level, where those pivots read them as before."""
+_RESTART_PROOF_SUFFIX = ".incremental"
+"""The suffix of the file this pivot writes beside the lock of a stage that keeps an incremental
+output and commits with it (``restart_proof_path``). No released pivot writes one, so this file
+beside a lock an older pivot wrote (``older_format``) is proof that this pivot wrote that stage's
+lock first and the older pivot replaced it — removing the lock and restarting the output from
+empty, or rerunning the stage — so the lock it left is not the stage's history
+(``restart_proofs``)."""
+_RESTART_PROOF_TEXT = """\
+# Pivot wrote this file beside the lock of a stage that keeps an incremental output, and reads
+# it to tell its own lock from one an older pivot wrote in that lock's place, which may have
+# restarted the output from empty. Commit it with the lock; it is the same in every project.
+"""
 
 SCHEMA_VERSION = 3
 STAGES_REL_PATH = ".pivot/stages"
@@ -79,6 +93,30 @@ def get_stages_dir(state_dir: pathlib.Path) -> pathlib.Path:
     .pivot/cache/stages/ so they can be versioned for reproducibility.
     """
     return state_dir / "stages"
+
+
+def restart_proof_path(stages_dir: pathlib.Path, stage_name: str) -> pathlib.Path:
+    """Where pivot records that it wrote ``stage_name``'s lock, beside that lock, for a stage
+    that keeps an incremental output (``_RESTART_PROOF_SUFFIX``). A stage name is short enough
+    for a lock file name, so it is short enough for this one."""
+    return stages_dir / f"{stage_name}{_RESTART_PROOF_SUFFIX}"
+
+
+def _write_restart_proof(path: pathlib.Path) -> None:
+    """Write the restart proof at ``path`` atomically, leaving one that holds its bytes
+    untouched: the file belongs to the project's history, and every run writes the same bytes."""
+    data = _RESTART_PROOF_TEXT.encode()
+    try:
+        if path.read_bytes() == data:
+            return
+    except OSError:
+        pass
+
+    def write_bytes(fd: int) -> None:
+        with os.fdopen(fd, "wb") as f:
+            _ = f.write(data)
+
+    cache.atomic_write_file(path, write_bytes)
 
 
 def stage_name_error(name: str) -> str | None:
@@ -630,6 +668,12 @@ class StageLock:
         """Where the listing of this stage's directory output ``identity`` is committed."""
         return listing.output_listing_path(self.stages_dir, identity)
 
+    @property
+    def restart_proof_path(self) -> pathlib.Path:
+        """Where this pivot records that it wrote this stage's lock, for a stage that keeps an
+        incremental output (``restart_proof_path``)."""
+        return restart_proof_path(self.stages_dir, self.stage_name)
+
     def write(
         self,
         data: LockData,
@@ -637,22 +681,29 @@ class StageLock:
         hashed_dirs: Mapping[str, listing.HashedDirectory] | None = None,
         input_paths: Mapping[ArtifactIdentity, str] | None = None,
         cache_dir: pathlib.Path | None = None,
+        outs: Iterable[ArtifactRef] = (),
     ) -> list[pathlib.Path]:
-        """Write the lock file and the listing of each directory it records, atomically, and
-        return the paths of the files it wrote or left unchanged.
+        """Write the lock file, the listing of each directory it records and, for a stage that
+        ``outs`` says keeps an incremental output, the restart proof, atomically, and return the
+        paths of the files it wrote or left unchanged.
 
         A directory output's listing goes to ``listing.output_listing_path``; a directory
         dependency named in ``input_paths`` (a pipeline input, by its project-relative path)
         has its listing at ``listing.input_listing_path``. A listing comes from ``hashed_dirs``
-        (by directory hash), else from the cache object in ``cache_dir``. Each listing is
-        written before the lock, so no lock names a listing not yet written; a file already
-        holding the bytes is left as it is.
+        (by directory hash), else from the cache object in ``cache_dir``. Each listing, and the
+        restart proof, is written before the lock, so no lock names a listing not yet written
+        and none stands without its proof; a file already holding the bytes is left as it is.
+
+        ``outs`` are the stage's registered outputs. A stage with an incremental one commits the
+        restart proof beside its lock (``_RESTART_PROOF_SUFFIX``), so that an older pivot's
+        rewrite of that lock is caught (``restart_proofs``).
 
         Every recorded path must pass ``path_policy.recorded_path_error``, the rule ``read``
         applies to a lock's paths, so this never writes a lock that ``read`` refuses; a path that
         fails raises InvalidPathError naming it. A recorded name that holds a control character
         is written, and one warning names every such name.
         """
+        incremental = any(ref.tag is ArtifactTag.INCREMENTAL for ref in outs)
         hashed_dirs = hashed_dirs or {}
         input_paths = input_paths or {}
         normalized_outs = _ensure_identity_keys(data["output_hashes"])
@@ -733,6 +784,9 @@ class StageLock:
                 listing.store_object(cache_dir, item.record["hash"], item.data)
             listing.write(item.target, item.data)
             written.append(item.target)
+        if incremental:
+            _write_restart_proof(self.restart_proof_path)
+            written.append(self.restart_proof_path)
 
         def write_yaml(fd: int) -> None:
             with os.fdopen(fd, "w") as f:
@@ -752,41 +806,44 @@ def committed_listing(lock_data: LockData, path: pathlib.Path) -> pathlib.Path |
     return None if "older_format" in lock_data else path
 
 
-def restarted_listings(
+def restart_proofs(
     stage_lock: StageLock, lock_data: LockData | None, outs: Iterable[ArtifactRef]
 ) -> list[pathlib.Path]:
-    """The output listings this pivot wrote that still stand beside ``lock_data``, a lock an
-    older pivot rewrote (``older_format``), for a stage with an incremental output; empty for
-    any other stage or lock.
+    """The files this pivot wrote that still stand beside ``lock_data``, a lock an older pivot
+    rewrote (``older_format``), for a stage with an incremental output; empty for any other
+    stage or lock.
 
-    Such a listing proves this pivot wrote the stage's lock before the older pivot rewrote it.
-    A released pivot stops instead of restarting an incremental output from this pivot's lock
-    (``_RECORDS_KEY``), but one that read the lock as missing (the lock removed by hand, or a
-    release that predates those checks) starts that output from empty: its lock is not to be
-    taken as the stage's history (``restarted_reason``).
+    Each proves this pivot wrote the stage's lock before the older pivot rewrote it: the
+    restart proof, which every such lock is written with, and the listing of each directory
+    output, which an older pivot writes for none. A released pivot stops at the stage instead
+    of restarting its incremental output from this pivot's lock (``_RECORDS_KEY``), so it
+    rewrites that lock only after a person removed it, which starts the output from empty: the
+    lock it leaves is not to be taken as the stage's history (``restarted_reason``).
     """
     if lock_data is None or "older_format" not in lock_data:
         return []
     refs = list(outs)
     if not any(ref.tag is ArtifactTag.INCREMENTAL for ref in refs):
         return []
-    return [
-        path for ref in refs if (path := stage_lock.output_listing_path(ref.identity)).is_file()
-    ]
+    candidates = [stage_lock.restart_proof_path]
+    candidates.extend(stage_lock.output_listing_path(ref.identity) for ref in refs)
+    return [path for path in candidates if path.is_file()]
 
 
-def restarted_reason(stage_lock: StageLock, listings: list[pathlib.Path]) -> str:
-    """Why pivot refuses a stage ``restarted_listings`` names, and the two ways to settle it."""
+def restarted_reason(stage_lock: StageLock, proofs: list[pathlib.Path]) -> str:
+    """Why pivot refuses a stage ``restart_proofs`` names, and the two ways to settle it."""
     lock_shown = shlex.quote(os.path.relpath(stage_lock.path))
-    listings_shown = " ".join(shlex.quote(os.path.relpath(path)) for path in listings)
+    proofs_shown = " ".join(shlex.quote(os.path.relpath(path)) for path in proofs)
     stage = shlex.quote(stage_lock.stage_name)
+    one = len(proofs) == 1
     return (
-        f"an older pivot rewrote {lock_shown} after this pivot wrote it ({listings_shown}, "
-        + "which this pivot wrote beside it, is still there), and the stage keeps an "
-        + "incremental output, so that pivot may have restarted the output from empty. Restore "
-        + "the output from the commit before the older pivot's (`git checkout <commit> -- "
-        + f"{lock_shown} {listings_shown}`, then `pivot checkout --force {stage}`), or rerun "
-        + f"the stage from what that lock records, on purpose, with `pivot repro --force {stage}`. "
+        f"an older pivot rewrote {lock_shown} after this pivot wrote it ({proofs_shown}, "
+        + f"which this pivot wrote beside it, {'is' if one else 'are'} still there), and the "
+        + "stage keeps an incremental output, so that pivot may have restarted the output from "
+        + "empty. Restore the output from the commit before the older pivot's (`git checkout "
+        + f"<commit> -- {lock_shown} {proofs_shown}`, then `pivot checkout --force {stage}`), "
+        + "or rerun the stage from what that lock records, on purpose, with "
+        + f"`pivot repro --force {stage}`. "
         + "Everyone who works on a project upgrades pivot together"
     )
 
@@ -796,17 +853,19 @@ def find_orphaned_locks(
     registered_stages: set[str],
     registered_listings: Iterable[pathlib.Path] = (),
 ) -> list[str]:
-    """Find lock and listing files in stages_dir that belong to no registered stage or input.
+    """Find lock, listing and restart-proof files in stages_dir that belong to no registered
+    stage or input.
 
     When a pipeline is restructured (stages renamed/removed), old lock files
     persist and old output files remain on disk. Detecting orphaned locks helps
     users identify stale artifacts from previous pipeline configurations.
     A listing file is orphaned when ``registered_listings`` (the listing paths of the
-    registered stages' outputs and inputs) does not hold it.
+    registered stages' outputs and inputs) does not hold it; a restart proof
+    (``restart_proof_path``) is orphaned when no registered stage has its name.
 
     Returns:
         Sorted list of the stage names that have lock files but aren't registered, and of the
-        paths, relative to stages_dir, of the orphaned listing files.
+        paths, relative to stages_dir, of the orphaned listing and restart-proof files.
     """
     if not stages_dir.is_dir():
         return []
@@ -820,6 +879,11 @@ def find_orphaned_locks(
         stage_name = str(rel)[: -len(_LOCK_SUFFIX)]
         if stage_name not in registered_stages:
             orphaned.append(stage_name)
+
+    for proof_file in stages_dir.rglob(f"*{_RESTART_PROOF_SUFFIX}"):
+        rel = str(proof_file.relative_to(stages_dir))
+        if proof_file.is_file() and rel[: -len(_RESTART_PROOF_SUFFIX)] not in registered_stages:
+            orphaned.append(rel)
 
     known = set(registered_listings)
     for listing_file in stages_dir.rglob(f"*{listing.SUFFIX}"):

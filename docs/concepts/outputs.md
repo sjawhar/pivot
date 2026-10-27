@@ -222,15 +222,16 @@ and the listing this Pivot wrote beside that lock is not read. A `.pvt` it
 rewrote is read from its own file list; the `<path>.pvt.listing` beside it is
 named in one warning, and `git rm <path>.pvt.listing` removes it. One case is
 refused: when an older release started a stage with an incremental output from
-empty (its lock removed by hand, as its message offers), this Pivot's listing of
-that output is still beside the lock it wrote, and `pivot status` reports the
-stage, `pivot verify` fails it and `pivot repro` refuses it, each naming the
-lock and the listing. Restore the output from the commit before the older
-release's (`git checkout <commit> -- <lock> <listing>`, then `pivot checkout
---force <stage>`), or rerun the stage from what that lock records, on purpose,
-with `pivot repro --force <stage>`. An incremental file output leaves no listing
-beside its lock, so a restart of it cannot be told from an ordinary run and is
-read as it is.
+empty (its lock removed by hand, as its message offers), a file this Pivot wrote
+beside the lock is still there — the restart proof it commits for every
+incremental stage, and for a directory output its listing too — and `pivot
+status` reports the stage, `pivot verify` fails it and `pivot repro` refuses it,
+each naming the lock and that file. Restore the output from the commit before
+the older release's (`git checkout <commit> -- <lock> <file>`, then `pivot
+checkout --force <stage>`), or rerun the stage from what that lock records, on
+purpose, with `pivot repro --force <stage>`. This holds whether the incremental
+output is a directory or a file: the restart proof stands beside the lock for
+both.
 
 A symlink inside a directory artifact is not stored: it is left out of the
 listing and does not come back on restore. When a stage writes the artifact,

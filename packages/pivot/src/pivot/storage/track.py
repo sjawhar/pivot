@@ -15,6 +15,8 @@ from pivot.storage import cache, listing
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from pivot.types import HashInfo
 
 # Use union types to avoid type: ignore on fallback assignment
@@ -56,6 +58,11 @@ _VALID_KEYS = frozenset({"path", "hash", "size", "nfiles", "source"})
 # Keys an older pivot wrote for a directory, with its files listed in the .pvt itself.
 _OLD_FORMAT_KEYS = frozenset({"num_files", "manifest", "empty_dirs"})
 _REQUIRED_SOURCE_KEYS = frozenset({"repo", "rev", "rev_lock", "stage", "path", "remote"})
+# A manifest entry's fields every restore reads, and those it builds a path or cache key from.
+# `size` is not required: only a symlink restore through a tree no pivot has checked reads it,
+# and it then checks the content by hash alone (`cache._tree_file_holds`).
+_MANIFEST_ENTRY_READ_KEYS = ("relpath", "hash", "isexec")
+_MANIFEST_ENTRY_STR_KEYS = ("relpath", "hash")
 
 
 def is_pvt_data(data: object) -> TypeGuard[PvtData]:
@@ -87,6 +94,48 @@ def _is_count(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def pvt_field_error(data: Mapping[str, object]) -> str | None:
+    """Why a restore cannot use a document shaped like a .pvt, naming the field, or None.
+
+    A .pvt names the fields it has, not what they hold. A restore checks ``path`` for
+    traversal, builds a cache key from ``hash``, and, for a directory .pvt an older pivot wrote
+    with its files inside it, builds a path from each manifest entry's ``relpath`` and each
+    ``empty_dirs`` entry and a cache key from each entry's ``hash``, and reads each entry's
+    ``isexec``. So a hand-written .pvt whose all-digit hash YAML reads as an integer, whose
+    manifest entry has no hash, or whose relpath or empty directory holds a NUL byte would stop
+    the restore with a raw TypeError, KeyError or ValueError. Only those fields are named here:
+    a restore never builds a path from ``path`` (``get`` names the file by its target), and
+    what the format itself refuses (``is_pvt_data``, ``listing.from_inline``) is not a field
+    error but a .pvt pivot does not read.
+    """
+    for key in ("path", "hash"):
+        if not isinstance(data[key], str):
+            return f"field {key!r} is not a string"
+    empty_dirs = data.get("empty_dirs", [])
+    if isinstance(empty_dirs, list):
+        for index, relpath in enumerate(cast("list[object]", empty_dirs)):
+            if isinstance(relpath, str) and "\0" in relpath:
+                return f"field 'empty_dirs[{index}]' holds a NUL byte"
+    if "manifest" not in data:
+        return None
+    manifest = data["manifest"]
+    if not isinstance(manifest, list):
+        return "field 'manifest' is not a list"
+    for index, raw in enumerate(cast("list[object]", manifest)):
+        if not isinstance(raw, dict):
+            return f"field 'manifest[{index}]' is not a mapping"
+        entry = cast("dict[object, object]", raw)
+        for key in _MANIFEST_ENTRY_READ_KEYS:
+            if key not in entry:
+                return f"field 'manifest[{index}].{key}' is missing"
+        for key in _MANIFEST_ENTRY_STR_KEYS:
+            if not isinstance(entry[key], str):
+                return f"field 'manifest[{index}].{key}' is not a string"
+        if "\0" in cast("str", entry["relpath"]):
+            return f"field 'manifest[{index}].relpath' holds a NUL byte"
+    return None
+
+
 @functools.cache
 def _warn_old_format(pvt_path: pathlib.Path) -> None:
     """Warn once per process for each directory .pvt an older pivot wrote, naming the command
@@ -116,29 +165,62 @@ def _warn_stale_listing(pvt_path: pathlib.Path) -> None:
     )
 
 
-def parse_pvt(data: object) -> tuple[PvtData, listing.DirListing | None] | None:
-    """A parsed .pvt's data, or None if invalid or insecure.
+def _sizeless_directory_error(document: dict[str, object]) -> str | None:
+    """The reason an older pivot's directory ``.pvt`` whose inline members lack a ``size`` is
+    refused — this pivot records a directory by its listing, whose content-addressed bytes carry
+    each member's size — with the remedy; None when ``from_inline`` rejected the ``.pvt`` for
+    another reason, which stays a plain invalid ``.pvt``."""
+    manifest = document.get("manifest")
+    if not isinstance(manifest, list):
+        return None
+    sizeless = False
+    for raw in cast("list[object]", manifest):
+        if not isinstance(raw, dict):
+            return None
+        entry = cast("dict[str, object]", raw)
+        relpath, file_hash, size = entry.get("relpath"), entry.get("hash"), entry.get("size")
+        if not (isinstance(relpath, str) and isinstance(file_hash, str) and len(file_hash) == 16):
+            return None
+        if not (isinstance(size, int) and not isinstance(size, bool) and size >= 0):
+            sizeless = True
+    if not sizeless:
+        return None
+    path = document.get("path")
+    shown = path if isinstance(path, str) else "<path>"
+    return (
+        "its directory members have no size, which this pivot records in each directory's "
+        + f"listing; rewrite the .pvt with `pivot track --force {shown}`"
+    )
+
+
+def parse_pvt(data: object) -> tuple[PvtData, listing.DirListing | None] | str | None:
+    """A parsed .pvt's data, why a restore cannot use it, or None if invalid or insecure.
 
     A directory .pvt an older pivot wrote lists its files inline; it is read as this format's
     record, and that list is returned as the directory's listing (None for any other .pvt).
+    A document that has a .pvt's required fields but holds one a restore cannot use is that
+    field's message (``pvt_field_error``), which a get reports for the target.
     """
-    if isinstance(data, dict) and _OLD_FORMAT_KEYS & cast("dict[str, object]", data).keys():
+    if isinstance(data, dict):
         document = cast("dict[str, object]", data)
-        members = listing.from_inline(document.get("manifest"), document.get("empty_dirs", []))
-        if members is None:
-            return None
-        record = listing.record_of(members, listing.encode(members))
-        converted: dict[str, object] = {
-            "path": document.get("path"),
-            "hash": record["hash"],
-            "size": record["size"],
-            "nfiles": record["nfiles"],
-        }
-        if "source" in document:
-            converted["source"] = document["source"]
-        if not is_pvt_data(converted) or has_path_traversal(converted["path"]):
-            return None
-        return converted, members
+        if document.keys() >= _REQUIRED_KEYS and (error := pvt_field_error(document)) is not None:
+            return error
+        if _OLD_FORMAT_KEYS & document.keys():
+            members = listing.from_inline(document.get("manifest"), document.get("empty_dirs", []))
+            if members is None:
+                return _sizeless_directory_error(document)
+            record = listing.record_of(members, listing.encode(members))
+            converted: dict[str, object] = {
+                "path": document.get("path"),
+                "hash": record["hash"],
+                "size": record["size"],
+                "nfiles": record["nfiles"],
+            }
+            if "source" in document:
+                converted["source"] = document["source"]
+            if not is_pvt_data(converted) or has_path_traversal(converted["path"]):
+                return None
+            return converted, members
     candidate = cast("object", data)  # not narrowed by the dict check above
     if not is_pvt_data(candidate) or has_path_traversal(candidate["path"]):
         return None
@@ -183,10 +265,13 @@ def write_pvt_file(pvt_path: pathlib.Path, data: PvtData) -> None:
     cache.atomic_write_file(pvt_path, write_yaml)
 
 
-def _load_pvt(pvt_path: pathlib.Path) -> tuple[PvtData, listing.DirListing | None] | None:
+def _load_pvt(
+    pvt_path: pathlib.Path,
+) -> tuple[PvtData, listing.DirListing | None] | str | None:
     """A .pvt file's data and, for an older pivot's directory .pvt, its inline listing (with
     one warning per process saying how to convert it, or how to remove a stale ``.pvt.listing``
-    beside it); None if missing, invalid, or insecure.
+    beside it); None if missing, invalid, or insecure; the reason a restore cannot use it when
+    its fields are read but refused (``parse_pvt``), for a caller to name.
     """
     try:
         with open(pvt_path) as f:
@@ -194,6 +279,8 @@ def _load_pvt(pvt_path: pathlib.Path) -> tuple[PvtData, listing.DirListing | Non
     except (FileNotFoundError, PermissionError, UnicodeDecodeError, yaml.YAMLError):
         return None
     parsed = parse_pvt(data)
+    if isinstance(parsed, str):
+        return parsed
     if parsed is not None and parsed[1] is not None:
         if listing.tracked_listing_path(pvt_path).exists():
             _warn_stale_listing(pvt_path)
@@ -205,7 +292,7 @@ def _load_pvt(pvt_path: pathlib.Path) -> tuple[PvtData, listing.DirListing | Non
 def read_pvt_file(pvt_path: pathlib.Path) -> PvtData | None:
     """Read .pvt manifest file; returns None if missing, invalid, or insecure."""
     parsed = _load_pvt(pvt_path)
-    return None if parsed is None else parsed[0]
+    return parsed[0] if isinstance(parsed, tuple) else None
 
 
 def get_pvt_path(data_path: pathlib.Path) -> pathlib.Path:
@@ -236,6 +323,9 @@ def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
             if not pvt_path.is_file():
                 continue
             parsed = _load_pvt(pvt_path)
+            if isinstance(parsed, str):
+                logger.warning(f"Skipping {pvt_path}: {parsed}")
+                continue
             if parsed is None:
                 logger.warning(f"Skipping invalid .pvt file: {pvt_path}")
                 continue
@@ -285,6 +375,6 @@ def tracked_members(
     assert is_dir_hash(record), "only a tracked directory has a listing"
     pvt_path = get_pvt_path(data_path)
     parsed = _load_pvt(pvt_path)
-    if parsed is not None and parsed[1] is not None and parsed[0]["hash"] == record["hash"]:
+    if isinstance(parsed, tuple) and parsed[1] is not None and parsed[0]["hash"] == record["hash"]:
         return parsed[1]
     return listing.read(listing.tracked_listing_path(pvt_path), record, cache_dir, strict=strict)

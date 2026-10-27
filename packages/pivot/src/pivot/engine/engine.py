@@ -2445,8 +2445,8 @@ class Engine:
         all_stages: dict[str, RegistryStageInfo],
         project_root: pathlib.Path,
     ) -> dict[pathlib.Path, tuple[int, int, int] | None]:
-        """The lock and listing files ``stage_names`` record, each with its (inode, mtime,
-        size), or None when absent. A lock or listing is written by an atomic replace, so a
+        """The lock, listing and restart-proof files ``stage_names`` record, each with its
+        (inode, mtime, size), or None when absent. Each is written by an atomic replace, so a
         file whose stat changes was written. Empty outside a git repository, where git ignores
         nothing."""
         from pivot import git
@@ -2473,6 +2473,8 @@ class Engine:
             candidates.extend(
                 listing.output_listing_path(stages_dir, out.identity) for out in stage_info["outs"]
             )
+            if any(out.tag is types.ArtifactTag.INCREMENTAL for out in stage_info["outs"]):
+                candidates.append(lock.restart_proof_path(stages_dir, name))
             candidates.extend(
                 listing.input_listing_path(stages_dir, store.input_relpath(ref))
                 for ref in stage_info["deps"].values()

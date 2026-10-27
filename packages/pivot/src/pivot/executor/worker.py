@@ -2218,6 +2218,7 @@ def _commit_lock_and_build_deferred(
         hashed_dirs=hashed_dirs,
         input_paths=input_listing_paths(stage_info["deps"], store, lock_data["dep_hashes"]),
         cache_dir=store_cache_dir(store),
+        outs=stage_info["outs"],
     )
     return _build_deferred_writes(
         stage_info,

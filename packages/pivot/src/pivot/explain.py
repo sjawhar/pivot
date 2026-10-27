@@ -230,7 +230,7 @@ def get_stage_explanation(
         )
     if not force:
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
-        restarted = lock.restarted_listings(stage_lock, lock_data, outs)
+        restarted = lock.restart_proofs(stage_lock, lock_data, outs)
         if restarted:
             return StageExplanation(
                 stage_name=stage_name,

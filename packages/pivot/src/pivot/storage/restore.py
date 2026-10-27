@@ -1,24 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import enum
+import functools
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import xxhash
 import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
-from pivot.remote import storage as remote
 from pivot.storage import cache, listing, lock, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
+    from pivot.remote.protocol import RemoteStorage
     from pivot.storage.track import PvtData
-    from pivot.types import DirHash
+    from pivot.types import DirHash, TransferResult
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,8 @@ class RestoreResult(TypedDict):
     status: RestoreStatus
     path: str
     message: str
+    unreachable_remote: NotRequired[str]
+    """The URL of the remote this restore could not reach, so the rest of the get skips it."""
 
 
 class TargetInfo(TypedDict):
@@ -54,6 +58,8 @@ class TargetInfo(TypedDict):
     paths: list[str]
     hashes: dict[str, HashInfo | None]
     members: dict[str, listing.DirListing]  # each directory's listing at the revision, by path
+    error: NotRequired[str]
+    """Why the target cannot be restored (its .pvt is not valid), reported for each path."""
 
 
 class StageTarget(TypedDict):
@@ -75,8 +81,12 @@ def _parse_lock_data_from_bytes(content: bytes) -> lock.CommittedLock | None:
     return parsed if isinstance(parsed, lock.CommittedLock) else None
 
 
-def _parse_pvt_data_from_bytes(content: bytes) -> tuple[PvtData, listing.DirListing | None] | None:
-    """Parse .pvt file content from bytes, with an older pivot's inline directory listing."""
+def _parse_pvt_data_from_bytes(
+    content: bytes,
+) -> tuple[PvtData, listing.DirListing | None] | str | None:
+    """Parse .pvt file content from bytes: None if it is not a valid .pvt file, else its data
+    with an older pivot's inline directory listing, or why a restore cannot use it
+    (``track.pvt_field_error``)."""
     try:
         data: object = yaml.load(content, Loader=yaml_config.Loader)
     except yaml.YAMLError:
@@ -98,8 +108,10 @@ def get_lock_data_from_revision(
 
 def get_pvt_data_from_revision(
     pvt_rel_path: str, rev: str
-) -> tuple[PvtData, listing.DirListing | None] | None:
-    """Read and parse .pvt file from a git revision."""
+) -> tuple[PvtData, listing.DirListing | None] | str | None:
+    """Read and parse .pvt file from a git revision: None when the revision has no valid .pvt
+    file there, else its data with an older pivot's inline listing, or why a restore cannot use
+    it."""
     content = git.read_file_from_revision(pvt_rel_path, rev)
     if content is None:
         return None
@@ -206,8 +218,21 @@ def resolve_targets(
         rel_target = _normalize_target_path(target, proj_root)
         pvt_rel_path = rel_target + ".pvt"
 
-        # Try as a .pvt tracked file
+        # Try as a .pvt tracked file. One that is not valid is this target's error, so the other
+        # targets are still restored and reported.
         parsed_pvt = get_pvt_data_from_revision(pvt_rel_path, rev)
+        if isinstance(parsed_pvt, str):
+            results.append(
+                TargetInfo(
+                    target_type=TargetType.FILE,
+                    original_target=target,
+                    paths=[rel_target],
+                    hashes={rel_target: None},
+                    members={},
+                    error=f"{pvt_rel_path} at {rev} is not a valid .pvt file: {parsed_pvt}",
+                )
+            )
+            continue
         if parsed_pvt is not None:
             pvt_data, inline_members = parsed_pvt
             pvt_hash = track.pvt_to_hash_info(pvt_data)
@@ -253,12 +278,6 @@ def resolve_targets(
     return results
 
 
-def _verify_content_hash(content: bytes, expected_hash: str) -> bool:
-    """Verify content matches expected xxhash64 hash."""
-    actual_hash = xxhash.xxh64(content).hexdigest()
-    return actual_hash == expected_hash
-
-
 def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> os.stat_result:
     """Atomically replace a cache-miss target under the cache restore lock; return the written
     file's stat, taken before it replaced the target."""
@@ -283,6 +302,49 @@ def _record_file_hashes(
         state_db.save_many(entries)
 
 
+def _reason(error: exceptions.PivotError | OSError) -> str:
+    """``error``'s message, followed on the next line by the tip a pivot error carries."""
+    if isinstance(error, exceptions.PivotError) and (tip := error.get_suggestion()):
+        return f"{error}\n  Tip: {tip}"
+    return str(error)
+
+
+def _download_error(failed: list[TransferResult]) -> exceptions.RemoteError:
+    """The error of a download whose ``failed`` files did not arrive: a file's failure to reach
+    the remote if there is one, since it ends the remote step for the rest of the get, else the
+    first file's error."""
+    unreachable = [result for result in failed if "connection_failed" in result]
+    result = (unreachable or failed)[0]
+    message = result["error"] if "error" in result else "unknown error"
+    if unreachable:
+        return exceptions.RemoteUnreachableError(message)
+    return exceptions.RemoteError(message)
+
+
+def _download(remote: RemoteStorage, files_dir: pathlib.Path, hashes: list[str]) -> None:
+    """Download the cache objects ``hashes`` names into ``files_dir``, raising the error of a
+    download whose files did not arrive (``_download_error``)."""
+    results = asyncio.run(
+        remote.download_batch(
+            [(file_hash, cache.get_cache_path(files_dir, file_hash)) for file_hash in hashes],
+            readonly=True,
+        )
+    )
+    if failed := [result for result in results if not result["success"]]:
+        raise _download_error(failed)
+
+
+def _skipped(dest_path: pathlib.Path, force: bool) -> RestoreResult | None:
+    """The result for a target already in the workspace that ``get`` keeps, or None."""
+    if dest_path.exists() and not force:
+        return RestoreResult(
+            status=RestoreStatus.SKIPPED,
+            path=str(dest_path),
+            message=f"Skipped: {dest_path} (already exists, use --force to overwrite)",
+        )
+    return None
+
+
 def restore_file(
     rel_path: str,
     output_hash: HashInfo | None,
@@ -291,61 +353,73 @@ def restore_file(
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
+    *,
+    remote_factory: Callable[[], RemoteStorage],
     hash_state_dir: pathlib.Path | None = None,
     members: listing.DirListing | None = None,
 ) -> RestoreResult:
-    """Restore a single file from revision. Returns result with status.
+    """Restore a single file from revision and return its result.
 
-    A restore whose content has a known hash records each file's hash in the StateDB of
-    ``hash_state_dir`` (the configured state directory when None; a stage output's own state
-    directory), so the next status, explanation or run looks it up instead of reading it.
-    ``members`` is a directory's listing at the revision; None reads the cache's object.
+    Tries the local cache, then git, then downloads the cache objects the output still misses
+    from the remote ``remote_factory`` opens; it is called only when that download is needed.
+    A remote that raised ``RemoteUnreachableError`` is named in the result's
+    ``unreachable_remote``.
+
+    ``members`` is a directory's listing at the revision; None reads the cache's object, and
+    the remote's when the cache holds none.
+
+    A restore records each file's hash in the StateDB of ``hash_state_dir`` (the configured
+    state directory when None; a stage output's own state directory), so the next status,
+    explanation or run looks it up instead of reading the file.
     """
     path_str = str(dest_path)
+    files_dir = cache_dir / "files"
 
-    if dest_path.exists() and not force:
-        return RestoreResult(
-            status=RestoreStatus.SKIPPED,
-            path=path_str,
-            message=f"Skipped: {dest_path} (already exists, use --force to overwrite)",
-        )
+    if (skipped := _skipped(dest_path, force)) is not None:
+        return skipped
 
     # Ensure parent directory exists before any restore strategy
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return RestoreResult(
+            status=RestoreStatus.ERROR,
+            path=path_str,
+            message=f"Error: {dest_path} - cannot create its directory: {e}",
+        )
 
     # Strategy 1: Try local cache (if hash available). A directory needs its listing: the one
     # committed at the revision, else the cache's object.
     if output_hash is not None:
-        if is_dir_hash(output_hash):
-            if members is None:
-                members = cache.cached_listing(cache_dir / "files", output_hash)
-            should_try_cache = members is not None
-        else:
-            cached_path = cache.get_cache_path(cache_dir / "files", output_hash["hash"])
-            should_try_cache = cached_path.exists()
-
-        if should_try_cache:
-            restored = list[tuple[pathlib.Path, os.stat_result, str]]()
-            try:
+        restored = list[tuple[pathlib.Path, os.stat_result, str]]()
+        success = False
+        try:
+            if is_dir_hash(output_hash):
+                if members is None:
+                    members = cache.cached_listing(files_dir, output_hash)
+                should_try_cache = members is not None
+            else:
+                should_try_cache = cache.get_cache_path(files_dir, output_hash["hash"]).exists()
+            if should_try_cache:
                 success = cache.restore_from_cache(
                     dest_path,
                     output_hash,
-                    cache_dir / "files",
+                    files_dir,
                     checkout_modes=checkout_modes,
                     state_dir=config.get_state_dir(),
                     members=members,
                     recorded=restored,
                 )
-            except OSError as e:
-                logger.debug(f"Cache restore failed for {rel_path}: {e}")
-                success = False
-            if success:
-                _record_file_hashes(hash_state_dir, restored)
-                return RestoreResult(
-                    status=RestoreStatus.RESTORED,
-                    path=path_str,
-                    message=f"Restored: {dest_path} (from cache)",
-                )
+        except (exceptions.PivotError, OSError) as e:
+            # Strategy 3 retries this restore, and reports the error if it happens again
+            logger.debug(f"Cache restore failed for {rel_path}: {e}")
+        if success:
+            _record_file_hashes(hash_state_dir, restored)
+            return RestoreResult(
+                status=RestoreStatus.RESTORED,
+                path=path_str,
+                message=f"Restored: {dest_path} (from cache)",
+            )
 
     # Strategy 2: Try git fallback
     content = git.read_file_from_revision(rel_path, rev)
@@ -367,50 +441,70 @@ def restore_file(
             message=f"Restored: {dest_path} (from git)",
         )
 
-    # Strategy 3: Try remote fallback (if hash available)
-    if output_hash is not None and not is_dir_hash(output_hash):
-        file_hash = output_hash["hash"]
-        remote_content = remote.fetch_from_remote(file_hash)
-        if remote_content is not None:
-            # Verify hash before trusting remote content
-            if not _verify_content_hash(remote_content, file_hash):
-                return RestoreResult(
-                    status=RestoreStatus.ERROR,
-                    path=path_str,
-                    message=(
-                        f"Error: {dest_path} - remote content corrupted (hash mismatch). "
-                        f"Expected {file_hash[:8]}..., try re-pushing from source."
-                    ),
-                )
-            try:
-                written = _write_fallback_content(dest_path, remote_content)
-            except OSError as e:
-                return RestoreResult(
-                    status=RestoreStatus.ERROR,
-                    path=path_str,
-                    message=f"Error: {dest_path} - failed to write from remote: {e}",
-                )
-            # Cache the fetched content for future use (best effort). An object already there
-            # is kept: another process may be linking it (cache.publish_cache_object).
-            try:
-                cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
-                with cache.staged_cache_file(cached_path) as staged:
-                    staged.write_bytes(remote_content)
-                    os.chmod(staged, 0o444)
-                    _ = cache.publish_cache_object(staged, cached_path)
-            except OSError:
-                pass  # Caching failure is non-fatal
-            _record_file_hashes(hash_state_dir, [(dest_path, written, file_hash)])
+    # Strategy 3: Download the cache objects the output still misses from the remote, then
+    # restore from the cache. Any failure is this target's error, so the targets already
+    # restored are still reported.
+    if output_hash is not None:
+        if is_dir_hash(output_hash) and members is None:
+            # A directory is restored from its listing, which names its files; with none
+            # committed or cached, its members are unknown and nothing can be downloaded.
+            return RestoreResult(
+                status=RestoreStatus.ERROR,
+                path=path_str,
+                message=f"Error: {dest_path} - not in local cache, git, or remote",
+            )
+        source = "cache"
+        remote: RemoteStorage | None = None
+        downloaded = list[tuple[pathlib.Path, os.stat_result, str]]()
+        try:
+            missing_hashes = cache.missing_cache_objects(
+                output_hash, members, files_dir, checkout_modes
+            )
+            if missing_hashes:
+                source = "remote"
+                remote = remote_factory()
+                _download(remote, files_dir, missing_hashes)
+            success = cache.restore_from_cache(
+                dest_path,
+                output_hash,
+                files_dir,
+                checkout_modes=checkout_modes,
+                state_dir=config.get_state_dir(),
+                members=members,
+                recorded=downloaded,
+            )
+        except exceptions.RemoteError as e:
+            failure = RestoreResult(
+                status=RestoreStatus.ERROR,
+                path=path_str,
+                message=f"Error: {dest_path} - failed to download from remote: {_reason(e)}",
+            )
+            if remote is not None and isinstance(e, exceptions.RemoteUnreachableError):
+                failure["unreachable_remote"] = remote.url
+            return failure
+        except (exceptions.PivotError, OSError) as e:
+            return RestoreResult(
+                status=RestoreStatus.ERROR,
+                path=path_str,
+                message=f"Error: {dest_path} - failed to restore from {source}: {_reason(e)}",
+            )
+        if success:
+            _record_file_hashes(hash_state_dir, downloaded)
             return RestoreResult(
                 status=RestoreStatus.RESTORED,
                 path=path_str,
-                message=f"Restored: {dest_path} (from remote)",
+                message=f"Restored: {dest_path} (from {source})",
             )
+        return RestoreResult(
+            status=RestoreStatus.ERROR,
+            path=path_str,
+            message=f"Error: {dest_path} - failed to restore from {source}",
+        )
 
     return RestoreResult(
         status=RestoreStatus.ERROR,
         path=path_str,
-        message=f"Error: {dest_path} - not in local cache, git, or remote",
+        message=f"Error: {dest_path} - not in git at {rev}, and no hash is recorded for it",
     )
 
 
@@ -422,6 +516,8 @@ def restore_targets_from_revision(
     stage_targets: Mapping[str, StageTarget],
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
+    *,
+    remote_factory: Callable[[], RemoteStorage],
 ) -> tuple[list[str], bool]:
     """Restore targets from a git revision.
 
@@ -446,6 +542,21 @@ def restore_targets_from_revision(
             raise exceptions.GetError("--output/-o can only be used with a single output")
 
     results = list[RestoreResult]()
+    # Resolves the remote and builds its backend once per call, not once per target that misses
+    # the cache
+    open_remote = functools.cache(remote_factory)
+    # A remote this call could not reach is not tried again, so an unreachable remote costs one
+    # connection timeout per call, not one per target. Only RemoteUnreachableError sets it: a
+    # failure of one object leaves the remote in use for the other targets.
+    unreachable: str | None = None
+
+    def reachable_remote() -> RemoteStorage:
+        if unreachable is not None:
+            raise exceptions.RemoteUnreachableError(
+                f"{unreachable} could not be reached for an earlier target, "
+                + "so it is not tried again"
+            )
+        return open_remote()
 
     for target_info in target_infos:
         hash_state_dir = (
@@ -456,6 +567,18 @@ def restore_targets_from_revision(
         for rel_path in target_info["paths"]:
             output_hash = target_info["hashes"].get(rel_path)
             dest_path = output if output is not None else proj_root / rel_path
+            if "error" in target_info:
+                # A target already in the workspace is kept, as for a valid .pvt, so the check
+                # refuses nothing that get skipped before it
+                results.append(
+                    _skipped(dest_path, force)
+                    or RestoreResult(
+                        status=RestoreStatus.ERROR,
+                        path=str(dest_path),
+                        message=f"Error: {dest_path} - {target_info['error']}",
+                    )
+                )
+                continue
 
             result = restore_file(
                 rel_path=rel_path,
@@ -465,9 +588,12 @@ def restore_targets_from_revision(
                 cache_dir=cache_dir,
                 checkout_modes=checkout_modes,
                 force=force,
+                remote_factory=reachable_remote,
                 hash_state_dir=hash_state_dir,
                 members=target_info["members"].get(rel_path),
             )
+            if "unreachable_remote" in result:
+                unreachable = result["unreachable_remote"]
             results.append(result)
 
     # Format output: show all messages, with errors summarized at the end

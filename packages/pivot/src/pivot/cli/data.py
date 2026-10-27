@@ -10,6 +10,8 @@ from pivot import config, discovery, exceptions, project, registry
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
+from pivot.remote import config as remote_config
+from pivot.remote import sync as transfer
 from pivot.storage import cache, restore
 from pivot.types import DataDiffResult, OutputFormat
 
@@ -143,23 +145,20 @@ def diff(
     required=True,
     help="Git revision (SHA, branch, tag) to retrieve files from",
 )
+@click.option("--remote", "remote_name", help="Remote name (uses default if not specified)")
 @click.option(
     "--output",
     "-o",
     type=click.Path(path_type=pathlib.Path),
     default=None,
-    help="Output path for single file target (incompatible with multiple targets or stage names)",
+    help="Output path when the targets name a single file (one target with one output)",
 )
-@click.option(
-    "--checkout-mode",
-    type=click.Choice(["symlink", "hardlink", "copy"]),
-    default=None,
-    help="Checkout mode for restoration (default: project config or hardlink)",
-)
+@cli_decorators.checkout_mode_option
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
 def get(
     targets: tuple[str, ...],
     rev: str,
+    remote_name: str | None,
     output: pathlib.Path | None,
     checkout_mode: str | None,
     force: bool,
@@ -175,6 +174,9 @@ def get(
       pivot get --rev abc123 train                # Get all outputs from stage
     """
     cache_dir = config.get_cache_dir()
+    if remote_name is not None:
+        # Checked now, so a misspelt name fails even when no target needs the remote
+        remote_config.get_remote_url(remote_name)
 
     checkout_modes = (
         [cache.CheckoutMode(checkout_mode)] if checkout_mode else config.get_checkout_mode_order()
@@ -220,6 +222,7 @@ def get(
         stage_targets=stage_targets,
         checkout_modes=checkout_modes,
         force=force,
+        remote_factory=lambda: transfer.create_remote_from_name(remote_name)[0],
     )
 
     for msg in messages:

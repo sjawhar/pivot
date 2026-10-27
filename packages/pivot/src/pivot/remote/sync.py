@@ -54,6 +54,8 @@ def _blob_hashes(
     hash_info: HashInfo,
     read_members: Callable[[types.DirHash], listing.DirListing],
     files_dir: pathlib.Path,
+    *,
+    require_members: bool = False,
 ) -> set[str]:
     """The cache objects that store an output: a file's object, or a directory's listing object
     and its files' objects.
@@ -63,14 +65,24 @@ def _blob_hashes(
     it. A directory whose listing neither holds, or whose committed listing cannot be used and
     the cache lacks, gives its listing object alone: a pull fetches it first, then names the
     files.
+
+    With ``require_members`` the caller (push) needs the member objects it would transfer, so a
+    directory whose listing can be read from neither the committed file nor the cache raises
+    (``CorruptListingError``/``ListingMissingError``, naming the file) rather than naming a
+    listing object that is not there — there is nothing to send for it, and reporting it
+    skipped would read as success.
     """
     if not is_dir_hash(hash_info):
         return {hash_info["hash"]}
     try:
         members = read_members(hash_info)
     except exceptions.ListingMissingError:
+        if require_members:
+            raise
         return {hash_info["hash"]}
     except exceptions.CorruptListingError as e:
+        if require_members:
+            raise
         logger.warning("%s; only the cache's copy of that listing is transferred", e)
         return {hash_info["hash"]}
     if not cache.get_cache_path(files_dir, hash_info["hash"]).exists():
@@ -84,6 +96,8 @@ def _output_blobs(
     identity: types.ArtifactIdentity,
     files_dir: pathlib.Path,
     lock_data: LockData | None,
+    *,
+    require_members: bool = False,
 ) -> set[str]:
     """The cache objects of a stage output, a directory's listing read beside its lock (unless
     ``lock_data``, the producer's lock, is an older pivot's: ``lock.committed_listing``)."""
@@ -91,18 +105,26 @@ def _output_blobs(
     if lock_data is not None:
         committed = lock.committed_listing(lock_data, committed)
     return _blob_hashes(
-        hash_info, lambda record: listing.read(committed, record, files_dir), files_dir
+        hash_info,
+        lambda record: listing.read(committed, record, files_dir),
+        files_dir,
+        require_members=require_members,
     )
 
 
 def _tracked_blobs(
-    data_path: pathlib.Path, pvt_data: track.PvtData, files_dir: pathlib.Path
+    data_path: pathlib.Path,
+    pvt_data: track.PvtData,
+    files_dir: pathlib.Path,
+    *,
+    require_members: bool = False,
 ) -> set[str]:
     """The cache objects of a tracked file or directory."""
     return _blob_hashes(
         track.pvt_to_hash_info(pvt_data),
         lambda _record: track.tracked_members(data_path, pvt_data, files_dir),
         files_dir,
+        require_members=require_members,
     )
 
 
@@ -111,6 +133,8 @@ def _get_file_hash_from_stages(
     state_dir: pathlib.Path,
     files_dir: pathlib.Path,
     all_stages: dict[str, RegistryStageInfo] | None = None,
+    *,
+    require_members: bool = False,
 ) -> set[str] | None:
     """The cache objects of a stage output named by its identity key, from the lock files."""
     if all_stages is not None:
@@ -128,7 +152,14 @@ def _get_file_hash_from_stages(
             for out_path, out_hash in lock_data["output_hashes"].items():
                 identity_key = types.identity_key(out_path)
                 if identity_key == target_identity_key and identity_key not in non_cached_paths:
-                    return _output_blobs(out_hash, stages_dir, out_path, files_dir, lock_data)
+                    return _output_blobs(
+                        out_hash,
+                        stages_dir,
+                        out_path,
+                        files_dir,
+                        lock_data,
+                        require_members=require_members,
+                    )
         return None
 
     from pivot.cli import helpers as cli_helpers
@@ -158,13 +189,24 @@ def _get_file_hash_from_stages(
         for out_path, out_hash in lock_data["output_hashes"].items():
             identity_key = types.identity_key(out_path)
             if identity_key == target_identity_key and identity_key not in non_cached_paths:
-                return _output_blobs(out_hash, stages_dir, out_path, files_dir, lock_data)
+                return _output_blobs(
+                    out_hash,
+                    stages_dir,
+                    out_path,
+                    files_dir,
+                    lock_data,
+                    require_members=require_members,
+                )
 
     return None
 
 
 def _get_file_hash_from_pvt(
-    rel_path: str, proj_root: pathlib.Path, files_dir: pathlib.Path
+    rel_path: str,
+    proj_root: pathlib.Path,
+    files_dir: pathlib.Path,
+    *,
+    require_members: bool = False,
 ) -> set[str] | None:
     """The cache objects of a path tracked by a .pvt file."""
     pvt_path = proj_root / (rel_path + ".pvt")
@@ -175,10 +217,14 @@ def _get_file_hash_from_pvt(
     if track_data is None:
         return None
 
-    return _tracked_blobs(proj_root / rel_path, track_data, files_dir)
+    return _tracked_blobs(
+        proj_root / rel_path, track_data, files_dir, require_members=require_members
+    )
 
 
-def _get_tracked_blobs(proj_root: pathlib.Path, files_dir: pathlib.Path) -> dict[str, set[str]]:
+def _get_tracked_blobs(
+    proj_root: pathlib.Path, files_dir: pathlib.Path, *, require_members: bool = False
+) -> dict[str, set[str]]:
     """The cache objects of every `pivot track`-ed file or directory, by its recorded hash.
 
     Imports are left out: `pivot import` writes the file straight to the workspace, so its
@@ -188,7 +234,9 @@ def _get_tracked_blobs(proj_root: pathlib.Path, files_dir: pathlib.Path) -> dict
     for data_path, pvt_data in track.discover_pvt_files(proj_root).items():
         if track.is_import(pvt_data):
             continue
-        blobs[pvt_data["hash"]] = _tracked_blobs(pathlib.Path(data_path), pvt_data, files_dir)
+        blobs[pvt_data["hash"]] = _tracked_blobs(
+            pathlib.Path(data_path), pvt_data, files_dir, require_members=require_members
+        )
     return blobs
 
 
@@ -208,11 +256,15 @@ def get_target_hashes(
     include_deps: bool = False,
     all_stages: dict[str, RegistryStageInfo] | None = None,
     cache_dir: pathlib.Path | None = None,
+    *,
+    require_members: bool = False,
 ) -> set[str]:
     """Resolve targets (stage names or file paths) to cache hashes.
 
     A directory resolves to its listing object and its files' objects. ``cache_dir`` is the
-    cache root (``config.get_cache_dir()`` when None).
+    cache root (``config.get_cache_dir()`` when None). With ``require_members`` (push), a
+    directory whose committed listing cannot be read and whose listing object the cache lacks
+    raises rather than naming an object that is not there (``_blob_hashes``).
     """
     _t = metrics.start()
     proj_root = project.get_project_root()
@@ -252,7 +304,12 @@ def get_target_hashes(
                         for out_path, out_hash in lock_data["output_hashes"].items():
                             if types.identity_key(out_path) not in non_cached_paths:
                                 hashes |= _output_blobs(
-                                    out_hash, stage_lock.stages_dir, out_path, files_dir, lock_data
+                                    out_hash,
+                                    stage_lock.stages_dir,
+                                    out_path,
+                                    files_dir,
+                                    lock_data,
+                                    require_members=require_members,
                                 )
                         if include_deps:
                             # Only deps whose blobs pivot caches (and so pushes) can be fetched:
@@ -281,16 +338,23 @@ def get_target_hashes(
                                             dep_identity,
                                             files_dir,
                                             producer_locks.get(producer),
+                                            require_members=require_members,
                                         )
                                     continue
                                 if tracked_blobs is None:
-                                    tracked_blobs = _get_tracked_blobs(proj_root, files_dir)
+                                    tracked_blobs = _get_tracked_blobs(
+                                        proj_root, files_dir, require_members=require_members
+                                    )
                                 hashes |= tracked_blobs.get(dep_hash["hash"], set[str]())
                         continue
             else:
                 resolved_identity = types.ArtifactIdentity(stage_name, target_identity.key)
                 out_blobs = _get_file_hash_from_stages(
-                    types.identity_key(resolved_identity), state_dir, files_dir, all_stages
+                    types.identity_key(resolved_identity),
+                    state_dir,
+                    files_dir,
+                    all_stages,
+                    require_members=require_members,
                 )
                 if out_blobs is not None:
                     hashes |= out_blobs
@@ -319,13 +383,19 @@ def get_target_hashes(
             target_identity = output_identities.get(rel_path, target_identity)
 
         out_blobs = _get_file_hash_from_stages(
-            types.identity_key(target_identity), state_dir, files_dir, all_stages
+            types.identity_key(target_identity),
+            state_dir,
+            files_dir,
+            all_stages,
+            require_members=require_members,
         )
         if out_blobs is not None:
             hashes |= out_blobs
             continue
 
-        pvt_blobs = _get_file_hash_from_pvt(rel_path, proj_root, files_dir)
+        pvt_blobs = _get_file_hash_from_pvt(
+            rel_path, proj_root, files_dir, require_members=require_members
+        )
         if pvt_blobs is not None:
             hashes |= pvt_blobs
             continue
@@ -411,9 +481,23 @@ async def _push_async(
     check_remote_url(state_db, remote_name, remote)
 
     if targets:
-        local_hashes = get_target_hashes(
-            targets, state_dir, include_deps=False, all_stages=all_stages, cache_dir=cache_dir
-        )
+        try:
+            local_hashes = get_target_hashes(
+                targets,
+                state_dir,
+                include_deps=False,
+                all_stages=all_stages,
+                cache_dir=cache_dir,
+                require_members=True,
+            )
+        except (exceptions.CorruptListingError, exceptions.ListingMissingError) as e:
+            # A directory this push was asked to transfer has no readable listing and no cache
+            # object for it, so pivot holds none of its members: fail it, naming the file, as
+            # `pivot verify` does, rather than count it skipped and read as success.
+            metrics.end("sync.push_async", _t)
+            return TransferSummary(
+                transferred=0, skipped=0, failed=1, errors=[f"{e}. {e.get_suggestion()}"]
+            )
     else:
         local_hashes = get_local_cache_hashes(cache_dir)
 
