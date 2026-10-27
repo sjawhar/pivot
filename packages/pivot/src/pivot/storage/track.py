@@ -13,6 +13,8 @@ from pivot.storage import cache
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from pivot.types import DirManifestEntry, HashInfo
 
 # Use union types to avoid type: ignore on fallback assignment
@@ -53,6 +55,9 @@ class PvtData(TypedDict):
 _REQUIRED_KEYS = frozenset({"path", "hash", "size"})
 _VALID_KEYS = frozenset({"path", "hash", "size", "num_files", "manifest", "empty_dirs", "source"})
 _REQUIRED_SOURCE_KEYS = frozenset({"repo", "rev", "rev_lock", "stage", "path", "remote"})
+# A manifest entry's fields every restore reads, and those it builds a path or cache key from
+_MANIFEST_ENTRY_READ_KEYS = ("relpath", "hash", "isexec")
+_MANIFEST_ENTRY_STR_KEYS = ("relpath", "hash")
 
 
 def is_pvt_data(data: object) -> TypeGuard[PvtData]:
@@ -76,6 +81,36 @@ def is_pvt_data(data: object) -> TypeGuard[PvtData]:
         if not all(isinstance(source_dict[k], str) for k in _REQUIRED_SOURCE_KEYS):
             return False
     return True
+
+
+def pvt_field_error(data: Mapping[str, object]) -> str | None:
+    """Why a restore cannot use a .pvt that ``is_pvt_data`` accepts, naming the field, or None.
+
+    ``is_pvt_data`` checks which fields a .pvt has, not what they hold. A restore builds a path
+    from ``path`` and each manifest entry's ``relpath``, a cache key from ``hash`` and each
+    entry's ``hash``, and reads each entry's ``isexec``, so a hand-written .pvt whose all-digit
+    hash YAML reads as an integer, or whose manifest entry has no hash, would stop the restore
+    with a raw TypeError or KeyError. Fields a restore does not read are not checked.
+    """
+    for key in ("path", "hash"):
+        if not isinstance(data[key], str):
+            return f"field {key!r} is not a string"
+    if "manifest" not in data:
+        return None
+    manifest = data["manifest"]
+    if not isinstance(manifest, list):
+        return "field 'manifest' is not a list"
+    for index, raw in enumerate(cast("list[object]", manifest)):
+        if not isinstance(raw, dict):
+            return f"field 'manifest[{index}]' is not a mapping"
+        entry = cast("dict[object, object]", raw)
+        for key in _MANIFEST_ENTRY_READ_KEYS:
+            if key not in entry:
+                return f"field 'manifest[{index}].{key}' is missing"
+        for key in _MANIFEST_ENTRY_STR_KEYS:
+            if not isinstance(entry[key], str):
+                return f"field 'manifest[{index}].{key}' is not a string"
+    return None
 
 
 def _is_empty_dirs(data: dict[str, object]) -> bool:

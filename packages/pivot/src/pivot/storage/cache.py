@@ -804,10 +804,12 @@ def _repair_tree_dir_isexec(cache_dir_path: pathlib.Path, manifest: list[DirMani
             os.chmod(f, 0o555 if entry["isexec"] else 0o444)
 
 
-# The marker's earlier name, which pivot 0.3.4 touched after checking only a tree's layout,
-# partial trees included: every tree is checked once more and the old marker dropped.
-_TREE_LAYOUT_MARKER_SUFFIX = ".verified"
-_LEGACY_TREE_MARKER_SUFFIX = ".layout-checked"
+# The marker's earlier names, which no pivot trusts: pivot 0.3.4 touched `.layout-checked` after
+# checking only a tree's layout, partial trees included, and pivot 0.3.5 to 0.5.11 touched
+# `.verified` after checking each file's size, not its content. Every tree so marked is checked
+# once more, by content, and its old markers dropped.
+_TREE_LAYOUT_MARKER_SUFFIX = ".content-checked"
+_LEGACY_TREE_MARKER_SUFFIXES = (".layout-checked", ".verified")
 # Held exclusively while a tree is checked and repaired; never deleted.
 _TREE_LOCK_SUFFIX = ".lock"
 
@@ -824,10 +826,9 @@ def _mark_tree(cache_dir_path: pathlib.Path) -> None:
     so a cache the user cannot write still restores without one."""
     with contextlib.suppress(OSError):
         _tree_layout_marker(cache_dir_path).touch()
-    with contextlib.suppress(OSError):
-        cache_dir_path.with_name(cache_dir_path.name + _LEGACY_TREE_MARKER_SUFFIX).unlink(
-            missing_ok=True
-        )
+    for suffix in _LEGACY_TREE_MARKER_SUFFIXES:
+        with contextlib.suppress(OSError):
+            cache_dir_path.with_name(cache_dir_path.name + suffix).unlink(missing_ok=True)
 
 
 def _tree_file_holds(
@@ -883,8 +884,9 @@ def _ensure_tree_complete(
 
     The tree publisher marks a tree once it is complete (``_publish_tree``). A tree without the
     mark is checked: one an older pivot built, which can hold entries its hash does not record
-    and 0o444-everywhere files, or one it copied straight to its name and was killed while
-    copying, leaving files missing or cut short under a name a restore trusts. The check, the
+    and 0o444-everywhere files, one an older pivot marked after checking only sizes, which can
+    hold stale bytes of the recorded size, or one it copied straight to its name and was killed
+    while copying, leaving files missing or cut short under a name a restore trusts. The check, the
     repair and the mark run under the tree's exclusive lock, so two repairers never change the
     tree's directory modes under each other. Returns False, the tree unmarked, when the tree
     differs and cannot be repaired, or cannot be checked: a file's object is absent, or this user

@@ -285,6 +285,45 @@ async def test_s3_download_file_auth_error(
         await s3_remote.download_file("abc123def4567890", local_path)
 
 
+@pytest.mark.parametrize(
+    ("cache_hash", "error"),
+    [
+        pytest.param(
+            "abc123def4567890",
+            botocore_exc.EndpointConnectionError(endpoint_url="http://127.0.0.1:9/b/files/ab"),
+            id="refused",
+        ),
+        pytest.param(
+            "abc123def4567890",
+            botocore_exc.ConnectTimeoutError(endpoint_url="http://10.255.255.1:9/b/files/ab"),
+            id="connect-timeout",
+        ),
+        pytest.param(
+            "4040404040404040",
+            botocore_exc.EndpointConnectionError(
+                endpoint_url="http://127.0.0.1:9/b/files/40/40404040404040"
+            ),
+            id="refused-for-a-key-holding-404",
+        ),
+    ],
+)
+async def test_s3_download_that_cannot_connect_is_a_connection_error(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    cache_hash: str,
+    error: Exception,
+) -> None:
+    """A download that cannot connect to S3 raises RemoteConnectionError, so a caller knows the
+    remote, not one object, is unusable; a key whose text holds 404 is not "not found"."""
+    mock_client = mocker.AsyncMock()
+    mock_client.get_object = mocker.AsyncMock(side_effect=error)
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    with pytest.raises(exceptions.RemoteConnectionError, match="Failed to download from S3"):
+        await s3_remote.download_file(cache_hash, tmp_path / "downloaded.txt")
+
+
 async def test_upload_file(
     s3_remote: remote_mod.S3Remote,
     tmp_path: pathlib.Path,

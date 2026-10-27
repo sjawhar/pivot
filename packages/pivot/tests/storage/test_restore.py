@@ -13,7 +13,7 @@ from pivot import exceptions, project
 from pivot.cli import checkout
 from pivot.remote import sync as transfer
 from pivot.storage import cache, restore
-from pivot.types import FileHash
+from pivot.types import FileHash, TransferResult
 
 if TYPE_CHECKING:
     import pathlib
@@ -161,7 +161,7 @@ size: 1024
 """
     result = restore._parse_pvt_data_from_bytes(content)
 
-    assert result is not None
+    assert isinstance(result, dict), result
     assert result["path"] == "data.csv"
     assert result["hash"] == "abc123"
 
@@ -186,6 +186,32 @@ path: data.csv
     result = restore._parse_pvt_data_from_bytes(content)
 
     assert result is None
+
+
+@pytest.mark.parametrize(
+    ("content", "reason"),
+    [
+        pytest.param(
+            b"path: data.csv\nhash: 1234567890123456\nsize: 1\n",
+            "field 'hash' is not a string",
+            id="all-digit-hash",
+        ),
+        pytest.param(
+            b"path: 1234\nhash: abc123\nsize: 1\n", "field 'path' is not a string", id="int-path"
+        ),
+        pytest.param(
+            b"path: data/\nhash: abc123\nsize: 1\nmanifest:\n- relpath: a.txt\n  isexec: false\n",
+            "field 'manifest[0].hash' is missing",
+            id="manifest-entry-without-hash",
+        ),
+    ],
+)
+def test_parse_pvt_data_from_bytes_names_a_field_a_restore_cannot_use(
+    content: bytes, reason: str
+) -> None:
+    """A .pvt whose field a restore builds a path or cache key from has the wrong type, or whose
+    manifest entry lacks a field a restore reads, returns the reason naming the field."""
+    assert restore._parse_pvt_data_from_bytes(content) == reason
 
 
 # =============================================================================
@@ -263,6 +289,25 @@ def test_resolve_targets_as_pvt_file(git_repo: GitRepo, monkeypatch: pytest.Monk
     assert targets[0]["target_type"] == "file"
     assert targets[0]["hashes"]["data.csv"] is not None
     assert targets[0]["hashes"]["data.csv"]["hash"] == "abc123"  # type: ignore[index]
+
+
+def test_resolve_targets_reports_an_invalid_pvt_as_that_targets_error(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A .pvt at the revision that is not valid resolves to that target's error, naming the
+    file, the revision and the field, rather than stopping every target."""
+    repo_path, commit = git_repo
+    (repo_path / "data.csv.pvt").write_text("path: data.csv\nhash: 1234567890123456\nsize: 1\n")
+    sha = commit("add pvt file")[:7]
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    targets = restore.resolve_targets(["data.csv"], sha, {})
+
+    assert targets[0]["paths"] == ["data.csv"]
+    assert "error" in targets[0]
+    assert targets[0]["error"] == (
+        f"data.csv.pvt at {sha} is not a valid .pvt file: field 'hash' is not a string"
+    )
 
 
 def test_resolve_targets_as_git_file(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -550,6 +595,60 @@ def test_restore_file_cache_miss_reports_the_remote_error(
     assert any("Failed to restore" in msg for msg in messages), "Should have failure summary"
 
 
+class _UnreachableRemote:
+    """A remote no download can connect to; counts the download batches asked of it."""
+
+    url: str = "s3://unreachable/cache"
+    batches: int
+
+    def __init__(self) -> None:
+        self.batches = 0
+
+    async def download_batch(
+        self, items: list[tuple[str, pathlib.Path]], *, readonly: bool = False
+    ) -> list[TransferResult]:
+        assert readonly, "get downloads cache objects read-only"
+        self.batches += 1
+        return [
+            TransferResult(hash=h, success=False, error="cannot connect", connection_failed=True)
+            for h, _ in items
+        ]
+
+
+def test_restore_targets_tries_an_unreachable_remote_once(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once a target's download cannot connect to the remote, each later target that needs the
+    remote fails naming it, without another download."""
+    repo_path, commit = git_repo
+    for name, file_hash in (("a.csv", "aaaaaaaaaaaaaaaa"), ("b.csv", "bbbbbbbbbbbbbbbb")):
+        pvt_content = {"path": name, "hash": file_hash, "size": 1}
+        (repo_path / f"{name}.pvt").write_text(yaml.dump(pvt_content))
+    sha = commit("add pvt files")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    remote = _UnreachableRemote()
+
+    messages, success = restore.restore_targets_from_revision(
+        targets=["a.csv", "b.csv"],
+        rev=sha[:7],
+        output=None,
+        cache_dir=repo_path / ".pivot" / "cache",
+        stage_targets={},
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+        # The fake has only the url and download_batch a restore uses
+        remote_factory=lambda: cast("RemoteStorage", cast("object", remote)),
+    )
+
+    assert not success
+    assert remote.batches == 1, "the second target does not try the unreachable remote"
+    assert "a.csv - failed to download from remote: cannot connect" in messages[0], messages
+    assert (
+        "b.csv - failed to download from remote: s3://unreachable/cache could not be reached "
+        + "for an earlier target, so it is not tried again"
+    ) in messages[1], messages
+
+
 def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
     """Restores file from local cache when available."""
     repo_path, commit = git_repo
@@ -731,15 +830,29 @@ path: data/
 hash: abc123
 size: 1024
 manifest:
-  a.txt: def456
-  b.txt: ghi789
+- relpath: a.txt
+  hash: def456
+  size: 512
+  isexec: false
+- relpath: b.txt
+  hash: ghi789
+  size: 512
+  isexec: false
 """
     result = restore._parse_pvt_data_from_bytes(content)
 
-    assert result is not None
+    assert isinstance(result, dict), result
     assert result["path"] == "data/"
     assert result["hash"] == "abc123"
     assert "manifest" in result
+
+
+def test_parse_pvt_data_rejects_a_manifest_that_is_not_a_list() -> None:
+    """A manifest written as a mapping of path to hash is not the list of entries .pvt records,
+    so it is reported instead of failing a restore that reads its entries."""
+    content = b"path: data/\nhash: abc123\nsize: 1024\nmanifest:\n  a.txt: def456\n"
+
+    assert restore._parse_pvt_data_from_bytes(content) == "field 'manifest' is not a list"
 
 
 # =============================================================================

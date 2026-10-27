@@ -102,9 +102,17 @@ async def _stream_download_to_fd(
 async def _download_verified(
     s3: S3Client, bucket: str, key: str, dest: Path, expected_hash: str
 ) -> None:
-    """Stream bucket/key into the existing file ``dest`` and check its xxh64 digest."""
+    """Stream bucket/key into the existing file ``dest`` and check its xxh64 digest.
+
+    A request that cannot connect (refused, timed out, no route, a proxy or TLS failure) raises
+    ``RemoteConnectionError``: the remote, not this object, is unusable.
+    """
+    from botocore import exceptions as botocore_exc
+
     try:
         response = await s3.get_object(Bucket=bucket, Key=key)
+    except botocore_exc.ConnectionError as exc:
+        raise exceptions.RemoteConnectionError(f"Failed to download from S3: {exc}") from exc
     except Exception as exc:
         error_str = str(exc)
         if "NoSuchKey" in error_str or "404" in error_str:

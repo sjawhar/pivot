@@ -6,7 +6,7 @@ import functools
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, TypedDict, TypeGuard
+from typing import TYPE_CHECKING, NotRequired, TypedDict, TypeGuard
 
 import yaml
 
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
     from pivot.remote.protocol import RemoteStorage
     from pivot.storage.track import PvtData
-    from pivot.types import StorageLockData
+    from pivot.types import StorageLockData, TransferResult
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,8 @@ class RestoreResult(TypedDict):
     status: RestoreStatus
     path: str
     message: str
+    unreachable_remote: NotRequired[str]
+    """The URL of the remote this restore could not reach, so the rest of the get skips it."""
 
 
 class TargetInfo(TypedDict):
@@ -54,6 +56,8 @@ class TargetInfo(TypedDict):
     original_target: str
     paths: list[str]
     hashes: dict[str, HashInfo | None]
+    error: NotRequired[str]
+    """Why the target cannot be restored (its .pvt is not valid), reported for each path."""
 
 
 class StageTarget(TypedDict):
@@ -84,11 +88,14 @@ def _parse_lock_data_from_bytes(content: bytes) -> StorageLockData | None:
     return _parse_yaml_bytes(content, lock.is_lock_data)
 
 
-def _parse_pvt_data_from_bytes(content: bytes) -> PvtData | None:
-    """Parse .pvt file content from bytes."""
+def _parse_pvt_data_from_bytes(content: bytes) -> PvtData | str | None:
+    """Parse .pvt file content from bytes: None if it is not a valid .pvt file, else its data, or
+    why a restore cannot use it (``track.pvt_field_error``)."""
     data = _parse_yaml_bytes(content, track.is_pvt_data)
     if data is None:
         return None
+    if (error := track.pvt_field_error(data)) is not None:
+        return error
     # Security check: no path traversal in stored path
     if track.has_path_traversal(data["path"]):
         return None
@@ -107,8 +114,9 @@ def get_lock_data_from_revision(
     return _parse_lock_data_from_bytes(content)
 
 
-def get_pvt_data_from_revision(pvt_rel_path: str, rev: str) -> PvtData | None:
-    """Read and parse .pvt file from a git revision."""
+def get_pvt_data_from_revision(pvt_rel_path: str, rev: str) -> PvtData | str | None:
+    """Read and parse .pvt file from a git revision: None when the revision has no valid .pvt
+    file there, else its data, or why a restore cannot use it."""
     content = git.read_file_from_revision(pvt_rel_path, rev)
     if content is None:
         return None
@@ -186,8 +194,20 @@ def resolve_targets(
         rel_target = _normalize_target_path(target, proj_root)
         pvt_rel_path = rel_target + ".pvt"
 
-        # Try as a .pvt tracked file
+        # Try as a .pvt tracked file. One that is not valid is this target's error, so the other
+        # targets are still restored and reported.
         pvt_data = get_pvt_data_from_revision(pvt_rel_path, rev)
+        if isinstance(pvt_data, str):
+            results.append(
+                TargetInfo(
+                    target_type=TargetType.FILE,
+                    original_target=target,
+                    paths=[rel_target],
+                    hashes={rel_target: None},
+                    error=f"{pvt_rel_path} at {rev} is not a valid .pvt file: {pvt_data}",
+                )
+            )
+            continue
         if pvt_data is not None:
             results.append(
                 TargetInfo(
@@ -240,6 +260,18 @@ def _reason(error: exceptions.PivotError | OSError) -> str:
     return str(error)
 
 
+def _download_error(failed: list[TransferResult]) -> exceptions.RemoteError:
+    """The error of a download whose ``failed`` files did not arrive: a file's connection failure
+    if there is one, since it ends the remote step for the rest of the get, else the first file's
+    error."""
+    unreachable = [result for result in failed if "connection_failed" in result]
+    result = (unreachable or failed)[0]
+    message = result["error"] if "error" in result else "unknown error"
+    if unreachable:
+        return exceptions.RemoteConnectionError(message)
+    return exceptions.RemoteError(message)
+
+
 def restore_file(
     rel_path: str,
     output_hash: HashInfo | None,
@@ -255,6 +287,8 @@ def restore_file(
 
     Tries the local cache, then git, then downloads the cache objects the output still misses
     from the remote ``remote_factory`` opens; it is called only when that download is needed.
+    A remote that raised ``RemoteConnectionError`` is named in the result's
+    ``unreachable_remote``.
     """
     path_str = str(dest_path)
     files_dir = cache_dir / "files"
@@ -324,12 +358,14 @@ def restore_file(
     # restored are still reported.
     if output_hash is not None:
         source = "cache"
+        remote: RemoteStorage | None = None
         try:
             missing_hashes = cache.missing_cache_objects(output_hash, files_dir, checkout_modes)
             if missing_hashes:
                 source = "remote"
+                remote = remote_factory()
                 download_results = asyncio.run(
-                    remote_factory().download_batch(
+                    remote.download_batch(
                         [
                             (file_hash, cache.get_cache_path(files_dir, file_hash))
                             for file_hash in missing_hashes
@@ -337,14 +373,8 @@ def restore_file(
                         readonly=True,
                     )
                 )
-                for result in download_results:
-                    if not result["success"]:
-                        error = result["error"] if "error" in result else "unknown error"
-                        return RestoreResult(
-                            status=RestoreStatus.ERROR,
-                            path=path_str,
-                            message=f"Error: {dest_path} - failed to download from remote: {error}",
-                        )
+                if failed := [result for result in download_results if not result["success"]]:
+                    raise _download_error(failed)
             success = cache.restore_from_cache(
                 dest_path,
                 output_hash,
@@ -353,11 +383,14 @@ def restore_file(
                 state_dir=config.get_state_dir(),
             )
         except exceptions.RemoteError as e:
-            return RestoreResult(
+            failure = RestoreResult(
                 status=RestoreStatus.ERROR,
                 path=path_str,
                 message=f"Error: {dest_path} - failed to download from remote: {_reason(e)}",
             )
+            if remote is not None and isinstance(e, exceptions.RemoteConnectionError):
+                failure["unreachable_remote"] = remote.url
+            return failure
         except (exceptions.PivotError, OSError) as e:
             return RestoreResult(
                 status=RestoreStatus.ERROR,
@@ -420,11 +453,31 @@ def restore_targets_from_revision(
     # Resolves the remote and builds its backend once per call, not once per target that misses
     # the cache
     open_remote = functools.cache(remote_factory)
+    # A remote this call could not reach is not tried again, so an unreachable remote costs one
+    # connection timeout per call, not one per target
+    unreachable: str | None = None
+
+    def reachable_remote() -> RemoteStorage:
+        if unreachable is not None:
+            raise exceptions.RemoteConnectionError(
+                f"{unreachable} could not be reached for an earlier target, "
+                + "so it is not tried again"
+            )
+        return open_remote()
 
     for target_info in target_infos:
         for rel_path in target_info["paths"]:
             output_hash = target_info["hashes"].get(rel_path)
             dest_path = output if output is not None else proj_root / rel_path
+            if "error" in target_info:
+                results.append(
+                    RestoreResult(
+                        status=RestoreStatus.ERROR,
+                        path=str(dest_path),
+                        message=f"Error: {dest_path} - {target_info['error']}",
+                    )
+                )
+                continue
 
             result = restore_file(
                 rel_path=rel_path,
@@ -434,8 +487,10 @@ def restore_targets_from_revision(
                 cache_dir=cache_dir,
                 checkout_modes=checkout_modes,
                 force=force,
-                remote_factory=open_remote,
+                remote_factory=reachable_remote,
             )
+            if "unreachable_remote" in result:
+                unreachable = result["unreachable_remote"]
             results.append(result)
 
     # Format output: show all messages, with errors summarized at the end

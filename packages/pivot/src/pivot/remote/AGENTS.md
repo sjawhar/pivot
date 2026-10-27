@@ -55,14 +55,20 @@ hash-mismatch error, and the staged atomic download. A change to the hash or the
 `batch.py` owns the orchestration both backends run: `bulk_exists` (per-hash requests below 50
 hashes, a listing per 2-char prefix from 50 up), `cache_hashes` (which object names are cache
 objects), and `transfer_batch` (a failed transfer is a `TransferResult(success=False)`, never an
-exception). A backend passes its client context and per-object coroutines; checks on one object,
-such as GCS's upload verification, belong in those coroutines, not in `batch.py`.
+exception; one that raised `RemoteConnectionError` also carries `connection_failed`, which `get`
+reads to stop trying an unreachable remote). A backend passes its client context and per-object
+coroutines; checks on one object, such as GCS's upload verification, belong in those coroutines,
+not in `batch.py`. A per-object coroutine raises `RemoteConnectionError` only when the remote
+itself is unusable (no connection, credentials, a server error after retries), never for one
+missing or corrupt object.
 
 - **S3Remote** uses `aioboto3.Session()` — one session per instance, one client per method call;
   batch methods share that client across concurrent tasks. A session or client that cannot
   start (a missing AWS profile when the session is made, an invalid `AWS_ENDPOINT_URL` when the
   client opens) raises one `RemoteConnectionError` before any transfer; missing credentials
-  still fail each request, so a batch reports each item failed.
+  still fail each request, so a batch reports each item failed. A download that cannot connect
+  (botocore's `ConnectionError`: refused, connect timeout, proxy or TLS failure) raises
+  `RemoteConnectionError`.
 - **GCSRemote** opens one `aiohttp.ClientSession` per method call, shared by a batch's concurrent
   transfers, and fetches the token before the first request, so missing credentials raise one
   `RemoteConnectionError` before any transfer. It passes its own `aiohttp.ClientTimeout` (no

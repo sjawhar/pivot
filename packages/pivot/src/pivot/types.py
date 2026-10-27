@@ -533,6 +533,8 @@ class TransferResult(TypedDict):
     hash: str
     success: bool
     error: NotRequired[str]
+    # Present when the transfer failed with a RemoteConnectionError: pivot could not use the remote
+    connection_failed: NotRequired[Literal[True]]
 
 
 class TransferSummary(TypedDict):

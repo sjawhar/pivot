@@ -427,7 +427,7 @@ counts separately.
 
 Retrieve files or stage outputs from a specific git revision.
 
-Each output comes from the local cache, then git, then the remote: `get` downloads the cache objects the output is missing and restores it from the cache. An output that fails is reported with its reason; `get` still restores and reports the other targets.
+Each output comes from the local cache, then git, then the remote: `get` downloads the cache objects the output is missing and restores it from the cache. An output that fails is reported with its reason; `get` still restores and reports the other targets. If the remote cannot be reached, `get` does not try it again for the later targets: each one that needs it fails naming the remote. A target whose `.pvt` file at the revision is not valid fails naming the file and its first bad field.
 
 ```bash
 pivot get TARGETS... --rev REVISION [OPTIONS]

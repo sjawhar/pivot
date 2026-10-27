@@ -153,12 +153,7 @@ def diff(
     default=None,
     help="Output path when the targets name a single file (one target with one output)",
 )
-@click.option(
-    "--checkout-mode",
-    type=click.Choice(["symlink", "hardlink", "copy"]),
-    default=None,
-    help="Checkout mode (default: cache.checkout_mode, else hardlink, symlink, copy)",
-)
+@cli_decorators.checkout_mode_option
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
 def get(
     targets: tuple[str, ...],

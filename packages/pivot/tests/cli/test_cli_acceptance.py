@@ -14,6 +14,7 @@ import py_compile
 import re
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -1154,22 +1155,20 @@ def test_get_leaves_no_output_or_cache_after_failed_remote_download(
     assert not cached_path.exists()
 
 
-def _tracked_pair_with_second_uncached(tmp_path: pathlib.Path) -> pathlib.Path:
-    """A project tracking first.txt and second.txt, both deleted from the workspace and
-    second.txt also deleted from the cache."""
+def _tracked_pair_with_second_uncached(
+    tmp_path: pathlib.Path, second: str = "second.txt"
+) -> pathlib.Path:
+    """A project tracking first.txt and ``second`` (a path from the root), both deleted from the
+    workspace and ``second`` also deleted from the cache."""
     root = _project(
         tmp_path,
-        {
-            ".gitignore": "first.txt\nsecond.txt\n",
-            "first.txt": "first\n",
-            "second.txt": "second\n",
-        },
+        {".gitignore": f"first.txt\n{second}\n", "first.txt": "first\n", second: "second\n"},
     )
-    _ok(_pivot(root, "track", "first.txt", "second.txt"))
-    second_hash, _ = cache.hash_file(root / "second.txt")
+    _ok(_pivot(root, "track", "first.txt", second))
+    second_hash, _ = cache.hash_file(root / second)
     _commit(root, "track files")
     (root / "first.txt").unlink()
-    (root / "second.txt").unlink()
+    (root / second).unlink()
     cache.get_cache_path(root / ".pivot" / "cache" / "files", second_hash).unlink()
     return root
 
@@ -1253,6 +1252,56 @@ def test_pull_reports_a_remote_backend_that_cannot_start_as_a_remote_error(
     assert not (root / "second.txt").exists()
 
 
+def _refused_endpoint() -> str:
+    """The URL of a local port nothing listens on, so a connection to it is refused at once."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [pytest.param("s3://bucket-x/cache", id="s3"), pytest.param("gs://bucket-x/cache", id="gcs")],
+)
+def test_get_tries_an_unreachable_remote_once(tmp_path: pathlib.Path, url: str) -> None:
+    """A remote pivot cannot connect to fails the first target that needs it with the connection
+    error; each later target that needs it fails naming the remote, without trying it again, so
+    an unreachable remote costs one connection timeout per get, not one per target."""
+    names = ("a.txt", "b.txt", "c.txt")
+    root = _project(
+        tmp_path, {".gitignore": "a.txt\nb.txt\nc.txt\n", **{name: name for name in names}}
+    )
+    _ok(_pivot(root, "config", "set", "remotes.origin", url))
+    _ok(_pivot(root, "config", "set", "remote.retries", "0"))
+    _ok(_pivot(root, "track", *names))
+    _commit(root, "track files")
+    for name in names:
+        file_hash, _ = cache.hash_file(root / name)
+        cache.get_cache_path(root / ".pivot" / "cache" / "files", file_hash).unlink()
+        (root / name).unlink()
+    endpoint = _refused_endpoint()
+    env = _env(
+        AWS_ENDPOINT_URL=endpoint,
+        AWS_ACCESS_KEY_ID="x",
+        AWS_SECRET_ACCESS_KEY="x",
+        AWS_DEFAULT_REGION="us-east-1",
+        STORAGE_EMULATOR_HOST=endpoint,
+    )
+
+    proc = _pivot(root, "get", "--rev", "HEAD", *names, env=env)
+    out = proc.stdout + proc.stderr
+
+    not_tried = f"{url} could not be reached for an earlier target, so it is not tried again"
+    assert proc.returncode == 1, out
+    assert "a.txt - failed to download from remote: " in out, out
+    assert f"b.txt - failed to download from remote: {not_tried}" in out, out
+    assert f"c.txt - failed to download from remote: {not_tried}" in out, out
+    assert out.count(not_tried) == 2, "only the first target tries the remote"
+    assert "Tip: Check network connection and remote credentials" in out, out
+    assert "Failed to restore 3 file(s)" in out, out
+
+
 _EXEC_DIR_PIPELINE = """\
 import os
 import pathlib
@@ -1324,14 +1373,12 @@ def _executable_tools_only_on_remote(
     return root, env
 
 
-def test_get_reports_earlier_targets_when_the_downloaded_output_cannot_be_linked(
-    tmp_path: pathlib.Path, moto_services: dict[str, str]
+def _get_restores_first_and_refuses_executable_tools(
+    root: pathlib.Path, env: dict[str, str], source: str
 ) -> None:
-    """An object get downloads has no executable bit, so with --checkout-mode hardlink an
-    executable member cannot be linked: that output fails with the reason, and the target
-    restored before it is still reported."""
-    root, env = _executable_tools_only_on_remote(tmp_path, moto_services["s3"])
-
+    """Run get for first.txt and x/tools with --checkout-mode hardlink, and check that first.txt
+    is restored from the cache and that x/tools, restored from ``source`` ("remote" or "cache"),
+    fails because its executable member cannot be linked, with that reason and its tip."""
     proc = _pivot(
         root, "get", "--rev", "HEAD", "--checkout-mode", "hardlink", "first.txt", "x/tools", env=env
     )
@@ -1340,10 +1387,21 @@ def test_get_reports_earlier_targets_when_the_downloaded_output_cannot_be_linked
     assert proc.returncode == 1, out
     assert "first.txt (from cache)" in out, out
     assert (root / "first.txt").read_text() == "first\n"
-    assert "tools.dat - failed to restore from remote: Cache object" in out, out
+    assert f"tools.dat - failed to restore from {source}: Cache object" in out, out
     assert "needs isexec=True" in out, out
     assert "Tip: Add CheckoutMode.COPY to checkout_modes" in out, out
     assert not (root / "data" / "x" / "tools.dat").exists()
+
+
+def test_get_reports_earlier_targets_when_the_downloaded_output_cannot_be_linked(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """An object get downloads has no executable bit, so with --checkout-mode hardlink an
+    executable member cannot be linked: that output fails with the reason, and the target
+    restored before it is still reported."""
+    root, env = _executable_tools_only_on_remote(tmp_path, moto_services["s3"])
+
+    _get_restores_first_and_refuses_executable_tools(root, env, "remote")
 
 
 def test_get_reports_earlier_targets_when_a_pulled_output_cannot_be_linked(
@@ -1355,18 +1413,7 @@ def test_get_reports_earlier_targets_when_a_pulled_output_cannot_be_linked(
     _ok(_pivot(root, "pull", "x/tools", env=env))
     shutil.rmtree(root / "data" / "x")
 
-    proc = _pivot(
-        root, "get", "--rev", "HEAD", "--checkout-mode", "hardlink", "first.txt", "x/tools", env=env
-    )
-    out = proc.stdout + proc.stderr
-
-    assert proc.returncode == 1, out
-    assert "first.txt (from cache)" in out, out
-    assert (root / "first.txt").read_text() == "first\n"
-    assert "tools.dat - failed to restore from cache: Cache object" in out, out
-    assert "needs isexec=True" in out, out
-    assert "Tip: Add CheckoutMode.COPY to checkout_modes" in out, out
-    assert not (root / "data" / "x" / "tools.dat").exists()
+    _get_restores_first_and_refuses_executable_tools(root, env, "cache")
 
 
 def test_get_reports_earlier_targets_when_an_unmarked_tree_member_is_unreadable(
@@ -1453,17 +1500,7 @@ def test_get_reports_earlier_targets_when_a_target_directory_cannot_be_created(
 ) -> None:
     """A target whose directory cannot be made, because a file holds its name, fails with the
     reason, and the target restored before it is still reported."""
-    root = _project(
-        tmp_path,
-        {
-            ".gitignore": "first.txt\nsub/second.txt\n",
-            "first.txt": "first\n",
-            "sub/second.txt": "second\n",
-        },
-    )
-    _ok(_pivot(root, "track", "first.txt", "sub/second.txt"))
-    _commit(root, "track files")
-    (root / "first.txt").unlink()
+    root = _tracked_pair_with_second_uncached(tmp_path, "sub/second.txt")
     shutil.rmtree(root / "sub")
     (root / "sub").write_text("a file where the directory was\n")
 
@@ -1476,16 +1513,37 @@ def test_get_reports_earlier_targets_when_a_target_directory_cannot_be_created(
     assert "second.txt - cannot create its directory: [Errno 17] File exists" in out, out
 
 
-def test_get_reports_earlier_targets_when_a_tracked_file_records_an_invalid_hash(
-    tmp_path: pathlib.Path,
+@pytest.mark.parametrize(
+    ("pvt", "reason"),
+    [
+        pytest.param(
+            "path: bad.txt\nhash: zzzzzzzzzzzzzzzz\nsize: 1\n",
+            "failed to restore from cache: Hash contains invalid characters",
+            id="hash-not-a-cache-key",
+        ),
+        pytest.param(
+            "path: bad.txt\nhash: 1234567890123456\nsize: 1\n",
+            "bad.txt.pvt at HEAD is not a valid .pvt file: field 'hash' is not a string",
+            id="all-digit-hash",
+        ),
+        pytest.param(
+            "path: bad.txt\nhash: 0123456789abcdef\nsize: 1\n"
+            + "manifest:\n- relpath: a.txt\n  size: 1\n  isexec: false\n",
+            "bad.txt.pvt at HEAD is not a valid .pvt file: field 'manifest[0].hash' is missing",
+            id="manifest-entry-without-hash",
+        ),
+    ],
+)
+def test_get_reports_earlier_targets_when_a_tracked_file_has_an_invalid_pvt(
+    tmp_path: pathlib.Path, pvt: str, reason: str
 ) -> None:
-    """A committed .pvt whose hash is not a cache key fails that target with the reason, and
-    the target restored before it is still reported."""
+    """A committed .pvt that is hand-written wrong (a hash that is not a cache key, an all-digit
+    hash YAML reads as an integer, a manifest entry with no hash) fails that target with the
+    reason, naming the file and the field where the .pvt itself is invalid, and the target
+    restored before it is still reported."""
     root = _project(tmp_path, {".gitignore": "first.txt\n", "first.txt": "first\n"})
     _ok(_pivot(root, "track", "first.txt"))
-    (root / "bad.txt.pvt").write_text(
-        yaml.safe_dump({"path": "bad.txt", "hash": "z" * 16, "size": 1}, sort_keys=False)
-    )
+    (root / "bad.txt.pvt").write_text(pvt)
     _commit(root, "track files")
     (root / "first.txt").unlink()
 
@@ -1495,7 +1553,8 @@ def test_get_reports_earlier_targets_when_a_tracked_file_records_an_invalid_hash
     assert proc.returncode == 1, out
     assert "first.txt (from cache)" in out, out
     assert (root / "first.txt").read_text() == "first\n"
-    assert "bad.txt - failed to restore from cache: Hash contains invalid characters" in out, out
+    assert f"bad.txt - {reason}" in out, out
+    assert not (root / "bad.txt").exists()
 
 
 def test_get_refuses_an_unknown_remote_name_before_restoring_anything(
@@ -1517,10 +1576,12 @@ def test_get_refuses_an_unknown_remote_name_before_restoring_anything(
     assert not (root / "artifact.txt").exists()
 
 
-def _unmarked_shards_tree_with_stale_member(tmp_path: pathlib.Path) -> tuple[pathlib.Path, str]:
+def _unmarked_shards_tree_with_stale_member(
+    tmp_path: pathlib.Path,
+) -> tuple[pathlib.Path, pathlib.Path, str]:
     """A project whose d/shards output is gone from the workspace and whose unmarked SYMLINK
     cache tree holds every recorded file at its recorded size, 0.txt with stale bytes. Returns
-    the root and 0.txt's recorded hash."""
+    the root, the tree and 0.txt's recorded hash."""
     root = _project(
         tmp_path,
         {
@@ -1538,7 +1599,7 @@ def _unmarked_shards_tree_with_stale_member(tmp_path: pathlib.Path) -> tuple[pat
     (tree / "0.txt").write_text("xx")  # stale, the size of "11"
     shutil.rmtree(root / "data" / "d" / "shards.dat")
     stale_entry = next(e for e in output_hash["manifest"] if e["relpath"] == "0.txt")
-    return root, stale_entry["hash"]
+    return root, tree, stale_entry["hash"]
 
 
 def test_symlink_checkout_repairs_stale_bytes_in_a_complete_unmarked_tree(
@@ -1546,7 +1607,7 @@ def test_symlink_checkout_repairs_stale_bytes_in_a_complete_unmarked_tree(
 ) -> None:
     """An unmarked SYMLINK cache tree that holds every recorded file at its recorded size, one
     with stale bytes, is checked by content before a restore links it into the workspace."""
-    root, _ = _unmarked_shards_tree_with_stale_member(tmp_path)
+    root, _, _ = _unmarked_shards_tree_with_stale_member(tmp_path)
     shards = root / "data" / "d" / "shards.dat"
 
     proc = _pivot(root, "checkout", "--checkout-mode", "symlink", "d/shards")
@@ -1556,13 +1617,120 @@ def test_symlink_checkout_repairs_stale_bytes_in_a_complete_unmarked_tree(
     assert (shards / "1.txt").read_text() == "15"
 
 
-def test_symlink_checkout_through_an_unrepairable_stale_tree_writes_nothing(
+# The mark pivot 0.3.5 to 0.5.11 put beside a tree after checking its files' sizes, not content
+_SIZE_CHECKED_MARK = ".verified"
+
+
+@pytest.mark.parametrize(
+    ("setup", "command"),
+    [
+        pytest.param((), ("checkout", "--checkout-mode", "symlink", "d/shards"), id="checkout"),
+        pytest.param(
+            (), ("get", "--rev", "HEAD", "--checkout-mode", "symlink", "d/shards"), id="get"
+        ),
+        pytest.param(
+            (("config", "set", "cache.checkout_mode", "symlink,hardlink,copy"),),
+            ("repro", "--force"),
+            id="repro-force",
+        ),
+    ],
+)
+def test_symlink_restore_rechecks_a_stale_tree_an_older_pivot_marked_after_a_size_check(
+    tmp_path: pathlib.Path, setup: tuple[tuple[str, ...], ...], command: tuple[str, ...]
+) -> None:
+    """Pivot 0.3.5 to 0.5.11 marked a SYMLINK cache tree after checking its files' sizes only, so
+    a tree holding stale bytes of the recorded size can carry that mark. checkout, get and a
+    symlink commit check such a tree by content and repair it before linking it, and drop the
+    old mark."""
+    root, tree, _ = _unmarked_shards_tree_with_stale_member(tmp_path)
+    old_mark = tree.with_name(tree.name + _SIZE_CHECKED_MARK)
+    old_mark.touch()
+    for args in setup:
+        _ok(_pivot(root, *args))
+    _commit(root, "v1")
+    shards = root / "data" / "d" / "shards.dat"
+
+    proc = _pivot(root, *command)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (shards / "0.txt").read_text() == "11"
+    assert shards.resolve() == tree.resolve(), "the output is linked to the repaired tree"
+    assert not old_mark.exists(), "the size-only mark is dropped once the content is checked"
+
+
+def _released_pivot(venv: pathlib.Path, version: str) -> str:
+    """Install pivot ``version`` from the package index into a new venv at ``venv`` and return
+    its ``pivot``. Needs uv and the index, so only CI runs it: CI runs the suite without uv on
+    PATH and names uv's executable in ``PIVOT_TEST_UV``."""
+    uv = os.environ.get("PIVOT_TEST_UV", "")
+    if not (pathlib.Path(uv).is_file() and os.access(uv, os.X_OK)):
+        pytest.fail(f"PIVOT_TEST_UV must name the uv executable; it is {uv!r}", pytrace=False)
+    made = subprocess.run(
+        [uv, "venv", "--python", "3.13", str(venv)],
+        env=_env(),
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert made.returncode == 0, made.stdout + made.stderr
+    installed = subprocess.run(
+        [uv, "pip", "install", "--python", str(venv / "bin" / "python"), f"pivot=={version}"],
+        env=_env(),
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    return str(venv / "bin" / "pivot")
+
+
+@pytest.mark.skipif(not os.environ.get("CI"), reason="installs pivot 0.5.11 from PyPI; runs in CI")
+def test_symlink_checkout_repairs_a_stale_tree_pivot_0_5_11_linked_and_marked(
     tmp_path: pathlib.Path,
 ) -> None:
-    """An unmarked SYMLINK tree with a stale member whose own cache object is gone cannot be
-    repaired: checkout fails and leaves the workspace without the output, rather than linking
-    the stale bytes."""
-    root, stale_hash = _unmarked_shards_tree_with_stale_member(tmp_path)
+    """Two builds on one project. Pivot 0.5.11, the last release whose tree check compared only
+    sizes, links a stale same-size tree into the workspace and marks it; this build's checkout
+    then checks the tree by content and repairs it rather than trusting that mark."""
+    released = _released_pivot(tmp_path / "venv", "0.5.11")
+    (tmp_path / "project").mkdir()
+    root, tree, _ = _unmarked_shards_tree_with_stale_member(tmp_path / "project")
+    shards = root / "data" / "d" / "shards.dat"
+    old = subprocess.run(
+        [released, "checkout", "--checkout-mode", "symlink", "d/shards"],
+        cwd=root,
+        env=_env(),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert old.returncode == 0, old.stdout + old.stderr
+    assert (shards / "0.txt").read_text() == "xx", "precondition: pivot 0.5.11 links stale bytes"
+    assert tree.with_name(tree.name + _SIZE_CHECKED_MARK).exists(), "precondition: and marks them"
+    assert shards.is_symlink(), "precondition: as a link to the tree"
+    shards.unlink()
+
+    proc = _pivot(root, "checkout", "--checkout-mode", "symlink", "d/shards")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (shards / "0.txt").read_text() == "11"
+
+
+@pytest.mark.parametrize(
+    "marks",
+    [pytest.param((), id="unmarked"), pytest.param((_SIZE_CHECKED_MARK,), id="size-checked")],
+)
+def test_symlink_checkout_through_an_unrepairable_stale_tree_writes_nothing(
+    tmp_path: pathlib.Path, marks: tuple[str, ...]
+) -> None:
+    """A SYMLINK tree with a stale member whose own cache object is gone cannot be repaired,
+    whether unmarked or marked by an older pivot's size check: checkout fails and leaves the
+    workspace without the output, rather than linking the stale bytes."""
+    root, tree, stale_hash = _unmarked_shards_tree_with_stale_member(tmp_path)
+    for suffix in marks:
+        tree.with_name(tree.name + suffix).touch()
     cache.get_cache_path(root / ".pivot" / "cache" / "files", stale_hash).unlink()
     shards = root / "data" / "d" / "shards.dat"
 
