@@ -583,19 +583,6 @@ def _restore_tracked_file(
     )
 
 
-def restore_missing_tracked_files(project_root: pathlib.Path) -> None:
-    """Restore each tracked file missing from the workspace from the cache.
-
-    Files that exist are neither checked nor touched; a file the cache lacks stays missing for
-    ``verify_tracked_files`` to report.
-    """
-    cache_dir = config.get_cache_dir() / "files"
-    for data_path, track_data in track.discover_pvt_files(project_root).items():
-        path = pathlib.Path(data_path)
-        if not path.exists() and _restore_tracked_file(path, track_data, cache_dir):
-            logger.info(f"Restored tracked file: {data_path}")
-
-
 def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = False) -> None:
     """Verify all .pvt tracked files exist and warn on hash mismatches.
 
@@ -606,7 +593,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     """
     from pivot import metrics
 
-    tracked_files = track.discover_pvt_files(project_root)
+    tracked_files = track.discover_pvt_files_and_update_memo(project_root)
     if not tracked_files:
         return
 
