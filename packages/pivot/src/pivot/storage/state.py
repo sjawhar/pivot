@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Self
 import lmdb
 
 from pivot import exceptions, run_history
-from pivot.types import DeferredWrites, NoCommitRecord
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +23,7 @@ if TYPE_CHECKING:
 
     from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
+    from pivot.types import DeferredWrites, NoCommitRecord
 
 # Key prefixes for different entry types
 _HASH_PREFIX = b"hash:"  # File hash entries
@@ -264,6 +264,17 @@ def _is_str_dict(value: object) -> typing.TypeGuard[dict[str, str]]:
         isinstance(key, str) and isinstance(item, str)
         for key, item in typing.cast("dict[object, object]", value).items()
     )
+
+
+def _json_object(value: bytes | None) -> dict[str, object] | None:
+    """`value` decoded as a JSON object, or None if it is absent or not one."""
+    if value is None:
+        return None
+    try:
+        data: object = json.loads(value)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return typing.cast("dict[str, object]", data) if isinstance(data, dict) else None
 
 
 class InvalidAstHashKeyError(Exception):
@@ -919,30 +930,25 @@ class StateDB:
         return run_history.deserialize_run_cache_entry(value)
 
     def get_no_commit_record(self, stage_name: str) -> NoCommitRecord | None:
-        """The record a `--no-commit` run of `stage_name` left, or None (absent, or not a JSON
-        object).
+        """The stage's `nocommit:` record, or None (absent, or not a JSON object).
 
-        It holds each field this Pivot knows that is valid: `code_manifest` with `output_hashes`,
-        both or neither. A record without them (one another Pivot wrote with only its own field)
-        reads as a record without them, never as absent.
+        It holds `code_manifest` and `output_hashes`, the keys a `--no-commit` run writes, only
+        together and only when both are valid, and every other key as stored, for the feature
+        that writes it to validate (`types.NoCommitRecord`). A record without these two, or with
+        either malformed, reads as present with its other keys, never as absent.
         """
         self._check_closed()
         with self._read_transaction() as txn:
             value = txn.get(_NOCOMMIT_PREFIX + stage_name.encode())
-        if value is None:
+        record = _json_object(value)
+        if record is None:
             return None
-        try:
-            data: object = json.loads(value)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return None
-        if not isinstance(data, dict):
-            return None
-        record = typing.cast("dict[str, object]", data)
-        manifest = record.get("code_manifest")
-        outputs = record.get("output_hashes")
+        manifest = record.pop("code_manifest", None)
+        outputs = record.pop("output_hashes", None)
         if _is_str_dict(manifest) and _is_str_dict(outputs):
-            return NoCommitRecord(code_manifest=manifest, output_hashes=outputs)
-        return NoCommitRecord()
+            record["code_manifest"] = manifest
+            record["output_hashes"] = outputs
+        return typing.cast("NoCommitRecord", typing.cast("object", record))
 
     def prune_run_cache(self, valid_run_ids: set[str]) -> int:
         """Remove run cache entries that reference runs not in valid_run_ids.
@@ -1073,7 +1079,11 @@ class StateDB:
 
                 nocommit_key = _NOCOMMIT_PREFIX + stage_name.encode()
                 if "no_commit_record" in deferred:
-                    txn.put(nocommit_key, json.dumps(deferred["no_commit_record"]).encode())
+                    # Set the run's keys (it writes both) and keep every other key: another
+                    # feature writes its keys into the same record (`types.NoCommitRecord`).
+                    record = _json_object(txn.get(nocommit_key)) or dict[str, object]()
+                    record.update(deferred["no_commit_record"])
+                    txn.put(nocommit_key, json.dumps(record).encode())
                 elif "clear_no_commit_record" in deferred and deferred["clear_no_commit_record"]:
                     txn.delete(nocommit_key)
         except lmdb.MapFullError as e:

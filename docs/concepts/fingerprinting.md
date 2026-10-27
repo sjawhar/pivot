@@ -269,11 +269,12 @@ that code. A stage's fingerprint describes the code that Pivot loaded, not the
 file as it is when the stage starts. If you edit a stage or a helper while the
 run continues (in an editor, or from an upstream stage), the stages of that run
 use the loaded version, and their locks record it. The next run loads your edit
-and reruns the stages it changes. This holds for every user module, whatever
-loaded it: a module under the project root, one on `PYTHONPATH`, an editable
-install's finder, a zip on `sys.path`, `importlib.util.spec_from_file_location`,
-`sitecustomize` before Pivot started, or a loader a module calls itself (see
-below).
+and reruns the stages it changes. This holds for every user module Pivot can
+read the source of, whatever loaded it: a module under the project root, one on
+`PYTHONPATH`, an editable install's finder, a zip on `sys.path`,
+`importlib.util.spec_from_file_location`, `sitecustomize` before Pivot started,
+or a loader a module calls itself (see below). A module Pivot cannot read the
+source of is never reused, as the next paragraphs say.
 
 A worker imports some modules from their files itself: a module outside the
 project root (on `PYTHONPATH`, or a package installed from a source checkout),
@@ -296,7 +297,15 @@ A user module whose source Pivot cannot read (a sourceless `.pyc`, or a module
 from a loader that gives no source) is never trusted: Pivot cannot tell which
 code a worker holds. A stage that uses it warns once per run ("uses user
 modules whose source pivot cannot read"), reruns on every run, and never files
-or reuses a run-cache entry. Load such modules from `.py` source files.
+or reuses a run-cache entry. Load such modules from `.py` source files. The same
+holds for a module an import hook loads with its own subclass of
+`importlib.machinery.SourceFileLoader`, or another loader built on
+`importlib.abc.SourceLoader` (tools that rewrite source as it is imported
+install one): such a loader may run cached bytecode that Python checks only by
+the file's size and whole-second modification time, so the file can say one
+thing while the module runs another. A loader with only the old `load_module`
+method still imports as it does without Pivot, and its module is treated the
+same way.
 
 A module imported before Pivot starts, by `sitecustomize` or a `.pth` import
 line (in the `pivot` process and in every worker), was loaded before Pivot
@@ -317,7 +326,9 @@ stage, as above. Import such modules from the pipeline or a stage instead. A
 forward step of the system clock between an edit and the start of a pivot
 process can make that edit look older than the start: the 2 s margin covers a
 step of about 1 s where the file system keeps whole-second change times, and of
-2 s where it keeps exact ones.
+2 s where it keeps exact ones. A file system that keeps change times in
+2-second steps (FAT) uses the whole margin, so there an edit made just as a
+pivot process starts can be missed.
 
 Under `pivot repro --no-commit` no lock is written. The run records, for
 `pivot commit`, the manifest each stage's lock would have held, warnings' marks

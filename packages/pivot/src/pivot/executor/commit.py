@@ -124,7 +124,7 @@ def commit_stages(
             previous_lock = production_lock.read()
             # A --no-commit run left a record of the code it ran; it decides once the outputs are
             # hashed, so a stage with one is never skipped here. A record without that code (one
-            # holding only another Pivot's field) decides nothing.
+            # holding only another feature's key) decides nothing.
             run_record = stage_db.get_no_commit_record(stage_name) or {}
             run_manifest = run_record.get("code_manifest")
             run_outputs = run_record.get("output_hashes")

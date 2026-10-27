@@ -158,8 +158,11 @@ class _RecordingLoader(importlib.abc.Loader):
         origin = getattr(spec, "origin", None)
         # CPython's exact SourceFileLoader accepts a timestamp-valid old pyc. Use the checked-hash
         # loader Pivot uses for every other user `.py`: these are the bytes it actually executes.
-        # A subclass can execute transformed or virtual source; never substitute it with a
-        # filesystem loader, and record it unreadable unless another recorder captured it.
+        # Any other loader built on CPython's `SourceLoader` (a `SourceFileLoader` subclass, as an
+        # import hook that rewrites source installs) may run bytecode checked only by the source's
+        # size and whole-second mtime, or compile other text than its `get_data` gives. It is never
+        # replaced with a filesystem loader, and its module is recorded unreadable. Another loader
+        # is recorded from the source it gives before it executes.
         if type(self._loader) is importlib.machinery.SourceFileLoader and isinstance(origin, str):
             loader = _ProjectSourceLoader(module.__name__, origin)
             loader.exec_module(module)
@@ -168,6 +171,7 @@ class _RecordingLoader(importlib.abc.Loader):
             data = (
                 loaded_source.loader_source(self._loader, origin, module.__name__)
                 if isinstance(origin, str)
+                and not isinstance(self._loader, importlib.abc.SourceLoader)
                 else None
             )
             self._loader.exec_module(module)
@@ -221,10 +225,15 @@ def _record_spec_loader(spec: importlib.machinery.ModuleSpec | None) -> None:
     """Replace a user-code spec's loader with ``_RecordingLoader``, so Pivot records the source
     the module is compiled from. Both seams the recorder installs decide here:
     ``_RecordingFinder.find_spec`` and the wrapped ``importlib.util.spec_from_file_location``.
+
+    A loader without ``exec_module`` (PEP 302's ``load_module`` only, which CPython 3.13 still
+    imports with an ``ImportWarning``) is left as it is: wrapped, the import would call the
+    wrapper's ``exec_module`` and fail. Its module is judged as one no recorder saw compile.
     """
     if (
         spec is not None
         and spec.loader is not None
+        and hasattr(spec.loader, "exec_module")
         and isinstance(spec.origin, str)
         and _should_record_origin(spec.origin)
         and not isinstance(spec.loader, (_ProjectSourceLoader, _RecordingLoader))

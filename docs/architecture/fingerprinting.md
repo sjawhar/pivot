@@ -237,9 +237,21 @@ discovery (`loaded_source.record_user_modules`), and in a worker at each import 
 stage returns. That covers an editable install's meta-path finder, a zip on `sys.path`,
 `importlib.util.spec_from_file_location` and the loader a finder on `sys.meta_path` returns: the
 loader's `get_data` on the module's `.py` origin, else its `get_source`. A module whose loader
-gives neither (a sourceless `.pyc`, an extension module) is recorded as unreadable. A loader a
-module calls itself (`SourceFileLoader(...).load_module()`, or `spec_from_loader` and
-`exec_module`) passes no import hook, so its module is judged as one no recorder saw compile.
+gives neither (a sourceless `.pyc`, an extension module) is recorded as unreadable. CPython's own
+`SourceFileLoader` is replaced with `_ProjectSourceLoader`, which records the bytes it compiled or
+validated checked-hash bytecode against. Any other loader built on CPython's `SourceLoader` (a
+`SourceFileLoader` subclass, as an import hook that rewrites source installs, or another
+`importlib.abc.SourceLoader`) is not replaced, since it may transform the source, and its module
+is recorded as unreadable: its `get_code` may run cached bytecode that CPython checks only by the
+source's size and whole-second mtime, so `get_data` can give an edited file while the module runs
+the earlier code (`discovery._RecordingLoader.exec_module`). A zip importer is not such a loader
+(`zipimport.zipimporter` is no `importlib.abc.SourceLoader`), so its modules keep their source. A
+loader with only PEP 302's `load_module` and no `exec_module`, which CPython 3.13 still imports
+with an `ImportWarning` (its import system calls `load_module` "slated for removal in Python
+3.15"), is left unwrapped, so the import works as without Pivot; no recorder sees its module
+compile, and it is judged as below, where its loader makes it unreadable. A loader a module calls
+itself (`SourceFileLoader(...).load_module()`, or `spec_from_loader` and `exec_module`) passes no
+import hook, so its module is judged as one no recorder saw compile.
 
 A user module that no recorder saw compile was imported before discovery installed the recorder,
 by `sitecustomize` or a `.pth` import line (in the coordinator, and in each worker before its
@@ -260,7 +272,12 @@ which records the module's file when those bytes are shown to be the bytes it wa
   with 128-byte inodes stamps a change up to 1 s before it happened), the kernel's coarse
   timestamps, and a forward step of the wall clock between an edit and Pivot's import, which the
   margin covers up to 2 s where change times are exact and to about 1 s where they are whole
-  seconds. Every import in the process then read these bytes;
+  seconds. A file system that keeps change times in 2-second steps (FAT, Linux's `vfat`) spends
+  the whole margin: on a FAT32 loop mount every change time is an even second, so an edit reads
+  as up to just under 2 s early (1.7 s in eight edits measured). There the margin covers no clock
+  step and no kernel tick, and an edit made in the first milliseconds of a process, before the
+  interpreter's own startup has reached any import, can read as older than the start: a stated
+  limit for a project on such a file system. Every import in the process then read these bytes;
 - the bytecode that loader may have run instead is the code of these bytes. A cached file that
   has not changed since the start is the one the import saw: either CPython's check rejects it
   for this source, or its code (`marshal`) equals the source compiled now, which catches the
@@ -284,10 +301,10 @@ before it imported Pivot: start Pivot in a process of its own, as the `pivot` co
 workers are. A forward step of the system clock between an edit and the start of a pivot process
 can make that edit look older than the start once it passes what the 2 s margin leaves after the
 file system's timestamp granularity (about 1 s where change times are whole seconds, 2 s where
-they are exact); so can a file system that stamps change times with another machine's clock (a
-network file system's server) that far behind this one. These records belong to the import
-session: `loaded_source.prune` drops them when it ends, so the next discovery judges the
-modules again.
+they are exact, none where they are in 2-second steps); so can a file system that stamps change
+times with another machine's clock (a network file system's server) that far behind this one.
+These records belong to the import session: `loaded_source.prune` drops them when it ends, so
+the next discovery judges the modules again.
 
 Discovery's path hook and the module recorder are installed only while a discovery imports;
 `discovery._remove_import_hooks` gives CPython's machinery back when it returns, fails or is
@@ -323,6 +340,13 @@ stage on the worker used is not this stage's concern. Records compare by module 
 digest, so a new package that shadows a module mid-run differs too. A stage sent with a token
 other than the one its worker started with, and without the records, cannot be compared, so
 every module it used that the worker loaded counts.
+A pipeline a program builds itself and passes to `executor.run(pipeline=...)` is never
+discovered, so the coordinator holds no record of its modules and sends none: the worker compares
+no module (`check_stage` skips a module the coordinator sent no record for), and the stage is
+fingerprinted from the files when it is ready to run, as before this check existed. An edit to
+its code during that run is not detected. This is by design for that programmatic path: the
+`pivot` command, the engine's watch and server modes, and `executor.run` without `pipeline`
+always discover the pipeline, so their modules are recorded.
 When an import session ends, the entries of the modules it removed are dropped, with the
 `linecache` lines pinned for them, and so are those `record_unseen_modules` made
 (`loaded_source.prune`).
@@ -337,8 +361,10 @@ filed or used, and `pivot commit` carries them (`skip.rerun_mark_reason`,
 `skip.carry_rerun_marks`). Under `--no-commit` the run keeps the manifest its lock would have held,
 marks included, with the output hashes (`nocommit:<stage>` in StateDB); `pivot commit` writes that
 manifest while the outputs on disk are still those, and computes the input hash of the run-cache
-entry from it. A record without them (one that holds only another Pivot's field) is read as a
-record without them, so `pivot commit` treats the stage as one with no record. A warm worker that
+entry from it. Applying that record replaces only these two keys and keeps every other key, as
+the `*.pvt` members another feature writes into the same record during the run. A record without
+them (one that holds only another feature's key) reads as present, with that key, so
+`pivot commit` treats the stage as one with no record. A warm worker that
 imported the module before the edit holds the version the coordinator loaded, so its stages are
 not marked.
 

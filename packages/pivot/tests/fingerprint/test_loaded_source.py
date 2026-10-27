@@ -16,7 +16,8 @@ import time
 import types
 import uuid
 import zipfile
-from typing import cast
+from collections.abc import Sequence
+from typing import cast, override
 
 import pytest
 import xxhash
@@ -452,6 +453,145 @@ def test_a_module_another_loader_loaded_before_the_recorder_is_unreadable(
     assert _reason(name) == "its loader (_TransformingLoader) is not CPython's source file loader"
 
 
+def _leave_stale_bytecode(path: pathlib.Path) -> None:
+    """Leave `path` returning "bravo", with mtime-checked bytecode returning "alpha" that CPython's
+    check accepts for it: an edit that keeps the size and puts the mtime back."""
+    path.write_text('def value():\n    return "alpha"\n')
+    py_compile.compile(str(path), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+    old = path.stat()
+    path.write_text('def value():\n    return "bravo"\n')
+    os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
+
+
+class _CachingSourceLoader(importlib.abc.SourceLoader):
+    """A loader built on CPython's `SourceLoader` that is no `SourceFileLoader`: with `path_stats`,
+    its `get_code` runs cached bytecode that matches the source's size and whole-second mtime."""
+
+    _path: str
+
+    def __init__(self, fullname: str, path: str) -> None:
+        self._path = path
+
+    @override
+    def get_filename(self, fullname: str) -> str:
+        return self._path
+
+    @override
+    def get_data(self, path: str) -> bytes:
+        return pathlib.Path(path).read_bytes()
+
+    @override
+    def path_stats(self, path: str) -> dict[str, float]:
+        status = os.stat(path)
+        return {"mtime": status.st_mtime, "size": status.st_size}
+
+
+class _LoadModuleOnlyLoader:
+    """A PEP 302 loader with `load_module` and no `exec_module`, which CPython 3.13 still imports,
+    with an `ImportWarning`."""
+
+    _path: str
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+
+    def get_filename(self, fullname: str) -> str:
+        return self._path
+
+    def load_module(self, fullname: str) -> types.ModuleType:
+        module = types.ModuleType(fullname)
+        module.__file__ = self._path
+        module.__loader__ = self
+        sys.modules[fullname] = module
+        exec(compile(pathlib.Path(self._path).read_bytes(), self._path, "exec"), vars(module))
+        return module
+
+
+class _ServingFinder(importlib.abc.MetaPathFinder):
+    """A finder ahead of `sys.path`'s that serves one module with a given loader, as an import
+    hook does."""
+
+    _name: str
+    _loader: importlib.abc.Loader | _LoadModuleOnlyLoader
+
+    def __init__(self, name: str, loader: importlib.abc.Loader | _LoadModuleOnlyLoader) -> None:
+        self._name = name
+        self._loader = loader
+
+    @override
+    def find_spec(
+        self,
+        fullname: str,
+        path: Sequence[str] | None,
+        target: types.ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        if fullname != self._name:
+            return None
+        return importlib.util.spec_from_loader(fullname, self._loader)
+
+
+def _import_through_the_recorder(
+    name: str, loader: importlib.abc.Loader | _LoadModuleOnlyLoader, monkeypatch: pytest.MonkeyPatch
+) -> types.ModuleType:
+    """Import `name`, served by `loader`, with the module recorder installed, as a discovery or a
+    worker imports a module an import hook serves."""
+    monkeypatch.setitem(sys.modules, name, types.ModuleType(name))  # removed after the test
+    del sys.modules[name]
+    sys.meta_path.insert(0, _ServingFinder(name, loader))  # restore_import_machinery undoes it
+    discovery._install_module_recorder()
+    try:
+        return importlib.import_module(name)
+    finally:
+        discovery._uninstall_module_recorder()
+
+
+@pytest.mark.parametrize(
+    "loader_class",
+    [_TransformingLoader, _CachingSourceLoader],
+    ids=["source-file-loader-subclass", "source-loader"],
+)
+def test_a_module_a_source_loader_loads_through_the_recorder_is_unreadable(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    loader_class: type[_TransformingLoader | _CachingSourceLoader],
+) -> None:
+    """A loader built on CPython's `SourceLoader`, other than `SourceFileLoader` itself, may run
+    bytecode checked only by the source's size and whole-second mtime, and the recorder does not
+    replace it with Pivot's loader, since a subclass may transform the source. Its `get_data` then
+    gives the edited file while the module runs the earlier code, so the module is unreadable: a
+    stage that uses it reruns, and never reports the earlier code's output as cached."""
+    path = tmp_path / "hooked.py"
+    _leave_stale_bytecode(path)
+    name = f"hooked_{uuid.uuid4().hex}"
+
+    module = _import_through_the_recorder(name, loader_class(name, str(path)), monkeypatch)
+
+    assert module.value() == "alpha", "the import ran the earlier bytecode"
+    assert type(vars(module)["__spec__"].loader) is discovery._RecordingLoader
+    assert loaded_source.digests()[name] == f"{path.resolve()}\0"
+
+
+def test_a_legacy_load_module_only_loader_still_imports_with_the_recorder_installed(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PEP 302 loader with only `load_module` imports on CPython 3.13 (its import system warns
+    that `load_module` is slated for removal in 3.15) and imports on main; wrapped by the recorder,
+    its import failed. The recorder leaves it unwrapped, so it imports as without Pivot. No
+    recorder sees the module compile, so it is judged as a module imported before the recorder:
+    its loader is not CPython's, so it is unreadable."""
+    path = tmp_path / "legacy.py"
+    path.write_text("VALUE = 41\n")
+    name = f"legacy_{uuid.uuid4().hex}"
+
+    with pytest.warns(ImportWarning, match="exec_module"):
+        module = _import_through_the_recorder(name, _LoadModuleOnlyLoader(str(path)), monkeypatch)
+    _started_now(monkeypatch)
+    loaded_source.record_unseen_modules()
+
+    assert module.VALUE == 41
+    assert _reason(name) == "its loader (_LoadModuleOnlyLoader) is not CPython's source file loader"
+
+
 def test_stale_bytecode_the_import_ran_makes_the_module_unreadable(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -459,11 +599,7 @@ def test_stale_bytecode_the_import_ran_makes_the_module_unreadable(
     edit that keeps both imports the earlier code. The file then does not hold the module's code,
     though Python's own check accepts the bytecode for it."""
     path = tmp_path / "stale.py"
-    path.write_text('def value():\n    return "alpha"\n')
-    py_compile.compile(str(path), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
-    old = path.stat()
-    path.write_text('def value():\n    return "bravo"\n')
-    os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
+    _leave_stale_bytecode(path)
     module = _import_before_recorder(path, monkeypatch)
     assert module.value() == "alpha", "the import ran the earlier bytecode"
     _started_now(monkeypatch)

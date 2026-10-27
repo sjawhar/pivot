@@ -150,19 +150,25 @@ class OnError(enum.StrEnum):
 
 
 class NoCommitRecord(TypedDict, total=False):
-    """What a `--no-commit` run of a stage ran and wrote, kept for `pivot commit` under the
-    StateDB key `nocommit:<stage>`.
+    """What a stage's outputs hold that no lock records yet, kept under the StateDB key
+    `nocommit:<stage>`. A written lock supersedes it, and its whole record is removed.
 
-    `code_manifest` is the manifest the run's lock would have held, rerun marks included, and
-    `output_hashes` the outputs it wrote; this Pivot writes both, and reads neither without the
-    other. `pivot commit` writes that manifest when the outputs on disk still have these hashes.
-    The shape is open: another field joins as an optional key, and
-    `StateDB.get_no_commit_record` keeps these two only when both are valid and ignores every
-    other key, so a record that holds only another Pivot's field still reads, without these two.
+    Two features write the record, each its own keys. `code_manifest` is the manifest a
+    `--no-commit` run's lock would have held, rerun marks included, and `output_hashes` the
+    outputs it wrote: the run writes both (`StateDB.apply_deferred_writes`), and
+    `StateDB.get_no_commit_record` reads neither without the other; `pivot commit` writes that
+    manifest when the outputs on disk still have these hashes. `pvt_members` maps each `*.pvt`
+    file Pivot wrote in a directory output (path relative to the project root) to its content
+    hash; the feature that keeps those files owns it.
+
+    Every writer replaces only its own keys and keeps every other key, in one write transaction.
+    Every reader validates only its own keys and returns every other key as stored, so a record
+    that holds only another feature's keys reads as present, and a malformed key hides no other.
     """
 
     code_manifest: dict[str, str]
     output_hashes: dict[str, str]  # output identity key -> content hash
+    pvt_members: dict[str, str]  # `*.pvt` path relative to the project root -> content hash
 
 
 class DeferredWrites(TypedDict, total=False):

@@ -46,7 +46,12 @@ Record the bytes each user module was compiled from, and fingerprint those:
   bytes the checked-hash bytecode was validated against, or compiled from) and calls
   `loaded_source.record`. Every other user-code module is recorded from its own loader at the end
   of discovery and at each import a worker's hooks see (editable-install finders, zip importers,
-  `spec_from_file_location`). A module whose loader gives no source is recorded as unreadable.
+  `spec_from_file_location`). A module whose loader gives no source is recorded as unreadable, and
+  so is one loaded by any loader built on CPython's `SourceLoader` other than `SourceFileLoader`
+  itself (which `_ProjectSourceLoader` replaces): such a loader may run cached bytecode CPython
+  checks only by the source's size and whole-second mtime, so its `get_data` is not the code that
+  ran. A loader with only `load_module` is left unwrapped, so it still imports, and its module is
+  judged as one no recorder saw compile.
 - `loaded_source.getsource` puts the recorded lines into `linecache` as an entry without an mtime
   (CPython's form for loader-supplied source, which `checkcache` leaves alone) and calls
   `inspect.getsource`. It restores the entry if something cleared `linecache`; `prune` removes it
@@ -87,6 +92,10 @@ project keeps every recorded fingerprint.
 - `inspect.getsource` is not a pure function of the function object: it reads the file system.
 - The rule is about the module, not the loader that imported it: a fix inside one loader misses
   every other way a module is imported.
+- A loader's `get_data` is not the code its `exec_module` ran. Apply one rule to a loader type
+  wherever a module is judged: the round that judged a `SourceFileLoader` subclass unreadable
+  before the recorder still recorded it readable through the recorder, and served a stale result
+  as fresh. An attack set needs every loader type crossed with every point it can be reached.
 - Check per stage, not per worker: a worker's other stages did not use the module.
 - Test code-change detection with the edit made *after* the import and *before* the fingerprint,
   and with the stage order that leaves the function unhashed until after the edit.
@@ -103,3 +112,8 @@ project keeps every recorded fingerprint.
   pytest-xdist worker runs many tests in one process, so a leaked hook makes the suite pass or
   fail by schedule. The suite's `restore_import_machinery` fixture restores them after each test
   and ends the discovery session the test started.
+- A StateDB record that two features write (`nocommit:`, `types.NoCommitRecord`) needs both a
+  reader and a writer per feature that touch only that feature's keys: each writer reads the
+  record and replaces its own keys in one write transaction, and each reader validates its own
+  keys and returns the rest as stored. Checking only the reader missed a whole-record put that
+  erased the other feature's key on every `--no-commit` run.

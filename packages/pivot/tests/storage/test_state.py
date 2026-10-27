@@ -1497,36 +1497,98 @@ def test_apply_deferred_writes_empty_output_paths_with_flag_true(
 
 
 _RAN = {"code_manifest": {"func:helpers.plain": "1f2e"}, "output_hashes": {"p/use_plain": "9a8b"}}
+# The key another feature writes into the same record: `*.pvt` directory members.
+_PVT = {"pvt_members": {"data/out/a.pvt": "77aa"}}
 
 
 @pytest.mark.parametrize(
     ("stored", "expected"),
     [
         pytest.param(_RAN, _RAN, id="this-pivots-fields"),
-        pytest.param({"pvt_members": {"data/out/a.pvt": "77aa"}}, {}, id="another-field-only"),
+        pytest.param(_PVT, _PVT, id="another-field-only"),
+        pytest.param({**_RAN, **_PVT}, {**_RAN, **_PVT}, id="another-field-too"),
         pytest.param(
-            {**_RAN, "pvt_members": {"data/out/a.pvt": "77aa"}}, _RAN, id="another-field-too"
-        ),
-        pytest.param(
-            {"code_manifest": _RAN["code_manifest"], "pvt_members": {"data/out/a.pvt": "77aa"}},
-            {},
-            id="manifest-without-outputs",
+            {"code_manifest": _RAN["code_manifest"], **_PVT}, _PVT, id="manifest-without-outputs"
         ),
         pytest.param(
             {**_RAN, "code_manifest": {"func:helpers.plain": 1}}, {}, id="malformed-manifest"
+        ),
+        pytest.param(
+            {**_RAN, "code_manifest": {"func:helpers.plain": 1}, **_PVT},
+            _PVT,
+            id="malformed-manifest-and-another-field",
+        ),
+        pytest.param(
+            {**_RAN, "pvt_members": ["data/out/a.pvt"]},
+            {**_RAN, "pvt_members": ["data/out/a.pvt"]},
+            id="another-field-as-stored",
         ),
     ],
 )
 def test_a_no_commit_record_reads_each_valid_field_it_knows(
     tmp_path: pathlib.Path, stored: object, expected: object
 ) -> None:
-    """The code manifest and the output hashes read together, when both are valid. A record
-    without them, as one a Pivot that writes only `pvt_members` leaves, reads as a record without
-    them, never as absent, so the field this Pivot does not know is not lost with it."""
+    """The code manifest and the output hashes read together, when both are valid. Every other
+    key, as the `pvt_members` another feature writes, reads as stored, for that feature to
+    validate: a record that holds only it reads as present, never as absent, and a malformed
+    manifest hides no other key."""
     with state.StateDB(tmp_path) as db:
         db.put_raw(b"nocommit:p/use_plain", json.dumps(stored).encode())
 
         assert db.get_no_commit_record("p/use_plain") == expected
+
+
+_OLDER_RUN = {
+    "code_manifest": {"func:helpers.plain": "0000"},
+    "output_hashes": {"p/use_plain": "11"},
+}
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        pytest.param(None, _RAN, id="no-record"),
+        pytest.param(json.dumps(_PVT).encode(), {**_RAN, **_PVT}, id="another-field-only"),
+        pytest.param(
+            json.dumps({**_OLDER_RUN, **_PVT}).encode(),
+            {**_RAN, **_PVT},
+            id="an-older-run-and-another-field",
+        ),
+        pytest.param(b"not json", _RAN, id="unreadable-record"),
+    ],
+)
+def test_applying_a_no_commit_record_replaces_its_keys_and_keeps_every_other(
+    tmp_path: pathlib.Path, stored: bytes | None, expected: dict[str, object]
+) -> None:
+    """Another feature writes its keys into the stage's `nocommit:` record during the run, before
+    the coordinator applies the run's record (the worker adds each `*.pvt` member before it writes
+    the file). Applying the run's record replaces the code manifest and output hashes, an older
+    run's included, and keeps every other key."""
+    deferred: DeferredWrites = {
+        "no_commit_record": {
+            "code_manifest": _RAN["code_manifest"],
+            "output_hashes": _RAN["output_hashes"],
+        }
+    }
+    with state.StateDB(tmp_path) as db:
+        if stored is not None:
+            db.put_raw(b"nocommit:p/use_plain", stored)
+
+        db.apply_deferred_writes("p/use_plain", [], deferred)
+
+        raw = db.get_raw(b"nocommit:p/use_plain")
+        assert raw is not None and json.loads(raw) == expected
+        assert db.get_no_commit_record("p/use_plain") == expected
+
+
+def test_a_written_lock_removes_the_whole_no_commit_record(tmp_path: pathlib.Path) -> None:
+    """A lock written for the stage supersedes the record, every feature's keys included."""
+    with state.StateDB(tmp_path) as db:
+        db.put_raw(b"nocommit:p/use_plain", json.dumps({**_RAN, **_PVT}).encode())
+
+        db.apply_deferred_writes("p/use_plain", [], {"clear_no_commit_record": True})
+
+        assert db.get_no_commit_record("p/use_plain") is None
 
 
 @pytest.mark.parametrize(

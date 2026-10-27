@@ -20,7 +20,7 @@ import textwrap
 import time
 import zipfile
 from collections.abc import Generator, Sequence
-from typing import cast
+from typing import NoReturn, cast
 
 import pytest
 from tests.conftest import send_rpc
@@ -449,18 +449,21 @@ def test_commit_of_outputs_edited_after_a_no_commit_run_trusts_the_user(
     assert _output(project, "use_plain") == "plain-hand-edited"
 
 
-def test_no_commit_warning_does_not_say_the_result_will_not_be_reused(
+def test_edited_source_warning_under_no_commit_warns_that_commit_keeps_the_mark(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Under --no-commit no lock is written, and `pivot commit` records the outputs on disk as
-    current. The edited-source warning must not tell the user the result "will not be reused";
-    like the uncovered-import warning, it must say what `pivot commit` will do."""
+    """Under --no-commit no lock is written, and `pivot commit` records these outputs with the
+    mark this run set. The edited-source warning says so, as the uncovered-import warning does;
+    it still says the result will not be reused, because the next run reruns the stage."""
     project, pythonpath = _project(tmp_path, _EDIT_THEN_USE, helpers_in_root=False)
 
     result = _run(project, "repro", "--no-commit", pythonpath=pythonpath)
     printed = " ".join((result.stdout + result.stderr).split())
     assert f"Stage 'p/use_plain' {_EDITED}: helpers." in printed, printed
-    assert "will not be reused" not in printed or "pivot commit" in printed, printed
+    assert (
+        "its result will not be reused; the next run reruns it. "
+        + "`pivot commit` keeps that when it records these outputs."
+    ) in printed, printed
 
 
 def test_marked_run_files_no_run_cache_entry(tmp_path: pathlib.Path) -> None:
@@ -553,6 +556,112 @@ def test_helper_from_a_meta_path_finder_edited_mid_run_is_not_cached_stale(
     _run(project, "config", "set", "core.max_workers", "1", pythonpath=site)
 
     _assert_loaded_code_recorded(project, site)
+
+
+# `sitecustomize` puts a finder ahead of `sys.path`'s that serves `helpers` with a loader built on
+# CPython's `SourceLoader`, as an import hook that rewrites source does, and does not import it:
+# discovery and the worker import it with Pivot's recorder installed.
+_SOURCE_LOADER_FINDER = """\
+import importlib.abc
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+
+class SubclassLoader(importlib.machinery.SourceFileLoader):
+    pass
+
+
+class CachingLoader(importlib.abc.SourceLoader):
+    def __init__(self, fullname, path):
+        self.path = path
+
+    def get_filename(self, fullname):
+        return self.path
+
+    def get_data(self, path):
+        with open(path, "rb") as file:
+            return file.read()
+
+    def path_stats(self, path):
+        status = os.stat(path)
+        return {{"mtime": status.st_mtime, "size": status.st_size}}
+
+    def set_data(self, path, data):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as file:
+            file.write(data)
+
+
+class Finder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "helpers":
+            return None
+        return importlib.util.spec_from_loader(fullname, {loader}(fullname, {helper!r}))
+
+
+sys.meta_path.insert(0, Finder())
+"""
+
+
+@pytest.mark.parametrize(
+    ("shape", "loader"),
+    [
+        ("edited-mid-run", "SubclassLoader"),
+        ("edited-mid-run", "CachingLoader"),
+        ("stale-bytecode-out-of-root", "SubclassLoader"),
+        ("stale-bytecode-in-root", "SubclassLoader"),
+    ],
+    ids=["edit-run-sub", "edit-run-source-loader", "post-sub-pyc", "post-sub-pyc-inroot"],
+)
+def test_helper_a_source_loader_serves_with_stale_bytecode_is_never_cached_stale(
+    tmp_path: pathlib.Path, shape: str, loader: str
+) -> None:
+    """A `SourceFileLoader` subclass, or another loader built on CPython's `SourceLoader`, runs
+    cached bytecode CPython checks only by the source's size and whole-second mtime, so the
+    helper's file can say v2 while the module runs v1: `edit_helper` edits it mid-run and puts
+    its mtime back, or the bytecode is left stale before the first run. Pivot does not replace
+    such a loader with its own, so the helper is unreadable: `use_plain` reruns on every run, and
+    no run reports it cached with an output the helper on disk does not return."""
+    root = tmp_path / "project" if shape == "stale-bytecode-in-root" else tmp_path / "hooked"
+    root.mkdir(parents=True)
+    helper = root / "helpers.py"
+    helper.write_text(_HELPERS)
+    edit = "pass"
+    if shape == "edited-mid-run":
+        edit = (
+            f"p = pathlib.Path({str(helper)!r}); s = p.stat(); "
+            + "p.write_text(p.read_text().replace('-v1', '-v2')); "
+            + "os.utime(p, ns=(s.st_atime_ns, s.st_mtime_ns))"
+        )
+    else:
+        py_compile.compile(str(helper), invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+        old = helper.stat()
+        helper.write_text(_HELPERS.replace("-v1", "-v2"))
+        os.utime(helper, ns=(old.st_atime_ns, old.st_mtime_ns))
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(
+        _SOURCE_LOADER_FINDER.format(loader=loader, helper=str(helper))
+    )
+    project = _edge_project(
+        tmp_path,
+        "import os\nimport pathlib\n\nimport helpers\nfrom pivot import Pipeline, stage\n",
+        _EARLY_SEED,
+        edit,
+        site,
+    )
+    _run(project, "config", "set", "core.max_workers", "1", pythonpath=site)
+
+    runs = list[tuple[str, str, str, bool]]()
+    for _ in range(3):
+        status = _repro_json(project, site)["p/use_plain"][0]
+        marked = "unreadable-source:helpers" in _lock(project, "use_plain")
+        runs.append((status, _output(project, "use_plain"), helper.read_text(), marked))
+
+    assert all(status != "cached" or output in on_disk for status, output, on_disk, _ in runs), runs
+    assert all(status == "ran" and marked for status, _, _, marked in runs), runs
 
 
 def test_in_root_helper_loaded_by_spec_from_file_location_is_not_cached_stale(
@@ -804,14 +913,23 @@ def test_helper_imported_before_discovery_and_edited_before_it_is_never_reused(
     assert second["p/use_plain"][0] == "ran", second
 
 
+def _whole_second_directory_unavailable(reason: str) -> NoReturn:
+    """The whole-second test runs only where `CI` is set, and CI can make this file system: a
+    missing tool, a failed `mkfs` or `mount`, or an image that keeps sub-second times fails the
+    test, so the only real-file-system proof is never retired by a quiet skip."""
+    pytest.fail(reason)
+
+
 @contextlib.contextmanager
 def _whole_second_directory(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
     """A directory on an ext4 file system made with 128-byte inodes, which keep whole-second
-    timestamps, mounted from an image under `tmp_path`. Skips the test when it cannot be made."""
+    timestamps, mounted from an image under `tmp_path`. Fails the test when it cannot be made."""
     search = os.pathsep.join((os.environ.get("PATH", ""), "/usr/sbin", "/sbin"))
     mkfs = shutil.which("mkfs.ext4", path=search)
     if mkfs is None or shutil.which("sudo") is None:
-        pytest.skip("needs mkfs.ext4 and sudo to mount a file system with whole-second times")
+        _whole_second_directory_unavailable(
+            "needs mkfs.ext4 and sudo to mount a file system with whole-second times"
+        )
     image = tmp_path / "whole-second.ext4"
     with image.open("wb") as file:
         file.truncate(64 * 1024 * 1024)
@@ -819,7 +937,7 @@ def _whole_second_directory(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
         [mkfs, "-q", "-F", "-I", "128", str(image)], capture_output=True, text=True, check=False
     )
     if made.returncode != 0:
-        pytest.skip(f"mkfs.ext4 -I 128 failed: {made.stderr.strip()}")
+        _whole_second_directory_unavailable(f"mkfs.ext4 -I 128 failed: {made.stderr.strip()}")
     mount = tmp_path / "mnt"
     mount.mkdir()
     mounted = subprocess.run(
@@ -829,7 +947,7 @@ def _whole_second_directory(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
         check=False,
     )
     if mounted.returncode != 0:
-        pytest.skip(f"cannot mount the image: {mounted.stderr.strip()}")
+        _whole_second_directory_unavailable(f"cannot mount the image: {mounted.stderr.strip()}")
     try:
         subprocess.run(
             ["sudo", "-n", "chown", f"{os.getuid()}:{os.getgid()}", str(mount)],
@@ -839,7 +957,7 @@ def _whole_second_directory(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
         probe = mount / "probe"
         probe.write_text("probe")
         if probe.stat().st_ctime_ns % 1_000_000_000:
-            pytest.skip("the image keeps sub-second change times")
+            _whole_second_directory_unavailable("the image keeps sub-second change times")
         yield mount
     finally:
         subprocess.run(["sudo", "-n", "umount", "-l", str(mount)], capture_output=True, check=False)

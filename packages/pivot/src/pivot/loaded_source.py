@@ -13,12 +13,16 @@ bytes it compiles; every other user-code module an import finds (an editable ins
 zip on `sys.path`, `importlib.util.spec_from_file_location`, a sourceless `.pyc`) is recorded from
 its loader when it appears (`record_modules`, `record_user_modules`). A user module whose loader
 gives no source is recorded as unreadable: Pivot cannot tell which code it holds, so a stage that
-uses it is never trusted. A user module no recorder saw compile, because it was imported before
-the recorder was installed (by `sitecustomize`, a `.pth` import line or the program that runs
-Pivot) or by a loader called directly (`SourceFileLoader(...).load_module()`), is recorded from
-its file only where Pivot can show the file holds the code it was compiled from, and as
-unreadable otherwise (`record_unseen_modules`, at the end of discovery, when a worker starts and
-after each stage a worker runs).
+uses it is never trusted. So is one a loader built on CPython's `SourceLoader` loads, other than
+the `SourceFileLoader` that `_ProjectSourceLoader` replaces: it may run cached bytecode CPython
+checks only by the source's size and whole-second mtime, which its `get_data` does not show
+(`discovery._RecordingLoader`). A user module no recorder saw compile, because it was imported
+before the recorder was installed (by `sitecustomize`, a `.pth` import line or the program that
+runs Pivot), by a loader called directly (`SourceFileLoader(...).load_module()`) or by a loader
+with only `load_module`, which the recorder does not wrap, is recorded from its file only where
+Pivot can show the file holds the code it was compiled from, and as unreadable otherwise
+(`record_unseen_modules`, at the end of discovery, when a worker starts and after each stage a
+worker runs).
 
 Import machinery and `linecache` are process-global, so this record is too. A module loaded again
 (a watch reload) replaces its entry, and `prune`, at the end of an import session, drops the
@@ -105,8 +109,11 @@ _CODE_KINDS = frozenset({"func", "class", "const", "default", "schema", "partial
 # change up to 1 s before it happened, the kernel's coarse clock up to one tick before, and a
 # forward step of the wall clock between an edit and the import of this module moves the start
 # later by the step. The three share this one margin: 2 s covers a step of up to 2 s where the
-# file system stamps exact times, and of about 1 s where it keeps whole seconds. The cost: a
-# module edited less than 2 s before a process started is unreadable in that process.
+# file system stamps exact times, and of about 1 s where it keeps whole seconds. A file system
+# that keeps change times in 2-second steps (FAT, Linux's `vfat`) spends all of it: on a FAT32 loop
+# mount every change time is an even second, so an edit reads up to just under 2 s early (1.7 s
+# measured), and the margin covers no clock step there (a stated limit). The cost: a module
+# edited less than 2 s before a process started is unreadable in that process.
 _CHANGE_TIME_SLACK_NS = 2_000_000_000
 
 # On Linux, the wall clock less the boot clock when this module was imported: the wall-clock time
