@@ -603,9 +603,11 @@ class Pipeline:
         Its fingerprints and its runs start their state-directory record with them
         (``state_dir.entry_invocation``), so a ``core.state_dir`` edited after the load leaves
         this pipeline in one directory; a caller who wants the new one loads the pipeline again.
-        A value that could not be used, or a path that could not become a directory, is kept as
-        its error, so the entry points fall back to ``.pivot`` (or fail) as at the load, without
-        reading the configuration again, also when the path becomes usable after the load.
+        A value that could not be used is kept as its error, so the entry points fall back to
+        ``.pivot`` (or fail) as at the load, without reading the configuration again. A path that
+        could not become a directory is kept as its fallback (``state_dir.kept_by_pipeline``):
+        the stages' locks are in ``.pivot``, so every reader in its fingerprints and runs uses
+        ``.pivot`` too, whether or not the path can be used by then.
         Read-only: ``include()`` alone adds to it.
         """
         return _stdlib_types.MappingProxyType(self._resolved_state_dirs)
@@ -763,7 +765,9 @@ class Pipeline:
             for foreign_pipeline, _ in closure:
                 if foreign_pipeline._root not in stage_state_dirs:
                     stage_state_dirs[foreign_pipeline._root] = foreign_pipeline._stage_state_dir()
-            resolved_state_dirs = {root: resolved[root] for root in stage_state_dirs}
+            resolved_state_dirs = {
+                root: state_dir_mod.kept_by_pipeline(resolved[root]) for root in stage_state_dirs
+            }
         for root, (included, resolution) in self._included_state_dirs.items():
             if root in resolved_state_dirs:
                 _require_one_state_dir(

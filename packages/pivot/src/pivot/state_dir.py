@@ -11,6 +11,7 @@ import copy
 import logging
 import os
 import pathlib
+import shlex
 import typing
 from collections.abc import Iterator, Mapping
 
@@ -35,7 +36,9 @@ class StateDirWarnings(typing.TypedDict):
 # One project root's ``core.state_dir`` as a record resolved it: the directory the value names
 # (``<root>/.pivot`` when it is unset), or the error that says why it cannot be used. A value
 # that names a path which cannot become a directory this process writes is kept as
-# ``StateDirTargetError``, decided with the value: the stages keep their state in ``.pivot``.
+# ``StateDirTargetError``, with the outcome decided with the value: the stages keep their state
+# in ``.pivot``, and a command that needs the configured directory falls back to ``.pivot`` too
+# or fails on the path (``StateDirTargetError.fallback``).
 type StateDirResolution = pathlib.Path | exceptions.ConfigError | UnicodeDecodeError
 
 
@@ -114,22 +117,29 @@ def state_dir_for(root: pathlib.Path) -> pathlib.Path:
     configuration keeps state in ``<root>/.pivot``. The ``.pivot`` marker and its configuration
     always remain at the project root. A value that cannot be used raises: ``ConfigError``
     (``EmptyStateDirError`` for ``''``), or ``UnicodeDecodeError`` for a config that is not
-    UTF-8. A path that cannot become a directory answers as ``_unusable_target`` says. Within
-    one invocation (``begin_invocation``, ``entry_invocation``), each root's config is read and
+    UTF-8. A path that cannot become a directory is returned as the value names it, unreported:
+    it is the directory configured, which ``config set`` and ``config unset`` read to tell what
+    the old value leaves behind. A command that uses the state directory looks it up with
+    ``locate_state_dir``, which answers and reports as the record decided. Within one
+    invocation (``begin_invocation``, ``entry_invocation``), each root's config is read and
     resolved once and the record keeps the outcome, an error included, so every later lookup
     answers or raises from it; outside one, every call reads and resolves it again.
     """
-    resolution = _resolution(root)
+    resolution = resolution_for(root)
     if isinstance(resolution, pathlib.Path):
         return resolution
     if isinstance(resolution, exceptions.StateDirTargetError):
-        return _unusable_target(root, resolution)
+        return resolution.path
     # A fresh copy each time, so lookups never share one exception's traceback or context.
     raise copy.copy(resolution)
 
 
-def _resolution(root: pathlib.Path) -> StateDirResolution:
-    """``root``'s resolution: the record's, or read and resolved now (and kept in the record)."""
+def resolution_for(root: pathlib.Path) -> StateDirResolution:
+    """``root``'s resolution: the record's, or read and resolved now (and kept in the record).
+
+    A worker's record starts with its Pivot process's resolution, so it takes every answer,
+    the outcome for a path that cannot be used included, from the same decision.
+    """
     invocation = _invocation.get()
     resolution = None if invocation is None else invocation["resolved"].get(root)
     if resolution is None:
@@ -160,10 +170,24 @@ def _resolve_state_dir(root: pathlib.Path) -> StateDirResolution:
         if target_problem is not None:
             # An unusable local state directory owns the one warning, as an unusable value does.
             return exceptions.StateDirTargetError(
-                f"{target_problem} (core.state_dir in {config_path})", state_dir
+                f"{target_problem} (core.state_dir in {config_path})",
+                state_dir,
+                _holds_writable_state(state_dir),
             )
     warn_if_global_state_dir_ignored(root, shadowed=present)
     return state_dir
+
+
+def _holds_writable_state(state_dir: pathlib.Path) -> bool:
+    """Whether ``<state_dir>/state.lmdb`` is a directory this process can write and search.
+
+    Such a path cannot become a state directory, yet Pivot 0.5.2 ran a project's commands with
+    it, keeping its run history and caches there; a command handed the path would write into it
+    while the stages write to ``.pivot``. So such a path falls back to ``.pivot`` for every
+    reader. Any other unusable path fails where a command opens it, as 0.5.2 did.
+    """
+    database = state_dir / "state.lmdb"
+    return os.path.isdir(database) and os.access(database, os.W_OK | os.X_OK)
 
 
 def resolved_state_dir(root: pathlib.Path, resolution: StateDirResolution) -> pathlib.Path:
@@ -176,6 +200,18 @@ def resolved_state_dir(root: pathlib.Path, resolution: StateDirResolution) -> pa
     return resolution if isinstance(resolution, pathlib.Path) else root / ".pivot"
 
 
+def kept_by_pipeline(resolution: StateDirResolution) -> StateDirResolution:
+    """The resolution a loaded pipeline keeps for its fingerprints and its runs.
+
+    Its stages record ``.pivot`` for a path that cannot become a directory, so the pipeline keeps
+    that path's fallback outcome: every reader in its fingerprints and runs uses ``.pivot`` too,
+    whether or not the path can be used by then. Any other resolution is kept as it is.
+    """
+    if isinstance(resolution, exceptions.StateDirTargetError) and not resolution.fallback:
+        return exceptions.StateDirTargetError(str(resolution), resolution.path, True)
+    return resolution
+
+
 def state_dir_or_default(root: pathlib.Path, *, warn: bool = True) -> pathlib.Path:
     """The state directory of a command that 0.5.2 ran without one; nothing is created here.
 
@@ -186,7 +222,7 @@ def state_dir_or_default(root: pathlib.Path, *, warn: bool = True) -> pathlib.Pa
     pass ``warn=False``; a command that reads or writes state uses the warning-enabled resolver
     and then fails where 0.5.2 failed.
     """
-    return _state_dir_or_default(root, _resolution(root), warn=warn)
+    return _state_dir_or_default(root, resolution_for(root), warn=warn)
 
 
 def _state_dir_or_default(
@@ -212,17 +248,16 @@ def _state_dir_or_default(
 def _unusable_target(
     root: pathlib.Path, resolution: exceptions.StateDirTargetError
 ) -> pathlib.Path:
-    """The state directory of a command that needs one, when the record found the path unusable.
+    """The state directory of a command that needs one, for a path the record found unusable.
 
-    The record's stages keep their state in ``<root>/.pivot``. While the configured path still
-    cannot be used, the command gets it and fails where it opens it, as 0.5.2 did. Once it can
-    be, the command gets ``.pivot``, where those stages keep their state. So a pipeline loaded
-    while the path could not be used never splits its state: it fails as 0.5.2 did, or it runs
-    in ``.pivot``.
+    The record decided it with the value, and nothing checks the path again. ``.pivot``, where
+    the stages keep their state, when the path falls back (it holds a database this process can
+    write, so 0.5.2 ran the command); otherwise the path, which ``ensure_state_dir`` leaves
+    uncreated, so the command fails where it opens it, as 0.5.2 did. Either way the command
+    reports the path once, as every command that uses the state directory does.
     """
-    if state_dir_target_problem(resolution.path) is None:
-        return root / ".pivot"
-    return resolution.path
+    default = _state_dir_or_default(root, resolution, warn=True)
+    return default if resolution.fallback else resolution.path
 
 
 def ensure_state_dir_or_default(root: pathlib.Path) -> pathlib.Path:
@@ -277,7 +312,7 @@ def legacy_state_dir_for(state_dir: pathlib.Path) -> pathlib.Path | None:
         root = project.get_project_root()
     except exceptions.ProjectNotInitializedError:
         return None
-    configured = _resolution(root)
+    configured = resolution_for(root)
     if isinstance(configured, exceptions.StateDirTargetError):
         configured = configured.path
     if not isinstance(configured, pathlib.Path):
@@ -306,9 +341,13 @@ def report_legacy_state_dir(state_dir: pathlib.Path) -> None:
     """Warn once per invocation that reads fall back to ``.pivot`` for ``state_dir``.
 
     ``.pivot`` holds stage locks or cache objects while ``core.state_dir`` names another
-    directory. Pivot 0.5.2 kept them there, and so does a run while ``core.state_dir`` cannot
-    be used (``''``, or a path that cannot become a directory). The files cannot tell the two
-    apart, so the notice names both and says what to do in each case.
+    directory. Earlier Pivot releases kept them there, and so does a run while
+    ``core.state_dir`` is unset or cannot be used (``''``, or a path that cannot become a
+    directory). The files cannot tell these apart, so the notice names them all. When
+    ``.pivot/stages`` exists, it says how to move the locks: with ``mv`` and absolute paths,
+    which works whether or not git tracks them and from any directory, while ``state_dir`` is a
+    directory without ``stages``; otherwise ``mv`` would put the directory inside the existing
+    one, or fail, so it says to move the lock files into ``<state_dir>/stages``.
     """
     reported = _reported()
     if reported is None or state_dir in reported["legacy"]:
@@ -317,18 +356,20 @@ def report_legacy_state_dir(state_dir: pathlib.Path) -> None:
     if legacy is None:
         return
     reported["legacy"].add(state_dir)
-    root = project.get_project_root()
-    try:
-        target = (state_dir / "stages").relative_to(root)
-    except ValueError:
-        move = f"mv {legacy / 'stages'} {state_dir / 'stages'}"
+    source, destination = legacy / "stages", state_dir / "stages"
+    delete = ", or delete them if a run that could not use core.state_dir made them"
+    if not os.path.isdir(source):
+        advice = ""
+    elif os.path.isdir(state_dir) and not os.path.lexists(destination):
+        command = f"mv {shlex.quote(str(source))} {shlex.quote(str(destination))}"
+        advice = f"; move the locks with `{command}`{delete}"
     else:
-        move = f"git mv .pivot/stages {target}"
+        advice = f"; move the lock files under {source} into {destination}{delete}"
     logger.warning(
-        "core.state_dir is %s, but %s holds stage locks or cache objects of this project: Pivot 0.5.2 kept them there, and so does a run while core.state_dir cannot be used (an empty value, or a path that is not a writable directory). Pivot reads missing locks and cache entries there; move the locks with `%s`, or delete them if such a run made them.",
+        "core.state_dir is %s, but %s holds stage locks or cache objects of this project: earlier Pivot releases kept them there, and so does a run while core.state_dir is unset or cannot be used (an empty value, or a path that is not a writable directory). Pivot reads missing locks and cache entries there%s.",
         state_dir,
         legacy,
-        move,
+        advice,
     )
 
 
@@ -357,9 +398,11 @@ def begin_invocation(
     """Start one invocation's record, used until the returned token is reset.
 
     Its resolutions start with ``state_dirs`` and it reads the config of any other project
-    afresh. A worker's stage passes the state directory its Pivot process decided for the
-    command, so a ``core.state_dir`` edited during a ``--watch`` session never reaches it. With
-    ``report``, each state-directory problem is warned once; without it, none is.
+    afresh. A worker's stage passes the resolution its Pivot process decided for the command,
+    the outcome for a path that cannot be used included, so the worker reads every state file
+    where its Pivot process does, and a ``core.state_dir`` edited during a ``--watch`` session
+    never reaches it. With ``report``, each state-directory problem is warned once; without it,
+    none is.
     """
     reported = (
         StateDirWarnings(
@@ -398,10 +441,11 @@ def entry_invocation(
     ``core.state_dir`` is read and resolved once per call, as the kernel opens it then, the
     check that the path can be a directory included, and an edit of the value during the call
     moves nothing. The record starts with ``state_dirs``; a pipeline passes the resolutions it
-    made when it was loaded, a value or a path it could not use included, so its fingerprints
-    and its runs use the directory its stages' locks are in and read no config. A CLI
-    invocation, or an entry point already in progress, holds the record for the whole call, and
-    this leaves it alone. The record reports nothing: a library caller's warnings stay silent.
+    made when it was loaded, a value it could not use included and a path it could not use as
+    its ``.pivot`` fallback (``kept_by_pipeline``), so its fingerprints and its runs use the
+    directory its stages' locks are in and read no config. A CLI invocation, or an entry point
+    already in progress, holds the record for the whole call, and this leaves it alone. The
+    record reports nothing: a library caller's warnings stay silent.
 
     Yields the record's resolutions by project root, so the caller can keep them.
     """
@@ -548,10 +592,10 @@ def locate_state_dir(root: pathlib.Path) -> pathlib.Path:
 
     An empty hand-edited ``core.state_dir`` falls back to ``<root>/.pivot`` through
     ``state_dir_or_default``, decided once per invocation and kept in its record. A path that
-    cannot become a directory answers as ``_unusable_target`` says. Other invalid config values
-    still raise ``ConfigError``.
+    cannot become a directory answers as the record decided it (``_unusable_target``). Other
+    invalid config values still raise ``ConfigError``.
     """
-    resolution = _resolution(root)
+    resolution = resolution_for(root)
     if isinstance(resolution, pathlib.Path):
         return resolution
     if isinstance(resolution, exceptions.StateDirTargetError):
@@ -573,14 +617,15 @@ def ensure_state_dir(root: pathlib.Path) -> pathlib.Path:
 
     A directory this call creates gets the default ``.gitignore``. One that already exists is
     left as it is, so a deleted ``.pivot/.gitignore`` stays deleted until ``init`` writes it. A
-    directory that cannot be created (``state_dir_target_problem``) is returned as it is, so the
-    command fails where it opens it, as 0.5.2 did.
+    path the record found unable to become a directory is left uncreated: the command gets
+    ``.pivot`` or the path, as the record decided, and fails where it opens the path, as 0.5.2
+    did.
     """
     state_dir = locate_state_dir(root)
     if (
         os.path.isdir(state_dir)
         or not (root / ".pivot").is_dir()
-        or state_dir_target_problem(state_dir) is not None
+        or isinstance(resolution_for(root), exceptions.StateDirTargetError)
     ):
         return state_dir
     return make_state_dir(state_dir)

@@ -374,3 +374,54 @@ def test_unusable_local_state_dir_suppresses_the_global_state_dir_notice(
     assert listed.returncode == 0, listed.stdout + listed.stderr
     assert str(global_config) not in listed.stderr
     assert listed.stderr.count("Pivot uses the default .pivot.") == 1, listed.stderr
+
+
+# Every command that uses the state directory reports a path that cannot become one, once, with
+# or without a global value; the global notice is left out. `history`, `show` and `fingerprint
+# reset` reach the state directory only through the lookup of a command that needs it, and fail
+# as on 0.5.2.
+
+_PATH_CASES = {"regular-file": "afile", "under-a-regular-file": "afile/state"}
+
+# name -> (arguments, 0.5.2's exit code with such a path)
+_STATE_COMMANDS: dict[str, tuple[tuple[str, ...], int]] = {
+    "list": (("list",), 0),
+    "history": (("history",), 1),
+    "history-json": (("history", "--json"), 1),
+    "show": (("show",), 1),
+    "fingerprint-reset": (("fingerprint", "reset"), 1),
+}
+
+
+@pytest.mark.parametrize("command", _STATE_COMMANDS.values(), ids=_STATE_COMMANDS)
+@pytest.mark.parametrize("value", _PATH_CASES.values(), ids=_PATH_CASES)
+@pytest.mark.parametrize("with_global", [True, False], ids=["global", "no-global"])
+def test_every_state_command_reports_an_unusable_path_once(
+    tmp_path: pathlib.Path, with_global: bool, value: str, command: tuple[tuple[str, ...], int]
+) -> None:
+    args, exit_code = command
+    home = tmp_path / "home"
+    global_config = home / ".config" / "pivot" / "config.yaml"
+    if with_global:
+        global_config.parent.mkdir(parents=True)
+        global_config.write_text("core:\n  state_dir: global-state\n")
+    root = tmp_path / "project"
+    root.mkdir()
+    assert helpers.run_cli(root, home, "git", "init", "-q").returncode == 0
+    assert helpers.run_pivot(root, home, "init").returncode == 0
+    (root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: {value}\n")
+    (root / "afile").write_text("not a directory\n")
+    (root / "pipeline.py").write_text("from pivot import Pipeline\n\npipeline = Pipeline('test')\n")
+
+    result = helpers.run_pivot(root, home, *args)
+
+    output = result.stdout + result.stderr
+    assert "Traceback" not in output, output
+    assert result.returncode == exit_code, output
+    assert str(global_config) not in result.stderr
+    assert result.stderr.count("Pivot uses the default .pivot.") == 1, result.stderr
+    # The warning names the file in the way, which the command's `Error:` line does not.
+    assert f"must be a directory: {os.path.realpath(root / 'afile')} (" in result.stderr
+    if exit_code:
+        errors = [line for line in result.stderr.splitlines() if line.startswith("Error")]
+        assert len(errors) == 1, result.stderr

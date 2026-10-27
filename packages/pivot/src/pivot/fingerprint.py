@@ -314,10 +314,10 @@ def _producing_state_dir() -> pathlib.Path | None:
     called by hand, outside every entry point, reads and resolves the configuration again for
     each lookup: correct, and slow. An unreadable or unusable value (other than ``''``, which
     falls back to ``.pivot``) leaves the entry unfiled, and the caches are best effort, so it
-    is dropped; for a path that cannot become a directory the entry goes where
-    ``state_dir.locate_state_dir`` says, never into that path once it can be used. Nothing is
-    created here: the StateDB that reads or writes the entries creates the directory
-    (``state_dir.make_state_dir``).
+    is dropped; for a path that cannot become a directory the entry goes where the record
+    decided once (``state_dir.locate_state_dir``): ``.pivot``, or the path, whose flush fails
+    and drops the entry while it still cannot be opened. Nothing is created here: the StateDB
+    that reads or writes the entries creates the directory (``state_dir.make_state_dir``).
     """
     from pivot import project, state_dir
 

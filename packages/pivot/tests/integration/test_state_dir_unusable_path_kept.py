@@ -1,16 +1,20 @@
 """A pipeline keeps the `.pivot` fallback its stages took for a path that could not be a directory.
 
-`core.state_dir: s1`, where `s1` is a regular file when the pipeline loads, so its stages record
-`.pivot`. A library caller then removes the file and runs the pipeline it loaded: its locks, its
-run record, its database entries, its fingerprint caches and its cache objects all go to `.pivot`,
-and `s1` is never created. Or the caller loads `pa` while `s1` is a file, removes the file, then
-loads `pb` and includes `pa`, after `pb`'s `with` block or inside it: `pa` keeps its state in
-`.pivot` and `pb` in `s1`, so the include is refused, naming both directories, and nothing runs.
+`core.state_dir: s1`, where `s1` cannot become a directory when the pipeline loads (a regular
+file, or a link to a path under a regular file), so its stages record `.pivot`. A library caller
+then removes the file, re-points the link at a usable directory, or leaves the file, and runs the
+pipeline it loaded: its locks, its run record, its database entries, its fingerprint caches and
+its cache objects all go to `.pivot`, and the configured path gets nothing. The pipeline keeps
+the outcome its load decided; nothing checks the path again. Or the caller loads `pa` while `s1`
+is a file, removes the file, then loads `pb` and includes `pa`, after `pb`'s `with` block or
+inside it: `pa` keeps its state in `.pivot` and `pb` in `s1`, so the include is refused, naming
+both directories, and nothing runs.
 """
 
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 import typing
@@ -84,11 +88,15 @@ with Pipeline("pb") as pipeline:
     b(pipeline.input("input.txt", t=str))
 """
 
+_SINGLE_SHAPES = ("file-removed", "link-re-pointed", "file-kept")
+
 _CALLER = """\
 import importlib
 import os
 import pathlib
 import sys
+
+_INCLUDE_SHAPES = ("after-block", "inside-block")
 
 
 def main() -> None:
@@ -99,12 +107,17 @@ def main() -> None:
 
     from pivot import discovery, exceptions, executor
 
-    if shape == "single":
+    if shape not in _INCLUDE_SHAPES:
         pipeline = discovery.discover_pipeline()
     else:
         pa = importlib.import_module("pa").pipeline
-    (root / "s1").unlink()
-    if shape != "single":
+    if shape == "link-re-pointed":
+        (root / "s1").unlink()
+        (root / "real").mkdir()
+        (root / "s1").symlink_to("real")
+    elif shape != "file-kept":
+        (root / "s1").unlink()
+    if shape in _INCLUDE_SHAPES:
         try:
             pipeline = importlib.import_module("pb").pipeline
             if shape == "after-block":
@@ -128,10 +141,15 @@ def _run(tmp_path: pathlib.Path, shape: str) -> tuple[pathlib.Path, str]:
     assert helpers.run_cli(root, home, "git", "init", "-q").returncode == 0
     assert helpers.run_pivot(root, home, "init").returncode == 0
     (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: s1\n")
-    (root / "s1").write_text("a regular file where the state directory goes\n")
+    if shape == "link-re-pointed":
+        # The link names a path under a regular file, so it cannot become a directory.
+        (root / "afile").write_text("a regular file\n")
+        (root / "s1").symlink_to("afile/x")
+    else:
+        (root / "s1").write_text("a regular file where the state directory goes\n")
     (root / "data" / "raw").mkdir(parents=True)
     (root / "data" / "raw" / "input.txt").write_text("first\n")
-    if shape == "single":
+    if shape in _SINGLE_SHAPES:
         (root / "pipeline.py").write_text(_TWO_STAGES)
     else:
         (root / "pa.py").write_text(_PA)
@@ -157,13 +175,19 @@ def _keys(state_dir: pathlib.Path, prefix: bytes) -> int:
         return len(list(db.iter_prefix(prefix)))
 
 
-def test_a_pipeline_loaded_while_its_path_was_a_file_runs_in_pivot_after_the_file_goes(
-    tmp_path: pathlib.Path,
+@pytest.mark.parametrize("shape", _SINGLE_SHAPES)
+def test_a_pipeline_loaded_while_its_path_could_not_be_used_runs_in_pivot(
+    tmp_path: pathlib.Path, shape: str
 ) -> None:
-    root, output = _run(tmp_path, "single")
+    root, output = _run(tmp_path, shape)
 
     assert "RAN test/a=ran test/b=ran" in output, output
-    assert not (root / "s1").exists(), output
+    if shape == "file-removed":
+        assert not os.path.lexists(root / "s1"), output
+    elif shape == "link-re-pointed":
+        assert not list((root / "real").iterdir()), output
+    else:
+        assert (root / "s1").is_file(), output
     pivot_dir = root / ".pivot"
     locks = sorted(path.name for path in (pivot_dir / "stages" / "test").iterdir())
     assert locks == ["a.lock", "b.lock"], output
@@ -178,15 +202,24 @@ def test_a_pipeline_loaded_while_its_path_was_a_file_runs_in_pivot_after_the_fil
     ]
     assert len(objects) == 2, output
 
-    # A later command can use `s1`, so it reads the locks from `.pivot`; its notice must say
-    # that a run while the path could not be used puts them there, not only Pivot 0.5.2.
+    if shape != "file-removed":
+        return
+    # A later command can use `s1`, so it reads the locks from `.pivot`; its notice must name
+    # every source of locks there, and a move that works although git tracks none of them.
     status = helpers.run_pivot(root, tmp_path / "home", "status")
     assert status.returncode == 0, status.stdout + status.stderr
     assert (
-        "holds stage locks or cache objects of this project: Pivot 0.5.2 kept them there, and "
-        + "so does a run while core.state_dir cannot be used"
+        "holds stage locks or cache objects of this project: earlier Pivot releases kept them "
+        + "there, and so does a run while core.state_dir is unset or cannot be used"
     ) in status.stderr, status.stderr
-    assert "or delete them if such a run made them." in status.stderr, status.stderr
+    real_root = os.path.realpath(root)
+    move = shlex.join(["mv", f"{real_root}/.pivot/stages", f"{real_root}/s1/stages"])
+    assert f"move the locks with `{move}`" in status.stderr, status.stderr
+    assert "or delete them if a run that could not use core.state_dir made them." in status.stderr
+    # Run as printed, from a subdirectory, with no lock tracked by git.
+    moved = subprocess.run(shlex.split(move), cwd=root / "data", capture_output=True, check=False)
+    assert moved.returncode == 0, moved.stderr
+    assert sorted(path.name for path in (root / "s1" / "stages" / "test").iterdir()) == locks
 
 
 @pytest.mark.parametrize("shape", ["after-block", "inside-block"])

@@ -1,5 +1,6 @@
 import os
 import pathlib
+import pickle
 
 import pydantic
 import pytest
@@ -273,29 +274,89 @@ def test_a_record_keeps_an_unusable_value_and_reads_the_config_once(
     assert reads == [project_root / ".pivot" / "config.yaml"]
 
 
-def test_a_record_keeps_the_fallback_for_a_path_that_cannot_be_a_directory(
+def test_a_record_keeps_the_failure_it_decided_for_a_path_that_cannot_be_a_directory(
     project_root: pathlib.Path,
 ) -> None:
-    """A record decides once that the configured path cannot become a directory: its stages'
-    directory stays `.pivot` after the path becomes usable, and a command that needs the
-    configured directory gets the path only while it still cannot be used, then `.pivot`."""
+    """A record decides once, with the value, that a regular file where the state directory
+    goes fails a command that needs the configured directory: it gets the path, before and
+    after the file goes, and nothing creates it. Its stages' directory stays `.pivot`."""
     (project_root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: s1\n")
     (project_root / "s1").write_text("a regular file\n")
     default = project_root / ".pivot"
     token = state_dir_mod.begin_invocation(report=False)
     try:
+        resolution = state_dir_mod.resolution_for(project_root)
+        assert isinstance(resolution, exceptions.StateDirTargetError)
+        assert not resolution.fallback
         assert state_dir_mod.state_dir_or_default(project_root) == default
         assert state_dir_mod.locate_state_dir(project_root) == project_root / "s1"
         (project_root / "s1").unlink()
         assert state_dir_mod.state_dir_or_default(project_root) == default
-        assert state_dir_mod.locate_state_dir(project_root) == default
-        assert state_dir_mod.ensure_state_dir(project_root) == default
-        assert state_dir_mod.state_dir_for(project_root) == default
+        assert state_dir_mod.locate_state_dir(project_root) == project_root / "s1"
+        assert state_dir_mod.ensure_state_dir(project_root) == project_root / "s1"
+        assert state_dir_mod.state_dir_for(project_root) == project_root / "s1"
     finally:
         state_dir_mod.end_invocation(token)
 
     assert not (project_root / "s1").exists()
     assert state_dir_mod.state_dir_or_default(project_root) == project_root / "s1"
+
+
+def test_a_record_falls_back_for_a_path_that_still_holds_a_writable_database(
+    project_root: pathlib.Path,
+) -> None:
+    """A state directory without write permission whose `state.lmdb` can still be written
+    falls back to `.pivot` for every reader, after it is made writable again too."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permission bits")
+    (project_root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: s1\n")
+    s1 = project_root / "s1"
+    (s1 / "state.lmdb").mkdir(parents=True)
+    s1.chmod(0o555)
+    default = project_root / ".pivot"
+    token = state_dir_mod.begin_invocation(report=False)
+    try:
+        resolution = state_dir_mod.resolution_for(project_root)
+        assert isinstance(resolution, exceptions.StateDirTargetError)
+        assert resolution.fallback
+        assert state_dir_mod.state_dir_or_default(project_root) == default
+        assert state_dir_mod.locate_state_dir(project_root) == default
+        assert state_dir_mod.ensure_state_dir(project_root) == default
+        s1.chmod(0o755)
+        assert state_dir_mod.locate_state_dir(project_root) == default
+        assert state_dir_mod.state_dir_or_default(project_root) == default
+    finally:
+        s1.chmod(0o755)
+        state_dir_mod.end_invocation(token)
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_a_kept_path_outcome_survives_pickling(fallback: bool) -> None:
+    """A worker receives its Pivot process's outcome for an unusable path whole."""
+    error = exceptions.StateDirTargetError("why", pathlib.Path("/project/s1"), fallback)
+    copied = pickle.loads(pickle.dumps(error))
+
+    assert (type(copied), str(copied), copied.path, copied.fallback) == (
+        exceptions.StateDirTargetError,
+        "why",
+        pathlib.Path("/project/s1"),
+        fallback,
+    )
+
+
+def test_a_pipeline_keeps_the_fallback_for_a_path_that_cannot_be_a_directory() -> None:
+    """A pipeline's stages record `.pivot` for such a path, so its runs use `.pivot` too."""
+    path = pathlib.Path("/project/s1")
+    failing = exceptions.StateDirTargetError("why", path, False)
+
+    kept = state_dir_mod.kept_by_pipeline(failing)
+
+    assert isinstance(kept, exceptions.StateDirTargetError)
+    assert (str(kept), kept.path, kept.fallback) == ("why", path, True)
+    usable = pathlib.Path("/project/state")
+    empty = exceptions.EmptyStateDirError("empty")
+    assert state_dir_mod.kept_by_pipeline(usable) is usable
+    assert state_dir_mod.kept_by_pipeline(empty) is empty
 
 
 # --- Error handling tests ---

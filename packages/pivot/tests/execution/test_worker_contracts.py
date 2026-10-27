@@ -117,7 +117,7 @@ def _stage_info(
         params_arg_name=None,
         project_root=project,
         state_dir=project / ".pivot",
-        project_state_dir=project / ".pivot",
+        state_dir_resolution=project / ".pivot",
         collection_params={},
         incremental_inputs={},
         unsafe_fingerprint=unsafe_fingerprint,

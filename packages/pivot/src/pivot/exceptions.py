@@ -379,19 +379,24 @@ class EmptyStateDirError(ConfigError):
 class StateDirTargetError(ConfigError):
     """``core.state_dir`` names a path that cannot become a directory this process writes.
 
-    A state-directory record keeps it as the root's resolution, decided once with the value:
-    the stages keep their state in ``.pivot``. ``path`` is the directory the value names.
+    A state-directory record keeps it as the root's resolution, with the outcome decided once
+    with the value: the stages keep their state in ``.pivot``, and ``fallback`` says what a
+    command that needs the configured directory gets. True: ``.pivot`` as well, so every reader
+    uses ``.pivot``. False: ``path``, where the command fails as 0.5.2 failed. ``path`` is the
+    directory the value names.
     """
 
     path: pathlib.Path
+    fallback: bool
 
-    def __init__(self, message: str, path: pathlib.Path) -> None:
+    def __init__(self, message: str, path: pathlib.Path, fallback: bool) -> None:
         super().__init__(message)
         self.path = path
+        self.fallback = fallback
 
     @override
-    def __reduce__(self) -> tuple[type, tuple[str, pathlib.Path]]:
-        return (self.__class__, (str(self), self.path))
+    def __reduce__(self) -> tuple[type, tuple[str, pathlib.Path, bool]]:
+        return (self.__class__, (str(self), self.path, self.fallback))
 
 
 class ConfigValidationError(ConfigError):

@@ -510,7 +510,9 @@ def prepare_worker_info(
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process.
 
-    Uses stage's state_dir if set, otherwise falls back to default_state_dir.
+    Uses stage's state_dir if set, otherwise falls back to default_state_dir. The worker gets
+    this process's resolution of the project's ``core.state_dir``, not a directory derived from
+    it, so it reads every state file where this process does.
     """
     # Use stage's state_dir if set, otherwise fall back to default
     state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
@@ -538,7 +540,7 @@ def prepare_worker_info(
         params_arg_name=stage_info["params_arg_name"],
         project_root=project_root,
         state_dir=state_dir,
-        project_state_dir=default_state_dir,
+        state_dir_resolution=state_dir_mod.resolution_for(project_root),
         collection_params=stage_info["collection_params"],
         unsafe_fingerprint=stage_info["unsafe_fingerprint"],
         no_fingerprint=stage_info["no_fingerprint"],
