@@ -19,7 +19,7 @@ import anyio
 import pytest
 import watchfiles
 
-from pivot import discovery, project
+from pivot import cli, discovery, exceptions, project
 from pivot.engine import agent_rpc, sources
 from pivot.engine import engine as engine_mod
 from pivot.engine.types import EngineState, InputEvent, OutputEvent
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     import pathlib
     from collections.abc import AsyncGenerator, Callable
 
+    import click.testing
     from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
     from pivot.registry import PipelineLike
@@ -1738,3 +1739,225 @@ async def test_reload_bringing_in_owning_pipeline_keeps_tracked_file_and_sidecar
                 + "of stage 'b/tree'"
             ) in caplog.text
             tg.cancel_scope.cancel()
+
+
+_OWNERSHIP_BEFORE = """\
+from __future__ import annotations
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def keep(raw: str) -> str:
+    return raw + "-keep"
+
+
+with Pipeline("reload") as pipeline:
+    keep(pipeline.input("input.txt"))
+"""
+
+# Adds `tree`, whose directory output data/reload/tree/ holds the tracked f.txt.pvt
+_OWNERSHIP_AFTER = """\
+from __future__ import annotations
+
+from typing import Annotated
+
+from pivot.compose import Pipeline, directory, stage
+
+
+@stage
+def keep(raw: str) -> str:
+    return raw + "-keep"
+
+
+@stage
+def tree() -> Annotated[dict[str, str], directory]:
+    return {"g.txt": "g"}
+
+
+with Pipeline("reload") as pipeline:
+    keep(pipeline.input("input.txt"))
+    tree()
+"""
+
+
+def _helper_leaf_errors(
+    group: BaseExceptionGroup[exceptions.TrackedFileMissingError],
+) -> list[exceptions.TrackedFileMissingError]:
+    """The errors in ``group`` and in the groups nested in it (each task group adds a level)."""
+    leaves = list[exceptions.TrackedFileMissingError]()
+    for error in group.exceptions:
+        if isinstance(error, BaseExceptionGroup):
+            leaves.extend(_helper_leaf_errors(error))
+        else:
+            leaves.append(error)
+    return leaves
+
+
+@pytest.mark.anyio
+async def test_reload_declaring_the_output_around_a_missing_tracked_file_keeps_its_sidecar(
+    watch_project: pathlib.Path, runner: click.testing.CliRunner
+) -> None:
+    """Audit D1, watch reload adding ownership: the re-run stops and the .pvt survives.
+
+    A file tracked while no stage declared its directory is missing. An edit to pipeline.py
+    that declares that directory as a stage's output re-runs the pipeline; the re-run must stop
+    on the missing tracked file rather than run the stage, whose output replacement would
+    delete the sidecar.
+    """
+    pipeline_py = watch_project / "pipeline.py"
+    pipeline_py.write_text(_OWNERSHIP_BEFORE)
+    tracked = watch_project / "data" / "reload" / "tree" / "f.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("tracked bytes")
+    track_result = runner.invoke(cli.cli, ["track", "data/reload/tree/f.txt"])
+    assert track_result.exit_code == 0, track_result.output
+    pvt_path = track.get_pvt_path(tracked)
+    sidecar = pvt_path.read_bytes()
+    tracked.unlink()
+    pipeline = _helper_discover(watch_project)
+    recorder = _Recorder()
+    missing_errors = list[exceptions.TrackedFileMissingError]()
+
+    try:
+        async with engine_mod.Engine(pipeline=pipeline) as eng:
+            eng.add_sink(recorder)
+            eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+                await _helper_wait_until_watching(eng)
+
+                pipeline_py.write_text(_OWNERSHIP_AFTER)
+                reload_index = await recorder.wait_for(_helper_is_reload)
+                # The missing-file error ends eng.run and cancels this wait; reaching the
+                # stage's completion means the re-run ran it instead
+                tree_done = await recorder.wait_for(
+                    _helper_completes("reload/tree"), start=reload_index
+                )
+                await recorder.wait_for(_helper_is_idle, start=tree_done)
+                tg.cancel_scope.cancel()
+    except* exceptions.TrackedFileMissingError as group:
+        missing_errors.extend(_helper_leaf_errors(group))
+
+    assert pvt_path.is_file(), "the reload's re-run must not delete the tracked file's .pvt"
+    assert pvt_path.read_bytes() == sidecar
+    assert not any(
+        event["type"] == "stage_completed" and event["stage"] == "reload/tree"
+        for event in recorder.events
+    ), "the stage owning the missing tracked file must not run"
+    assert len(missing_errors) == 1, "the re-run must stop on the missing tracked file"
+    assert "f.txt" in str(missing_errors[0])
+
+
+_RPC_ROOT_ALONE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def alive() -> str:
+    return "alive"
+
+
+with Pipeline("a") as pipeline:
+    alive()
+"""
+
+_RPC_ROOT_INCLUDING_B = """\
+from other.pipeline import pipeline as b
+from pivot import Pipeline, stage
+
+
+@stage
+def alive() -> str:
+    return "alive"
+
+
+with Pipeline("a") as pipeline:
+    alive()
+    pipeline.include(b)
+"""
+
+# Pipeline b's stage writes a directory output at data/b/tree/
+_RPC_OTHER = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def tree() -> Annotated[dict[str, str], directory]:
+    return {"g.txt": "g"}
+
+
+with Pipeline("b") as pipeline:
+    tree()
+"""
+
+
+@pytest.mark.anyio
+async def test_rpc_forced_run_stops_on_a_missing_file_tracked_inside_another_pipelines_output(
+    watch_project: pathlib.Path, runner: click.testing.CliRunner
+) -> None:
+    """Audit D1, watch RPC row: a forced RPC `run` of a/alive stops on the missing tracked file.
+
+    The file was tracked at data/b/tree/f.txt before pipeline b declared that directory output
+    (`pivot track` refuses a path inside any pipeline's declared output). With a/alive and b/tree
+    loaded in a watching engine, an RPC `run` with `force` must not run the stage while that
+    tracked file is missing.
+    """
+    (watch_project / "pipeline.py").write_text(_RPC_ROOT_ALONE)
+    tracked = watch_project / "data" / "b" / "tree" / "f.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("tracked bytes")
+    track_result = runner.invoke(cli.cli, ["track", "data/b/tree/f.txt"])
+    assert track_result.exit_code == 0, track_result.output
+    pvt_path = track.get_pvt_path(tracked)
+    tracked.unlink()
+    (watch_project / "other").mkdir()
+    (watch_project / "other" / "pipeline.py").write_text(_RPC_OTHER)
+    (watch_project / "pipeline.py").write_text(_RPC_ROOT_INCLUDING_B)
+    pipeline = _helper_discover(watch_project)
+    assert sorted(pipeline.list_stages()) == ["a/alive", "b/tree"]
+    recorder = _Recorder()
+    socket_path = watch_project / "rpc.sock"
+    ready = threading.Event()
+    accepted = list[bool]()
+    missing_errors = list[exceptions.TrackedFileMissingError]()
+
+    try:
+        async with engine_mod.Engine(pipeline=pipeline) as eng:
+            eng.add_sink(recorder)
+            handler = agent_rpc.AgentRpcHandler(engine=eng)
+            eng.add_source(
+                agent_rpc.AgentRpcSource(socket_path=socket_path, handler=handler, ready=ready)
+            )
+            eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+                await _helper_wait_until_watching(eng)
+                client = rpc_client_impl.RpcPivotClient()
+                with anyio.fail_after(5):
+                    while not ready.is_set():
+                        await anyio.sleep(0.01)
+                    await client.connect(socket_path)
+                try:
+                    accepted.append(await client.run(["a/alive"], force=True))
+                    # The missing-file error ends eng.run and cancels this wait; reaching the
+                    # stage's completion means the run ran it instead
+                    alive_done = await recorder.wait_for(_helper_completes("a/alive"))
+                    await recorder.wait_for(_helper_is_idle, start=alive_done)
+                finally:
+                    with anyio.CancelScope(shield=True):
+                        await client.disconnect()
+                tg.cancel_scope.cancel()
+    except* exceptions.TrackedFileMissingError as group:
+        missing_errors.extend(_helper_leaf_errors(group))
+
+    assert accepted == [True], "the engine accepts the RPC run request"
+    assert not any(
+        event["type"] == "stage_completed" and event["stage"] == "a/alive"
+        for event in recorder.events
+    ), "the forced run must not run a/alive while a tracked file is missing"
+    assert len(missing_errors) == 1, "the run must stop on the missing tracked file"
+    assert "data/b/tree/f.txt" in str(missing_errors[0])
+    assert pvt_path.is_file(), "the stopped run keeps the sidecar"
