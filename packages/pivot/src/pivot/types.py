@@ -538,6 +538,9 @@ class TransferResult(TypedDict):
     hash: str
     success: bool
     error: NotRequired[str]
+    # Present when the transfer failed with RemoteUnreachableError: no connection to the remote
+    # could be made, so every other transfer to it would fail the same way
+    connection_failed: NotRequired[Literal[True]]
 
 
 class TransferSummary(TypedDict):
@@ -584,6 +587,14 @@ class TrackedFileStatus(enum.StrEnum):
     MISSING = "missing"
 
 
+class ImportCheckStatus(enum.StrEnum):
+    """Update check result for an imported artifact."""
+
+    UP_TO_DATE = "up_to_date"
+    UPDATE_AVAILABLE = "update_available"
+    ERROR = "error"
+
+
 class PipelineStatusInfo(TypedDict):
     """Status info for a single stage in pivot status output."""
 
@@ -610,12 +621,28 @@ class RemoteSyncInfo(TypedDict):
     pull_count: int
 
 
+class ImportStatusInfo(TypedDict):
+    """One imported artifact's update check, for pivot status --check-imports output.
+
+    The revisions are the first 8 characters of each commit. A field that does not apply to
+    the status is None (null in JSON): both revisions for up_to_date and error, error for the
+    others.
+    """
+
+    path: str
+    status: ImportCheckStatus
+    current_rev: str | None
+    latest_rev: str | None
+    error: str | None
+
+
 class StatusOutput(TypedDict, total=False):
     """JSON output structure for pivot status command."""
 
     stages: list[PipelineStatusInfo]
     tracked_files: list[TrackedFileInfo]
     remote: RemoteSyncInfo
+    imports: list[ImportStatusInfo]
     suggestions: list[str]
 
 
@@ -657,6 +684,7 @@ class ExplainOutput(TypedDict, total=False):
     stages: list[ExplainStageJson]
     tracked_files: list[TrackedFileInfo]
     remote: RemoteSyncInfo
+    imports: list[ImportStatusInfo]
     suggestions: list[str]
 
 

@@ -174,6 +174,15 @@ resources_option = click.option(
 )
 """The ``--resources`` option of every command that runs stages, parsed to ``dict[str, int]``."""
 
+checkout_mode_option = click.option(
+    "--checkout-mode",
+    type=click.Choice(["symlink", "hardlink", "copy"]),
+    default=None,
+    help="Checkout mode (default: cache.checkout_mode, else hardlink, symlink, copy)",
+)
+"""The ``--checkout-mode`` option of every command that restores outputs: ``checkout``, ``get`` and
+``pull``. None means the configured order."""
+
 
 def store_pipeline_in_context(pipeline: PipelineLike) -> None:
     """Store a Pipeline in the Click context."""

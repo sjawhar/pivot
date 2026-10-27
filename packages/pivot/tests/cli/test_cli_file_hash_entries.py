@@ -9,6 +9,7 @@ The tests drive the installed `pivot` binary, as a user does.
 
 from __future__ import annotations
 
+import errno
 import os
 import pathlib
 import subprocess
@@ -20,6 +21,7 @@ import boto3
 import pytest
 import xxhash
 
+from pivot import types
 from pivot.storage import cache, state
 
 if TYPE_CHECKING:
@@ -365,3 +367,44 @@ def test_track_of_a_directory_records_every_file_it_read(tmp_path: pathlib.Path)
     assert [path for path in files if not _helper_recorded(root, path)] == [], (
         "track records the hash of every file of the directory it read"
     )
+
+
+def test_known_file_hashes_skips_a_member_it_cannot_stat(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed directory output whose one member a forced rerun left as a checkout link that
+    ``lstat`` reads but ``stat`` cannot (EIO, ESTALE, EACCES on the link's ``readlink`` or its
+    target) gets no known-hash entry for that member, so the lookup never fails the command.
+    The other members keep their entries: the result is exactly the list the lookup returns when
+    that member is not in the manifest at all. At 87c648fc the unguarded stat raised the member's
+    ``OSError`` straight out of ``known_file_hashes``, failing the stage."""
+    out = tmp_path / "out"
+    (out / "sub").mkdir(parents=True)
+    (out / "good.txt").write_bytes(b"good")
+    bad = out / "sub" / "bad.txt"
+    bad.write_bytes(b"bad")
+    good_entry = types.DirManifestEntry(
+        relpath="good.txt", hash=xxhash.xxh64(b"good").hexdigest(), size=4, isexec=False
+    )
+    bad_entry = types.DirManifestEntry(
+        relpath="sub/bad.txt", hash=xxhash.xxh64(b"bad").hexdigest(), size=3, isexec=False
+    )
+    full = types.DirHash(hash="0" * 16, manifest=[good_entry, bad_entry])
+    without_bad = types.DirHash(hash="0" * 16, manifest=[good_entry])
+
+    real_stat = os.stat
+
+    def stat_eio_on_bad(path: int | str | os.PathLike[str], *args: object, **kwargs: object):
+        if not isinstance(path, int) and os.fspath(path) == str(bad):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type] - pass-through
+
+    monkeypatch.setattr(os, "stat", stat_eio_on_bad)
+
+    skipped = cache.known_file_hashes(out, full)
+    expected = cache.known_file_hashes(out, without_bad)
+
+    assert [(str(path), file_hash) for path, _, file_hash in skipped] == [
+        (str(path), file_hash) for path, _, file_hash in expected
+    ]
+    assert str(bad) not in {str(path) for path, _, _ in skipped}

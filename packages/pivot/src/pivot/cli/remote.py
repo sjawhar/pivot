@@ -259,12 +259,7 @@ def fetch(
     is_flag=True,
     help="Only restore files that don't exist in workspace",
 )
-@click.option(
-    "--checkout-mode",
-    type=click.Choice(["symlink", "hardlink", "copy"]),
-    default=None,
-    help="Checkout mode for restoration (default: project config or hardlink)",
-)
+@cli_decorators.checkout_mode_option
 @click.pass_context
 def pull(
     ctx: click.Context,
