@@ -14,6 +14,7 @@ import collections.abc as collections_abc
 import contextlib
 import ctypes
 import dataclasses
+import errno
 import functools
 import importlib
 import importlib._bootstrap as importlib_bootstrap
@@ -513,8 +514,10 @@ _TGKILL_SYSCALLS = {
         ("arm", ("gnueabihf", "gnueabi", "musleabihf", "musleabi"), 268),
         ("powerpc64le", ("gnu", "musl"), 250),  # arch/powerpc/kernel/syscalls/syscall.tbl#L328
         ("s390x", ("gnu", "musl"), 241),  # arch/s390/kernel/syscalls/syscall.tbl#L198
-        # scripts/syscall.tbl#L167, riscv's table (scripts/Makefile.asm-headers#L20)
+        # scripts/syscall.tbl#L167, the table riscv and loongarch use (scripts/Makefile.asm-headers#L20;
+        # neither arch/riscv nor arch/loongarch kernel/Makefile.syscalls sets another)
         ("riscv64", ("gnu", "musl"), 131),
+        ("loongarch64", ("gnu", "gnuf32", "gnusf", "musl", "muslf32", "muslsf"), 131),
     )
     for libc in libcs
 }
@@ -524,7 +527,9 @@ _TGKILL_SYSCALLS = {
 def _tgkill() -> Callable[[int, int, int], int] | None:
     """``tgkill(tgid, tid, sig)`` through the C library's ``syscall()``, which glibc and musl
     both export, with tgkill's number for this process's ABI. None where that number is not
-    known (not Linux, or an ABI not in ``_TGKILL_SYSCALLS``), logged once."""
+    known (not Linux, or an ABI not in ``_TGKILL_SYSCALLS``), logged once: there a stopped
+    worker gets ``os.kill``, Pivot's behaviour before tgkill, and the race ``terminate``
+    describes remains."""
     abi: object = getattr(sys.implementation, "_multiarch", None)
     number = _TGKILL_SYSCALLS.get(abi) if isinstance(abi, str) else None
     if number is None:
@@ -559,15 +564,33 @@ def terminate(pid: int) -> None:
     ``get_signalthread``, https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_sig.c#L1935-L1974),
     and adds each new thread at the end of that list (bsd/kern/kern_fork.c#L1368), so the main
     thread comes first. Read from the source, not run on macOS.
+
+    A tgkill that fails for any reason but a process that is gone (ESRCH, raised as
+    ProcessLookupError) falls back to ``os.kill``, with a warning naming the worker, so a stop
+    is never left unsent.
+
+    A stage that keeps SIGTERM blocked on the main thread holds this signal pending until
+    ``WorkerPool`` SIGKILLs the worker after the grace; with ``os.kill`` another thread could
+    take it and the worker exit sooner. Its cleanup runs either way, from Ctrl-C's SIGINT.
     """
     tgkill = _tgkill()
     if tgkill is None:
         os.kill(pid, signal.SIGTERM)
         return
-    # A process's main thread has the process's id as its thread id.
-    if tgkill(pid, pid, signal.SIGTERM) != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
+    # A process's main thread has the process's id as its thread id. tgkill to a process whose
+    # main thread has exited while others run reaches no thread; a loky worker never gets there,
+    # because it leaves its main thread only through os._exit, which ends the whole process.
+    if tgkill(pid, pid, signal.SIGTERM) == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.ESRCH:
+        raise ProcessLookupError(error, os.strerror(error))
+    logger.warning(
+        "tgkill could not send SIGTERM to worker %s (%s); sending it to the process",
+        pid,
+        os.strerror(error),
+    )
+    os.kill(pid, signal.SIGTERM)
 
 
 def kill_descendants(pid: int) -> None:

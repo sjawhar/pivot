@@ -1,7 +1,6 @@
 """A worker whose Pivot process dies or is interrupted unwinds its running stage, then exits.
 
-The tests of ``worker.terminate`` and ``worker._tgkill`` call them directly. Every other test
-drives the installed `pivot` binary in a fresh project, as a user does. The project
+Each test drives the installed `pivot` binary in a fresh project, as a user does. The project
 has a stage `hold` that starts a child process (in its own session, so only the stage or Pivot
 can stop it) and waits, stopping the child the way the test's ``cleanup`` says, as a stage that
 starts a detached container removes it. Most tests add a second stage, `quick`, that returns at
@@ -13,14 +12,11 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import dataclasses
-import errno
-import logging
 import os
 import pathlib
 import signal
 import subprocess
 import sys
-import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -409,117 +405,46 @@ def test_sigint_inherited_as_ignored_does_not_interrupt_the_stage(tmp_path: path
         assert (run.root / "data" / "t" / "hold.txt").read_text() == "done", output
 
 
+_SIGTERM_BIT = 1 << (signal.SIGTERM - 1)
+
+
+def _helper_sigterm_pending_on_thread(pid: int, tid: int) -> bool:
+    """Whether SIGTERM waits for thread ``tid`` alone (``SigPnd``), not for the process
+    (``ShdPnd``, which any of its threads may take)."""
+    try:
+        status = pathlib.Path(f"/proc/{pid}/task/{tid}/status").read_text()
+    except OSError:
+        return False
+    for line in status.splitlines():
+        if line.startswith("SigPnd:"):
+            return bool(int(line.split()[1], 16) & _SIGTERM_BIT)
+    return False
+
+
 @pytest.mark.parametrize("how", ["interrupt", "ctrl-c"])
-def test_stop_reaches_the_stage_while_its_thread_waits_for_a_cpu(
+def test_stop_is_queued_on_the_stage_thread_while_it_waits_for_a_cpu(
     tmp_path: pathlib.Path, how: str
 ) -> None:
-    """On a loaded machine, the stage's thread (the worker's main thread) can still be waiting
-    for a CPU, woken by Ctrl-C, when pivot's stop reaches the worker. Linux then gives a signal
-    sent to the worker to another of its threads, such as one of NumPy's. The stage still gets
-    the stop and its cleanup runs. The test keeps that thread stopped until pivot has stopped
-    the idle worker, which it stops in the same pass as the busy one."""
+    """Pivot's stop waits for the stage's own thread, not for whichever thread of the worker
+    is running. The test holds that thread stopped, as a loaded machine does, and releases it
+    only once SIGTERM is pending for it alone; then the stage's cleanup must finish.
+
+    A signal sent to the process lands in the process's pending set, which any thread may take,
+    and the kernel never queues one on a thread it refuses to wake (``kernel/signal.c:946-961``,
+    ``:975-980``, ``:4131`` at v7.0), so no stall in pivot can make this pass without the fix."""
     with _helper_running(tmp_path, "except-keyboard-interrupt") as run:
-        quick = run.pid("quick")
-        with _helper_main_thread_held(run.pid("worker")):
+        worker_pid = run.pid("worker")
+        with _helper_main_thread_held(worker_pid):
             run.send_stop(how)
-            assert _helper_wait_until(
-                lambda: not _helper_alive(quick), worker.TERMINATION_GRACE_S / 2
-            ), f"pivot never stopped the idle worker\n{run.log.read_text()}"
+            pending = _helper_wait_until(
+                lambda: _helper_sigterm_pending_on_thread(worker_pid, worker_pid),
+                worker.TERMINATION_GRACE_S / 2,
+            )
+            assert pending, (
+                "pivot never queued SIGTERM on the stage's thread "
+                f"(worker {worker_pid})\n{run.log.read_text()}"
+            )
         run.wait_for_exit(how)
 
-        assert (run.markers / "cleaned").exists(), (
-            f"the stage's cleanup never finished\n{run.log.read_text()}"
-        )
+        _helper_assert_cleaned_up(run, how)
         run.assert_workers_and_child_gone()
-
-
-@pytest.mark.parametrize("path", ["tgkill", "os-kill"])
-def test_terminate_sends_sigterm(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
-    """``worker.terminate`` sends SIGTERM through the tgkill system call, or through
-    ``os.kill`` where it knows no tgkill number for the ABI; a process that is gone raises
-    ProcessLookupError, which ``WorkerPool`` ignores."""
-    if path == "os-kill":
-        monkeypatch.setattr(worker, "_tgkill", lambda: None)
-    proc = subprocess.Popen(["sleep", "60"])
-    try:
-        worker.terminate(proc.pid)
-        assert proc.wait(timeout=10) == -signal.SIGTERM
-    finally:
-        proc.kill()
-        proc.wait()
-    with pytest.raises(ProcessLookupError):
-        worker.terminate(proc.pid)
-
-
-@pytest.mark.parametrize("abi", ["darwin", "x86_64-linux-gnux32", "mips64el-linux-gnuabi64", None])
-def test_terminate_without_a_tgkill_number_uses_os_kill_and_logs_it_once(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, abi: str | None
-) -> None:
-    """An ABI not in ``_TGKILL_SYSCALLS`` (macOS's triplet, an x32 process on an x86-64
-    machine, a Linux ABI not in the table, or an interpreter with no triplet) gets no tgkill
-    number: ``terminate`` sends SIGTERM with ``os.kill``, and ``_tgkill`` says so once, at debug
-    level, naming the triplet."""
-    if abi is None:
-        monkeypatch.delattr(sys.implementation, "_multiarch", raising=False)
-    else:
-        monkeypatch.setattr(sys.implementation, "_multiarch", abi, raising=False)
-    worker._tgkill.cache_clear()
-    try:
-        with caplog.at_level(logging.DEBUG, logger=worker.logger.name):
-            assert worker._tgkill() is None
-            proc = subprocess.Popen(["sleep", "60"])
-            try:
-                worker.terminate(proc.pid)
-                worker.terminate(proc.pid)
-                assert proc.wait(timeout=10) == -signal.SIGTERM
-            finally:
-                proc.kill()
-                proc.wait()
-        logged = [r for r in caplog.records if "No tgkill system call number" in r.getMessage()]
-        assert len(logged) == 1, [r.getMessage() for r in caplog.records]
-        assert logged[0].levelno == logging.DEBUG
-        assert str(abi) in logged[0].getMessage()
-    finally:
-        monkeypatch.undo()
-        worker._tgkill.cache_clear()
-
-
-def test_tgkill_system_call_number_fits_this_architecture() -> None:
-    """The number ``worker._tgkill`` passes to ``syscall()`` for this process's ABI is tgkill's:
-    signal 0 (a check that sends nothing) to this process's own main thread succeeds, and to a
-    thread of another process fails with ESRCH. A wrong number runs another system call."""
-    tgkill = worker._tgkill()
-    abi = getattr(sys.implementation, "_multiarch", None)
-    assert tgkill is not None, f"no tgkill system call number for {abi}"
-    assert tgkill(os.getpid(), os.getpid(), 0) == 0, os.strerror(ctypes.get_errno())
-    other = subprocess.Popen(["sleep", "60"])
-    try:
-        assert tgkill(os.getpid(), other.pid, 0) == -1
-        assert ctypes.get_errno() == errno.ESRCH
-    finally:
-        other.kill()
-        other.wait()
-
-
-def test_tgkill_takes_the_thread_group_then_the_thread() -> None:
-    """``_tgkill`` passes ``tgid`` then ``tid``: signal 0 to a thread of this process other than
-    its main thread succeeds only in that order. ``terminate`` passes the process id as both, so
-    it cannot tell the order."""
-    tgkill = worker._tgkill()
-    assert tgkill is not None
-    ready, done = threading.Event(), threading.Event()
-    native = list[int]()
-
-    def _park() -> None:
-        native.append(threading.get_native_id())
-        ready.set()
-        done.wait()
-
-    thread = threading.Thread(target=_park)
-    thread.start()
-    try:
-        assert ready.wait(10)
-        assert tgkill(os.getpid(), native[0], 0) == 0, os.strerror(ctypes.get_errno())
-    finally:
-        done.set()
-        thread.join()

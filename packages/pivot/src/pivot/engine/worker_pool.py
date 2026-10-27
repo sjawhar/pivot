@@ -366,7 +366,10 @@ class WorkerPool:
     def _stop_workers(executor: loky.ProcessPoolExecutor) -> None:
         """Take ``executor``'s workers out of it, send each SIGTERM (``worker.terminate``),
         and SIGKILL with its descendants any worker still alive after
-        ``worker.TERMINATION_GRACE_S``."""
+        ``worker.TERMINATION_GRACE_S``.
+
+        A send that fails is logged and the pass goes on, so one worker can never cost the
+        others their signal, or the grace, the join and the SIGKILL that bound every stop."""
         # loky exposes no public list of its worker processes. A watch reload may have
         # replaced this executor already, which leaves it no lock and no workers.
         with executor._processes_management_lock or contextlib.nullcontext():
@@ -374,8 +377,12 @@ class WorkerPool:
             executor._processes.clear()
         for process in processes:
             if process.pid is not None:
-                with contextlib.suppress(ProcessLookupError):
+                try:
                     worker.terminate(process.pid)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    _logger.exception("Could not send SIGTERM to worker %s", process.pid)
         deadline = time.monotonic() + worker.TERMINATION_GRACE_S
         for process in processes:
             process.join(max(0.0, deadline - time.monotonic()))

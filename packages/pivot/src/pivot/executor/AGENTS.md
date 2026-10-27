@@ -11,7 +11,9 @@ already makes it ignore SIGINT), so a stop signalled to the whole process group 
 its owner's shutdown, which removes its `pymp-*` directory.
 Stop a worker with `worker.terminate`, which sends SIGTERM at its main thread (tgkill), not with
 `os.kill`: Linux can give a signal sent to the process to another of its threads, such as one of
-NumPy's OpenBLAS threads, and the stage on the main thread then never stops (see
+NumPy's OpenBLAS threads, and the stage on the main thread then never stops. A stage that keeps
+SIGTERM blocked on that thread therefore holds the stop until the SIGKILL after the grace; its
+cleanup still runs from Ctrl-C's SIGINT (see
 `docs/solutions/2026-02-01-loky-reusable-executor-warm-workers.md`).
 
 One-shot Engines give idle workers `core.ONE_SHOT_WORKER_IDLE_TIMEOUT_S`. Long-lived watch,
