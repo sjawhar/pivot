@@ -39,10 +39,9 @@ from pivot.storage import cache, lock
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import FileHash, LockData, OnError, StageStatus, identity_key
+from tests import helpers
 
 if TYPE_CHECKING:
-    from multiprocessing.synchronize import Event
-
     from pytest_mock import MockerFixture
 
     from pivot.registry import RegistryStageInfo
@@ -1984,13 +1983,6 @@ async def test_coordinator_tier2_skip_when_generation_unavailable(
     pool.submit.assert_not_called()
 
 
-def _helper_hold_write_lock(state_dir: str, held: Event, release: Event) -> None:
-    db = state_mod.StateDB(pathlib.Path(state_dir))
-    with db, db._write_transaction(timeout=10.0):
-        held.set()
-        release.wait(120)
-
-
 @pytest.mark.anyio
 async def test_coordinator_skip_check_gives_up_its_save_after_2_s_of_a_held_write_lock(
     tmp_path: pathlib.Path,
@@ -2017,7 +2009,7 @@ async def test_coordinator_skip_check_gives_up_its_save_after_2_s_of_a_held_writ
     ctx = multiprocessing.get_context("spawn")
     held, release = ctx.Event(), ctx.Event()
     holder = ctx.Process(
-        target=_helper_hold_write_lock, args=(str(tmp_path / ".pivot"), held, release)
+        target=helpers.hold_write_lock, args=(str(tmp_path / ".pivot"), held, release)
     )
     holder.start()
     try:

@@ -7,7 +7,6 @@ import contextlib
 import logging
 import multiprocessing
 import os
-import pathlib
 import time
 from typing import TYPE_CHECKING
 
@@ -18,8 +17,8 @@ from pivot.storage import cache, state
 from tests import helpers
 
 if TYPE_CHECKING:
+    import pathlib
     from collections.abc import Callable, Generator
-    from multiprocessing.synchronize import Event
 
     from pytest_mock import MockerFixture
 
@@ -319,13 +318,6 @@ def test_a_state_database_on_a_read_only_filesystem_is_not_used(
             path.chmod(mode)
 
 
-def _helper_hold_write_lock(state_dir: str, held: Event, release: Event) -> None:
-    db = state.StateDB(pathlib.Path(state_dir))
-    with db, db._write_transaction(timeout=10.0):
-        held.set()
-        release.wait(60)
-
-
 def test_write_back_waits_no_longer_than_its_budget_for_a_held_lock(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -337,7 +329,7 @@ def test_write_back_waits_no_longer_than_its_budget_for_a_held_lock(
     state_dir = _helper_new_state_dir(tmp_path)
     ctx = multiprocessing.get_context("spawn")
     held, release = ctx.Event(), ctx.Event()
-    holder = ctx.Process(target=_helper_hold_write_lock, args=(str(state_dir), held, release))
+    holder = ctx.Process(target=helpers.hold_write_lock, args=(str(state_dir), held, release))
     holder.start()
     try:
         assert held.wait(30), "The holder took the write lock"

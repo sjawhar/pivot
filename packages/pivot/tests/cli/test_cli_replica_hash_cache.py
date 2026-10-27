@@ -27,10 +27,10 @@ import lmdb
 import pytest
 
 from pivot.storage import state
+from tests import helpers
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from multiprocessing.synchronize import Event
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 _FILES = 12
@@ -185,6 +185,31 @@ def _cp_r(src: pathlib.Path, dst: pathlib.Path) -> None:
     shutil.copytree(src, dst, symlinks=True, copy_function=shutil.copy)
 
 
+def _skip_if_identity_refused(tmp_path: pathlib.Path) -> None:
+    """Skip when ``tmp_path``'s filesystem is off the identity allowlist
+    (``state._IDENTITY_FS_TYPES``), so a hard link there is not served by identity and a test
+    that pins an identity-served read cannot hold. pytest's temporary directory can land on
+    such a filesystem — a container's own overlayfs root among them — and the documented test
+    command (``uv run pytest packages/pivot/tests ...``) must not go red there on correct code.
+    CI keeps this coverage on ext4; the skip reason names the filesystem."""
+    mounts = state._read_mounts()
+    if state._device_allowed(mounts, os.stat(tmp_path).st_dev, tmp_path):
+        return
+    real = os.fsencode(os.path.realpath(tmp_path))
+    fstype = next(
+        (
+            os.fsdecode(mount_type)
+            for point, mount_type in mounts["points"]
+            if real == point or real.startswith(point.rstrip(b"/") + b"/")
+        ),
+        "an unlisted filesystem",
+    )
+    pytest.skip(
+        f"the temporary directory is on {fstype}, off the identity allowlist "
+        + "(state._IDENTITY_FS_TYPES); a hard-linked replica is not served by identity there"
+    )
+
+
 @pytest.mark.parametrize(
     "make_replica",
     [pytest.param(_cp_al, id="cp-al"), pytest.param(_bet_replica, id="bet-replica")],
@@ -194,6 +219,7 @@ def test_a_hard_linked_replicas_first_status_reads_no_output(
 ) -> None:
     """Each output file of the replica is the original's inode, so the entry its copied state
     database holds for the original's path vouches for it, and status reads none of them."""
+    _skip_if_identity_refused(tmp_path)
     root = _helper_project(tmp_path / "live")
     replica = tmp_path / "replica"
     make_replica(root, replica)
@@ -217,11 +243,11 @@ def test_a_copied_replicas_second_status_reads_no_output(
     assert _helper_status(replica, tmp_path) == []
 
 
-def _helper_hold_write_lock(state_dir: str, held: Event, release: Event) -> None:
-    db = state.StateDB(pathlib.Path(state_dir))
-    with db, db._write_transaction(timeout=10.0):
-        held.set()
-        release.wait(120)
+def _helper_json(proc: subprocess.CompletedProcess[str]) -> object:
+    """The JSON document a `--json` command wrote to standard output, which must be alone there
+    (`pivot status --json` sends its notes to standard error)."""
+    _ = _ok(proc)
+    return json.loads(proc.stdout)
 
 
 def _helper_dump(state_dir: pathlib.Path) -> dict[bytes, bytes]:
@@ -247,7 +273,7 @@ def test_status_against_a_locked_state_db_exits_0_and_saves_once_it_is_free(
 
     ctx = multiprocessing.get_context("spawn")
     held, release = ctx.Event(), ctx.Event()
-    holder = ctx.Process(target=_helper_hold_write_lock, args=(str(state_dir), held, release))
+    holder = ctx.Process(target=helpers.hold_write_lock, args=(str(state_dir), held, release))
     holder.start()
     try:
         assert held.wait(30), "The holder took the write lock"
@@ -269,6 +295,40 @@ def test_status_against_a_locked_state_db_exits_0_and_saves_once_it_is_free(
     assert _helper_status(replica, tmp_path) == []
 
 
+def test_status_with_the_fingerprint_caches_to_fill_does_not_wait_for_a_held_lock(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A `pivot status` that has fingerprint entries to save (here `pivot fingerprint reset`
+    emptied them) gives the same report while another process holds the state database's write
+    lock, and gives up each save after its 2 s budget instead of a pivot write's 30 s."""
+    root = _helper_project(tmp_path / "live")
+    state_dir = root / ".pivot"
+    _ok(_pivot(root, "fingerprint", "reset"))
+    started = time.monotonic()
+    free = _helper_json(_pivot(root, "status", "--json"))
+    free_seconds = time.monotonic() - started
+    _ok(_pivot(root, "fingerprint", "reset"))
+
+    ctx = multiprocessing.get_context("spawn")
+    held, release = ctx.Event(), ctx.Event()
+    holder = ctx.Process(target=helpers.hold_write_lock, args=(str(state_dir), held, release))
+    holder.start()
+    try:
+        assert held.wait(30), "The holder took the write lock"
+        started = time.monotonic()
+        locked = _helper_json(_pivot(root, "status", "--json"))
+        locked_seconds = time.monotonic() - started
+    finally:
+        release.set()
+        holder.join(30)
+    assert holder.exitcode == 0
+
+    assert locked == free, "The report is the same under a held lock"
+    assert locked_seconds < free_seconds + 15, (
+        "Each save gives up after 2 s; a pivot write would wait 30 s"
+    )
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root writes through any file mode")
 @pytest.mark.parametrize(
     ("make_replica", "lock_writable", "opened"),
@@ -288,6 +348,8 @@ def test_status_against_a_read_only_state_db_exits_0_and_leaves_it_unchanged(
     lets this reader register against writers; with a lock file it cannot write either (another
     user's project), the database is not used and status reads the files. Either way status
     reports, exits 0, and leaves the database as it was."""
+    if opened == 0:  # the bet-replica-served case relies on the hard links being served
+        _skip_if_identity_refused(tmp_path)
     root = _helper_project(tmp_path / "live")
     replica = tmp_path / "replica"
     make_replica(root, replica)

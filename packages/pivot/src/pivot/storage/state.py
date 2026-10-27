@@ -20,7 +20,7 @@ from pivot import exceptions, run_history
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Callable, Generator, Iterable
 
     from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
@@ -673,6 +673,11 @@ class StateDB:
             return {}
         results = dict[pathlib.Path, str | None]()
         by_identity = list[tuple[pathlib.Path, os.stat_result, bytes, str]]()
+        # Decided before the transaction: _read_mounts reads /proc and _device_allowed may
+        # resolve a path, and neither may run while a read transaction pins a snapshot. Each
+        # device is decided once, so the call inside the transaction is one dict read.
+        for path, fs_stat in items:
+            self._identity_allowed(fs_stat.st_dev, path)
         with self._read_transaction() as txn:
             for path, fs_stat in items:
                 key = _make_key_file_hash(path)
@@ -1335,6 +1340,37 @@ def open_readonly(state_dir: pathlib.Path, *, create: bool = True) -> Generator[
         yield state_db
 
 
+def save_best_effort(
+    state_dir: pathlib.Path,
+    write: Callable[[StateDB], None],
+    *,
+    what: str,
+    create: bool = True,
+    timeout: float = _WRITE_BACK_TIMEOUT,
+) -> bool:
+    """Run ``write`` against a writable StateDB in ``state_dir``, best-effort; True if it ran.
+
+    Every cache a read-only command fills goes through here: the file-hash entries
+    (``write_back_file_hashes``) and the fingerprint caches
+    (``fingerprint.flush_ast_hash_cache``, ``flush_manifest_cache``). Each one is a cache that
+    its own reader validates, and no decision depends on an entry being present, so a write
+    that cannot happen at once is skipped with a debug log naming ``what`` instead of failing
+    or holding up the command: another process holding the write lock for longer than
+    ``timeout`` (2 s, a fraction of a pivot write's own 30 s; 0 makes one attempt), a database
+    this user cannot write, a read-only filesystem, a full map. Without ``create``, a state
+    directory that has no database is left without one.
+    """
+    if not create and not (state_dir / "state.lmdb").exists():
+        return False
+    try:
+        with StateDB(state_dir, write_timeout=timeout) as state_db:
+            write(state_db)
+    except (exceptions.PivotDBWriteTimeoutError, StateDBError, lmdb.Error, OSError) as error:
+        logger.debug("Not saving %s in %s: %s", what, state_dir, error)
+        return False
+    return True
+
+
 def write_back_file_hashes(
     state_dir: pathlib.Path,
     entries: list[FileHashEntry],
@@ -1346,22 +1382,19 @@ def write_back_file_hashes(
     ``pivot status``, every explanation, ``pivot diff``, ``pivot plots diff``, the engine's
     skip check and the engine of a ``--no-commit`` run call this with the hashes they had to
     read, so the next check reads none of those files (status's tracked files, ``pivot diff``
-    and ``pivot plots diff`` through ``cache.hash_read_only``). A file-hash entry is a cache
-    that every read validates by ``stat``, and no decision depends on one being present, so a
-    write that cannot happen at once is skipped with a debug log instead of failing or holding
-    up the check: another process holding the write lock for longer than ``timeout`` (2 s, a
-    fraction of a pivot write's own 30 s; 0 makes one attempt), a database this user cannot
-    write, a read-only filesystem, a full map. With no entries it takes no lock, and a state
-    directory with no database is left without one.
+    and ``pivot plots diff`` through ``cache.hash_read_only``). The write is best-effort and
+    creates no database (``save_best_effort``); with no entries it takes no lock.
     """
-    if not entries or not (state_dir / "state.lmdb").exists():
+    if not entries:
         return
     # A write-back can land after a concurrent `pivot repro` recorded a newer entry for one of
     # these paths: it puts back the stat it read and drops the index entry of the inode repro
     # recorded. Both then fail the next lookup's stat match, so that file is read once more; no
     # wrong hash is served.
-    try:
-        with StateDB(state_dir, write_timeout=timeout) as state_db:
-            state_db.save_file_hash_entries(entries)
-    except (exceptions.PivotDBWriteTimeoutError, StateDBError, lmdb.Error, OSError) as error:
-        logger.debug("Not saving %d file hashes in %s: %s", len(entries), state_dir, error)
+    _ = save_best_effort(
+        state_dir,
+        lambda state_db: state_db.save_file_hash_entries(entries),
+        what=f"{len(entries)} file hashes",
+        create=False,
+        timeout=timeout,
+    )

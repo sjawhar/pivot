@@ -21,6 +21,7 @@ from pivot.storage import state, store
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+    from multiprocessing.synchronize import Event
 
     import pytest
 
@@ -342,3 +343,12 @@ def mount_table(
         )
     path.write_text("".join(lines))
     monkeypatch.setattr(state, "_MOUNTINFO", path)
+
+
+def hold_write_lock(state_dir: str, held: Event, release: Event) -> None:
+    """Hold the state database's write lock in ``state_dir`` until ``release`` is set; the
+    target of a spawned process, so it lives in this importable module."""
+    db = state.StateDB(pathlib.Path(state_dir))
+    with db, db._write_transaction(timeout=10.0):
+        held.set()
+        release.wait(120)

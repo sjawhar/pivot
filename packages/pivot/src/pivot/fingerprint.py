@@ -865,7 +865,13 @@ def _walk_to(path: tuple[str, ...], owners: dict[tuple[str, ...], Any]) -> Any:
 
 
 def flush_ast_hash_cache() -> None:
-    """Flush pending AST hash writes to StateDB (call from coordinator)."""
+    """Flush pending AST hash writes to StateDB (call from coordinator).
+
+    The AST hash cache only saves a later parse, so the write is best-effort
+    (``state.save_best_effort``): a write lock another process holds for longer than 2 s, or a
+    database this user cannot write, leaves the entries pending for the next flush instead of
+    holding up a `pivot status` behind a running `pivot repro`.
+    """
     global _pending_ast_writes
     if not _pending_ast_writes:
         return
@@ -873,23 +879,29 @@ def flush_ast_hash_cache() -> None:
     pending = _pending_ast_writes
     _pending_ast_writes = []
 
+    saved = False
     try:
         from pivot.config import io
         from pivot.storage import state
 
-        with state.StateDB(io.get_state_dir(), readonly=False) as db:
-            db.save_ast_hash_many(pending)
-        metrics.count("fingerprint.ast_hash_cache.flush")
+        saved = state.save_best_effort(
+            io.get_state_dir(),
+            lambda db: db.save_ast_hash_many(pending),
+            what=f"{len(pending)} AST hashes",
+        )
     except Exception:
-        # OSError (filesystem), ImportError (module), lmdb.Error, etc.
-        # Restore pending writes on failure so they can be retried on next flush.
-        # This prevents permanent loss of cache entries on transient failures.
-        _pending_ast_writes.extend(pending)
+        # OSError (filesystem), ImportError (module), etc.
         _logger.debug("Failed to flush AST hash cache (%d entries)", len(pending), exc_info=True)
+    if saved:
+        metrics.count("fingerprint.ast_hash_cache.flush")
+    else:
+        # Keep the pending writes so the next flush retries them. This prevents permanent loss
+        # of cache entries on a transient failure, a held write lock included.
+        _pending_ast_writes.extend(pending)
 
 
 def flush_manifest_cache() -> None:
-    """Flush pending manifest writes to StateDB."""
+    """Flush pending manifest writes to StateDB, best-effort (``flush_ast_hash_cache``)."""
     global _pending_manifest_writes
     if not _pending_manifest_writes:
         return
@@ -897,16 +909,22 @@ def flush_manifest_cache() -> None:
     pending = _pending_manifest_writes
     _pending_manifest_writes = []
 
+    saved = False
     try:
         from pivot.config import io
         from pivot.storage import state
 
-        with state.StateDB(io.get_state_dir(), readonly=False) as db:
-            db.put_raw_many(pending)
-        metrics.count("fingerprint.manifest_cache.flush")
+        saved = state.save_best_effort(
+            io.get_state_dir(),
+            lambda db: db.put_raw_many(pending),
+            what=f"{len(pending)} manifest entries",
+        )
     except Exception:
-        _pending_manifest_writes.extend(pending)
         _logger.debug("Failed to flush manifest cache (%d entries)", len(pending), exc_info=True)
+    if saved:
+        metrics.count("fingerprint.manifest_cache.flush")
+    else:
+        _pending_manifest_writes.extend(pending)
 
 
 def _normalize_changed_paths(
