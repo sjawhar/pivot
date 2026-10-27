@@ -20,6 +20,7 @@ COMMAND_CATEGORIES = {
         "check-ignore",
         "doctor",
         "fingerprint",
+        "gc",
     ],
 }
 
@@ -67,6 +68,7 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
         "Check if paths are ignored by .pivotignore.",
     ),
     "doctor": ("pivot.cli.doctor", "doctor", "Check environment and configuration for issues."),
+    "gc": ("pivot.cli.gc", "gc_cmd", "Remove cache objects no record names."),
     "fingerprint": (
         "pivot.cli.fingerprint",
         "fingerprint",

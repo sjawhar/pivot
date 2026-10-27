@@ -27,7 +27,7 @@ import xxhash
 import yaml
 
 from pivot import loaders
-from pivot.storage import cache
+from pivot.storage import cache, gc
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -2254,13 +2254,18 @@ with Pipeline("r") as pipeline:
 
 
 def _helper_snapshot(root: pathlib.Path) -> dict[str, bytes]:
-    """Every file under the outputs, the cache and the locks, by path."""
+    """Every file under the outputs, the cache and the locks, by path.
+
+    The cache's project register (``cache/projects/``) is pivot's own note that this project
+    uses the cache, written by any command that resolves it, so it is not output state.
+    """
     tops = [root / "data", root / ".pivot" / "cache", root / ".pivot" / "stages"]
+    register = root / ".pivot" / "cache" / gc.REGISTER_DIR
     return {
         str(path.relative_to(root)): path.read_bytes()
         for top in tops
         for path in sorted(top.rglob("*"))
-        if path.is_file()
+        if path.is_file() and register not in path.parents
     }
 
 

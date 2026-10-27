@@ -827,7 +827,7 @@ def test_restore_file_from_remote_keeps_an_object_already_cached(
 
     assert success
     assert cached_path.stat().st_mode & 0o777 == 0o555, "the published object was replaced"
-    left = [p.name for p in cached_path.parent.iterdir() if p.name != cache._PREFIX_LOCK]
+    left = [p.name for p in cached_path.parent.iterdir() if p.name != cache.PREFIX_LOCK]
     assert left == [cached_path.name], "no temp file left"
 
 

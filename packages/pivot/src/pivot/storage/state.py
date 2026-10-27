@@ -909,6 +909,22 @@ class StateDB:
             return None
         return run_history.deserialize_run_cache_entry(value)
 
+    def list_run_cache_entries(self) -> list[RunCacheEntry]:
+        """Every run cache entry in the database, for a collection that must keep what they
+        name. Materialized inside the read transaction, which is then closed."""
+        self._check_closed()
+        entries = list[run_history.RunCacheEntry]()
+        with self._read_transaction() as txn:
+            cursor = txn.cursor()
+            if cursor.set_range(_RUNCACHE_PREFIX):
+                key = cursor.key()
+                while key.startswith(_RUNCACHE_PREFIX):
+                    entries.append(run_history.deserialize_run_cache_entry(cursor.value()))
+                    if not cursor.next():
+                        break
+                    key = cursor.key()
+        return entries
+
     def prune_run_cache(self, valid_run_ids: set[str]) -> int:
         """Remove run cache entries that reference runs not in valid_run_ids.
 
@@ -1059,8 +1075,10 @@ class StateDB:
             limit_gb = _MAP_SIZE / (1024**3)
             percent = used_bytes / _MAP_SIZE * 100
             logger.warning(
-                f"State database at {used_gb:.1f}GB ({percent:.0f}%%), approaching "
-                + f"{limit_gb:.0f}GB limit. Run `pivot gc` or delete .pivot/state.lmdb/ to free space."
+                f"State database at {used_gb:.1f}GB ({percent:.0f}%), approaching "
+                + f"{limit_gb:.0f}GB limit. Run `pivot gc` to prune run history and unused "
+                + "cache objects; the database file itself shrinks only when you delete "
+                + ".pivot/state.lmdb/"
             )
 
     def __enter__(self) -> Self:

@@ -20,6 +20,9 @@ records each output's content hash.
         b2c3d4e5f6g7h8     # cached file (content-addressed)
         .pivot_cache.lock  # lock file pivot keeps in each prefix directory
       ...
+    projects/
+      3f2a1c0d9e8b7a65.json  # one project that uses this cache (see below)
+    gc.lock                  # held while `pivot gc` collects this cache
   stages/
     demo/
       clean.lock           # lock file for stage "demo/clean"
@@ -46,6 +49,54 @@ Because the cache is content-addressed:
 - Reverting a parameter change can restore outputs from cache without
   re-executing
 - The cache is shared across all [pipelines](pipelines.md) in a project
+
+## What Keeps a Cache Object Alive
+
+Nothing in the cache is ever removed by a pipeline run, so the cache only grows until you
+run [`pivot gc`](../cli/index.md#pivot-gc). A collection reads what is on disk, never what
+git records, and keeps every object that any of these names:
+
+| Record | Where it lives | What it names |
+|--------|----------------|---------------|
+| Stage lock `outs` | `.pivot/stages/**/<stage>.lock` | each output's hash; a directory's tree hash **and** every hash in its manifest |
+| Stage lock `deps` | the same file | each input's hash, which may outlive the stage that produced it |
+| `.pvt` file | anywhere under the project root | a tracked file's hash, or a tracked directory's hash and members |
+| Run-cache row | `.pivot/state.lmdb/` | the output hashes a previous run can restore without executing |
+| Workspace link | `data/**` and any tracked path | the object a `symlink` checkout points at, file or whole directory |
+| Cache ref | `.pivot/cache/files/refs/**` | the object a `kind: cache` store published |
+
+Two more rules cover objects no record names yet:
+
+- **A grace period.** A stage publishes its objects before it writes the lock that names
+  them, so an object younger than `--grace-hours` (24 by default) is kept. The age is the
+  object's `st_ctime`: a cached file carries its source file's mtime, which says nothing
+  about when it was cached.
+- **Hard links.** An object with more than one link is kept, because some directory entry
+  outside the cache holds that inode. `--remove-linked` overrides this, for a worktree that
+  was deleted without unlinking its outputs; the plan then says how many objects that is.
+
+A collection takes each prefix directory's `.pivot_cache.lock` exclusively while it lists
+and deletes there, which excludes every process staging a new object, and takes
+`<cache>/gc.lock` for the whole run, so two collections never run on one cache. It removes a
+directory tree with its `.verified` marker, and never removes a lock file or a `.pivot_tmp_*`
+entry another process owns.
+
+### A Cache Several Projects Share
+
+A `cache.dir` outside the project root (or a `PIVOT_CACHE_DIR` pointing elsewhere) can hold
+the outputs of projects whose locks this one cannot read. Each project records itself in the
+cache under `projects/<digest>.json`:
+
+```json
+{"root": "/home/me/experiment", "state_dir": "/home/me/experiment/.pivot",
+ "host": "workstation", "pivot": "0.5.11", "last_write": "2026-10-27T06:43:11Z"}
+```
+
+Every pivot command that resolves the cache writes this entry, at most once an hour per
+project, and a collection reads every project it names. An entry whose root is gone is
+dropped, with a note. `pivot gc` **refuses to remove anything** from an external cache that
+records no project, or whose records it cannot read; `pivot gc --projects PATH` names the
+projects that share it and records them, so later runs need no flag.
 
 ## Per-Stage Lock Files
 
@@ -218,6 +269,18 @@ Record current outputs in lock files and cache without re-running:
 
 ```
 $ pivot commit demo/train
+```
+
+### `pivot gc`
+
+Remove the cache objects no record names (see
+[What Keeps a Cache Object Alive](#what-keeps-a-cache-object-alive)):
+
+```
+$ pivot gc --dry-run               # what would go, and how much space it holds
+$ pivot gc                         # collect, asking first on a terminal
+$ pivot gc --yes                   # collect from a script or a CI job
+$ pivot gc --projects ../other     # a cache this project and ../other share
 ```
 
 ## Relationship to Other Concepts

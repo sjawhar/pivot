@@ -229,6 +229,14 @@ class UncachedIncrementalOutputError(CacheError):
     """Raised when an incremental output exists without a cache entry."""
 
 
+class CacheCollectionRefusedError(CacheError):
+    """Raised when `pivot gc` will not collect a cache, having removed nothing.
+
+    The message is the whole explanation: which cache, why it was refused, and what the user
+    can run instead.
+    """
+
+
 class CacheModeCollisionError(CacheError):
     """A HARDLINK/SYMLINK checkout shares the cache object's own permissions and found it
     already recorded with the wrong executable bit, with no COPY fallback available.

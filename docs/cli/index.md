@@ -23,6 +23,7 @@ Complete reference for all Pivot command-line commands.
 | Fetch to local cache | `pivot fetch` |
 | Pull outputs from remote | `pivot pull` |
 | Reset fingerprint cache | `pivot fingerprint reset` |
+| Free cache space | `pivot gc --dry-run` |
 | Watch for changes | `pivot repro --watch` |
 
 ---
@@ -961,6 +962,68 @@ pivot doctor [OPTIONS]
 | `--remote` | Also check remote connectivity |
 
 Configuration errors identify the invalid key and value and state the required format.
+
+---
+
+### `pivot gc`
+
+Remove the cache objects no record names.
+
+```bash
+pivot gc [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--dry-run` | Print the plan and remove nothing |
+| `--yes` / `-y` | Remove without asking. Required when stdin is not a terminal |
+| `--projects PATH` | Another project that shares this cache. Repeatable, and recorded in the cache's register |
+| `--grace-hours FLOAT` | Keep every object published in the last N hours (default 24) |
+| `--remove-linked` | Also remove objects a directory entry outside the cache still hardlinks |
+| `--json` | Write one JSON document to stdout; notes go to stderr |
+
+Pivot keeps every object named by a stage lock (`outs` and `deps`), a `.pvt` file, a
+run-cache row, a workspace link or a cache ref, in this project and in every project the
+cache records; every object published in the last `--grace-hours`; and every object some
+directory entry outside the cache still hardlinks. It removes the rest. See
+[Caching](../concepts/caching.md#what-keeps-a-cache-object-alive) for the whole rule, and
+for what `pivot gc` does with a cache several projects share.
+
+The run first prunes this project's run history to `core.run_history_retention`, as every
+pipeline run does. It does not shrink `.pivot/state.lmdb/`: deleting rows frees pages inside
+the file for reuse, and the file itself shrinks only when you delete the directory.
+
+**Examples:**
+
+```bash
+# What would go, and how much space it holds
+pivot gc --dry-run
+
+# Collect, asking first on a terminal
+pivot gc
+
+# Collect from a script or a CI job
+pivot gc --yes
+
+# A cache two projects share, named once and recorded for later runs
+pivot gc --projects ../other-experiment
+
+# Nothing published in the last hour is kept
+pivot gc --yes --grace-hours 1
+```
+
+```
+$ pivot gc --dry-run
+Scanned 163,692 objects (33.5 GB) in /data/pivot-cache/files.
+Kept 141,398 objects (29.1 GB): 137,204 named by 235 locks and 812 run-cache entries in 2 projects,
+  3,996 by 110,024 workspace links, 198 published in the last 24.0h, 1,204 still hardlinked elsewhere.
+Would remove 22,294 objects (4.4 GB). Nothing was removed (--dry-run).
+```
+
+After a collection, `pivot diff` and `pivot get --rev` may need `pivot fetch` for a revision
+whose objects were removed.
 
 ---
 
