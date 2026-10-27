@@ -7,6 +7,7 @@ import importlib.util
 import inspect
 import linecache
 import logging
+import marshal
 import os
 import pathlib
 import py_compile
@@ -16,8 +17,9 @@ import time
 import types
 import uuid
 import zipfile
-from collections.abc import Sequence
-from typing import cast, override
+from collections.abc import Callable, Sequence
+from importlib import _bootstrap_external
+from typing import cast, final, override
 
 import pytest
 import xxhash
@@ -264,9 +266,32 @@ def test_a_sourceless_module_is_recorded_as_unreadable(
     module = importlib.import_module(name)
     monkeypatch.setitem(sys.modules, name, module)
 
-    assert loaded_source.digests()[name].endswith("\0")
+    assert loaded_source._record_fields(loaded_source.digests()[name])[1] == "", "no digest"
+    assert _reason(name).startswith(_untrusted(importlib.machinery.SourcelessFileLoader))
     edited, unreadable = loaded_source.check_stage({f"func:{name}.value": "x"}, set(), "", None)
     assert (edited, unreadable) == ([], [name])
+
+
+def test_an_unreadable_record_made_while_the_module_ran_does_not_stand(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker's import hook records the modules an import names (`record_modules`), so a
+    package whose body imports its own submodule is recorded unreadable while its loader still
+    runs it. That record is not a source Pivot's loader read: the zip importer's `.py` source,
+    recorded once the module ran, stands."""
+    archive = tmp_path / "lib.zip"
+    name = f"zipped_{uuid.uuid4().hex}"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr(
+            f"{name}.py",
+            "from pivot import loaded_source\n\nloaded_source.record_modules([__name__])\n",
+        )
+    discovery.install_user_code_loader(str(tmp_path))
+    monkeypatch.syspath_prepend(str(archive))
+
+    importlib.import_module(name)
+
+    assert loaded_source._record_fields(loaded_source.digests()[name])[1] != "", "readable"
 
 
 def test_a_stage_uses_modules_its_manifest_hashes_or_it_imported(
@@ -388,6 +413,15 @@ def _reason(name: str) -> str:
     return loaded_source._record_fields(loaded_source.digests()[name])[2]
 
 
+def _unseen(why: str) -> str:
+    """The reason recorded for a module no recorder saw compile, for `why`."""
+    return loaded_source._unseen_reason(why)
+
+
+def _loader_named(loader_class: type) -> str:
+    return f"its loader, {loader_class.__module__}.{loader_class.__qualname__}"
+
+
 def test_a_module_imported_before_the_recorder_is_recorded_from_its_unchanged_file(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -421,7 +455,7 @@ def test_a_module_whose_file_changed_since_the_process_started_is_unreadable(
     loaded_source.record_unseen_modules()
 
     assert loaded_source.digests()[name] == (
-        f"{path.resolve()}\0\0its file changed after this process started"
+        f"{path.resolve()}\0\0{_unseen('its file changed after this process started')}"
     )
     assert loaded_source.digest(str(path)) is None
     with caplog.at_level(logging.WARNING, logger="pivot.loaded_source"):
@@ -432,8 +466,10 @@ def test_a_module_whose_file_changed_since_the_process_started_is_unreadable(
             )
     warnings = [r.getMessage() for r in caplog.records if r.name == "pivot.loaded_source"]
     assert len(warnings) == 1, warnings
-    assert f"user module '{name}' compile" in warnings[0]
+    assert f"Pivot cannot trust the code of user module '{name}'" in warnings[0]
+    assert "pivot did not see it compile" in warnings[0]
     assert "because its file changed after this process started" in warnings[0]
+    assert "Fix: import it from the pipeline or from a stage instead" in warnings[0]
 
 
 def test_a_module_another_loader_loaded_before_the_recorder_is_unreadable(
@@ -450,7 +486,9 @@ def test_a_module_another_loader_loaded_before_the_recorder_is_unreadable(
 
     loaded_source.record_unseen_modules()
 
-    assert _reason(name) == "its loader (_TransformingLoader) is not CPython's source file loader"
+    assert _reason(name) == _unseen(
+        f"{_loader_named(_TransformingLoader)}, is not CPython's source file loader"
+    )
 
 
 def _leave_stale_bytecode(path: pathlib.Path) -> None:
@@ -507,14 +545,86 @@ class _LoadModuleOnlyLoader:
         return module
 
 
+class _ProxyLoader(importlib.abc.Loader):
+    """dd-trace-py's `_ImportHookChainedLoader`: its own `create_module` and `exec_module`, and
+    every other attribute (`get_data` included) taken from the loader it wraps."""
+
+    _loader: importlib.abc.Loader
+
+    def __init__(self, loader: importlib.abc.Loader) -> None:
+        self._loader = loader
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._loader, name)
+
+    @override
+    def create_module(self, spec: importlib.machinery.ModuleSpec) -> types.ModuleType | None:
+        return self._loader.create_module(spec)
+
+    @override
+    def exec_module(self, module: types.ModuleType) -> None:
+        self._loader.exec_module(module)
+
+
+class _ComposedLoader(importlib.abc.Loader):
+    """A loader whose `get_data` reads the file and whose `exec_module` runs CPython's
+    `SourceFileLoader` inside it."""
+
+    _path: str
+
+    def __init__(self, fullname: str, path: str) -> None:
+        self._path = path
+
+    def get_filename(self, fullname: str) -> str:
+        return self._path
+
+    def get_data(self, path: str) -> bytes:
+        return pathlib.Path(path).read_bytes()
+
+    @override
+    def exec_module(self, module: types.ModuleType) -> None:
+        importlib.machinery.SourceFileLoader(module.__name__, self._path).exec_module(module)
+
+
+@final
+class _BootstrapLoader(_bootstrap_external.FileLoader, _bootstrap_external.SourceLoader):
+    """CPython's own definition of `SourceFileLoader`, its private bases and methods, in a class
+    that is no `SourceFileLoader` and that `isinstance` does not see as an
+    `importlib.abc.SourceLoader`."""
+
+    path_stats = _bootstrap_external.SourceFileLoader.path_stats
+    set_data = _bootstrap_external.SourceFileLoader.set_data
+
+
+class _FileCacheLoader(importlib.abc.FileLoader):
+    """pytest's assertion rewriter's model: a `FileLoader` that is no `SourceLoader` and runs its
+    own cached bytecode while the cache's header matches the source's whole-second mtime and
+    size."""
+
+    @override
+    def get_source(self, fullname: str) -> str:
+        return self.get_data(self.path).decode()
+
+    @override
+    def get_code(self, fullname: str) -> types.CodeType:
+        status = os.stat(self.path)
+        cached = pathlib.Path(importlib.util.cache_from_source(self.path))
+        stamp = (int(status.st_mtime) & 0xFFFFFFFF).to_bytes(4, "little") + (
+            status.st_size & 0xFFFFFFFF
+        ).to_bytes(4, "little")
+        if cached.exists() and cached.read_bytes()[8:16] == stamp:
+            return cast("types.CodeType", marshal.loads(cached.read_bytes()[16:]))
+        return compile(self.get_data(self.path), self.path, "exec", dont_inherit=True)
+
+
 class _ServingFinder(importlib.abc.MetaPathFinder):
     """A finder ahead of `sys.path`'s that serves one module with a given loader, as an import
     hook does."""
 
     _name: str
-    _loader: importlib.abc.Loader | _LoadModuleOnlyLoader
+    _loader: object
 
-    def __init__(self, name: str, loader: importlib.abc.Loader | _LoadModuleOnlyLoader) -> None:
+    def __init__(self, name: str, loader: object) -> None:
         self._name = name
         self._loader = loader
 
@@ -527,11 +637,44 @@ class _ServingFinder(importlib.abc.MetaPathFinder):
     ) -> importlib.machinery.ModuleSpec | None:
         if fullname != self._name:
             return None
-        return importlib.util.spec_from_loader(fullname, self._loader)
+        return importlib.util.spec_from_loader(fullname, cast("importlib.abc.Loader", self._loader))
+
+
+class _ChainFinder(importlib.abc.MetaPathFinder):
+    """dd-trace-py's `ModuleWatchdog.find_spec`: find one module with the other finders on
+    `sys.meta_path`, Pivot's recorder among them, and wrap the loader found in `_ProxyLoader`."""
+
+    _name: str
+    _finding: bool = False
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    @override
+    def find_spec(
+        self,
+        fullname: str,
+        path: Sequence[str] | None,
+        target: types.ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        if fullname != self._name or self._finding:
+            return None
+        self._finding = True
+        try:
+            for finder in sys.meta_path:
+                find_spec = None if finder is self else getattr(finder, "find_spec", None)
+                spec = None if find_spec is None else find_spec(fullname, path, target)
+                if isinstance(spec, importlib.machinery.ModuleSpec):
+                    if isinstance(spec.loader, importlib.abc.Loader):
+                        spec.loader = _ProxyLoader(spec.loader)
+                    return spec
+            return None
+        finally:
+            self._finding = False
 
 
 def _import_through_the_recorder(
-    name: str, loader: importlib.abc.Loader | _LoadModuleOnlyLoader, monkeypatch: pytest.MonkeyPatch
+    name: str, loader: object, monkeypatch: pytest.MonkeyPatch
 ) -> types.ModuleType:
     """Import `name`, served by `loader`, with the module recorder installed, as a discovery or a
     worker imports a module an import hook serves."""
@@ -545,40 +688,149 @@ def _import_through_the_recorder(
         discovery._uninstall_module_recorder()
 
 
+def _untrusted(loader_class: type) -> str:
+    """The start of the reason recorded for a module `loader_class` executed."""
+    return f"{_loader_named(loader_class)}, is not one pivot can show runs the source it reads"
+
+
+def _proxy_around_cpythons_loader(name: str, path: str) -> _ProxyLoader:
+    return _ProxyLoader(importlib.machinery.SourceFileLoader(name, path))
+
+
 @pytest.mark.parametrize(
-    "loader_class",
-    [_TransformingLoader, _CachingSourceLoader],
-    ids=["source-file-loader-subclass", "source-loader"],
+    "make_loader",
+    [
+        pytest.param(_TransformingLoader, id="source-file-loader-subclass"),
+        pytest.param(_CachingSourceLoader, id="source-loader"),
+        pytest.param(_proxy_around_cpythons_loader, id="proxy"),
+        pytest.param(_ComposedLoader, id="runs-cpythons-loader-inside"),
+        pytest.param(_BootstrapLoader, id="private-source-loader-bases"),
+        pytest.param(_FileCacheLoader, id="file-loader-with-its-own-cache"),
+    ],
 )
-def test_a_module_a_source_loader_loads_through_the_recorder_is_unreadable(
+def test_a_module_a_loader_pivot_cannot_vouch_for_loads_through_the_recorder_is_unreadable(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    loader_class: type[_TransformingLoader | _CachingSourceLoader],
+    make_loader: Callable[[str, str], object],
 ) -> None:
-    """A loader built on CPython's `SourceLoader`, other than `SourceFileLoader` itself, may run
-    bytecode checked only by the source's size and whole-second mtime, and the recorder does not
-    replace it with Pivot's loader, since a subclass may transform the source. Its `get_data` then
-    gives the edited file while the module runs the earlier code, so the module is unreadable: a
-    stage that uses it reruns, and never reports the earlier code's output as cached."""
+    """Pivot trusts a loader's source only where it can show that loader runs it: CPython's
+    `SourceFileLoader`, which it replaces, a zip importer that compiled the `.py` member, and its
+    own loader run inside another. Each loader here runs the earlier bytecode while its
+    `get_data` gives the edited file: a `SourceFileLoader` subclass, another `SourceLoader`, a
+    proxy around CPython's loader, a loader that runs CPython's inside it, CPython's own
+    definition of `SourceFileLoader` on its private bases, and a `FileLoader` that caches its own
+    bytecode. Each module is unreadable, with a reason that names its loader: a stage that uses
+    it reruns, and never reports the earlier code's output as cached."""
     path = tmp_path / "hooked.py"
     _leave_stale_bytecode(path)
     name = f"hooked_{uuid.uuid4().hex}"
+    loader = make_loader(name, str(path))
 
-    module = _import_through_the_recorder(name, loader_class(name, str(path)), monkeypatch)
+    module = _import_through_the_recorder(name, loader, monkeypatch)
 
     assert module.value() == "alpha", "the import ran the earlier bytecode"
     assert type(vars(module)["__spec__"].loader) is discovery._RecordingLoader
-    assert loaded_source.digests()[name] == f"{path.resolve()}\0"
+    assert loaded_source.digests()[name].startswith(
+        f"{path.resolve()}\0\0{_untrusted(type(loader))}"
+    )
+    assert _reason(name).endswith(
+        "Fix: import the module without that loader, or accept the reruns"
+    )
+
+
+def test_a_loader_that_wraps_pivots_own_keeps_the_source_pivot_recorded(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finder that finds a module through the rest of `sys.meta_path`, Pivot's recorder among
+    them, and wraps the loader it gets, as dd-trace-py's ModuleWatchdog does, runs Pivot's loader
+    inside its own. The source that loader recorded stands: the module stays readable, recorded
+    from the bytes it compiled, not the earlier bytecode."""
+    name = f"chained_{uuid.uuid4().hex}"
+    path = tmp_path / f"{name}.py"
+    _leave_stale_bytecode(path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.meta_path.insert(0, _ChainFinder(name))  # restore_import_machinery undoes it
+    monkeypatch.setitem(sys.modules, name, types.ModuleType(name))  # removed after the test
+    del sys.modules[name]
+    discovery._install_module_recorder()
+    try:
+        module = importlib.import_module(name)
+    finally:
+        discovery._uninstall_module_recorder()
+
+    assert type(vars(module)["__spec__"].loader._loader) is _ProxyLoader
+    assert module.value() == "bravo", "Pivot's loader compiled the source"
+    assert loaded_source.digests()[name] == _text(path, path.read_bytes())
+
+
+def test_a_reload_an_untrusted_loader_runs_does_not_keep_the_earlier_record(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a record Pivot's loader made while this execution ran stands for it. The module was
+    first imported with CPython's loader, which Pivot replaces and records; a reload through a
+    proxy that runs no Pivot loader inside is unreadable, not trusted on that earlier record."""
+    name = f"reloaded_{uuid.uuid4().hex}"
+    path = tmp_path / f"{name}.py"
+    path.write_text('def value():\n    return "alpha"\n')
+    module = _import_through_the_recorder(
+        name, importlib.machinery.SourceFileLoader(name, str(path)), monkeypatch
+    )
+    assert loaded_source.digests()[name] == _text(path, path.read_bytes())
+    proxy = _ProxyLoader(importlib.machinery.SourceFileLoader(name, str(path)))
+    sys.meta_path.insert(0, _ServingFinder(name, proxy))  # restore_import_machinery undoes it
+
+    discovery._install_module_recorder()
+    try:
+        importlib.reload(module)
+    finally:
+        discovery._uninstall_module_recorder()
+
+    assert _reason(name).startswith(_untrusted(_ProxyLoader))
+
+
+def test_a_zip_module_run_from_its_bytecode_member_is_unreadable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zip importer tries a module's `.pyc` member before its `.py` member, and runs the `.pyc`
+    when its header matches the `.py` member's zip time and size, as in a zipped `compileall -b`
+    tree or an egg. The `.py` text is then not the code that ran: the module is unreadable, with
+    the bytecode member named. A zip with only the `.py` member stays readable
+    (`test_a_module_in_a_zip_is_recorded_from_the_zip`)."""
+    archive = tmp_path / "lib.zip"
+    name = f"zipped_{uuid.uuid4().hex}"
+    source = b'def value():\n    return "bravo"\n'
+    stamp = (2024, 1, 1, 0, 0, 0)
+    code = compile(
+        b'def value():\n    return "alpha"\n', f"{archive}/{name}.py", "exec", dont_inherit=True
+    )
+    header = (
+        importlib.util.MAGIC_NUMBER
+        + bytes(4)
+        + (int(time.mktime((*stamp, 0, 0, -1))) & 0xFFFFFFFF).to_bytes(4, "little")
+        + len(source).to_bytes(4, "little")
+    )
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr(zipfile.ZipInfo(f"{name}.py", date_time=stamp), source)
+        zf.writestr(zipfile.ZipInfo(f"{name}.pyc", date_time=stamp), header + marshal.dumps(code))
+    discovery.install_user_code_loader(str(tmp_path))
+    monkeypatch.syspath_prepend(str(archive))
+
+    module = importlib.import_module(name)
+
+    assert module.value() == "alpha", "zipimport ran the bytecode member"
+    assert _reason(name).startswith(
+        f"its zip importer ran the bytecode member {archive}{os.sep}{name}.pyc"
+    )
 
 
 def test_a_legacy_load_module_only_loader_still_imports_with_the_recorder_installed(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A PEP 302 loader with only `load_module` imports on CPython 3.13 (its import system warns
-    that `load_module` is slated for removal in 3.15) and imports on main; wrapped by the recorder,
-    its import failed. The recorder leaves it unwrapped, so it imports as without Pivot. No
-    recorder sees the module compile, so it is judged as a module imported before the recorder:
-    its loader is not CPython's, so it is unreadable."""
+    """A PEP 302 loader with only `load_module` imports on CPython 3.13 (its import system warns,
+    with an `ImportWarning`, that it falls back to `load_module`) and imports on main; wrapped by
+    the recorder, its import failed. The recorder leaves it unwrapped, so it imports as without
+    Pivot. No recorder sees the module compile, so it is judged as a module imported before the
+    recorder: its loader is not CPython's, so it is unreadable."""
     path = tmp_path / "legacy.py"
     path.write_text("VALUE = 41\n")
     name = f"legacy_{uuid.uuid4().hex}"
@@ -589,7 +841,9 @@ def test_a_legacy_load_module_only_loader_still_imports_with_the_recorder_instal
     loaded_source.record_unseen_modules()
 
     assert module.VALUE == 41
-    assert _reason(name) == "its loader (_LoadModuleOnlyLoader) is not CPython's source file loader"
+    assert _reason(name) == _unseen(
+        f"{_loader_named(_LoadModuleOnlyLoader)}, is not CPython's source file loader"
+    )
 
 
 def test_stale_bytecode_the_import_ran_makes_the_module_unreadable(
@@ -606,7 +860,7 @@ def test_stale_bytecode_the_import_ran_makes_the_module_unreadable(
 
     loaded_source.record_unseen_modules()
 
-    assert _reason(module.__name__) == "its cached bytecode is not the code of its file"
+    assert _reason(module.__name__) == _unseen("its cached bytecode is not the code of its file")
 
 
 @pytest.mark.parametrize(
@@ -640,7 +894,7 @@ def test_bytecode_written_after_the_process_started(
     assert loaded_source.digests()[module.__name__] == (
         _text(path, data)
         if trusted
-        else f"{path.resolve()}\0\0its bytecode file changed after this process started"
+        else f"{path.resolve()}\0\0{_unseen('its bytecode file changed after this process started')}"
     )
 
 
@@ -667,7 +921,7 @@ def test_a_module_imported_without_bytecode_is_recorded_unless_bytecode_was_remo
     loaded_source.record_unseen_modules()
 
     assert loaded_source.digests()[kept_module.__name__] == _text(kept, b"VALUE = 1\n")
-    assert _reason(removed_module.__name__) == (
+    assert _reason(removed_module.__name__) == _unseen(
         "its bytecode directory changed after this process started"
     )
 
@@ -697,7 +951,9 @@ def test_a_worker_logs_the_coordinators_reason_for_an_unseen_module(
     """The coordinator's record of a module it could not vouch for carries the reason, so the
     worker whose stage uses the module says why the stage is not reused."""
     name = "coordinator_only"
-    records = {name: f"{tmp_path / 'm.py'}\0\0its file changed after this process started"}
+    records = {
+        name: f"{tmp_path / 'm.py'}\0\0{_unseen('its file changed after this process started')}"
+    }
     loaded_source.set_coordinator(records)
 
     with caplog.at_level(logging.WARNING, logger="pivot.loaded_source"):
@@ -706,7 +962,7 @@ def test_a_worker_logs_the_coordinators_reason_for_an_unseen_module(
         )
 
     assert checked == ([], [name])
-    assert f"user module '{name}' compile" in caplog.text
+    assert f"Pivot cannot trust the code of user module '{name}'" in caplog.text
     assert "because its file changed after this process started" in caplog.text
 
 
@@ -749,7 +1005,7 @@ def test_a_forward_clock_step_after_an_edit_cannot_show_the_edit_came_before_the
     loaded_source.record_unseen_modules()
 
     assert module.value() == "v1"
-    assert _reason(module.__name__) == "its file changed after this process started"
+    assert _reason(module.__name__) == _unseen("its file changed after this process started")
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads the boot clock")
@@ -825,7 +1081,7 @@ def test_a_worker_judges_the_modules_it_imported_before_its_initializer(
 
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == repr(
-        f"{path.resolve()}\0\0its file changed after this process started"
+        f"{path.resolve()}\0\0{_unseen('its file changed after this process started')}"
     )
 
 

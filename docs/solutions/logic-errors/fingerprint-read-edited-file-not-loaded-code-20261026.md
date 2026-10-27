@@ -44,14 +44,16 @@ Record the bytes each user module was compiled from, and fingerprint those:
 
 - `discovery._ProjectSourceLoader.get_code` captures the source bytes its own `get_data` read (the
   bytes the checked-hash bytecode was validated against, or compiled from) and calls
-  `loaded_source.record`. Every other user-code module is recorded from its own loader at the end
-  of discovery and at each import a worker's hooks see (editable-install finders, zip importers,
-  `spec_from_file_location`). A module whose loader gives no source is recorded as unreadable, and
-  so is one loaded by any loader built on CPython's `SourceLoader` other than `SourceFileLoader`
-  itself (which `_ProjectSourceLoader` replaces): such a loader may run cached bytecode CPython
-  checks only by the source's size and whole-second mtime, so its `get_data` is not the code that
-  ran. A loader with only `load_module` is left unwrapped, so it still imports, and its module is
-  judged as one no recorder saw compile.
+  `loaded_source.record`. Every other user-code module passes the recorder
+  (`discovery._RecordingLoader`), which trusts a loader's source only where Pivot can show that
+  loader runs it: CPython's `SourceFileLoader` (replaced by `_ProjectSourceLoader`), a zip
+  importer whose origin is the `.py` member (it compiled that member; with a `.pyc` origin it ran
+  bytecode it checks only by the `.py` member's zip time and size), and Pivot's own loader run
+  inside a loader that wraps it during this execution (dd-trace-py's ModuleWatchdog wraps the
+  loader the rest of `sys.meta_path` returns). Every other loader's module is recorded as
+  unreadable, with a reason that names the loader, so a loader shape no one listed is safe by
+  default. A loader with only `load_module` is left unwrapped, so it still imports, and its
+  module is judged as one no recorder saw compile.
 - `loaded_source.getsource` puts the recorded lines into `linecache` as an entry without an mtime
   (CPython's form for loader-supplied source, which `checkcache` leaves alone) and calls
   `inspect.getsource`. It restores the entry if something cleared `linecache`; `prune` removes it
@@ -96,6 +98,14 @@ project keeps every recorded fingerprint.
   wherever a module is judged: the round that judged a `SourceFileLoader` subclass unreadable
   before the recorder still recorded it readable through the recorder, and served a stale result
   as fresh. An attack set needs every loader type crossed with every point it can be reached.
+- Trust by allowlist, not by denylist. A rule that listed the loaders to distrust (every
+  `importlib.abc.SourceLoader` but CPython's own) left eight of fourteen new loader shapes stale:
+  a proxy around CPython's loader, a loader that runs CPython's inside it, CPython's own
+  `SourceFileLoader` definition on its private bases (which `isinstance` does not see as an
+  `importlib.abc.SourceLoader`), a `FileLoader` with its own bytecode cache, and a zip holding a
+  `.pyc` beside its `.py`. Name only the loaders that can be shown to run what Pivot read, and
+  record everything else as unreadable. Check a type claim against the code it implies: a zip
+  importer is no `SourceLoader`, and still runs a `.pyc` it checks only by time and size.
 - Check per stage, not per worker: a worker's other stages did not use the module.
 - Test code-change detection with the edit made *after* the import and *before* the fingerprint,
   and with the stage order that leaves the function unhashed until after the edit.
@@ -112,8 +122,10 @@ project keeps every recorded fingerprint.
   pytest-xdist worker runs many tests in one process, so a leaked hook makes the suite pass or
   fail by schedule. The suite's `restore_import_machinery` fixture restores them after each test
   and ends the discovery session the test started.
-- A StateDB record that two features write (`nocommit:`, `types.NoCommitRecord`) needs both a
-  reader and a writer per feature that touch only that feature's keys: each writer reads the
-  record and replaces its own keys in one write transaction, and each reader validates its own
-  keys and returns the rest as stored. Checking only the reader missed a whole-record put that
-  erased the other feature's key on every `--no-commit` run.
+- A StateDB record that two features write (`nocommit:`, `types.NoCommitRecord`) needs a writer
+  per feature that touches only that feature's keys, and one reader that both features can keep:
+  each writer reads the record and replaces its own keys in one write transaction, and the reader
+  validates every key the record declares on its own, so a malformed key is dropped and hides no
+  other, and a consumer that needs two keys together checks that both are present. Checking only
+  the reader missed a whole-record put that erased the other feature's key on every
+  `--no-commit` run.

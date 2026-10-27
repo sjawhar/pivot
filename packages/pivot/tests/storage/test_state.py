@@ -1508,30 +1508,39 @@ _PVT = {"pvt_members": {"data/out/a.pvt": "77aa"}}
         pytest.param(_PVT, _PVT, id="another-field-only"),
         pytest.param({**_RAN, **_PVT}, {**_RAN, **_PVT}, id="another-field-too"),
         pytest.param(
-            {"code_manifest": _RAN["code_manifest"], **_PVT}, _PVT, id="manifest-without-outputs"
+            {"code_manifest": _RAN["code_manifest"], **_PVT},
+            {"code_manifest": _RAN["code_manifest"], **_PVT},
+            id="manifest-without-outputs",
         ),
         pytest.param(
-            {**_RAN, "code_manifest": {"func:helpers.plain": 1}}, {}, id="malformed-manifest"
+            {**_RAN, "code_manifest": {"func:helpers.plain": 1}},
+            {"output_hashes": _RAN["output_hashes"]},
+            id="malformed-manifest",
         ),
         pytest.param(
-            {**_RAN, "code_manifest": {"func:helpers.plain": 1}, **_PVT},
+            {**_RAN, "output_hashes": ["p/use_plain"], **_PVT},
+            {"code_manifest": _RAN["code_manifest"], **_PVT},
+            id="malformed-outputs-and-another-field",
+        ),
+        pytest.param({**_RAN, "pvt_members": ["data/out/a.pvt"]}, _RAN, id="malformed-pvt-members"),
+        pytest.param({**_RAN, "pvt_members": 7}, _RAN, id="pvt-members-not-an-object"),
+        pytest.param(
+            {"code_manifest": 7, "output_hashes": {"p/use_plain": 9}, **_PVT},
             _PVT,
-            id="malformed-manifest-and-another-field",
+            id="malformed-run-keys-and-valid-pvt-members",
         ),
         pytest.param(
-            {**_RAN, "pvt_members": ["data/out/a.pvt"]},
-            {**_RAN, "pvt_members": ["data/out/a.pvt"]},
-            id="another-field-as-stored",
+            {**_RAN, "later_field": [1]}, {**_RAN, "later_field": [1]}, id="unknown-key-as-stored"
         ),
     ],
 )
 def test_a_no_commit_record_reads_each_valid_field_it_knows(
     tmp_path: pathlib.Path, stored: object, expected: object
 ) -> None:
-    """The code manifest and the output hashes read together, when both are valid. Every other
-    key, as the `pvt_members` another feature writes, reads as stored, for that feature to
-    validate: a record that holds only it reads as present, never as absent, and a malformed
-    manifest hides no other key."""
+    """Each key the record declares (the run's code manifest and output hashes, and the
+    `pvt_members` another feature writes) is validated on its own: a malformed one is dropped
+    and hides no other. A key the record does not declare reads as stored, and a record that
+    holds only another feature's key reads as present, never as absent."""
     with state.StateDB(tmp_path) as db:
         db.put_raw(b"nocommit:p/use_plain", json.dumps(stored).encode())
 

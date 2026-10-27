@@ -36,6 +36,8 @@ _RUNCACHE_PREFIX = b"runcache:"  # Run cache entries for skip detection
 _FP_PREFIX = b"fp:"  # AST fingerprint/hash cache entries
 _SM_PREFIX = b"sm:"  # Stage manifest cache entries
 _NOCOMMIT_PREFIX = b"nocommit:"  # What a --no-commit run of a stage ran, for `pivot commit`
+# The keys `types.NoCommitRecord` declares, each a str -> str mapping the reader validates alone.
+_NO_COMMIT_FIELDS = ("code_manifest", "output_hashes", "pvt_members")
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024
@@ -932,10 +934,9 @@ class StateDB:
     def get_no_commit_record(self, stage_name: str) -> NoCommitRecord | None:
         """The stage's `nocommit:` record, or None (absent, or not a JSON object).
 
-        It holds `code_manifest` and `output_hashes`, the keys a `--no-commit` run writes, only
-        together and only when both are valid, and every other key as stored, for the feature
-        that writes it to validate (`types.NoCommitRecord`). A record without these two, or with
-        either malformed, reads as present with its other keys, never as absent.
+        Each key `types.NoCommitRecord` declares (`code_manifest`, `output_hashes`,
+        `pvt_members`) is validated on its own: a malformed one is dropped and hides no other.
+        Every other key reads as stored, and a record without these keys reads as present.
         """
         self._check_closed()
         with self._read_transaction() as txn:
@@ -943,11 +944,9 @@ class StateDB:
         record = _json_object(value)
         if record is None:
             return None
-        manifest = record.pop("code_manifest", None)
-        outputs = record.pop("output_hashes", None)
-        if _is_str_dict(manifest) and _is_str_dict(outputs):
-            record["code_manifest"] = manifest
-            record["output_hashes"] = outputs
+        for field in _NO_COMMIT_FIELDS:
+            if field in record and not _is_str_dict(record[field]):
+                del record[field]
         return typing.cast("NoCommitRecord", typing.cast("object", record))
 
     def prune_run_cache(self, valid_run_ids: set[str]) -> int:
@@ -1079,8 +1078,8 @@ class StateDB:
 
                 nocommit_key = _NOCOMMIT_PREFIX + stage_name.encode()
                 if "no_commit_record" in deferred:
-                    # Set the run's keys (it writes both) and keep every other key: another
-                    # feature writes its keys into the same record (`types.NoCommitRecord`).
+                    # Set the run's keys (`types.NoCommitRun`: both, always) and keep every other
+                    # key: another feature writes its keys into the same record.
                     record = _json_object(txn.get(nocommit_key)) or dict[str, object]()
                     record.update(deferred["no_commit_record"])
                     txn.put(nocommit_key, json.dumps(record).encode())

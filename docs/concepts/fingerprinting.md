@@ -271,10 +271,10 @@ run continues (in an editor, or from an upstream stage), the stages of that run
 use the loaded version, and their locks record it. The next run loads your edit
 and reruns the stages it changes. This holds for every user module Pivot can
 read the source of, whatever loaded it: a module under the project root, one on
-`PYTHONPATH`, an editable install's finder, a zip on `sys.path`,
-`importlib.util.spec_from_file_location`, `sitecustomize` before Pivot started,
-or a loader a module calls itself (see below). A module Pivot cannot read the
-source of is never reused, as the next paragraphs say.
+`PYTHONPATH`, an editable install's finder, a zip on `sys.path` whose `.py` file
+Python compiles, `importlib.util.spec_from_file_location`, `sitecustomize`
+before Pivot started, or a loader a module calls itself (see below). A module
+Pivot cannot read the source of is never reused, as the next paragraphs say.
 
 A worker imports some modules from their files itself: a module outside the
 project root (on `PYTHONPATH`, or a package installed from a source checkout),
@@ -297,18 +297,28 @@ A user module whose source Pivot cannot read (a sourceless `.pyc`, or a module
 from a loader that gives no source) is never trusted: Pivot cannot tell which
 code a worker holds. A stage that uses it warns once per run ("uses user
 modules whose source pivot cannot read"), reruns on every run, and never files
-or reuses a run-cache entry. Load such modules from `.py` source files. The same
-holds for a module an import hook loads with its own subclass of
-`importlib.machinery.SourceFileLoader`, or another loader built on
-`importlib.abc.SourceLoader` (tools that rewrite source as it is imported
-install one): such a loader may run cached bytecode that Python checks only by
-the file's size and whole-second modification time, so the file can say one
-thing while the module runs another. Pivot then never reports the stage as
-cached, but each rerun runs whatever that loader runs: if the loader runs old
-bytecode, the output is still the old code's. Pivot stops claiming the result
-is fresh; it cannot make your loader run the current code. A loader with only
-the old `load_module` method still imports as it does without Pivot, and its
-module is treated the same way.
+or reuses a run-cache entry. The same holds for a module from any loader Pivot
+cannot show runs the source it reads. Pivot trusts only three: Python's own
+source file loader (which Pivot replaces with its own), a zip importer that
+compiled the module's `.py` file, and Pivot's own loader run inside another (an
+import hook that wraps the loader it finds, as dd-trace-py's ModuleWatchdog
+does). Every other loader may run cached bytecode, or text other than its
+source, so the file can say one thing while the module runs another: a
+subclass of `importlib.machinery.SourceFileLoader` or
+another `importlib.abc.SourceLoader` (tools that rewrite source as it is
+imported install one), a proxy around Python's loader, or a loader that caches
+its own bytecode. So can a zip that holds a `.pyc` beside the `.py` file, as a
+zipped `compileall -b` tree or an egg does: Python runs that `.pyc` when its
+header matches the `.py` file's time and size. The first stage in each process
+that uses such a module logs why ("Pivot cannot trust the code of user module
+'…'"), naming the loader, and what to do: import the module without that
+loader, or accept that the stage reruns on every run. Pivot then never reports
+the stage as cached, unless you `pivot commit` outputs that no run recorded,
+but each rerun runs whatever that loader runs: if the loader runs old bytecode,
+the output is still the old code's. Pivot stops claiming the result is fresh;
+it cannot make your loader run the current code. A loader with only the old
+`load_module` method still imports as it does without Pivot, and its module is
+treated the same way.
 
 A module imported before Pivot starts, by `sitecustomize` or a `.pth` import
 line (in the `pivot` process and in every worker), was loaded before Pivot
@@ -320,18 +330,22 @@ file and its cached bytecode show it is the module's code: CPython's own loader
 imported it, and neither the file nor the bytecode it may have run changed
 after the process started or in the 2 s before. Otherwise Pivot treats the
 module as one whose source it cannot read, and the first stage that uses it in
-each process also logs why ("Pivot did not see user module '…' compile"). That
-happens when the file changes while Pivot starts or in the 2 s before it starts
-(a stage that uses it reruns once more on the next run), in a process that
-loaded a module and then edited it, and for a module a custom loader imported.
-A worker whose text differs from the one the `pivot` process recorded marks the
-stage, as above. Import such modules from the pipeline or a stage instead. A
+each process also logs why ("Pivot cannot trust the code of user module '…'":
+Pivot did not see it compile). That happens when the file changes while Pivot
+starts or in the 2 s before it starts (a stage that uses it reruns once more on
+the next run), in a process that loaded a module and then edited it, and for a
+module a custom loader imported. A worker whose text differs from the one the
+`pivot` process recorded marks the stage, as above. Import such modules from
+the pipeline or a stage instead. A
 forward step of the system clock between an edit and the start of a pivot
 process can make that edit look older than the start: the 2 s margin covers a
 step of about 1 s where the file system keeps whole-second change times, and of
 2 s where it keeps exact ones. A file system that keeps change times in
 2-second steps (FAT) uses the whole margin, so there an edit made just as a
-pivot process starts can be missed.
+pivot process starts can be missed. Linux's FAT driver also sets a file's
+change time to its modification time whenever it reads the file's entry from
+disk again, so there an edit whose modification time a tool put back can look
+unchanged; Pivot then catches it only by the file's cached bytecode.
 
 Under `pivot repro --no-commit` no lock is written. The run records, for
 `pivot commit`, the manifest each stage's lock would have held, warnings' marks

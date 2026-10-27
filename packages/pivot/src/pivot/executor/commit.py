@@ -123,11 +123,19 @@ def commit_stages(
             production_lock = lock.StageLock(stage_name, stages_dir)
             previous_lock = production_lock.read()
             # A --no-commit run left a record of the code it ran; it decides once the outputs are
-            # hashed, so a stage with one is never skipped here. A record without that code (one
-            # holding only another feature's key) decides nothing.
-            run_record = stage_db.get_no_commit_record(stage_name) or {}
-            run_manifest = run_record.get("code_manifest")
-            run_outputs = run_record.get("output_hashes")
+            # hashed, so a stage with one is never skipped here. The run writes its two keys
+            # together and the reader drops a malformed key on its own, so a record without both
+            # (one holding only another feature's key) decides nothing.
+            run_record = stage_db.get_no_commit_record(stage_name)
+            run_manifest: dict[str, str] | None = None
+            run_outputs: dict[str, str] | None = None
+            if (
+                run_record is not None
+                and "code_manifest" in run_record
+                and "output_hashes" in run_record
+            ):
+                run_manifest = run_record["code_manifest"]
+                run_outputs = run_record["output_hashes"]
 
             # 5. If not force and no explicit stages, check lock — skip if unchanged
             if (

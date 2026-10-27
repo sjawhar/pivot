@@ -10,19 +10,19 @@ worker compares the modules a stage used against what the coordinator loaded (`c
 
 The contract is about the module, not the loader. `discovery._ProjectSourceLoader` records the
 bytes it compiles; every other user-code module an import finds (an editable install's finder, a
-zip on `sys.path`, `importlib.util.spec_from_file_location`, a sourceless `.pyc`) is recorded from
-its loader when it appears (`record_modules`, `record_user_modules`). A user module whose loader
-gives no source is recorded as unreadable: Pivot cannot tell which code it holds, so a stage that
-uses it is never trusted. So is one a loader built on CPython's `SourceLoader` loads, other than
-the `SourceFileLoader` that `_ProjectSourceLoader` replaces: it may run cached bytecode CPython
-checks only by the source's size and whole-second mtime, which its `get_data` does not show
-(`discovery._RecordingLoader`). A user module no recorder saw compile, because it was imported
-before the recorder was installed (by `sitecustomize`, a `.pth` import line or the program that
-runs Pivot), by a loader called directly (`SourceFileLoader(...).load_module()`) or by a loader
-with only `load_module`, which the recorder does not wrap, is recorded from its file only where
-Pivot can show the file holds the code it was compiled from, and as unreadable otherwise
-(`record_unseen_modules`, at the end of discovery, when a worker starts and after each stage a
-worker runs).
+zip on `sys.path`, `importlib.util.spec_from_file_location`, a sourceless `.pyc`) is recorded when
+its loader executes it (`discovery._RecordingLoader`), and a module the recorder loaded without
+recording it when it appears (`record_modules`, `record_user_modules`). The recorder trusts a
+loader's source only where it can show that loader runs it: CPython's `SourceFileLoader`, which
+`_ProjectSourceLoader` replaces, a zip importer that compiled the `.py` member, and a loader that
+ran Pivot's own inside it. Every other user module is recorded as unreadable, with a reason that
+names its loader: Pivot cannot tell which code it holds, so a stage that uses it is never
+trusted. A user module no recorder saw compile, because it was imported before the recorder was
+installed (by `sitecustomize`, a `.pth` import line or the program that runs Pivot), by a loader
+called directly (`SourceFileLoader(...).load_module()`) or by a loader with only `load_module`,
+which the recorder does not wrap, is recorded from its file only where Pivot can show the file
+holds the code it was compiled from, and as unreadable otherwise (`record_unseen_modules`, at the
+end of discovery, when a worker starts and after each stage a worker runs).
 
 Import machinery and `linecache` are process-global, so this record is too. A module loaded again
 (a watch reload) replaces its entry, and `prune`, at the end of an import session, drops the
@@ -66,8 +66,8 @@ logger = logging.getLogger(__name__)
 class _Loaded(NamedTuple):
     """One user module's source when this process loaded it.
 
-    `data` and `digest` are None for a module whose loader gives no source: it is unreadable.
-    `reason` says why a module no recorder saw compile is unreadable (`record_unseen_modules`).
+    `data` and `digest` are None for an unreadable module: Pivot cannot show which code it holds.
+    `reason` says why Pivot cannot trust an unreadable module's code, and what to do.
     """
 
     filename: str  # the name the compiled code carries (`co_filename`, the module's `__file__`)
@@ -112,8 +112,12 @@ _CODE_KINDS = frozenset({"func", "class", "const", "default", "schema", "partial
 # file system stamps exact times, and of about 1 s where it keeps whole seconds. A file system
 # that keeps change times in 2-second steps (FAT, Linux's `vfat`) spends all of it: on a FAT32 loop
 # mount every change time is an even second, so an edit reads up to just under 2 s early (1.7 s
-# measured), and the margin covers no clock step there (a stated limit). The cost: a module
-# edited less than 2 s before a process started is unreadable in that process.
+# measured), and the margin covers no clock step there (a stated limit). Linux's FAT driver also
+# sets an inode's change time to its modification time when it reads the inode from disk
+# (`fs/fat/inode.c`, `fat_fill_inode`), so there a modification time put back puts the change
+# time back once the inode is read again; only `_bytecode_reason` can then catch the edit (a
+# stated limit). The cost: a module edited less than 2 s before a process started is unreadable
+# in that process.
 _CHANGE_TIME_SLACK_NS = 2_000_000_000
 
 # On Linux, the wall clock less the boot clock when this module was imported: the wall-clock time
@@ -140,8 +144,11 @@ def record(filename: str, module: str, data: bytes) -> None:
         _recorded_objects[module] = loaded
 
 
-def record_loaded_module(module: types.ModuleType, data: bytes | None) -> None:
-    """Record a user module at the loader execution that produced this module object.
+def record_loaded_module(
+    module: types.ModuleType, data: bytes | None, reason: str | None = None
+) -> None:
+    """Record a user module at the loader execution that produced this module object: from
+    `data`, or as unreadable, for `reason`, when `data` is None.
 
     A source read afterward is not a snapshot: the file can already have changed. The discovery
     and worker import recorders call this wrapper around `loader.exec_module`.
@@ -154,7 +161,23 @@ def record_loaded_module(module: types.ModuleType, data: bytes | None) -> None:
         return
     _recorded_objects[name] = module
     path = os.path.realpath(filename)
-    _store(_Loaded(filename, path, name, data, None if data is None else _hash(data)))
+    if data is None:
+        _store(_Loaded(filename, path, name, None, None, reason))
+    else:
+        _store(_Loaded(filename, path, name, data, _hash(data)))
+
+
+def record_marker(name: str) -> object:
+    """What `source_recorded_since` compares against: module `name`'s record now."""
+    return _by_module.get(name)
+
+
+def source_recorded_since(name: str, marker: object) -> bool:
+    """Whether module `name`'s source was recorded since `record_marker(name)` returned
+    `marker`: Pivot's own loader compiled it then. A record made before, or an unreadable one,
+    is not."""
+    loaded = _by_module.get(name)
+    return loaded is not marker and loaded is not None and loaded.digest is not None
 
 
 def record_modules(names: Iterable[str]) -> None:
@@ -183,7 +206,16 @@ def record_modules(names: Iterable[str]) -> None:
         if type(loader).__name__ != "_RecordingLoader":
             continue
         _recorded_objects[name] = module
-        _store(_Loaded(filename, os.path.realpath(filename), name, None, None))
+        _store(
+            _Loaded(
+                filename,
+                os.path.realpath(filename),
+                name,
+                None,
+                None,
+                "pivot's recorder loaded it but recorded no source for the code it ran",
+            )
+        )
 
 
 def record_user_modules() -> None:
@@ -214,7 +246,7 @@ def record_unseen_modules() -> None:
         _recorded_objects[name] = module
         if filename is None:
             continue
-        data, reason = _verified_source(module, filename, started)
+        data, why = _verified_source(module, filename, started)
         _store(
             _Loaded(
                 filename,
@@ -222,10 +254,21 @@ def record_unseen_modules() -> None:
                 name,
                 data,
                 None if data is None else _hash(data),
-                reason,
+                None if why is None else _unseen_reason(why),
             )
         )
         _unseen.add(name)
+
+
+def _unseen_reason(why: str) -> str:
+    """Why Pivot cannot trust a module no recorder saw compile, for `why`, and what to do."""
+    return (
+        "pivot did not see it compile (it was imported before pivot installed its recorder, by "
+        + "sitecustomize, a .pth file or the program that runs pivot, or by a loader the "
+        + "recorder does not wrap), and cannot show that its file holds the code it runs, "
+        + f"because {why}. Fix: import it from the pipeline or from a stage instead, with no "
+        + "import hook that loads it with its own loader"
+    )
 
 
 def prune() -> None:
@@ -362,8 +405,8 @@ def check_stage(
     Edited: this process holds a record for the module (path and content) that differs from
     the coordinator's, so the stage ran code its fingerprint does not describe. A different file
     for the same name (a new package shadowing a module) differs too. Unreadable: either side has
-    no source for the module, so no one can tell which code ran. For a module no recorder saw
-    compile (`record_unseen_modules`), the reason is logged once per process.
+    no source it can trust for the module, so no one can tell which code ran; the reason is logged
+    once per process.
 
     The coordinator's records are the ones the worker started with, or `coordinator_digests` when
     the stage carries them. When neither matches `coordinator_token`, nothing can be compared, so
@@ -393,7 +436,7 @@ def check_stage(
         if expected is None:
             if own is not None and own.digest is None:
                 unreadable.append(name)
-                _warn_unseen(name, own.reason)
+                _warn_unreadable(name, own.reason)
             continue
         wanted = expected.get(name)
         # A direct executor can receive a preloaded test or library function without discovery
@@ -406,26 +449,23 @@ def check_stage(
             continue
         if own is not None and own.digest is None:
             unreadable.append(name)
-            _warn_unseen(name, own.reason)
+            _warn_unreadable(name, own.reason)
         elif _record_is_unreadable(wanted):
             unreadable.append(name)
-            _warn_unseen(name, _record_fields(wanted)[2])
+            _warn_unreadable(name, _record_fields(wanted)[2])
         elif own is not None and _record_text(own) != wanted:
             edited.append(name)
     return edited, unreadable
 
 
-def _warn_unseen(name: str, reason: str | None) -> None:
-    """Log, once per process, why a module no recorder saw compile cannot be trusted."""
+def _warn_unreadable(name: str, reason: str | None) -> None:
+    """Log, once per process, why Pivot cannot trust an unreadable module's code."""
     if not reason or name in _warned:
         return
     _warned.add(name)
     logger.warning(
-        "Pivot did not see user module '%s' compile: it was imported before pivot installed its "
-        + "recorder (by sitecustomize, a .pth file or the program that runs pivot), or by a "
-        + "loader the recorder does not wrap. Pivot cannot show that its file holds the code it "
-        + "runs, because %s, so a stage that uses it is never reused. Fix: import it from the "
-        + "pipeline or from a stage instead.",
+        "Pivot cannot trust the code of user module '%s', so a stage that uses it is never "
+        + "reused: %s.",
         name,
         reason,
     )
@@ -465,28 +505,6 @@ def _store(loaded: _Loaded) -> None:
         _by_file[loaded.path] = loaded
     _line_entries.pop(loaded.filename, None)
     _token = None
-
-
-def loader_source(loader: object, filename: str, module_name: str) -> bytes | None:
-    """The source a module's loader gives before it executes: raw `.py` bytes (`get_data`), else
-    decoded loader source (`get_source`). None means the module is unreadable."""
-    if filename.endswith(".py"):
-        get_data = getattr(loader, "get_data", None)
-        if callable(get_data):
-            try:
-                data = get_data(filename)
-            except (ImportError, OSError):
-                data = None
-            if isinstance(data, bytes):
-                return data
-    get_source = getattr(loader, "get_source", None)
-    if not callable(get_source):
-        return None
-    try:
-        source = get_source(module_name)
-    except (ImportError, OSError, SyntaxError, UnicodeDecodeError):
-        return None
-    return source.encode() if isinstance(source, str) else None
 
 
 def _hash(data: bytes) -> str:
@@ -564,7 +582,8 @@ def _verified_source(
     spec = vars(module).get("__spec__")
     loader = getattr(spec, "loader", None) or vars(module).get("__loader__")
     if type(loader) is not importlib.machinery.SourceFileLoader:
-        return None, f"its loader ({type(loader).__qualname__}) is not CPython's source file loader"
+        name = f"{type(loader).__module__}.{type(loader).__qualname__}"
+        return None, f"its loader, {name}, is not CPython's source file loader"
     if started is None:
         return None, "pivot cannot tell when this process loaded it"
     since = started - _CHANGE_TIME_SLACK_NS

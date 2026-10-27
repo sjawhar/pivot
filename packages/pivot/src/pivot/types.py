@@ -155,20 +155,27 @@ class NoCommitRecord(TypedDict, total=False):
 
     Two features write the record, each its own keys. `code_manifest` is the manifest a
     `--no-commit` run's lock would have held, rerun marks included, and `output_hashes` the
-    outputs it wrote: the run writes both (`StateDB.apply_deferred_writes`), and
-    `StateDB.get_no_commit_record` reads neither without the other; `pivot commit` writes that
-    manifest when the outputs on disk still have these hashes. `pvt_members` maps each `*.pvt`
-    file Pivot wrote in a directory output (path relative to the project root) to its content
-    hash; the feature that keeps those files owns it.
+    outputs it wrote: the run writes both (`NoCommitRun`, `StateDB.apply_deferred_writes`), and
+    `pivot commit` writes that manifest when both are present and the outputs on disk still have
+    these hashes. `pvt_members` maps each `*.pvt` file Pivot wrote in a directory output (path
+    relative to the project root) to its content hash; the feature that keeps those files owns it.
 
     Every writer replaces only its own keys and keeps every other key, in one write transaction.
-    Every reader validates only its own keys and returns every other key as stored, so a record
-    that holds only another feature's keys reads as present, and a malformed key hides no other.
+    The reader (`StateDB.get_no_commit_record`) validates each of these three keys on its own and
+    returns every other key as stored, so a record that holds only one feature's keys reads as
+    present, and a malformed key hides no other.
     """
 
     code_manifest: dict[str, str]
     output_hashes: dict[str, str]  # output identity key -> content hash
     pvt_members: dict[str, str]  # `*.pvt` path relative to the project root -> content hash
+
+
+class NoCommitRun(TypedDict):
+    """The keys of `NoCommitRecord` a `--no-commit` run writes: always both, never one alone."""
+
+    code_manifest: dict[str, str]
+    output_hashes: dict[str, str]  # output identity key -> content hash
 
 
 class DeferredWrites(TypedDict, total=False):
@@ -185,7 +192,7 @@ class DeferredWrites(TypedDict, total=False):
     run_cache_delete_input_hash: str
     increment_outputs: bool  # True → increment output generations; False/absent → skip
     file_hash_entries: list[tuple[str, int, int, int, str]]  # (path, mtime_ns, size, inode, hash)
-    no_commit_record: NoCommitRecord  # a --no-commit run's record for `pivot commit`
+    no_commit_record: NoCommitRun  # a --no-commit run's keys of its `nocommit:` record
     clear_no_commit_record: bool  # a lock was written: drop the stage's --no-commit record
 
 

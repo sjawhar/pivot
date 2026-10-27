@@ -69,7 +69,7 @@ from pivot.types import (
     HashInfo,
     LockData,
     LogMessage,
-    NoCommitRecord,
+    NoCommitRun,
     OutputMessage,
     OutputMessageKind,
     StageResult,
@@ -1191,8 +1191,9 @@ def _execute_stage(
                     logger.warning(
                         "Stage '%s' uses user modules whose source pivot cannot read: %s. Pivot "
                         + "cannot tell which code ran, so its result is never reused; every run "
-                        + "reruns it while pivot cannot read them.%s Fix: load the modules from "
-                        + ".py source files, imported by the pipeline or a stage.",
+                        + "reruns it while pivot cannot read them.%s The first stage in each "
+                        + "process that uses such a module logs why pivot cannot trust it, and "
+                        + "what to do.",
                         stage_name,
                         unreadable_modules,
                         commit_note,
@@ -1226,7 +1227,7 @@ def _execute_stage(
                         output_lines=ring_buffer.snapshot(),
                         metrics=metrics.get_entries(),
                         deferred_writes=DeferredWrites(
-                            no_commit_record=NoCommitRecord(
+                            no_commit_record=NoCommitRun(
                                 code_manifest=lock_manifest,
                                 output_hashes={
                                     key: hash_info["hash"]

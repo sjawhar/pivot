@@ -231,29 +231,51 @@ worker ran the loaded version, and the next run would report the old output as c
 
 So the record is about the module, not the loader. `discovery._ProjectSourceLoader` records the
 bytes each user module was compiled from (`loaded_source.record`). Every other user-code module
-(`fingerprint.is_user_code`) that an import finds is recorded from its own loader: at the end of
-discovery (`loaded_source.record_user_modules`), and in a worker at each import its hooks see
+(`fingerprint.is_user_code`) that an import finds passes the recorder, which wraps its loader
+(`discovery._RecordingLoader`): an editable install's meta-path finder, a zip on `sys.path`,
+`importlib.util.spec_from_file_location`, and the loader any finder on `sys.meta_path` returns. A
+module the recorder loaded without recording it is recorded at the end of discovery
+(`loaded_source.record_user_modules`) and in a worker at each import its hooks see
 (`loaded_source.record_modules`, also run for the modules unpickling a stage imports) and when a
-stage returns. That covers an editable install's meta-path finder, a zip on `sys.path`,
-`importlib.util.spec_from_file_location` and the loader a finder on `sys.meta_path` returns: the
-loader's `get_data` on the module's `.py` origin, else its `get_source`. A module whose loader
-gives neither (a sourceless `.pyc`, an extension module) is recorded as unreadable. CPython's own
-`SourceFileLoader` is replaced with `_ProjectSourceLoader`, which records the bytes it compiled or
-validated checked-hash bytecode against. Any other loader built on CPython's `SourceLoader` (a
-`SourceFileLoader` subclass, as an import hook that rewrites source installs, or another
-`importlib.abc.SourceLoader`) is not replaced, since it may transform the source, and its module
-is recorded as unreadable: its `get_code` may run cached bytecode that CPython checks only by the
-source's size and whole-second mtime, so `get_data` can give an edited file while the module runs
-the earlier code (`discovery._RecordingLoader.exec_module`). Unreadable means the stage reruns on
-every run and is never reported as cached; it does not make the output current: each rerun runs
-what that loader runs, which can still be the stale bytecode. A zip importer is not such a loader
-(`zipimport.zipimporter` is no `importlib.abc.SourceLoader`), so its modules keep their source. A
-loader with only PEP 302's `load_module` and no `exec_module`, which CPython 3.13 still imports
-with an `ImportWarning` (its import system calls `load_module` "slated for removal in Python
-3.15"), is left unwrapped, so the import works as without Pivot; no recorder sees its module
-compile, and it is judged as below, where its loader makes it unreadable. A loader a module calls
-itself (`SourceFileLoader(...).load_module()`, or `spec_from_loader` and `exec_module`) passes no
-import hook, so its module is judged as one no recorder saw compile.
+stage returns.
+
+The recorder trusts a loader's source only where Pivot can show the code that ran is the code it
+read (`discovery._RecordingLoader.exec_module`), and records every other loader's module as
+unreadable. A list of loaders to distrust leaks: each loader shape it does not name (a proxy
+around CPython's loader, a loader that runs CPython's inside it, CPython's own `SourceFileLoader`
+definition on its private bases, a `FileLoader` that caches its own bytecode, a zip holding a
+`.pyc` beside its `.py`) serves a stale result as cached. So the rule names what is trusted, and
+a new loader shape is unreadable by default:
+
+- CPython's exact `SourceFileLoader`, which accepts mtime-checked bytecode for an edit that keeps
+  the size and whole-second mtime, is replaced with `_ProjectSourceLoader`, which records the bytes
+  it compiled or validated checked-hash bytecode against.
+- A zip importer (`zipimport.zipimporter`) only when it compiled the `.py` member: its origin ends
+  in `.py`, and Pivot records that member's bytes. A zip importer tries a `.pyc` member first
+  (CPython 3.13 `zipimport.py:290`) and runs it when its header matches the `.py` member's zip
+  time, to within 1 s, and size (`:658-660`, `:690-695`), or when it is hash-based and either
+  unchecked or matching the source's hash; its origin then names the `.pyc`, and the module is
+  unreadable.
+- A module Pivot's own loader recorded during this execution, inside another loader that wraps it:
+  a finder modelled on dd-trace-py's ModuleWatchdog finds the module through the rest of
+  `sys.meta_path`, Pivot's recorder among it, and wraps the loader it gets. A record from before
+  the execution (an earlier import, before `importlib.reload`) does not count, nor an unreadable
+  one a worker's import hook made while the module's body imported a submodule. Pivot trusts that
+  such a wrapper runs no other code into the module after its own loader.
+
+An unreadable module's record carries a reason that names its loader, and the first stage in each
+process that uses it logs that reason with the fix: import the module without that loader, or
+accept that the stage reruns on every run. Unreadable means the stage reruns on every run Pivot
+performs, and no run Pivot performs reports it as cached; it does not make the output current:
+each rerun runs what that loader runs, which can still be the stale bytecode. A `pivot commit`
+of outputs no run recorded (the "trust me" commit) writes a lock without the mark, and the next
+run reports the stage as cached. A loader with only PEP 302's `load_module` and no `exec_module`,
+which CPython 3.13 still imports with an `ImportWarning` (its import system calls `load_module`
+"slated for removal in Python 3.15"), is left unwrapped, so the import works as without Pivot; no
+recorder sees its module compile, and it is judged as below, where its loader makes it
+unreadable. A loader a module calls itself (`SourceFileLoader(...).load_module()`, or
+`spec_from_loader` and `exec_module`) passes no import hook, so its module is judged as one no
+recorder saw compile.
 
 A user module that no recorder saw compile was imported before discovery installed the recorder,
 by `sitecustomize` or a `.pth` import line (in the coordinator, and in each worker before its
@@ -278,8 +300,12 @@ which records the module's file when those bytes are shown to be the bytes it wa
   the whole margin: on a FAT32 loop mount every change time is an even second, so an edit reads
   as up to just under 2 s early (1.7 s in eight edits measured). There the margin covers no clock
   step and no kernel tick, and an edit made in the first milliseconds of a process, before the
-  interpreter's own startup has reached any import, can read as older than the start: a stated
-  limit for a project on such a file system. Every import in the process then read these bytes;
+  interpreter's own startup has reached any import, can read as older than the start. Linux's FAT
+  driver also keeps no change time on disk: it sets an inode's change time to its modification
+  time when it reads the inode (`fs/fat/inode.c`, `fat_fill_inode`), so once the inode is read
+  again, an edit whose modification time a tool put back has its change time put back too, and
+  only the bytecode check below can catch it. Both are stated limits for a project on such a file
+  system. Every import in the process then read these bytes;
 - the bytecode that loader may have run instead is the code of these bytes. A cached file that
   has not changed since the start is the one the import saw: either CPython's check rejects it
   for this source, or its code (`marshal`) equals the source compiled now, which catches the

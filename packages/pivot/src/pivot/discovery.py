@@ -13,7 +13,8 @@ import pathlib
 import py_compile
 import sys
 import types as _stdlib_types
-from typing import TYPE_CHECKING, Final, override
+import zipimport
+from typing import TYPE_CHECKING, Final, cast, override
 
 import cloudpickle
 
@@ -138,7 +139,8 @@ class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
 
 
 class _RecordingLoader(importlib.abc.Loader):
-    """Wrap a non-Pivot loader so Pivot captures user source before `exec_module` runs it."""
+    """Wrap a non-Pivot loader so Pivot records the source of the code it runs, or records the
+    module unreadable where it cannot show which code that is (`exec_module`)."""
 
     _loader: importlib.abc.Loader
 
@@ -156,26 +158,60 @@ class _RecordingLoader(importlib.abc.Loader):
     def exec_module(self, module: _stdlib_types.ModuleType) -> None:
         spec = getattr(module, "__spec__", None)
         origin = getattr(spec, "origin", None)
-        # CPython's exact SourceFileLoader accepts a timestamp-valid old pyc. Use the checked-hash
-        # loader Pivot uses for every other user `.py`: these are the bytes it actually executes.
-        # Any other loader built on CPython's `SourceLoader` (a `SourceFileLoader` subclass, as an
-        # import hook that rewrites source installs) may run bytecode checked only by the source's
-        # size and whole-second mtime, or compile other text than its `get_data` gives. It is never
-        # replaced with a filesystem loader, and its module is recorded unreadable. Another loader
-        # is recorded from the source it gives before it executes.
+        # Pivot trusts a module's recorded source only where it can show the code that ran is the
+        # code it read, and records every other loader's module unreadable, so a loader no one
+        # listed is safe by default. CPython's exact SourceFileLoader may run a timestamp-valid
+        # old pyc, so it is replaced with the checked-hash loader Pivot uses for every other user
+        # `.py`, which records the bytes it executes.
         if type(self._loader) is importlib.machinery.SourceFileLoader and isinstance(origin, str):
             loader = _ProjectSourceLoader(module.__name__, origin)
             loader.exec_module(module)
-            data = loader.recorded_source
-        else:
-            data = (
-                loaded_source.loader_source(self._loader, origin, module.__name__)
-                if isinstance(origin, str)
-                and not isinstance(self._loader, importlib.abc.SourceLoader)
-                else None
-            )
-            self._loader.exec_module(module)
-        loaded_source.record_loaded_module(module, data)
+            loaded_source.record_loaded_module(module, loader.recorded_source)
+            return
+        data, reason = self._trusted_source(origin)
+        marker = loaded_source.record_marker(module.__name__)
+        self._loader.exec_module(module)
+        # A loader that wraps Pivot's own, as dd-trace-py's ModuleWatchdog wraps the loader it
+        # finds on `sys.meta_path` (which holds Pivot's recorder), ran it inside: the source that
+        # loader recorded during this execution stands. A record from before it (an earlier
+        # import, under `importlib.reload`) does not, nor an unreadable one a worker's import hook
+        # made while the module's body imported a submodule.
+        if not loaded_source.source_recorded_since(module.__name__, marker):
+            loaded_source.record_loaded_module(module, data, reason)
+
+    def _trusted_source(self, origin: object) -> tuple[bytes | None, str | None]:
+        """The source this loader is shown to compile before it executes, or None and why Pivot
+        cannot trust the code it runs.
+
+        A zip importer tries a module's `.pyc` member before its `.py` member, and runs a
+        timestamp `.pyc` whose header matches the `.py` member's zip time (to within 1 s) and
+        size, or a hash-based one it does not check or whose hash matches; its origin then names
+        the `.pyc`. With a `.py` origin it compiled that member, the bytes `get_data` gives. Any
+        other loader may run cached bytecode, or text other than the source it gives, which Pivot
+        cannot see: a `SourceFileLoader` subclass, a proxy around CPython's loader, or a loader
+        that caches its own bytecode.
+        """
+        # Typed as `object`: typeshed's zipimporter is no `importlib.abc.Loader`.
+        loader = cast("object", self._loader)
+        if type(loader) is zipimport.zipimporter and isinstance(origin, str):
+            if not origin.endswith(".py"):
+                return None, (
+                    f"its zip importer ran the bytecode member {origin} instead of compiling the "
+                    + ".py source pivot reads, and pivot cannot show that bytecode is that "
+                    + "source's code. Fix: remove the .pyc member from the archive, or accept "
+                    + "the reruns"
+                )
+            try:
+                return loader.get_data(origin), None
+            except (ImportError, OSError):
+                return None, f"its zip importer could not read {origin}"
+        return None, (
+            f"its loader, {type(loader).__module__}.{type(loader).__qualname__}, is not one "
+            + "pivot can show runs the source it reads (pivot trusts only CPython's source file "
+            + "loader, a zip importer that compiles the .py file, and its own loader, also "
+            + "inside another; any other loader may run cached bytecode, or text other than its "
+            + "source). Fix: import the module without that loader, or accept the reruns"
+        )
 
     def __getattr__(self, name: str) -> object:
         try:

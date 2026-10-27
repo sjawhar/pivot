@@ -7,7 +7,9 @@ the next run never reports an output that edited code would change as cached.
 """
 
 import contextlib
+import importlib.util
 import json
+import marshal
 import os
 import pathlib
 import py_compile
@@ -558,13 +560,15 @@ def test_helper_from_a_meta_path_finder_edited_mid_run_is_not_cached_stale(
     _assert_loaded_code_recorded(project, site)
 
 
-# `sitecustomize` puts a finder ahead of `sys.path`'s that serves `helpers` with a loader built on
-# CPython's `SourceLoader`, as an import hook that rewrites source does, and does not import it:
-# discovery and the worker import it with Pivot's recorder installed.
-_SOURCE_LOADER_FINDER = """\
+# `sitecustomize` puts a finder ahead of `sys.path`'s that serves `helpers` with a loader Pivot
+# cannot show runs the source it gives, as an import hook does, and does not import it: discovery
+# and the worker import it with Pivot's recorder installed.
+_UNTRUSTED_LOADER_FINDER = """\
+import importlib._bootstrap_external as _bootstrap_external
 import importlib.abc
 import importlib.machinery
 import importlib.util
+import marshal
 import os
 import sys
 
@@ -594,6 +598,69 @@ class CachingLoader(importlib.abc.SourceLoader):
             file.write(data)
 
 
+class ProxyLoader:
+    # dd-trace-py's `_ImportHookChainedLoader`: its own create_module and exec_module, every other
+    # attribute (get_data included) taken from CPython's loader, which it wraps.
+    def __init__(self, fullname, path):
+        self.loader = importlib.machinery.SourceFileLoader(fullname, path)
+
+    def __getattr__(self, name):
+        return getattr(self.loader, name)
+
+    def create_module(self, spec):
+        return self.loader.create_module(spec)
+
+    def exec_module(self, module):
+        self.loader.exec_module(module)
+
+
+class ComposedLoader(importlib.abc.Loader):
+    # Reads the file for get_data, and runs CPython's own loader inside exec_module.
+    def __init__(self, fullname, path):
+        self.path = path
+
+    def get_filename(self, fullname):
+        return self.path
+
+    def get_data(self, path):
+        with open(path, "rb") as file:
+            return file.read()
+
+    def exec_module(self, module):
+        importlib.machinery.SourceFileLoader(module.__name__, self.path).exec_module(module)
+
+
+class BootstrapLoader(_bootstrap_external.FileLoader, _bootstrap_external.SourceLoader):
+    # CPython's own definition of SourceFileLoader, on its private bases: no SourceFileLoader,
+    # and no importlib.abc.SourceLoader to isinstance.
+    path_stats = _bootstrap_external.SourceFileLoader.path_stats
+    set_data = _bootstrap_external.SourceFileLoader.set_data
+
+
+class FileCacheLoader(importlib.abc.FileLoader):
+    # pytest's assertion rewriter's model: no SourceLoader, and it caches its own bytecode under
+    # the source's whole-second mtime and size.
+    def get_source(self, fullname):
+        return self.get_data(self.path).decode()
+
+    def get_code(self, fullname):
+        status = os.stat(self.path)
+        key = b"%d:%d\\n" % (int(status.st_mtime), status.st_size)
+        cache = os.path.join(os.path.dirname(self.path), "__pycache__", "helpers.rw")
+        try:
+            with open(cache, "rb") as file:
+                blob = file.read()
+            if blob.startswith(key):
+                return marshal.loads(blob[len(key):])
+        except OSError:
+            pass
+        code = compile(self.get_data(self.path), self.path, "exec", dont_inherit=True)
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        with open(cache, "wb") as file:
+            file.write(key + marshal.dumps(code))
+        return code
+
+
 class Finder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname != "helpers":
@@ -605,6 +672,27 @@ sys.meta_path.insert(0, Finder())
 """
 
 
+def _runs_of_use_plain(
+    project: pathlib.Path, pythonpath: pathlib.Path, helper: pathlib.Path
+) -> tuple[str, list[tuple[str, str, str, bool]]]:
+    """What a first `pivot repro` printed, warnings included, then three more runs: for each,
+    `use_plain`'s status and output, the helper's text on disk, and whether `use_plain`'s lock
+    marks the helper unreadable."""
+    first = _repro(project, pythonpath)
+    runs = list[tuple[str, str, str, bool]]()
+    for _ in range(3):
+        status = _repro_json(project, pythonpath)["p/use_plain"][0]
+        marked = "unreadable-source:helpers" in _lock(project, "use_plain")
+        runs.append((status, _output(project, "use_plain"), helper.read_text(), marked))
+    return first, runs
+
+
+# What a stage that uses an unreadable helper logs, once per process, before its reason.
+_UNTRUSTED = (
+    "Pivot cannot trust the code of user module 'helpers', so a stage that uses it is never"
+)
+
+
 @pytest.mark.parametrize(
     ("shape", "loader"),
     [
@@ -612,18 +700,40 @@ sys.meta_path.insert(0, Finder())
         ("edited-mid-run", "CachingLoader"),
         ("stale-bytecode-out-of-root", "SubclassLoader"),
         ("stale-bytecode-in-root", "SubclassLoader"),
+        ("edited-mid-run", "ProxyLoader"),
+        ("stale-bytecode-out-of-root", "ProxyLoader"),
+        ("edited-mid-run", "ComposedLoader"),
+        ("stale-bytecode-out-of-root", "ComposedLoader"),
+        ("edited-mid-run", "BootstrapLoader"),
+        ("stale-bytecode-out-of-root", "BootstrapLoader"),
+        ("edited-mid-run", "FileCacheLoader"),
     ],
-    ids=["edit-run-sub", "edit-run-source-loader", "post-sub-pyc", "post-sub-pyc-inroot"],
+    ids=[
+        "edit-run-sub",
+        "edit-run-source-loader",
+        "post-sub-pyc",
+        "post-sub-pyc-inroot",
+        "edit-run-proxy",
+        "post-proxy-pyc",
+        "edit-run-composed",
+        "post-composed-pyc",
+        "edit-run-bootstrap",
+        "post-bootstrap-pyc",
+        "edit-run-filecache",
+    ],
 )
-def test_helper_a_source_loader_serves_with_stale_bytecode_is_never_cached_stale(
+def test_helper_a_loader_pivot_cannot_vouch_for_serves_is_never_cached_stale(
     tmp_path: pathlib.Path, shape: str, loader: str
 ) -> None:
-    """A `SourceFileLoader` subclass, or another loader built on CPython's `SourceLoader`, runs
-    cached bytecode CPython checks only by the source's size and whole-second mtime, so the
-    helper's file can say v2 while the module runs v1: `edit_helper` edits it mid-run and puts
-    its mtime back, or the bytecode is left stale before the first run. Pivot does not replace
-    such a loader with its own, so the helper is unreadable: `use_plain` reruns on every run, and
-    no run reports it cached with an output the helper on disk does not return."""
+    """Each loader here can run cached bytecode that is checked only by the source's size and
+    whole-second mtime while its `get_data` gives the file: a `SourceFileLoader` subclass,
+    another `SourceLoader`, a proxy around CPython's loader (dd-trace-py's chained loader), a
+    loader that runs CPython's inside it, CPython's own `SourceFileLoader` definition on its
+    private bases, and a `FileLoader` with its own bytecode cache (pytest's assertion rewriter's
+    model). The helper's file can then say v2 while the module runs v1: `edit_helper` edits it
+    mid-run and puts its mtime back, or the bytecode is left stale before the first run. Pivot
+    trusts none of these loaders, so the helper is unreadable: `use_plain` reruns on every run,
+    and no run reports it cached with an output the helper on disk does not return."""
     root = tmp_path / "project" if shape == "stale-bytecode-in-root" else tmp_path / "hooked"
     root.mkdir(parents=True)
     helper = root / "helpers.py"
@@ -643,7 +753,7 @@ def test_helper_a_source_loader_serves_with_stale_bytecode_is_never_cached_stale
     site = tmp_path / "site"
     site.mkdir()
     (site / "sitecustomize.py").write_text(
-        _SOURCE_LOADER_FINDER.format(loader=loader, helper=str(helper))
+        _UNTRUSTED_LOADER_FINDER.format(loader=loader, helper=str(helper))
     )
     project = _edge_project(
         tmp_path,
@@ -654,14 +764,127 @@ def test_helper_a_source_loader_serves_with_stale_bytecode_is_never_cached_stale
     )
     _run(project, "config", "set", "core.max_workers", "1", pythonpath=site)
 
-    runs = list[tuple[str, str, str, bool]]()
-    for _ in range(3):
-        status = _repro_json(project, site)["p/use_plain"][0]
-        marked = "unreadable-source:helpers" in _lock(project, "use_plain")
-        runs.append((status, _output(project, "use_plain"), helper.read_text(), marked))
+    first, runs = _runs_of_use_plain(project, site, helper)
 
     assert all(status != "cached" or output in on_disk for status, output, on_disk, _ in runs), runs
     assert all(status == "ran" and marked for status, _, _, marked in runs), runs
+    assert f"{_UNTRUSTED} reused: its loader, sitecustomize.{loader}, is not one pivot" in first, (
+        first
+    )
+
+
+def test_helper_a_zip_runs_from_its_bytecode_member_is_never_cached_stale(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A zip on PYTHONPATH holds `helpers.py` (v2) and a legacy `helpers.pyc` (v1) whose header
+    matches the `.py` member's zip time and size, as a zipped `compileall -b` tree or an egg
+    does. zipimport tries the `.pyc` first and runs it, so the module holds v1 while its source
+    says v2: the helper is unreadable, and no run reports `use_plain` cached with v1."""
+    archive = tmp_path / "ext" / "helpers.zip"
+    archive.parent.mkdir()
+    source = _HELPERS.replace("-v1", "-v2").encode()
+    stamp = (2024, 1, 1, 0, 0, 0)
+    code = compile(_HELPERS, f"{archive}/helpers.py", "exec", dont_inherit=True)
+    header = (
+        importlib.util.MAGIC_NUMBER
+        + bytes(4)
+        + (int(time.mktime((*stamp, 0, 0, -1))) & 0xFFFFFFFF).to_bytes(4, "little")
+        + len(source).to_bytes(4, "little")
+    )
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr(zipfile.ZipInfo("helpers.py", date_time=stamp), source)
+        zf.writestr(zipfile.ZipInfo("helpers.pyc", date_time=stamp), header + marshal.dumps(code))
+    unpacked = tmp_path / "helpers_in_the_zip.py"
+    unpacked.write_bytes(source)
+    project = _edge_project(
+        tmp_path,
+        "import helpers\nfrom pivot import Pipeline, stage\n",
+        _EARLY_SEED,
+        "pass",
+        archive,
+    )
+    _run(project, "config", "set", "core.max_workers", "1", pythonpath=archive)
+
+    first, runs = _runs_of_use_plain(project, archive, unpacked)
+
+    assert all(output == "plain-v1" for _, output, _, _ in runs), "zipimport runs the .pyc"
+    assert all(status == "ran" and marked for status, _, _, marked in runs), runs
+    assert f"{_UNTRUSTED} reused: its zip importer ran the bytecode member {archive}" in first, (
+        first
+    )
+
+
+# `sitecustomize` puts a finder in front, modelled on dd-trace-py's `ModuleWatchdog.find_spec`: it
+# finds `helpers` with the other finders on `sys.meta_path`, Pivot's recorder among them, and
+# wraps the loader it gets.
+_WRAPPING_FINDER = """\
+import importlib.abc
+import sys
+
+
+class ChainedLoader:
+    def __init__(self, loader):
+        self.loader = loader
+
+    def __getattr__(self, name):
+        return getattr(self.loader, name)
+
+    def create_module(self, spec):
+        return self.loader.create_module(spec)
+
+    def exec_module(self, module):
+        self.loader.exec_module(module)
+
+
+class WatchdogFinder(importlib.abc.MetaPathFinder):
+    finding = False
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "helpers" or self.finding:
+            return None
+        self.finding = True
+        try:
+            for finder in sys.meta_path:
+                if finder is self or not hasattr(finder, "find_spec"):
+                    continue
+                spec = finder.find_spec(fullname, path, target)
+                if spec is not None:
+                    if spec.loader is not None:
+                        spec.loader = ChainedLoader(spec.loader)
+                    return spec
+            return None
+        finally:
+            self.finding = False
+
+
+sys.meta_path.insert(0, WatchdogFinder())
+"""
+
+
+def test_helper_a_loader_wrapping_pivots_own_serves_stays_readable(tmp_path: pathlib.Path) -> None:
+    """A finder modelled on dd-trace-py's ModuleWatchdog wraps the loader the rest of
+    `sys.meta_path` returns, so Pivot's own loader runs inside the wrapper: the helper keeps the
+    source Pivot recorded. One worker imports it before the edit, the lock records the loaded
+    code, the next run reruns for the edit, and the run after is cached."""
+    hooked = tmp_path / "hooked"
+    hooked.mkdir()
+    helper = hooked / "helpers.py"
+    helper.write_text(_HELPERS)
+    (hooked / "sitecustomize.py").write_text(_WRAPPING_FINDER)
+    project = _edge_project(
+        tmp_path,
+        "import pathlib\n\nimport helpers\nfrom pivot import Pipeline, stage\n",
+        _EARLY_OTHER,
+        f"p = pathlib.Path({str(helper)!r}); p.write_text(p.read_text().replace('-v1', '-v2'))",
+        hooked,
+    )
+    _run(project, "config", "set", "core.max_workers", "1", pythonpath=hooked)
+
+    _assert_loaded_code_recorded(project, hooked)
+
+    third = _repro_json(project, hooked)
+    assert third["p/use_plain"][0] == "cached", third
+    assert "unreadable-source:" not in _lock(project, "use_plain")
 
 
 def test_in_root_helper_loaded_by_spec_from_file_location_is_not_cached_stale(
@@ -877,7 +1100,7 @@ def test_helper_imported_before_discovery_and_left_unchanged_is_reused(
     first = _repro(project, site)
     second = _repro_json(project, site)
 
-    assert "did not see user module" not in first, first
+    assert "Pivot cannot trust the code of user module" not in first, first
     assert "unreadable-source:" not in _lock(project, "use_plain")
     assert second["p/use_plain"][0] == "cached", second
 
@@ -907,7 +1130,8 @@ def test_helper_imported_before_discovery_and_edited_before_it_is_never_reused(
     first = _repro(project, site)
     second = _repro_json(project, site)
 
-    assert "Pivot did not see user module 'helpers' compile" in first, first
+    assert "Pivot cannot trust the code of user module 'helpers'" in first, first
+    assert "pivot did not see it compile" in first, first
     assert "because its file changed after this process started" in first, first
     assert "unreadable-source:helpers" in _lock(project, "use_plain")
     assert second["p/use_plain"][0] == "ran", second
@@ -1160,11 +1384,24 @@ def test_a_lock_a_later_run_writes_retires_the_no_commit_record(tmp_path: pathli
     assert _output(project, "use_plain") == "plain-v2"
 
 
-def test_commit_reads_a_no_commit_record_without_code_as_no_record(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize(
+    "record",
+    [
+        pytest.param({"pvt_members": {"data/p/out/a.pvt": "77aa"}}, id="pvt-members-only"),
+        pytest.param(
+            {"code_manifest": {"func:helpers.plain": "0" * 16}, "output_hashes": 7},
+            id="manifest-with-malformed-outputs",
+        ),
+    ],
+)
+def test_commit_reads_a_no_commit_record_without_code_as_no_record(
+    tmp_path: pathlib.Path, record: dict[str, object]
+) -> None:
     """A Pivot that keeps `.pvt` files in directory outputs leaves a `nocommit:` record with only
-    its own field (`pvt_members`). It holds no code a run ran, so `pivot commit` acts as with no
-    record: it leaves a current lock alone, and after an edit records the outputs against the
-    code on disk, which retires the record."""
+    its own field (`pvt_members`), and the reader drops a malformed key on its own, which can
+    leave the run's manifest without its output hashes. Neither holds a run's code with the
+    outputs it wrote, so `pivot commit` acts as with no record: it leaves a current lock alone,
+    and after an edit records the outputs against the code on disk, which retires the record."""
     pipeline = (
         "import helpers\nfrom pivot import Pipeline, stage\n\n\n@stage\n"
         + "def use_plain(seed: str) -> str:\n    return helpers.plain()\n\n\n"
@@ -1174,10 +1411,7 @@ def test_commit_reads_a_no_commit_record_without_code_as_no_record(tmp_path: pat
     _repro(project)
     lock_before = _lock(project, "use_plain")
     with state.StateDB(project / ".pivot") as db:
-        db.put_raw(
-            b"nocommit:p/use_plain",
-            json.dumps({"pvt_members": {"data/p/out/a.pvt": "77aa"}}).encode(),
-        )
+        db.put_raw(b"nocommit:p/use_plain", json.dumps(record).encode())
 
     unchanged = _run(project, "commit")
 
