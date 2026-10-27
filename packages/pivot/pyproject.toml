@@ -13,7 +13,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-  "aiohttp>=3.9",
+  "aiohttp>=3.10",
   "anyio>=4.11",
   "click>=8.0",
   "cloudpickle>=3.0",

@@ -42,9 +42,9 @@ def set_bound(pyproject: pathlib.Path, version: str) -> str:
     text = pyproject.read_text("utf-8")
     matches = list(_PIVOT_REQUIREMENT_LINE.finditer(text))
     if len(matches) != 1:
+        found = [match.group(0).strip() for match in matches]
         raise SystemExit(
-            f"{pyproject}: expected exactly one requirement on pivot, found {len(matches)}: "
-            f"{[match.group(0).strip() for match in matches]}"
+            f"{pyproject}: expected exactly one requirement on pivot, found {len(matches)}: {found}"
         )
     match = matches[0]
     requirement = f'{match["indent"]}"pivot>={version}"{match["trailer"]}'

@@ -134,6 +134,84 @@ def test_read_pvt_file_missing_required_fields_returns_none(
     assert result is None
 
 
+def _helper_pvt(**fields: object) -> dict[str, object]:
+    """A valid file .pvt's fields, with ``fields`` replacing or adding to them."""
+    return {"path": "data.csv", "hash": "0123456789abcdef", "size": 1, **fields}
+
+
+_ENTRY = {"relpath": "a.txt", "hash": "0123456789abcdef", "size": 1, "isexec": False}
+
+
+@pytest.mark.parametrize(
+    ("data", "error"),
+    [
+        pytest.param(_helper_pvt(path=1), "field 'path' is not a string", id="int-path"),
+        pytest.param(
+            _helper_pvt(hash=1234567890123456), "field 'hash' is not a string", id="int-hash"
+        ),
+        pytest.param(
+            _helper_pvt(manifest={"a.txt": "0123456789abcdef"}),
+            "field 'manifest' is not a list",
+            id="manifest-mapping",
+        ),
+        pytest.param(
+            _helper_pvt(manifest=["a.txt"]),
+            "field 'manifest[0]' is not a mapping",
+            id="manifest-entry-string",
+        ),
+        pytest.param(
+            _helper_pvt(manifest=[{k: v for k, v in _ENTRY.items() if k != "hash"}]),
+            "field 'manifest[0].hash' is missing",
+            id="manifest-entry-without-hash",
+        ),
+        pytest.param(
+            _helper_pvt(manifest=[_ENTRY, {k: v for k, v in _ENTRY.items() if k != "isexec"}]),
+            "field 'manifest[1].isexec' is missing",
+            id="manifest-entry-without-isexec",
+        ),
+        pytest.param(
+            _helper_pvt(manifest=[{**_ENTRY, "relpath": 7}]),
+            "field 'manifest[0].relpath' is not a string",
+            id="manifest-entry-int-relpath",
+        ),
+        pytest.param(
+            _helper_pvt(manifest=[_ENTRY, {**_ENTRY, "relpath": "a\0b"}]),
+            "field 'manifest[1].relpath' holds a NUL byte",
+            id="manifest-entry-nul-relpath",
+        ),
+        pytest.param(
+            _helper_pvt(manifest=[_ENTRY], empty_dirs=["e", "f\0"]),
+            "field 'empty_dirs[1]' holds a NUL byte",
+            id="nul-empty-dir",
+        ),
+    ],
+)
+def test_pvt_field_error_names_a_field_a_restore_cannot_use(data: object, error: str) -> None:
+    """A .pvt that has every field but holds one a restore builds a path or cache key from with
+    the wrong type or a NUL byte, or a manifest entry without a field a restore reads, is named
+    by field."""
+    assert track.is_pvt_data(data), "the field check runs on data is_pvt_data accepts"
+    assert track.pvt_field_error(data) == error
+
+
+def test_pvt_field_error_skips_what_no_restore_needs() -> None:
+    """A tracked directory's .pvt passes, and what no restore needs is not checked: the .pvt's
+    size and num_files, a manifest entry's size (present or not) and the types of its size and
+    isexec, and a NUL byte in path, which no restore builds a path from."""
+    source = dict.fromkeys(("repo", "rev", "rev_lock", "stage", "path", "remote"), "x")
+    tracked = _helper_pvt(num_files=1, manifest=[_ENTRY], empty_dirs=["empty"], source=source)
+    no_size = {k: v for k, v in _ENTRY.items() if k != "size"}
+    loose = _helper_pvt(
+        path="a\0b",
+        size="1",
+        num_files="2",
+        manifest=[{**_ENTRY, "size": "1", "isexec": "false"}, no_size],
+    )
+
+    assert track.pvt_field_error(tracked) is None
+    assert track.pvt_field_error(loose) is None
+
+
 # get_pvt_path
 
 
