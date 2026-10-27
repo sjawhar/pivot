@@ -28,9 +28,6 @@ def no_fingerprint(code_deps: list[str] | None = None) -> Callable[[F], F]:
     return decorator
 
 
-_FINGERPRINT_BY_NAME_ATTR = "__pivot_fingerprint_by_name__"
-
-
 def fingerprint_by_name[F: Callable[..., object]](func: F) -> F:
     """Record a helper by its module and qualified name only.
 
@@ -52,8 +49,8 @@ def fingerprint_by_name[F: Callable[..., object]](func: F) -> F:
     however the decorator keeps `__wrapped__` (in its `__dict__`, a slot or a property),
     because the decorator instance can carry state Pivot cannot fingerprint soundly. Unsafe
     fingerprinting does not suppress that refusal. To clear it, put the mark above the
-    class-based decorator (the decorator accepts an instance that `functools.update_wrapper`
-    made), or use a `functools.wraps` function decorator. Without a mark below it, a
+    class-based decorator (the decorator accepts any such instance, also one with `__slots__`
+    and no `__dict__`), or use a `functools.wraps` function decorator. Without a mark below it, a
     `functools.wraps` decorator is fingerprinted as in earlier versions: Pivot does not see what
     its own lines read through a module (`settings.FACTOR`), or its body when `functools.cache`
     wraps it.
@@ -67,10 +64,9 @@ def fingerprint_by_name[F: Callable[..., object]](func: F) -> F:
     Use bare: ``@fingerprint_by_name``, not ``@fingerprint_by_name()``.
     """
     _validate_fingerprint_by_name_target(func)
-    # Store the function itself. `functools.update_wrapper` copies `__dict__`, so the copy in
-    # a wrapper holds another function, and the wrapper does not read as marked. An identity
-    # check also holds after the function's address is reused.
-    func.__dict__[_FINGERPRINT_BY_NAME_ATTR] = func
+    from pivot import fingerprint as _fp
+
+    _fp.mark_by_name(func)
     return func
 
 

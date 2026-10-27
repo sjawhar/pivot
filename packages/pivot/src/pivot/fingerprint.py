@@ -1479,7 +1479,7 @@ def _user_member_value(value: Any) -> Any:
             return unwrapped
         if unwrapped is not value and inspect.isfunction(unwrapped):
             return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
-    if hasattr(value, "__get__") and _is_user_class_instance(value):
+    if _has_attribute(value, "__get__") and _is_user_class_instance(value):
         return value
     return _UNREAD
 
@@ -1964,6 +1964,29 @@ def _check_non_scalar_capture(
     errors.append(message)
 
 
+def _has_attribute(value: Any, name: str) -> bool:
+    """`hasattr(value, name)` for a value the walk reads, where an error other than
+    AttributeError from the lookup also means no attribute.
+
+    Python calls an object's `__getattr__` only for a name its class and `__dict__` lack. One
+    that raises KeyError or RuntimeError for that name (a dict-backed config, an `AttrDict`, a
+    lazy object) says the attribute is absent, but `hasattr` lets the error through, and the
+    walk would stop on it.
+    """
+    try:
+        return hasattr(value, name)
+    except Exception:  # the error of the value's own `__getattr__` or property
+        return False
+
+
+def _attribute_or_none(value: Any, name: str) -> Any:
+    """`getattr(value, name, None)`, with the errors `_has_attribute` takes as no attribute."""
+    try:
+        return getattr(value, name, None)
+    except Exception:  # the error of the value's own `__getattr__` or property
+        return None
+
+
 def _is_user_class_instance(value: Any) -> bool:
     """Return whether `value` is an instance of a user-defined class."""
     return not isinstance(value, type) and is_user_code(type(value))
@@ -1996,10 +2019,10 @@ def _library_module(value: Any) -> types.ModuleType | None:
     such as `expit`) is looked up in every loaded module; `np.frompyfunc` products stay
     refused because no module binds their generated names.
     """
-    name = getattr(value, "__name__", None)
+    name = _attribute_or_none(value, "__name__")
     if not isinstance(name, str):
         return None
-    module_name = getattr(value, "__module__", None)
+    module_name = _attribute_or_none(value, "__module__")
     candidates: list[types.ModuleType | None]
     if isinstance(module_name, str):
         candidates = [sys.modules.get(module_name)]
@@ -2021,14 +2044,16 @@ def _library_name(value: Any) -> str:
     `np.mean` is `numpy.mean` and `from numpy import median` is `numpy.median`, so a binding
     that now holds another library function reads as changed. A method bound to a class or a
     scalar carries it in brackets (`builtins.str.join[',']`): the bound object is part of what
-    the callable does.
+    the callable does. A marked class-based decorator without names of its own (one with
+    `__slots__` that `functools.update_wrapper` did not make), or a library wrapper over one, is
+    named by the helper at the end of its chain: the module-level function that
+    `@fingerprint_by_name` checked.
     """
     bound = getattr(value, "__self__", None)
-    qualname = (
-        getattr(value, "__qualname__", None)
-        or getattr(value, "__name__", None)
-        or type(value).__qualname__
-    )
+    named = getattr(value, "__qualname__", None) or getattr(value, "__name__", None)
+    if not named and _recorded_by_name(value):
+        return _library_name(unwrap(value))
+    qualname = named or type(value).__qualname__
     module = getattr(value, "__module__", None)
     if not isinstance(module, str):
         owner_class = getattr(value, "__objclass__", None)
@@ -2057,7 +2082,7 @@ def _carries_instance(value: Any) -> bool:
     neither does a library module's own export (`np.random.normal`, `random.random`), whose
     state belongs to the library.
     """
-    bound = getattr(value, "__self__", None)
+    bound = _attribute_or_none(value, "__self__")
     if bound is None or isinstance(
         bound, (types.ModuleType, type, bool, int, float, str, bytes, logging.Logger)
     ):
@@ -2240,7 +2265,7 @@ def _is_user_class_attribute(cls: type, attribute: str) -> bool:
         return False
     raw = vars(owner)[attribute]
     if isinstance(raw, (classmethod, staticmethod)) or (
-        hasattr(raw, "__get__") and not callable(raw)
+        _has_attribute(raw, "__get__") and not callable(raw)
     ):
         return False
     sunder = len(attribute) > 2 and attribute[0] == attribute[-1] == "_"
@@ -2792,11 +2817,10 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     # over a class-based decorator over the mark and drop the class. A chain with a user class
     # instance above the mark is refused. A marked instance of a class-based decorator is named
     # like a marked function: its own `__dict__` is not dumped.
-    callable_value = callable(cast("object", value)) and not isinstance(value, type)
-    decision = _mark_decision(value) if callable_value else None
+    decision = _mark_decision(value)
     if decision is _MarkDecision.REFUSED:
         _refuse_class_above_mark(value)
-    if hasattr(value, "model_dump") and not isinstance(value, type):
+    if _has_attribute(value, "model_dump") and not isinstance(value, type):
         return _canonicalize_value_for_hash(value.model_dump(), (*active, id(value)))
     if inspect.isfunction(value):
         return ["function", _function_identity(value, active)]
@@ -2839,7 +2863,7 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         inner = (*active, id(value))
         fields = {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
         return [_definition_ref(type(value)), _canonicalize_value_for_hash(fields, inner)]
-    if type(value).__repr__ is object.__repr__ and hasattr(value, "__dict__"):
+    if type(value).__repr__ is object.__repr__ and _has_attribute(value, "__dict__"):
         inner = (*active, id(value))
         attributes = vars(value)
         if _BY_NAME_MARK in attributes:
@@ -3219,6 +3243,24 @@ def _has_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) 
 
 
 _BY_NAME_MARK = "__pivot_fingerprint_by_name__"
+# The marked objects without a `__dict__` to hold the mark: a class-based decorator with
+# `__slots__`, which may lack a `__weakref__` slot too, so no weak reference can hold it. The
+# table is keyed by `id(obj)` because such a class may define `__eq__` without `__hash__`, which
+# makes the object unusable as a key. The value is the object itself, a strong reference: the
+# table keeps every marked object alive for the life of the process, so its address is never
+# freed and no other object can get its id. `fingerprinted_by_name` also checks the stored value
+# is `obj` itself, so a lookup by id alone never marks another object.
+_marked_without_dict = dict[int, Any]()
+
+
+def mark_by_name(obj: Any) -> None:
+    """Mark `obj` itself for `@pivot.fingerprint_by_name` (see `fingerprinted_by_name`)."""
+    try:
+        namespace: dict[str, Any] = object.__getattribute__(obj, "__dict__")
+    except AttributeError:
+        _marked_without_dict[id(obj)] = obj
+        return
+    namespace[_BY_NAME_MARK] = obj
 
 
 def fingerprinted_by_name(obj: Any) -> bool:
@@ -3226,26 +3268,28 @@ def fingerprinted_by_name(obj: Any) -> bool:
 
     The mark is the marked object, in the `__dict__` of that object. `functools.update_wrapper`
     copies `__dict__` into a wrapper, so the copy in a wrapper holds a different object, and the
-    wrapper is not marked.
+    wrapper is not marked. An object without a `__dict__` is marked when `_marked_without_dict`
+    holds it.
     """
     try:
         namespace: Mapping[str, Any] = object.__getattribute__(obj, "__dict__")
-        return namespace.get(_BY_NAME_MARK) is obj
     except AttributeError:
-        return False
+        return _marked_without_dict.get(id(obj)) is obj
+    return namespace.get(_BY_NAME_MARK) is obj
 
 
 def wrapper_chain(obj: Any, stop: Callable[[Any], bool] | None = None) -> Iterator[Any]:
     """Yield `obj`, then each object its `__wrapped__` chain reaches, in order.
 
-    Every read of a `__wrapped__` chain in pivot goes through this, so each path sees the chain
-    `inspect.unwrap` sees. It follows the chain as `inspect.unwrap` does: by attribute access,
-    so a `__wrapped__` kept in a slot or a property counts as one in an instance `__dict__`; a
-    class ends the chain; `stop` ends it at the first object it accepts; and its loop guard, by
-    object identity and the recursion limit, ends the chain before an object it has already
-    yielded. `inspect.unwrap` raises ValueError at a loop, and so does `unwrap`; a decision about
-    the chain (`_mark_decision`) takes a loop as the chain's end, so a looped chain without a
-    mark on it is decided as main decides it.
+    Every step along a `__wrapped__` chain in pivot goes through this, so each path sees the
+    chain `inspect.unwrap` sees; the mark decision first asks whether a value keeps a
+    `__wrapped__` of its own (`_mark_chain`). It follows the chain as `inspect.unwrap` does: by
+    attribute access, so a `__wrapped__` kept in a slot or a property counts as one in an
+    instance `__dict__`; a class ends the chain; `stop` ends it at the first object it accepts;
+    and its loop guard, by object identity and the recursion limit, ends the chain before an
+    object it has already yielded. `inspect.unwrap` raises ValueError at a loop, and so does
+    `unwrap`; a decision about the chain (`_mark_decision`, through `_mark_chain`) takes a loop
+    as the chain's end, so a looped chain without a mark on it is decided as main decides it.
     """
     memo = {id(obj): obj}
     limit = sys.getrecursionlimit()
@@ -3264,12 +3308,58 @@ def wrapper_chain(obj: Any, stop: Callable[[Any], bool] | None = None) -> Iterat
 def unwrap(obj: Any, stop: Callable[[Any], bool] | None = None) -> Any:
     """`inspect.unwrap(obj, stop=stop)`, through `wrapper_chain`: the last object on `obj`'s
     `__wrapped__` chain, or the first one `stop` accepts. A loop raises ValueError, as it does
-    in `inspect.unwrap`."""
+    in `inspect.unwrap`.
+
+    It differs from `inspect.unwrap` in two pathological chains, and each fails loudly and
+    drops nothing: with a `__wrapped__` property that returns another object on each access,
+    the second test of the end (`looped`, and `stop` asked again) can raise ValueError where
+    `inspect.unwrap` returns; and on a chain longer than the recursion limit, `_stop_at_mark`
+    asked of a lower link can see a mark that `_mark_decision` asked of the top does not, and
+    the walk then raises.
+    """
     *_, end = wrapper_chain(obj, stop)
     looped = not isinstance(end, type) and hasattr(end, "__wrapped__")
     if looped and (stop is None or not stop(end)):
         raise ValueError(f"wrapper loop when unwrapping {obj!r}")
     return end
+
+
+def _keeps_own_wrapped(obj: Any) -> bool:
+    """Whether `obj` keeps a `__wrapped__` of its own: in its `__dict__`, or on its class (a slot,
+    a property, a class attribute). Nothing of `obj` runs: neither its `__getattr__` nor the
+    property."""
+    try:
+        namespace: Mapping[str, Any] = object.__getattribute__(obj, "__dict__")
+    except AttributeError:
+        namespace = {}
+    return "__wrapped__" in namespace or any(
+        "__wrapped__" in vars(klass) for klass in type(obj).__mro__
+    )
+
+
+def _mark_chain(obj: Any) -> Iterator[Any]:
+    """`wrapper_chain(obj)` as the mark decision reads it, for a value main may not walk as code.
+
+    `obj` is a wrapper only if it keeps a `__wrapped__` of its own (`_keeps_own_wrapped`), so its
+    `__getattr__` is not asked. Then the chain is read as `wrapper_chain` reads it, with the same
+    reads, and a lookup that raises an exception other than AttributeError ends the chain. Main
+    reads no `__wrapped__` of a value it does not unwrap, such as a callable user class instance,
+    which it refuses as it is; so an object whose `__getattr__` answers every name, or raises
+    KeyError for a missing one (a dict-backed config, an `AttrDict`), and a `__wrapped__`
+    property that raises, give no chain, and the value is decided as main decides it. Where main
+    does unwrap the value, `unwrap` reads the chain as `inspect.unwrap` does on main, errors
+    included.
+    """
+    if not _keeps_own_wrapped(obj):
+        yield obj
+        return
+    chain = wrapper_chain(obj)
+    while True:
+        try:
+            current = next(chain)
+        except Exception:  # StopIteration at the end, or the error of user code in a lookup
+            return
+        yield current
 
 
 def _recorded_by_name(obj: Any) -> bool:
@@ -3290,7 +3380,7 @@ def _recorded_by_name(obj: Any) -> bool:
         return False
     if is_user_code(type(obj)):
         return False
-    below = wrapper_chain(obj)
+    below = _mark_chain(obj)
     next(below)  # `obj` itself
     for current in below:
         if fingerprinted_by_name(current):
@@ -3317,10 +3407,14 @@ def _mark_decision(obj: Any) -> _MarkDecision | None:
     Every path that reads a value (a global, closure cell, default, class member, module
     attribute, partial function or argument, loader field, default factory) asks it before it
     unwraps, so no path drops an object on such a chain without a decision. The decision and
-    every unwrap read the chain through `wrapper_chain`, so they see the same objects. Without a
-    mark the answer is None and the walk is main's.
+    every unwrap read the chain through `wrapper_chain`, so they see the same objects of a chain
+    whose objects keep their own `__wrapped__`. The decision reads it through `_mark_chain`, and
+    only for a callable: main walks no other value as code, and reads no `__wrapped__` of a
+    value it does not unwrap, so the decision does not ask the value's own `__getattr__`, and
+    takes an error from a lookup as the end of the chain. Without a mark the answer is None and
+    the walk is main's.
     """
-    if isinstance(obj, (type, types.ModuleType)):
+    if not callable(obj) or isinstance(obj, (type, types.ModuleType)):
         return None
     target = obj.__func__ if inspect.ismethod(obj) else obj
     if _mark_on_chain(target) is None:
@@ -3333,10 +3427,10 @@ def _mark_decision(obj: Any) -> _MarkDecision | None:
 
 
 def _class_above_mark(obj: Any) -> Any:
-    """The first user class instance on `obj`'s `__wrapped__` chain (`wrapper_chain`), `obj`
+    """The first user class instance on `obj`'s `__wrapped__` chain (`_mark_chain`), `obj`
     included, that is above a marked object, or None."""
     found: Any = None
-    for current in wrapper_chain(obj):
+    for current in _mark_chain(obj):
         if fingerprinted_by_name(current):
             return found
         if found is None and _is_user_class_instance(current):
@@ -3354,7 +3448,7 @@ def _refuse_class_above_mark(value: Any) -> None:
     instance = _class_above_mark(value.__func__ if inspect.ismethod(value) else value)
     marked = _mark_on_chain(instance)  # below the instance: `_class_above_mark` stops at a mark
     decorator = _definition_ref(type(instance))
-    helper = _definition_ref(marked) if marked is not None else _definition_ref(instance)
+    helper = _library_name(marked) if marked is not None else _definition_ref(instance)
     stage = _current_stage_name.get()
     prefix = f"Stage '{stage}': " if stage else ""
     message = (
@@ -3376,9 +3470,9 @@ def _refuse_class_above_mark(value: Any) -> None:
 
 
 def _mark_on_chain(obj: Any) -> Any:
-    """The first marked object on `obj`'s `__wrapped__` chain (`wrapper_chain`), `obj` included,
+    """The first marked object on `obj`'s `__wrapped__` chain (`_mark_chain`), `obj` included,
     or None."""
-    return next((current for current in wrapper_chain(obj) if fingerprinted_by_name(current)), None)
+    return next((current for current in _mark_chain(obj) if fingerprinted_by_name(current)), None)
 
 
 def _stop_at_mark(obj: Any) -> bool:
@@ -3388,7 +3482,8 @@ def _stop_at_mark(obj: Any) -> bool:
     above it, and `_mark_decision` refuses a user class instance above it, so no unwrap passes
     either. A library wrapper (a `contextlib.contextmanager` helper, `functools.cache`) is not a
     stop. Without a mark on the chain nothing stops, and the unwrap goes to the end, as on main.
-    Each unwrap with this stop is `unwrap`, which reads the chain as `_mark_decision` does.
+    Each unwrap with this stop is `unwrap`, which reads the chain as `_mark_decision` does, and
+    raises where a `__wrapped__` lookup raises, as `inspect.unwrap` does on main.
     """
     if _mark_on_chain(obj) is None:
         return False

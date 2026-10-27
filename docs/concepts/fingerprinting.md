@@ -239,6 +239,11 @@ function's code and is tracked with it. A default that is a pipeline input
 handle (`raw=RAW` with `RAW = pipeline.input("t.csv")`) is wired as an input
 and tracked by its content.
 
+An object whose `__getattr__` raises an error other than `AttributeError` for
+a name it does not have (a dict-backed config, an `AttrDict`, a lazy object)
+gets the same decision as any other object of its kind: Pivot takes that error
+as a missing attribute rather than stopping the fingerprint on it.
+
 Fix: move a mutable or nested value into the stage's [StageParams](parameters.md).
 Configuration in module-level mutable collections is not supported.
 
@@ -311,8 +316,9 @@ changes. It reruns once when the helper moves to another module, when the
 helper gets a new name, or when someone removes the mark.
 
 The decorator accepts a module-level function, and a `functools.wraps`,
-`contextlib.contextmanager` or class-based wrapper of one (an instance that
-`functools.update_wrapper` made). It refuses a class, a method, a lambda, a
+`contextlib.contextmanager` or class-based wrapper of one (an instance whose
+`__wrapped__` leads to the function, also one with `__slots__` and no
+`__dict__`). It refuses a class, a method, a lambda, a
 nested function, a `functools.partial`, a helper that imports a user module in
 its body, and a helper that uses `importlib.import_module` or `__import__`.
 Import the module at the top of the helper's file instead.

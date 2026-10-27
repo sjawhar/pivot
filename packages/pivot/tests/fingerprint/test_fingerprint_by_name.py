@@ -5,6 +5,7 @@
 import ast
 import contextlib
 import functools
+import gc
 import importlib
 import inspect
 import json
@@ -19,6 +20,7 @@ import types
 import typing
 
 import cloudpickle
+import pydantic
 import pytest
 import yaml
 
@@ -45,7 +47,18 @@ def module_dir(tmp_path: pathlib.Path):
         name
         for name in sys.modules
         if name.startswith(
-            ("fbn_", "fbn2_", "fbnhelp_", "fbnstage_", "rk_", "rk4_", "rk5_", "rk6_", "rk7_")
+            (
+                "fbn_",
+                "fbn2_",
+                "fbnhelp_",
+                "fbnstage_",
+                "rk_",
+                "rk4_",
+                "rk5_",
+                "rk6_",
+                "rk7_",
+                "rk8_",
+            )
         )
     ]
     for name in to_remove:
@@ -2647,6 +2660,17 @@ def traced(fn):
         return fn(*args, **kwargs)
 
     return wrapper
+
+
+class SlotTraced:
+    __slots__ = ("fn", "__wrapped__")
+
+    def __init__(self, fn):
+        self.fn = fn
+        self.__wrapped__ = fn
+
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs) * 4
 """
 
 _R5_HELPER = """\
@@ -2820,7 +2844,7 @@ import contextlib
 import functools
 
 from pivot import fingerprint_by_name
-from rk5_deco import Traced, TracedGen
+from rk5_deco import SlotTraced, Traced, TracedGen
 
 
 {decorators}def helper(*_args):
@@ -2844,6 +2868,17 @@ _R6_FIX_SHAPES = {
         "@contextlib.contextmanager\n@fingerprint_by_name\n@TracedGen\n",
         "yield",
         ("value * 3\n", "value * 30\n"),
+    ),
+    # A class-based decorator with `__slots__` and no `__dict__` carries the mark too.
+    "marked_slots_class": (
+        "@fingerprint_by_name\n@SlotTraced\n",
+        "return",
+        ("kwargs) * 4\n", "kwargs) * 40\n"),
+    ),
+    "cache_over_marked_slots_class": (
+        "@functools.cache\n@fingerprint_by_name\n@SlotTraced\n",
+        "return",
+        ("kwargs) * 4\n", "kwargs) * 40\n"),
     ),
 }
 
@@ -3436,7 +3471,7 @@ def test_wrapper_chain_and_unwrap_read_a_chain_as_inspect_unwrap_does(chain: str
 
 _R7_LOOP_STAGE = """\
 class Looped:
-    pass
+{body}
 
 
 LOOPED = Looped()
@@ -3448,14 +3483,517 @@ def my_stage():
 """
 
 
+@pytest.mark.parametrize(
+    "body",
+    ["    pass", "    def __call__(self):\n        return 1"],
+    ids=["plain", "callable"],
+)
 def test_a_looped_chain_without_a_mark_is_decided_as_main_decides_it(
-    module_dir: pathlib.Path,
+    module_dir: pathlib.Path, body: str
 ) -> None:
     """A value whose `__wrapped__` chain loops, with no mark on it, gets main's non-scalar
-    refusal. The mark decision takes the loop as the chain's end and gives no answer, where
-    `inspect.unwrap` would raise ValueError, so the mark machinery adds no error main lacks."""
-    _write(module_dir / "rk7_loop.py", _R7_LOOP_STAGE)
+    refusal. The decision asks no value that is not callable; for a callable it takes the loop
+    as the chain's end and gives no answer, where `inspect.unwrap` would raise ValueError, so the
+    mark machinery adds no error main lacks."""
+    _write(module_dir / "rk7_loop.py", _R7_LOOP_STAGE.format(body=body))
     stage = _fresh("rk7_loop").my_stage
     assert fingerprint._mark_decision(sys.modules["rk7_loop"].LOOPED) is None
     with pytest.raises(exceptions.StageDefinitionError, match="captures non-scalar variable"):
         fingerprint.get_stage_fingerprint(stage)
+
+
+# ---------------------------------------------------------------------------------------------
+# Without a mark the walk decides as main decides. The mark decision asks only a callable for
+# its chain, reads the callable's own `__wrapped__` without its `__getattr__`, and takes an error
+# from a lookup as the end of the chain. No attribute probe of the walk stops on the error a
+# value's `__getattr__` raises for a name it lacks: main stopped on `model_dump` (a partial
+# argument), `__self__` and `__get__` (a class attribute) and `__name__` (a callable). Such a
+# value is decided as a plain object of its kind is.
+# ---------------------------------------------------------------------------------------------
+
+_R8_CONFIG = """\
+class KeyConfig:
+    def __init__(self, data):
+        self._data = data
+
+    def __getattr__(self, name):
+        return self._data[name]
+
+
+class AttrDict(dict):
+    __getattr__ = dict.__getitem__
+
+
+class Lazy:
+    def __init__(self, scale):
+        self.scale = scale
+
+    def __getattr__(self, name):
+        raise RuntimeError(f"not configured: {name}")
+
+
+class SlotKey:
+    __slots__ = ("_data",)
+
+    def __init__(self, data):
+        self._data = data
+
+    def __getattr__(self, name):
+        return self._data[name]
+
+
+class CallKey(KeyConfig):
+    def __call__(self):
+        return 3
+
+
+class WrappedRaises:
+    scale = 3
+
+    @property
+    def __wrapped__(self):
+        raise RuntimeError("boom")
+
+    def __call__(self):
+        return 3
+
+
+class WrappedKey:
+    scale = 3
+
+    @property
+    def __wrapped__(self):
+        return KeyConfig({})
+
+    def __call__(self):
+        return 3
+
+
+class Plain:
+    def __init__(self):
+        self.scale = 3
+
+
+class CallPlain(Plain):
+    def __call__(self):
+        return 3
+
+
+KEY = KeyConfig({"scale": 3})
+ATTR = AttrDict(scale=3)
+LAZY = Lazy(3)
+SLOT = SlotKey({"scale": 3})
+CALL_KEY = CallKey({"scale": 3})
+WRAPPED_RAISES = WrappedRaises()
+WRAPPED_KEY = WrappedKey()
+PLAIN = Plain()
+CALL_PLAIN = CallPlain()
+"""
+# Each object, and the plain object of its kind whose decision it must get.
+_R8_CONTROLS = {
+    "KEY": "PLAIN",
+    "ATTR": "PLAIN",
+    "LAZY": "PLAIN",
+    "SLOT": "PLAIN",
+    "CALL_KEY": "CALL_PLAIN",
+    "WRAPPED_RAISES": "CALL_PLAIN",
+    "WRAPPED_KEY": "CALL_PLAIN",
+}
+_R8_HOLDER = "import rk8_cfg\n\n\nclass Holder:\n    cfg = rk8_cfg.{obj}\n\n\n"
+_R8_FORMS = {
+    "global": "from rk8_cfg import {obj} as CFG\n\n\ndef my_stage():\n    return CFG.scale\n",
+    "module_attribute": "import rk8_cfg\n\n\ndef my_stage():\n    return rk8_cfg.{obj}.scale\n",
+    "default": "import rk8_cfg\n\n\ndef my_stage(cfg=rk8_cfg.{obj}):\n    return cfg.scale\n",
+    "closure_cell": (
+        "import rk8_cfg\n\n\ndef _make(cfg):\n    def my_stage():\n        return cfg.scale\n\n"
+        "    return my_stage\n\n\nmy_stage = _make(rk8_cfg.{obj})\n"
+    ),
+    "partial_argument": (
+        "import functools\n\nimport rk8_cfg\n\n\ndef _apply(cfg):\n    return cfg.scale\n\n\n"
+        "RUNNER = functools.partial(_apply, rk8_cfg.{obj})\n\n\ndef my_stage():\n    return RUNNER()\n"
+    ),
+    "partial_keyword": (
+        "import functools\n\nimport rk8_cfg\n\n\ndef _apply(cfg=None):\n    return cfg.scale\n\n\n"
+        "RUNNER = functools.partial(_apply, cfg=rk8_cfg.{obj})\n\n\n"
+        "def my_stage():\n    return RUNNER()\n"
+    ),
+    "helper_default": (
+        "import rk8_cfg\n\n\ndef _apply(cfg=rk8_cfg.{obj}):\n    return cfg.scale\n\n\n"
+        "def my_stage():\n    return _apply()\n"
+    ),
+    "class_member_named": _R8_HOLDER + "def my_stage():\n    return Holder.cfg.scale\n",
+    "class_member_unnamed": _R8_HOLDER
+    + "def my_stage():\n    holder = Holder()\n    return holder.cfg.scale\n",
+}
+
+
+def _r8_stage(module_dir: pathlib.Path, config: str, obj: str, form: str) -> typing.Any:
+    tag = f"{obj}_{form}".lower()
+    _write(module_dir / "rk8_cfg.py", config)
+    _write(module_dir / f"rk8_s_{tag}.py", _R8_FORMS[form].format(obj=obj))
+    return _fresh("rk8_cfg", f"rk8_s_{tag}").my_stage
+
+
+def _r8_outcome(module_dir: pathlib.Path, obj: str, form: str) -> str:
+    """ "manifest", "non-scalar refusal", or the first line of another refusal."""
+    try:
+        fingerprint.get_stage_fingerprint(_r8_stage(module_dir, _R8_CONFIG, obj, form))
+    except exceptions.StageDefinitionError as refused:
+        first = str(refused).splitlines()[0]
+        return "non-scalar refusal" if "captures non-scalar variable" in first else first
+    return "manifest"
+
+
+@pytest.mark.parametrize("unsafe", [False, True], ids=["strict", "unsafe"])
+@pytest.mark.parametrize("form", list(_R8_FORMS))
+@pytest.mark.parametrize("obj", list(_R8_CONTROLS))
+def test_an_object_whose_getattr_raises_is_decided_as_a_plain_object_is(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch, obj: str, form: str, unsafe: bool
+) -> None:
+    """No mark anywhere. A value whose `__getattr__` raises KeyError or RuntimeError for a name it
+    lacks (a dict-backed config, an `AttrDict`, a lazy object, one with `__slots__`), or whose
+    `__wrapped__` property raises or leads to such a value, gets the decision a plain object of
+    its kind gets in the same form: main's non-scalar refusal, or a manifest. The walk never
+    stops on the object's own error."""
+    if unsafe:
+        monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
+    else:
+        monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING", raising=False)
+    expected = _r8_outcome(module_dir, _R8_CONTROLS[obj], form)
+    assert expected in ("manifest", "non-scalar refusal"), expected
+    assert _r8_outcome(module_dir, obj, form) == expected
+
+
+@pytest.mark.parametrize("form", ["global", "module_attribute", "default", "closure_cell"])
+@pytest.mark.parametrize("obj", ["KEY", "ATTR", "LAZY"])
+def test_an_unmarked_object_whose_getattr_raises_gets_mains_refusal_or_unsafe_acceptance(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch, obj: str, form: str
+) -> None:
+    """Main refuses these captures with the non-scalar message and accepts them under unsafe
+    fingerprinting. Round 7 asked them for `__wrapped__` and stopped on their own error."""
+    monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING", raising=False)
+    with pytest.raises(exceptions.StageDefinitionError, match="captures non-scalar variable"):
+        fingerprint.get_stage_fingerprint(_r8_stage(module_dir, _R8_CONFIG, obj, form))
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
+    assert fingerprint.get_stage_fingerprint(_r8_stage(module_dir, _R8_CONFIG, obj, form))
+
+
+_R8_SPY = """\
+NAMES = []
+
+
+class Spy:
+    scale = 3
+
+    def __getattr__(self, name):
+        NAMES.append(name)
+        raise AttributeError(name)
+
+
+class CallSpy(Spy):
+    def __call__(self):
+        return 3
+
+
+class Recorded:
+    scale = 3
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    @property
+    def __wrapped__(self):
+        NAMES.append("__wrapped__")
+        return self.fn
+
+
+SPY = Spy()
+CALL_SPY = CallSpy()
+RECORDED = Recorded(len)
+"""
+
+
+@pytest.mark.parametrize("form", list(_R8_FORMS))
+@pytest.mark.parametrize("obj", ["SPY", "CALL_SPY", "RECORDED"])
+def test_the_mark_decision_reads_no_wrapped_main_does_not_read(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch, obj: str, form: str
+) -> None:
+    """Main reads no `__wrapped__` of these values. The decision does not either: it asks no
+    value that is not callable (`RECORDED` keeps a `__wrapped__` property), and it reads a
+    callable's own `__wrapped__` without the callable's `__getattr__`."""
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
+    stage = _r8_stage(module_dir, _R8_SPY, obj, form)
+    fingerprint.get_stage_fingerprint(stage)
+    assert "__wrapped__" not in sys.modules["rk8_cfg"].NAMES
+
+
+_R8_NOT_CALLABLE = """\
+from pivot import fingerprint_by_name
+
+
+@fingerprint_by_name
+def helper():
+    return 5
+
+
+class Holds:
+    def __init__(self, fn):
+        self.__wrapped__ = fn
+
+
+HELD = Holds(helper)
+
+
+def my_stage():
+    return HELD
+"""
+
+
+def test_a_value_that_is_not_callable_gets_mains_decision_with_a_mark_below(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Main walks no value that is not callable as code, so the mark decision gives no answer for
+    one, even with a mark on its chain: the stage gets main's non-scalar refusal, which unsafe
+    fingerprinting turns into a warning, as on main."""
+    monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING", raising=False)
+    _write(module_dir / "rk8_held.py", _R8_NOT_CALLABLE)
+    module = _fresh("rk8_held")
+    assert fingerprint._mark_decision(module.HELD) is None
+    with pytest.raises(exceptions.StageDefinitionError, match="captures non-scalar variable"):
+        fingerprint.get_stage_fingerprint(module.my_stage)
+    monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
+    assert fingerprint.get_stage_fingerprint(module.my_stage)
+
+
+def test_the_canonical_form_of_an_object_whose_getattr_raises_is_that_of_a_plain_object(
+    module_dir: pathlib.Path,
+) -> None:
+    """Main asked `hasattr(value, "model_dump")` of each value in the canonical form (a partial
+    argument, a loader field, a helper's default), and a `__getattr__` that raises KeyError or
+    RuntimeError stopped the walk there. Such an object has no `model_dump` and no `__dict__`
+    beyond its own, so it is canonicalized as a plain object is; a pydantic model is still
+    dumped."""
+    _write(module_dir / "rk8_cfg.py", _R8_CONFIG)
+    cfg = _fresh("rk8_cfg")
+    canonical = fingerprint._canonicalize_value_for_hash
+    assert canonical(cfg.KEY) == ["rk8_cfg.KeyConfig", canonical({"_data": {"scale": 3}})]
+    assert canonical(cfg.LAZY) == ["rk8_cfg.Lazy", canonical({"scale": 3})]
+    assert canonical(cfg.ATTR) == canonical({"scale": 3})
+    assert canonical(cfg.SLOT)[0] == "SlotKey"
+
+    class Model(pydantic.BaseModel):
+        scale: int = 3
+
+    assert canonical(Model()) == canonical({"scale": 3})
+
+
+@typing.final
+class _GetattrWrapped:
+    """Gives `__wrapped__` from `__getattr__` only."""
+
+    def __init__(self, fn: object) -> None:
+        self._fn = fn
+
+    def __getattr__(self, name: str) -> object:
+        if name == "__wrapped__":
+            return self._fn
+        raise AttributeError(name)
+
+
+@typing.final
+class _KeyRaising:
+    def __getattr__(self, name: str) -> object:
+        raise KeyError(name)
+
+
+@typing.final
+class _PropRaising:
+    @property
+    def __wrapped__(self) -> object:
+        raise RuntimeError("boom")
+
+
+@typing.final
+class _CountingWrapped:
+    """Counts the reads of its `__wrapped__` property."""
+
+    def __init__(self, fn: object) -> None:
+        self.fn = fn
+        self.reads = 0
+
+    @property
+    def __wrapped__(self) -> object:
+        self.reads += 1
+        return self.fn
+
+
+def test_the_mark_decision_reads_a_chain_from_the_values_own_wrapped() -> None:
+    """`_mark_chain` asks a value for its chain only if the value keeps a `__wrapped__` of its
+    own (in its `__dict__` or on its class), so a value whose `__getattr__` alone gives one has
+    no chain; then the chain is `wrapper_chain`'s, read with the same number of reads; and an
+    error from a lookup ends the chain where it is raised."""
+    getattr_only = _GetattrWrapped(len)
+    assert [*fingerprint._mark_chain(getattr_only)] == [getattr_only]
+    assert [*fingerprint.wrapper_chain(getattr_only)] == [getattr_only, len]
+
+    middle = _GetattrWrapped(len)
+    top = _PropWrapped(middle)
+    assert [*fingerprint._mark_chain(top)] == [top, middle, len]
+
+    counted, control = _CountingWrapped(len), _CountingWrapped(len)
+    assert [*fingerprint._mark_chain(counted)] == [counted, len]
+    assert [*fingerprint.wrapper_chain(control)] == [control, len]
+    assert counted.reads == control.reads == 2
+
+    raising = _KeyRaising()
+    above = _PropWrapped(raising)
+    assert [*fingerprint._mark_chain(above)] == [above, raising]
+    with pytest.raises(KeyError):
+        fingerprint.unwrap(above)
+
+    prop = _PropRaising()
+    assert [*fingerprint._mark_chain(prop)] == [prop]
+
+
+# ---------------------------------------------------------------------------------------------
+# A class-based decorator with `__slots__` and no `__dict__` carries the mark: the decorator
+# keeps such an object in `_marked_without_dict`. The refusal's first fix works for it, and the
+# walk names it by the helper at the end of its chain.
+# ---------------------------------------------------------------------------------------------
+
+_R8_SLOT_HELPER = """\
+import functools
+
+from pivot import fingerprint_by_name
+from rk5_deco import SlotTraced, Traced
+
+
+{decorators}def helper(*_args):
+    return 5
+"""
+
+
+@pytest.mark.parametrize("wrapper", ["", "@functools.cache\n"], ids=["bare", "cache"])
+def test_the_refusals_first_fix_works_for_a_class_decorator_with_slots_and_no_dict(
+    module_dir: pathlib.Path, wrapper: str
+) -> None:
+    """`SlotTraced` above the mark is refused, and the refusal's first fix is to put the mark
+    above it. Following the fix gives a helper Pivot records by name, the helper's own name."""
+    _write(module_dir / "rk5_deco.py", _R5_DECO)
+    _write(
+        module_dir / "rk8_hrefused.py",
+        _R8_SLOT_HELPER.format(decorators=f"{wrapper}@SlotTraced\n@fingerprint_by_name\n"),
+    )
+    _write(
+        module_dir / "rk8_srefused.py",
+        "import rk8_hrefused as h\n\n\ndef my_stage():\n    return h.helper()\n",
+    )
+    with pytest.raises(exceptions.StageDefinitionError) as refused:
+        fingerprint.get_stage_fingerprint(
+            _fresh("rk5_deco", "rk8_hrefused", "rk8_srefused").my_stage
+        )
+    message = str(refused.value)
+    assert "'rk5_deco.SlotTraced' is above 'rk8_hrefused.helper'" in message, message
+    assert "put @fingerprint_by_name above the class-based decorator" in message, message
+
+    _write(
+        module_dir / "rk8_hfixed.py",
+        _R8_SLOT_HELPER.format(decorators=f"{wrapper}@fingerprint_by_name\n@SlotTraced\n"),
+    )
+    _write(
+        module_dir / "rk8_sfixed.py",
+        "import rk8_hfixed as h\n\n\ndef my_stage():\n    return h.helper()\n",
+    )
+    manifest = fingerprint.get_stage_fingerprint(
+        _fresh("rk5_deco", "rk8_hfixed", "rk8_sfixed").my_stage
+    )
+    named = {value for key, value in manifest.items() if key.startswith("ext:")}
+    assert "rk8_hfixed.helper" in named, manifest
+
+
+_R8_SLOT_UNIT = """\
+import functools
+
+from pivot import fingerprint_by_name
+from rk5_deco import SlotTraced, Traced
+
+
+def helper():
+    return 5
+
+
+INSTANCE = SlotTraced(helper)
+MARKED = fingerprint_by_name(INSTANCE)
+CACHED = functools.cache(MARKED)
+OTHER = SlotTraced(helper)
+ABOVE = Traced(MARKED)
+"""
+
+
+def test_the_mark_on_an_object_without_a_dict_marks_that_object_only(
+    module_dir: pathlib.Path,
+) -> None:
+    """The mark on a `SlotTraced` instance marks that instance: not a wrapper over it, not
+    another instance over the same function, not the function. The walk names it, and a
+    library wrapper over it, by the helper its chain ends at, and a refusal of a class-based
+    decorator above it names that helper."""
+    _write(module_dir / "rk5_deco.py", _R5_DECO)
+    _write(module_dir / "rk8_unit.py", _R8_SLOT_UNIT)
+    unit = _fresh("rk5_deco", "rk8_unit")
+    assert unit.MARKED is unit.INSTANCE
+    assert fingerprint.fingerprinted_by_name(unit.MARKED)
+    for other in (unit.CACHED, unit.OTHER, unit.helper, unit.ABOVE):
+        assert not fingerprint.fingerprinted_by_name(other), other
+    assert fingerprint._library_name(unit.MARKED) == "rk8_unit.helper"
+    assert fingerprint._library_name(unit.CACHED) == "rk8_unit.helper"
+    assert fingerprint._mark_decision(unit.CACHED) is fingerprint._MarkDecision.BY_NAME
+    assert fingerprint._mark_decision(unit.OTHER) is None
+    with pytest.raises(exceptions.StageDefinitionError) as refused:
+        fingerprint._refuse_class_above_mark(unit.ABOVE)
+    assert "'rk5_deco.Traced' is above 'rk8_unit.helper'" in str(refused.value)
+
+
+@typing.final
+class _SlotsOnly:
+    __slots__ = ("__wrapped__",)
+
+    def __init__(self, fn: object) -> None:
+        self.__wrapped__ = fn
+
+    @typing.override
+    def __eq__(self, other: object) -> bool:  # an __eq__ without __hash__: not hashable
+        return other is self
+
+    def __call__(self) -> int:
+        return 1
+
+
+def _helper_for_slots() -> int:
+    return 1
+
+
+def test_a_deleted_marked_slots_object_leaves_no_mark_on_a_new_object() -> None:
+    """A marked object without a `__dict__` is held by the table of marked objects, by a strong
+    reference, so deleting every other reference neither frees it nor frees its address: no new
+    object gets its id, and no new object reads as marked. The object need not be hashable."""
+    marked = _SlotsOnly(_helper_for_slots)
+    with pytest.raises(TypeError):
+        hash(marked)
+    fingerprint.mark_by_name(marked)
+    key = id(marked)
+    assert fingerprint.fingerprinted_by_name(marked)
+    del marked
+    gc.collect()
+
+    assert isinstance(fingerprint._marked_without_dict[key], _SlotsOnly)
+    fresh = [_SlotsOnly(_helper_for_slots) for _ in range(2000)]
+    assert key not in {id(item) for item in fresh}
+    assert not any(fingerprint.fingerprinted_by_name(item) for item in fresh)
+
+    # The lookup checks identity too: an entry under another object's id does not mark it.
+    stranger = _SlotsOnly(_helper_for_slots)
+    fingerprint._marked_without_dict[id(stranger)] = fresh[0]
+    try:
+        assert not fingerprint.fingerprinted_by_name(stranger)
+    finally:
+        del fingerprint._marked_without_dict[id(stranger)]
