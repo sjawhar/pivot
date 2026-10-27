@@ -58,6 +58,7 @@ def module_dir(tmp_path: pathlib.Path):
                 "rk6_",
                 "rk7_",
                 "rk8_",
+                "rk9_",
             )
         )
     ]
@@ -3574,6 +3575,14 @@ class Plain:
         self.scale = 3
 
 
+class TypeRaises:
+    def __init__(self):
+        self.scale = 3
+
+    def __getattr__(self, name):
+        raise TypeError(f"bad name: {name}")
+
+
 class CallPlain(Plain):
     def __call__(self):
         return 3
@@ -3588,6 +3597,7 @@ WRAPPED_RAISES = WrappedRaises()
 WRAPPED_KEY = WrappedKey()
 PLAIN = Plain()
 CALL_PLAIN = CallPlain()
+TYPE_RAISES = TypeRaises()
 """
 # Each object, and the plain object of its kind whose decision it must get.
 _R8_CONTROLS = {
@@ -3595,6 +3605,7 @@ _R8_CONTROLS = {
     "ATTR": "PLAIN",
     "LAZY": "PLAIN",
     "SLOT": "PLAIN",
+    "TYPE_RAISES": "PLAIN",
     "CALL_KEY": "CALL_PLAIN",
     "WRAPPED_RAISES": "CALL_PLAIN",
     "WRAPPED_KEY": "CALL_PLAIN",
@@ -3997,3 +4008,188 @@ def test_a_deleted_marked_slots_object_leaves_no_mark_on_a_new_object() -> None:
         assert not fingerprint.fingerprinted_by_name(stranger)
     finally:
         del fingerprint._marked_without_dict[id(stranger)]
+
+
+# ---------------------------------------------------------------------------------------------
+# The pydantic probe asks for `model_dump` as the chain reader asks for `__wrapped__`: from the
+# object's own `__dict__`, or on its class as a slot, a property or a method, with no
+# `__getattr__` and no property run. An object that merely answers every name it lacks (a
+# `unittest.mock.MagicMock`, an attribute tree such as `addict.Dict`) is not a pydantic model:
+# it gets the decision a plain object of its kind gets, and its canonical form holds its own
+# state. Main calls `model_dump()` on such an object, which raises TypeError for a non-callable
+# answer, recurses without end for a MagicMock, or returns a value holding none of its state.
+# ---------------------------------------------------------------------------------------------
+
+_R9_CONFIG = """\
+from unittest import mock
+
+
+class Plain:
+    def __init__(self, factor):
+        self.factor = factor
+
+
+class CallPlain(Plain):
+    def __call__(self):
+        return self.factor
+
+
+class Tree:
+    def __init__(self, factor):
+        self.factor = factor
+
+    def __getattr__(self, name):
+        return Tree(0)
+
+
+class Invent:
+    def __init__(self, factor):
+        self.factor = factor
+
+    def __getattr__(self, name):
+        return Invent(0)
+
+    def __call__(self, *args, **kwargs):
+        return 1
+
+
+PLAIN = Plain({factor})
+CALL_PLAIN = CallPlain({factor})
+TREE = Tree({factor})
+INVENT = Invent({factor})
+MAGIC = mock.MagicMock(factor={factor})
+"""
+# Each answering object, and the plain object of its kind whose decision it must get.
+_R9_CONTROLS = {"TREE": "PLAIN", "INVENT": "CALL_PLAIN"}
+_R9_FORMS = {
+    "partial_argument": (
+        "import functools\n\nimport rk9_cfg\n\n\ndef _apply(cfg):\n    return cfg.factor\n\n\n"
+        "RUNNER = functools.partial(_apply, rk9_cfg.{obj})\n\n\n"
+        "def my_stage():\n    return RUNNER()\n"
+    ),
+    "partial_keyword": (
+        "import functools\n\nimport rk9_cfg\n\n\ndef _apply(cfg=None):\n    return cfg.factor\n\n\n"
+        "RUNNER = functools.partial(_apply, cfg=rk9_cfg.{obj})\n\n\n"
+        "def my_stage():\n    return RUNNER()\n"
+    ),
+    "helper_default": (
+        "import rk9_cfg\n\n\ndef _apply(cfg=rk9_cfg.{obj}):\n    return cfg.factor\n\n\n"
+        "def my_stage():\n    return _apply()\n"
+    ),
+}
+
+
+def _r9_outcome(module_dir: pathlib.Path, obj: str, form: str, factor: int = 3) -> str:
+    """ "manifest", "non-scalar refusal", or the first line of another refusal. Any other
+    exception propagates: it is the defect."""
+    tag = f"{obj}_{form}".lower()
+    _write(module_dir / "rk9_cfg.py", _R9_CONFIG.format(factor=factor))
+    _write(module_dir / f"rk9_s_{tag}.py", _R9_FORMS[form].format(obj=obj))
+    stage = _fresh("rk9_cfg", f"rk9_s_{tag}").my_stage
+    try:
+        fingerprint.get_stage_fingerprint(stage)
+    except exceptions.StageDefinitionError as refused:
+        first = str(refused).splitlines()[0]
+        return "non-scalar refusal" if "captures non-scalar variable" in first else first
+    return "manifest"
+
+
+@pytest.mark.parametrize("unsafe", [False, True], ids=["strict", "unsafe"])
+@pytest.mark.parametrize("form", list(_R9_FORMS))
+@pytest.mark.parametrize("obj", list(_R9_CONTROLS))
+def test_an_object_that_answers_every_name_gets_a_plain_objects_decision(
+    module_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch, obj: str, form: str, unsafe: bool
+) -> None:
+    """No mark anywhere. An object whose `__getattr__` returns a fresh object for every name it
+    lacks has no `model_dump`; it gets the decision the plain object of its kind gets."""
+    if unsafe:
+        monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
+    else:
+        monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING", raising=False)
+    expected = _r9_outcome(module_dir, _R9_CONTROLS[obj], form)
+    assert expected in ("manifest", "non-scalar refusal"), expected
+    assert _r9_outcome(module_dir, obj, form) == expected
+
+
+# The MagicMock case runs in a child process capped at 2 GiB of address space: where the probe
+# runs `model_dump`, a MagicMock returns a new MagicMock at each level, and the recursion takes
+# several GiB before it ends.
+_R9_MAGIC_CHILD = """\
+import os, resource, sys
+resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))
+root = sys.argv[1]
+os.chdir(root)
+sys.path.insert(0, root)
+from pivot import exceptions, fingerprint
+import rk9_stage
+try:
+    fingerprint.get_stage_fingerprint(rk9_stage.my_stage)
+except exceptions.StageDefinitionError as refused:
+    print("DECISION refused:", str(refused).splitlines()[0])
+else:
+    print("DECISION manifest")
+"""
+
+
+@pytest.mark.parametrize("unsafe", [False, True], ids=["strict", "unsafe"])
+@pytest.mark.parametrize("form", list(_R9_FORMS))
+def test_a_magicmock_gets_a_decision_not_an_error(
+    module_dir: pathlib.Path, form: str, unsafe: bool
+) -> None:
+    """A MagicMock (a library object that answers every name) as a partial argument, a partial
+    keyword or a helper's default gets a manifest or a Pivot refusal, not an error from
+    `model_dump` (RecursionError, or MemoryError under the cap)."""
+    _write(module_dir / "rk9_cfg.py", _R9_CONFIG.format(factor=3))
+    _write(module_dir / "rk9_stage.py", _R9_FORMS[form].format(obj="MAGIC"))
+    (module_dir / ".pivot").mkdir(exist_ok=True)  # the child runs there, as a project root
+    env = {key: value for key, value in os.environ.items() if key != "PIVOT_UNSAFE_FINGERPRINTING"}
+    if unsafe:
+        env["PIVOT_UNSAFE_FINGERPRINTING"] = "1"
+    done = subprocess.run(
+        [sys.executable, "-c", _R9_MAGIC_CHILD, str(module_dir)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+        check=False,
+    )
+    assert done.returncode == 0 and "DECISION" in done.stdout, done.stderr[-1500:]
+
+
+@pytest.mark.parametrize("obj", ["PLAIN", "TREE", "INVENT"])
+def test_the_canonical_form_of_an_object_that_answers_every_name_holds_its_state(
+    module_dir: pathlib.Path, obj: str
+) -> None:
+    """The canonical form of a partial argument records the object's own attributes, so an edit
+    to them changes it, as it does for a plain object."""
+    forms = list[typing.Any]()
+    for factor in (3, 30):
+        _write(module_dir / "rk9_cfg.py", _R9_CONFIG.format(factor=factor))
+        cfg = _fresh("rk9_cfg")
+        forms.append(fingerprint._canonicalize_value_for_hash(getattr(cfg, obj)))
+    assert forms[0] != forms[1], forms
+
+
+def test_a_pydantic_model_is_still_dumped_however_it_keeps_model_dump(
+    module_dir: pathlib.Path,
+) -> None:
+    """`model_dump` on the class (a pydantic model), in the instance's own `__dict__`, or in a
+    slot still dumps. Only an object that answers the name without keeping it does not."""
+
+    class Model(pydantic.BaseModel):
+        scale: int = 3
+
+    canonical = fingerprint._canonicalize_value_for_hash
+    assert canonical(Model()) == canonical({"scale": 3})
+
+    class OwnDict:
+        model_dump: typing.Callable[[], dict[str, int]]
+
+        def __init__(self) -> None:
+            self.model_dump = lambda: {"scale": 3}
+
+    assert canonical(OwnDict()) == canonical({"scale": 3})
+
+    _write(module_dir / "rk9_cfg.py", _R9_CONFIG.format(factor=3))
+    cfg = _fresh("rk9_cfg")
+    assert canonical(cfg.TREE) == ["rk9_cfg.Tree", canonical({"factor": 3})]

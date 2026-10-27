@@ -1987,6 +1987,19 @@ def _attribute_or_none(value: Any, name: str) -> Any:
         return None
 
 
+def _keeps_own_attribute(obj: Any, name: str) -> bool:
+    """Whether `obj` keeps `name` of its own: in its `__dict__`, or on its class (a slot, a
+    property, a method, a class attribute). Nothing of `obj` runs: neither its `__getattr__` nor
+    a property, so an object that answers every name it lacks (a `unittest.mock.MagicMock`, an
+    attribute tree) does not read as having it.
+    """
+    try:
+        namespace: Mapping[str, Any] = object.__getattribute__(obj, "__dict__")
+    except AttributeError:
+        namespace = {}
+    return name in namespace or any(name in vars(klass) for klass in type(obj).__mro__)
+
+
 def _is_user_class_instance(value: Any) -> bool:
     """Return whether `value` is an instance of a user-defined class."""
     return not isinstance(value, type) and is_user_code(type(value))
@@ -2022,7 +2035,7 @@ def _library_module(value: Any) -> types.ModuleType | None:
     name = _attribute_or_none(value, "__name__")
     if not isinstance(name, str):
         return None
-    module_name = _attribute_or_none(value, "__module__")
+    module_name = getattr(value, "__module__", None)
     candidates: list[types.ModuleType | None]
     if isinstance(module_name, str):
         candidates = [sys.modules.get(module_name)]
@@ -2790,13 +2803,14 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     library function, or a library module's own callable export,
     becomes `["external", _library_name]`: its repr can hold an address (`np.mean`). A
     `functools.partial` is canonicalised through its function and arguments. A pydantic
-    instance is dumped in python mode, which keeps each secret (`SecretStr`, `SecretBytes`,
-    `Secret[T]`) as its own object; a secret becomes `["secret", digest]`, the keyed digest the
-    lock file records for it (`parameters.secret_digest`), so changing it changes the hash and
-    no fingerprint holds its value. A dataclass instance becomes `[module.qualname,
-    canonical({field: value})]`, field by field, so a secret inside one reaches that leaf
-    rather than the generated repr's mask. An object whose class keeps `object.__repr__`
-    (which holds the address) and that has a `__dict__` becomes
+    instance, which keeps `model_dump` in its own `__dict__` or on its class
+    (`_keeps_own_attribute`), is dumped in python mode, which keeps each secret (`SecretStr`,
+    `SecretBytes`, `Secret[T]`) as its own object; a secret becomes `["secret", digest]`, the
+    keyed digest the lock file records for it (`parameters.secret_digest`), so changing it
+    changes the hash and no fingerprint holds its value. A dataclass instance becomes
+    `[module.qualname, canonical({field: value})]`, field by field, so a secret inside one
+    reaches that leaf rather than the generated repr's mask. An object whose class keeps
+    `object.__repr__` (which holds the address) and that has a `__dict__` becomes
     `[module.qualname, canonical(vars(obj))]`, without the `@fingerprint_by_name` mark that
     `functools.update_wrapper` copies into a wrapper. A compiled regex becomes
     `["re.Pattern", canonical(pattern), flags]`, so its full pattern is recorded. Other leaves
@@ -2820,7 +2834,7 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     decision = _mark_decision(value)
     if decision is _MarkDecision.REFUSED:
         _refuse_class_above_mark(value)
-    if _has_attribute(value, "model_dump") and not isinstance(value, type):
+    if not isinstance(value, type) and _keeps_own_attribute(value, "model_dump"):
         return _canonicalize_value_for_hash(value.model_dump(), (*active, id(value)))
     if inspect.isfunction(value):
         return ["function", _function_identity(value, active)]
@@ -3324,33 +3338,20 @@ def unwrap(obj: Any, stop: Callable[[Any], bool] | None = None) -> Any:
     return end
 
 
-def _keeps_own_wrapped(obj: Any) -> bool:
-    """Whether `obj` keeps a `__wrapped__` of its own: in its `__dict__`, or on its class (a slot,
-    a property, a class attribute). Nothing of `obj` runs: neither its `__getattr__` nor the
-    property."""
-    try:
-        namespace: Mapping[str, Any] = object.__getattribute__(obj, "__dict__")
-    except AttributeError:
-        namespace = {}
-    return "__wrapped__" in namespace or any(
-        "__wrapped__" in vars(klass) for klass in type(obj).__mro__
-    )
-
-
 def _mark_chain(obj: Any) -> Iterator[Any]:
     """`wrapper_chain(obj)` as the mark decision reads it, for a value main may not walk as code.
 
-    `obj` is a wrapper only if it keeps a `__wrapped__` of its own (`_keeps_own_wrapped`), so its
-    `__getattr__` is not asked. Then the chain is read as `wrapper_chain` reads it, with the same
-    reads, and a lookup that raises an exception other than AttributeError ends the chain. Main
-    reads no `__wrapped__` of a value it does not unwrap, such as a callable user class instance,
-    which it refuses as it is; so an object whose `__getattr__` answers every name, or raises
-    KeyError for a missing one (a dict-backed config, an `AttrDict`), and a `__wrapped__`
+    `obj` is a wrapper only if it keeps a `__wrapped__` of its own (`_keeps_own_attribute`), so
+    its `__getattr__` is not asked. Then the chain is read as `wrapper_chain` reads it, with the
+    same reads, and a lookup that raises an exception other than AttributeError ends the chain.
+    Main reads no `__wrapped__` of a value it does not unwrap, such as a callable user class
+    instance, which it refuses as it is; so an object whose `__getattr__` answers every name, or
+    raises KeyError for a missing one (a dict-backed config, an `AttrDict`), and a `__wrapped__`
     property that raises, give no chain, and the value is decided as main decides it. Where main
     does unwrap the value, `unwrap` reads the chain as `inspect.unwrap` does on main, errors
     included.
     """
-    if not _keeps_own_wrapped(obj):
+    if not _keeps_own_attribute(obj, "__wrapped__"):
         yield obj
         return
     chain = wrapper_chain(obj)
