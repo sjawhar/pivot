@@ -345,6 +345,13 @@ class RemoteConnectionError(RemoteError):
         return "Check network connection and remote credentials"
 
 
+class RemoteUnreachableError(RemoteConnectionError):
+    """Raised when a connection to the remote cannot be made after the retries: a DNS failure, a
+    refused connection, a connect timeout, a TLS failure or a proxy that cannot be connected to.
+    Every object of the remote fails the same way, unlike a failure of one object on a remote
+    that answered."""
+
+
 class InvalidRemoteURLError(RemoteError):
     """Raised when remote URL is malformed or uses unsupported scheme."""
 
@@ -359,14 +366,6 @@ class RemoteTransferError(RemoteError):
     @override
     def get_suggestion(self) -> str:
         return "Check network connection and remote permissions"
-
-
-class RemoteFetchError(RemoteError):
-    """Raised when fetching from remote fails."""
-
-    @override
-    def get_suggestion(self) -> str:
-        return "Check network connection and verify the file exists on remote"
 
 
 class RemoteNotConfiguredError(RemoteError):
