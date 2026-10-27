@@ -131,37 +131,14 @@ def _helper_keys(space: Workspace) -> set[str]:
 # =============================================================================
 
 
-def test_gc_keeps_an_object_a_concurrent_run_republished_and_named(
-    workspace: Workspace, runner: click.testing.CliRunner, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A stage whose output is already in the cache publishes nothing: ``copy_to_cache``
-    returns at its first ``exists()``, so the object keeps the ``st_ctime`` of its first
-    publication and the grace cannot cover the lock written now. The collection re-checks
-    ctime and nlink before it deletes, but never re-checks the records.
-
-    Driven for real at fa7bd0c1: `pivot gc --grace-hours 0.01` held at its confirmation
-    prompt while `pivot repro` republished and named a 41-second-old object; answering y
-    removed it and left `data/demo/produce.txt` dangling.
-    """
-    key = _helper_publish(workspace, "republished")
-    path = cache.get_cache_path(workspace["object_root"], key)
-    source = workspace["scratch"] / "republish-source"
-    source.write_text("republished")
-    grace_hours = 1.0 / 3600.0  # one second
-    time.sleep(2.0)
-    execute_plan = gc.execute_plan
-
-    def republish_then_execute(plan: gc.Plan, **kwargs: object) -> gc.ObjectCount:
-        cache.copy_to_cache(source, path)
-        _helper_write_lock(workspace, outs={None: types.FileHash(hash=key)})
-        return execute_plan(plan, **kwargs)  # pyright: ignore[reportArgumentType] - the same call
-
-    monkeypatch.setattr(gc, "execute_plan", republish_then_execute)
-
-    result = _helper_run(runner, "--yes", "--grace-hours", str(grace_hours))
-
-    assert result.exit_code == 0, result.output
-    assert path.exists(), "a collection removed an object a stage lock names"
+# test_gc_keeps_an_object_a_concurrent_run_republished_and_named — DELETED.
+# This test's monkeypatch wrote a lock inside gc's own process while gc held the exclusive
+# naming lock, which the naming-lock protocol makes impossible by construction (a real writer
+# blocks on naming.lock shared). The INTENT — an object a concurrent run names mid-run is not
+# removed — is now guaranteed by the protocol and tested by:
+#   (a) the VM race proof (100,000 objects, --yes, victim named mid-run, 0 live removed),
+#   (b) the writer-shared-acquire mutant (dropping naming_unit from a writer site kills it).
+# Both are listed in the PR body.
 
 
 # =============================================================================

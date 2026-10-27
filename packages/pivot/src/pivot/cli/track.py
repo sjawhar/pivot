@@ -9,6 +9,7 @@ from pivot import config, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.storage import cache
+from pivot.storage import gc as gc_mod
 from pivot.storage import track as track_mod
 
 
@@ -153,43 +154,48 @@ def _track_single_path(
     if abs_path_str in existing_tracked and not force:
         raise click.ClickException(f"'{path_str}' is already tracked. Use --force to update.")
 
-    # Hash and cache
-    if path.is_dir():
-        dir_hash = cache.hash_directory(
-            path, cache_dir=cache_dir, warn_left_out_symlinks=warn_left_out_symlinks
-        )
-        manifest = dir_hash["manifest"]
-        total_size = sum(e["size"] for e in manifest)
-        num_files = len(manifest)
+    # Naming-lock unit (shared): copy_to_cache checks object existence, then write_pvt_file
+    # writes the record that names the objects. gc cannot delete while this unit is open.
+    with gc_mod.naming_unit(
+        cache_dir.parent
+    ):  # cache_dir is <cache>/files; naming.lock is at <cache>
+        # Hash and cache
+        if path.is_dir():
+            dir_hash = cache.hash_directory(
+                path, cache_dir=cache_dir, warn_left_out_symlinks=warn_left_out_symlinks
+            )
+            manifest = dir_hash["manifest"]
+            total_size = sum(e["size"] for e in manifest)
+            num_files = len(manifest)
 
-        for entry in manifest:
-            file_path = path / entry["relpath"]
-            file_cache_path = cache.get_cache_path(cache_dir, entry["hash"])
-            cache.copy_to_cache(file_path, file_cache_path, executable=entry["isexec"])
+            for entry in manifest:
+                file_path = path / entry["relpath"]
+                file_cache_path = cache.get_cache_path(cache_dir, entry["hash"])
+                cache.copy_to_cache(file_path, file_cache_path, executable=entry["isexec"])
 
-        pvt_data: track_mod.PvtData = {
-            "path": path.name,
-            "hash": dir_hash["hash"],
-            "size": total_size,
-            "num_files": num_files,
-            "manifest": manifest,
-        }
-        if "empty_dirs" in dir_hash:
-            pvt_data["empty_dirs"] = dir_hash["empty_dirs"]
-    else:
-        file_hash, _ = cache.hash_file(path)
-        file_size = path.stat().st_size
-        file_cache_path = cache.get_cache_path(cache_dir, file_hash)
-        cache.copy_to_cache(path, file_cache_path)
+            pvt_data: track_mod.PvtData = {
+                "path": path.name,
+                "hash": dir_hash["hash"],
+                "size": total_size,
+                "num_files": num_files,
+                "manifest": manifest,
+            }
+            if "empty_dirs" in dir_hash:
+                pvt_data["empty_dirs"] = dir_hash["empty_dirs"]
+        else:
+            file_hash, _ = cache.hash_file(path)
+            file_size = path.stat().st_size
+            file_cache_path = cache.get_cache_path(cache_dir, file_hash)
+            cache.copy_to_cache(path, file_cache_path)
 
-        pvt_data = {
-            "path": path.name,
-            "hash": file_hash,
-            "size": file_size,
-        }
+            pvt_data = {
+                "path": path.name,
+                "hash": file_hash,
+                "size": file_size,
+            }
 
-    # Write .pvt file
-    track_mod.write_pvt_file(pvt_path, pvt_data)
+        # Write .pvt file
+        track_mod.write_pvt_file(pvt_path, pvt_data)
 
     # Update existing_tracked for subsequent paths
     existing_tracked[abs_path_str] = pvt_data

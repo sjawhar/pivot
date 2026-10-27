@@ -12,6 +12,7 @@ import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
 from pivot.storage import cache, lock, track
+from pivot.storage import gc as gc_mod
 from pivot.types import HashInfo
 
 if TYPE_CHECKING:
@@ -490,16 +491,22 @@ def restore_targets_from_revision(
                 )
                 continue
 
-            result = restore_file(
-                rel_path=rel_path,
-                output_hash=output_hash,
-                rev=rev,
-                dest_path=dest_path,
-                cache_dir=cache_dir,
-                checkout_modes=checkout_modes,
-                force=force,
-                remote_factory=reachable_remote,
-            )
+            # Naming-lock unit (shared): restore_file checks object existence and creates the
+            # workspace link. The record is in git (the revision's lock), so the unit covers
+            # only the link creation, but that link IS the workspace's only record in symlink
+            # mode. gc cannot delete while this unit is open. ``cache_dir`` here is the cache
+            # root (``restore_file`` reads objects from ``cache_dir / "files"``).
+            with gc_mod.naming_unit(cache_dir):
+                result = restore_file(
+                    rel_path=rel_path,
+                    output_hash=output_hash,
+                    rev=rev,
+                    dest_path=dest_path,
+                    cache_dir=cache_dir,
+                    checkout_modes=checkout_modes,
+                    force=force,
+                    remote_factory=reachable_remote,
+                )
             if "unreachable_remote" in result:
                 unreachable = result["unreachable_remote"]
             results.append(result)

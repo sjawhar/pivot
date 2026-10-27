@@ -287,11 +287,13 @@ def read_register(
             # The root is unreachable (unmounted share, another host's path, cross-host cache).
             # The register records the host but a host mismatch does not prove deletion, so
             # this entry is unreadable (M2: refuse rather than drop and remove its objects).
-            unreadable.append((
-                scope_label(scope),
-                f"the project root {scope['root']} and its parent are absent; if it is on "
-                + "another host or an unmounted filesystem, restore access before collecting",
-            ))
+            unreadable.append(
+                (
+                    scope_label(scope),
+                    f"the project root {scope['root']} and its parent are absent; if it is on "
+                    + "another host or an unmounted filesystem, restore access before collecting",
+                )
+            )
     return live, gone, unreadable
 
 
@@ -710,18 +712,26 @@ def naming_unit(cache_dir: pathlib.Path) -> Generator[None]:
     The turnstile SH is released immediately after acquiring naming SH. This unit must NOT
     span stage execution — only the commit step.
 
-    Where ``flock`` is refused (``cache.NO_FLOCK_ERRNO``), the unit runs unlocked.
+    The cache directory is created when missing: the commit this unit guards is about to
+    publish into it, and a first commit into a fresh cache must hold the lock like any other
+    (otherwise ``gc --grace-hours 0`` started mid-commit could collect its objects). Where
+    ``flock`` is refused (``cache.NO_FLOCK_ERRNO``), the unit runs unlocked. Where the lock
+    files cannot be opened at all (a cache this user cannot write), the unit also runs
+    unlocked: such a writer cannot publish, and only re-links objects that already exist.
     """
     ts_path = cache_dir / NAMING_TURNSTILE
     nm_path = cache_dir / NAMING_LOCK
     try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
         ts_fd = cache.open_cache_lock(ts_path)
-    except OSError:
+    except OSError as e:
+        logger.debug("Cannot open %s (%s); proceeding unlocked", ts_path, e)
         yield
         return
     try:
         nm_fd = cache.open_cache_lock(nm_path)
-    except OSError:
+    except OSError as e:
+        logger.debug("Cannot open %s (%s); proceeding unlocked", nm_path, e)
         os.close(ts_fd)
         yield
         return
@@ -734,6 +744,13 @@ def naming_unit(cache_dir: pathlib.Path) -> Generator[None]:
         except OSError as e:
             if e.errno not in cache.NO_FLOCK_ERRNO:
                 raise
+            # gc refuses outright on a filesystem that refuses flock (collection_lock), so a
+            # writer here is never racing a collector. This is a reasoned exemption, not a
+            # silent fallback: if gc ever collects on a flockless mount, the writers must also
+            # take the lock. See storage/AGENTS.md "gc refuses, writers proceed."
+            logger.debug(
+                "flock refused on %s; proceeding unlocked (gc refuses on this mount)", nm_path
+            )
             locked = False
         yield
     finally:
@@ -901,29 +918,18 @@ def _keep_reason(
 def execute_plan(
     plan: Plan,
     *,
-    scopes: Iterable[ProjectScope],
-    cache_dir: pathlib.Path,
+    roots: Roots,
     grace_hours: float,
     remove_linked: bool,
     now: float | None = None,
 ) -> ObjectCount:
     """Remove what the plan condemns, under each prefix's lock, and return what went.
 
-    The liveness records are re-read here, after the plan's scan and immediately before the
-    deletions, so an object a concurrent run named between the scan and now — a lock, a
-    run-cache row, a workspace link — is kept (``_keep_reason`` against the fresh records). Each
-    object is also re-checked against the grace and the hardlink rule, because since the scan a
-    checkout can have hardlinked it and a reusing run can have refreshed its timestamp
-    (``copy_to_cache``). The deletion protocol (how wide the remaining exposure is and whether a
-    per-object re-check under the prefix lock can close it) is under a design consult; the
-    current implementation re-reads the records once at the start of this pass. A record that
-    could not be read keeps every object, as the plan does.
-
-    Raises:
-        ProjectUnreadableError: a project became unreadable since the plan; nothing is removed.
+    The caller holds ``naming_exclusive`` and passes the ``roots`` it collected under that lock,
+    so no writer can name an object between the caller's ``collect_roots`` and this pass's
+    unlinks. Each object is still re-checked against the grace and the hardlink rule (a checkout
+    already in flight before the lock was taken may have hardlinked it).
     """
-    fresh_roots = collect_roots(scopes, cache_dir)
-    keep_all = bool(fresh_roots["unreadable"] or fresh_roots["outward_dirs"])
     cutoff = (time.time() if now is None else now) - grace_hours * 3600
     removed = ObjectCount(objects=0, bytes=0)
     by_prefix = dict[pathlib.Path, list[Doomed]]()
@@ -941,11 +947,11 @@ def execute_plan(
                     removed["bytes"] += doomed["bytes"]
                     continue
                 key = prefix_dir.name + path.name
-                if keep_all or (
+                if (
                     _keep_reason(
                         key,
                         stats,
-                        fresh_roots,
+                        roots,
                         is_dir=doomed["is_dir"],
                         cutoff=cutoff,
                         remove_linked=remove_linked,

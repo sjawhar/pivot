@@ -12,6 +12,7 @@ import pathlib
 
 from pivot import config, exceptions, parameters, project, registry, run_history, skip, types
 from pivot.executor import worker
+from pivot.storage import gc as gc_mod
 from pivot.storage import lock
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
@@ -149,61 +150,66 @@ def commit_stages(
                 if not decision["changed"]:
                     continue
 
-            # 6. Hash and cache outputs
-            output_hashes_by_key = dict[str, HashInfo]()
-            output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
-            output_paths_by_identity = dict[types.ArtifactIdentity, str]()
-            file_hash_entries = list[tuple[str, int, int, int, str]]()
-            outputs_missing = False
-            for out in stage_outs:
-                identity_key = types.identity_key(out.identity)
+            # 6-7. Hash, cache outputs and write the lock, under the naming lock (shared):
+            # store.commit checks object existence and creates the checkout; the lock file
+            # names the objects. gc cannot delete while this unit is open.
+            with gc_mod.naming_unit(config.get_cache_dir()):
+                output_hashes_by_key = dict[str, HashInfo]()
+                output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
+                output_paths_by_identity = dict[types.ArtifactIdentity, str]()
+                file_hash_entries = list[tuple[str, int, int, int, str]]()
+                outputs_missing = False
+                for out in stage_outs:
+                    identity_key = types.identity_key(out.identity)
+                    try:
+                        out_path = store.resolve_display_path(out)
+                        hash_info = store.commit(
+                            out,
+                            out_path,
+                            state_dir=default_state_dir,
+                            warn_left_out_symlinks=warn_left_out_symlinks,
+                        )
+                        file_hash_entries.extend(
+                            worker.output_file_hash_entries(out_path, hash_info)
+                        )
+                        output_hashes_by_key[identity_key] = hash_info
+                        output_hashes_by_identity[out.identity] = hash_info
+                        output_paths_by_identity[out.identity] = out_path.relative_to(
+                            project_root
+                        ).as_posix()
+                    except FileNotFoundError:
+                        logger.error(
+                            "Stage '%s': output missing: %s — skipping", stage_name, identity_key
+                        )
+                        outputs_missing = True
+                        break
+                    except OSError:
+                        logger.error(
+                            "Stage '%s': output unreadable: %s — skipping",
+                            stage_name,
+                            identity_key,
+                        )
+                        outputs_missing = True
+                        break
+
+                if outputs_missing:
+                    failed.append(stage_name)
+                    continue
+
+                # 7. Write production lock
+                new_lock_data = LockData(
+                    code_manifest=code_manifest,
+                    params=current_params,
+                    dep_hashes=dict(sorted(dep_hashes_by_identity.items())),
+                    output_hashes=dict(sorted(output_hashes_by_identity.items())),
+                    output_paths=output_paths_by_identity,
+                )
                 try:
-                    out_path = store.resolve_display_path(out)
-                    hash_info = store.commit(
-                        out,
-                        out_path,
-                        state_dir=default_state_dir,
-                        warn_left_out_symlinks=warn_left_out_symlinks,
-                    )
-                    file_hash_entries.extend(worker.output_file_hash_entries(out_path, hash_info))
-                    output_hashes_by_key[identity_key] = hash_info
-                    output_hashes_by_identity[out.identity] = hash_info
-                    output_paths_by_identity[out.identity] = out_path.relative_to(
-                        project_root
-                    ).as_posix()
-                except FileNotFoundError:
-                    logger.error(
-                        "Stage '%s': output missing: %s — skipping", stage_name, identity_key
-                    )
-                    outputs_missing = True
-                    break
-                except OSError:
-                    logger.error(
-                        "Stage '%s': output unreadable: %s — skipping",
-                        stage_name,
-                        identity_key,
-                    )
-                    outputs_missing = True
-                    break
-
-            if outputs_missing:
-                failed.append(stage_name)
-                continue
-
-            # 7. Write production lock
-            new_lock_data = LockData(
-                code_manifest=code_manifest,
-                params=current_params,
-                dep_hashes=dict(sorted(dep_hashes_by_identity.items())),
-                output_hashes=dict(sorted(output_hashes_by_identity.items())),
-                output_paths=output_paths_by_identity,
-            )
-            try:
-                production_lock.write(new_lock_data)
-            except exceptions.InvalidPathError as exc:
-                logger.error("%s — skipping", exc)
-                failed.append(stage_name)
-                continue
+                    production_lock.write(new_lock_data)
+                except exceptions.InvalidPathError as exc:
+                    logger.error("%s — skipping", exc)
+                    failed.append(stage_name)
+                    continue
 
             # 8. Update StateDB: dep generations, output generations, run cache entry
             run_id = run_history.generate_run_id()

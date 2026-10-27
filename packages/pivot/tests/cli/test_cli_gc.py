@@ -649,10 +649,11 @@ def _helper_refuse_flock(_fd: int, _operation: int) -> None:
     raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
 
 
-def test_gc_refuses_grace_zero_where_the_filesystem_refuses_flock(
+def test_gc_refuses_where_the_filesystem_refuses_flock(
     workspace: Workspace, runner: click.testing.CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Where the locks exclude nothing, the grace is the only guard left, so it must stay."""
+    """Where flock is refused, gc refuses outright — even with a grace period — because the
+    naming lock cannot protect writers from a concurrent collection."""
     dead = _helper_publish(workspace, "dead")
     monkeypatch.setattr(fcntl, "flock", _helper_refuse_flock)
 
@@ -660,24 +661,23 @@ def test_gc_refuses_grace_zero_where_the_filesystem_refuses_flock(
 
     assert result.exit_code != 0, result.output
     assert "this filesystem refuses flock()" in result.output, result.output
-    assert "Run with a grace period." in result.output, result.output
+    assert "Nothing was removed." in result.output, result.output
     assert _helper_keys(workspace) == {dead}, "a refusal removes nothing"
 
 
-def test_gc_warns_but_collects_with_a_grace_where_flock_is_refused(
+def test_gc_refuses_flock_even_with_a_grace_period(
     workspace: Workspace, runner: click.testing.CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With a grace period the collection may go on, and says what the locks are worth."""
-    _helper_publish(workspace, "dead")
+    """A grace period does not rescue a collection where flock is refused: the naming lock is
+    what makes deletion safe, and the grace is only extra protection."""
+    dead = _helper_publish(workspace, "dead")
     monkeypatch.setattr(fcntl, "flock", _helper_refuse_flock)
-    # 0.0001h is 0.36s: waiting longer puts the object outside the grace whatever the load.
-    time.sleep(0.6)
 
-    result = _helper_run(runner, "--yes", "--grace-hours", "0.0001")
+    result = _helper_run(runner, "--yes", "--grace-hours", "24")
 
-    assert result.exit_code == 0, result.output
-    assert "refuses flock(), so pivot's cache locks exclude nothing here" in result.output
-    assert _helper_keys(workspace) == set(), result.output
+    assert result.exit_code != 0, result.output
+    assert "this filesystem refuses flock()" in result.output, result.output
+    assert _helper_keys(workspace) == {dead}, "a refusal removes nothing"
 
 
 def test_gc_waits_for_a_prefix_a_publisher_holds(
@@ -740,30 +740,23 @@ def test_gc_prunes_run_history_to_the_retention(
 
 
 # =============================================================================
-# Concurrency, round 2: the records re-read that keeps an object a run names
+# The naming-lock protocol: gc holds naming.lock exclusive while it deletes,
+# so no writer can name a cache object during the deletion pass.
+# The re-read guard (round 2) is withdrawn; the naming lock replaces it.
 # =============================================================================
 
 
-def test_gc_keeps_an_object_a_lock_named_after_the_plan(
-    workspace: Workspace, runner: click.testing.CliRunner, monkeypatch: pytest.MonkeyPatch
+def test_gc_creates_naming_lock_files(
+    workspace: Workspace, runner: click.testing.CliRunner
 ) -> None:
-    """The deletions re-read the records after the scan, so a lock a concurrent run writes
-    between the plan and the delete keeps its object even when the grace does not cover it.
-    Guard two of B1; a mutant that drops the re-read removes this object and fails here."""
-    key = _helper_publish(workspace, "named after the plan")
-    time.sleep(1.1)  # older than the one-second grace, so only the re-read can save it
-    real_execute = gc.execute_plan
+    """A collection creates naming.lock and naming.turnstile in the cache."""
+    _helper_publish(workspace, "dead")
 
-    def write_lock_then_execute(plan: gc.Plan, **kwargs: object) -> gc.ObjectCount:
-        _helper_write_lock(workspace, outs={None: types.FileHash(hash=key)})
-        return real_execute(plan, **kwargs)  # pyright: ignore[reportArgumentType] - the same call
-
-    monkeypatch.setattr(gc, "execute_plan", write_lock_then_execute)
-
-    result = _helper_run(runner, "--yes", "--grace-hours", str(1.0 / 3600.0))
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
 
     assert result.exit_code == 0, result.output
-    assert key in _helper_keys(workspace), "the deletions did not re-read the records"
+    assert (workspace["cache_dir"] / gc.NAMING_LOCK).exists(), "naming.lock not created"
+    assert (workspace["cache_dir"] / gc.NAMING_TURNSTILE).exists(), "naming.turnstile not created"
 
 
 def test_gc_keeps_a_republished_object_hardlinked_after_the_plan(
@@ -840,9 +833,7 @@ def test_gc_keeps_an_object_a_registered_peer_of_an_internal_cache_names(
             code_manifest={"self:peer": "abc123"},
             params={},
             dep_hashes={},
-            output_hashes={
-                types.ArtifactIdentity("peer/stage", None): types.FileHash(hash=theirs)
-            },
+            output_hashes={types.ArtifactIdentity("peer/stage", None): types.FileHash(hash=theirs)},
         )
     )
     gc.register_project(workspace["cache_dir"], peer, peer / ".pivot")
