@@ -38,66 +38,6 @@ def _helper_hash(content: bytes) -> str:
 
 
 # -----------------------------------------------------------------------------
-# RemoteFetcher Protocol Tests (for pivot get --rev)
-# -----------------------------------------------------------------------------
-
-
-def test_set_and_get_default_remote(mocker: MockerFixture) -> None:
-    """set_default_remote sets and get_default_remote retrieves it."""
-    mock_fetcher = mocker.Mock()
-
-    old_remote = remote_mod.get_default_remote()
-    try:
-        remote_mod.set_default_remote(mock_fetcher)
-        assert remote_mod.get_default_remote() is mock_fetcher
-
-        remote_mod.set_default_remote(None)
-        assert remote_mod.get_default_remote() is None
-    finally:
-        remote_mod.set_default_remote(old_remote)
-
-
-def test_fetch_from_remote_no_remote_configured() -> None:
-    """fetch_from_remote returns None when no remote configured."""
-    old_remote = remote_mod.get_default_remote()
-    try:
-        remote_mod.set_default_remote(None)
-        result = remote_mod.fetch_from_remote("abc123def4567890")
-        assert result is None
-    finally:
-        remote_mod.set_default_remote(old_remote)
-
-
-def test_fetch_from_remote_success(mocker: MockerFixture) -> None:
-    """fetch_from_remote returns content when remote fetch succeeds."""
-    mock_fetcher = mocker.Mock()
-    mock_fetcher.fetch.return_value = b"file content"
-
-    old_remote = remote_mod.get_default_remote()
-    try:
-        remote_mod.set_default_remote(mock_fetcher)
-        result = remote_mod.fetch_from_remote("abc123def4567890")
-        assert result == b"file content"
-        mock_fetcher.fetch.assert_called_once_with("abc123def4567890")
-    finally:
-        remote_mod.set_default_remote(old_remote)
-
-
-def test_fetch_from_remote_fetch_error(mocker: MockerFixture) -> None:
-    """fetch_from_remote returns None when remote raises RemoteFetchError."""
-    mock_fetcher = mocker.Mock()
-    mock_fetcher.fetch.side_effect = exceptions.RemoteFetchError("Network error")
-
-    old_remote = remote_mod.get_default_remote()
-    try:
-        remote_mod.set_default_remote(mock_fetcher)
-        result = remote_mod.fetch_from_remote("abc123def4567890")
-        assert result is None
-    finally:
-        remote_mod.set_default_remote(old_remote)
-
-
-# -----------------------------------------------------------------------------
 # S3Remote Initialization Tests
 # -----------------------------------------------------------------------------
 
@@ -343,6 +283,79 @@ async def test_s3_download_file_auth_error(
         match="Failed to download from S3",
     ):
         await s3_remote.download_file("abc123def4567890", local_path)
+
+
+@pytest.mark.parametrize(
+    ("cache_hash", "error"),
+    [
+        pytest.param(
+            "abc123def4567890",
+            botocore_exc.EndpointConnectionError(endpoint_url="http://127.0.0.1:9/b/files/ab"),
+            id="refused",
+        ),
+        pytest.param(
+            "abc123def4567890",
+            botocore_exc.ConnectTimeoutError(endpoint_url="http://10.255.255.1:9/b/files/ab"),
+            id="connect-timeout",
+        ),
+        pytest.param(
+            "4040404040404040",
+            botocore_exc.EndpointConnectionError(
+                endpoint_url="http://127.0.0.1:9/b/files/40/40404040404040"
+            ),
+            id="refused-for-a-key-holding-404",
+        ),
+    ],
+)
+async def test_s3_download_that_cannot_connect_is_unreachable(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    cache_hash: str,
+    error: Exception,
+) -> None:
+    """A download that cannot connect to S3 raises RemoteUnreachableError, so a caller knows the
+    remote, not one object, is unusable; a key whose text holds 404 is not "not found"."""
+    mock_client = mocker.AsyncMock()
+    mock_client.get_object = mocker.AsyncMock(side_effect=error)
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    with pytest.raises(exceptions.RemoteUnreachableError, match="Failed to download from S3"):
+        await s3_remote.download_file(cache_hash, tmp_path / "downloaded.txt")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            botocore_exc.ReadTimeoutError(endpoint_url="http://127.0.0.1:9/b/files/ab"),
+            id="read-timeout",
+        ),
+        pytest.param(
+            botocore_exc.ConnectionClosedError(endpoint_url="http://127.0.0.1:9/b/files/ab"),
+            id="closed-before-the-reply",
+        ),
+        pytest.param(
+            botocore_exc.ClientError(
+                {"Error": {"Code": "403", "Message": "Forbidden"}}, "GetObject"
+            ),
+            id="403",
+        ),
+    ],
+)
+async def test_s3_download_the_remote_answered_is_not_unreachable(
+    s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path, mocker: MockerFixture, error: Exception
+) -> None:
+    """A download that reached S3 and failed is that object's error, not RemoteUnreachableError,
+    so get keeps using the remote for its other targets."""
+    mock_client = mocker.AsyncMock()
+    mock_client.get_object = mocker.AsyncMock(side_effect=error)
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    with pytest.raises(exceptions.RemoteError) as exc_info:
+        await s3_remote.download_file("abc123def4567890", tmp_path / "downloaded.txt")
+
+    assert not isinstance(exc_info.value, exceptions.RemoteUnreachableError)
 
 
 async def test_upload_file(

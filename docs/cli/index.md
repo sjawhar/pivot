@@ -436,34 +436,44 @@ counts separately.
 
 Retrieve files or stage outputs from a specific git revision.
 
+Each output comes from the local cache, then git, then the remote: `get` downloads the cache objects the output is missing and restores it from the cache. An output that fails is reported with its reason; `get` still restores and reports the other targets. An object the remote does not serve (missing, corrupt, refused with an HTTP status, or a download that breaks off) fails only the outputs that need it. If no connection to the remote can be made (a DNS failure, a refused connection, a connect timeout, a TLS failure or a proxy that cannot be connected to, after `remote.retries` retries; on S3 also a connection reset on every retry), `get` stops using the remote for the rest of the command: each later output that needs it fails naming the remote, even if the remote would answer by then, so run `get` again. Missing or refused credentials do not stop it: each output that needs the remote tries again.
+
+A target whose `.pvt` file at the revision has a field `get` cannot use fails naming the file and that field: a `path` or `hash` that is not a string, a `manifest` that is not a list, a manifest entry that is not a mapping, lacks `relpath`, `hash` or `isexec`, or whose `relpath` or `hash` is not a string, and a manifest `relpath` or an `empty_dirs` entry holding a NUL byte. A target already in the workspace is skipped first, as for a valid `.pvt` file. A `.pvt` file that is not the shape pivot writes (a mapping with `path`, `hash` and `size`, and only keys pivot writes) is not read as a `.pvt` file, nor is one whose fields `get` can use but whose `path` is absolute or holds `..`: `get` looks the target up in git, and stops before restoring anything if git does not track it.
+
 ```bash
 pivot get TARGETS... --rev REVISION [OPTIONS]
 ```
 
 **Arguments:**
 
-- `TARGETS` - File paths or stage names (required)
+- `TARGETS` - Stage names (`demo/train`, or `demo/train:key` for one output), or paths of tracked (`.pvt`) or git-tracked files (required). A stage output's workspace path, such as `data/demo/train.jsonl`, works only if git tracks that file; name the stage instead.
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
 | `--rev` / `-r REV` | Git revision (SHA, branch, tag) - required |
+| `--remote NAME` | Remote name (uses default if not specified). An unknown name fails before anything is restored |
 | `--output` / `-o PATH` | Output path (single file only) |
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
 | `--force` / `-f` | Overwrite existing files |
 
+A downloaded cache object has no executable bit, so an executable file in a directory output cannot be hard-linked or symlinked to it. With a mode order that has no `copy` (`--checkout-mode hardlink` or `symlink`, or a `cache.checkout_mode` without `copy`), that output fails with an error naming the file. The default order, hardlink, symlink, copy, ends with `copy`, which restores the bit.
+
 **Examples:**
 
 ```bash
-# Get file from specific commit
-pivot get data/demo/train.jsonl --rev abc123
+# Get a stage's outputs from a specific commit
+pivot get demo/train --rev abc123
 
 # Get stage output from branch
 pivot get demo/train --rev feature-branch
 
-# Get with custom output path
-pivot get data/demo/train.jsonl --rev v1.0 --output old_train.jsonl
+# Get a stage's single output to a custom path
+pivot get demo/train --rev v1.0 --output old_train.jsonl
+
+# Get from a specific remote
+pivot get demo/train --rev abc123 --remote origin
 ```
 
 ---

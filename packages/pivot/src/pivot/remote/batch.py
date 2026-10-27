@@ -66,7 +66,9 @@ async def bulk_exists[C](
 
     Raises:
         RemoteError: A hash is not a valid cache hash (before any request).
-        Exception: Whatever ``open_client`` raises, unchanged (for GCS, unusable credentials).
+        Exception: Whatever ``open_client`` raises, unchanged (``RemoteConnectionError`` when a
+            backend cannot set up access: GCS unusable credentials, an S3 client that cannot
+            start).
         RemoteConnectionError: An existence check or listing failed; the message starts with
             ``label`` (the backend's name).
     """
@@ -166,8 +168,10 @@ async def transfer_batch[C](
 ) -> list[TransferResult]:
     """Run ``transfer_one`` for every ``(hash, local_path)`` in parallel on one client.
 
-    A transfer that raises becomes ``TransferResult(success=False, error=...)``, its exception
-    worded by ``exceptions.describe_error``, so one failed file never stops the rest.
+    A transfer that raises becomes ``TransferResult(success=False, error=...)``, so one failed file
+    never stops the rest: a generic exception is worded by ``exceptions.describe_error``, and a
+    ``RemoteUnreachableError`` (no connection to the remote could be made) keeps its message and
+    also sets ``connection_failed``.
     ``callback(completed, total, file_name)`` runs after each success.
 
     Raises:
@@ -197,6 +201,10 @@ async def transfer_batch[C](
                         if callback:
                             callback(completed, len(items), local_path.name)
                         return TransferResult(hash=hash_, success=True)
+                    except exceptions.RemoteUnreachableError as e:
+                        return TransferResult(
+                            hash=hash_, success=False, error=str(e), connection_failed=True
+                        )
                     except Exception as e:
                         error = exceptions.describe_error(e)
                         return TransferResult(hash=hash_, success=False, error=error)
