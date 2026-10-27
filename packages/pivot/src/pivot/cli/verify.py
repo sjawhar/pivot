@@ -205,6 +205,7 @@ def _create_remote_if_needed(allow_missing: bool) -> protocol.RemoteStorage | No
     except exceptions.RemoteError:
         raise
     except Exception as e:
+        # pivot's own error: its cause keeps the library's text, as before
         raise exceptions.RemoteError(f"Failed to create remote connection: {e}") from e
     return remote
 

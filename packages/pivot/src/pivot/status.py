@@ -157,12 +157,13 @@ def _get_explanations_in_parallel(
             try:
                 explanations_by_name[stage_name] = future.result()
             except Exception as e:
-                logger.warning(f"Failed to get explanation for {stage_name}: {e}")
+                message = exceptions.describe_error(e)
+                logger.warning(f"Failed to get explanation for {stage_name}: {message}")
                 explanations_by_name[stage_name] = StageExplanation(
                     stage_name=stage_name,
                     will_run=True,
                     is_forced=False,
-                    reason=f"Error: {e}",
+                    reason=f"Error: {message}",
                     code_changes=list[CodeChange](),
                     param_changes=list[ParamChange](),
                     dep_changes=list[DepChange](),
@@ -510,7 +511,7 @@ async def _check_imports_batch(
     results = list[ImportStatusInfo]()
     for (rel_path, _, _), check_or_exc in zip(tasks, checks, strict=True):
         if isinstance(check_or_exc, Exception):
-            error = str(check_or_exc) or type(check_or_exc).__name__
+            error = exceptions.describe_error(check_or_exc)
             logger.warning("Failed to check import %s: %s", rel_path, error)
             results.append(
                 ImportStatusInfo(

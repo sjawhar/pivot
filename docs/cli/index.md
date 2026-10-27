@@ -37,6 +37,15 @@ All commands support:
 | `--quiet` / `-q` | Suppress non-essential output |
 | `--help` | Show help message |
 
+**Errors.** A failure pivot recognizes prints its own message, often with a tip. Any other failure
+prints one line: an operating-system error as its message and the path it names (for example
+`Error: Permission denied: /home/me/proj/.pivot/cache/files/c9`), anything else as
+`Error: Unexpected <type>: <message>`. In `run` and `repro`, a stage that fails because pivot's
+own code hit such an error prints that same one line under its name; a failure that comes out of
+your own stage function prints its traceback, so you can debug it. The `--json` record keeps the
+stage's full reason in both cases, unchanged. `pivot --verbose <command>` also prints the
+traceback, after the TUI exits for `--tui`.
+
 **Path arguments.** `pivot track`, `push`, `fetch` and `pull` read a relative path from the
 current directory. `diff`, `checkout`, `repro`, `dag`, `get` and `check-ignore` read it from the
 project root, so from `sub/` they take the file `data/x.csv` as `data/x.csv`, not

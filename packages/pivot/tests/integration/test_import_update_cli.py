@@ -631,9 +631,10 @@ def test_update_failure_of_one_import_does_not_stop_the_others(
     result = runner.invoke(cli.cli, ["update"])
 
     assert result.exit_code == 1
-    assert f"Unexpected error updating {track.get_pvt_path(a_path)}: IsADirectoryError" in (
-        result.output
-    )
+    # The OS's words and the path, without the exception class or a traceback (--verbose logs it)
+    assert f"Error updating {track.get_pvt_path(a_path)}: Is a directory: " in result.output
+    assert "IsADirectoryError" not in result.output
+    assert "Traceback" not in result.output
     assert f"Updated: {b_path}" in result.output
     assert b_path.read_bytes() == b"b2"
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import sys
 import time
 from typing import TYPE_CHECKING
@@ -22,6 +23,21 @@ __all__ = [
     "LiveConsoleSink",
     "ResultCollectorSink",
 ]
+
+
+def _console_reason(event: StageCompleted) -> str:
+    """What the console prints under a failed stage.
+
+    The one-line ``display_reason`` when the event has one, else ``reason``. Under ``--verbose``
+    (the root logger at DEBUG) a one-line display gives way to the full ``reason``, the traceback
+    of an unexpected error. An empty display means a log line already names the failure.
+    """
+    if "display_reason" not in event:
+        return event["reason"]
+    display = event["display_reason"]
+    if display and logging.getLogger().isEnabledFor(logging.DEBUG):
+        return event["reason"]
+    return display
 
 
 _CATEGORY_SYMBOL: dict[DisplayCategory, str] = {
@@ -170,9 +186,9 @@ def _print_completions(
                     for log_line in stage_log:
                         escaped = rich.markup.escape(log_line)
                         console.print(f"          [dim]{escaped}[/dim]")
-                if event["reason"]:
-                    for detail in _format_error_detail(event["reason"], total=total):
-                        console.print(detail)
+                if detail := _console_reason(event):
+                    for line in _format_error_detail(detail, total=total):
+                        console.print(line)
             elif event["stage"] in warnings_by_stage:
                 buffered = warnings_by_stage[event["stage"]]
                 stage_lines = [

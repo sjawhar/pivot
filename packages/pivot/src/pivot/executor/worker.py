@@ -1062,13 +1062,21 @@ def _execute_stage(
                 ring_buffer,
                 input_hash=input_hash,
             )
-        except Exception:
-            return _make_result(
+        except Exception as exc:
+            # The record keeps the traceback. A failure out of the user's stage function prints
+            # it as before; one raised by pivot's own code prints as one line (--verbose: the
+            # traceback).
+            result = _make_result(
                 StageStatus.FAILED,
                 traceback.format_exc(),
                 ring_buffer,
                 input_hash=input_hash,
             )
+            raised_by_stage = getattr(_stage_call, "error", None) is exc
+            _stage_call.error = None
+            if not raised_by_stage:
+                result["display_reason"] = exceptions.describe_error(exc)
+            return result
 
 
 def user_code_files() -> list[str]:
@@ -1697,6 +1705,11 @@ def _prepare_incremental_inputs(
     return values
 
 
+# The exception that propagated out of the user's stage function in this thread, if any, so the
+# failure is shown as the user's own (their traceback) and not as pivot's.
+_stage_call = threading.local()
+
+
 def _run_stage_function_with_store(
     func: Callable[..., Any],
     stage_name: str,
@@ -1748,7 +1761,12 @@ def _run_stage_function_with_store(
 
         _set_deterministic_seeds()
 
-        result = _execute_with_joblib_protection(func, kwargs)
+        _stage_call.error = None
+        try:
+            result = _execute_with_joblib_protection(func, kwargs)
+        except BaseException as exc:
+            _stage_call.error = exc
+            raise
         _raise_if_stopped()
 
         output_values = _resolve_output_values(result, outs, stage_name)
