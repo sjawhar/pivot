@@ -121,10 +121,18 @@ def _track_single_path(
     if not path.exists():
         raise click.ClickException(f"Path not found: {path_str}")
 
-    # Check if tracking file inside symlinked directory
+    # Check if tracking file inside symlinked directory. The .pvt is written beside the data
+    # (get_pvt_path), so a directory that really lies outside the project takes the .pvt with
+    # it, where no command finds it again: refuse before anything is cached or written.
     warning: str | None = None
-    project_root = project.get_project_root()
     if project.contains_symlink_in_path(path, project_root):
+        outside = project.real_location_outside(path.parent, project_root.resolve())
+        if outside is not None:
+            raise click.ClickException(
+                f"Cannot track '{path_str}': its .pvt would be written outside the project, "
+                + f"in '{outside}', where pivot does not find it. Track the file where it "
+                + "really is, inside the project."
+            )
         warning = (
             f"Warning: '{path_str}' is inside a symlinked directory. "
             + "Tracked path may not be portable across environments."

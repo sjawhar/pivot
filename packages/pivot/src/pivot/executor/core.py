@@ -596,7 +596,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     """
     from pivot import metrics
 
-    tracked_files = track.discover_pvt_files(project_root)
+    tracked_files = track.discover_pvt_files_and_update_memo(project_root)
     if not tracked_files:
         return
 
