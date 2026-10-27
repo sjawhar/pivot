@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import errno
+import logging
 import os
 import pathlib
 import signal
@@ -21,6 +22,7 @@ from pivot import loaded_source
 from pivot.engine import worker_pool
 from pivot.engine.worker_pool import WorkerPool
 from pivot.executor import core as executor_core
+from pivot.executor import worker
 
 if TYPE_CHECKING:
     from multiprocessing.managers import SyncManager
@@ -731,3 +733,55 @@ def test_failed_manager_replacement_does_not_poison_later_runs(
         assert pool.output_queue().get(timeout=10) is None
     finally:
         pool.shutdown()
+
+
+@pytest.mark.parametrize("error", [errno.ENOSYS, errno.EPERM])
+def test_stop_workers_bounds_the_stop_when_one_send_fails(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: int
+) -> None:
+    """A send that raises still leaves every other worker signalled and the stop bounded: the
+    grace, the join and the SIGKILL below it run, and the failure names the worker. Without
+    that, one failing send leaves the pool's workers alive and `pivot repro` never exits."""
+    joined = list[int]()
+    killed = list[int]()
+
+    class _Process:
+        pid: int
+        exitcode: int | None
+
+        def __init__(self, pid: int, exitcode: int | None) -> None:
+            self.pid = pid
+            self.exitcode = exitcode
+
+        def join(self, _timeout: float | None = None) -> None:
+            joined.append(self.pid)
+
+    class _Executor:
+        _processes_management_lock: None = None
+        _processes: dict[int, _Process] = {0: _Process(101, None), 1: _Process(102, 0)}
+
+    signalled = list[int]()
+
+    def _terminate(pid: int) -> None:
+        signalled.append(pid)
+        if pid == 101:
+            raise OSError(error, os.strerror(error))
+
+    def _kill_descendants(pid: int) -> None:
+        killed.append(pid)
+
+    def _kill(pid: int, _signal: int) -> None:
+        killed.append(pid)
+
+    monkeypatch.setattr(worker, "terminate", _terminate)
+    monkeypatch.setattr(worker, "kill_descendants", _kill_descendants)
+    monkeypatch.setattr(os, "kill", _kill)
+
+    with caplog.at_level(logging.ERROR, logger=worker_pool._logger.name):
+        WorkerPool._stop_workers(cast("loky.ProcessPoolExecutor", cast("object", _Executor())))
+
+    assert signalled == [101, 102]
+    assert joined[:2] == [101, 102]
+    # 101 never exited, so it and its descendants are killed; 102 exited within the grace.
+    assert killed == [101, 101]
+    assert [r.getMessage() for r in caplog.records] == ["Could not send SIGTERM to worker 101"]

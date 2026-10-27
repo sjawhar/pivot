@@ -557,6 +557,9 @@ class TransferResult(TypedDict):
     hash: str
     success: bool
     error: NotRequired[str]
+    # Present when the transfer failed with RemoteUnreachableError: no connection to the remote
+    # could be made, so every other transfer to it would fail the same way
+    connection_failed: NotRequired[Literal[True]]
 
 
 class TransferSummary(TypedDict):

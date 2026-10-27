@@ -35,7 +35,8 @@ uv run ruff check .
 # Type check
 uv run basedpyright .
 
-# Run tests (parallel). With CI set, the wheel smoke test also runs and needs uv's path:
+# Run tests (parallel). With CI set, the tests that install pivot into a fresh venv also run
+# and need uv's path: the wheel smoke tests and the pivot 0.5.11 two-build test.
 # PIVOT_TEST_UV="$(command -v uv)" uv run pytest packages/pivot/tests packages/pivot-tui/tests -n auto
 uv run pytest packages/pivot/tests packages/pivot-tui/tests -n auto
 ```

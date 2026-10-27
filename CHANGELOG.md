@@ -2,6 +2,34 @@
 
 <!-- version list -->
 
+## v0.5.12 (2026-10-27)
+
+### Bug Fixes
+
+- **cli**: Restore get targets from remote ([#522](https://github.com/sjawhar/pivot/pull/522),
+  [`f3b8a3f`](https://github.com/sjawhar/pivot/commit/f3b8a3f9b01fb572711eec54f73ea38ea5090917))
+
+### Continuous Integration
+
+- Run no suite on a draft and cancel superseded pull-request runs
+  ([#526](https://github.com/sjawhar/pivot/pull/526),
+  [`7aba10b`](https://github.com/sjawhar/pivot/commit/7aba10b480c5bc52432f6c609ca8c20c299afc7a))
+
+- Run the benchmark on a pull request only when it carries the benchmark label
+  ([#531](https://github.com/sjawhar/pivot/pull/531),
+  [`1d362ee`](https://github.com/sjawhar/pivot/commit/1d362eee9076a32bb22a0d5d8a335cf26a4c4c36))
+
+### Testing
+
+- Read watch outputs once so a rerunning stage cannot race the check
+  ([#529](https://github.com/sjawhar/pivot/pull/529),
+  [`25759f8`](https://github.com/sjawhar/pivot/commit/25759f8d43ede6bd9fe2ec7d38b56f8c2c05c5b8))
+
+- Restore permissions a test removes so a rerun can delete its temporary tree
+  ([#532](https://github.com/sjawhar/pivot/pull/532),
+  [`8eae480`](https://github.com/sjawhar/pivot/commit/8eae48051222fc24800916de787fe3f7e61087d0))
+
+
 ## v0.5.11 (2026-10-27)
 
 ### Bug Fixes

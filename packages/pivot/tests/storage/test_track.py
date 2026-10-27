@@ -134,6 +134,84 @@ def test_read_pvt_file_missing_required_fields_returns_none(
     assert result is None
 
 
+def _helper_pvt(**fields: object) -> dict[str, object]:
+    """A valid file .pvt's fields, with ``fields`` replacing or adding to them."""
+    return {"path": "data.csv", "hash": "0123456789abcdef", "size": 1, **fields}
+
+
+_ENTRY = {"relpath": "a.txt", "hash": "0123456789abcdef", "size": 1, "isexec": False}
+
+
+@pytest.mark.parametrize(
+    ("data", "error"),
+    [
+        pytest.param(_helper_pvt(path=1), "field 'path' is not a string", id="int-path"),
+        pytest.param(
+            _helper_pvt(hash=1234567890123456), "field 'hash' is not a string", id="int-hash"
+        ),
+        pytest.param(
+            _helper_pvt(manifest={"a.txt": "0123456789abcdef"}),
+            "field 'manifest' is not a list",
+            id="manifest-mapping",
+        ),
+        pytest.param(
+            _helper_pvt(manifest=["a.txt"]),
+            "field 'manifest[0]' is not a mapping",
+            id="manifest-entry-string",
+        ),
+        pytest.param(
+            _helper_pvt(manifest=[{k: v for k, v in _ENTRY.items() if k != "hash"}]),
+            "field 'manifest[0].hash' is missing",
+            id="manifest-entry-without-hash",
+        ),
+        pytest.param(
+            _helper_pvt(manifest=[_ENTRY, {k: v for k, v in _ENTRY.items() if k != "isexec"}]),
+            "field 'manifest[1].isexec' is missing",
+            id="manifest-entry-without-isexec",
+        ),
+        pytest.param(
+            _helper_pvt(manifest=[{**_ENTRY, "relpath": 7}]),
+            "field 'manifest[0].relpath' is not a string",
+            id="manifest-entry-int-relpath",
+        ),
+        pytest.param(
+            _helper_pvt(manifest=[_ENTRY, {**_ENTRY, "relpath": "a\0b"}]),
+            "field 'manifest[1].relpath' holds a NUL byte",
+            id="manifest-entry-nul-relpath",
+        ),
+        pytest.param(
+            _helper_pvt(manifest=[_ENTRY], empty_dirs=["e", "f\0"]),
+            "field 'empty_dirs[1]' holds a NUL byte",
+            id="nul-empty-dir",
+        ),
+    ],
+)
+def test_pvt_field_error_names_a_field_a_restore_cannot_use(data: object, error: str) -> None:
+    """A .pvt that has every field but holds one a restore builds a path or cache key from with
+    the wrong type or a NUL byte, or a manifest entry without a field a restore reads, is named
+    by field."""
+    assert track.is_pvt_data(data), "the field check runs on data is_pvt_data accepts"
+    assert track.pvt_field_error(data) == error
+
+
+def test_pvt_field_error_skips_what_no_restore_needs() -> None:
+    """A tracked directory's .pvt passes, and what no restore needs is not checked: the .pvt's
+    size and num_files, a manifest entry's size (present or not) and the types of its size and
+    isexec, and a NUL byte in path, which no restore builds a path from."""
+    source = dict.fromkeys(("repo", "rev", "rev_lock", "stage", "path", "remote"), "x")
+    tracked = _helper_pvt(num_files=1, manifest=[_ENTRY], empty_dirs=["empty"], source=source)
+    no_size = {k: v for k, v in _ENTRY.items() if k != "size"}
+    loose = _helper_pvt(
+        path="a\0b",
+        size="1",
+        num_files="2",
+        manifest=[{**_ENTRY, "size": "1", "isexec": "false"}, no_size],
+    )
+
+    assert track.pvt_field_error(tracked) is None
+    assert track.pvt_field_error(loose) is None
+
+
 # get_pvt_path
 
 
@@ -333,3 +411,106 @@ def test_write_pvt_file_rejects_path_traversal(tmp_path: pathlib.Path) -> None:
 
     with pytest.raises(SecurityValidationError, match=r"path traversal|\.\."):
         track.write_pvt_file(pvt_path, data)
+
+
+# restore_target: a .pvt restores its file only inside the project
+
+
+def test_restore_target_takes_the_name_pivot_track_writes(tmp_path: pathlib.Path) -> None:
+    """The sidecar's own name is the file beside it, with nothing to say about it."""
+    (tmp_path / "sub").mkdir()
+
+    target = track.restore_target(tmp_path / "sub" / "data.csv.pvt", "data.csv", tmp_path)
+
+    assert target == track.RestoreTarget(tmp_path / "sub" / "data.csv", None)
+
+
+@pytest.mark.parametrize("value", ["", ".", "./"])
+def test_restore_target_skips_a_pvt_whose_path_names_no_file(
+    tmp_path: pathlib.Path, value: str
+) -> None:
+    """Such a value names the directory holding the .pvt, which a restore would replace."""
+    (tmp_path / "sub").mkdir()
+
+    target = track.restore_target(tmp_path / "sub" / "dot.pvt", value, tmp_path)
+
+    assert target.path is None
+    assert target.warning == (
+        f"Skipping sub/dot.pvt: its path {value!r} names no file; set path: to the name of the "
+        "file or directory beside the .pvt."
+    )
+
+
+def test_restore_target_skips_a_sidecar_literally_named_pvt(tmp_path: pathlib.Path) -> None:
+    """A file named '.pvt' has own name ''; clause b must run before clause a, or '' matches
+    clause a and the .pvt restores its own directory, which checkout --force then replaces."""
+    (tmp_path / "sub").mkdir()
+
+    target = track.restore_target(tmp_path / "sub" / ".pvt", "", tmp_path)
+
+    assert target.path is None, target
+    assert "names no file" in (target.warning or ""), target
+
+
+def test_restore_target_skips_a_pvt_whose_file_lies_outside_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The file's directory is resolved: a symlink out of the project takes the file with it."""
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "link").symlink_to(outside, target_is_directory=True)
+
+    target = track.restore_target(root / "x.pvt", "link/x.csv", root)
+
+    assert target.path is None
+    assert target.warning == (
+        f"Skipping x.pvt: its path 'link/x.csv' resolves to '{outside / 'x.csv'}', outside the "
+        f"project root '{root}'. A .pvt restores its file only inside the project; move it "
+        "beside its data and set path: to the data's name."
+    )
+
+
+def test_restore_target_skips_a_pvt_whose_path_cannot_be_resolved(tmp_path: pathlib.Path) -> None:
+    """Where a path leads is unknown when it cannot be resolved, so it is not restored."""
+    target = track.restore_target(tmp_path / "x.pvt", "sub\0/x.csv", tmp_path)
+
+    assert target.path is None
+    assert "outside the project root" in (target.warning or "")
+
+
+def test_restore_target_takes_a_file_under_a_symlink_inside_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An in-project symlink keeps working, and the reader is told the names disagree."""
+    (tmp_path / "data_real").mkdir()
+    (tmp_path / "dlink").symlink_to("data_real", target_is_directory=True)
+
+    target = track.restore_target(tmp_path / "y.pvt", "dlink/y.csv", tmp_path)
+
+    assert target.path == tmp_path / "dlink" / "y.csv"
+    assert target.warning == (
+        "y.pvt: its path 'dlink/y.csv' is not the .pvt's own name 'y'. 'pivot checkout' with no "
+        "target, 'pivot pull' and 'pivot repro --checkout-missing' restore 'dlink/y.csv'; "
+        "'pivot checkout y.pvt', 'pivot get', 'pivot update' and 'pivot push' use the file named "
+        "'y' beside the .pvt. Set path: to that name, the form 'pivot track' writes."
+    )
+
+
+def test_discover_pvt_files_leaves_out_a_pvt_that_leads_out_of_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Every command reads the discovery, so one skip keeps all of them inside the project."""
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "link").symlink_to(outside, target_is_directory=True)
+    (root / "x.pvt").write_text("path: link/x.csv\nhash: hash1\nsize: 5\n")
+    (root / "dot.pvt").write_text("path: .\nhash: hash2\nsize: 5\n")
+    track.write_pvt_file(root / "kept.csv.pvt", track.PvtData(path="kept.csv", hash="h", size=1))
+
+    result = track.discover_pvt_files(root)
+
+    assert list(result) == [str(root / "kept.csv")]

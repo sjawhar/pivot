@@ -12,7 +12,10 @@ import codecs
 import collections
 import collections.abc as collections_abc
 import contextlib
+import ctypes
 import dataclasses
+import errno
+import functools
 import importlib
 import importlib._bootstrap as importlib_bootstrap
 import importlib.util
@@ -577,6 +580,98 @@ class _StopState:
 
 _stop = _StopState()
 
+# tgkill's system call number for each process ABI, keyed by CPython's platform triplet
+# (`sys.implementation._multiarch`; CPython's Misc/platform_triplet.c names them). Each number is
+# the line of Linux v7.0 cited beside it, under https://github.com/torvalds/linux/blob/v7.0/.
+_TGKILL_SYSCALLS = {
+    f"{arch}-linux-{libc}": number
+    for arch, libcs, number in (
+        ("x86_64", ("gnu", "musl"), 234),  # arch/x86/entry/syscalls/syscall_64.tbl#L246
+        ("i386", ("gnu", "musl"), 270),  # arch/x86/entry/syscalls/syscall_32.tbl#L285
+        # scripts/syscall.tbl#L167 (arch/arm64/tools/syscall_64.tbl is a symbolic link to it)
+        ("aarch64", ("gnu", "musl"), 131),
+        # arch/arm/tools/syscall.tbl#L286 (EABI, the only ABI these triplets name)
+        ("arm", ("gnueabihf", "gnueabi", "musleabihf", "musleabi"), 268),
+        ("powerpc64le", ("gnu", "musl"), 250),  # arch/powerpc/kernel/syscalls/syscall.tbl#L328
+        ("s390x", ("gnu", "musl"), 241),  # arch/s390/kernel/syscalls/syscall.tbl#L198
+        # scripts/syscall.tbl#L167, the table riscv and loongarch use (scripts/Makefile.asm-headers#L20;
+        # neither arch/riscv nor arch/loongarch kernel/Makefile.syscalls sets another)
+        ("riscv64", ("gnu", "musl"), 131),
+        ("loongarch64", ("gnu", "gnuf32", "gnusf", "musl", "muslf32", "muslsf"), 131),
+    )
+    for libc in libcs
+}
+
+
+@functools.cache
+def _tgkill() -> Callable[[int, int, int], int] | None:
+    """``tgkill(tgid, tid, sig)`` through the C library's ``syscall()``, which glibc and musl
+    both export, with tgkill's number for this process's ABI. None where that number is not
+    known (not Linux, or an ABI not in ``_TGKILL_SYSCALLS``), logged once: there a stopped
+    worker gets ``os.kill``, Pivot's behaviour before tgkill, and the race ``terminate``
+    describes remains."""
+    abi: object = getattr(sys.implementation, "_multiarch", None)
+    number = _TGKILL_SYSCALLS.get(abi) if isinstance(abi, str) else None
+    if number is None:
+        logger.debug(
+            "No tgkill system call number for %s (machine %s): stopped workers get os.kill",
+            abi,
+            os.uname().machine,
+        )
+        return None
+    syscall = ctypes.CDLL(None, use_errno=True).syscall
+    syscall.restype = ctypes.c_long
+    return lambda tgid, tid, sig: syscall(
+        ctypes.c_long(number), ctypes.c_long(tgid), ctypes.c_long(tid), ctypes.c_long(sig)
+    )
+
+
+def terminate(pid: int) -> None:
+    """Send worker ``pid`` SIGTERM (``_stop_worker``) at its main thread, where its stage runs.
+
+    A signal sent to a process (``os.kill``) can reach any of its threads. Linux gives it to
+    the main thread only while that thread is on a CPU or has no signal pending. Once Ctrl-C
+    has woken the main thread and load keeps it waiting for a CPU, Linux gives SIGTERM to
+    another thread, such as one of the OpenBLAS threads NumPy starts on import, and that thread
+    takes the Ctrl-C too. CPython's handler there only marks the signals for the main thread,
+    which finds no signal when it runs and goes back to sleep: the stage never stops, and Pivot
+    kills the worker after ``TERMINATION_GRACE_S`` with the stage's cleanup not run. tgkill
+    sends the signal to one thread, which alone can take it.
+
+    Where ``_tgkill`` knows no system call number, ``os.kill`` sends it. On macOS that is
+    enough: XNU gives a signal sent to a process to the first of its threads that does not block
+    it ("We attempt to deliver a proc-wide signal to the first thread in the task",
+    ``get_signalthread``, https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_sig.c#L1935-L1974),
+    and adds each new thread at the end of that list (bsd/kern/kern_fork.c#L1368), so the main
+    thread comes first. Read from the source, not run on macOS.
+
+    A tgkill that fails for any reason but a process that is gone (ESRCH, raised as
+    ProcessLookupError) falls back to ``os.kill``, with a warning naming the worker, so a stop
+    is never left unsent.
+
+    A stage that keeps SIGTERM blocked on the main thread holds this signal pending until
+    ``WorkerPool`` SIGKILLs the worker after the grace; with ``os.kill`` another thread could
+    take it and the worker exit sooner. Its cleanup runs either way, from Ctrl-C's SIGINT.
+    """
+    tgkill = _tgkill()
+    if tgkill is None:
+        os.kill(pid, signal.SIGTERM)
+        return
+    # A process's main thread has the process's id as its thread id. tgkill to a process whose
+    # main thread has exited while others run reaches no thread; a loky worker never gets there,
+    # because it leaves its main thread only through os._exit, which ends the whole process.
+    if tgkill(pid, pid, signal.SIGTERM) == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.ESRCH:
+        raise ProcessLookupError(error, os.strerror(error))
+    logger.warning(
+        "tgkill could not send SIGTERM to worker %s (%s); sending it to the process",
+        pid,
+        os.strerror(error),
+    )
+    os.kill(pid, signal.SIGTERM)
+
 
 def kill_descendants(pid: int) -> None:
     """SIGKILL every live descendant of process ``pid``. A process that detached from that
@@ -650,14 +745,14 @@ def _raise_if_stopped() -> None:
 def unwind_when_stopped(parent_pid: int) -> None:
     """Loky worker initializer: stop this worker when it is told to or its parent dies.
 
-    SIGTERM (``WorkerPool.hard_cancel``) or SIGINT (Ctrl-C at a terminal) raises
-    ``WorkerTerminated`` in the running stage, so its cleanup runs (stopping the processes or
-    containers it started); after SIGTERM the worker then exits. When the Pivot process that
-    started the worker dies, as when it is SIGKILLed, a watchdog thread sends this worker's
-    main thread SIGTERM (a signal to that thread interrupts a blocking call there) and exits
-    the worker after ``TERMINATION_GRACE_S`` itself, in case the stage replaced the SIGTERM
-    handler or is blocked where no signal reaches it. Every exit first kills the processes
-    still descended from the worker.
+    SIGTERM (``WorkerPool.hard_cancel``, sent at the main thread by ``terminate``) or SIGINT
+    (Ctrl-C at a terminal) raises ``WorkerTerminated`` in the running stage, so its cleanup runs
+    (stopping the processes or containers it started); after SIGTERM the worker then exits.
+    When the Pivot process that started the worker dies, as when it is SIGKILLed, a watchdog
+    thread sends this worker's main thread SIGTERM (a signal to that thread interrupts a
+    blocking call there) and exits the worker after ``TERMINATION_GRACE_S`` itself, in case the
+    stage replaced the SIGTERM handler or is blocked where no signal reaches it. Every exit
+    first kills the processes still descended from the worker.
 
     A SIGINT the worker inherited as ignored (pivot run as a background job of a
     non-interactive shell) stays ignored, as it does for pivot itself.
