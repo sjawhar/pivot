@@ -2144,11 +2144,16 @@ def compute_dep_generation_map(
 
 
 def input_listing_paths(
-    deps: dict[str, types.ArtifactRef], store: store_mod.Store
+    deps: dict[str, types.ArtifactRef],
+    store: store_mod.Store,
+    dep_hashes: Mapping[types.ArtifactIdentity, HashInfo],
 ) -> dict[types.ArtifactIdentity, str]:
     """Each pipeline input dependency's project-relative path, which names the listing file of
-    one that is a directory."""
-    if not isinstance(store, store_mod.WorkspaceStore):
+    one that is a directory. Empty when ``dep_hashes``, the lock's, records no directory: the
+    lock writer reads a path only for a directory."""
+    if not isinstance(store, store_mod.WorkspaceStore) or not any(
+        is_dir_hash(hash_info) for hash_info in dep_hashes.values()
+    ):
         return {}
     return {
         ref.identity: store.input_relpath(ref)
@@ -2211,7 +2216,7 @@ def _commit_lock_and_build_deferred(
     production_lock.write(
         lock_data,
         hashed_dirs=hashed_dirs,
-        input_paths=input_listing_paths(stage_info["deps"], store),
+        input_paths=input_listing_paths(stage_info["deps"], store, lock_data["dep_hashes"]),
         cache_dir=store_cache_dir(store),
     )
     return _build_deferred_writes(

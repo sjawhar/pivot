@@ -310,6 +310,12 @@ def list_files_at_revision(directory: str, rev: str, pattern: str = "*") -> list
     return [f"{directory}/{f}" for f in files]
 
 
+def in_repository(root: Path) -> bool:
+    """Whether git can find a repository from ``root``: through a ``.git`` at or above it, or
+    through ``GIT_DIR``. Elsewhere ``ignored_paths`` names nothing."""
+    return "GIT_DIR" in os.environ or _find_git_root(root) is not None
+
+
 def ignored_paths(root: Path, paths: Sequence[Path]) -> list[Path]:
     """The ``paths`` git would ignore, as ``git check-ignore`` decides from ``root``.
 

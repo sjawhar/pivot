@@ -214,7 +214,9 @@ def commit_stages(
                 production_lock.write(
                     new_lock_data,
                     hashed_dirs=hashed_dirs,
-                    input_paths=worker.input_listing_paths(stage_info["deps"], store),
+                    input_paths=worker.input_listing_paths(
+                        stage_info["deps"], store, new_lock_data["dep_hashes"]
+                    ),
                     cache_dir=store.cache_dir,
                 )
             except exceptions.InvalidPathError as exc:

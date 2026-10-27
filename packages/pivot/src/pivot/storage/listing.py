@@ -39,6 +39,7 @@ from pivot.types import ArtifactIdentity, DirHash, DirManifestEntry
 
 if TYPE_CHECKING:
     import pathlib
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -334,9 +335,9 @@ def _short(value: str) -> str:
     return f"~{xxhash.xxh64(os.fsencode(value)).hexdigest()}"
 
 
-def _checked(path: pathlib.Path, fallback: pathlib.Path) -> pathlib.Path:
-    """``path`` if its final name fits NAME_MAX, else its deterministic ``fallback``."""
-    return path if len(os.fsencode(path.name)) <= _NAME_MAX else fallback
+def _checked(path: pathlib.Path, fallback: Callable[[], pathlib.Path]) -> pathlib.Path:
+    """``path`` if its final name fits NAME_MAX, else its deterministic ``fallback()``."""
+    return path if len(os.fsencode(path.name)) <= _NAME_MAX else fallback()
 
 
 def output_listing_path(stages_dir: pathlib.Path, identity: ArtifactIdentity) -> pathlib.Path:
@@ -348,7 +349,7 @@ def output_listing_path(stages_dir: pathlib.Path, identity: ArtifactIdentity) ->
     key = identity.key or ""
     return _checked(
         stages_dir / f"{identity.producer}={_enc(key)}{SUFFIX}",
-        stages_dir / f"{identity.producer}={_short(key)}{SUFFIX}",
+        lambda: stages_dir / f"{identity.producer}={_short(key)}{SUFFIX}",
     )
 
 
@@ -360,7 +361,7 @@ def input_listing_path(stages_dir: pathlib.Path, input_path: str) -> pathlib.Pat
     inputs = stages_dir / INPUTS_DIR
     return _checked(
         inputs / f"{_enc(input_path)}{SUFFIX}",
-        inputs / f"{_short(input_path)}{SUFFIX}",
+        lambda: inputs / f"{_short(input_path)}{SUFFIX}",
     )
 
 
@@ -370,7 +371,7 @@ def tracked_listing_path(pvt_path: pathlib.Path) -> pathlib.Path:
     direct = pvt_path.with_name(pvt_path.name + SUFFIX)
     return _checked(
         direct,
-        pvt_path.with_name(f".{_short(pvt_path.name)}.pvt{SUFFIX}"),
+        lambda: pvt_path.with_name(f".{_short(pvt_path.name)}.pvt{SUFFIX}"),
     )
 
 

@@ -2447,9 +2447,13 @@ class Engine:
     ) -> dict[pathlib.Path, tuple[int, int, int] | None]:
         """The lock and listing files ``stage_names`` record, each with its (inode, mtime,
         size), or None when absent. A lock or listing is written by an atomic replace, so a
-        file whose stat changes was written."""
+        file whose stat changes was written. Empty outside a git repository, where git ignores
+        nothing."""
+        from pivot import git
         from pivot.storage import listing, lock
 
+        if not git.in_repository(project_root):
+            return {}
         default_state_dir = config.get_state_dir()
         pipeline = self._require_pipeline()
         store = store_mod.WorkspaceStore(

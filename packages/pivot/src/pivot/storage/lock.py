@@ -526,8 +526,7 @@ def _recorded_paths(
             yield relpath, item.out_path, item.dependency
 
 
-@dataclasses.dataclass(frozen=True)
-class _ListingWrite:
+class _ListingWrite(NamedTuple):
     """A listing file ``StageLock.write`` writes beside its lock."""
 
     target: pathlib.Path
