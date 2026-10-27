@@ -6,6 +6,7 @@ the way a user does, so it covers discovery, config and the real command wiring.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import os
@@ -32,9 +33,10 @@ import yaml
 from pivot import loaders
 from pivot.remote import keys
 from pivot.storage import cache
+from tests import helpers
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
@@ -46,10 +48,10 @@ def _env(**extra: str) -> dict[str, str]:
 
 
 def _pivot(
-    cwd: pathlib.Path, *args: str, env: dict[str, str] | None = None
+    cwd: pathlib.Path, *args: str, env: dict[str, str] | None = None, executable: str = _PIVOT
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [_PIVOT, *args],
+        [executable, *args],
         cwd=cwd,
         env=env or _env(),
         capture_output=True,
@@ -1252,52 +1254,108 @@ def test_pull_reports_a_remote_backend_that_cannot_start_as_a_remote_error(
     assert not (root / "second.txt").exists()
 
 
-def _refused_endpoint() -> str:
+@contextlib.contextmanager
+def _refused_endpoint() -> Iterator[str]:
     """The URL of a local port nothing listens on, so a connection to it is refused at once."""
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    return f"http://127.0.0.1:{port}"
+    yield f"http://127.0.0.1:{port}"
+
+
+@contextlib.contextmanager
+def _endpoint_that_never_connects() -> Iterator[str]:
+    """The URL of a local port that never completes a connection, so connecting to it times out:
+    it listens with a full accept queue and never accepts, and Linux drops a SYN to a listener
+    whose accept queue is full."""
+    with contextlib.ExitStack() as stack:
+        listener = stack.enter_context(socket.socket())
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(0)
+        address = listener.getsockname()
+        for _ in range(8):
+            filler = stack.enter_context(socket.socket())
+            filler.settimeout(0.5)
+            try:
+                filler.connect(address)
+            except TimeoutError:
+                break
+        else:
+            pytest.fail("the listener kept completing connections")
+        yield f"http://127.0.0.1:{address[1]}"
 
 
 @pytest.mark.parametrize(
-    "url",
-    [pytest.param("s3://bucket-x/cache", id="s3"), pytest.param("gs://bucket-x/cache", id="gcs")],
+    ("url", "endpoint", "reason"),
+    [
+        pytest.param(
+            "s3://bucket-x/cache",
+            _refused_endpoint,
+            "Could not connect to the endpoint URL",
+            id="s3-refused",
+        ),
+        pytest.param(
+            "gs://bucket-x/cache",
+            _refused_endpoint,
+            "ClientConnectorError connecting to 127.0.0.1",
+            id="gcs-refused",
+        ),
+        pytest.param(
+            "s3://bucket-x/cache",
+            _endpoint_that_never_connects,
+            "Connect timeout on endpoint URL",
+            id="s3-connect-timeout",
+        ),
+        pytest.param(
+            "gs://bucket-x/cache",
+            _endpoint_that_never_connects,
+            "ConnectionTimeoutError",
+            id="gcs-connect-timeout",
+        ),
+    ],
 )
-def test_get_tries_an_unreachable_remote_once(tmp_path: pathlib.Path, url: str) -> None:
-    """A remote pivot cannot connect to fails the first target that needs it with the connection
-    error; each later target that needs it fails naming the remote, without trying it again, so
-    an unreachable remote costs one connection timeout per get, not one per target."""
+def test_get_tries_an_unreachable_remote_once(
+    tmp_path: pathlib.Path,
+    url: str,
+    endpoint: Callable[[], contextlib.AbstractContextManager[str]],
+    reason: str,
+) -> None:
+    """A remote no connection can be made to (refused, or a connect timeout) fails the first
+    target that needs it with that reason; each later target that needs it fails naming the
+    remote, without trying it again, so an unreachable remote costs one connection timeout per
+    get, not one per target."""
     names = ("a.txt", "b.txt", "c.txt")
     root = _project(
         tmp_path, {".gitignore": "a.txt\nb.txt\nc.txt\n", **{name: name for name in names}}
     )
     _ok(_pivot(root, "config", "set", "remotes.origin", url))
     _ok(_pivot(root, "config", "set", "remote.retries", "0"))
+    _ok(_pivot(root, "config", "set", "remote.connect_timeout", "1"))
     _ok(_pivot(root, "track", *names))
     _commit(root, "track files")
     for name in names:
         file_hash, _ = cache.hash_file(root / name)
         cache.get_cache_path(root / ".pivot" / "cache" / "files", file_hash).unlink()
         (root / name).unlink()
-    endpoint = _refused_endpoint()
-    env = _env(
-        AWS_ENDPOINT_URL=endpoint,
-        AWS_ACCESS_KEY_ID="x",
-        AWS_SECRET_ACCESS_KEY="x",
-        AWS_DEFAULT_REGION="us-east-1",
-        STORAGE_EMULATOR_HOST=endpoint,
-    )
 
-    proc = _pivot(root, "get", "--rev", "HEAD", *names, env=env)
+    with endpoint() as address:
+        env = _env(
+            AWS_ENDPOINT_URL=address,
+            AWS_ACCESS_KEY_ID="x",
+            AWS_SECRET_ACCESS_KEY="x",
+            AWS_DEFAULT_REGION="us-east-1",
+            STORAGE_EMULATOR_HOST=address,
+        )
+        proc = _pivot(root, "get", "--rev", "HEAD", *names, env=env)
     out = proc.stdout + proc.stderr
 
     not_tried = f"{url} could not be reached for an earlier target, so it is not tried again"
     assert proc.returncode == 1, out
     assert "a.txt - failed to download from remote: " in out, out
+    assert reason in out, out
+    assert out.count(reason) == 1, "only the first target tries the remote"
     assert f"b.txt - failed to download from remote: {not_tried}" in out, out
     assert f"c.txt - failed to download from remote: {not_tried}" in out, out
-    assert out.count(not_tried) == 2, "only the first target tries the remote"
     assert "Tip: Check network connection and remote credentials" in out, out
     assert "Failed to restore 3 file(s)" in out, out
 
@@ -1532,15 +1590,30 @@ def test_get_reports_earlier_targets_when_a_target_directory_cannot_be_created(
             "bad.txt.pvt at HEAD is not a valid .pvt file: field 'manifest[0].hash' is missing",
             id="manifest-entry-without-hash",
         ),
+        pytest.param(
+            "path: bad.txt\nhash: 0123456789abcdef\nsize: 1\n"
+            + 'manifest:\n- relpath: "a\\0b"\n  hash: 0123456789abcdef\n  size: 1\n'
+            + "  isexec: false\n",
+            "bad.txt.pvt at HEAD is not a valid .pvt file: field 'manifest[0].relpath' holds a "
+            + "NUL byte",
+            id="manifest-entry-nul-relpath",
+        ),
+        pytest.param(
+            "path: bad.txt\nhash: 0123456789abcdef\nsize: 1\n"
+            + "manifest:\n- relpath: a.txt\n  hash: 0123456789abcdef\n  size: 1\n"
+            + '  isexec: false\nempty_dirs:\n- "e\\0"\n',
+            "bad.txt.pvt at HEAD is not a valid .pvt file: field 'empty_dirs[0]' holds a NUL byte",
+            id="nul-empty-dir",
+        ),
     ],
 )
 def test_get_reports_earlier_targets_when_a_tracked_file_has_an_invalid_pvt(
     tmp_path: pathlib.Path, pvt: str, reason: str
 ) -> None:
     """A committed .pvt that is hand-written wrong (a hash that is not a cache key, an all-digit
-    hash YAML reads as an integer, a manifest entry with no hash) fails that target with the
-    reason, naming the file and the field where the .pvt itself is invalid, and the target
-    restored before it is still reported."""
+    hash YAML reads as an integer, a manifest entry with no hash, a NUL byte in a relpath or an
+    empty directory) fails that target with the reason, naming the file and the field where the
+    .pvt itself is invalid, and the target restored before it is still reported."""
     root = _project(tmp_path, {".gitignore": "first.txt\n", "first.txt": "first\n"})
     _ok(_pivot(root, "track", "first.txt"))
     (root / "bad.txt.pvt").write_text(pvt)
@@ -1555,6 +1628,65 @@ def test_get_reports_earlier_targets_when_a_tracked_file_has_an_invalid_pvt(
     assert (root / "first.txt").read_text() == "first\n"
     assert f"bad.txt - {reason}" in out, out
     assert not (root / "bad.txt").exists()
+
+
+@pytest.mark.parametrize("mode", ["symlink", "copy"])
+def test_get_restores_a_pvt_whose_manifest_entries_have_no_size(
+    tmp_path: pathlib.Path, mode: str
+) -> None:
+    """A hand-edited directory .pvt whose manifest entries have no size restores in every mode.
+    A symlink restore through a tree no pivot has checked by content checks each file by hash
+    alone, where it stopped get with a raw KeyError('size') that hid the earlier target."""
+    root = _project(
+        tmp_path, {".gitignore": "first.txt\n/d\n", "first.txt": "first\n", "d/a.txt": "a\n"}
+    )
+    _ok(_pivot(root, "track", "first.txt", "d"))
+    pvt = yaml.safe_load((root / "d.pvt").read_text())
+    _plant_unmarked_tree(root / ".pivot" / "cache" / "files", pvt)
+    for entry in pvt["manifest"]:
+        del entry["size"]
+    (root / "d.pvt").write_text(yaml.safe_dump(pvt, sort_keys=False))
+    _commit(root, "track")
+    (root / "first.txt").unlink()
+    shutil.rmtree(root / "d")
+
+    proc = _pivot(root, "get", "--rev", "HEAD", "--checkout-mode", mode, "first.txt", "d")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 0, out
+    assert "first.txt (from cache)" in out, out
+    assert (root / "d" / "a.txt").read_text() == "a\n"
+    assert (root / "d").is_symlink() == (mode == "symlink")
+
+
+@pytest.mark.parametrize(
+    ("force", "returncode", "reported"),
+    [
+        pytest.param(False, 0, "Skipped: ", id="kept"),
+        pytest.param(
+            True,
+            1,
+            "bad.txt.pvt at HEAD is not a valid .pvt file: field 'hash' is not a string",
+            id="force",
+        ),
+    ],
+)
+def test_get_skips_a_workspace_file_whose_pvt_is_invalid_before_checking_it(
+    tmp_path: pathlib.Path, force: bool, returncode: int, reported: str
+) -> None:
+    """A target already in the workspace is skipped without --force, as for a valid .pvt, so the
+    .pvt field check refuses nothing get skipped before it; with --force the target fails naming
+    the field and the workspace file is left as it was."""
+    root = _project(tmp_path, {".gitignore": "bad.txt\n", "bad.txt": "here\n"})
+    (root / "bad.txt.pvt").write_text("path: bad.txt\nhash: 1234567890123456\nsize: 1\n")
+    _commit(root, "bad pvt")
+
+    proc = _pivot(root, "get", "--rev", "HEAD", *(["--force"] if force else []), "bad.txt")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == returncode, out
+    assert reported in out, out
+    assert (root / "bad.txt").read_text() == "here\n"
 
 
 def test_get_refuses_an_unknown_remote_name_before_restoring_anything(
@@ -1658,34 +1790,6 @@ def test_symlink_restore_rechecks_a_stale_tree_an_older_pivot_marked_after_a_siz
     assert not old_mark.exists(), "the size-only mark is dropped once the content is checked"
 
 
-def _released_pivot(venv: pathlib.Path, version: str) -> str:
-    """Install pivot ``version`` from the package index into a new venv at ``venv`` and return
-    its ``pivot``. Needs uv and the index, so only CI runs it: CI runs the suite without uv on
-    PATH and names uv's executable in ``PIVOT_TEST_UV``."""
-    uv = os.environ.get("PIVOT_TEST_UV", "")
-    if not (pathlib.Path(uv).is_file() and os.access(uv, os.X_OK)):
-        pytest.fail(f"PIVOT_TEST_UV must name the uv executable; it is {uv!r}", pytrace=False)
-    made = subprocess.run(
-        [uv, "venv", "--python", "3.13", str(venv)],
-        env=_env(),
-        capture_output=True,
-        text=True,
-        timeout=600,
-        check=False,
-    )
-    assert made.returncode == 0, made.stdout + made.stderr
-    installed = subprocess.run(
-        [uv, "pip", "install", "--python", str(venv / "bin" / "python"), f"pivot=={version}"],
-        env=_env(),
-        capture_output=True,
-        text=True,
-        timeout=600,
-        check=False,
-    )
-    assert installed.returncode == 0, installed.stdout + installed.stderr
-    return str(venv / "bin" / "pivot")
-
-
 @pytest.mark.skipif(not os.environ.get("CI"), reason="installs pivot 0.5.11 from PyPI; runs in CI")
 def test_symlink_checkout_repairs_a_stale_tree_pivot_0_5_11_linked_and_marked(
     tmp_path: pathlib.Path,
@@ -1693,19 +1797,11 @@ def test_symlink_checkout_repairs_a_stale_tree_pivot_0_5_11_linked_and_marked(
     """Two builds on one project. Pivot 0.5.11, the last release whose tree check compared only
     sizes, links a stale same-size tree into the workspace and marks it; this build's checkout
     then checks the tree by content and repairs it rather than trusting that mark."""
-    released = _released_pivot(tmp_path / "venv", "0.5.11")
+    released = helpers.venv_pivot(tmp_path / "venv", "pivot==0.5.11")
     (tmp_path / "project").mkdir()
     root, tree, _ = _unmarked_shards_tree_with_stale_member(tmp_path / "project")
     shards = root / "data" / "d" / "shards.dat"
-    old = subprocess.run(
-        [released, "checkout", "--checkout-mode", "symlink", "d/shards"],
-        cwd=root,
-        env=_env(),
-        capture_output=True,
-        text=True,
-        timeout=180,
-        check=False,
-    )
+    old = _pivot(root, "checkout", "--checkout-mode", "symlink", "d/shards", executable=released)
     assert old.returncode == 0, old.stdout + old.stderr
     assert (shards / "0.txt").read_text() == "xx", "precondition: pivot 0.5.11 links stale bytes"
     assert tree.with_name(tree.name + _SIZE_CHECKED_MARK).exists(), "precondition: and marks them"

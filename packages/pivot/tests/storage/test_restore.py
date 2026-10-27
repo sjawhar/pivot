@@ -649,6 +649,101 @@ def test_restore_targets_tries_an_unreachable_remote_once(
     ) in messages[1], messages
 
 
+class _RefusingRemote:
+    """A remote that answers but refuses this user's credentials for every download; counts the
+    download batches asked of it."""
+
+    url: str = "gs://refusing/cache"
+    batches: int
+
+    def __init__(self) -> None:
+        self.batches = 0
+
+    async def download_batch(
+        self, items: list[tuple[str, pathlib.Path]], *, readonly: bool = False
+    ) -> list[TransferResult]:
+        self.batches += 1
+        raise exceptions.RemoteConnectionError("credentials refused")
+
+
+def test_restore_targets_tries_a_remote_that_answered_again_for_each_target(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A remote that answered with an error (a RemoteConnectionError that is not
+    RemoteUnreachableError: credentials refused, one object denied) is tried again by each later
+    target, which reports the remote's own reason."""
+    repo_path, commit = git_repo
+    for name, file_hash in (("a.csv", "aaaaaaaaaaaaaaaa"), ("b.csv", "bbbbbbbbbbbbbbbb")):
+        pvt_content = {"path": name, "hash": file_hash, "size": 1}
+        (repo_path / f"{name}.pvt").write_text(yaml.dump(pvt_content))
+    sha = commit("add pvt files")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    remote = _RefusingRemote()
+
+    messages, success = restore.restore_targets_from_revision(
+        targets=["a.csv", "b.csv"],
+        rev=sha[:7],
+        output=None,
+        cache_dir=repo_path / ".pivot" / "cache",
+        stage_targets={},
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+        # The fake has only the url and download_batch a restore uses
+        remote_factory=lambda: cast("RemoteStorage", cast("object", remote)),
+    )
+
+    assert not success
+    assert remote.batches == 2, "each target tries a remote that answered"
+    for message in messages[:2]:
+        assert "failed to download from remote: credentials refused" in message, messages
+
+
+@pytest.mark.parametrize(
+    ("fields", "field"),
+    [
+        pytest.param(
+            'manifest:\n- relpath: "a\\0b"\n  hash: fedcba9876543210\n  size: 1\n'
+            + "  isexec: false\n",
+            "field 'manifest[0].relpath' holds a NUL byte",
+            id="nul-relpath",
+        ),
+        pytest.param(
+            "manifest:\n- relpath: a.txt\n  hash: fedcba9876543210\n  size: 1\n"
+            + '  isexec: false\nempty_dirs:\n- "e\\0"\n',
+            "field 'empty_dirs[0]' holds a NUL byte",
+            id="nul-empty-dir",
+        ),
+    ],
+)
+def test_symlink_restore_reports_a_pvt_path_it_cannot_build(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, fields: str, field: str
+) -> None:
+    """A symlink restore through a tree no pivot has checked builds a path from each manifest
+    relpath and empty directory, so one holding a NUL byte is that target's error, not a raw
+    ValueError."""
+    repo_path, commit = git_repo
+    tree = cache.get_cache_path(repo_path / ".pivot" / "cache" / "files", "0123456789abcdef")
+    tree.mkdir(parents=True)
+    (tree / "a.txt").write_text("a")
+    (repo_path / "d.pvt").write_text("path: d\nhash: '0123456789abcdef'\nsize: 1\n" + fields)
+    sha = commit("add pvt")[:7]
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    messages, success = restore.restore_targets_from_revision(
+        targets=["d"],
+        rev=sha,
+        output=None,
+        cache_dir=repo_path / ".pivot" / "cache",
+        stage_targets={},
+        checkout_modes=[cache.CheckoutMode.SYMLINK],
+        force=False,
+        remote_factory=_helper_unused_remote,
+    )
+
+    assert not success
+    assert f"d - d.pvt at {sha} is not a valid .pvt file: {field}" in messages[0], messages
+
+
 def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
     """Restores file from local cache when available."""
     repo_path, commit = git_repo

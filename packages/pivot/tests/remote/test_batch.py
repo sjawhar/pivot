@@ -223,25 +223,34 @@ async def test_transfer_batch_reports_each_item_and_never_raises(tmp_path: pathl
     assert client.opened == 1, "one client for the whole batch"
 
 
-async def _copy_or_cannot_connect(client: _Client, hash_: str, local_path: pathlib.Path) -> None:
+async def _copy_or_fail_on_the_remote(
+    client: _Client, hash_: str, local_path: pathlib.Path
+) -> None:
     if local_path.name == "unreachable":
-        raise exceptions.RemoteConnectionError("cannot reach the remote")
+        raise exceptions.RemoteUnreachableError("cannot reach the remote")
+    if local_path.name == "refused":
+        raise exceptions.RemoteConnectionError("permission denied to read this object")
     await _copy(client, hash_, local_path)
 
 
-async def test_transfer_batch_marks_a_transfer_that_could_not_reach_the_remote(
+async def test_transfer_batch_marks_only_a_transfer_that_could_not_reach_the_remote(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A transfer that raised RemoteConnectionError says so, so a caller can stop using the
-    remote; a transfer that failed for another reason does not."""
-    items = [("a000000000000001", tmp_path / "unreachable"), ("a000000000000002", tmp_path / "bad")]
+    """A transfer that raised RemoteUnreachableError says so, so a caller can stop using the
+    remote; a transfer the remote refused (a RemoteConnectionError for one object) or that failed
+    for another reason does not."""
+    items = [
+        ("a000000000000001", tmp_path / "unreachable"),
+        ("a000000000000002", tmp_path / "refused"),
+        ("a000000000000003", tmp_path / "bad"),
+    ]
 
     results = await batch.transfer_batch(
         items,
         4,
         None,
         open_client=_Client(set()).open,
-        transfer_one=_copy_or_cannot_connect,
+        transfer_one=_copy_or_fail_on_the_remote,
         metric="fake.transfer",
     )
 
@@ -252,7 +261,12 @@ async def test_transfer_batch_marks_a_transfer_that_could_not_reach_the_remote(
             "error": "cannot reach the remote",
             "connection_failed": True,
         },
-        {"hash": "a000000000000002", "success": False, "error": "cannot read bad"},
+        {
+            "hash": "a000000000000002",
+            "success": False,
+            "error": "permission denied to read this object",
+        },
+        {"hash": "a000000000000003", "success": False, "error": "cannot read bad"},
     ]
 
 

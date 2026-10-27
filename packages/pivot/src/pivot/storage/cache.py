@@ -807,7 +807,8 @@ def _repair_tree_dir_isexec(cache_dir_path: pathlib.Path, manifest: list[DirMani
 # The marker's earlier names, which no pivot trusts: pivot 0.3.4 touched `.layout-checked` after
 # checking only a tree's layout, partial trees included, and pivot 0.3.5 to 0.5.11 touched
 # `.verified` after checking each file's size, not its content. Every tree so marked is checked
-# once more, by content, and its old markers dropped.
+# by content on each restore or commit until it is marked anew, which drops the old markers; a
+# user who cannot write its prefix directory cannot mark it.
 _TREE_LAYOUT_MARKER_SUFFIX = ".content-checked"
 _LEGACY_TREE_MARKER_SUFFIXES = (".layout-checked", ".verified")
 # Held exclusively while a tree is checked and repaired; never deleted.
@@ -835,10 +836,12 @@ def _tree_file_holds(
     path: pathlib.Path, path_stat: os.stat_result, entry: DirManifestEntry
 ) -> bool:
     """Whether a tree file, ``path_stat`` its ``os.lstat``, is a regular file holding ``entry``'s
-    bytes: its recorded size and content hash. Hashes the file only once the cheap checks pass."""
+    bytes: its recorded size and content hash. Hashes the file only once the cheap checks pass.
+    The size is only that cheap check, so an entry without one (a hand-written ``.pvt``; every
+    lock records it) is checked by hash alone."""
     return (
         stat.S_ISREG(path_stat.st_mode)
-        and path_stat.st_size == entry["size"]
+        and ("size" not in entry or path_stat.st_size == entry["size"])
         and hash_file(path)[0] == entry["hash"]
     )
 

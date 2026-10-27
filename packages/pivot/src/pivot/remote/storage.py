@@ -104,15 +104,17 @@ async def _download_verified(
 ) -> None:
     """Stream bucket/key into the existing file ``dest`` and check its xxh64 digest.
 
-    A request that cannot connect (refused, timed out, no route, a proxy or TLS failure) raises
-    ``RemoteConnectionError``: the remote, not this object, is unusable.
+    A request that ends in botocore's ``ConnectionError`` after ``remote.retries`` retries (DNS
+    failure, refused, connect timeout, a proxy or TLS failure, or a connection reset, which
+    aiobotocore reports the same way) raises ``RemoteUnreachableError``: the remote, not this
+    object, is unusable. Any other failure is this object's error.
     """
     from botocore import exceptions as botocore_exc
 
     try:
         response = await s3.get_object(Bucket=bucket, Key=key)
     except botocore_exc.ConnectionError as exc:
-        raise exceptions.RemoteConnectionError(f"Failed to download from S3: {exc}") from exc
+        raise exceptions.RemoteUnreachableError(f"Failed to download from S3: {exc}") from exc
     except Exception as exc:
         error_str = str(exc)
         if "NoSuchKey" in error_str or "404" in error_str:

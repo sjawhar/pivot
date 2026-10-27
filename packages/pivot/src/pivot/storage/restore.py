@@ -261,15 +261,26 @@ def _reason(error: exceptions.PivotError | OSError) -> str:
 
 
 def _download_error(failed: list[TransferResult]) -> exceptions.RemoteError:
-    """The error of a download whose ``failed`` files did not arrive: a file's connection failure
-    if there is one, since it ends the remote step for the rest of the get, else the first file's
-    error."""
+    """The error of a download whose ``failed`` files did not arrive: a file's failure to reach
+    the remote if there is one, since it ends the remote step for the rest of the get, else the
+    first file's error."""
     unreachable = [result for result in failed if "connection_failed" in result]
     result = (unreachable or failed)[0]
     message = result["error"] if "error" in result else "unknown error"
     if unreachable:
-        return exceptions.RemoteConnectionError(message)
+        return exceptions.RemoteUnreachableError(message)
     return exceptions.RemoteError(message)
+
+
+def _skipped(dest_path: pathlib.Path, force: bool) -> RestoreResult | None:
+    """The result for a target already in the workspace that ``get`` keeps, or None."""
+    if dest_path.exists() and not force:
+        return RestoreResult(
+            status=RestoreStatus.SKIPPED,
+            path=str(dest_path),
+            message=f"Skipped: {dest_path} (already exists, use --force to overwrite)",
+        )
+    return None
 
 
 def restore_file(
@@ -287,18 +298,14 @@ def restore_file(
 
     Tries the local cache, then git, then downloads the cache objects the output still misses
     from the remote ``remote_factory`` opens; it is called only when that download is needed.
-    A remote that raised ``RemoteConnectionError`` is named in the result's
+    A remote that raised ``RemoteUnreachableError`` is named in the result's
     ``unreachable_remote``.
     """
     path_str = str(dest_path)
     files_dir = cache_dir / "files"
 
-    if dest_path.exists() and not force:
-        return RestoreResult(
-            status=RestoreStatus.SKIPPED,
-            path=path_str,
-            message=f"Skipped: {dest_path} (already exists, use --force to overwrite)",
-        )
+    if (skipped := _skipped(dest_path, force)) is not None:
+        return skipped
 
     # Ensure parent directory exists before any restore strategy
     try:
@@ -388,7 +395,7 @@ def restore_file(
                 path=path_str,
                 message=f"Error: {dest_path} - failed to download from remote: {_reason(e)}",
             )
-            if remote is not None and isinstance(e, exceptions.RemoteConnectionError):
+            if remote is not None and isinstance(e, exceptions.RemoteUnreachableError):
                 failure["unreachable_remote"] = remote.url
             return failure
         except (exceptions.PivotError, OSError) as e:
@@ -454,12 +461,13 @@ def restore_targets_from_revision(
     # the cache
     open_remote = functools.cache(remote_factory)
     # A remote this call could not reach is not tried again, so an unreachable remote costs one
-    # connection timeout per call, not one per target
+    # connection timeout per call, not one per target. Only RemoteUnreachableError sets it: a
+    # failure of one object leaves the remote in use for the other targets.
     unreachable: str | None = None
 
     def reachable_remote() -> RemoteStorage:
         if unreachable is not None:
-            raise exceptions.RemoteConnectionError(
+            raise exceptions.RemoteUnreachableError(
                 f"{unreachable} could not be reached for an earlier target, "
                 + "so it is not tried again"
             )
@@ -470,8 +478,11 @@ def restore_targets_from_revision(
             output_hash = target_info["hashes"].get(rel_path)
             dest_path = output if output is not None else proj_root / rel_path
             if "error" in target_info:
+                # A target already in the workspace is kept, as for a valid .pvt, so the check
+                # refuses nothing that get skipped before it
                 results.append(
-                    RestoreResult(
+                    _skipped(dest_path, force)
+                    or RestoreResult(
                         status=RestoreStatus.ERROR,
                         path=str(dest_path),
                         message=f"Error: {dest_path} - {target_info['error']}",

@@ -169,7 +169,8 @@ async def transfer_batch[C](
     """Run ``transfer_one`` for every ``(hash, local_path)`` in parallel on one client.
 
     A transfer that raises becomes ``TransferResult(success=False, error=str(exc))``, so one
-    failed file never stops the rest; a ``RemoteConnectionError`` also sets ``connection_failed``.
+    failed file never stops the rest; a ``RemoteUnreachableError`` (no connection to the remote
+    could be made) also sets ``connection_failed``.
     ``callback(completed, total, file_name)`` runs after each success.
 
     Raises:
@@ -199,7 +200,7 @@ async def transfer_batch[C](
                         if callback:
                             callback(completed, len(items), local_path.name)
                         return TransferResult(hash=hash_, success=True)
-                    except exceptions.RemoteConnectionError as e:
+                    except exceptions.RemoteUnreachableError as e:
                         return TransferResult(
                             hash=hash_, success=False, error=str(e), connection_failed=True
                         )

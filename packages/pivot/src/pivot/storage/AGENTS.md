@@ -109,7 +109,12 @@ When multiple `pivot` processes share the same StateDB:
   write the tree) is not used: a restore goes file by file, a commit fails. Only
   `<tree>.content-checked` is trusted: `<tree>.layout-checked` (pivot 0.3.4, partial trees
   included) and `<tree>.verified` (pivot 0.3.5 to 0.5.11, sizes only) are older marks that never
-  checked content, so such a tree is checked once more and the old mark removed.
+  checked content, so such a tree is checked again and the old mark removed. The mark is only
+  written where this user can write the tree's prefix directory: for a user who cannot, every
+  symlink restore or commit checks an old-marked tree again, and a symlink commit through a
+  stale one fails, until a user who can write the cache runs one
+  `pivot checkout --checkout-mode symlink` through it. That cost is the price of not trusting a
+  size-only mark.
 
 ## Path Storage
 

@@ -55,7 +55,9 @@ class PvtData(TypedDict):
 _REQUIRED_KEYS = frozenset({"path", "hash", "size"})
 _VALID_KEYS = frozenset({"path", "hash", "size", "num_files", "manifest", "empty_dirs", "source"})
 _REQUIRED_SOURCE_KEYS = frozenset({"repo", "rev", "rev_lock", "stage", "path", "remote"})
-# A manifest entry's fields every restore reads, and those it builds a path or cache key from
+# A manifest entry's fields every restore reads, and those it builds a path or cache key from.
+# `size` is not required: only a symlink restore through a tree no pivot has checked reads it,
+# and it then checks the content by hash alone (`cache._tree_file_holds`).
 _MANIFEST_ENTRY_READ_KEYS = ("relpath", "hash", "isexec")
 _MANIFEST_ENTRY_STR_KEYS = ("relpath", "hash")
 
@@ -86,15 +88,22 @@ def is_pvt_data(data: object) -> TypeGuard[PvtData]:
 def pvt_field_error(data: Mapping[str, object]) -> str | None:
     """Why a restore cannot use a .pvt that ``is_pvt_data`` accepts, naming the field, or None.
 
-    ``is_pvt_data`` checks which fields a .pvt has, not what they hold. A restore builds a path
-    from ``path`` and each manifest entry's ``relpath``, a cache key from ``hash`` and each
-    entry's ``hash``, and reads each entry's ``isexec``, so a hand-written .pvt whose all-digit
-    hash YAML reads as an integer, or whose manifest entry has no hash, would stop the restore
-    with a raw TypeError or KeyError. Fields a restore does not read are not checked.
+    ``is_pvt_data`` checks which fields a .pvt has, not what they hold. A restore checks ``path``
+    for traversal, builds a path from each manifest entry's ``relpath`` and each ``empty_dirs``
+    entry and a cache key from ``hash`` and each entry's ``hash``, and reads each entry's
+    ``isexec``. So a hand-written .pvt whose all-digit hash YAML reads as an integer, whose
+    manifest entry has no hash, or whose relpath or empty directory holds a NUL byte would stop
+    the restore with a raw TypeError, KeyError or ValueError. Only those fields are checked: a
+    restore never builds a path from ``path`` (``get`` names the file by its target), and other
+    fields, the types of ``size`` and ``isexec`` included, restore whatever they hold.
     """
     for key in ("path", "hash"):
         if not isinstance(data[key], str):
             return f"field {key!r} is not a string"
+    # is_pvt_data has checked that empty_dirs is a list of strings
+    for index, relpath in enumerate(cast("list[str]", data.get("empty_dirs", []))):
+        if "\0" in relpath:
+            return f"field 'empty_dirs[{index}]' holds a NUL byte"
     if "manifest" not in data:
         return None
     manifest = data["manifest"]
@@ -110,6 +119,8 @@ def pvt_field_error(data: Mapping[str, object]) -> str | None:
         for key in _MANIFEST_ENTRY_STR_KEYS:
             if not isinstance(entry[key], str):
                 return f"field 'manifest[{index}].{key}' is not a string"
+        if "\0" in cast("str", entry["relpath"]):
+            return f"field 'manifest[{index}].relpath' holds a NUL byte"
     return None
 
 

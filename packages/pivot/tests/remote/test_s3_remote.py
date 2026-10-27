@@ -307,21 +307,55 @@ async def test_s3_download_file_auth_error(
         ),
     ],
 )
-async def test_s3_download_that_cannot_connect_is_a_connection_error(
+async def test_s3_download_that_cannot_connect_is_unreachable(
     s3_remote: remote_mod.S3Remote,
     tmp_path: pathlib.Path,
     mocker: MockerFixture,
     cache_hash: str,
     error: Exception,
 ) -> None:
-    """A download that cannot connect to S3 raises RemoteConnectionError, so a caller knows the
+    """A download that cannot connect to S3 raises RemoteUnreachableError, so a caller knows the
     remote, not one object, is unusable; a key whose text holds 404 is not "not found"."""
     mock_client = mocker.AsyncMock()
     mock_client.get_object = mocker.AsyncMock(side_effect=error)
     _helper_patch_s3_client(mocker, s3_remote, mock_client)
 
-    with pytest.raises(exceptions.RemoteConnectionError, match="Failed to download from S3"):
+    with pytest.raises(exceptions.RemoteUnreachableError, match="Failed to download from S3"):
         await s3_remote.download_file(cache_hash, tmp_path / "downloaded.txt")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            botocore_exc.ReadTimeoutError(endpoint_url="http://127.0.0.1:9/b/files/ab"),
+            id="read-timeout",
+        ),
+        pytest.param(
+            botocore_exc.ConnectionClosedError(endpoint_url="http://127.0.0.1:9/b/files/ab"),
+            id="closed-before-the-reply",
+        ),
+        pytest.param(
+            botocore_exc.ClientError(
+                {"Error": {"Code": "403", "Message": "Forbidden"}}, "GetObject"
+            ),
+            id="403",
+        ),
+    ],
+)
+async def test_s3_download_the_remote_answered_is_not_unreachable(
+    s3_remote: remote_mod.S3Remote, tmp_path: pathlib.Path, mocker: MockerFixture, error: Exception
+) -> None:
+    """A download that reached S3 and failed is that object's error, not RemoteUnreachableError,
+    so get keeps using the remote for its other targets."""
+    mock_client = mocker.AsyncMock()
+    mock_client.get_object = mocker.AsyncMock(side_effect=error)
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+
+    with pytest.raises(exceptions.RemoteError) as exc_info:
+        await s3_remote.download_file("abc123def4567890", tmp_path / "downloaded.txt")
+
+    assert not isinstance(exc_info.value, exceptions.RemoteUnreachableError)
 
 
 async def test_upload_file(
