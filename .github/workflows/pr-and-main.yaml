@@ -11,7 +11,7 @@ on:
     # CI_RUN_DRAFT_PRS to `true` to run drafts again (the same switch in benchmark.yaml).
     types: [opened, synchronize, reopened, ready_for_review]
 
-# A push to a pull request starts a run of this workflow, and of Benchmark when the pull request
+# A push to a pull request runs this workflow's jobs, and Benchmark's jobs when the pull request
 # carries the `benchmark` label, 12 jobs together; without a concurrency group the run of the commit
 # it replaced keeps its runners to the end. So the runs of one pull request cancel each other. A
 # push to main never cancels and is never cancelled: each main commit is tested on its own, and

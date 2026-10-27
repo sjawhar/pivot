@@ -7,12 +7,12 @@ name: Benchmark
 on:
   pull_request:
     # ready_for_review: a draft runs no job of this workflow (every job below carries the draft
-    # condition), so marking the pull request ready is what runs them on its head. Set the
-    # repository variable CI_RUN_DRAFT_PRS to `true` to run drafts again (the same switch in
-    # pr-and-main.yaml).
-    # labeled: adding `benchmark` runs the jobs on the pull request's head; adding any other label
-    # skips them. No `unlabeled`: removing `benchmark` starts no run, so a running benchmark
-    # finishes, and the pull request's later pushes skip every job.
+    # condition), so marking a pull request that carries `benchmark` ready is what runs them on its
+    # head. Set the repository variable CI_RUN_DRAFT_PRS to `true` to run drafts again (the same
+    # switch in pr-and-main.yaml).
+    # labeled: adding `benchmark` to a ready pull request runs the jobs on its head; adding any
+    # other label skips them. No `unlabeled`: removing `benchmark` starts no run, so a running
+    # benchmark finishes, and the pull request's later pushes skip every job.
     types: [opened, synchronize, reopened, ready_for_review, labeled]
   schedule:
     - cron: "0 6 * * 1"
@@ -36,7 +36,8 @@ env:
 # id, so nothing cancels them and they cancel nothing. A pull-request run skips every job when the
 # pull request is a draft, when it does not carry `benchmark`, or when the event adds another
 # label, so adding an unrelated label never cancels a running benchmark. This condition and the
-# `if` of both jobs are the same; change all three together.
+# `if` of both jobs are the same; change all three together. A test in benchmarks/test_workflow.py
+# evaluates all three for each kind of event and fails when they disagree.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && (github.event.pull_request.draft != true || vars.CI_RUN_DRAFT_PRS == 'true') && contains(github.event.pull_request.labels.*.name, 'benchmark') && (github.event.action != 'labeled' || github.event.label.name == 'benchmark') && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
