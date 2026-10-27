@@ -507,7 +507,8 @@ _TGKILL_SYSCALLS = {
     for arch, libcs, number in (
         ("x86_64", ("gnu", "musl"), 234),  # arch/x86/entry/syscalls/syscall_64.tbl#L246
         ("i386", ("gnu", "musl"), 270),  # arch/x86/entry/syscalls/syscall_32.tbl#L285
-        ("aarch64", ("gnu", "musl"), 131),  # arch/arm64/tools/syscall_64.tbl#L167
+        # scripts/syscall.tbl#L167 (arch/arm64/tools/syscall_64.tbl is a symbolic link to it)
+        ("aarch64", ("gnu", "musl"), 131),
         # arch/arm/tools/syscall.tbl#L286 (EABI, the only ABI these triplets name)
         ("arm", ("gnueabihf", "gnueabi", "musleabihf", "musleabi"), 268),
         ("powerpc64le", ("gnu", "musl"), 250),  # arch/powerpc/kernel/syscalls/syscall.tbl#L328

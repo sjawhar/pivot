@@ -13,11 +13,13 @@ import contextlib
 import ctypes
 import dataclasses
 import errno
+import logging
 import os
 import pathlib
 import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -448,6 +450,39 @@ def test_terminate_sends_sigterm(monkeypatch: pytest.MonkeyPatch, path: str) -> 
         worker.terminate(proc.pid)
 
 
+@pytest.mark.parametrize("abi", ["darwin", "x86_64-linux-gnux32", "mips64el-linux-gnuabi64", None])
+def test_terminate_without_a_tgkill_number_uses_os_kill_and_logs_it_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, abi: str | None
+) -> None:
+    """An ABI not in ``_TGKILL_SYSCALLS`` (macOS's triplet, an x32 process on an x86-64
+    machine, a Linux ABI not in the table, or an interpreter with no triplet) gets no tgkill
+    number: ``terminate`` sends SIGTERM with ``os.kill``, and ``_tgkill`` says so once, at debug
+    level, naming the triplet."""
+    if abi is None:
+        monkeypatch.delattr(sys.implementation, "_multiarch", raising=False)
+    else:
+        monkeypatch.setattr(sys.implementation, "_multiarch", abi, raising=False)
+    worker._tgkill.cache_clear()
+    try:
+        with caplog.at_level(logging.DEBUG, logger=worker.logger.name):
+            assert worker._tgkill() is None
+            proc = subprocess.Popen(["sleep", "60"])
+            try:
+                worker.terminate(proc.pid)
+                worker.terminate(proc.pid)
+                assert proc.wait(timeout=10) == -signal.SIGTERM
+            finally:
+                proc.kill()
+                proc.wait()
+        logged = [r for r in caplog.records if "No tgkill system call number" in r.getMessage()]
+        assert len(logged) == 1, [r.getMessage() for r in caplog.records]
+        assert logged[0].levelno == logging.DEBUG
+        assert str(abi) in logged[0].getMessage()
+    finally:
+        monkeypatch.undo()
+        worker._tgkill.cache_clear()
+
+
 def test_tgkill_system_call_number_fits_this_architecture() -> None:
     """The number ``worker._tgkill`` passes to ``syscall()`` for this process's ABI is tgkill's:
     signal 0 (a check that sends nothing) to this process's own main thread succeeds, and to a
@@ -463,3 +498,27 @@ def test_tgkill_system_call_number_fits_this_architecture() -> None:
     finally:
         other.kill()
         other.wait()
+
+
+def test_tgkill_takes_the_thread_group_then_the_thread() -> None:
+    """``_tgkill`` passes ``tgid`` then ``tid``: signal 0 to a thread of this process other than
+    its main thread succeeds only in that order. ``terminate`` passes the process id as both, so
+    it cannot tell the order."""
+    tgkill = worker._tgkill()
+    assert tgkill is not None
+    ready, done = threading.Event(), threading.Event()
+    native = list[int]()
+
+    def _park() -> None:
+        native.append(threading.get_native_id())
+        ready.set()
+        done.wait()
+
+    thread = threading.Thread(target=_park)
+    thread.start()
+    try:
+        assert ready.wait(10)
+        assert tgkill(os.getpid(), native[0], 0) == 0, os.strerror(ctypes.get_errno())
+    finally:
+        done.set()
+        thread.join()
