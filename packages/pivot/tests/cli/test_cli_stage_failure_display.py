@@ -128,8 +128,10 @@ def test_r2_repro_names_an_unopenable_artifact_lock_once_and_keeps_the_jsonl_rea
 def test_r3_verify_allow_missing_keeps_the_remote_error_text_of_main(
     tmp_path: pathlib.Path,
 ) -> None:
-    """B3: `RemoteError("Failed to create remote connection: ...")` is pivot's own error; its text
-    prints as at main, with no `Unexpected ProfileNotFound: `."""
+    """B3: the remote-setup failure is pivot's own error; its text prints as at main, with the
+    library cause kept and no `Unexpected <type>:`. Since #522 (0.5.12) main words it
+    `Cannot set up S3 access for <url>: <cause>` with a tip; before #530 the head added
+    `Unexpected ProfileNotFound:` to the cause, which this pins out."""
     root = _project(tmp_path, _BIG)
     assert _pivot(root, "config", "set", "remotes.origin", "s3://bucket/prefix").returncode == 0
     assert _pivot(root, "config", "set", "default_remote", "origin").returncode == 0
@@ -150,10 +152,11 @@ def test_r3_verify_allow_missing_keeps_the_remote_error_text_of_main(
     )
 
     assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert proc.stderr.splitlines()[-1] == (
-        "Error: Failed to create remote connection: "
+    assert "Unexpected" not in proc.stderr, proc.stderr
+    assert (
+        "Error: Cannot set up S3 access for s3://bucket/prefix: "
         + "The config profile (pr530-gate-no-such-profile) could not be found"
-    ), proc.stderr
+    ) in proc.stderr.splitlines(), proc.stderr
 
 
 def _one_remote_configured() -> dict[str, str]:
