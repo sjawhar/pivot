@@ -1778,9 +1778,13 @@ def test_repro_watch_waits_for_a_fixed_params_yaml_then_reruns(tmp_path: pathlib
     env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
 
     def scaled() -> list[int] | None:
-        if not output.exists():
+        # A rerun removes the output before it writes the new one, so the output can vanish
+        # while it is read. A missing output is not yet written.
+        try:
+            frame = loaders.DataFrameJSONL().load(output)
+        except FileNotFoundError:
             return None
-        return [int(n) for n in loaders.DataFrameJSONL().load(output)["n"].tolist()]
+        return [int(n) for n in frame["n"].tolist()]
 
     with log_path.open("wb") as log:
         proc = subprocess.Popen(
@@ -1861,9 +1865,13 @@ def test_repro_watch_runs_a_lone_cpu_stage_and_survives_a_capacity_error(
     env["PIVOT_CACHE_DIR"] = str(tmp_path / "cache")
 
     def doubled() -> list[int] | None:
-        if not output.exists():
+        # A rerun removes the output before it writes the new one, so the output can vanish
+        # while it is read. A missing output is not yet written.
+        try:
+            frame = loaders.DataFrameJSONL().load(output)
+        except FileNotFoundError:
             return None
-        return [int(value) for value in loaders.DataFrameJSONL().load(output)["n"].tolist()]
+        return [int(value) for value in frame["n"].tolist()]
 
     with log_path.open("wb") as log:
         proc = subprocess.Popen(
