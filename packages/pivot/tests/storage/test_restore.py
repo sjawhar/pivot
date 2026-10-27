@@ -10,10 +10,11 @@ import yaml
 
 from pivot import exceptions, project
 from pivot.cli import checkout
-from pivot.storage import cache, restore, track
+from pivot.storage import cache, ownership, restore, track
 from pivot.types import FileHash
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from multiprocessing.synchronize import Event
 
     from conftest import GitRepo
@@ -768,6 +769,58 @@ def test_restore_file_force_keeps_existing_output_until_cache_swap(
 
     assert result["status"] is restore.RestoreStatus.RESTORED
     assert target.read_text() == "cached content"
+
+
+def test_restore_file_records_pvt_members_before_writing_them(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`pivot get` of a stage restores the revision's output, which no lock here records: it
+    records each `*.pvt` member the restore writes, with the content it will hold, before it
+    writes anything; a target it skips records nothing."""
+    (tmp_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    cache_dir = tmp_path / "cache"
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "notes.pvt").write_text("stage notes")
+    (source / "value.txt").write_text("v")
+    output_hash = cache.save_to_cache(source, cache_dir / "files")
+    target = tmp_path / "data" / "b" / "tree"
+    recorded = list[dict[pathlib.Path, str]]()
+
+    def record(members: Mapping[pathlib.Path, str]) -> None:
+        assert not target.exists()
+        recorded.append(dict(members))
+
+    result = restore.restore_file(
+        rel_path="data/b/tree",
+        output_hash=output_hash,
+        rev="HEAD",
+        dest_path=target,
+        cache_dir=cache_dir,
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+        record_members=record,
+    )
+
+    assert result["status"] is restore.RestoreStatus.RESTORED, result["message"]
+    notes = target / "notes.pvt"
+    assert recorded == [{ownership.normalized(notes): cache.hash_file(notes)[0]}]
+    assert notes.read_text() == "stage notes"
+
+    skipped = restore.restore_file(
+        rel_path="data/b/tree",
+        output_hash=output_hash,
+        rev="HEAD",
+        dest_path=target,
+        cache_dir=cache_dir,
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+        record_members=record,
+    )
+
+    assert skipped["status"] is restore.RestoreStatus.SKIPPED
+    assert len(recorded) == 1
 
 
 def test_parse_pvt_data_with_manifest() -> None:

@@ -9,9 +9,10 @@ tracked path replaces that path's own content and nothing else: it fails the sam
 would remove another tracked file, import or sidecar beneath it.
 
 A stage may return a directory member named ``*.pvt``. Such a file is the stage's when the stage
-records it (``StageMembers``): its lock, or the record its last ``--no-commit`` run left
-(``nocommit:<stage>``), lists it at that path, and it is a sidecar Pivot cannot parse or a file
-whose content the stage recorded there. Every other ``*.pvt`` under an output is the user's, for
+records it (``StageMembers``): its lock, or its ``nocommit:<stage>`` record, lists it at that
+path, and it is a sidecar Pivot cannot parse or a file whose content the stage recorded there.
+Pivot adds a member to that record before it writes the file (``record_members``), so no member
+it writes is ever unrecorded. Every other ``*.pvt`` under an output is the user's, for
 ``pivot commit`` too.
 """
 
@@ -21,6 +22,8 @@ import enum
 import os
 import pathlib
 from typing import TYPE_CHECKING, TypedDict
+
+import lmdb
 
 from pivot import exceptions, project, types
 from pivot.storage import cache, lock, state, track
@@ -34,6 +37,10 @@ if TYPE_CHECKING:
 # The ``*.pvt`` files a stage itself writes in one output: path -> the content hashes the stage
 # recorded there, or None for a file the stage wrote in this run (any content there is its own).
 type StageMembers = dict[pathlib.Path, frozenset[str] | None]
+
+# Records ``*.pvt`` files (path -> content hash) as one stage's own before Pivot writes them:
+# ``record_members`` bound to that stage.
+type MemberRecorder = Callable[[Mapping[pathlib.Path, str]], None]
 
 
 class ReplacementKind(enum.StrEnum):
@@ -102,14 +109,69 @@ def recorded_members(output_path: pathlib.Path, *hashes: types.HashInfo | None) 
     return {path: frozenset(recorded) for path, recorded in found.items()}
 
 
+def member_hashes(
+    output_path: pathlib.Path, output_hash: types.HashInfo | None
+) -> dict[pathlib.Path, str]:
+    """The ``*.pvt`` files ``output_hash`` puts in ``output_path``, each with its content hash."""
+    if output_hash is None or not types.is_dir_hash(output_hash):
+        return {}
+    root = normalized(output_path)
+    return {
+        root / entry["relpath"]: entry["hash"]
+        for entry in output_hash["manifest"]
+        if entry["relpath"].endswith(".pvt")
+    }
+
+
+def record_members(
+    project_root: pathlib.Path,
+    state_dir: pathlib.Path,
+    stage_name: str,
+    members: Mapping[pathlib.Path, str],
+) -> None:
+    """Record ``members`` (path -> content hash), ``*.pvt`` files Pivot is about to write in the
+    stage's outputs, as the stage's own, in its ``nocommit:<stage>`` record.
+
+    Every path that writes such a file calls this first, so a crash leaves at worst a record
+    without a file, which claims nothing. Opens no StateDB when there is nothing to record.
+
+    Raises:
+        exceptions.MemberRecordError: The record could not be written (the write lock timed
+            out, the database is full or read-only, or it cannot be opened). The caller must not
+            write the members; it fails, naming the stage and the reason.
+    """
+    if not members:
+        return
+    root = normalized(project_root)
+    relative = {
+        normalized(path).relative_to(root).as_posix(): content_hash
+        for path, content_hash in members.items()
+    }
+    try:
+        with state.StateDB(state_dir) as state_db:
+            state_db.add_no_commit_pvt_members(stage_name, relative)
+    except (
+        exceptions.PivotDBWriteTimeoutError,
+        state.StateDBError,
+        lmdb.Error,
+        OSError,
+        RuntimeError,
+    ) as exc:
+        raise exceptions.MemberRecordError(
+            f"Stage '{stage_name}' cannot record its .pvt output files "
+            + f"({', '.join(sorted(relative))}) as its own before writing them: {exc}. "
+            + "Pivot wrote none of them; fix the state database and rerun."
+        ) from exc
+
+
 def no_commit_members(
     project_root: pathlib.Path, record: types.NoCommitRecord | None
 ) -> StageMembers:
-    """The ``*.pvt`` members a stage's last ``--no-commit`` run wrote that still hold what it
-    wrote, each with that content hash.
+    """The ``*.pvt`` members the stage's ``nocommit:`` record lists that still hold what Pivot
+    wrote there, each with that content hash.
 
-    A record outlives a run that leaves the lock's outputs in place, so a member counts only
-    while its content is the run's: a user's file put at that path later stays the user's.
+    A record outlives a write the lock's outputs later replace, so a member counts only while
+    its content is the recorded one: a user's file put at that path later stays the user's.
     """
     if record is None or "pvt_members" not in record:
         return {}
@@ -371,7 +433,7 @@ def saved_input_warnings(
 ) -> list[str]:
     """One warning per user sidecar already inside or beside an output these stages write.
 
-    A stage's own ``*.pvt`` members, as its lock or its last ``--no-commit`` run records them,
+    A stage's own ``*.pvt`` members, as its lock or its ``nocommit:`` record lists them,
     draw no warning. Both are read only for an output that holds a ``*.pvt``, so a project with
     none pays one walk per directory output.
     """

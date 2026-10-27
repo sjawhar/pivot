@@ -12,6 +12,7 @@ import ast
 import contextlib
 import dataclasses
 import fcntl
+import functools
 import importlib
 import importlib.util
 import io
@@ -38,7 +39,7 @@ import pytest
 from pivot import exceptions, loaders, stage_def, types
 from pivot import project as pivot_project
 from pivot.executor import worker
-from pivot.storage import artifact_lock, cache, lock, state, track
+from pivot.storage import artifact_lock, cache, lock, ownership, state, track
 from pivot.storage import store as store_mod
 from pivot.types import (
     FileHash,
@@ -52,7 +53,7 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from types import ModuleType
 
 _STAGE = "skip/consume"
@@ -1619,6 +1620,132 @@ def test_writer_failure_keeps_later_sibling_output_unchanged(tmp_path: pathlib.P
         )
 
     assert later_path.read_text() == "previous sibling output"
+
+
+def _pvt_member_tree() -> types.ArtifactRef:
+    return _ref(
+        _STAGE,
+        "tree",
+        tag=types.ArtifactTag.DIRECTORY,
+        loader=cast("loaders.Loader[object, object]", loaders.Text()),
+    )
+
+
+def test_output_write_records_a_pvt_member_before_the_file_exists(tmp_path: pathlib.Path) -> None:
+    """A directory output's `*.pvt` member is recorded as the stage's, with the content it will
+    hold, before it appears at its path: a crash at any point leaves at worst a record without a
+    file. The output's other members are already written then."""
+    store = store_mod.WorkspaceStore(tmp_path, "skip", {}, cache_dir=tmp_path / "cache")
+    tree = _pvt_member_tree()
+    output_path = store.resolve_display_path(tree)
+    notes = output_path / "notes.pvt"
+    recorded = list[dict[pathlib.Path, str]]()
+
+    def record(members: Mapping[pathlib.Path, str]) -> None:
+        assert not notes.exists()
+        assert (output_path / "value.txt").read_text() == "v"
+        recorded.append(dict(members))
+
+    written = worker._write_outputs_with_store(
+        {tree: {"notes.pvt": "stage notes", "value.txt": "v"}},
+        store,
+        tmp_path,
+        record_members=record,
+    )
+
+    assert written["paths"][tree] == output_path
+    assert recorded == [{notes: cache.hash_file(notes)[0]}]
+    assert notes.read_text() == "stage notes"
+    assert sorted(path.name for path in output_path.iterdir()) == ["notes.pvt", "value.txt"]
+
+
+_RECORD_FAILURES = [
+    pytest.param(
+        exceptions.PivotDBWriteTimeoutError("Timed out after 30.0s waiting for LMDB write lock"),
+        "Timed out after 30.0s",
+        id="write-lock-timeout",
+    ),
+    pytest.param(state.DatabaseFullError("State database is full"), "is full", id="full"),
+    pytest.param(
+        RuntimeError("Internal error: worker attempted write to readonly StateDB."),
+        "readonly StateDB",
+        id="read-only",
+    ),
+]
+
+
+def _refuse_record(monkeypatch: pytest.MonkeyPatch, failure: Exception) -> None:
+    def refuse(_db: state.StateDB, _stage: str, _members: Mapping[str, str]) -> None:
+        raise failure
+
+    monkeypatch.setattr(state.StateDB, "add_no_commit_pvt_members", refuse)
+
+
+@pytest.mark.parametrize(("failure", "reason"), _RECORD_FAILURES)
+def test_output_write_that_cannot_record_a_pvt_member_leaves_no_member(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, failure: Exception, reason: str
+) -> None:
+    """Recording a `*.pvt` member is not best-effort: when the StateDB write fails, the write
+    raises a Pivot error naming the stage and the reason, the member never appears at its path
+    and no staged copy is left in the output."""
+    store = store_mod.WorkspaceStore(tmp_path, "skip", {}, cache_dir=tmp_path / "cache")
+    tree = _pvt_member_tree()
+    output_path = store.resolve_display_path(tree)
+    _refuse_record(monkeypatch, failure)
+
+    with pytest.raises(exceptions.MemberRecordError) as exc_info:
+        worker._write_outputs_with_store(
+            {tree: {"notes.pvt": "stage notes", "value.txt": "v"}},
+            store,
+            tmp_path,
+            record_members=functools.partial(
+                ownership.record_members, tmp_path, tmp_path / ".pivot", _STAGE
+            ),
+        )
+
+    assert f"Stage '{_STAGE}'" in str(exc_info.value)
+    assert reason in str(exc_info.value)
+    assert sorted(path.name for path in output_path.iterdir()) == ["value.txt"]
+
+
+def _returns_pvt_member() -> dict[str, str]:
+    return {"notes.pvt": "stage notes", "value.txt": "v"}
+
+
+@pytest.mark.parametrize("no_commit", [False, True], ids=["run", "no-commit"])
+@pytest.mark.parametrize(("failure", "reason"), _RECORD_FAILURES)
+def test_stage_fails_when_its_pvt_member_cannot_be_recorded(
+    project: pathlib.Path,
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    reason: str,
+    no_commit: bool,
+) -> None:
+    """A stage whose `*.pvt` member cannot be recorded as its own fails, naming the stage and the
+    reason, and leaves no member and no staged copy in its output."""
+    tree = _ref(
+        _STAGE,
+        tag=types.ArtifactTag.DIRECTORY,
+        loader=cast("loaders.Loader[object, object]", loaders.Text()),
+    )
+    _refuse_record(monkeypatch, failure)
+
+    result = worker.execute_stage(
+        _STAGE,
+        _stage_info(
+            _returns_pvt_member, project, worker_env, deps={}, outs=[tree], no_commit=no_commit
+        ),
+        worker_env,
+        output_queue,
+    )
+
+    assert result["status"] == StageStatus.FAILED, result["reason"]
+    assert f"Stage '{_STAGE}'" in result["reason"]
+    assert reason in result["reason"]
+    output_path = store_mod.WorkspaceStore(project, "skip", {}).resolve_display_path(tree)
+    assert sorted(path.name for path in output_path.iterdir()) == ["value.txt"]
 
 
 # =============================================================================

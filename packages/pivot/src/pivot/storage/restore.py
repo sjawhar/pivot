@@ -247,8 +247,13 @@ def restore_file(
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
+    record_members: ownership.MemberRecorder | None = None,
 ) -> RestoreResult:
-    """Restore a single file from revision. Returns result with status."""
+    """Restore a single file from revision. Returns result with status.
+
+    ``record_members`` (a stage output restored to its own path) records the ``*.pvt`` members
+    ``output_hash`` writes as the stage's before anything is written.
+    """
     path_str = str(dest_path)
 
     if dest_path.exists() and not force:
@@ -257,6 +262,9 @@ def restore_file(
             path=path_str,
             message=f"Skipped: {dest_path} (already exists, use --force to overwrite)",
         )
+
+    if record_members is not None:
+        record_members(ownership.member_hashes(dest_path, output_hash))
 
     # Ensure parent directory exists before any restore strategy
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -378,8 +386,8 @@ def _stage_members(
     hashes: tuple[HashInfo | None, ...],
     stage_target: StageTarget,
 ) -> ownership.StageMembers:
-    """A stage output's own ``*.pvt`` members: the ones ``hashes`` and its last ``--no-commit``
-    run record."""
+    """A stage output's own ``*.pvt`` members: the ones ``hashes`` and the stage's ``nocommit:``
+    record list."""
     return ownership.merged_members(
         ownership.recorded_members(path, *hashes),
         ownership.stored_no_commit_members(
@@ -487,6 +495,13 @@ def restore_targets_from_revision(
     results = list[RestoreResult]()
 
     for target_info in target_infos:
+        # A stage target restored to its own path writes the revision's output, which no lock
+        # here records: its `*.pvt` members are recorded as the stage's before it is written
+        stage_target = (
+            stage_targets[target_info["original_target"]]
+            if target_info["target_type"] is TargetType.STAGE
+            else None
+        )
         for rel_path in target_info["paths"]:
             output_hash = target_info["hashes"].get(rel_path)
             dest_path = output_path if output_path is not None else proj_root / rel_path
@@ -499,6 +514,16 @@ def restore_targets_from_revision(
                 cache_dir=cache_dir,
                 checkout_modes=checkout_modes,
                 force=force,
+                record_members=(
+                    functools.partial(
+                        ownership.record_members,
+                        proj_root,
+                        stage_target["state_dir"],
+                        stage_target["stage_name"],
+                    )
+                    if stage_target is not None and dest_path == proj_root / rel_path
+                    else None
+                ),
             )
             results.append(result)
 

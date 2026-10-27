@@ -5,12 +5,15 @@ import os
 import pathlib
 import pickle
 import stat
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from pivot import config, exceptions, loaders, types
-from pivot.storage import cache, store, track
+from pivot.storage import cache, ownership, store, track
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 def _helper_ref(
@@ -139,6 +142,39 @@ def test_workspace_store_commit_and_restore(tmp_path: pathlib.Path) -> None:
     restored = workspace_store.restore_from_cache(ref, output_hash)
     assert restored is True
     assert output_path.read_text() == "hello cache"
+
+
+def test_workspace_store_restore_records_pvt_members_before_writing_them(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A restore of a hash no lock records (a run-cache restore) records each `*.pvt` member it
+    writes, with the content it will hold, after the ownership check and before it writes
+    anything."""
+    workspace_store = store.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="pipe",
+        input_bindings={},
+        cache_dir=tmp_path / "cache" / "files",
+    )
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.Text())
+    output_path = workspace_store.prepare_output(ref)
+    notes = output_path / "notes.pvt"
+    notes.write_text("stage notes")
+    (output_path / "value.txt").write_text("v")
+    output_hash = workspace_store.commit(
+        ref, output_path, members={ownership.normalized(notes): None}
+    )
+    cache.remove_output(output_path)
+    recorded = list[dict[pathlib.Path, str]]()
+
+    def record(members: Mapping[pathlib.Path, str]) -> None:
+        assert not output_path.exists()
+        recorded.append(dict(members))
+
+    assert workspace_store.restore_from_cache(ref, output_hash, record_members=record) is True
+
+    assert recorded == [{ownership.normalized(notes): cache.hash_file(notes)[0]}]
+    assert notes.read_text() == "stage notes"
 
 
 def test_workspace_store_pickle_round_trip(tmp_path: pathlib.Path) -> None:

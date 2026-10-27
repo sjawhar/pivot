@@ -23,7 +23,7 @@ from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
-from pivot.types import OnError, StageStatus
+from pivot.types import OnError, StageResult, StageStatus
 
 if TYPE_CHECKING:
     import concurrent.futures
@@ -541,6 +541,19 @@ def prepare_worker_info(
         unsafe_fingerprint=stage_info["unsafe_fingerprint"],
         no_fingerprint=stage_info["no_fingerprint"],
     )
+
+
+def apply_deferred_writes(
+    stage_name: str,
+    output_paths: list[str],
+    result: StageResult,
+    state_db: state_mod.StateDB,
+) -> None:
+    """Apply deferred StateDB writes from worker result."""
+    if "deferred_writes" not in result:
+        return
+    # result["deferred_writes"] is DeferredWrites from worker
+    state_db.apply_deferred_writes(stage_name, output_paths, result["deferred_writes"])
 
 
 # =========================================================================

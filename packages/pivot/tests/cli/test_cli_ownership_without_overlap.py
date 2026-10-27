@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import pathlib
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from conftest import isolated_pivot_dir
 from pivot import cli, project
+from pivot.engine import engine as engine_mod
 from pivot.storage import state, store
 
 if TYPE_CHECKING:
@@ -464,6 +465,129 @@ def test_a_written_lock_ends_the_no_commit_record(
         assert after_commit is None
         assert after_second == ["data/b/tree/notes.pvt"]
         assert after_run is None
+
+
+@pytest.mark.parametrize("command", ["get", "checkout"])
+def test_forced_restore_of_a_tracked_directory_replaces_its_own_pvt_named_file(
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    """A tracked directory may hold a file named `*.pvt` that is part of its own content, not a
+    sidecar. A forced restore of that directory (`get --rev R --force`, `checkout --force`) is its
+    own restore: it restores the directory, that file included, as at main (kills mutant Q07:
+    `get --force` does not count a tracked directory's own `*.pvt` content as its own)."""
+    repo_path, commit = git_repo
+    (repo_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.chdir(repo_path)
+    (repo_path / "pipeline.py").write_text(_ROOT_PIPELINE)
+    tracked_dir = repo_path / "data" / "raw" / "dir"
+    tracked_dir.mkdir(parents=True)
+    member = tracked_dir / "x.txt"
+    member.write_text("v1")
+    notes = tracked_dir / "notes.pvt"
+    notes.write_text("part of the tracked directory\n")
+    tracked = runner.invoke(cli.cli, ["track", "data/raw/dir"])
+    assert tracked.exit_code == 0, tracked.output
+    sha = commit("v1")
+    tracked_dir.chmod(0o755)
+    member.unlink()
+    member.write_text("local edit")
+
+    if command == "get":
+        result = runner.invoke(cli.cli, ["get", "--rev", sha[:7], "--force", "data/raw/dir"])
+    else:
+        result = runner.invoke(cli.cli, ["checkout", "data/raw/dir", "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert "Refusing" not in result.output
+    assert member.read_text() == "v1"
+    assert notes.read_text() == "part of the tracked directory\n"
+
+
+@pytest.mark.parametrize("written_by", ["get", "no-commit-run-cache"])
+def test_only_missing_checkout_replaces_a_pvt_member_pivot_recorded(
+    runner: click.testing.CliRunner,
+    git_repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    written_by: str,
+) -> None:
+    """`pivot get --rev R <stage> --force`, or a `--no-commit` run the run cache serves, writes
+    the stage's own `notes.pvt`, which only the stage's `nocommit:` record lists. Every file in
+    the output is then in the cache, so `checkout --only-missing` (which `pivot pull` runs)
+    replaces the output with the lock's, as at main: the swap's check reads that record."""
+    repo_path, commit = git_repo
+    (repo_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.chdir(repo_path)
+    (repo_path / "pipeline.py").write_text(_PVT_MEMBER_SOMETIMES_PIPELINE)
+    params = repo_path / "params.yaml"
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+    params.write_text("b/tree:\n  n: 2\n")
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+    sha = commit("n=2")
+    params.unlink()
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+    if written_by == "get":
+        written = runner.invoke(cli.cli, ["get", "--rev", sha[:7], "b/tree", "--force"])
+    else:
+        params.write_text("b/tree:\n  n: 2\n")
+        written = runner.invoke(cli.cli, ["repro", "--no-commit"])
+        params.unlink()
+    assert written.exit_code == 0, written.output
+    notes = repo_path / "data" / "b" / "tree" / "notes.pvt"
+    assert notes.read_text() == "ordinary stage output"
+
+    result = runner.invoke(cli.cli, ["checkout", "--only-missing"])
+
+    assert result.exit_code == 0, result.output
+    assert "Refusing" not in result.output
+    assert not notes.exists()
+    assert (repo_path / "data" / "b" / "tree" / "value.txt").read_text() == "1"
+
+
+def test_coordinator_skip_replaces_a_pvt_member_only_the_record_lists(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `--no-commit` run writes the stage's own `notes.pvt`, which only the stage's
+    `nocommit:` record lists. A later run whose params match the lock again is skipped in the
+    coordinator, which restores the lock's output over that member itself, reading the record,
+    instead of failing the check and handing the stage to a worker (kills mutant N18: the
+    coordinator skip ignores the record)."""
+    outcomes = list[object]()
+    try_skip = engine_mod.Engine._try_skip_in_coordinator
+
+    async def recording_try_skip(
+        self: engine_mod.Engine, stage_name: str, *args: Any, **kwargs: Any
+    ) -> bool:
+        try:
+            skipped = await try_skip(self, stage_name, *args, **kwargs)
+        except Exception as exc:
+            outcomes.append(type(exc).__name__)
+            raise
+        outcomes.append(skipped)
+        return skipped
+
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_PVT_MEMBER_SOMETIMES_PIPELINE)
+        params = root / "params.yaml"
+        assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+        params.write_text("b/tree:\n  n: 2\n")
+        pending = runner.invoke(cli.cli, ["repro", "--no-commit"])
+        assert pending.exit_code == 0, pending.output
+        notes = root / "data" / "b" / "tree" / "notes.pvt"
+        assert notes.read_text() == "ordinary stage output"
+        params.unlink()
+        monkeypatch.setattr(engine_mod.Engine, "_try_skip_in_coordinator", recording_try_skip)
+
+        result = runner.invoke(cli.cli, ["repro"])
+
+        assert result.exit_code == 0, result.output
+        assert outcomes == [True]
+        assert not notes.exists()
+        assert (root / "data" / "b" / "tree" / "value.txt").read_text() == "1"
 
 
 def test_storage_agents_md_names_only_existing_workspace_store_methods() -> None:

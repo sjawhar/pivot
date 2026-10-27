@@ -1076,21 +1076,19 @@ def test_apply_deferred_writes_path_too_long_output(tmp_path: pathlib.Path) -> N
 
 
 def test_no_commit_record_is_kept_until_a_lock_clears_it(tmp_path: pathlib.Path) -> None:
-    """A --no-commit run's record replaces the stage's earlier one and stays until a deferred
-    write for a written lock clears it; other stages have none."""
-    first: DeferredWrites = {"no_commit_record": {"pvt_members": {"data/s/a.pvt": "aaa"}}}
-    second: DeferredWrites = {"no_commit_record": {"pvt_members": {}}}
+    """The stage's record stays through deferred writes that write no lock for it, until a
+    deferred write for its written lock clears it; other stages have none."""
     cleared: DeferredWrites = {"clear_no_commit_record": True}
 
     with state.StateDB(tmp_path) as db:
         assert db.get_no_commit_record("s") is None
-        db.apply_deferred_writes("s", [], first)
+        db.add_no_commit_pvt_members("s", {"data/s/a.pvt": "aaa"})
         assert db.get_no_commit_record("s") == {"pvt_members": {"data/s/a.pvt": "aaa"}}
         assert db.get_no_commit_record("other") is None
         db.apply_deferred_writes("s", [], {"dep_generations": {"dep": 1}})
         assert db.get_no_commit_record("s") == {"pvt_members": {"data/s/a.pvt": "aaa"}}
-        db.apply_deferred_writes("s", [], second)
-        assert db.get_no_commit_record("s") == {"pvt_members": {}}
+        db.apply_deferred_writes("other", [], cleared)
+        assert db.get_no_commit_record("s") == {"pvt_members": {"data/s/a.pvt": "aaa"}}
         db.apply_deferred_writes("s", [], cleared)
         assert db.get_no_commit_record("s") is None
         db.apply_deferred_writes("s", [], cleared)
@@ -1117,6 +1115,64 @@ def test_unreadable_no_commit_record_reads_as_none(tmp_path: pathlib.Path, store
 
     with state.StateDB(tmp_path, readonly=True) as db:
         assert db.get_no_commit_record("s") is None
+
+
+def test_adding_pvt_members_keeps_the_record_and_its_other_fields(tmp_path: pathlib.Path) -> None:
+    """Members Pivot records before it writes them join the stage's record: earlier members stay,
+    a member written again takes its new hash, a field another writer keeps in the record (the
+    shared `nocommit:` record) stays, and a written lock still clears the whole record."""
+    with state.StateDB(tmp_path) as db:
+        db.add_no_commit_pvt_members("s", {"data/s/b.pvt": "bbb"})
+        assert db.get_no_commit_record("s") == {"pvt_members": {"data/s/b.pvt": "bbb"}}
+        db.add_no_commit_pvt_members("s", {"data/s/a.pvt": "aaa", "data/s/b.pvt": "ccc"})
+        assert db.get_no_commit_record("s") == {
+            "pvt_members": {"data/s/a.pvt": "aaa", "data/s/b.pvt": "ccc"}
+        }
+        assert db.get_no_commit_record("other") is None
+    env = lmdb.open(str(tmp_path / "state.lmdb"))
+    with env.begin(write=True) as txn:
+        txn.put(b"nocommit:s", b'{"output_hashes": {"s": "h"}, "pvt_members": {"x.pvt": "x"}}')
+    env.close()
+
+    with state.StateDB(tmp_path) as db:
+        db.add_no_commit_pvt_members("s", {"data/s/a.pvt": "aaa"})
+    env = lmdb.open(str(tmp_path / "state.lmdb"))
+    with env.begin() as txn:
+        stored = txn.get(b"nocommit:s")
+    env.close()
+    assert stored is not None
+    assert json.loads(stored) == {
+        "output_hashes": {"s": "h"},
+        "pvt_members": {"data/s/a.pvt": "aaa", "x.pvt": "x"},
+    }
+
+    with state.StateDB(tmp_path) as db:
+        db.apply_deferred_writes("s", [], {"clear_no_commit_record": True})
+        assert db.get_no_commit_record("s") is None
+
+
+def test_adding_pvt_members_replaces_an_unreadable_record(tmp_path: pathlib.Path) -> None:
+    """A record this Pivot cannot read claims nothing; recording members starts a new one."""
+    with state.StateDB(tmp_path):
+        pass
+    env = lmdb.open(str(tmp_path / "state.lmdb"))
+    with env.begin(write=True) as txn:
+        txn.put(b"nocommit:s", b'{"pvt_members": ["data/s/a.pvt"]}')
+    env.close()
+
+    with state.StateDB(tmp_path) as db:
+        db.add_no_commit_pvt_members("s", {"data/s/b.pvt": "bbb"})
+        assert db.get_no_commit_record("s") == {"pvt_members": {"data/s/b.pvt": "bbb"}}
+
+
+def test_readonly_statedb_refuses_to_add_pvt_members(tmp_path: pathlib.Path) -> None:
+    with state.StateDB(tmp_path):
+        pass
+    with (
+        state.StateDB(tmp_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly"),
+    ):
+        db.add_no_commit_pvt_members("s", {"data/s/b.pvt": "bbb"})
 
 
 # -----------------------------------------------------------------------------

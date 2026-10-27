@@ -235,10 +235,11 @@ pivot commit [STAGES...] [OPTIONS]
 
 Without arguments, commits all stale stages. With stage names, unconditionally commits those stages.
 
-A `.pvt` file inside an output is the stage's only when the stage's lock lists it there, or its
-last `pivot repro --no-commit` run wrote it there and it is unchanged since. `pivot commit`
-refuses, naming it, any other `.pvt` in an output, such as a user's sidecar or one this version
-of Pivot cannot read, instead of recording it as the stage's output.
+A `.pvt` file inside an output is the stage's only when the stage's lock lists it there, or
+Pivot recorded it there before writing it (a `pivot repro` run, `--no-commit` included, or
+`pivot get` of the stage) and it is unchanged since. `pivot commit` refuses, naming it, any
+other `.pvt` in an output, such as a user's sidecar or one this version of Pivot cannot read,
+instead of recording it as the stage's output.
 
 **Options:**
 
@@ -410,16 +411,20 @@ naming it, `pivot track --force` updates it in place with the same warning, and 
 restore, `pivot commit`, forced checkout or forced `pivot get` that would remove it or its `.pvt`
 sidecar fails before changing anything. A forced restore of a tracked directory (or of a tracked
 file over a directory) likewise fails before it would remove another tracked file, import or
-`.pvt` sidecar beneath it. Move the file and its `.pvt` sidecar outside the output (for example
-under `data/raw/`). The check finds a sidecar beside its file, where Pivot writes it; a
-hand-edited `.pvt` elsewhere whose `path` points into an output is not protected.
+`.pvt` sidecar beneath it. A restore requested through a stage name restores that stage's output,
+so a tracked file at that output's path makes it fail too. Move the file and its `.pvt` sidecar
+outside the output (for example under `data/raw/`). The check finds a sidecar beside its file,
+where Pivot writes it; a hand-edited `.pvt` elsewhere whose `path` points into an output is not
+protected.
 
 A stage may return a directory member named `*.pvt`. Pivot treats such a file as the stage's
-when the stage's lock or its current run records it at that path, or its last
-`pivot repro --no-commit` run wrote it there and it is unchanged since, and every other `.pvt`
-under an output as a user's sidecar, which a `.pvt` this version of Pivot cannot read may be.
-`pivot commit` claims no other `.pvt`: it refuses, naming the file, rather than record it as the
-stage's output, after which the next run would delete it.
+when the stage's lock records it at that path, or Pivot recorded it there before writing it and
+it is unchanged since. A run, a run-cache restore (also under `pivot repro --no-commit`) and
+`pivot get` of a stage record each such member before they write it; `pivot checkout` and
+`pivot pull` restore only what the lock records. Every other `.pvt` under an output is a user's
+sidecar, which a `.pvt` this version of Pivot cannot read may be. `pivot commit` claims no other
+`.pvt`: it refuses, naming the file, rather than record it as the stage's output, after which the
+next run would delete it.
 
 ---
 
@@ -447,12 +452,14 @@ pivot checkout [TARGETS...] [OPTIONS]
 Checkout summaries count restored, skipped, and missing **files**. Each file in a directory output
 counts separately.
 
-A checkout that would replace an existing path holding another user's file refuses for that
-path: a stage output that holds a tracked file or `.pvt` sidecar, or a tracked path that holds
-another tracked file, import or `.pvt` sidecar beneath it. Only `--force` and an `--only-missing`
-directory swap replace an existing path. `--force` checks every target before it restores the
-first, restores the ones it does not refuse, and then fails naming each file it kept.
-`pivot pull --force` restores the same way.
+A checkout that would replace an existing path holding another user's file refuses: a stage
+output that holds a tracked file or `.pvt` sidecar, or a tracked path that holds another tracked
+file, import or `.pvt` sidecar beneath it. A target that names a stage restores that stage's
+outputs, so a tracked file or sidecar at one of their paths refuses it too. Only `--force` and an
+`--only-missing` directory swap replace an existing path. `--force` checks every target before it
+changes any: if it refuses one, it changes nothing and exits 1, naming every refused target and
+the files that block it. `pivot pull --force` restores the same way. An `--only-missing` swap is
+checked when it is decided.
 
 ---
 

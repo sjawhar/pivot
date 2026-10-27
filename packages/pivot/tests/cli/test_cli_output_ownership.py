@@ -257,7 +257,8 @@ def test_checkout_without_force_restores_other_files_beside_saved_input(
 ) -> None:
     """`checkout` and `checkout --only-missing` never replace an existing output, so a tracked
     file saved inside one makes neither refuse for ownership: each restores every other file and
-    reports that output as main does. `checkout --force` refuses only for that output."""
+    reports that output as main does. `checkout --force` refuses that output and, having checked
+    every target first, restores nothing."""
     with isolated_pivot_dir(runner, tmp_path) as root:
         (root / "pipeline.py").write_text(_ROOT_PIPELINE)
         _write_other_pipeline(root)
@@ -298,7 +299,7 @@ def test_checkout_without_force_restores_other_files_beside_saved_input(
         assert forced.exit_code != 0, forced.output
         assert "Refusing to replace a stage output" in forced_output
         assert "data/b/tree/saved.txt.pvt" in forced_output
-        assert outside.read_text() == "outside"
+        assert not outside.exists(), forced.output
         assert saved.read_text() == "user input"
         assert sidecar.exists()
 
@@ -319,6 +320,92 @@ with Pipeline("b") as pipeline:
 """
 
 _UNREADABLE = "format: 99\nnot a sidecar this Pivot can read\n"
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [["--all"], ["data/b/tree", "data/raw/dir", "data/raw/in.txt"]],
+    ids=["all", "targets"],
+)
+def test_forced_checkout_names_every_refused_target_and_changes_nothing(
+    runner: CliRunner, tmp_path: pathlib.Path, targets: list[str]
+) -> None:
+    """`checkout --force` refuses two targets for different user files: a stage output holding a
+    tracked file saved inside it, and a tracked directory holding another tracked file. It names
+    both targets and the file that blocks each, and changes no target, a third one's local edit
+    included, whether the targets are named or `--all`."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_TREE_PIPELINE)
+        assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+        # Saved while no pipeline declared data/b/tree (main's track allowed it in any state)
+        (root / "pipeline.py").write_text(_ROOT_PIPELINE)
+        saved = root / "data" / "b" / "tree" / "f.txt"
+        saved.write_text("saved")
+        tracked_dir = root / "data" / "raw" / "dir"
+        tracked_dir.mkdir(parents=True)
+        (tracked_dir / "keep.txt").write_text("keep")
+        raw = root / "data" / "raw" / "in.txt"
+        raw.write_text("raw v1")
+        tracked = runner.invoke(
+            cli.cli, ["track", "data/b/tree/f.txt", "data/raw/dir", "data/raw/in.txt"]
+        )
+        assert tracked.exit_code == 0, tracked.output
+        tracked_dir.chmod(0o755)
+        nested = tracked_dir / "n.txt"
+        nested.write_text("nested")
+        assert runner.invoke(cli.cli, ["track", "data/raw/dir/n.txt"]).exit_code == 0
+        (root / "pipeline.py").write_text(_TREE_PIPELINE)
+        raw.unlink()
+        raw.write_text("local edit")
+
+        result = runner.invoke(cli.cli, ["checkout", *targets, "--force"])
+
+        output = " ".join(result.output.split())
+        assert result.exit_code != 0, result.output
+        assert (
+            "tracked path 'data/b/tree/f.txt' (sidecar 'data/b/tree/f.txt.pvt') is inside stage "
+            + "output 'data/b/tree'"
+        ) in output
+        assert (
+            "tracked path 'data/raw/dir/n.txt' (sidecar 'data/raw/dir/n.txt.pvt') is inside "
+            + "restored path 'data/raw/dir'"
+        ) in output
+        assert raw.read_text() == "local edit"
+        assert saved.read_text() == "saved"
+        assert nested.read_text() == "nested"
+
+
+def test_forced_checkout_names_each_refused_target_one_file_blocks(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """One tracked file beneath two tracked directories, one inside the other, blocks the forced
+    restore of each: `checkout --all --force` names it under both refused targets."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_ROOT_PIPELINE)
+        outer = root / "data" / "raw" / "dir"
+        outer.mkdir(parents=True)
+        (outer / "keep.txt").write_text("keep")
+        assert runner.invoke(cli.cli, ["track", "data/raw/dir"]).exit_code == 0
+        outer.chmod(0o755)
+        inner = outer / "sub"
+        inner.mkdir()
+        (inner / "s.txt").write_text("s")
+        assert runner.invoke(cli.cli, ["track", "data/raw/dir/sub"]).exit_code == 0
+        inner.chmod(0o755)
+        nested = inner / "n.txt"
+        nested.write_text("nested")
+        assert runner.invoke(cli.cli, ["track", "data/raw/dir/sub/n.txt"]).exit_code == 0
+
+        result = runner.invoke(cli.cli, ["checkout", "--all", "--force"])
+
+        output = " ".join(result.output.split())
+        assert result.exit_code != 0, result.output
+        for target in ("data/raw/dir", "data/raw/dir/sub"):
+            assert (
+                "tracked path 'data/raw/dir/sub/n.txt' (sidecar 'data/raw/dir/sub/n.txt.pvt') is "
+                + f"inside restored path '{target}'"
+            ) in output
+        assert nested.read_text() == "nested"
 
 
 def test_pivot_commit_does_not_give_an_unreadable_user_sidecar_to_the_stage(
@@ -541,8 +628,8 @@ def test_forced_restore_of_a_tracked_path_keeps_other_tracked_files_beneath_it(
     refuse, before removing anything, to restore it over a tracked file and sidecar saved beneath
     it, in each state: a tracked file whose path became a directory output (file), a tracked
     directory holding a directory output (directory), and a tracked directory holding another
-    tracked file (nested). `checkout --all --force` still restores each target it does not
-    refuse."""
+    tracked file (nested). `checkout --all --force` checks every target before it changes any, so
+    it restores no other target either."""
     repo_path, commit = git_repo
     (repo_path / ".pivot").mkdir()
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
@@ -567,7 +654,7 @@ def test_forced_restore_of_a_tracked_path_keeps_other_tracked_files_beneath_it(
     assert saved.read_text() == "saved"
     assert track.get_pvt_path(saved).is_file()
     if command == "checkout-all":
-        assert outside.read_text() == "outside"
+        assert not outside.exists(), result.output
 
 
 @pytest.mark.parametrize("command", ["checkout", "get"])

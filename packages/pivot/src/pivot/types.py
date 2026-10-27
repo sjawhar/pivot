@@ -150,11 +150,13 @@ class OnError(enum.StrEnum):
 
 
 class NoCommitRecord(TypedDict, total=False):
-    """What a `--no-commit` run of a stage wrote, kept in StateDB (`nocommit:<stage>`).
+    """What Pivot wrote in a stage's outputs that no lock records yet (StateDB `nocommit:<stage>`).
 
-    A written lock supersedes it. `pvt_members` maps each `*.pvt` file the run wrote in a directory
-    output (path relative to the project root) to its content hash: until a lock records them,
-    they are the stage's own files, which `pivot commit` claims and later runs replace.
+    A written lock supersedes it. `pvt_members` maps each `*.pvt` file Pivot wrote in a directory
+    output (path relative to the project root) to its content hash. Every path that writes one
+    adds it before the file exists: a run (`--no-commit` included), a run-cache restore and
+    `pivot get` of a stage. Until a lock records them, they are the stage's own files, which
+    `pivot commit` claims and later runs replace.
     """
 
     pvt_members: dict[str, str]
@@ -174,8 +176,7 @@ class DeferredWrites(TypedDict, total=False):
     run_cache_delete_input_hash: str
     increment_outputs: bool  # True → increment output generations; False/absent → skip
     file_hash_entries: list[tuple[str, int, int, int, str]]  # (path, mtime_ns, size, inode, hash)
-    no_commit_record: NoCommitRecord  # a --no-commit run's record for `pivot commit`
-    clear_no_commit_record: bool  # a lock was written: drop the stage's --no-commit record
+    clear_no_commit_record: bool  # a lock was written: drop the stage's nocommit: record
 
 
 class StageResult(TypedDict):

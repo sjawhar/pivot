@@ -285,12 +285,15 @@ class WorkspaceStore:
         checkout_modes: list[config.CheckoutMode] | None = None,
         recorded_hash: types.HashInfo | None = None,
         no_commit_members: ownership.StageMembers | None = None,
+        record_members: ownership.MemberRecorder | None = None,
     ) -> bool:
         """Restore an output to ``output_hash``, refusing first if that would remove a user file.
 
         ``recorded_hash`` is the hash the stage's lock records now, when it differs from the
         restored one (a run-cache restore), and ``no_commit_members`` the ``*.pvt`` files the
-        stage's last ``--no-commit`` run wrote: members any of them records are the stage's.
+        stage's ``nocommit:`` record lists: members any of them records are the stage's.
+        ``record_members`` records the ``*.pvt`` members ``output_hash`` writes, after the check
+        and before the restore, for a hash no lock records.
         """
         if self._cache_dir is None:
             return False
@@ -302,6 +305,8 @@ class WorkspaceStore:
             no_commit_members or {},
         )
         self.refuse_output_replacements([ref], {ref: members})
+        if record_members is not None:
+            record_members(ownership.member_hashes(output_path, output_hash))
         return cache.restore_from_cache(
             output_path,
             output_hash,

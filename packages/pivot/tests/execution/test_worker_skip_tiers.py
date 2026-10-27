@@ -222,6 +222,7 @@ class _EvictedCacheStore(store_mod.WorkspaceStore):
         checkout_modes: list[cache.CheckoutMode] | None = None,
         recorded_hash: types.HashInfo | None = None,
         no_commit_members: ownership.StageMembers | None = None,
+        record_members: ownership.MemberRecorder | None = None,
     ) -> bool:
         return False
 

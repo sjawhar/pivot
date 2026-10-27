@@ -297,7 +297,7 @@ StateDB is an LMDB-backed key-value store for all pipeline state. Keys use prefi
 | `runcache:` | Run cache entries (stage name + input hash) |
 | `run:` | Run history manifests |
 | `remote:` | Remote index entries |
-| `nocommit:` | What a `--no-commit` run of a stage wrote: its `*.pvt` directory members (path → content hash), until a lock is written |
+| `nocommit:` | What Pivot wrote in a stage's outputs that no lock records yet: its `*.pvt` directory members (path → content hash), each added before the file is written, until a lock is written |
 
 **Path handling strategies:** Hash keys use `resolve()` (follows symlinks) so that symlinked files deduplicate to the same cache entry. Generation keys use `normpath()` (preserves symlinks) so that logical path identity is maintained for dependency tracking.
 
@@ -306,6 +306,7 @@ StateDB is an LMDB-backed key-value store for all pipeline state. Keys use prefi
 - Workers open StateDB in `readonly=True` mode (no write contention)
 - Workers collect `DeferredWrites` and return them to the coordinator
 - Coordinator applies all writes atomically in a single LMDB transaction
+- One exception: before a worker writes a `*.pvt` member into a directory output (a run or a run-cache restore), it adds that member to the stage's `nocommit:` record in its own write transaction, so a crash never leaves the stage's member unrecorded. Only a stage that writes such a member pays this write
 
 ### Generation tracking
 
@@ -349,7 +350,8 @@ Multiple simultaneous `pivot repro` invocations on the same project are safe and
 The coordinator-worker pattern ensures multi-process safety:
 
 1. **Worker processes** (readonly): Open StateDB in readonly mode, see consistent MVCC
-   snapshots. Collect deferred writes locally instead of writing directly.
+   snapshots. Collect deferred writes locally instead of writing directly. The one direct
+   write is the `nocommit:` record of a `*.pvt` member, made before the member is written.
 2. **Coordinator process** (read-write): Applies all deferred writes in a single atomic
    transaction after worker completes via `apply_deferred_writes()`.
 
@@ -446,8 +448,8 @@ pivot commit
 
 ### How It Works
 
-1. `--no-commit`: stages execute and outputs are written to disk. No lock files and no cache copies are written. StateDB keeps one record per stage that ran (`nocommit:<stage>`): the `*.pvt` files it wrote in its directory outputs, with their content hashes. Until a lock is written, each such file that still holds what the run wrote is the stage's own: a later run or restore replaces it, and `status` does not warn about it.
-2. `pivot commit [stage_names...]`: computes current workspace state (fingerprints code, hashes deps and outputs), writes production lock files, saves outputs to cache, and updates StateDB. Without arguments, commits all stale stages. With stage names, unconditionally commits those stages. It takes as the stage's own only the `*.pvt` files its lock lists, or that its `--no-commit` record lists and that are unchanged since; it refuses, naming it, any other `.pvt` in an output, which may be a user's sidecar. A written lock removes the record.
+1. `--no-commit`: stages execute and outputs are written to disk. No lock files and no cache copies are written. StateDB keeps one record per stage (`nocommit:<stage>`): the `*.pvt` files Pivot wrote in its directory outputs since its lock was last written, with their content hashes. Each is added before the file is written, as every path that writes a stage's `*.pvt` member without writing its lock does (a run-cache restore, `pivot get` of the stage), so a crash leaves at worst a record without a file. Until a lock is written, each such file that still holds the recorded content is the stage's own: a later run or restore replaces it, and `status` does not warn about it.
+2. `pivot commit [stage_names...]`: computes current workspace state (fingerprints code, hashes deps and outputs), writes production lock files, saves outputs to cache, and updates StateDB. Without arguments, commits all stale stages. With stage names, unconditionally commits those stages. It takes as the stage's own only the `*.pvt` files its lock lists, or that its `nocommit:` record lists and that are unchanged since; it refuses, naming it, any other `.pvt` in an output, which may be a user's sidecar. A written lock removes the record.
 
 ### Use Case
 

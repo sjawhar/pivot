@@ -136,9 +136,9 @@ def commit_stages(
                 previous_lock["code_manifest"] if previous_lock is not None else None, fingerprint
             )
             reusable = skip.uncovered_import_reason(code_manifest) is None
-            # The stage's own *.pvt files are the ones its lock or its last --no-commit run
-            # records. Every other *.pvt in an output is a user's: the commit refuses before it
-            # would claim one, so a later run cannot delete it as the stage's.
+            # The stage's own *.pvt files are the ones its lock or its nocommit: record lists.
+            # Every other *.pvt in an output is a user's: the commit refuses before it would
+            # claim one, so a later run cannot delete it as the stage's.
             run_members = ownership.no_commit_members(
                 project_root, stage_db.get_no_commit_record(stage_name)
             )

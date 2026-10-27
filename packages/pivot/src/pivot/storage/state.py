@@ -19,7 +19,7 @@ from pivot import exceptions, run_history
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Generator, Iterable, Mapping
 
     from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
@@ -35,7 +35,7 @@ _RUN_PREFIX = b"run:"  # Run history entries
 _RUNCACHE_PREFIX = b"runcache:"  # Run cache entries for skip detection
 _FP_PREFIX = b"fp:"  # AST fingerprint/hash cache entries
 _SM_PREFIX = b"sm:"  # Stage manifest cache entries
-_NOCOMMIT_PREFIX = b"nocommit:"  # What a --no-commit run of a stage wrote, until a lock is written
+_NOCOMMIT_PREFIX = b"nocommit:"  # What Pivot wrote in a stage's outputs that no lock records yet
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024
@@ -919,7 +919,7 @@ class StateDB:
         return run_history.deserialize_run_cache_entry(value)
 
     def get_no_commit_record(self, stage_name: str) -> NoCommitRecord | None:
-        """The record a `--no-commit` run of `stage_name` left, or None (absent or unreadable)."""
+        """The stage's `nocommit:` record, or None (absent or unreadable)."""
         self._check_closed()
         with self._read_transaction() as txn:
             value = txn.get(_NOCOMMIT_PREFIX + stage_name.encode())
@@ -937,6 +937,37 @@ class StateDB:
             return None
         checked = typing.cast("object", {"pvt_members": members})
         return typing.cast("NoCommitRecord", checked)
+
+    def add_no_commit_pvt_members(self, stage_name: str, members: Mapping[str, str]) -> None:
+        """Add `members` (path relative to the project root -> content hash) to the `*.pvt`
+        members the stage's `nocommit:` record lists, keeping every other entry and field.
+
+        Pivot calls this before it writes those files, so a crash leaves at worst a record
+        without a file. An unreadable record is replaced.
+        """
+        self._check_closed()
+        self._check_write_allowed()
+        key = _NOCOMMIT_PREFIX + stage_name.encode()
+        try:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
+                value = txn.get(key)
+                record = dict[str, object]()
+                if value is not None:
+                    try:
+                        data: object = json.loads(value)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        data = None
+                    if isinstance(data, dict):
+                        record = typing.cast("dict[str, object]", data)
+                pvt_members = dict[str, str]()
+                current = record.get("pvt_members")
+                if _is_str_dict(current):
+                    pvt_members.update(typing.cast("dict[str, str]", current))
+                pvt_members.update(members)
+                record["pvt_members"] = dict(sorted(pvt_members.items()))
+                txn.put(key, json.dumps(record).encode())
+        except lmdb.MapFullError as e:
+            raise DatabaseFullError(_DB_FULL_MSG) from e
 
     def prune_run_cache(self, valid_run_ids: set[str]) -> int:
         """Remove run cache entries that reference runs not in valid_run_ids.
@@ -1065,11 +1096,9 @@ class StateDB:
                         value = _pack_value(mtime_ns, size, inode, hash_hex)
                         txn.put(key, value)
 
-                nocommit_key = _NOCOMMIT_PREFIX + stage_name.encode()
-                if "no_commit_record" in deferred:
-                    txn.put(nocommit_key, json.dumps(deferred["no_commit_record"]).encode())
-                elif "clear_no_commit_record" in deferred and deferred["clear_no_commit_record"]:
-                    txn.delete(nocommit_key)
+                # A written lock supersedes the stage's nocommit: record
+                if "clear_no_commit_record" in deferred and deferred["clear_no_commit_record"]:
+                    txn.delete(_NOCOMMIT_PREFIX + stage_name.encode())
 
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
