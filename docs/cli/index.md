@@ -42,9 +42,10 @@ prints one line: an operating-system error as its message and the path it names 
 `Error: Permission denied: /home/me/proj/.pivot/cache/files/c9`), anything else as
 `Error: Unexpected <type>: <message>`. In `run` and `repro`, a stage that fails because pivot's
 own code hit such an error prints that same one line under its name; a failure that comes out of
-your own stage function prints its traceback, so you can debug it. The `--json` record keeps the
-stage's full reason in both cases, unchanged. `pivot --verbose <command>` also prints the
-traceback, after the TUI exits for `--tui`.
+your own code (the stage function, or the `load`, `save` or `empty` of a loader you wrote) prints
+its traceback, so you can debug it. The `--json` record keeps the stage's full reason in both
+cases, unchanged. `pivot --verbose <command>` also prints the traceback, after the TUI exits for
+`--tui`.
 
 **Path arguments.** `pivot track`, `push`, `fetch` and `pull` read a relative path from the
 current directory. `diff`, `checkout`, `repro`, `dag`, `get` and `check-ignore` read it from the

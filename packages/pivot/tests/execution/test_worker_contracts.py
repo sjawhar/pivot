@@ -1,8 +1,9 @@
 """Worker behaviors a stage author or the coordinator relies on, through execute_stage and helpers.
 
 Covers what reaches the output queue (logs, stdout/stderr, state changes), the reasons a run or
-skip reports, params overrides, artifact locking, deferred StateDB writes, seeding and nested
-parallelism, and the value plumbing between the store and the stage function.
+skip reports, whose code a failure came out of and what a failed stage leaves in the worker,
+params overrides, artifact locking, deferred StateDB writes, seeding and nested parallelism, and
+the value plumbing between the store and the stage function.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import ast
 import contextlib
 import dataclasses
 import fcntl
+import gc
 import importlib
 import importlib.util
 import io
@@ -29,6 +31,7 @@ import termios
 import textwrap
 import threading
 import time
+import weakref
 from typing import TYPE_CHECKING, cast, override
 
 import joblib.parallel
@@ -1269,6 +1272,147 @@ def test_worker_defers_file_hash_cache_writes_to_the_coordinator(
     assert "file_hash_entries" in deferred
     output = project.resolve() / "data" / "skip" / "consume.txt"
     assert [entry[0] for entry in deferred["file_hash_entries"]] == [str(raw), str(output)]
+
+
+# =============================================================================
+# Whose code a failure came out of, and what a failed stage leaves behind
+# =============================================================================
+
+
+@dataclasses.dataclass(frozen=True)
+class _SeesHeldError(loaders.Reader[str]):
+    """A user's dependency loader: records the exception the worker holds as it runs."""
+
+    seen: list[BaseException | None] = dataclasses.field(compare=False)
+
+    @override
+    def load(self, path: pathlib.Path) -> str:
+        self.seen.append(worker._stage_call.error)
+        return path.read_text()
+
+
+@dataclasses.dataclass(frozen=True)
+class _UserText(loaders.Text):
+    """A user's subclass of a pivot loader."""
+
+
+def _user_empty() -> dict[str, int]:
+    return {}
+
+
+@pytest.mark.parametrize(
+    ("loader", "users"),
+    [
+        pytest.param(loaders.Text(), False, id="pivot-loader"),
+        pytest.param(
+            loaders.JSON[list[int]](empty_factory=list), False, id="pivot-loader-builtin-option"
+        ),
+        pytest.param(loaders.JSON(empty_factory=_user_empty), True, id="pivot-loader-user-option"),
+        pytest.param(_UserText(), True, id="user-subclass-of-pivot-loader"),
+        pytest.param(_SeesHeldError([]), True, id="user-loader"),
+    ],
+)
+def test_only_a_pivot_loader_without_user_options_is_pivots_own_code(
+    loader: loaders.Reader[object], users: bool
+) -> None:
+    """A failure out of a loader is the user's unless the loader runs only pivot's code: an
+    instance of a `pivot.loaders` class whose options hold none of the user's code."""
+    code = worker._loader_code(loader)
+
+    assert (code is worker._USER_CODE) is users
+
+
+@pytest.mark.parametrize("directory", [False, True], ids=["file", "directory-member"])
+@pytest.mark.parametrize(
+    ("loader", "users"),
+    [
+        pytest.param(loaders.Text(), False, id="pivot-loader"),
+        pytest.param(_UserText(), True, id="user-subclass-of-pivot-loader"),
+    ],
+)
+def test_a_load_failure_inside_pivots_own_loader_is_pivots(
+    project: pathlib.Path,
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    directory: bool,
+    loader: loaders.Text,
+    users: bool,
+) -> None:
+    """A dependency that holds no text fails pivot's Text loader as pivot's own error, one display
+    line; the same bytes through a user's loader class fail as the user's, with their traceback."""
+    if directory:
+        group = project / "data" / "upstream"
+        group.mkdir(parents=True)
+        (group / "a.txt").write_bytes(b"\xff")
+        func: Callable[..., str] = _join_group
+        deps = {"group": _ref("upstream", tag=types.ArtifactTag.DIRECTORY, loader=loader)}
+    else:
+        (project / "raw.txt").write_bytes(b"\xff")
+        func = _upper
+        deps = {"data": _ref("raw", tag=types.ArtifactTag.INPUT, loader=loader)}
+
+    result = worker.execute_stage(
+        _STAGE, _stage_info(func, project, worker_env, deps=deps), worker_env, output_queue
+    )
+
+    assert result["status"] == StageStatus.FAILED
+    assert result["reason"].rstrip().endswith("invalid start byte"), result["reason"]
+    assert ("display_reason" in result) is not users, result
+
+
+class _Big:
+    """A 4 MB value that only a stage's frame holds."""
+
+    data: bytearray
+
+    def __init__(self) -> None:
+        self.data = bytearray(4_000_000)
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [
+        pytest.param(
+            lambda: exceptions.OutputMissingError("the stage raised pivot's own error"),
+            id="pivot-error",
+        ),
+        pytest.param(lambda: SystemExit(3), id="system-exit"),
+        pytest.param(worker.WorkerTerminated, id="keyboard-interrupt"),
+        pytest.param(lambda: ValueError("bad"), id="unexpected-error"),
+    ],
+)
+def test_a_failed_stage_leaves_neither_its_exception_nor_its_locals_in_the_worker(
+    project: pathlib.Path,
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    make_error: Callable[[], BaseException],
+) -> None:
+    """Whichever handler a stage fails through, a warm worker keeps nothing of its exception: not
+    the locals its traceback's frames hold (here 4 MB), and not the exception the next stage's
+    loader would see."""
+    held = list[weakref.ref[_Big]]()
+
+    def fails(data: str) -> str:
+        big = _Big()
+        held.append(weakref.ref(big))
+        raise make_error()
+
+    failed = worker.execute_stage(
+        _STAGE, _stage_info(fails, project, worker_env), worker_env, output_queue
+    )
+    _ = gc.collect()
+
+    assert failed["status"] == StageStatus.FAILED, failed["reason"]
+    assert held[0]() is None, "the failed stage's 4 MB local is still reachable"
+
+    seen = list[BaseException | None]()
+    deps = {"data": _ref("raw", tag=types.ArtifactTag.INPUT, loader=_SeesHeldError(seen))}
+    after = worker.execute_stage(
+        _STAGE, _stage_info(_upper, project, worker_env, deps=deps), worker_env, output_queue
+    )
+
+    assert after["status"] == StageStatus.RAN, after["reason"]
+    assert seen == [None], "the next stage's loader sees the failed stage's exception"
 
 
 # =============================================================================

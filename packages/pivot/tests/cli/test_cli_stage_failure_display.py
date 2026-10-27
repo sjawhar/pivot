@@ -3,6 +3,8 @@ and one test per behaviour a surviving mutant broke.
 
 A failed stage's console line is one line (`display_reason`); `--verbose` prints the traceback the
 record holds; the JSONL `reason` keeps main's bytes. A cause inside a PivotError keeps main's text.
+A failure out of the user's own code, their stage function or a loader they wrote, keeps main's
+traceback (round three).
 """
 
 from __future__ import annotations
@@ -287,6 +289,174 @@ def test_a_user_stage_keeps_its_traceback_and_pivots_own_error_is_one_line(
     assert "Unexpected ValueError" not in out, out
     assert f"{_EACCES}: {files}" in out, out
     assert "PermissionError: [Errno" not in out, out
+
+
+_USER_LOADERS = """\
+import dataclasses
+import pathlib
+from typing import Annotated, override
+
+from pivot import Pipeline, directory, incremental, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class BadSave(loaders.Writer[str]):
+    @override
+    def save(self, data: str, path: pathlib.Path) -> None:
+        raise ValueError("custom writer bug in save")
+
+
+@dataclasses.dataclass(frozen=True)
+class BadLoad(loaders.Loader[str]):
+    @override
+    def load(self, path: pathlib.Path) -> str:
+        raise KeyError("custom loader bug in load")
+
+    @override
+    def save(self, data: str, path: pathlib.Path) -> None:
+        path.write_text(data)
+
+    @override
+    def empty(self) -> str:
+        return ""
+
+
+@dataclasses.dataclass(frozen=True)
+class BadEmpty(loaders.Loader[str]):
+    @override
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text()
+
+    @override
+    def save(self, data: str, path: pathlib.Path) -> None:
+        path.write_text(data)
+
+    @override
+    def empty(self) -> str:
+        raise LookupError("custom loader bug in empty")
+
+
+def bad_factory() -> dict[str, int]:
+    raise RuntimeError("custom empty_factory bug")
+
+
+"""
+
+_USER_LOADER_CASES = [
+    pytest.param(
+        """\
+@stage
+def custom_save() -> Annotated[str, BadSave()]:
+    return "x"
+
+
+with Pipeline("p") as pipeline:
+    custom_save()
+""",
+        "save",
+        'raise ValueError("custom writer bug in save")',
+        "ValueError: custom writer bug in save",
+        id="writer-save",
+    ),
+    pytest.param(
+        """\
+@stage
+def produce() -> Annotated[str, BadLoad()]:
+    return "x"
+
+
+@stage
+def consume(text: str) -> str:
+    return text
+
+
+with Pipeline("p") as pipeline:
+    consume(produce())
+""",
+        "load",
+        'raise KeyError("custom loader bug in load")',
+        "KeyError: 'custom loader bug in load'",
+        id="loader-load",
+    ),
+    pytest.param(
+        """\
+@stage
+def produce() -> Annotated[dict[str, str], directory, BadLoad()]:
+    return {"a.txt": "a"}
+
+
+@stage
+def consume(parts: dict[str, str]) -> str:
+    return ",".join(parts)
+
+
+with Pipeline("p") as pipeline:
+    consume(produce())
+""",
+        "load",
+        'raise KeyError("custom loader bug in load")',
+        "KeyError: 'custom loader bug in load'",
+        id="loader-load-of-a-directory-member",
+    ),
+    pytest.param(
+        """\
+@stage
+def grow(previous: str) -> Annotated[str, incremental, BadEmpty()]:
+    return previous + "x"
+
+
+with Pipeline("p") as pipeline:
+    grow(previous=pipeline.previous())
+""",
+        "empty",
+        'raise LookupError("custom loader bug in empty")',
+        "LookupError: custom loader bug in empty",
+        id="loader-empty",
+    ),
+    pytest.param(
+        """\
+@stage
+def grow(
+    previous: dict[str, int],
+) -> Annotated[dict[str, int], incremental, loaders.JSON(empty_factory=bad_factory)]:
+    return {"n": len(previous)}
+
+
+with Pipeline("p") as pipeline:
+    grow(previous=pipeline.previous())
+""",
+        "bad_factory",
+        'raise RuntimeError("custom empty_factory bug")',
+        "RuntimeError: custom empty_factory bug",
+        id="pivot-loader-calling-a-user-function",
+    ),
+]
+
+
+@pytest.mark.parametrize(("stages", "function", "raised", "last_line"), _USER_LOADER_CASES)
+def test_a_failure_out_of_a_users_loader_or_writer_keeps_its_traceback(
+    tmp_path: pathlib.Path, stages: str, function: str, raised: str, last_line: str
+) -> None:
+    """A loader the user wrote is their code, as the stage function is: a failure out of its
+    `save`, its `load` (of a dependency, or of each file of a directory dependency), or its
+    `empty` (an incremental output's first run), or out of a user's function a pivot loader
+    calls, prints main's traceback ending at the user's file and line, with no --verbose."""
+    pipeline = _USER_LOADERS + stages
+    root = tmp_path / "proj"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    assert _pivot(root, "init").returncode == 0
+    (root / "pipeline.py").write_text(pipeline)
+
+    proc = _pivot(root, "repro")
+
+    out = proc.stdout + proc.stderr
+    line = next(number for number, text in enumerate(pipeline.splitlines(), 1) if raised in text)
+    assert proc.returncode == 1, out
+    assert "Traceback (most recent call last)" in out, out
+    assert f'pipeline.py", line {line}, in {function}' in out, out
+    assert last_line in out, out
+    assert f"Unexpected {last_line.partition(':')[0]}" not in out, out
 
 
 # Makes a write into the directory PIVOT_TEST_FULL_DIR fail with ENOSPC, in pivot and in every

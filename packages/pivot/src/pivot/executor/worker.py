@@ -1063,18 +1063,16 @@ def _execute_stage(
                 input_hash=input_hash,
             )
         except Exception as exc:
-            # The record keeps the traceback. A failure out of the user's stage function prints
-            # it as before; one raised by pivot's own code prints as one line (--verbose: the
-            # traceback).
+            # The record keeps the traceback. A failure out of the user's own code (the stage
+            # function, or a loader or writer of theirs: `_stage_call`) prints it as before; one
+            # raised by pivot's own code prints as one line (--verbose: the traceback).
             result = _make_result(
                 StageStatus.FAILED,
                 traceback.format_exc(),
                 ring_buffer,
                 input_hash=input_hash,
             )
-            raised_by_stage = getattr(_stage_call, "error", None) is exc
-            _stage_call.error = None
-            if not raised_by_stage:
+            if _stage_call.error is not exc:
                 result["display_reason"] = exceptions.describe_error(exc)
             return result
 
@@ -1130,6 +1128,9 @@ def execute_stage(
         )
     finally:
         _stop.stage_running = False
+        # Every way out of the stage drops its exception, whose frames hold the stage's locals
+        # and loaded inputs, so a warm worker does not keep them until its next stage.
+        _stage_call.error = None
     if _stop.exit_requested:
         _exit_worker(1)
     result["user_code_files"] = user_code_files()
@@ -1431,16 +1432,74 @@ def _execute_with_joblib_protection(func: Callable[..., Any], kwargs: dict[str, 
         return func(**kwargs)
 
 
+class _StageCall(threading.local):
+    """The exception that came out of a call into the user's own code in this thread's stage."""
+
+    error: BaseException | None = None
+
+
+# A stage's failure is shown as the user's own (their traceback) when the exception came out of a
+# call pivot makes into code the user wrote: the stage function, or a loader or writer of theirs
+# (`_loader_code`). Any other failure is pivot's own and prints as one line. The call decides,
+# never the exception's type or frames. execute_stage clears it when the stage ends.
+_stage_call = _StageCall()
+
+
+class _UserCode:
+    """Brackets a call into the user's own code: an exception that leaves it is theirs."""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        if exc_val is not None:
+            _stage_call.error = exc_val
+
+
+_USER_CODE = _UserCode()
+_PIVOT_CODE = contextlib.nullcontext()
+
+
+def _loader_code(loader: object) -> contextlib.AbstractContextManager[None]:
+    """The bracket for a call to ``loader``'s load, save or empty. Only an instance of a class
+    ``pivot.loaders`` defines, with no user code among its options, is pivot's own code
+    (``JSON(empty_factory=f)`` calls the user's ``f``); any other loader (the user's class, their
+    subclass of a pivot loader, a library's) is called as the user's."""
+    if type(loader).__module__ == loaders.__name__ and not any(
+        _is_user_option(getattr(loader, field.name))
+        for field in dataclasses.fields(cast("Any", loader))
+    ):
+        return _PIVOT_CODE
+    return _USER_CODE
+
+
+def _is_user_option(value: object) -> bool:
+    """Whether a loader option is the user's code: a function or class, or an instance of a
+    class, defined outside the libraries. The user's pipeline modules reach a worker pickled by
+    value (``discovery``), so a definition of theirs names a module ``sys.modules`` lacks."""
+    definition = value if callable(value) else type(value)
+    module = sys.modules.get(getattr(definition, "__module__", None) or "")
+    return module is None or fingerprint.is_user_code(module)
+
+
 def _load_dep_from_path(ref: types.ArtifactRef, path: pathlib.Path) -> Any:
     """Load an artifact after the caller has resolved its workspace/cache path."""
     loader = cast("Any", ref.format)
+    loader_code = _loader_code(loader)
     if ref.tag is types.ArtifactTag.DIRECTORY and ref.directory is None:
         values = dict[str, Any]()
         for file_path in sorted(p for p in path.rglob("*") if p.is_file()):
             rel_key = file_path.relative_to(path).as_posix()
-            values[rel_key] = loader.load(file_path)
+            with loader_code:
+                values[rel_key] = loader.load(file_path)
         return values
-    return loader.load(path)
+    with loader_code:
+        return loader.load(path)
 
 
 def _resolve_output_values(
@@ -1586,18 +1645,20 @@ def _write_output_with_store(
         if ref.identity.key is None
         else f"output {ref.identity.key!r}"
     )
+    writer_code = _loader_code(writer)
 
     def save_output(output_value: Any, destination: pathlib.Path) -> None:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", loaders.LossyOutputWarning)
-            try:
-                writer.save(output_value, destination)
-            except TypeError as e:
-                if isinstance(writer, loaders.YAML):
-                    raise TypeError(
-                        f"Stage '{ref.identity.producer}' cannot write {output_label}: {e}"
-                    ) from e
-                raise
+            with writer_code:
+                try:
+                    writer.save(output_value, destination)
+                except TypeError as e:
+                    if isinstance(writer, loaders.YAML):
+                        raise TypeError(
+                            f"Stage '{ref.identity.producer}' cannot write {output_label}: {e}"
+                        ) from e
+                    raise
         for caught_warning in caught:
             if issubclass(caught_warning.category, loaders.LossyOutputWarning):
                 logger.warning(
@@ -1677,7 +1738,8 @@ def _prepare_incremental_inputs(
         ref = outs_by_identity[identity]
         loader = cast("loaders.Loader[Any, Any]", ref.format)
         if lock_data is None:
-            values[param_name] = loader.empty()
+            with _loader_code(loader):
+                values[param_name] = loader.empty()
             continue
 
         output_hash = lock_data["output_hashes"].get(identity)
@@ -1703,11 +1765,6 @@ def _prepare_incremental_inputs(
             )
         values[param_name] = _load_dep_from_path(ref, output_path)
     return values
-
-
-# The exception that propagated out of the user's stage function in this thread, if any, so the
-# failure is shown as the user's own (their traceback) and not as pivot's.
-_stage_call = threading.local()
 
 
 def _run_stage_function_with_store(
@@ -1761,12 +1818,8 @@ def _run_stage_function_with_store(
 
         _set_deterministic_seeds()
 
-        _stage_call.error = None
-        try:
+        with _USER_CODE:
             result = _execute_with_joblib_protection(func, kwargs)
-        except BaseException as exc:
-            _stage_call.error = exc
-            raise
         _raise_if_stopped()
 
         output_values = _resolve_output_values(result, outs, stage_name)
