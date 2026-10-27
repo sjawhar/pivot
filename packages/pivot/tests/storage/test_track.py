@@ -363,6 +363,17 @@ def test_restore_target_skips_a_pvt_whose_path_names_no_file(
     )
 
 
+def test_restore_target_skips_a_sidecar_literally_named_pvt(tmp_path: pathlib.Path) -> None:
+    """A file named '.pvt' has own name ''; clause b must run before clause a, or '' matches
+    clause a and the .pvt restores its own directory, which checkout --force then replaces."""
+    (tmp_path / "sub").mkdir()
+
+    target = track.restore_target(tmp_path / "sub" / ".pvt", "", tmp_path)
+
+    assert target.path is None, target
+    assert "names no file" in (target.warning or ""), target
+
+
 def test_restore_target_skips_a_pvt_whose_file_lies_outside_the_project(
     tmp_path: pathlib.Path,
 ) -> None:

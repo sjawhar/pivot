@@ -226,6 +226,23 @@ def test_checkout_force_keeps_the_directory_a_pvt_that_names_no_file_sits_in(
     assert (root / ".git").is_dir(), "the project's git directory survives"
 
 
+def test_checkout_force_keeps_the_directory_a_sidecar_named_dot_pvt_sits_in(
+    tmp_path: pathlib.Path,
+) -> None:
+    root = _project(tmp_path / "project")
+    (root / "sub").mkdir()
+    (root / "sub" / "precious.txt").write_text("keep me\n")
+    hash_ = _cached_hash(root, "seed\n")
+    (root / "sub" / ".pvt").write_text(f'path: ""\nhash: {hash_}\nsize: 5\n')
+
+    proc = _pivot(root, "checkout", "--force")
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 0, out
+    assert (root / "sub").is_dir(), out
+    assert (root / "sub" / "precious.txt").read_text() == "keep me\n"
+
+
 def test_checkout_restores_the_file_a_pvt_names_beside_itself_without_a_warning(
     tmp_path: pathlib.Path,
 ) -> None:

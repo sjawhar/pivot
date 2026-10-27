@@ -178,6 +178,14 @@ sidecar beside its data inside the project and set `path:` to the data's name.
 from a `data -> /mnt/external` symlink: the `.pvt` would be written beside the
 data, outside the project, where no Pivot command reads it again.
 
+The check reads "inside the project" from the resolved path, so it does not see
+a bind mount inside the project that points outside: `resolve()` cannot detect a
+bind mount, and a `.pvt` restored under it lands outside the project (git and DVC
+share this limit, and setting a bind mount up needs `CAP_SYS_ADMIN`). The check
+and the write are separate steps, so a local process that can already write in
+the project can replace a checked directory with a symlink pointing outside
+between the two and land the file there.
+
 ---
 
 **See also:** [Artifacts & the DAG](artifacts-and-dag.md) | [Outputs](outputs.md) | [Loaders](loaders.md)
