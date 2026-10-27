@@ -6,13 +6,16 @@ change, cold and warm, the memo walk must find exactly what main finds, in main'
 
 from __future__ import annotations
 
+import builtins
 import contextlib
 import errno
 import fcntl
+import logging
 import os
 import pathlib
 import random
 import shutil
+import socket
 import stat
 import threading
 import time
@@ -389,6 +392,63 @@ def test_memo_write_that_fails_is_skipped(
     monkeypatch.setattr(os, "ftruncate", _disk_full)
 
     _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
+
+
+def test_memo_write_cut_short_by_a_full_disk_leaves_an_empty_file(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """The disk fills partway through the memo write: the pre-flight returns what main finds and
+    empties the file again, so no cut memo keeps the space, and the next walk lists every
+    directory."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    time.sleep(_ONE_TICK_S)
+    _helper_add_pvt(memo_project)
+    path = os.fspath(track._memo_path())
+    real_write = os.write
+    memo_writes = list[int]()
+
+    def _fills_up(fd: int, data: bytes | memoryview) -> int:
+        if os.readlink(f"/proc/self/fd/{fd}") != path:
+            return real_write(fd, data)
+        if memo_writes:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        memo_writes.append(real_write(fd, bytes(data)[: len(data) // 2]))
+        return memo_writes[0]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "write", _fills_up)
+        found = _helper_preflight(memo_project)
+
+    assert memo_writes and memo_writes[0] > 0, "the write began, through os.write"
+    assert pathlib.Path(path).read_bytes() == b"", "the cut memo is emptied"
+    _helper_assert_matches_main(found, memo_project)
+    warm, listings = _helper_listings(mocker, lambda: track.discover_pvt_files(memo_project))
+    assert listings == len(_helper_directories(memo_project)), "every directory is listed"
+    _helper_assert_matches_main(warm, memo_project)
+
+
+def test_preflight_fstats_the_memo_once_and_writes_through_its_descriptor(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """A pre-flight that rewrites the memo makes one fstat of it: the write goes through the
+    descriptor (``os.write``), and no file object is built on the descriptor, which would fstat
+    it again."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    time.sleep(_ONE_TICK_S)
+    _helper_add_pvt(memo_project)
+    fstat = mocker.spy(os, "fstat")
+    opened = mocker.spy(builtins, "open")
+    written = mocker.spy(track, "_write_memo")
+
+    _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
+
+    assert written.call_count == 1, "the memo is rewritten"
+    assert fstat.call_count == 1, "with one fstat"
+    assert [call for call in opened.call_args_list if isinstance(call.args[0], int)] == []
 
 
 def _helper_record_ends(content: bytes) -> list[int]:
@@ -900,13 +960,14 @@ def test_filesystem_off_the_allowlist_is_always_listed(
     mocker: MockerFixture,
     fstype: str | None,
 ) -> None:
-    """NFS, overlayfs, FUSE and unknown filesystems get a full listing and no memo."""
+    """NFS, overlayfs, FUSE and unknown filesystems get a full listing, and no memo file is
+    created on them."""
     _helper_mountinfo(monkeypatch, tmp_path / "mountinfo", memo_project, fstype)
     _helper_build_tree(memo_project)
     _helper_settle(monkeypatch)
 
     _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
-    assert _helper_memo()["dirs"] == {}, "nothing is recorded off the allowlist"
+    assert not track._memo_path().exists(), "no memo file is created off the allowlist"
 
     listed = mocker.spy(os, "scandir")
     found = track.discover_pvt_files(memo_project)
@@ -925,7 +986,7 @@ def test_without_mountinfo_no_directory_is_trusted(
     _helper_settle(monkeypatch)
     _helper_record(memo_project)
 
-    assert _helper_memo()["dirs"] == {}, "nothing is recorded without mountinfo"
+    assert not track._memo_path().exists(), "no memo file is created without mountinfo"
     _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
 
 
@@ -1489,6 +1550,13 @@ def _helper_owned_by_another_account(
     _helper_fstat_reports(patch, memo, uid=os.geteuid() + 1)
 
 
+def _helper_another_accounts_and_loose(
+    memo: pathlib.Path, _tmp_path: pathlib.Path, patch: pytest.MonkeyPatch
+) -> None:
+    """An fstat of the memo file reports another uid as its owner and mode 0666."""
+    _helper_fstat_reports(patch, memo, uid=os.geteuid() + 1, mode=0o066)
+
+
 def _helper_hard_linked(
     memo: pathlib.Path, tmp_path: pathlib.Path, _patch: pytest.MonkeyPatch
 ) -> None:
@@ -1496,10 +1564,16 @@ def _helper_hard_linked(
 
 
 def _helper_fstat_reports(
-    patch: pytest.MonkeyPatch, path: pathlib.Path, *, uid: int | None = None, mode: int = 0
+    patch: pytest.MonkeyPatch,
+    path: pathlib.Path,
+    *,
+    uid: int | None = None,
+    mode: int = 0,
+    device: int | None = None,
 ) -> None:
-    """Make an fstat of ``path``'s file report ``uid`` as its owner and ``mode`` bits added, as
-    a file another account made, or a filesystem that ignores modes, would show."""
+    """Make an fstat of ``path``'s file report ``uid`` as its owner, ``mode`` bits added and
+    ``device``, as a file another account made, a filesystem that ignores modes, or a mount that
+    reports its own owner and mode, would show."""
     real_fstat = os.fstat
 
     def _fstat(fd: int) -> os.stat_result:
@@ -1511,10 +1585,60 @@ def _helper_fstat_reports(
             return result
         fields = list(result)
         fields[0] = result.st_mode | mode
+        fields[2] = result.st_dev if device is None else device
         fields[4] = result.st_uid if uid is None else uid
         return os.stat_result(fields)
 
     patch.setattr(os, "fstat", _fstat)
+
+
+def _helper_listings(
+    mocker: MockerFixture, walk: Callable[[], dict[str, track.PvtData]]
+) -> tuple[dict[str, track.PvtData], int]:
+    """Run ``walk``; return what it found and how many directories it listed."""
+    listed = mocker.spy(os, "scandir")
+    found = walk()
+    listings = listed.call_count
+    mocker.stop(listed)
+    return found, listings
+
+
+@pytest.mark.parametrize(
+    "spoil",
+    [
+        pytest.param(_helper_owned_by_another_account, id="owned-by-another-account"),
+        pytest.param(_helper_another_accounts_and_loose, id="another-accounts-at-mode-666"),
+    ],
+)
+def test_memo_file_of_another_account_is_neither_used_nor_touched(
+    memo_project: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    spoil: Callable[[pathlib.Path, pathlib.Path, pytest.MonkeyPatch], None],
+) -> None:
+    """A memo file whose fstat shows another owner is refused by both walks, which list every
+    directory, and the pre-flight never writes, replaces or removes it, loose or not."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    path = track._memo_path()
+    before, inode = path.read_bytes(), path.stat().st_ino
+    time.sleep(_ONE_TICK_S)
+    _helper_add_pvt(memo_project)
+    directories = len(_helper_directories(memo_project))
+    spoil(path, tmp_path, monkeypatch)
+
+    found, read_only_listings = _helper_listings(
+        mocker, lambda: track.discover_pvt_files(memo_project)
+    )
+    recorded, preflight_listings = _helper_listings(mocker, lambda: _helper_preflight(memo_project))
+
+    assert read_only_listings == directories, "the read-only walk lists every directory"
+    assert preflight_listings == directories, "so does the pre-flight"
+    _helper_assert_matches_main(found, memo_project)
+    _helper_assert_matches_main(recorded, memo_project)
+    assert (path.read_bytes(), path.stat().st_ino) == (before, inode), "the file is left as it was"
 
 
 @pytest.mark.parametrize(
@@ -1525,55 +1649,241 @@ def _helper_fstat_reports(
         pytest.param(_helper_mode(0o620), id="group-may-write"),
         pytest.param(_helper_mode(0o604), id="others-may-read"),
         pytest.param(_helper_mode(0o602), id="others-may-write"),
-        pytest.param(_helper_owned_by_another_account, id="owned-by-another-account"),
         pytest.param(_helper_hard_linked, id="hard-linked"),
     ],
 )
-def test_memo_file_another_account_could_use_is_neither_read_nor_written(
+def test_loosened_memo_is_replaced_by_a_new_private_file(
     memo_project: pathlib.Path,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
+    caplog: pytest.LogCaptureFixture,
     spoil: Callable[[pathlib.Path, pathlib.Path, pytest.MonkeyPatch], None],
 ) -> None:
-    """A memo file whose fstat shows another owner, group or other mode bits, or a second link,
-    is not used: both walks list every directory, and the pre-flight writes nothing into it."""
+    """The account's own memo with group or other bits, or a second link, (``chmod -R go+rX
+    .pivot``, say) is refused by the read-only walk, which leaves it. The pre-flight empties it,
+    so no descriptor opened on it and no other link keeps its names, and records the memo in a
+    new 0600 file with one link; a descriptor opened before reaches only the old, empty file."""
     _helper_build_tree(memo_project)
     _helper_settle(monkeypatch)
     _helper_record(memo_project)
     path = track._memo_path()
-    before = path.read_bytes()
-    time.sleep(_ONE_TICK_S)
-    _helper_add_pvt(memo_project)
+    old, inode = path.read_bytes(), path.stat().st_ino
+    held = os.open(path, os.O_RDWR)
+    try:
+        time.sleep(_ONE_TICK_S)
+        _helper_add_pvt(memo_project)
+        directories = len(_helper_directories(memo_project))
+        spoil(path, tmp_path, monkeypatch)
+        caplog.set_level(logging.DEBUG, logger=track.logger.name)
+
+        found, read_only_listings = _helper_listings(
+            mocker, lambda: track.discover_pvt_files(memo_project)
+        )
+        assert read_only_listings == directories, "the read-only walk lists every directory"
+        assert "Replacing the .pvt walk memo" not in caplog.text, "and tries no replacement"
+        assert (path.read_bytes(), path.stat().st_ino) == (old, inode), "it only refuses"
+        recorded, preflight_listings = _helper_listings(
+            mocker, lambda: _helper_preflight(memo_project)
+        )
+        new = path.stat()
+
+        assert preflight_listings == directories, "the pre-flight lists every directory once"
+        _helper_assert_matches_main(found, memo_project)
+        _helper_assert_matches_main(recorded, memo_project)
+        assert new.st_ino != inode, "the memo is a new file"
+        assert (stat.S_IMODE(new.st_mode), new.st_nlink) == (0o600, 1)
+        assert os.fstat(held).st_size == 0, "the old file holds no name"
+        if (tmp_path / "second-link").exists():
+            assert (tmp_path / "second-link").read_bytes() == b"", "nor does its other link"
+        os.pwrite(held, old, 0)
+        assert set(_helper_memo()["dirs"]) == _helper_relative_directories(memo_project), (
+            "a write through the earlier descriptor does not reach the memo"
+        )
+    finally:
+        os.close(held)
+    _, warm_listings = _helper_listings(mocker, lambda: track.discover_pvt_files(memo_project))
+    assert warm_listings == 0, "the new memo is used"
+
+
+def test_memo_the_open_file_cannot_be_read_is_not_used(
+    memo_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A read of the open memo that the filesystem refuses (an I/O error on a failing disk) is
+    not raised: both walks list every directory, find what main finds, and the file is left as
+    it is."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    path = track._memo_path()
+    before, inode = path.read_bytes(), path.stat().st_ino
     directories = len(_helper_directories(memo_project))
-    spoil(path, tmp_path, monkeypatch)
 
-    listed = mocker.spy(os, "scandir")
-    found = track.discover_pvt_files(memo_project)
-    read_only_listings = listed.call_count
-    listed.reset_mock()
-    recorded = _helper_preflight(memo_project)
-    preflight_listings = listed.call_count
+    def _unreadable(_fd: int, _size: int, _offset: int) -> bytes:
+        raise OSError(errno.EIO, "Input/output error")
 
-    assert read_only_listings == directories, "the read-only walk lists every directory"
-    assert preflight_listings == directories, "so does the pre-flight"
+    monkeypatch.setattr(os, "pread", _unreadable)
+    caplog.set_level(logging.DEBUG, logger=track.logger.name)
+
+    found, read_only_listings = _helper_listings(
+        mocker, lambda: track.discover_pvt_files(memo_project)
+    )
+    recorded, preflight_listings = _helper_listings(mocker, lambda: _helper_preflight(memo_project))
+
+    assert "cannot be read: [Errno 5]" in caplog.text
+    assert (read_only_listings, preflight_listings) == (directories, directories)
     _helper_assert_matches_main(found, memo_project)
     _helper_assert_matches_main(recorded, memo_project)
-    assert path.read_bytes() == before, "nothing is written into it"
+    assert (path.read_bytes(), path.stat().st_ino) == (before, inode), "the file is left as it is"
 
 
-def test_new_memo_file_others_could_read_is_not_written(
+def test_replacement_never_removes_a_file_that_took_the_memos_path(
     memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The check runs before the first write too: on a filesystem that shows the new file with
-    group and other bits (one that ignores modes), the pre-flight records nothing in it."""
+    """Another file is renamed onto the memo's path while the pre-flight replaces a loosened
+    memo: the pre-flight removes only the file it checked, so the other file stays, and that
+    walk has no memo."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    path = track._memo_path()
+    path.chmod(0o644)
+    other = path.parent / "other"
+    other.write_bytes(b"other")
+    other_inode = other.stat().st_ino
+    real_lstat = os.lstat
+
+    def _swap_then_lstat(
+        target: str | os.PathLike[str], *, dir_fd: int | None = None
+    ) -> os.stat_result:
+        if os.fspath(target) == os.fspath(path) and other.exists():
+            other.replace(path)
+        return real_lstat(target, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "lstat", _swap_then_lstat)
+
+    _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
+
+    assert not other.exists(), "the other file took the memo's path"
+    assert (path.stat().st_ino, path.read_bytes()) == (other_inode, b"other"), "and stays"
+
+
+def test_new_memo_file_others_could_read_is_removed(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check runs on a new file too: on a filesystem that shows the new file with group and
+    other bits (one that ignores modes), the pre-flight records nothing and removes it."""
     _helper_build_tree(memo_project)
     _helper_settle(monkeypatch)
     _helper_fstat_reports(monkeypatch, track._memo_path(), mode=0o044)
 
     _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
 
-    assert track._memo_path().read_bytes() == b"", "created, but nothing written"
+    assert not track._memo_path().exists(), "created, refused and removed"
+
+
+_OTHER_DEVICE = os.makedev(0, 4250)
+
+
+def _helper_memo_on(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    root: pathlib.Path,
+    project: str,
+    memo: str,
+) -> None:
+    """Mount the project's device as ``project`` and the state database's directory, with the
+    memo file in it, as ``memo`` on a device of its own (an fstat of the memo file and a stat of
+    the directory report it)."""
+    path = track._memo_path()
+    _helper_write_mountinfo(
+        monkeypatch,
+        tmp_path / "mountinfo-memo",
+        [
+            _helper_mount_line(91, os.stat(root).st_dev, "/mnt/project", project),
+            _helper_mount_line(94, _OTHER_DEVICE, os.path.realpath(path.parent), memo),
+        ],
+    )
+    _helper_fstat_reports(monkeypatch, path, device=_OTHER_DEVICE)
+    real_stat = os.stat
+
+    def _stat(
+        target: str | os.PathLike[str], *, dir_fd: int | None = None, follow_symlinks: bool = True
+    ) -> os.stat_result:
+        result = real_stat(target, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if os.fspath(target) != os.fspath(path.parent):
+            return result
+        return os.stat_result((*tuple(result)[:2], _OTHER_DEVICE, *tuple(result)[3:]))
+
+    monkeypatch.setattr(os, "stat", _stat)
+
+
+def test_directories_off_the_allowlist_are_not_recorded_in_a_memo_on_it(
+    memo_project: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """The project on NFS and its memo on ext4: the memo is created and written, but records no
+    directory of the project, and every walk lists every directory."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_memo_on(monkeypatch, tmp_path, memo_project, "nfs4", "ext4")
+
+    _helper_record(memo_project)
+    _, listings = _helper_listings(mocker, lambda: track.discover_pvt_files(memo_project))
+
+    memo = _helper_memo()
+    assert memo["root"] == str(memo_project.resolve()), "the memo file is used"
+    assert memo["dirs"] == {}, "no directory on NFS is recorded"
+    assert listings == len(_helper_directories(memo_project)), "every directory is listed"
+
+
+@pytest.mark.parametrize(
+    ("fstype", "used"),
+    [
+        pytest.param("fuse.bindfs", False, id="bindfs"),
+        pytest.param("cifs", False, id="cifs"),
+        pytest.param("nfs4", False, id="nfs"),
+        pytest.param("ext4", True, id="ext4"),
+    ],
+)
+def test_memo_on_a_filesystem_off_the_allowlist_is_not_used_or_created(
+    memo_project: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    fstype: str,
+    used: bool,
+) -> None:
+    """bindfs, CIFS and NFS can report the mount's owner and mode instead of the file's, so a
+    memo whose device mountinfo lists off the allowlist is used and written by neither walk, and
+    the pre-flight creates none there, while the project's directories stay on ext4."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    path = track._memo_path()
+    before = path.read_bytes()
+    assert track._unpack_memo(before) is not None, "the memo is recorded"
+    _helper_memo_on(monkeypatch, tmp_path, memo_project, "ext4", fstype)
+    directories = len(_helper_directories(memo_project))
+
+    found, read_only_listings = _helper_listings(
+        mocker, lambda: track.discover_pvt_files(memo_project)
+    )
+    recorded, preflight_listings = _helper_listings(mocker, lambda: _helper_preflight(memo_project))
+    path.unlink()
+    _helper_preflight(memo_project)
+
+    assert read_only_listings == (0 if used else directories)
+    assert preflight_listings == (0 if used else directories)
+    _helper_assert_matches_main(found, memo_project)
+    _helper_assert_matches_main(recorded, memo_project)
+    if not used:
+        assert not path.exists(), "no memo is created there"
 
 
 def test_memo_path_that_is_a_symlink_is_not_followed(
@@ -1664,6 +1974,72 @@ def test_fifo_at_the_memo_path_is_not_waited_on(
     _helper_assert_matches_main(found, memo_project)
     _helper_assert_matches_main(recorded, memo_project)
     assert stat.S_ISFIFO(os.lstat(fifo).st_mode), "nothing replaced it"
+
+
+def _helper_fifo(path: pathlib.Path, _patch: pytest.MonkeyPatch) -> Callable[[], None]:
+    os.mkfifo(path, 0o600)
+
+    def _release() -> None:  # frees a walk that waits on it, so the test fails instead of hanging
+        with path.open("wb"):
+            pass
+
+    return _release
+
+
+def _helper_directory(path: pathlib.Path, _patch: pytest.MonkeyPatch) -> Callable[[], None]:
+    path.mkdir(mode=0o700)
+    return lambda: None
+
+
+def _helper_socket(path: pathlib.Path, patch: pytest.MonkeyPatch) -> Callable[[], None]:
+    """A Unix socket file, bound by its short relative name (the absolute path may pass the
+    108-byte limit of a socket address); the file stays after the socket is closed."""
+    patch.chdir(path.parent)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as bound:
+        bound.bind(path.name)
+    return lambda: None
+
+
+@pytest.mark.parametrize(
+    ("make", "read_only_reason"),
+    [
+        pytest.param(_helper_fifo, "is not a regular file (prw-------)", id="fifo"),
+        pytest.param(_helper_directory, "is not a regular file (drwx------)", id="directory"),
+        pytest.param(_helper_socket, "No such device or address", id="socket"),
+    ],
+)
+def test_memo_path_that_is_no_regular_file_is_refused(
+    memo_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    caplog: pytest.LogCaptureFixture,
+    make: Callable[[pathlib.Path, pytest.MonkeyPatch], Callable[[], None]],
+    read_only_reason: str,
+) -> None:
+    """The memo must be a regular file: a FIFO or a directory at its path is refused for that
+    reason, and a socket cannot be opened at all. Neither walk waits on what is there, both list
+    every directory, and nothing replaces it."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    path = track._memo_path()
+    release = make(path, monkeypatch)
+    kind = stat.S_IFMT(os.lstat(path).st_mode)
+    directories = len(_helper_directories(memo_project))
+    caplog.set_level(logging.DEBUG, logger=track.logger.name)
+
+    listed = mocker.spy(os, "scandir")
+    found = _helper_run_without_waiting(lambda: track.discover_pvt_files(memo_project), release)
+    read_only_listings = listed.call_count
+    read_only_log = caplog.text
+    listed.reset_mock()
+    recorded = _helper_run_without_waiting(lambda: _helper_preflight(memo_project), release)
+    preflight_listings = listed.call_count
+
+    assert read_only_reason in read_only_log
+    assert (read_only_listings, preflight_listings) == (directories, directories)
+    _helper_assert_matches_main(found, memo_project)
+    _helper_assert_matches_main(recorded, memo_project)
+    assert stat.S_IFMT(os.lstat(path).st_mode) == kind, "nothing replaced it"
 
 
 def test_memo_file_content_round_trips_and_rejects_a_partial_memo() -> None:

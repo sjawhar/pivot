@@ -165,23 +165,30 @@ def get_data_path(pvt_path: pathlib.Path) -> pathlib.Path:
 #
 # The memo is the account's own file, pvt-memo-<uid> in the state database's directory
 # (state.lmdb, which .pivot/.gitignore keeps out of git), created with mode 0600. A walk reads
-# it, and the pre-flight writes it, only after an fstat of the open file shows that the running
-# account owns it, that no other account may read or write it (no group or other mode bits; a
-# POSIX ACL's mask shows in the group bits) and that it has one link; otherwise every directory
-# is listed. So only the account that listed a directory reads its names, whatever path reaches
-# the file (a symlinked .pivot or state.lmdb, a bind mount) and whatever modes the project's
-# directories have, at the cost of the file's open and one fstat per walk. The memo's own path
-# is never followed through a symlink, and a hard link fails the check, so the write cannot land
-# in another of the account's files. The file is rewritten in place, so the directory holding
-# it does not change with each write. A listing in which an entry's type could not be read (the
-# lstat a filesystem without d_type needs failed) is never recorded: that entry is not
-# descended, as in os.walk, and a walk that can read its type must not reuse that.
+# it, and the pre-flight writes it, only after an fstat of the open file shows a regular file on
+# a filesystem of the allowlist above (where owner and mode are the file's own and the kernel
+# enforces them; bindfs, CIFS and NFS can report the mount's instead), owned by the running
+# account, with no group or other mode bits (a POSIX ACL's mask shows in the group bits) and one
+# link. Otherwise every directory is listed. A file of another account, of another kind or on
+# another filesystem is never written, replaced or removed. When the account's own file fails
+# only the mode or link check (its owner loosened it), the pre-flight empties it, unlinks it and
+# creates a new 0600 file, so its names leave that path, every descriptor opened on it and any
+# other link to it. So no other account reads the memo's names, whatever path reaches the file
+# (a symlinked .pivot or state.lmdb, a bind mount) and whatever modes the project's directories
+# have, except while the owner leaves the file loose, until the next pre-flight replaces it. The
+# cost is the file's open and one fstat per walk. The memo's own path is never followed through
+# a symlink, and a hard link fails the check, so the write cannot land in another of the
+# account's files. The file is rewritten in place, so the directory holding it does not change
+# with each write. A listing in which an entry's type could not be read (the lstat a filesystem
+# without d_type needs failed) is never recorded: that entry is not descended, as in os.walk,
+# and a walk that can read its type must not reuse that.
 _MEMO_SETTLE_NS = 2_000_000_000
 _NS_PER_S = 1_000_000_000
 _MEMO_FS_TYPES = frozenset({b"ext2", b"ext3", b"ext4", b"xfs", b"btrfs", b"tmpfs", b"f2fs", b"zfs"})
 _MEMO_ERRORS = (exceptions.PivotError, OSError, ValueError)  # ValueError: a NUL in core.state_dir
 _MEMO_RECORD = struct.Struct(">II")  # a memo file record's key and value sizes
 _MEMO_COUNT = struct.Struct(">I")  # the root record's value: how many listings follow it
+_MEMO_OPEN = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC  # no symlink followed, no FIFO waited on
 _MOUNTINFO = pathlib.Path("/proc/self/mountinfo")
 _MOUNTINFO_ESCAPE = re.compile(rb"\\([0-7]{3})")
 _LISTING_VERSION = b"\x03"  # an earlier version is never reused; version 1 may omit a subdirectory
@@ -306,16 +313,16 @@ def _unpack_listing(listing: bytes) -> tuple[list[str], list[str]] | None:
 
 
 def _walk(
-    root: pathlib.Path, memo: dict[str, bytes], *, record: bool
+    root: pathlib.Path, memo: dict[str, bytes], mounts: _Mounts, *, record: bool
 ) -> tuple[list[pathlib.Path], dict[str, bytes]]:
     """Return every .pvt candidate under root, in ``os.walk`` order, and the listings to record.
 
     Visits the directories ``os.walk(root, followlinks=False)`` visits, with one stat each. A
     directory is listed unless ``memo`` holds a listing under its current stamp, its filesystem is
-    on the allowlist, and ``_times_trusted`` accepts its times. With ``record``, the second result
-    holds the listing of every such directory whose entries' types could all be read.
+    on the allowlist (``mounts``, read once per walk), and ``_times_trusted`` accepts its times.
+    With ``record``, the second result holds the listing of every such directory whose entries'
+    types could all be read.
     """
-    mounts = _read_mounts()
     allowed_devices = dict[int, bool]()
     real_root = os.path.realpath(root)
     settled_before = time.time_ns() - _MEMO_SETTLE_NS
@@ -401,19 +408,46 @@ def _memo_path() -> pathlib.Path:
     return config.get_state_dir() / "state.lmdb" / f"pvt-memo-{os.geteuid()}"
 
 
-def _memo_refusal(memo_stat: os.stat_result) -> str | None:
-    """Why an open memo file must not be used, or None when only the running account may use it.
+def _memo_device_allowed(mounts: _Mounts, device: int, directory: pathlib.Path) -> bool:
+    """``_device_allowed`` for the memo's directory, resolving its real path only when mountinfo
+    does not list the device (a btrfs subvolume)."""
+    return device in mounts["allowed"] or _device_allowed(
+        mounts, device, os.path.realpath(directory)
+    )
 
-    It must belong to the running account, give group and others no access (a POSIX ACL's mask
-    shows in the group bits) and have one link.
+
+def _memo_refusal(
+    memo_stat: os.stat_result, mounts: _Mounts, directory: pathlib.Path
+) -> tuple[str, bool] | None:
+    """Why an open memo file must not be used, and whether the pre-flight may replace it; None
+    when no other account can reach it.
+
+    It must be a regular file on a filesystem of the allowlist (where owner and mode are the
+    file's own and the kernel enforces them), owned by the running account; any other file is
+    refused and never replaced. The account's own file must also give group and others no access
+    (a POSIX ACL's mask shows in the group bits) and have one link; one that does not was loosened
+    by its owner, and the pre-flight replaces it.
     """
+    if not stat.S_ISREG(memo_stat.st_mode):
+        return f"is not a regular file ({stat.filemode(memo_stat.st_mode)})", False
+    if not _memo_device_allowed(mounts, memo_stat.st_dev, directory):
+        return "is on a filesystem off the allowlist", False
     if memo_stat.st_uid != os.geteuid():
-        return f"belongs to uid {memo_stat.st_uid}"
+        return f"belongs to uid {memo_stat.st_uid}", False
     if memo_stat.st_mode & 0o077:
-        return f"has mode {stat.filemode(memo_stat.st_mode)}"
+        return f"has mode {stat.filemode(memo_stat.st_mode)}", True
     if memo_stat.st_nlink != 1:
-        return f"has {memo_stat.st_nlink} links"
+        return f"has {memo_stat.st_nlink} links", True
     return None
+
+
+def _unlink_memo(path: pathlib.Path, memo_stat: os.stat_result) -> bool:
+    """Unlink ``path`` if it still names the file ``memo_stat`` describes (OSError propagates)."""
+    named = os.lstat(path)
+    if (named.st_dev, named.st_ino) != (memo_stat.st_dev, memo_stat.st_ino):
+        return False
+    os.unlink(path)
+    return True
 
 
 def _pack_memo(root: str, dirs: dict[str, bytes]) -> bytes:
@@ -448,38 +482,98 @@ def _unpack_memo(content: bytes) -> _Memo | None:
     return _Memo(root=os.fsdecode(root), dirs={os.fsdecode(rel): item for rel, item in listings})
 
 
-def _open_memo(flags: int) -> tuple[int | None, _Memo | None]:
-    """Open the account's memo file with ``flags`` and read it: its descriptor and its memo.
+def _create_memo(path: pathlib.Path, mounts: _Mounts) -> int | None:
+    """Create the account's memo file with mode 0600 and return its descriptor.
 
-    The descriptor is None (and the caller lists every directory) when the file is missing or
-    cannot be opened, or when an fstat of the open file fails ``_memo_refusal``; a debug log names
-    the reason, except for a missing file. The memo's own path is never followed through a
-    symlink, and a FIFO there is not waited on. The memo is None when the file holds no whole
-    memo. Any failure means no memo: every directory is listed, as main does.
+    None when the state database's directory does not exist yet (the memo never creates it) or is
+    on a filesystem off the allowlist, so nothing is created there, or when another process made
+    the file first. A new file that fails ``_memo_refusal`` is removed again.
+    """
+    try:
+        directory = os.stat(path.parent)
+        if not _memo_device_allowed(mounts, directory.st_dev, path.parent):
+            logger.debug(f"No .pvt walk memo: {path.parent} is on a filesystem off the allowlist")
+            return None
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | _MEMO_OPEN, 0o600)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        logger.debug(f"No .pvt walk memo: cannot create it: {e}")
+        return None
+    try:
+        memo_stat = os.fstat(fd)
+        refusal = _memo_refusal(memo_stat, mounts, path.parent)
+        if refusal is None:
+            return fd
+        logger.debug(f"No .pvt walk memo: the new file {path} {refusal[0]}")
+        _unlink_memo(path, memo_stat)
+    except OSError as e:
+        logger.debug(f"No .pvt walk memo: cannot check the new file {path}: {e}")
+    os.close(fd)
+    return None
+
+
+def _replace_memo(
+    fd: int, path: pathlib.Path, memo_stat: os.stat_result, mounts: _Mounts
+) -> int | None:
+    """Replace a loosened memo of the account's own, open as ``fd``, with a new private file.
+
+    The old file is emptied, so no descriptor opened on it and no other link to it keeps its
+    names, and its path is unlinked if it still names it. Returns the new file's descriptor, or
+    None (no memo for this walk).
+    """
+    try:
+        os.ftruncate(fd, 0)
+        if not _unlink_memo(path, memo_stat):
+            return None
+    except OSError as e:
+        logger.debug(f"No .pvt walk memo: cannot replace {path}: {e}")
+        return None
+    return _create_memo(path, mounts)
+
+
+def _open_memo(mounts: _Mounts, *, write: bool) -> tuple[int | None, _Memo | None]:
+    """Open the account's memo file and read it: its descriptor and its memo.
+
+    The descriptor is None, and the caller lists every directory, when the file cannot be opened
+    or an fstat of the open file fails ``_memo_refusal``; a debug log names the reason (not for a
+    missing file). For the pre-flight (``write``), a missing memo is created and a loosened one of
+    the account's own is replaced. The memo's own path is never followed through a symlink, and a
+    FIFO there is not waited on. The memo is None when the file holds no whole memo. Any failure
+    means no memo: every directory is listed, as main does.
     """
     try:
         path = _memo_path()
-        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
-    except FileNotFoundError:
+    except _MEMO_ERRORS as e:
+        logger.debug(f"Listing every directory: cannot find the .pvt walk memo: {e}")
         return None, None
+    try:
+        fd = os.open(path, (os.O_RDWR if write else os.O_RDONLY) | _MEMO_OPEN)
+    except FileNotFoundError:
+        return (_create_memo(path, mounts) if write else None), None
     except _MEMO_ERRORS as e:
         logger.debug(f"Listing every directory: cannot open the .pvt walk memo: {e}")
         return None, None
+    replacement = None
     try:
         memo_stat = os.fstat(fd)
-        refusal = _memo_refusal(memo_stat)
-        content = os.pread(fd, memo_stat.st_size, 0) if refusal is None else b""
+        refusal = _memo_refusal(memo_stat, mounts, path.parent)
+        if refusal is None:
+            content = os.pread(fd, memo_stat.st_size, 0)
+            memo = _unpack_memo(content)
+            if memo is None and content:
+                logger.debug(f"Listing every directory: the .pvt walk memo {path} is malformed")
+            return fd, memo
+        reason, replaceable = refusal
+        if write and replaceable:
+            logger.debug(f"Replacing the .pvt walk memo {path}: it {reason}")
+            replacement = _replace_memo(fd, path, memo_stat, mounts)
     except OSError as e:
-        refusal = f"cannot be read: {e}"
-        content = b""
-    if refusal is not None:
-        os.close(fd)
-        logger.debug(f"Listing every directory: the .pvt walk memo {path} {refusal}")
-        return None, None
-    memo = _unpack_memo(content)
-    if memo is None and content:
-        logger.debug(f"Listing every directory: the .pvt walk memo {path} is malformed")
-    return fd, memo
+        reason = f"cannot be read: {e}"
+    os.close(fd)
+    if replacement is None:
+        logger.debug(f"Listing every directory: the .pvt walk memo {path} {reason}")
+    return replacement, None
 
 
 def _write_memo(fd: int, content: bytes) -> None:
@@ -487,15 +581,25 @@ def _write_memo(fd: int, content: bytes) -> None:
 
     The file is emptied first, so a walk reading it meanwhile, or after this process is killed
     mid-write, sees a prefix of the new memo, which does not parse: that walk lists every
-    directory. A failure is logged and skipped.
+    directory. A write that fails (a full disk, say) is logged and the file emptied again, so no
+    cut memo keeps the space.
     """
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        os.ftruncate(fd, 0)
-        with open(fd, "wb", closefd=False) as memo_file:
-            memo_file.write(content)
     except OSError as e:
         logger.debug(f"Could not record the .pvt walk memo: {e}")
+        return
+    try:
+        os.ftruncate(fd, 0)
+        unwritten = memoryview(content)
+        while unwritten:
+            unwritten = unwritten[os.write(fd, unwritten) :]
+    except OSError as e:
+        logger.debug(f"Could not record the .pvt walk memo: {e}")
+        try:
+            os.ftruncate(fd, 0)
+        except OSError as truncate_error:
+            logger.debug(f"Could not empty the .pvt walk memo: {truncate_error}")
 
 
 def _trusted_listings(memo: _Memo | None, root: pathlib.Path) -> dict[str, bytes]:
@@ -509,26 +613,31 @@ def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
     instead of listed; every .pvt found is read. Never writes or creates the memo: only the
     repro/run pre-flight does (``discover_pvt_files_and_update_memo``).
     """
-    fd, memo = _open_memo(os.O_RDONLY)
+    mounts = _read_mounts()
+    fd, memo = _open_memo(mounts, write=False)
     if fd is not None:
         os.close(fd)
-    candidates, _ = _walk(root, _trusted_listings(memo, root), record=False)
+    candidates, _ = _walk(root, _trusted_listings(memo, root), mounts, record=False)
     return _read_pvt_files(candidates)
 
 
 def discover_pvt_files_and_update_memo(root: pathlib.Path) -> dict[str, PvtData]:
     """``discover_pvt_files`` for the repro/run pre-flight, the memo's one writer.
 
-    Opens the account's memo file read-write, creating it with mode 0600 when it is missing, and
-    when the walk's listings differ from it, writes in place the listing of every directory
-    ``_walk`` may record, dropping every other listing. It never creates the state database's
-    directory, so before the first pivot write there it records nothing. A memo that cannot be
-    opened or fails ``_memo_refusal`` is neither read nor written for this walk.
+    Opens the account's memo file read-write (``_open_memo``: a missing memo is created with mode
+    0600, a loosened one replaced) and, when the walk's listings differ from it, writes in place
+    the listing of every directory ``_walk`` may record, dropping every other listing. It never
+    creates the state database's directory, so before the first pivot write there it records
+    nothing. A memo that cannot be opened or fails ``_memo_refusal`` is neither read nor written
+    for this walk.
     """
     real_root = _memo_root(root)
-    fd, previous = _open_memo(os.O_RDWR | os.O_CREAT)
+    mounts = _read_mounts()
+    fd, previous = _open_memo(mounts, write=True)
     try:
-        candidates, listings = _walk(root, _trusted_listings(previous, root), record=fd is not None)
+        candidates, listings = _walk(
+            root, _trusted_listings(previous, root), mounts, record=fd is not None
+        )
         if fd is not None and previous != _Memo(root=real_root, dirs=listings):
             _write_memo(fd, _pack_memo(real_root, listings))
     finally:
