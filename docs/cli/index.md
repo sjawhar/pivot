@@ -40,10 +40,14 @@ All commands support:
 **Errors.** A failure pivot recognizes prints its own message, often with a tip. Any other failure
 prints one line: an operating-system error as its message and the path it names (for example
 `Error: Permission denied: /home/me/proj/.pivot/cache/files/c9`), anything else as
-`Error: Unexpected <type>: <message>`. In `run` and `repro`, a stage that fails because pivot's
-own code hit such an error prints that same one line under its name; a failure that comes out of
-your own code (the stage function, or the `load`, `save` or `empty` of a loader you wrote) prints
-its traceback, so you can debug it. The `--json` record keeps the stage's full reason in both
+`Error: Unexpected <type>: <message>`. In `run` and `repro`, a stage prints that one line under its
+name only when pivot's own file operations on the files it manages failed: storing the stage's
+outputs in the cache, opening the state database, reading or writing the stage's lock file, or
+creating the stage's output file in a format pivot writes itself (text, JSON, JSON Lines, YAML,
+pickle), as in a read-only output directory. Every other stage failure prints its traceback, as
+before: one in your stage function, in a loader or writer (pivot's own included, with any code of
+yours it runs, such as a plot's tick formatter or an object's `__str__` that pandas calls), and
+any failure pivot did not classify. The `--json` record keeps the stage's full reason in both
 cases, unchanged. `pivot --verbose <command>` also prints the traceback, after the TUI exits for
 `--tui`.
 

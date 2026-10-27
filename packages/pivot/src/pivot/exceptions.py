@@ -1,5 +1,9 @@
+import collections.abc
+import contextlib
 import os
 import pathlib
+import threading
+import types
 from difflib import get_close_matches
 from typing import override
 
@@ -444,3 +448,71 @@ def _path_text(name: object) -> str:
     quoted with its escapes, as the exception's own text quotes it."""
     text = os.fsdecode(name) if isinstance(name, bytes) else str(name)
     return text if text and text.isprintable() else repr(text)
+
+
+# A stage that fails prints one line (`describe_error`) only when the exception left pivot's own
+# I/O on state pivot owns: storing outputs in its cache, opening its state database, reading or
+# writing the stage's lock file, and creating the stage's output file. Each such call is marked
+# where pivot makes it (`PIVOT_IO`, `pivot_output_io`), so the call decides, never the exception's
+# type or frames. Any other failure keeps its traceback: one out of the stage function, out of a
+# loader or writer (pivot's own included), out of whatever code of the user's they run, and any
+# failure nothing marked.
+
+
+class _PivotIO(threading.local):
+    """This thread's running stage: the exception that left pivot's own I/O on state it owns, and
+    the output path pivot is writing now."""
+
+    error: BaseException | None = None
+    output: pathlib.Path | None = None
+
+
+_pivot_io = _PivotIO()
+
+
+class _PivotIOCall:
+    """Brackets a call of pivot's own I/O on state it owns: an exception that leaves it is
+    pivot's."""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: types.TracebackType | None,
+    ) -> None:
+        if exc_val is not None:
+            _pivot_io.error = exc_val
+
+
+PIVOT_IO = _PivotIOCall()
+_NOT_PIVOT_IO = contextlib.nullcontext()
+
+
+def pivot_output_io(path: pathlib.Path) -> contextlib.AbstractContextManager[None]:
+    """The bracket for a pivot writer creating its file at ``path``. It is pivot's own I/O only
+    while pivot is writing that very output (``writing_output``), not when a stage function or a
+    user's writer calls the writer for a path of its own."""
+    return PIVOT_IO if path == _pivot_io.output else _NOT_PIVOT_IO
+
+
+@contextlib.contextmanager
+def writing_output(path: pathlib.Path) -> collections.abc.Generator[None]:
+    """Mark ``path`` as the output pivot is writing while the block runs."""
+    _pivot_io.output = path
+    try:
+        yield
+    finally:
+        _pivot_io.output = None
+
+
+def raised_by_pivot_io(error: BaseException) -> bool:
+    """Whether ``error`` left pivot's own I/O on state it owns, in this thread's stage."""
+    return _pivot_io.error is error
+
+
+def clear_pivot_io() -> None:
+    """Drop the stage's recorded failure, whose frames hold the stage's locals and inputs."""
+    _pivot_io.error = None

@@ -25,6 +25,8 @@ import numpy
 import pandas
 import yaml
 
+from pivot import exceptions
+
 
 class LossyOutputWarning(UserWarning):
     """An output was written in Pivot's old form because the exact form cannot hold it.
@@ -160,7 +162,9 @@ class JSON[T](Loader[T, T]):
 
     @override
     def save(self, data: T, path: pathlib.Path) -> None:
-        with open(path, "w") as f:
+        with exceptions.pivot_output_io(path):
+            handle = open(path, "w")  # noqa: SIM115 - only creating the file is pivot's own I/O
+        with handle as f:
             json.dump(data, f, indent=self.indent)
 
     @override
@@ -249,8 +253,9 @@ class YAML[T](Loader[T, T]):
                 LossyOutputWarning,
                 stacklevel=2,
             )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        with exceptions.pivot_output_io(path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
 
     @override
     def empty(self) -> T:
@@ -275,9 +280,9 @@ class Text(Loader[str, str]):
         if not isinstance(data, str):  # pyright: ignore[reportUnnecessaryIsInstance] - runtime validation for misuse
             raise TypeError(f"Text save expects str, got {type(data).__name__}")  # pyright: ignore[reportUnreachable]
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".txt.tmp")
+        with exceptions.pivot_output_io(path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".txt.tmp")
         try:
             with os.fdopen(fd, "w", newline="") as f:
                 f.write(data)
@@ -317,9 +322,9 @@ class JSONL(Loader[list[dict[str, Any]], list[dict[str, Any]]]):
         if not isinstance(data, list):  # pyright: ignore[reportUnnecessaryIsInstance] - runtime validation for misuse
             raise TypeError(f"JSONL save expects list, got {type(data).__name__}")  # pyright: ignore[reportUnreachable]
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
+        with exceptions.pivot_output_io(path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
         try:
             with os.fdopen(fd, "w") as f:
                 for item in data:
@@ -542,8 +547,9 @@ def _parse_jsonl_header(record: object, path: pathlib.Path) -> _JsonlHeader | No
 
 
 def _write_text_atomically(path: pathlib.Path, chunks: collections_abc.Iterable[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
+    with exceptions.pivot_output_io(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
     try:
         with os.fdopen(fd, "w") as f:
             f.writelines(chunks)
@@ -793,7 +799,9 @@ class Pickle[T](Loader[T, T]):
 
     @override
     def save(self, data: T, path: pathlib.Path) -> None:
-        with open(path, "wb") as f:
+        with exceptions.pivot_output_io(path):
+            handle = open(path, "wb")  # noqa: SIM115 - only creating the file is pivot's own I/O
+        with handle as f:
             pickle.dump(data, f, protocol=self.protocol)
 
 

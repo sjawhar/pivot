@@ -1,10 +1,10 @@
 """Round two of #530 (BET-331): the gate's red tests R1-R5 (PR530Gate, at 3577dbc1), as written,
 and one test per behaviour a surviving mutant broke.
 
-A failed stage's console line is one line (`display_reason`); `--verbose` prints the traceback the
-record holds; the JSONL `reason` keeps main's bytes. A cause inside a PivotError keeps main's text.
-A failure out of the user's own code, their stage function or a loader they wrote, keeps main's
-traceback (round three).
+A stage's console line is one line (`display_reason`) only when pivot's own I/O on state it owns
+failed; `--verbose` prints the traceback the record holds; the JSONL `reason` keeps main's bytes. A
+cause inside a PivotError keeps main's text. Any other stage failure, out of the user's code or a
+loader or writer (pivot's own included), keeps main's traceback (round four).
 """
 
 from __future__ import annotations
@@ -291,12 +291,13 @@ def test_a_user_stage_keeps_its_traceback_and_pivots_own_error_is_one_line(
     assert "PermissionError: [Errno" not in out, out
 
 
-_USER_LOADERS = """\
+_USER_CODE = """\
 import dataclasses
+import functools
 import pathlib
 from typing import Annotated, override
 
-from pivot import Pipeline, directory, incremental, loaders, stage
+from pivot import Pipeline, directory, incremental, loaders, plot, stage
 
 
 @dataclasses.dataclass(frozen=True)
@@ -340,9 +341,35 @@ def bad_factory() -> dict[str, int]:
     raise RuntimeError("custom empty_factory bug")
 
 
+def first_state_with(start: int) -> dict[str, int]:
+    raise ValueError(f"bug in the user's partial-wrapped empty_factory ({start})")
+
+
+def label(x: float, pos: int) -> str:
+    return ["only one label"][int(x)]
+
+
+class BadState:
+    def __getstate__(self) -> object:
+        raise ValueError("bug in the user's __getstate__")
+
+
+class BadStr:
+    def __str__(self) -> str:
+        raise ValueError("bug in the user's __str__")
+
+
+@dataclasses.dataclass(frozen=True)
+class SubclassedText(loaders.Text):
+    @override
+    def save(self, data: str, path: pathlib.Path) -> None:
+        raise ValueError("bug in a subclass of a pivot loader")
+
+
 """
 
-_USER_LOADER_CASES = [
+_USER_CODE_CASES = [
+    # The user's own loader and writer.
     pytest.param(
         """\
 @stage
@@ -430,18 +457,115 @@ with Pipeline("p") as pipeline:
         "RuntimeError: custom empty_factory bug",
         id="pivot-loader-calling-a-user-function",
     ),
+    pytest.param(
+        """\
+@stage
+def custom_text() -> Annotated[str, SubclassedText()]:
+    return "x"
+
+
+with Pipeline("p") as pipeline:
+    custom_text()
+""",
+        "save",
+        'raise ValueError("bug in a subclass of a pivot loader")',
+        "ValueError: bug in a subclass of a pivot loader",
+        id="user-subclass-of-a-pivot-loader",
+    ),
+    # The user's code that pivot's own loaders run: round three's review (R3-1), and the case
+    # no rule by call site or loader can reach, a value's __str__ that pandas calls.
+    pytest.param(
+        """\
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+
+
+@stage
+def chart() -> Annotated[Figure, plot]:
+    fig, ax = plt.subplots()
+    ax.plot(range(5))
+    ax.xaxis.set_major_formatter(label)
+    return fig
+
+
+with Pipeline("p") as pipeline:
+    chart()
+""",
+        "label",
+        'return ["only one label"][int(x)]',
+        "IndexError: list index out of range",
+        id="plot-tick-formatter-in-matplotlib-save",
+    ),
+    pytest.param(
+        """\
+@stage
+def pickled() -> Annotated[BadState, loaders.Pickle()]:
+    return BadState()
+
+
+with Pipeline("p") as pipeline:
+    pickled()
+""",
+        "__getstate__",
+        'raise ValueError("bug in the user\'s __getstate__")',
+        "ValueError: bug in the user's __getstate__",
+        id="getstate-in-pickle-save",
+    ),
+    pytest.param(
+        """\
+@stage
+def grow(
+    previous: dict[str, int],
+) -> Annotated[
+    dict[str, int], incremental, loaders.JSON(empty_factory=functools.partial(first_state_with, 1))
+]:
+    return {"n": len(previous)}
+
+
+with Pipeline("p") as pipeline:
+    grow(previous=pipeline.previous())
+""",
+        "first_state_with",
+        'raise ValueError(f"bug in the user\'s partial-wrapped empty_factory ({start})")',
+        "ValueError: bug in the user's partial-wrapped empty_factory (1)",
+        id="partial-wrapped-empty-factory",
+    ),
+    pytest.param(
+        """\
+import pandas as pd
+
+
+@stage
+def table() -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return pd.DataFrame({"a": [BadStr()]})
+
+
+with Pipeline("p") as pipeline:
+    table()
+""",
+        "__str__",
+        'raise ValueError("bug in the user\'s __str__")',
+        "ValueError: bug in the user's __str__",
+        id="str-called-by-pandas-in-csv-save",
+    ),
 ]
 
 
-@pytest.mark.parametrize(("stages", "function", "raised", "last_line"), _USER_LOADER_CASES)
-def test_a_failure_out_of_a_users_loader_or_writer_keeps_its_traceback(
+@pytest.mark.parametrize(("stages", "function", "raised", "last_line"), _USER_CODE_CASES)
+def test_a_failure_outside_pivots_own_io_keeps_its_traceback(
     tmp_path: pathlib.Path, stages: str, function: str, raised: str, last_line: str
 ) -> None:
-    """A loader the user wrote is their code, as the stage function is: a failure out of its
-    `save`, its `load` (of a dependency, or of each file of a directory dependency), or its
-    `empty` (an incremental output's first run), or out of a user's function a pivot loader
-    calls, prints main's traceback ending at the user's file and line, with no --verbose."""
-    pipeline = _USER_LOADERS + stages
+    """Only pivot's own I/O on state it owns prints one line. A failure out of the user's code
+    anywhere else prints main's traceback, ending at the user's file and line, with no
+    --verbose: a loader or writer the user wrote (`save`, `load` of a dependency or of each file
+    of a directory dependency, `empty` on an incremental output's first run), a subclass of a
+    pivot loader, and the user's code that pivot's own loaders run (a function given as an
+    option, plain or wrapped in `functools.partial`, a plot's tick formatter, a value's
+    `__getstate__`, a value's `__str__` that pandas calls)."""
+    pipeline = _USER_CODE + stages
     root = tmp_path / "proj"
     root.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
