@@ -919,7 +919,13 @@ class StateDB:
         return run_history.deserialize_run_cache_entry(value)
 
     def get_no_commit_record(self, stage_name: str) -> NoCommitRecord | None:
-        """The stage's `nocommit:` record, or None (absent or unreadable)."""
+        """The stage's `nocommit:` record, or None when it is absent or not a JSON object.
+
+        The record is shared: each writer owns its keys and keeps the others (`pvt_members` here;
+        a `--no-commit` run's `code_manifest` and `output_hashes`). This reader checks only
+        `pvt_members` and leaves a malformed one out; every other key is returned as stored, so a
+        record holding only another writer's keys still reads as present.
+        """
         self._check_closed()
         with self._read_transaction() as txn:
             value = txn.get(_NOCOMMIT_PREFIX + stage_name.encode())
@@ -932,11 +938,9 @@ class StateDB:
         if not isinstance(data, dict):
             return None
         record = typing.cast("dict[str, object]", data)
-        members = record.get("pvt_members", {})
-        if not _is_str_dict(members):
-            return None
-        checked = typing.cast("object", {"pvt_members": members})
-        return typing.cast("NoCommitRecord", checked)
+        if "pvt_members" in record and not _is_str_dict(record["pvt_members"]):
+            del record["pvt_members"]
+        return typing.cast("NoCommitRecord", typing.cast("object", record))
 
     def add_no_commit_pvt_members(self, stage_name: str, members: Mapping[str, str]) -> None:
         """Add `members` (path relative to the project root -> content hash) to the `*.pvt`

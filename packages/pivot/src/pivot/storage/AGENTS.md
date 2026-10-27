@@ -35,7 +35,7 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 | `remote:` | Remote index entries |
 | `remote_url:` | Remote URL tracking for change detection |
 | `fp:` | AST fingerprint/hash cache entries |
-| `nocommit:` | What Pivot wrote in a stage's outputs that no lock records yet (`stage` → its `*.pvt` directory members, path → content hash, each added before the file is written); a written lock removes it |
+| `nocommit:` | A stage's shared record of what Pivot wrote for it that no lock records yet (`stage` → JSON object: `pvt_members`, its `*.pvt` directory members, path → content hash, each added before the file is written; a `--no-commit` run's `code_manifest` and `output_hashes`). Every key is optional: each writer sets only its own keys and keeps the rest in one write transaction, and each reader checks only its own keys, so a record holding only another writer's keys reads as present. A written lock removes it |
 
 **When adding new state types**, define a new prefix constant and document it here.
 

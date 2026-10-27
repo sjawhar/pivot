@@ -1100,21 +1100,70 @@ def test_no_commit_record_is_kept_until_a_lock_clears_it(tmp_path: pathlib.Path)
     [
         pytest.param(b"\xff not json", id="not-json"),
         pytest.param(b"[1, 2]", id="not-an-object"),
-        pytest.param(b'{"pvt_members": {"data/s/a.pvt": 1}}', id="hash-not-a-string"),
-        pytest.param(b'{"pvt_members": ["data/s/a.pvt"]}', id="members-not-a-mapping"),
     ],
 )
 def test_unreadable_no_commit_record_reads_as_none(tmp_path: pathlib.Path, stored: bytes) -> None:
-    """A record this Pivot cannot read lists no member, so nothing is claimed through it."""
+    """A record this Pivot cannot read at all lists no member, so nothing is claimed through it."""
+    _helper_store_no_commit_record(tmp_path, stored)
+
+    with state.StateDB(tmp_path, readonly=True) as db:
+        assert db.get_no_commit_record("s") is None
+
+
+_RUN_FIELDS = {"code_manifest": {"func:tree": "a1b2"}, "output_hashes": {"b/tree": "c3d4"}}
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        pytest.param(b'{"pvt_members": {"data/s/a.pvt": 1}}', {}, id="hash-not-a-string"),
+        pytest.param(b'{"pvt_members": ["data/s/a.pvt"]}', {}, id="members-not-a-mapping"),
+        pytest.param(
+            json.dumps({**_RUN_FIELDS, "pvt_members": ["data/s/a.pvt"]}).encode(),
+            _RUN_FIELDS,
+            id="beside-run-fields",
+        ),
+    ],
+)
+def test_malformed_pvt_members_are_left_out_of_a_record_that_still_reads(
+    tmp_path: pathlib.Path, stored: bytes, expected: dict[str, object]
+) -> None:
+    """The reader checks only `pvt_members`: a malformed value lists no member, so nothing is
+    claimed through it, and the record's other keys still read, unchanged."""
+    _helper_store_no_commit_record(tmp_path, stored)
+
+    with state.StateDB(tmp_path, readonly=True) as db:
+        assert db.get_no_commit_record("s") == expected
+
+
+def test_record_holding_only_run_fields_reads_as_present_and_survives_adding_members(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The `nocommit:` record is shared with a `--no-commit` run's own writer, which keeps
+    `code_manifest` and `output_hashes` in it. A record holding only those reads as present with
+    them unchanged, and recording `*.pvt` members keeps them as stored."""
+    _helper_store_no_commit_record(tmp_path, json.dumps(_RUN_FIELDS).encode())
+    members = {"pvt_members": {"data/s/a.pvt": "aaa"}}
+
+    with state.StateDB(tmp_path) as db:
+        assert db.get_no_commit_record("s") == _RUN_FIELDS
+        db.add_no_commit_pvt_members("s", {"data/s/a.pvt": "aaa"})
+        assert db.get_no_commit_record("s") == {**_RUN_FIELDS, **members}
+    env = lmdb.open(str(tmp_path / "state.lmdb"))
+    with env.begin() as txn:
+        stored = txn.get(b"nocommit:s")
+    env.close()
+    assert stored is not None
+    assert json.loads(stored) == {**_RUN_FIELDS, **members}
+
+
+def _helper_store_no_commit_record(tmp_path: pathlib.Path, stored: bytes) -> None:
     with state.StateDB(tmp_path):
         pass
     env = lmdb.open(str(tmp_path / "state.lmdb"))
     with env.begin(write=True) as txn:
         txn.put(b"nocommit:s", stored)
     env.close()
-
-    with state.StateDB(tmp_path, readonly=True) as db:
-        assert db.get_no_commit_record("s") is None
 
 
 def test_adding_pvt_members_keeps_the_record_and_its_other_fields(tmp_path: pathlib.Path) -> None:

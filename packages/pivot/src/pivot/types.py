@@ -150,15 +150,24 @@ class OnError(enum.StrEnum):
 
 
 class NoCommitRecord(TypedDict, total=False):
-    """What Pivot wrote in a stage's outputs that no lock records yet (StateDB `nocommit:<stage>`).
+    """A stage's StateDB `nocommit:<stage>` record: what Pivot wrote for the stage that no lock
+    records yet. A written lock removes the whole record.
 
-    A written lock supersedes it. `pvt_members` maps each `*.pvt` file Pivot wrote in a directory
-    output (path relative to the project root) to its content hash. Every path that writes one
-    adds it before the file exists: a run (`--no-commit` included), a run-cache restore and
-    `pivot get` of a stage. Until a lock records them, they are the stage's own files, which
-    `pivot commit` claims and later runs replace.
+    The record is shared, and every key is optional. Each writer owns its keys and keeps every
+    other key as stored (a read-modify-write in one write transaction); each reader checks only
+    its own keys and tolerates the absence of the others, so a record holding only another
+    writer's keys still reads as present.
+
+    `pvt_members` maps each `*.pvt` file Pivot wrote in a directory output (path relative to the
+    project root) to its content hash. Every path that writes one adds it before the file exists:
+    a run (`--no-commit` included), a run-cache restore and `pivot get` of a stage. Until a lock
+    records them, they are the stage's own files, which `pivot commit` claims and later runs
+    replace. `code_manifest` and `output_hashes` are what a `--no-commit` run ran and wrote, for
+    `pivot commit`.
     """
 
+    code_manifest: dict[str, str]
+    output_hashes: dict[str, str]  # output identity key -> content hash
     pvt_members: dict[str, str]
 
 
