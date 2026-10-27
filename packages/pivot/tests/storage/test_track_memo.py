@@ -14,6 +14,7 @@ import pathlib
 import random
 import shutil
 import stat
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -25,7 +26,7 @@ from pivot.executor import core as executor_core
 from pivot.storage import cache, state, track
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterator
+    from collections.abc import Callable, Iterator
 
     from pytest_mock import MockerFixture
 
@@ -39,24 +40,27 @@ _INSIDE_SETTLE_WINDOW_NS = 1_000_000_000
 # use; a test that moves the clock past the window waits the tick itself.
 _ONE_TICK_S = 0.05
 
-
-@pytest.fixture(autouse=True)
-def _listable_modes() -> Generator[None]:
-    """Make new directories 0o755 whatever the user's umask: the memo records only directories
-    every account may read and search."""
-    previous = os.umask(0o022)
-    yield
-    os.umask(previous)
+# How long a test waits for a walk that must not block (on a FIFO, or on a lock another holds).
+_NO_WAIT_S = 10.0
 
 
 @pytest.fixture
-def memo_project(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """A project root on a filesystem the memo trusts (mountinfo says ext4)."""
+def new_project(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+    """A project root on a filesystem the memo trusts (mountinfo says ext4), with no state
+    database yet."""
     root = tmp_path / "project"
     (root / ".pivot").mkdir(parents=True)
     monkeypatch.setattr(project, "_project_root_cache", root)
     _helper_mountinfo(monkeypatch, tmp_path / "mountinfo", root, "ext4")
     return root
+
+
+@pytest.fixture
+def memo_project(new_project: pathlib.Path) -> pathlib.Path:
+    """``new_project`` once a pivot command has made its state database, whose directory holds
+    the memo file."""
+    _helper_create_state_database()
+    return new_project
 
 
 def _helper_mount_line(mount_id: int, device: int, point: str, fstype: str) -> str:
@@ -141,16 +145,23 @@ def _helper_preflight(root: pathlib.Path) -> dict[str, track.PvtData]:
 def _helper_record(root: pathlib.Path) -> None:
     """Record the memo for an unchanging tree.
 
-    The first pre-flight's own write creates the state database's write lock, which changes
-    ``.pivot/state.lmdb``; the second records that directory as it then stays.
+    The first pre-flight creates the memo file, which changes ``.pivot/state.lmdb``; the second
+    records that directory as it then stays (the file is rewritten in place).
     """
     _helper_preflight(root)
     _helper_preflight(root)
 
 
-def _helper_memo() -> state.PvtDirMemo:
-    with state.StateDB(config.get_state_dir(), readonly=True) as state_db:
-        return state_db.read_pvt_dir_memo()
+def _helper_memo() -> track._Memo:
+    """What the account's memo file holds; no root and no listing when there is no whole memo."""
+    path = track._memo_path()
+    memo = track._unpack_memo(path.read_bytes()) if path.exists() else None
+    return memo if memo is not None else track._Memo(root="", dirs={})
+
+
+def _helper_write_memo(memo: track._Memo) -> None:
+    """Write ``memo`` over the account's memo file, keeping the file."""
+    track._memo_path().write_bytes(track._pack_memo(memo["root"], memo["dirs"]))
 
 
 def _helper_assert_matches_main(found: dict[str, track.PvtData], root: pathlib.Path) -> None:
@@ -179,7 +190,8 @@ def _helper_build_tree(root: pathlib.Path) -> None:
 def test_settled_unchanged_directories_are_stat_not_listed(
     memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
 ) -> None:
-    """After the pre-flight records the memo, a walk lists no directory and stats every one."""
+    """After the pre-flight records the memo, a walk lists no directory and stats every one, and
+    a pre-flight with nothing changed writes nothing."""
     _helper_build_tree(memo_project)
     _helper_settle(monkeypatch)
     directories = _helper_directories(memo_project)
@@ -197,46 +209,64 @@ def test_settled_unchanged_directories_are_stat_not_listed(
     warm = track.discover_pvt_files(memo_project)
     listings = listed.call_count
     stated = {os.fspath(call.args[0]) for call in lstat.call_args_list}
+    written = mocker.spy(track, "_write_memo")
+    _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
 
     assert listings == 0, "no settled, unchanged directory is listed again"
     assert set(directories[1:]) <= stated, "every directory below the root still gets its lstat"
     _helper_assert_matches_main(warm, memo_project)
+    assert written.call_count == 0, "an unchanged memo is not written again"
+
+
+def test_memo_file_is_the_accounts_own(memo_project: pathlib.Path) -> None:
+    """The pre-flight creates the memo file beside the state database's files, named for the
+    running account, owned by it, with mode 0600 and one link."""
+    _helper_build_tree(memo_project)
+
+    _helper_preflight(memo_project)
+
+    path = track._memo_path()
+    memo_stat = path.stat()
+    assert path == config.get_state_dir() / "state.lmdb" / f"pvt-memo-{os.geteuid()}"
+    assert (memo_stat.st_uid, stat.S_IMODE(memo_stat.st_mode), memo_stat.st_nlink) == (
+        os.geteuid(),
+        0o600,
+        1,
+    )
 
 
 def test_read_only_walk_does_not_write_the_memo(
     memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """discover_pvt_files reads the memo but never records one."""
+    """discover_pvt_files reads the memo but never creates or records one."""
     _helper_build_tree(memo_project)
     _helper_settle(monkeypatch)
-    with state.StateDB(config.get_state_dir()):
-        pass  # the database exists, so the read-only walk opens it
 
     _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
 
-    assert _helper_memo() == state.PvtDirMemo(root=None, dirs={})
+    assert not track._memo_path().exists()
 
 
-def test_read_only_walk_creates_no_state_database(memo_project: pathlib.Path) -> None:
+def test_read_only_walk_creates_no_state_database(new_project: pathlib.Path) -> None:
     """With no state database yet, the read-only walk lists everything and creates none."""
-    _helper_build_tree(memo_project)
+    _helper_build_tree(new_project)
 
-    _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+    _helper_assert_matches_main(track.discover_pvt_files(new_project), new_project)
 
     assert not (config.get_state_dir() / "state.lmdb").exists()
 
 
 def test_read_only_walk_does_not_create_a_database_in_an_empty_state_directory(
-    memo_project: pathlib.Path,
+    new_project: pathlib.Path,
 ) -> None:
-    """An empty state.lmdb directory (no data file yet) is not opened, so nothing is created."""
-    _helper_build_tree(memo_project)
+    """An empty state.lmdb directory (no data file yet) gets no file from the read-only walk."""
+    _helper_build_tree(new_project)
     lmdb_dir = config.get_state_dir() / "state.lmdb"
     lmdb_dir.mkdir(parents=True)
 
-    _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+    _helper_assert_matches_main(track.discover_pvt_files(new_project), new_project)
 
-    assert list(lmdb_dir.iterdir()) == [], "the read-only walk created no database files"
+    assert list(lmdb_dir.iterdir()) == [], "the read-only walk created no file"
 
 
 def test_unreadable_config_means_a_full_listing_not_an_error(
@@ -259,78 +289,156 @@ def test_unreadable_config_means_a_full_listing_not_an_error(
     _helper_assert_matches_main(found, memo_project)
 
 
-def test_preflight_does_not_wait_on_a_busy_database_for_the_memo(
+def test_state_directory_with_a_nul_byte_means_a_full_listing_not_an_error(
     memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """While another process holds the write lock, the pre-flight skips recording the memo."""
+    """A ``core.state_dir`` holding a NUL byte cannot be opened (``ValueError``): both walks list
+    everything and return what main finds; the command fails later, where main's does."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    (memo_project / ".pivot" / "config.yaml").write_text('core:\n  state_dir: "state\\0dir"\n')
+    config_io.clear_config_cache()
+    assert "\0" in os.fspath(config.get_state_dir())
+
+    _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+    _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
+
+
+def _helper_run_without_waiting(
+    call: Callable[[], dict[str, track.PvtData]], release: Callable[[], None]
+) -> dict[str, track.PvtData]:
+    """Run ``call`` in a thread and return its result. When it is still running after
+    ``_NO_WAIT_S``, ``release`` frees what it waits on, and the test fails."""
+    outcome = list[dict[str, track.PvtData] | BaseException]()
+
+    def _run() -> None:
+        try:
+            outcome.append(call())
+        except BaseException as error:  # re-raised in the test's thread below
+            outcome.append(error)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(_NO_WAIT_S)
+    waited = thread.is_alive()
+    if waited:
+        release()
+        thread.join()
+    assert not waited, f"the walk waited more than {_NO_WAIT_S} s"
+    (result,) = outcome
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
+def test_preflight_does_not_wait_while_another_preflight_writes_the_memo(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While another pre-flight holds the memo file's lock, the pre-flight skips its write."""
     _helper_build_tree(memo_project)
     _helper_settle(monkeypatch)
     _helper_record(memo_project)
-    before = _helper_memo()
+    before = track._memo_path().read_bytes()
     time.sleep(_ONE_TICK_S)
     _helper_add_pvt(memo_project)
-    lock_path = config.get_state_dir() / "state.lmdb" / "pivot-write.lock"
 
-    with lock_path.open("a+b") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        start = time.monotonic()
-        found = _helper_preflight(memo_project)
-        took = time.monotonic() - start
+    with track._memo_path().open("rb") as other:
+        fcntl.flock(other.fileno(), fcntl.LOCK_EX)
+        found = _helper_run_without_waiting(
+            lambda: _helper_preflight(memo_project),
+            lambda: fcntl.flock(other.fileno(), fcntl.LOCK_UN),
+        )
 
-    assert took < 10.0, f"the memo write gave up quickly, not after the 30 s default ({took:.1f} s)"
     _helper_assert_matches_main(found, memo_project)
-    assert _helper_memo() == before, "nothing was recorded while the lock was held"
+    assert track._memo_path().read_bytes() == before, "nothing was recorded while it was locked"
 
 
-def test_preflight_survives_a_write_lock_it_cannot_open(
+def test_preflight_survives_a_memo_file_it_cannot_open(
     memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The memo write is optional: a write lock the pre-flight cannot open (OSError) is skipped."""
+    """A memo file the account cannot open (mode 000) means a full listing and is left alone."""
     _helper_build_tree(memo_project)
     _helper_settle(monkeypatch)
     _helper_record(memo_project)
-    lock = config.get_state_dir() / "state.lmdb" / "pivot-write.lock"
+    path = track._memo_path()
+    before = path.read_bytes()
     _helper_track(memo_project / "a" / "b" / "after.csv", "after\n")
-    lock.chmod(0)
+    path.chmod(0)
     try:
         found = _helper_preflight(memo_project)
     finally:
-        lock.chmod(0o644)
+        path.chmod(0o600)
 
     _helper_assert_matches_main(found, memo_project)
+    assert path.read_bytes() == before
 
 
-def test_preflight_skips_a_memo_write_the_database_refuses(
+def test_memo_write_that_fails_is_skipped(
     memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The database turns read-only between the memo read and its write: the write's LMDB error
-    is skipped and the pre-flight returns what main finds."""
+    """A memo write the filesystem refuses (a full disk, say) is skipped: the pre-flight returns
+    what main finds."""
     _helper_build_tree(memo_project)
     _helper_settle(monkeypatch)
     _helper_record(memo_project)
     _helper_track(memo_project / "a" / "b" / "after.csv", "after\n")
-    lmdb_dir = config.get_state_dir() / "state.lmdb"
-    files = list(lmdb_dir.iterdir())
-    real_walk = track._walk
 
-    def _walk_then_lock(
-        root: pathlib.Path, memo: dict[str, bytes], *, record: bool
-    ) -> tuple[list[pathlib.Path], dict[str, bytes]]:
-        result = real_walk(root, memo, record=record)
-        for path in files:
-            path.chmod(0o444)
-        lmdb_dir.chmod(0o555)
-        return result
+    def _disk_full(_fd: int, _length: int) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
 
-    monkeypatch.setattr(track, "_walk", _walk_then_lock)
-    try:
-        found = _helper_preflight(memo_project)
-    finally:
-        lmdb_dir.chmod(0o755)
-        for path in files:
-            path.chmod(0o644)
+    monkeypatch.setattr(os, "ftruncate", _disk_full)
 
-    _helper_assert_matches_main(found, memo_project)
+    _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
+
+
+def _helper_record_ends(content: bytes) -> list[int]:
+    """Where each record of a memo file's content ends."""
+    ends = list[int]()
+    offset = 0
+    while offset < len(content):
+        key_size, value_size = track._MEMO_RECORD.unpack_from(content, offset)
+        offset += track._MEMO_RECORD.size + key_size + value_size
+        ends.append(offset)
+    return ends
+
+
+def test_memo_cut_short_is_not_used(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """The pre-flight empties the memo file and writes it in place, so a walk reading it during
+    the write, or after the pre-flight was killed mid-write, sees a prefix of the new memo. Every
+    prefix (cut at, around and between record ends, inside a record's sizes, its name and its
+    listing) does not parse, so the walk lists every directory and finds what main finds; the
+    next pre-flight writes the whole memo again."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    time.sleep(_ONE_TICK_S)
+    _helper_add_pvt(memo_project)
+    _helper_preflight(memo_project)
+    content = track._memo_path().read_bytes()
+    assert track._unpack_memo(content) == _helper_memo() != track._Memo(root="", dirs={})
+    ends = _helper_record_ends(content)
+    starts = [0, *ends[:-1]]
+    cuts = {0, *ends, *(end - 1 for end in ends), *(end + 1 for end in ends)}
+    cuts |= {start + track._MEMO_RECORD.size // 2 for start in starts}  # inside the sizes
+    cuts |= {start + track._MEMO_RECORD.size + 1 for start in starts}  # inside the name
+    cuts |= {(start + end) // 2 for start, end in zip(starts, ends, strict=True)}  # the listing
+    directories = len(_helper_directories(memo_project))
+
+    for cut in sorted(cut for cut in cuts if cut < len(content)):
+        track._memo_path().write_bytes(content[:cut])
+        listed = mocker.spy(os, "scandir")
+        found = track.discover_pvt_files(memo_project)
+        listings = listed.call_count
+        mocker.stop(listed)
+
+        assert track._unpack_memo(content[:cut]) is None, f"a memo cut at {cut} does not parse"
+        assert listings == directories, f"cut at {cut}: every directory is listed"
+        _helper_assert_matches_main(found, memo_project)
+
+    _helper_preflight(memo_project)
+    assert track._memo_path().read_bytes() == content, "the next pre-flight rewrites it whole"
 
 
 def _helper_build_untracked_tree(root: pathlib.Path) -> None:
@@ -349,13 +457,14 @@ def _helper_create_state_database() -> pathlib.Path:
 
 
 def test_preflight_with_no_tracked_file_creates_no_state_database(
-    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    new_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """As on main, a pre-flight that finds no tracked file never opens, so never creates, it."""
-    _helper_build_untracked_tree(memo_project)
+    """As on main, a pre-flight that finds no tracked file creates no state database, so no
+    memo file either."""
+    _helper_build_untracked_tree(new_project)
     _helper_settle(monkeypatch)
 
-    executor_core.verify_tracked_files(memo_project)
+    executor_core.verify_tracked_files(new_project)
 
     assert not (config.get_state_dir() / "state.lmdb").exists()
 
@@ -363,14 +472,10 @@ def test_preflight_with_no_tracked_file_creates_no_state_database(
 def test_preflight_with_no_tracked_file_and_a_read_only_database_succeeds(
     memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A read-only state database and nothing tracked: the pre-flight returns, as main does.
-
-    The memo read fails here (a read-only StateDB still opens the environment writable) and that
-    failure is skipped, so this pins the read side's LMDB error handling; the early return
-    before any write is pinned by ``..._creates_no_state_database``.
-    """
+    """A read-only state database directory and nothing tracked: the memo file cannot be
+    created, and the pre-flight returns, as main does."""
     _helper_build_untracked_tree(memo_project)
-    lmdb_dir = _helper_create_state_database()
+    lmdb_dir = config.get_state_dir() / "state.lmdb"
     _helper_settle(monkeypatch)
     files = list(lmdb_dir.iterdir())
     for path in files:
@@ -383,6 +488,8 @@ def test_preflight_with_no_tracked_file_and_a_read_only_database_succeeds(
         for path in files:
             path.chmod(0o644)
 
+    assert not track._memo_path().exists()
+
 
 def test_preflight_with_no_tracked_file_records_into_an_existing_database(
     memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
@@ -390,7 +497,6 @@ def test_preflight_with_no_tracked_file_records_into_an_existing_database(
     """A project with nothing tracked still gets the memo when its state database exists: the
     second pre-flight lists no directory."""
     _helper_build_untracked_tree(memo_project)
-    _helper_create_state_database()
     _helper_settle(monkeypatch)
 
     executor_core.verify_tracked_files(memo_project)
@@ -518,6 +624,23 @@ def test_memo_walk_matches_main_after_a_change(
     _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
     _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
     _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
+
+
+def test_preflight_drops_the_listing_of_a_directory_it_no_longer_visits(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The memo holds only what the last pre-flight recorded: a removed directory's listing is
+    dropped, not kept beside the new ones."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    assert "c" in _helper_memo()["dirs"]
+    time.sleep(_ONE_TICK_S)
+
+    _helper_remove_dir(memo_project)
+    _helper_preflight(memo_project)
+
+    assert set(_helper_memo()["dirs"]) == _helper_relative_directories(memo_project)
 
 
 def test_memo_walk_matches_main_across_random_changes(
@@ -915,6 +1038,7 @@ def test_mount_point_with_a_space_is_unescaped(
     root = mount / "project"
     (root / ".pivot").mkdir(parents=True)
     monkeypatch.setattr(project, "_project_root_cache", root)
+    _helper_create_state_database()
     btrfs = _helper_mount_line(92, os.makedev(0, 4243), os.path.realpath(mount), "btrfs")
     assert "\\040" in btrfs
     _helper_write_mountinfo(monkeypatch, tmp_path / "mountinfo", [btrfs])
@@ -1074,9 +1198,14 @@ def _helper_empty_name(listing: bytes) -> bytes:
     return listing[:_COUNT_AT] + track._SUBDIR_COUNT.pack(0) + b"x.csv.pvt\0\0new.csv.pvt"
 
 
-def _helper_earlier_version(listing: bytes) -> bytes:
-    """A listing as an earlier build of the memo wrote it, which may omit a subdirectory."""
-    return b"\x01" + listing[len(track._LISTING_VERSION) :]
+def _helper_version_1(listing: bytes) -> bytes:
+    """The listing as version 1 wrote it, which could omit a name: here, every name."""
+    return b"\x01" + listing[len(track._LISTING_VERSION) : track._LISTING_HEADER]
+
+
+def _helper_version_2(listing: bytes) -> bytes:
+    """The listing as version 2 (in the state database) wrote it, every name omitted."""
+    return b"\x02" + listing[len(track._LISTING_VERSION) : track._LISTING_HEADER]
 
 
 @pytest.mark.parametrize(
@@ -1086,7 +1215,8 @@ def _helper_earlier_version(listing: bytes) -> bytes:
         pytest.param(_helper_count_too_large, id="subdirectory-count-too-large"),
         pytest.param(_helper_name_with_slash, id="name-with-a-slash"),
         pytest.param(_helper_empty_name, id="empty-name"),
-        pytest.param(_helper_earlier_version, id="earlier-listing-version"),
+        pytest.param(_helper_version_1, id="earlier-listing-version-1"),
+        pytest.param(_helper_version_2, id="earlier-listing-version-2"),
     ],
 )
 def test_malformed_recorded_listing_is_listed_again(
@@ -1098,11 +1228,9 @@ def test_malformed_recorded_listing_is_listed_again(
     _helper_build_tree(memo_project)
     _helper_settle(monkeypatch)
     _helper_record(memo_project)
-    with state.StateDB(config.get_state_dir()) as state_db:
-        memo = state_db.read_pvt_dir_memo()
-        assert memo["root"] is not None
-        broken = {**memo["dirs"], "a/b": corrupt(memo["dirs"]["a/b"])}
-        state_db.update_pvt_dir_memo(memo, memo["root"], broken)
+    memo = _helper_memo()
+    broken = {**memo["dirs"], "a/b": corrupt(memo["dirs"]["a/b"])}
+    _helper_write_memo(track._Memo(root=memo["root"], dirs=broken))
 
     _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
     _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
@@ -1118,18 +1246,16 @@ def test_dotdot_in_a_recorded_listing_never_leaves_the_project(
     _helper_track(memo_project.parent / "outside" / "o.csv", "outside\n")
     _helper_settle(monkeypatch)
     _helper_record(memo_project)
-    with state.StateDB(config.get_state_dir()) as state_db:
-        memo = state_db.read_pvt_dir_memo()
-        assert memo["root"] is not None
-        listing = memo["dirs"][""]
-        (count,) = track._SUBDIR_COUNT.unpack_from(listing, _COUNT_AT)
-        poisoned = (
-            listing[:_COUNT_AT]
-            + track._SUBDIR_COUNT.pack(count + 1)
-            + b"..\0"
-            + listing[track._LISTING_HEADER :]
-        )
-        state_db.update_pvt_dir_memo(memo, memo["root"], {**memo["dirs"], "": poisoned})
+    memo = _helper_memo()
+    listing = memo["dirs"][""]
+    (count,) = track._SUBDIR_COUNT.unpack_from(listing, _COUNT_AT)
+    poisoned = (
+        listing[:_COUNT_AT]
+        + track._SUBDIR_COUNT.pack(count + 1)
+        + b"..\0"
+        + listing[track._LISTING_HEADER :]
+    )
+    _helper_write_memo(track._Memo(root=memo["root"], dirs={**memo["dirs"], "": poisoned}))
 
     _helper_assert_matches_main(track.discover_pvt_files(memo_project), memo_project)
 
@@ -1264,148 +1390,288 @@ def test_directory_time_outside_the_stamp_is_listed_every_walk(
     assert "" in memo["dirs"], "the other directories still are"
 
 
-@pytest.mark.parametrize(
-    "mode",
-    [
-        pytest.param(0o700, id="private"),
-        pytest.param(0o750, id="others-may-not-list"),
-        pytest.param(0o711, id="others-may-search-but-not-read"),
-        pytest.param(0o754, id="others-may-read-but-not-search"),
-        pytest.param(0o705, id="group-may-not-list"),
-    ],
-)
-def test_directory_some_account_may_not_list_never_reaches_the_memo(
-    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, mode: int
-) -> None:
-    """Other accounts can read the state database, so it holds no name that an account able to
-    reach the project could not list itself. A directory not every account may read and search
-    is listed every walk, as is everything below it (a recorded path names each directory above),
-    and the tracked file under it is found by listing."""
-    _helper_build_tree(memo_project)
-    private = memo_project / "private"
-    (private / "q3-layoff-list" / "names").mkdir(parents=True)
-    _helper_track(private / "held.csv", "held\n")
-    private.chmod(mode)
-    _helper_settle(monkeypatch)
-
-    _helper_record(memo_project)
-    memo = _helper_memo()
-    listed = mocker.spy(os, "scandir")
-    warm = track.discover_pvt_files(memo_project)
-    listed_paths = {os.fspath(call.args[0]) for call in listed.call_args_list if call.args}
-    database = (config.get_state_dir() / "state.lmdb" / "data.mdb").read_bytes()
-
-    assert [rel for rel in memo["dirs"] if rel == "private" or rel.startswith("private/")] == []
-    assert [rel for rel, listing in memo["dirs"].items() if b"q3-layoff-list" in listing] == []
-    assert b"q3-layoff-list" not in database, "no name from inside it reaches the state database"
-    assert "a/b" in memo["dirs"], "directories every account may list are still recorded"
-    assert {os.fspath(private), os.fspath(private / "q3-layoff-list")} <= listed_paths, (
-        "it and the directories below it are listed on every walk"
-    )
-    _helper_assert_matches_main(warm, memo_project)
-    assert str(private / "held.csv") in warm, "the .pvt under it is found by listing"
+# =============================================================================
+# The memo file: only the account that listed a directory reads its names
+# =============================================================================
 
 
-def _helper_listable_above(monkeypatch: pytest.MonkeyPatch, directory: pathlib.Path) -> None:
-    """Report every directory above ``directory`` as mode 755, so only the test's own directories
-    decide (pytest's base directory is private)."""
-    above = {os.fspath(parent) for parent in pathlib.Path(os.path.realpath(directory)).parents}
-    real_lstat = os.lstat
+def _helper_inside(root: pathlib.Path, tmp_path: pathlib.Path) -> pathlib.Path:
+    """The default layout: the state directory is the project's .pivot."""
+    return root / ".pivot"
 
-    def _lstat(path: str | os.PathLike[str], *, dir_fd: int | None = None) -> os.stat_result:
-        result = real_lstat(path, dir_fd=dir_fd)
-        if os.fspath(path) in above:
-            return os.stat_result((stat.S_IFDIR | 0o755, *tuple(result)[1:]))
-        return result
 
-    monkeypatch.setattr(os, "lstat", _lstat)
+def _helper_private_directory(root: pathlib.Path, tmp_path: pathlib.Path) -> pathlib.Path:
+    """The default layout, with the untracked names under a mode-700 directory."""
+    (root / "notes").chmod(0o700)
+    return root / ".pivot"
+
+
+def _helper_outside_under_a_private_home(
+    root: pathlib.Path, tmp_path: pathlib.Path
+) -> pathlib.Path:
+    """``core.state_dir`` outside the project, and the project under a mode-700 directory."""
+    state_dir = tmp_path / "state"
+    (root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: {state_dir}\n")
+    root.parent.chmod(0o700)
+    return state_dir
+
+
+def _helper_symlinked_state_database(root: pathlib.Path, tmp_path: pathlib.Path) -> pathlib.Path:
+    """``.pivot/state.lmdb`` is a symlink to a directory outside the project."""
+    elsewhere = tmp_path / "elsewhere" / "state.lmdb"
+    elsewhere.mkdir(parents=True)
+    (root / ".pivot" / "state.lmdb").symlink_to(elsewhere, target_is_directory=True)
+    root.parent.chmod(0o700)
+    return root / ".pivot"
+
+
+def _helper_symlinked_data_file(root: pathlib.Path, tmp_path: pathlib.Path) -> pathlib.Path:
+    """``.pivot/state.lmdb/data.mdb`` alone is a symlink to a file outside the project."""
+    data_file = tmp_path / "elsewhere" / "data.mdb"
+    data_file.parent.mkdir(parents=True)
+    data_file.touch()
+    (root / ".pivot" / "state.lmdb").mkdir()
+    (root / ".pivot" / "state.lmdb" / "data.mdb").symlink_to(data_file)
+    root.parent.chmod(0o700)
+    return root / ".pivot"
 
 
 @pytest.mark.parametrize(
-    ("home_mode", "state_inside", "recorded"),
+    "layout",
     [
-        pytest.param(0o700, False, False, id="outside-and-the-project-under-a-private-directory"),
-        pytest.param(0o755, False, True, id="outside-and-every-directory-above-listable"),
-        pytest.param(
-            0o705, False, False, id="outside-and-the-group-may-not-list-a-directory-above"
-        ),
-        pytest.param(0o700, True, True, id="inside-and-the-project-under-a-private-directory"),
+        pytest.param(_helper_inside, id="state-directory-inside"),
+        pytest.param(_helper_private_directory, id="a-private-directory"),
+        pytest.param(_helper_outside_under_a_private_home, id="state-directory-outside"),
+        pytest.param(_helper_symlinked_state_database, id="symlinked-state-database"),
+        pytest.param(_helper_symlinked_data_file, id="symlinked-data-file"),
     ],
 )
-def test_state_directory_outside_the_project_needs_every_directory_above_listable(
+def test_memo_records_any_directory_and_the_state_database_holds_no_name(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    home_mode: int,
-    state_inside: bool,
-    recorded: bool,
+    layout: Callable[[pathlib.Path, pathlib.Path], pathlib.Path],
 ) -> None:
-    """An account that cannot reach the project can read a state directory outside it
-    (``core.state_dir``). The memo then records a name only when every directory from / down to
-    the project root lets every account read and search it; otherwise it records nothing. With the
-    state directory inside the project, a reader has reached the root, so the directories above
-    it do not count."""
-    home = tmp_path / "home"
-    root = home / "project"
+    """The memo file is the account's own (mode 0600), so it records directories of any mode,
+    wherever the state directory or the state database is. The state database, which other
+    accounts can read, holds no untracked name."""
+    root = tmp_path / "home" / "project"
     (root / ".pivot").mkdir(parents=True)
-    state_dir = root / ".pivot" if state_inside else tmp_path / "state"
-    if not state_inside:
-        (root / ".pivot" / "config.yaml").write_text(f"core:\n  state_dir: {state_dir}\n")
     monkeypatch.setattr(project, "_project_root_cache", root)
-    config_io.clear_config_cache()
     _helper_mountinfo(monkeypatch, tmp_path / "mountinfo", root, "ext4")
     _helper_build_tree(root)
     (root / "notes" / "q3-layoff-list").mkdir(parents=True)
-    home.chmod(home_mode)
-    _helper_listable_above(monkeypatch, home)
-    _helper_settle(monkeypatch)
+    state_dir = layout(root, tmp_path)
+    config_io.clear_config_cache()
     assert config.get_state_dir() == state_dir
+    _helper_create_state_database()
+    _helper_settle(monkeypatch)
 
     _helper_record(root)
-    memo = _helper_memo()
     database = (state_dir / "state.lmdb" / "data.mdb").read_bytes()
+    assert b"q3-layoff-list" not in database, "no untracked name reaches the state database"
 
     _helper_assert_matches_main(track.discover_pvt_files(root), root)
-    if recorded:
-        assert memo["root"] == str(root.resolve())
-        assert "notes/q3-layoff-list" in memo["dirs"], "the memo is recorded"
-    else:
-        assert memo == state.PvtDirMemo(root=None, dirs={}), "nothing is recorded"
-        assert b"q3-layoff-list" not in database, "no untracked name reaches the state database"
+    assert {"notes", "notes/q3-layoff-list"} <= set(_helper_memo()["dirs"]), "memo recorded"
+    assert stat.S_IMODE(track._memo_path().stat().st_mode) == 0o600
 
 
-# =============================================================================
-# State database
-# =============================================================================
+def _helper_mode(mode: int) -> Callable[[pathlib.Path, pathlib.Path, pytest.MonkeyPatch], None]:
+    def _spoil(memo: pathlib.Path, _tmp_path: pathlib.Path, _patch: pytest.MonkeyPatch) -> None:
+        memo.chmod(mode)
+
+    return _spoil
 
 
-def test_update_pvt_dir_memo_records_root_and_replaces_entries(tmp_path: pathlib.Path) -> None:
-    with state.StateDB(tmp_path / "state") as state_db:
-        empty = state_db.read_pvt_dir_memo()
-        assert empty == state.PvtDirMemo(root=None, dirs={})
-
-        state_db.update_pvt_dir_memo(empty, "/p", {"": b"root", "a": b"a1", "a/b": b"ab"})
-        first = state_db.read_pvt_dir_memo()
-        assert first == state.PvtDirMemo(root="/p", dirs={"": b"root", "a": b"a1", "a/b": b"ab"})
-
-        state_db.update_pvt_dir_memo(first, "/q", {"": b"root", "a": b"a2", "c": b"c"})
-        assert state_db.read_pvt_dir_memo() == state.PvtDirMemo(
-            root="/q", dirs={"": b"root", "a": b"a2", "c": b"c"}
-        ), "changed entries are replaced and unvisited ones deleted"
+def _helper_owned_by_another_account(
+    memo: pathlib.Path, _tmp_path: pathlib.Path, patch: pytest.MonkeyPatch
+) -> None:
+    """An fstat of the memo file reports another uid as its owner."""
+    _helper_fstat_reports(patch, memo, uid=os.geteuid() + 1)
 
 
-def test_update_pvt_dir_memo_with_no_root_empties_the_memo(tmp_path: pathlib.Path) -> None:
-    with state.StateDB(tmp_path / "state") as state_db:
-        state_db.update_pvt_dir_memo(state_db.read_pvt_dir_memo(), "/p", {"": b"root", "a": b"a"})
-        state_db.update_pvt_dir_memo(state_db.read_pvt_dir_memo(), None, {})
-
-        assert state_db.read_pvt_dir_memo() == state.PvtDirMemo(root=None, dirs={})
+def _helper_hard_linked(
+    memo: pathlib.Path, tmp_path: pathlib.Path, _patch: pytest.MonkeyPatch
+) -> None:
+    os.link(memo, tmp_path / "second-link")
 
 
-def test_update_pvt_dir_memo_skips_paths_too_long_for_a_key(tmp_path: pathlib.Path) -> None:
-    """A directory whose path does not fit an LMDB key is not recorded: it is listed every walk."""
-    long_rel = "/".join(["d" * 100] * 6)
-    with state.StateDB(tmp_path / "state") as state_db:
-        state_db.update_pvt_dir_memo(
-            state_db.read_pvt_dir_memo(), "/p", {"": b"root", long_rel: b"long"}
-        )
-        assert state_db.read_pvt_dir_memo()["dirs"] == {"": b"root"}
+def _helper_fstat_reports(
+    patch: pytest.MonkeyPatch, path: pathlib.Path, *, uid: int | None = None, mode: int = 0
+) -> None:
+    """Make an fstat of ``path``'s file report ``uid`` as its owner and ``mode`` bits added, as
+    a file another account made, or a filesystem that ignores modes, would show."""
+    real_fstat = os.fstat
+
+    def _fstat(fd: int) -> os.stat_result:
+        result = real_fstat(fd)
+        if not path.exists() or (result.st_dev, result.st_ino) != (
+            path.stat().st_dev,
+            path.stat().st_ino,
+        ):
+            return result
+        fields = list(result)
+        fields[0] = result.st_mode | mode
+        fields[4] = result.st_uid if uid is None else uid
+        return os.stat_result(fields)
+
+    patch.setattr(os, "fstat", _fstat)
+
+
+@pytest.mark.parametrize(
+    "spoil",
+    [
+        pytest.param(_helper_mode(0o644), id="mode-644"),
+        pytest.param(_helper_mode(0o640), id="group-may-read"),
+        pytest.param(_helper_mode(0o620), id="group-may-write"),
+        pytest.param(_helper_mode(0o604), id="others-may-read"),
+        pytest.param(_helper_mode(0o602), id="others-may-write"),
+        pytest.param(_helper_owned_by_another_account, id="owned-by-another-account"),
+        pytest.param(_helper_hard_linked, id="hard-linked"),
+    ],
+)
+def test_memo_file_another_account_could_use_is_neither_read_nor_written(
+    memo_project: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    spoil: Callable[[pathlib.Path, pathlib.Path, pytest.MonkeyPatch], None],
+) -> None:
+    """A memo file whose fstat shows another owner, group or other mode bits, or a second link,
+    is not used: both walks list every directory, and the pre-flight writes nothing into it."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    path = track._memo_path()
+    before = path.read_bytes()
+    time.sleep(_ONE_TICK_S)
+    _helper_add_pvt(memo_project)
+    directories = len(_helper_directories(memo_project))
+    spoil(path, tmp_path, monkeypatch)
+
+    listed = mocker.spy(os, "scandir")
+    found = track.discover_pvt_files(memo_project)
+    read_only_listings = listed.call_count
+    listed.reset_mock()
+    recorded = _helper_preflight(memo_project)
+    preflight_listings = listed.call_count
+
+    assert read_only_listings == directories, "the read-only walk lists every directory"
+    assert preflight_listings == directories, "so does the pre-flight"
+    _helper_assert_matches_main(found, memo_project)
+    _helper_assert_matches_main(recorded, memo_project)
+    assert path.read_bytes() == before, "nothing is written into it"
+
+
+def test_new_memo_file_others_could_read_is_not_written(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check runs before the first write too: on a filesystem that shows the new file with
+    group and other bits (one that ignores modes), the pre-flight records nothing in it."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_fstat_reports(monkeypatch, track._memo_path(), mode=0o044)
+
+    _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
+
+    assert track._memo_path().read_bytes() == b"", "created, but nothing written"
+
+
+def test_memo_path_that_is_a_symlink_is_not_followed(
+    memo_project: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """A symlink at the memo's path is not followed, even to a private file of the account's
+    own that would pass the check: the walks list every directory and nothing is written
+    through it."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    path = track._memo_path()
+    target = tmp_path / "private-file"
+    shutil.copy2(path, target)
+    path.unlink()
+    path.symlink_to(target)
+    before = target.read_bytes()
+    time.sleep(_ONE_TICK_S)
+    _helper_add_pvt(memo_project)
+    directories = len(_helper_directories(memo_project))
+
+    listed = mocker.spy(os, "scandir")
+    found = track.discover_pvt_files(memo_project)
+    read_only_listings = listed.call_count
+    recorded = _helper_preflight(memo_project)
+
+    assert read_only_listings == directories
+    _helper_assert_matches_main(found, memo_project)
+    _helper_assert_matches_main(recorded, memo_project)
+    assert path.is_symlink() and target.read_bytes() == before, "nothing written through it"
+
+
+def test_memo_check_reads_the_open_file_not_its_path(
+    memo_project: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """The memo file is replaced by a private one just after the walk opens a mode-644 one: the
+    check must judge the open file, so the walk lists every directory."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    path = track._memo_path()
+    private = tmp_path / "private-memo"
+    shutil.copy2(path, private)
+    path.chmod(0o644)
+    real_open = os.open
+
+    def _open_then_replace(
+        file: str | os.PathLike[str], flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        fd = real_open(file, flags, mode, dir_fd=dir_fd)
+        if os.fspath(file) == os.fspath(path) and private.exists():
+            os.replace(private, path)
+        return fd
+
+    monkeypatch.setattr(os, "open", _open_then_replace)
+    listed = mocker.spy(os, "scandir")
+    found = track.discover_pvt_files(memo_project)
+    listings = listed.call_count
+
+    assert not private.exists(), "the private file replaced the open one"
+    assert listings == len(_helper_directories(memo_project)), "every directory is listed"
+    _helper_assert_matches_main(found, memo_project)
+
+
+def test_fifo_at_the_memo_path_is_not_waited_on(
+    memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A FIFO at the memo's path (which anyone who may write the directory can make) does not
+    hold up either walk: both list every directory."""
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    fifo = track._memo_path()
+    os.mkfifo(fifo, 0o600)
+
+    def _release() -> None:
+        with fifo.open("wb"):
+            pass
+
+    found = _helper_run_without_waiting(lambda: track.discover_pvt_files(memo_project), _release)
+    recorded = _helper_run_without_waiting(lambda: _helper_preflight(memo_project), _release)
+
+    _helper_assert_matches_main(found, memo_project)
+    _helper_assert_matches_main(recorded, memo_project)
+    assert stat.S_ISFIFO(os.lstat(fifo).st_mode), "nothing replaced it"
+
+
+def test_memo_file_content_round_trips_and_rejects_a_partial_memo() -> None:
+    memo = track._Memo(
+        root="/p", dirs={"": b"root", "a": b"\0\n\xff", os.fsdecode(b"caf\xe9/x"): b"x"}
+    )
+    content = track._pack_memo(memo["root"], memo["dirs"])
+
+    assert track._unpack_memo(content) == memo
+    for partial in (b"", content[:5], content[:-1], content + b"\0"):
+        assert track._unpack_memo(partial) is None, partial

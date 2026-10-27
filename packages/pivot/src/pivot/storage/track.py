@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import pathlib
@@ -9,11 +10,10 @@ import struct
 import time
 from typing import TYPE_CHECKING, NotRequired, TypedDict, TypeGuard, cast
 
-import lmdb
 import yaml
 
 from pivot import config, exceptions, project
-from pivot.storage import cache, state
+from pivot.storage import cache
 
 logger = logging.getLogger(__name__)
 
@@ -163,28 +163,28 @@ def get_data_path(pvt_path: pathlib.Path) -> pathlib.Path:
 # file does not change its directory), and is trusted only on filesystems that keep directory
 # times this way.
 #
-# Other accounts can read the state database, so the memo holds only names that every account
-# able to read the database could list itself. When the state directory is inside the project, an
-# account that reads it has reached the project root, so a directory is recorded only when it and
-# every directory above it up to the project root let owner, group and others read and search
-# them (the recorded path holds a name from each of those directories). When the state directory
-# is outside the project, every directory from / down to the project root must allow that too, or
-# nothing is recorded. Any other directory, a mode-700 one say, is listed every time, so a .pvt
-# under it is found by listing, never from the memo. Only mode bits are read, not POSIX ACLs: an
-# account an ACL entry denies can still read a recorded name. A chmod changes the ctime, so a
-# directory made private no longer matches its stamp. A listing in which an entry's type could
-# not be read (the lstat a filesystem without d_type needs failed) is never recorded: that entry
-# is not descended, as in os.walk, and a walk that can read its type must not reuse that.
+# The memo is the account's own file, pvt-memo-<uid> in the state database's directory
+# (state.lmdb, which .pivot/.gitignore keeps out of git), created with mode 0600. A walk reads
+# it, and the pre-flight writes it, only after an fstat of the open file shows that the running
+# account owns it, that no other account may read or write it (no group or other mode bits; a
+# POSIX ACL's mask shows in the group bits) and that it has one link; otherwise every directory
+# is listed. So only the account that listed a directory reads its names, whatever path reaches
+# the file (a symlinked .pivot or state.lmdb, a bind mount) and whatever modes the project's
+# directories have, at the cost of the file's open and one fstat per walk. The memo's own path
+# is never followed through a symlink, and a hard link fails the check, so the write cannot land
+# in another of the account's files. The file is rewritten in place, so the directory holding
+# it does not change with each write. A listing in which an entry's type could not be read (the
+# lstat a filesystem without d_type needs failed) is never recorded: that entry is not
+# descended, as in os.walk, and a walk that can read its type must not reuse that.
 _MEMO_SETTLE_NS = 2_000_000_000
 _NS_PER_S = 1_000_000_000
 _MEMO_FS_TYPES = frozenset({b"ext2", b"ext3", b"ext4", b"xfs", b"btrfs", b"tmpfs", b"f2fs", b"zfs"})
-_EVERYONE_LISTS = 0o555  # read and search for owner, group and others
-# The memo write's wait for the write lock: the memo is worth less than a busy database's time.
-_MEMO_WRITE_TIMEOUT_S = 1.0
-_MEMO_DB_ERRORS = (exceptions.PivotError, state.StateDBError, RuntimeError, OSError, lmdb.Error)
+_MEMO_ERRORS = (exceptions.PivotError, OSError, ValueError)  # ValueError: a NUL in core.state_dir
+_MEMO_RECORD = struct.Struct(">II")  # a memo file record's key and value sizes
+_MEMO_COUNT = struct.Struct(">I")  # the root record's value: how many listings follow it
 _MOUNTINFO = pathlib.Path("/proc/self/mountinfo")
 _MOUNTINFO_ESCAPE = re.compile(rb"\\([0-7]{3})")
-_LISTING_VERSION = b"\x02"  # a version-1 listing may omit a subdirectory, so it is never reused
+_LISTING_VERSION = b"\x03"  # an earlier version is never reused; version 1 may omit a subdirectory
 _STAMP = struct.Struct(">QQqq")  # st_dev, st_ino, st_mtime_ns, st_ctime_ns
 _STAMP_TIMES = range(-(2**63), 2**63)  # the times _STAMP's signed 64-bit fields hold
 _SUBDIR_COUNT = struct.Struct(">I")
@@ -312,8 +312,7 @@ def _walk(
 
     Visits the directories ``os.walk(root, followlinks=False)`` visits, with one stat each. A
     directory is listed unless ``memo`` holds a listing under its current stamp, its filesystem is
-    on the allowlist, its mode bits and those above it let every account that can reach the
-    project list it, and ``_times_trusted`` accepts its times. With ``record``, the second result
+    on the allowlist, and ``_times_trusted`` accepts its times. With ``record``, the second result
     holds the listing of every such directory whose entries' types could all be read.
     """
     mounts = _read_mounts()
@@ -329,17 +328,14 @@ def _walk(
     if not stat.S_ISDIR(root_stat.st_mode):
         return candidates, listings
 
-    stack = [(os.fspath(root), "", root_stat, True)]
+    stack = [(os.fspath(root), "", root_stat)]
     while stack:
-        path, rel, dir_stat, above_listable = stack.pop()
+        path, rel, dir_stat = stack.pop()
         device = dir_stat.st_dev
         if device not in allowed_devices:
             real_path = os.path.join(real_root, rel) if rel else real_root
             allowed_devices[device] = _device_allowed(mounts, device, real_path)
-        listable = above_listable and dir_stat.st_mode & _EVERYONE_LISTS == _EVERYONE_LISTS
-        memoizable = (
-            allowed_devices[device] and listable and _times_trusted(dir_stat, settled_before)
-        )
+        memoizable = allowed_devices[device] and _times_trusted(dir_stat, settled_before)
         stamp = (
             _STAMP.pack(device, dir_stat.st_ino, dir_stat.st_mtime_ns, dir_stat.st_ctime_ns)
             if memoizable
@@ -368,7 +364,7 @@ def _walk(
             except OSError:
                 continue
             if stat.S_ISDIR(child_stat.st_mode):  # a symlink or file now: not descended
-                stack.append((child, os.path.join(rel, name), child_stat, listable))
+                stack.append((child, os.path.join(rel, name), child_stat))
     return candidates, listings
 
 
@@ -393,87 +389,152 @@ def _memo_root(root: pathlib.Path) -> str:
     return os.fspath(root.resolve())
 
 
-def _read_stored_memo() -> state.PvtDirMemo | None:
-    """The stored memo, or None when there is no state database or it cannot be read.
+class _Memo(TypedDict):
+    """The walk's directory memo, as the account's memo file holds it."""
 
-    Never creates the database. Any failure to read it (a config error, a read-only or
-    unopenable database) means no memo: every directory is listed, as main does.
+    root: str  # the project root the listings were taken under
+    dirs: dict[str, bytes]  # project-relative directory path ("" is the root) -> packed listing
+
+
+def _memo_path() -> pathlib.Path:
+    """The running account's memo file, beside the state database's files."""
+    return config.get_state_dir() / "state.lmdb" / f"pvt-memo-{os.geteuid()}"
+
+
+def _memo_refusal(memo_stat: os.stat_result) -> str | None:
+    """Why an open memo file must not be used, or None when only the running account may use it.
+
+    It must belong to the running account, give group and others no access (a POSIX ACL's mask
+    shows in the group bits) and have one link.
     """
-    try:
-        state_dir = config.get_state_dir()
-        if not (state_dir / "state.lmdb" / "data.mdb").is_file():
-            return None
-        with state.StateDB(state_dir, readonly=True) as state_db:
-            return state_db.read_pvt_dir_memo()
-    except _MEMO_DB_ERRORS as e:
-        logger.debug(f"Listing every directory: cannot read the .pvt walk memo: {e}")
+    if memo_stat.st_uid != os.geteuid():
+        return f"belongs to uid {memo_stat.st_uid}"
+    if memo_stat.st_mode & 0o077:
+        return f"has mode {stat.filemode(memo_stat.st_mode)}"
+    if memo_stat.st_nlink != 1:
+        return f"has {memo_stat.st_nlink} links"
+    return None
+
+
+def _pack_memo(root: str, dirs: dict[str, bytes]) -> bytes:
+    """A memo file's content: a record whose key is the root and whose value is the number of
+    listings, then one record per directory listing."""
+    records = [
+        (os.fsencode(root), _MEMO_COUNT.pack(len(dirs))),
+        *((os.fsencode(rel), item) for rel, item in dirs.items()),
+    ]
+    return b"".join(_MEMO_RECORD.pack(len(key), len(value)) + key + value for key, value in records)
+
+
+def _unpack_memo(content: bytes) -> _Memo | None:
+    """The memo ``_pack_memo`` made, or None when ``content`` is not one whole memo.
+
+    A memo cut short anywhere (a pre-flight killed mid-write, or a walk reading during a write)
+    is not whole: it ends inside a record, or holds fewer listings than its root record counts.
+    """
+    records = list[tuple[bytes, bytes]]()
+    offset = 0
+    while offset + _MEMO_RECORD.size <= len(content):
+        key_size, value_size = _MEMO_RECORD.unpack_from(content, offset)
+        key_at = offset + _MEMO_RECORD.size
+        value_at = key_at + key_size
+        offset = value_at + value_size
+        records.append((content[key_at:value_at], content[value_at:offset]))
+    if offset != len(content) or not records:
         return None
+    (root, count), *listings = records
+    if len(count) != _MEMO_COUNT.size or _MEMO_COUNT.unpack(count)[0] != len(listings):
+        return None
+    return _Memo(root=os.fsdecode(root), dirs={os.fsdecode(rel): item for rel, item in listings})
 
 
-def _trusted_listings(memo: state.PvtDirMemo | None, root: pathlib.Path) -> dict[str, bytes]:
-    return memo["dirs"] if memo is not None and memo["root"] == _memo_root(root) else {}
+def _open_memo(flags: int) -> tuple[int | None, _Memo | None]:
+    """Open the account's memo file with ``flags`` and read it: its descriptor and its memo.
 
-
-def _readers_reach_the_project(real_root: str) -> bool:
-    """Whether every account that can read the state database could reach the project root.
-
-    True when the state directory's real path is inside the project, since reading it means
-    passing through the root. Otherwise true only when every directory from ``/`` down to the
-    root's parent lets owner, group and others read and search it; ``_walk`` checks the root's own
-    mode. A state directory that cannot be resolved, or a directory that cannot be stat'ed, counts
-    as not reachable.
+    The descriptor is None (and the caller lists every directory) when the file is missing or
+    cannot be opened, or when an fstat of the open file fails ``_memo_refusal``; a debug log names
+    the reason, except for a missing file. The memo's own path is never followed through a
+    symlink, and a FIFO there is not waited on. The memo is None when the file holds no whole
+    memo. Any failure means no memo: every directory is listed, as main does.
     """
     try:
-        state_dir = os.path.realpath(config.get_state_dir())
-        if os.path.commonpath([state_dir, real_root]) == real_root:
-            return True
-        return all(
-            os.lstat(above).st_mode & _EVERYONE_LISTS == _EVERYONE_LISTS
-            for above in pathlib.PurePath(real_root).parents
-        )
-    except (exceptions.PivotError, OSError):
-        return False
+        path = _memo_path()
+        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    except FileNotFoundError:
+        return None, None
+    except _MEMO_ERRORS as e:
+        logger.debug(f"Listing every directory: cannot open the .pvt walk memo: {e}")
+        return None, None
+    try:
+        memo_stat = os.fstat(fd)
+        refusal = _memo_refusal(memo_stat)
+        content = os.pread(fd, memo_stat.st_size, 0) if refusal is None else b""
+    except OSError as e:
+        refusal = f"cannot be read: {e}"
+        content = b""
+    if refusal is not None:
+        os.close(fd)
+        logger.debug(f"Listing every directory: the .pvt walk memo {path} {refusal}")
+        return None, None
+    memo = _unpack_memo(content)
+    if memo is None and content:
+        logger.debug(f"Listing every directory: the .pvt walk memo {path} is malformed")
+    return fd, memo
+
+
+def _write_memo(fd: int, content: bytes) -> None:
+    """Write ``content`` over the open memo file, unless another pre-flight is writing it.
+
+    The file is emptied first, so a walk reading it meanwhile, or after this process is killed
+    mid-write, sees a prefix of the new memo, which does not parse: that walk lists every
+    directory. A failure is logged and skipped.
+    """
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(fd, 0)
+        with open(fd, "wb", closefd=False) as memo_file:
+            memo_file.write(content)
+    except OSError as e:
+        logger.debug(f"Could not record the .pvt walk memo: {e}")
+
+
+def _trusted_listings(memo: _Memo | None, root: pathlib.Path) -> dict[str, bytes]:
+    return memo["dirs"] if memo is not None and memo["root"] == _memo_root(root) else {}
 
 
 def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
     """Find all .pvt files under root, return {data_path: PvtData}.
 
     Finds what ``os.walk`` over the whole tree finds. Directories the memo vouches for are stat'ed
-    instead of listed; every .pvt found is read. Never writes the memo: only the repro/run
-    pre-flight does (``discover_pvt_files_and_update_memo``).
+    instead of listed; every .pvt found is read. Never writes or creates the memo: only the
+    repro/run pre-flight does (``discover_pvt_files_and_update_memo``).
     """
-    candidates, _ = _walk(root, _trusted_listings(_read_stored_memo(), root), record=False)
+    fd, memo = _open_memo(os.O_RDONLY)
+    if fd is not None:
+        os.close(fd)
+    candidates, _ = _walk(root, _trusted_listings(memo, root), record=False)
     return _read_pvt_files(candidates)
 
 
 def discover_pvt_files_and_update_memo(root: pathlib.Path) -> dict[str, PvtData]:
     """``discover_pvt_files`` for the repro/run pre-flight, the memo's one writer.
 
-    Records the listing of every directory ``_walk`` may record and drops every other listing.
-    When an account that cannot reach the project could read the state database
-    (``_readers_reach_the_project``), it records nothing and empties the memo. With no tracked
-    file found, it records only into a state database that already exists, so it never creates
-    one. A memo that cannot be recorded (another pivot writer holds the lock longer than
-    ``_MEMO_WRITE_TIMEOUT_S``, or the database is read-only, full or failing) is skipped. A writer
-    that bypasses pivot's lock can hold the memo write until it commits.
+    Opens the account's memo file read-write, creating it with mode 0600 when it is missing, and
+    when the walk's listings differ from it, writes in place the listing of every directory
+    ``_walk`` may record, dropping every other listing. It never creates the state database's
+    directory, so before the first pivot write there it records nothing. A memo that cannot be
+    opened or fails ``_memo_refusal`` is neither read nor written for this walk.
     """
-    previous = _read_stored_memo()
     real_root = _memo_root(root)
-    record = _readers_reach_the_project(real_root)
-    candidates, listings = _walk(root, _trusted_listings(previous, root), record=record)
-    found = _read_pvt_files(candidates)
-    if not found and previous is None:
-        return found
+    fd, previous = _open_memo(os.O_RDWR | os.O_CREAT)
     try:
-        with state.StateDB(config.get_state_dir(), write_timeout=_MEMO_WRITE_TIMEOUT_S) as state_db:
-            state_db.update_pvt_dir_memo(
-                previous if previous is not None else state.PvtDirMemo(root=None, dirs={}),
-                real_root if record else None,
-                listings,
-            )
-    except _MEMO_DB_ERRORS as e:
-        logger.debug(f"Could not record the .pvt walk memo: {e}")
-    return found
+        candidates, listings = _walk(root, _trusted_listings(previous, root), record=fd is not None)
+        if fd is not None and previous != _Memo(root=real_root, dirs=listings):
+            _write_memo(fd, _pack_memo(real_root, listings))
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return _read_pvt_files(candidates)
 
 
 def is_import(data: PvtData) -> bool:

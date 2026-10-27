@@ -14,13 +14,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import cli, compose, config
-from pivot.storage import cache, state, track
+from pivot import cli, compose
+from pivot.storage import cache, track
 from pivot.types import TrackedFileStatus
 
 if TYPE_CHECKING:
     import pathlib
-    from collections.abc import Generator
 
     from click.testing import CliRunner
 
@@ -33,15 +32,6 @@ def shout(raw: str) -> str:
     return raw.upper()
 
 
-@pytest.fixture(autouse=True)
-def _listable_modes() -> Generator[None]:
-    """Make new directories 0o755 whatever the user's umask: the memo records only directories
-    every account may read and search."""
-    previous = os.umask(0o022)
-    yield
-    os.umask(previous)
-
-
 @pytest.fixture
 def memo_project(
     mock_discovery: compose.Pipeline,
@@ -50,7 +40,6 @@ def memo_project(
 ) -> pathlib.Path:
     """A project whose stage reads ``data/raw/input.txt``, on a filesystem the memo trusts."""
     root = mock_discovery.root
-    root.chmod(0o755)  # pytest makes tmp_path private; the memo records no private directory
     raw_dir = root / "data" / "raw"
     raw_dir.mkdir(parents=True)
     (raw_dir / "input.txt").write_text("original")
@@ -70,11 +59,10 @@ def _helper_settle(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(time, "time_ns", lambda: _REAL_TIME_NS() + _PAST_SETTLE_WINDOW_NS)
 
 
-def _helper_memo() -> state.PvtDirMemo:
-    if not (config.get_state_dir() / "state.lmdb").exists():
-        return state.PvtDirMemo(root=None, dirs={})
-    with state.StateDB(config.get_state_dir(), readonly=True) as state_db:
-        return state_db.read_pvt_dir_memo()
+def _helper_memo() -> track._Memo | None:
+    """What the account's memo file holds; None when there is no memo file."""
+    path = track._memo_path()
+    return track._unpack_memo(path.read_bytes()) if path.exists() else None
 
 
 def _helper_stamp(directory: pathlib.Path) -> tuple[int, int]:
@@ -100,22 +88,24 @@ def test_only_the_run_preflight_records_the_pvt_walk_memo(
     ):
         result = runner.invoke(cli.cli, args)
         assert result.exit_code == 0, f"pivot {' '.join(args)}: {result.output}"
-        assert _helper_memo() == state.PvtDirMemo(root=None, dirs={}), (
-            f"pivot {' '.join(args)} records no memo"
-        )
+        assert _helper_memo() is None, f"pivot {' '.join(args)} records no memo"
 
     result = runner.invoke(cli.cli, ["repro"])
 
     assert result.exit_code == 0, result.output
     memo = _helper_memo()
-    assert memo["root"] == str(memo_project.resolve()), "repro's pre-flight records the memo"
+    assert memo is not None, "repro's pre-flight records the memo"
+    assert memo["root"] == str(memo_project.resolve())
     assert {"", "data", "data/raw"} <= set(memo["dirs"])
 
 
 def _helper_track_and_run(runner: CliRunner) -> None:
+    """Track the input and run twice: the first run makes the state database, whose directory
+    holds the memo file, and the second records the memo."""
     assert runner.invoke(cli.cli, ["track", "data/raw/input.txt"]).exit_code == 0
-    first = runner.invoke(cli.cli, ["repro"])
-    assert first.exit_code == 0, first.output
+    for _ in range(2):
+        result = runner.invoke(cli.cli, ["repro"])
+        assert result.exit_code == 0, result.output
 
 
 def test_pvt_rewritten_in_place_within_the_settle_window_is_read_anew(
@@ -125,7 +115,8 @@ def test_pvt_rewritten_in_place_within_the_settle_window_is_read_anew(
     before = _REAL_TIME_NS()
     monkeypatch.setattr(time, "time_ns", lambda: before)
     _helper_track_and_run(runner)
-    assert "data/raw" not in _helper_memo()["dirs"], "not recorded inside the settle window"
+    memo = _helper_memo()
+    assert memo is not None and "data/raw" not in memo["dirs"], "not recorded inside the window"
 
     _helper_rewrite_in_place_and_check(memo_project, runner)
 
@@ -136,7 +127,8 @@ def test_pvt_rewritten_in_place_after_the_settle_window_is_read_anew(
     """data/raw's listing is recorded, yet the .pvt rewritten in place is read anew."""
     _helper_settle(monkeypatch)
     _helper_track_and_run(runner)
-    assert "data/raw" in _helper_memo()["dirs"], "recorded once settled"
+    memo = _helper_memo()
+    assert memo is not None and "data/raw" in memo["dirs"], "recorded once settled"
 
     _helper_rewrite_in_place_and_check(memo_project, runner)
 
