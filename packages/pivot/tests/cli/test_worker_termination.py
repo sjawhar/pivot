@@ -1,6 +1,7 @@
 """A worker whose Pivot process dies or is interrupted unwinds its running stage, then exits.
 
-Each test drives the installed `pivot` binary in a fresh project, as a user does. The project
+The tests of ``worker.terminate`` and ``worker._tgkill`` call them directly. Every other test
+drives the installed `pivot` binary in a fresh project, as a user does. The project
 has a stage `hold` that starts a child process (in its own session, so only the stage or Pivot
 can stop it) and waits, stopping the child the way the test's ``cleanup`` says, as a stage that
 starts a detached container removes it. Most tests add a second stage, `quick`, that returns at
