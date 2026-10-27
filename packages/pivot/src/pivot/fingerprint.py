@@ -1992,12 +1992,23 @@ def _keeps_own_attribute(obj: Any, name: str) -> bool:
     property, a method, a class attribute). Nothing of `obj` runs: neither its `__getattr__` nor
     a property, so an object that answers every name it lacks (a `unittest.mock.MagicMock`, an
     attribute tree) does not read as having it.
+
+    Every value the walk canonicalizes is asked for `model_dump` here, so the MRO is walked by
+    an explicit loop, not `any(... for ...)`: the loop reads each class dict directly
+    (`klass.__dict__`, not `vars(klass)`) and returns on the first hit, with no generator frame
+    per value on this path (`AGENTS.md`: fingerprint checks are cheap, O(1) shallow/static).
     """
     try:
         namespace: Mapping[str, Any] = object.__getattribute__(obj, "__dict__")
     except AttributeError:
-        namespace = {}
-    return name in namespace or any(name in vars(klass) for klass in type(obj).__mro__)
+        pass
+    else:
+        if name in namespace:
+            return True
+    for klass in type(obj).__mro__:  # noqa: SIM110 - explicit loop keeps this hot check frame-free
+        if name in klass.__dict__:
+            return True
+    return False
 
 
 def _is_user_class_instance(value: Any) -> bool:
@@ -2835,7 +2846,15 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     if decision is _MarkDecision.REFUSED:
         _refuse_class_above_mark(value)
     if not isinstance(value, type) and _keeps_own_attribute(value, "model_dump"):
-        return _canonicalize_value_for_hash(value.model_dump(), (*active, id(value)))
+        try:
+            dump: Any = value.model_dump
+        except AttributeError:
+            # A `model_dump` the class keeps but the object does not hold: an unset slot, or a
+            # property that raises AttributeError. Main's `hasattr` is False there too, so the
+            # value takes the branches below and is canonicalized as the plain object it is.
+            dump = _UNREAD
+        if dump is not _UNREAD:
+            return _canonicalize_value_for_hash(dump(), (*active, id(value)))
     if inspect.isfunction(value):
         return ["function", _function_identity(value, active)]
     if decision is _MarkDecision.BY_NAME and not _carries_instance(value):
@@ -3265,10 +3284,18 @@ _BY_NAME_MARK = "__pivot_fingerprint_by_name__"
 # freed and no other object can get its id. `fingerprinted_by_name` also checks the stored value
 # is `obj` itself, so a lookup by id alone never marks another object.
 _marked_without_dict = dict[int, Any]()
+# Whether `@pivot.fingerprint_by_name` has marked anything in this process. `mark_by_name` is
+# the only way an object is marked, so until it runs no `__wrapped__` chain can hold a mark:
+# every mark decision is None and the walk is main's. A project that marks nothing — the common
+# one — then pays one module-global read for a value the walk classifies, not a chain read and
+# an MRO walk (`AGENTS.md`: fingerprint checks are cheap, O(1) shallow/static).
+_marks_made = False
 
 
 def mark_by_name(obj: Any) -> None:
     """Mark `obj` itself for `@pivot.fingerprint_by_name` (see `fingerprinted_by_name`)."""
+    global _marks_made
+    _marks_made = True
     try:
         namespace: dict[str, Any] = object.__getattribute__(obj, "__dict__")
     except AttributeError:
@@ -3373,6 +3400,8 @@ def _recorded_by_name(obj: Any) -> bool:
     decorator) or an instance of a user class above the mark is user code: `_mark_decision`
     fingerprints the function by its own code and refuses the instance.
     """
+    if not _marks_made:  # nothing in this process is marked (`_marks_made`)
+        return False
     if fingerprinted_by_name(obj):
         return True
     if inspect.ismethod(obj):
@@ -3414,9 +3443,19 @@ def _mark_decision(obj: Any) -> _MarkDecision | None:
     value it does not unwrap, so the decision does not ask the value's own `__getattr__`, and
     takes an error from a lookup as the end of the chain. Without a mark the answer is None and
     the walk is main's.
+
+    Two short-circuits keep the decision off the hot path: without a mark in the process
+    (`_marks_made`) it is None for every value, with no chain read; and within one
+    `fingerprint_pass()` an object is decided once, so a value classified twice reads its chain
+    once.
     """
-    if not callable(obj) or isinstance(obj, (type, types.ModuleType)):
+    if not _marks_made or not callable(obj) or isinstance(obj, (type, types.ModuleType)):
         return None
+    return _memoized("mark", obj, lambda: _chain_mark_decision(obj))
+
+
+def _chain_mark_decision(obj: Any) -> _MarkDecision | None:
+    """`_mark_decision` for a callable in a process that holds a mark: the chain reads."""
     target = obj.__func__ if inspect.ismethod(obj) else obj
     if _mark_on_chain(target) is None:
         return None
@@ -3472,7 +3511,10 @@ def _refuse_class_above_mark(value: Any) -> None:
 
 def _mark_on_chain(obj: Any) -> Any:
     """The first marked object on `obj`'s `__wrapped__` chain (`_mark_chain`), `obj` included,
-    or None."""
+    or None. Without a mark in the process (`_marks_made`) no chain holds one, and none is read.
+    """
+    if not _marks_made:
+        return None
     return next((current for current in _mark_chain(obj) if fingerprinted_by_name(current)), None)
 
 

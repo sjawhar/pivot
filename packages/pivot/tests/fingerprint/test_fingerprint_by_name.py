@@ -4193,3 +4193,100 @@ def test_a_pydantic_model_is_still_dumped_however_it_keeps_model_dump(
     _write(module_dir / "rk9_cfg.py", _R9_CONFIG.format(factor=3))
     cfg = _fresh("rk9_cfg")
     assert canonical(cfg.TREE) == ["rk9_cfg.Tree", canonical({"factor": 3})]
+
+
+# ---------------------------------------------------------------------------------------------
+# The mark decision costs nothing where nothing is marked. `mark_by_name` is the only way an
+# object carries the mark, so in a process where it has not run no `__wrapped__` chain can hold
+# one: the decision is None for every value, reads no chain, and the walk is main's. A value
+# gets the same decision either way.
+# ---------------------------------------------------------------------------------------------
+
+_R10_NO_MARK_CHILD = """\
+from pivot import fingerprint
+
+reads = []
+
+
+def helper(x):
+    return x * 2
+
+
+class Wrapping:
+    def __init__(self, fn):
+        self.fn = fn
+
+    @property
+    def __wrapped__(self):
+        reads.append(1)
+        return self.fn
+
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
+
+
+def classify(value):
+    return (
+        fingerprint._mark_decision(value),
+        fingerprint._value_kind(value),
+        fingerprint._canonicalize_value_for_hash(value),
+    )
+
+
+value = Wrapping(helper)
+unmarked = classify(value)
+print("READS", len(reads))
+
+
+def other(x):
+    return x
+
+
+fingerprint.mark_by_name(other)  # a mark on another object, so the process holds one
+print("SAME", classify(Wrapping(helper))[:2] == unmarked[:2])
+"""
+
+
+def test_without_a_mark_in_the_process_the_decision_reads_no_chain() -> None:
+    """A project that marks nothing pays no chain read for a value the walk classifies: the
+    value's own `__wrapped__` property is never asked. The decision it gets is the one it gets
+    in a process that does hold a mark."""
+    done = subprocess.run(
+        [sys.executable, "-c", _R10_NO_MARK_CHILD],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr[-1500:]
+    assert "READS 0" in done.stdout, done.stdout
+    assert "SAME True" in done.stdout, done.stdout
+
+
+# ---------------------------------------------------------------------------------------------
+# An attribute the class keeps that the object does not hold. `model_dump` in a slot that was
+# never assigned, or a `model_dump` property that raises AttributeError, is no attribute to
+# `hasattr`, which is what main asks: the value is canonicalized as the plain object it is,
+# rather than raising out of the fingerprint.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_model_dump_the_object_does_not_hold_is_canonicalized_as_a_plain_object() -> None:
+    """The walk asks whether the value keeps `model_dump` of its own, which an unset slot and a
+    raising property answer; reading it then raises AttributeError, as it does for `hasattr` on
+    main, and the value takes the plain-object branch."""
+
+    class SlotModelDump:  # the class keeps `model_dump`; the instance never assigns the slot
+        __slots__ = ("model_dump",)  # pyright: ignore[reportUnannotatedClassAttribute, reportUninitializedInstanceVariable]
+
+    class RaisingModelDump:
+        __slots__ = ()  # pyright: ignore[reportUnannotatedClassAttribute]
+
+        @property
+        def model_dump(self) -> typing.Callable[[], dict[str, int]]:
+            raise AttributeError("model_dump")
+
+    for value in (SlotModelDump(), RaisingModelDump()):
+        assert fingerprint._keeps_own_attribute(value, "model_dump")
+        canonical = fingerprint._canonicalize_value_for_hash(value)
+        assert canonical == [type(value).__name__, repr(value)], canonical
