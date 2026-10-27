@@ -314,8 +314,10 @@ happens when the file changes while Pivot starts or in the 2 s before it starts
 loaded a module and then edited it, and for a module a custom loader imported.
 A worker whose text differs from the one the `pivot` process recorded marks the
 stage, as above. Import such modules from the pipeline or a stage instead. A
-forward step of the system clock of more than 2 s between an edit and the start
-of a pivot process can make that edit look older than the start.
+forward step of the system clock between an edit and the start of a pivot
+process can make that edit look older than the start: the 2 s margin covers a
+step of about 1 s where the file system keeps whole-second change times, and of
+2 s where it keeps exact ones.
 
 Under `pivot repro --no-commit` no lock is written. The run records, for
 `pivot commit`, the manifest each stage's lock would have held, warnings' marks

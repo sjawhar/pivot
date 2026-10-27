@@ -255,10 +255,12 @@ which records the module's file when those bytes are shown to be the bytes it wa
 - the file's change time (`st_ctime`) is at least 2 s older than the process start. The start is
   read on Linux from `/proc/self/stat` against the boot clock, added to the boot's wall-clock
   time, the smaller of its value when Pivot was imported and now, so a step of the wall clock
-  after the import cannot move the start later (psutil elsewhere). The 2 s cover a file system
-  that keeps whole seconds (ext4 with 128-byte inodes stamps a change up to 1 s before it
-  happened), the kernel's coarse timestamps, and a forward step of the wall clock of up to 2 s
-  between an edit and Pivot's import. Every import in the process then read these bytes;
+  after the import cannot move the start later (psutil elsewhere). The three errors that can make
+  an edit look older than it is share those 2 s: a file system that keeps whole seconds (ext4
+  with 128-byte inodes stamps a change up to 1 s before it happened), the kernel's coarse
+  timestamps, and a forward step of the wall clock between an edit and Pivot's import, which the
+  margin covers up to 2 s where change times are exact and to about 1 s where they are whole
+  seconds. Every import in the process then read these bytes;
 - the bytecode that loader may have run instead is the code of these bytes. A cached file that
   has not changed since the start is the one the import saw: either CPython's check rejects it
   for this source, or its code (`marshal`) equals the source compiled now, which catches the
@@ -279,11 +281,13 @@ costs the same as a sourceless module: the stages that use it rerun on every run
 and file no run-cache entry.
 Two cases are not detected. A process forked without exec from a parent that imported the module
 before it imported Pivot: start Pivot in a process of its own, as the `pivot` command and its
-workers are. A forward step of the system clock of more than 2 s between an edit and the start
-of a pivot process can make that edit look older than the start; so can a file system that
-stamps change times with another machine's clock (a network file system's server) more than 2 s
-behind this one. These records belong to the import session: `loaded_source.prune` drops them
-when it ends, so the next discovery judges the modules again.
+workers are. A forward step of the system clock between an edit and the start of a pivot process
+can make that edit look older than the start once it passes what the 2 s margin leaves after the
+file system's timestamp granularity (about 1 s where change times are whole seconds, 2 s where
+they are exact); so can a file system that stamps change times with another machine's clock (a
+network file system's server) that far behind this one. These records belong to the import
+session: `loaded_source.prune` drops them when it ends, so the next discovery judges the
+modules again.
 
 Discovery's path hook and the module recorder are installed only while a discovery imports;
 `discovery._remove_import_hooks` gives CPython's machinery back when it returns, fails or is

@@ -229,6 +229,24 @@ async def _run_in_daemon_thread[T](func: Callable[[], T]) -> T:
     return results[0]
 
 
+def _deferred_writes_to_apply(result: StageResult, *, no_commit: bool) -> DeferredWrites | None:
+    """The StateDB writes a finished stage persists, or None when it persists nothing.
+
+    Only a RAN or CACHED stage writes. Under ``--no-commit`` only the record of what ran is
+    kept, for ``pivot commit``; nothing else is persisted.
+    """
+    if result["status"] not in (StageStatus.RAN, StageStatus.CACHED):
+        return None
+    if "deferred_writes" not in result:
+        return None
+    deferred = result["deferred_writes"]
+    if not no_commit:
+        return deferred
+    if "no_commit_record" not in deferred:
+        return None
+    return DeferredWrites(no_commit_record=deferred["no_commit_record"])
+
+
 class Engine:
     """Async coordinator for pipeline execution using anyio.
 
@@ -1316,26 +1334,10 @@ class Engine:
                                     )
                                     stage_durations[stage_name] = duration_ms
 
-                                    # Apply deferred writes for RAN and CACHED stages. Under
-                                    # --no-commit only the record of what ran is kept, for
-                                    # `pivot commit`; nothing else is persisted.
-                                    deferred = (
-                                        result["deferred_writes"]
-                                        if "deferred_writes" in result
-                                        else None
+                                    deferred = _deferred_writes_to_apply(
+                                        result, no_commit=no_commit
                                     )
-                                    if no_commit and deferred is not None:
-                                        deferred = (
-                                            DeferredWrites(
-                                                no_commit_record=deferred["no_commit_record"]
-                                            )
-                                            if "no_commit_record" in deferred
-                                            else None
-                                        )
-                                    if (
-                                        result["status"] in (StageStatus.RAN, StageStatus.CACHED)
-                                        and deferred is not None
-                                    ):
+                                    if deferred is not None:
                                         stage_info = self._get_stage(stage_name)
                                         output_paths = [
                                             types.identity_key(out.identity)

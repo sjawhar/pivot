@@ -71,7 +71,7 @@ def carry_rerun_marks(
     markers = {key: value for key, value in previous.items() if _is_rerun_mark(key)}
     if not markers:
         return fingerprint
-    static = {key: value for key, value in previous.items() if key not in markers}
+    static = strip_rerun_marks(previous)
     if static != fingerprint:
         return fingerprint
     return {**fingerprint, **markers}

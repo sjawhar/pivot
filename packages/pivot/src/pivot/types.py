@@ -157,8 +157,8 @@ class NoCommitRecord(TypedDict, total=False):
     `output_hashes` the outputs it wrote; this Pivot writes both, and reads neither without the
     other. `pivot commit` writes that manifest when the outputs on disk still have these hashes.
     The shape is open: another field joins as an optional key, and
-    `StateDB.get_no_commit_record` returns each field it knows that is valid and ignores the
-    rest, so a record that holds only another Pivot's field still reads, without these two.
+    `StateDB.get_no_commit_record` keeps these two only when both are valid and ignores every
+    other key, so a record that holds only another Pivot's field still reads, without these two.
     """
 
     code_manifest: dict[str, str]

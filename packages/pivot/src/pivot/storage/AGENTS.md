@@ -35,7 +35,7 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 | `remote:` | Remote index entries |
 | `remote_url:` | Remote URL tracking for change detection |
 | `fp:` | AST fingerprint/hash cache entries |
-| `nocommit:` | What a `--no-commit` run of a stage ran (`stage` → code manifest, marks included, and output hashes), for `pivot commit`; a written lock removes it. The reader returns each valid field it knows, so a record without the manifest (another Pivot's field only) reads as a record without it |
+| `nocommit:` | What a `--no-commit` run of a stage ran (`stage` → code manifest, marks included, and output hashes), for `pivot commit`; a written lock removes it. The reader keeps the manifest and the output hashes only together and ignores every other key, so a record without them (another Pivot's field only) reads as a record without them |
 
 **When adding new state types**, define a new prefix constant and document it here.
 

@@ -13,7 +13,7 @@ import pathlib
 import py_compile
 import sys
 import types as _stdlib_types
-from typing import TYPE_CHECKING, Final, cast, override
+from typing import TYPE_CHECKING, Final, override
 
 import cloudpickle
 
@@ -167,8 +167,7 @@ class _RecordingLoader(importlib.abc.Loader):
         else:
             data = (
                 loaded_source.loader_source(self._loader, origin, module.__name__)
-                if type(self._loader) is not importlib.machinery.SourceFileLoader
-                and isinstance(origin, str)
+                if isinstance(origin, str)
                 else None
             )
             self._loader.exec_module(module)
@@ -200,13 +199,7 @@ class _RecordingFinder(importlib.abc.MetaPathFinder):
                 continue
             spec = find_spec(fullname, path, target)
             if spec is not None:
-                if (
-                    spec.loader is not None
-                    and isinstance(spec.origin, str)
-                    and _should_record_origin(spec.origin)
-                    and not isinstance(spec.loader, (_ProjectSourceLoader, _RecordingLoader))
-                ):
-                    spec.loader = _RecordingLoader(cast("importlib.abc.Loader", spec.loader))
+                _record_spec_loader(spec)
                 return spec
         return None
 
@@ -222,6 +215,21 @@ def _should_record_origin(origin: str) -> bool:
         return not fingerprint.is_library_path(pathlib.Path(origin).resolve())
     except OSError:
         return True
+
+
+def _record_spec_loader(spec: importlib.machinery.ModuleSpec | None) -> None:
+    """Replace a user-code spec's loader with ``_RecordingLoader``, so Pivot records the source
+    the module is compiled from. Both seams the recorder installs decide here:
+    ``_RecordingFinder.find_spec`` and the wrapped ``importlib.util.spec_from_file_location``.
+    """
+    if (
+        spec is not None
+        and spec.loader is not None
+        and isinstance(spec.origin, str)
+        and _should_record_origin(spec.origin)
+        and not isinstance(spec.loader, (_ProjectSourceLoader, _RecordingLoader))
+    ):
+        spec.loader = _RecordingLoader(spec.loader)
 
 
 def _install_module_recorder() -> None:
@@ -243,14 +251,7 @@ def _install_module_recorder() -> None:
             loader=loader,
             submodule_search_locations=submodule_search_locations,
         )
-        if (
-            spec is not None
-            and spec.loader is not None
-            and isinstance(spec.origin, str)
-            and _should_record_origin(spec.origin)
-            and not isinstance(spec.loader, (_ProjectSourceLoader, _RecordingLoader))
-        ):
-            spec.loader = _RecordingLoader(spec.loader)
+        _record_spec_loader(spec)
         return spec
 
     _wrapped_spec_from_file_location = spec_from_file_location
@@ -422,9 +423,10 @@ def import_session_root() -> pathlib.Path | None:
 
 
 def install_user_code_loader(root: str) -> None:
-    """Import user code through ``_ProjectSourceLoader`` in this process from now on, as a
-    discovery for ``root`` does while it imports: the initializer of each worker
-    (``executor.core``), for the worker's life.
+    """Import user code through ``_ProjectSourceLoader`` in this process from now on, and record
+    the source of every user module another loader loads (the module recorder), as a discovery
+    for ``root`` does while it imports: the initializer of each worker (``executor.core``), for
+    the worker's life.
 
     A worker imports user code by name: a stage's module that discovery could not send by
     value (one outside the root, or under it in a ``src`` layout) and any module a stage body

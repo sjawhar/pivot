@@ -352,7 +352,7 @@ def _tracked_import(
         result = _original_import(name, globals, locals, fromlist or (), level)
         if not level:
             # Unpickling a stage imports the modules it refers to before the stage starts. Record
-            # each user module as this worker loaded it, whatever loader that was.
+            # each one the recorder saw compile; `record_unseen_modules` judges the rest.
             loaded_source.record_modules(_package_chain(name))
         return result
     package = _import_package(globals) if level else None
@@ -511,9 +511,9 @@ def _untrusted_modules(
     loaded_source.record_user_modules()
     if loaded_source.is_worker():
         loaded_source.record_unseen_modules()
+    used = set[str]()
     manifest = fingerprint_manifest
     if stage_info["no_fingerprint"]:
-        used = set[str]()
         files = set[str]()
         for key in fingerprint_manifest:
             if not key.startswith("file:"):
@@ -525,7 +525,6 @@ def _untrusted_modules(
         used.update(loaded_source.modules_from_files(files))
         manifest = {}
     else:
-        used = set[str]()
         stage_func = inspect.unwrap(stage_info["func"])
         stage_file = inspect.getsourcefile(stage_func)
         if (
@@ -2275,7 +2274,7 @@ def _build_deferred_writes(
     `skip.check_stage` never consults the run cache for it, so no tier skips it.
     """
     # A lock written now supersedes any record a --no-commit run left for `pivot commit`.
-    result: DeferredWrites = {"clear_no_commit_record": True}
+    result = DeferredWrites(clear_no_commit_record=True)
 
     if increment_outputs:
         result["increment_outputs"] = True

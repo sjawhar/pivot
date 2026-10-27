@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Self
 import lmdb
 
 from pivot import exceptions, run_history
+from pivot.types import DeferredWrites, NoCommitRecord
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,6 @@ if TYPE_CHECKING:
 
     from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
-    from pivot.types import DeferredWrites, NoCommitRecord
 
 # Key prefixes for different entry types
 _HASH_PREFIX = b"hash:"  # File hash entries
@@ -259,7 +259,7 @@ def _make_key_dep_generation(stage_name: str, dep_identity: str) -> bytes:
     return _DEP_PREFIX + f"{stage_name}:{dep_identity}".encode()
 
 
-def _is_str_dict(value: object) -> bool:
+def _is_str_dict(value: object) -> typing.TypeGuard[dict[str, str]]:
     return isinstance(value, dict) and all(
         isinstance(key, str) and isinstance(item, str)
         for key, item in typing.cast("dict[object, object]", value).items()
@@ -938,13 +938,11 @@ class StateDB:
         if not isinstance(data, dict):
             return None
         record = typing.cast("dict[str, object]", data)
-        checked = dict[str, object]()
         manifest = record.get("code_manifest")
         outputs = record.get("output_hashes")
         if _is_str_dict(manifest) and _is_str_dict(outputs):
-            checked["code_manifest"] = manifest
-            checked["output_hashes"] = outputs
-        return typing.cast("NoCommitRecord", typing.cast("object", checked))
+            return NoCommitRecord(code_manifest=manifest, output_hashes=outputs)
+        return NoCommitRecord()
 
     def prune_run_cache(self, valid_run_ids: set[str]) -> int:
         """Remove run cache entries that reference runs not in valid_run_ids.

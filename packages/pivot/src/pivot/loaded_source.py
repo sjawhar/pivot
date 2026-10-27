@@ -102,10 +102,11 @@ _CODE_KINDS = frozenset({"func", "class", "const", "default", "schema", "partial
 
 # How long before the process start a file's change time must be for the file to count as
 # unchanged since. A file system that keeps whole seconds (ext4 with 128-byte inodes) stamps a
-# change up to 1 s before it happened, the kernel's coarse clock up to one tick (10 ms) before,
-# and a forward step of the wall clock between an edit and the import of this module moves the
-# start later by the step. 2 s covers all three up to a step of 2 s. The cost: a module edited
-# less than 2 s before a process started is unreadable in that process.
+# change up to 1 s before it happened, the kernel's coarse clock up to one tick before, and a
+# forward step of the wall clock between an edit and the import of this module moves the start
+# later by the step. The three share this one margin: 2 s covers a step of up to 2 s where the
+# file system stamps exact times, and of about 1 s where it keeps whole seconds. The cost: a
+# module edited less than 2 s before a process started is unreadable in that process.
 _CHANGE_TIME_SLACK_NS = 2_000_000_000
 
 # On Linux, the wall clock less the boot clock when this module was imported: the wall-clock time
@@ -127,7 +128,7 @@ os.register_at_fork(after_in_child=_note_fork)
 def record(filename: str, module: str, data: bytes) -> None:
     """Record that `module` was compiled from `data`, the content of `filename` at load time."""
     path = os.path.realpath(filename)
-    _store(_Loaded(filename, path, module, data, xxhash.xxh64(data).hexdigest()))
+    _store(_Loaded(filename, path, module, data, _hash(data)))
     if (loaded := sys.modules.get(module)) is not None:
         _recorded_objects[module] = loaded
 
@@ -289,7 +290,8 @@ def set_coordinator(coordinator_digests: Mapping[str, str]) -> None:
 
 def is_worker() -> bool:
     """Whether this process is a worker: it started with the coordinator's records
-    (`set_coordinator`). Any other process that checks a stage ran the code it fingerprinted."""
+    (`set_coordinator`). In any other process a stage is checked against this process's own
+    records, so there is no other process's record to differ from."""
     return _coordinator is not None
 
 
@@ -359,8 +361,8 @@ def check_stage(
     The coordinator's records are the ones the worker started with, or `coordinator_digests` when
     the stage carries them. When neither matches `coordinator_token`, nothing can be compared, so
     every used module this process recorded counts as edited. A process that never got the
-    coordinator's records is the coordinator itself, which ran what it fingerprinted: only
-    unreadable modules count there.
+    coordinator's records is the coordinator itself, which has no other process's record to
+    compare against: only unreadable modules count there.
     """
     known = set(_by_module)
     expected: dict[str, str] | None = None
@@ -381,12 +383,12 @@ def check_stage(
     unreadable = list[str]()
     for name in sorted(used):
         own = _by_module.get(name)
-        wanted = None if expected is None else expected.get(name)
-        if _coordinator is None:
+        if expected is None:
             if own is not None and own.digest is None:
                 unreadable.append(name)
                 _warn_unseen(name, own.reason)
             continue
+        wanted = expected.get(name)
         # A direct executor can receive a preloaded test or library function without discovery
         # ever sending a module record to its workers. It has no coordinator snapshot to compare;
         # do not turn that legacy programmatic path into a permanent rerun. A normal discovery
@@ -548,8 +550,9 @@ def _verified_source(
     CPython's source file loader imported it (a plain `sys.path` import), the file's change time
     is at least `_CHANGE_TIME_SLACK_NS` older than this process's start, so every import in this
     process read these bytes, and the bytecode that loader may have run instead is the code of
-    these bytes (`_bytecode_reason`). A forward step of the wall clock of more than that margin
-    between an edit and the import of this module can make the edit look older than the start.
+    these bytes (`_bytecode_reason`). A forward step of the wall clock between an edit and the
+    import of this module spends that margin, less what the file system's timestamp granularity
+    already takes of it, and a larger step makes the edit look older than the start.
     """
     spec = vars(module).get("__spec__")
     loader = getattr(spec, "loader", None) or vars(module).get("__loader__")
@@ -640,7 +643,7 @@ def _bytecode_accepted(bytecode: bytes, data: bytes, source: os.stat_result) -> 
 
 
 def _token_of(records: Mapping[str, str]) -> str:
-    return xxhash.xxh64(json.dumps(sorted(records.items())).encode()).hexdigest()
+    return _hash(json.dumps(sorted(records.items())).encode())
 
 
 def _source_lines(data: bytes) -> list[str] | None:
