@@ -12,6 +12,7 @@ import subprocess
 import sys
 import types
 import typing
+import weakref
 from collections.abc import Callable
 from typing import ClassVar
 from unittest import mock
@@ -513,7 +514,10 @@ def test_editing_immutable_capture_changes_fingerprint(
     same: object,
     edited: object,
 ) -> None:
-    fingerprint._getclosurevars_cache.clear()
+    # The closure-variable cache holds the values it read. monkeypatch puts the module's values
+    # back after the test, so the patched values must stay in a cache of this test's own.
+    cache = weakref.WeakKeyDictionary[Callable[..., object], object]()
+    monkeypatch.setattr(fingerprint, "_getclosurevars_cache", cache)
     original = fingerprint.get_stage_fingerprint(func)
 
     monkeypatch.setattr(sys.modules[__name__], variable, same)
