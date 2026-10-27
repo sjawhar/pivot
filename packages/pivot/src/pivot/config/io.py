@@ -323,13 +323,14 @@ def get_cache_dir() -> pathlib.Path:
 
 
 def register_cache_use() -> None:
-    """Record this project as a user of its cache.
+    """Record this project as a user of its cache, under the naming lock (shared).
 
     A cache outside the project root can be shared by projects that cannot read each other's
-    locks, and the register is the only thing that tells a collection they exist. Recording
-    on a read as well as on a write is deliberate: a project that only checks out still holds
-    links into the cache. Call this at command entry, not from ``get_cache_dir``, so that
-    ``get_cache_dir`` stays a pure reader.
+    locks, and the register is the only thing that tells a collection they exist. The naming
+    lock prevents a registration from landing while ``gc`` holds the lock exclusive and is
+    deleting (the oracle's fifth live-object path: a worktree that registers mid-gc would lose
+    its objects because ``resolve_scopes`` ran before the registration). Call this at command
+    entry, not from ``get_cache_dir``, so that ``get_cache_dir`` stays a pure reader.
     """
     from pivot.storage import gc
 
@@ -337,7 +338,9 @@ def register_cache_use() -> None:
         root = project.get_project_root()
     except exceptions.ProjectNotInitializedError:
         return
-    gc.register_project(get_cache_dir(), root, get_state_dir())
+    cache_dir = get_cache_dir()
+    with gc.naming_unit(cache_dir):
+        gc.register_project(cache_dir, root, get_state_dir())
 
 
 def get_state_dir() -> pathlib.Path:

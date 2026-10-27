@@ -222,29 +222,13 @@ def gc_cmd(
     retention = config.get_run_history_retention()
     would_prune, valid_run_ids = _plan_prune(state_dir, retention)
 
-    with gc.collection_lock(cache_dir) as locked:
-        if not locked:
-            if grace_hours == 0:
-                raise exceptions.CacheCollectionRefusedError(
-                    f"Refusing to collect {cache_dir}: this filesystem refuses flock(), so "
-                    + "the cache's locks exclude nothing here and --grace-hours 0 would "
-                    + "leave this run with no guard against removing an object another "
-                    + "process has just published. Run with a grace period. Nothing was "
-                    + "removed."
-                )
-            _echo(
-                f"Warning: {cache_dir} is on a filesystem that refuses flock(), so pivot's "
-                + "cache locks exclude nothing here; another process can publish into this "
-                + "cache while it is collected. Objects published in the last "
-                + f"{_format_grace(grace_hours)}h are kept all the same.",
-                to_stderr=True,
-            )
-
+    with gc.collection_lock(cache_dir):
+        # The plan and the prompt stay OUTSIDE the naming lock, so a dry run and a prompted
+        # user do not block writers. The confirmed non-dry path takes the naming lock
+        # exclusively to re-read the register, prune, collect roots and delete — while it
+        # holds the lock, no writer can name a cache object, so the plan it builds is correct
+        # by construction and needs no re-read in execute_plan.
         try:
-            # The run-cache rows a confirmed prune would drop are left out of the plan, so a
-            # dry run and the real run condemn the same objects (B3). The prune itself runs only
-            # in the confirmed non-dry path, after the prompt (B4), before the deletions re-read
-            # the records.
             roots = gc.collect_roots(
                 scopes, cache_dir, prune_state_dir=state_dir, valid_run_ids=valid_run_ids
             )
@@ -271,8 +255,6 @@ def gc_cmd(
                 cache_dir, roots, grace_hours=grace_hours, remove_linked=remove_linked
             )
 
-            # A dry run reports the plan as its removal, so its counts are the ones a real run
-            # removes and `kept` is what would survive.
             removed = gc.ObjectCount(objects=len(plan["doomed"]), bytes=plan["doomed_bytes"])
             if dry_run:
                 if would_prune and not keep_all:
@@ -286,27 +268,40 @@ def gc_cmd(
                     if remove_linked and plan["linked"]["objects"]:
                         _echo(_linked_disclosure(plan), to_stderr=notes_to_stderr)
                     _confirm(plan, object_root, assume_yes=assume_yes)
-                # Confirmed and not refused. Prune first so the deletions' re-read of the records
-                # sees the dropped rows; a run that could not parse a record prunes nothing.
-                if not keep_all:
-                    pruned = _apply_prune(state_dir, retention)
-                    if pruned:
-                        _echo(
-                            f"Pruned {pruned:,} runs beyond the retention of {retention} "
-                            + "(core.run_history_retention).",
-                            to_stderr=notes_to_stderr,
-                        )
-                removed = (
-                    gc.execute_plan(
-                        plan,
-                        scopes=scopes,
-                        cache_dir=cache_dir,
-                        grace_hours=grace_hours,
-                        remove_linked=remove_linked,
+                # Confirmed. Under the naming lock, re-read the register, prune, re-read
+                # every record, and delete. While this lock is held no writer can name a
+                # cache object, so the roots we read here are the truth.
+                with gc.naming_exclusive(cache_dir):
+                    scopes, gone = gc.resolve_scopes(
+                        cache_dir, project_root, state_dir, project_paths
                     )
-                    if plan["doomed"]
-                    else gc.ObjectCount(objects=0, bytes=0)
-                )
+                    if gone:
+                        _echo(gc.dropped_note(gone), to_stderr=notes_to_stderr)
+                    if not keep_all:
+                        pruned = _apply_prune(state_dir, retention)
+                        if pruned:
+                            _echo(
+                                f"Pruned {pruned:,} runs beyond the retention of {retention} "
+                                + "(core.run_history_retention).",
+                                to_stderr=notes_to_stderr,
+                            )
+                    roots = gc.collect_roots(
+                        scopes,
+                        cache_dir,
+                        prune_state_dir=state_dir,
+                        valid_run_ids=valid_run_ids,
+                    )
+                    keep_all = bool(roots["unreadable"] or roots["outward_dirs"])
+                    removed = (
+                        gc.execute_plan(
+                            plan,
+                            roots=roots,
+                            grace_hours=grace_hours,
+                            remove_linked=remove_linked,
+                        )
+                        if plan["doomed"] and not keep_all
+                        else gc.ObjectCount(objects=0, bytes=0)
+                    )
         except gc.ProjectUnreadableError as e:
             raise exceptions.CacheCollectionRefusedError(
                 gc.refusal_unreadable(cache_dir, len(scopes), [(gc.scope_label(e.scope), e.reason)])
