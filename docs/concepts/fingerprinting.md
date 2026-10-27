@@ -303,9 +303,12 @@ holds for a module an import hook loads with its own subclass of
 `importlib.abc.SourceLoader` (tools that rewrite source as it is imported
 install one): such a loader may run cached bytecode that Python checks only by
 the file's size and whole-second modification time, so the file can say one
-thing while the module runs another. A loader with only the old `load_module`
-method still imports as it does without Pivot, and its module is treated the
-same way.
+thing while the module runs another. Pivot then never reports the stage as
+cached, but each rerun runs whatever that loader runs: if the loader runs old
+bytecode, the output is still the old code's. Pivot stops claiming the result
+is fresh; it cannot make your loader run the current code. A loader with only
+the old `load_module` method still imports as it does without Pivot, and its
+module is treated the same way.
 
 A module imported before Pivot starts, by `sitecustomize` or a `.pth` import
 line (in the `pivot` process and in every worker), was loaded before Pivot

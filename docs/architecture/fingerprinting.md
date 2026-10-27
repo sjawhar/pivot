@@ -244,7 +244,9 @@ validated checked-hash bytecode against. Any other loader built on CPython's `So
 `importlib.abc.SourceLoader`) is not replaced, since it may transform the source, and its module
 is recorded as unreadable: its `get_code` may run cached bytecode that CPython checks only by the
 source's size and whole-second mtime, so `get_data` can give an edited file while the module runs
-the earlier code (`discovery._RecordingLoader.exec_module`). A zip importer is not such a loader
+the earlier code (`discovery._RecordingLoader.exec_module`). Unreadable means the stage reruns on
+every run and is never reported as cached; it does not make the output current: each rerun runs
+what that loader runs, which can still be the stale bytecode. A zip importer is not such a loader
 (`zipimport.zipimporter` is no `importlib.abc.SourceLoader`), so its modules keep their source. A
 loader with only PEP 302's `load_module` and no `exec_module`, which CPython 3.13 still imports
 with an `ImportWarning` (its import system calls `load_module` "slated for removal in Python
