@@ -1010,6 +1010,14 @@ def test_restore_file_records_pvt_members_before_writing_them(
         assert not target.exists()
         recorded.append(dict(members))
 
+    restore_target = ownership.ForcedRestore(
+        replacement=ownership.stage_output(target, "b/tree"),
+        restored=output_hash,
+        claims=lambda: ownership.StageClaims(
+            locked={}, no_commit={}, recorder=record, cache_dir=None
+        ),
+    )
+
     result = restore.restore_file(
         rel_path="data/b/tree",
         output_hash=output_hash,
@@ -1018,7 +1026,7 @@ def test_restore_file_records_pvt_members_before_writing_them(
         cache_dir=cache_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
-        record_members=record,
+        target=restore_target,
         remote_factory=_helper_unused_remote,
     )
 
@@ -1035,7 +1043,7 @@ def test_restore_file_records_pvt_members_before_writing_them(
         cache_dir=cache_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
-        record_members=record,
+        target=restore_target,
         remote_factory=_helper_unused_remote,
     )
 

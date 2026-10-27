@@ -259,11 +259,26 @@ def _make_key_dep_generation(stage_name: str, dep_identity: str) -> bytes:
     return _DEP_PREFIX + f"{stage_name}:{dep_identity}".encode()
 
 
-def _is_str_dict(value: object) -> bool:
+def _is_str_dict(value: object) -> typing.TypeGuard[dict[str, str]]:
     return isinstance(value, dict) and all(
         isinstance(key, str) and isinstance(item, str)
         for key, item in typing.cast("dict[object, object]", value).items()
     )
+
+
+def _json_object(value: bytes | None) -> dict[str, object] | None:
+    """`value` decoded as a JSON object, or None if it is absent or not one."""
+    if value is None:
+        return None
+    try:
+        data: object = json.loads(value)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return typing.cast("dict[str, object]", data) if isinstance(data, dict) else None
+
+
+# The keys of a stage's `nocommit:` record (`types.NoCommitRecord`), each a str -> str mapping
+_NO_COMMIT_FIELDS = ("code_manifest", "output_hashes", "pvt_members")
 
 
 class InvalidAstHashKeyError(Exception):
@@ -919,27 +934,22 @@ class StateDB:
         return run_history.deserialize_run_cache_entry(value)
 
     def get_no_commit_record(self, stage_name: str) -> NoCommitRecord | None:
-        """The stage's `nocommit:` record, or None when it is absent or not a JSON object.
+        """The stage's `nocommit:` record, or None (absent, or not a JSON object).
 
-        The record is shared: each writer owns its keys and keeps the others (`pvt_members` here;
-        a `--no-commit` run's `code_manifest` and `output_hashes`). This reader checks only
-        `pvt_members` and leaves a malformed one out; every other key is returned as stored, so a
-        record holding only another writer's keys still reads as present.
+        The record is shared (`types.NoCommitRecord`): a `--no-commit` run writes `code_manifest`
+        and `output_hashes`, and a write of a `*.pvt` member adds to `pvt_members`. Each of the
+        three is checked on its own: a malformed one is left out and never hides another, and
+        every other key is returned as stored. A record holding none of them reads as present.
         """
         self._check_closed()
         with self._read_transaction() as txn:
             value = txn.get(_NOCOMMIT_PREFIX + stage_name.encode())
-        if value is None:
+        record = _json_object(value)
+        if record is None:
             return None
-        try:
-            data: object = json.loads(value)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return None
-        if not isinstance(data, dict):
-            return None
-        record = typing.cast("dict[str, object]", data)
-        if "pvt_members" in record and not _is_str_dict(record["pvt_members"]):
-            del record["pvt_members"]
+        for field in _NO_COMMIT_FIELDS:
+            if field in record and not _is_str_dict(record[field]):
+                del record[field]
         return typing.cast("NoCommitRecord", typing.cast("object", record))
 
     def add_no_commit_pvt_members(self, stage_name: str, members: Mapping[str, str]) -> None:
@@ -955,18 +965,11 @@ class StateDB:
         try:
             with self._write_transaction(timeout=self._write_timeout) as txn:
                 value = txn.get(key)
-                record = dict[str, object]()
-                if value is not None:
-                    try:
-                        data: object = json.loads(value)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        data = None
-                    if isinstance(data, dict):
-                        record = typing.cast("dict[str, object]", data)
+                record = _json_object(value) or dict[str, object]()
                 pvt_members = dict[str, str]()
                 current = record.get("pvt_members")
                 if _is_str_dict(current):
-                    pvt_members.update(typing.cast("dict[str, str]", current))
+                    pvt_members.update(current)
                 pvt_members.update(members)
                 record["pvt_members"] = dict(sorted(pvt_members.items()))
                 txn.put(key, json.dumps(record).encode())

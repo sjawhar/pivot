@@ -8,17 +8,19 @@ the replacement reaches and fails, naming them, before anything is removed. A fo
 tracked path replaces that path's own content and nothing else: it fails the same way before it
 would remove another tracked file, import or sidecar beneath it.
 
-A stage may return a directory member named ``*.pvt``. Such a file is the stage's when the stage
-records it (``StageMembers``): its lock, or its ``nocommit:<stage>`` record, lists it at that
-path, and it is a sidecar Pivot cannot parse or a file whose content the stage recorded there.
-Pivot adds a member to that record before it writes the file (``record_members``), so no member
-it writes is ever unrecorded. Every other ``*.pvt`` under an output is the user's, for
-``pivot commit`` too.
+A stage may write a ``*.pvt`` file in a directory output. Such a file is the stage's when the
+stage records it at that path (``stage_members``, the one rule every caller uses): its lock, the
+hash a restore writes, its ``nocommit:<stage>`` record, or what this run writes lists it there,
+and it is a sidecar Pivot cannot parse or a file whose content the stage recorded there. Pivot
+adds a member to that record before it writes the file (``record_members``), so no member it
+writes is ever unrecorded. Every other ``*.pvt`` under an output is the user's, for
+``pivot commit`` too. ``forced_restore_refusal`` is the one decision behind every forced restore.
 """
 
 from __future__ import annotations
 
 import enum
+import functools
 import os
 import pathlib
 from typing import TYPE_CHECKING, TypedDict
@@ -34,13 +36,33 @@ if TYPE_CHECKING:
     from pivot.registry import RegistryStageInfo
     from pivot.storage.store import WorkspaceStore
 
-# The ``*.pvt`` files a stage itself writes in one output: path -> the content hashes the stage
-# recorded there, or None for a file the stage wrote in this run (any content there is its own).
-type StageMembers = dict[pathlib.Path, frozenset[str] | None]
+# The ``*.pvt`` files a stage claims in its outputs: path -> the content hashes the stage
+# recorded at that path (none for a path this run returns, before it writes it). A ``*.pvt`` at a
+# listed path is the stage's when it does not parse as a sidecar, or when its content is a
+# recorded one.
+type StageMembers = dict[pathlib.Path, frozenset[str]]
 
 # Records ``*.pvt`` files (path -> content hash) as one stage's own before Pivot writes them:
 # ``record_members`` bound to that stage.
 type MemberRecorder = Callable[[Mapping[pathlib.Path, str]], None]
+
+
+class StageClaims(TypedDict):
+    """What one stage has recorded as its own ``*.pvt`` files, across its outputs.
+
+    Read once per run or command (``stage_claims``, ``read_stage_claims``); ``stage_members``
+    turns it into one output's members.
+    """
+
+    locked: Mapping[pathlib.Path, types.HashInfo]
+    """Each output's ``normalized`` path -> the hash the stage's lock records for it."""
+    no_commit: StageMembers
+    """The members the stage's ``nocommit:`` record lists that still hold the recorded content."""
+    recorder: MemberRecorder | None
+    """Records the ``*.pvt`` files Pivot writes for the stage before it writes them; None when
+    the caller writes none."""
+    cache_dir: pathlib.Path | None
+    """The cache object root (``<cache.dir>/files``) the stage's outputs are cached in."""
 
 
 class ReplacementKind(enum.StrEnum):
@@ -87,6 +109,17 @@ class UnreadableOverlap(TypedDict):
     replacement: Replacement
 
 
+class ForcedRestore(TypedDict):
+    """A path a restore replaces (``checkout``, ``pull``, ``get``) and what decides its members."""
+
+    replacement: Replacement
+    restored: types.HashInfo | None
+    """The hash the restore writes; None for a file restored from git."""
+    claims: Callable[[], StageClaims] | None
+    """For a stage output restored to its own path: reads the stage's claims, called only when
+    the path holds a ``*.pvt``."""
+
+
 # A path a replacement must not remove: a user ``.pvt`` sidecar, or a directory Pivot could not
 # read and so cannot clear of user files.
 type OutputOverlap = SidecarOverlap | UnreadableOverlap
@@ -116,23 +149,12 @@ def normalized(path: pathlib.Path) -> pathlib.Path:
     return pathlib.Path(os.path.normpath(path.absolute()))
 
 
-def recorded_members(output_path: pathlib.Path, *hashes: types.HashInfo | None) -> StageMembers:
-    """The ``*.pvt`` members ``hashes`` record in ``output_path``, with each recorded hash."""
-    root = normalized(output_path)
-    found = dict[pathlib.Path, set[str]]()
-    for output_hash in hashes:
-        if output_hash is None or not types.is_dir_hash(output_hash):
-            continue
-        for entry in output_hash["manifest"]:
-            if entry["relpath"].endswith(".pvt"):
-                found.setdefault(root / entry["relpath"], set[str]()).add(entry["hash"])
-    return {path: frozenset(recorded) for path, recorded in found.items()}
-
-
 def member_hashes(
     output_path: pathlib.Path, output_hash: types.HashInfo | None
 ) -> dict[pathlib.Path, str]:
-    """The ``*.pvt`` files ``output_hash`` puts in ``output_path``, each with its content hash."""
+    """The ``*.pvt`` files ``output_hash`` puts in ``output_path``, each with its content hash.
+
+    Only a directory hash lists files, whatever the output's tag is."""
     if output_hash is None or not types.is_dir_hash(output_hash):
         return {}
     root = normalized(output_path)
@@ -141,6 +163,55 @@ def member_hashes(
         for entry in output_hash["manifest"]
         if entry["relpath"].endswith(".pvt")
     }
+
+
+def _hash_members(output_path: pathlib.Path, *hashes: types.HashInfo | None) -> StageMembers:
+    """The ``*.pvt`` files ``hashes`` put in ``output_path``, each with every hash recorded."""
+    found = dict[pathlib.Path, set[str]]()
+    for output_hash in hashes:
+        for path, content_hash in member_hashes(output_path, output_hash).items():
+            found.setdefault(path, set[str]()).add(content_hash)
+    return {path: frozenset(recorded) for path, recorded in found.items()}
+
+
+def stage_members(
+    output_path: pathlib.Path,
+    claims: StageClaims | None,
+    *,
+    restored: types.HashInfo | None = None,
+    returned: StageMembers | None = None,
+) -> StageMembers:
+    """The stage's own ``*.pvt`` files in ``output_path``: the one rule every write, restore,
+    commit and warning uses.
+
+    A file is listed when the hash the stage's lock records for the output lists it, or the hash
+    a restore writes (``restored``), or the stage's ``nocommit:`` record, or what this run writes
+    (``returned``). Whether the output is a directory is read from those hashes and from what
+    the run writes, never from the output's tag: a ``PathOnly`` output can be a directory too.
+
+    At a path the lock or the restored hash lists, the file's current content is recorded too
+    when Pivot holds it in the cache: a lock that changed through git lists the content of
+    another run there, and the stage's own file from the run before is cached. Replacing such a
+    file loses nothing the cache cannot restore.
+    """
+    found = dict[pathlib.Path, set[str]]()
+    locked = claims["locked"].get(normalized(output_path)) if claims is not None else None
+    cache_dir = claims["cache_dir"] if claims is not None else None
+    for path, recorded in _hash_members(output_path, restored, locked).items():
+        found[path] = set(recorded)
+        if cache_dir is not None and path.is_file():
+            content = cache.hash_file(path)[0]
+            if content not in recorded and cache.get_cache_path(cache_dir, content).exists():
+                found[path].add(content)
+    sources = list[StageMembers]()
+    if claims is not None:
+        sources.append(claims["no_commit"])
+    if returned is not None:
+        sources.append(returned)
+    for source in sources:
+        for path, recorded in source.items():
+            found.setdefault(path, set[str]()).update(recorded)
+    return {path: frozenset(recorded) for path, recorded in found.items()}
 
 
 def record_members(
@@ -184,7 +255,22 @@ def record_members(
         ) from exc
 
 
-def no_commit_members(
+def record_restored(
+    read_claims: Callable[[], StageClaims], output_path: pathlib.Path, restored: types.HashInfo
+) -> None:
+    """Record the ``*.pvt`` files restoring ``restored`` writes in ``output_path`` as the stage's,
+    before the restore writes them, unless the stage's lock records that hash for the output
+    (the lock already lists them). Reads the claims only when there is a file to record."""
+    members = member_hashes(output_path, restored)
+    if not members:
+        return
+    claims = read_claims()
+    if claims["recorder"] is None or claims["locked"].get(normalized(output_path)) == restored:
+        return
+    claims["recorder"](members)
+
+
+def _no_commit_members(
     project_root: pathlib.Path, record: types.NoCommitRecord | None
 ) -> StageMembers:
     """The ``*.pvt`` members the stage's ``nocommit:`` record lists that still hold what Pivot
@@ -196,7 +282,7 @@ def no_commit_members(
     if record is None or "pvt_members" not in record:
         return {}
     root = normalized(project_root)
-    members = dict[pathlib.Path, frozenset[str] | None]()
+    members = dict[pathlib.Path, frozenset[str]]()
     for relpath, content_hash in record["pvt_members"].items():
         path = root / relpath
         if path.is_file() and cache.hash_file(path)[0] == content_hash:
@@ -204,39 +290,40 @@ def no_commit_members(
     return members
 
 
-def stored_no_commit_members(
-    project_root: pathlib.Path, stages: Iterable[tuple[str, pathlib.Path]]
-) -> StageMembers:
-    """``no_commit_members`` of these ``(stage, state_dir)`` pairs, from each stage's StateDB.
+def stage_claims(
+    project_root: pathlib.Path,
+    locked: Mapping[pathlib.Path, types.HashInfo],
+    no_commit_record: types.NoCommitRecord | None,
+    *,
+    cache_dir: pathlib.Path | None,
+    recorder: MemberRecorder | None = None,
+) -> StageClaims:
+    """A stage's claims: ``locked`` maps each output path to the hash the stage's lock records
+    for it, and ``no_commit_record`` is the stage's ``nocommit:`` record."""
+    return StageClaims(
+        locked={normalized(path): output_hash for path, output_hash in locked.items()},
+        no_commit=_no_commit_members(project_root, no_commit_record),
+        recorder=recorder,
+        cache_dir=cache_dir,
+    )
 
-    Opens each state directory's StateDB once, read-only, and never creates one.
-    """
-    names_by_dir = dict[pathlib.Path, list[str]]()
-    for stage_name, state_dir in stages:
-        names_by_dir.setdefault(state_dir, []).append(stage_name)
-    found = list[StageMembers]()
-    for state_dir, names in names_by_dir.items():
-        if not (state_dir / "state.lmdb").exists():
-            continue
+
+def read_stage_claims(
+    project_root: pathlib.Path,
+    stage_name: str,
+    state_dir: pathlib.Path,
+    locked: Mapping[pathlib.Path, types.HashInfo],
+    *,
+    cache_dir: pathlib.Path | None,
+    recorder: MemberRecorder | None = None,
+) -> StageClaims:
+    """``stage_claims``, reading the stage's ``nocommit:`` record from the StateDB in
+    ``state_dir`` (opened read-only, never created)."""
+    record: types.NoCommitRecord | None = None
+    if (state_dir / "state.lmdb").exists():
         with state.StateDB(state_dir, readonly=True) as state_db:
-            found.extend(
-                no_commit_members(project_root, state_db.get_no_commit_record(name))
-                for name in names
-            )
-    return merged_members(*found)
-
-
-def merged_members(*sources: StageMembers) -> StageMembers:
-    """Every member any source lists, with every hash recorded for it (None: any content)."""
-    merged = dict[pathlib.Path, frozenset[str] | None]()
-    for source in sources:
-        for path, recorded in source.items():
-            if path not in merged:
-                merged[path] = recorded
-                continue
-            current = merged[path]
-            merged[path] = None if current is None or recorded is None else current | recorded
-    return merged
+            record = state_db.get_no_commit_record(stage_name)
+    return stage_claims(project_root, locked, record, cache_dir=cache_dir, recorder=recorder)
 
 
 def _same_location(path_a: pathlib.Path, path_b: pathlib.Path) -> bool:
@@ -265,8 +352,7 @@ def _is_stage_member(
 ) -> bool:
     if pvt_path not in members:
         return False
-    recorded = members[pvt_path]
-    return recorded is None or data is None or cache.hash_file(pvt_path)[0] in recorded
+    return data is None or cache.hash_file(pvt_path)[0] in members[pvt_path]
 
 
 def find_output_overlaps(
@@ -430,6 +516,53 @@ def ownership_error(
     return exceptions.OutputOwnershipError(f"{header}\n{details}\n{remedy}")
 
 
+def _restore_members(target: ForcedRestore, output_path: pathlib.Path) -> StageMembers:
+    """The ``*.pvt`` files under a restored path that its restore may replace."""
+    match target["replacement"]["kind"]:
+        case ReplacementKind.STAGE_OUTPUT:
+            claims = target["claims"]() if target["claims"] is not None else None
+            return stage_members(output_path, claims, restored=target["restored"])
+        case ReplacementKind.TRACKED:
+            # A tracked path's own content: what the restore writes and what its sidecar lists now
+            current = track.read_pvt_file(track.get_pvt_path(output_path))
+            return _hash_members(
+                output_path,
+                target["restored"],
+                track.pvt_to_hash_info(current) if current is not None else None,
+            )
+        case ReplacementKind.DESTINATION:
+            return {}
+
+
+def forced_restore_refusal(
+    project_root: pathlib.Path, targets: Iterable[ForcedRestore]
+) -> exceptions.OutputOwnershipError | None:
+    """The refusal naming every target whose restore would remove a user's file, with each file
+    that blocks it, or None: the one decision behind ``checkout``, ``pull`` and ``get``.
+
+    A command checks every target with it before it replaces any, and checks each target again,
+    under that target's restore lock, just before it replaces it: a user file that appears in
+    the meantime refuses that target alone. Only a path that exists (or is a symlink) is
+    replaced, so only such a path is checked. Each target is checked on its own, so the refusal
+    names every refused one. A stage output is checked with ``stage_members`` of its stage's
+    claims and the restored hash; a tracked path as its own restore, whose members are its own
+    content (the restored hash's and its current sidecar's); a destination with none.
+    """
+    overlaps = dict[tuple[pathlib.Path, pathlib.Path], OutputOverlap]()
+    for target in targets:
+        path = target["replacement"]["path"]
+        if not (path.exists() or path.is_symlink()):
+            continue
+        found = find_output_overlaps(
+            project_root, [target["replacement"]], functools.partial(_restore_members, target)
+        )
+        for overlap in found:
+            overlaps.setdefault((overlap_path(overlap), normalized(path)), overlap)
+    if not overlaps:
+        return None
+    return ownership_error(project_root, [overlaps[key] for key in sorted(overlaps)])
+
+
 def find_declared_overlap(
     path: pathlib.Path, outputs: Mapping[str, DeclaredOutput], project_root: pathlib.Path
 ) -> str | None:
@@ -474,12 +607,13 @@ def saved_input_warnings(
     stages: Mapping[str, RegistryStageInfo],
     workspace: WorkspaceStore,
     default_state_dir: pathlib.Path,
+    cache_dir: pathlib.Path,
 ) -> list[str]:
     """One warning per user sidecar already inside or beside an output these stages write.
 
-    A stage's own ``*.pvt`` members, as its lock or its ``nocommit:`` record lists them,
-    draw no warning. Both are read only for an output that holds a ``*.pvt``, so a project with
-    none pays one walk per directory output.
+    A stage's own ``*.pvt`` members (``stage_members``, with ``cache_dir`` the cache object
+    root) draw no warning. The stage's claims are read only for an output that holds a
+    ``*.pvt``, so a project with none pays one walk per directory output.
     """
     replacements = list[Replacement]()
     owners = dict[pathlib.Path, tuple[str, types.ArtifactIdentity, pathlib.Path]]()
@@ -493,11 +627,13 @@ def saved_input_warnings(
     def members_of(output_path: pathlib.Path) -> StageMembers:
         stage_name, identity, state_dir = owners[output_path]
         lock_data = lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).read()
-        recorded = None if lock_data is None else lock_data["output_hashes"].get(identity)
-        return merged_members(
-            recorded_members(output_path, recorded),
-            stored_no_commit_members(project_root, [(stage_name, state_dir)]),
+        locked = (
+            {output_path: lock_data["output_hashes"][identity]}
+            if lock_data is not None and identity in lock_data["output_hashes"]
+            else {}
         )
+        claims = read_stage_claims(project_root, stage_name, state_dir, locked, cache_dir=cache_dir)
+        return stage_members(output_path, claims)
 
     return [
         _warning(overlap, project_root)

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import shutil
+from typing import TYPE_CHECKING, cast
 
+import anyio.to_thread
 import pytest
 
 from conftest import isolated_pivot_dir
-from pivot import cli, project
+from pivot import cli, discovery, project
+from pivot.engine import agent_rpc
+from pivot.engine import engine as engine_mod
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
@@ -697,3 +701,96 @@ def test_restoring_a_tracked_directory_keeps_a_tracked_file_saved_inside_it(
     assert saved.is_file(), result.output
     assert saved.read_text() == "saved", result.output
     assert (saved.parent / "f.txt.pvt").is_file(), result.output
+
+
+_THREE_TREES_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def a() -> Annotated[dict[str, str], directory]:
+    return {"g.txt": "a"}
+
+
+@stage
+def m() -> Annotated[dict[str, str], directory]:
+    return {"g.txt": "m"}
+
+
+@stage
+def z() -> Annotated[dict[str, str], directory]:
+    return {"g.txt": "z"}
+
+
+with Pipeline("q") as pipeline:
+    a()
+    m()
+    z()
+"""
+
+
+def _helper_pending_runs_with_a_saved_file_in_the_middle(
+    runner: CliRunner, root: pathlib.Path
+) -> pathlib.Path:
+    """Stages q/a, q/m and q/z ran under `--no-commit`; a tracked file and its sidecar were then
+    copied into q/m's output. Returns the copied file."""
+    (root / "pipeline.py").write_text(_THREE_TREES_PIPELINE)
+    pending = runner.invoke(cli.cli, ["repro", "--no-commit"])
+    assert pending.exit_code == 0, pending.output
+    user = root / "data" / "raw" / "u.txt"
+    user.parent.mkdir(parents=True)
+    user.write_text("user bytes")
+    assert runner.invoke(cli.cli, ["track", "data/raw/u.txt"]).exit_code == 0
+    saved = root / "data" / "q" / "m" / "u.txt"
+    shutil.copy2(user, saved)
+    shutil.copy2(track.get_pvt_path(user), track.get_pvt_path(saved))
+    return saved
+
+
+def test_pivot_commit_reports_an_ownership_refusal_as_that_stages_failure(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """`pivot commit` refuses q/m, whose output holds a user's tracked file, and goes on: q/a and
+    q/z are committed and listed, q/m is listed as failed with the refusal naming the sidecar,
+    the command exits 1, and the file and its sidecar are kept."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        saved = _helper_pending_runs_with_a_saved_file_in_the_middle(runner, root)
+
+        result = runner.invoke(cli.cli, ["commit"])
+
+        output = " ".join(result.output.split())
+        assert result.exit_code == 1, result.output
+        assert "Committed 2 stage(s): q/a q/z" in output, result.output
+        assert "Failed 1 stage(s): q/m" in output, result.output
+        assert "sidecar 'data/q/m/u.txt.pvt'" in output, result.output
+        stages = root / ".pivot" / "stages" / "q"
+        assert sorted(path.name for path in stages.glob("*.lock")) == ["a.lock", "z.lock"]
+        assert saved.read_text() == "user bytes"
+        assert track.get_pvt_path(saved).is_file()
+
+
+@pytest.mark.anyio
+async def test_rpc_commit_returns_an_ownership_refusal_as_that_stages_failure(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """The RPC `commit` returns its full result when one stage is refused: q/a and q/z
+    committed, q/m failed, never an error in place of that result."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        # The CLI runs its own event loop, so it is set up outside this test's loop
+        saved = await anyio.to_thread.run_sync(
+            _helper_pending_runs_with_a_saved_file_in_the_middle, runner, root
+        )
+        pipeline = discovery.discover_pipeline(root)
+        assert pipeline is not None
+
+        async with engine_mod.Engine(pipeline=pipeline) as engine:
+            result = cast(
+                "agent_rpc.CommitResult",
+                await agent_rpc.AgentRpcHandler(engine=engine).handle_query("commit"),
+            )
+
+        assert result == agent_rpc.CommitResult(committed=["q/a", "q/z"], failed=["q/m"])
+        assert saved.read_text() == "user bytes"
+        assert track.get_pvt_path(saved).is_file()

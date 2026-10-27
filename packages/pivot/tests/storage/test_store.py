@@ -162,7 +162,7 @@ def test_workspace_store_restore_records_pvt_members_before_writing_them(
     notes.write_text("stage notes")
     (output_path / "value.txt").write_text("v")
     output_hash = workspace_store.commit(
-        ref, output_path, members={ownership.normalized(notes): None}
+        ref, output_path, written={ownership.normalized(notes): frozenset[str]()}
     )
     cache.remove_output(output_path)
     recorded = list[dict[pathlib.Path, str]]()
@@ -171,7 +171,8 @@ def test_workspace_store_restore_records_pvt_members_before_writing_them(
         assert not output_path.exists()
         recorded.append(dict(members))
 
-    assert workspace_store.restore_from_cache(ref, output_hash, record_members=record) is True
+    claims = ownership.StageClaims(locked={}, no_commit={}, recorder=record, cache_dir=None)
+    assert workspace_store.restore_from_cache(ref, output_hash, claims=claims) is True
 
     assert recorded == [{ownership.normalized(notes): cache.hash_file(notes)[0]}]
     assert notes.read_text() == "stage notes"

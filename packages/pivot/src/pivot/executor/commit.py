@@ -12,7 +12,7 @@ import pathlib
 
 from pivot import config, exceptions, parameters, project, registry, run_history, skip, types
 from pivot.executor import worker
-from pivot.storage import lock, ownership
+from pivot.storage import lock
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import ArtifactTag, DeferredWrites, HashInfo, LockData
@@ -139,8 +139,12 @@ def commit_stages(
             # The stage's own *.pvt files are the ones its lock or its nocommit: record lists.
             # Every other *.pvt in an output is a user's: the commit refuses before it would
             # claim one, so a later run cannot delete it as the stage's.
-            run_members = ownership.no_commit_members(
-                project_root, stage_db.get_no_commit_record(stage_name)
+            claims = worker.stage_claims(
+                store,
+                stage_outs,
+                previous_lock,
+                stage_db.get_no_commit_record(stage_name),
+                project_root,
             )
 
             # 5. If not force and no explicit stages, check lock — skip if unchanged
@@ -170,15 +174,7 @@ def commit_stages(
                         out_path,
                         state_dir=default_state_dir,
                         warn_left_out_symlinks=warn_left_out_symlinks,
-                        members=ownership.merged_members(
-                            ownership.recorded_members(
-                                out_path,
-                                previous_lock["output_hashes"].get(out.identity)
-                                if previous_lock is not None
-                                else None,
-                            ),
-                            run_members,
-                        ),
+                        claims=claims,
                     )
                     file_hash_entries.extend(worker.output_file_hash_entries(out_path, hash_info))
                     output_hashes_by_key[identity_key] = hash_info
@@ -198,6 +194,12 @@ def commit_stages(
                         stage_name,
                         identity_key,
                     )
+                    outputs_missing = True
+                    break
+                except exceptions.OutputOwnershipError as exc:
+                    # This stage's failure alone: the stages before it stay committed, and the
+                    # ones after it are still tried
+                    logger.error("Stage '%s': %s", stage_name, exc)
                     outputs_missing = True
                     break
 

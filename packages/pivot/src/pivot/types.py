@@ -154,9 +154,9 @@ class NoCommitRecord(TypedDict, total=False):
     records yet. A written lock removes the whole record.
 
     The record is shared, and every key is optional. Each writer owns its keys and keeps every
-    other key as stored (a read-modify-write in one write transaction); each reader checks only
-    its own keys and tolerates the absence of the others, so a record holding only another
-    writer's keys still reads as present.
+    other key as stored (a read-modify-write in one write transaction). The reader
+    (`StateDB.get_no_commit_record`) checks all three keys, each on its own: a malformed one is
+    left out and never hides another, and a record holding none of them still reads as present.
 
     `pvt_members` maps each `*.pvt` file Pivot wrote in a directory output (path relative to the
     project root) to its content hash. Every path that writes one adds it before the file exists:

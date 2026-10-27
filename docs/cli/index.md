@@ -250,7 +250,8 @@ A `.pvt` file inside an output is the stage's only when the stage's lock lists i
 Pivot recorded it there before writing it (a `pivot repro` run, `--no-commit` included, or
 `pivot get` of the stage) and it is unchanged since. `pivot commit` refuses, naming it, any
 other `.pvt` in an output, such as a user's sidecar or one this version of Pivot cannot read,
-instead of recording it as the stage's output.
+instead of recording it as the stage's output. A refusal fails that stage alone: the command
+still commits the other stages, lists the refused one under `Failed`, and exits 1.
 
 **Options:**
 
@@ -428,14 +429,17 @@ outside the output (for example under `data/raw/`). The check finds a sidecar be
 where Pivot writes it; a hand-edited `.pvt` elsewhere whose `path` points into an output is not
 protected.
 
-A stage may return a directory member named `*.pvt`. Pivot treats such a file as the stage's
+A stage may write a `*.pvt` file in a directory output: a member of a `directory` output, or a
+file inside a directory a `PathOnly` output returns. Pivot treats such a file as the stage's
 when the stage's lock records it at that path, or Pivot recorded it there before writing it and
 it is unchanged since. A run, a run-cache restore (also under `pivot repro --no-commit`) and
-`pivot get` of a stage record each such member before they write it; `pivot checkout` and
-`pivot pull` restore only what the lock records. Every other `.pvt` under an output is a user's
-sidecar, which a `.pvt` this version of Pivot cannot read may be. `pivot commit` claims no other
-`.pvt`: it refuses, naming the file, rather than record it as the stage's output, after which the
-next run would delete it.
+`pivot get` of a stage record each such file before they write it; `pivot checkout` and
+`pivot pull` restore only what the lock records. After the lock changes through git (for
+example `git checkout` of an older commit), a file at a path the lock records whose content is
+in the cache is the stage's too: the stage wrote it in a run Pivot cached. Every other `.pvt`
+under an output is a user's sidecar, which a `.pvt` this version of Pivot cannot read may be.
+`pivot commit` claims no other `.pvt`: it refuses, naming the file, rather than record it as the
+stage's output, after which the next run would delete it.
 
 ---
 
@@ -469,9 +473,12 @@ file, import or `.pvt` sidecar beneath it. A target that names a stage restores 
 outputs, so a tracked file or sidecar at one of their paths refuses it too. Only `--force` and an
 `--only-missing` directory swap replace an existing path. `--force` checks every target before it
 changes any: if it refuses one, it changes nothing and exits 1, naming every refused target and
-the files that block it. `pivot pull --force` restores the same way. An `--only-missing` swap is
-checked when it is decided. A directory inside an output that Pivot cannot read refuses the
-restore too, naming that directory: a tracked file may hide inside where Pivot cannot look.
+the files that block it. It then checks each target again just before it replaces it, so a
+tracked file and sidecar copied into an output while the command runs refuse that target alone,
+named, and the command exits 1 with the file kept. `pivot pull --force` restores the same way.
+An `--only-missing` swap is checked when it is decided. A directory inside an output that Pivot
+cannot read refuses the restore too, naming that directory: a tracked file may hide inside where
+Pivot cannot look.
 
 ---
 
@@ -499,7 +506,7 @@ pivot get TARGETS... --rev REVISION [OPTIONS]
 | `--remote NAME` | Remote name (uses default if not specified). An unknown name fails before anything is restored |
 | `--output` / `-o PATH` | Output path (single file only) |
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
-| `--force` / `-f` | Overwrite existing files. Refuses, before changing anything, when a replaced path holds another user's file: a stage output or an `--output` path that holds a tracked file or `.pvt` sidecar, or a tracked path that holds another tracked file, import or `.pvt` sidecar beneath it. A tracked file restored over a file is always overwritten |
+| `--force` / `-f` | Overwrite existing files. Refuses, before changing anything, when a replaced path holds another user's file: a stage output or an `--output` path that holds a tracked file or `.pvt` sidecar, or a tracked path that holds another tracked file, import or `.pvt` sidecar beneath it. Each target is checked again just before it is replaced: one that a user's file entered meanwhile fails alone, named, and the others are still restored. A target whose `.pvt` is not valid is only reported, so it refuses nothing. A tracked file restored over a file is always overwritten |
 
 A downloaded cache object has no executable bit, so an executable file in a directory output cannot be hard-linked or symlinked to it. With a mode order that has no `copy` (`--checkout-mode hardlink` or `symlink`, or a `cache.checkout_mode` without `copy`), that output fails with an error naming the file. The default order, hardlink, symlink, copy, ends with `copy`, which restores the bit.
 

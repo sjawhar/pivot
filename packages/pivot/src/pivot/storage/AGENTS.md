@@ -35,7 +35,7 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 | `remote:` | Remote index entries |
 | `remote_url:` | Remote URL tracking for change detection |
 | `fp:` | AST fingerprint/hash cache entries |
-| `nocommit:` | A stage's shared record of what Pivot wrote for it that no lock records yet (`stage` → JSON object: `pvt_members`, its `*.pvt` directory members, path → content hash, each added before the file is written; a `--no-commit` run's `code_manifest` and `output_hashes`). Every key is optional: each writer sets only its own keys and keeps the rest in one write transaction, and each reader checks only its own keys, so a record holding only another writer's keys reads as present. A written lock removes it |
+| `nocommit:` | A stage's shared record of what Pivot wrote for it that no lock records yet (`stage` → JSON object: `pvt_members`, its `*.pvt` directory members, path → content hash, each added before the file is written; a `--no-commit` run's `code_manifest` and `output_hashes`). Every key is optional: each writer sets only its own keys and keeps the rest in one write transaction. The reader checks all three keys, each on its own: a malformed one is left out and never hides another, and a record holding none of them reads as present. A written lock removes it |
 
 **When adding new state types**, define a new prefix constant and document it here.
 
@@ -140,11 +140,16 @@ When multiple `pivot` processes share the same StateDB:
   (a stage-name target of `checkout` or `pull`, a stage output under `--all`) is that stage's
   output restore whatever else the path is (`checkout._validate_and_build_files`), so a tracked
   file, sidecar or import at or beneath it refuses it.
-- A command checks every target before it changes any, and if it refuses one it changes nothing:
-  `get --force` (`restore._refuse_forced_replacements`) and `checkout --force` and `pull --force`
-  (`checkout._ownership_refusal`, which checks each target on its own so the refusal names every
-  refused target and the files that block it). An `--only-missing` swap is checked in
-  `_restore_path_locked`, under the restore lock, once the swap is decided; default checkout and
+- Every forced restore makes one decision, `ownership.forced_restore_refusal`, over targets built
+  once per command (`checkout._restore_targets` for `checkout` and `pull`,
+  `restore._restore_targets` for `get`; a `get` target whose `.pvt` is not valid is only reported,
+  never replaced, so it is not a target). The command checks every target before it changes any,
+  and if it refuses one it changes nothing; each target is checked on its own, so the refusal
+  names every refused target and the files that block it. Then each target is checked again,
+  under its restore lock, just before it is replaced (`checkout._restore_path_locked`,
+  `restore._replace_checked`): a user file that appeared since the first check refuses that
+  target alone, naming it, and the command exits 1. Only a path that exists is checked. An
+  `--only-missing` swap is checked there too, once the swap is decided; default checkout and
   `--only-missing` without a swap replace nothing.
 - The check looks only where a replacement reaches: for a stage output or destination, the
   sidecar beside it and beside each directory above it (one that does not parse counts; one that
@@ -155,27 +160,36 @@ When multiple `pivot` processes share the same StateDB:
 - A directory under a replacement that Pivot cannot read is a blocking overlap
   (`ownership.UnreadableOverlap`): `os.walk` reports it through `onerror`, and Pivot refuses,
   naming it, rather than skip it, because a tracked file may hide inside where it cannot look.
-- A stage may return a directory member named `*.pvt`. One is the stage's own when the stage
-  records it (`ownership.StageMembers`): the lock's output hash, the hash a restore writes, this
-  run's return value, or the stage's `nocommit:<stage>` record (`ownership.no_commit_members`, a
-  file counted only while it holds the recorded content, since the record outlives a write the
-  lock's outputs later replace). At a recorded path, a `.pvt` that does not parse is the stage's,
-  and one that parses is the stage's only if its content is a recorded one; a `.pvt` at any other
-  path is the user's. `pivot commit` passes the members the lock and the record list and nothing
-  else, so it refuses, naming it, a `.pvt` that does not parse at any other path: were it to
-  claim that file, the lock would list it and the next forced run would delete it. `status` and
-  the engine read the lock and the record for this only when an output holds a `*.pvt`.
+- A stage may write a `*.pvt` file in a directory output: a `directory` output's key, or a file
+  inside a directory a `PathOnly` output returns. One is the stage's own when the stage records it
+  at that path, by the one rule `ownership.stage_members` (every write, restore, commit, warning
+  and forced restore uses it): the hash the stage's lock records for the output, the hash a
+  restore writes, what this run writes, or the stage's `nocommit:<stage>` record (a file counted
+  only while it holds the recorded content, since the record outlives a write the lock's outputs
+  later replace). The claims are read once per run or command (`ownership.StageClaims`). Whether
+  an output is a directory is read from those hashes and from what the run writes, never from its
+  tag. At a recorded path, a `.pvt` that does not parse is the stage's, and one that parses is
+  the stage's only if its content is a recorded one, or, at a path the lock or the restored hash
+  lists, a content Pivot holds in the cache (a lock that changed through git lists another run's
+  content there; replacing a cached file loses nothing the cache cannot restore). A `.pvt` at any
+  other path is the user's. `pivot commit` passes the claims and nothing else, so it refuses,
+  naming it, a `.pvt` that does not parse at any other path: were it to claim that file, the lock
+  would list it and the next forced run would delete it. A refusal fails that stage alone; the
+  other stages are still committed. `status` and the engine read the claims only when an output
+  holds a `*.pvt`.
 - Pivot never writes a stage's `*.pvt` member into the workspace before it is recorded as the
   stage's (`ownership.record_members` adds it to the `nocommit:` record), so a crash leaves at
-  worst a record without a file. A run (`--no-commit` included) writes each member under a name
-  that is not a `*.pvt`, records its content, then renames it into place
-  (`worker._write_output_with_store`); a run-cache restore records before
-  `WorkspaceStore.restore_from_cache` writes (`record_members`); `pivot get` of a stage records in
-  `restore.restore_file`. Generation and lock restores, incremental restores, `checkout` and
-  `pull` write only what the lock records. These writes only add to the record
-  (`StateDB.add_no_commit_pvt_members` merges and keeps every other field); only a written lock
-  removes it (`clear_no_commit_record`, from a run without `--no-commit` or `pivot commit`). An
-  entry whose file a later write replaced claims nothing, by the content check above.
+  worst a record without a file. A run (`--no-commit` included) writes each output entry that
+  brings one (a `*.pvt` key, a `PathOnly` directory holding one) under a name that is not a
+  `*.pvt`, records the content of each `*.pvt` in it, then renames it into place
+  (`worker._save_recorded`). A restore records the members of the hash it writes unless the
+  stage's lock records that hash (`ownership.record_restored`): a run-cache restore in
+  `WorkspaceStore.restore_from_cache`, `pivot get` of a stage in `restore.restore_file`.
+  Generation and lock restores, incremental restores, `checkout` and `pull` write only what the
+  lock records. These writes only add to the record (`StateDB.add_no_commit_pvt_members` merges
+  and keeps every other field); only a written lock removes it (`clear_no_commit_record`, from a
+  run without `--no-commit` or `pivot commit`). An entry whose file a later write replaced claims
+  nothing, by the content check above.
 - A worker writes the StateDB itself in exactly two cases, both only for a stage whose directory
   output holds a `*.pvt` member: before it renames a member it wrote into place, and before a
   run-cache restore writes one. Every other worker write goes through `DeferredWrites`. The
@@ -185,10 +199,13 @@ When multiple `pivot` processes share the same StateDB:
   database is full or read-only, it cannot be opened), `record_members` raises
   `MemberRecordError` naming the stage and the reason, nothing is moved into place, the staged
   copy is removed, and the stage fails.
-- The check runs when a command starts replacing an output, not again just before each removal,
-  for a restore, a symlink-mode commit, checkout, `get --force` and presentation; a sidecar created
-  inside an output during that window is not seen. That is acceptable because `track` and
-  `import` refuse to create a sidecar inside an output, so only a hand-made file can appear there.
+- A forced restore checks each target just before it replaces it, so the window in which a
+  sidecar created inside a target is not seen is that one target's own restore (building the
+  replacement from the cache, then the swap), not the whole command. Every other replacement
+  (a stage's write, a restore in a run, a symlink-mode commit, presentation) is checked when it
+  starts replacing that output, with the same window for that output. `track` and `import`
+  refuse to create a sidecar inside an output, so only a file copied or made by hand can appear
+  there during it.
 - `track` and `import` load every pipeline (`discovery.declared_outputs`, as `--all` discovers
   them) and refuse a new path overlapping any declared output, naming the stage. A `pipeline.py`
   that fails to load fails them; one that loads but defines no Pivot pipeline declares nothing. A

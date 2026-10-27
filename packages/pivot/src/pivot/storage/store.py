@@ -18,7 +18,12 @@ if TYPE_CHECKING:
 class Store(Protocol):
     def checkout(self, ref: types.ArtifactRef) -> pathlib.Path: ...
 
-    def prepare_output(self, ref: types.ArtifactRef) -> pathlib.Path: ...
+    def prepare_output(
+        self,
+        ref: types.ArtifactRef,
+        claims: ownership.StageClaims | None = None,
+        returned: ownership.StageMembers | None = None,
+    ) -> pathlib.Path: ...
 
     def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> types.HashInfo: ...
 
@@ -76,7 +81,15 @@ class CacheStore:
             raise FileNotFoundError(cache_path)
         return cache_path
 
-    def prepare_output(self, ref: types.ArtifactRef) -> pathlib.Path:
+    def prepare_output(
+        self,
+        ref: types.ArtifactRef,
+        claims: ownership.StageClaims | None = None,
+        returned: ownership.StageMembers | None = None,
+    ) -> pathlib.Path:
+        """A fresh path in the cache for the output. Nothing in the workspace is replaced, so
+        ``claims`` and ``returned`` (the stage's ``*.pvt`` files there) do not apply."""
+        _ = claims, returned
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         if ref.tag == types.ArtifactTag.DIRECTORY:
             return pathlib.Path(tempfile.mkdtemp(prefix="pivot_cache_out_", dir=self._cache_dir))
@@ -206,28 +219,38 @@ class WorkspaceStore:
     def refuse_output_replacements(
         self,
         refs: Iterable[types.ArtifactRef],
-        members: Mapping[types.ArtifactRef, ownership.StageMembers] | None = None,
+        claims: ownership.StageClaims | None = None,
+        returned: Mapping[types.ArtifactRef, ownership.StageMembers] | None = None,
     ) -> None:
         """Fail before replacing these outputs removes a user's tracked path or `.pvt` sidecar.
 
-        ``members`` gives each output's ``*.pvt`` files that are the stage's own
-        (``ownership.find_output_overlaps``).
+        Each output's own ``*.pvt`` files are ``ownership.stage_members`` of ``claims`` (the
+        stage's) and of what this run writes there (``returned``).
         """
         replacements = list[ownership.Replacement]()
-        members_by_path = dict[pathlib.Path, ownership.StageMembers]()
+        written = dict[pathlib.Path, ownership.StageMembers]()
         for ref in refs:
             path = ownership.normalized(self._resolve_output_path(ref))
             replacements.append(ownership.stage_output(path, ref.identity.producer))
-            if members is not None and ref in members:
-                members_by_path[path] = members[ref]
+            if returned is not None and ref in returned:
+                written[path] = returned[ref]
         ownership.refuse_output_replacements(
-            self._project_root, replacements, lambda path: members_by_path.get(path, {})
+            self._project_root,
+            replacements,
+            lambda path: ownership.stage_members(path, claims, returned=written.get(path)),
         )
 
     def prepare_output(
-        self, ref: types.ArtifactRef, *, members: ownership.StageMembers | None = None
+        self,
+        ref: types.ArtifactRef,
+        claims: ownership.StageClaims | None = None,
+        returned: ownership.StageMembers | None = None,
     ) -> pathlib.Path:
-        self.refuse_output_replacements([ref], None if members is None else {ref: members})
+        """Clear the output's path for the stage to write, refusing first if that would remove
+        a user's file (``refuse_output_replacements``)."""
+        self.refuse_output_replacements(
+            [ref], claims, None if returned is None else {ref: returned}
+        )
         path = self._resolve_path(ref)
         if ref.tag == types.ArtifactTag.DIRECTORY:
             cache.remove_output(path)
@@ -244,14 +267,16 @@ class WorkspaceStore:
         *,
         state_dir: pathlib.Path | None = None,
         warn_left_out_symlinks: bool = True,
-        members: ownership.StageMembers | None = None,
+        claims: ownership.StageClaims | None = None,
+        written: ownership.StageMembers | None = None,
     ) -> types.HashInfo:
         """Hash a written output once and, unless it is a metric, place it in the cache.
 
         ``warn_left_out_symlinks`` logs the warning naming the symlinks a directory output
-        leaves out; a quiet command turns it off. ``members`` are the stage's own ``*.pvt``
-        files in the output; every other ``*.pvt`` there is a user's, and the commit refuses
-        before linking the output to the cache would replace it.
+        leaves out; a quiet command turns it off. The stage's own ``*.pvt`` files in the output
+        are ``ownership.stage_members`` of ``claims`` and of the ones this run wrote there
+        (``written``); every other ``*.pvt`` there is a user's, and the commit refuses before
+        linking the output to the cache would replace it.
         """
         output_hash: types.HashInfo
         if path.is_dir():
@@ -266,7 +291,9 @@ class WorkspaceStore:
             output_hash = types.FileHash(hash=file_hash)
         if self._cache_dir is not None and ref.tag is not types.ArtifactTag.METRIC:
             # Linking to the cache replaces each workspace file (symlink mode: the directory)
-            self.refuse_output_replacements([ref], None if members is None else {ref: members})
+            self.refuse_output_replacements(
+                [ref], claims, None if written is None else {ref: written}
+            )
             cache.store_hashed_output(
                 path,
                 output_hash,
@@ -283,30 +310,27 @@ class WorkspaceStore:
         *,
         state_dir: pathlib.Path | None = None,
         checkout_modes: list[config.CheckoutMode] | None = None,
-        recorded_hash: types.HashInfo | None = None,
-        no_commit_members: ownership.StageMembers | None = None,
-        record_members: ownership.MemberRecorder | None = None,
+        claims: ownership.StageClaims | None = None,
     ) -> bool:
         """Restore an output to ``output_hash``, refusing first if that would remove a user file.
 
-        ``recorded_hash`` is the hash the stage's lock records now, when it differs from the
-        restored one (a run-cache restore), and ``no_commit_members`` the ``*.pvt`` files the
-        stage's ``nocommit:`` record lists: members any of them records are the stage's.
-        ``record_members`` records the ``*.pvt`` members ``output_hash`` writes, after the check
-        and before the restore, for a hash no lock records.
+        The stage's own ``*.pvt`` files are ``ownership.stage_members`` of ``claims`` and the
+        restored hash. ``ownership.record_restored`` then records the ones ``output_hash`` writes
+        that the stage's lock does not list, before the restore writes them.
         """
         if self._cache_dir is None:
             return False
         if ref.tag is types.ArtifactTag.METRIC:
             return False
         output_path = self._resolve_output_path(ref)
-        members = ownership.merged_members(
-            ownership.recorded_members(output_path, output_hash, recorded_hash),
-            no_commit_members or {},
+        ownership.refuse_output_replacements(
+            self._project_root,
+            [ownership.stage_output(ownership.normalized(output_path), ref.identity.producer)],
+            lambda path: ownership.stage_members(path, claims, restored=output_hash),
         )
-        self.refuse_output_replacements([ref], {ref: members})
-        if record_members is not None:
-            record_members(ownership.member_hashes(output_path, output_hash))
+        if claims is not None:
+            stage_claims = claims
+            ownership.record_restored(lambda: stage_claims, output_path, output_hash)
         return cache.restore_from_cache(
             output_path,
             output_hash,

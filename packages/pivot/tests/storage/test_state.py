@@ -1111,26 +1111,48 @@ def test_unreadable_no_commit_record_reads_as_none(tmp_path: pathlib.Path, store
 
 
 _RUN_FIELDS = {"code_manifest": {"func:tree": "a1b2"}, "output_hashes": {"b/tree": "c3d4"}}
+_MEMBERS = {"pvt_members": {"data/s/a.pvt": "aaa"}}
 
 
 @pytest.mark.parametrize(
     ("stored", "expected"),
     [
-        pytest.param(b'{"pvt_members": {"data/s/a.pvt": 1}}', {}, id="hash-not-a-string"),
-        pytest.param(b'{"pvt_members": ["data/s/a.pvt"]}', {}, id="members-not-a-mapping"),
+        pytest.param({"pvt_members": {"data/s/a.pvt": 1}}, {}, id="hash-not-a-string"),
+        pytest.param({"pvt_members": ["data/s/a.pvt"]}, {}, id="members-not-a-mapping"),
         pytest.param(
-            json.dumps({**_RUN_FIELDS, "pvt_members": ["data/s/a.pvt"]}).encode(),
+            {**_RUN_FIELDS, "pvt_members": ["data/s/a.pvt"]},
             _RUN_FIELDS,
-            id="beside-run-fields",
+            id="members-malformed-run-fields-valid",
+        ),
+        pytest.param(
+            {"code_manifest": "a1b2", "output_hashes": {"b/tree": 3}, **_MEMBERS},
+            _MEMBERS,
+            id="run-fields-malformed-members-valid",
+        ),
+        pytest.param(
+            {"code_manifest": ["func:tree"], "output_hashes": _RUN_FIELDS["output_hashes"]},
+            {"output_hashes": _RUN_FIELDS["output_hashes"]},
+            id="code-manifest-malformed",
+        ),
+        pytest.param(
+            {"code_manifest": _RUN_FIELDS["code_manifest"], "output_hashes": None, **_MEMBERS},
+            {"code_manifest": _RUN_FIELDS["code_manifest"], **_MEMBERS},
+            id="output-hashes-malformed",
+        ),
+        pytest.param(
+            {"later_key": [1], "pvt_members": 5},
+            {"later_key": [1]},
+            id="other-key-kept-as-stored",
         ),
     ],
 )
-def test_malformed_pvt_members_are_left_out_of_a_record_that_still_reads(
-    tmp_path: pathlib.Path, stored: bytes, expected: dict[str, object]
+def test_each_malformed_field_is_left_out_and_hides_no_other(
+    tmp_path: pathlib.Path, stored: dict[str, object], expected: dict[str, object]
 ) -> None:
-    """The reader checks only `pvt_members`: a malformed value lists no member, so nothing is
-    claimed through it, and the record's other keys still read, unchanged."""
-    _helper_store_no_commit_record(tmp_path, stored)
+    """The reader checks `code_manifest`, `output_hashes` and `pvt_members` each on its own: a
+    malformed one is left out (a malformed `pvt_members` lists no member, so nothing is claimed
+    through it), every valid one still reads, and any other key is returned as stored."""
+    _helper_store_no_commit_record(tmp_path, json.dumps(stored).encode())
 
     with state.StateDB(tmp_path, readonly=True) as db:
         assert db.get_no_commit_record("s") == expected

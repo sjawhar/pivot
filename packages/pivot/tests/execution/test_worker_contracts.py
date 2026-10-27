@@ -1650,7 +1650,7 @@ def test_output_write_records_a_pvt_member_before_the_file_exists(tmp_path: path
         {tree: {"notes.pvt": "stage notes", "value.txt": "v"}},
         store,
         tmp_path,
-        record_members=record,
+        claims=ownership.StageClaims(locked={}, no_commit={}, recorder=record, cache_dir=None),
     )
 
     assert written["paths"][tree] == output_path
@@ -1698,8 +1698,13 @@ def test_output_write_that_cannot_record_a_pvt_member_leaves_no_member(
             {tree: {"notes.pvt": "stage notes", "value.txt": "v"}},
             store,
             tmp_path,
-            record_members=functools.partial(
-                ownership.record_members, tmp_path, tmp_path / ".pivot", _STAGE
+            claims=ownership.StageClaims(
+                locked={},
+                no_commit={},
+                cache_dir=None,
+                recorder=functools.partial(
+                    ownership.record_members, tmp_path, tmp_path / ".pivot", _STAGE
+                ),
             ),
         )
 

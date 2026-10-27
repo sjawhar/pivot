@@ -220,9 +220,7 @@ class _EvictedCacheStore(store_mod.WorkspaceStore):
         *,
         state_dir: pathlib.Path | None = None,
         checkout_modes: list[cache.CheckoutMode] | None = None,
-        recorded_hash: types.HashInfo | None = None,
-        no_commit_members: ownership.StageMembers | None = None,
-        record_members: ownership.MemberRecorder | None = None,
+        claims: ownership.StageClaims | None = None,
     ) -> bool:
         return False
 

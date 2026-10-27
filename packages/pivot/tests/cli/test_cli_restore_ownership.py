@@ -2,25 +2,28 @@
 
 A restore requested through a stage is that stage's output restore, whatever else the path is.
 Pivot records a stage's `*.pvt` member as the stage's before it writes the file, on every path
-that writes one. A forced checkout checks every target before it changes any.
+that writes one. A forced checkout checks every target before it changes any, and checks each
+target again just before it replaces it.
 """
 
 from __future__ import annotations
 
 import contextlib
+import pathlib
+import shutil
 import stat
-from typing import TYPE_CHECKING
+import subprocess
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from conftest import isolated_pivot_dir
 from pivot import cli, project, types
+from pivot.cli import checkout as checkout_mod
 from pivot.remote import storage as remote_storage
-from pivot.storage import track
+from pivot.storage import cache, track
 
 if TYPE_CHECKING:
-    import pathlib
-
     from click.testing import CliRunner
     from pytest_mock import MockerFixture
 
@@ -373,3 +376,286 @@ def test_forced_checkout_all_leaves_a_sibling_untouched_when_a_directory_is_unre
         assert tracked.read_text() == "user secret bytes"
         assert track.get_pvt_path(tracked).is_file()
         assert raw.read_text() == "local edit", result.output
+
+
+_TWO_TREES_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def one() -> Annotated[dict[str, str], directory]:
+    return {"g.txt": "one"}
+
+
+@stage
+def two() -> Annotated[dict[str, str], directory]:
+    return {"g.txt": "two"}
+
+
+with Pipeline("b") as pipeline:
+    one()
+    two()
+"""
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(["checkout", "--force"], id="checkout-force"),
+        pytest.param(["checkout", "--all", "--force"], id="checkout-all-force"),
+        pytest.param(["pull", "--force"], id="pull-force"),
+        pytest.param(["get", "--rev", "HEAD", "b/one", "b/two", "--force"], id="get-force"),
+    ],
+)
+def test_forced_restore_keeps_a_tracked_file_that_lands_in_an_output_while_it_runs(
+    runner: CliRunner,
+    git_repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    command: list[str],
+) -> None:
+    """A tracked file and its sidecar are copied into one output after the command checked every
+    target, while it restores the other output. The restore checks each target again, under its
+    restore lock, just before it replaces it: it refuses that target, names the sidecar, exits 1
+    and keeps both files. The other output is still restored."""
+    repo_path, commit = git_repo
+    (repo_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.chdir(repo_path)
+    (repo_path / "pipeline.py").write_text(_TWO_TREES_PIPELINE)
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+    user = repo_path / "data" / "raw" / "u.txt"
+    user.parent.mkdir(parents=True)
+    user.write_text("user bytes")
+    assert runner.invoke(cli.cli, ["track", "data/raw/u.txt"]).exit_code == 0
+    user_sidecar = track.get_pvt_path(user).read_bytes()
+    commit("two trees")
+    outputs = [(repo_path / "data" / "b" / name).resolve() for name in ("one", "two")]
+    mocker.patch(
+        "pivot.remote.sync.create_remote_from_name",
+        return_value=(mocker.Mock(spec=remote_storage.S3Remote), "origin"),
+    )
+    mocker.patch(
+        "pivot.remote.sync.pull",
+        return_value=types.TransferSummary(transferred=0, skipped=0, failed=0, errors=[]),
+    )
+    # One restore at a time, so the second output's restore starts after the first one's
+    monkeypatch.setattr(checkout_mod, "MAX_CONCURRENT_RESTORES", 1)
+    landed = list[pathlib.Path]()
+    restore_from_cache = cache.restore_from_cache
+
+    def restore_while_a_file_lands(path: pathlib.Path, *args: Any, **kwargs: Any) -> bool:
+        if not landed and path.resolve() in outputs:
+            other = outputs[1] if path.resolve() == outputs[0] else outputs[0]
+            shutil.copy2(user, other / "u.txt")
+            shutil.copy2(track.get_pvt_path(user), other / "u.txt.pvt")
+            landed.append(other)
+        return restore_from_cache(path, *args, **kwargs)
+
+    monkeypatch.setattr(cache, "restore_from_cache", restore_while_a_file_lands)
+
+    result = runner.invoke(cli.cli, command)
+
+    assert landed, result.output
+    other = landed[0]
+    assert (other / "u.txt").read_text() == "user bytes", result.output
+    assert (other / "u.txt.pvt").read_bytes() == user_sidecar
+    assert result.exit_code != 0, result.output
+    assert f"data/b/{other.name}/u.txt.pvt" in " ".join(result.output.split())
+    restored = outputs[0] if other == outputs[1] else outputs[1]
+    assert (restored / "g.txt").read_text() == restored.name
+
+
+_PATH_ONLY_DIRECTORY_PIPELINE = """\
+import pathlib
+import tempfile
+from typing import Annotated
+
+from pivot import Pipeline, loaders, stage
+
+NOTES = {notes!r}
+
+
+@stage
+def build() -> Annotated[pathlib.Path, loaders.PathOnly()]:
+    out = pathlib.Path(tempfile.mkdtemp()) / "build"
+    (out / "sub").mkdir(parents=True)
+    (out / "a.txt").write_text("a")
+    (out / "sub" / "a.txt").write_text("a")
+    (out / "notes.pvt").write_text(NOTES)
+    (out / "sub" / "deep.pvt").write_text(NOTES)
+    return out
+
+
+with Pipeline("p") as pipeline:
+    build()
+"""
+
+
+@pytest.mark.parametrize(
+    "notes",
+    [
+        pytest.param("ordinary stage output", id="not-a-sidecar"),
+        pytest.param("path: a.txt\nhash: 0123456789abcdef\nsize: 1\n", id="parses-as-sidecar"),
+    ],
+)
+def test_path_only_directory_output_holding_its_own_pvt_files_runs_as_at_main(
+    runner: CliRunner, tmp_path: pathlib.Path, notes: str
+) -> None:
+    """A stage returns a directory it built outside the project (`PathOnly`, the documented
+    directory artifact), holding its own `*.pvt` files. They are the stage's, whatever the
+    output's tag: `repro`, `repro --force`, `status`, `repro --force --no-commit` with
+    `commit`, and `checkout <stage> --force` all succeed and keep them, as at main."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_PATH_ONLY_DIRECTORY_PIPELINE.format(notes=notes))
+
+        results = [
+            runner.invoke(cli.cli, command)
+            for command in (
+                ["repro"],
+                ["repro", "--force"],
+                ["status"],
+                ["repro", "--force", "--no-commit"],
+                ["commit", "p/build"],
+                ["checkout", "p/build", "--force"],
+            )
+        ]
+
+        for result in results:
+            assert result.exit_code == 0, result.output
+            assert "Refusing" not in result.output, result.output
+            assert "Warning:" not in result.output, result.output
+        (output,) = (root / "data" / "p").glob("build*")
+        assert (output / "notes.pvt").read_text() == notes
+        assert (output / "sub" / "deep.pvt").read_text() == notes
+
+
+_SIDECAR_SHAPED_MEMBER_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, StageParams, directory, stage
+
+
+class TreeParams(StageParams):
+    n: int = 1
+
+
+@stage
+def tree(params: TreeParams) -> Annotated[dict[str, str], directory]:
+    return {
+        "value.txt": str(params.n),
+        "fake.pvt": f"path: value.txt\\nhash: abcdef{params.n:010x}\\nsize: 1\\n",
+    }
+
+
+with Pipeline("b") as pipeline:
+    tree(params=TreeParams())
+"""
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(["checkout", "b/tree", "--force"], id="checkout-force"),
+        pytest.param(["repro"], id="repro"),
+    ],
+)
+def test_stage_sidecar_shaped_member_stays_the_stages_after_its_lock_changes_through_git(
+    runner: CliRunner, git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """A stage writes `fake.pvt`, which parses as a sidecar. The user checks out an older lock
+    from git: it lists `fake.pvt` with the older content, and the workspace holds the newer
+    content the stage wrote, which Pivot cached. That file is still the stage's: restoring the
+    older lock replaces it, as at main."""
+    repo_path, commit = git_repo
+    (repo_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.chdir(repo_path)
+    (repo_path / "pipeline.py").write_text(_SIDECAR_SHAPED_MEMBER_PIPELINE)
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+    fake = repo_path / "data" / "b" / "tree" / "fake.pvt"
+    first = fake.read_text()
+    assert track.read_pvt_file(fake) is not None
+    sha = commit("n=1")
+    params = repo_path / "params.yaml"
+    params.write_text("b/tree:\n  n: 2\n")
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+    assert fake.read_text() != first
+    commit("n=2")
+    params.unlink()
+    lock_path = ".pivot/stages/b/tree.lock"
+    subprocess.run(["git", "checkout", sha, "--", lock_path], cwd=repo_path, check=True)
+
+    result = runner.invoke(cli.cli, command)
+
+    assert result.exit_code == 0, result.output
+    assert "Refusing" not in result.output, result.output
+    assert fake.read_text() == first
+
+
+def test_run_cache_restore_after_the_lock_changes_through_git_keeps_the_stages_pvt(
+    runner: CliRunner, git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stage writes `notes.pvt` only with `n: 2`. The user checks out the `n: 1` lock from git,
+    which lists no `notes.pvt`, keeps `n: 2`, and edits `value.txt`: `repro` restores the run
+    cache's `n: 2` output over the directory, and that hash lists the `notes.pvt` the workspace
+    holds. The file is the stage's (the hash the restore writes lists it), so the restore
+    succeeds and keeps it."""
+    repo_path, commit = git_repo
+    (repo_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.chdir(repo_path)
+    (repo_path / "pipeline.py").write_text(_PVT_MEMBER_SOMETIMES_PIPELINE)
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+    sha = commit("n=1")
+    (repo_path / "params.yaml").write_text("b/tree:\n  n: 2\n")
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+    tree = repo_path / "data" / "b" / "tree"
+    notes = tree / "notes.pvt"
+    assert notes.read_text() == "ordinary stage output"
+    commit("n=2")
+    lock_path = ".pivot/stages/b/tree.lock"
+    subprocess.run(["git", "checkout", sha, "--", lock_path], cwd=repo_path, check=True)
+    (tree / "value.txt").unlink()
+    (tree / "value.txt").write_text("edited")
+
+    result = runner.invoke(cli.cli, ["repro"])
+
+    assert result.exit_code == 0, result.output
+    assert "Refusing" not in result.output, result.output
+    assert notes.read_text() == "ordinary stage output"
+    assert (tree / "value.txt").read_text() == "2"
+
+
+def test_forced_get_restores_the_other_targets_beside_one_whose_pvt_is_not_valid(
+    runner: CliRunner, git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`pivot get --force` only reports a target whose `.pvt` at the revision is not valid; it
+    never replaces that path. A tracked file inside the path therefore refuses nothing: the
+    other target is restored, the invalid one is reported, and the tracked file is kept."""
+    repo_path, commit = git_repo
+    (repo_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.chdir(repo_path)
+    (repo_path / "pipeline.py").write_text(_A_PIPELINE)
+    other = repo_path / "other.txt"
+    other.write_text("v1")
+    tracked = repo_path / "data" / "d" / "f.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("user bytes")
+    assert runner.invoke(cli.cli, ["track", "data/d/f.txt"]).exit_code == 0
+    invalid = repo_path / "data" / "d.pvt"
+    invalid.write_text("path: d\nhash: 1234567890123456\nsize: 1\n")
+    sha = commit("v1")
+    invalid.unlink()
+    other.write_text("local edit")
+
+    result = runner.invoke(cli.cli, ["get", "--rev", sha[:7], "data/d", "other.txt", "--force"])
+
+    assert "Refusing" not in result.output, result.output
+    assert "not a valid .pvt file" in result.output, result.output
+    assert other.read_text() == "v1", result.output
+    assert tracked.read_text() == "user bytes"
+    assert track.get_pvt_path(tracked).is_file()

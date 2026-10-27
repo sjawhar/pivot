@@ -1109,7 +1109,7 @@ class Engine:
         # Warn once per run about a tracked file saved inside one of these outputs before track
         # refused that; the store fails the stage before it would remove the file
         for warning in ownership.saved_input_warnings(
-            project_root, all_stages, store, config.get_state_dir()
+            project_root, all_stages, store, config.get_state_dir(), cache_dir / "files"
         ):
             _logger.warning(warning)
         runnable, dep_errors = engine_graph.get_runnable_stages(
@@ -1993,8 +1993,12 @@ class Engine:
                 state_db,
                 state_dir=state_dir,
                 file_hash_entries=restored_entries,
-                no_commit_members=ownership.no_commit_members(
-                    project.get_project_root(), state_db.get_no_commit_record(stage_name)
+                claims=worker.stage_claims(
+                    store,
+                    stage_info["outs"],
+                    lock_data,
+                    state_db.get_no_commit_record(stage_name),
+                    project.get_project_root(),
                 ),
             )
             if restored and restored_entries:
