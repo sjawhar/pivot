@@ -154,7 +154,7 @@ def test_gc_keeps_an_object_a_concurrent_run_republished_and_named(
     def republish_then_execute(plan: gc.Plan, **kwargs: object) -> gc.ObjectCount:
         cache.copy_to_cache(source, path)
         _helper_write_lock(workspace, outs={None: types.FileHash(hash=key)})
-        return execute_plan(plan, **kwargs)  # type: ignore[arg-type] - the same call
+        return execute_plan(plan, **kwargs)  # pyright: ignore[reportArgumentType] - the same call
 
     monkeypatch.setattr(gc, "execute_plan", republish_then_execute)
 
@@ -277,7 +277,7 @@ def test_gc_refuses_a_projects_path_that_is_not_a_pivot_project(
 def test_gc_drops_the_register_entry_whose_root_is_gone(
     shared: Workspace, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """"Dropped 1 projects from the cache register" must mean the entry is gone from the
+    """ "Dropped 1 projects from the cache register" must mean the entry is gone from the
     register; at fa7bd0c1 the entry stays and every later run repeats the note.
     """
     gone = tmp_path / "a-worktree-that-was-deleted"

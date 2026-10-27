@@ -284,7 +284,7 @@ def test_gc_removes_a_tree_with_its_marker_and_leaves_its_lock_file(
     """A tree no record names goes with its `.verified` marker; lock files never go."""
     tree = _helper_publish_tree(workspace, "dead-tree")
     tree_path = cache.get_cache_path(workspace["object_root"], tree["hash"])
-    marker = tree_path.with_name(tree_path.name + cache.TREE_MARKER_SUFFIX)
+    marker = tree_path.with_name(tree_path.name + cache._TREE_LAYOUT_MARKER_SUFFIX)
     tree_lock = tree_path.with_name(tree_path.name + ".lock")
     tree_lock.touch()
     assert marker.exists(), "a published tree is marked"
@@ -358,7 +358,7 @@ def test_gc_leaves_the_prefix_lock_and_temporary_entries(
     assert result.exit_code == 0, result.output
     assert _helper_keys(workspace) == set(), result.output
     assert temp.exists(), "a temporary entry a publisher owns was removed"
-    assert (prefix / cache.PREFIX_LOCK).exists(), "the prefix lock was removed"
+    assert (prefix / cache._PREFIX_LOCK).exists(), "the prefix lock was removed"
 
 
 # =============================================================================
@@ -631,7 +631,7 @@ def test_gc_refuses_while_another_collection_holds_the_cache(
 ) -> None:
     """One collection at a time, so two never plan against each other's deletions."""
     dead = _helper_publish(workspace, "dead")
-    fd = cache.open_cache_lock(workspace["cache_dir"] / gc.GC_LOCK)
+    fd = cache._open_cache_lock(workspace["cache_dir"] / gc.GC_LOCK)
     fcntl.flock(fd, fcntl.LOCK_EX)
     try:
         result = _helper_run(runner, "--yes", "--grace-hours", "0")
@@ -686,7 +686,7 @@ def test_gc_waits_for_a_prefix_a_publisher_holds(
     """The prefix lock a staging publisher holds keeps the collection out of that prefix."""
     dead = _helper_publish(workspace, "dead")
     dead_path = cache.get_cache_path(workspace["object_root"], dead)
-    fd = cache.open_cache_lock(dead_path.parent / cache.PREFIX_LOCK)
+    fd = cache._open_cache_lock(dead_path.parent / cache._PREFIX_LOCK)
     fcntl.flock(fd, fcntl.LOCK_EX)
     outcome = list[int]()
 
@@ -775,7 +775,7 @@ def test_gc_keeps_an_object_a_lock_named_after_the_plan(
 
     def write_lock_then_execute(plan: gc.Plan, **kwargs: object) -> gc.ObjectCount:
         _helper_write_lock(workspace, outs={None: types.FileHash(hash=key)})
-        return real_execute(plan, **kwargs)  # type: ignore[arg-type] - the same call
+        return real_execute(plan, **kwargs)  # pyright: ignore[reportArgumentType] - the same call
 
     monkeypatch.setattr(gc, "execute_plan", write_lock_then_execute)
 
@@ -798,7 +798,7 @@ def test_gc_keeps_a_republished_object_hardlinked_after_the_plan(
 
     def hardlink_then_execute(plan: gc.Plan, **kwargs: object) -> gc.ObjectCount:
         os.link(path, workspace["root"] / "data_hardlink")
-        return real_execute(plan, **kwargs)  # type: ignore[arg-type] - the same call
+        return real_execute(plan, **kwargs)  # pyright: ignore[reportArgumentType] - the same call
 
     monkeypatch.setattr(gc, "execute_plan", hardlink_then_execute)
 

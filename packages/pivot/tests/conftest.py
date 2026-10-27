@@ -12,6 +12,7 @@ import pathlib
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -114,6 +115,41 @@ def _get_cgroup_memory_limit_bytes() -> int | None:
         pass
 
     return None
+
+
+@pytest.fixture
+def tmp_path(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
+    """pytest's ``tmp_path``, with owner access given back to every directory in it at teardown.
+
+    Pivot publishes cache trees read-only (0o555), and some tests take a directory's write or read
+    bit to reach an error path. pytest's delete makes a directory writable only after it fails to
+    remove a file in it, so it cannot remove the subdirectories of a read-only directory that holds
+    only directories, nor anything in a directory its owner cannot read. One such tree left behind
+    stopped the next run that reused the same ``--basetemp`` at start.
+    """
+    yield tmp_path
+    restore_owner_access(tmp_path)
+
+
+def restore_owner_access(root: pathlib.Path) -> None:
+    """Give the owner read, write and search on ``root`` and on every directory under it.
+
+    Directories only: removing an entry needs its directory's bits, never its own, and a file can
+    be a hardlink to a file outside ``root``, which a chmod would change too. Symlinks are not
+    followed, so nothing outside ``root`` changes. A directory a straggling process removed needs
+    nothing.
+    """
+    pending = [str(root)]
+    while pending:
+        directory = pending.pop()
+        with contextlib.suppress(FileNotFoundError):
+            mode = os.lstat(directory).st_mode
+            if mode & stat.S_IRWXU != stat.S_IRWXU:
+                os.chmod(directory, mode | stat.S_IRWXU)
+            with os.scandir(directory) as entries:
+                pending.extend(
+                    entry.path for entry in entries if entry.is_dir(follow_symlinks=False)
+                )
 
 
 @pytest.fixture

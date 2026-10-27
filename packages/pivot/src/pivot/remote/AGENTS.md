@@ -55,19 +55,44 @@ hash-mismatch error, and the staged atomic download. A change to the hash or the
 `batch.py` owns the orchestration both backends run: `bulk_exists` (per-hash requests below 50
 hashes, a listing per 2-char prefix from 50 up), `cache_hashes` (which object names are cache
 objects), and `transfer_batch` (a failed transfer is a `TransferResult(success=False)`, never an
-exception). A backend passes its client context and per-object coroutines; checks on one object,
-such as GCS's upload verification, belong in those coroutines, not in `batch.py`.
+exception; one that raised `RemoteUnreachableError` also carries `connection_failed`, which `get`
+reads to stop using the remote for the rest of the command). A backend passes its client context
+and per-object coroutines; checks on one object, such as GCS's upload verification, belong in
+those coroutines, not in `batch.py`.
+
+`RemoteUnreachableError` (a `RemoteConnectionError`, so every handler of that still catches it)
+means no connection to the remote could be made, after the retries: a DNS failure, a refused
+connection, a connect timeout, a TLS failure or a proxy that cannot be connected to. Every object
+fails the same way then, so `get` does not try the remote again for its later targets. A
+per-object coroutine raises it for nothing else: an HTTP status on one object (a 403 included),
+a reply that breaks off, a missing or corrupt object, and credentials that are missing or
+refused are that object's or that call's error, and the next target tries the remote again.
 
 - **S3Remote** uses `aioboto3.Session()` — one session per instance, one client per method call;
-  batch methods share that client across concurrent tasks.
+  batch methods share that client across concurrent tasks. A session or client that cannot
+  start (a missing AWS profile when the session is made, an invalid `AWS_ENDPOINT_URL` when the
+  client opens) raises one `RemoteConnectionError` before any transfer; missing credentials
+  still fail each request, so a batch reports each item failed. A download whose request ends in
+  botocore's `ConnectionError` after `remote.retries` retries raises `RemoteUnreachableError`.
+  aiobotocore raises that for DNS, refused, connect-timeout, TLS and proxy failures, and also
+  for an aiohttp connection error after connecting (a reset), so on S3 a connection reset on
+  every retry counts too; a connection closed before the reply (`ConnectionClosedError`) and a
+  read timeout do not.
 - **GCSRemote** opens one `aiohttp.ClientSession` per method call, shared by a batch's concurrent
   transfers, and fetches the token before the first request, so missing credentials raise one
-  `RemoteConnectionError` before any transfer (S3 batches instead report each item failed). It
-  passes its own `aiohttp.ClientTimeout` (no total deadline, `remote.connect_timeout` to connect)
-  to every storage request it makes, because gcloud-aio's defaults are whole-request deadlines of
-  10-30s, too short for large objects. Only the token request keeps gcloud-aio's fixed 10s total,
+  `RemoteConnectionError` before any transfer. A token request that cannot connect or times out
+  (gcloud-aio-auth tries it 5 times) raises `RemoteUnreachableError` when a credentials file
+  names the token endpoint; without one gcloud-aio asks the GCE metadata server, whose name does
+  not resolve off GCE, so there the same failure is the credentials error. It passes its own
+  `aiohttp.ClientTimeout` (no total deadline, `remote.connect_timeout` to connect) to every
+  storage request it makes, because gcloud-aio's defaults are whole-request deadlines of 10-30s,
+  too short for large objects. Only the token request keeps gcloud-aio's fixed 10s total,
   because its public API exposes no timeout for it. It retries transient failures
-  `remote.retries` times.
+  `remote.retries` times (`_with_retries`); a download's request and body are one attempt, so a
+  body that breaks off or stalls is downloaded again from its start. A storage request that
+  cannot connect (`ClientConnectorError`, which covers DNS, refused, TLS and proxy connect
+  failures, and `ConnectionTimeoutError`) raises `RemoteUnreachableError` (`_remote_error`); a
+  reset after connecting and a proxy that answers with an error status do not.
 - **Every GCS upload is one simple upload (`uploadType=media`), at any size**, streamed from disk
   in one POST. Never pass `force_resumable_upload=True`: each retry reopens the file from byte 0,
   so a resumable session would resume nothing, and gcloud-aio's own retry of a failed resumable

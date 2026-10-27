@@ -50,6 +50,9 @@ OBJECTS_DIR = "files"
 REGISTER_DIR = "projects"
 # Held exclusively for a whole collection, so two collections never run on one cache.
 GC_LOCK = "gc.lock"
+# Every marker file beside a whole-directory tree object, removed with the tree: the current
+# content-checked marker and the layout-only/size-only markers older pivot versions wrote.
+_TREE_MARKER_SUFFIXES = (cache._TREE_LAYOUT_MARKER_SUFFIX, *cache._LEGACY_TREE_MARKER_SUFFIXES)  # pyright: ignore[reportPrivateUsage] - the collector, a storage/ sibling, removes cache's own markers
 DEFAULT_GRACE_HOURS = 24.0
 # A process rewrites its register entry at most this often.
 _REGISTER_REFRESH_SECONDS = 3600.0
@@ -493,7 +496,7 @@ def _walk_project(
             for entry in entries:
                 path = pathlib.Path(entry.path)
                 if entry.is_symlink():
-                    key = cache.get_symlink_cache_key(path, object_root)
+                    key = cache._get_symlink_cache_hash(path, object_root)  # pyright: ignore[reportPrivateUsage] - the collector reads the same symlink targets as a checkout
                     if key is not None and cache.is_valid_hash(key):
                         keys.add(key)
                     if entry.name.endswith(".pvt") and entry.is_file():
@@ -540,8 +543,7 @@ def collect_roots(
                         roots["named"] |= _lock_keys(lock_path)
                     except yaml.YAMLError:
                         logger.warning(
-                            "Cannot parse %s as a stage lock; keeping every cache object because "
-                            "a lock pivot cannot read may name any of them",
+                            "Cannot parse %s as a stage lock; keeping every cache object because a lock pivot cannot read may name any of them",
                             lock_path,
                         )
                         roots["unparseable"].append(str(lock_path))
@@ -581,7 +583,7 @@ def collection_lock(cache_dir: pathlib.Path) -> Generator[bool]:
     """
     path = cache_dir / GC_LOCK
     try:
-        fd = cache.open_cache_lock(path)
+        fd = cache._open_cache_lock(path)  # pyright: ignore[reportPrivateUsage] - the collector takes the cache's own locks
     except OSError as e:
         raise exceptions.CacheCollectionRefusedError(
             f"Refusing to collect {cache_dir}: cannot open {path} ({e.strerror or e}). "
@@ -597,7 +599,7 @@ def collection_lock(cache_dir: pathlib.Path) -> Generator[bool]:
                 + "Wait for it to finish. Nothing was removed."
             ) from None
         except OSError as e:
-            if e.errno not in cache.NO_FLOCK_ERRNO:
+            if e.errno not in cache._NO_FLOCK_ERRNO:  # pyright: ignore[reportPrivateUsage] - the collector reads the cache's flock errno set
                 raise
             locked = False
         yield locked
@@ -609,12 +611,12 @@ def collection_lock(cache_dir: pathlib.Path) -> Generator[bool]:
 def _prefix_locked(prefix_dir: pathlib.Path) -> Generator[None]:
     """Hold one prefix directory's lock exclusively, excluding every staging publisher and
     the temporary sweep while this directory is listed and collected."""
-    fd = cache.open_cache_lock(prefix_dir / cache.PREFIX_LOCK)
+    fd = cache._open_cache_lock(prefix_dir / cache._PREFIX_LOCK)  # pyright: ignore[reportPrivateUsage] - the collector takes each prefix's own lock
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
         except OSError as e:
-            if e.errno not in cache.NO_FLOCK_ERRNO:
+            if e.errno not in cache._NO_FLOCK_ERRNO:  # pyright: ignore[reportPrivateUsage] - the collector reads the cache's flock errno set
                 raise
         yield
     finally:
@@ -684,7 +686,7 @@ def build_plan(
             for entry in sorted(entries, key=lambda e: e.name):
                 key = prefix_dir.name + entry.name
                 # Skips every name that is not an object: the prefix lock, a `.pivot_tmp_*`
-                # entry a publisher owns, and a tree's `.verified` marker and `.lock` file.
+                # entry a publisher owns, and a tree's `.content-checked` marker and `.lock` file.
                 if not cache.is_valid_hash(key):
                     continue
                 try:
@@ -812,12 +814,12 @@ def execute_plan(
                 ):
                     continue
                 try:
-                    cache.clear_path(path)
+                    cache._clear_path(path)  # pyright: ignore[reportPrivateUsage] - the collector removes objects with the cache's own remover
                 except OSError as e:
                     logger.warning("Cannot remove cache object %s: %s", path, e)
                     continue
                 if doomed["is_dir"]:
-                    for suffix in (cache.TREE_MARKER_SUFFIX, cache.LEGACY_TREE_MARKER_SUFFIX):
+                    for suffix in _TREE_MARKER_SUFFIXES:
                         with contextlib.suppress(OSError):
                             path.with_name(path.name + suffix).unlink(missing_ok=True)
                 removed["objects"] += 1

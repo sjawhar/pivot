@@ -29,7 +29,7 @@ def _helper_entries(directory: pathlib.Path) -> list[str]:
     return sorted(
         p.name
         for p in directory.iterdir()
-        if p.name != cache.PREFIX_LOCK and not p.name.endswith(cache._TREE_LOCK_SUFFIX)
+        if p.name != cache._PREFIX_LOCK and not p.name.endswith(cache._TREE_LOCK_SUFFIX)
     )
 
 
@@ -917,7 +917,7 @@ def test_cleanup_preserves_recent_temps(tmp_path: pathlib.Path) -> None:
 
     assert recent_temp.exists()
     # Cleanup
-    cache.clear_path(recent_temp)
+    cache._clear_path(recent_temp)
 
 
 def test_cleanup_skips_symlinks_via_is_dir(tmp_path: pathlib.Path) -> None:
@@ -1760,8 +1760,8 @@ def test_save_to_cache_symlink_wrong_hash(tmp_path: pathlib.Path) -> None:
     assert h2["hash"] == h1["hash"]
 
 
-def test_get_symlink_cache_key_extracts_hash(tmp_path: pathlib.Path) -> None:
-    """get_symlink_cache_key extracts hash from valid symlink."""
+def test_get_symlink_cache_hash_extracts_hash(tmp_path: pathlib.Path) -> None:
+    """_get_symlink_cache_hash extracts hash from valid symlink."""
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     cache_dir = tmp_path / "cache"
@@ -1771,29 +1771,29 @@ def test_get_symlink_cache_key_extracts_hash(tmp_path: pathlib.Path) -> None:
     )
     assert output_hash is not None
 
-    extracted = cache.get_symlink_cache_key(test_file, cache_dir)
+    extracted = cache._get_symlink_cache_hash(test_file, cache_dir)
     assert extracted == output_hash["hash"]
 
 
-def test_get_symlink_cache_key_returns_none_for_regular_file(tmp_path: pathlib.Path) -> None:
-    """get_symlink_cache_key returns None for non-symlink."""
+def test_get_symlink_cache_hash_returns_none_for_regular_file(tmp_path: pathlib.Path) -> None:
+    """_get_symlink_cache_hash returns None for non-symlink."""
     test_file = tmp_path / "file.txt"
     test_file.write_text("content")
     cache_dir = tmp_path / "cache"
 
-    result = cache.get_symlink_cache_key(test_file, cache_dir)
+    result = cache._get_symlink_cache_hash(test_file, cache_dir)
     assert result is None
 
 
-def test_get_symlink_cache_key_returns_none_for_outside_cache(tmp_path: pathlib.Path) -> None:
-    """get_symlink_cache_key returns None for symlink outside cache."""
+def test_get_symlink_cache_hash_returns_none_for_outside_cache(tmp_path: pathlib.Path) -> None:
+    """_get_symlink_cache_hash returns None for symlink outside cache."""
     target = tmp_path / "target.txt"
     target.write_text("content")
     link = tmp_path / "link.txt"
     link.symlink_to(target)
     cache_dir = tmp_path / "cache"
 
-    result = cache.get_symlink_cache_key(link, cache_dir)
+    result = cache._get_symlink_cache_hash(link, cache_dir)
     assert result is None
 
 
@@ -2926,7 +2926,7 @@ def test_symlink_tree_publish_removes_a_killed_publishers_copy(tmp_path: pathlib
     left = _helper_entries(tree.parent)
     assert len(left) == 1 and left[0].startswith(cache._CACHE_TEMP_PREFIX), "the killed copy"
     # The sweep of one prefix directory runs at most once per _CACHE_SWEEP_INTERVAL.
-    os.utime(tree.parent / cache.PREFIX_LOCK, (0, 0))
+    os.utime(tree.parent / cache._PREFIX_LOCK, (0, 0))
 
     cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
 
@@ -3051,13 +3051,21 @@ def test_symlink_restore_refuses_a_tree_it_cannot_repair(tmp_path: pathlib.Path)
     assert not cache._tree_layout_marker(tree).exists()
 
 
+@pytest.mark.parametrize(
+    "old_suffix",
+    [
+        pytest.param(".layout-checked", id="pivot-0.3.4-layout-checked"),
+        pytest.param(".verified", id="pivot-0.5.11-size-checked"),
+    ],
+)
 def test_symlink_restore_rechecks_a_partial_tree_an_older_pivot_marked(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, old_suffix: str
 ) -> None:
     """Pivot 0.3.4 marked a tree after checking only its layout, so its mark sits beside partial
-    trees too. The restore checks such a tree again, repairs it, and replaces the old mark."""
+    trees too; pivot 0.3.5 to 0.5.11 marked one after checking only sizes. The restore checks such
+    a tree again, repairs it, and replaces the old mark."""
     cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
-    old_mark = tree.with_name(tree.name + ".layout-checked")
+    old_mark = tree.with_name(tree.name + old_suffix)
     old_mark.touch()
     out = tmp_path / "out"
 
@@ -3066,6 +3074,29 @@ def test_symlink_restore_rechecks_a_partial_tree_an_older_pivot_marked(
     )
 
     assert cache.hash_directory(out, cache_dir=cache_dir)["hash"] == output_hash["hash"]
+    assert cache._tree_layout_marker(tree).exists()
+    assert not old_mark.exists()
+
+
+def test_symlink_restore_repairs_stale_bytes_in_a_complete_tree_pivot_0_5_11_marked(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Pivot 0.3.5 to 0.5.11 marked a tree `.verified` after checking its files' sizes only, so a
+    tree holding every file at its recorded size, one with stale bytes, can carry that mark. The
+    restore checks it by content, repairs the stale file, links the tree and marks it anew."""
+    cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
+    (tree / "b.txt").write_text("b.txt " * 100)
+    (tree / "c.txt").write_text("C.TXT " * 100)  # stale bytes of the recorded size
+    old_mark = tree.with_name(tree.name + ".verified")
+    old_mark.touch()
+    out = tmp_path / "out"
+
+    assert cache.restore_from_cache(
+        out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    assert out.resolve() == tree.resolve()
+    assert (out / "c.txt").read_text() == "c.txt " * 100
     assert cache._tree_layout_marker(tree).exists()
     assert not old_mark.exists()
 
@@ -3091,14 +3122,14 @@ def test_symlink_restore_goes_file_by_file_past_a_damaged_tree_it_cannot_lock(
     cache) is not used: the output is restored file by file from the cached objects, and the
     tree is left unmarked."""
     cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
-    real_open = cache.open_cache_lock
+    real_open = cache._open_cache_lock
 
     def _tree_lock_not_writable(path: pathlib.Path) -> int:
-        if path.name.endswith(cache._TREE_LOCK_SUFFIX) and path.name != cache.PREFIX_LOCK:
+        if path.name.endswith(cache._TREE_LOCK_SUFFIX) and path.name != cache._PREFIX_LOCK:
             raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path))
         return real_open(path)
 
-    monkeypatch.setattr(cache, "open_cache_lock", _tree_lock_not_writable)
+    monkeypatch.setattr(cache, "_open_cache_lock", _tree_lock_not_writable)
     out = tmp_path / "out"
 
     assert cache.restore_from_cache(
@@ -3247,14 +3278,14 @@ def test_sweep_reports_and_skips_a_temporary_entry_it_cannot_remove(
     prefix = cache_dir / "ab"
     stuck = prefix / f"{cache._CACHE_TEMP_PREFIX}theirs"
     (stuck / "sub").mkdir(parents=True)
-    real_clear = cache.clear_path
+    real_clear = cache._clear_path
 
     def _clear_unless_theirs(path: pathlib.Path) -> None:
         if path == stuck:
             raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path / "sub"))
         real_clear(path)
 
-    monkeypatch.setattr(cache, "clear_path", _clear_unless_theirs)
+    monkeypatch.setattr(cache, "_clear_path", _clear_unless_theirs)
     src = tmp_path / "src"
     src_hash = _helper_tree_hash(src)
 
@@ -3294,7 +3325,7 @@ def test_copy_to_cache_removes_a_killed_copy_beside_its_objects(tmp_path: pathli
         cache._CACHE_TEMP_PREFIX
     ]
     # The sweep of one prefix directory runs at most once per _CACHE_SWEEP_INTERVAL.
-    os.utime(prefix / cache.PREFIX_LOCK, (0, 0))
+    os.utime(prefix / cache._PREFIX_LOCK, (0, 0))
 
     cache.copy_to_cache(src, prefix / "00000000000002")
 
@@ -3317,7 +3348,7 @@ def test_sweep_removes_an_older_pivots_temporary_files_once_untouched_for_an_hou
     cache.copy_to_cache(src, prefix / "00000000000001")
     assert _helper_entries(prefix) == sorted([*legacy, "00000000000001"])
 
-    os.utime(prefix / cache.PREFIX_LOCK, (0, 0))
+    os.utime(prefix / cache._PREFIX_LOCK, (0, 0))
     later = time.time() + 2 * cache._CACHE_SWEEP_INTERVAL
     monkeypatch.setattr(time, "time", lambda: later)
     cache.copy_to_cache(src, prefix / "00000000000002")

@@ -19,6 +19,8 @@ import typing
 import psutil
 import pytest
 
+from tests import helpers
+
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]
 
 _PIPELINE = """\
@@ -165,18 +167,13 @@ def _wait_for(condition: typing.Callable[[], bool], what: str, timeout_s: float 
         time.sleep(0.1)
 
 
-def _clean_env() -> dict[str, str]:
-    """Return ``os.environ`` without the workspace's ``VIRTUAL_ENV*`` and ``PYTHONPATH*``."""
-    return {k: v for k, v in os.environ.items() if not k.startswith(("VIRTUAL_ENV", "PYTHONPATH"))}
-
-
 def _run(
     args: list[str],
     cwd: pathlib.Path,
     *,
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    env = _clean_env()
+    env = helpers.clean_env()
     if extra_env is not None:
         env.update(extra_env)
     return subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, timeout=600)
@@ -184,22 +181,14 @@ def _run(
 
 def _install_wheel(tmp_path: pathlib.Path, *requirements: str) -> str:
     """Build pivot's wheel, install it and ``requirements`` into a new venv, return ``pivot``."""
-    uv = os.environ.get("PIVOT_TEST_UV", "")
-    if not (pathlib.Path(uv).is_file() and os.access(uv, os.X_OK)):
-        pytest.fail(f"PIVOT_TEST_UV must name the uv executable; it is {uv!r}", pytrace=False)
     dist = tmp_path / "dist"
-    build = _run([uv, "build", "--package", "pivot", "--wheel", "--out-dir", str(dist)], _REPO_ROOT)
+    build = _run(
+        [helpers.uv_executable(), "build", "--package", "pivot", "--wheel", "--out-dir", str(dist)],
+        _REPO_ROOT,
+    )
     assert build.returncode == 0, build.stderr
     wheel = next(dist.glob("pivot-*.whl"))
-
-    venv = tmp_path / "venv"
-    assert _run([uv, "venv", "--python", "3.13", str(venv)], tmp_path).returncode == 0
-    install = _run(
-        [uv, "pip", "install", "--python", str(venv / "bin" / "python"), str(wheel), *requirements],
-        tmp_path,
-    )
-    assert install.returncode == 0, install.stderr
-    return str(venv / "bin" / "pivot")
+    return helpers.venv_pivot(tmp_path / "venv", str(wheel), *requirements)
 
 
 @pytest.mark.skipif(not os.environ.get("CI"), reason="builds and installs a wheel; runs in CI")
@@ -299,7 +288,7 @@ def test_fresh_wheel_watch_reload_replaces_workers_within_the_cap(
         watch = subprocess.Popen(
             [pivot, "repro", "--watch", "--force"],
             cwd=project,
-            env=_clean_env(),
+            env=helpers.clean_env(),
             stdin=subprocess.DEVNULL,
             stdout=output,
             stderr=subprocess.STDOUT,

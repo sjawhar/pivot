@@ -32,10 +32,16 @@ records each output's content hash.
 
 Each prefix directory also holds a `.pivot_cache.lock` file, and while a file
 or directory is being cached a `.pivot_tmp_*` entry; in `symlink` checkout
-mode, each cached directory tree has a `<hash>.verified` marker and may have
-a `<hash>.lock` file beside it. Pivot keeps the lock files and removes the
+mode, each cached directory tree has a `<hash>.content-checked` marker and may
+have a `<hash>.lock` file beside it. Pivot keeps the lock files and removes the
 `.pivot_tmp_*` entries a killed process leaves (at most once an hour per
-prefix directory). Do not delete these files while pivot runs.
+prefix directory). Do not delete these files while pivot runs. A tree that
+pivot 0.5.11 or older marked `<hash>.verified` is checked by content again,
+then marked anew. A user who cannot write the cache cannot mark it, so pivot
+checks the tree on each of their symlink restores and commits, and their
+symlink commit through a stale one fails. One
+`pivot checkout --checkout-mode symlink` through the tree by a user who can
+write the cache ends this.
 
 A cache several machines share (a `cache.dir` on a network filesystem) needs
 file locks that work across those machines: NFSv4, or NFSv3 with its lock
@@ -70,16 +76,24 @@ Two more rules cover objects no record names yet:
 - **A grace period.** A stage publishes its objects before it writes the lock that names
   them, so an object younger than `--grace-hours` (24 by default) is kept. The age is the
   object's `st_ctime`: a cached file carries its source file's mtime, which says nothing
-  about when it was cached.
+  about when it was cached. A run that re-uses an object already in the cache publishes
+  nothing, so pivot refreshes the object's timestamp on that cache hit (git's "update the
+  mtime of an object already present"), which brings a re-used object back inside the grace.
 - **Hard links.** An object with more than one link is kept, because some directory entry
   outside the cache holds that inode. `--remove-linked` overrides this, for a worktree that
   was deleted without unlinking its outputs; the plan then says how many objects that is.
 
-A collection takes each prefix directory's `.pivot_cache.lock` exclusively while it lists
-and deletes there, which excludes every process staging a new object, and takes
-`<cache>/gc.lock` for the whole run, so two collections never run on one cache. It removes a
-directory tree with its `.verified` marker, and never removes a lock file or a `.pivot_tmp_*`
-entry another process owns.
+A collection is safe to run while pipelines publish into the same cache. It takes each prefix
+directory's `.pivot_cache.lock` exclusively while it lists and deletes there, which excludes
+every process staging a new object, and takes `<cache>/gc.lock` for the whole run, so two
+collections never run on one cache. Before it deletes, it re-reads every record a second
+time — after the scan, immediately before the unlink — and keeps any object a run has named
+since the scan; this is what protects an object a concurrent run both re-publishes and names
+while the collection is running. The one remaining exposure is an object a run names in the
+gap between that final re-read and its own unlink: one `lstat` per object, not the whole
+scan. A collection removes a directory tree with its `.content-checked` marker (and the
+`.layout-checked` and `.verified` markers older pivot versions wrote), and never removes a
+lock file or a `.pivot_tmp_*` entry another process owns.
 
 ### A Cache Several Projects Share
 
@@ -89,14 +103,18 @@ cache under `projects/<digest>.json`:
 
 ```json
 {"root": "/home/me/experiment", "state_dir": "/home/me/experiment/.pivot",
- "host": "workstation", "pivot": "0.5.11", "last_write": "2026-10-27T06:43:11Z"}
+ "host": "workstation", "pivot": "0.5.12", "last_write": "2026-10-27T06:43:11Z"}
 ```
 
 Every pivot command that resolves the cache writes this entry, at most once an hour per
 project, and a collection reads every project it names. An entry whose root is gone is
-dropped, with a note. `pivot gc` **refuses to remove anything** from an external cache that
-records no project, or whose records it cannot read; `pivot gc --projects PATH` names the
-projects that share it and records them, so later runs need no flag.
+dropped from the register, with a note. `pivot gc` **refuses to remove anything** from an
+external cache that records no project, or whose records it cannot read; `pivot gc --projects
+PATH` names the projects that share it and records them, so later runs need no flag. A
+`--projects` path must be a real pivot project — a directory with a readable `.pivot` state
+directory. A path that is not one (the cache itself, a parent directory, a worktree that was
+deleted and re-created, a typo) names no records, so pivot refuses the whole run rather than
+collect this cache on one project's records alone.
 
 ## Per-Stage Lock Files
 
@@ -282,6 +300,13 @@ $ pivot gc                         # collect, asking first on a terminal
 $ pivot gc --yes                   # collect from a script or a CI job
 $ pivot gc --projects ../other     # a cache this project and ../other share
 ```
+
+A collection also prunes this project's run history to `core.run_history_retention`, the same
+policy every pipeline run applies, and the run-cache rows that prune drops are counted in the
+plan. A `--dry-run` prunes nothing and reports exactly what a real run would remove; a run
+refused at the prompt (or without a terminal and without `--yes`) prunes nothing and removes
+nothing. The first `pivot gc` of a project that has never cached anything finds no cache
+directory, reports nothing to remove and exits 0.
 
 ## Relationship to Other Concepts
 
