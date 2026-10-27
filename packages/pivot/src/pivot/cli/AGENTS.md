@@ -43,6 +43,7 @@ Set `auto_discover=False` only for commands that don't use the stage registry:
 | history, show | False | Read run history only |
 | get | False | Restores files and `.pvt` targets from git; discovers the pipeline itself for stage targets, and a broken `pipeline.py` only stops stage targets |
 | import, update | False | Work from git revisions, lock files and `.pvt` files |
+| gc | False | Reads the locks, `.pvt` files, run-cache rows and links on disk; a broken `pipeline.py` must never stop a user from freeing disk |
 | push, pull, fetch | True (default) | Need registry for output cache filtering |
 
 **Principle:** The pipeline registry is the canonical source of stage metadata. Commands that inspect stage properties (outputs, tags, deps) must use auto-discovery. Only commands that truly don't touch stage data should use `auto_discover=False`.

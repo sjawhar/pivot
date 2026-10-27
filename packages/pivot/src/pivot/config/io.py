@@ -303,11 +303,16 @@ def get_run_history_retention() -> int:
     return merged.core.run_history_retention
 
 
-def get_cache_dir() -> pathlib.Path:
+def get_cache_dir(*, register: bool = True) -> pathlib.Path:
     """Get cache directory, checking env var first.
 
     Precedence: PIVOT_CACHE_DIR env var > config file > default (.pivot/cache).
     Relative paths are resolved against the project root.
+
+    ``register`` records this project as a user of the cache (``_register_in_cache``).
+    `pivot gc` passes False: it must read the register as earlier runs left it, so that a
+    cache no project has ever recorded is refused rather than collected on this project's
+    records alone.
     """
     env_cache = os.environ.get("PIVOT_CACHE_DIR", "").strip()
     if env_cache:
@@ -318,7 +323,27 @@ def get_cache_dir() -> pathlib.Path:
 
     if not cache_dir.is_absolute():
         cache_dir = project.get_project_root() / cache_dir
+    if register:
+        _register_in_cache(cache_dir)
     return cache_dir
+
+
+def _register_in_cache(cache_dir: pathlib.Path) -> None:
+    """Record this project as a user of its cache, so that a collection run in another
+    project that shares the cache keeps the objects this one's records name.
+
+    A cache outside the project root can be shared by projects that cannot read each other's
+    locks, and the register is the only thing that tells a collection they exist. Recording
+    on a read as well as on a write is deliberate: a project that only checks out still holds
+    links into the cache. Nothing here may fail a command.
+    """
+    from pivot.storage import gc
+
+    try:
+        root = project.get_project_root()
+    except exceptions.ProjectNotInitializedError:
+        return
+    gc.register_project(cache_dir, root, get_state_dir())
 
 
 def get_state_dir() -> pathlib.Path:

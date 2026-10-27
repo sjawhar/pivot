@@ -952,7 +952,7 @@ async def test_download_batch_keeps_existing_destination(
 
     assert [r["success"] for r in results] == [True]
     assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
-    left = [p.name for p in tmp_path.iterdir() if p.name != cache._PREFIX_LOCK]
+    left = [p.name for p in tmp_path.iterdir() if p.name != cache.PREFIX_LOCK]
     assert left == ["entry"], "no download temp file left"
 
 
@@ -992,7 +992,7 @@ async def test_download_batch_without_hard_links(
     assert dest.read_bytes() == content
     if inode is not None:
         assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
-    left = [p.name for p in tmp_path.iterdir() if p.name != cache._PREFIX_LOCK]
+    left = [p.name for p in tmp_path.iterdir() if p.name != cache.PREFIX_LOCK]
     assert left == ["entry"], "no download temp file left"
 
 

@@ -114,7 +114,7 @@ def atomic_write_file(
         tmp = pathlib.Path(tmp_path)
     else:
         tmp = staging_path
-        _clear_path(tmp)
+        clear_path(tmp)
         fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     fd_closed = False
     try:
@@ -123,7 +123,7 @@ def atomic_write_file(
         os.chmod(tmp, mode)
         tmp.replace(dest)
     except BaseException:
-        _clear_path(tmp)
+        clear_path(tmp)
         raise
     finally:
         # Only close fd if write_fn didn't (e.g., exception before os.fdopen)
@@ -180,7 +180,7 @@ def _cache_object_key(path: pathlib.Path, cache_dir: pathlib.Path | None) -> str
     """
     if cache_dir is None:
         return None
-    key = _get_symlink_cache_hash(path, cache_dir)
+    key = get_symlink_cache_key(path, cache_dir)
     if key is None or not is_valid_hash(key) or not path.is_file():
         return None
     return key
@@ -423,7 +423,7 @@ def _make_writable_and_retry(func: Callable[[str], object], path: str, exc: Base
     func(path)
 
 
-def _clear_path(path: pathlib.Path) -> None:
+def clear_path(path: pathlib.Path) -> None:
     """Remove file, symlink, or directory at path if it exists.
 
     IMPORTANT: Never chmod files before deletion - they may be hardlinks to the
@@ -475,7 +475,7 @@ def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
                 continue
             if age < cutoff:
                 logger.debug(f"Cleaning up stale temp: {entry.path}")
-                _clear_path(pathlib.Path(entry.path))
+                clear_path(pathlib.Path(entry.path))
         except OSError as e:
             logger.debug(f"Failed to clean up temp {entry.path}: {e}")
 
@@ -492,11 +492,16 @@ def _cleanup_fresh_restore_orphans(path: pathlib.Path, token: str) -> None:
     )
     for entry in os.scandir(path.parent):
         if entry.name.startswith(prefixes):
-            _clear_path(pathlib.Path(entry.path))
+            clear_path(pathlib.Path(entry.path))
 
 
-def _get_symlink_cache_hash(path: pathlib.Path, cache_dir: pathlib.Path) -> str | None:
-    """Extract hash from symlink target if it points to cache, else None."""
+def get_symlink_cache_key(path: pathlib.Path, cache_dir: pathlib.Path) -> str | None:
+    """Extract the cache key from a symlink's target if it points into cache_dir, else None.
+
+    The target may be a file object or a whole-directory tree object: both live at
+    ``<cache_dir>/XX/YYYY...``. Callers that need a file object check that themselves
+    (``_cache_object_key``).
+    """
     if not path.is_symlink():
         return None
     try:
@@ -552,18 +557,19 @@ def publish_cache_object(
 # Every temporary entry pivot makes in a cache prefix directory carries this prefix.
 _CACHE_TEMP_PREFIX = ".pivot_tmp_"
 # Taken shared by every process while its temporary entries exist in the prefix directory, and
-# exclusive by the sweep. Never a cache key (cache scans skip it), and never deleted.
-_PREFIX_LOCK = ".pivot_cache.lock"
+# exclusive by the sweep or by `pivot gc`. Never a cache key (cache scans skip it), and never
+# deleted.
+PREFIX_LOCK = ".pivot_cache.lock"
 # The sweep of one prefix directory runs at most this often; the lock file's mtime records it.
 _CACHE_SWEEP_INTERVAL = 3600
 # Opening or creating a lock fails this way in a cache directory this user cannot write.
 _CANNOT_WRITE_ERRNO = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 # flock() fails this way on a filesystem that refuses it: Lustre mounted without `flock`
 # (ENOSYS), NFS when its lock manager does not answer (ENOLCK), some FUSE filesystems.
-_NO_FLOCK_ERRNO = frozenset({errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP})
+NO_FLOCK_ERRNO = frozenset({errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP})
 
 
-def _open_cache_lock(path: pathlib.Path) -> int:
+def open_cache_lock(path: pathlib.Path) -> int:
     """Open the lock file at ``path`` in a cache directory, creating it if needed.
 
     A cache directory can be shared by several users. The file is created writable by exactly
@@ -609,7 +615,7 @@ def _sweep_cache_temps(prefix_dir: pathlib.Path) -> None:
             else:
                 continue
             if stale:
-                _clear_path(pathlib.Path(entry.path))
+                clear_path(pathlib.Path(entry.path))
         except FileNotFoundError:
             continue
         except OSError as e:
@@ -635,7 +641,7 @@ def _staging_in(prefix_dir: pathlib.Path) -> Generator[None]:
     The kernel drops a killed process's lock with its file descriptors. Converting the exclusive
     lock to shared may release it first; this process has made no temporary entry yet.
     """
-    fd = _open_cache_lock(prefix_dir / _PREFIX_LOCK)
+    fd = open_cache_lock(prefix_dir / PREFIX_LOCK)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -649,7 +655,7 @@ def _staging_in(prefix_dir: pathlib.Path) -> Generator[None]:
         try:
             fcntl.flock(fd, fcntl.LOCK_SH)
         except OSError as e:
-            if e.errno not in _NO_FLOCK_ERRNO:
+            if e.errno not in NO_FLOCK_ERRNO:
                 raise
         yield
     finally:
@@ -746,7 +752,7 @@ def _checkout_from_cache(
             _stage_checkout(tmp_path, cache_path, checkout_mode, executable=executable)
         except PermissionError:
             # A read-only parent. Replacing an existing entry needs it writable anyway,
-            # so make it writable as _clear_path does (never chmod the file: it may be
+            # so make it writable as clear_path does (never chmod the file: it may be
             # a hardlink to the read-only cache), then retry.
             parent_mode = path.parent.stat().st_mode
             if parent_mode & stat.S_IWUSR or not (path.exists() or path.is_symlink()):
@@ -756,7 +762,7 @@ def _checkout_from_cache(
         try:
             tmp_path.replace(path)
         except IsADirectoryError:
-            _clear_path(path)
+            clear_path(path)
             tmp_path.replace(path)
     finally:
         # Also covers a replace() that did nothing: POSIX rename is a no-op when both
@@ -806,8 +812,8 @@ def _repair_tree_dir_isexec(cache_dir_path: pathlib.Path, manifest: list[DirMani
 
 # The marker's earlier name, which pivot 0.3.4 touched after checking only a tree's layout,
 # partial trees included: every tree is checked once more and the old marker dropped.
-_TREE_LAYOUT_MARKER_SUFFIX = ".verified"
-_LEGACY_TREE_MARKER_SUFFIX = ".layout-checked"
+TREE_MARKER_SUFFIX = ".verified"
+LEGACY_TREE_MARKER_SUFFIX = ".layout-checked"
 # Held exclusively while a tree is checked and repaired; never deleted.
 _TREE_LOCK_SUFFIX = ".lock"
 
@@ -816,7 +822,7 @@ def _tree_layout_marker(cache_dir_path: pathlib.Path) -> pathlib.Path:
     """Return the file beside a whole-directory SYMLINK cache tree that records the tree holds
     exactly what its hash records. The name is never a cache key, so cache scans skip it.
     """
-    return cache_dir_path.with_name(cache_dir_path.name + _TREE_LAYOUT_MARKER_SUFFIX)
+    return cache_dir_path.with_name(cache_dir_path.name + TREE_MARKER_SUFFIX)
 
 
 def _mark_tree(cache_dir_path: pathlib.Path) -> None:
@@ -825,7 +831,7 @@ def _mark_tree(cache_dir_path: pathlib.Path) -> None:
     with contextlib.suppress(OSError):
         _tree_layout_marker(cache_dir_path).touch()
     with contextlib.suppress(OSError):
-        cache_dir_path.with_name(cache_dir_path.name + _LEGACY_TREE_MARKER_SUFFIX).unlink(
+        cache_dir_path.with_name(cache_dir_path.name + LEGACY_TREE_MARKER_SUFFIX).unlink(
             missing_ok=True
         )
 
@@ -884,7 +890,7 @@ def _ensure_tree_complete(
         return True
     fd: int | None
     try:
-        fd = _open_cache_lock(cache_dir_path.with_name(cache_dir_path.name + _TREE_LOCK_SUFFIX))
+        fd = open_cache_lock(cache_dir_path.with_name(cache_dir_path.name + _TREE_LOCK_SUFFIX))
     except OSError as e:
         if e.errno not in _CANNOT_WRITE_ERRNO:
             raise
@@ -1181,7 +1187,7 @@ def _save_file_to_cache(
     """Save single file to cache."""
     # Idempotency: check if already a valid cache symlink (cheap check first)
     if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK:
-        existing_hash = _get_symlink_cache_hash(path, cache_dir)
+        existing_hash = get_symlink_cache_key(path, cache_dir)
         if existing_hash is not None:
             cache_path = get_cache_path(cache_dir, existing_hash)
             if cache_path.exists():
@@ -1212,7 +1218,7 @@ def _store_file(
     copy_to_cache(path, cache_path)
     with restore_lock(path, state_dir) as lock_token:
         staging_path = restore_staging_path(path, lock_token)
-        _clear_path(staging_path)
+        clear_path(staging_path)
         _checkout_with_fallback(
             path,
             cache_path,
@@ -1236,7 +1242,7 @@ def _save_directory_to_cache(
         checkout_modes
         and checkout_modes[0] == CheckoutMode.SYMLINK
         and path.is_symlink()
-        and _get_symlink_cache_hash(path, cache_dir) == output_hash["hash"]
+        and get_symlink_cache_key(path, cache_dir) == output_hash["hash"]
         and get_cache_path(cache_dir, output_hash["hash"]).exists()
     ):
         return output_hash
@@ -1307,7 +1313,7 @@ def _publish_tree(
             if _tree_matches(cache_dir_path, output_hash, _scan_entries(cache_dir_path)):
                 _mark_tree(cache_dir_path)
         finally:
-            _clear_path(staged)
+            clear_path(staged)
 
 
 def _store_directory(
@@ -1344,7 +1350,7 @@ def _store_directory(
                     + "it again"
                 )
 
-            _clear_path(path)
+            clear_path(path)
             path.symlink_to(cache_dir_path.resolve())
         else:
             # HARDLINK/COPY modes: replace each file with link/copy from cache
@@ -1352,7 +1358,7 @@ def _store_directory(
                 file_path = path / entry["relpath"]
                 cache_path = get_cache_path(cache_dir, entry["hash"])
                 staging_path = restore_staging_path(file_path)
-                _clear_path(staging_path)
+                clear_path(staging_path)
                 _checkout_with_fallback(
                     file_path,
                     cache_path,
@@ -1475,7 +1481,7 @@ def _restore_file_from_cache(
             )
 
     staging_path = restore_staging_path(path, lock_token)
-    _clear_path(staging_path)
+    clear_path(staging_path)
     _checkout_with_fallback(path, cache_path, checkout_modes, staging_path=staging_path)
     return True
 
@@ -1534,7 +1540,7 @@ def _restore_directory_from_cache(
         temp_symlink = path.parent / f"{restore_prefix}symlink_{secrets.token_hex(4)}"
         try:
             temp_symlink.symlink_to(cache_dir_path.resolve())
-            _clear_path(path)
+            clear_path(path)
             temp_symlink.replace(path)
             return True
         except OSError as e:
@@ -1599,7 +1605,7 @@ def _restore_directory_from_cache(
         swap_completed = True
 
         try:
-            _clear_path(backup_path)
+            clear_path(backup_path)
         except OSError as e:
             logger.debug(f"Backup cleanup failed (non-critical): {e}")
         return True
@@ -1613,14 +1619,14 @@ def _restore_directory_from_cache(
         raise
     finally:
         if temp_path.exists():
-            _clear_path(temp_path)
+            clear_path(temp_path)
         if backup_path.exists() and swap_completed and not backup_restore_failed:
-            _clear_path(backup_path)
+            clear_path(backup_path)
 
 
 def remove_output(path: pathlib.Path) -> None:
     """Remove output file or directory before execution."""
-    _clear_path(path)
+    clear_path(path)
 
 
 class MissingRestore(TypedDict):
@@ -1719,7 +1725,7 @@ def restore_missing_in_directory(
                 if not file_cache_path.exists():
                     missing.append((entry, file_path, file_cache_path))
             else:
-                changed[relpath] = _get_symlink_cache_hash(file_path, cache_dir)
+                changed[relpath] = get_symlink_cache_key(file_path, cache_dir)
             continue
         if file_path.exists():
             if not file_path.is_file():
@@ -1751,7 +1757,7 @@ def restore_missing_in_directory(
             continue
         extra_path = path / relpath
         if extra_path.is_symlink():
-            changed[relpath] = _get_symlink_cache_hash(extra_path, cache_dir)
+            changed[relpath] = get_symlink_cache_key(extra_path, cache_dir)
         else:
             changed[relpath], _ = hash_file(extra_path, state_db)
     # A hash pivot 0.3.3 recorded lists no empty directories, so on disk none of them is extra.

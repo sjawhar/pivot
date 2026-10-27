@@ -190,7 +190,7 @@ async def test_atomic_download_failure_leaves_nothing(
     with pytest.raises(exceptions.RemoteError, match="Hash mismatch"):
         await keys.atomic_download(dest, _failing, overwrite=overwrite, readonly=True)
 
-    assert [p.name for p in tmp_path.iterdir() if p.name != cache._PREFIX_LOCK] == []
+    assert [p.name for p in tmp_path.iterdir() if p.name != cache.PREFIX_LOCK] == []
 
 
 async def test_atomic_download_overwrite_replaces_an_existing_file(tmp_path: pathlib.Path) -> None:
@@ -212,7 +212,7 @@ async def test_atomic_download_keeps_an_existing_cache_entry(tmp_path: pathlib.P
     await keys.atomic_download(dest, _writer(b"content"), overwrite=False, readonly=True)
 
     assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
-    assert [p.name for p in tmp_path.iterdir() if p.name != cache._PREFIX_LOCK] == ["entry"]
+    assert [p.name for p in tmp_path.iterdir() if p.name != cache.PREFIX_LOCK] == ["entry"]
 
 
 @pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP])
@@ -238,4 +238,4 @@ async def test_atomic_download_without_hard_links(
     assert dest.read_bytes() == b"content"
     if inode is not None:
         assert dest.stat().st_ino == inode, "the existing cache entry must not be replaced"
-    assert [p.name for p in tmp_path.iterdir() if p.name != cache._PREFIX_LOCK] == ["entry"]
+    assert [p.name for p in tmp_path.iterdir() if p.name != cache.PREFIX_LOCK] == ["entry"]
