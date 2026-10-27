@@ -202,6 +202,23 @@ def test_a_pipeline_loaded_while_its_path_could_not_be_used_runs_in_pivot(
     ]
     assert len(objects) == 2, output
 
+    # The library caller gets the command's warning once, at the load: the path cannot be used
+    # and Pivot uses `.pivot` (for a link under a file, it names that file, as a command does).
+    real_root = os.path.realpath(root)
+    in_the_way = f"{real_root}/afile" if shape == "link-re-pointed" else f"{real_root}/s1"
+    role = "core.state_dir parent" if shape == "link-re-pointed" else "core.state_dir"
+    warning = (
+        f"{role} must be a directory: {in_the_way} (core.state_dir in "
+        + f"{real_root}/.pivot/config.yaml). The state directory cannot be used; Pivot uses the "
+        + "default .pivot."
+    )
+    assert output.splitlines().count(warning) == 1, output
+    assert output.count("Pivot uses the default .pivot.") == 1, output
+    if shape == "file-kept":
+        # The same line a command prints while the path still cannot be used.
+        status = helpers.run_pivot(root, tmp_path / "home", "status")
+        assert status.stderr.splitlines().count(warning) == 1, status.stderr
+
     if shape != "file-removed":
         return
     # A later command can use `s1`, so it reads the locks from `.pivot`; its notice must name
@@ -212,7 +229,6 @@ def test_a_pipeline_loaded_while_its_path_could_not_be_used_runs_in_pivot(
         "holds stage locks or cache objects of this project: earlier Pivot releases kept them "
         + "there, and so does a run while core.state_dir is unset or cannot be used"
     ) in status.stderr, status.stderr
-    real_root = os.path.realpath(root)
     move = shlex.join(["mv", f"{real_root}/.pivot/stages", f"{real_root}/s1/stages"])
     assert f"move the locks with `{move}`" in status.stderr, status.stderr
     assert "or delete them if a run that could not use core.state_dir made them." in status.stderr

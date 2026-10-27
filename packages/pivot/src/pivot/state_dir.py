@@ -55,6 +55,9 @@ class StateDirInvocation(typing.TypedDict):
     fallback: dict[pathlib.Path, pathlib.Path]
     # None under --quiet and for a worker's stage: these warnings stay silent.
     reported: StateDirWarnings | None
+    # A library entry point's record (``entry_invocation``): it reports only a path that cannot
+    # become a directory, once per pipeline load (``report_unusable_path_to_library``).
+    library: bool
 
 
 # Set by the CLI callback for one CLI invocation, by a worker for one stage, and by a library
@@ -231,18 +234,41 @@ def _state_dir_or_default(
     if isinstance(resolution, pathlib.Path):
         return resolution
     config_path = root / ".pivot" / "config.yaml"
+    reported = _reported()
+    if warn and reported is not None and config_path not in reported["unusable"]:
+        reported["unusable"].add(config_path)
+        logger.warning(_unusable_message(root, resolution))
+    return root / ".pivot"
+
+
+def _unusable_message(
+    root: pathlib.Path, resolution: exceptions.ConfigError | UnicodeDecodeError
+) -> str:
+    """The one warning about a value, or the path it names, that cannot be used."""
     reason = "The state directory is unknown"
     if isinstance(resolution, UnicodeDecodeError):
-        problem = f"{config_path} is not valid UTF-8: {resolution}"
+        problem = f"{root / '.pivot' / 'config.yaml'} is not valid UTF-8: {resolution}"
     else:
         problem = str(resolution)
         if isinstance(resolution, exceptions.StateDirTargetError):
             reason = "The state directory cannot be used"
-    reported = _reported()
-    if warn and reported is not None and config_path not in reported["unusable"]:
-        reported["unusable"].add(config_path)
-        logger.warning(f"{problem}. {reason}; Pivot uses the default .pivot.")
-    return root / ".pivot"
+    return f"{problem}. {reason}; Pivot uses the default .pivot."
+
+
+def report_unusable_path_to_library(root: pathlib.Path, resolution: StateDirResolution) -> None:
+    """Warn a library caller, at each pipeline load, that the configured path cannot be used.
+
+    The pipeline then keeps its state in ``.pivot`` for its whole life (``kept_by_pipeline``),
+    so the caller gets the warning a command prints, once per load. Silent under a CLI
+    invocation, which reports it once per command, and in a worker.
+    """
+    invocation = _invocation.get()
+    if (
+        invocation is not None
+        and invocation["library"]
+        and isinstance(resolution, exceptions.StateDirTargetError)
+    ):
+        logger.warning(_unusable_message(root, resolution))
 
 
 def _unusable_target(
@@ -393,7 +419,10 @@ def report_cache_stage_overlap(
 
 
 def begin_invocation(
-    *, report: bool, state_dirs: Mapping[pathlib.Path, StateDirResolution] | None = None
+    *,
+    report: bool,
+    state_dirs: Mapping[pathlib.Path, StateDirResolution] | None = None,
+    library: bool = False,
 ) -> contextvars.Token[StateDirInvocation | None]:
     """Start one invocation's record, used until the returned token is reset.
 
@@ -402,7 +431,7 @@ def begin_invocation(
     the outcome for a path that cannot be used included, so the worker reads every state file
     where its Pivot process does, and a ``core.state_dir`` edited during a ``--watch`` session
     never reaches it. With ``report``, each state-directory problem is warned once; without it,
-    none is.
+    none is, except that a ``library`` record reports an unusable path at each pipeline load.
     """
     reported = (
         StateDirWarnings(
@@ -419,6 +448,7 @@ def begin_invocation(
             resolved=dict[pathlib.Path, StateDirResolution](state_dirs or {}),
             fallback=dict[pathlib.Path, pathlib.Path](),
             reported=reported,
+            library=library,
         )
     )
 
@@ -445,7 +475,9 @@ def entry_invocation(
     its ``.pivot`` fallback (``kept_by_pipeline``), so its fingerprints and its runs use the
     directory its stages' locks are in and read no config. A CLI invocation, or an entry point
     already in progress, holds the record for the whole call, and this leaves it alone. The
-    record reports nothing: a library caller's warnings stay silent.
+    record reports one thing: each pipeline loaded under it warns once when the path
+    ``core.state_dir`` names cannot be used (``report_unusable_path_to_library``), as a command
+    would; a library caller's other state-directory warnings stay silent.
 
     Yields the record's resolutions by project root, so the caller can keep them.
     """
@@ -453,7 +485,7 @@ def entry_invocation(
     if invocation is not None:
         yield invocation["resolved"]
         return
-    token = begin_invocation(report=False, state_dirs=state_dirs)
+    token = begin_invocation(report=False, state_dirs=state_dirs, library=True)
     try:
         yield typing.cast("StateDirInvocation", _invocation.get())["resolved"]
     finally:

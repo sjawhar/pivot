@@ -759,12 +759,15 @@ class Pipeline:
         new_registry = registry.StageRegistry()
         closure = self._upstream_closure()
         # One record for the load: each project root's state directory is read and resolved
-        # once, recorded on its stages, and kept for this pipeline's fingerprints and runs.
+        # once, recorded on its stages, and kept for this pipeline's fingerprints and runs. A
+        # library caller is told once per load that a path it cannot use sends them to `.pivot`.
         with state_dir_mod.entry_invocation() as resolved:
             stage_state_dirs = {self._root: self._stage_state_dir()}
             for foreign_pipeline, _ in closure:
                 if foreign_pipeline._root not in stage_state_dirs:
                     stage_state_dirs[foreign_pipeline._root] = foreign_pipeline._stage_state_dir()
+            for root in stage_state_dirs:
+                state_dir_mod.report_unusable_path_to_library(root, resolved[root])
             resolved_state_dirs = {
                 root: state_dir_mod.kept_by_pipeline(resolved[root]) for root in stage_state_dirs
             }

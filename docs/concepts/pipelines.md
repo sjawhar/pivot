@@ -152,7 +152,8 @@ caches all use that directory. That includes the fallback to `.pivot` when the
 value, or the path it names, cannot be used: a pipeline loaded while the path
 could not be used (a regular file, a dangling link, a directory it cannot write)
 keeps `.pivot` for everything it writes, whether or not the path can be used
-when it runs. So `include()` refuses a pipeline loaded before an edit of
+when it runs. A program that loads it gets the warning a `pivot` command prints,
+once per load. So `include()` refuses a pipeline loaded before an edit of
 `core.state_dir` (or of a symbolic link it names, or of whether the path it
 names can be used) into one loaded after it: the error names both directories.
 Load both pipelines after the change. The pipelines of one `pivot` command, or
