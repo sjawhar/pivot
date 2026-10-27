@@ -6,7 +6,8 @@ inode as the original, so its entry is found by the file's identity and nothing 
 copied output is a new file: the first status reads it and saves its hash, so the second
 status reads nothing. `pivot diff` and `pivot plots diff` look files up and save what they read
 the same way. The tests drive the installed `pivot` binary and record every file of the
-replica's outputs that the process opens.
+replica's outputs that the process opens, so the hard-link tests need the temporary directory
+on a filesystem type the identity lookup trusts (``state._IDENTITY_FS_TYPES``; ext4 in CI).
 """
 
 from __future__ import annotations
@@ -407,3 +408,121 @@ def test_a_copied_replicas_second_plots_diff_reads_no_plot(tmp_path: pathlib.Pat
     second, out = _helper_opens(replica, "plots", tmp_path, "plots", "diff")
     assert "No plot changes." in out, out
     assert second == []
+
+
+def test_diff_and_plots_diff_leave_a_project_without_a_state_database(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot diff` and `pivot plots diff` look files up read-only and save best-effort, so a
+    project with no state database is left without one."""
+    root = _helper_show_project(tmp_path / "live")
+    shutil.rmtree(root / ".pivot" / "state.lmdb")
+
+    for args in (("diff", "--no-tui", "."), ("plots", "diff")):
+        _ok(_pivot(root, *args))
+        assert not (root / ".pivot" / "state.lmdb").exists(), args
+
+
+def test_diff_and_plots_diff_read_the_files_past_a_damaged_state_database(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A damaged state database (its first 8 KiB zeroed, as a torn copy of a live one can leave
+    it) does not fail the two read-only reports, which read no database before they saved
+    hashes: `pivot diff` and `pivot plots diff` read the files, exit 0 and leave it as it was."""
+    root = _helper_show_project(tmp_path / "live")
+    data_file = root / ".pivot" / "state.lmdb" / "data.mdb"
+    with data_file.open("r+b") as f:
+        f.write(b"\0" * 8192)
+    before = data_file.read_bytes()
+
+    opened, out = _helper_opens(root, "data", tmp_path, "diff", "--no-tui", ".")
+    assert "No data file changes detected." in out, out
+    assert len(opened) == _FILES, "Every compared file is read"
+    opened, out = _helper_opens(root, "plots", tmp_path, "plots", "diff")
+    assert "No plot changes." in out, out
+    assert [pathlib.Path(path).name for path in opened] == ["chart.png"]
+    assert data_file.read_bytes() == before
+
+
+_STATE_DIR_PIPELINE = f"""\
+import json
+import pathlib
+import tempfile
+from typing import Annotated
+
+import matplotlib.figure
+import pandas as pd
+
+from pivot import Pipeline, loaders, plot, stage
+
+
+@stage
+def make_tables() -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "tables"
+    for i in range({_FILES}):
+        (out / f"d{{i % 3}}").mkdir(parents=True, exist_ok=True)
+        (out / f"d{{i % 3}}" / f"t{{i:02d}}.json").write_text(json.dumps({{"row": i}}))
+    return out
+
+
+@stage
+def make_csv() -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return pd.DataFrame({{"id": [1, 2], "value": [10, 20]}})
+
+
+@stage
+def chart() -> Annotated[matplotlib.figure.Figure, plot]:
+    figure = matplotlib.figure.Figure()
+    figure.subplots().plot([1, 2])
+    return figure
+
+
+with Pipeline("show") as pipeline:
+    make_tables()
+    make_csv()
+    chart()
+"""
+
+
+def test_with_the_state_dir_elsewhere_each_command_saves_where_status_reads(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With ``core.state_dir`` set elsewhere a stage keeps its state in ``.pivot``. `pivot diff`
+    (a directory output and a single-file output), `pivot plots diff` and a `--no-commit` run
+    save the hashes they read there, so the next diff and `pivot status` read none of them."""
+    root = (tmp_path / "live").resolve()
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    _ok(_pivot(root, "init"))
+    (root / "pipeline.py").write_text(_STATE_DIR_PIPELINE)
+    (root / ".gitignore").write_text("/data/\n/plots/\n/.state/\n__pycache__/\n")
+    _ok(_pivot(root, "config", "set", "core.state_dir", ".state"))
+    _ok(_pivot(root, "repro"))
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "run"],
+        cwd=root,
+        check=True,
+    )
+    replica = tmp_path / "replica"
+    _cp_r(root, replica)
+
+    first, _ = _helper_opens(replica, "data", tmp_path, "diff", "--no-tui", ".")
+    assert len(first) == _FILES + 1, "A copy is a new file"
+    assert _helper_opens(replica, "data", tmp_path, "diff", "--no-tui", ".")[0] == []
+    assert len(_helper_opens(replica, "plots", tmp_path, "plots", "diff")[0]) == 1
+    assert _helper_outputs_status_opens(replica, tmp_path) == [], "Status reads none of them"
+
+    _ok(_pivot(replica, "repro", "--no-commit", "--force"))
+    assert _helper_outputs_status_opens(replica, tmp_path) == [], "Status reads no output"
+
+
+def _helper_outputs_status_opens(root: pathlib.Path, tmp_path: pathlib.Path) -> list[str]:
+    """The stage outputs (under data/ and plots/) that `pivot status --json` opens in ``root``."""
+    opened, _ = _helper_opens(root, ".", tmp_path, "status", "--json")
+    resolved = root.resolve()
+    return [
+        path
+        for path in opened
+        if pathlib.Path(path).relative_to(resolved).parts[0] in ("data", "plots")
+    ]

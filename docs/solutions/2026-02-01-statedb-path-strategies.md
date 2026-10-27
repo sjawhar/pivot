@@ -72,11 +72,20 @@ same hash, and both paths name one inode, so the identity lookup is never weaker
 lookup at the recorded path. The second check is what keeps a reused inode number from being
 served: a copy that keeps mtimes (`cp -a`, `rsync -a`, `shutil.copy2`) can give a new file the
 number, size and mtime of a deleted one, but the deleted file's path names nothing any more.
-Its change time is for filesystems that show two live files with one device and inode number
-(mergerfs with `inodecalc=passthrough` reports each branch's inode number under one device):
-every link of an inode shares one change time, and two such files do not. The entry itself
-has no ctime because a new hard link changes it, which would invalidate every hard-linked
-replica; check (2) reads both change times at lookup time instead.
+The entry itself has no ctime because a new hard link changes it, which would invalidate every
+hard-linked replica; check (2) reads both change times at lookup time instead.
+
+The argument needs one device and inode number to name one live file. Some filesystems break
+that: mergerfs with `inodecalc=passthrough` reports each branch's inode number under one
+device, and other FUSE, network and union filesystems make inode numbers up. The change time
+cannot tell two such files apart: one command that changes both (`touch -d @T a b`,
+`chmod -R`) gives them one change time to the nanosecond, and with it one size and mtime: on
+mergerfs that let `pivot repro` keep a stale output. So
+the identity lookup runs only on a device that `/proc/self/mountinfo` mounts with a type on
+`state._IDENTITY_FS_TYPES` (ext2, ext3, ext4, xfs, btrfs, tmpfs, f2fs, zfs; a btrfs
+subvolume's own device counts as btrfs). Any other filesystem, and macOS, which has no
+mountinfo, gets the path lookup only: it loses the replica speedup, never correctness. The
+`.pvt` walk memo (#513) reads the same list; whichever merges second moves both to one helper.
 
 `pivot status`, every explanation, `pivot diff` and `pivot plots diff` open the database
 read-only, then save the hashes they had to read with `state.write_back_file_hashes`,

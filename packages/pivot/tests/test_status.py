@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import lmdb
 import pytest
 
 from pivot import config, exceptions, executor, explain, registry, status
@@ -335,6 +336,29 @@ def test_tracked_files_status_saves_the_hashes_it_read(
     assert [entry["status"] for entry in first] == ["clean", "clean"]
     assert second == first
     assert reads.call_count == 0, "Every file the first check read was saved"
+
+
+def test_tracked_files_status_fails_on_a_damaged_state_database(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Status reports a damaged state database (here its first 8 KiB zeroed) instead of reading
+    past it, as it always has; only `pivot diff` and `pivot plots diff` read the files instead
+    (``cache.hash_read_only``'s ``read_files_if_damaged``)."""
+    (set_project_root / ".git").mkdir(exist_ok=True)
+    data_file = set_project_root / "data.txt"
+    data_file.write_text("content")
+    track.write_pvt_file(
+        set_project_root / "data.txt.pvt",
+        track.PvtData(path="data.txt", hash=cache.hash_file(data_file)[0], size=7),
+    )
+    state_dir = config.get_state_dir()
+    with state_mod.StateDB(state_dir):
+        pass
+    with (state_dir / "state.lmdb" / "data.mdb").open("r+b") as f:
+        f.write(b"\0" * 8192)
+
+    with pytest.raises(lmdb.Error):
+        status.get_tracked_files_status(set_project_root)
 
 
 def test_tracked_files_modified(set_project_root: pathlib.Path) -> None:

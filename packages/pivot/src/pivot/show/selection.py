@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import collections
-import contextlib
+import functools
 import logging
 import os
 import pathlib
@@ -319,6 +319,23 @@ def _workspace_members(
     return result
 
 
+def _selected_members(
+    selected: list[tuple[_DiffOutput, frozenset[str] | None]],
+    proj_root: pathlib.Path,
+    cache_dir: pathlib.Path,
+    state_db: state.StateDB | None,
+    pending: list[tuple[pathlib.Path, os.stat_result, str]],
+) -> dict[str, tuple[str, pathlib.Path]]:
+    """The workspace members of the selected outputs whose stages share one state directory,
+    each with its hash and path (``_workspace_members``)."""
+    members = dict[str, tuple[str, pathlib.Path]]()
+    for output, prefixes in selected:
+        members.update(
+            _workspace_members(output, prefixes, proj_root, cache_dir, state_db, pending)
+        )
+    return members
+
+
 def select_data_files(targets: Sequence[str]) -> DataSelection | None:
     """Select the data files ``targets`` name, at git HEAD and in the workspace.
 
@@ -330,10 +347,10 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
     either side is named in one warning. Returns None when no registered stage has an output
     `pivot diff` can compare.
 
-    Workspace files are hashed as ``pivot status`` hashes them: each output's stage StateDB is
-    read read-only (none is created), and the hashes read from files are saved afterwards with
-    one best-effort ``state.write_back_file_hashes`` per state directory, so the next diff, or
-    status, reads none of them.
+    Workspace files are hashed as ``pivot status`` hashes them (``cache.hash_read_only``): each
+    output's stage StateDB is read read-only (none is created; a damaged one is not used), and
+    the hashes read from files are saved afterwards with one best-effort write per state
+    directory, so the next diff, or status, reads none of them.
     """
     from pivot.cli import helpers as cli_helpers
 
@@ -351,40 +368,28 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
     selection, unresolved = _select_outputs(
         targets, outputs, paths_by_identity, stage_infos, proj_root
     )
-    read_by_state_dir = dict[pathlib.Path, list[tuple[pathlib.Path, os.stat_result, str]]]()
-    with contextlib.ExitStack() as stack:
-        state_dbs = dict[pathlib.Path, state.StateDB | None]()
-        for path, prefixes in selection.items():
-            output = outputs[path]
-            if output["changed_kind"] is not None:
-                head_kind, workspace_kind = output["changed_kind"]
-                logger.warning(
-                    "Output %s is %s at git HEAD and %s in the workspace, so it is not compared",
-                    path,
-                    head_kind,
-                    workspace_kind,
-                )
-                continue
-            head_hashes.update(_head_members(output, prefixes))
-            if not output["in_workspace"]:
-                continue
-            state_dir = output["state_dir"]
-            if state_dir not in state_dbs:
-                state_dbs[state_dir] = stack.enter_context(
-                    state.open_readonly(state_dir, create=False)
-                )
-            for member, (file_hash, file_path) in _workspace_members(
-                output,
-                prefixes,
-                proj_root,
-                cache_dir,
-                state_dbs[state_dir],
-                read_by_state_dir.setdefault(state_dir, []),
-            ).items():
-                workspace_hashes[member] = file_hash
-                workspace_paths[member] = file_path
-    for state_dir, read in read_by_state_dir.items():
-        state.write_back_file_hashes(state_dir, cache.deferred_file_hash_entries(read))
+    by_state_dir = dict[pathlib.Path, list[tuple[_DiffOutput, frozenset[str] | None]]]()
+    for path, prefixes in selection.items():
+        output = outputs[path]
+        if output["changed_kind"] is not None:
+            head_kind, workspace_kind = output["changed_kind"]
+            logger.warning(
+                "Output %s is %s at git HEAD and %s in the workspace, so it is not compared",
+                path,
+                head_kind,
+                workspace_kind,
+            )
+            continue
+        head_hashes.update(_head_members(output, prefixes))
+        if output["in_workspace"]:
+            by_state_dir.setdefault(output["state_dir"], []).append((output, prefixes))
+    for state_dir, selected in by_state_dir.items():
+        hash_members = functools.partial(_selected_members, selected, proj_root, cache_dir)
+        for member, (file_hash, file_path) in cache.hash_read_only(
+            state_dir, hash_members, create=False, read_files_if_damaged=True
+        ).items():
+            workspace_hashes[member] = file_hash
+            workspace_paths[member] = file_path
 
     covered = set[str]()
     if any(path is not None for _, path in unresolved):

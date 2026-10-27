@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import pathlib
 import re
 import stat
@@ -16,10 +17,12 @@ import anyio
 
 from pivot import compose, exceptions, project, stage_def
 from pivot import names as stage_names
-from pivot.storage import store
+from pivot.storage import state, store
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+
+    import pytest
 
     from pivot.registry import PipelineLike
 
@@ -323,3 +326,19 @@ def create_pipeline_py(
 
     pipeline_path.write_text("\n".join(lines))
     return pipeline_path
+
+
+def mount_table(
+    monkeypatch: pytest.MonkeyPatch, path: pathlib.Path, mounts: Sequence[tuple[int, str, str]]
+) -> None:
+    """Point the identity lookup at a ``/proc/self/mountinfo`` written to ``path`` that lists
+    ``mounts``, each (device, mount point, filesystem type), with the kernel's escaping."""
+    lines = list[str]()
+    for mount_id, (device, point, fstype) in enumerate(mounts, 90):
+        escaped = point.replace("\\", "\\134").replace(" ", "\\040")
+        lines.append(
+            f"{mount_id} 1 {os.major(device)}:{os.minor(device)} / {escaped} "
+            + f"rw,relatime shared:{mount_id} - {fstype} /dev/fake{mount_id} rw\n"
+        )
+    path.write_text("".join(lines))
+    monkeypatch.setattr(state, "_MOUNTINFO", path)

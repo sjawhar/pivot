@@ -18,6 +18,7 @@ import tempfile
 import time
 from typing import TYPE_CHECKING, TypedDict
 
+import lmdb
 import xxhash
 
 from pivot import exceptions, metrics
@@ -217,7 +218,8 @@ def deferred_file_hash_entries(
     StateDB to hand to one that can.
 
     Each path is made absolute here, so the writer keys it the same from any working
-    directory. The writer leaves out an entry whose key exceeds LMDB's limit.
+    directory. The writer leaves out an entry whose key exceeds LMDB's limit, or whose mtime
+    is outside 1970-2554 (``state._put_file_hashes``).
     """
     return [
         (
@@ -230,6 +232,44 @@ def deferred_file_hash_entries(
         )
         for path, file_stat, file_hash in entries
     ]
+
+
+def hash_read_only[T](
+    state_dir: pathlib.Path,
+    hash_files: Callable[
+        [state_mod.StateDB | None, list[tuple[pathlib.Path, os.stat_result, str]]], T
+    ],
+    *,
+    create: bool = True,
+    read_files_if_damaged: bool = False,
+) -> T:
+    """Hash files against ``state_dir``'s StateDB read-only, then save what had to be read.
+
+    ``hash_files(state_db, pending)`` gets the database ``state.open_readonly`` opens (None
+    where this user cannot use it, or, with ``create`` False, where there is none) and a list
+    to pass as ``hash_file``'s and ``hash_directory``'s ``pending``. Once it returns, the
+    hashes it read from files are saved with one best-effort ``state.write_back_file_hashes``.
+    `pivot status` (its tracked files), `pivot diff` and `pivot plots diff` hash workspace
+    files this way.
+
+    With ``read_files_if_damaged``, an ``lmdb.Error`` from the open or from a lookup (a damaged
+    database) is logged at debug, and ``hash_files`` runs again with no database and a new
+    list, reading every file; nothing is saved to that database. Without it the error
+    propagates.
+    """
+    from pivot.storage import state as state_mod
+
+    pending = list[tuple[pathlib.Path, os.stat_result, str]]()
+    try:
+        with state_mod.open_readonly(state_dir, create=create) as state_db:
+            result = hash_files(state_db, pending)
+    except lmdb.Error as error:
+        if not read_files_if_damaged:
+            raise
+        logger.debug("Reading files without the state database in %s: %s", state_dir, error)
+        return hash_files(None, [])
+    state_mod.write_back_file_hashes(state_dir, deferred_file_hash_entries(pending))
+    return result
 
 
 def _cache_object_key(path: pathlib.Path, cache_dir: pathlib.Path | None) -> str | None:

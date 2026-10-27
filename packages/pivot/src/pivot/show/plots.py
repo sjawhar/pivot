@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import html
 import json
 import logging
@@ -98,10 +99,11 @@ def get_plot_hashes_from_workspace(
 ) -> dict[str, str]:
     """Compute current file hashes for plot files.
 
-    Paths are relative to project root. Each file is hashed as ``pivot status`` hashes it: the
-    StateDB of ``state_dirs[path]`` (``plot_state_dirs``; the configured state directory for a
-    path not in it) is read read-only, none is created, and the hashes read from files are
-    saved afterwards with one best-effort ``state.write_back_file_hashes`` per state directory.
+    Paths are relative to project root. Each file is hashed as ``pivot status`` hashes it
+    (``cache.hash_read_only``): the StateDB of ``state_dirs[path]`` (``plot_state_dirs``; the
+    configured state directory for a path not in it) is read read-only, none is created and a
+    damaged one is not used, and the hashes read from files are saved afterwards with one
+    best-effort write per state directory.
     """
     proj_root = project.get_project_root()
     default_state_dir = config.get_state_dir()
@@ -113,13 +115,26 @@ def get_plot_hashes_from_workspace(
             by_state_dir.setdefault(state_dir, []).append((path_str, path))
     result = dict[str, str]()
     for state_dir, files in by_state_dir.items():
-        read = list[tuple[pathlib.Path, os.stat_result, str]]()
-        with state.open_readonly(state_dir, create=False) as state_db:
-            for path_str, path in files:
-                file_hash, _ = cache.hash_file(path, state_db, pending=read)
-                result[path_str] = file_hash
-        state.write_back_file_hashes(state_dir, cache.deferred_file_hash_entries(read))
+        result.update(
+            cache.hash_read_only(
+                state_dir,
+                functools.partial(_hash_plots, files),
+                create=False,
+                read_files_if_damaged=True,
+            )
+        )
     return result
+
+
+def _hash_plots(
+    files: list[tuple[str, pathlib.Path]],
+    state_db: state.StateDB | None,
+    pending: list[tuple[pathlib.Path, os.stat_result, str]],
+) -> dict[str, str]:
+    """Each plot file's hash, keyed by its project-relative path."""
+    return {
+        path_str: cache.hash_file(path, state_db, pending=pending)[0] for path_str, path in files
+    }
 
 
 def diff_plots(

@@ -45,7 +45,6 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
-import os
 import pathlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, cast
@@ -83,6 +82,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
+    import os
     from collections.abc import Callable
 
     import networkx as nx
@@ -356,12 +356,12 @@ def get_tracked_files_status(
     """
     tracked = track.discover_pvt_files(project_root)
     total = len(tracked)
-    results = list[TrackedFileInfo]()
-
     cache_dir = config.get_cache_dir() / "files"
-    state_dir = config.get_state_dir()
-    pending = list[tuple[pathlib.Path, os.stat_result, str]]()
-    with state_mod.open_readonly(state_dir) as state_db:
+
+    def _hash_tracked(
+        state_db: state_mod.StateDB | None, pending: list[tuple[pathlib.Path, os.stat_result, str]]
+    ) -> list[TrackedFileInfo]:
+        results = list[TrackedFileInfo]()
         for i, (abs_path_str, track_data) in enumerate(sorted(tracked.items()), 1):
             path = pathlib.Path(abs_path_str)
             rel_path = str(path.relative_to(project_root))
@@ -396,9 +396,10 @@ def get_tracked_files_status(
             )
             if on_progress is not None:
                 on_progress(i, total)
-    state_mod.write_back_file_hashes(state_dir, cache.deferred_file_hash_entries(pending))
+        return results
 
-    return results
+    # A damaged state database fails status, as it always has (`pivot diff` reads files instead).
+    return cache.hash_read_only(config.get_state_dir(), _hash_tracked)
 
 
 def get_remote_status(

@@ -1,20 +1,37 @@
-"""A file-hash entry is also found by the file's identity, (st_dev, st_ino), and that match is
-never weaker than a path match at the recorded path (Dispatch BET-263)."""
+"""A file-hash entry is also found by the file's identity, (st_dev, st_ino), on a filesystem
+that keeps one identity for one live file, and that match is never weaker than a path match
+at the recorded path (Dispatch BET-263)."""
 
 from __future__ import annotations
 
 import os
+import pathlib
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from pivot.storage import cache, state
 from pivot.types import DeferredWrites
+from tests import helpers
 
 if TYPE_CHECKING:
-    import pathlib
+    from collections.abc import Callable
 
     from pytest_mock import MockerFixture
+
+
+@pytest.fixture(autouse=True)
+def mounted_as_ext4(
+    tmp_path: pathlib.Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> pathlib.Path:
+    """The mount table mounts the temporary directory's filesystem as ext4, so these tests do
+    not depend on the filesystem the directory is on. Returns the mountinfo file, which a test
+    may rewrite."""
+    mountinfo = tmp_path_factory.mktemp("mounts") / "mountinfo"
+    helpers.mount_table(monkeypatch, mountinfo, [(os.stat(tmp_path).st_dev, "/", "ext4")])
+    return mountinfo
 
 
 def _helper_record(state_dir: pathlib.Path, path: pathlib.Path) -> str:
@@ -236,10 +253,10 @@ def test_a_recorded_path_that_now_names_another_devices_inode_vouches_for_nothin
 def test_another_live_file_with_the_recorded_identity_is_not_served(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Two live files can show one (st_dev, st_ino): mergerfs with `inodecalc=passthrough`
-    reports each branch's inode number under the mount's one device. The recorded path then
-    names the same device and inode as the file looked up, and check (2) must still refuse it:
-    it is another file, with its own change time, so its hash is not this file's."""
+    """Check (2) compares change times too, a second check behind the filesystem allowlist:
+    should a filesystem on the list ever show another live file with the recorded identity
+    (faked here, after `touch -r a.txt b.txt` gave it the recorded size and mtime), its own
+    change time still refuses it."""
     state_dir = tmp_path / ".pivot"
     recorded_path = tmp_path / "branch1" / "a.txt"
     recorded_path.parent.mkdir()
@@ -268,6 +285,197 @@ def test_another_live_file_with_the_recorded_identity_is_not_served(
         served = state_db.get(other, shown)
     assert served != recorded_hash, "another file's hash was served for b.txt"
     assert served is None
+
+
+def test_another_live_file_touched_with_the_recorded_file_is_not_served(
+    tmp_path: pathlib.Path, mounted_as_ext4: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two live files that a filesystem shows with one (st_dev, st_ino) (mergerfs with
+    `inodecalc=passthrough`) get one change time from one command that changes both:
+    `touch -d @T a.txt b.txt`, `chmod -R`, `chown -R`. The PR body says such a file is never
+    served the other's hash, so the lookup must still refuse b.txt: mergerfs is not on the
+    allowlist, and no stat field tells the two files apart."""
+    helpers.mount_table(
+        monkeypatch, mounted_as_ext4, [(os.stat(tmp_path).st_dev, "/", "fuse.mergerfs")]
+    )
+    state_dir = tmp_path / ".pivot"
+    recorded_path = tmp_path / "branch1" / "a.txt"
+    recorded_path.parent.mkdir()
+    recorded_path.write_bytes(b"hello world\n")
+    with state.StateDB(state_dir) as state_db:
+        recorded_hash, _ = cache.hash_file(recorded_path, state_db)
+    other = tmp_path / "branch2" / "b.txt"
+    other.parent.mkdir()
+    other.write_bytes(b"HELLO WORLD\n")
+    recorded = recorded_path.stat()
+    # What such a filesystem shows of b.txt after one `touch -d @T a.txt b.txt`, where a.txt's
+    # mtime already was T: a.txt's device, inode number, size and mtime, and the change time
+    # that one touch gave both files (equal to the nanosecond on ext4, kernel 7.0).
+    fields = list(other.stat())
+    fields[1], fields[2] = recorded.st_ino, recorded.st_dev
+    shown = os.stat_result(
+        fields,
+        {
+            "st_atime_ns": recorded.st_atime_ns,
+            "st_mtime_ns": recorded.st_mtime_ns,
+            "st_ctime_ns": recorded.st_ctime_ns,
+        },
+    )
+    assert shown.st_size == recorded.st_size
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        served = state_db.get(other, shown)
+    assert served != recorded_hash, "another file's hash was served for b.txt"
+
+
+def _helper_linked_replica(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, str]:
+    """A recorded file under ``root`` and a hard link of it at another path: the state
+    directory, the link and the recorded hash."""
+    state_dir = root / ".pivot"
+    live = _helper_file(root / "live" / "f.txt", b"content")
+    live_hash = _helper_record(state_dir, live)
+    link = root / "replica" / "f.txt"
+    link.parent.mkdir(parents=True)
+    os.link(live, link)
+    return state_dir, link, live_hash
+
+
+@pytest.mark.parametrize("fstype", ["ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs", "f2fs", "zfs"])
+def test_an_allowlisted_filesystem_serves_a_hard_link_by_identity(
+    tmp_path: pathlib.Path,
+    mounted_as_ext4: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    fstype: str,
+) -> None:
+    """Each type on the allowlist keeps one (st_dev, st_ino) for one live file, so a hard link
+    there is served by identity without being read."""
+    state_dir, link, live_hash = _helper_linked_replica(tmp_path)
+    helpers.mount_table(monkeypatch, mounted_as_ext4, [(os.stat(tmp_path).st_dev, "/", fstype)])
+    reads = mocker.spy(cache, "_hash_contents")
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        assert cache.hash_file(link, state_db)[0] == live_hash
+    assert reads.call_count == 0
+
+
+@pytest.mark.parametrize(
+    "fstype",
+    [
+        pytest.param("fuse.mergerfs", id="mergerfs"),
+        pytest.param("fuse.sshfs", id="sshfs"),
+        pytest.param("nfs4", id="nfs"),
+        pytest.param("overlay", id="overlayfs"),
+        pytest.param("9p", id="unknown-type"),
+        pytest.param(None, id="not-in-mountinfo"),
+    ],
+)
+def test_a_filesystem_off_the_allowlist_gets_the_path_lookup_only(
+    tmp_path: pathlib.Path,
+    mounted_as_ext4: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    fstype: str | None,
+) -> None:
+    """Off the allowlist (FUSE, NFS, overlayfs, an unknown type, or a device mountinfo does not
+    list and no btrfs mount holds) even a real hard link of a recorded file is read, and the
+    identity index is not consulted; the recorded path itself still hits by path."""
+    state_dir, link, live_hash = _helper_linked_replica(tmp_path)
+    live = tmp_path / "live" / "f.txt"
+    mounts = [] if fstype is None else [(os.stat(tmp_path).st_dev, "/", fstype)]
+    helpers.mount_table(monkeypatch, mounted_as_ext4, mounts)
+    index = mocker.spy(state, "_identity_candidate")
+    reads = mocker.spy(cache, "_hash_contents")
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        assert state_db.get(live, live.stat()) == live_hash, "The path lookup still serves"
+        assert state_db.get(link, link.stat()) is None
+        assert cache.hash_file(link, state_db)[0] == live_hash
+    assert index.call_count == 0
+    assert reads.call_count == 1, "The link is read"
+
+
+def test_without_mountinfo_no_file_is_looked_up_by_identity(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No /proc/self/mountinfo (macOS, or /proc not mounted): every lookup is by path."""
+    state_dir, link, _ = _helper_linked_replica(tmp_path)
+    monkeypatch.setattr(state, "_MOUNTINFO", tmp_path / "no-such-mountinfo")
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        assert state_db.get(link, link.stat()) is None
+
+
+def _helper_unlisted_under_btrfs(root: pathlib.Path) -> list[tuple[int, str, str]]:
+    return [(os.makedev(0, 4243), os.path.realpath(root), "btrfs")]
+
+
+def _helper_unlisted_under_ext4(root: pathlib.Path) -> list[tuple[int, str, str]]:
+    return [(os.makedev(0, 4243), os.path.realpath(root), "ext4")]
+
+
+def _helper_unlisted_under_tmpfs_inside_btrfs(root: pathlib.Path) -> list[tuple[int, str, str]]:
+    return [
+        (os.makedev(0, 4243), os.path.realpath(root.parent), "btrfs"),
+        (os.makedev(0, 4244), os.path.realpath(root), "tmpfs"),
+    ]
+
+
+def _helper_listed_as_ext4_and_nfs(root: pathlib.Path) -> list[tuple[int, str, str]]:
+    device = os.stat(root).st_dev
+    return [(device, "/srv/a", "ext4"), (device, "/srv/b", "nfs4")]
+
+
+@pytest.mark.parametrize(
+    ("mounts", "served"),
+    [
+        pytest.param(_helper_unlisted_under_btrfs, True, id="unlisted-device-under-btrfs"),
+        pytest.param(_helper_unlisted_under_ext4, False, id="unlisted-device-under-ext4"),
+        pytest.param(
+            _helper_unlisted_under_tmpfs_inside_btrfs, False, id="the-deepest-mount-decides"
+        ),
+        pytest.param(_helper_listed_as_ext4_and_nfs, False, id="device-listed-as-ext4-and-nfs"),
+    ],
+)
+def test_the_filesystem_type_comes_from_mountinfo(
+    tmp_path: pathlib.Path,
+    mounted_as_ext4: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mounts: Callable[[pathlib.Path], list[tuple[int, str, str]]],
+    served: bool,
+) -> None:
+    """A device mountinfo does not list is a btrfs subvolume, with a device of its own, when
+    the deepest mount holding the file is btrfs (its escaped mount point, here with a space,
+    unescaped), and is refused under any other; a device listed with any type off the
+    allowlist is refused."""
+    root = tmp_path / "with space"
+    state_dir, link, live_hash = _helper_linked_replica(root)
+    helpers.mount_table(monkeypatch, mounted_as_ext4, mounts(root))
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        assert state_db.get(link, link.stat()) == (live_hash if served else None)
+
+
+def test_the_mount_table_is_read_once_per_state_db(
+    tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """A StateDB reads mountinfo on its first identity lookup and decides each device once, so
+    a replica's many lookups cost one read of the file."""
+    state_dir = tmp_path / ".pivot"
+    links = list[tuple[pathlib.Path, str]]()
+    for name in ("a", "b", "c"):
+        live = _helper_file(tmp_path / "live" / f"{name}.txt", name.encode())
+        link = tmp_path / "replica" / f"{name}.txt"
+        link.parent.mkdir(exist_ok=True)
+        os.link(live, link)
+        links.append((link, _helper_record(state_dir, live)))
+    mounts_read = mocker.spy(state, "_read_mounts")
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        for link, live_hash in links:
+            assert state_db.get(link, link.stat()) == live_hash
+        assert state_db.get_many([(link, link.stat()) for link, _ in links]) == dict(links)
+    assert mounts_read.call_count == 1
 
 
 def test_rewriting_a_path_drops_its_old_inodes_index_entry(tmp_path: pathlib.Path) -> None:

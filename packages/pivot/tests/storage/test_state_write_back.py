@@ -4,21 +4,24 @@ cannot write still serves reads (Dispatch BET-263)."""
 from __future__ import annotations
 
 import contextlib
+import logging
 import multiprocessing
 import os
 import pathlib
 import time
 from typing import TYPE_CHECKING
 
+import lmdb
 import pytest
 
 from pivot.storage import cache, state
+from tests import helpers
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable, Generator
     from multiprocessing.synchronize import Event
 
-    import lmdb
+    from pytest_mock import MockerFixture
 
     from pivot.types import FileHashEntry
 
@@ -35,8 +38,15 @@ def _helper_new_state_dir(tmp_path: pathlib.Path) -> pathlib.Path:
     return state_dir
 
 
-def test_write_back_saves_entries_and_their_identity(tmp_path: pathlib.Path) -> None:
-    """Saved entries are found by their own path and, for a hard link, by identity."""
+def test_write_back_saves_entries_and_their_identity(
+    tmp_path: pathlib.Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Saved entries are found by their own path and, for a hard link on a filesystem that
+    keeps one identity per live file (mountinfo says ext4), by identity."""
+    mountinfo = tmp_path_factory.mktemp("mounts") / "mountinfo"
+    helpers.mount_table(monkeypatch, mountinfo, [(os.stat(tmp_path).st_dev, "/", "ext4")])
     data = tmp_path / "data.txt"
     data.write_text("data")
     link = tmp_path / "link.txt"
@@ -317,11 +327,11 @@ def _helper_hold_write_lock(state_dir: str, held: Event, release: Event) -> None
 
 
 def test_write_back_waits_no_longer_than_its_budget_for_a_held_lock(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """While another process holds the write lock, a write-back gives up after 2 s, well inside
-    a pivot write's own 30 s, and saves nothing; with no entries, or with a timeout of 0, it
-    does not wait at all."""
+    a pivot write's own 30 s, saves nothing and says so in a debug log; with no entries, or with
+    a timeout of 0, it does not wait at all."""
     data = tmp_path / "data.txt"
     data.write_text("data")
     state_dir = _helper_new_state_dir(tmp_path)
@@ -332,7 +342,8 @@ def test_write_back_waits_no_longer_than_its_budget_for_a_held_lock(
     try:
         assert held.wait(30), "The holder took the write lock"
         started = time.monotonic()
-        state.write_back_file_hashes(state_dir, _helper_entries(data))
+        with caplog.at_level(logging.DEBUG, logger="pivot.storage.state"):
+            state.write_back_file_hashes(state_dir, _helper_entries(data))
         budget = time.monotonic() - started
         started = time.monotonic()
         state.write_back_file_hashes(state_dir, [])
@@ -344,5 +355,100 @@ def test_write_back_waits_no_longer_than_its_budget_for_a_held_lock(
 
     assert 2.0 <= budget < 3.0
     assert no_wait < 0.5
+    assert "Not saving 1 file hashes" in caplog.text
     with state.StateDB(state_dir, readonly=True) as state_db:
         assert state_db.get(data, data.stat()) is None
+
+
+def _helper_damage(state_dir: pathlib.Path) -> pathlib.Path:
+    """Zero the database file's first 8 KiB, both LMDB meta pages, as a torn copy can leave
+    it; returns the file."""
+    data_file = state_dir / "state.lmdb" / "data.mdb"
+    with data_file.open("r+b") as f:
+        f.write(b"\0" * 8192)
+    return data_file
+
+
+def _helper_hasher(
+    path: pathlib.Path, seen: list[state.StateDB | None]
+) -> Callable[[state.StateDB | None, list[tuple[pathlib.Path, os.stat_result, str]]], str]:
+    """A ``hash_read_only`` body that hashes ``path`` and records each database it is given."""
+
+    def _hash(
+        state_db: state.StateDB | None, pending: list[tuple[pathlib.Path, os.stat_result, str]]
+    ) -> str:
+        seen.append(state_db)
+        return cache.hash_file(path, state_db, pending=pending)[0]
+
+    return _hash
+
+
+def test_hash_read_only_saves_what_its_body_read_in_one_write_back(
+    tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """The body gets the database read-only and a list for ``pending``; what it read is saved
+    afterwards, once, so the next call reads nothing."""
+    data = tmp_path / "data.txt"
+    data.write_text("data")
+    state_dir = _helper_new_state_dir(tmp_path)
+    write_back = mocker.spy(state, "write_back_file_hashes")
+    seen = list[state.StateDB | None]()
+
+    assert cache.hash_read_only(state_dir, _helper_hasher(data, seen)) == cache.hash_file(data)[0]
+    assert seen[0] is not None and seen[0].readonly
+    assert write_back.call_count == 1
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        assert state_db.get(data, data.stat()) == cache.hash_file(data)[0]
+
+
+def test_hash_read_only_reads_the_files_past_a_database_lmdb_cannot_open_when_asked(
+    tmp_path: pathlib.Path, mocker: MockerFixture, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With ``read_files_if_damaged`` (`pivot diff`, `pivot plots diff`) a damaged database is
+    not used: the body runs with none, every file is read, and nothing is written to the
+    database. Without it (status) the error propagates, as it always has."""
+    data = tmp_path / "data.txt"
+    data.write_text("data")
+    state_dir = _helper_new_state_dir(tmp_path)
+    data_file = _helper_damage(state_dir)
+    before = data_file.read_bytes()
+    write_back = mocker.spy(state, "write_back_file_hashes")
+    seen = list[state.StateDB | None]()
+
+    with caplog.at_level(logging.DEBUG, logger="pivot.storage.cache"):
+        result = cache.hash_read_only(
+            state_dir, _helper_hasher(data, seen), read_files_if_damaged=True
+        )
+    assert result == cache.hash_file(data)[0]
+    assert seen == [None]
+    assert write_back.call_count == 0
+    assert data_file.read_bytes() == before
+    assert "Reading files without the state database" in caplog.text
+    with pytest.raises(lmdb.Error):
+        cache.hash_read_only(state_dir, _helper_hasher(data, seen))
+
+
+def test_hash_read_only_reads_the_files_again_after_a_lookup_fails(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """A database that opens but fails a lookup (a damaged page) is not used either: with
+    ``read_files_if_damaged`` the body runs again with no database, and nothing is saved."""
+    data = tmp_path / "data.txt"
+    data.write_text("data")
+    state_dir = _helper_new_state_dir(tmp_path)
+
+    def _corrupted(
+        self: state.StateDB, items: list[tuple[pathlib.Path, os.stat_result]]
+    ) -> dict[pathlib.Path, str | None]:
+        raise lmdb.Error("MDB_CORRUPTED: Located page was wrong type")
+
+    monkeypatch.setattr(state.StateDB, "get_many", _corrupted)
+    write_back = mocker.spy(state, "write_back_file_hashes")
+    seen = list[state.StateDB | None]()
+
+    result = cache.hash_read_only(state_dir, _helper_hasher(data, seen), read_files_if_damaged=True)
+    assert result == cache.hash_file(data)[0]
+    assert [state_db is None for state_db in seen] == [False, True]
+    assert write_back.call_count == 0
+    with pytest.raises(lmdb.Error):
+        cache.hash_read_only(state_dir, _helper_hasher(data, seen))

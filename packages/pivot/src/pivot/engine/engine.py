@@ -64,7 +64,6 @@ from pivot.storage import store as store_mod
 from pivot.types import (
     ArtifactTag,
     CompletionType,
-    DeferredWrites,
     HashInfo,
     LockData,
     OnError,
@@ -1972,12 +1971,9 @@ class Engine:
         deps = stage_info["deps"]
 
         def _save_file_hashes(entries: list[types.FileHashEntry]) -> None:
-            """Record the file hashes this check read or restored, so the next one reads none."""
-            if entries:
-                with state_mod.StateDB(stage_state_dir) as writable_db:
-                    writable_db.apply_deferred_writes(
-                        stage_name, [], DeferredWrites(file_hash_entries=entries)
-                    )
+            """Record the file hashes this check read or restored, so the next one reads none:
+            best-effort, waiting at most 2 s for another process's write lock."""
+            state_mod.write_back_file_hashes(stage_state_dir, entries)
 
         def _use_outputs(state_db: state_mod.StateDB) -> _SkipOutcome:
             file_hash_entries = list[types.FileHashEntry]()

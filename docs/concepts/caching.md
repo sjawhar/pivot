@@ -161,14 +161,19 @@ paths: a copy that hard-links Pivot's read-only outputs and copies the database,
 or `cp -al`, which hard-links the database too, so the two share it. Pivot also
 finds an entry by the file's device and inode: a hard-linked output reuses the
 original's entry, after Pivot checks that the original path still names the same
-file, so `pivot status` in such a copy reads no output. A copied output is a new
-file and is read once: `pivot status` saves the hashes it computed, so the next
-`pivot status` reads none of them. Every command that hashes a dependency or an
-output saves its hash the same way, also those that otherwise write nothing:
-`pivot repro --no-commit`, `--dry-run` and `--explain`, `pivot verify`,
-`pivot diff` and `pivot plots diff`. That save is skipped, never an error, when
-another Pivot command holds the database's write lock or the database cannot be
-written.
+file, so `pivot status` in such a copy reads no output. It does so only on a
+filesystem that gives each live file its own inode number on its device: ext2,
+ext3, ext4, XFS, Btrfs, tmpfs, F2FS and ZFS, read from `/proc/self/mountinfo`.
+On any other filesystem (FUSE mounts such as mergerfs or sshfs, NFS, overlayfs),
+and on systems without `/proc/self/mountinfo` such as macOS, a copy's outputs are
+read once instead. A copied output is a new file and is read once: `pivot status`
+saves the hashes it computed, so the next `pivot status` reads none of them.
+Every command that hashes a dependency or an output saves its hash the same way,
+also those that write no lock file: `pivot repro --no-commit`, `--dry-run` and
+`--explain`, `pivot verify`, `pivot diff` and `pivot plots diff`. That save never
+creates a state database, and it is skipped, never an error, when the database
+cannot be written or another Pivot command holds its write lock for more than
+2 seconds.
 
 ## Checkout Modes
 

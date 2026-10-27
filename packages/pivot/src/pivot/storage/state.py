@@ -6,6 +6,7 @@ import fcntl
 import logging
 import os
 import pathlib
+import re
 import struct
 import threading
 import time
@@ -50,6 +51,16 @@ _DB_FULL_MSG = (
 
 # How long a best-effort write-back waits for another process's write lock
 _WRITE_BACK_TIMEOUT = 2.0
+
+# Filesystem types on which one (st_dev, st_ino) names one live file, so a file there may be
+# looked up by identity (``_make_key_file_identity``). ext2 and ext3 keep ext2's on-disk inode
+# tables (kernel Documentation/filesystems/ext2.rst). #513's `.pvt` walk memo reads the same
+# list; whichever of the two merges second moves both to one shared helper.
+_IDENTITY_FS_TYPES = frozenset(
+    {b"ext2", b"ext3", b"ext4", b"xfs", b"btrfs", b"tmpfs", b"f2fs", b"zfs"}
+)
+_MOUNTINFO = pathlib.Path("/proc/self/mountinfo")
+_MOUNTINFO_ESCAPE = re.compile(rb"\\([0-7]{3})")
 
 
 class _SharedEnv(typing.TypedDict):
@@ -283,7 +294,8 @@ def _make_key_file_identity(dev: int, inode: int) -> bytes:
     inode, not always the last written: a batch that writes P, Q, P for one inode leaves Q),
     and a lookup that misses by path follows it.
 
-    The identity lookup is never weaker than a path lookup at the recorded path. It serves
+    The identity lookup is never weaker than a path lookup at the recorded path. It runs only
+    on a filesystem that keeps one (st_dev, st_ino) for one live file (below), and serves
     another path's entry only when (1) that entry matches this file's stat exactly as a path
     lookup there would (mtime_ns, size, device, inode) and (2) that path, stat'ed now, still
     names this file: the same device and inode, and the same change time. A path lookup at
@@ -300,20 +312,26 @@ def _make_key_file_identity(dev: int, inode: int) -> bytes:
     - Another filesystem: the device is part of the key, of the entry and of check (2).
     - A bind mount shows one filesystem, with one device number, at two places, so its two
       paths are two links to one inode: served while the recorded path still names it.
-    - Two live files with one (st_dev, st_ino). The argument above assumes the pair names one
-      live file, as POSIX requires, but a filesystem can break that: mergerfs with
-      `inodecalc=passthrough` shows each branch's inode number under the mount's one device.
-      Two such files keep their own change times, so (2) refuses one for the other, also
-      when `touch -r` or a timestamp-keeping copy gives them one size and mtime. Serving one
-      for the other would take the two to agree on size, mtime and change time to the
-      nanosecond, changes within one timestamp tick, the coincidence the stat match of one
-      path already accepts for a file rewritten within one tick.
+
+    The argument assumes that one (st_dev, st_ino) names one live file, as POSIX requires.
+    Some filesystems break that: mergerfs with `inodecalc=passthrough` shows each branch's
+    inode number under the mount's one device, and other FUSE, network and union filesystems
+    make inode numbers up. No stat field tells two such files apart, the change time
+    included: one command that changes both (`touch -d @T a b`, `chmod -R`, `chown -R`) gives
+    them one change time to the nanosecond. So a file is looked up by identity only when
+    ``/proc/self/mountinfo`` mounts its device with a type on ``_IDENTITY_FS_TYPES`` (ext2,
+    ext3, ext4, xfs, btrfs, tmpfs, f2fs, zfs; ``_device_allowed``). Any other type, every
+    ``fuse.*`` among them, an unknown type, or no mountinfo (macOS) gets the path lookup only:
+    such a filesystem loses the replica speedup, never correctness. The change time in (2)
+    stays a second check.
 
     Both change times in (2) are read at lookup time, from what should be one inode, so a hard
     link made before the lookup, which changes the inode's change time, invalidates nothing;
-    the entry itself holds no change time (``_FILE_HASH_STAT``) for that reason. The index is
-    only a hint: an index entry that is stale or wrong fails (1) or (2) and serves nothing.
-    Check (2) is a ``stat``, never a read of the file.
+    the entry itself holds no change time (``_FILE_HASH_STAT``) for that reason. A hard link
+    made between the stat of the file and the stat of the recorded path (during a long walk)
+    turns the file away: one more read, never a wrong hash. The index is only a hint: an
+    index entry that is stale or wrong fails (1) or (2) and serves nothing. Check (2) is a
+    ``stat``, never a read of the file.
     """
     return _INODE_PREFIX + struct.pack(">QQ", dev, inode)
 
@@ -355,8 +373,8 @@ def _put_file_hashes(txn: lmdb.Transaction, entries: Iterable[FileHashEntry]) ->
 
 def _names_inode(path: bytes, fs_stat: os.stat_result) -> bool:
     """Whether ``path`` exists now and is the file ``fs_stat`` describes: the same device and
-    inode, and the same change time, which every link of one inode shares and two live files
-    that a filesystem shows with one (st_dev, st_ino) do not (``_make_key_file_identity``)."""
+    inode, and the same change time, which every link of one inode shares (a second check
+    behind the filesystem allowlist, ``_make_key_file_identity``)."""
     try:
         current = os.stat(path)
     except OSError:
@@ -375,6 +393,58 @@ def _identity_candidate(
         return None
     other_hash = _match_cached_hash(txn.get(other_key), fs_stat)
     return None if other_hash is None else (other_key[len(_HASH_PREFIX) :], other_hash)
+
+
+class _Mounts(typing.TypedDict):
+    """What ``/proc/self/mountinfo`` says about the identity lookup's allowlist."""
+
+    allowed: frozenset[int]  # devices mounted only with an allowlisted type
+    refused: frozenset[int]  # devices mounted with any type off the allowlist
+    points: list[tuple[bytes, bytes]]  # (mount point, type), deepest first
+
+
+def _read_mounts() -> _Mounts:
+    """Read the mounts; without the file (not Linux) no device is allowed."""
+    try:
+        lines = _MOUNTINFO.read_bytes().splitlines()
+    except OSError:
+        return _Mounts(allowed=frozenset(), refused=frozenset(), points=[])
+    allowed = set[int]()
+    refused = set[int]()
+    points = list[tuple[bytes, bytes]]()
+    for line in lines:
+        # id parent major:minor root mount-point options [optional fields...] - type source ...
+        fields = line.split()
+        try:
+            fstype = fields[fields.index(b"-", 6) + 1]
+            major, minor = fields[2].split(b":")
+            device = os.makedev(int(major), int(minor))
+        except (ValueError, IndexError):
+            continue
+        (allowed if fstype in _IDENTITY_FS_TYPES else refused).add(device)
+        point = _MOUNTINFO_ESCAPE.sub(lambda match: bytes([int(match[1], 8)]), fields[4])
+        points.append((point, fstype))
+    points.sort(key=lambda mount: len(mount[0]), reverse=True)
+    return _Mounts(allowed=frozenset(allowed - refused), refused=frozenset(refused), points=points)
+
+
+def _device_allowed(mounts: _Mounts, device: int, path: str | os.PathLike[str]) -> bool:
+    """Whether a file on ``device``, at ``path``, may be looked up by identity.
+
+    A device mounted with any type off the allowlist (FUSE, NFS, overlayfs, an unknown type)
+    is refused. A device the file does not list is a btrfs subvolume, which reports a device
+    of its own: it is allowed when the deepest mount holding ``path`` is btrfs, and refused
+    otherwise.
+    """
+    if device in mounts["allowed"]:
+        return True
+    if device in mounts["refused"]:
+        return False
+    real_path = os.fsencode(os.path.realpath(path))
+    for point, fstype in mounts["points"]:
+        if real_path == point or real_path.startswith(point.rstrip(b"/") + b"/"):
+            return fstype == b"btrfs"
+    return False
 
 
 def _make_key_output_generation(identity: str) -> bytes:
@@ -486,6 +556,8 @@ class StateDB:
     _readonly: bool
     _write_timeout: float
     _write_lock_path: pathlib.Path
+    _mounts: _Mounts | None
+    _identity_devices: dict[int, bool]
 
     def __init__(
         self,
@@ -508,6 +580,8 @@ class StateDB:
         self._readonly = readonly
         self._write_timeout = write_timeout
         self._write_lock_path = lmdb_path / "pivot-write.lock"
+        self._mounts = None
+        self._identity_devices = dict[int, bool]()
 
     @property
     def _env(self) -> lmdb.Environment:
@@ -590,9 +664,9 @@ class StateDB:
         """Batch query for multiple files.
 
         A file whose own path has no matching entry is looked up by its identity, the entry
-        of another path that names the same inode (``_make_key_file_identity`` says when that
-        entry is served). The transaction holds only the database reads; the ``stat`` that
-        confirms each identity match comes after it.
+        of another path that names the same inode, when its filesystem is on the allowlist
+        (``_make_key_file_identity`` says when that entry is served). The transaction holds
+        only the database reads; the ``stat`` that confirms each identity match comes after it.
         """
         self._check_closed()
         if not items:
@@ -604,7 +678,7 @@ class StateDB:
                 key = _make_key_file_hash(path)
                 found = _match_cached_hash(txn.get(key), fs_stat)
                 results[path] = found
-                if found is None:
+                if found is None and self._identity_allowed(fs_stat.st_dev, path):
                     candidate = _identity_candidate(txn, key, fs_stat)
                     if candidate is not None:
                         by_identity.append((path, fs_stat, *candidate))
@@ -612,6 +686,17 @@ class StateDB:
             if _names_inode(other_path, fs_stat):
                 results[path] = other_hash
         return results
+
+    def _identity_allowed(self, device: int, path: pathlib.Path) -> bool:
+        """Whether a file on ``device`` may be looked up by identity (``_device_allowed``).
+        The mount table is read on this StateDB's first identity lookup, and each device is
+        decided once, so a lookup costs one dict read."""
+        allowed = self._identity_devices.get(device)
+        if allowed is None:
+            if self._mounts is None:
+                self._mounts = _read_mounts()
+            allowed = self._identity_devices[device] = _device_allowed(self._mounts, device, path)
+        return allowed
 
     def save(self, path: pathlib.Path, fs_stat: os.stat_result, file_hash: str) -> None:
         """Cache file metadata and hash, as ``save_many`` does for one entry."""
@@ -1258,15 +1343,16 @@ def write_back_file_hashes(
 ) -> None:
     """Save the file-hash entries a read-only check computed, best-effort, in one transaction.
 
-    ``pivot status``, every explanation, ``pivot diff``, ``pivot plots diff`` and the engine of
-    a ``--no-commit`` run call this with the hashes they had to read, so the next check reads
-    none of those files. A file-hash entry is a cache that every read validates by ``stat``,
-    and no decision depends on one being present, so a write that cannot happen at once is
-    skipped with a debug log instead of failing or holding up the check: another process
-    holding the write lock for longer than ``timeout`` (2 s, a fraction of a pivot write's own
-    30 s; 0 makes one attempt), a database this user cannot write, a read-only filesystem, a
-    full map. With no entries it takes no lock, and a state directory with no database is left
-    without one.
+    ``pivot status``, every explanation, ``pivot diff``, ``pivot plots diff``, the engine's
+    skip check and the engine of a ``--no-commit`` run call this with the hashes they had to
+    read, so the next check reads none of those files (status's tracked files, ``pivot diff``
+    and ``pivot plots diff`` through ``cache.hash_read_only``). A file-hash entry is a cache
+    that every read validates by ``stat``, and no decision depends on one being present, so a
+    write that cannot happen at once is skipped with a debug log instead of failing or holding
+    up the check: another process holding the write lock for longer than ``timeout`` (2 s, a
+    fraction of a pivot write's own 30 s; 0 makes one attempt), a database this user cannot
+    write, a read-only filesystem, a full map. With no entries it takes no lock, and a state
+    directory with no database is left without one.
     """
     if not entries or not (state_dir / "state.lmdb").exists():
         return

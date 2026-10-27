@@ -293,7 +293,7 @@ StateDB is an LMDB-backed key-value store for all pipeline state. Keys use prefi
 | Prefix | Purpose |
 |--------|---------|
 | `hash:` | File hash cache (the absolute path as given, no symlink followed; the entry holds `stat()`'s mtime_ns, size, device and inode) |
-| `inode:` | Identity index: device and inode → the `hash:` key of one path recorded with that inode (not always the last written); a lookup that misses by path serves that entry only if it matches the file's stat and its path still names the file, with the same device, inode and change time |
+| `inode:` | Identity index: device and inode → the `hash:` key of one path recorded with that inode (not always the last written); a lookup that misses by path follows it only on a filesystem type `/proc/self/mountinfo` lists as keeping inode numbers unique (ext2/3/4, xfs, btrfs, tmpfs, f2fs, zfs), and serves that entry only if it matches the file's stat and its path still names the file, with the same device, inode and change time |
 | `gen:` | Output generation counters (the artifact identity, `stage` or `stage:key`) |
 | `dep:` | Stage dependency generations (stage name + dep path) |
 | `runcache:` | Run cache entries (stage name + input hash) |
