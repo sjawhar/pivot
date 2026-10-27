@@ -21,20 +21,38 @@ def _echo(message: str, *, to_stderr: bool) -> None:
     click.echo(message, err=to_stderr)
 
 
-def _prune_run_history(state_dir: pathlib.Path, *, dry_run: bool) -> tuple[int, int]:
-    """Apply ``core.run_history_retention`` to this project's run history.
+def _plan_prune(state_dir: pathlib.Path, retention: int) -> tuple[int, set[str]]:
+    """What a run-history prune would do, without mutating anything.
 
-    Returns the number of runs pruned (or that a real run would prune) and the retention.
-    Pruning also drops the run-cache rows of the runs it removes (``StateDB.prune_runs``),
-    which is the policy every pipeline run already applies.
+    Returns the number of runs beyond the retention and the run IDs a prune keeps, so the plan
+    can drop the run-cache rows of the runs a confirmed run removes (``StateDB.prune_runs``). A
+    sentinel row (``__``-prefixed) is never pruned and so needs no run ID here.
     """
-    retention = config.get_run_history_retention()
     if not (state_dir / "state.lmdb").exists():
-        return 0, retention
-    with state.StateDB(state_dir, readonly=dry_run) as db:
-        if dry_run:
-            return max(0, len(db.list_runs(limit=retention + 1000)) - retention), retention
-        return db.prune_runs(retention), retention
+        return 0, set[str]()
+    with state.StateDB(state_dir, readonly=True) as db:
+        runs = db.list_runs(limit=retention + 1000)
+    return max(0, len(runs) - retention), {run["run_id"] for run in runs[:retention]}
+
+
+def _apply_prune(state_dir: pathlib.Path, retention: int) -> int:
+    """Prune this project's run history to the retention and return the number of runs removed.
+
+    Pruning also drops the run-cache rows of the runs it removes (``StateDB.prune_runs``), the
+    policy every pipeline run already applies. This mutates, so it runs only in a confirmed,
+    non-dry collection, after the plan and the prompt.
+    """
+    if not (state_dir / "state.lmdb").exists():
+        return 0
+    with state.StateDB(state_dir) as db:
+        return db.prune_runs(retention)
+
+
+def _format_grace(hours: float) -> str:
+    """Format a grace period so a small one is not rounded to a misleading ``0.0h``."""
+    if hours == 0 or hours >= 0.1:
+        return f"{hours:.1f}"
+    return f"{hours:g}"
 
 
 def _summary_lines(
@@ -58,7 +76,7 @@ def _summary_lines(
         + f"{by['locks'] + by['run_cache']:,} named by {counts['locks']:,} locks and "
         + f"{counts['rows']:,} run-cache entries in {len(scopes)} projects,\n"
         + f"  {by['links']:,} by {counts['links']:,} workspace links, "
-        + f"{by['grace']:,} published in the last {grace_hours:.1f}h, "
+        + f"{by['grace']:,} published in the last {_format_grace(grace_hours)}h, "
         + f"{by['hardlinked']:,} still hardlinked elsewhere.",
     ]
 
@@ -173,6 +191,34 @@ def gc_cmd(
     if gone:
         _echo(gc.dropped_note(gone), to_stderr=notes_to_stderr)
 
+    if not cache_dir.is_dir():
+        # N4: a cache that has never stored anything has nothing to collect. Pivot does not
+        # create it just to lock it; it reports nothing to remove and exits 0.
+        empty = gc.GcResult(
+            cache=str(cache_dir),
+            scanned=gc.ObjectCount(objects=0, bytes=0),
+            kept=gc.Kept(
+                objects=0,
+                bytes=0,
+                by=gc.KeptBy(locks=0, run_cache=0, links=0, grace=0, hardlinked=0),
+            ),
+            removed=gc.ObjectCount(objects=0, bytes=0),
+            projects=[str(scope["root"]) for scope in scopes],
+            dry_run=dry_run,
+        )
+        if output_json:
+            click.echo(json.dumps(empty, indent=2))
+            return
+        if not quiet:
+            click.echo(
+                f"{object_root} does not exist, so this cache has stored nothing; there is "
+                + "nothing to remove."
+            )
+        return
+
+    retention = config.get_run_history_retention()
+    would_prune, valid_run_ids = _plan_prune(state_dir, retention)
+
     with gc.collection_lock(cache_dir) as locked:
         if not locked:
             if grace_hours == 0:
@@ -186,37 +232,72 @@ def gc_cmd(
             _echo(
                 f"Warning: {cache_dir} is on a filesystem that refuses flock(), so pivot's "
                 + "cache locks exclude nothing here; another process can publish into this "
-                + f"cache while it is collected. Objects published in the last {grace_hours:.1f}h "
-                + "are kept all the same.",
+                + "cache while it is collected. Objects published in the last "
+                + f"{_format_grace(grace_hours)}h are kept all the same.",
                 to_stderr=True,
             )
 
-        pruned, retention = _prune_run_history(state_dir, dry_run=dry_run)
-        if pruned:
-            _echo(
-                f"{'Would prune' if dry_run else 'Pruned'} {pruned:,} runs beyond the "
-                + f"retention of {retention} (core.run_history_retention).",
-                to_stderr=notes_to_stderr,
+        try:
+            # The run-cache rows a confirmed prune would drop are left out of the plan, so a
+            # dry run and the real run condemn the same objects (B3). The prune itself runs only
+            # in the confirmed non-dry path, after the prompt (B4), before the deletions re-read
+            # the records.
+            roots = gc.collect_roots(
+                scopes, cache_dir, prune_state_dir=state_dir, valid_run_ids=valid_run_ids
+            )
+            if roots["unparseable"]:
+                _echo(
+                    "Warning: could not parse "
+                    + ", ".join(roots["unparseable"])
+                    + " as a stage lock; keeping every cache object, because a lock pivot "
+                    + "cannot read may name any of them. Nothing was removed. Fix the lock and "
+                    + "re-run.",
+                    to_stderr=True,
+                )
+            plan = gc.build_plan(
+                cache_dir, roots, grace_hours=grace_hours, remove_linked=remove_linked
             )
 
-        try:
-            roots = gc.collect_roots(scopes, cache_dir)
+            # A dry run reports the plan as its removal, so its counts are the ones a real run
+            # removes and `kept` is what would survive.
+            removed = gc.ObjectCount(objects=len(plan["doomed"]), bytes=plan["doomed_bytes"])
+            if dry_run:
+                if would_prune and not roots["unparseable"]:
+                    _echo(
+                        f"Would prune {would_prune:,} runs beyond the retention of {retention} "
+                        + "(core.run_history_retention).",
+                        to_stderr=notes_to_stderr,
+                    )
+            else:
+                if plan["doomed"]:
+                    if remove_linked and plan["linked"]["objects"]:
+                        _echo(_linked_disclosure(plan), to_stderr=notes_to_stderr)
+                    _confirm(plan, object_root, assume_yes=assume_yes)
+                # Confirmed and not refused. Prune first so the deletions' re-read of the records
+                # sees the dropped rows; a run that could not parse a record prunes nothing.
+                if not roots["unparseable"]:
+                    pruned = _apply_prune(state_dir, retention)
+                    if pruned:
+                        _echo(
+                            f"Pruned {pruned:,} runs beyond the retention of {retention} "
+                            + "(core.run_history_retention).",
+                            to_stderr=notes_to_stderr,
+                        )
+                removed = (
+                    gc.execute_plan(
+                        plan,
+                        scopes=scopes,
+                        cache_dir=cache_dir,
+                        grace_hours=grace_hours,
+                        remove_linked=remove_linked,
+                    )
+                    if plan["doomed"]
+                    else gc.ObjectCount(objects=0, bytes=0)
+                )
         except gc.ProjectUnreadableError as e:
             raise exceptions.CacheCollectionRefusedError(
                 gc.refusal_unreadable(cache_dir, len(scopes), [(gc.scope_label(e.scope), e.reason)])
             ) from e
-
-        plan = gc.build_plan(cache_dir, roots, grace_hours=grace_hours, remove_linked=remove_linked)
-
-        # A dry run reports the plan as its removal, so its counts are the ones a real run
-        # removes and `kept` is what would survive.
-        removed = gc.ObjectCount(objects=len(plan["doomed"]), bytes=plan["doomed_bytes"])
-        if not dry_run:
-            if plan["doomed"]:
-                if remove_linked and plan["linked"]["objects"]:
-                    _echo(_linked_disclosure(plan), to_stderr=notes_to_stderr)
-                _confirm(plan, object_root, assume_yes=assume_yes)
-            removed = gc.execute_plan(plan, grace_hours=grace_hours, remove_linked=remove_linked)
 
     result = gc.result_document(cache_dir, plan, removed, scopes, dry_run=dry_run)
     if output_json:

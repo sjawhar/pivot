@@ -94,6 +94,9 @@ class Roots(TypedDict):
     run_cache: set[str]
     linked: set[str]  # workspace links and cache refs
     counts: RootCounts
+    # The records (lock files) pivot could not parse. A non-empty list means a record of an
+    # unknown shape could name any object, so a collection keeps every object and removes none.
+    unparseable: list[str]
 
 
 class ObjectCount(TypedDict):
@@ -285,6 +288,16 @@ def scope_label(scope: ProjectScope) -> str:
     return f"{scope['root']} (host {scope['host']}, last wrote {scope['last_write']})"
 
 
+def refusal_not_a_project(cache_dir: pathlib.Path, path: pathlib.Path) -> str:
+    """What a collection says when a ``--projects`` path is not a pivot project it can read."""
+    return (
+        f"Refusing to collect {cache_dir}: --projects {path} is not a pivot project; it has "
+        "no readable .pivot\nstate directory, so it names no records and cannot protect "
+        "anything in this cache. Name every\nproject that shares this cache by its root (the "
+        "directory that holds .pivot). Nothing was removed."
+    )
+
+
 def refusal_unreadable(
     cache_dir: pathlib.Path, recorded: int, unreadable: list[tuple[str, str]]
 ) -> str:
@@ -312,6 +325,16 @@ def dropped_note(gone: list[pathlib.Path]) -> str:
     )
 
 
+def _drop_gone_entries(cache_dir: pathlib.Path, gone: list[pathlib.Path]) -> None:
+    """Delete the register entry of every project whose root is gone, so the drop is permanent.
+
+    Best-effort: a cache this user cannot write keeps the stale entries, and the next run
+    reports them again, but nothing is removed on their account."""
+    for root in gone:
+        with contextlib.suppress(OSError):
+            register_path(cache_dir, root).unlink(missing_ok=True)
+
+
 def resolve_scopes(
     cache_dir: pathlib.Path,
     project_root: pathlib.Path,
@@ -326,8 +349,9 @@ def resolve_scopes(
     ``--projects`` names is registered, so the next run needs no flag.
 
     Raises:
-        exceptions.CacheCollectionRefusedError: the cache is external and records no usable
-            project, or an entry cannot be read.
+        exceptions.CacheCollectionRefusedError: a ``--projects`` path is not a pivot project
+            this cache can read, or the cache is external and records no usable project, or an
+            entry cannot be read.
     """
     here = ProjectScope(
         root=project_root, state_dir=state_dir, host=socket.gethostname(), last_write="now"
@@ -336,6 +360,12 @@ def resolve_scopes(
     for path in extra:
         root = path.resolve()
         scope_state_dir = root / ".pivot"
+        # A --projects path must be a real pivot project: a readable .pivot state directory.
+        # A directory that is not one (the cache itself, a parent, a deleted-and-recreated
+        # worktree, a typo) names no records, so accepting it would collect this cache on one
+        # project's records alone and remove another project's live objects.
+        if not (scope_state_dir.is_dir() and os.access(scope_state_dir, os.R_OK | os.X_OK)):
+            raise exceptions.CacheCollectionRefusedError(refusal_not_a_project(cache_dir, root))
         named.append(
             ProjectScope(
                 root=root,
@@ -356,6 +386,7 @@ def resolve_scopes(
         )
     if not live and not named:
         raise exceptions.CacheCollectionRefusedError(refusal_external(cache_dir, project_root))
+    _drop_gone_entries(cache_dir, gone)
     return _dedupe_scopes([here, *live, *named]), gone
 
 
@@ -396,9 +427,14 @@ def _text_keys(path: pathlib.Path) -> set[str]:
 
 
 def _lock_keys(path: pathlib.Path) -> set[str]:
-    """Every key a stage lock names: each ``outs`` and ``deps`` hash and manifest member."""
+    """Every key a stage lock names: each ``outs`` and ``deps`` hash and manifest member.
+
+    ``open`` raising ``OSError`` refuses the run (the lock cannot be read, so what it names is
+    unknown); ``yaml.load`` raising ``yaml.YAMLError`` (a committed lock left with git conflict
+    markers, a truncated one) is caught by ``collect_roots``, which then keeps every object
+    rather than let a lock it cannot parse licence a delete."""
     with open(path) as f:
-        data: object = yaml.load(f, Loader=yaml_config.Loader)  # OSError refuses the run
+        data: object = yaml.load(f, Loader=yaml_config.Loader)
     if not lock.is_lock_data(data):
         return _text_keys(path)
     entries = [*data["deps"], *data["outs"]]
@@ -413,12 +449,24 @@ def _pvt_keys(path: pathlib.Path) -> set[str]:
     return set(_hash_info_keys(track.pvt_to_hash_info(data)))
 
 
-def _run_cache_keys(state_dir: pathlib.Path) -> tuple[set[str], int]:
-    """Every key the run-cache rows of one project's database name, and the number of rows."""
+def _run_cache_keys(
+    state_dir: pathlib.Path, valid_run_ids: set[str] | None = None
+) -> tuple[set[str], int]:
+    """Every key the run-cache rows of one project's database name, and the number of rows.
+
+    ``valid_run_ids`` restricts the rows to those a run-history prune would keep — its sentinel
+    rows (``__``-prefixed) and the rows of runs within the retention — so the plan counts an
+    object whose only record is a row the confirmed run will drop (``StateDB.prune_runs``)."""
     if not (state_dir / "state.lmdb").exists():
         return set(), 0
     with state.StateDB(state_dir, readonly=True) as db:
         entries = db.list_run_cache_entries()
+    if valid_run_ids is not None:
+        entries = [
+            entry
+            for entry in entries
+            if entry["run_id"].startswith("__") or entry["run_id"] in valid_run_ids
+        ]
     keys = {
         key
         for entry in entries
@@ -458,8 +506,17 @@ def _walk_project(
     return pvt_paths, keys
 
 
-def collect_roots(scopes: Iterable[ProjectScope], cache_dir: pathlib.Path) -> Roots:
+def collect_roots(
+    scopes: Iterable[ProjectScope],
+    cache_dir: pathlib.Path,
+    *,
+    prune_state_dir: pathlib.Path | None = None,
+    valid_run_ids: set[str] | None = None,
+) -> Roots:
     """Read every record of every project in scope and return the keys they name.
+
+    ``prune_state_dir`` and ``valid_run_ids`` restrict that project's run-cache rows to the ones
+    a run-history prune keeps, so the plan reflects the confirmed run's prune (B3/B4).
 
     Raises:
         ProjectUnreadableError: a project in scope cannot be read, so what it names is
@@ -471,6 +528,7 @@ def collect_roots(scopes: Iterable[ProjectScope], cache_dir: pathlib.Path) -> Ro
         run_cache=set[str](),
         linked=set[str](),
         counts=RootCounts(locks=0, pvt_files=0, rows=0, links=0),
+        unparseable=list[str](),
     )
     for scope in scopes:
         try:
@@ -478,14 +536,23 @@ def collect_roots(scopes: Iterable[ProjectScope], cache_dir: pathlib.Path) -> Ro
             if stages_dir.is_dir():
                 for lock_path in sorted(stages_dir.rglob("*.lock")):
                     roots["counts"]["locks"] += 1
-                    roots["named"] |= _lock_keys(lock_path)
+                    try:
+                        roots["named"] |= _lock_keys(lock_path)
+                    except yaml.YAMLError:
+                        logger.warning(
+                            "Cannot parse %s as a stage lock; keeping every cache object because "
+                            "a lock pivot cannot read may name any of them",
+                            lock_path,
+                        )
+                        roots["unparseable"].append(str(lock_path))
             pvt_paths, links = _walk_project(scope["root"], object_root, cache_dir)
             for pvt_path in pvt_paths:
                 roots["counts"]["pvt_files"] += 1
                 roots["named"] |= _pvt_keys(pvt_path)
             roots["counts"]["links"] += len(links)
             roots["linked"] |= links
-            rows_keys, rows = _run_cache_keys(scope["state_dir"])
+            scope_valid = valid_run_ids if scope["state_dir"] == prune_state_dir else None
+            rows_keys, rows = _run_cache_keys(scope["state_dir"], scope_valid)
             roots["counts"]["rows"] += rows
             roots["run_cache"] |= rows_keys
         except OSError as e:
@@ -628,13 +695,20 @@ def build_plan(
                 size = _tree_bytes(pathlib.Path(entry.path)) if is_dir else stats.st_size
                 plan["scanned"]["objects"] += 1
                 plan["scanned"]["bytes"] += size
-                reason = _keep_reason(
-                    key,
-                    stats,
-                    roots,
-                    is_dir=is_dir,
-                    cutoff=cutoff,
-                    remove_linked=remove_linked,
+                # A record pivot could not parse may name any object, so a collection that saw
+                # one keeps every object and removes none (``collect_roots``). Otherwise the
+                # object stays only when a record, the grace or the hardlink rule holds it.
+                reason = (
+                    "locks"
+                    if roots["unparseable"]
+                    else _keep_reason(
+                        key,
+                        stats,
+                        roots,
+                        is_dir=is_dir,
+                        cutoff=cutoff,
+                        remove_linked=remove_linked,
+                    )
                 )
                 if reason is not None:
                     plan["kept"]["objects"] += 1
@@ -684,13 +758,30 @@ def _keep_reason(
 
 
 def execute_plan(
-    plan: Plan, *, grace_hours: float, remove_linked: bool, now: float | None = None
+    plan: Plan,
+    *,
+    scopes: Iterable[ProjectScope],
+    cache_dir: pathlib.Path,
+    grace_hours: float,
+    remove_linked: bool,
+    now: float | None = None,
 ) -> ObjectCount:
     """Remove what the plan condemns, under each prefix's lock, and return what went.
 
-    Every object is checked again here: between the plan and this pass a checkout can have
-    hardlinked it and a publisher can have republished it, and either keeps it.
+    The liveness records are re-read here, after the plan's scan and immediately before the
+    deletions, so an object a concurrent run named between the scan and now — a lock, a
+    run-cache row, a workspace link — is kept (``_keep_reason`` against the fresh records). Each
+    object is also re-checked against the grace and the hardlink rule, because since the scan a
+    checkout can have hardlinked it and a reusing run can have refreshed its timestamp
+    (``copy_to_cache``). The residual exposure is an object a run both re-uses and names in the
+    gap between this re-read and that object's own unlink — one ``lstat`` per object, not the
+    whole scan. An unparseable record seen now keeps every object, as the plan does.
+
+    Raises:
+        ProjectUnreadableError: a project became unreadable since the plan; nothing is removed.
     """
+    fresh_roots = collect_roots(scopes, cache_dir)
+    keep_all = bool(fresh_roots["unparseable"])
     cutoff = (time.time() if now is None else now) - grace_hours * 3600
     removed = ObjectCount(objects=0, bytes=0)
     by_prefix = dict[pathlib.Path, list[Doomed]]()
@@ -707,8 +798,17 @@ def execute_plan(
                     removed["objects"] += 1
                     removed["bytes"] += doomed["bytes"]
                     continue
-                if stats.st_ctime > cutoff or (
-                    not doomed["is_dir"] and stats.st_nlink > 1 and not remove_linked
+                key = prefix_dir.name + path.name
+                if keep_all or (
+                    _keep_reason(
+                        key,
+                        stats,
+                        fresh_roots,
+                        is_dir=doomed["is_dir"],
+                        cutoff=cutoff,
+                        remove_linked=remove_linked,
+                    )
+                    is not None
                 ):
                     continue
                 try:

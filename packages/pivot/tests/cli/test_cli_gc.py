@@ -737,3 +737,72 @@ def test_gc_prunes_run_history_to_the_retention(
     assert "Pruned 2 runs beyond the retention of 1" in result.output, result.output
     with state.StateDB(workspace["state_dir"]) as db:
         assert len(db.list_runs()) == 1, result.output
+
+
+# =============================================================================
+# Concurrency, round 2: the two guards that keep an object a run re-uses and names
+# =============================================================================
+
+
+def test_gc_keeps_an_object_a_cache_hit_refreshed(
+    workspace: Workspace, runner: click.testing.CliRunner
+) -> None:
+    """A re-run whose output is already cached publishes nothing, so `copy_to_cache` refreshes
+    the object's timestamp (git's "update the mtime of an object already present"). That keeps an
+    object a run is reusing inside a short grace even before any record names it. Guard one of
+    B1; a mutant that drops the refresh fails here."""
+    key = _helper_publish(workspace, "reused")
+    source = workspace["scratch"] / "reused-source"
+    source.write_text("reused")
+    time.sleep(1.1)  # older than the one-second grace below
+    cache.copy_to_cache(source, cache.get_cache_path(workspace["object_root"], key))
+
+    result = _helper_run(runner, "--yes", "--grace-hours", str(1.0 / 3600.0))
+
+    assert result.exit_code == 0, result.output
+    assert key in _helper_keys(workspace), "a cache hit did not refresh the object's timestamp"
+
+
+def test_gc_keeps_an_object_a_lock_named_after_the_plan(
+    workspace: Workspace, runner: click.testing.CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deletions re-read the records after the scan, so a lock a concurrent run writes
+    between the plan and the delete keeps its object even when the grace does not cover it.
+    Guard two of B1; a mutant that drops the re-read removes this object and fails here."""
+    key = _helper_publish(workspace, "named after the plan")
+    time.sleep(1.1)  # older than the one-second grace, so only the re-read can save it
+    real_execute = gc.execute_plan
+
+    def write_lock_then_execute(plan: gc.Plan, **kwargs: object) -> gc.ObjectCount:
+        _helper_write_lock(workspace, outs={None: types.FileHash(hash=key)})
+        return real_execute(plan, **kwargs)  # type: ignore[arg-type] - the same call
+
+    monkeypatch.setattr(gc, "execute_plan", write_lock_then_execute)
+
+    result = _helper_run(runner, "--yes", "--grace-hours", str(1.0 / 3600.0))
+
+    assert result.exit_code == 0, result.output
+    assert key in _helper_keys(workspace), "the deletions did not re-read the records"
+
+
+def test_gc_keeps_a_republished_object_hardlinked_after_the_plan(
+    workspace: Workspace, runner: click.testing.CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hardlink-mode control that already passed: a hardlink checkout made between the plan
+    and the delete shares the object's inode, so the per-object re-check keeps it by nlink even
+    with no record and no grace. A mutant that drops the execute-time re-check fails here."""
+    key = _helper_publish(workspace, "hardlinked after the plan")
+    path = cache.get_cache_path(workspace["object_root"], key)
+    time.sleep(1.1)
+    real_execute = gc.execute_plan
+
+    def hardlink_then_execute(plan: gc.Plan, **kwargs: object) -> gc.ObjectCount:
+        os.link(path, workspace["root"] / "data_hardlink")
+        return real_execute(plan, **kwargs)  # type: ignore[arg-type] - the same call
+
+    monkeypatch.setattr(gc, "execute_plan", hardlink_then_execute)
+
+    result = _helper_run(runner, "--yes", "--grace-hours", str(1.0 / 3600.0))
+
+    assert result.exit_code == 0, result.output
+    assert key in _helper_keys(workspace), "a hardlinked object was removed"
