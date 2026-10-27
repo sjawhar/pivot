@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
+# Stops only a hung test: a worker whose pivot died exits about TERMINATION_GRACE_S later.
+_HUNG_TEST_S = 120.0
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="reads the /proc process table"
@@ -73,33 +75,40 @@ def hold() -> str:
     child = subprocess.Popen(["sleep", "300"], start_new_session=True)
     _mark("worker.pid", str(os.getpid()))
     _mark("child.pid", str(child.pid))
-    _mark("started")
+    # Each branch writes `started` inside its `try`: a stop the test sends once it sees
+    # `started` must find the cleanup armed.
     if CLEANUP in ("none", "own-sigterm-handler"):
+        _mark("started")
         time.sleep(300)
         return "done"
     if CLEANUP == "blocked-in-c":
+        _mark("started")
         _block_in_c()
         return "done"
     if CLEANUP == "except-keyboard-interrupt":
         try:
+            _mark("started")
             time.sleep(300)
         except KeyboardInterrupt:
+            _mark("cleanup-started")
             _stop_child(child)
             _mark("cleaned")
             raise
         return "done"
     if CLEANUP == "swallow":
         try:
+            _mark("started")
             time.sleep(300)
         except BaseException:
             _stop_child(child)
         return "fallback"
     try:
+        _mark("started")
         time.sleep(5 if CLEANUP == "short" else 300)
         return "done"
     finally:
+        _mark("cleanup-started")
         if CLEANUP == "hang":
-            _mark("cleanup-started")
             time.sleep(600)
         _stop_child(child)
         _mark("cleaned")
@@ -174,6 +183,30 @@ class _Run:
             ), f"{name} process {pid} survived"
 
 
+def _helper_assert_cleaned_up(run: _Run, how: str, marker: str = "cleaned") -> None:
+    """Require the stage's cleanup ``marker`` once pivot has been stopped ``how``.
+
+    After SIGINT, pivot exits only once it has stopped its workers, so the marker is written
+    by then or never. After SIGKILL, the worker unwinds on its own when it sees pivot gone:
+    wait until it writes the marker or exits. A failure says whether the cleanup started
+    (`cleanup-started`) and shows pivot's log.
+    """
+    path = run.markers / marker
+    if how == "kill":
+        worker_pid = run.pid("worker")
+        start = time.monotonic()
+        settled = _helper_wait_until(
+            lambda: path.exists() or not _helper_alive(worker_pid), _HUNG_TEST_S
+        )
+        print(f"waited {time.monotonic() - start:.1f}s for {marker} or the worker's exit")
+        if not settled:
+            pytest.fail(f"the worker neither wrote {marker} nor exited:\n{run.log.read_text()}")
+    if not path.exists():
+        began = (run.markers / "cleanup-started").exists()
+        cleanup = "started but did not finish" if began else "never started"
+        pytest.fail(f"no {marker}: the stage's cleanup {cleanup}\n{run.log.read_text()}")
+
+
 @contextlib.contextmanager
 def _helper_running(
     tmp_path: pathlib.Path,
@@ -245,9 +278,7 @@ def test_stopped_pivot_lets_the_running_stage_clean_up(
     with _helper_running(tmp_path, cleanup) as run:
         run.stop(how)
 
-        assert _helper_wait_until(lambda: (run.markers / "cleaned").exists(), 15), (
-            "the stage's cleanup never finished"
-        )
+        _helper_assert_cleaned_up(run, how)
         run.assert_workers_and_child_gone()
 
 
@@ -256,9 +287,7 @@ def test_ctrl_c_in_watch_mode_lets_the_running_stage_clean_up(tmp_path: pathlib.
     with _helper_running(tmp_path, "finally", watch=True) as run:
         run.stop("ctrl-c")
 
-        assert _helper_wait_until(lambda: (run.markers / "cleaned").exists(), 15), (
-            "the stage's cleanup never finished"
-        )
+        _helper_assert_cleaned_up(run, "ctrl-c")
         run.assert_workers_and_child_gone()
 
 
@@ -271,7 +300,7 @@ def test_cleanup_that_hangs_is_cut_off_and_its_child_killed(
     with _helper_running(tmp_path, "hang") as run:
         run.stop(how)
 
-        assert _helper_wait_until(lambda: (run.markers / "cleanup-started").exists(), 15)
+        _helper_assert_cleaned_up(run, how, "cleanup-started")
         run.assert_workers_and_child_gone()
 
 
