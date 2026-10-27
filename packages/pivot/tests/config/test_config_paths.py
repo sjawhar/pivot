@@ -302,28 +302,36 @@ def test_a_record_keeps_the_failure_it_decided_for_a_path_that_cannot_be_a_direc
     assert state_dir_mod.state_dir_or_default(project_root) == project_root / "s1"
 
 
-def test_a_record_falls_back_for_a_path_that_still_holds_a_writable_database(
-    project_root: pathlib.Path,
+@pytest.mark.parametrize("entries", [("state.lmdb", "locks"), ("state.lmdb",), ("locks",)])
+def test_a_record_falls_back_only_where_052_ran(
+    project_root: pathlib.Path, entries: tuple[str, ...]
 ) -> None:
-    """A state directory without write permission whose `state.lmdb` can still be written
-    falls back to `.pivot` for every reader, after it is made writable again too."""
+    """A state directory without write permission falls back to `.pivot` for every reader only
+    where Pivot 0.5.2 ran a command there: both the database and the lock directory it opens
+    are present, so it had to create neither. Without one of them 0.5.2 failed on this path,
+    and so does the command: it gets the path, and nothing creates it."""
     if os.geteuid() == 0:
         pytest.skip("root ignores directory permission bits")
     (project_root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: s1\n")
     s1 = project_root / "s1"
-    (s1 / "state.lmdb").mkdir(parents=True)
+    for entry in entries:
+        (s1 / entry).mkdir(parents=True)
     s1.chmod(0o555)
     default = project_root / ".pivot"
+    falls_back = set(entries) == {"state.lmdb", "locks"}
+    expected = default if falls_back else s1
     token = state_dir_mod.begin_invocation(report=False)
     try:
         resolution = state_dir_mod.resolution_for(project_root)
         assert isinstance(resolution, exceptions.StateDirTargetError)
-        assert resolution.fallback
+        assert resolution.fallback is falls_back
+        # What the command writes goes to `.pivot` either way; only a command that needs the
+        # configured directory sees the difference.
         assert state_dir_mod.state_dir_or_default(project_root) == default
-        assert state_dir_mod.locate_state_dir(project_root) == default
-        assert state_dir_mod.ensure_state_dir(project_root) == default
+        assert state_dir_mod.locate_state_dir(project_root) == expected
+        assert state_dir_mod.ensure_state_dir(project_root) == expected
         s1.chmod(0o755)
-        assert state_dir_mod.locate_state_dir(project_root) == default
+        assert state_dir_mod.locate_state_dir(project_root) == expected
         assert state_dir_mod.state_dir_or_default(project_root) == default
     finally:
         s1.chmod(0o755)

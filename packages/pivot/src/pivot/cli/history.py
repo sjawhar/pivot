@@ -5,14 +5,60 @@ from typing import TYPE_CHECKING
 
 import click
 
-from pivot import config
+from pivot import config, project
+from pivot import state_dir as state_dir_mod
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.storage import state
 from pivot.types import StageStatus
 
 if TYPE_CHECKING:
+    import pathlib
+
     from pivot.run_history import RunManifest
+
+
+def _run_history_dirs() -> list[pathlib.Path]:
+    """The directories whose ``state.lmdb`` can hold this project's runs, the command's first.
+
+    A run record is read where it was written. A command that fell back to ``.pivot`` because
+    the configured path cannot be written reads that path too, where its own earlier runs are
+    (``state_dir.other_state_dir_for``); reading one needs no write permission. The other
+    direction is left alone: Pivot 0.5.2 read the database of the configured directory, so a
+    project whose runs are in ``.pivot`` because they were made before the value was set reports
+    them exactly as 0.5.2 does, from the configured directory alone.
+    """
+    state_dir = config.locate_state_dir()
+    dirs = [state_dir]
+    other = state_dir_mod.other_state_dir_for(state_dir)
+    if (
+        other is not None
+        and other != project.get_project_root() / ".pivot"
+        and (other / "state.lmdb").is_dir()
+    ):
+        dirs.append(other)
+    return dirs
+
+
+def _list_runs(limit: int) -> list[RunManifest]:
+    """The project's most recent runs, newest first, from every directory that holds runs."""
+    runs: dict[str, RunManifest] = {}
+    for state_dir in _run_history_dirs():
+        with state.StateDB(state_dir) as state_db:
+            for run in state_db.list_runs(limit=limit):
+                runs.setdefault(run["run_id"], run)
+    # Run IDs are timestamp-prefixed, so sorting them orders the runs by time.
+    return sorted(runs.values(), key=lambda run: run["run_id"], reverse=True)[:limit]
+
+
+def _read_run(run_id: str) -> RunManifest | None:
+    """One run by ID, from whichever of the project's directories recorded it."""
+    for state_dir in _run_history_dirs():
+        with state.StateDB(state_dir) as state_db:
+            run = state_db.read_run(run_id)
+        if run is not None:
+            return run
+    return None
 
 
 @cli_decorators.pivot_command(auto_discover=False)
@@ -24,8 +70,7 @@ def history(ctx: click.Context, limit: int, output_json: bool) -> None:
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
 
-    with state.StateDB(config.locate_state_dir()) as state_db:
-        runs = state_db.list_runs(limit=limit)
+    runs = _list_runs(limit)
 
     if output_json:
         click.echo(json.dumps(runs, indent=2))
@@ -74,16 +119,15 @@ def show_cmd(ctx: click.Context, run_id: str | None, output_json: bool) -> None:
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
 
-    with state.StateDB(config.locate_state_dir()) as state_db:
-        if run_id:
-            run = state_db.read_run(run_id)
-            if run is None:
-                raise click.ClickException(f"Run not found: {run_id}")
-        else:
-            runs = state_db.list_runs(limit=1)
-            if not runs:
-                raise click.ClickException("No runs recorded")
-            run = runs[0]
+    if run_id:
+        run = _read_run(run_id)
+        if run is None:
+            raise click.ClickException(f"Run not found: {run_id}")
+    else:
+        runs = _list_runs(1)
+        if not runs:
+            raise click.ClickException("No runs recorded")
+        run = runs[0]
 
     if output_json:
         click.echo(json.dumps(run, indent=2))

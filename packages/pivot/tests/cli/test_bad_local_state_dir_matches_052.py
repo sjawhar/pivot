@@ -53,6 +53,12 @@ _CASES = {
     "regular-file": "core:\n  state_dir: afile\n",
     "unwritable-absolute": "core:\n  state_dir: /root/x\n",
     "read-only-parent": "core:\n  state_dir: ro/state\n",
+    # Three layouts of a configured directory this build filled, then made unwritable. Its
+    # `state.lmdb` stays writable in each; Pivot 0.5.2 ran a command only in the first, where
+    # the lock directory it opens is there too.
+    "lost-write-permission": "core:\n  state_dir: s1\n",
+    "lost-write-permission-no-locks": "core:\n  state_dir: s1\n",
+    "unwritable-empty-database": "core:\n  state_dir: s1\n",
 }
 
 # One invocation per command in `pivot --help`, each group with its first subcommand. Every
@@ -333,6 +339,96 @@ _052_EXIT_CODES: dict[str, dict[str, int]] = {
         "update": 0,
         "verify": 0,
     },
+    "lost-write-permission": {
+        "check-ignore": 0,
+        "checkout": 0,
+        "commit": 0,
+        "completion": 0,
+        "config": 0,
+        "dag": 0,
+        "diff": 0,
+        "doctor": 0,
+        "fetch": 1,
+        "fingerprint": 0,
+        "get": 0,
+        "history": 0,
+        "import": 1,
+        "init": 0,
+        "list": 0,
+        "metrics": 0,
+        "params": 0,
+        "plots": 0,
+        "pull": 1,
+        "push": 1,
+        "remote": 0,
+        "repro": 0,
+        "run": 0,
+        "show": 0,
+        "status": 0,
+        "track": 0,
+        "update": 0,
+        "verify": 0,
+    },
+    "lost-write-permission-no-locks": {
+        "check-ignore": 0,
+        "checkout": 1,
+        "commit": 0,
+        "completion": 0,
+        "config": 0,
+        "dag": 0,
+        "diff": 0,
+        "doctor": 0,
+        "fetch": 1,
+        "fingerprint": 0,
+        "get": 0,
+        "history": 0,
+        "import": 1,
+        "init": 0,
+        "list": 0,
+        "metrics": 0,
+        "params": 0,
+        "plots": 0,
+        "pull": 1,
+        "push": 1,
+        "remote": 0,
+        "repro": 0,
+        "run": 0,
+        "show": 0,
+        "status": 0,
+        "track": 0,
+        "update": 0,
+        "verify": 0,
+    },
+    "unwritable-empty-database": {
+        "check-ignore": 0,
+        "checkout": 1,
+        "commit": 0,
+        "completion": 0,
+        "config": 0,
+        "dag": 0,
+        "diff": 0,
+        "doctor": 0,
+        "fetch": 1,
+        "fingerprint": 0,
+        "get": 0,
+        "history": 0,
+        "import": 1,
+        "init": 0,
+        "list": 0,
+        "metrics": 0,
+        "params": 0,
+        "plots": 0,
+        "pull": 1,
+        "push": 1,
+        "remote": 0,
+        "repro": 0,
+        "run": 0,
+        "show": 1,
+        "status": 0,
+        "track": 0,
+        "update": 0,
+        "verify": 0,
+    },
 }
 
 
@@ -359,11 +455,12 @@ def _build_base(directory: pathlib.Path, pivot: str) -> pathlib.Path:
 
 
 def _case(
-    base: pathlib.Path, destination: pathlib.Path, case: str
+    base: pathlib.Path, destination: pathlib.Path, case: str, pivot: str = helpers.PIVOT
 ) -> tuple[pathlib.Path, pathlib.Path]:
     """Copy the base project to ``destination`` and give it the case's config."""
     copy = destination / "copy"
     shutil.copytree(base, copy, symlinks=True)
+    home = copy / "home"
     root = copy / "project"
     if case == "regular-file":
         (root / "afile").write_text("not a directory\n")
@@ -371,7 +468,19 @@ def _case(
         (root / "ro").mkdir()
         (root / "ro").chmod(0o555)
     (root / ".pivot" / "config.yaml").write_text(_CASES[case])
-    return copy / "home", root
+    if case.startswith(("lost-write-permission", "unwritable-empty-database")):
+        if case == "unwritable-empty-database":
+            (root / "s1" / "state.lmdb").mkdir(parents=True)
+        else:
+            assert helpers.run_cli(root, home, pivot, "repro").returncode == 0
+            # The lock directory Pivot 0.5.2 opens under the state directory. Each build's own
+            # run leaves a different layout there, so the case names this one.
+            (root / "s1" / "locks").mkdir(exist_ok=True)
+        if case == "lost-write-permission-no-locks":
+            for name in ("stages", "cache", "locks"):
+                shutil.rmtree(root / "s1" / name, ignore_errors=True)
+        (root / "s1").chmod(0o555)
+    return home, root
 
 
 @pytest.fixture(scope="session")
@@ -385,7 +494,13 @@ def test_command_exits_as_on_052(
     base_project: pathlib.Path, tmp_path: pathlib.Path, case: str, command: str
 ) -> None:
     """Same exit code as 0.5.2; a failure is one `Error:` line, never a traceback."""
-    if os.geteuid() == 0 and case in {"unwritable-absolute", "read-only-parent"}:
+    if os.geteuid() == 0 and case in {
+        "unwritable-absolute",
+        "read-only-parent",
+        "lost-write-permission",
+        "lost-write-permission-no-locks",
+        "unwritable-empty-database",
+    }:
         pytest.skip("root ignores permission bits")
     home, root = _case(base_project, tmp_path, case)
     result = helpers.run_pivot(root, home, *_COMMANDS[command])
@@ -438,12 +553,12 @@ def _capture(pivot: str) -> None:
 
         def run_one(index: int) -> tuple[str, str, subprocess.CompletedProcess[str]]:
             case, command = runs[index]
-            home, root = _case(base, pathlib.Path(tmp) / str(index), case)
+            home, root = _case(base, pathlib.Path(tmp) / str(index), case, pivot)
             return case, command, helpers.run_cli(root, home, pivot, *_COMMANDS[command])
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(run_one, range(len(runs))))
-        # The read-only-parent case leaves a 0555 directory that would stop the cleanup.
+        # Two cases leave a 0555 directory that would stop the cleanup.
         subprocess.run(["chmod", "-R", "u+w", tmp], check=False)
     table = {case: dict[str, int]() for case in _CASES}
     for case, command, result in results:

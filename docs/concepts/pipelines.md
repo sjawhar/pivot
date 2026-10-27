@@ -153,7 +153,8 @@ value, or the path it names, cannot be used: a pipeline loaded while the path
 could not be used (a regular file, a dangling link, a directory it cannot write)
 keeps `.pivot` for everything it writes, whether or not the path can be used
 when it runs. A program that loads it gets the warning a `pivot` command prints,
-once per load. So `include()` refuses a pipeline loaded before an edit of
+once per load, so `discover_pipeline(all_pipelines=True)` prints one line per
+pipeline file it loads. So `include()` refuses a pipeline loaded before an edit of
 `core.state_dir` (or of a symbolic link it names, or of whether the path it
 names can be used) into one loaded after it: the error names both directories.
 Load both pipelines after the change. The pipelines of one `pivot` command, or
@@ -184,10 +185,17 @@ history, and `history` reports that same history. `--quiet` silences the warning
 
 A command decides once, when it first resolves the value, what a path that cannot be used
 means, and every part of the command, its worker processes included, takes that answer. A
-path that still holds a state database Pivot can write (a state directory that lost its write
-permission after a run, for example) falls back to `.pivot` for everything, as 0.5.2 ran such
-commands. Any other unusable path stays the command's state directory, so a command that opens
-it fails there, as on 0.5.2.
+path Pivot 0.5.2 ran such a command with — one that already holds the database and the lock
+directory 0.5.2 opened, as a state directory that lost its write permission after a run does —
+falls back to `.pivot` for everything the command writes. Any other unusable path, including one
+whose lock directory 0.5.2 would have had to create, stays the command's state directory, so a
+command that opens it fails there with 0.5.2's error, as on 0.5.2.
+
+The fallback decides where Pivot **writes**; it never decides where Pivot **reads** state that
+already exists, because reading needs no write permission. So one project has at most two state
+directories to read, and a reader that misses an entry in the one it writes to looks in the
+other: `pivot history`, `pivot show` and a restore still find the runs, locks and cache objects
+that a run recorded in a configured directory which has since lost its write permission.
 
 When `core.state_dir` names another directory but `.pivot` holds stage locks or cache objects,
 Pivot reads a stage lock missing from the configured directory, and its cached objects, from

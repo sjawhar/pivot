@@ -419,12 +419,12 @@ def resolve_cache_object_path(
     cache_path = get_cache_path(cache_dir, file_hash)
     if is_cache_object_path(cache_path, directory=directory):
         return cache_path
-    legacy_files_dir = state_dir_mod.legacy_cache_files_dir_for(cache_dir)
-    if legacy_files_dir is not None:
-        legacy_path = get_cache_path(legacy_files_dir, file_hash)
-        if is_cache_object_path(legacy_path, directory=directory):
+    other_files_dir = state_dir_mod.other_cache_files_dir_for(cache_dir)
+    if other_files_dir is not None:
+        other_path = get_cache_path(other_files_dir, file_hash)
+        if is_cache_object_path(other_path, directory=directory):
             state_dir_mod.report_legacy_state_dir(cache_dir.parent.parent)
-            return legacy_path
+            return other_path
     return None
 
 

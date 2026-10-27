@@ -61,17 +61,17 @@ def get_stages_dir(state_dir: pathlib.Path) -> pathlib.Path:
 
 
 def resolve_stage_lock_path(stages_dir: pathlib.Path, stage_name: str) -> pathlib.Path:
-    """Return an existing stage lock, falling back to the matching 0.5.2 lock once."""
+    """Return an existing stage lock, falling back to the project's other stages directory."""
     primary_path = stages_dir / f"{stage_name}.lock"
     if primary_path.exists():
         return primary_path
-    legacy_stages_dir = state_dir_mod.legacy_stages_dir_for(stages_dir)
-    if legacy_stages_dir is None:
+    other_stages_dir = state_dir_mod.other_stages_dir_for(stages_dir)
+    if other_stages_dir is None:
         return primary_path
-    legacy_path = legacy_stages_dir / f"{stage_name}.lock"
-    if legacy_path.exists():
+    other_path = other_stages_dir / f"{stage_name}.lock"
+    if other_path.exists():
         state_dir_mod.report_legacy_state_dir(stages_dir.parent)
-        return legacy_path
+        return other_path
     return primary_path
 
 

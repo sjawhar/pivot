@@ -109,10 +109,16 @@ def get_lock_data_from_revision(
         if content is not None:
             return _parse_lock_data_from_bytes(content)
 
-    legacy_stages_dir = ".pivot/stages"
-    if stages_dir == legacy_stages_dir:
-        return None
-    content = git.read_file_from_revision(f"{legacy_stages_dir}/{stage_name}.lock", rev)
+    other_state_dir = state_dir_mod.other_state_dir_for(state_dir)
+    other_stages_dir = None
+    if other_state_dir is not None:
+        try:
+            other_stages_dir = lock.stages_rel_path(other_state_dir, root)
+        except ValueError:
+            other_stages_dir = None
+    content = None
+    if other_stages_dir is not None and other_stages_dir != stages_dir:
+        content = git.read_file_from_revision(f"{other_stages_dir}/{stage_name}.lock", rev)
     if content is None:
         if stages_dir is None:
             raise exceptions.ConfigError(

@@ -10,6 +10,7 @@ so `status` right after `repro` reports the stage cached.
 
 from __future__ import annotations
 
+import json
 import os
 import typing
 
@@ -131,3 +132,58 @@ def test_status_right_after_repro_reports_a_secret_stage_cached(tmp_path: pathli
     assert "0 stale" in status.stdout, status.stdout
     keys = sorted(path.relative_to(root).as_posix() for path in root.rglob("secret.key"))
     assert keys == [".pivot/secret.key", "s1/secret.key"]
+
+
+def test_the_recorded_runs_stay_readable_after_the_directory_lost_write_permission(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Reading needs no write permission: `history`, `history --json` and `show` still find the
+    runs recorded in the configured directory, as Pivot 0.5.2 does."""
+    home, root = _project(tmp_path, _TWO_STAGES)
+    (root / "data" / "raw" / "input.txt").write_text("second\n")
+    second = helpers.run_pivot(root, home, "repro")
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert _keys(root / "s1", b"run:") == 2
+    s1 = root / "s1"
+    s1.chmod(0o555)
+    try:
+        listed = helpers.run_pivot(root, home, "history")
+        as_json = helpers.run_pivot(root, home, "history", "--json")
+        shown = helpers.run_pivot(root, home, "show")
+    finally:
+        s1.chmod(0o755)
+
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    assert "No runs recorded" not in listed.stdout, listed.stdout
+    assert len(listed.stdout.strip().splitlines()) == 4, listed.stdout
+    assert as_json.returncode == 0, as_json.stdout + as_json.stderr
+    runs = json.loads(as_json.stdout)
+    assert len(runs) == 2, as_json.stdout
+    assert [run["run_id"] for run in runs] == sorted(
+        (run["run_id"] for run in runs), reverse=True
+    ), as_json.stdout
+    assert shown.returncode == 0, shown.stdout + shown.stderr
+    assert runs[0]["run_id"] in shown.stdout, shown.stdout
+    # Each command reports the path it cannot write, once, and nothing else.
+    for result in (listed, as_json, shown):
+        assert result.stderr.count("Pivot uses the default .pivot.") == 1, result.stderr
+        assert "holds stage locks or cache objects" not in result.stderr, result.stderr
+
+
+def test_checkout_restores_from_the_directory_that_lost_write_permission(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A restore reads the lock and the cache object where the run left them."""
+    home, root = _project(tmp_path, _TWO_STAGES)
+    output = root / "data" / "test" / "b.txt"
+    produced = output.read_text()
+    output.unlink()
+    s1 = root / "s1"
+    s1.chmod(0o555)
+    try:
+        restored = helpers.run_pivot(root, home, "checkout")
+    finally:
+        s1.chmod(0o755)
+
+    assert restored.returncode == 0, restored.stdout + restored.stderr
+    assert output.read_text() == produced, restored.stdout + restored.stderr

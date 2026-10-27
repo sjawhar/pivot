@@ -24,18 +24,18 @@ logger = logging.getLogger(__name__)
 
 
 def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
-    """Scan current and legacy default caches for all local content hashes."""
+    """Scan this project's cache directories, its other one included, for local content hashes."""
     _t = metrics.start()
     files_dirs = [cache_dir / "files"]
-    legacy_files_dir = state_dir_mod.legacy_cache_files_dir_for(files_dirs[0])
-    if legacy_files_dir is not None:
-        files_dirs.append(legacy_files_dir)
+    other_files_dir = state_dir_mod.other_cache_files_dir_for(files_dirs[0])
+    if other_files_dir is not None:
+        files_dirs.append(other_files_dir)
 
     hashes = set[str]()
     for files_dir in files_dirs:
         if not files_dir.exists():
             continue
-        is_legacy = files_dir == legacy_files_dir
+        is_other = files_dir == other_files_dir
         with os.scandir(files_dir) as prefix_entries:
             for prefix_entry in prefix_entries:
                 if not prefix_entry.is_dir() or len(prefix_entry.name) != 2:
@@ -48,7 +48,7 @@ def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
                             object_path
                         ):
                             hashes.add(full_hash)
-                            if is_legacy:
+                            if is_other:
                                 state_dir_mod.report_legacy_state_dir(cache_dir.parent)
 
     metrics.end("sync.get_local_cache_hashes", _t)
@@ -144,7 +144,7 @@ def _get_file_hash_from_stages(
     # is read through StageLock, which finds a stage's lock where it is, one stage at a time.
     stages_dir = lock.get_stages_dir(state_dir)
     stage_names = set[str]()
-    for scanned_dir in (stages_dir, state_dir_mod.legacy_stages_dir_for(stages_dir)):
+    for scanned_dir in (stages_dir, state_dir_mod.other_stages_dir_for(stages_dir)):
         if scanned_dir is not None and scanned_dir.is_dir():
             stage_names.update(
                 lock_file.relative_to(scanned_dir).with_suffix("").as_posix()

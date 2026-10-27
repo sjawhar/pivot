@@ -175,22 +175,30 @@ def _resolve_state_dir(root: pathlib.Path) -> StateDirResolution:
             return exceptions.StateDirTargetError(
                 f"{target_problem} (core.state_dir in {config_path})",
                 state_dir,
-                _holds_writable_state(state_dir),
+                _ran_in_052(state_dir),
             )
     warn_if_global_state_dir_ignored(root, shadowed=present)
     return state_dir
 
 
-def _holds_writable_state(state_dir: pathlib.Path) -> bool:
-    """Whether ``<state_dir>/state.lmdb`` is a directory this process can write and search.
+# What Pivot 0.5.2 opened under the state directory at the start of a state-using command: its
+# database, and the directory of its artifact locks. 0.5.2 created each when it was missing.
+_052_STATE_ENTRIES = ("state.lmdb", "locks")
 
-    Such a path cannot become a state directory, yet Pivot 0.5.2 ran a project's commands with
-    it, keeping its run history and caches there; a command handed the path would write into it
-    while the stages write to ``.pivot``. So such a path falls back to ``.pivot`` for every
-    reader. Any other unusable path fails where a command opens it, as 0.5.2 did.
+
+def _ran_in_052(state_dir: pathlib.Path) -> bool:
+    """Whether Pivot 0.5.2 ran a state-using command with ``state_dir``, which cannot be written.
+
+    0.5.2 opened ``<state_dir>/state.lmdb`` and ``<state_dir>/locks`` there, and created each
+    when it was missing, so it ran only where both are already directories it can write. Then
+    its state is there and the command's work goes to ``.pivot``: the fallback. Where 0.5.2
+    would have had to create one of them, it failed, and so does the command: it gets the path
+    and fails where it opens it.
     """
-    database = state_dir / "state.lmdb"
-    return os.path.isdir(database) and os.access(database, os.W_OK | os.X_OK)
+    return all(
+        os.path.isdir(state_dir / entry) and os.access(state_dir / entry, os.W_OK | os.X_OK)
+        for entry in _052_STATE_ENTRIES
+    )
 
 
 def resolved_state_dir(root: pathlib.Path, resolution: StateDirResolution) -> pathlib.Path:
@@ -332,35 +340,49 @@ def get_state_dir() -> pathlib.Path:
     return state_dir_for(project.get_project_root())
 
 
-def legacy_state_dir_for(state_dir: pathlib.Path) -> pathlib.Path | None:
-    """Return the 0.5.2 state directory paired with ``state_dir``, if this project has one."""
+def other_state_dir_for(state_dir: pathlib.Path) -> pathlib.Path | None:
+    """The project's other state directory, where state it recorded earlier can still be.
+
+    One resolver answers "where does this project's recorded state live for reading", in both
+    directions. A reader that misses an entry under ``state_dir`` looks there; a writer never
+    does. ``.pivot`` for the configured directory: Pivot 0.5.2 kept its state there, and so
+    does a run made before ``core.state_dir`` was set or while it cannot be used. The
+    configured path for ``.pivot``, when the record fell back to ``.pivot`` because that path
+    cannot be written although it still holds this project's state
+    (``StateDirTargetError.fallback``): reading it needs no write permission, so a run
+    recorded there stays readable. Returns None when this project has no other directory.
+    """
     try:
         root = project.get_project_root()
     except exceptions.ProjectNotInitializedError:
         return None
-    configured = resolution_for(root)
-    if isinstance(configured, exceptions.StateDirTargetError):
-        configured = configured.path
-    if not isinstance(configured, pathlib.Path):
+    resolution = resolution_for(root)
+    default = root / ".pivot"
+    if isinstance(resolution, exceptions.StateDirTargetError):
+        if resolution.fallback and state_dir == default:
+            return resolution.path
+        configured = resolution.path
+    elif isinstance(resolution, pathlib.Path):
+        configured = resolution
+    else:
         return None
-    legacy = root / ".pivot"
-    if configured != state_dir or configured == legacy:
+    if configured != state_dir or configured == default:
         return None
-    return legacy
+    return default
 
 
-def legacy_stages_dir_for(stages_dir: pathlib.Path) -> pathlib.Path | None:
-    """Return the old stages directory corresponding to a configured stages directory."""
-    legacy = legacy_state_dir_for(stages_dir.parent)
-    return None if legacy is None else legacy / "stages"
+def other_stages_dir_for(stages_dir: pathlib.Path) -> pathlib.Path | None:
+    """The other stages directory of the project whose locks are in ``stages_dir``."""
+    other = other_state_dir_for(stages_dir.parent)
+    return None if other is None else other / "stages"
 
 
-def legacy_cache_files_dir_for(cache_files_dir: pathlib.Path) -> pathlib.Path | None:
-    """Return the old cache object directory corresponding to a default configured cache."""
-    legacy = legacy_state_dir_for(cache_files_dir.parent.parent)
-    if legacy is None:
+def other_cache_files_dir_for(cache_files_dir: pathlib.Path) -> pathlib.Path | None:
+    """The other cache-object directory paired with a default configured cache."""
+    other = other_state_dir_for(cache_files_dir.parent.parent)
+    if other is None:
         return None
-    return legacy / "cache" / "files"
+    return other / "cache" / "files"
 
 
 def report_legacy_state_dir(state_dir: pathlib.Path) -> None:
@@ -373,13 +395,15 @@ def report_legacy_state_dir(state_dir: pathlib.Path) -> None:
     ``.pivot/stages`` exists, it says how to move the locks: with ``mv`` and absolute paths,
     which works whether or not git tracks them and from any directory, while ``state_dir`` is a
     directory without ``stages``; otherwise ``mv`` would put the directory inside the existing
-    one, or fail, so it says to move the lock files into ``<state_dir>/stages``.
+    one, or fail, so it says to move the lock files into ``<state_dir>/stages``. Reading the
+    other way round, from ``.pivot`` into a configured path that cannot be written, says
+    nothing: the command already reported that path once.
     """
     reported = _reported()
     if reported is None or state_dir in reported["legacy"]:
         return
-    legacy = legacy_state_dir_for(state_dir)
-    if legacy is None:
+    legacy = other_state_dir_for(state_dir)
+    if legacy is None or legacy != project.get_project_root() / ".pivot":
         return
     reported["legacy"].add(state_dir)
     source, destination = legacy / "stages", state_dir / "stages"

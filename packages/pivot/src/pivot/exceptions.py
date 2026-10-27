@@ -382,8 +382,8 @@ class StateDirTargetError(ConfigError):
     A state-directory record keeps it as the root's resolution, with the outcome decided once
     with the value: the stages keep their state in ``.pivot``, and ``fallback`` says what a
     command that needs the configured directory gets. True: ``.pivot`` as well, so every reader
-    uses ``.pivot``. False: ``path``, where the command fails as 0.5.2 failed. ``path`` is the
-    directory the value names.
+    uses ``.pivot``; it is true only where Pivot 0.5.2 ran such a command. False: ``path``,
+    where the command fails as 0.5.2 failed. ``path`` is the directory the value names.
     """
 
     path: pathlib.Path
