@@ -69,6 +69,7 @@ When a test needs a fixture's side effect but not its return value, use `@pytest
 - `sample_data_file` — create sample CSV
 - `set_project_root` — set project root to `tmp_path`
 - `git_repo` — create a git repo with commit function
+- `tmp_path` — pytest's, overridden so that at teardown every directory in it gets its owner's read, write and search bits back (`restore_owner_access`); a test that leaves a read-only tree there (a cache tree pivot published, a `chmod` to reach an error path) needs no `finally` to let pytest delete it
 
 ---
 
