@@ -87,6 +87,22 @@ def contains_symlink_in_path(path: pathlib.Path, base: pathlib.Path) -> bool:
     return False
 
 
+def real_location_outside(path: pathlib.Path, resolved_root: pathlib.Path) -> pathlib.Path | None:
+    """Where ``path`` really is, when that place lies outside ``resolved_root``, else None.
+
+    ``path`` is resolved, so a symlink anywhere on the way counts: this answers where a write
+    through ``path`` lands, which ``normalize_path`` and ``relative_within`` do not (both place a
+    path by its spelling, keeping symlinks). ``resolved_root`` is already resolved, so one walk
+    serves many paths. A ``path`` that cannot be resolved (a NUL byte, a filesystem error) counts
+    as outside and comes back as it was given, because where it leads is unknown.
+    """
+    try:
+        real = path.resolve()
+    except (OSError, ValueError):
+        return path
+    return None if real.is_relative_to(resolved_root) else real
+
+
 def resolve_path_for_comparison(path: str, context: str) -> pathlib.Path:
     """Resolve path for overlap comparison, falling back to normalized for missing stage outputs."""
     try:

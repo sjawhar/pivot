@@ -455,12 +455,7 @@ def _print_summary(outcomes: list[RestoreOutcome], quiet: bool) -> bool:
 
 @cli_decorators.pivot_command(allow_all=True)
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
-@click.option(
-    "--checkout-mode",
-    type=click.Choice(["symlink", "hardlink", "copy"]),
-    default=None,
-    help="Checkout mode for restoration (default: project config or hardlink)",
-)
+@cli_decorators.checkout_mode_option
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
 @click.option(
     "--only-missing",

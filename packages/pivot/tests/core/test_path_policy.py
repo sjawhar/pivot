@@ -124,94 +124,26 @@ def test_validate_path_syntax_error_traversal(tmp_path: pathlib.Path) -> None:
     assert "contains path traversal" in (result["error"] or "")
 
 
-# --- Symlink escape tests ---
+# --- A symlink is a filesystem fact, not a fact about the declared path ---
 
 
-def test_validate_path_symlink_escape_error(tmp_path: pathlib.Path) -> None:
-    """OUT type should error when symlink escapes base_dir."""
+def test_validate_path_accepts_a_declared_path_that_symlinks_outside_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Registration reads the path as written: an output may already link to a cache elsewhere."""
     outside_dir = tmp_path / "outside"
     outside_dir.mkdir()
     outside_file = outside_dir / "secret.txt"
     outside_file.write_text("secret")
-
     project_dir = tmp_path / "project"
     project_dir.mkdir()
-    symlink = project_dir / "link.txt"
-    symlink.symlink_to(outside_file)
+    (project_dir / "link.txt").symlink_to(outside_file)
 
-    result = path_policy.validate_path(
-        "link.txt",
-        path_policy.PathType.OUT,
-        project_dir,
-        check_exists=True,
-    )
+    result = path_policy.validate_path("link.txt", path_policy.PathType.OUT, project_dir)
 
-    assert not result["valid"]
-    assert "resolves outside base via symlink" in (result["error"] or "")
-
-
-def test_validate_path_symlink_escape_warn(tmp_path: pathlib.Path) -> None:
-    """DEP type should warn when symlink escapes base_dir."""
-    outside_dir = tmp_path / "outside"
-    outside_dir.mkdir()
-    outside_file = outside_dir / "data.csv"
-    outside_file.write_text("data")
-
-    project_dir = tmp_path / "project"
-    project_dir.mkdir()
-    symlink = project_dir / "link.csv"
-    symlink.symlink_to(outside_file)
-
-    result = path_policy.validate_path(
-        "link.csv",
-        path_policy.PathType.DEP,
-        project_dir,
-        check_exists=True,
-    )
-
-    assert result["valid"]
-    assert len(result["warnings"]) == 1
-    assert "resolves outside base via symlink" in result["warnings"][0]
-
-
-def test_validate_path_symlink_within_base_ok(tmp_path: pathlib.Path) -> None:
-    """Symlinks that stay within base_dir should be fine."""
-    target_file = tmp_path / "target.txt"
-    target_file.write_text("content")
-    symlink = tmp_path / "link.txt"
-    symlink.symlink_to(target_file)
-
-    result = path_policy.validate_path(
-        "link.txt",
-        path_policy.PathType.OUT,
-        tmp_path,
-        check_exists=True,
-    )
-
-    assert result["valid"]
-    assert len(result["warnings"]) == 0
-
-
-def test_validate_path_check_exists_false_skips_symlink_check(tmp_path: pathlib.Path) -> None:
-    """When check_exists=False, symlink resolution is skipped."""
-    outside_dir = tmp_path / "outside"
-    outside_dir.mkdir()
-    outside_file = outside_dir / "secret.txt"
-    outside_file.write_text("secret")
-
-    project_dir = tmp_path / "project"
-    project_dir.mkdir()
-    symlink = project_dir / "link.txt"
-    symlink.symlink_to(outside_file)
-
-    result = path_policy.validate_path(
-        "link.txt",
-        path_policy.PathType.OUT,
-        project_dir,
-        check_exists=False,
-    )
-
-    assert result["valid"], "Should not check symlink when check_exists=False"
+    assert result["valid"], result["error"]
+    assert result["normalized_path"] == project_dir / "link.txt"
+    assert result["warnings"] == []
 
 
 # --- require_valid_path tests ---
@@ -303,5 +235,3 @@ def test_policy_structure() -> None:
     """Policies should have required fields."""
     for path_type, policy in path_policy.POLICIES.items():
         assert "allow_absolute" in policy, f"{path_type} missing allow_absolute"
-        assert "symlink_escape_action" in policy, f"{path_type} missing symlink_escape_action"
-        assert policy["symlink_escape_action"] in ("error", "warn", "allow")
