@@ -284,13 +284,13 @@ def test_gc_drops_the_register_entry_whose_root_is_gone(
     gc.register_project(shared["cache_dir"], shared["root"], shared["state_dir"])
     gc.register_project(shared["cache_dir"], gone, gone / ".pivot")
 
-    first = _helper_run(runner, "--dry-run", "--grace-hours", "0")
+    first = _helper_run(runner, "--yes", "--grace-hours", "0")
 
     assert first.exit_code == 0, first.output
     assert "Dropped 1 projects from the cache register" in first.output, first.output
     assert not gc.register_path(shared["cache_dir"], gone).exists(), "the entry is still recorded"
 
-    second = _helper_run(runner, "--dry-run", "--grace-hours", "0")
+    second = _helper_run(runner, "--yes", "--grace-hours", "0")
 
     assert "Dropped" not in second.output, second.output
 

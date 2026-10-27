@@ -89,11 +89,12 @@ every process staging a new object, and takes `<cache>/gc.lock` for the whole ru
 collections never run on one cache. Before it deletes, it re-reads every record a second
 time — after the scan, immediately before the unlink — and keeps any object a run has named
 since the scan; this is what protects an object a concurrent run both re-publishes and names
-while the collection is running. The one remaining exposure is an object a run names in the
-gap between that final re-read and its own unlink: one `lstat` per object, not the whole
-scan. A collection removes a directory tree with its `.content-checked` marker (and the
-`.layout-checked` and `.verified` markers older pivot versions wrote), and never removes a
-lock file or a `.pivot_tmp_*` entry another process owns.
+while the collection is running. The deletion protocol — including the width of the remaining
+exposure and whether a per-object re-check under the prefix lock can close it — is under a
+design consult and will be settled in a later round; the current implementation re-reads the
+records once at the start of the deletion pass. A collection removes a directory tree with its
+`.content-checked` marker (and the `.layout-checked` and `.verified` markers older pivot
+versions wrote), and never removes a lock file or a `.pivot_tmp_*` entry another process owns.
 
 ### A Cache Several Projects Share
 

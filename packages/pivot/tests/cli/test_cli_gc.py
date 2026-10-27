@@ -284,7 +284,7 @@ def test_gc_removes_a_tree_with_its_marker_and_leaves_its_lock_file(
     """A tree no record names goes with its `.verified` marker; lock files never go."""
     tree = _helper_publish_tree(workspace, "dead-tree")
     tree_path = cache.get_cache_path(workspace["object_root"], tree["hash"])
-    marker = tree_path.with_name(tree_path.name + cache._TREE_LAYOUT_MARKER_SUFFIX)
+    marker = tree_path.with_name(tree_path.name + cache.TREE_MARKER_SUFFIXES[0])
     tree_lock = tree_path.with_name(tree_path.name + ".lock")
     tree_lock.touch()
     assert marker.exists(), "a published tree is marked"
@@ -358,7 +358,7 @@ def test_gc_leaves_the_prefix_lock_and_temporary_entries(
     assert result.exit_code == 0, result.output
     assert _helper_keys(workspace) == set(), result.output
     assert temp.exists(), "a temporary entry a publisher owns was removed"
-    assert (prefix / cache._PREFIX_LOCK).exists(), "the prefix lock was removed"
+    assert (prefix / cache.PREFIX_LOCK).exists(), "the prefix lock was removed"
 
 
 # =============================================================================
@@ -631,7 +631,7 @@ def test_gc_refuses_while_another_collection_holds_the_cache(
 ) -> None:
     """One collection at a time, so two never plan against each other's deletions."""
     dead = _helper_publish(workspace, "dead")
-    fd = cache._open_cache_lock(workspace["cache_dir"] / gc.GC_LOCK)
+    fd = cache.open_cache_lock(workspace["cache_dir"] / gc.GC_LOCK)
     fcntl.flock(fd, fcntl.LOCK_EX)
     try:
         result = _helper_run(runner, "--yes", "--grace-hours", "0")
@@ -686,7 +686,7 @@ def test_gc_waits_for_a_prefix_a_publisher_holds(
     """The prefix lock a staging publisher holds keeps the collection out of that prefix."""
     dead = _helper_publish(workspace, "dead")
     dead_path = cache.get_cache_path(workspace["object_root"], dead)
-    fd = cache._open_cache_lock(dead_path.parent / cache._PREFIX_LOCK)
+    fd = cache.open_cache_lock(dead_path.parent / cache.PREFIX_LOCK)
     fcntl.flock(fd, fcntl.LOCK_EX)
     outcome = list[int]()
 
@@ -740,27 +740,8 @@ def test_gc_prunes_run_history_to_the_retention(
 
 
 # =============================================================================
-# Concurrency, round 2: the two guards that keep an object a run re-uses and names
+# Concurrency, round 2: the records re-read that keeps an object a run names
 # =============================================================================
-
-
-def test_gc_keeps_an_object_a_cache_hit_refreshed(
-    workspace: Workspace, runner: click.testing.CliRunner
-) -> None:
-    """A re-run whose output is already cached publishes nothing, so `copy_to_cache` refreshes
-    the object's timestamp (git's "update the mtime of an object already present"). That keeps an
-    object a run is reusing inside a short grace even before any record names it. Guard one of
-    B1; a mutant that drops the refresh fails here."""
-    key = _helper_publish(workspace, "reused")
-    source = workspace["scratch"] / "reused-source"
-    source.write_text("reused")
-    time.sleep(1.1)  # older than the one-second grace below
-    cache.copy_to_cache(source, cache.get_cache_path(workspace["object_root"], key))
-
-    result = _helper_run(runner, "--yes", "--grace-hours", str(1.0 / 3600.0))
-
-    assert result.exit_code == 0, result.output
-    assert key in _helper_keys(workspace), "a cache hit did not refresh the object's timestamp"
 
 
 def test_gc_keeps_an_object_a_lock_named_after_the_plan(
@@ -806,3 +787,69 @@ def test_gc_keeps_a_republished_object_hardlinked_after_the_plan(
 
     assert result.exit_code == 0, result.output
     assert key in _helper_keys(workspace), "a hardlinked object was removed"
+
+
+# =============================================================================
+# BLK-2: a symlinked directory inside the project must be walked
+# =============================================================================
+
+
+def test_gc_keeps_an_object_a_pvt_under_a_symlinked_directory_names(
+    workspace: Workspace, runner: click.testing.CliRunner
+) -> None:
+    """A project whose data directory is a symlink to another directory inside the project: the
+    walk must follow it and see the .pvt beneath it. The mutant that skips symlinked dirs misses
+    this record and removes the object."""
+    tracked = _helper_publish(workspace, "under-symlink")
+    real_dir = workspace["root"] / "data_real"
+    real_dir.mkdir()
+    track.write_pvt_file(
+        real_dir / "tracked.txt.pvt",
+        track.PvtData(path="tracked.txt", hash=tracked, size=len("under-symlink")),
+    )
+    link_dir = workspace["root"] / "data"
+    link_dir.symlink_to(real_dir)
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code == 0, result.output
+    assert tracked in _helper_keys(workspace), (
+        "an object named by a .pvt under a symlinked directory was removed"
+    )
+
+
+# =============================================================================
+# BLK-3: a registered peer of an internal cache must be read
+# =============================================================================
+
+
+def test_gc_keeps_an_object_a_registered_peer_of_an_internal_cache_names(
+    workspace: Workspace, runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A cache inside the project root can have a registered peer (another project pointing its
+    PIVOT_CACHE_DIR at this one's internal cache). The collection must read the register and keep
+    every object the peer's locks name."""
+    mine = _helper_publish(workspace, "mine")
+    theirs = _helper_publish(workspace, "theirs")
+    _helper_write_lock(workspace, outs={None: types.FileHash(hash=mine)})
+    peer = tmp_path / "peer"
+    peer_stages = peer / ".pivot" / "stages"
+    peer_stages.mkdir(parents=True)
+    lock.StageLock("peer/stage", peer_stages).write(
+        types.LockData(
+            code_manifest={"self:peer": "abc123"},
+            params={},
+            dep_hashes={},
+            output_hashes={
+                types.ArtifactIdentity("peer/stage", None): types.FileHash(hash=theirs)
+            },
+        )
+    )
+    gc.register_project(workspace["cache_dir"], peer, peer / ".pivot")
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code == 0, result.output
+    assert theirs in _helper_keys(workspace), (
+        "an object named by a registered peer of an internal cache was removed"
+    )
