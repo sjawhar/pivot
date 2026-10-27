@@ -176,12 +176,12 @@ def get_data_path(pvt_path: pathlib.Path) -> pathlib.Path:
 # other link to it. So no other account reads the memo's names, whatever path reaches the file
 # (a symlinked .pivot or state.lmdb, a bind mount) and whatever modes the project's directories
 # have, except while the owner leaves the file loose, until the next pre-flight replaces it. The
-# cost is the file's open and one fstat per walk. The memo's own path is never followed through
-# a symlink, and a hard link fails the check, so the write cannot land in another of the
-# account's files. The file is rewritten in place, so the directory holding it does not change
-# with each write. A listing in which an entry's type could not be read (the lstat a filesystem
-# without d_type needs failed) is never recorded: that entry is not descended, as in os.walk,
-# and a walk that can read its type must not reuse that.
+# cost is the file's open and one fstat per walk (one more when a loosened memo is replaced).
+# The memo's own path is never followed through a symlink, and a hard link fails the check, so
+# the write cannot land in another of the account's files. The file is rewritten in place, so the
+# directory holding it does not change with each write. A listing in which an entry's type could
+# not be read (the lstat a filesystem without d_type needs failed) is never recorded: that entry
+# is not descended, as in os.walk, and a walk that can read its type must not reuse that.
 _MEMO_SETTLE_NS = 2_000_000_000
 _NS_PER_S = 1_000_000_000
 _MEMO_FS_TYPES = frozenset({b"ext2", b"ext3", b"ext4", b"xfs", b"btrfs", b"tmpfs", b"f2fs", b"zfs"})
@@ -490,8 +490,8 @@ def _create_memo(path: pathlib.Path, mounts: _Mounts) -> int | None:
     the file first. A new file that fails ``_memo_refusal`` is removed again.
     """
     try:
-        directory = os.stat(path.parent)
-        if not _memo_device_allowed(mounts, directory.st_dev, path.parent):
+        parent_stat = os.stat(path.parent)
+        if not _memo_device_allowed(mounts, parent_stat.st_dev, path.parent):
             logger.debug(f"No .pvt walk memo: {path.parent} is on a filesystem off the allowlist")
             return None
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | _MEMO_OPEN, 0o600)
@@ -568,6 +568,7 @@ def _open_memo(mounts: _Mounts, *, write: bool) -> tuple[int | None, _Memo | Non
         if write and replaceable:
             logger.debug(f"Replacing the .pvt walk memo {path}: it {reason}")
             replacement = _replace_memo(fd, path, memo_stat, mounts)
+            reason = "could not be replaced"
     except OSError as e:
         reason = f"cannot be read: {e}"
     os.close(fd)
