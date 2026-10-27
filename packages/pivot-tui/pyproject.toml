@@ -13,7 +13,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "pivot",
+    "pivot>=0.5.11",
     "textual>=7.0",
 ]
 

@@ -184,9 +184,7 @@ def _run(
 
 def _install_wheel(tmp_path: pathlib.Path, *requirements: str) -> str:
     """Build pivot's wheel, install it and ``requirements`` into a new venv, return ``pivot``."""
-    uv = os.environ.get("PIVOT_TEST_UV", "")
-    if not (pathlib.Path(uv).is_file() and os.access(uv, os.X_OK)):
-        pytest.fail(f"PIVOT_TEST_UV must name the uv executable; it is {uv!r}", pytrace=False)
+    uv = _uv()
     dist = tmp_path / "dist"
     build = _run([uv, "build", "--package", "pivot", "--wheel", "--out-dir", str(dist)], _REPO_ROOT)
     assert build.returncode == 0, build.stderr
@@ -200,6 +198,60 @@ def _install_wheel(tmp_path: pathlib.Path, *requirements: str) -> str:
     )
     assert install.returncode == 0, install.stderr
     return str(venv / "bin" / "pivot")
+
+
+def _uv() -> str:
+    uv = os.environ.get("PIVOT_TEST_UV", "")
+    if not (pathlib.Path(uv).is_file() and os.access(uv, os.X_OK)):
+        pytest.fail(f"PIVOT_TEST_UV must name the uv executable; it is {uv!r}", pytrace=False)
+    return uv
+
+
+@pytest.mark.skipif(not os.environ.get("CI"), reason="builds and installs wheels; runs in CI")
+def test_pivot_tui_wheel_imports_against_the_pivot_wheel_built_beside_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """pivot-tui imports ``pivot.display`` and ``pivot.types``, so the pivot-tui a release ships
+    must install and import against the pivot released beside it.
+
+    This is the check the workspace cannot run: ``[tool.uv.sources] pivot = { workspace = true }``
+    makes the bound inert, so ``uv lock --check`` and every other job stay green while a published
+    pivot-tui names a pivot that lacks what it imports. Here both wheels are built from this tree
+    and installed into a fresh venv with ``--no-sources`` (no workspace editable pivot), so the
+    resolver must satisfy pivot-tui's bound with the co-built pivot wheel and the import must find
+    every module. A bound above the co-built pivot's version fails to resolve; a missing module
+    fails the import.
+    """
+    uv = _uv()
+    dist = tmp_path / "dist"
+    for package in ("pivot", "pivot-tui"):
+        build = _run(
+            [uv, "build", "--package", package, "--wheel", "--out-dir", str(dist)], _REPO_ROOT
+        )
+        assert build.returncode == 0, build.stderr
+    pivot_wheel = next(dist.glob("pivot-*.whl"))
+    tui_wheel = next(dist.glob("pivot_tui-*.whl"))
+
+    venv = tmp_path / "venv"
+    assert _run([uv, "venv", "--python", "3.13", str(venv)], tmp_path).returncode == 0
+    python = venv / "bin" / "python"
+    install = _run(
+        [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "--no-sources",
+            str(tui_wheel),
+            str(pivot_wheel),
+        ],
+        tmp_path,
+    )
+    assert install.returncode == 0, install.stdout + install.stderr
+
+    imported = _run([str(python), "-c", "import pivot_tui.diff"], tmp_path)
+    assert imported.returncode == 0, imported.stdout + imported.stderr
 
 
 @pytest.mark.skipif(not os.environ.get("CI"), reason="builds and installs a wheel; runs in CI")

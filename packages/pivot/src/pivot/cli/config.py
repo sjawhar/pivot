@@ -1,21 +1,36 @@
-import json
 from typing import Any, cast
 
 import click
 import pydantic
 
-from pivot import config, exceptions
+from pivot import config, display, exceptions
 from pivot.cli import completion
+from pivot.cli import decorators as cli_decorators
 
 
 def _format_value(value: Any) -> str:
-    """Format a config value for display."""
+    """Format a config value for display: URL credentials hidden, control characters escaped."""
     if value is None:
         return "(not set)"
     if isinstance(value, list):
         items = cast("list[Any]", value)
-        return ", ".join(str(v) for v in items)
-    return str(value)
+        text = ", ".join(str(v) for v in items)
+    else:
+        text = str(value)
+    return display.redact_url_credentials(display.escape_control(text))
+
+
+def _redact(value: Any) -> Any:
+    """``value`` with URL credentials hidden in every string it holds, for JSON output."""
+    if isinstance(value, str):
+        return display.redact_url_credentials(value)
+    if isinstance(value, dict):
+        mapping = cast("dict[Any, Any]", value)
+        return {key: _redact(item) for key, item in mapping.items()}
+    if isinstance(value, list):
+        items = cast("list[Any]", value)
+        return [_redact(item) for item in items]
+    return value
 
 
 def _flatten_config(data: dict[str, Any], prefix: str = "") -> dict[str, Any]:
@@ -40,6 +55,7 @@ def config_cmd() -> None:
 @click.option("--global", "use_global", is_flag=True, help="Show only global config")
 @click.option("--local", "use_local", is_flag=True, help="Show only local config")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+@cli_decorators.with_error_handling
 def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
     """Display all configuration values."""
     data: dict[str, Any]
@@ -52,7 +68,7 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
         data = merged.model_dump()
 
     if output_json:
-        click.echo(json.dumps(data, indent=2))
+        click.echo(display.to_json(_redact(data), indent=2))
         return
 
     flat = _flatten_config(data)
@@ -67,10 +83,11 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
             remotes_dict = cast("dict[str, str]", value)
             for remote_name, remote_url in remotes_dict.items():
                 _, source = config.get_config_value(f"remotes.{remote_name}")
-                click.echo(f"remotes.{remote_name} = {remote_url} ({source})")
+                name = display.escape_control(remote_name)
+                click.echo(f"remotes.{name} = {_format_value(remote_url)} ({source})")
         else:
             _, source = config.get_config_value(key)
-            click.echo(f"{key} = {_format_value(value)} ({source})")
+            click.echo(f"{display.escape_control(key)} = {_format_value(value)} ({source})")
 
 
 def _get_nested_value(data: dict[str, Any], key: str) -> Any:
@@ -95,6 +112,7 @@ def _get_nested_value(data: dict[str, Any], key: str) -> Any:
 @click.option("--global", "use_global", is_flag=True, help="Get from global config only")
 @click.option("--local", "use_local", is_flag=True, help="Get from local config only")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
+@cli_decorators.with_error_handling
 def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -> None:
     """Get a configuration value by dotted key."""
     if use_global and use_local:
@@ -115,7 +133,7 @@ def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -
         value, source = config.get_config_value(key)
 
     if output_json:
-        click.echo(json.dumps({"key": key, "value": value, "source": str(source)}))
+        click.echo(display.to_json({"key": key, "value": _redact(value), "source": str(source)}))
         return
 
     click.echo(f"{key} = {_format_value(value)} ({source})")
@@ -125,6 +143,7 @@ def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -
 @click.argument("key", shell_complete=completion.complete_config_keys)
 @click.argument("value")
 @click.option("--global", "use_global", is_flag=True, help="Set in global config")
+@cli_decorators.with_error_handling
 def config_set(key: str, value: str, use_global: bool) -> None:
     """Set a configuration value."""
     try:
@@ -143,6 +162,7 @@ def config_set(key: str, value: str, use_global: bool) -> None:
 @config_cmd.command("unset")
 @click.argument("key", shell_complete=completion.complete_config_keys)
 @click.option("--global", "use_global", is_flag=True, help="Unset from global config")
+@cli_decorators.with_error_handling
 def config_unset(key: str, use_global: bool) -> None:
     """Remove a configuration value (reverts to default or inherited value)."""
     if not config.is_valid_key(key):

@@ -108,7 +108,9 @@ With `--check-imports`, an `imports` array holds one entry per imported artifact
 
 Pivot writes exactly one JSON document to standard output for every option combination. Notes such as "No remotes configured" and warnings go to standard error. A failed run (for example `--remote-only` with no remote configured) exits non-zero, with its error on standard error and nothing on standard output.
 
-Python's `json` module and jq 1.7 parse every document. A strict JSON parser (JavaScript's `JSON.parse`, Go's `encoding/json`, Rust's `serde_json`) can reject one: with `--explain`, a stage parameter whose value is non-finite (for example `float("inf")`) prints as `Infinity`, which is not valid JSON.
+Every document is valid RFC 8259 JSON, so a strict parser (JavaScript's `JSON.parse`, Go's `encoding/json`, Rust's `serde_json`) reads it as Python's `json` module and jq do. A value that JSON has no number for is written as a string: a non-finite float (for example a stage parameter set to `float("inf")`) reads as `"Infinity"`, `"-Infinity"` or `"NaN"` — the same names Python used to write bare — in every `--json` document and every `--jsonl` line. A reader that expects a number for such a field must accept these three strings.
+
+A URL that Pivot prints has its credentials hidden: `https://user:token@host/repo.git` reads as `https://***@host/repo.git`, in JSON, in text and in warnings. The configured URL itself is unchanged, and a URL without credentials is printed byte for byte.
 
 ### Quiet Mode
 

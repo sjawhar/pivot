@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING
 
 import click
 
-from pivot import config
+from pivot import config, display
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.storage import state
@@ -28,7 +27,7 @@ def history(ctx: click.Context, limit: int, output_json: bool) -> None:
         runs = state_db.list_runs(limit=limit)
 
     if output_json:
-        click.echo(json.dumps(runs, indent=2))
+        click.echo(display.to_json(runs, indent=2))
         return
 
     if quiet:
@@ -59,7 +58,8 @@ def _print_run_summary(run: RunManifest) -> None:
     total_duration_ms = sum(s["duration_ms"] for s in stages.values())
     duration_str = _format_duration(total_duration_ms)
 
-    click.echo(f"{run['run_id']:<26}  {ran:>3}  {skipped:>7}  {failed:>6}  {duration_str:>8}")
+    run_id = display.escape_control(run["run_id"])
+    click.echo(f"{run_id:<26}  {ran:>3}  {skipped:>7}  {failed:>6}  {duration_str:>8}")
 
 
 @cli_decorators.pivot_command("show", auto_discover=False)
@@ -86,7 +86,7 @@ def show_cmd(ctx: click.Context, run_id: str | None, output_json: bool) -> None:
             run = runs[0]
 
     if output_json:
-        click.echo(json.dumps(run, indent=2))
+        click.echo(display.to_json(run, indent=2))
         return
 
     if not quiet:
@@ -95,14 +95,14 @@ def show_cmd(ctx: click.Context, run_id: str | None, output_json: bool) -> None:
 
 def _print_run_detail(run: RunManifest) -> None:
     """Print detailed view of a run."""
-    click.echo(f"Run:     {run['run_id']}")
-    click.echo(f"Started: {run['started_at']}")
-    click.echo(f"Ended:   {run['ended_at']}")
+    click.echo(f"Run:     {display.escape_control(run['run_id'])}")
+    click.echo(f"Started: {display.escape_control(run['started_at'])}")
+    click.echo(f"Ended:   {display.escape_control(run['ended_at'])}")
 
     if run["targeted_stages"]:
         click.echo("Targets:")
         for target in run["targeted_stages"]:
-            click.echo(f"  - {target}")
+            click.echo(f"  - {display.escape_control(target)}")
 
     click.echo()
     click.echo("Stages:")
@@ -129,7 +129,9 @@ def _print_run_detail(run: RunManifest) -> None:
             case StageStatus.FAILED:
                 icon = "\u2717"
 
-        click.echo(f"  {icon} {name:<24} {status:<8} {duration_str:>8}  {reason}")
+        shown_name = display.escape_control(name)
+        shown_reason = display.escape_control(reason)
+        click.echo(f"  {icon} {shown_name:<24} {status:<8} {duration_str:>8}  {shown_reason}")
 
 
 def _format_duration(duration_ms: int) -> str:
