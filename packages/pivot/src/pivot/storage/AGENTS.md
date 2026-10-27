@@ -18,7 +18,7 @@ Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not 
 
 ## File-Hash Write-Back
 
-Every command that writes the workspace records the hash of each file it reads, commits or restores, so `pivot status --explain` (read-only; it writes nothing) finds a matching entry and reads no file. The one exception is a run with `--no-commit`, which by design writes no lock, cache or StateDB entry. A new command that writes or reads workspace files must record them the same way:
+Every command that writes the workspace records the hash of each file it reads, commits or restores, so `pivot status --explain` and `pivot verify` (both read-only; they write nothing and go through the same explanation path) find a matching entry and read no file. The one exception is a run with `--no-commit`, which by design writes no lock, cache or StateDB entry. A new command that writes or reads workspace files must record them the same way:
 
 - `hash_file(..., pending=...)` and `hash_directory(..., pending=...)` append `(path, stat, hash)` for each file they had to read instead of saving it; a caller with a writable StateDB saves them with one `save_many`.
 - A restore records each file with the stat of what it staged, taken before the rename puts it in place (the same inode): `cache.restore_from_cache(..., recorded=...)`, `cache.atomic_write_file`'s return value. A write that lands after the rename then changes the stat, so the entry does not vouch for it.
@@ -106,12 +106,20 @@ When multiple `pivot` processes share the same StateDB:
   takes an exclusive lock only on a file opened for writing; one this user cannot write is
   opened read-only. Lock files are never deleted.
 - A whole-directory SYMLINK tree is built under a temporary name beside its cache name, renamed
-  into place, checked, then marked (`<tree>.verified`), because a restore symlinks to a tree as
-  soon as its name exists. A restore or commit checks an unmarked tree (exact files, sizes,
-  executable bits and directories) under the tree's exclusive `<tree>.lock`, repairs it in place
-  from the files' own cache objects, then marks it. A tree it cannot repair is not used: a
-  restore goes file by file, a commit fails. `<tree>.layout-checked`, the mark pivot 0.3.4 also
-  gave partial trees, is not trusted.
+  into place, checked, then marked (`<tree>.content-checked`), because a restore symlinks to a
+  tree as soon as its name exists. A restore or commit checks every unmarked tree member's path,
+  content hash, size and executable bit, plus its directories, under the tree's exclusive
+  `<tree>.lock`; it repairs mismatches in place from the files' own cache objects, then marks the
+  tree. A tree it cannot check or repair (a file's object is absent, or this user cannot read or
+  write the tree) is not used: a restore goes file by file, a commit fails. Only
+  `<tree>.content-checked` is trusted: `<tree>.layout-checked` (pivot 0.3.4, partial trees
+  included) and `<tree>.verified` (pivot 0.3.5 to 0.5.11, sizes only) are older marks that never
+  checked content, so such a tree is checked again and the old mark removed. The mark is only
+  written where this user can write the tree's prefix directory: for a user who cannot, every
+  symlink restore or commit checks an old-marked tree again, and a symlink commit through a
+  stale one fails, until a user who can write the cache runs one
+  `pivot checkout --checkout-mode symlink` through it. That cost is the price of not trusting a
+  size-only mark.
 
 ## Path Storage
 

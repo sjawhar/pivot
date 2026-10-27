@@ -813,15 +813,18 @@ async def test_download_file_mid_stream_error(
     assert not dest_file.exists(), "Dest file should not exist after mid-stream error"
 
 
+@pytest.mark.usefixtures("no_retries")
 async def test_download_file_stream_read_timeout(
-    gcs_remote: gcs.GCSRemote,
+    gcs_bucket: str,
     tmp_path: pathlib.Path,
     gcs_client: gcloud_storage.Storage,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """download_file cleans up when stream.read() times out."""
+    """A body that stalls is that object's error, not an unreachable remote, and download_file
+    cleans up."""
     monkeypatch.setattr(gcs, "STREAM_CHUNK_SIZE", 256)
     monkeypatch.setattr(gcs, "STREAM_READ_TIMEOUT", 0.1)
+    gcs_remote = gcs.GCSRemote(f"gs://{gcs_bucket}/test-prefix/")
     cache_hash = "abc123def4567890"
     await _put(gcs_client, gcs_remote, cache_hash, b"x" * 1024)
     real_stream_download = gcs._stream_download_to_fd
@@ -844,9 +847,10 @@ async def test_download_file_stream_read_timeout(
     monkeypatch.setattr(gcs, "_stream_download_to_fd", _inject_hanging_read)
     dest_file = tmp_path / "dest.txt"
 
-    with pytest.raises(asyncio.TimeoutError):
+    with pytest.raises(exceptions.RemoteConnectionError, match="GCS read error.*TimeoutError") as e:
         await gcs_remote.download_file(cache_hash, dest_file)
 
+    assert not isinstance(e.value, exceptions.RemoteUnreachableError)
     temp_files = [f for f in os.listdir(tmp_path) if f.startswith(".pivot_download_")]
     assert len(temp_files) == 0, f"Temp files not cleaned up: {temp_files}"
     assert not dest_file.exists(), "Dest file should not exist after timeout"

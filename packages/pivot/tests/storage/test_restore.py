@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import multiprocessing
+import os
 import queue
 from typing import TYPE_CHECKING, cast
 
@@ -9,15 +11,20 @@ import yaml
 
 from pivot import exceptions, project
 from pivot.cli import checkout
-from pivot.storage import cache, restore, state
-from pivot.types import FileHash
+from pivot.remote import sync as transfer
+from pivot.storage import cache, restore
+from pivot.types import FileHash, TransferResult
 
 if TYPE_CHECKING:
-    import os
     import pathlib
     from multiprocessing.synchronize import Event
 
     from conftest import GitRepo
+    from pivot.remote.protocol import RemoteStorage
+
+
+def _helper_unused_remote() -> RemoteStorage:
+    raise AssertionError("this restore must not open the remote")
 
 
 def _hold_checkout_restore(
@@ -86,6 +93,7 @@ def _get_while_checkout_restores(
         cache_dir=cache_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=True,
+        remote_factory=_helper_unused_remote,
     )
     result_queue.put(("get", result["status"]))
 
@@ -153,7 +161,7 @@ size: 1024
 """
     result = restore._parse_pvt_data_from_bytes(content)
 
-    assert result is not None
+    assert isinstance(result, dict), result
     assert result["path"] == "data.csv"
     assert result["hash"] == "abc123"
 
@@ -178,6 +186,32 @@ path: data.csv
     result = restore._parse_pvt_data_from_bytes(content)
 
     assert result is None
+
+
+@pytest.mark.parametrize(
+    ("content", "reason"),
+    [
+        pytest.param(
+            b"path: data.csv\nhash: 1234567890123456\nsize: 1\n",
+            "field 'hash' is not a string",
+            id="all-digit-hash",
+        ),
+        pytest.param(
+            b"path: 1234\nhash: abc123\nsize: 1\n", "field 'path' is not a string", id="int-path"
+        ),
+        pytest.param(
+            b"path: data/\nhash: abc123\nsize: 1\nmanifest:\n- relpath: a.txt\n  isexec: false\n",
+            "field 'manifest[0].hash' is missing",
+            id="manifest-entry-without-hash",
+        ),
+    ],
+)
+def test_parse_pvt_data_from_bytes_names_a_field_a_restore_cannot_use(
+    content: bytes, reason: str
+) -> None:
+    """A .pvt whose field a restore builds a path or cache key from has the wrong type, or whose
+    manifest entry lacks a field a restore reads, returns the reason naming the field."""
+    assert restore._parse_pvt_data_from_bytes(content) == reason
 
 
 # =============================================================================
@@ -257,6 +291,25 @@ def test_resolve_targets_as_pvt_file(git_repo: GitRepo, monkeypatch: pytest.Monk
     assert targets[0]["hashes"]["data.csv"]["hash"] == "abc123"  # type: ignore[index]
 
 
+def test_resolve_targets_reports_an_invalid_pvt_as_that_targets_error(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A .pvt at the revision that is not valid resolves to that target's error, naming the
+    file, the revision and the field, rather than stopping every target."""
+    repo_path, commit = git_repo
+    (repo_path / "data.csv.pvt").write_text("path: data.csv\nhash: 1234567890123456\nsize: 1\n")
+    sha = commit("add pvt file")[:7]
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    targets = restore.resolve_targets(["data.csv"], sha, {})
+
+    assert targets[0]["paths"] == ["data.csv"]
+    assert "error" in targets[0]
+    assert targets[0]["error"] == (
+        f"data.csv.pvt at {sha} is not a valid .pvt file: field 'hash' is not a string"
+    )
+
+
 def test_resolve_targets_as_git_file(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
     """Resolves target as plain git-tracked file."""
     repo_path, commit = git_repo
@@ -326,6 +379,7 @@ def test_restore_targets_from_revision_invalid_rev(
             stage_targets={},
             checkout_modes=[cache.CheckoutMode.COPY],
             force=False,
+            remote_factory=_helper_unused_remote,
         )
 
 
@@ -351,6 +405,7 @@ def test_restore_targets_from_revision_output_with_multiple_targets(
             stage_targets={},
             checkout_modes=[cache.CheckoutMode.COPY],
             force=False,
+            remote_factory=_helper_unused_remote,
         )
 
 
@@ -378,6 +433,7 @@ def test_restore_targets_from_revision_git_file(
         stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
+        remote_factory=_helper_unused_remote,
     )
 
     assert len(messages) == 1
@@ -409,6 +465,7 @@ def test_restore_targets_from_revision_skip_existing(
         stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
+        remote_factory=_helper_unused_remote,
     )
 
     assert len(messages) == 1
@@ -440,6 +497,7 @@ def test_restore_targets_from_revision_force_overwrite(
         stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=True,
+        remote_factory=_helper_unused_remote,
     )
 
     assert len(messages) == 1
@@ -488,6 +546,7 @@ def test_restore_targets_from_revision_output_with_stage(
         },
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
+        remote_factory=_helper_unused_remote,
     )
 
     assert success
@@ -500,8 +559,11 @@ def test_restore_targets_from_revision_output_with_stage(
 # =============================================================================
 
 
-def test_restore_file_cache_miss_error(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Returns error message when file not in cache, git, or remote."""
+def test_restore_file_cache_miss_reports_the_remote_error(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tracked file in neither the cache nor git reaches the remote step, whose error names
+    what is wrong with the remote: here, that none is configured."""
     repo_path, commit = git_repo
 
     # Create a .pvt file that references a hash not in cache
@@ -514,7 +576,7 @@ def test_restore_file_cache_miss_error(git_repo: GitRepo, monkeypatch: pytest.Mo
 
     cache_dir = repo_path / ".pivot" / "cache"
 
-    messages, _ = restore.restore_targets_from_revision(
+    messages, success = restore.restore_targets_from_revision(
         targets=["data.csv"],
         rev=sha[:7],
         output=None,
@@ -522,13 +584,164 @@ def test_restore_file_cache_miss_error(git_repo: GitRepo, monkeypatch: pytest.Mo
         stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
+        remote_factory=lambda: transfer.create_remote_from_name(None)[0],
     )
 
-    # Function returns multiple messages: errors, blank line, summary
-    assert any("not in local cache" in msg for msg in messages), (
-        "Should have error about cache miss"
-    )
+    assert not success
+    assert any(
+        "data.csv - failed to download from remote: No remotes configured." in msg
+        for msg in messages
+    ), messages
     assert any("Failed to restore" in msg for msg in messages), "Should have failure summary"
+
+
+class _UnreachableRemote:
+    """A remote no download can connect to; counts the download batches asked of it."""
+
+    url: str = "s3://unreachable/cache"
+    batches: int
+
+    def __init__(self) -> None:
+        self.batches = 0
+
+    async def download_batch(
+        self, items: list[tuple[str, pathlib.Path]], *, readonly: bool = False
+    ) -> list[TransferResult]:
+        assert readonly, "get downloads cache objects read-only"
+        self.batches += 1
+        return [
+            TransferResult(hash=h, success=False, error="cannot connect", connection_failed=True)
+            for h, _ in items
+        ]
+
+
+def test_restore_targets_tries_an_unreachable_remote_once(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once a target's download cannot connect to the remote, each later target that needs the
+    remote fails naming it, without another download."""
+    repo_path, commit = git_repo
+    for name, file_hash in (("a.csv", "aaaaaaaaaaaaaaaa"), ("b.csv", "bbbbbbbbbbbbbbbb")):
+        pvt_content = {"path": name, "hash": file_hash, "size": 1}
+        (repo_path / f"{name}.pvt").write_text(yaml.dump(pvt_content))
+    sha = commit("add pvt files")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    remote = _UnreachableRemote()
+
+    messages, success = restore.restore_targets_from_revision(
+        targets=["a.csv", "b.csv"],
+        rev=sha[:7],
+        output=None,
+        cache_dir=repo_path / ".pivot" / "cache",
+        stage_targets={},
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+        # The fake has only the url and download_batch a restore uses
+        remote_factory=lambda: cast("RemoteStorage", cast("object", remote)),
+    )
+
+    assert not success
+    assert remote.batches == 1, "the second target does not try the unreachable remote"
+    assert "a.csv - failed to download from remote: cannot connect" in messages[0], messages
+    assert (
+        "b.csv - failed to download from remote: s3://unreachable/cache could not be reached "
+        + "for an earlier target, so it is not tried again"
+    ) in messages[1], messages
+
+
+class _RefusingRemote:
+    """A remote that answers but refuses this user's credentials for every download; counts the
+    download batches asked of it."""
+
+    url: str = "gs://refusing/cache"
+    batches: int
+
+    def __init__(self) -> None:
+        self.batches = 0
+
+    async def download_batch(
+        self, items: list[tuple[str, pathlib.Path]], *, readonly: bool = False
+    ) -> list[TransferResult]:
+        self.batches += 1
+        raise exceptions.RemoteConnectionError("credentials refused")
+
+
+def test_restore_targets_tries_a_remote_that_answered_again_for_each_target(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A remote that answered with an error (a RemoteConnectionError that is not
+    RemoteUnreachableError: credentials refused, one object denied) is tried again by each later
+    target, which reports the remote's own reason."""
+    repo_path, commit = git_repo
+    for name, file_hash in (("a.csv", "aaaaaaaaaaaaaaaa"), ("b.csv", "bbbbbbbbbbbbbbbb")):
+        pvt_content = {"path": name, "hash": file_hash, "size": 1}
+        (repo_path / f"{name}.pvt").write_text(yaml.dump(pvt_content))
+    sha = commit("add pvt files")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    remote = _RefusingRemote()
+
+    messages, success = restore.restore_targets_from_revision(
+        targets=["a.csv", "b.csv"],
+        rev=sha[:7],
+        output=None,
+        cache_dir=repo_path / ".pivot" / "cache",
+        stage_targets={},
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+        # The fake has only the url and download_batch a restore uses
+        remote_factory=lambda: cast("RemoteStorage", cast("object", remote)),
+    )
+
+    assert not success
+    assert remote.batches == 2, "each target tries a remote that answered"
+    for message in messages[:2]:
+        assert "failed to download from remote: credentials refused" in message, messages
+
+
+@pytest.mark.parametrize(
+    ("fields", "field"),
+    [
+        pytest.param(
+            'manifest:\n- relpath: "a\\0b"\n  hash: fedcba9876543210\n  size: 1\n'
+            + "  isexec: false\n",
+            "field 'manifest[0].relpath' holds a NUL byte",
+            id="nul-relpath",
+        ),
+        pytest.param(
+            "manifest:\n- relpath: a.txt\n  hash: fedcba9876543210\n  size: 1\n"
+            + '  isexec: false\nempty_dirs:\n- "e\\0"\n',
+            "field 'empty_dirs[0]' holds a NUL byte",
+            id="nul-empty-dir",
+        ),
+    ],
+)
+def test_symlink_restore_reports_a_pvt_path_it_cannot_build(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, fields: str, field: str
+) -> None:
+    """A symlink restore through a tree no pivot has checked builds a path from each manifest
+    relpath and empty directory, so one holding a NUL byte is that target's error, not a raw
+    ValueError."""
+    repo_path, commit = git_repo
+    tree = cache.get_cache_path(repo_path / ".pivot" / "cache" / "files", "0123456789abcdef")
+    tree.mkdir(parents=True)
+    (tree / "a.txt").write_text("a")
+    (repo_path / "d.pvt").write_text("path: d\nhash: '0123456789abcdef'\nsize: 1\n" + fields)
+    sha = commit("add pvt")[:7]
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+
+    messages, success = restore.restore_targets_from_revision(
+        targets=["d"],
+        rev=sha,
+        output=None,
+        cache_dir=repo_path / ".pivot" / "cache",
+        stage_targets={},
+        checkout_modes=[cache.CheckoutMode.SYMLINK],
+        force=False,
+        remote_factory=_helper_unused_remote,
+    )
+
+    assert not success
+    assert f"d - d.pvt at {sha} is not a valid .pvt file: {field}" in messages[0], messages
 
 
 def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -562,6 +775,7 @@ def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPa
         stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
+        remote_factory=_helper_unused_remote,
     )
 
     assert len(messages) == 1
@@ -654,9 +868,53 @@ def test_restore_file_force_keeps_existing_output_until_cache_swap(
         cache_dir=cache_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=True,
+        remote_factory=_helper_unused_remote,
     )
 
     assert result["status"] is restore.RestoreStatus.RESTORED
+    assert target.read_text() == "cached content"
+
+
+def test_restore_file_labels_a_retried_cache_restore_from_cache(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cache restore that fails once is retried by the remote step; with nothing to download,
+    a retry that succeeds is reported as from the cache, not from the remote."""
+    repo_path, commit = git_repo
+    (repo_path / "README").write_text("not the restored file")
+    commit("initial")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    cache_dir = repo_path / ".pivot" / "cache"
+    file_hash = "0123456789abcdef"
+    cache_path = cache.get_cache_path(cache_dir / "files", file_hash)
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("cached content")
+    target = repo_path / "data" / "out.txt"
+    real_link = os.link
+    failed = list[str]()
+
+    def _link_failing_once(src: pathlib.Path, dst: pathlib.Path) -> None:
+        if not failed:
+            failed.append(str(dst))
+            raise OSError(errno.EIO, "injected I/O error", str(dst))
+        real_link(src, dst)
+
+    monkeypatch.setattr(os, "link", _link_failing_once)
+
+    result = restore.restore_file(
+        rel_path="data/out.txt",
+        output_hash=FileHash(hash=file_hash),
+        rev="HEAD",
+        dest_path=target,
+        cache_dir=cache_dir,
+        checkout_modes=[cache.CheckoutMode.HARDLINK],
+        force=False,
+        remote_factory=_helper_unused_remote,
+    )
+
+    assert failed, "the first hard link should have failed"
+    assert result["status"] is restore.RestoreStatus.RESTORED, result["message"]
+    assert result["message"] == f"Restored: {target} (from cache)"
     assert target.read_text() == "cached content"
 
 
@@ -667,15 +925,29 @@ path: data/
 hash: abc123
 size: 1024
 manifest:
-  a.txt: def456
-  b.txt: ghi789
+- relpath: a.txt
+  hash: def456
+  size: 512
+  isexec: false
+- relpath: b.txt
+  hash: ghi789
+  size: 512
+  isexec: false
 """
     result = restore._parse_pvt_data_from_bytes(content)
 
-    assert result is not None
+    assert isinstance(result, dict), result
     assert result["path"] == "data/"
     assert result["hash"] == "abc123"
     assert "manifest" in result
+
+
+def test_parse_pvt_data_rejects_a_manifest_that_is_not_a_list() -> None:
+    """A manifest written as a mapping of path to hash is not the list of entries .pvt records,
+    so it is reported instead of failing a restore that reads its entries."""
+    content = b"path: data/\nhash: abc123\nsize: 1024\nmanifest:\n  a.txt: def456\n"
+
+    assert restore._parse_pvt_data_from_bytes(content) == "field 'manifest' is not a list"
 
 
 # =============================================================================
@@ -725,6 +997,7 @@ def test_restore_directory_from_cache_with_manifest(
         stage_targets={},
         checkout_modes=[cache.CheckoutMode.COPY],
         force=False,
+        remote_factory=_helper_unused_remote,
     )
 
     assert success, f"Expected success, got messages: {messages}"
@@ -732,206 +1005,3 @@ def test_restore_directory_from_cache_with_manifest(
     assert "from cache" in messages[0]
     assert (output_path / "a.txt").read_bytes() == b"file 1 content"
     assert (output_path / "b.txt").read_bytes() == b"file 2 content"
-
-
-def test_restore_file_from_remote_caches_with_readonly_permissions(
-    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Files cached from remote have read-only (0o444) permissions."""
-    import xxhash
-
-    repo_path, commit = git_repo
-
-    # Set up directories
-    cache_dir = repo_path / ".pivot" / "cache"
-    (cache_dir / "files").mkdir(parents=True)
-
-    # Create content that will "come from remote"
-    content = b"content from remote"
-    file_hash = xxhash.xxh64(content).hexdigest()
-
-    # Create a .pvt file pointing to that hash (not in local cache)
-    pvt_content = {"path": "data.csv", "hash": file_hash, "size": len(content)}
-    (repo_path / "data.csv.pvt").write_text(yaml.dump(pvt_content))
-
-    sha = commit("add pvt file")
-
-    monkeypatch.setattr(project, "_project_root_cache", repo_path)
-
-    # Mock remote.fetch_from_remote to return our content
-    monkeypatch.setattr(
-        "pivot.storage.restore.remote.fetch_from_remote",
-        lambda h: content,  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
-    )
-
-    output_path = repo_path / "restored_data.csv"
-
-    messages, success = restore.restore_targets_from_revision(
-        targets=["data.csv"],
-        rev=sha[:7],
-        output=output_path,
-        cache_dir=cache_dir,
-        stage_targets={},
-        checkout_modes=[cache.CheckoutMode.COPY],
-        force=False,
-    )
-
-    assert success
-    assert len(messages) == 1
-    assert "from remote" in messages[0]
-    assert output_path.read_bytes() == content
-
-    # Verify cached file has read-only permissions
-    cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
-    assert cached_path.exists(), "File should be cached after restore from remote"
-    mode = cached_path.stat().st_mode & 0o777
-    assert mode == 0o444, f"Cache file should have 0o444 permissions, got {oct(mode)}"
-
-
-def test_restore_file_from_remote_keeps_an_object_already_cached(
-    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Caching remote content never replaces an object a concurrent commit published first:
-    a checkout may be linking or symlinking it, and its executable bit belongs to it."""
-    import xxhash
-
-    repo_path, commit = git_repo
-    cache_dir = repo_path / ".pivot" / "cache"
-    content = b"#!/bin/sh\necho from remote\n"
-    file_hash = xxhash.xxh64(content).hexdigest()
-    (repo_path / "tool.pvt").write_text(
-        yaml.dump({"path": "tool", "hash": file_hash, "size": len(content)})
-    )
-    sha = commit("add pvt file")
-    monkeypatch.setattr(project, "_project_root_cache", repo_path)
-    cached_path = cache.get_cache_path(cache_dir / "files", file_hash)
-
-    def _fetch_while_a_commit_publishes(_hash: str) -> bytes:
-        cached_path.parent.mkdir(parents=True)
-        cached_path.write_bytes(content)
-        cached_path.chmod(0o555)
-        return content
-
-    monkeypatch.setattr(
-        "pivot.storage.restore.remote.fetch_from_remote", _fetch_while_a_commit_publishes
-    )
-
-    _, success = restore.restore_targets_from_revision(
-        targets=["tool"],
-        rev=sha[:7],
-        output=repo_path / "restored_tool",
-        cache_dir=cache_dir,
-        stage_targets={},
-        checkout_modes=[cache.CheckoutMode.COPY],
-        force=False,
-    )
-
-    assert success
-    assert cached_path.stat().st_mode & 0o777 == 0o555, "the published object was replaced"
-    left = [p.name for p in cached_path.parent.iterdir() if p.name != cache._PREFIX_LOCK]
-    assert left == [cached_path.name], "no temp file left"
-
-
-def test_restore_file_from_remote_hash_mismatch(
-    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Remote content with hash mismatch is rejected and returns error."""
-    import xxhash
-
-    repo_path, commit = git_repo
-
-    # Set up directories
-    cache_dir = repo_path / ".pivot" / "cache"
-    (cache_dir / "files").mkdir(parents=True)
-
-    # Create content but calculate hash for DIFFERENT content
-    actual_content = b"corrupted content from remote"
-    expected_content = b"original content"
-    expected_hash = xxhash.xxh64(expected_content).hexdigest()
-
-    # Create a .pvt file pointing to the expected hash (not in local cache)
-    pvt_content = {"path": "data.csv", "hash": expected_hash, "size": len(expected_content)}
-    (repo_path / "data.csv.pvt").write_text(yaml.dump(pvt_content))
-
-    sha = commit("add pvt file")
-
-    monkeypatch.setattr(project, "_project_root_cache", repo_path)
-
-    # Mock remote.fetch_from_remote to return WRONG content (simulating corruption)
-    monkeypatch.setattr(
-        "pivot.storage.restore.remote.fetch_from_remote",
-        lambda h: actual_content,  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
-    )
-
-    output_path = repo_path / "restored_data.csv"
-
-    messages, success = restore.restore_targets_from_revision(
-        targets=["data.csv"],
-        rev=sha[:7],
-        output=output_path,
-        cache_dir=cache_dir,
-        stage_targets={},
-        checkout_modes=[cache.CheckoutMode.COPY],
-        force=False,
-    )
-
-    # Should fail due to hash mismatch
-    assert not success
-    assert any("corrupted" in msg or "hash mismatch" in msg for msg in messages), (
-        f"Should have hash mismatch error, got: {messages}"
-    )
-    # Output file should NOT be created with corrupted content
-    assert not output_path.exists(), "Corrupted content should not be written to output"
-    # Cache should NOT store corrupted content
-    cached_path = cache.get_cache_path(cache_dir / "files", expected_hash)
-    assert not cached_path.exists(), "Corrupted content should not be cached"
-
-
-def test_restore_file_from_remote_success(
-    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Remote content is restored, cached, and its hash recorded for the next status."""
-    import xxhash
-
-    repo_path, commit = git_repo
-
-    # Set up directories
-    cache_dir = repo_path / ".pivot" / "cache"
-    (cache_dir / "files").mkdir(parents=True)
-
-    content = b"content from remote"
-    file_hash = xxhash.xxh64(content).hexdigest()
-
-    pvt_content = {"path": "data.csv", "hash": file_hash, "size": len(content)}
-    (repo_path / "data.csv.pvt").write_text(yaml.dump(pvt_content))
-
-    sha = commit("add pvt file")
-
-    monkeypatch.setattr(project, "_project_root_cache", repo_path)
-    monkeypatch.setattr(
-        "pivot.storage.restore.remote.fetch_from_remote",
-        lambda h: content,  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
-    )
-
-    # Create output directory as read-only to simulate write failure
-    output_dir = repo_path / "readonly_dir"
-    output_dir.mkdir()
-    output_path = output_dir / "data.csv"
-
-    # First restore should succeed
-    messages, success = restore.restore_targets_from_revision(
-        targets=["data.csv"],
-        rev=sha[:7],
-        output=output_path,
-        cache_dir=cache_dir,
-        stage_targets={},
-        checkout_modes=[cache.CheckoutMode.COPY],
-        force=False,
-    )
-
-    assert success
-    assert output_path.read_bytes() == content
-    with state.StateDB(repo_path / ".pivot", readonly=True) as state_db:
-        assert state_db.get(output_path, output_path.stat()) == file_hash, (
-            "The fetched file's hash is recorded"
-        )
