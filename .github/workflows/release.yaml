@@ -17,8 +17,13 @@ jobs:
   release:
     runs-on: ubuntu-24.04
     environment: pypi
+    # Only a push to main of this repository releases. `branches: [main]` matches the triggering
+    # run's branch, and a pull request run's branch is the pull request's head branch, which a
+    # fork can name main; this job checks out that run's head with DEPLOY_KEY and a PyPI token.
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
       !startsWith(github.event.workflow_run.head_commit.message || '', 'chore(release):')
     permissions:
       contents: write
