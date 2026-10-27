@@ -18,6 +18,7 @@ from pivot.config.io import get_run_history_retention as get_run_history_retenti
 from pivot.config.io import get_state_dir as get_state_dir
 from pivot.config.io import get_watch_debounce as get_watch_debounce
 from pivot.config.io import load_config_file as load_config_file
+from pivot.config.io import register_cache_use as register_cache_use
 from pivot.config.io import set_config_value as set_config_value
 from pivot.config.io import unset_config_value as unset_config_value
 from pivot.config.models import CacheConfig as CacheConfig

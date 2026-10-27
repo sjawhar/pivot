@@ -56,6 +56,7 @@ from pivot import (
     types,
 )
 from pivot.storage import artifact_lock, cache, lock, state
+from pivot.storage import gc as gc_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
     DeferredWrites,
@@ -895,51 +896,57 @@ def _execute_stage(
 
                     # Check run cache for previously executed configuration (skip if forcing)
                     if run_reason and not stage_info["force"] and run_cache_allowed:
-                        run_cache_skip = _try_skip_via_run_cache_with_store(
-                            stage_name,
-                            input_hash,
-                            stage_outs,
-                            store,
-                            state_db,
-                            state_dir=project_state_dir,
-                        )
-                        if run_cache_skip is not None:
-                            if no_commit:
-                                return _make_result(
-                                    StageStatus.CACHED,
-                                    "unchanged (run cache)",
-                                    ring_buffer,
-                                    input_hash=input_hash,
-                                )
-                            new_lock_data = LockData(
-                                code_manifest=current_fingerprint,
-                                params=current_params,
-                                dep_hashes=_to_identity_hashes(dict(sorted(dep_hashes.items()))),
-                                output_hashes=_to_identity_hashes(
-                                    dict(sorted(run_cache_skip["output_hashes"].items()))
-                                ),
-                                output_paths=lock_output_paths(stage_outs, store, project_root),
-                            )
-                            _raise_if_stopped()
-                            deferred = _commit_lock_and_build_deferred(
-                                stage_info,
-                                new_lock_data,
+                        # Naming-lock unit (shared): the run-cache restore checks whether
+                        # objects exist and creates workspace links, then the lock file names
+                        # them. gc cannot delete while this unit is open.
+                        with gc_mod.naming_unit(config.get_cache_dir()):
+                            run_cache_skip = _try_skip_via_run_cache_with_store(
+                                stage_name,
                                 input_hash,
-                                run_cache_skip["output_hashes"],
-                                production_lock,
+                                stage_outs,
+                                store,
                                 state_db,
-                                file_hash_entries=file_hash_entries
-                                + run_cache_skip["file_hash_entries"],
-                                increment_outputs=run_cache_skip["outputs_restored"],
+                                state_dir=project_state_dir,
                             )
-                            return StageResult(
-                                status=StageStatus.CACHED,
-                                reason="unchanged (run cache)",
-                                input_hash=input_hash,
-                                output_lines=ring_buffer.snapshot(),
-                                metrics=metrics.get_entries(),
-                                deferred_writes=deferred,
-                            )
+                            if run_cache_skip is not None:
+                                if no_commit:
+                                    return _make_result(
+                                        StageStatus.CACHED,
+                                        "unchanged (run cache)",
+                                        ring_buffer,
+                                        input_hash=input_hash,
+                                    )
+                                new_lock_data = LockData(
+                                    code_manifest=current_fingerprint,
+                                    params=current_params,
+                                    dep_hashes=_to_identity_hashes(
+                                        dict(sorted(dep_hashes.items()))
+                                    ),
+                                    output_hashes=_to_identity_hashes(
+                                        dict(sorted(run_cache_skip["output_hashes"].items()))
+                                    ),
+                                    output_paths=lock_output_paths(stage_outs, store, project_root),
+                                )
+                                _raise_if_stopped()
+                                deferred = _commit_lock_and_build_deferred(
+                                    stage_info,
+                                    new_lock_data,
+                                    input_hash,
+                                    run_cache_skip["output_hashes"],
+                                    production_lock,
+                                    state_db,
+                                    file_hash_entries=file_hash_entries
+                                    + run_cache_skip["file_hash_entries"],
+                                    increment_outputs=run_cache_skip["outputs_restored"],
+                                )
+                                return StageResult(
+                                    status=StageStatus.CACHED,
+                                    reason="unchanged (run cache)",
+                                    input_hash=input_hash,
+                                    output_lines=ring_buffer.snapshot(),
+                                    metrics=metrics.get_entries(),
+                                    deferred_writes=deferred,
+                                )
 
                 covered_modules = frozenset(fingerprint.covered_user_modules(current_fingerprint))
                 with _track_stage_imports(covered_modules) as stage_imports:
@@ -989,56 +996,59 @@ def _execute_stage(
                     output_hashes = _hash_output_paths(
                         output_paths, cache_dir=_store_cache_dir(store)
                     )
-                else:
-                    output_hashes = _commit_outputs_with_store(
-                        output_paths, store, project_state_dir
-                    )
-                    for ref, path in output_paths.items():
-                        file_hash_entries.extend(
-                            output_file_hash_entries(
-                                path, output_hashes[types.identity_key(ref.identity)]
-                            )
-                        )
-
-                # For --no-commit, skip lock/cache writes entirely
-                if no_commit:
+                    # For --no-commit, skip lock/cache writes entirely
                     return _make_result(
                         StageStatus.RAN,
                         run_reason,
                         ring_buffer,
                         input_hash=input_hash,
                     )
+                else:
+                    # Naming-lock unit (shared): copy_to_cache checks object existence, the
+                    # checkout creates the workspace link, and the lock file names the objects.
+                    # gc cannot delete while this unit is open. The unit does NOT cover stage
+                    # execution (which already completed above).
+                    with gc_mod.naming_unit(config.get_cache_dir()):
+                        output_hashes = _commit_outputs_with_store(
+                            output_paths, store, project_state_dir
+                        )
+                        for ref, path in output_paths.items():
+                            file_hash_entries.extend(
+                                output_file_hash_entries(
+                                    path, output_hashes[types.identity_key(ref.identity)]
+                                )
+                            )
 
-                # Build lock data
-                new_lock_data = LockData(
-                    code_manifest=lock_manifest,
-                    params=current_params,
-                    dep_hashes=_to_identity_hashes(dict(sorted(dep_hashes.items()))),
-                    output_hashes=_to_identity_hashes(dict(sorted(output_hashes.items()))),
-                    output_paths=lock_output_paths(stage_outs, store, project_root),
-                )
+                        # Build lock data
+                        new_lock_data = LockData(
+                            code_manifest=lock_manifest,
+                            params=current_params,
+                            dep_hashes=_to_identity_hashes(dict(sorted(dep_hashes.items()))),
+                            output_hashes=_to_identity_hashes(dict(sorted(output_hashes.items()))),
+                            output_paths=lock_output_paths(stage_outs, store, project_root),
+                        )
 
-                # Single StateDB open for post-execution work
-                with state.StateDB(state_dir, readonly=True) as state_db:
-                    _raise_if_stopped()
-                    deferred = _commit_lock_and_build_deferred(
-                        stage_info,
-                        new_lock_data,
-                        input_hash,
-                        output_hashes,
-                        production_lock,
-                        state_db,
-                        reusable=not uncovered,
-                        file_hash_entries=file_hash_entries,
-                    )
-                    return StageResult(
-                        status=StageStatus.RAN,
-                        reason=run_reason,
-                        input_hash=input_hash,
-                        output_lines=ring_buffer.snapshot(),
-                        metrics=metrics.get_entries(),
-                        deferred_writes=deferred,
-                    )
+                        # Single StateDB open for post-execution work
+                        with state.StateDB(state_dir, readonly=True) as state_db:
+                            _raise_if_stopped()
+                            deferred = _commit_lock_and_build_deferred(
+                                stage_info,
+                                new_lock_data,
+                                input_hash,
+                                output_hashes,
+                                production_lock,
+                                state_db,
+                                reusable=not uncovered,
+                                file_hash_entries=file_hash_entries,
+                            )
+                            return StageResult(
+                                status=StageStatus.RAN,
+                                reason=run_reason,
+                                input_hash=input_hash,
+                                output_lines=ring_buffer.snapshot(),
+                                metrics=metrics.get_entries(),
+                                deferred_writes=deferred,
+                            )
         except (
             exceptions.OutputMissingError,
             exceptions.CacheRestoreError,

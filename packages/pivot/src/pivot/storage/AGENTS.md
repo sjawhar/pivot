@@ -121,3 +121,42 @@ When multiple `pivot` processes share the same StateDB:
 All paths stored in the database must be **relative** to ensure portability across machines and correct cache behavior.
 
 See `docs/solutions/2026-02-01-statedb-path-strategies.md` for path handling patterns.
+
+## Cache Lock Order (the naming-lock protocol)
+
+`pivot gc` is the only pivot command that deletes a user's cached data. Its safety rests on
+mutual exclusion with writers, not on timing. The protocol uses two reader/writer locks plus a
+turnstile to prevent starvation. **The lock order must never be inverted; any path that takes
+them in another order is a deadlock bug.**
+
+```
+gc.lock (EX, gc-from-gc)  →  naming.turnstile (EX)  →  naming.lock (EX)  →  prefix .pivot_cache.lock (EX)
+                              naming.turnstile (SH)  →  naming.lock (SH)  →  (turnstile UN)
+```
+
+- **`gc.lock`** (EX, non-blocking): excludes two gc runs on one cache. Taken first, held for the
+  whole run including the prompt. Writers must NOT take it.
+- **`naming.turnstile`** (EX for gc, SH for writers): the turnstile prevents writer starvation.
+  gc takes it exclusive (new writers queue), then takes naming exclusive (waits for in-flight
+  units). Writers take it shared, then naming shared, then release turnstile immediately.
+- **`naming.lock`** (EX for gc, SH for writers): the mutual-exclusion lock. While gc holds it
+  exclusive, no writer can name a cache object. While a writer holds it shared, gc waits.
+- **Prefix `.pivot_cache.lock`** (EX): excludes the gc scan/delete from concurrent staging
+  publishers in one prefix directory. Taken AFTER naming.lock.
+
+### Writer commit unit
+
+A naming unit spans from the **first existence check on a cache object** to the **durable record
+that names it** (lock file, `.pvt`, run-cache row or workspace link). It must NEVER span stage
+execution — only the commit step. See `gc.naming_unit`.
+
+Sites: `executor/worker.py` (normal commit and run-cache skip), `executor/commit.py` (`pivot
+commit`), `cli/track.py` (`pivot track`), `storage/restore.py` (restore from revision).
+
+### Where flock is refused
+
+**gc refuses, writers proceed.** On a filesystem that refuses `flock` (NFS `nolock`, Lustre
+without `flock`), `collection_lock` refuses the gc run outright — no objects are deleted. Writers
+proceed unlocked because there is no collector to race. If a future change makes gc collect on
+such a mount, the writers must also take the lock. This pair is by design; do not change one side
+without the other.

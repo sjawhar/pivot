@@ -680,17 +680,11 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bo
     straight through to whatever mode the cache object carries, and only COPY checkout
     re-chmods afterwards (see ``_stage_checkout``).
 
-    The object is published with ``publish_cache_object`` and never changed afterwards, its mode
-    included. When the object is already present this is a cache hit: a run reusing it
-    publishes nothing, so pivot refreshes the object's timestamp best-effort (git's "update the
-    mtime of an object already present"). That bumps its ``st_ctime``, which ``pivot gc`` reads
-    as the publication time, so a short collection grace covers an object a concurrent run is
-    reusing and about to name. A shared cache's foreign-owned object cannot be touched; that is
-    expected and ignored.
+    The object is published with ``publish_cache_object`` and never changed afterwards, its
+    mode included. An object already there is kept whatever executable bit it carries; a
+    directory entry needing the other bit is checked out as a copy (``_checkout_with_fallback``).
     """
     if cache_path.exists():
-        with contextlib.suppress(OSError):
-            os.utime(cache_path)
         return
 
     with staged_cache_file(cache_path) as staged:
@@ -819,6 +813,20 @@ _TREE_LAYOUT_MARKER_SUFFIX = ".content-checked"
 _LEGACY_TREE_MARKER_SUFFIXES = (".layout-checked", ".verified")
 # Held exclusively while a tree is checked and repaired; never deleted.
 _TREE_LOCK_SUFFIX = ".lock"
+
+# --- the contract the collector reads this module through -------------------------------
+# ``storage/gc.py`` is the one consumer outside this module of the cache's own primitives: it
+# takes the same locks, reads the same checkout symlinks, removes objects with the same
+# remover, and removes the same tree markers. These names are that contract, so a change to
+# any of them is type-checked against the collector instead of being an untyped reach-in.
+PREFIX_LOCK = _PREFIX_LOCK
+NO_FLOCK_ERRNO = _NO_FLOCK_ERRNO
+open_cache_lock = _open_cache_lock
+clear_path = _clear_path
+get_symlink_cache_key = _get_symlink_cache_hash
+# Every marker beside a whole-directory tree object: the current content-checked one and the
+# layout-only/size-only ones older pivot versions wrote. A collected tree takes all of them.
+TREE_MARKER_SUFFIXES = (_TREE_LAYOUT_MARKER_SUFFIX, *_LEGACY_TREE_MARKER_SUFFIXES)
 
 
 def _tree_layout_marker(cache_dir_path: pathlib.Path) -> pathlib.Path:
