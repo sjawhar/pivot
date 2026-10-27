@@ -594,6 +594,53 @@ def test_process_start_is_never_after_the_process_started() -> None:
     assert before - loaded_source._CHANGE_TIME_SLACK_NS <= started <= now
 
 
+def test_a_forward_clock_step_after_an_edit_cannot_show_the_edit_came_before_the_start(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The module was imported when the process started and its file was edited 0.1 s later;
+    then the wall clock stepped 1.9 s forward (an NTP step), which moves a start computed from the
+    wall clock 1.9 s later, past the edit. Inside the 2 s margin the file still counts as changed
+    since the start: the module holds v1, the file v2, and the record is not the file's bytes."""
+    path = tmp_path / "stepped.py"
+    path.write_text('def value():\n    return "v1"\n')
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = _import_before_recorder(path, monkeypatch)
+    path.write_text('def value():\n    return "v2, edited"\n')
+    edited = max(path.stat().st_ctime_ns, path.lstat().st_ctime_ns)
+    started = edited - 100_000_000 + 1_900_000_000
+    monkeypatch.setattr(loaded_source, "_process_start_ns", lambda: started)
+
+    loaded_source.record_unseen_modules()
+
+    assert module.value() == "v1"
+    assert _reason(module.__name__) == "its file changed after this process started"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads the boot clock")
+@pytest.mark.parametrize(
+    ("step_s", "earlier_s"), [(5, 5), (-5, 0)], ids=["forward-step", "backward-step"]
+)
+def test_a_step_of_the_wall_clock_after_import_never_moves_the_start_later(
+    monkeypatch: pytest.MonkeyPatch, step_s: int, earlier_s: int
+) -> None:
+    """The start is the boot's wall-clock time plus the time from boot to the start. A forward
+    step of the wall clock after Pivot was imported would move it later by the step, so an edit
+    made before the step could read as older than the start: the boot's wall-clock time stays as
+    it was at import. A backward step moves the start earlier, which only makes more files count
+    as changed since it."""
+    wall_at_boot = time.time_ns() - time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    monkeypatch.setattr(loaded_source, "_WALL_AT_BOOT_ON_IMPORT_NS", wall_at_boot)
+    started = loaded_source._process_start_ns()
+    # The wall clock read `step_s` less at import than now: it stepped by `step_s` since.
+    monkeypatch.setattr(
+        loaded_source, "_WALL_AT_BOOT_ON_IMPORT_NS", wall_at_boot - step_s * 1_000_000_000
+    )
+    stepped = loaded_source._process_start_ns()
+
+    assert started is not None and stepped is not None
+    assert abs(started - stepped - earlier_s * 1_000_000_000) < 1_000_000, (started, stepped)
+
+
 def test_a_forked_process_cannot_vouch_for_modules_its_parent_loaded() -> None:
     """A process forked without exec holds the modules its parent imported before it started,
     so its own start time says nothing about when they were compiled."""
@@ -705,3 +752,69 @@ def test_a_stage_checks_the_modules_it_imported_while_it_ran(
     )
 
     assert edited == [imported.__name__]
+
+
+@pytest.mark.parametrize(
+    ("changed_since_start", "expected"),
+    [(True, (list[str](), ["direct"])), (False, (["direct"], list[str]()))],
+    ids=["file-changed-since-the-worker-started", "file-older-than-the-worker"],
+)
+def test_a_worker_judges_a_module_a_loader_called_directly_loaded(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_since_start: bool,
+    expected: tuple[list[str], list[str]],
+) -> None:
+    """A stage's module loads a helper with a `SourceFileLoader` it calls itself, which no
+    recorder wraps. After the stage the worker judges it as discovery judges a module imported
+    before the recorder, and compares it with the coordinator's record: a file changed since the
+    worker started is unreadable, and an older one whose bytes differ from what the coordinator
+    recorded is edited."""
+    stage_path = tmp_path / "stage_module.py"
+    stage_module = _load(stage_path, "def stage():\n    return 1\n", monkeypatch)
+    helper = tmp_path / "direct.py"
+    helper.write_text("VALUE = 2\n")
+    if not changed_since_start:
+        _started_now(monkeypatch)
+    monkeypatch.setitem(sys.modules, "direct", types.ModuleType("direct"))  # removed after
+    _import_with("direct", importlib.machinery.SourceFileLoader("direct", str(helper)), str(helper))
+    coordinator = {
+        stage_module.__name__: _text(stage_path, b"def stage():\n    return 1\n"),
+        "direct": _text(helper, b"VALUE = 1\n"),
+    }
+    loaded_source.set_coordinator(coordinator)
+
+    checked = worker._untrusted_modules(
+        _stage_info(stage_module.stage, coordinator),
+        {"const:direct.VALUE": "h"},
+        worker._StageImports(covered=frozenset()),
+        tmp_path,
+    )
+
+    assert checked == expected
+
+
+def test_a_process_without_the_coordinators_records_judges_no_module_after_a_stage(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`execute_stage` called in a host process (a test, or a program that runs stages itself)
+    ran the code it fingerprinted, and the host's own loader may have loaded its modules
+    (pytest's assertion rewriter is not CPython's source file loader). Judged by discovery's
+    rule they would be unreadable, and every stage that uses one would rerun on every run."""
+    stage_path = tmp_path / "stage_module.py"
+    stage_module = _load(stage_path, "def stage():\n    return 1\n", monkeypatch)
+    hosted = tmp_path / "hosted.py"
+    hosted.write_text("VALUE = 1\n")
+    name = f"hosted_{uuid.uuid4().hex}"
+    monkeypatch.setitem(sys.modules, name, types.ModuleType(name))  # removed after the test
+    _import_with(name, _TransformingLoader(name, str(hosted)), str(hosted))
+
+    checked = worker._untrusted_modules(
+        _stage_info(stage_module.stage, {}),
+        {f"const:{name}.VALUE": "h"},
+        worker._StageImports(covered=frozenset(), imported={name}),
+        tmp_path,
+    )
+
+    assert checked == ([], [])
+    assert name not in loaded_source.digests()

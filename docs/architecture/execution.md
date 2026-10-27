@@ -449,7 +449,7 @@ pivot commit
 1. `--no-commit`: stages execute and outputs are written to disk. No lock files and no cache copies are written. StateDB keeps one record per stage that ran (`nocommit:<stage>`): the code manifest the run's lock would have held, rerun marks included, and the hashes of the outputs it wrote.
 2. `pivot commit [stage_names...]`: computes current workspace state (hashes deps and outputs), writes production lock files, saves outputs to cache, and updates StateDB. Without arguments, commits all stale stages. With stage names, unconditionally commits those stages. The code manifest it writes depends on the outputs:
    - The outputs on disk are the ones a `--no-commit` run wrote (its record): `pivot commit` writes the manifest that run recorded. The run's code is the code the stage ran, which can differ from the code on disk now (a helper edited while the run continued), and a rerun mark the run set stays. An unmarked record files a run-cache entry under that manifest. A marked record stays non-reusable: it files no entry and deletes one at its static input hash.
-   - No record, or outputs that differ from it (edited by hand after the run): `pivot commit` fingerprints the code on disk now and records the outputs against it, as below.
+   - No record, a record without a code manifest (one that holds only another Pivot's field), or outputs that differ from it (edited by hand after the run): `pivot commit` fingerprints the code on disk now and records the outputs against it, as below.
 
 ### Use Case
 

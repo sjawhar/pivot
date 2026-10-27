@@ -502,8 +502,15 @@ def _untrusted_modules(
     What it used: the modules its manifest hashes, the module that defines the stage, and the
     modules it imported while it ran. A `@no_fingerprint` stage's code is its declared files, so
     for it the modules loaded from those files count instead of its imports.
+
+    A worker first judges every user module it loaded that no recorder saw compile, as discovery
+    does (`loaded_source.record_unseen_modules`): a module a stage's module loaded with a loader
+    it called directly (`SourceFileLoader(...).load_module()`, `spec_from_loader`) holds the file
+    as this worker read it, which may be after an edit the coordinator's record predates.
     """
     loaded_source.record_user_modules()
+    if loaded_source.is_worker():
+        loaded_source.record_unseen_modules()
     manifest = fingerprint_manifest
     if stage_info["no_fingerprint"]:
         used = set[str]()
@@ -1090,7 +1097,8 @@ def _execute_stage(
                     logger.warning(
                         "Stage '%s' uses user modules whose source pivot cannot read: %s. Pivot "
                         + "cannot tell which code ran, so its result is never reused; every run "
-                        + "reruns it.%s Fix: load the modules from .py source files.",
+                        + "reruns it while pivot cannot read them.%s Fix: load the modules from "
+                        + ".py source files, imported by the pipeline or a stage.",
                         stage_name,
                         unreadable_modules,
                         commit_note,

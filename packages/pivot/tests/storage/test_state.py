@@ -1494,3 +1494,49 @@ def test_apply_deferred_writes_empty_output_paths_with_flag_true(
     with state.StateDB(db_path) as db:
         # Should not raise
         db.apply_deferred_writes("stage", [], deferred)
+
+
+_RAN = {"code_manifest": {"func:helpers.plain": "1f2e"}, "output_hashes": {"p/use_plain": "9a8b"}}
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        pytest.param(_RAN, _RAN, id="this-pivots-fields"),
+        pytest.param({"pvt_members": {"data/out/a.pvt": "77aa"}}, {}, id="another-field-only"),
+        pytest.param(
+            {**_RAN, "pvt_members": {"data/out/a.pvt": "77aa"}}, _RAN, id="another-field-too"
+        ),
+        pytest.param(
+            {"code_manifest": _RAN["code_manifest"], "pvt_members": {"data/out/a.pvt": "77aa"}},
+            {},
+            id="manifest-without-outputs",
+        ),
+        pytest.param(
+            {**_RAN, "code_manifest": {"func:helpers.plain": 1}}, {}, id="malformed-manifest"
+        ),
+    ],
+)
+def test_a_no_commit_record_reads_each_valid_field_it_knows(
+    tmp_path: pathlib.Path, stored: object, expected: object
+) -> None:
+    """The code manifest and the output hashes read together, when both are valid. A record
+    without them, as one a Pivot that writes only `pvt_members` leaves, reads as a record without
+    them, never as absent, so the field this Pivot does not know is not lost with it."""
+    with state.StateDB(tmp_path) as db:
+        db.put_raw(b"nocommit:p/use_plain", json.dumps(stored).encode())
+
+        assert db.get_no_commit_record("p/use_plain") == expected
+
+
+@pytest.mark.parametrize(
+    "value", [None, b"[]", b"not json"], ids=["absent", "not-an-object", "not-json"]
+)
+def test_a_no_commit_record_is_none_when_absent_or_not_a_json_object(
+    tmp_path: pathlib.Path, value: bytes | None
+) -> None:
+    with state.StateDB(tmp_path) as db:
+        if value is not None:
+            db.put_raw(b"nocommit:p/use_plain", value)
+
+        assert db.get_no_commit_record("p/use_plain") is None

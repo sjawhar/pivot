@@ -272,7 +272,8 @@ use the loaded version, and their locks record it. The next run loads your edit
 and reruns the stages it changes. This holds for every user module, whatever
 loaded it: a module under the project root, one on `PYTHONPATH`, an editable
 install's finder, a zip on `sys.path`, `importlib.util.spec_from_file_location`,
-or `sitecustomize` before Pivot started (see below).
+`sitecustomize` before Pivot started, or a loader a module calls itself (see
+below).
 
 A worker imports some modules from their files itself: a module outside the
 project root (on `PYTHONPATH`, or a package installed from a source checkout),
@@ -299,16 +300,22 @@ or reuses a run-cache entry. Load such modules from `.py` source files.
 
 A module imported before Pivot starts, by `sitecustomize` or a `.pth` import
 line (in the `pivot` process and in every worker), was loaded before Pivot
-could record its source. Pivot reads its file when it discovers the pipeline,
-and each worker when it starts, and trusts that text only when the file and
-its cached bytecode show it is the module's code: CPython's own loader imported
-it, and neither the file nor the bytecode it may have run changed after the
-process started. Otherwise Pivot treats the module as one whose source it
-cannot read, and the first stage that uses it in each process also logs why
-("Pivot did not see user module '…' compile"). That happens when the file
-changes while Pivot starts, in a process that loaded a module and then edited
-it, and for a module a custom loader imported. Import such modules from the
-pipeline or a stage instead.
+could record its source; a module that a module loads with a loader it calls
+itself (`SourceFileLoader(...).load_module()`) passes no hook that records it.
+Pivot reads such a module's file when it discovers the pipeline, and each
+worker when it starts and after each stage, and trusts that text only when the
+file and its cached bytecode show it is the module's code: CPython's own loader
+imported it, and neither the file nor the bytecode it may have run changed
+after the process started or in the 2 s before. Otherwise Pivot treats the
+module as one whose source it cannot read, and the first stage that uses it in
+each process also logs why ("Pivot did not see user module '…' compile"). That
+happens when the file changes while Pivot starts or in the 2 s before it starts
+(a stage that uses it reruns once more on the next run), in a process that
+loaded a module and then edited it, and for a module a custom loader imported.
+A worker whose text differs from the one the `pivot` process recorded marks the
+stage, as above. Import such modules from the pipeline or a stage instead. A
+forward step of the system clock of more than 2 s between an edit and the start
+of a pivot process can make that edit look older than the start.
 
 Under `pivot repro --no-commit` no lock is written. The run records, for
 `pivot commit`, the manifest each stage's lock would have held, warnings' marks

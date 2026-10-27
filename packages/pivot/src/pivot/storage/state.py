@@ -919,7 +919,13 @@ class StateDB:
         return run_history.deserialize_run_cache_entry(value)
 
     def get_no_commit_record(self, stage_name: str) -> NoCommitRecord | None:
-        """The record a `--no-commit` run of `stage_name` left, or None (absent or unreadable)."""
+        """The record a `--no-commit` run of `stage_name` left, or None (absent, or not a JSON
+        object).
+
+        It holds each field this Pivot knows that is valid: `code_manifest` with `output_hashes`,
+        both or neither. A record without them (one another Pivot wrote with only its own field)
+        reads as a record without them, never as absent.
+        """
         self._check_closed()
         with self._read_transaction() as txn:
             value = txn.get(_NOCOMMIT_PREFIX + stage_name.encode())
@@ -932,12 +938,13 @@ class StateDB:
         if not isinstance(data, dict):
             return None
         record = typing.cast("dict[str, object]", data)
+        checked = dict[str, object]()
         manifest = record.get("code_manifest")
         outputs = record.get("output_hashes")
-        if not _is_str_dict(manifest) or not _is_str_dict(outputs):
-            return None
-        checked = typing.cast("object", {"code_manifest": manifest, "output_hashes": outputs})
-        return typing.cast("NoCommitRecord", checked)
+        if _is_str_dict(manifest) and _is_str_dict(outputs):
+            checked["code_manifest"] = manifest
+            checked["output_hashes"] = outputs
+        return typing.cast("NoCommitRecord", typing.cast("object", checked))
 
     def prune_run_cache(self, valid_run_ids: set[str]) -> int:
         """Remove run cache entries that reference runs not in valid_run_ids.

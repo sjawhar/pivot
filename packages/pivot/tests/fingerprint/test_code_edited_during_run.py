@@ -6,20 +6,27 @@ code after discovery (from an upstream stage) and check, through the installed `
 the next run never reports an output that edited code would change as cached.
 """
 
+import contextlib
 import json
 import os
 import pathlib
 import py_compile
 import shutil
+import signal
 import subprocess
 import sys
 import sysconfig
 import textwrap
+import time
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
 from typing import cast
 
 import pytest
+from tests.conftest import send_rpc
+
+from pivot import loaded_source
+from pivot.storage import state
 
 _PIVOT = pathlib.Path(sys.executable).parent / "pivot"
 # The command that runs pivot: the installed CLI unless a test names another interpreter.
@@ -739,9 +746,9 @@ def test_helper_a_pth_line_imports_at_startup_edited_mid_run_is_not_cached_stale
 def test_helper_imported_before_discovery_and_left_unchanged_is_reused(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A helper `sitecustomize` imports before Pivot installs its recorder, unchanged since the
-    run started: its file and bytecode show it holds the file's code, so Pivot records it, warns
-    about nothing, and reuses the stage that uses it."""
+    """A helper `sitecustomize` imports before Pivot installs its recorder, unchanged for longer
+    than the 2 s margin when the run starts: its file and bytecode show it holds the file's code,
+    so Pivot records it, warns about nothing, and reuses the stage that uses it."""
     pipeline = (
         "import helpers\nfrom pivot import Pipeline, stage\n\n\n@stage\n"
         + "def use_plain(seed: str) -> str:\n    return helpers.plain()\n\n\n"
@@ -755,6 +762,8 @@ def test_helper_imported_before_discovery_and_left_unchanged_is_reused(
         + f"sys.path.remove({str(project)!r})\n"
     )
     _run(project, "config", "set", "core.max_workers", "1", pythonpath=site)
+    # A file changed less than the margin before a process started is unreadable in it.
+    time.sleep(loaded_source._CHANGE_TIME_SLACK_NS / 1e9)
 
     first = _repro(project, site)
     second = _repro_json(project, site)
@@ -795,6 +804,221 @@ def test_helper_imported_before_discovery_and_edited_before_it_is_never_reused(
     assert second["p/use_plain"][0] == "ran", second
 
 
+@contextlib.contextmanager
+def _whole_second_directory(tmp_path: pathlib.Path) -> Generator[pathlib.Path]:
+    """A directory on an ext4 file system made with 128-byte inodes, which keep whole-second
+    timestamps, mounted from an image under `tmp_path`. Skips the test when it cannot be made."""
+    search = os.pathsep.join((os.environ.get("PATH", ""), "/usr/sbin", "/sbin"))
+    mkfs = shutil.which("mkfs.ext4", path=search)
+    if mkfs is None or shutil.which("sudo") is None:
+        pytest.skip("needs mkfs.ext4 and sudo to mount a file system with whole-second times")
+    image = tmp_path / "whole-second.ext4"
+    with image.open("wb") as file:
+        file.truncate(64 * 1024 * 1024)
+    made = subprocess.run(
+        [mkfs, "-q", "-F", "-I", "128", str(image)], capture_output=True, text=True, check=False
+    )
+    if made.returncode != 0:
+        pytest.skip(f"mkfs.ext4 -I 128 failed: {made.stderr.strip()}")
+    mount = tmp_path / "mnt"
+    mount.mkdir()
+    mounted = subprocess.run(
+        ["sudo", "-n", "mount", "-o", "loop", str(image), str(mount)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if mounted.returncode != 0:
+        pytest.skip(f"cannot mount the image: {mounted.stderr.strip()}")
+    try:
+        subprocess.run(
+            ["sudo", "-n", "chown", f"{os.getuid()}:{os.getgid()}", str(mount)],
+            capture_output=True,
+            check=True,
+        )
+        probe = mount / "probe"
+        probe.write_text("probe")
+        if probe.stat().st_ctime_ns % 1_000_000_000:
+            pytest.skip("the image keeps sub-second change times")
+        yield mount
+    finally:
+        subprocess.run(["sudo", "-n", "umount", "-l", str(mount)], capture_output=True, check=False)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="mounts an ext4 image")
+@pytest.mark.skipif(
+    not os.environ.get("CI"), reason="mounts a file system image with sudo; runs where CI is set"
+)
+def test_helper_edited_in_the_second_its_process_started_on_a_whole_second_file_system(
+    tmp_path: pathlib.Path,
+) -> None:
+    """On ext4 made with 128-byte inodes a change time keeps whole seconds, so an edit made in the
+    second its process started reads as up to 1 s older than it was. `sitecustomize` imports the
+    in-root helper when the `pivot` process starts and then, once, edits it, 0.1 to 0.3 s into
+    that second: the run uses the loaded plain-v1. No later run may report `use_plain` cached
+    while helpers.py returns plain-v2."""
+    pipeline = (
+        "import helpers\nfrom pivot import Pipeline, stage\n\n\n@stage\n"
+        + "def use_plain(seed: str) -> str:\n    return helpers.plain()\n\n\n"
+        + 'with Pipeline("p") as pipeline:\n    use_plain(pipeline.input("seed.txt"))\n'
+    )
+    with _whole_second_directory(tmp_path) as root:
+        project, _ = _project(root, pipeline)
+        helpers_file = project / "helpers.py"
+        flag = tmp_path / "edit.flag"
+        site = tmp_path / "site"
+        site.mkdir()
+        (site / "sitecustomize.py").write_text(
+            f"import pathlib\nimport sys\nsys.path.insert(0, {str(project)!r})\nimport helpers\n"
+            + f"sys.path.remove({str(project)!r})\nflag = pathlib.Path({str(flag)!r})\n"
+            + "if flag.exists():\n    flag.unlink()\n"
+            + f"    path = pathlib.Path({str(helpers_file)!r})\n"
+            + "    path.write_text(path.read_text().replace('-v1', '-v2'))\n"
+        )
+        _run(project, "config", "set", "core.max_workers", "1", pythonpath=site)
+        _repro(project, site)
+        flag.touch()
+        # Start the run 0.1 to 0.3 s into a second, so the edit lands in the second it started.
+        while not 0.1 <= time.time() % 1 <= 0.3:
+            time.sleep(0.002)
+        _repro(project, site)
+        assert not flag.exists(), "sitecustomize did not edit the helper"
+        later = list[tuple[str, str]]()
+        for _ in range(2):
+            stages = _repro_json(project, site)
+            later.append((stages["p/use_plain"][0], _output(project, "use_plain")))
+
+    assert all(status != "cached" or output == "plain-v2" for status, output in later), later
+    assert later[-1][1] == "plain-v2", later
+
+
+_FOUR_STAGES = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def a(seed: str) -> str:
+    return "a:" + seed
+
+
+@stage
+def b(seed: str) -> str:
+    return "b:" + seed
+
+
+@stage
+def c(seed: str) -> str:
+    return "c:" + seed
+
+
+@stage
+def d(seed: str) -> str:
+    return "d:" + seed
+
+
+with Pipeline("p") as pipeline:
+    seed = pipeline.input("seed.txt")
+    a(seed)
+    b(seed)
+    c(seed)
+    d(seed)
+"""
+
+# Wraps the worker's check of a stage's modules, in every process this PYTHONPATH reaches, to log
+# the process and whether it holds the coordinator's records when it checks.
+_LOG_EACH_CHECK = """\
+import os
+
+if os.environ.get("JUDGE_LOG"):
+    from pivot import loaded_source
+    from pivot.executor import worker
+
+    _checked = worker._untrusted_modules
+
+    def _logged(*args, **kwargs):
+        with open(os.environ["JUDGE_LOG"], "a") as log:
+            log.write(f"{os.getpid()} {loaded_source.is_worker()}\\n")
+        return _checked(*args, **kwargs)
+
+    worker._untrusted_modules = _logged
+"""
+
+
+def _wait_for_checks(log: pathlib.Path, count: int, proc: subprocess.Popen[bytes]) -> None:
+    deadline = time.monotonic() + 120
+    while not (log.exists() and len(log.read_text().splitlines()) >= count):
+        assert proc.poll() is None, f"pivot exited with {proc.returncode} before {count} checks"
+        assert time.monotonic() < deadline, f"fewer than {count} checks: {log.read_text()!r}"
+        time.sleep(0.1)
+
+
+@pytest.mark.parametrize(
+    ("surface", "workers"),
+    [("repro", 1), ("repro", 4), ("run", 4), ("watch", 4), ("rpc", 4)],
+    ids=["repro-1-worker", "repro-4-workers", "run", "watch", "rpc-warm-pool"],
+)
+def test_every_worker_that_checks_a_stage_holds_the_coordinators_records(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, surface: str, workers: int
+) -> None:
+    """A worker judges the modules no recorder saw compile after each stage only while it holds
+    the coordinator's records (`loaded_source.is_worker`), which a process that runs a stage
+    itself does not. Every pool Pivot starts runs `core._init_worker`, which sets them: one worker
+    and many, `pivot run`, `--watch`, and the RPC server, whose second run uses the warm pool."""
+    project, _ = _project(tmp_path, _FOUR_STAGES)
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(_LOG_EACH_CHECK)
+    _run(project, "config", "set", "core.max_workers", str(workers))
+    log = tmp_path / "checks.log"
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("VIRTUAL_ENV", "PIVOT_UNSAFE_FINGERPRINTING", "PYTHONPATH")
+    }
+    env.update(COLUMNS="1000", PYTHONPATH=str(site), JUDGE_LOG=str(log))
+    command = {
+        "repro": ["repro"],
+        "run": ["run", "p/a", "p/b", "p/c", "p/d"],
+        "watch": ["repro", "--watch", "--json"],
+        "rpc": ["repro", "--watch", "--serve"],
+    }[surface]
+    expected = 8 if surface == "rpc" else 4
+
+    with (tmp_path / "pivot.out").open("wb") as out:
+        proc = subprocess.Popen(
+            [str(_PIVOT), *command], cwd=project, env=env, stdout=out, stderr=subprocess.STDOUT
+        )
+    try:
+        if surface in ("repro", "run"):
+            assert proc.wait(timeout=300) == 0, (tmp_path / "pivot.out").read_text()
+        else:
+            _wait_for_checks(log, 4, proc)
+            if surface == "rpc":
+                # Relative to the project: a long temporary path exceeds the socket path limit.
+                monkeypatch.chdir(project)
+                sock = pathlib.Path(".pivot", "agent.sock")
+                deadline = time.monotonic() + 60
+                reply = send_rpc(sock, "run", {"force": True})
+                while "result" not in reply and time.monotonic() < deadline:
+                    time.sleep(0.2)  # refused until the first run has finished
+                    reply = send_rpc(sock, "run", {"force": True})
+                assert "result" in reply, reply
+                _wait_for_checks(log, expected, proc)
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM if surface == "rpc" else signal.SIGINT)
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+    checks = [line.split() for line in log.read_text().splitlines()]
+    assert len(checks) >= expected, checks
+    assert all(holds == "True" for _, holds in checks), checks
+    assert all(int(pid) != proc.pid for pid, _ in checks), (proc.pid, checks)
+
+
 def test_a_lock_a_later_run_writes_retires_the_no_commit_record(tmp_path: pathlib.Path) -> None:
     """A normal run after `pivot repro --no-commit` writes a lock, which supersedes the record the
     --no-commit run left. The user then puts that run's output (plain-v1) back by hand and runs
@@ -816,6 +1040,37 @@ def test_a_lock_a_later_run_writes_retires_the_no_commit_record(tmp_path: pathli
     after = _repro_json(project)
     assert after["p/use_plain"][0] == "cached", after
     assert _output(project, "use_plain") == "plain-v2"
+
+
+def test_commit_reads_a_no_commit_record_without_code_as_no_record(tmp_path: pathlib.Path) -> None:
+    """A Pivot that keeps `.pvt` files in directory outputs leaves a `nocommit:` record with only
+    its own field (`pvt_members`). It holds no code a run ran, so `pivot commit` acts as with no
+    record: it leaves a current lock alone, and after an edit records the outputs against the
+    code on disk, which retires the record."""
+    pipeline = (
+        "import helpers\nfrom pivot import Pipeline, stage\n\n\n@stage\n"
+        + "def use_plain(seed: str) -> str:\n    return helpers.plain()\n\n\n"
+        + 'with Pipeline("p") as pipeline:\n    use_plain(pipeline.input("seed.txt"))\n'
+    )
+    project, _ = _project(tmp_path, pipeline)
+    _repro(project)
+    lock_before = _lock(project, "use_plain")
+    with state.StateDB(project / ".pivot") as db:
+        db.put_raw(
+            b"nocommit:p/use_plain",
+            json.dumps({"pvt_members": {"data/p/out/a.pvt": "77aa"}}).encode(),
+        )
+
+    unchanged = _run(project, "commit")
+
+    assert "Nothing to commit" in unchanged.stdout, unchanged.stdout
+    assert _lock(project, "use_plain") == lock_before
+    (project / "helpers.py").write_text(_HELPERS.replace("-v1", "-v2"))
+    edited = _run(project, "commit")
+    assert "Committed 1 stage(s)" in edited.stdout, edited.stdout
+    assert _lock(project, "use_plain") != lock_before
+    with state.StateDB(project / ".pivot", readonly=True) as db:
+        assert db.get_no_commit_record("p/use_plain") is None
 
 
 _EXT_STAGE = (

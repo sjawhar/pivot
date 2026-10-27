@@ -9,14 +9,16 @@ Fingerprinting therefore reads source and source digests from what this module r
 worker compares the modules a stage used against what the coordinator loaded (`check_stage`).
 
 The contract is about the module, not the loader. `discovery._ProjectSourceLoader` records the
-bytes it compiles; every other user-code module (an editable install's finder, a zip on
-`sys.path`, `importlib.util.spec_from_file_location`, a sourceless `.pyc`) is recorded from its
-loader when it appears (`record_modules`, `record_user_modules`). A user module whose loader gives
-no source is recorded as unreadable: Pivot cannot tell which code it holds, so a stage that uses
-it is never trusted. A user module no recorder saw compile, because it was imported before the
-recorder was installed (by `sitecustomize`, a `.pth` import line or the program that runs Pivot),
-is recorded from its file only where Pivot can show the file holds the code it was compiled from,
-and as unreadable otherwise (`record_unseen_modules`).
+bytes it compiles; every other user-code module an import finds (an editable install's finder, a
+zip on `sys.path`, `importlib.util.spec_from_file_location`, a sourceless `.pyc`) is recorded from
+its loader when it appears (`record_modules`, `record_user_modules`). A user module whose loader
+gives no source is recorded as unreadable: Pivot cannot tell which code it holds, so a stage that
+uses it is never trusted. A user module no recorder saw compile, because it was imported before
+the recorder was installed (by `sitecustomize`, a `.pth` import line or the program that runs
+Pivot) or by a loader called directly (`SourceFileLoader(...).load_module()`), is recorded from
+its file only where Pivot can show the file holds the code it was compiled from, and as
+unreadable otherwise (`record_unseen_modules`, at the end of discovery, when a worker starts and
+after each stage a worker runs).
 
 Import machinery and `linecache` are process-global, so this record is too. A module loaded again
 (a watch reload) replaces its entry, and `prune`, at the end of an import session, drops the
@@ -98,9 +100,20 @@ _forked = False
 # function by name only (its body is not hashed), and `module:` only marks an import as covered.
 _CODE_KINDS = frozenset({"func", "class", "const", "default", "schema", "partial", "loader"})
 
-# A file's change time is stamped from a clock that can trail the change by one kernel tick (at
-# most 10 ms), so a change this close before the process started counts as after it.
-_CHANGE_TIME_SLACK_NS = 50_000_000
+# How long before the process start a file's change time must be for the file to count as
+# unchanged since. A file system that keeps whole seconds (ext4 with 128-byte inodes) stamps a
+# change up to 1 s before it happened, the kernel's coarse clock up to one tick (10 ms) before,
+# and a forward step of the wall clock between an edit and the import of this module moves the
+# start later by the step. 2 s covers all three up to a step of 2 s. The cost: a module edited
+# less than 2 s before a process started is unreadable in that process.
+_CHANGE_TIME_SLACK_NS = 2_000_000_000
+
+# On Linux, the wall clock less the boot clock when this module was imported: the wall-clock time
+# of boot as the wall clock read then. `_process_start_ns` takes the smaller of it and the value
+# now, so a forward step of the wall clock after the import cannot move the start later.
+_WALL_AT_BOOT_ON_IMPORT_NS = (
+    time.time_ns() - time.clock_gettime_ns(time.CLOCK_BOOTTIME) if sys.platform == "linux" else 0
+)
 
 
 def _note_fork() -> None:
@@ -173,13 +186,16 @@ def record_user_modules() -> None:
 def record_unseen_modules() -> None:
     """Record every loaded user module that no recorder saw compile: one imported before Pivot
     installed its recorder, by `sitecustomize`, a `.pth` import line or the program that runs
-    Pivot, or by a loader the recorder does not wrap.
+    Pivot, or by a loader the recorder does not wrap (a loader called directly, as
+    `SourceFileLoader(...).load_module()` or `spec_from_loader` with `exec_module`).
 
     Its record holds its file's bytes where they are shown to be the bytes it was compiled from
     (`_verified_source`). Otherwise it is unreadable, with the reason, so a stage that uses it is
     never reused, and `check_stage` logs the reason once per process. Discovery calls this once
-    it has imported the project, and a worker when it starts; `prune` forgets these records when
-    the import session ends, so the next discovery judges the modules again.
+    it has imported the project, and a worker when it starts and after each stage it runs
+    (`worker._untrusted_modules`), so a worker judges every user module it loaded, whatever
+    loaded it; `prune` forgets these records when the import session ends, so the next discovery
+    judges the modules again.
     """
     started = _process_start_ns()
     for name in list(sys.modules):
@@ -269,6 +285,12 @@ def set_coordinator(coordinator_digests: Mapping[str, str]) -> None:
     """In a worker, keep the coordinator's `digests()` for `check_stage`."""
     global _coordinator
     _coordinator = (_token_of(coordinator_digests), dict(coordinator_digests))
+
+
+def is_worker() -> bool:
+    """Whether this process is a worker: it started with the coordinator's records
+    (`set_coordinator`). Any other process that checks a stage ran the code it fingerprinted."""
+    return _coordinator is not None
 
 
 def coordinator_records(module_name: str) -> bool:
@@ -488,12 +510,14 @@ def _module_file(module: types.ModuleType) -> str | None:
 
 
 def _process_start_ns() -> int | None:
-    """When this process started, in wall-clock nanoseconds and never later than it did, or None
-    if the system does not say, or this process was forked from one that imported this module:
-    its modules were loaded before it started.
+    """When this process started, in wall-clock nanoseconds, or None if the system does not say,
+    or this process was forked from one that imported this module: its modules were loaded before
+    it started.
 
-    Linux gives the start in clock ticks since boot; read against the boot clock, it lands within
-    one tick before the true start. psutil reads it elsewhere.
+    Linux gives the start in clock ticks since boot. Added to the wall-clock time of boot, the
+    smaller of its value when this module was imported and now, it lands within one tick before
+    the true start, unless the wall clock stepped forward between the start and the import of
+    this module: then it is late by the step. psutil reads it elsewhere.
     """
     if _forked:
         return None
@@ -510,7 +534,8 @@ def _process_start_ns() -> int | None:
         boot_ns = int(fields[19]) * 1_000_000_000 // os.sysconf("SC_CLK_TCK")
     except (OSError, ValueError, IndexError):
         return None
-    return time.time_ns() - (time.clock_gettime_ns(time.CLOCK_BOOTTIME) - boot_ns)
+    wall_at_boot = time.time_ns() - time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    return boot_ns + min(_WALL_AT_BOOT_ON_IMPORT_NS, wall_at_boot)
 
 
 def _verified_source(
@@ -520,10 +545,11 @@ def _verified_source(
     Pivot cannot show that.
 
     No recorder saw the module compile, so its file is read now. Those bytes are its code when
-    CPython's source file loader imported it (a plain `sys.path` import), the file has not
-    changed since this process started (its change time, which no tool can set back, is older),
-    so every import in this process read these bytes, and the bytecode that loader may have run
-    instead is the code of these bytes (`_bytecode_reason`).
+    CPython's source file loader imported it (a plain `sys.path` import), the file's change time
+    is at least `_CHANGE_TIME_SLACK_NS` older than this process's start, so every import in this
+    process read these bytes, and the bytecode that loader may have run instead is the code of
+    these bytes (`_bytecode_reason`). A forward step of the wall clock of more than that margin
+    between an edit and the import of this module can make the edit look older than the start.
     """
     spec = vars(module).get("__spec__")
     loader = getattr(spec, "loader", None) or vars(module).get("__loader__")

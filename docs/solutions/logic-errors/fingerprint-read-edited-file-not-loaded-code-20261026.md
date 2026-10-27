@@ -61,13 +61,17 @@ Record the bytes each user module was compiled from, and fingerprint those:
 - A `--no-commit` run records the manifest its lock would have held; `pivot commit` writes it while
   the outputs on disk are still the ones that run wrote.
 - A user module imported before Pivot installs its recorder (by `sitecustomize` or a `.pth` import
-  line, in the coordinator and in every worker) was compiled before any recorder could see it.
-  `loaded_source.record_unseen_modules`, at the end of discovery and in each worker's initializer,
-  reads its file and records it only where the file and its cached bytecode show they hold the
-  module's code: CPython's own source file loader imported it, the file's change time is older than
-  the process, and the bytecode the loader may have run instead compiles to the same code. Any
-  other such module is recorded as unreadable, with the reason, which a stage that uses it logs
-  once per process.
+  line, in the coordinator and in every worker) was compiled before any recorder could see it, and
+  a module that a module loads with a loader it calls itself (`SourceFileLoader(...).load_module()`)
+  passes no recorder. `loaded_source.record_unseen_modules`, at the end of discovery, in each
+  worker's initializer and in a worker after each stage, reads its file and records it only where
+  the file and its cached bytecode show they hold the module's code: CPython's own source file
+  loader imported it, the file's change time is at least 2 s older than the process start (a
+  file system with whole-second times stamps a change up to 1 s early, and a forward step of the
+  wall clock moves the start later), and the bytecode the loader may have run instead compiles to
+  the same code. Any other such module is recorded as unreadable, with the reason, which a stage
+  that uses it logs once per process; a worker whose record differs from the coordinator's marks
+  the stage.
 - The path hook and the module recorder are installed only while a discovery imports; a worker
   keeps its own for its life. Left installed after discovery, the recorder recorded modules that
   a later caller (or a later test) loaded, and changed what that caller fingerprinted.
@@ -89,6 +93,11 @@ project keeps every recorded fingerprint.
 - "Every module is recorded" includes modules that exist before Pivot runs any code. Check what
   `sys.modules` holds when the recorder starts, and decide for each module whether its file can
   be shown to hold its code; never fall back to reading the file silently.
+- A time comparison that proves a file unchanged needs a margin for every way a timestamp can
+  read early: a file system that keeps whole seconds, and a step of the wall clock between the
+  edit and the moment the start is computed; pin the clock's offset when Pivot is imported.
+- A module can appear after the last check: a worker loads modules while its stages run, by
+  loaders no hook sees. Judge again at each point a process can have loaded one.
 - A process-wide hook (`sys.meta_path`, `sys.path_hooks`, a `linecache` pin, a patched
   `importlib.util` function) must end with the session that installed it, in the tests too: one
   pytest-xdist worker runs many tests in one process, so a leaked hook makes the suite pass or
