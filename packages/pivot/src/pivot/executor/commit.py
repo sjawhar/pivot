@@ -181,6 +181,10 @@ def commit_stages(
                     )
                     outputs_missing = True
                     break
+                except exceptions.UnreadableLinkError as exc:
+                    logger.error("Stage '%s': %s — skipping", stage_name, exc)
+                    outputs_missing = True
+                    break
                 except OSError:
                     logger.error(
                         "Stage '%s': output unreadable: %s — skipping",

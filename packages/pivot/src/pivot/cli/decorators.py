@@ -50,7 +50,8 @@ def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         try:
             return func(*args, **kwargs)
-        except click.ClickException:
+        except (click.ClickException, click.exceptions.Exit):
+            # ctx.exit(code) raises Exit: let click exit with the code, not print "Exit(1)"
             raise
         except exceptions.PivotError as e:
             raise errors.handle_pivot_error(e) from e

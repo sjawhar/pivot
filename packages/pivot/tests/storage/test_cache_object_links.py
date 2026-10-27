@@ -2,11 +2,14 @@
 
 Every case is checked against ``_helper_resolved_key``, the check as it stood at
 sjawhar/pivot#516's head (``resolve()`` on the link and on the cache directory, for every link):
-the cheap check must give the same answer for every tree.
+the cheap check must give the same answer for every tree it can read. A link it cannot read
+raises (the tests at the end of the file): #516's ``resolve()`` hid a readlink error that came
+after a good lstat, and the link was left out of the manifest as a user symlink.
 """
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import pathlib
@@ -17,6 +20,7 @@ from typing import TYPE_CHECKING
 import pytest
 import xxhash
 
+from pivot import exceptions
 from pivot.show import selection
 from pivot.storage import cache, state
 from pivot.types import DirHash, is_dir_hash
@@ -717,36 +721,52 @@ def test_publish_tree_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Pat
     assert tree.with_name(f"{tree.name}.verified").exists()
 
 
+def _helper_refusal(call: Callable[[], str]) -> exceptions.UnreadableLinkError:
+    """The ``UnreadableLinkError`` ``call`` raises. Without one, the test fails with what
+    ``call`` says it returned (at #516's head, the members it recorded)."""
+    try:
+        outcome = call()
+    except exceptions.UnreadableLinkError as error:
+        return error
+    pytest.fail(outcome)
+
+
+def _helper_hash(restored: pathlib.Path, cache_dir: pathlib.Path) -> str:
+    result = cache.hash_directory(restored, cache_dir=cache_dir, warn_left_out_symlinks=True)
+    return f"recorded {[e['relpath'] for e in result['manifest']]}"
+
+
+def _helper_assert_unreadable(
+    error: exceptions.UnreadableLinkError, link: pathlib.Path, cause: type[OSError], code: int
+) -> None:
+    """The refusal names ``link``, says what to do, and keeps the OSError behind it."""
+    assert error.path == os.fspath(link)
+    assert isinstance(error.__cause__, cause)
+    assert error.__cause__.errno == code
+    assert str(error).startswith(f"Cannot read symlink '{link}': ")
+    assert str(error).endswith("readable, or remove the link.")
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root searches any directory")
 def test_hash_directory_raises_for_a_member_link_into_an_unsearchable_prefix_directory(
     tmp_path: pathlib.Path,
 ) -> None:
-    """walk_artifact_members: "PermissionError propagates: a partial hash would be wrong". A
-    symlink checkout's member link whose object this user cannot stat (its two-character
-    directory lost search permission, as in a shared cache another user owns) raises, as the
-    base raised from ``Path.is_file()``; it is not left out of the manifest as a user symlink."""
+    """walk_artifact_members: an error that leaves an entry unclassified propagates, since a
+    partial hash would be wrong. A symlink checkout's member link whose object this user cannot
+    stat (its two-character directory lost search permission, as in a shared cache another user
+    owns) raises, as the base raised ``PermissionError`` from ``Path.is_file()``; it is not left
+    out of the manifest as a user symlink."""
     cache_dir = tmp_path / "cache" / "files"
-    source = tmp_path / "source"
-    source.mkdir()
-    for index in range(3):
-        (source / f"f{index}.txt").write_text(f"{index}\n")
-    output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK)
-    assert is_dir_hash(output_hash)
     restored = tmp_path / "restored"
-    assert cache.restore_from_cache(
-        restored, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK
-    )
-    assert all(member.is_symlink() for member in restored.iterdir())
+    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
     prefix = cache.get_cache_path(cache_dir, output_hash["manifest"][0]["hash"]).parent
     os.chmod(prefix, 0)
     try:
-        with pytest.raises(PermissionError):
-            result = cache.hash_directory(
-                restored, cache_dir=cache_dir, warn_left_out_symlinks=True
-            )
-            pytest.fail(f"recorded {[e['relpath'] for e in result['manifest']]}")
+        error = _helper_refusal(lambda: _helper_hash(restored, cache_dir))
     finally:
         os.chmod(prefix, 0o755)
+    link = restored / output_hash["manifest"][0]["relpath"]
+    _helper_assert_unreadable(error, link, PermissionError, errno.EACCES)
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root searches any directory")
@@ -754,8 +774,8 @@ def test_hash_directory_raises_for_member_links_in_a_listable_unsearchable_direc
     tmp_path: pathlib.Path,
 ) -> None:
     """A directory inside the artifact this user can list but not search (mode r--): its member
-    links cannot be read, so the hash raises, as the base raised from ``Path.is_symlink()``; the
-    links are not left out of the manifest as user symlinks."""
+    links cannot be read, so the hash raises, as the base raised ``PermissionError`` from
+    ``Path.is_symlink()``; the links are not left out of the manifest as user symlinks."""
     cache_dir = tmp_path / "cache" / "files"
     source = tmp_path / "source"
     (source / "sub").mkdir(parents=True)
@@ -771,10 +791,81 @@ def test_hash_directory_raises_for_member_links_in_a_listable_unsearchable_direc
     assert all(member.is_symlink() for member in sub.iterdir())
     os.chmod(sub, 0o400)
     try:
-        with pytest.raises(PermissionError):
-            result = cache.hash_directory(
-                restored, cache_dir=cache_dir, warn_left_out_symlinks=True
-            )
-            pytest.fail(f"recorded {[e['relpath'] for e in result['manifest']]}")
+        error = _helper_refusal(lambda: _helper_hash(restored, cache_dir))
     finally:
         os.chmod(sub, 0o755)
+    _helper_assert_unreadable(
+        error, sub / pathlib.Path(error.path).name, PermissionError, errno.EACCES
+    )
+
+
+def _helper_fail_readlink(monkeypatch: pytest.MonkeyPatch, victim: pathlib.Path) -> None:
+    """``os.readlink`` raises EIO for ``victim``, as on a faulty FUSE or NFS mount. ``os.lstat``
+    is not patched, so ``victim`` is still a symlink to ``Path.is_symlink()`` and the walk."""
+    real_readlink = os.readlink
+    target = os.fspath(victim)
+
+    def failing_readlink(path: str | os.PathLike[str], *, dir_fd: int | None = None) -> str:
+        if os.fspath(path) == target:
+            raise OSError(errno.EIO, os.strerror(errno.EIO), target)
+        return real_readlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "readlink", failing_readlink)
+    assert os.path.islink(target), "lstat still works"
+
+
+def test_hash_of_a_checkout_link_that_cannot_be_read(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlink checkout's member link that can be lstat'd but not read raises, so ``pivot
+    commit`` refuses the output. #516's ``resolve()`` hid the readlink error, so the link was
+    left out as a user symlink and the commit recorded the other members only."""
+    cache_dir = tmp_path / "cache" / "files"
+    restored = tmp_path / "restored"
+    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    victim = restored / output_hash["manifest"][0]["relpath"]
+    _helper_fail_readlink(monkeypatch, victim)
+    error = _helper_refusal(lambda: _helper_hash(restored, cache_dir))
+    _helper_assert_unreadable(error, victim, OSError, errno.EIO)
+
+
+def test_only_missing_with_a_checkout_link_that_cannot_be_read(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``checkout --only-missing`` over the same tree, with another member deleted: the link it
+    cannot read raises. #516 called that member a local change the cache cannot restore."""
+    cache_dir = tmp_path / "cache" / "files"
+    restored = tmp_path / "restored"
+    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    deleted = restored / output_hash["manifest"][1]["relpath"]
+    deleted.unlink()
+    victim = restored / output_hash["manifest"][0]["relpath"]
+    _helper_fail_readlink(monkeypatch, victim)
+
+    def only_missing() -> str:
+        result = cache.restore_missing_in_directory(
+            restored, output_hash, cache_dir, [cache.CheckoutMode.SYMLINK]
+        )
+        return f"returned {result}"
+
+    error = _helper_refusal(only_missing)
+    _helper_assert_unreadable(error, victim, OSError, errno.EIO)
+    assert not deleted.is_symlink(), "nothing is written"
+
+
+def test_hash_of_a_user_symlink_that_cannot_be_read(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user symlink, to a file outside the cache, that can be lstat'd but not read raises too:
+    without its text the check cannot tell it from a checkout link. #516 left it out, which was
+    the right answer for this link."""
+    cache_dir = tmp_path / "cache" / "files"
+    restored = tmp_path / "restored"
+    _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n")
+    user_link = restored / "u.txt"
+    user_link.symlink_to(outside)
+    _helper_fail_readlink(monkeypatch, user_link)
+    error = _helper_refusal(lambda: _helper_hash(restored, cache_dir))
+    _helper_assert_unreadable(error, user_link, OSError, errno.EIO)

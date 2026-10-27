@@ -300,11 +300,13 @@ def _links_to_object(link: pathlib.Path, cache_path: pathlib.Path, cache_root: C
 
 # What ``Path.is_symlink()`` and ``Path.is_file()`` read as "no such file" on Python 3.13
 # (pathlib's ``_IGNORED_ERRNOS``), and readlink's answer for a path that is not a symlink. Any
-# other error (EACCES, EIO, ESTALE) leaves a link unclassified: the checks below raise it, as
-# those calls did, rather than call the link a user symlink and record a partial hash. They test
-# errno themselves, not through pathlib: from Python 3.14 ``Path.is_file()`` is
-# ``os.path.isfile``, which hides every error:
-# https://github.com/python/cpython/blob/v3.14.0/Lib/pathlib/__init__.py#L690-L696
+# other error (EACCES, EIO, ESTALE) leaves a link unclassified, a readlink error after a good
+# lstat included (non-strict realpath would hide that one): the checks below raise
+# ``UnreadableLinkError`` rather than call the link a user symlink and record a partial hash.
+# It is not an OSError, so a caller that reads an OSError as "missing" or "changed" (an output
+# check that would restore over the link) does not catch it. They test errno themselves, not
+# through pathlib: from Python 3.14 ``Path.is_file()`` is ``os.path.isfile``, which hides every
+# error: https://github.com/python/cpython/blob/v3.14.0/Lib/pathlib/__init__.py#L690-L696
 _NO_FILE_ERRNO = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
 _NOT_A_LINK_ERRNO = _NO_FILE_ERRNO | {errno.EINVAL}
 
@@ -312,13 +314,13 @@ _NOT_A_LINK_ERRNO = _NO_FILE_ERRNO | {errno.EINVAL}
 def _symlink_cache_key(path: str | os.PathLike[str], cache_root: CacheRoot) -> str | None:
     """Return ``XX + YYYY...`` when the symlink ``path`` resolves to ``<cache_root>/XX/YYYY...``
     with 16 characters in all, else None (``path`` is not a symlink, or resolves elsewhere).
-    Any other error reading ``path`` propagates (``_NOT_A_LINK_ERRNO``).
+    Any other error reading ``path`` raises ``UnreadableLinkError`` (``_NOT_A_LINK_ERRNO``).
     """
     try:
         target = _resolve_link(path, cache_root)
     except OSError as e:
         if e.errno not in _NOT_A_LINK_ERRNO:
-            raise
+            raise exceptions.UnreadableLinkError(os.fspath(path), e.strerror or str(e)) from e
         return None
     except ValueError:
         return None
@@ -343,7 +345,7 @@ def _cache_object_key(path: str | os.PathLike[str], cache_root: CacheRoot | None
     at another name in it, at a directory, at nothing, or in a loop is a user symlink, even when
     it ends at a file named like a hash. A file-by-file symlink checkout restores each directory
     member as a link to its object. ``cache_root`` is None for no cache. An error that leaves
-    the link unclassified propagates (``_NO_FILE_ERRNO``).
+    the link unclassified raises ``UnreadableLinkError`` (``_NO_FILE_ERRNO``).
     """
     if cache_root is None:
         return None
@@ -354,7 +356,7 @@ def _cache_object_key(path: str | os.PathLike[str], cache_root: CacheRoot | None
         is_file = stat.S_ISREG(os.stat(path).st_mode)
     except OSError as e:
         if e.errno not in _NO_FILE_ERRNO:
-            raise
+            raise exceptions.UnreadableLinkError(os.fspath(path), e.strerror or str(e)) from e
         return None
     return key if is_file else None
 
@@ -384,7 +386,8 @@ def walk_artifact_members(
     counts as the file it points to; any other symlink, a symlinked directory included, is not
     stored and is appended to ``left_out``. The walk never follows a symlink, so every regular
     file it collects lies inside the directory. An error that leaves an entry unclassified
-    (PermissionError, EIO; see ``_NO_FILE_ERRNO``) propagates: a partial hash would be wrong.
+    propagates, since a partial hash would be wrong; for a symlink it is ``UnreadableLinkError``
+    (EIO, EACCES; see ``_NO_FILE_ERRNO``).
 
     Args:
         directory: Directory to scan
