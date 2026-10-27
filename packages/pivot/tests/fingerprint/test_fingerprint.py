@@ -24,7 +24,7 @@ import xxhash
 from pydantic import BaseModel
 
 import pivot_tui.stats
-from pivot import ast_utils, exceptions, fingerprint, loaders
+from pivot import ast_utils, exceptions, fingerprint, loaders, project
 from pivot.storage import state as state_mod
 
 
@@ -1884,8 +1884,6 @@ def test_should_skip_persistent_cache_normal_function():
 
 def test_get_func_source_info_normal_function(monkeypatch: pytest.MonkeyPatch):
     """Should return source info for normal functions."""
-    from pivot import project
-
     # Set cache to the repo root (parent of src/ and tests/) so test file is within project
     repo_root = pathlib.Path(__file__).parent.parent.parent
     project._project_root_cache = repo_root
@@ -1906,8 +1904,6 @@ def test_get_func_source_info_builtin():
 
 def test_get_func_source_info_lambda(monkeypatch: pytest.MonkeyPatch):
     """Lambdas defined in source files should have source info."""
-    from pivot import project
-
     # Set cache to the repo root (parent of src/ and tests/) so test file is within project
     repo_root = pathlib.Path(__file__).parent.parent.parent
     project._project_root_cache = repo_root
@@ -1921,10 +1917,25 @@ def test_get_func_source_info_lambda(monkeypatch: pytest.MonkeyPatch):
     assert digest == xxhash.xxh64(pathlib.Path(__file__).read_bytes()).hexdigest()
 
 
+def _helper_queued() -> fingerprint._PendingCacheWrites:
+    """The fingerprint cache writes queued for the current project."""
+    return fingerprint._current_pending_writes()
+
+
+def _helper_capture_manifest_writes(
+    monkeypatch: pytest.MonkeyPatch, writes: list[tuple[bytes, bytes]]
+) -> None:
+    """Queue the current project's manifest writes in `writes`."""
+    pending = fingerprint._PendingCacheWrites(
+        root=project.get_project_root(), ast=list[fingerprint.AstHashEntry](), manifest=writes
+    )
+    monkeypatch.setattr(fingerprint, "_pending_writes", pending)
+
+
 def test_flush_ast_hash_cache_empty():
     """Flushing empty pending writes should not error."""
     # Clear any pending writes first
-    fingerprint._pending_ast_writes.clear()
+    _helper_queued()["ast"].clear()
     # Should not raise
     fingerprint.flush_ast_hash_cache()
 
@@ -1933,14 +1944,12 @@ def test_flush_ast_hash_cache_empty():
 def reset_fingerprint_cache_state(monkeypatch):
     """Reset fingerprint module state for testing persistent cache behavior."""
     # Save original state
-    orig_pending = fingerprint._pending_ast_writes.copy()
-    orig_pending_manifest = fingerprint._pending_manifest_writes.copy()
+    orig_pending = fingerprint._pending_writes
     orig_db = fingerprint._state_db
     orig_attempted = fingerprint._state_db_init_attempted
 
     # Reset state
-    fingerprint._pending_ast_writes.clear()
-    fingerprint._pending_manifest_writes.clear()
+    fingerprint._pending_writes = None
     fingerprint._hash_function_ast_cache.clear()
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -1948,10 +1957,7 @@ def reset_fingerprint_cache_state(monkeypatch):
     yield
 
     # Restore original state
-    fingerprint._pending_ast_writes.clear()
-    fingerprint._pending_ast_writes.extend(orig_pending)
-    fingerprint._pending_manifest_writes.clear()
-    fingerprint._pending_manifest_writes.extend(orig_pending_manifest)
+    fingerprint._pending_writes = orig_pending
     fingerprint._hash_function_ast_cache.clear()
     fingerprint._state_db = orig_db
     fingerprint._state_db_init_attempted = orig_attempted
@@ -2094,7 +2100,7 @@ def test_persistent_cache_full_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
 
     # Reset fingerprint module state
-    fingerprint._pending_ast_writes.clear()
+    _helper_queued()["ast"].clear()
     fingerprint._hash_function_ast_cache.clear()
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -2119,13 +2125,13 @@ def my_stage():
 
         # Step 1: First call - should compute and queue
         hash1 = fingerprint.hash_function_ast(func)
-        assert len(fingerprint._pending_ast_writes) == 1
+        assert len(_helper_queued()["ast"]) == 1
         assert isinstance(hash1, str)
         assert len(hash1) == 16  # xxhash64 hexdigest
 
         # Step 2: Flush to StateDB
         fingerprint.flush_ast_hash_cache()
-        assert len(fingerprint._pending_ast_writes) == 0
+        assert len(_helper_queued()["ast"]) == 0
 
         # Clear memory cache to force persistent lookup
         fingerprint._hash_function_ast_cache.clear()
@@ -2148,7 +2154,7 @@ def my_stage():
         hash2 = fingerprint.hash_function_ast(func2)
         assert hash2 == hash1
         # No new pending writes (cache hit)
-        assert len(fingerprint._pending_ast_writes) == 0
+        assert len(_helper_queued()["ast"]) == 0
 
         # Step 4: Modify the file (change mtime/size)
         import time
@@ -2172,7 +2178,7 @@ def my_stage():
         # Step 5: Should miss cache (mtime changed) and compute new hash
         hash3 = fingerprint.hash_function_ast(func3)
         assert hash3 != hash1  # Different code = different hash
-        assert len(fingerprint._pending_ast_writes) == 1  # Queued for cache
+        assert len(_helper_queued()["ast"]) == 1  # Queued for cache
     finally:
         sys.modules.pop("my_stage", None)
         # Clean up fingerprint module state
@@ -2197,7 +2203,7 @@ def test_graceful_degradation_when_statedb_unavailable(tmp_path, monkeypatch):
     )
 
     # Reset fingerprint module state
-    fingerprint._pending_ast_writes.clear()
+    _helper_queued()["ast"].clear()
     fingerprint._hash_function_ast_cache.clear()
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -2225,7 +2231,7 @@ def graceful_stage():
         assert len(hash_result) == 16  # xxhash64 hexdigest
 
         # Entries are still queued (flush will fail gracefully too)
-        assert len(fingerprint._pending_ast_writes) == 1
+        assert len(_helper_queued()["ast"]) == 1
 
         # Flush should not raise either
         fingerprint.flush_ast_hash_cache()  # Fails silently
@@ -2251,7 +2257,7 @@ def test_flush_ast_hash_cache_writes_to_statedb(tmp_path, monkeypatch):
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
 
     # Reset fingerprint module state
-    fingerprint._pending_ast_writes.clear()
+    _helper_queued()["ast"].clear()
     fingerprint._hash_function_ast_cache.clear()
 
     # Manually queue some entries (simulating what hash_function_ast does)
@@ -2262,7 +2268,7 @@ def test_flush_ast_hash_cache_writes_to_statedb(tmp_path, monkeypatch):
         ("src/b.py", "1123456789abcdef", "func_b", py_ver, schema_ver, "bbbb444455556666"),
         ("src/c.py", "2123456789abcdef", "MyClass.method", py_ver, schema_ver, "cccc777788889999"),
     ]
-    fingerprint._pending_ast_writes.extend(test_entries)
+    _helper_queued()["ast"].extend(test_entries)
 
     # Flush to StateDB
     fingerprint.flush_ast_hash_cache()
@@ -2276,7 +2282,7 @@ def test_flush_ast_hash_cache_writes_to_statedb(tmp_path, monkeypatch):
             )
 
     # Pending writes should be cleared
-    assert len(fingerprint._pending_ast_writes) == 0
+    assert len(_helper_queued()["ast"]) == 0
 
 
 # ==============================================================================
@@ -2421,7 +2427,7 @@ def test_cached_manifest_source_map_includes_module_attribute_source(
         "import f8_settings\n\n\ndef scale(x):\n    return x * f8_settings.FACTOR\n"
     )
     writes = list[tuple[bytes, bytes]]()
-    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
+    _helper_capture_manifest_writes(monkeypatch, writes)
     monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
     try:
         stage_module = importlib.import_module("f8_stage")
@@ -2528,7 +2534,7 @@ def test_recorded_reads_detect_each_changed_live_value(
     (tmp_path / "reads_settings.py").write_text(f"SOURCE = {source!r}\nATTR = 6\n")
     (tmp_path / "reads_stage.py").write_text(_READS_MODULE)
     writes = list[tuple[bytes, bytes]]()
-    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
+    _helper_capture_manifest_writes(monkeypatch, writes)
     monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
     try:
         settings = importlib.import_module("reads_settings")
@@ -2595,7 +2601,7 @@ def test_recorded_reads_replay_method_and_body_import_reads(
     (tmp_path / "replay_body.py").write_text(_REPLAY_BODY)
     (tmp_path / "replay_stage.py").write_text(_REPLAY_STAGE)
     writes = list[tuple[bytes, bytes]]()
-    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
+    _helper_capture_manifest_writes(monkeypatch, writes)
     monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
     names = ("replay_stage", "replay_lib", "replay_body")
     try:
@@ -2710,8 +2716,7 @@ def test_manifest_cache_hit(tmp_path, monkeypatch):
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
 
     # Reset fingerprint state
-    fingerprint._pending_ast_writes.clear()
-    fingerprint._pending_manifest_writes.clear()
+    fingerprint._pending_writes = None
     fingerprint._hash_function_ast_cache.clear()
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -2732,11 +2737,11 @@ def cached_stage():
         # First call — computes and queues
         manifest1 = fingerprint.get_stage_fingerprint_cached("cached_stage", module.cached_stage)
         assert "self:cached_stage" in manifest1
-        assert len(fingerprint._pending_manifest_writes) == 1
+        assert len(_helper_queued()["manifest"]) == 1
 
         # Flush
         fingerprint.flush_manifest_cache()
-        assert len(fingerprint._pending_manifest_writes) == 0
+        assert len(_helper_queued()["manifest"]) == 0
 
         # Clear in-memory caches to force persistent lookup
         fingerprint._hash_function_ast_cache.clear()
@@ -2749,7 +2754,7 @@ def cached_stage():
         manifest2 = fingerprint.get_stage_fingerprint_cached("cached_stage", module.cached_stage)
         assert manifest2 == manifest1
         # No new pending writes (cache hit)
-        assert len(fingerprint._pending_manifest_writes) == 0
+        assert len(_helper_queued()["manifest"]) == 0
     finally:
         sys.modules.pop("cached_stage", None)
         if fingerprint._state_db is not None:
@@ -2771,8 +2776,7 @@ def test_manifest_cache_miss_on_source_change(tmp_path, monkeypatch):
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
 
-    fingerprint._pending_ast_writes.clear()
-    fingerprint._pending_manifest_writes.clear()
+    fingerprint._pending_writes = None
     fingerprint._hash_function_ast_cache.clear()
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -2821,7 +2825,7 @@ def changing_stage():
             "changing_stage", module2.changing_stage
         )
         assert manifest2 != manifest1  # Different code = different manifest
-        assert len(fingerprint._pending_manifest_writes) == 1  # Queued for flush
+        assert len(_helper_queued()["manifest"]) == 1  # Queued for flush
     finally:
         sys.modules.pop("changing_stage", None)
         if fingerprint._state_db is not None:
@@ -2843,8 +2847,7 @@ def test_manifest_cache_miss_on_file_deleted(tmp_path, monkeypatch):
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
 
-    fingerprint._pending_ast_writes.clear()
-    fingerprint._pending_manifest_writes.clear()
+    fingerprint._pending_writes = None
     fingerprint._hash_function_ast_cache.clear()
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -2891,7 +2894,7 @@ def main_stage():
 
         # Recompute — should miss because helper_mod.py stat fails
         fingerprint.get_stage_fingerprint_cached("main_stage", mod_m.main_stage)
-        assert len(fingerprint._pending_manifest_writes) == 1  # Cache miss -> re-queued
+        assert len(_helper_queued()["manifest"]) == 1  # Cache miss -> re-queued
     finally:
         sys.modules.pop("helper_mod", None)
         sys.modules.pop("main_mod", None)
@@ -2914,8 +2917,7 @@ def test_manifest_cache_non_file_backed_function(tmp_path, monkeypatch):
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
 
-    fingerprint._pending_ast_writes.clear()
-    fingerprint._pending_manifest_writes.clear()
+    fingerprint._pending_writes = None
     fingerprint._hash_function_ast_cache.clear()
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -2991,7 +2993,7 @@ def test_make_manifest_cache_key_different_functions_differ(tmp_path, monkeypatc
 
 def test_flush_manifest_cache_empty():
     """Flushing empty pending manifest writes should not error."""
-    fingerprint._pending_manifest_writes.clear()
+    _helper_queued()["manifest"].clear()
     # Should not raise
     fingerprint.flush_manifest_cache()
 
@@ -3007,19 +3009,19 @@ def test_flush_manifest_cache_failure_restores_pending(tmp_path, monkeypatch):
     )
 
     # Queue some entries
-    fingerprint._pending_manifest_writes.clear()
+    _helper_queued()["manifest"].clear()
     test_entries = [(b"sm:test_stage\x003.13\x001", b'{"m":{},"s":{}}')]
-    fingerprint._pending_manifest_writes.extend(test_entries)
+    _helper_queued()["manifest"].extend(test_entries)
 
     # Flush should fail (blocker is a file, so mkdir(parents=True) raises NotADirectoryError)
     fingerprint.flush_manifest_cache()
 
     # Entries should be restored for retry
-    assert len(fingerprint._pending_manifest_writes) == 1
-    assert fingerprint._pending_manifest_writes[0] == test_entries[0]
+    assert len(_helper_queued()["manifest"]) == 1
+    assert _helper_queued()["manifest"][0] == test_entries[0]
 
     # Clean up
-    fingerprint._pending_manifest_writes.clear()
+    _helper_queued()["manifest"].clear()
 
 
 def test_try_manifest_cache_hit_corrupted_json(tmp_path, monkeypatch):
@@ -3120,8 +3122,7 @@ def test_get_stage_fingerprint_cached_without_statedb(tmp_path, monkeypatch):
     """get_stage_fingerprint_cached works correctly even without a StateDB."""
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
 
-    fingerprint._pending_ast_writes.clear()
-    fingerprint._pending_manifest_writes.clear()
+    fingerprint._pending_writes = None
     fingerprint._hash_function_ast_cache.clear()
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = True  # Simulate prior failure
@@ -3143,10 +3144,10 @@ def no_db_stage():
 
         assert "self:no_db_stage" in manifest
         # Should still queue for flush (even though flush may fail later)
-        assert len(fingerprint._pending_manifest_writes) == 1
+        assert len(_helper_queued()["manifest"]) == 1
     finally:
         sys.modules.pop("no_db_stage", None)
-        fingerprint._pending_manifest_writes.clear()
+        _helper_queued()["manifest"].clear()
         fingerprint._state_db = None
         fingerprint._state_db_init_attempted = False
 
@@ -3344,7 +3345,7 @@ def test_manifest_cache_flush_persists_to_statedb(tmp_path, monkeypatch):
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
 
     # Reset fingerprint module state
-    fingerprint._pending_manifest_writes.clear()
+    _helper_queued()["manifest"].clear()
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
 
@@ -3368,13 +3369,11 @@ def test_stage():
         manifest = fingerprint.get_stage_fingerprint_cached("test_stage", func)
         assert isinstance(manifest, dict)
         assert "self:test_stage" in manifest
-        assert len(fingerprint._pending_manifest_writes) > 0, "Should queue manifest writes"
+        assert len(_helper_queued()["manifest"]) > 0, "Should queue manifest writes"
 
         # Step 2: Flush to StateDB
         fingerprint.flush_manifest_cache()
-        assert len(fingerprint._pending_manifest_writes) == 0, (
-            "Pending writes should be empty after flush"
-        )
+        assert len(_helper_queued()["manifest"]) == 0, "Pending writes should be empty after flush"
 
         # Step 3: Verify manifest is in StateDB
         with state.StateDB(db_path, readonly=True) as db:
@@ -3469,7 +3468,7 @@ def test_invalidate_manifests_for_paths_recomputes_affected_stage(tmp_path, monk
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: db_path)
 
-    fingerprint._pending_manifest_writes.clear()
+    _helper_queued()["manifest"].clear()
     fingerprint._hash_function_ast_cache.clear()
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False
@@ -3547,8 +3546,7 @@ def same_stat_project(
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: state_dir)
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
-    fingerprint._pending_manifest_writes.clear()
-    fingerprint._pending_ast_writes.clear()
+    fingerprint._pending_writes = None
     fingerprint._hash_function_ast_cache.clear()
     fingerprint._state_db = None
     fingerprint._state_db_init_attempted = False

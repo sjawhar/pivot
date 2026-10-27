@@ -192,11 +192,25 @@ _schema_hash_cache: weakref.WeakKeyDictionary[type, str] = weakref.WeakKeyDictio
 # readonly StateDB and fingerprinting should complete during discovery.
 _state_db: "StateDB | None" = None
 _state_db_init_attempted: bool = False
-_pending_ast_writes: list[AstHashEntry] = []
 
-# Pending manifest cache writes, flushed at process exit.
-# Format: list of (key_bytes, value_bytes) tuples.
-_pending_manifest_writes: list[tuple[bytes, bytes]] = []
+
+class _PendingCacheWrites(TypedDict):
+    """Function hashes and stage manifests waiting to be written to one project's StateDB.
+
+    Every entry names source files relative to `root`, the project root it was computed under,
+    so only that project's StateDB may hold it.
+    """
+
+    root: pathlib.Path
+    ast: list[AstHashEntry]
+    manifest: list[tuple[bytes, bytes]]  # (key, value)
+
+
+# Cache writes queued since the last flush (end of discovery, a watch-mode reload, process exit).
+# A process can be pointed at several projects in turn (`project._project_root_cache`, which tests
+# and a reused pivot worker rebind), so the writes keep the project they were queued for
+# (`_current_pending_writes`).
+_pending_writes: _PendingCacheWrites | None = None
 
 
 # Source files visited during a single stage's fingerprinting.
@@ -864,49 +878,98 @@ def _walk_to(path: tuple[str, ...], owners: dict[tuple[str, ...], Any]) -> Any:
     return owners[path]
 
 
+def _current_pending_writes() -> _PendingCacheWrites:
+    """Return the cache writes queued for the current project.
+
+    Writes queued while another project was current are dropped: their keys and source maps
+    name that project's files, so they must never reach this project's StateDB. One comparison
+    per call, against the root the queue was opened for.
+
+    Raises:
+        ProjectNotInitializedError: If no project is current.
+    """
+    global _pending_writes
+    from pivot import project
+
+    root = project.get_project_root()
+    pending = _pending_writes
+    if pending is not None and (pending["root"] is root or pending["root"] == root):
+        return pending
+    if pending is not None and (pending["ast"] or pending["manifest"]):
+        _logger.debug(
+            "Dropping %d AST hash and %d manifest cache writes queued for project %s, not %s",
+            len(pending["ast"]),
+            len(pending["manifest"]),
+            pending["root"],
+            root,
+        )
+    pending = _pending_writes = _PendingCacheWrites(
+        root=root, ast=list[AstHashEntry](), manifest=list[tuple[bytes, bytes]]()
+    )
+    return pending
+
+
+def _queued_for_current_project() -> _PendingCacheWrites | None:
+    """Return the cache writes queued for the current project; None when nothing is queued or
+    no project is current (at exit, after a test cleared the cached project root)."""
+    pending = _pending_writes
+    if pending is None or not (pending["ast"] or pending["manifest"]):
+        return None
+    try:
+        return _current_pending_writes()
+    except (exceptions.ProjectNotInitializedError, OSError):
+        return None
+
+
 def flush_ast_hash_cache() -> None:
-    """Flush pending AST hash writes to StateDB (call from coordinator)."""
-    global _pending_ast_writes
-    if not _pending_ast_writes:
+    """Flush the current project's pending AST hash writes to its StateDB (call from coordinator).
+
+    Hashes queued while another project was current are dropped (`_current_pending_writes`).
+    """
+    pending = _queued_for_current_project()
+    if pending is None or not pending["ast"]:
         return
 
-    pending = _pending_ast_writes
-    _pending_ast_writes = []
+    entries = pending["ast"]
+    pending["ast"] = list[AstHashEntry]()
 
     try:
         from pivot.config import io
         from pivot.storage import state
 
         with state.StateDB(io.get_state_dir(), readonly=False) as db:
-            db.save_ast_hash_many(pending)
+            db.save_ast_hash_many(entries)
         metrics.count("fingerprint.ast_hash_cache.flush")
     except Exception:
         # OSError (filesystem), ImportError (module), lmdb.Error, etc.
         # Restore pending writes on failure so they can be retried on next flush.
         # This prevents permanent loss of cache entries on transient failures.
-        _pending_ast_writes.extend(pending)
-        _logger.debug("Failed to flush AST hash cache (%d entries)", len(pending), exc_info=True)
+        pending["ast"].extend(entries)
+        _logger.debug("Failed to flush AST hash cache (%d entries)", len(entries), exc_info=True)
 
 
 def flush_manifest_cache() -> None:
-    """Flush pending manifest writes to StateDB."""
-    global _pending_manifest_writes
-    if not _pending_manifest_writes:
+    """Flush the current project's pending manifest writes to its StateDB.
+
+    Manifests queued while another project was current are dropped (`_current_pending_writes`).
+    """
+    pending = _queued_for_current_project()
+    if pending is None or not pending["manifest"]:
         return
 
-    pending = _pending_manifest_writes
-    _pending_manifest_writes = []
+    entries = pending["manifest"]
+    pending["manifest"] = list[tuple[bytes, bytes]]()
 
     try:
         from pivot.config import io
         from pivot.storage import state
 
         with state.StateDB(io.get_state_dir(), readonly=False) as db:
-            db.put_raw_many(pending)
+            db.put_raw_many(entries)
         metrics.count("fingerprint.manifest_cache.flush")
     except Exception:
-        _pending_manifest_writes.extend(pending)
-        _logger.debug("Failed to flush manifest cache (%d entries)", len(pending), exc_info=True)
+        pending["manifest"].extend(entries)
+        _logger.debug("Failed to flush manifest cache (%d entries)", len(entries), exc_info=True)
 
 
 def _normalize_changed_paths(
@@ -951,8 +1014,6 @@ def invalidate_manifests_for_paths(
     paths: Sequence[str | os.PathLike[str] | pathlib.Path],
 ) -> None:
     """Invalidate cached manifests that reference changed source files."""
-    global _pending_manifest_writes
-
     if not paths:
         return
     changed_paths = _normalize_changed_paths(paths)
@@ -971,15 +1032,16 @@ def invalidate_manifests_for_paths(
     except Exception:
         _logger.debug("Failed to scan manifest cache for invalidation", exc_info=True)
 
-    if _pending_manifest_writes:
+    pending = _queued_for_current_project()
+    if pending is not None and pending["manifest"]:
         pending_keys = set[bytes]()
-        for key, raw in _pending_manifest_writes:
+        for key, raw in pending["manifest"]:
             if _manifest_references_paths(raw, changed_paths):
                 pending_keys.add(key)
         if pending_keys:
             keys_to_delete.update(pending_keys)
-            _pending_manifest_writes = [
-                (key, value) for key, value in _pending_manifest_writes if key not in pending_keys
+            pending["manifest"] = [
+                (key, value) for key, value in pending["manifest"] if key not in pending_keys
             ]
 
     if not keys_to_delete:
@@ -1109,7 +1171,7 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
                 },
                 separators=(",", ":"),
             ).encode()
-            _pending_manifest_writes.append((key, value))
+            _current_pending_writes()["manifest"].append((key, value))
 
         return manifest
     finally:
@@ -2944,7 +3006,7 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
         # 5. Queue persistent write (if source info available and not skipping)
         if source_info is not None and qualname is not None:
             rel_path, digest = source_info
-            _pending_ast_writes.append(
+            _current_pending_writes()["ast"].append(
                 (rel_path, digest, qualname, _PYTHON_VERSION, _CACHE_SCHEMA_VERSION, result)
             )
             metrics.count("fingerprint.hash_function_ast.persistent_cache_miss")
