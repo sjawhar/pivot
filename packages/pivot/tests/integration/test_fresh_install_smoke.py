@@ -287,9 +287,12 @@ def test_fresh_wheel_watch_reload_replaces_workers_within_the_cap(
     outputs = [project / "data" / "watch" / f"wide@{index}.yaml" for index in range(_WATCH_CAP)]
 
     def generation_done(generation: int) -> bool:
-        return all(
-            out.exists() and f"generation: {generation}" in out.read_text() for out in outputs
-        )
+        # The session's rerun removes each output before it writes the new one, so an output can
+        # vanish at any moment. Read each once; a missing output is not yet written.
+        try:
+            return all(f"generation: {generation}" in out.read_text() for out in outputs)
+        except FileNotFoundError:
+            return False
 
     log = tmp_path / "watch.log"
     with log.open("w") as output:
