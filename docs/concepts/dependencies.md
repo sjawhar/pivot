@@ -163,6 +163,21 @@ example) and writes a `.pvt` sidecar to commit in their place:
 pivot track data/raw/values.csv
 ```
 
+The sidecar sits beside its data, and its `path:` is the data's name
+(`values.csv` in `data/raw/values.csv.pvt`). `pivot checkout`, `pivot pull` and
+`pivot repro --checkout-missing` restore the file that `path:` names, under the
+directory holding the `.pvt`.
+
+**A `.pvt` restores its file only inside the project.** A sidecar whose `path:`
+names no file (`.`, `./` or empty), holds `..`, is absolute, or names a file
+whose directory really lies outside the project through a symlink, is skipped
+with a warning that names it; the command keeps going and exits 0. Move such a
+sidecar beside its data inside the project and set `path:` to the data's name.
+
+`pivot track` refuses a path whose directory really lies outside the project, as
+from a `data -> /mnt/external` symlink: the `.pvt` would be written beside the
+data, outside the project, where no Pivot command reads it again.
+
 ---
 
 **See also:** [Artifacts & the DAG](artifacts-and-dag.md) | [Outputs](outputs.md) | [Loaders](loaders.md)

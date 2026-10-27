@@ -461,6 +461,31 @@ def test_repro_allows_data_symlinked_outside_the_project(tmp_path: pathlib.Path)
     assert (external_data / "symlinked-data" / "copy.txt").read_text() == "VALUE"
 
 
+def test_checkout_restores_a_stage_output_in_data_symlinked_outside_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A stage output is placed by the pipeline, not by a .pvt, so the outward link is kept."""
+    root = tmp_path / "project"
+    root.mkdir()
+    external_data = tmp_path / "big-data"
+    external_data.mkdir()
+    (root / "data").symlink_to(external_data, target_is_directory=True)
+    _project(
+        root,
+        {
+            "pipeline.py": _SYMLINKED_DATA_PIPELINE,
+            "data/raw/value.txt": "VALUE",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    output = external_data / "symlinked-data" / "copy.txt"
+    output.unlink()
+
+    _ok(_pivot(root, "checkout"))
+
+    assert output.read_text() == "VALUE"
+
+
 def test_runtime_files_pivot_creates_are_git_ignored(tmp_path: pathlib.Path) -> None:
     """Config lock, artifact locks and the agent socket must not show up as untracked files."""
     root = _project(tmp_path, {"pipeline.py": _CLONE_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})

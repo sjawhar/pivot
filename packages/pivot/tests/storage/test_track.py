@@ -333,3 +333,95 @@ def test_write_pvt_file_rejects_path_traversal(tmp_path: pathlib.Path) -> None:
 
     with pytest.raises(SecurityValidationError, match=r"path traversal|\.\."):
         track.write_pvt_file(pvt_path, data)
+
+
+# restore_target: a .pvt restores its file only inside the project
+
+
+def test_restore_target_takes_the_name_pivot_track_writes(tmp_path: pathlib.Path) -> None:
+    """The sidecar's own name is the file beside it, with nothing to say about it."""
+    (tmp_path / "sub").mkdir()
+
+    target = track.restore_target(tmp_path / "sub" / "data.csv.pvt", "data.csv", tmp_path)
+
+    assert target == track.RestoreTarget(tmp_path / "sub" / "data.csv", None)
+
+
+@pytest.mark.parametrize("value", ["", ".", "./"])
+def test_restore_target_skips_a_pvt_whose_path_names_no_file(
+    tmp_path: pathlib.Path, value: str
+) -> None:
+    """Such a value names the directory holding the .pvt, which a restore would replace."""
+    (tmp_path / "sub").mkdir()
+
+    target = track.restore_target(tmp_path / "sub" / "dot.pvt", value, tmp_path)
+
+    assert target.path is None
+    assert target.warning == (
+        f"Skipping sub/dot.pvt: its path {value!r} names no file; set path: to the name of the "
+        "file or directory beside the .pvt."
+    )
+
+
+def test_restore_target_skips_a_pvt_whose_file_lies_outside_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The file's directory is resolved: a symlink out of the project takes the file with it."""
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "link").symlink_to(outside, target_is_directory=True)
+
+    target = track.restore_target(root / "x.pvt", "link/x.csv", root)
+
+    assert target.path is None
+    assert target.warning == (
+        f"Skipping x.pvt: its path 'link/x.csv' resolves to '{outside / 'x.csv'}', outside the "
+        f"project root '{root}'. A .pvt restores its file only inside the project; move it "
+        "beside its data and set path: to the data's name."
+    )
+
+
+def test_restore_target_skips_a_pvt_whose_path_cannot_be_resolved(tmp_path: pathlib.Path) -> None:
+    """Where a path leads is unknown when it cannot be resolved, so it is not restored."""
+    target = track.restore_target(tmp_path / "x.pvt", "sub\0/x.csv", tmp_path)
+
+    assert target.path is None
+    assert "outside the project root" in (target.warning or "")
+
+
+def test_restore_target_takes_a_file_under_a_symlink_inside_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An in-project symlink keeps working, and the reader is told the names disagree."""
+    (tmp_path / "data_real").mkdir()
+    (tmp_path / "dlink").symlink_to("data_real", target_is_directory=True)
+
+    target = track.restore_target(tmp_path / "y.pvt", "dlink/y.csv", tmp_path)
+
+    assert target.path == tmp_path / "dlink" / "y.csv"
+    assert target.warning == (
+        "y.pvt: its path 'dlink/y.csv' is not the .pvt's own name 'y'. 'pivot checkout' with no "
+        "target, 'pivot pull' and 'pivot repro --checkout-missing' restore 'dlink/y.csv'; "
+        "'pivot checkout y.pvt', 'pivot get', 'pivot update' and 'pivot push' use the file named "
+        "'y' beside the .pvt. Set path: to that name, the form 'pivot track' writes."
+    )
+
+
+def test_discover_pvt_files_leaves_out_a_pvt_that_leads_out_of_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Every command reads the discovery, so one skip keeps all of them inside the project."""
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "link").symlink_to(outside, target_is_directory=True)
+    (root / "x.pvt").write_text("path: link/x.csv\nhash: hash1\nsize: 5\n")
+    (root / "dot.pvt").write_text("path: .\nhash: hash2\nsize: 5\n")
+    track.write_pvt_file(root / "kept.csv.pvt", track.PvtData(path="kept.csv", hash="h", size=1))
+
+    result = track.discover_pvt_files(root)
+
+    assert list(result) == [str(root / "kept.csv")]

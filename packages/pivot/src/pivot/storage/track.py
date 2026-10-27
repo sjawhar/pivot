@@ -3,11 +3,11 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, NotRequired, TypedDict, TypeGuard, cast
+from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, TypeGuard, cast
 
 import yaml
 
-from pivot import exceptions
+from pivot import exceptions, project
 from pivot.storage import cache
 
 logger = logging.getLogger(__name__)
@@ -142,10 +142,70 @@ def get_data_path(pvt_path: pathlib.Path) -> pathlib.Path:
     return pvt_path.with_suffix("")
 
 
-def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
-    """Find all .pvt files under root, return {data_path: PvtData}."""
-    from pivot import project
+class RestoreTarget(NamedTuple):
+    """The file a discovered .pvt restores, and the one line to tell its reader about it."""
 
+    path: pathlib.Path | None  # None when the .pvt is skipped and drives no write
+    warning: str | None
+
+
+def restore_target(
+    pvt_path: pathlib.Path, data_path_value: str, root: pathlib.Path
+) -> RestoreTarget:
+    """What the ``path:`` value of the .pvt at ``pvt_path`` names, under ``root``.
+
+    A .pvt restores its file only inside the project, so one function answers that for every
+    command that reads a sidecar:
+
+    - the value is the .pvt's own name without ``.pvt``, the only form ``pivot track`` and
+      ``pivot import`` write: the file beside the .pvt, with no filesystem call;
+    - the value names no file (``''``, ``.``, ``./``): skipped, because the path it gives is the
+      directory holding the .pvt, which a restore would replace with the file;
+    - the file's directory really lies outside the project, through a symlink or because it
+      cannot be resolved: skipped, because a .pvt restores its file only inside the project;
+    - any other value: the file it names, with a warning that it is not the .pvt's own name, as
+      the commands that take a target use the name instead.
+
+    An absolute or ``..`` value never reaches here: ``read_pvt_file`` refuses that .pvt.
+    """
+    display = os.path.relpath(pvt_path, root)
+    if not pathlib.PurePosixPath(data_path_value).parts:
+        return RestoreTarget(
+            None,
+            f"Skipping {display}: its path {data_path_value!r} names no file; set path: to the "
+            + "name of the file or directory beside the .pvt.",
+        )
+    own_name = pvt_path.name.removesuffix(".pvt")
+    if data_path_value == own_name:
+        return RestoreTarget(pvt_path.parent / own_name, None)
+
+    data_path = pathlib.Path(os.path.normpath(pvt_path.parent / data_path_value))
+    resolved_root = root.resolve()
+    outside = project.real_location_outside(data_path.parent, resolved_root)
+    if outside is not None:
+        return RestoreTarget(
+            None,
+            f"Skipping {display}: its path {data_path_value!r} resolves to "
+            + f"'{outside / data_path.name}', outside the project root '{resolved_root}'. "
+            + "A .pvt restores its file only inside the project; move it beside its data and "
+            + "set path: to the data's name.",
+        )
+    mismatch = (
+        f"{display}: its path {data_path_value!r} is not the .pvt's own name {own_name!r}. "
+        + "'pivot checkout' with no target, 'pivot pull' and 'pivot repro --checkout-missing' "
+        + f"restore {data_path_value!r}; 'pivot checkout {display}', 'pivot get', "
+        + f"'pivot update' and 'pivot push' use the file named {own_name!r} beside the .pvt. "
+        + "Set path: to that name, the form 'pivot track' writes."
+    )
+    return RestoreTarget(data_path, mismatch)
+
+
+def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
+    """Find all .pvt files under root, return {data_path: PvtData}.
+
+    A .pvt whose ``path:`` names no file, or a file outside the project, is left out with a
+    warning, so no command it feeds writes there (see ``restore_target``).
+    """
     result = dict[str, PvtData]()
 
     for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
@@ -160,7 +220,11 @@ def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
                 logger.warning(f"Skipping invalid .pvt file: {pvt_path}")
                 continue
 
-            data_path = pvt_path.parent / data["path"]
+            data_path, warning = restore_target(pvt_path, data["path"], root)
+            if warning is not None:
+                logger.warning(warning)
+            if data_path is None:
+                continue
             normalized = project.normalize_path(data_path)
             result[str(normalized)] = data
 
