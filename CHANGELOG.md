@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v0.5.11 (2026-10-27)
+
+### Bug Fixes
+
+- **storage**: Keep a backslash in a file or directory name instead of reading it as a separator
+  ([#520](https://github.com/sjawhar/pivot/pull/520),
+  [`0ab4b1f`](https://github.com/sjawhar/pivot/commit/0ab4b1f8d2ddd566d4a7e098a9452afd29e2d9cc))
+
+### Testing
+
+- Wait on what the serve and worker-termination tests check, not on timing
+  ([#527](https://github.com/sjawhar/pivot/pull/527),
+  [`efbd180`](https://github.com/sjawhar/pivot/commit/efbd180345a01048b62756d369be2f9e0b1bc832))
+
+
 ## v0.5.10 (2026-10-26)
 
 ### Bug Fixes
