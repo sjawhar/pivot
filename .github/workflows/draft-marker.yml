@@ -1,0 +1,80 @@
+# A push to a draft pull request runs no job of Tests (pr-and-main.yaml) or Benchmark
+# (benchmark.yaml), and a skipped job's check reads as passed (docs.github.com, "Using
+# conditions to control job execution"), so a head where nothing ran must carry something that
+# does not. This workflow is that marker, and it is alone here for two reasons.
+#
+# It is a commit status, not a failing job: GitHub keeps every check run of a head, one per
+# workflow run, and a newer one does not replace an older failure (measured in
+# theorem-labs/grading-tools on commit b10c94657c, where a later successful check of the same name
+# left the rollup failing), so a failing job here would leave the head red for good, even after it
+# is tested. A status overwrites by context, so the lint job of Tests sets this same context to
+# success on every pull-request run whose jobs run.
+#
+# It is its own workflow, with no concurrency group, so no concurrency setting of Tests or
+# Benchmark, now or later, can cancel it: a cancelled marker job would leave a cancelled check run
+# on the head for good.
+name: Draft marker
+
+on:
+  pull_request:
+    # No ready_for_review: its payload is never a draft, so this job would only skip.
+    types: [opened, synchronize, reopened]
+
+jobs:
+  draft:
+    name: Draft marker
+    if: github.event.pull_request.draft == true && vars.CI_RUN_DRAFT_PRS != 'true'
+    runs-on: ubuntu-24.04
+    # Two `gh api` calls and nothing else; without a limit a job that stops making progress holds
+    # its runner for GitHub's 360-minute default.
+    timeout-minutes: 10
+    permissions:
+      # Reads this commit's combined status and writes ci/untested-draft on it.
+      statuses: write
+    steps:
+      # A fork's pull request gets a read-only token whatever `permissions:` says, so the write
+      # would fail this job; a fork's draft head carries no marker rather than a red job.
+      - name: Mark this head untested
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |-
+          set -euo pipefail
+          # Skip the write only on evidence about THIS commit: a run of the suites on $SHA already
+          # set ci/untested-draft to success. The pull request's draft state is not that evidence:
+          # GitHub can process a push and a ready-for-review out of order, so the ready run tests
+          # the previous commit while this one gets only the skipped draft run (measured in
+          # theorem-labs/binary-equivalence-taiga at 20:01Z on 2026-10-25). Only a read that
+          # succeeds and says `success` skips; a failed read marks the head. If Tests' lint job
+          # writes success after this read but before the write below, the head reads untested
+          # although it was tested: a false red that a re-run of that lint job clears, never a
+          # false green.
+          if cur=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/status" \
+                --jq '[.statuses[] | select(.context == "ci/untested-draft") | .state] | first // ""') &&
+             [ "$cur" = success ]; then
+            echo "::notice::a run of the suites on this commit already cleared ci/untested-draft; leaving it"
+            exit 0
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -f state=failure -f context=ci/untested-draft -f target_url="$RUN_URL" \
+            -f description='Draft pull request: CI ran no suite on this head' >/dev/null
+          echo "::warning title=No CI ran on this head::This head was pushed to a draft pull request, so CI ran no suite on it. Mark the pull request ready for review to run every job on this head. If the pull request is ALREADY ready and this head still reads failure, GitHub processed the push and the ready out of order and the suites ran on the previous commit: push again, or run 'gh pr ready --undo <n> && gh pr ready <n>'."
+          {
+            echo "### CI ran no suite on this head"
+            echo
+            echo "The commit status \`ci/untested-draft\` is **failure** until a run of the suites on THIS commit"
+            echo "sets it to success. Marking the pull request ready for review starts that run."
+            echo
+            echo "If the pull request is already ready and this head still reads failure, GitHub processed the push"
+            echo "and the ready-for-review out of order, so the suites ran on the previous commit. A re-run of the"
+            echo "ready run writes on that older commit and a re-run of the draft run skips every job, so only a"
+            echo "new event clears it:"
+            echo
+            echo '```'
+            echo "git commit --allow-empty -m 'run CI on this head' && git push"
+            echo "# or, with no new commit:"
+            echo "gh pr ready --undo <number> && gh pr ready <number>"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -5,13 +5,40 @@ on:
     branches:
       - main
   pull_request:
+    # ready_for_review: a draft runs no job of this workflow (every job below carries the draft
+    # condition), so marking the pull request ready is what runs them all on its head.
+    # draft-marker.yml marks the head a draft leaves untested. Set the repository variable
+    # CI_RUN_DRAFT_PRS to `true` to run drafts again (the same switch in benchmark.yaml).
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# A push to a pull request starts a run of this workflow and of Benchmark, 12 jobs together, and
+# without a concurrency group the run of the commit it replaced keeps its runners to the end. So
+# the runs of one pull request cancel each other. A push to main never cancels and is never
+# cancelled: each main commit is tested on its own, and Release publishes from that commit's run.
+# One group for main would not do that even without cancel-in-progress, because GitHub keeps one
+# pending run per group and cancels the older one when another queues behind the running one
+# (docs.github.com, "Control the concurrency of workflows and jobs"). So main's runs take a group
+# of their own, the run id, which nothing else ever joins.
+concurrency:
+  # A run that will skip every job takes a group of its own too, so it can never cancel a run that
+  # will test the head. Measured in theorem-labs/binary-equivalence-taiga at 19:24:11Z on
+  # 2026-10-25: a push to a draft and a `gh pr ready` 2.3 seconds later made two runs in the same
+  # second, and the draft run, which ran nothing, cancelled the ready run and left the head
+  # untested.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && (github.event.pull_request.draft != true || vars.CI_RUN_DRAFT_PRS == 'true') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   UV_VERSION: 0.9.18
 
 jobs:
   lint:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || vars.CI_RUN_DRAFT_PRS == 'true'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # The last step writes the commit status ci/untested-draft.
+      statuses: write
 
     steps:
       - uses: actions/checkout@v5
@@ -31,14 +58,32 @@ jobs:
       - name: Install dependencies
         run: |-
           uv sync --all-extras --all-groups --locked
-          echo "$(pwd)/.venv/bin" >> $GITHUB_PATH
+          echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Run lint
         run: |-
           ruff check . --output-format=github
           ruff format --check .
 
+      # Every pull-request run whose jobs run takes this job, so it clears the draft marker:
+      # draft-marker.yml sets the commit status ci/untested-draft to failure on a draft head, and a
+      # status overwrites by context, unlike a check run. `!cancelled()` so a lint failure does not
+      # leave a tested head marked untested; a run cancelled before this step writes nothing. A
+      # fork's pull request gets a read-only token whatever `permissions:` says, so the
+      # same-repository test keeps the write from failing there.
+      - name: Clear the draft marker on a head whose jobs run
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |-
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -f state=success -f context=ci/untested-draft -f target_url="$RUN_URL" \
+            -f description='CI runs every job on this head' >/dev/null
+
   typecheck:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || vars.CI_RUN_DRAFT_PRS == 'true'
     runs-on: ubuntu-24.04
 
     steps:
@@ -59,12 +104,13 @@ jobs:
       - name: Install dependencies
         run: |-
           uv sync --all-extras --all-groups --locked
-          echo "$(pwd)/.venv/bin" >> $GITHUB_PATH
+          echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Run typecheck
         run: basedpyright .
 
   test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft != true || vars.CI_RUN_DRAFT_PRS == 'true'
     runs-on: ubuntu-24.04
     name: test (${{ matrix.package.name }})
     strategy:
@@ -96,7 +142,7 @@ jobs:
       - name: Install dependencies
         run: |-
           uv sync --all-extras --all-groups --locked
-          echo "$(pwd)/.venv/bin" >> $GITHUB_PATH
+          echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Run tests for ${{ matrix.package.name }} without uv on PATH
         # The suite must pass where uv is not on PATH. Only the wheel smoke test uses uv, by the
@@ -120,8 +166,10 @@ jobs:
           PIVOT_TEST_UV="$uv" pytest ${{ matrix.package.path }} -n auto ${{ matrix.package.extra_args }}
 
   known-regressions:
-    # Runs on pushes to main only, so a PR that records or fixes a regression can still merge.
-    if: github.event_name == 'push'
+    # Runs on pushes to main only, so a PR that records or fixes a regression can still merge. The
+    # draft condition every job carries changes nothing here today; it keeps a draft from running
+    # this job if the push condition is ever relaxed.
+    if: github.event_name == 'push' && (github.event_name != 'pull_request' || github.event.pull_request.draft != true || vars.CI_RUN_DRAFT_PRS == 'true')
     runs-on: ubuntu-24.04
 
     steps:
