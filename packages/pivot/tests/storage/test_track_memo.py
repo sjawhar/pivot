@@ -2051,3 +2051,40 @@ def test_memo_file_content_round_trips_and_rejects_a_partial_memo() -> None:
     assert track._unpack_memo(content) == memo
     for partial in (b"", content[:5], content[:-1], content + b"\0"):
         assert track._unpack_memo(partial) is None, partial
+
+
+def test_memo_vouched_directory_still_skips_a_pvt_whose_path_leaves_the_project(
+    memo_project: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The memo holds names only, so every .pvt it vouches for is still read: on the warm walk,
+    which lists no directory, a .pvt whose ``path:`` resolves outside the project through a
+    symlink is still skipped with ``restore_target``'s warning, and everything else is found
+    as main finds it."""
+    _helper_build_tree(memo_project)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (memo_project / "c" / "link").symlink_to(outside)
+    track.write_pvt_file(
+        memo_project / "c" / "escape.csv.pvt",
+        track.PvtData(path="link/escape.csv", hash="0" * 16, size=1),
+    )
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+    caplog.set_level(logging.WARNING, logger=track.logger.name)
+    caplog.clear()
+
+    found, listings = _helper_listings(mocker, lambda: track.discover_pvt_files(memo_project))
+
+    assert listings == 0, "the memo vouches for every directory: each is stat'ed, not listed"
+    expected = {
+        key: data
+        for key, data in _helper_main_walk(memo_project).items()
+        if data["path"] != "link/escape.csv"
+    }
+    assert found == expected, "the escaping .pvt is skipped, everything else is found"
+    assert list(found) == list(expected), "in main's order"
+    assert "outside the project root" in caplog.text, "with restore_target's warning"
