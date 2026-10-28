@@ -2,6 +2,28 @@
 
 <!-- version list -->
 
+## v0.5.14 (2026-10-27)
+
+### Performance Improvements
+
+- **storage**: Stat unchanged directories instead of listing them when finding .pvt files
+  ([#513](https://github.com/sjawhar/pivot/pull/513),
+  [`7fbdfa3`](https://github.com/sjawhar/pivot/commit/7fbdfa31cbdcb01832a935f5a57335239db5ed57))
+
+
+## v0.5.13 (2026-10-27)
+
+### Bug Fixes
+
+- **executor**: Send a stopped worker's SIGTERM to its main thread, where its stage runs
+  ([#528](https://github.com/sjawhar/pivot/pull/528),
+  [`e463210`](https://github.com/sjawhar/pivot/commit/e46321080a2a95a8dd803bb1753c0efd79e850b4))
+
+- **track**: Restore a .pvt's file only inside the project
+  ([#533](https://github.com/sjawhar/pivot/pull/533),
+  [`361a6e8`](https://github.com/sjawhar/pivot/commit/361a6e876be9771de8ca642826e8756a1b885827))
+
+
 ## v0.5.12 (2026-10-27)
 
 ### Bug Fixes
