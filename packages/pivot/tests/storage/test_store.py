@@ -1,6 +1,7 @@
 # pyright: reportMissingImports=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportAttributeAccessIssue=false, reportMissingTypeArgument=false, reportAny=false, reportExplicitAny=false, reportUnknownParameterType=false, reportUnknownArgumentType=false, reportUntypedFunctionDecorator=false, reportUnusedParameter=false, reportUnusedCallResult=false
 from __future__ import annotations
 
+import errno
 import os
 import pathlib
 import pickle
@@ -236,6 +237,89 @@ def test_workspace_store_names_a_late_tracked_file_before_the_stage_writer_runs(
     message = str(error.value)
     assert "user.txt.pvt" in message
     assert "data/stage" in message
+
+
+def _land_during_output_removal(
+    monkeypatch: pytest.MonkeyPatch, land: Callable[[], object]
+) -> Callable[[], bool]:
+    """Run ``land`` at the removal's first unlink: ``shutil.rmtree`` has listed the output's
+    entries by then, so what ``land`` adds is not removed and the output's ``rmdir`` fails."""
+    original_unlink = os.unlink
+    landed = False
+
+    def unlink_after_landing(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes], *, dir_fd: int | None = None
+    ) -> None:
+        nonlocal landed
+        if not landed:
+            landed = True
+            land()
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", unlink_after_landing)
+    return lambda: landed
+
+
+def test_workspace_store_names_a_tracked_file_that_lands_while_its_output_is_removed(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user file and sidecar copied into a directory output after prepare_output's check, while
+    the old output is being removed, stop the removal: the store refuses with the forced-restore
+    message naming them and the output, not "Directory not empty", and keeps both."""
+    workspace_store = store.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="pipe",
+        input_bindings={},
+        cache_dir=tmp_path / "cache" / "files",
+    )
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
+    output_path = workspace_store.prepare_output(ref)
+    for index in range(3):
+        (output_path / f"f{index}.txt").write_text(f"stage {index}")
+    user_file = output_path / "user.txt"
+
+    def copy_user_file() -> None:
+        user_file.write_text("user bytes")
+        track.write_pvt_file(
+            track.get_pvt_path(user_file),
+            track.PvtData(path="user.txt", hash="0123456789abcdef", size=10),
+        )
+
+    landed = _land_during_output_removal(monkeypatch, copy_user_file)
+
+    with pytest.raises(exceptions.OutputOwnershipError) as error:
+        workspace_store.prepare_output(ref)
+
+    assert landed()
+    message = str(error.value)
+    assert "user.txt.pvt" in message
+    assert "data/stage" in message
+    assert "Directory not empty" not in message
+    assert user_file.read_text() == "user bytes"
+    assert track.get_pvt_path(user_file).is_file()
+    assert sorted(path.name for path in output_path.iterdir()) == ["user.txt", "user.txt.pvt"]
+
+
+def test_workspace_store_raises_the_removal_error_when_no_user_file_blocks_it(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file that is no user's (no sidecar) landing in the output while it is removed is not a
+    refusal: the removal's own error propagates."""
+    workspace_store = store.WorkspaceStore(
+        project_root=tmp_path, pipeline_name="pipe", input_bindings={}
+    )
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
+    output_path = workspace_store.prepare_output(ref)
+    (output_path / "f0.txt").write_text("stage")
+    stray = output_path / "stray.txt"
+    landed = _land_during_output_removal(monkeypatch, lambda: stray.write_text("stray"))
+
+    with pytest.raises(OSError, match="Directory not empty") as error:
+        workspace_store.prepare_output(ref)
+
+    assert landed()
+    assert error.value.errno == errno.ENOTEMPTY
+    assert stray.read_text() == "stray"
 
 
 def test_workspace_store_restore_records_pvt_members_before_writing_them(

@@ -287,17 +287,26 @@ class WorkspaceStore:
         returned: ownership.StageMembers | None = None,
     ) -> pathlib.Path:
         """Clear the output's path for the stage to write, refusing first if that would remove
-        a user's file (``refuse_output_replacements``)."""
+        a user's file (``refuse_output_replacements``).
+
+        A user's file copied into a directory output after that check, while the output is being
+        removed, keeps the directory from being removed. When the removal fails, the forced-restore
+        refusal runs on what remains and names that file; only if it finds none does the removal's
+        own error propagate. Nothing more is deleted to make the removal succeed.
+        """
         self.refuse_output_replacements(
             [ref], claims, None if returned is None else {ref: returned}
         )
         path = self._resolve_path(ref)
-        if ref.tag == types.ArtifactTag.DIRECTORY:
+        if ref.tag != types.ArtifactTag.DIRECTORY:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        try:
             cache.remove_output(path)
+        except OSError:
+            self.refuse_output_replacement_at_write(ref, claims, returned)
+            raise
+        if ref.tag == types.ArtifactTag.DIRECTORY:
             path.mkdir(parents=True, exist_ok=True)
-            return path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        cache.remove_output(path)
         return path
 
     def commit(

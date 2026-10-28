@@ -285,12 +285,16 @@ When multiple `pivot` processes share the same StateDB:
   restore and repro's restore of a missing tracked file make the same swap check. A stage writer
   calls `WorkspaceStore.refuse_output_replacement_at_write` after `prepare_output` and before
   its loader writes, so a user file that lands in that window is refused with the same target and
-  sidecar message rather than leaking a loader's "Directory not empty" error. Once renamed, no
-  writer that names its files by path can add one to that entry, so a file copied into a target
-  while the command runs refuses that target. What the swap can still miss: a writer holding an
-  open handle on a directory inside the target (its working directory, or a directory descriptor),
-  which can add a file to the renamed entry after the walk; or a sidecar created beside the target,
-  or beside a directory above it, in the instant between the swap's check and its rename.
+  sidecar message rather than leaking a loader's "Directory not empty" error. `prepare_output`
+  makes the same check when its removal of the old output fails, as it does when a user file
+  copied in during the removal keeps the directory from being removed: it refuses naming that
+  file, raises the removal's own error only when the check finds none, and never deletes more to
+  make the removal succeed. Once a swap renames an entry aside, no writer that names its files by
+  path can add one to that entry, so a file copied into a target while the command runs refuses
+  that target. What the swap can still miss: a writer holding an open handle on a directory inside
+  the target (its working directory, or a directory descriptor), which can add a file to the
+  renamed entry after the walk; or a sidecar created beside the target, or beside a directory above
+  it, in the instant between the swap's check and its rename.
 - A directory restore killed between renaming the old entry aside and checking it leaves a backup.
   The next directory restore of that path holds the same restore lock and checks that backup
   before removing it. If the check finds a user file, Pivot keeps the backup and warns, naming the
