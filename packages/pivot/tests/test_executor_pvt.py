@@ -272,6 +272,7 @@ def test_checkout_missing_keeps_a_tracked_file_that_lands_during_directory_resto
         keep_existing_copy: bool = False,
         display_path: pathlib.Path | None = None,
         before_swap: Callable[[pathlib.Path], None] | None = None,
+        cache_root: cache.CacheRoot | None = None,
     ) -> os.stat_result:
         nonlocal landed
         staged = original_checkout(
@@ -283,6 +284,7 @@ def test_checkout_missing_keeps_a_tracked_file_that_lands_during_directory_resto
             keep_existing_copy=keep_existing_copy,
             display_path=display_path,
             before_swap=before_swap,
+            cache_root=cache_root,
         )
         if not landed:
             data_dir.mkdir()

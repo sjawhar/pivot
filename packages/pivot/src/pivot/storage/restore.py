@@ -362,6 +362,9 @@ def restore_file(
     if (skipped := _skipped(dest_path, force)) is not None:
         return skipped
 
+    if target["claims"] is not None and output_hash is not None:
+        ownership.record_restored(target["claims"], dest_path, output_hash)
+
     state_dir = state_dir or config.locate_state_dir()
     try:
         return _restore_from_sources(

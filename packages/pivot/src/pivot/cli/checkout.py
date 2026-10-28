@@ -297,7 +297,13 @@ def _restore_path_locked(
                 settled = list[tuple[pathlib.Path, os.stat_result, str]]()
                 with _open_hash_cache_for_checkout(hash_state_dir) as state_db:
                     outcome = cache.restore_missing_in_directory(
-                        path, output_hash, cache_dir, checkout_modes, state_db, settled
+                        path,
+                        output_hash,
+                        cache_dir,
+                        checkout_modes,
+                        state_db,
+                        settled,
+                        before_write=lambda: _refuse([target]),
                     )
                 record(settled)
                 if outcome["local_changes"]:

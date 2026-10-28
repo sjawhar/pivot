@@ -2309,6 +2309,8 @@ def restore_missing_in_directory(
     checkout_modes: list[CheckoutMode],
     state_db: state_mod.StateDB | None = None,
     pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
+    *,
+    before_write: Callable[[], None] | None = None,
 ) -> MissingRestore:
     """Restore missing target files and empty directories without overwriting local changes.
 
@@ -2415,6 +2417,8 @@ def restore_missing_in_directory(
         return MissingRestore(restored=0, missing=len(missing), local_changes=[], replace=False)
 
     for entry, file_path, file_cache_path in missing:
+        if before_write is not None:
+            before_write()
         file_path.parent.mkdir(parents=True, exist_ok=True)
         staged = _checkout_with_fallback(
             file_path,
