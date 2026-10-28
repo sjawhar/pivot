@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import collections
 import csv
-import json
 import logging
 import os
 import pathlib
@@ -13,7 +12,7 @@ import numpy
 import pandas
 import tabulate
 
-from pivot import config, loaders
+from pivot import config, display, loaders
 from pivot.types import (
     ChangeType,
     DataDiffResult,
@@ -229,7 +228,7 @@ def _make_row_key(row: pandas.Series[Any], key_columns: list[str]) -> str:
     """Create a collision-free key from row values using JSON serialization."""
     # Convert to list, handling NaN values explicitly
     vals = [None if pandas.isna(row[k]) else row[k] for k in key_columns]
-    return json.dumps(vals, sort_keys=True, default=str)
+    return display.to_json(vals, default=str, sort_keys=True)
 
 
 def _diff_rows_by_key(
@@ -591,11 +590,12 @@ def format_diff_summary(result: DataDiffResult) -> str:
     lines = list[str]()
 
     # Header
+    path = display.escape_control(result["path"])
     if result["reorder_only"]:
-        lines.append(f"{result['path']}: REORDER ONLY")
+        lines.append(f"{path}: REORDER ONLY")
         lines.append("  Same content, different row order")
     else:
-        lines.append(f"{result['path']}:")
+        lines.append(f"{path}:")
 
     # Row counts
     old_rows = result["old_rows"]
@@ -628,14 +628,15 @@ def format_diff_summary(result: DataDiffResult) -> str:
         lines.append("  Schema changes:")
         for change in result["schema_changes"]:
             symbol = STATUS_SYMBOLS[change["change_type"]]
+            column = display.escape_control(change["column"])
+            old_dtype = display.escape_control(change["old_dtype"] or "")
+            new_dtype = display.escape_control(change["new_dtype"] or "")
             if change["change_type"] == ChangeType.ADDED:
-                lines.append(f"    {symbol} {change['column']}: {change['new_dtype']}")
+                lines.append(f"    {symbol} {column}: {new_dtype}")
             elif change["change_type"] == ChangeType.REMOVED:
-                lines.append(f"    {symbol} {change['column']}: {change['old_dtype']}")
+                lines.append(f"    {symbol} {column}: {old_dtype}")
             else:
-                lines.append(
-                    f"    {symbol} {change['column']}: {change['old_dtype']} -> {change['new_dtype']}"
-                )
+                lines.append(f"    {symbol} {column}: {old_dtype} -> {new_dtype}")
 
     # Row change summary
     if result["row_changes"]:
@@ -662,7 +663,7 @@ def format_diff_table(
 ) -> str:
     """Format diff results for display."""
     if output_format == OutputFormat.JSON:
-        return json.dumps(diffs, indent=2, default=json_default)
+        return display.to_json(diffs, default=json_default, indent=2)
 
     if not diffs:
         return "No data file changes."
@@ -682,7 +683,7 @@ def format_row_changes_table(
 ) -> str:
     """Format row changes as a table."""
     if output_format == OutputFormat.JSON:
-        return json.dumps(row_changes, indent=2, default=json_default)
+        return display.to_json(row_changes, default=json_default, indent=2)
 
     if not row_changes:
         return "No row changes."
@@ -691,7 +692,7 @@ def format_row_changes_table(
     rows = list[list[str]]()
     for change in row_changes:
         change_char = STATUS_SYMBOLS[change["change_type"]]
-        row = [change_char, str(change["key"])]
+        row = [change_char, display.escape_control(str(change["key"]))]
 
         values = (
             change["new_values"]
@@ -701,9 +702,9 @@ def format_row_changes_table(
         if values:
             for col in columns:
                 val = values.get(col, "")
-                row.append(str(val) if val is not None else "")
+                row.append(display.escape_control(str(val)) if val is not None else "")
         rows.append(row)
 
-    headers = ["", "Key"] + columns
+    headers = ["", "Key"] + [display.escape_control(col) for col in columns]
     tablefmt = "github" if output_format == "md" else "plain"
     return tabulate.tabulate(rows, headers=headers, tablefmt=tablefmt, disable_numparse=True)

@@ -277,32 +277,28 @@ def test_check_git_repository_warn_when_not_in_repo(tmp_path: pathlib.Path) -> N
 
 
 # =============================================================================
-# URL Sanitization Tests
+# URL Redaction Tests
 # =============================================================================
 
 
-def test_sanitize_url_preserves_url_without_password() -> None:
-    """_sanitize_url preserves URLs without passwords."""
+def test_redacted_preserves_url_without_user_info() -> None:
+    """_redacted leaves a URL that carries no credentials unchanged."""
     url = "s3://my-bucket/prefix"
-    assert doctor_module._sanitize_url(url) == url
+    assert doctor_module._redacted(url) == url
 
 
-def test_sanitize_url_removes_password() -> None:
-    """_sanitize_url removes password from URL."""
-    url = "s3://user:secret@my-bucket/prefix"
-    result = doctor_module._sanitize_url(url)
-
-    assert "secret" not in result
-    assert "user@" in result
+def test_redacted_hides_user_and_password() -> None:
+    """_redacted replaces the whole user-info, user name included."""
+    assert doctor_module._redacted("s3://user:secret@my-bucket/prefix") == (
+        "s3://***@my-bucket/prefix"
+    )
 
 
-def test_sanitize_url_preserves_port() -> None:
-    """_sanitize_url preserves port number."""
-    url = "http://user:pass@host:8080/path"
-    result = doctor_module._sanitize_url(url)
-
-    assert "pass" not in result
-    assert ":8080" in result
+def test_redacted_preserves_port() -> None:
+    """_redacted keeps the host and port of a URL whose credentials it hides."""
+    assert doctor_module._redacted("http://user:pass@host:8080/path") == (
+        "http://***@host:8080/path"
+    )
 
 
 # =============================================================================

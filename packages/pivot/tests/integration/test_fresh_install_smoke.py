@@ -191,6 +191,37 @@ def _install_wheel(tmp_path: pathlib.Path, *requirements: str) -> str:
     return helpers.venv_pivot(tmp_path / "venv", str(wheel), *requirements)
 
 
+@pytest.mark.skipif(not os.environ.get("CI"), reason="builds and installs wheels; runs in CI")
+def test_pivot_tui_wheel_imports_against_the_pivot_wheel_built_beside_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """pivot-tui imports ``pivot.display`` and ``pivot.types``, so the pivot-tui a release ships
+    must install and import against the pivot released beside it.
+
+    This is the check the workspace cannot run: ``[tool.uv.sources] pivot = { workspace = true }``
+    makes the bound inert, so ``uv lock --check`` and every other job stay green while a published
+    pivot-tui names a pivot that lacks what it imports. Here both wheels are built from this tree
+    and installed together into a fresh venv, so the resolver must satisfy pivot-tui's bound with
+    the co-built pivot wheel and the import must find every module. A bound above the co-built
+    pivot's version fails to resolve; a missing module fails the import.
+    """
+    uv = helpers.uv_executable()
+    dist = tmp_path / "dist"
+    for package in ("pivot", "pivot-tui"):
+        build = _run(
+            [uv, "build", "--package", package, "--wheel", "--out-dir", str(dist)], _REPO_ROOT
+        )
+        assert build.returncode == 0, build.stderr
+    pivot_wheel = next(dist.glob("pivot-*.whl"))
+    tui_wheel = next(dist.glob("pivot_tui-*.whl"))
+
+    venv = tmp_path / "venv"
+    helpers.venv_pivot(venv, str(tui_wheel), str(pivot_wheel))
+    python = venv / "bin" / "python"
+    imported = _run([str(python), "-c", "import pivot_tui.diff"], tmp_path)
+    assert imported.returncode == 0, imported.stdout + imported.stderr
+
+
 @pytest.mark.skipif(not os.environ.get("CI"), reason="builds and installs a wheel; runs in CI")
 def test_wheel_installed_in_fresh_venv_runs_init_repro_status_dag(tmp_path: pathlib.Path) -> None:
     pivot = _install_wheel(tmp_path)
