@@ -97,7 +97,7 @@ def _get_stage_output_info() -> tuple[dict[str, HashInfo], dict[str, pathlib.Pat
             out.identity for out in stage_info["outs"] if out.tag is not types.ArtifactTag.METRIC
         }
 
-        stage_state_dir = registry.get_stage_state_dir(stage_info, config.get_state_dir())
+        stage_state_dir = registry.get_stage_state_dir(stage_info, config.locate_state_dir())
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         lock_data = stage_lock.read()
         if lock_data:
@@ -577,7 +577,7 @@ def checkout(
     if pipeline is not None:
         stage_outputs, output_state_dirs = _get_stage_output_info()
 
-    state_dir = config.get_state_dir()
+    state_dir = config.locate_state_dir()
 
     # Run async checkout. The file hashes every restore read or wrote are saved once per state
     # directory when it ends, also when a target failed, best-effort.

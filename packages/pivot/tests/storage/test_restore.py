@@ -12,7 +12,7 @@ import yaml
 from pivot import exceptions, project
 from pivot.cli import checkout
 from pivot.remote import sync as transfer
-from pivot.storage import cache, restore
+from pivot.storage import cache, restore, state
 from pivot.types import FileHash, TransferResult
 
 if TYPE_CHECKING:
@@ -745,7 +745,7 @@ def test_symlink_restore_reports_a_pvt_path_it_cannot_build(
 
 
 def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Restores file from local cache when available."""
+    """Restores file from local cache when available and records its hash."""
     repo_path, commit = git_repo
 
     # Set up cache directory
@@ -781,6 +781,8 @@ def test_restore_file_from_cache(git_repo: GitRepo, monkeypatch: pytest.MonkeyPa
     assert len(messages) == 1
     assert "from cache" in messages[0]
     assert output_path.read_bytes() == b"cached content"
+    with state.StateDB(repo_path / ".pivot", readonly=True) as state_db:
+        assert state_db.get(output_path, output_path.stat()) == file_hash
 
 
 def test_get_waits_for_checkout_restore_on_shared_cache(tmp_path: pathlib.Path) -> None:
