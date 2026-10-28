@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import pydantic
 
-from pivot import parameters, project, registry, skip, types
+from pivot import exceptions, parameters, project, registry, skip, types
 from pivot.executor import worker
 from pivot.storage import lock, state, track
 from pivot.storage import store as store_mod
@@ -263,15 +263,30 @@ def get_stage_explanation(
         unavailable = list[types.ArtifactRef]()
         empty_dirs_unrecorded = list[types.ArtifactRef]()
         if not allow_missing:
-            restoration = worker.restore_outputs_to_hashes(
-                store,
-                outs,
-                lock_data["output_hashes"],
-                state_db,
-                state_dir=state_dir,
-                restore=False,
-                report_changes=True,
-            )
+            try:
+                restoration = worker.restore_outputs_to_hashes(
+                    store,
+                    outs,
+                    lock_data["output_hashes"],
+                    state_db,
+                    state_dir=state_dir,
+                    restore=False,
+                    report_changes=True,
+                )
+            except exceptions.UnreadableLinkError as error:
+                # An output holds a link the check cannot read: its message, which names the
+                # link, is the stage's reason and the one report of it. Raised, it would also be
+                # logged as a warning by the caller (status, verify, repro --dry-run).
+                return StageExplanation(
+                    stage_name=stage_name,
+                    will_run=True,
+                    is_forced=force,
+                    reason=str(error),
+                    code_changes=[],
+                    param_changes=[],
+                    dep_changes=[],
+                    upstream_stale=[],
+                )
             unavailable = restoration.unavailable
             empty_dirs_unrecorded = restoration.empty_dirs_unrecorded
         if not decision["changed"] and (unavailable or empty_dirs_unrecorded):

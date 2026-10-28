@@ -1261,6 +1261,27 @@ def test_pivot_gc_refuses_a_registered_project_with_an_unreadable_database(
     assert str(peer) in out and "That project may hold outputs" in out, out
 
 
+def test_pivot_gc_refuses_a_project_registered_without_a_project_id(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A state directory that is a regular file cannot hold a project id. `pivot track` still
+    works there, as on 0.5.2, and registers without an id; a collection refuses that entry."""
+    shared = tmp_path / "shared-cache"
+    here = _shared_project(tmp_path / "here", shared)
+    away = _shared_project(tmp_path / "away", shared)
+    (away / "state-file").write_text("not a directory\n")
+    config = away / ".pivot" / "config.yaml"
+    config.write_text(config.read_text() + "core:\n  state_dir: state-file\n")
+    _, obj = _cached_link(away, shared, "data.txt", "tracked with an unusable state dir\n")
+
+    refused = _run(here, "gc", "--yes", "--grace-hours", "0")
+
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert str(away) in out and "records no project id" in out, out
+    assert obj.exists(), "gc removed an object named by a project registered without an id"
+
+
 def test_pivot_gc_keeps_everything_for_a_link_into_the_cache_root_but_not_its_objects(
     tmp_path: pathlib.Path,
 ) -> None:

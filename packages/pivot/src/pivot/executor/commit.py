@@ -76,7 +76,7 @@ def _commit_stages(
     else:
         targets = all_stage_names
 
-    default_state_dir = config.get_state_dir()
+    default_state_dir = config.locate_state_dir()
     project_root = project.get_project_root()
     store = store_mod.WorkspaceStore(
         project_root=project_root,
@@ -196,6 +196,10 @@ def _commit_stages(
                     )
                     outputs_missing = True
                     break
+                except exceptions.UnreadableLinkError as exc:
+                    logger.error("Stage '%s': %s — skipping", stage_name, exc)
+                    outputs_missing = True
+                    break
                 except OSError:
                     logger.error(
                         "Stage '%s': output unreadable: %s — skipping", stage_name, identity_key
@@ -227,6 +231,10 @@ def _commit_stages(
                         )
                         outputs_missing = True
                         break
+                    except exceptions.UnreadableLinkError as exc:
+                        logger.error("Stage '%s': %s — skipping", stage_name, exc)
+                        outputs_missing = True
+                        break
                     except OSError:
                         logger.error(
                             "Stage '%s': output unreadable: %s — skipping",
@@ -235,11 +243,24 @@ def _commit_stages(
                         )
                         outputs_missing = True
                         break
-                    file_hash_entries.extend(
-                        cache.deferred_file_hash_entries(
-                            cache.known_file_hashes(out_path, hash_info)
+                    try:
+                        file_hash_entries.extend(
+                            cache.deferred_file_hash_entries(
+                                cache.known_file_hashes(out_path, hash_info)
+                            )
                         )
-                    )
+                    except exceptions.UnreadableLinkError as exc:
+                        logger.error("Stage '%s': %s — skipping", stage_name, exc)
+                        outputs_missing = True
+                        break
+                    except OSError:
+                        logger.error(
+                            "Stage '%s': output unreadable: %s — skipping",
+                            stage_name,
+                            identity_key,
+                        )
+                        outputs_missing = True
+                        break
                     output_hashes_by_key[identity_key] = hash_info
                     output_hashes_by_identity[out.identity] = hash_info
                     output_paths_by_identity[out.identity] = out_path.relative_to(

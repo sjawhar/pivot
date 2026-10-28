@@ -144,10 +144,11 @@ directory that the last writer saw.
 Every pivot process that names a cache object registers its project first, inside the naming
 lock described above: a stage commit, a run-cache restore, `pivot commit`, `pivot track` and
 `pivot get --rev`, whatever the command and whether or not the cache existed when it started
-(the project whose first run creates a shared cache is registered by that run). `checkout`,
-`pull` and a pipeline run also register before they restore workspace links. Read-only commands
-do not register. If the register cannot be written, the command refuses before it names an
-object. A project id is best-effort through #503's state resolver. If the state directory cannot
+(the project whose first run creates a shared cache is registered by that run). `checkout` and
+`pull` also register before they restore workspace links. Read-only commands such as `status`,
+`diff`, `list` and `dag` do not register. If the register cannot be written, the command
+refuses before it names an object. A project id is best-effort through #503's state resolver.
+If the state directory cannot
 store it, the entry has no id, the writer still follows 0.5.2 behavior, and gc refuses that
 entry with recovery instructions. A read-only cache is the one exception to a register-write
 failure, because no collection can delete from it.

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 import pytest
 
-from pivot import cli, project, run_history, types
+from pivot import cli, exceptions, project, run_history, types
 from pivot.storage import cache, gc, lock, state, track
 
 if TYPE_CHECKING:
@@ -847,6 +847,26 @@ def test_gc_keeps_every_object_when_a_symlinked_directory_leaves_the_project(
     assert _helper_keys(workspace) >= {tracked, dead}, "a collection removed an object"
 
 
+def test_gc_keeps_every_object_when_a_symlink_cannot_be_classified(
+    workspace: Workspace, runner: click.testing.CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#519 can leave a checkout link unclassified; that cannot license a delete."""
+    tracked = _helper_publish(workspace, "behind an unreadable checkout link")
+    dead = _helper_publish(workspace, "named by nothing")
+    link = workspace["root"] / "possibly-cache-link"
+    link.symlink_to(cache.get_cache_path(workspace["object_root"], tracked))
+
+    def unreadable(_path: pathlib.Path, _root: pathlib.Path) -> str | None:
+        raise exceptions.UnreadableLinkError(str(link), "Input/output error")
+
+    monkeypatch.setattr(cache, "get_symlink_cache_key", unreadable)
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code == 0, result.output
+    assert "classify a symlink as a cache object" in result.output, result.output
+    assert _helper_keys(workspace) >= {tracked, dead}, "a collection removed an unknown link"
+
+
 # =============================================================================
 # BLK-3: a registered peer of an internal cache must be read
 # =============================================================================
@@ -940,3 +960,23 @@ def test_gc_refuses_a_named_project_whose_configured_state_dir_is_missing(
     assert result.exit_code != 0, result.output
     assert "state directory" in result.output, result.output
     assert dead in _helper_keys(workspace), "a refused collection removed an object"
+
+
+def test_gc_dry_run_refuses_a_named_project_whose_configured_state_dir_is_missing(
+    workspace: Workspace,
+    runner: click.testing.CliRunner,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A dry run reports what the real run does. The real run refuses a named project whose
+    state directory is missing, so the dry run refuses too instead of printing a removal plan."""
+    base = tmp_path_factory.mktemp("missing-state-dry")
+    other = base / "other"
+    (other / ".pivot").mkdir(parents=True)
+    (other / ".pivot" / "config.yaml").write_text("core:\n  state_dir: ../not-there\n")
+    _helper_publish(workspace, "a dry run must not plan to remove this")
+
+    result = _helper_run(runner, "--dry-run", "--projects", str(other))
+
+    assert result.exit_code != 0, result.output
+    assert "state directory" in result.output, result.output
+    assert "Would remove" not in result.output, result.output

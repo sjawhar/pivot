@@ -264,15 +264,17 @@ def resolve_targets(
     return results
 
 
-def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> os.stat_result:
-    """Atomically replace a cache-miss target under the cache restore lock; return the written
-    file's stat, taken before it replaced the target."""
+def _write_fallback_content(
+    dest_path: pathlib.Path, content: bytes, state_dir: pathlib.Path
+) -> os.stat_result:
+    """Atomically replace a cache-miss target under the resolved state directory's restore lock;
+    return the written file's stat, taken before it replaced the target."""
 
     def write_content(fd: int) -> None:
         with os.fdopen(fd, "wb") as file:
             file.write(content)
 
-    with cache.restore_lock(dest_path, config.get_state_dir()) as lock_token:
+    with cache.restore_lock(dest_path, state_dir) as lock_token:
         staging_path = (
             cache.restore_staging_path(dest_path, lock_token) if lock_token is not None else None
         )
@@ -315,6 +317,7 @@ def _restore_named(
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     *,
+    state_dir: pathlib.Path,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> bool:
     """Restore ``dest_path`` from the cache inside a naming-lock unit (shared).
@@ -323,17 +326,17 @@ def _restore_named(
     the record naming the objects is in git (the revision's lock), so the link is the
     workspace's only record in symlink mode. gc cannot delete while this unit is open.
     ``cache_dir`` is the cache root, as `pivot gc` locks it; objects are read from its ``files``.
-    Materialized files are appended to ``recorded`` for #516's StateDB file-hash queue.
+    Materialized files are appended to ``recorded`` for #516's StateDB file-hash queue. The
+    state directory is the stage's own directory for a stage target, otherwise the configured
+    directory from ``config.locate_state_dir()``.
     """
-    with gc_mod.naming_unit(
-        cache_dir, project=(project.get_project_root(), config.get_state_dir())
-    ):
+    with gc_mod.naming_unit(cache_dir, project=(project.get_project_root(), state_dir)):
         return cache.restore_from_cache(
             dest_path,
             output_hash,
             cache_dir / "files",
             checkout_modes=checkout_modes,
-            state_dir=config.get_state_dir(),
+            state_dir=state_dir,
             recorded=recorded,
         )
 
@@ -348,6 +351,7 @@ def restore_file(
     force: bool,
     *,
     remote_factory: Callable[[], RemoteStorage],
+    state_dir: pathlib.Path | None = None,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> RestoreResult:
     """Restore a single file from revision and return its result.
@@ -361,11 +365,12 @@ def restore_file(
 
     A restore appends ``(path, stat, hash)`` for each file it materializes to ``recorded``, for
     the caller to save in a StateDB (#516). Each stat is of what was staged, taken before the
-    rename put it in place.
+    rename put it in place. ``state_dir`` is the stage's own directory for a stage target,
+    otherwise the configured directory from ``config.locate_state_dir()``.
     """
+    state_dir = state_dir or config.locate_state_dir()
     path_str = str(dest_path)
     files_dir = cache_dir / "files"
-
     if (skipped := _skipped(dest_path, force)) is not None:
         return skipped
 
@@ -395,7 +400,12 @@ def restore_file(
                 )
             if should_try_cache:
                 success = _restore_named(
-                    dest_path, output_hash, cache_dir, checkout_modes, recorded=restored
+                    dest_path,
+                    output_hash,
+                    cache_dir,
+                    checkout_modes,
+                    state_dir=state_dir,
+                    recorded=restored,
                 )
         except (exceptions.PivotError, OSError) as e:
             # Strategy 3 retries this restore, and reports the error if it happens again
@@ -413,7 +423,7 @@ def restore_file(
     content = git.read_file_from_revision(rel_path, rev)
     if content is not None:
         try:
-            written = _write_fallback_content(dest_path, content)
+            written = _write_fallback_content(dest_path, content, state_dir)
         except OSError as e:
             return RestoreResult(
                 status=RestoreStatus.ERROR,
@@ -460,7 +470,12 @@ def restore_file(
                     if failed := [result for result in download_results if not result["success"]]:
                         raise _download_error(failed)
                 success = _restore_named(
-                    dest_path, output_hash, cache_dir, checkout_modes, recorded=downloaded
+                    dest_path,
+                    output_hash,
+                    cache_dir,
+                    checkout_modes,
+                    state_dir=state_dir,
+                    recorded=downloaded,
                 )
                 missing_hashes = (
                     []
@@ -593,6 +608,7 @@ def restore_targets_from_revision(
                     checkout_modes=checkout_modes,
                     force=force,
                     remote_factory=reachable_remote,
+                    state_dir=hash_state_dir,
                     recorded=recorded,
                 )
                 batch.add(hash_state_dir, recorded)

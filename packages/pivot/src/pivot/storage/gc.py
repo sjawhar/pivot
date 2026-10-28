@@ -474,15 +474,18 @@ def _project_from_entry(path: pathlib.Path) -> _RegisteredProject:
     )
 
 
+def _recorded_where(scope: ProjectScope) -> str:
+    """Which host wrote a register entry, as a refusal names it."""
+    if scope["host"] != socket.gethostname():
+        return f"recorded by host {scope['host']}"
+    return "recorded by this host"
+
+
 def _registered_scope_reason(
     entry: pathlib.Path, scope: ProjectScope, reason: str
 ) -> tuple[str, str]:
     """Describe a registered project the collector cannot prove it read."""
-    where = (
-        f"recorded by host {scope['host']}"
-        if scope["host"] != socket.gethostname()
-        else "recorded by this host"
-    )
+    where = _recorded_where(scope)
     return (
         scope_label(scope),
         f"{where}, and its project root or state directory is not visible here ({reason}; it may "
@@ -513,17 +516,6 @@ def _identity_reason(
 ) -> tuple[str, str] | None:
     """Why a visible registered project is not the one its entry describes, or None."""
     scope = registered["scope"]
-    try:
-        project_id = _read_project_id(scope["state_dir"])
-    except (OSError, ValueError) as e:
-        project_id = None
-        detail = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
-    else:
-        detail = (
-            "the entry records no project id"
-            if registered["project_id"] is None
-            else "a different project id"
-        )
     if registered["project_id"] is None:
         return (
             scope_label(scope),
@@ -532,13 +524,20 @@ def _identity_reason(
             + f"there, then delete {entry} and re-run; if the project is gone for good, delete "
             + f"{entry} and re-run",
         )
+    try:
+        project_id = _read_project_id(scope["state_dir"])
+    except (OSError, ValueError) as e:
+        return _registered_scope_reason(
+            entry, scope, f"no project id readable in {scope['state_dir']}: {_error_text(e)}"
+        )
     if project_id != registered["project_id"]:
         return (
             scope_label(scope),
-            f"its project id cannot be confirmed in {scope['state_dir']} ({detail}). This path may "
-            + "hold a different project, a disk that is not mounted, or a state directory that "
-            + "is not visible. Make the registered project visible and re-run; if that project is "
-            + f"gone for good or its state database was reset, delete {entry} and re-run",
+            f"{_recorded_where(scope)}, and {scope['state_dir']} holds a different project id. "
+            + "This path holds a different project here, or the project's state database was "
+            + "reset. Make the registered project visible at this path and re-run; if that "
+            + f"project is gone for good or its state database was reset, delete {entry} and "
+            + "re-run",
         )
     if scope["host"] != socket.gethostname():
         return None
@@ -598,10 +597,11 @@ def read_register(
 ) -> tuple[list[ProjectScope], list[tuple[str, str]]]:
     """Return the register's live projects and the entries a collection cannot use.
 
-    A live entry supplies positive evidence only after the collector opens the root, `.pivot`
-    marker, and the registered project's current state directory, then finds the entry's project
-    id there. On the registering host, every recorded mount below the project must still be
-    mounted. The state directory comes from that project's own ``core.state_dir`` resolver.
+    A live entry supplies positive evidence only after the collector finds the entry's project
+    id in the registered project's current state directory, which comes from that project's own
+    ``core.state_dir`` resolver. On the registering host, every recorded mount below the project
+    must still be mounted. ``resolve_scopes`` then opens every scope's root, `.pivot` and state
+    directory before any record is read.
     """
     register = cache_dir / REGISTER_DIR
     live = list[ProjectScope]()
@@ -626,7 +626,6 @@ def read_register(
         scope = registered["scope"]
         try:
             scope["state_dir"] = state_dir_mod.locate_state_dir(scope["root"])
-            _read_scope_directories(scope)
         except (exceptions.ConfigError, UnicodeDecodeError) as e:
             unreadable.append(_registered_scope_reason(path, scope, f"cannot read its config: {e}"))
             continue
@@ -741,7 +740,7 @@ def resolve_scopes(
         )
         try:
             _read_scope_directories(scope)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             raise exceptions.CacheCollectionRefusedError(
                 refusal_unreadable(
                     cache_dir,
@@ -749,7 +748,7 @@ def resolve_scopes(
                     [
                         (
                             scope_label(scope),
-                            f"its state directory cannot be read: {e.strerror or e}",
+                            f"its state directory cannot be read: {_error_text(e)}",
                         )
                     ],
                 )
@@ -767,15 +766,16 @@ def resolve_scopes(
     for scope in scopes:
         try:
             _read_scope_directories(scope)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             raise exceptions.CacheCollectionRefusedError(
-                refusal_unreadable(
-                    cache_dir,
-                    len(scopes),
-                    [(scope_label(scope), e.strerror or str(e))],
-                )
+                refusal_unreadable(cache_dir, len(scopes), [(scope_label(scope), _error_text(e))])
             ) from e
     return scopes
+
+
+def _error_text(error: OSError | ValueError) -> str:
+    """An error's reason without its errno prefix; a NUL byte in a path raises ValueError."""
+    return error.strerror if isinstance(error, OSError) and error.strerror else str(error)
 
 
 def _dedupe_scopes(scopes: list[ProjectScope]) -> list[ProjectScope]:
@@ -942,7 +942,13 @@ def _walk_project(
             for entry in entries:
                 path = pathlib.Path(entry.path)
                 if entry.is_symlink():
-                    key = cache.get_symlink_cache_key(path, object_root)
+                    try:
+                        key = cache.get_symlink_cache_key(path, object_root)
+                    except exceptions.UnreadableLinkError:
+                        # #519 cannot classify the link as a cache object. It may name a live
+                        # object, so preserve every object and name this link in the warning.
+                        outward.append(path)
+                        continue
                     if key is not None and cache.is_valid_hash(key):
                         # A checkout of a cache object, file or whole tree: not a subtree.
                         keys.add(key)

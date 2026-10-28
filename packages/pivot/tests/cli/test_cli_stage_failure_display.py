@@ -889,9 +889,9 @@ def test_a_click_exception_in_a_group_keeps_its_message() -> None:
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores mode 000")
-def test_status_json_reason_words_an_unreadable_cache_object(tmp_path: pathlib.Path) -> None:
-    """B4 (M24): `pivot status --json` holds the explanation failure as `Error: <strerror>:
-    <path>`, the same words as its warning."""
+def test_status_json_reason_names_an_unreadable_link(tmp_path: pathlib.Path) -> None:
+    """#519: `pivot status --json` keeps the pivot-owned unreadable-link message as the stage's
+    reason, with the member link it could not classify rather than the cache object's raw error."""
     root = _project(tmp_path, _BIG)
     output = root / "data" / "p" / "big"
     for member in output.iterdir():
@@ -907,4 +907,7 @@ def test_status_json_reason_words_an_unreadable_cache_object(tmp_path: pathlib.P
         cache_object.parent.chmod(0o755)
 
     reasons = {stage["name"]: stage["reason"] for stage in json.loads(proc.stdout)["stages"]}
-    assert reasons["p/big"] == f"Error: {_EACCES}: {cache_object}", proc.stdout + proc.stderr
+    assert reasons["p/big"] == (
+        f"Cannot read symlink '{link}': {_EACCES}. "
+        + "Make the link and what it points to readable, or remove the link."
+    ), proc.stdout + proc.stderr

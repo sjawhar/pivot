@@ -1084,11 +1084,11 @@ directory cannot be read is refused and nothing is removed. A registered project
 when its root, `.pivot`, state directory and project id are visible; on the host that
 registered it, every recorded mount below it must also be mounted. Otherwise the run refuses,
 names the entry, and removes nothing. A symlinked directory in a project that leads outside it
-(`data -> /mnt/big/data`, or a plain `.venv -> /opt/venvs/x`), or a symlink whose target is
-missing, hides the records beneath it, so `pivot gc` keeps every object, removes nothing, and
-names the link. A link into the cache's own `files/` is a checkout; a link elsewhere under a
-broad cache root (such as `PIVOT_CACHE_DIR=/scratch`) is still outside the project and keeps
-everything.
+(`data -> /mnt/big/data`, or a plain `.venv -> /opt/venvs/x`), a symlink whose target is
+missing, or a link Pivot cannot classify as a cache object hides records. `pivot gc` keeps every
+object, removes nothing, and names the link. A link into the cache's own `files/` is a checkout;
+a link elsewhere under a broad cache root (such as `PIVOT_CACHE_DIR=/scratch`) is outside the
+project and keeps everything.
 
 When it collects, the run also prunes this project's run history to
 `core.run_history_retention`, as every pipeline run does, and counts the run-cache rows that

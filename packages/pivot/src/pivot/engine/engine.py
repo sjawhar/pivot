@@ -1118,12 +1118,10 @@ class Engine:
         if cache_dir is None:
             cache_dir = config.get_cache_dir()
 
-        # Verify tracked files before building DAG. A restore here or in a skipped stage links
-        # objects from records already on disk, so create the state directory and register the
-        # project in the cache before any link exists.
+        # Verify tracked files before building DAG. This may restore a tracked file, but stage
+        # commits register in their own narrow naming units so stage execution never waits for gc.
         project_root = project.get_project_root()
         default_state_dir = config.get_state_dir()
-        config.register_cache_use()
         executor_core.verify_tracked_files(project_root, checkout_missing=checkout_missing)
 
         # Build bipartite graph (single source of truth)
