@@ -10,12 +10,13 @@ result is checked against the ``xxhash`` library. Adapted from the round-5 revie
 
 from __future__ import annotations
 
-import json
 import random
 import string
 from typing import TYPE_CHECKING
 
 import xxhash
+
+from pivot.storage import cache
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -30,7 +31,7 @@ _P1I = pow(_P1, -1, 1 << 64)
 _P2I = pow(_P2, -1, 1 << 64)
 _ALPHABET = (string.ascii_letters + string.digits).encode()
 _ALLOWED = frozenset(_ALPHABET)
-_SENTINEL = "\x00" * 16  # json.dumps escapes it, so it is found in the encoded document
+_SENTINEL = "\x00" * 16  # pivot's JSON escapes it, so it is found in the encoded document
 _ENCODED_SENTINEL = b"\\u0000" * 16
 
 
@@ -117,20 +118,21 @@ def forge_value(build: Callable[[str], bytes], target_hex: str, *, prefix: str =
     return value
 
 
-def manifest_json(entries: list[dict[str, object]], empty_dirs: list[str] | None = None) -> bytes:
-    """A manifest as pivot names a directory by it: sorted keys, no spaces."""
-    hashed: object = {"empty_dirs": empty_dirs, "manifest": entries} if empty_dirs else entries
-    return json.dumps(hashed, sort_keys=True, separators=(",", ":")).encode()
+def _encode(entries: list[dict[str, object]], empty_dirs: list[str] | None) -> bytes:
+    """A manifest as pivot names a directory by it: pivot's own encoding, imported, so a change to
+    it changes what these forgeries target instead of leaving them testing a copy."""
+    return cache._manifest_json(entries, empty_dirs or [])
 
 
 def pad_to(
     entries: list[dict[str, object]], target_hex: str, empty_dirs: list[str] | None = None
 ) -> list[dict[str, object]]:
     """``entries`` with a key pivot never writes added to the last one, padded so the whole
-    manifest, that key included, hashes to ``target_hex`` (the round-5 reviewer's forgery)."""
+    manifest, that key included, hashes to ``target_hex`` (the round-5 reviewer's forgery: it
+    passes a gate that hashes the manifest as written, not one that hashes pivot's four fields)."""
 
     def build(value: str) -> bytes:
-        return manifest_json([*entries[:-1], {**entries[-1], "zzz": value}], empty_dirs)
+        return _encode([*entries[:-1], {**entries[-1], "zzz": value}], empty_dirs)
 
     return [*entries[:-1], {**entries[-1], "zzz": forge_value(build, target_hex)}]
 
@@ -143,9 +145,23 @@ def steer_with_relpath(
 ) -> list[dict[str, object]]:
     """``entries`` plus ``extra`` as their last entry, its relpath ``zz`` and 16 free characters
     chosen so the manifest hashes to ``target_hex``, with no key pivot does not write: a forgery
-    that survives dropping unknown keys."""
+    that survives dropping unknown keys, but names a file the tree lacks."""
 
     def build(value: str) -> bytes:
-        return manifest_json([*entries, {**extra, "relpath": value}], empty_dirs)
+        return _encode([*entries, {**extra, "relpath": value}], empty_dirs)
 
     return [*entries, {**extra, "relpath": forge_value(build, target_hex, prefix="zz")}]
+
+
+def steer_with_size(
+    entries: list[dict[str, object]], target_hex: str, empty_dirs: list[str] | None = None
+) -> list[dict[str, object]]:
+    """``entries`` with the last one's ``size`` replaced by a string of 16 free characters chosen
+    so the manifest hashes to ``target_hex``: only pivot's four fields, and every relpath one the
+    tree holds, so nothing but the tree's marker tells it from the tree's manifest. A `.pvt`
+    accepts a string size; lock reading refuses it."""
+
+    def build(value: str) -> bytes:
+        return _encode([*entries[:-1], {**entries[-1], "size": value}], empty_dirs)
+
+    return [*entries[:-1], {**entries[-1], "size": forge_value(build, target_hex)}]

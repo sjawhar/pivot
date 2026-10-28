@@ -353,7 +353,7 @@ def get_tracked_files_status(
     # cannot be opened or written never fails status
     cache_dir = config.get_cache_dir() / "files"
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
-    with state_mod.open_hash_cache(config.get_state_dir()) as state_db:
+    with state_mod.open_readonly(config.get_state_dir(), create=False) as state_db:
         for i, (abs_path_str, track_data) in enumerate(sorted(tracked.items()), 1):
             path = pathlib.Path(abs_path_str)
             rel_path = str(path.relative_to(project_root))

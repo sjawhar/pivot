@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import json
 import logging
@@ -497,8 +498,14 @@ class StateDB:
         """Cache file metadata and hash, as ``save_many`` does for one entry."""
         self.save_many([(path, fs_stat, file_hash)])
 
-    def save_many(self, entries: Iterable[tuple[pathlib.Path, os.stat_result, str]]) -> None:
-        """Batch save multiple entries atomically.
+    def save_many(
+        self,
+        entries: Iterable[tuple[pathlib.Path, os.stat_result, str]],
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """Batch save multiple entries atomically, waiting at most ``timeout`` seconds (this
+        database's write timeout when None) for another process's write lock.
 
         An entry whose key exceeds LMDB's limit is left out: this cache only saves a later
         hash, so a path too long for it must not fail the caller.
@@ -506,7 +513,9 @@ class StateDB:
         self._check_closed()
         self._check_write_allowed()
         try:
-            with self._write_transaction(timeout=self._write_timeout) as txn:
+            with self._write_transaction(
+                timeout=self._write_timeout if timeout is None else timeout
+            ) as txn:
                 for path, fs_stat, file_hash in entries:
                     key = _make_key_file_hash(path)
                     if len(key) > _MAX_KEY_SIZE:
@@ -526,11 +535,12 @@ class StateDB:
     def save_many_best_effort(
         self, entries: list[tuple[pathlib.Path, os.stat_result, str]]
     ) -> bool:
-        """``save_many``, best-effort: a write that fails (``_CACHE_ERRORS``) is logged at debug
-        level and dropped, so a hash save never fails the command (``save_best_effort``). True if
-        it saved."""
+        """``save_many``, best-effort: it waits at most ``_WRITE_BACK_TIMEOUT`` for the write
+        lock, as ``save_best_effort`` does, and a write that fails (``_CACHE_ERRORS``) is logged at
+        debug level and dropped, so a hash save never fails or stalls the command. True if it
+        saved."""
         try:
-            self.save_many(entries)
+            self.save_many(entries, timeout=_WRITE_BACK_TIMEOUT)
         except _CACHE_ERRORS as error:
             logger.debug("Not saving %d file hashes: %s", len(entries), error)
             return False
@@ -1181,20 +1191,39 @@ def save_best_effort(
     return True
 
 
-def open_hash_cache(
-    state_dir: pathlib.Path | None,
-) -> contextlib.AbstractContextManager[StateDB | None]:
-    """``state_dir``'s StateDB opened read-only, for a check to look file hashes up in; None when
-    it has no database yet (a check never creates one) or cannot be opened (``_CACHE_ERRORS``: a
-    database this user cannot write, which LMDB will not open even read-only, or another user's).
-    The check then reads the files, as it does with no cache, instead of failing the command."""
-    if state_dir is None or not (state_dir / "state.lmdb").exists():
-        return contextlib.nullcontext(None)
+@contextlib.contextmanager
+def open_readonly(
+    state_dir: pathlib.Path | None, *, create: bool = True
+) -> Generator[StateDB | None]:
+    """Open ``state_dir``'s StateDB to read it, yielding None where this user cannot open it.
+
+    LMDB opens even a read-only environment writable, so a database whose files this user cannot
+    write (``PermissionError``, ``lmdb.ReadonlyError``) or one on a read-only filesystem
+    (``EROFS``) cannot be opened: the caller then reads the files instead, as it would with no
+    database, rather than failing the command. Only those cases yield None; a damaged database
+    raises. Opening creates a database where there is none, unless ``create`` is False (a check
+    never creates one); no ``state_dir`` yields None. The caller's own errors propagate with no
+    context from the open.
+    """
+    if state_dir is None or (not create and not (state_dir / "state.lmdb").exists()):
+        yield None
+        return
+    state_db: StateDB | None
     try:
-        return StateDB(state_dir, readonly=True)
-    except _CACHE_ERRORS as error:
-        logger.debug("Not looking file hashes up in %s: %s", state_dir, error)
-        return contextlib.nullcontext(None)
+        state_db = StateDB(state_dir, readonly=True)
+    except (PermissionError, lmdb.ReadonlyError) as error:
+        logger.debug("Reading files without the state database in %s: %s", state_dir, error)
+        state_db = None
+    except OSError as error:
+        if error.errno != errno.EROFS:
+            raise
+        logger.debug("Reading files without the state database in %s: %s", state_dir, error)
+        state_db = None
+    if state_db is None:
+        yield None
+        return
+    with state_db:
+        yield state_db
 
 
 def save_file_hashes(

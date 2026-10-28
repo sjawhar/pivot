@@ -335,8 +335,9 @@ def _canonical_manifest(output_hash: DirHash) -> bytes | None:
     writes for each entry (``_MANIFEST_ENTRY_FIELDS``); a field pivot does not write is left out.
 
     None when an entry lacks one of those fields or holds a value JSON cannot encode, as a
-    hand-written .pvt or lock can (``when: 2026-01-01``). No tree is trusted for such a manifest,
-    so its restore goes file by file, which reads none of those values.
+    hand-written .pvt or lock can (``when: 2026-01-01``), or nests too deep to encode. No tree is
+    trusted for such a manifest, so its restore goes file by file, which reads none of those
+    values.
     """
     try:
         entries = [
@@ -344,7 +345,7 @@ def _canonical_manifest(output_hash: DirHash) -> bytes | None:
             for entry in output_hash["manifest"]
         ]
         return _manifest_json(entries, _recorded_empty_dirs(output_hash))
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, RecursionError):
         return None
 
 
@@ -986,9 +987,11 @@ def _read_marker(cache_dir_path: pathlib.Path) -> str | None:
 
 def _mark_tree(cache_dir_path: pathlib.Path, digest: str) -> None:
     """Mark a tree checked to hold exactly the manifest whose ``_manifest_digest`` is ``digest``,
-    by writing that digest into its marker, renamed into place whole. The marker only saves a
-    check, so a cache the user cannot write still restores without one."""
-    with contextlib.suppress(OSError):
+    by writing that digest into its marker, renamed into place whole. The marker is staged under
+    the prefix directory's shared lock (``_staging_in``), so no concurrent sweep removes it before
+    the rename. The marker only saves a check, so a cache the user cannot write still restores
+    without one."""
+    with contextlib.suppress(OSError), _staging_in(cache_dir_path.parent):
         fd, staged = tempfile.mkstemp(prefix=_CACHE_TEMP_PREFIX, dir=cache_dir_path.parent)
         try:
             with os.fdopen(fd, "w") as file:
@@ -1008,11 +1011,11 @@ def _tree_file_holds(
 ) -> bool:
     """Whether a tree file, ``path_stat`` its ``os.lstat``, is a regular file holding ``entry``'s
     bytes: its recorded size and content hash. Hashes the file only once the cheap checks pass.
-    The size is only that cheap check, so an entry without one is checked by hash alone; a tree
-    check sees only manifests that hold every field pivot writes (``_canonical_manifest``)."""
+    A tree check sees only manifests that hold every field pivot writes, ``size`` included
+    (``_canonical_manifest``)."""
     return (
         stat.S_ISREG(path_stat.st_mode)
-        and ("size" not in entry or path_stat.st_size == entry["size"])
+        and path_stat.st_size == entry["size"]
         and hash_file(path)[0] == entry["hash"]
     )
 
@@ -1051,10 +1054,11 @@ def _tree_matches(
 
 
 def _ensure_tree_complete(
-    cache_dir_path: pathlib.Path, output_hash: DirHash, cache_dir: pathlib.Path
+    cache_dir_path: pathlib.Path, output_hash: DirHash, cache_dir: pathlib.Path, *, repair: bool
 ) -> bool:
     """Return whether a whole-directory SYMLINK cache tree holds exactly what ``output_hash``
-    records, checking a tree once and repairing it in place from its files' own cache objects.
+    records, checking a tree once; with ``repair``, repairing it in place from its files' own
+    cache objects first.
 
     A tree's name is the XXH64 of its manifest, and XXH64 is not second-preimage resistant: a
     manifest someone commits in a .pvt or lock can be made to hash to any tree's name. So the name
@@ -1065,20 +1069,27 @@ def _ensure_tree_complete(
     - marked for this manifest: trusted, without reading the tree;
     - marked for another manifest: not trusted and never changed, since its content is what
       another manifest was checked against and an output may symlink to it;
-    - marked by an older pivot (an empty marker): checked against this manifest, not repaired;
+    - marked by an older pivot (an empty marker): checked against this manifest, never repaired;
       re-marked if it matches;
     - unmarked (a killed publisher, a tree an older pivot built or marked after checking only
-      layout or sizes): checked, and if it differs repaired from its files' own cache objects;
-      after a repair the tree's manifest is recomputed (``hash_directory``) and must equal the
-      caller's, entry for entry, before the tree is marked.
+      layout or sizes): checked, and marked only if it holds this manifest exactly.
+
+    Only a commit passes ``repair``: its manifest is ``hash_directory`` of the bytes it commits, so
+    repairing toward it rewrites the tree toward bytes that exist. A restore's manifest comes from a
+    .pvt or a lock: it is a claim, not a source of truth, so it never drives a write into the
+    cache. Repairing toward it and then comparing the result with that same manifest proves
+    nothing, and would let a forged manifest rewrite the bytes of every output already linked to
+    the tree. A restore whose tree does not match goes file by file. After a repair the tree's
+    manifest is recomputed (``hash_directory``) and must equal the caller's, entry for entry,
+    before the tree is marked; that catches a cache object whose bytes are not its name's.
 
     A manifest that is not even nominally the tree's (its XXH64 is another name) or that holds a
-    value JSON cannot encode is refused before anything is read: that only spares work and keeps
-    an honest mismatch from repairing a tree, and is not what makes a tree trustworthy. The check,
-    the repair and the mark run under the tree's exclusive lock, so two repairers never change the
-    tree's directory modes under each other. Returns False, the tree left as it was or unmarked,
-    when the tree differs and cannot be repaired, or cannot be checked: a file's object is absent,
-    or this user cannot read the tree, write it or take its lock.
+    value JSON cannot encode is refused before anything is read: that only spares work, and is not
+    what makes a tree trustworthy. The check, the repair and the mark run under the tree's
+    exclusive lock, so two repairers never change the tree's directory modes under each other.
+    Returns False, the tree left as it was or unmarked, when the tree differs (and, with
+    ``repair``, cannot be repaired), or cannot be checked: a file's object is absent, or this user
+    cannot read the tree, write it or take its lock.
     """
     canonical = _canonical_manifest(output_hash)
     if canonical is None or xxhash.xxh64(canonical).hexdigest() != output_hash["hash"]:
@@ -1111,7 +1122,7 @@ def _ensure_tree_complete(
         try:
             scanned = _scan_entries(cache_dir_path)
             if not _tree_matches(cache_dir_path, output_hash, scanned):
-                if fd is None or marked is not None:
+                if not repair or fd is None or marked is not None:
                     return False
                 _repair_tree_dir_isexec(cache_dir_path, output_hash["manifest"])
                 _repair_tree_dir_layout(cache_dir_path, output_hash, scanned)
@@ -1358,7 +1369,7 @@ def missing_cache_objects(
         if (
             checkout_modes[0] == CheckoutMode.SYMLINK
             and tree_path.exists()
-            and _ensure_tree_complete(tree_path, output_hash, cache_dir)
+            and _ensure_tree_complete(tree_path, output_hash, cache_dir, repair=False)
         ):
             return []
         hashes = [entry["hash"] for entry in output_hash["manifest"]]
@@ -1491,10 +1502,11 @@ def _publish_tree(
     which is the same empty tree. A later publish into the same prefix directory removes the copy
     a killed publisher left (``_staging_in``).
 
-    The tree is marked only once it is checked to hold what ``output_hash`` records: a sweep on
-    another host whose flock is not coherent with this host's can remove files from the copy
-    while it is built (see storage/AGENTS.md). An unmarked tree is checked and repaired by the
-    next commit or restore through it (``_ensure_tree_complete``).
+    The tree is not marked here: the commit that published it checks it and marks it next
+    (``_ensure_tree_complete``), since a sweep on another host whose flock is not coherent with
+    this host's can remove files from the copy while it is built (see storage/AGENTS.md). An
+    unmarked tree is checked by the next restore through it and repaired only by the next commit
+    of that output.
     """
     manifest = output_hash["manifest"]
 
@@ -1526,12 +1538,6 @@ def _publish_tree(
             except OSError as e:
                 if e.errno not in (errno.ENOTEMPTY, errno.EEXIST):
                     raise
-                return
-            canonical = _canonical_manifest(output_hash)
-            if canonical is not None and _tree_matches(
-                cache_dir_path, output_hash, _scan_entries(cache_dir_path)
-            ):
-                _mark_tree(cache_dir_path, _manifest_digest(canonical))
         finally:
             _clear_path(staged)
 
@@ -1562,12 +1568,12 @@ def _store_directory(
             # A tree an older pivot built keeps its 0o444-everywhere files, entries its hash does
             # not record, or files missing from a copy it was killed in, forever otherwise: its name
             # never changes, so this branch never revisits an existing tree directory above.
-            if not _ensure_tree_complete(cache_dir_path, output_hash, cache_dir):
+            if not _ensure_tree_complete(cache_dir_path, output_hash, cache_dir, repair=True):
                 raise exceptions.CacheRestoreError(
                     f"Cache tree {cache_dir_path} differs from what its hash records, or cannot "
-                    + "be read, and cannot be repaired (a file's cache object is missing, or "
-                    + "another user owns it); remove the tree, or have its owner remove it, to "
-                    + "let this commit publish it again"
+                    + "be read, and cannot be repaired (a file's cache object is missing, another "
+                    + "user owns it, or it is marked for another manifest); remove the tree, or "
+                    + "have its owner remove it, to let this commit publish it again"
                 )
 
             _clear_path(path)
@@ -1758,12 +1764,15 @@ def _restore_directory_from_cache(
         _cleanup_fresh_restore_orphans(path, target_token)
     restore_prefix = f"{_RESTORE_TEMP_PREFIX}{target_token}."
 
-    if symlink_fast_path and not _ensure_tree_complete(cache_dir_path, output_hash, cache_dir):
-        # Same check as _store_directory. A tree this user cannot check or repair is not used:
+    if symlink_fast_path and not _ensure_tree_complete(
+        cache_dir_path, output_hash, cache_dir, repair=False
+    ):
+        # A restore only checks the tree, never repairs it toward the manifest it was given. A tree
+        # that does not hold that manifest exactly, or that this user cannot check, is not used:
         # the output is restored file by file from the objects instead, if they are cached.
         logger.warning(
-            "Cache tree %s was not checked to hold the manifest given for it, or differs from it "
-            + "and cannot be repaired, or cannot be read; restoring %s file by file",
+            "Cache tree %s was not checked to hold the manifest given for it, or differs from it, "
+            + "or cannot be read; restoring %s file by file",
             cache_dir_path,
             path,
         )

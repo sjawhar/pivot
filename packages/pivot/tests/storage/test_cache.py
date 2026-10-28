@@ -16,6 +16,7 @@ import time
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+import xxhash
 
 from pivot import exceptions
 from pivot.storage import cache, state
@@ -23,6 +24,8 @@ from pivot.types import DirHash, DirManifestEntry, FileHash, HashInfo, is_dir_ha
 from tests import xxh64_forge
 
 if TYPE_CHECKING:
+    import contextlib
+
     from pytest_mock import MockerFixture
 
 
@@ -2107,11 +2110,15 @@ def test_directory_output_isexec_collision_falls_back_to_copy(tmp_path: pathlib.
     assert not os.access(non_exec_dir / "shared.sh", os.X_OK), "the first save is unaffected"
 
 
-def test_restore_from_cache_repairs_legacy_symlink_tree_isexec(tmp_path: pathlib.Path) -> None:
+def test_restore_from_cache_keeps_the_executable_bit_past_a_legacy_symlink_tree(
+    tmp_path: pathlib.Path,
+) -> None:
     """A whole-directory SYMLINK cache tree an older pivot built (every file 0o444
-    regardless of isexec) must not keep serving a non-executable file forever: its tree hash
-    already incorporates isexec, so the tree directory is never rebuilt, but a restore through
-    the symlink fast path must still see the manifest's executable bit.
+    regardless of isexec) must not serve a non-executable file: its tree hash already
+    incorporates isexec, so the tree directory is never rebuilt. The restore's tree check sees
+    the wrong executable bit and does not trust the tree; a restore never writes into a tree, so
+    it restores the output file by file, with the manifest's executable bit, and leaves the tree
+    as it is until a commit repairs it.
     """
     cache_dir = tmp_path / "cache"
     modes = [cache.CheckoutMode.SYMLINK]
@@ -2137,8 +2144,10 @@ def test_restore_from_cache_repairs_legacy_symlink_tree_isexec(tmp_path: pathlib
     assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
 
     assert os.access(output / "run.sh", os.X_OK), (
-        "restoring from a legacy tree cache must still see the manifest's executable bit"
+        "restoring past a legacy tree cache must still give the manifest's executable bit"
     )
+    assert not output.is_symlink()
+    assert not os.access(tree_path / "run.sh", os.X_OK), "the restore left the tree as it is"
 
 
 def test_save_to_cache_symlink_repairs_legacy_tree_isexec(tmp_path: pathlib.Path) -> None:
@@ -3016,9 +3025,13 @@ def _helper_tree_with_files_missing(
     return cache_dir, tree, output_hash
 
 
-def test_symlink_restore_repairs_a_tree_left_with_files_missing(tmp_path: pathlib.Path) -> None:
-    """A tree whose name exists but which lacks files is not trusted: the restore repairs it from
-    the file objects, so the output hashes to the hash it was restored for."""
+def test_symlink_restore_goes_file_by_file_past_a_tree_left_with_files_missing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A tree whose name exists but which lacks files is not trusted. A restore never writes into
+    a tree (round 7: its manifest is a claim, not a source of truth), so it leaves the tree as it
+    is and restores the output file by file from the file objects; a commit of the output, whose
+    manifest is `hash_directory` of real bytes, repairs the tree and marks it."""
     cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
     out = tmp_path / "out"
 
@@ -3026,15 +3039,27 @@ def test_symlink_restore_repairs_a_tree_left_with_files_missing(tmp_path: pathli
         out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
     )
 
-    assert out.resolve() == tree.resolve()
+    assert not out.is_symlink()
     assert cache.hash_directory(out, cache_dir=cache_dir)["hash"] == output_hash["hash"]
+    assert not (tree / "c.txt").exists(), "the restore did not write into the tree"
+    assert not cache._tree_layout_marker(tree).exists()
+
+    committed = tmp_path / "committed"
+    committed.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (committed / name).write_text(f"{name} " * 100)
+    assert (
+        cache.save_to_cache(committed, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK)
+        == output_hash
+    )
+    assert committed.resolve() == tree.resolve()
     assert (tree / "c.txt").stat().st_mode & 0o777 == 0o444
-    assert cache._tree_layout_marker(tree).exists()
+    assert cache._read_marker(tree) == _helper_digest(output_hash)
 
 
 def test_symlink_restore_refuses_a_tree_it_cannot_repair(tmp_path: pathlib.Path) -> None:
-    """With a missing file's object gone too, the tree can restore nothing; the restore reports a
-    cache miss instead of symlinking to it."""
+    """With a missing file's object gone too, neither the tree nor the objects can restore the
+    output; the restore reports a cache miss instead of symlinking to the tree."""
     cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
     c_hash = next(e["hash"] for e in output_hash["manifest"] if e["relpath"] == "c.txt")
     cache.get_cache_path(cache_dir, c_hash).unlink()
@@ -3060,7 +3085,8 @@ def test_symlink_restore_rechecks_a_partial_tree_an_older_pivot_marked(
 ) -> None:
     """Pivot 0.3.4 marked a tree after checking only its layout, so its mark sits beside partial
     trees too; pivot 0.3.5 to 0.5.11 marked one after checking only sizes. The restore checks such
-    a tree again, repairs it, and replaces the old mark."""
+    a tree again, does not trust it, and restores the output file by file; it neither repairs the
+    tree nor marks it, so the old mark stays until a commit repairs and marks the tree."""
     cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
     old_mark = tree.with_name(tree.name + old_suffix)
     old_mark.touch()
@@ -3070,17 +3096,19 @@ def test_symlink_restore_rechecks_a_partial_tree_an_older_pivot_marked(
         out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
     )
 
+    assert not out.is_symlink()
     assert cache.hash_directory(out, cache_dir=cache_dir)["hash"] == output_hash["hash"]
-    assert cache._tree_layout_marker(tree).exists()
-    assert not old_mark.exists()
+    assert not cache._tree_layout_marker(tree).exists()
+    assert not (tree / "c.txt").exists()
 
 
-def test_symlink_restore_repairs_stale_bytes_in_a_complete_tree_pivot_0_5_11_marked(
+def test_symlink_restore_does_not_trust_stale_bytes_in_a_tree_pivot_0_5_11_marked(
     tmp_path: pathlib.Path,
 ) -> None:
     """Pivot 0.3.5 to 0.5.11 marked a tree `.verified` after checking its files' sizes only, so a
     tree holding every file at its recorded size, one with stale bytes, can carry that mark. The
-    restore checks it by content, repairs the stale file, links the tree and marks it anew."""
+    restore checks it by content, does not trust it, leaves it as it is and restores the output
+    file by file."""
     cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
     (tree / "b.txt").write_text("b.txt " * 100)
     (tree / "c.txt").write_text("C.TXT " * 100)  # stale bytes of the recorded size
@@ -3092,20 +3120,21 @@ def test_symlink_restore_repairs_stale_bytes_in_a_complete_tree_pivot_0_5_11_mar
         out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
     )
 
-    assert out.resolve() == tree.resolve()
+    assert not out.is_symlink()
     assert (out / "c.txt").read_text() == "c.txt " * 100
-    assert cache._tree_layout_marker(tree).exists()
-    assert not old_mark.exists()
+    assert (tree / "c.txt").read_text() == "C.TXT " * 100, "the restore did not write the tree"
+    assert not cache._tree_layout_marker(tree).exists()
 
 
-def test_symlink_restore_records_repaired_bytes_not_stale_same_size_bytes(
+def test_symlink_restore_records_restored_bytes_not_stale_same_size_bytes(
     tmp_path: pathlib.Path,
 ) -> None:
     """Two-guarantee probe (Dispatch BET-237 records every output hash; #522 content-checks a
     tree): restoring through an unmarked SYMLINK cache tree that holds every file at its recorded
-    size, one with stale bytes, content-checks and repairs the tree before it records anything.
-    So every hash it records vouches for the bytes its file now holds, never the stale bytes a
-    size-only check would have waved through and recorded as the output's hash."""
+    size, one with stale bytes, content-checks the tree before it records anything, does not trust
+    it, and restores the output file by file. So every hash it records vouches for the bytes its
+    file now holds, never the stale bytes a size-only check would have waved through, linked and
+    recorded as the output's hash."""
     cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
     (tree / "b.txt").write_text("b.txt " * 100)
     (tree / "c.txt").write_text("C.TXT " * 100)  # stale bytes of the recorded size, tree unmarked
@@ -3122,6 +3151,8 @@ def test_symlink_restore_records_repaired_bytes_not_stale_same_size_bytes(
     )
 
     assert (out / "c.txt").read_text() == "c.txt " * 100
+    assert not out.is_symlink()
+    assert (tree / "c.txt").read_text() == "C.TXT " * 100, "the restore did not write the tree"
     assert cache.hash_directory(out, cache_dir=cache_dir)["hash"] == output_hash["hash"]
     recorded_names = {path.name for path, _, _ in recorded}
     assert recorded_names == {"a.txt", "b.txt", "c.txt"}, recorded_names
@@ -3163,22 +3194,31 @@ def _helper_forge(
 ) -> DirHash:
     """``entries`` made to hash to ``honest``'s tree name (XXH64 is not second-preimage
     resistant): ``padded`` adds a key pivot never writes to the last entry (the round-5
-    reviewer's forgery); ``canonical`` adds a last entry holding only pivot's four fields, its
-    relpath steering the hash, its content a cached object, so even a comparison of only those
-    fields sees a manifest that names the tree."""
+    reviewer's forgery, which only a gate over the manifest as written lets through);
+    ``canonical`` adds a last entry holding only pivot's four fields, its relpath steering the
+    hash, its content a cached object; ``size`` steers through the last entry's size, a string,
+    so every relpath is one the tree holds. The last two pass pivot's own XXH64 gate, so only the
+    tree's marker refuses them; each is checked to pass the gate it was built for."""
     if forgery == "padded":
         manifest = xxh64_forge.pad_to(entries, honest["hash"])
-    else:
+        assert xxhash.xxh64(cache._manifest_json(manifest, [])).hexdigest() == honest["hash"]
+    elif forgery == "canonical":
         filler = cache_dir.parent / "filler.bin"
         filler.write_bytes(b"F")
         filler_hash = cache.hash_file(filler)[0]
         cache.copy_to_cache(filler, cache.get_cache_path(cache_dir, filler_hash))
         extra: dict[str, object] = {"hash": filler_hash, "size": 1, "isexec": False}
         manifest = xxh64_forge.steer_with_relpath(entries, extra, honest["hash"])
-    return cast("DirHash", cast("object", {"hash": honest["hash"], "manifest": manifest}))
+    else:
+        manifest = xxh64_forge.steer_with_size(entries, honest["hash"])
+    forged = cast("DirHash", cast("object", {"hash": honest["hash"], "manifest": manifest}))
+    canonical = cache._canonical_manifest(forged)
+    passes_gate = canonical is not None and xxhash.xxh64(canonical).hexdigest() == honest["hash"]
+    assert passes_gate == (forgery != "padded"), "the forgery passes the gate it was built for"
+    return forged
 
 
-@pytest.mark.parametrize("forgery", ["padded", "canonical"])
+@pytest.mark.parametrize("forgery", ["padded", "canonical", "size"])
 @pytest.mark.parametrize("target", ["hash-inside-the-tree", "absolute-path"])
 def test_symlink_restore_records_no_hash_a_forged_manifest_chose(
     tmp_path: pathlib.Path, target: str, forgery: str
@@ -3189,10 +3229,10 @@ def test_symlink_restore_records_no_hash_a_forged_manifest_chose(
     trusted only for the manifest it was checked to hold, which its marker records by SHA-256.
 
     The trust decision is asserted first. The ``canonical`` forgery steers with an extra entry
-    naming a file the tree lacks; at 0664ea83 the fast path's stat of that file failed and the
-    restore fell back to file by file, so the restore alone records nothing there even though
-    the tree was trusted. Neither forgery is trusted, takes the fast path or is vouched for, and
-    the tree is left as it was."""
+    naming a file the tree lacks, so with the tree trusted the fast path's stat of that file fails
+    and the restore falls back to file by file; the ``size`` forgery names only files the tree
+    holds, so with the tree trusted the fast path would record its hashes. No forgery is trusted,
+    takes the fast path or is vouched for, and the tree is left as it was."""
     cache_dir, tree, honest = _helper_marked_tree(tmp_path)
     victim = tmp_path / "victim.txt"
     victim.write_bytes(b"victim bytes")
@@ -3205,7 +3245,9 @@ def test_symlink_restore_records_no_hash_a_forged_manifest_chose(
     out = tmp_path / "out"
     recorded = list[tuple[pathlib.Path, os.stat_result, str]]()
 
-    assert not cache._ensure_tree_complete(tree, forged, cache_dir), "the forgery is not trusted"
+    assert not cache._ensure_tree_complete(tree, forged, cache_dir, repair=False), (
+        "the forgery is not trusted"
+    )
 
     _ = cache.restore_from_cache(
         out, forged, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK], recorded=recorded
@@ -3218,17 +3260,21 @@ def test_symlink_restore_records_no_hash_a_forged_manifest_chose(
     assert cache._read_marker(tree) == _helper_digest(honest), "still marked for its manifest"
 
 
-@pytest.mark.parametrize("forgery", ["padded", "canonical"])
-def test_a_forged_manifest_cannot_make_an_honest_restore_serve_its_bytes(
+@pytest.mark.parametrize("forgery", ["padded", "canonical", "size"])
+def test_a_forged_manifest_cannot_rewrite_a_tree_an_output_links_to(
     tmp_path: pathlib.Path, forgery: str
 ) -> None:
-    """Defect on main (7fbdfa31, #522's tree check), closed here: a forged manifest under an
-    unmarked honest tree's name made `_ensure_tree_complete` repair the tree to the forger's
-    bytes and mark it, so every later honest restore of that hash served them. A padded forgery
-    is refused before the tree is touched. One steered with only pivot's fields repairs the tree
-    to the bytes it names and marks it for that manifest alone, so an honest restore does not
-    trust the tree and restores the honest bytes file by file."""
+    """Round 7 (the reviewer's reproduction at 83a65e7c): an unmarked tree an output is already
+    symlinked to was repaired toward any manifest that passed the XXH64 gate, and the recomputation
+    compared the result with that same manifest. A canonical forgery (pivot's four fields, steered
+    by a last entry's relpath) so rewrote the tree to `BBBB` plus a file, and marked it: the linked
+    output read `BBBB` and hashed to its lock's hash, and honest symlink commits failed with
+    "remove the tree". Main (7fbdfa31, #522) had the same repair. A restore now never writes into
+    the tree, whatever the manifest: the linked output still reads `AAAA`, the tree is not marked
+    for the forgery, an honest restore links the tree, and an honest commit goes through."""
     cache_dir, tree, honest = _helper_marked_tree(tmp_path)
+    linked = tmp_path / "src"
+    assert linked.resolve() == tree.resolve(), "the fixture's output is linked to the tree"
     cache._tree_layout_marker(tree).unlink()
     other = tmp_path / "other.txt"
     other.write_bytes(b"BBBB")
@@ -3238,19 +3284,69 @@ def test_a_forged_manifest_cannot_make_an_honest_restore_serve_its_bytes(
         {"relpath": "a.txt", "hash": other_hash, "size": 4, "isexec": False}
     ]
     forged = _helper_forge(honest, entries, forgery, cache_dir)
+
+    _ = cache.missing_cache_objects(forged, cache_dir, [cache.CheckoutMode.SYMLINK])
+    assert (linked / "a.txt").read_bytes() == b"AAAA", "deciding what to download writes nothing"
+
     _ = cache.restore_from_cache(
         tmp_path / "evil", forged, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
     )
 
+    assert (linked / "a.txt").read_bytes() == b"AAAA", "the linked output's bytes are unchanged"
+    assert sorted(path.name for path in linked.iterdir()) == ["a.txt"]
+    assert cache._read_marker(tree) is None, "the tree is not marked for the forgery"
     legit = tmp_path / "legit"
     assert cache.restore_from_cache(
         legit, honest, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
     )
-
+    assert legit.resolve() == tree.resolve()
     assert (legit / "a.txt").read_bytes() == b"AAAA"
-    assert cache.hash_directory(legit, cache_dir=cache_dir)["hash"] == honest["hash"]
-    if forgery == "padded":
-        assert (tree / "a.txt").read_bytes() == b"AAAA", "refused before the tree was touched"
+    committed = tmp_path / "committed"
+    committed.mkdir()
+    (committed / "a.txt").write_bytes(b"AAAA")
+    assert (
+        cache.save_to_cache(committed, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK])
+        == honest
+    )
+
+
+def test_a_concurrent_sweep_cannot_drop_a_mark_a_check_reported(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 7: `_mark_tree` stages the marker as a `.pivot_tmp_*` file in the tree's prefix
+    directory. Staged without the prefix lock, a concurrent sweep (another process taking that
+    lock exclusively) removed it before the rename, so `_ensure_tree_complete` reported a tree
+    complete that stayed unmarked. The marker is staged under the prefix lock (`_staging_in`), so
+    the sweep cannot take the lock while it is staged."""
+    cache_dir, tree, honest = _helper_marked_tree(tmp_path)
+    marker = cache._tree_layout_marker(tree)
+    marker.unlink()
+    prefix_dir = tree.parent
+    real_replace = os.replace
+    sweeps = list[bool]()
+
+    def replace_after_a_concurrent_sweep(
+        src: str | os.PathLike[str], dst: str | os.PathLike[str]
+    ) -> None:
+        if pathlib.Path(dst) == marker:
+            fd = os.open(prefix_dir / cache._PREFIX_LOCK, os.O_RDWR | os.O_CREAT, 0o666)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                sweeps.append(False)
+            else:
+                cache._sweep_cache_temps(prefix_dir)
+                sweeps.append(True)
+            finally:
+                os.close(fd)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace_after_a_concurrent_sweep)
+    assert cache._ensure_tree_complete(tree, honest, cache_dir, repair=False)
+    monkeypatch.undo()
+
+    assert cache._read_marker(tree) == _helper_digest(honest), "the reported mark is in place"
+    assert sweeps == [False], "no sweep took the prefix lock while the marker was staged"
 
 
 @pytest.mark.parametrize("field", ["unread", "size"])
@@ -3285,17 +3381,17 @@ def test_a_manifest_value_json_cannot_encode_still_restores(
 def test_a_repair_whose_result_differs_from_the_manifest_is_not_marked(
     tmp_path: pathlib.Path,
 ) -> None:
-    """After repairing an unmarked tree, its manifest is recomputed and must equal the caller's,
-    entry for entry, before the tree is marked. A cache object holding other bytes than its name
-    (a corrupt object) is copied in by the repair; the recomputed manifest then differs, and the
-    tree is left unmarked rather than vouched for."""
+    """After a commit repairs an unmarked tree, its manifest is recomputed and must equal the
+    commit's, entry for entry, before the tree is marked. A cache object holding other bytes than
+    its name (a corrupt object) is copied in by the repair; the recomputed manifest then differs,
+    and the tree is left unmarked rather than vouched for."""
     cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
     c_hash = next(e["hash"] for e in output_hash["manifest"] if e["relpath"] == "c.txt")
     c_object = cache.get_cache_path(cache_dir, c_hash)
     c_object.chmod(0o644)
     c_object.write_text("not the bytes its name says")
 
-    assert not cache._ensure_tree_complete(tree, output_hash, cache_dir)
+    assert not cache._ensure_tree_complete(tree, output_hash, cache_dir, repair=True)
 
     assert not cache._tree_layout_marker(tree).exists()
 
@@ -3306,7 +3402,8 @@ def test_a_tree_an_older_pivot_marked_is_checked_not_repaired(
 ) -> None:
     """An older pivot marked a checked tree with an empty `.content-checked`. Such a tree is
     checked against the manifest: re-marked for it when it matches; when it differs, not trusted
-    and not repaired (an output may symlink to it), so the restore goes file by file."""
+    and never repaired, by a restore or by a commit (an output may symlink to it), so the restore
+    goes file by file and the commit's check fails."""
     cache_dir, tree, honest = _helper_marked_tree(tmp_path)
     marker = cache._tree_layout_marker(tree)
     marker.unlink()
@@ -3324,6 +3421,8 @@ def test_a_tree_an_older_pivot_marked_is_checked_not_repaired(
     assert out.is_symlink() == (not stale)
     assert (tree / "a.txt").read_bytes() == (b"ZZZZ" if stale else b"AAAA"), "not repaired"
     assert cache._read_marker(tree) == ("" if stale else _helper_digest(honest))
+    assert cache._ensure_tree_complete(tree, honest, cache_dir, repair=True) == (not stale)
+    assert (tree / "a.txt").read_bytes() == (b"ZZZZ" if stale else b"AAAA"), "a commit neither"
 
 
 @pytest.mark.parametrize("guard", ["check", "repair"])
@@ -3366,7 +3465,7 @@ def test_hashing_with_a_writable_state_database_never_fails_on_its_save(
         cache.hash_file(target)[0] if what == "file" else cache.hash_directory(target)["hash"]
     )
 
-    def full_save_many(*_: object) -> None:
+    def full_save_many(*_: object, **__: object) -> None:
         raise state.DatabaseFullError("state database is full")
 
     monkeypatch.setattr(state.StateDB, "save_many", full_save_many)
@@ -3378,6 +3477,53 @@ def test_hashing_with_a_writable_state_database_never_fails_on_its_save(
         )
 
     assert found == expected
+
+
+def test_a_best_effort_save_waits_at_most_the_best_effort_timeout(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 7 (review item 3): `save_many_best_effort` waited the database's own 30 s for the write
+    lock, so `hash_file`'s save-on-read could stall a command 30 s per file under contention. It
+    waits at most `_WRITE_BACK_TIMEOUT`, as `save_best_effort` does, then drops the save."""
+    target = tmp_path / "target"
+    target.write_bytes(b"content")
+    waited = list[float]()
+
+    def busy_write_lock(
+        _self: state.StateDB, *, timeout: float
+    ) -> contextlib.AbstractContextManager[None]:
+        waited.append(timeout)
+        raise exceptions.PivotDBWriteTimeoutError("another process holds the write lock")
+
+    monkeypatch.setattr(state.StateDB, "_write_transaction", busy_write_lock)
+    with state.StateDB(tmp_path / "state") as state_db:
+        found = cache.hash_file(target, state_db)[0]
+
+    assert found == xxhash.xxh64(b"content").hexdigest()
+    assert waited == [state._WRITE_BACK_TIMEOUT]
+
+
+def test_a_manifest_nested_too_deep_to_encode_restores_file_by_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Round 7 (review item 2): a .pvt whose `size` is nested 20,000 lists deep loads, then made
+    `_canonical_manifest` raise `RecursionError` out of the restore. It is a manifest no tree is
+    trusted for, so the restore goes file by file, as for a value JSON cannot encode."""
+    cache_dir, _, honest = _helper_marked_tree(tmp_path)
+    nested: object = 4
+    for _ in range(20_000):
+        nested = [nested]
+    entry: dict[str, object] = {**honest["manifest"][0], "size": nested}
+    deep = cast("DirHash", cast("object", {"hash": honest["hash"], "manifest": [entry]}))
+    out = tmp_path / "out"
+
+    assert cache._canonical_manifest(deep) is None
+    assert cache.restore_from_cache(
+        out, deep, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    assert not out.is_symlink()
+    assert (out / "a.txt").read_bytes() == b"AAAA"
 
 
 def test_hardlink_no_op_check_compares_the_device_too(
@@ -3424,8 +3570,11 @@ def test_hardlink_no_op_check_compares_the_device_too(
     assert [(path, recorded_hash) for path, _, recorded_hash in recorded] == [(out, file_hash)]
 
 
-def test_symlink_restore_repairs_a_tree_with_a_file_cut_short(tmp_path: pathlib.Path) -> None:
-    """A tree holding every file it records, one of them cut short, is not trusted either."""
+def test_symlink_restore_goes_file_by_file_past_a_tree_with_a_file_cut_short(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A tree holding every file it records, one of them cut short, is not trusted either: the
+    restore leaves it as it is and restores the output file by file."""
     cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
     (tree / "c.txt").write_text("c.txt " * 100)
     out = tmp_path / "out"
@@ -3434,8 +3583,9 @@ def test_symlink_restore_repairs_a_tree_with_a_file_cut_short(tmp_path: pathlib.
         out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
     )
 
-    assert out.resolve() == tree.resolve()
+    assert not out.is_symlink()
     assert cache.hash_directory(out, cache_dir=cache_dir)["hash"] == output_hash["hash"]
+    assert (tree / "b.txt").read_text() == "b.txt ", "the restore did not write the tree"
 
 
 def test_symlink_restore_goes_file_by_file_past_a_damaged_tree_it_cannot_lock(
@@ -3523,10 +3673,47 @@ def _helper_restore_at_barrier(
     return "ok" if restored else "not restored"
 
 
-def test_concurrent_restores_repair_one_damaged_tree_once(tmp_path: pathlib.Path) -> None:
-    """Several processes restoring through one damaged tree with a read-only root repair it one
-    at a time: each restore succeeds, the tree ends exactly what its hash records, its root
-    read-only again, with no repair's temporary file left inside it."""
+def _helper_repair_at_barrier(
+    tree: pathlib.Path, output_hash: DirHash, cache_dir: pathlib.Path, barrier: Barrier
+) -> str:
+    barrier.wait()
+    try:
+        complete = cache._ensure_tree_complete(tree, output_hash, cache_dir, repair=True)
+    except OSError as e:
+        return f"{type(e).__name__}: {e}"
+    return "ok" if complete else "not complete"
+
+
+def test_concurrent_restores_leave_a_damaged_tree_as_it_is(tmp_path: pathlib.Path) -> None:
+    """Several processes restoring through one damaged tree with a read-only root: a restore never
+    writes into a tree (round 7), so each restores its output file by file from the file objects,
+    and the tree keeps its one file and its read-only root."""
+    n_procs = 8
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Manager() as manager, ctx.Pool(n_procs) as pool:
+        root = tmp_path / "round"
+        root.mkdir()
+        cache_dir, output_hash = _helper_damaged_tree(root, 400)
+        tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+        barrier = manager.Barrier(n_procs, timeout=60)
+        results = pool.starmap(
+            _helper_restore_at_barrier,
+            [(root / f"out{i}", output_hash, cache_dir, barrier) for i in range(n_procs)],
+        )
+
+        assert results == ["ok"] * n_procs
+        assert sorted(p.name for p in tree.iterdir()) == ["f000.txt"]
+        assert tree.stat().st_mode & 0o777 == 0o555
+        for i in range(n_procs):
+            assert not (root / f"out{i}").is_symlink()
+            assert cache.hash_directory(root / f"out{i}", cache_dir=cache_dir) == output_hash
+
+
+def test_concurrent_commits_repair_one_damaged_tree_once(tmp_path: pathlib.Path) -> None:
+    """Several processes committing one output through one damaged tree with a read-only root
+    (each the commit's `_ensure_tree_complete(..., repair=True)`) repair it one at a time: each
+    succeeds, the tree ends exactly what its hash records, its root read-only again, with no
+    repair's temporary file left inside it."""
     n_procs = 8
     ctx = multiprocessing.get_context("spawn")
     with ctx.Manager() as manager, ctx.Pool(n_procs) as pool:
@@ -3537,8 +3724,8 @@ def test_concurrent_restores_repair_one_damaged_tree_once(tmp_path: pathlib.Path
             tree = cache.get_cache_path(cache_dir, output_hash["hash"])
             barrier = manager.Barrier(n_procs, timeout=60)
             results = pool.starmap(
-                _helper_restore_at_barrier,
-                [(root / f"out{i}", output_hash, cache_dir, barrier) for i in range(n_procs)],
+                _helper_repair_at_barrier,
+                [(tree, output_hash, cache_dir, barrier) for _ in range(n_procs)],
             )
 
             assert results == ["ok"] * n_procs
@@ -3547,8 +3734,6 @@ def test_concurrent_restores_repair_one_damaged_tree_once(tmp_path: pathlib.Path
             )
             assert cache.hash_directory(tree)["hash"] == output_hash["hash"]
             assert tree.stat().st_mode & 0o777 == 0o555
-            for i in range(n_procs):
-                assert cache.hash_directory(root / f"out{i}", cache_dir=cache_dir) == output_hash
 
 
 def _helper_tree_hash(src: pathlib.Path) -> DirHash:
@@ -4115,22 +4300,28 @@ def _helper_add_stale_dir_to_tree(tree_path: pathlib.Path) -> None:
     cache._tree_layout_marker(tree_path).unlink()
 
 
-def test_restore_from_cache_repairs_legacy_symlink_tree_empty_dirs(tmp_path: pathlib.Path) -> None:
-    """Restoring through a legacy SYMLINK cache tree gives the tree its hash records, not one
-    with extra empty directories that would hash differently from the lock."""
+def test_restore_from_cache_gives_the_recorded_dirs_past_a_legacy_tree(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A legacy SYMLINK cache tree with an empty directory its hash does not record is not
+    trusted: the restore gives the output what its hash records, file by file, not the tree's
+    extra directory that would hash differently from the lock, and leaves the tree as it is."""
     cache_dir = tmp_path / "cache"
     modes = [cache.CheckoutMode.SYMLINK]
     output = tmp_path / "out"
     output.mkdir()
     (output / "keep.txt").write_text("keep")
     output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
-    _helper_add_stale_dir_to_tree(cache.get_cache_path(cache_dir, output_hash["hash"]))
+    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+    _helper_add_stale_dir_to_tree(tree)
+    stale = _helper_dir_set(tree)
 
     cache.remove_output(output)
     assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
 
     assert _helper_dir_set(output) == set()
     assert cache.hash_directory(output, cache_dir=cache_dir) == output_hash
+    assert _helper_dir_set(tree) == stale, "the restore left the tree as it is"
 
 
 def test_save_to_cache_symlink_repairs_legacy_tree_empty_dirs(tmp_path: pathlib.Path) -> None:
@@ -4179,11 +4370,12 @@ def test_symlink_tree_leaves_out_user_symlinks(tmp_path: pathlib.Path) -> None:
     assert cache.hash_directory(output, cache_dir=cache_dir) == output_hash
 
 
-def test_restore_from_cache_repairs_legacy_symlink_tree_unlisted_files(
+def test_restore_from_cache_holds_only_recorded_files_past_a_legacy_tree(
     tmp_path: pathlib.Path,
 ) -> None:
-    """An older pivot copied a user symlink's target into the SYMLINK cache tree; restoring
-    through that tree removes what the hash does not record."""
+    """An older pivot copied a user symlink's target into the SYMLINK cache tree; the restore does
+    not trust that tree, restores only what the hash records, file by file, and leaves the tree
+    as it is."""
     cache_dir = tmp_path / "cache"
     modes = [cache.CheckoutMode.SYMLINK]
     output = tmp_path / "out"
@@ -4204,6 +4396,7 @@ def test_restore_from_cache_repairs_legacy_symlink_tree_unlisted_files(
 
     assert _helper_tree_listing(output) == ["keep.txt"]
     assert cache.hash_directory(output, cache_dir=cache_dir) == output_hash
+    assert (tree_path / "linked" / "big.bin").exists(), "the restore left the tree as it is"
 
 
 @pytest.mark.parametrize("with_empty_dir", [False, True], ids=["no-empty-dirs", "empty-dirs"])
@@ -4230,24 +4423,42 @@ def test_symlink_restore_does_not_walk_a_tree_this_pivot_built(
     assert scan.call_count == 0
 
 
-def test_symlink_restore_repairs_a_legacy_tree_once(
+def test_a_commit_repairs_a_legacy_tree_once_and_restores_then_link_it(
     tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
+    """A tree an older pivot built, with an empty directory its hash does not record: a restore
+    only checks it, so it restores the output file by file and leaves the tree as it is; a
+    symlink commit of the output repairs it and marks it, and every later restore links the tree
+    without checking it again."""
     cache_dir = tmp_path / "cache"
     modes = [cache.CheckoutMode.SYMLINK]
     output = tmp_path / "out"
     output.mkdir()
     (output / "keep.txt").write_text("keep")
     output_hash = cache.save_to_cache(output, cache_dir, checkout_modes=modes)
-    _helper_add_stale_dir_to_tree(cache.get_cache_path(cache_dir, output_hash["hash"]))
-    scan = mocker.spy(cache, "_scan_entries")
+    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+    _helper_add_stale_dir_to_tree(tree)
+    stale = _helper_dir_set(tree)
+    assert stale
 
+    cache.remove_output(output)
+    assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
+    assert not output.is_symlink()
+    assert _helper_dir_set(output) == set()
+    assert _helper_dir_set(tree) == stale, "the restore left the tree as it is"
+
+    committed = tmp_path / "committed"
+    committed.mkdir()
+    (committed / "keep.txt").write_text("keep")
+    assert cache.save_to_cache(committed, cache_dir, checkout_modes=modes) == output_hash
+    assert _helper_dir_set(tree) == set(), "the commit repaired the tree"
+
+    scan = mocker.spy(cache, "_scan_entries")
     for _ in range(2):
         cache.remove_output(output)
         assert cache.restore_from_cache(output, output_hash, cache_dir, checkout_modes=modes)
-
-    assert scan.call_count == 1
-    assert _helper_dir_set(output) == set()
+        assert output.resolve() == tree.resolve()
+    assert scan.call_count == 0, "a marked tree is linked without a check"
 
 
 def test_restore_missing_in_directory_recreates_missing_empty_dir(tmp_path: pathlib.Path) -> None:

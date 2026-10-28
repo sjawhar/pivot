@@ -177,7 +177,7 @@ def _restore_path_locked(
         match behavior:
             case CheckoutBehavior.ERROR:
                 read = list[tuple[pathlib.Path, os.stat_result, str]]()
-                with state.open_hash_cache(hash_state_dir) as state_db:
+                with state.open_readonly(hash_state_dir, create=False) as state_db:
                     matches = _on_disk_matches_expected(
                         path, output_hash, cache_dir, state_db, read
                     )
@@ -195,7 +195,7 @@ def _restore_path_locked(
                 if not is_dir_hash(output_hash) or path.is_symlink() or not path.is_dir():
                     return RestoreOutcome("skipped", path.name, skipped_files=total)
                 settled = list[tuple[pathlib.Path, os.stat_result, str]]()
-                with state.open_hash_cache(hash_state_dir) as state_db:
+                with state.open_readonly(hash_state_dir, create=False) as state_db:
                     outcome = cache.restore_missing_in_directory(
                         path, output_hash, cache_dir, checkout_modes, state_db, settled
                     )

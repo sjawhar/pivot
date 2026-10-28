@@ -613,7 +613,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     cache_dir = config.get_cache_dir() / "files"
 
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
-    with state_mod.open_hash_cache(config.get_state_dir()) as state_db:
+    with state_mod.open_readonly(config.get_state_dir(), create=False) as state_db:
         for data_path, track_data in tracked_files.items():
             path = pathlib.Path(data_path)
 

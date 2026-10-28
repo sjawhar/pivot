@@ -11,6 +11,9 @@ class MapFullError(Error):
 class BadValsizeError(Error):
     """Raised when a key or value is too large."""
 
+class ReadonlyError(Error):
+    """Raised when the environment or its files cannot be written (EACCES)."""
+
 class Cursor:
     """LMDB cursor for iterating over key-value pairs."""
 
