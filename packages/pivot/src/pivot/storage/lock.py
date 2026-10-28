@@ -16,6 +16,7 @@ For runtime mutual exclusion during concurrent execution, see
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import logging
@@ -24,11 +25,14 @@ import pathlib
 import posixpath
 import re
 import shlex
-from typing import TYPE_CHECKING, NamedTuple, cast, override
+import stat
+import threading
+from typing import TYPE_CHECKING, NamedTuple, cast, final, override
 
 import yaml
 
-from pivot import exceptions, path_policy, state_dir as state_dir_mod, yaml_config
+from pivot import exceptions, path_policy, yaml_config
+from pivot import state_dir as state_dir_mod
 from pivot.storage import cache, listing
 from pivot.types import (
     ArtifactIdentity,
@@ -40,6 +44,7 @@ from pivot.types import (
     HashInfo,
     LockData,
     OutEntry,
+    StageStatus,
     StorageLockData,
     identity_from_key,
     identity_key,
@@ -48,6 +53,8 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
+
+    from pivot.storage import state
 
 logger = logging.getLogger(__name__)
 
@@ -84,25 +91,400 @@ _RESTART_PROOF_TEXT = """\
 
 SCHEMA_VERSION = 3
 
+
 def stages_rel_path(state_dir: pathlib.Path, root: pathlib.Path) -> str:
     """Return the git-relative directory holding ``state_dir``'s lock files."""
     return (state_dir / "stages").resolve().relative_to(root.resolve()).as_posix()
 
 
-def _resolved_lock_path(
+def resolve_stage_lock_path(stages_dir: pathlib.Path, stage_name: str) -> pathlib.Path:
+    """Return the stage's current lock in either of the project's state directories.
+
+    A lock in only one directory is current. When both exist, run records decide which was
+    written last: a fallback run in legacy ``.pivot`` must not be hidden by an older configured
+    lock when the configured directory becomes writable again.
+    """
+    return _resolve_stage_lock(stages_dir, stage_name)[0]
+
+
+def _resolve_stage_lock(
     stages_dir: pathlib.Path, stage_name: str
-) -> tuple[pathlib.Path, pathlib.Path]:
-    """Return a readable lock and its stages directory, falling back to legacy .pivot state."""
-    primary = stages_dir / f"{stage_name}{_LOCK_SUFFIX}"
-    if primary.is_file():
-        return primary, stages_dir
+) -> tuple[pathlib.Path, pathlib.Path, object | None]:
+    """Return the current lock path, its directory, and parsed YAML when ordering read it."""
+    primary_path = stages_dir / f"{stage_name}{_LOCK_SUFFIX}"
     other_stages_dir = state_dir_mod.other_stages_dir_for(stages_dir)
-    if other_stages_dir is not None:
-        legacy = other_stages_dir / f"{stage_name}{_LOCK_SUFFIX}"
-        if legacy.is_file():
-            state_dir_mod.report_legacy_state_dir(stages_dir.parent)
-            return legacy, other_stages_dir
-    return primary, stages_dir
+    if other_stages_dir is None:
+        return primary_path, stages_dir, None
+    other_path = other_stages_dir / f"{stage_name}{_LOCK_SUFFIX}"
+    other_identity = _lock_identity(other_path)
+    if other_identity is None:
+        return primary_path, stages_dir, None
+    primary_identity = _lock_identity(primary_path)
+    if primary_identity is not None:
+        primary = _LockFile(primary_path, primary_identity)
+        other = _LockFile(other_path, other_identity)
+        if not _other_lock_is_current(
+            stage_name, primary, other, stages_dir.parent, other_stages_dir.parent
+        ):
+            ordering = state_dir_mod.lock_ordering()
+            if ordering is not None:
+                ordering["stale"].add(stages_dir.parent)
+            return primary_path, stages_dir, primary.valid_document()
+        state_dir_mod.report_legacy_state_dir(stages_dir.parent)
+        return other_path, other_stages_dir, other.valid_document()
+    state_dir_mod.report_legacy_state_dir(stages_dir.parent)
+    return other_path, other_stages_dir, None
+
+
+# A lock file's device, inode, size and change time.
+type _LockIdentity = tuple[int, int, int, int]
+
+
+def _lock_identity(path: pathlib.Path) -> _LockIdentity | None:
+    """Return a regular lock's identity, or None when the path is not a regular file."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return info.st_dev, info.st_ino, info.st_size, info.st_ctime_ns
+
+
+@final
+class _LockFile:
+    """A lock considered for ordering, parsed at most once."""
+
+    path: pathlib.Path
+    identity: _LockIdentity
+    _document: object | None
+    _output_hashes: list[str] | None
+    _read: bool
+
+    def __init__(self, path: pathlib.Path, identity: _LockIdentity) -> None:
+        self.path = path
+        self.identity = identity
+        self._document = None
+        self._output_hashes = None
+        self._read = False
+
+    def output_hashes(self) -> list[str] | None:
+        """Return the lock's output hashes, or None when it cannot be read as a lock."""
+        if not self._read:
+            self._read = True
+            try:
+                with open(self.path) as f:
+                    document: object = yaml.load(f, Loader=yaml_config.Loader)
+            except (OSError, UnicodeDecodeError, yaml.YAMLError):
+                document = None
+            parsed = parse_committed(document)
+            if isinstance(parsed, CommittedLock):
+                self._document = document
+                self._output_hashes = sorted(output["hash"] for output in parsed.data["outs"])
+        return self._output_hashes
+
+    def valid_document(self) -> object | None:
+        """Return the parsed YAML if it was a valid lock, otherwise None."""
+        _ = self.output_hashes()
+        return self._document
+
+
+# ``StateDB.list_runs`` keeps at most this many runs (`prune_runs`).
+_ALL_RUNS = 1 << 31
+
+# Guards databases held by one state-directory invocation.
+_held_databases_lock = threading.Lock()
+
+
+def _other_lock_is_current(
+    stage_name: str,
+    primary: _LockFile,
+    other: _LockFile,
+    primary_state_dir: pathlib.Path,
+    other_state_dir: pathlib.Path,
+) -> bool:
+    """Whether the lock in the other state directory is current."""
+    import lmdb
+
+    from pivot.storage import state
+
+    try:
+        return _order_locks(stage_name, primary, other, primary_state_dir, other_state_dir)
+    except (exceptions.PivotError, state.StateDBError, lmdb.Error, OSError, ValueError):
+        logger.debug("Cannot order the locks of %s; reading %s", stage_name, primary.path)
+        return False
+
+
+def _order_locks(
+    stage_name: str,
+    primary: _LockFile,
+    other: _LockFile,
+    primary_state_dir: pathlib.Path,
+    other_state_dir: pathlib.Path,
+) -> bool:
+    with contextlib.ExitStack() as stack:
+        databases = _ordering_databases(stack, (primary_state_dir, other_state_dir))
+        view = _ordering_view(databases)
+        return _order_with(stage_name, primary, other, databases, view, other_state_dir)
+
+
+def _order_with(
+    stage_name: str,
+    primary: _LockFile,
+    other: _LockFile,
+    databases: list[tuple[pathlib.Path, state.StateDB]],
+    view: state_dir_mod.OrderingView,
+    other_state_dir: pathlib.Path,
+) -> bool:
+    """Order two lock files, retaining an answer while their inputs stay unchanged."""
+    ordering = state_dir_mod.lock_ordering()
+    primary_key = os.fspath(primary.path)
+    key: object = None
+    if ordering is not None:
+        key = (view["dirs"], view["markers"], primary.identity, other.identity)
+        kept = ordering["decisions"].get(primary_key)
+        if kept is not None and kept[0] == key:
+            return kept[1]
+    answer = _answer(stage_name, primary, other, databases, view, os.fspath(other_state_dir))
+    if ordering is not None:
+        ordering["decisions"][primary_key] = (key, answer)
+    return answer
+
+
+def _answer(
+    stage_name: str,
+    primary: _LockFile,
+    other: _LockFile,
+    databases: list[tuple[pathlib.Path, state.StateDB]],
+    view: state_dir_mod.OrderingView,
+    other_state_dir: str,
+) -> bool:
+    """Order two locks by the stage's newest reusable runs."""
+    mentions = view["mentions"].get(stage_name)
+    if not mentions:
+        return False
+    first_outputs = view["first_outputs"]
+    for index, mention in enumerate(mentions):
+        if index == 0 and first_outputs is not None:
+            outputs = first_outputs[stage_name]
+        else:
+            outputs = _run_cache_outputs(stage_name, mention["input_hash"], databases)
+        if outputs is None:
+            break
+        if outputs == primary.output_hashes():
+            return False
+        if outputs == other.output_hashes():
+            return True
+    newest = mentions[0]
+    return newest["ran"] and newest["state_dir"] == other_state_dir
+
+
+def _ordering_databases(
+    stack: contextlib.ExitStack, state_dirs: tuple[pathlib.Path, pathlib.Path]
+) -> list[tuple[pathlib.Path, state.StateDB]]:
+    """Open each existing state database once for the current record."""
+    from pivot.storage import state
+
+    ordering = state_dir_mod.lock_ordering()
+    databases = list[tuple[pathlib.Path, state.StateDB]]()
+    for state_dir in state_dirs:
+        if ordering is not None:
+            held = _held_database(ordering, state_dir)
+            if held is not None:
+                databases.append((state_dir, held))
+        elif (state_dir / "state.lmdb").is_dir():
+            databases.append(
+                (state_dir, stack.enter_context(state.StateDB(state_dir, readonly=True)))
+            )
+    return databases
+
+
+def _held_database(
+    ordering: state_dir_mod.LockOrdering, state_dir: pathlib.Path
+) -> state.StateDB | None:
+    """Return this invocation's database for ``state_dir``, opening it if needed."""
+    from pivot.storage import state
+
+    pid = os.getpid()
+    key = os.fspath(state_dir)
+    data_file = os.path.join(key, "state.lmdb", "data.mdb")
+    current = _current_held(ordering, key, pid, data_file)
+    if current is not None:
+        return current
+    with _held_databases_lock:
+        current = _current_held(ordering, key, pid, data_file)
+        if current is not None:
+            return current
+        if not os.path.isdir(os.path.join(key, "state.lmdb")):
+            return None
+        database = state.StateDB(state_dir, readonly=True)
+        ordering["databases"].setdefault(key, []).append((pid, os.stat(data_file).st_ino, database))
+        return database
+
+
+def _current_held(
+    ordering: state_dir_mod.LockOrdering, key: str, pid: int, data_file: str
+) -> state.StateDB | None:
+    """Return the current process's still-current held database for ``key``."""
+    held = ordering["databases"].get(key)
+    if not held:
+        return None
+    opener, inode, database = held[-1]
+    if opener != pid:
+        return None
+    try:
+        return database if os.stat(data_file).st_ino == inode else None
+    except FileNotFoundError:
+        return None
+
+
+def _ordering_view(
+    databases: list[tuple[pathlib.Path, state.StateDB]],
+) -> state_dir_mod.OrderingView:
+    """Return the record's current view of runs in both state databases."""
+    dirs = tuple(os.fspath(state_dir) for state_dir, _database in databases)
+    markers = tuple(database.last_change() for _state_dir, database in databases)
+    ordering = state_dir_mod.lock_ordering()
+    view = None if ordering is None else ordering["views"].get(dirs)
+    if view is not None and view["markers"] == markers:
+        return view
+    newest = tuple(database.newest_run_id() for _state_dir, database in databases)
+    if view is not None and view["newest"] == newest:
+        view = state_dir_mod.OrderingView(
+            dirs=dirs,
+            newest=newest,
+            mentions=view["mentions"],
+            markers=markers,
+            first_outputs=None,
+        )
+    else:
+        view = _list_runs(databases, dirs, newest, markers, prefetch=ordering is not None)
+    if ordering is not None:
+        ordering["views"][dirs] = view
+    return view
+
+
+def _list_runs(
+    databases: list[tuple[pathlib.Path, state.StateDB]],
+    dirs: tuple[str, ...],
+    newest: tuple[str | None, ...],
+    markers: tuple[int, ...],
+    *,
+    prefetch: bool,
+) -> state_dir_mod.OrderingView:
+    """List runs from both databases and, for a record, prefetch their newest entries."""
+    mentions = dict[str, list[state_dir_mod.StageRunMention]]()
+    for (_state_dir, database), state_dir in zip(databases, dirs, strict=True):
+        for manifest in database.list_runs(limit=_ALL_RUNS):
+            for name, record in manifest["stages"].items():
+                input_hash = record["input_hash"]
+                status = record["status"]
+                if input_hash is None or status not in (StageStatus.RAN, StageStatus.CACHED):
+                    continue
+                mentions.setdefault(name, []).append(
+                    state_dir_mod.StageRunMention(
+                        run_id=manifest["run_id"],
+                        input_hash=input_hash,
+                        ran=status == StageStatus.RAN,
+                        state_dir=state_dir,
+                    )
+                )
+    for runs in mentions.values():
+        runs.sort(key=lambda mention: mention["run_id"], reverse=True)
+    if not prefetch:
+        return state_dir_mod.OrderingView(
+            dirs=dirs, newest=newest, mentions=mentions, markers=markers, first_outputs=None
+        )
+    first_outputs = dict[str, list[str] | None]()
+    pending = dict[str, str]()
+    for name, runs in mentions.items():
+        first_outputs[name] = None
+        pending[name] = runs[0]["input_hash"]
+    for _state_dir, database in databases:
+        if not pending:
+            break
+        for (name, _input_hash), entry in database.lookup_run_cache_many(pending.items()).items():
+            first_outputs[name] = sorted(output["hash"] for output in entry["output_hashes"])
+            del pending[name]
+    return state_dir_mod.OrderingView(
+        dirs=dirs,
+        newest=newest,
+        mentions=mentions,
+        markers=markers,
+        first_outputs=first_outputs,
+    )
+
+
+def _run_cache_outputs(
+    stage_name: str, input_hash: str, databases: list[tuple[pathlib.Path, state.StateDB]]
+) -> list[str] | None:
+    """Return one run-cache entry's output hashes from either state database."""
+    for _state_dir, database in databases:
+        entry = database.lookup_run_cache(stage_name, input_hash)
+        if entry is not None:
+            return sorted(output["hash"] for output in entry["output_hashes"])
+    return None
+
+
+def _end_lock_ordering(invocation: state_dir_mod.StateDirInvocation) -> None:
+    """Report the stale legacy locks a record found and close its held databases."""
+    ordering = invocation["lock_ordering"]
+    try:
+        if invocation["reported"] is not None:
+            for state_dir in sorted(ordering["stale"]):
+                state_dir_mod.report_stale_locks(state_dir, _find_stale_locks)
+    finally:
+        with _held_databases_lock:
+            held = [entry for entries in ordering["databases"].values() for entry in entries]
+            ordering["databases"].clear()
+        pid = os.getpid()
+        for opener, _inode, database in held:
+            if opener == pid:
+                database.close()
+
+
+def _find_stale_locks(
+    stages_dir: pathlib.Path, other_stages_dir: pathlib.Path
+) -> tuple[list[pathlib.Path], bool] | None:
+    """Return legacy locks the configured locks replaced, or None if they cannot be ordered."""
+    import lmdb
+
+    from pivot.storage import state
+
+    state_dir, other_state_dir = stages_dir.parent, other_stages_dir.parent
+    try:
+        names = sorted(
+            posixpath.join(os.path.relpath(directory, other_stages_dir), name)
+            .removeprefix("./")
+            .removesuffix(_LOCK_SUFFIX)
+            for directory, _subdirectories, files in os.walk(other_stages_dir)
+            for name in files
+            if name.endswith(_LOCK_SUFFIX)
+        )
+        stale = list[pathlib.Path]()
+        with contextlib.ExitStack() as stack:
+            databases = _ordering_databases(stack, (state_dir, other_state_dir))
+            view = _ordering_view(databases)
+            for stage_name in names:
+                if stage_name_error(stage_name) is not None:
+                    continue
+                primary_path = stages_dir / f"{stage_name}{_LOCK_SUFFIX}"
+                other_path = other_stages_dir / f"{stage_name}{_LOCK_SUFFIX}"
+                primary_identity = _lock_identity(primary_path)
+                other_identity = _lock_identity(other_path)
+                if primary_identity is None or other_identity is None:
+                    continue
+                primary = _LockFile(primary_path, primary_identity)
+                other = _LockFile(other_path, other_identity)
+                if not _order_with(stage_name, primary, other, databases, view, other_state_dir):
+                    stale.append(other_path)
+    except (exceptions.PivotError, state.StateDBError, lmdb.Error, OSError, ValueError):
+        logger.debug("Cannot order the locks under %s; not reporting stale locks", other_stages_dir)
+        return None
+    return stale, len(stale) == len(names)
+
+
+state_dir_mod.on_record_end(_end_lock_ordering)
 
 
 def get_stages_dir(state_dir: pathlib.Path) -> pathlib.Path:
@@ -597,6 +979,7 @@ class StageLock:
     stages_dir: pathlib.Path
     path: pathlib.Path
     _read_stages_dir: pathlib.Path
+    _read_path: pathlib.Path
 
     def __init__(self, stage_name: str, stages_dir: pathlib.Path) -> None:
         """Initialize a stage lock for the given stage in stages_dir."""
@@ -607,10 +990,16 @@ class StageLock:
         self.stages_dir = stages_dir
         self.path = stages_dir / f"{stage_name}{_LOCK_SUFFIX}"
         self._read_stages_dir = stages_dir
+        self._read_path = self.path
 
     def _load(self) -> object | None:
-        """The lock file's parsed YAML, or None when it is absent or unparseable."""
-        read_path, self._read_stages_dir = _resolved_lock_path(self.stages_dir, self.stage_name)
+        """The current lock's parsed YAML, or None when it is absent or unparseable."""
+        read_path, self._read_stages_dir, ordered = _resolve_stage_lock(
+            self.stages_dir, self.stage_name
+        )
+        self._read_path = read_path
+        if ordered is not None:
+            return ordered
         try:
             with open(read_path) as f:
                 return yaml.load(f, Loader=yaml_config.Loader)
@@ -676,12 +1065,11 @@ class StageLock:
         return result
 
     def _warn_format(self, *, older: bool) -> None:
-        read_path, _ = _resolved_lock_path(self.stages_dir, self.stage_name)
         try:
-            mtime_ns = read_path.stat().st_mtime_ns
+            mtime_ns = self._read_path.stat().st_mtime_ns
         except FileNotFoundError:
             return
-        _warn_format_once(str(read_path), mtime_ns, older)
+        _warn_format_once(str(self._read_path), mtime_ns, older)
 
     def output_listing_path(self, identity: ArtifactIdentity) -> pathlib.Path:
         """Where the listing of this stage's directory output is committed."""

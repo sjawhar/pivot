@@ -170,6 +170,7 @@ async def read_remote_config(
         return url, {}
     return url, source_config
 
+
 def _warn_source_state_dir_ignored(repo_url: str, problem: str) -> None:
     """Report a source core.state_dir that cannot be used; the import reads .pivot."""
     logger.warning(

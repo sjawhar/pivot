@@ -2541,8 +2541,8 @@ class Engine:
         """Warn once per run when git ignores a lock or listing file this run wrote: one of
         ``before`` whose stat changed (``_committed_files``).
 
-        A project made before `pivot init` wrote `!/stages/**` into `.pivot/.gitignore` can
-        hide them under a root pattern such as `lib/` or `build/`.
+        A project made before ``pivot init`` wrote ``!/**`` into the stages directory's
+        ``.gitignore`` can hide them under a root pattern such as ``lib/`` or ``build/``.
         """
         from pivot import git
 
@@ -2555,8 +2555,8 @@ class Engine:
         if ignored:
             _logger.warning(
                 "git ignores %s, which pivot just wrote and which must be committed: add "
-                + "`!/stages/**` to .pivot/.gitignore and make sure no other pattern ignores "
-                + ".pivot/ itself, or `git add -f` them",
+                + "`!/**` to the .gitignore in Pivot's stages directory and make sure no "
+                + "other pattern ignores .pivot itself, or `git add -f` them",
                 ", ".join(project.to_relative_path(path, project_root) for path in ignored),
             )
 

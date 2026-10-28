@@ -140,7 +140,6 @@ def _get_explanations_in_parallel(
     )
     explanations_by_name = dict[str, StageExplanation]()
 
-
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = dict[Future[StageExplanation], str]()
         for stage_name in execution_order:
@@ -185,7 +184,6 @@ def _get_explanations_in_parallel(
                     dep_changes=list[DepChange](),
                     upstream_stale=[],
                 )
-
 
     return explanations_by_name
 

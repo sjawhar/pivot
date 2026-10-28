@@ -16,12 +16,12 @@ from typing import TYPE_CHECKING, cast
 
 import xxhash
 
-from pivot.storage import cache
+from pivot.storage import listing
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pivot.types import DirHash
+    from pivot.types import DirManifestEntry
 
 _M = (1 << 64) - 1
 _P1 = 0x9E3779B185EBCA87
@@ -33,8 +33,8 @@ _P1I = pow(_P1, -1, 1 << 64)
 _P2I = pow(_P2, -1, 1 << 64)
 _ALPHABET = (string.ascii_letters + string.digits).encode()
 _ALLOWED = frozenset(_ALPHABET)
-_SENTINEL = "\x00" * 16  # pivot's JSON escapes it, so it is found in the encoded document
-_ENCODED_SENTINEL = b"\\u0000" * 16
+_SENTINEL = "\x00" * 16  # Pivot's listing format escapes each NUL as four ASCII bytes.
+_ENCODED_SENTINEL = b"\\000" * 16
 
 
 def _rotl(x: int, r: int) -> int:
@@ -121,20 +121,18 @@ def forge_value(build: Callable[[str], bytes], target_hex: str, *, prefix: str =
 
 
 def _encode(entries: list[dict[str, object]], empty_dirs: list[str] | None) -> bytes:
-    """A manifest as written, in pivot's own JSON encoding (imported, so a change to it changes
-    what the forgery targets): what the round-5 gate hashed."""
-    return cache._manifest_json(entries, empty_dirs or [])
+    """A directory listing as Pivot writes it, so the forgery targets its exact hashed bytes."""
+    return listing.encode(
+        listing.DirListing(
+            files=cast("list[DirManifestEntry]", entries),
+            empty_dirs=empty_dirs or [],
+        )
+    )
 
 
 def _canonical(entries: list[dict[str, object]], empty_dirs: list[str] | None) -> bytes:
-    """What pivot's own XXH64 gate hashes for a manifest: ``cache._canonical_manifest``, imported,
-    so the forgery targets exactly the gate's bytes, its order and fields included."""
-    output_hash: dict[str, object] = {"hash": "", "manifest": entries}
-    if empty_dirs:
-        output_hash["empty_dirs"] = empty_dirs
-    canonical = cache._canonical_manifest(cast("DirHash", cast("object", output_hash)))
-    assert canonical is not None, "a canonical forgery has a canonical form"
-    return canonical
+    """The canonical listing bytes Pivot hashes for a directory."""
+    return _encode(entries, empty_dirs)
 
 
 def pad_to(

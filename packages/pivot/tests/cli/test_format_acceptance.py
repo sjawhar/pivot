@@ -479,10 +479,9 @@ with Pipeline("lib") as pipeline:
 
 
 def test_repro_warns_when_git_ignores_a_lock_or_listing_it_wrote(tmp_path: pathlib.Path) -> None:
-    """A project made before `!/stages/**` existed, under a root `lib/` pattern."""
+    """A project made before the stages-level unignore existed, under a root `lib/` pattern."""
     root = _project(tmp_path, {"pipeline.py": _IGNORED_TREE_PIPELINE, ".gitignore": "lib/\n"})
-    gitignore = root / ".pivot" / ".gitignore"
-    gitignore.write_text(gitignore.read_text().replace("!/stages/**\n", ""))
+    (root / ".pivot" / "stages" / ".gitignore").unlink()
 
     repro = _pivot(root, "repro")
 
@@ -490,17 +489,16 @@ def test_repro_warns_when_git_ignores_a_lock_or_listing_it_wrote(tmp_path: pathl
     assert repro.returncode == 0, out
     assert ".pivot/stages/lib/make.lock" in out, out
     assert ".pivot/stages/lib/make=tree.listing" in out, out
-    assert "!/stages/**" in out, out
+    assert "!/**" in out, out
 
 
 def test_repro_warns_when_git_ignores_the_listing_of_a_directory_input_it_wrote(
     tmp_path: pathlib.Path,
 ) -> None:
-    """In a project made before `!/stages/**` existed, a root pattern such as `*.listing` hides
-    the input listing pivot writes for a directory input, as well as output listings."""
+    """Without the stages-level unignore, a root `*.listing` pattern hides input and output
+    listings."""
     root = _project(tmp_path, {"pipeline.py": _TREE_PIPELINE, ".gitignore": "*.listing\n"})
-    gitignore = root / ".pivot" / ".gitignore"
-    gitignore.write_text(gitignore.read_text().replace("!/stages/**\n", ""))
+    (root / ".pivot" / "stages" / ".gitignore").unlink()
     _helper_write_tree(root / "data" / "raw" / "corpus")
 
     repro = _pivot(root, "repro")
@@ -1042,13 +1040,12 @@ def test_a_committed_stale_listing_names_remedies_that_put_it_right(
 def test_repro_warns_when_git_ignores_a_lock_a_run_cache_restore_wrote(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A stage restored from its run cache rewrites its lock as a run does, so `repro` names
-    that lock when git ignores it (a project made before `!/stages/**`, a root `p/` pattern)."""
+    """A run-cache restore names its rewritten lock when a legacy project lacks the stages
+    unignore and a root `p/` pattern hides it."""
     root = _project(
         tmp_path, {"pipeline.py": _PLAIN_PIPELINE, "data/raw/in.txt": "abc", ".gitignore": "p/\n"}
     )
-    gitignore = root / ".pivot" / ".gitignore"
-    gitignore.write_text(gitignore.read_text().replace("!/stages/**\n", ""))
+    (root / ".pivot" / "stages" / ".gitignore").unlink()
     _ok(_pivot(root, "repro"))
     output = root / str(_helper_entry(root, "p/upper", "outs", None)["path"])
     lock_path = root / ".pivot" / "stages" / "p" / "upper.lock"

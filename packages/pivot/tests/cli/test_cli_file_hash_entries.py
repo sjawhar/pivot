@@ -199,7 +199,6 @@ def test_repro_records_the_hashes_its_skip_check_reads(tmp_path: pathlib.Path) -
     assert _helper_unrecorded(root) == [], "Every file the skip check read is recorded"
 
 
-
 def _helper_s3_env(moto_services: dict[str, str]) -> dict[str, str]:
     return _env(
         AWS_ENDPOINT_URL=moto_services["s3"],

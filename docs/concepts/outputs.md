@@ -170,10 +170,11 @@ In a file name, every byte of the key or path other than a letter, digit, `_`,
 `.`, `@` or `-` is written `%XX`; a name that would then be longer than 255
 bytes is written `~` and the xxhash64 of the key or path instead (for a tracked
 directory, `.~<hash>.pvt.listing` beside its `.pvt`). Commit listing files with
-the lock files. `pivot init` writes `!/stages/**` into `.pivot/.gitignore`, so a
-root `.gitignore` pattern such as `lib/` or `build/` cannot hide them; `pivot
-repro` warns, naming each one, when git ignores a lock or listing file it just
-wrote, and `pivot track` does the same for a `.pvt` and its listing.
+the lock files. `pivot init` writes `!/**` to the `.gitignore` in the stages
+directory, so a root `.gitignore` pattern such as `lib/` or `build/` cannot
+hide them; `pivot repro` warns, naming each one, when git ignores a lock or
+listing file it just wrote, and `pivot track` does the same for a `.pvt` and
+its listing.
 
 A listing file whose bytes do not hash to the directory hash its lock or `.pvt`
 records (hand-edited, left behind by a lock put back without it, merged line by

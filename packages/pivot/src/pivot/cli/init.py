@@ -18,7 +18,17 @@ _GITATTRIBUTES_CONTENT = f"""\
 # Pivot listing files: never merge one line by line; take it and its lock from one side
 {_GITATTRIBUTES_LINE}
 """
+_STAGES_GITIGNORE_CONTENT = "!/**\n"
 
+
+def _create_stages_gitignore(path: pathlib.Path) -> None:
+    """Create the stages-level negation that keeps locks and listings visible to Git."""
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    except FileExistsError:
+        return
+    with os.fdopen(descriptor, "w") as gitignore:
+        gitignore.write(_STAGES_GITIGNORE_CONTENT)
 
 
 def _ensure_gitattributes(path: pathlib.Path) -> bool:
@@ -91,6 +101,7 @@ def init(ctx: click.Context, force: bool) -> None:
 
     stages_dir = state_dir / "stages"
     state_dir_mod.make_dirs(stages_dir)
+    _create_stages_gitignore(stages_dir / ".gitignore")
 
     # Create .pivotignore with default patterns if it doesn't exist
     pivotignore_path = pathlib.Path.cwd() / ".pivotignore"

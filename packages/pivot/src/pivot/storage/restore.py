@@ -105,9 +105,7 @@ def get_lock_data_from_revision(
         state_dirs.append(other_state_dir)
     for candidate in state_dirs:
         try:
-            rel_path = str(
-                lock.get_stages_dir(candidate).relative_to(root) / f"{stage_name}.lock"
-            )
+            rel_path = str(lock.get_stages_dir(candidate).relative_to(root) / f"{stage_name}.lock")
         except ValueError:
             continue
         content = git.read_file_from_revision(rel_path, rev)
@@ -186,7 +184,6 @@ def resolve_targets(
             selected_key = types.identity_from_key(target).key
             hashes = dict[str, HashInfo | None]()
             members = dict[str, listing.DirListing]()
-            stages_rel = lock.get_stages_dir(stage_target["state_dir"]).relative_to(proj_root)
             for entry in committed.data["outs"]:
                 key = entry["key"]
                 if selected_key is not None and key != selected_key:
@@ -205,6 +202,16 @@ def resolve_targets(
                     if key in committed.listings:
                         members[path] = committed.listings[key]
                         continue
+                    listing_state_dir = stage_target["state_dir"]
+                    try:
+                        stages_rel = lock.get_stages_dir(listing_state_dir).relative_to(proj_root)
+                    except ValueError:
+                        legacy_state_dir = state_dir_mod.other_state_dir_for(listing_state_dir)
+                        if legacy_state_dir is None:
+                            raise exceptions.TargetNotFoundError(
+                                f"Stage '{stage_name}' has no git-tracked state directory"
+                            ) from None
+                        stages_rel = lock.get_stages_dir(legacy_state_dir).relative_to(proj_root)
                     listing_rel = listing.output_listing_path(
                         stages_rel, types.ArtifactIdentity(stage_name, key)
                     ).as_posix()

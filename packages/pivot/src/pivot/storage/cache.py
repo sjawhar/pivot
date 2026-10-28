@@ -491,6 +491,7 @@ def get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
         raise exceptions.SecurityValidationError(f"Hash contains invalid characters: {file_hash!r}")
     return cache_dir / file_hash[:2] / file_hash[2:]
 
+
 # The errnos for which pathlib treats an object as absent. Other errors, such as EACCES, must
 # remain visible to the caller because a cache object may exist but be unusable.
 _ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
@@ -1411,9 +1412,7 @@ def missing_cache_objects(
     else:
         hashes = [output_hash["hash"]]
     return [
-        file_hash
-        for file_hash in hashes
-        if resolve_cache_object_path(cache_dir, file_hash) is None
+        file_hash for file_hash in hashes if resolve_cache_object_path(cache_dir, file_hash) is None
     ]
 
 
@@ -1828,8 +1827,10 @@ def _restore_directory_from_cache(
         _cleanup_fresh_restore_orphans(path, target_token)
     restore_prefix = f"{_RESTORE_TEMP_PREFIX}{target_token}."
 
-    if symlink_fast_path and not _ensure_tree_complete(
-        cache_dir_path, members, cache_dir, repair=False
+    if (
+        cache_dir_path is not None
+        and symlink_fast_path
+        and not _ensure_tree_complete(cache_dir_path, members, cache_dir, repair=False)
     ):
         # This is the same content check as _store_directory, but a restore never repairs.
         # A tree that does not match its canonical marker is restored file by file when its
@@ -1846,6 +1847,7 @@ def _restore_directory_from_cache(
                 return False
 
     if symlink_fast_path:
+        assert cache_dir_path is not None
         temp_symlink = path.parent / f"{restore_prefix}symlink_{secrets.token_hex(4)}"
         try:
             tree_files = (
@@ -2052,9 +2054,8 @@ def restore_missing_in_directory(
                 f"Manifest contains path traversal: {relpath!r}"
             )
 
-        file_cache_path = (
-            resolve_cache_object_path(cache_dir, entry["hash"])
-            or get_cache_path(cache_dir, entry["hash"])
+        file_cache_path = resolve_cache_object_path(cache_dir, entry["hash"]) or get_cache_path(
+            cache_dir, entry["hash"]
         )
         if file_path.is_symlink():
             if not file_path.parent.resolve().is_relative_to(resolved_base):

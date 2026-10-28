@@ -363,7 +363,9 @@ class AgentRpcHandler:
                         {producer: locks[producer] for producer in producers},
                         reg_info["deps"].values(),
                         {
-                            producer: explain_mod.stages_dir(all_stages[producer], default_state_dir)
+                            producer: explain_mod.stages_dir(
+                                all_stages[producer], default_state_dir
+                            )
                             for producer in producers
                         },
                         store.cache_dir,

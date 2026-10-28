@@ -40,13 +40,13 @@ def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
                     continue
                 with os.scandir(prefix_entry.path) as hash_entries:
                     for hash_entry in hash_entries:
-                        if not hash_entry.is_file():
+                        if not hash_entry.is_file(follow_symlinks=False):
                             continue
                         full_hash = prefix_entry.name + hash_entry.name
                         if cache.is_valid_hash(full_hash):
                             hashes.add(full_hash)
                             if index:
-                                state_dir_mod.report_legacy_state_dir(cache_dir)
+                                state_dir_mod.report_legacy_state_dir(cache_dir.parent)
 
     metrics.end("sync.get_local_cache_hashes", _t)
     return hashes
@@ -173,11 +173,15 @@ def _get_file_hash_from_stages(
     from pivot.cli import helpers as cli_helpers
 
     stages_dir = lock.get_stages_dir(state_dir)
-    if not stages_dir.exists():
-        return None
+    stage_names = set[str]()
+    for scanned_dir in (stages_dir, state_dir_mod.other_stages_dir_for(stages_dir)):
+        if scanned_dir is not None and scanned_dir.is_dir():
+            stage_names.update(
+                lock_file.relative_to(scanned_dir).with_suffix("").as_posix()
+                for lock_file in scanned_dir.rglob("*.lock")
+            )
 
-    for lock_file in stages_dir.rglob("*.lock"):
-        stage_name = lock_file.relative_to(stages_dir).with_suffix("").as_posix()
+    for stage_name in sorted(stage_names):
         try:
             stage_info = cli_helpers.get_stage(stage_name)
             non_cached_paths = {

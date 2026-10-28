@@ -115,7 +115,7 @@ def _diff_outputs(
             {} if committed is None else {entry["key"]: entry for entry in committed.data["outs"]}
         )
         stages_dir = lock.get_stages_dir(
-            registry.get_stage_state_dir(stage_infos[stage_name], config.get_state_dir())
+            registry.get_stage_state_dir(stage_infos[stage_name], config.locate_state_dir())
         )
         for out in outs:
             output_path = store.resolve_display_path(out)
@@ -258,7 +258,7 @@ def _head_listing(at_head: _HeadListing, record: types.DirHash) -> listing.DirLi
     content = git.read_file_from_revision(at_head, "HEAD")
     try:
         return listing.read_found(
-            content, f"{at_head} at HEAD", record, config.get_cache_dir() / "files"
+            content, f"{at_head} at HEAD", record, config.locate_cache_dir() / "files"
         )
     except exceptions.ListingMissingError:
         return None

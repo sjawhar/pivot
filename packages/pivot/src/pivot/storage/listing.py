@@ -24,7 +24,6 @@ UTF-8; an empty directory's ``/`` goes inside the quotes. The listing is always 
 from __future__ import annotations
 
 import functools
-import hashlib
 import json
 import logging
 import operator
@@ -330,11 +329,11 @@ def _enc(value: str) -> str:
 
 
 def _short(value: str) -> str:
-    """A deterministic collision-resistant abbreviation for an overlong listing name.
+    """A deterministic XXH64 abbreviation for an overlong listing name.
 
     The original value remains in the lock or ``.pvt``; only its sidecar's name changes.
     """
-    return f"~{hashlib.sha256(os.fsencode(value)).hexdigest()}"
+    return f"~{xxhash.xxh64(os.fsencode(value)).hexdigest()}"
 
 
 def _checked(path: pathlib.Path, fallback: Callable[[], pathlib.Path]) -> pathlib.Path:
