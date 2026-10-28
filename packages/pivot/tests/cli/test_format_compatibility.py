@@ -162,8 +162,9 @@ def test_a_lock_an_older_pivot_rewrote_is_read_without_the_listing_left_beside_i
 ):
     """This pivot writes a project; a teammate on pivot 0.5.10 (main's lock reader) clones it,
     changes an input and reruns, writing locks in its format and leaving this pivot's listing
-    file beside the directory stage's lock stale. That file is not the old lock's listing:
-    `verify` passes, as the base's does, `repro` is cached, and no command warns about it."""
+    file beside the directory stage's lock stale. That file is not the old lock's listing: it is
+    never named as corrupt. Main's loaded-source fingerprint can safely rerun a consumer once as
+    Code changed; after that one-time upgrade run, verify and repro settle cleanly."""
     src = _project(tmp_path / "src")
     _ok(_run(src, _PIVOT, "repro"))
     _git(src, "add", "-A")
@@ -176,16 +177,23 @@ def test_a_lock_an_older_pivot_rewrote_is_read_without_the_listing_left_beside_i
     assert split_lock["schema_version"] == 2, split_lock
     assert (root / ".pivot/stages/p/split=parts.listing").is_file()
 
-    verified = _run(root, _PIVOT, "verify")
+    initial_verify = _run(root, _PIVOT, "verify")
     repro = _run(root, _PIVOT, "repro")
+    initial = initial_verify.stdout + initial_verify.stderr + repro.stdout + repro.stderr
 
-    for proc in (verified, repro):
+    assert repro.returncode == 0, initial
+    assert "does not hash" not in initial and "split=parts.listing" not in initial, initial
+    assert "Code changed" in initial_verify.stdout, initial_verify.stdout
+    assert "20" in (root / _PARTS / "train.csv").read_text(), "the output 0.5.10 wrote stays"
+
+    verified = _run(root, _PIVOT, "verify")
+    settled = _run(root, _PIVOT, "repro")
+    for proc in (verified, settled):
         out = proc.stdout + proc.stderr
         assert proc.returncode == 0, out
         assert "does not hash" not in out and "split=parts.listing" not in out, out
     assert "Verification passed" in verified.stdout, verified.stdout
-    assert "0 ran" in repro.stdout + repro.stderr, repro.stdout + repro.stderr
-    assert "20" in (root / _PARTS / "train.csv").read_text(), "the output 0.5.10 wrote stays"
+    assert "0 ran" in settled.stdout + settled.stderr, settled.stdout + settled.stderr
 
 
 # =============================================================================

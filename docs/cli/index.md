@@ -37,6 +37,53 @@ All commands support:
 | `--quiet` / `-q` | Suppress non-essential output |
 | `--help` | Show help message |
 
+**Output.** Three rules hold for every command:
+
+- **URL credentials are hidden.** Any URL Pivot prints — an import's repository URL, a remote
+  cache URL, a URL in a warning, a log line or an error — shows `***` in place of its user-info:
+  `https://user:token@host/repo.git` prints as `https://***@host/repo.git`. The stored URL is
+  unchanged, and a URL without credentials prints byte for byte. An scp-like `git@host:path` is
+  not a URL and prints as typed.
+- **Control characters are escaped in text output.** A value Pivot read from a file (a `.pvt`
+  file, a lock file, `.pivot/config.yaml`, `params.yaml`, a remote listing) prints each control
+  character as visible text (`\x1b`), tab and newline included, so one value stays on one line
+  and a crafted repository cannot drive the terminal. `--json` output is unchanged: JSON escapes
+  these characters itself.
+- **`--json` and `--jsonl` are strict JSON.** A non-finite float prints as the string
+  `"Infinity"`, `"-Infinity"` or `"NaN"`, so a strict RFC 8259 parser reads every document. See
+  [CI Integration](../guides/ci-integration.md#pivot-status---json).
+
+**Errors.** A failure pivot recognizes prints its own message, often with a tip. Any other failure
+prints one line: an operating-system error as its message and the path it names (for example
+`Error: Permission denied: /home/me/proj/.pivot/cache/files/c9`), anything else as
+`Error: Unexpected <type>: <message>`. In `run` and `repro`, a stage prints that one line under
+its name only when pivot's own file operation on the files it manages failed: storing the stage's
+outputs in the cache, opening the state database, reading or writing the stage's lock file,
+preparing the stage's output path, and creating the output file and renaming it into place in a
+format pivot writes itself (text, JSON, JSON Lines, YAML, pickle, DataFrame JSON Lines). Every
+other stage failure prints its traceback, as before: one in your stage function, in a loader or
+writer (pivot's own included, with any code of yours it runs), and any failure pivot did not
+classify. The `--json` record keeps the stage's full reason in both cases: its last line and your
+own frames are what they were, and pivot may add a frame of its own above them.
+`pivot --verbose <command>` also prints the traceback, after the TUI exits for `--tui`.
+
+The same cause therefore reads differently by output format, because a format that encodes your
+value as it writes it runs your value's own code inside the write:
+
+- **A disk that fills while the file is written** is one line for a text, YAML or DataFrame JSON
+  Lines output, where pivot writes text it has already encoded. It prints the traceback for a
+  JSON, JSON Lines or pickle output, where `json` and `pickle` encode your value as they write
+  it, so a `__getstate__`, a `__reduce__` or a container of yours may be what failed.
+- **A read-only output directory** is one line for those six formats, which pivot opens itself.
+  It prints the traceback for a CSV output and a plot, where pandas and matplotlib open the path
+  while running your value's code, and for a `pathlib.Path` output, whose move pivot has not
+  classified.
+- **A directory pivot has to create for the output** is one line for every format, including CSV
+  and a plot: pivot creates it before the writer runs.
+
+The first two rules above hold for these lines too: a credential in a path or a message is
+hidden, and a control character in either is escaped, in the one line and in the traceback alike.
+
 **Path arguments.** `pivot track`, `push`, `fetch` and `pull` read a relative path from the
 current directory. `diff`, `checkout`, `repro`, `dag`, `get` and `check-ignore` read it from the
 project root, so from `sub/` they take the file `data/x.csv` as `data/x.csv`, not
@@ -49,7 +96,9 @@ project: from a `link -> project` symlink, `link/data/x.csv` names `data/x.csv`.
 inside the project is not followed: from `project/dlink -> data`, `dlink/x.csv` matches no
 output in `diff`, `checkout`, `repro`, `dag`, `push`, `fetch` and `pull`, so give the path it
 points to, `data/x.csv`. `track` tracks a file through such a symlink, with a warning that the
-file is inside a symlinked directory.
+file is inside a symlinked directory, unless the directory really lies outside the project:
+then the `.pvt` would be written outside too, where no command finds it again, so `track`
+refuses ("its .pvt would be written outside the project").
 
 `pivot get` refuses every absolute path ("Path traversal not allowed in target").
 `pivot check-ignore` keeps a path under a symlink as typed, so a pattern anchored to the project
@@ -59,6 +108,15 @@ root.
 A path that leaves the project, including `link/../x.csv`, is refused by `checkout`, `push`,
 `fetch`, `pull` and `track` (`resolves outside project root`) and matches no output in
 `diff`, `repro` and `dag`.
+
+**A `.pvt` restores its file only inside the project.** `checkout`, `pull` and
+`repro --checkout-missing` read every `.pvt` under the project root and restore the file its
+`path:` names. A `.pvt` is skipped, with a warning naming it and exit code 0, when its `path:`
+names no file (`.`, `./` or empty), holds `..`, is absolute, or names a file whose directory
+really lies outside the project, through a symlink. `pivot track` and `pivot import` write
+`path:` as the name of the file beside the `.pvt`, which is always restored; any other value
+is warned about, because `checkout x.pvt`, `get`, `update` and `push` take the file beside the
+`.pvt` while `checkout` with no target takes `path:`.
 
 ---
 
@@ -234,6 +292,8 @@ pivot commit [STAGES...] [OPTIONS]
 ```
 
 Without arguments, commits all stale stages. With stage names, unconditionally commits those stages.
+
+The code a lock records depends on where the outputs came from. If they are the outputs a `pivot repro --no-commit` run wrote, unchanged since, the lock records the code that run ran, so an edit made while it ran, or since, still reruns the stage. Otherwise (outputs edited by hand, or written another way) the lock records the code on disk now: the "trust me" path.
 
 **Options:**
 

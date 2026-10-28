@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import enum
 import functools
 import logging
@@ -14,7 +13,6 @@ import click
 from pivot import config, exceptions, project, registry, types
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
-from pivot.cli import errors as cli_errors
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
 from pivot.storage import cache, listing, lock, state, track
@@ -124,16 +122,6 @@ def _tracked_expected(data_path: str, pvt_data: track.PvtData, cache_dir: pathli
     return Expected(output_hash, read_members)
 
 
-def _hash_cache(
-    state_dir: pathlib.Path | None,
-) -> contextlib.AbstractContextManager[state.StateDB | None]:
-    """``state_dir``'s StateDB, read-only, so a check reuses the hashes runs, ``pivot status``
-    and earlier checkouts recorded; None when it has none yet, so a check never creates it."""
-    if state_dir is not None and (state_dir / "state.lmdb").exists():
-        return state.StateDB(state_dir, readonly=True)
-    return contextlib.nullcontext(None)
-
-
 def _save_file_hashes(
     state_dir: pathlib.Path | None, entries: list[tuple[pathlib.Path, os.stat_result, str]]
 ) -> None:
@@ -227,7 +215,7 @@ def _restore_path_locked(
         match behavior:
             case CheckoutBehavior.ERROR:
                 read = list[tuple[pathlib.Path, os.stat_result, str]]()
-                with _hash_cache(hash_state_dir) as state_db:
+                with state.open_readonly(hash_state_dir) as state_db:
                     matches = _on_disk_matches_expected(
                         path, output_hash, cache_dir, state_db, read
                     )
@@ -245,7 +233,7 @@ def _restore_path_locked(
                 if members is None or path.is_symlink() or not path.is_dir():
                     return RestoreOutcome("skipped", path.name, skipped_files=total)
                 settled = list[tuple[pathlib.Path, os.stat_result, str]]()
-                with _hash_cache(hash_state_dir) as state_db:
+                with state.open_readonly(hash_state_dir) as state_db:
                     outcome = cache.restore_missing_in_directory(
                         path, members, cache_dir, checkout_modes, state_db, settled
                     )
@@ -340,18 +328,11 @@ async def _checkout_files_async(
         except click.ClickException as e:
             immediate_errors.append(e)
 
-    try:
-        async with asyncio.TaskGroup() as tg:
-            for abs_path_str, output_hash in files.items():
-                _ = tg.create_task(restore_one(abs_path_str, output_hash))
-    except* Exception as eg:
-        # Convert unexpected exceptions to a friendly error message, rendering a PivotError's
-        # actionable suggestion the same way the top-level CLI error handler does (cli/errors.py).
-        messages = [
-            cli_errors.format_pivot_error(e) if isinstance(e, exceptions.PivotError) else str(e)
-            for e in eg.exceptions
-        ]
-        raise click.ClickException("\n".join(messages)) from None
+    # Anything else a restore raises leaves as an exception group, which the command's error
+    # handler words (cli/decorators.py).
+    async with asyncio.TaskGroup() as tg:
+        for abs_path_str, output_hash in files.items():
+            _ = tg.create_task(restore_one(abs_path_str, output_hash))
 
     # Re-raise immediate failures (all of them, aggregated)
     if immediate_errors:

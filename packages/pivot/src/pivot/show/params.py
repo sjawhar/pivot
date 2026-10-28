@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import logging
 from typing import TYPE_CHECKING, TypedDict, cast
 
-from pivot import git, parameters
+from pivot import display, git, parameters
 from pivot.show import common
 from pivot.types import ChangeType, OutputFormat
 
@@ -139,7 +138,7 @@ def diff_params(
 
 def _values_equal(a: ParamValue, b: ParamValue) -> bool:
     """Compare values using JSON serialization for consistency."""
-    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+    return display.to_json(a, sort_keys=True) == display.to_json(b, sort_keys=True)
 
 
 def _apply_precision(value: ParamValue, precision: int) -> ParamValue:
@@ -164,7 +163,7 @@ def format_params_table(
             stage: {k: _apply_precision(v, precision) for k, v in stage_params.items()}
             for stage, stage_params in params.items()
         }
-        return json.dumps(rounded, indent=2)
+        return common.format_json(rounded)
 
     rows = list[list[str]]()
     for stage, stage_params in sorted(params.items()):
@@ -193,7 +192,7 @@ def format_diff_table(
             )
             for d in diffs
         ]
-        return json.dumps(rounded_diffs, indent=2)
+        return common.format_json(rounded_diffs)
 
     rows = list[list[str]]()
     for diff in diffs:
@@ -219,5 +218,5 @@ def _format_value(value: ParamValue, precision: int) -> str:
     if isinstance(value, float):
         return f"{value:.{precision}f}"
     if isinstance(value, dict | list):
-        return json.dumps(value)
+        return display.to_json(value)
     return str(value)

@@ -95,12 +95,13 @@ class _RunRequests:
         stages: list[str] | None = None,
         single_stage: bool = False,
         max_workers: int = 1,
+        force: bool = True,
     ) -> None:
         await self._send.send(
             RunRequested(
                 type="run_requested",
                 stages=stages,
-                force=True,
+                force=force,
                 reason="test",
                 single_stage=single_stage,
                 parallel=True,
@@ -779,6 +780,88 @@ with Pipeline("warm") as pipeline:
                 helper.write_text('def value() -> str:\n    return "bravo-two"\n')
                 await _helper_forced_run(requests, recorder, "warm/value")
                 assert output.read_text() == "bravo-two"
+                tg.cancel_scope.cancel()
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.anyio
+async def test_server_runs_do_not_rerun_a_stage_that_never_used_an_edited_helper(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In a long-lived engine (an RPC server), one worker imports an edited PYTHONPATH helper
+    for `use_plain`, then runs `unrelated`, which never touches it. `use_plain` reruns on every
+    run until pivot restarts, as documented; `unrelated` is cached on runs 2 and 3."""
+    module_name = f"server_edited_{uuid.uuid4().hex}"
+    helpers = tmp_path.resolve() / "helpers"
+    helpers.mkdir()
+    helper = helpers / f"{module_name}.py"
+    helper.write_text('def plain() -> str:\n    return "plain-v1"\n')
+    monkeypatch.syspath_prepend(str(helpers))
+    root = tmp_path.resolve() / "project"
+    (root / "data" / "raw").mkdir(parents=True)
+    (root / "data" / "raw" / "seed.txt").write_text("seed\n")
+    pipeline = _helper_project(
+        root,
+        monkeypatch,
+        f"""\
+import importlib
+import pathlib
+
+import {module_name}
+
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def edit_helper(seed: str) -> str:
+    path = pathlib.Path({str(helper)!r})
+    path.write_text(path.read_text().replace("-v1", "-v2"))
+    return "ready"
+
+
+@stage
+def use_plain(ready: str) -> str:
+    importlib.reload({module_name})
+    return {module_name}.plain()
+
+
+@stage
+def unrelated(value: str) -> str:
+    return "unrelated-fixed"
+
+
+with Pipeline("p") as pipeline:
+    unrelated(use_plain(edit_helper(pipeline.input("seed.txt"))))
+""",
+    )
+    executor_core.restart_workers(1, idle_timeout_s=None)
+    recorder = _Recorder()
+    requests = _RunRequests()
+
+    async def run_once() -> dict[str, StageStatus]:
+        start = len(recorder.events)
+        await requests.request_forced_run(force=False)
+        active = await recorder.wait_for(_helper_engine_state(EngineState.ACTIVE), start=start)
+        idle = await recorder.wait_for(_helper_engine_state(EngineState.IDLE), start=active)
+        return {
+            event["stage"]: event["status"]
+            for event in recorder.events[active:idle]
+            if event["type"] == "stage_completed"
+        }
+
+    try:
+        async with engine_mod.Engine(pipeline=pipeline) as eng:
+            eng.add_sink(recorder)
+            eng.add_source(requests)
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+                first = await run_once()
+                assert first["p/unrelated"] == StageStatus.RAN, first
+                for run in (2, 3):
+                    later = await run_once()
+                    assert later["p/unrelated"] == StageStatus.CACHED, (run, later)
+                    assert later["p/use_plain"] == StageStatus.RAN, (run, later)
                 tg.cancel_scope.cancel()
     finally:
         sys.modules.pop(module_name, None)

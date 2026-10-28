@@ -1138,13 +1138,13 @@ def test_a_listing_path_that_is_a_directory_is_named_and_replaced_by_a_stage_run
 
     named = verified.stdout + verified.stderr
     assert verified.returncode == 1, named
-    assert str(_OUTPUT_LISTING) in named and "move anything in it aside" in named, named
+    assert listing_file.name in named and "move anything in it aside" in named, named
     assert "pivot repro --force <stage>" in named and "Traceback" not in named, named
     assert forced.returncode == 0, forced.stdout + forced.stderr
     assert "Traceback" not in forced.stdout + forced.stderr
     out = refused.stdout + refused.stderr
     assert refused.returncode == 1, out
-    assert str(_OUTPUT_LISTING) in out and "remove it" in out and "Traceback" not in out, out
+    assert listing_file.name in out and "remove it" in out and "Traceback" not in out, out
     shutil.rmtree(listing_file)
     _ok(_pivot(root, "repro", "--force", "t/copy"))
     assert listing_file.read_bytes() == good

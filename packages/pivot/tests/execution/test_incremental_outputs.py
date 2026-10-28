@@ -113,6 +113,7 @@ def _worker_info(
         incremental_inputs={"previous": output.identity},
         unsafe_fingerprint=False,
         no_fingerprint=False,
+        loaded_sources_token="",
     )
 
 

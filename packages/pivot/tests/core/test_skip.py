@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from pivot import skip
 from pivot.types import ArtifactIdentity, DirHash, FileHash, HashInfo, LockData
 
@@ -413,30 +415,64 @@ def test_explain_unchanged_stage_has_empty_reason() -> None:
 
 
 # =============================================================================
-# Uncovered-import marker carried by pivot commit
+# Rerun marks (uncovered import, edited source) carried by pivot commit
 # =============================================================================
 
-_MARKER = f"{skip.UNCOVERED_IMPORT_KEY_PREFIX}helpers, helpers.lib"
+_UNCOVERED_MARK = f"{skip.UNCOVERED_IMPORT_KEY_PREFIX}helpers, helpers.lib"
+_EDITED_MARK = f"{skip.EDITED_SOURCE_KEY_PREFIX}helpers"
 
 
-def test_carry_uncovered_import_keeps_marker_when_static_fingerprint_is_unchanged() -> None:
+@pytest.mark.parametrize("mark", [_UNCOVERED_MARK, _EDITED_MARK])
+def test_carry_rerun_marks_keeps_marker_when_static_fingerprint_is_unchanged(mark: str) -> None:
     fingerprint = {"self:count": "aa", "module:helpers": ""}
 
-    carried = skip.carry_uncovered_import({**fingerprint, _MARKER: ""}, fingerprint)
+    carried = skip.carry_rerun_marks({**fingerprint, mark: ""}, fingerprint)
 
-    assert carried == {**fingerprint, _MARKER: ""}
-    assert skip.uncovered_import_reason(carried) is not None
+    assert carried == {**fingerprint, mark: ""}
+    assert skip.rerun_mark_reason(carried) is not None
 
 
-def test_carry_uncovered_import_drops_marker_after_a_code_edit() -> None:
-    previous = {"self:count": "aa", _MARKER: ""}
+@pytest.mark.parametrize("mark", [_UNCOVERED_MARK, _EDITED_MARK])
+def test_carry_rerun_marks_drops_marker_after_a_code_edit(mark: str) -> None:
+    previous = {"self:count": "aa", mark: ""}
     fingerprint = {"self:count": "bb"}
 
-    assert skip.carry_uncovered_import(previous, fingerprint) == fingerprint
+    assert skip.carry_rerun_marks(previous, fingerprint) == fingerprint
 
 
-def test_carry_uncovered_import_without_a_marked_lock_returns_the_fingerprint() -> None:
+def test_carry_rerun_marks_without_a_marked_lock_returns_the_fingerprint() -> None:
     fingerprint = {"self:count": "aa"}
 
-    assert skip.carry_uncovered_import(None, fingerprint) == fingerprint
-    assert skip.carry_uncovered_import(dict(fingerprint), fingerprint) == fingerprint
+    assert skip.carry_rerun_marks(None, fingerprint) == fingerprint
+    assert skip.carry_rerun_marks(dict(fingerprint), fingerprint) == fingerprint
+
+
+@pytest.mark.parametrize(
+    ("mark", "reason"),
+    [
+        (
+            _UNCOVERED_MARK,
+            "Previous run imported modules its fingerprint does not cover: helpers, helpers.lib",
+        ),
+        (_EDITED_MARK, "Previous run imported modules edited after pivot loaded them: helpers"),
+    ],
+)
+def test_marked_lock_reruns_with_its_reason_and_never_from_the_run_cache(
+    mark: str, reason: str
+) -> None:
+    """A lock with either mark never matches its fingerprint, names why, and is never satisfied
+    from the run cache."""
+    fingerprint = {"self:count": "aa"}
+    lock_data = LockData(
+        code_manifest={**fingerprint, mark: ""},
+        params={},
+        dep_hashes={},
+        output_hashes={},
+    )
+
+    for explain in (False, True):
+        decision = skip.check_stage(lock_data, fingerprint, {}, {}, [], explain=explain)
+
+        assert decision["changed"] is True
+        assert decision["reason"] == reason
+        assert decision["run_cache_allowed"] is False

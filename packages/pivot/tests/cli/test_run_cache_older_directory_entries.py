@@ -1,13 +1,14 @@
-"""An older pivot's run-cache entry restores a stage after an upgrade, whatever its
+"""An older pivot's run-cache entry settles a stage after an upgrade, whatever its
 dependencies: one that reads a directory output whole, one that reads a pipeline input
 directory whole, the directory's producer, a consumer of one file in it, and a file stage.
 
 Pivot 0.5.10 (and #516) hashed a whole directory as the JSON of its inline file list; this
 pivot hashes it as its listing. The entry an older pivot filed is looked up under the key that
 pivot computed: unmarked, with each directory dependency hashed the older way from its members
-(``worker.older_pivot_input_hash``, ``listing.legacy_digest``). From the PR #523 round-2
-recheck (slice ``cip``); needs uv (``PIVOT_TEST_UV``) and PyPI, like
-tests/cli/test_format_compatibility.py.
+(``worker.older_pivot_input_hash``, ``listing.legacy_digest``). Main can add loaded-source
+fingerprint entries a 0.5.10 lock never held; that safe one-time ``Code changed`` run replaces
+the entry, and the following run is cached. From the PR #523 round-2 recheck (slice ``cip``);
+needs uv (``PIVOT_TEST_UV``) and PyPI, like tests/cli/test_format_compatibility.py.
 """
 
 from __future__ import annotations
@@ -139,12 +140,16 @@ def _repro_reasons(root: pathlib.Path) -> dict[str, tuple[str, str]]:
         "r/upper",  # control: a file-only stage
     ],
 )
-def test_an_old_run_cache_entry_restores_a_stage_after_an_upgrade(
+def test_an_old_run_cache_entry_settles_a_stage_after_an_upgrade(
     old_project: pathlib.Path, tmp_path: pathlib.Path, stage: str
 ) -> None:
     root = tmp_path / "w"
     shutil.copytree(old_project, root, symlinks=True)
 
-    reasons = _repro_reasons(root)
+    first = _repro_reasons(root)
+    if first[stage] == ("cached", "unchanged (run cache)"):
+        return
+    assert first[stage] == ("ran", "Code changed"), first
 
-    assert reasons[stage] == ("cached", "unchanged (run cache)"), reasons
+    second = _repro_reasons(root)
+    assert second[stage][0] == "cached", second

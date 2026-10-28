@@ -5,11 +5,11 @@ import re
 import time
 from typing import TYPE_CHECKING, ClassVar, Self, override
 
-import rich.markup
 import textual.binding
 import textual.message
 import textual.widgets
 
+from pivot import display
 from pivot.types import StageStatus
 from pivot_tui.types import LogEntry
 
@@ -111,7 +111,7 @@ class StageLogPanel(textual.widgets.RichLog):
                 case StageStatus.COMPLETED | StageStatus.RAN | StageStatus.FAILED:
                     self.write("[dim]No logs recorded[/]")
                 case _:
-                    self.write(f"[dim]No logs yet for {rich.markup.escape(stage.name)}[/]")
+                    self.write(f"[dim]No logs yet for {display.escape_markup(stage.name)}[/]")
 
     def add_log(self, line: str, is_stderr: bool, timestamp: float) -> None:  # pragma: no cover
         """Add a new log line, with search highlighting if search is active."""
@@ -123,7 +123,7 @@ class StageLogPanel(textual.widgets.RichLog):
             self._write_line_highlighted(entry, is_current=False)
         else:
             time_str = time.strftime("[%H:%M:%S]", time.localtime(timestamp))
-            escaped_line = rich.markup.escape(line)
+            escaped_line = display.escape_markup(line)
             style = _get_line_style(line, is_stderr)
             if style:
                 self.write(f"[dim]{time_str}[/] [{style}]{escaped_line}[/]")
@@ -145,7 +145,7 @@ class StageLogPanel(textual.widgets.RichLog):
         self._raw_logs.append(LogEntry(line, is_stderr, timestamp))
 
         time_str = time.strftime("[%H:%M:%S]", time.localtime(timestamp))
-        escaped_line = rich.markup.escape(line)
+        escaped_line = display.escape_markup(line)
         style = _get_line_style(line, is_stderr)
 
         if style:
@@ -235,7 +235,7 @@ class StageLogPanel(textual.widgets.RichLog):
         text = (
             self._highlight_matches(entry.line)
             if self._search_pattern
-            else rich.markup.escape(entry.line)
+            else display.escape_markup(entry.line)
         )
 
         # Determine style based on log level (or stderr fallback)
@@ -256,7 +256,7 @@ class StageLogPanel(textual.widgets.RichLog):
     def _highlight_matches(self, line: str) -> str:
         """Highlight search matches in a line with Rich markup.
 
-        Security: Uses rich.markup.escape() to prevent markup injection.
+        Security: Uses display.escape_markup() to prevent markup injection.
         Precondition: self._search_pattern is not None.
         """
         assert self._search_pattern is not None
@@ -267,14 +267,14 @@ class StageLogPanel(textual.widgets.RichLog):
         for match in self._search_pattern.finditer(line):
             # Escape text before match
             if match.start() > last_end:
-                parts.append(rich.markup.escape(line[last_end : match.start()]))
+                parts.append(display.escape_markup(line[last_end : match.start()]))
             # Highlight the match
-            parts.append(f"[bold yellow]{rich.markup.escape(match.group())}[/]")
+            parts.append(f"[bold yellow]{display.escape_markup(match.group())}[/]")
             last_end = match.end()
 
         # Escape remaining text after last match (or entire line if no matches)
         if last_end < len(line):
-            parts.append(rich.markup.escape(line[last_end:]))
+            parts.append(display.escape_markup(line[last_end:]))
 
         return "".join(parts)
 

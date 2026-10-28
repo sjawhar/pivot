@@ -4,12 +4,9 @@ import enum
 import logging
 import os
 import pathlib
-import re
-from typing import Literal, TypedDict
+from typing import TypedDict
 
-from pivot import exceptions
-
-SymlinkAction = Literal["error", "warn", "allow"]
+from pivot import display, exceptions
 
 logger = logging.getLogger(__name__)
 
@@ -29,34 +26,15 @@ class PathPolicy(TypedDict):
     """Policy configuration for a path type."""
 
     allow_absolute: bool
-    symlink_escape_action: SymlinkAction
 
 
 POLICIES: dict[PathType, PathPolicy] = {
-    PathType.DEP: PathPolicy(
-        allow_absolute=True,
-        symlink_escape_action="warn",
-    ),
-    PathType.INPUT: PathPolicy(
-        allow_absolute=False,
-        symlink_escape_action="warn",
-    ),
-    PathType.OUT: PathPolicy(
-        allow_absolute=False,
-        symlink_escape_action="error",
-    ),
-    PathType.CWD: PathPolicy(
-        allow_absolute=False,
-        symlink_escape_action="error",
-    ),
-    PathType.VAR: PathPolicy(
-        allow_absolute=False,
-        symlink_escape_action="error",
-    ),
-    PathType.CLI_OUTPUT: PathPolicy(
-        allow_absolute=False,
-        symlink_escape_action="error",
-    ),
+    PathType.DEP: PathPolicy(allow_absolute=True),
+    PathType.INPUT: PathPolicy(allow_absolute=False),
+    PathType.OUT: PathPolicy(allow_absolute=False),
+    PathType.CWD: PathPolicy(allow_absolute=False),
+    PathType.VAR: PathPolicy(allow_absolute=False),
+    PathType.CLI_OUTPUT: PathPolicy(allow_absolute=False),
 }
 
 
@@ -106,29 +84,27 @@ def recorded_path_error(value: str) -> str | None:
     return None
 
 
-# Unicode category Cc is exactly these code points: C0 controls, DEL and C1 controls.
-_CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-
-
 def has_control_character(value: str) -> bool:
     """Whether ``value`` holds a control character (Unicode category Cc: C0, DEL or C1)."""
-    return _CONTROL_CHARACTER.search(value) is not None
+    return display.CONTROL_CHARACTER.search(value) is not None
 
 
 def validate_path(
     path: str,
     path_type: PathType,
     base_dir: pathlib.Path,
-    *,
-    check_exists: bool = False,
 ) -> PathValidationResult:
-    """Validate a path according to its type's policy.
+    """Validate a declared path according to its type's policy.
+
+    This runs at registration, on the path as it is written, so it never touches the
+    filesystem: a declared path inside the project stays valid whatever its components are
+    symlinked to. What a write may land on is checked where the write happens; see
+    ``docs/solutions/2026-02-02-path-resolution-design-patterns.md``.
 
     Args:
         path: The path string to validate
         path_type: Classification determining which policy applies
         base_dir: Directory that relative paths are resolved against and must stay within
-        check_exists: If True, also check symlink resolution (requires path to exist)
 
     Returns:
         PathValidationResult with validation outcome
@@ -167,28 +143,6 @@ def validate_path(
         # Allowed (deps only) - warn about reproducibility
         warnings.append(f"Absolute {path_type.value} path may break reproducibility: {path}")
 
-    # Symlink resolution (only if path exists and check_exists=True)
-    if check_exists and normalized.exists():
-        try:
-            real_path = normalized.resolve()
-            real_base = base_dir.resolve()
-            if not _is_within(real_path, real_base):
-                msg = f"{path_type.value} path resolves outside base via symlink: {path!r} -> {real_path}"
-                match policy["symlink_escape_action"]:
-                    case "error":
-                        return PathValidationResult(
-                            valid=False,
-                            normalized_path=None,
-                            error=msg,
-                            warnings=warnings,
-                        )
-                    case "warn":
-                        warnings.append(msg)
-                    case "allow":
-                        pass
-        except OSError as e:
-            warnings.append(f"Could not resolve symlink for {path_type.value}: {path!r} ({e})")
-
     return PathValidationResult(
         valid=True,
         normalized_path=normalized,
@@ -202,7 +156,6 @@ def require_valid_path(
     path_type: PathType,
     base_dir: pathlib.Path,
     *,
-    check_exists: bool = False,
     context: str = "",
 ) -> pathlib.Path:
     """Validate path and raise SecurityValidationError if invalid.
@@ -211,7 +164,6 @@ def require_valid_path(
         path: The path string to validate
         path_type: Classification determining which policy applies
         base_dir: Directory that relative paths are resolved against
-        check_exists: If True, also check symlink resolution
         context: Optional context for error messages (e.g., stage name)
 
     Returns:
@@ -220,7 +172,7 @@ def require_valid_path(
     Raises:
         SecurityValidationError: If path validation fails
     """
-    result = validate_path(path, path_type, base_dir, check_exists=check_exists)
+    result = validate_path(path, path_type, base_dir)
 
     for warning in result["warnings"]:
         prefix = f"{context}: " if context else ""

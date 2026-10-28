@@ -520,6 +520,141 @@ def test_import_rejects_remote_content_that_does_not_match_its_hash(
     assert not (consumer / "t.txt.pvt").exists()
 
 
+_DIRECTORY_OUTPUT_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def tree() -> Annotated[dict[str, str], directory]:
+    return {"g.txt": "g"}
+
+
+with Pipeline("p") as pipeline:
+    tree()
+"""
+
+
+def _helper_import_into_declared_output(
+    runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
+) -> None:
+    """Import smoke/total to data/p/tree/imported.txt, inside stage p/tree's directory output."""
+    (consumer / "pipeline.py").write_text(_DIRECTORY_OUTPUT_PIPELINE)
+    _helper_publish(source, bucket, "smoke/total", b"sum: 6\n", "v1")
+    data_path = _helper_import(runner, source, "smoke/total", "data/p/tree/imported.txt")
+    assert data_path.read_bytes() == b"sum: 6\n"
+
+
+def test_import_into_a_declared_directory_output_stays_listed_as_tracked(
+    runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
+) -> None:
+    """Audit D1, `pivot import --out` into a declared output: the tracked view lists it.
+
+    `pivot import` checks no stage overlap, so its sidecar can sit inside a stage's directory
+    output; `pivot status --tracked-only` must still list it.
+    """
+    _helper_import_into_declared_output(runner, source, bucket, consumer)
+
+    tracked = runner.invoke(cli.cli, ["status", "--tracked-only", "--json"])
+
+    assert tracked.exit_code == 0, tracked.output
+    assert {
+        entry["path"]: entry["status"] for entry in json.loads(tracked.stdout)["tracked_files"]
+    } == {"data/p/tree/imported.txt": types.TrackedFileStatus.CLEAN}, (
+        "status --tracked-only must list the import inside the declared output"
+    )
+
+
+def test_import_into_a_declared_directory_output_stays_listed_as_an_import(
+    runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
+) -> None:
+    """Audit D1, `pivot import --out` into a declared output: `status --check-imports` lists it."""
+    _helper_import_into_declared_output(runner, source, bucket, consumer)
+
+    imports = runner.invoke(cli.cli, ["status", "--check-imports"])
+
+    assert imports.exit_code == 0, imports.output
+    assert "\u2713 data/p/tree/imported.txt: up to date" in imports.output, imports.output
+
+
+_STATE_NAMED_IMPORT_PATHS = pytest.mark.parametrize(
+    "out",
+    [
+        pytest.param(".pivot/imported.txt", id="pivot-dir"),
+        pytest.param("sub/.git/imported.txt", id="nested-git"),
+    ],
+)
+
+
+def _helper_metadata_only_import(
+    runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, out: str
+) -> pathlib.Path:
+    """Create a metadata-only import of smoke/total at ``out`` and return its .pvt path."""
+    _helper_publish(source, bucket, "smoke/total", b"sum: 6\n", "v1")
+    result = runner.invoke(
+        cli.cli, ["import", str(source.root), "smoke/total", "--no-download", "--out", out]
+    )
+    assert result.exit_code == 0, result.output
+    assert "(metadata only)" in result.output, result.output
+    pvt_path = track.get_pvt_path(project.get_project_root() / out)
+    assert pvt_path.is_file()
+    return pvt_path
+
+
+@_STATE_NAMED_IMPORT_PATHS
+def test_metadata_only_import_under_a_state_named_dir_stays_listed_as_tracked(
+    runner: click.testing.CliRunner,
+    source: _Source,
+    bucket: _Bucket,
+    consumer: pathlib.Path,
+    out: str,
+) -> None:
+    """Audit D2, hidden imports: `status --tracked-only` lists the not-yet-downloaded import."""
+    _helper_metadata_only_import(runner, source, bucket, out)
+
+    tracked = runner.invoke(cli.cli, ["status", "--tracked-only", "--json"])
+
+    assert tracked.exit_code == 0, tracked.output
+    assert {
+        entry["path"]: entry["status"] for entry in json.loads(tracked.stdout)["tracked_files"]
+    } == {out: types.TrackedFileStatus.MISSING}, f"status --tracked-only must list {out}"
+
+
+@_STATE_NAMED_IMPORT_PATHS
+def test_metadata_only_import_under_a_state_named_dir_stays_listed_as_an_import(
+    runner: click.testing.CliRunner,
+    source: _Source,
+    bucket: _Bucket,
+    consumer: pathlib.Path,
+    out: str,
+) -> None:
+    """Audit D2, hidden imports: `status --check-imports` lists the import as up to date."""
+    _helper_metadata_only_import(runner, source, bucket, out)
+
+    imports = runner.invoke(cli.cli, ["status", "--check-imports"])
+
+    assert imports.exit_code == 0, imports.output
+    assert f"\u2713 {out}: up to date" in imports.output, imports.output
+
+
+@_STATE_NAMED_IMPORT_PATHS
+def test_metadata_only_import_under_a_state_named_dir_is_checked_by_update_dry_run(
+    runner: click.testing.CliRunner,
+    source: _Source,
+    bucket: _Bucket,
+    consumer: pathlib.Path,
+    out: str,
+) -> None:
+    """Audit D2, hidden imports: `update --dry-run` with no target still finds the import."""
+    pvt_path = _helper_metadata_only_import(runner, source, bucket, out)
+
+    check = runner.invoke(cli.cli, ["update", "--dry-run"])
+
+    assert check.exit_code == 0, check.output
+    assert f"Up to date: {pvt_path}" in check.output, check.output
+
+
 # =============================================================================
 # update
 # =============================================================================
@@ -625,9 +760,10 @@ def test_update_failure_of_one_import_does_not_stop_the_others(
     result = runner.invoke(cli.cli, ["update"])
 
     assert result.exit_code == 1
-    assert f"Unexpected error updating {track.get_pvt_path(a_path)}: IsADirectoryError" in (
-        result.output
-    )
+    # The OS's words and the path, without the exception class or a traceback (--verbose logs it)
+    assert f"Error updating {track.get_pvt_path(a_path)}: Is a directory: " in result.output
+    assert "IsADirectoryError" not in result.output
+    assert "Traceback" not in result.output
     assert f"Updated: {b_path}" in result.output
     assert b_path.read_bytes() == b"b2"
 

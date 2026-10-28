@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import pathlib
-import traceback
 from typing import TYPE_CHECKING
 
 import click
 
+from pivot import display
 from pivot.cli import decorators as cli_decorators
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pivot import import_artifact
@@ -61,10 +64,10 @@ def update(targets: tuple[str, ...], rev: str | None, dry_run: bool) -> None:
                 pvt_path = track.get_pvt_path(project.normalize_path(t_path, base=root))
             pvt_data = track.read_pvt_file(pvt_path)
             if pvt_data is None:
-                click.echo(f"Skipping invalid .pvt: {pvt_path}")
+                click.echo(f"Skipping invalid .pvt: {display.escape_control(str(pvt_path))}")
                 continue
             if not track.is_import(pvt_data):
-                click.echo(f"Skipping non-import: {pvt_path}")
+                click.echo(f"Skipping non-import: {display.escape_control(str(pvt_path))}")
                 continue
             pairs.append((pvt_path, pvt_data))
     else:
@@ -82,16 +85,17 @@ def update(targets: tuple[str, ...], rev: str | None, dry_run: bool) -> None:
     if dry_run:
         checks = asyncio.run(_batch_check(pairs))
         for (pvt_path, _), check_or_exc in zip(pairs, checks, strict=True):
+            shown = display.escape_control(str(pvt_path))
             if isinstance(check_or_exc, BaseException):
                 errors += 1
                 _report_error(pvt_path, check_or_exc)
             else:
                 if check_or_exc["available"]:
-                    current = check_or_exc["current_rev"][:8]
-                    latest = check_or_exc["latest_rev"][:8]
-                    click.echo(f"Update available: {pvt_path} ({current} → {latest})")
+                    current = display.escape_control(check_or_exc["current_rev"][:8])
+                    latest = display.escape_control(check_or_exc["latest_rev"][:8])
+                    click.echo(f"Update available: {shown} ({current} → {latest})")
                 else:
-                    click.echo(f"Up to date: {pvt_path}")
+                    click.echo(f"Up to date: {shown}")
     else:
         results = asyncio.run(_batch_update(pairs, rev))
         for (pvt_path, _), result_or_exc in zip(pairs, results, strict=True):
@@ -99,16 +103,15 @@ def update(targets: tuple[str, ...], rev: str | None, dry_run: bool) -> None:
                 errors += 1
                 _report_error(pvt_path, result_or_exc)
             else:
+                shown = display.escape_control(result_or_exc["path"])
+                old_rev = display.escape_control(result_or_exc["old_rev"][:8])
+                new_rev = display.escape_control(result_or_exc["new_rev"][:8])
                 if result_or_exc["downloaded"]:
-                    old_rev = result_or_exc["old_rev"][:8]
-                    new_rev = result_or_exc["new_rev"][:8]
-                    click.echo(f"Updated: {result_or_exc['path']} ({old_rev} → {new_rev})")
+                    click.echo(f"Updated: {shown} ({old_rev} → {new_rev})")
                 elif result_or_exc["metadata_updated"]:
-                    old_rev = result_or_exc["old_rev"][:8]
-                    new_rev = result_or_exc["new_rev"][:8]
-                    click.echo(f"Metadata updated: {result_or_exc['path']} ({old_rev} → {new_rev})")
+                    click.echo(f"Metadata updated: {shown} ({old_rev} → {new_rev})")
                 else:
-                    click.echo(f"Up to date: {result_or_exc['path']}")
+                    click.echo(f"Up to date: {shown}")
 
     if errors:
         raise SystemExit(1)
@@ -117,11 +120,9 @@ def update(targets: tuple[str, ...], rev: str | None, dry_run: bool) -> None:
 def _report_error(pvt_path: pathlib.Path, exc: BaseException) -> None:
     from pivot import exceptions
 
-    if isinstance(exc, (exceptions.PivotError, exceptions.RemoteError)):
-        click.echo(f"Error updating {pvt_path}: {exc}", err=True)
-    else:
-        click.echo(
-            f"Unexpected error updating {pvt_path}: {type(exc).__name__}: {exc}",
-            err=True,
-        )
-        traceback.print_exception(exc)
+    shown = display.escape_control(str(pvt_path))
+    if not isinstance(exc, exceptions.PivotError):
+        # Unexpected: --verbose shows the traceback; the message is one line naming the problem.
+        logger.debug("Unexpected error updating %s", shown, exc_info=exc)
+    message = f"Error updating {shown}: {exceptions.describe_error(exc)}"
+    click.echo(display.safe_message(message), err=True)

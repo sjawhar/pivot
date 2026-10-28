@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 import xxhash
 
+from pivot import loaded_source
 from pivot.executor import core as executor_core
 from pivot.executor import worker
 
@@ -89,6 +90,8 @@ class WorkerPool:
     _pings: dict[str, list[concurrent.futures.Future[None]]] = field(default_factory=dict)
     _user_code_files: dict[str, _FileStamp | None] = field(default_factory=dict)
     _code_changed: bool = False
+    # `loaded_source.token()` when this pool's workers were started: they hold those digests.
+    _sources_token: str | None = None
 
     def start(self, *, max_workers: int, idle_timeout_s: float | None = None) -> None:
         """Start a run without shrinking workers warmed by earlier runs."""
@@ -104,6 +107,7 @@ class WorkerPool:
         elif (
             self._idle_timeout_s != idle_timeout_s
             or self._has_stale_user_code()
+            or self._sources_token != loaded_source.token()
             or not executor_core.is_executor_usable(executor, self._max_workers)
         ):
             executor = self._replace_executor(idle_timeout_s)
@@ -117,6 +121,7 @@ class WorkerPool:
             self._restamp_user_code_files()
         self._stamp_coordinator_user_code()
         self._executor = executor
+        self._sources_token = loaded_source.token()
         self._idle_timeout_s = idle_timeout_s
         self._output_queue = typing.cast("mp.Queue[OutputMessage]", self._new_output_queue())
         self._shutdown_event = threading.Event()
@@ -132,6 +137,7 @@ class WorkerPool:
         """
         self._max_workers = max(self._max_workers, max_workers)
         self._executor = self._replace_executor(self._idle_timeout_s, warm_workers=max_workers)
+        self._sources_token = loaded_source.token()
         self._restamp_user_code_files()
 
     def _replace_executor(
@@ -332,10 +338,10 @@ class WorkerPool:
     def hard_cancel(self) -> None:
         """Stop workers mid-stage and signal the drain thread to stop.
 
-        Each worker is sent SIGTERM, which unwinds its running stage
-        (``worker.unwind_when_stopped``) so the stage's cleanup runs, and is given
-        ``worker.TERMINATION_GRACE_S`` to exit; a worker still alive then is killed with its
-        descendants.
+        Each worker's main thread, where its stage runs, is sent SIGTERM (``worker.terminate``),
+        which unwinds its running stage (``worker.unwind_when_stopped``) so the stage's cleanup
+        runs, and the worker is given ``worker.TERMINATION_GRACE_S`` to exit; a worker still
+        alive then is killed with its descendants.
 
         The workers are first taken out of loky's executor. Its manager thread takes a worker
         that exits without being asked to for a broken pool and SIGKILLs every worker the
@@ -364,8 +370,12 @@ class WorkerPool:
 
     @staticmethod
     def _stop_workers(executor: loky.ProcessPoolExecutor) -> None:
-        """Take ``executor``'s workers out of it, send each SIGTERM, and SIGKILL with its
-        descendants any worker still alive after ``worker.TERMINATION_GRACE_S``."""
+        """Take ``executor``'s workers out of it, send each SIGTERM (``worker.terminate``),
+        and SIGKILL with its descendants any worker still alive after
+        ``worker.TERMINATION_GRACE_S``.
+
+        A send that fails is logged and the pass goes on, so one worker can never cost the
+        others their signal, or the grace, the join and the SIGKILL that bound every stop."""
         # loky exposes no public list of its worker processes. A watch reload may have
         # replaced this executor already, which leaves it no lock and no workers.
         with executor._processes_management_lock or contextlib.nullcontext():
@@ -373,8 +383,12 @@ class WorkerPool:
             executor._processes.clear()
         for process in processes:
             if process.pid is not None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(process.pid, signal.SIGTERM)
+                try:
+                    worker.terminate(process.pid)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    _logger.exception("Could not send SIGTERM to worker %s", process.pid)
         deadline = time.monotonic() + worker.TERMINATION_GRACE_S
         for process in processes:
             process.join(max(0.0, deadline - time.monotonic()))

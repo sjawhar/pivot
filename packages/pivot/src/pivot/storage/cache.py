@@ -947,17 +947,35 @@ _TREE_LOCK_SUFFIX = ".lock"
 
 
 def _tree_layout_marker(cache_dir_path: pathlib.Path) -> pathlib.Path:
-    """Return the file beside a whole-directory SYMLINK cache tree that records the tree holds
-    exactly what its listing records. The name is never a cache key, so cache scans skip it.
-    """
+    """Return the file beside a whole-directory SYMLINK cache tree that holds the canonical
+    listing bytes verified when the tree was marked. The name is never a cache key, so cache
+    scans skip it."""
     return cache_dir_path.with_name(cache_dir_path.name + _TREE_LAYOUT_MARKER_SUFFIX)
 
 
-def _mark_tree(cache_dir_path: pathlib.Path) -> None:
-    """Mark a tree known to hold exactly what its listing records. The marker only saves a
-    check, so a cache the user cannot write still restores without one."""
+def _tree_marker_matches(cache_dir_path: pathlib.Path, canonical: bytes) -> bool:
+    """Whether the tree's marker holds exactly the canonical listing bytes from its mark.
+
+    A tree's XXH64 path is only an index: distinct listing bytes can share it. Comparing the
+    supplied listing to the bytes a commit verified before it marked this tree keeps such a
+    forged listing from selecting a tree as its own.
+    """
+    try:
+        return _tree_layout_marker(cache_dir_path).read_bytes() == canonical
+    except OSError:
+        return False
+
+
+def _mark_tree(cache_dir_path: pathlib.Path, canonical: bytes) -> None:
+    """Mark a tree known to hold ``canonical`` listing bytes. The marker only saves a check,
+    so a cache the user cannot write still restores without one."""
+
+    def write_marker(fd: int) -> None:
+        with os.fdopen(fd, "wb") as f:
+            _ = f.write(canonical)
+
     with contextlib.suppress(OSError):
-        _tree_layout_marker(cache_dir_path).touch()
+        atomic_write_file(_tree_layout_marker(cache_dir_path), write_marker)
     for suffix in _LEGACY_TREE_MARKER_SUFFIXES:
         with contextlib.suppress(OSError):
             cache_dir_path.with_name(cache_dir_path.name + suffix).unlink(missing_ok=True)
@@ -1012,22 +1030,20 @@ def _tree_matches(
 
 
 def _ensure_tree_complete(
-    cache_dir_path: pathlib.Path, members: listing.DirListing, cache_dir: pathlib.Path
+    cache_dir_path: pathlib.Path,
+    members: listing.DirListing,
+    cache_dir: pathlib.Path,
+    *,
+    repair: bool,
 ) -> bool:
-    """Return whether a whole-directory SYMLINK cache tree holds exactly what ``members``
-    records, checking a tree once and repairing it in place from its files' own cache objects.
+    """Return whether a tree holds ``members`` and is marked with those canonical listing bytes.
 
-    The tree publisher marks a tree once it is complete (``_publish_tree``). A tree without the
-    mark is checked: a copy a sweep on another host cut short while it was built, one a
-    publisher was killed in, leaving files missing or cut short under a name a restore trusts,
-    or one marked by an older check that compared sizes alone, which can hold stale bytes of
-    the recorded size. The check, the repair and the mark run under the tree's exclusive lock,
-    so two repairers never change the tree's directory modes under each other. Returns False,
-    the tree unmarked, when the tree differs and cannot be repaired, or cannot be checked: a
-    file's object is absent, or this user cannot read the tree, write it or take its lock.
+    Only a commit passes ``repair=True``: its ``members`` came from ``hash_directory`` of the
+    real output bytes. Restore and cache-missing checks pass False; their supplied listing may be
+    a forged XXH64 collision, so it can never drive a write into the cache or mark a tree.
     """
-    marker = _tree_layout_marker(cache_dir_path)
-    if marker.exists():
+    canonical = listing.encode(members)
+    if _tree_marker_matches(cache_dir_path, canonical):
         return True
     fd: int | None
     try:
@@ -1043,12 +1059,12 @@ def _ensure_tree_complete(
             except OSError:  # NFS refuses an exclusive lock on a file opened read-only
                 os.close(fd)
                 fd = None
-        if marker.exists():
+        if _tree_marker_matches(cache_dir_path, canonical):
             return True
         try:
             scanned = _scan_entries(cache_dir_path)
             if not _tree_matches(cache_dir_path, members, scanned):
-                if fd is None:
+                if not repair:
                     return False
                 _repair_tree_dir_isexec(cache_dir_path, members["files"])
                 _repair_tree_dir_layout(cache_dir_path, members, scanned)
@@ -1056,8 +1072,10 @@ def _ensure_tree_complete(
                     return False
         except PermissionError:  # another user's tree, or one with a file this user cannot read
             return False
-        _mark_tree(cache_dir_path)
-        return True
+        if not repair:
+            return False
+        _mark_tree(cache_dir_path, canonical)
+        return _tree_marker_matches(cache_dir_path, canonical)
     finally:
         if fd is not None:
             os.close(fd)
@@ -1289,8 +1307,8 @@ def missing_cache_objects(
     """Return hashes required to restore an output that are absent from the cache.
 
     ``members`` is a directory's listing (None for a file). With SYMLINK first, an existing
-    whole-directory tree for a directory output is checked, and repaired and marked if it can
-    be, before it is trusted (``_ensure_tree_complete``).
+    whole-directory tree for a directory output is checked but never repaired here: a supplied
+    listing must match its canonical mark byte-for-byte before the tree is trusted.
     """
     if is_dir_hash(output_hash):
         assert members is not None, "a directory is restored from its listing"
@@ -1298,7 +1316,7 @@ def missing_cache_objects(
         if (
             checkout_modes[0] == CheckoutMode.SYMLINK
             and tree.exists()
-            and _ensure_tree_complete(tree, members, cache_dir)
+            and _ensure_tree_complete(tree, members, cache_dir, repair=False)
         ):
             return []
         hashes = [entry["hash"] for entry in members["files"]]
@@ -1475,8 +1493,8 @@ def _publish_tree(
                 if e.errno not in (errno.ENOTEMPTY, errno.EEXIST):
                     raise
                 return
-            if _tree_matches(cache_dir_path, members, _scan_entries(cache_dir_path)):
-                _mark_tree(cache_dir_path)
+            # Marking belongs to the commit's repair-capable check below. A restore's supplied
+            # listing must never make this tree trusted or drive a cache write.
         finally:
             _clear_path(staged)
 
@@ -1509,7 +1527,9 @@ def _store_directory(
 
             # A tree missing files from a copy a publisher was killed in stays so forever
             # otherwise: its name never changes, so this branch never revisits an existing tree.
-            if not _ensure_tree_complete(cache_dir_path, members, cache_dir):
+            # These members came from hash_directory of the real output, so this is the one
+            # repair-capable call that may write and mark the canonical listing.
+            if not _ensure_tree_complete(cache_dir_path, members, cache_dir, repair=True):
                 raise exceptions.CacheRestoreError(
                     f"Cache tree {cache_dir_path} differs from what its listing records, or "
                     + "cannot be read, and cannot be repaired (a file's cache object is missing, "
@@ -1716,7 +1736,9 @@ def _restore_directory_from_cache(
         _cleanup_fresh_restore_orphans(path, target_token)
     restore_prefix = f"{_RESTORE_TEMP_PREFIX}{target_token}."
 
-    if symlink_fast_path and not _ensure_tree_complete(cache_dir_path, members, cache_dir):
+    if symlink_fast_path and not _ensure_tree_complete(
+        cache_dir_path, members, cache_dir, repair=False
+    ):
         # Same check as _store_directory. A tree this user cannot check or repair is not used:
         # the output is restored file by file from the objects instead, if they are cached.
         logger.warning(

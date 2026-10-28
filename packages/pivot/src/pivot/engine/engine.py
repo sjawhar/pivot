@@ -238,6 +238,24 @@ async def _run_in_daemon_thread[T](func: Callable[[], T]) -> T:
     return results[0]
 
 
+def _deferred_writes_to_apply(result: StageResult, *, no_commit: bool) -> DeferredWrites | None:
+    """The StateDB writes a finished stage persists, or None when it persists nothing.
+
+    Only a RAN or CACHED stage writes. Under ``--no-commit`` only the record of what ran is
+    kept, for ``pivot commit``; nothing else is persisted.
+    """
+    if result["status"] not in (StageStatus.RAN, StageStatus.CACHED):
+        return None
+    if "deferred_writes" not in result:
+        return None
+    deferred = result["deferred_writes"]
+    if not no_commit:
+        return deferred
+    if "no_commit_record" not in deferred:
+        return None
+    return DeferredWrites(no_commit_record=deferred["no_commit_record"])
+
+
 class Engine:
     """Async coordinator for pipeline execution using anyio.
 
@@ -1341,11 +1359,10 @@ class Engine:
                                     )
                                     stage_durations[stage_name] = duration_ms
 
-                                    # Apply deferred writes for RAN and CACHED stages
-                                    if (
-                                        result["status"] in (StageStatus.RAN, StageStatus.CACHED)
-                                        and not no_commit
-                                    ):
+                                    deferred = _deferred_writes_to_apply(
+                                        result, no_commit=no_commit
+                                    )
+                                    if deferred is not None:
                                         stage_info = self._get_stage(stage_name)
                                         output_paths = [
                                             types.identity_key(out.identity)
@@ -1355,8 +1372,8 @@ class Engine:
                                             stage_info, default_state_dir
                                         )
                                         stage_db = _get_state_db(stage_state_dir)
-                                        executor_core.apply_deferred_writes(
-                                            stage_name, output_paths, result, stage_db
+                                        stage_db.apply_deferred_writes(
+                                            stage_name, output_paths, deferred
                                         )
 
                                     # Record result
@@ -1372,9 +1389,20 @@ class Engine:
                                     # TerminatedWorkerError so a deliberate stop is not logged
                                     # as a stage failure.
                                     await anyio.lowlevel.checkpoint_if_cancelled()
-                                    _logger.exception("Stage %s failed with exception", stage_name)
+                                    # One line names the stage and why; --verbose shows the
+                                    # traceback. The reason recorded below stays str(e), and the
+                                    # console prints no second copy under the stage line.
+                                    _logger.error(
+                                        "Stage %s failed: %s",
+                                        stage_name,
+                                        exceptions.describe_error(e),
+                                    )
+                                    _logger.debug(
+                                        "Traceback of stage %s's failure", stage_name, exc_info=True
+                                    )
                                     self._worker_pool.mark_workers_unverified()
                                     failed_result = StageResult(
+                                        display_reason="",
                                         status=StageStatus.FAILED,
                                         reason=str(e),
                                         input_hash=None,
@@ -2296,20 +2324,21 @@ class Engine:
 
         # Emit StageCompleted event
         stage_index, total_stages = self._get_stage_index(stage_name)
-        await self.emit(
-            StageCompleted(
-                type="stage_completed",
-                stage=stage_name,
-                status=result["status"],
-                reason=result["reason"],
-                duration_ms=duration_ms,
-                index=stage_index,
-                total=total_stages,
-                run_id=run_id,
-                input_hash=result["input_hash"],
-                output_summary=output_summary,
-            )
+        completed = StageCompleted(
+            type="stage_completed",
+            stage=stage_name,
+            status=result["status"],
+            reason=result["reason"],
+            duration_ms=duration_ms,
+            index=stage_index,
+            total=total_stages,
+            run_id=run_id,
+            input_hash=result["input_hash"],
+            output_summary=output_summary,
         )
+        if "display_reason" in result:
+            completed["display_reason"] = result["display_reason"]
+        await self.emit(completed)
 
         # Release scheduler-held resources before downstream stages are considered.
         try:

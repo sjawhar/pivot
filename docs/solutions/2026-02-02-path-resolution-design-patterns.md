@@ -36,6 +36,12 @@ Input bindings and output locations are relative to the project root (the top-mo
 
 **Chosen:** `os.path.normpath()` - store the symlink path, not the target.
 
+This covers the paths a pipeline declares and the stage outputs derived from them: `data/` may
+be a symlink to `/mnt/external/`, and a stage writes its output there. It does not cover a
+`.pvt` sidecar's `path:`, which names the file that `checkout`, `pull` and
+`repro --checkout-missing` restore: that file's directory is resolved, and a `.pvt` naming a
+file outside the project is skipped with a warning (`storage/track.py`, `restore_target`).
+
 ### 4. A Backslash Is Part of a Name
 
 Pivot runs on POSIX only (Linux and macOS), where `/` is the one path separator and a backslash is an ordinary character in a file or directory name. `pathlib.Path` on POSIX already treats it that way: `Path("a\\b.csv").parts == ("a\\b.csv",)`.
@@ -104,7 +110,14 @@ Path validation has two distinct phases with different responsibilities:
 
 **Why this matters:** Output files may be symlinks to the cache directory (created by a previous run with symlink checkout mode). If the cache is on a different filesystem (e.g., cross-filesystem worktrees with shared cache), those symlinks point outside the project root. Registration must not reject them — the declared path `data/output.jsonl` is inside the project regardless of what the file currently symlinks to on disk.
 
-**Execution-time defense-in-depth:** `stage_def.py:_validate_path_not_escaped()` checks symlink targets when writing outputs. This is the correct place for filesystem state validation.
+**What guards an output write:** nothing resolves the output path before the write; the write
+itself never follows a symlink left in its place. A file is built under a temporary name beside
+its target and renamed over it, which replaces a symlink instead of writing through it
+(`storage/cache.py`, `_checkout_from_cache`). A directory output's old content, a symlink
+included, is removed before the worker creates the directories on the way to each file
+(`tests/test_directory_out_integration.py`,
+`test_rerun_writes_inside_the_output_directory_through_no_symlink_left_there`). A manifest
+member whose relative path leaves its directory is refused when the directory is restored.
 
 ## Prevention
 

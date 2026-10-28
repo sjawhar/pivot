@@ -433,9 +433,25 @@ def _resolve(
     if found is not None:
         assert source is not None, "committed bytes come from a named file"
         try:
-            return check(found, record, source), source
+            checked = check(found, record, source)
         except exceptions.CorruptListingError as e:
             problem = e
+        else:
+            cached = None if cache_dir is None else cache.get_cache_path(cache_dir, record["hash"])
+            if cached is None:
+                return checked, source
+            try:
+                canonical = check(cached.read_bytes(), record, cached)
+            except FileNotFoundError:
+                return checked, source
+            except OSError as e:
+                raise exceptions.CorruptListingError(f"{cached}: cannot be read ({e})") from e
+            if canonical != checked:
+                raise exceptions.CorruptListingError(
+                    f"{source}: its bytes differ from the canonical cache listing {cached}, though "
+                    + f"both hash to directory {record['hash']}; refuse an XXH64 collision"
+                )
+            return checked, source
     if problem is not None and strict:
         raise problem
     cached = None if cache_dir is None else cache.get_cache_path(cache_dir, record["hash"])

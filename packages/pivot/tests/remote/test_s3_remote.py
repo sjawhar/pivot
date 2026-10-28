@@ -749,6 +749,35 @@ async def test_upload_file_multipart_aborts_on_error(
     mock_client.abort_multipart_upload.assert_called_once()
 
 
+async def test_upload_file_warns_in_words_when_the_abort_fails(
+    s3_remote: remote_mod.S3Remote,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A multipart abort that fails on a dropped connection warns with the OS's message, not
+    Python's `[Errno 104] ...`; the upload's own error still raises."""
+    mocker.patch.object(remote_mod, "STREAM_CHUNK_SIZE", 100)
+    mock_client = mocker.AsyncMock()
+    mock_client.create_multipart_upload = mocker.AsyncMock(
+        return_value={"UploadId": "test-upload-id"}
+    )
+    mock_client.upload_part = mocker.AsyncMock(side_effect=Exception("Upload failed"))
+    mock_client.abort_multipart_upload = mocker.AsyncMock(
+        side_effect=ConnectionResetError(errno.ECONNRESET, os.strerror(errno.ECONNRESET))
+    )
+    _helper_patch_s3_client(mocker, s3_remote, mock_client)
+    test_file = tmp_path / "large_file.bin"
+    test_file.write_bytes(b"x" * 150)
+
+    with pytest.raises(Exception, match="Upload failed"):
+        await s3_remote.upload_file(test_file, "abc123def4567890")
+
+    assert [r.getMessage() for r in caplog.records if r.name == "pivot.remote.storage"] == [
+        f"Failed to abort multipart upload test-upload-id: {os.strerror(errno.ECONNRESET)}"
+    ]
+
+
 # -----------------------------------------------------------------------------
 # Atomic Download Tests
 # -----------------------------------------------------------------------------

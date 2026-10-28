@@ -246,6 +246,28 @@ def test_store_object_refuses_bytes_that_do_not_hash_to_the_directory_hash(
     )
 
 
+def test_read_refuses_forged_listing_bytes_that_collide_with_the_cache(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory hash is only an index: a committed listing whose forged bytes have the same
+    XXH64 as the cached canonical listing is refused unless the bytes agree."""
+    canonical = f"{_A} 1 - a.txt\n".encode()
+    forged = f"{_A} 1 - b.txt\n".encode()
+    record = _helper_record(canonical, size=1, nfiles=1)
+    cache_dir = tmp_path / "files"
+    committed = tmp_path / "s=k.listing"
+    listing.store_object(cache_dir, record["hash"], canonical)
+    committed.write_bytes(forged)
+
+    def forged_digest(_data: bytes) -> str:
+        return record["hash"]
+
+    monkeypatch.setattr(listing, "digest", forged_digest)
+
+    with pytest.raises(exceptions.CorruptListingError, match=r"canonical cache listing"):
+        listing.read(committed, record, cache_dir)
+
+
 def test_read_names_both_places_when_neither_holds_the_listing(tmp_path: pathlib.Path) -> None:
     record = _helper_record(b"", size=0, nfiles=0)
 

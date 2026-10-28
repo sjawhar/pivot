@@ -40,8 +40,19 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 | `remote:` | Remote index entries |
 | `remote_url:` | Remote URL tracking for change detection |
 | `fp:` | AST fingerprint/hash cache entries |
+| `nocommit:` | What a stage's outputs hold that no lock records yet (`stage` → a JSON object, `types.NoCommitRecord`): a `--no-commit` run's code manifest, marks included, and output hashes, for `pivot commit`, and the `*.pvt` directory members another feature writes (`pvt_members`); a written lock removes the whole record. Each writer replaces only its own keys and keeps every other key, in one write transaction. The reader validates each of the three keys on its own, dropping only a malformed one, and returns every other key as stored, so a record holding only another feature's key reads as present; `pivot commit` uses the run's manifest only when both of the run's keys are present |
 
 **When adding new state types**, define a new prefix constant and document it here.
+
+## The `.pvt` Walk Memo
+
+`track.discover_pvt_files` must find every `.pvt` that `os.walk` over the project finds. Never prune it by directory name or by stage output: `track` and `import` accept paths under `.git`, `.pivot` and other pipelines' outputs. The memo makes an unchanged directory cost one `lstat` instead of a listing:
+
+- A listing is reused only when the directory's stamp (`st_dev`, `st_ino`, `st_mtime_ns`, `st_ctime_ns`) matches, its mtime and ctime are at least 2 s before the walk start (a later change in the same timestamp tick would leave the stamp unchanged), its mtime and ctime are not both whole seconds (on a one-second-timestamp filesystem a clock stepped back into a recorded second would keep the stamp; such filesystems are always listed), both fit the stamp's signed 64-bit nanoseconds (1677 to 2262; any other time is listed every walk), and its mount type is on the allowlist read from `/proc/self/mountinfo`. A device mountinfo does not list (a btrfs subvolume reports its own) counts as btrfs only when the deepest mount holding the directory is btrfs.
+- It holds names only. Every `.pvt` found is read on every walk, since rewriting a file does not change its directory.
+- Only the repro/run pre-flight (`executor/core.py` `verify_tracked_files`) writes it, and only when the walk's listings differ from it. It writes through the descriptor (`os.write`) under an `flock` (when another pre-flight holds it, this one skips its write) and empties the file first, so a walk reading it meanwhile, or after a pre-flight killed mid-write, sees a prefix of the new memo. A prefix never parses (it ends inside a record, or holds fewer listings than the root record counts), so that walk lists every directory. A write that fails partway (a full disk) empties the file again, so no cut memo keeps the space. Every other caller only reads it, and reading never creates anything. A memo that cannot be read means every directory is listed.
+- It is not in the state database, which other accounts can read. It is a file of the running account's own, `state.lmdb/pvt-memo-<uid>` in the state directory (`.pivot/.gitignore` keeps `state.lmdb/` out of git), created with mode 0600. The pre-flight creates it only in a `state.lmdb` directory that already exists and is on an allowlisted filesystem, and rewrites it in place, so that directory's stamp does not change at each write. A walk opens it without following a symlink (`O_NOFOLLOW`, and `O_NONBLOCK` so a FIFO there cannot block it) and uses it, for reading or writing, only when an `fstat` of the open file shows a regular file, on a filesystem of the walk's allowlist (`_MEMO_FS_TYPES` through `_device_allowed`, with mountinfo read once per walk; there owner and mode are the file's own and the kernel enforces them, while bindfs, CIFS and NFS can report the mount's), owned by the running account, with no group or other permission bits (a POSIX ACL's mask shows in the group bits) and one link. Otherwise the walk lists every directory, writes nothing, and logs the reason at debug level. A file of another account, of another kind or on another filesystem is never written, replaced or removed. When the account's own memo fails only the mode or link check (its owner loosened it, `chmod -R go+rX .pivot` say), the read-only walk only refuses it, and the pre-flight empties it, unlinks it and creates a new 0600 file, so its names leave that path, every descriptor opened on it and any other link to it. So no other account reads the memo's names, whatever the modes of the project's directories and wherever the state directory or `state.lmdb` points, except while the owner leaves the file loose, until the next pre-flight replaces it. The cost is that `open` and one `fstat` per walk (one more when a loosened memo is replaced). Each account keeps its own memo in a shared state directory.
+- A listing in which an entry's type could not be read (the `lstat` a filesystem without `d_type` needs failed) is never recorded, so a walk that can read that type never reuses it.
 
 ## LMDB Specifics
 
@@ -94,39 +105,30 @@ When multiple `pivot` processes share the same StateDB:
 - Sharing a cache across hosts needs `flock` that is coherent across them (NFSv4, or NFSv3 with
   NLM). With host-local locks (NFS `nolock` or `local_lock=flock`/`all`, Lustre `localflock`)
   the locks here exclude nothing across hosts: one host's sweep can remove another host's live
-  temporary entry, and two hosts can repair one tree at once. A publisher checks its tree before
-  marking it, which narrows the window for marking a copy that lost files without closing it: a
-  sweep already deleting through the copy's directory descriptors keeps deleting after the
-  rename. Where `flock()` is refused (Lustre without `flock`: ENOSYS; NFS when its lock manager
-  does not answer: ENOLCK) staging goes on without the shared lock, and this process neither
-  sweeps nor repairs a tree. Only where every host sharing the cache is refused does nothing
-  sweep: an NFSv3 client whose own `rpc.statd` is down gets ENOLCK while other clients' locks
-  work, and their sweeps can remove its live temporary entries, with the effects above.
+  temporary entry. Where `flock()` is refused (Lustre without `flock`: ENOSYS; NFS when its lock
+  manager does not answer: ENOLCK) staging still goes on without the shared lock, but it never
+  trusts a tree merely because its XXH64 name exists.
 - A lock file in the cache is created writable by whoever can write its directory, since NFS
   takes an exclusive lock only on a file opened for writing; one this user cannot write is
   opened read-only. Lock files are never deleted.
 - A whole-directory SYMLINK tree lives at `<cache root>/trees/XX/YYYY...` (`cache.tree_path`),
-  named by the directory hash. It is built under a temporary name beside its name, renamed
-  into place, checked, then marked (`<tree>.content-checked`), because a restore symlinks to a
-  tree as soon as its name exists. A restore or commit checks every unmarked tree member's path,
-  content hash, size and executable bit, plus its directories, under the tree's exclusive
-  `<tree>.lock`; it repairs mismatches in place from the files' own cache objects, then marks the
-  tree. A tree it cannot check or repair (a file's object is absent, or this user cannot read or
-  write the tree) is not used: a restore goes file by file, a commit fails. Only
-  `<tree>.content-checked` is trusted: `<tree>.layout-checked` (pivot 0.3.4, partial trees
-  included) and `<tree>.verified` (pivot 0.3.5 to 0.5.11, sizes only) are older marks that never
-  checked content, so such a tree is checked again and the old mark removed. The mark is only
-  written where this user can write the tree's prefix directory: for a user who cannot, every
-  symlink restore or commit checks an old-marked tree again, and a symlink commit through a
-  stale one fails, until a user who can write the cache runs one
-  `pivot checkout --checkout-mode symlink` through it. That cost is the price of not trusting a
-  size-only mark.
+  named by the directory hash. Its `<tree>.content-checked` marker holds the exact canonical
+  listing bytes a commit verified from `hash_directory` of the real output; it is not an empty
+  "the XXH64 name looked right" flag. A supplied listing is trusted for that tree only when its
+  bytes equal the marker. A restore or `missing_cache_objects` passes `repair=False`: it checks
+  but never changes an unmarked/mismatched tree, instead restoring file by file. Only the commit
+  path passes `repair=True`, because its listing came from actual output bytes; it may repair
+  from the individual objects and write the canonical marker. `_publish_tree` never marks. A tree
+  it cannot check or repair is not used: a restore goes file by file, a commit fails. Old empty
+  `.layout-checked` (pivot 0.3.4) and `.verified` (pivot 0.3.5–0.5.11) markers are never trusted.
 - The object at a directory's hash under `files/` is its listing (`listing.store_object`),
   read-only like every object. Every listing read follows one rule (`listing._resolve`): a
   committed listing (workspace file, or a file at a git revision) that hashes to the recorded
-  directory hash is taken; one that does not, or cannot be read, falls back to this object with
-  one warning naming it, and is refused only when the object is absent too, or at once with
-  `strict` (`pivot verify`).
+  directory hash is taken only when, if the cache also holds the listing, its bytes equal that
+  canonical cache copy. Bytes that differ despite the same XXH64 are refused as a collision; a
+  listing that has the wrong hash or cannot be read falls back to the cache object with one
+  warning, and is refused only when that object is absent too, or at once with `strict`
+  (`pivot verify`).
 
 ## Lock and Listing Files
 

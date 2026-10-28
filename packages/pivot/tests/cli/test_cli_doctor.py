@@ -1,4 +1,6 @@
+import errno
 import json
+import os
 import pathlib
 import subprocess
 
@@ -8,6 +10,7 @@ import pytest
 from pivot import project
 from pivot.cli import cli
 from pivot.cli import doctor as doctor_module
+from pivot.remote import config as remote_config
 
 # =============================================================================
 # Human-Readable Output Tests
@@ -197,6 +200,24 @@ def test_check_project_root_returns_path_when_found(
     assert str(tmp_path) in event["value"]
 
 
+def test_check_remote_connectivity_words_an_os_error_as_its_message_and_path(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A remote config the check cannot read is reported as the OS's message and its path, which
+    `pivot doctor` prints and `--json` holds, not as Python's `[Errno 13] ...: '<path>'`."""
+    config_file = tmp_path / ".pivot" / "config.yaml"
+
+    def unreadable() -> dict[str, str]:
+        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(config_file))
+
+    monkeypatch.setattr(remote_config, "list_remotes", unreadable)
+
+    [event] = doctor_module._check_remote_connectivity(tmp_path)
+
+    assert event["status"] == doctor_module.CheckStatus.ERROR
+    assert event["details"] == {"error": f"{os.strerror(errno.EACCES)}: {config_file}"}
+
+
 def test_check_pipeline_config_ok_with_pipeline_py(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -277,32 +298,28 @@ def test_check_git_repository_warn_when_not_in_repo(tmp_path: pathlib.Path) -> N
 
 
 # =============================================================================
-# URL Sanitization Tests
+# URL Redaction Tests
 # =============================================================================
 
 
-def test_sanitize_url_preserves_url_without_password() -> None:
-    """_sanitize_url preserves URLs without passwords."""
+def test_redacted_preserves_url_without_user_info() -> None:
+    """_redacted leaves a URL that carries no credentials unchanged."""
     url = "s3://my-bucket/prefix"
-    assert doctor_module._sanitize_url(url) == url
+    assert doctor_module._redacted(url) == url
 
 
-def test_sanitize_url_removes_password() -> None:
-    """_sanitize_url removes password from URL."""
-    url = "s3://user:secret@my-bucket/prefix"
-    result = doctor_module._sanitize_url(url)
-
-    assert "secret" not in result
-    assert "user@" in result
+def test_redacted_hides_user_and_password() -> None:
+    """_redacted replaces the whole user-info, user name included."""
+    assert doctor_module._redacted("s3://user:secret@my-bucket/prefix") == (
+        "s3://***@my-bucket/prefix"
+    )
 
 
-def test_sanitize_url_preserves_port() -> None:
-    """_sanitize_url preserves port number."""
-    url = "http://user:pass@host:8080/path"
-    result = doctor_module._sanitize_url(url)
-
-    assert "pass" not in result
-    assert ":8080" in result
+def test_redacted_preserves_port() -> None:
+    """_redacted keeps the host and port of a URL whose credentials it hides."""
+    assert doctor_module._redacted("http://user:pass@host:8080/path") == (
+        "http://***@host:8080/path"
+    )
 
 
 # =============================================================================

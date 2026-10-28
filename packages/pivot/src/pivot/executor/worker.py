@@ -12,10 +12,14 @@ import codecs
 import collections
 import collections.abc as collections_abc
 import contextlib
+import ctypes
 import dataclasses
+import errno
+import functools
 import importlib
 import importlib._bootstrap as importlib_bootstrap
 import importlib.util
+import inspect
 import logging
 import os
 import pathlib
@@ -33,6 +37,7 @@ from typing import (
     Literal,
     NamedTuple,
     NoReturn,
+    NotRequired,
     TypedDict,
     cast,
     overload,
@@ -46,6 +51,7 @@ from pivot import (
     config,
     exceptions,
     fingerprint,
+    loaded_source,
     loaders,
     metrics,
     parameters,
@@ -53,6 +59,7 @@ from pivot import (
     run_history,
     skip,
     stage_def,
+    stage_io,
     types,
 )
 from pivot.storage import artifact_lock, cache, listing, lock, state
@@ -64,6 +71,7 @@ from pivot.types import (
     HashInfo,
     LockData,
     LogMessage,
+    NoCommitRun,
     OutputMessage,
     OutputMessageKind,
     StageResult,
@@ -74,7 +82,6 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Mapping, Sequence
-    from inspect import Signature
     from multiprocessing import Queue
     from types import ModuleType, TracebackType
 
@@ -135,6 +142,7 @@ _stage_imports_lock = threading.Lock()
 _covered_import_state = _CoveredImportState()
 _original_import = builtins.__import__
 _original_import_module = importlib.import_module
+_original_reload = importlib.reload
 _original_start_new_thread = _thread.start_new_thread
 _original_start_joinable_thread = _thread.start_joinable_thread
 _replaced_thread_starts: dict[tuple[ModuleType, str], object] = {}
@@ -346,7 +354,12 @@ def _tracked_import(
 ) -> object:
     tracked = _stage_imports
     if tracked is None:
-        return _original_import(name, globals, locals, fromlist or (), level)
+        result = _original_import(name, globals, locals, fromlist or (), level)
+        if not level:
+            # Unpickling a stage imports the modules it refers to before the stage starts. Record
+            # each one the recorder saw compile; `record_unseen_modules` judges the rest.
+            loaded_source.record_modules(_package_chain(name))
+        return result
     package = _import_package(globals) if level else None
     absolute: str | None = name
     if level:
@@ -360,14 +373,19 @@ def _tracked_import(
     with _covered_import(tracked, absolute, items):
         result = _original_import(name, globals, locals, fromlist or (), level)
     if absolute is not None:
-        _record_stage_import(_package_chain(absolute) + [f"{absolute}.{item}" for item in items])
+        names = _package_chain(absolute) + [f"{absolute}.{item}" for item in items]
+        loaded_source.record_modules(names)
+        _record_stage_import(names)
     return result
 
 
 def _tracked_import_module(name: str, package: str | None = None) -> object:
     tracked = _stage_imports
     if tracked is None:
-        return _original_import_module(name, package)
+        result = _original_import_module(name, package)
+        if not name.startswith("."):
+            loaded_source.record_modules(_package_chain(name))
+        return result
     try:
         absolute = importlib.util.resolve_name(name, package) if name.startswith(".") else name
     except (ImportError, ValueError):
@@ -375,7 +393,17 @@ def _tracked_import_module(name: str, package: str | None = None) -> object:
     with _covered_import(tracked, absolute, []):
         result = _original_import_module(name, package)
     if absolute is not None:
+        loaded_source.record_modules(_package_chain(absolute))
         _record_stage_import(_package_chain(absolute))
+    return result
+
+
+def _tracked_reload(module: ModuleType) -> ModuleType:
+    """Reload `module`; the discovery recorder wraps the reload's loader and refreshes its record."""
+    result = _original_reload(module)
+    tracked = _stage_imports
+    if tracked is not None:
+        _record_stage_import([result.__name__])
     return result
 
 
@@ -385,16 +413,18 @@ def install_import_hooks() -> None:
     The worker initializer (`executor.core._init_worker`) calls this; nothing else in Pivot's
     own process installs it. The hooks record nothing while no stage is running.
     """
-    global _original_import, _original_import_module, _hooks_installed
+    global _original_import, _original_import_module, _original_reload, _hooks_installed
     global _original_start_new_thread, _original_start_joinable_thread
     if _hooks_installed:
         return
     _original_import = builtins.__import__
     _original_import_module = importlib.import_module
+    _original_reload = importlib.reload
     _original_start_new_thread = _thread.start_new_thread
     _original_start_joinable_thread = _thread.start_joinable_thread
     builtins.__import__ = _tracked_import
     importlib.import_module = _tracked_import_module
+    importlib.reload = _tracked_reload
     for (module, name), hook in _THREAD_START_HOOKS.items():
         _replaced_thread_starts[module, name] = vars(module)[name]
         vars(module)[name] = hook
@@ -405,6 +435,7 @@ def _uninstall_import_hooks() -> None:
     global _hooks_installed
     builtins.__import__ = _original_import
     importlib.import_module = _original_import_module
+    importlib.reload = _original_reload
     for (module, name), original in _replaced_thread_starts.items():
         vars(module)[name] = original
     _replaced_thread_starts.clear()
@@ -465,6 +496,59 @@ def _track_stage_imports(covered: frozenset[str]) -> Generator[_StageImports]:
             _uninstall_import_hooks()
 
 
+def _untrusted_modules(
+    stage_info: WorkerStageInfo,
+    fingerprint_manifest: dict[str, str],
+    stage_imports: _StageImports,
+    project_root: pathlib.Path,
+) -> tuple[list[str], list[str]]:
+    """The user modules this stage used whose code it cannot vouch for: (edited, unreadable).
+
+    What it used: the modules its manifest hashes, the module that defines the stage, and the
+    modules it imported while it ran. A `@no_fingerprint` stage's code is its declared files, so
+    for it the modules loaded from those files count instead of its imports.
+
+    A worker first judges every user module it loaded that no recorder saw compile, as discovery
+    does (`loaded_source.record_unseen_modules`): a module a stage's module loaded with a loader
+    it called directly (`SourceFileLoader(...).load_module()`, `spec_from_loader`) holds the file
+    as this worker read it, which may be after an edit the coordinator's record predates.
+    """
+    loaded_source.record_user_modules()
+    if loaded_source.is_worker():
+        loaded_source.record_unseen_modules()
+    used = set[str]()
+    manifest = fingerprint_manifest
+    if stage_info["no_fingerprint"]:
+        files = set[str]()
+        for key in fingerprint_manifest:
+            if not key.startswith("file:"):
+                continue
+            candidate = pathlib.Path(key.removeprefix("file:"))
+            path = candidate if candidate.is_absolute() else project_root / candidate
+            if path.is_relative_to(project_root):
+                files.add(os.path.realpath(path))
+        used.update(loaded_source.modules_from_files(files))
+        manifest = {}
+    else:
+        stage_func = inspect.unwrap(stage_info["func"])
+        stage_file = inspect.getsourcefile(stage_func)
+        if (
+            loaded_source.coordinator_records(stage_func.__module__)
+            or isinstance(stage_file, str)
+            and pathlib.Path(stage_file).resolve().is_relative_to(project_root)
+        ):
+            used.add(stage_func.__module__)
+        used.update(stage_imports.imported)
+        used.update(stage_imports.new_outside_window)
+        used.update(stage_imports.added_in_window)
+    return loaded_source.check_stage(
+        manifest,
+        used,
+        stage_info["loaded_sources_token"],
+        stage_info["loaded_sources"] if "loaded_sources" in stage_info else None,
+    )
+
+
 # How long a stopped worker's running stage may take to unwind before the worker exits.
 TERMINATION_GRACE_S = 10.0
 
@@ -497,6 +581,98 @@ class _StopState:
 
 
 _stop = _StopState()
+
+# tgkill's system call number for each process ABI, keyed by CPython's platform triplet
+# (`sys.implementation._multiarch`; CPython's Misc/platform_triplet.c names them). Each number is
+# the line of Linux v7.0 cited beside it, under https://github.com/torvalds/linux/blob/v7.0/.
+_TGKILL_SYSCALLS = {
+    f"{arch}-linux-{libc}": number
+    for arch, libcs, number in (
+        ("x86_64", ("gnu", "musl"), 234),  # arch/x86/entry/syscalls/syscall_64.tbl#L246
+        ("i386", ("gnu", "musl"), 270),  # arch/x86/entry/syscalls/syscall_32.tbl#L285
+        # scripts/syscall.tbl#L167 (arch/arm64/tools/syscall_64.tbl is a symbolic link to it)
+        ("aarch64", ("gnu", "musl"), 131),
+        # arch/arm/tools/syscall.tbl#L286 (EABI, the only ABI these triplets name)
+        ("arm", ("gnueabihf", "gnueabi", "musleabihf", "musleabi"), 268),
+        ("powerpc64le", ("gnu", "musl"), 250),  # arch/powerpc/kernel/syscalls/syscall.tbl#L328
+        ("s390x", ("gnu", "musl"), 241),  # arch/s390/kernel/syscalls/syscall.tbl#L198
+        # scripts/syscall.tbl#L167, the table riscv and loongarch use (scripts/Makefile.asm-headers#L20;
+        # neither arch/riscv nor arch/loongarch kernel/Makefile.syscalls sets another)
+        ("riscv64", ("gnu", "musl"), 131),
+        ("loongarch64", ("gnu", "gnuf32", "gnusf", "musl", "muslf32", "muslsf"), 131),
+    )
+    for libc in libcs
+}
+
+
+@functools.cache
+def _tgkill() -> Callable[[int, int, int], int] | None:
+    """``tgkill(tgid, tid, sig)`` through the C library's ``syscall()``, which glibc and musl
+    both export, with tgkill's number for this process's ABI. None where that number is not
+    known (not Linux, or an ABI not in ``_TGKILL_SYSCALLS``), logged once: there a stopped
+    worker gets ``os.kill``, Pivot's behaviour before tgkill, and the race ``terminate``
+    describes remains."""
+    abi: object = getattr(sys.implementation, "_multiarch", None)
+    number = _TGKILL_SYSCALLS.get(abi) if isinstance(abi, str) else None
+    if number is None:
+        logger.debug(
+            "No tgkill system call number for %s (machine %s): stopped workers get os.kill",
+            abi,
+            os.uname().machine,
+        )
+        return None
+    syscall = ctypes.CDLL(None, use_errno=True).syscall
+    syscall.restype = ctypes.c_long
+    return lambda tgid, tid, sig: syscall(
+        ctypes.c_long(number), ctypes.c_long(tgid), ctypes.c_long(tid), ctypes.c_long(sig)
+    )
+
+
+def terminate(pid: int) -> None:
+    """Send worker ``pid`` SIGTERM (``_stop_worker``) at its main thread, where its stage runs.
+
+    A signal sent to a process (``os.kill``) can reach any of its threads. Linux gives it to
+    the main thread only while that thread is on a CPU or has no signal pending. Once Ctrl-C
+    has woken the main thread and load keeps it waiting for a CPU, Linux gives SIGTERM to
+    another thread, such as one of the OpenBLAS threads NumPy starts on import, and that thread
+    takes the Ctrl-C too. CPython's handler there only marks the signals for the main thread,
+    which finds no signal when it runs and goes back to sleep: the stage never stops, and Pivot
+    kills the worker after ``TERMINATION_GRACE_S`` with the stage's cleanup not run. tgkill
+    sends the signal to one thread, which alone can take it.
+
+    Where ``_tgkill`` knows no system call number, ``os.kill`` sends it. On macOS that is
+    enough: XNU gives a signal sent to a process to the first of its threads that does not block
+    it ("We attempt to deliver a proc-wide signal to the first thread in the task",
+    ``get_signalthread``, https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_sig.c#L1935-L1974),
+    and adds each new thread at the end of that list (bsd/kern/kern_fork.c#L1368), so the main
+    thread comes first. Read from the source, not run on macOS.
+
+    A tgkill that fails for any reason but a process that is gone (ESRCH, raised as
+    ProcessLookupError) falls back to ``os.kill``, with a warning naming the worker, so a stop
+    is never left unsent.
+
+    A stage that keeps SIGTERM blocked on the main thread holds this signal pending until
+    ``WorkerPool`` SIGKILLs the worker after the grace; with ``os.kill`` another thread could
+    take it and the worker exit sooner. Its cleanup runs either way, from Ctrl-C's SIGINT.
+    """
+    tgkill = _tgkill()
+    if tgkill is None:
+        os.kill(pid, signal.SIGTERM)
+        return
+    # A process's main thread has the process's id as its thread id. tgkill to a process whose
+    # main thread has exited while others run reaches no thread; a loky worker never gets there,
+    # because it leaves its main thread only through os._exit, which ends the whole process.
+    if tgkill(pid, pid, signal.SIGTERM) == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.ESRCH:
+        raise ProcessLookupError(error, os.strerror(error))
+    logger.warning(
+        "tgkill could not send SIGTERM to worker %s (%s); sending it to the process",
+        pid,
+        os.strerror(error),
+    )
+    os.kill(pid, signal.SIGTERM)
 
 
 def kill_descendants(pid: int) -> None:
@@ -571,14 +747,14 @@ def _raise_if_stopped() -> None:
 def unwind_when_stopped(parent_pid: int) -> None:
     """Loky worker initializer: stop this worker when it is told to or its parent dies.
 
-    SIGTERM (``WorkerPool.hard_cancel``) or SIGINT (Ctrl-C at a terminal) raises
-    ``WorkerTerminated`` in the running stage, so its cleanup runs (stopping the processes or
-    containers it started); after SIGTERM the worker then exits. When the Pivot process that
-    started the worker dies, as when it is SIGKILLed, a watchdog thread sends this worker's
-    main thread SIGTERM (a signal to that thread interrupts a blocking call there) and exits
-    the worker after ``TERMINATION_GRACE_S`` itself, in case the stage replaced the SIGTERM
-    handler or is blocked where no signal reaches it. Every exit first kills the processes
-    still descended from the worker.
+    SIGTERM (``WorkerPool.hard_cancel``, sent at the main thread by ``terminate``) or SIGINT
+    (Ctrl-C at a terminal) raises ``WorkerTerminated`` in the running stage, so its cleanup runs
+    (stopping the processes or containers it started); after SIGTERM the worker then exits.
+    When the Pivot process that started the worker dies, as when it is SIGKILLed, a watchdog
+    thread sends this worker's main thread SIGTERM (a signal to that thread interrupts a
+    blocking call there) and exits the worker after ``TERMINATION_GRACE_S`` itself, in case the
+    stage replaced the SIGTERM handler or is blocked where no signal reaches it. Every exit
+    first kills the processes still descended from the worker.
 
     A SIGINT the worker inherited as ignored (pivot run as a background job of a
     non-interactive shell) stays ignored, as it does for pivot itself.
@@ -686,7 +862,7 @@ class WorkerStageInfo(TypedDict):
     deps: dict[str, types.ArtifactRef]
     outs: list[types.ArtifactRef]
     store_spec: store_mod.StoreSpec
-    signature: Signature | None
+    signature: inspect.Signature | None
     params: stage_def.StageParams | None
     variant: str | None
     overrides: parameters.ParamsOverrides
@@ -703,6 +879,11 @@ class WorkerStageInfo(TypedDict):
     unsafe_fingerprint: bool
     # The stage is `@no_fingerprint`: its declared files are its code, so imports are not checked.
     no_fingerprint: bool
+    # `loaded_source.token()` of the user code the coordinator loaded when it sent the stage. The
+    # worker got those digests once, when it started (`core._init_worker`); `loaded_sources`
+    # carries them again only when the coordinator loaded code after that.
+    loaded_sources_token: str
+    loaded_sources: NotRequired[dict[str, str]]
 
 
 def _make_result(
@@ -795,11 +976,12 @@ def _execute_stage(
                     output_queue.put_nowait(
                         StateChange(kind=OutputMessageKind.STATE, stage=stage_name, state="running")
                     )
-                lock_data = production_lock.read(
-                    cache_dir=store_cache_dir(store), warn_old_format=False
-                )
+                with stage_io.PIVOT_IO:
+                    lock_data = production_lock.read(
+                        cache_dir=store_cache_dir(store), warn_old_format=False
+                    )
 
-                with state.StateDB(state_dir, readonly=True) as state_db:
+                with _open_state_db(state_dir) as state_db:
                     outputs_unusable: str | None = None
                     if lock_data is not None and not stage_info["force"]:
                         out_paths = [types.identity_key(out.identity) for out in stage_outs]
@@ -986,11 +1168,13 @@ def _execute_stage(
                     set[str]() if stage_info["no_fingerprint"] else stage_imports.uncovered()
                 )
                 lock_manifest = current_fingerprint
+                # Under --no-commit no lock is written now: `pivot commit` writes this run's
+                # manifest, marks included, when it records these same outputs.
+                commit_note = (
+                    " `pivot commit` keeps that when it records these outputs." if no_commit else ""
+                )
                 if uncovered:
                     modules = ", ".join(sorted(uncovered))
-                    commit_note = (
-                        " `pivot commit` will record these outputs as current." if no_commit else ""
-                    )
                     logger.warning(
                         "Stage '%s' imported user modules its fingerprint does not cover: %s. "
                         + "Its result will not be reused; the next run reruns it.%s Fix: import "
@@ -1005,14 +1189,50 @@ def _execute_stage(
                         **current_fingerprint,
                         f"{skip.UNCOVERED_IMPORT_KEY_PREFIX}{modules}": "",
                     }
+                edited, unreadable = _untrusted_modules(
+                    stage_info, current_fingerprint, stage_imports, project_root
+                )
+                if edited:
+                    edited_modules = ", ".join(edited)
+                    logger.warning(
+                        "Stage '%s' imported user modules that changed after pivot loaded them: "
+                        + "%s. Its fingerprint records the code pivot loaded, so its result will "
+                        + "not be reused; the next run reruns it.%s A watch or server session "
+                        + "loads a changed module outside the project root when pivot starts "
+                        + "again.",
+                        stage_name,
+                        edited_modules,
+                        commit_note,
+                    )
+                    lock_manifest = {
+                        **lock_manifest,
+                        f"{skip.EDITED_SOURCE_KEY_PREFIX}{edited_modules}": "",
+                    }
+                if unreadable:
+                    unreadable_modules = ", ".join(unreadable)
+                    logger.warning(
+                        "Stage '%s' uses user modules whose source pivot cannot read: %s. Pivot "
+                        + "cannot tell which code ran, so its result is never reused; every run "
+                        + "reruns it while pivot cannot read them.%s The first stage in each "
+                        + "process that uses such a module logs why pivot cannot trust it, and "
+                        + "what to do.",
+                        stage_name,
+                        unreadable_modules,
+                        commit_note,
+                    )
+                    lock_manifest = {
+                        **lock_manifest,
+                        f"{skip.UNREADABLE_SOURCE_KEY_PREFIX}{unreadable_modules}": "",
+                    }
                 if no_commit:
                     output_hashes = _hash_output_paths(
                         output_paths, cache_dir=store_cache_dir(store)
                     )
                 else:
-                    output_hashes = _commit_outputs_with_store(
-                        output_paths, store, project_state_dir, hashed_dirs
-                    )
+                    with stage_io.PIVOT_IO:
+                        output_hashes = _commit_outputs_with_store(
+                            output_paths, store, project_state_dir, hashed_dirs
+                        )
                     for ref, path in output_paths.items():
                         output_hash = output_hashes[types.identity_key(ref.identity)]
                         file_hash_entries.extend(
@@ -1027,13 +1247,24 @@ def _execute_stage(
                             )
                         )
 
-                # For --no-commit, skip lock/cache writes entirely
+                # For --no-commit, write no lock and no cache entry. Leave the record of what
+                # ran, which `pivot commit` writes if the outputs are still these.
                 if no_commit:
-                    return _make_result(
-                        StageStatus.RAN,
-                        run_reason,
-                        ring_buffer,
+                    return StageResult(
+                        status=StageStatus.RAN,
+                        reason=run_reason,
                         input_hash=input_hash,
+                        output_lines=ring_buffer.snapshot(),
+                        metrics=metrics.get_entries(),
+                        deferred_writes=DeferredWrites(
+                            no_commit_record=NoCommitRun(
+                                code_manifest=lock_manifest,
+                                output_hashes={
+                                    key: hash_info["hash"]
+                                    for key, hash_info in sorted(output_hashes.items())
+                                },
+                            )
+                        ),
                     )
 
                 # Build lock data
@@ -1046,7 +1277,7 @@ def _execute_stage(
                 )
 
                 # Single StateDB open for post-execution work
-                with state.StateDB(state_dir, readonly=True) as state_db:
+                with _open_state_db(state_dir) as state_db:
                     _raise_if_stopped()
                     deferred = _commit_lock_and_build_deferred(
                         stage_info,
@@ -1057,7 +1288,7 @@ def _execute_stage(
                         state_db,
                         store=store,
                         hashed_dirs=hashed_dirs,
-                        reusable=not uncovered,
+                        reusable=not uncovered and not edited and not unreadable,
                         file_hash_entries=file_hash_entries,
                     )
                     return StageResult(
@@ -1092,13 +1323,27 @@ def _execute_stage(
                 ring_buffer,
                 input_hash=input_hash,
             )
-        except Exception:
-            return _make_result(
+        except Exception as exc:
+            # The record keeps the traceback. The console prints one line only for a failure of
+            # pivot's own I/O on state it owns (`stage_io`): its cache, its state database, the
+            # stage's lock file, and preparing and creating the stage's output. Any other
+            # failure, out of the stage function, a loader or writer, or anything unmarked,
+            # prints its traceback as before; --verbose prints it in both cases.
+            result = _make_result(
                 StageStatus.FAILED,
                 traceback.format_exc(),
                 ring_buffer,
                 input_hash=input_hash,
             )
+            if stage_io.raised_by_pivot(exc):
+                result["display_reason"] = exceptions.describe_error(exc)
+            return result
+
+
+def _open_state_db(state_dir: pathlib.Path) -> state.StateDB:
+    """Open the stage's state database read-only; a failure to open it is pivot's own I/O."""
+    with stage_io.PIVOT_IO:
+        return state.StateDB(state_dir, readonly=True)
 
 
 def user_code_files() -> list[str]:
@@ -1152,6 +1397,9 @@ def execute_stage(
         )
     finally:
         _stop.stage_running = False
+        # Every way out of the stage drops its recorded failure, whose frames hold the stage's
+        # locals and loaded inputs, so a warm worker does not keep them until its next stage.
+        stage_io.clear()
     if _stop.exit_requested:
         _exit_worker(1)
     result["user_code_files"] = user_code_files()
@@ -1619,7 +1867,8 @@ def _write_outputs_with_store(
 def _write_output_with_store(
     ref: types.ArtifactRef, value: Any, store: store_mod.Store
 ) -> pathlib.Path:
-    output_path = store.prepare_output(ref)
+    with stage_io.PIVOT_IO:
+        output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
 
     output_label = (
@@ -1629,7 +1878,10 @@ def _write_output_with_store(
     )
 
     def save_output(output_value: Any, destination: pathlib.Path) -> None:
-        with warnings.catch_warnings(record=True) as caught:
+        with (
+            warnings.catch_warnings(record=True) as caught,
+            stage_io.writing_output(destination),
+        ):
             warnings.simplefilter("always", loaders.LossyOutputWarning)
             try:
                 writer.save(output_value, destination)
@@ -2213,13 +2465,14 @@ def _commit_lock_and_build_deferred(
     listing of each directory it records (``hashed_dirs`` holds the ones this run hashed; the
     rest come from the cache) and returns DeferredWrites for the coordinator to apply.
     """
-    production_lock.write(
-        lock_data,
-        hashed_dirs=hashed_dirs,
-        input_paths=input_listing_paths(stage_info["deps"], store, lock_data["dep_hashes"]),
-        cache_dir=store_cache_dir(store),
-        outs=stage_info["outs"],
-    )
+    with stage_io.PIVOT_IO:
+        production_lock.write(
+            lock_data,
+            hashed_dirs=hashed_dirs,
+            input_paths=input_listing_paths(stage_info["deps"], store, lock_data["dep_hashes"]),
+            cache_dir=store_cache_dir(store),
+            outs=stage_info["outs"],
+        )
     return _build_deferred_writes(
         stage_info,
         input_hash,
@@ -2256,12 +2509,13 @@ def _build_deferred_writes(
     """Build deferred writes for coordinator to apply.
 
     A result that is not ``reusable`` (its run imported user modules its fingerprint does not
-    cover) files no run-cache entry and deletes any entry at its input hash and at
-    ``legacy_input_hash``, the unmarked key an older pivot files under; its lock carries a key
-    no fingerprint has and `skip.check_stage` never consults the run cache for it, so no tier
-    skips it.
+    cover, or modules changed after the coordinator loaded them) files no run-cache entry and
+    deletes any entry at its input hash and at ``legacy_input_hash``, the unmarked key an older
+    pivot files under; its lock carries a key no fingerprint has and `skip.check_stage` never
+    consults the run cache for it, so no tier skips it.
     """
-    result: DeferredWrites = {}
+    # A lock written now supersedes any record a --no-commit run left for `pivot commit`.
+    result = DeferredWrites(clear_no_commit_record=True)
 
     if increment_outputs:
         result["increment_outputs"] = True
@@ -2273,7 +2527,7 @@ def _build_deferred_writes(
 
     # Incremental outputs continue from the latest lock state and never use the run cache.
     # An unsafe fingerprint may match a run whose captured values differed; a non-reusable
-    # result imported code its fingerprint does not cover. Never file either. A non-reusable run
+    # result ran code its fingerprint does not describe. Never file either. A non-reusable run
     # also removes any entry an earlier run filed at its key, which the check never saw.
     if reusable and not stage_info["unsafe_fingerprint"]:
         outs = stage_info["outs"]

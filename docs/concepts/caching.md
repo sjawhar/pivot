@@ -234,6 +234,11 @@ Record current outputs in lock files and cache without re-running:
 $ pivot commit demo/train
 ```
 
+Outputs a `pivot repro --no-commit` run wrote, unchanged since, are recorded
+against the code that run ran, so a code edit made during or after it still
+reruns the stage. Other outputs (edited by hand, or written another way) are
+recorded against the code on disk now.
+
 ## Relationship to Other Concepts
 
 The skip algorithm combines three input signals:

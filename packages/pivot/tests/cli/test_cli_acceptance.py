@@ -485,6 +485,31 @@ def test_repro_allows_data_symlinked_outside_the_project(tmp_path: pathlib.Path)
     assert (external_data / "symlinked-data" / "copy.txt").read_text() == "VALUE"
 
 
+def test_checkout_restores_a_stage_output_in_data_symlinked_outside_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A stage output is placed by the pipeline, not by a .pvt, so the outward link is kept."""
+    root = tmp_path / "project"
+    root.mkdir()
+    external_data = tmp_path / "big-data"
+    external_data.mkdir()
+    (root / "data").symlink_to(external_data, target_is_directory=True)
+    _project(
+        root,
+        {
+            "pipeline.py": _SYMLINKED_DATA_PIPELINE,
+            "data/raw/value.txt": "VALUE",
+        },
+    )
+    _ok(_pivot(root, "repro"))
+    output = external_data / "symlinked-data" / "copy.txt"
+    output.unlink()
+
+    _ok(_pivot(root, "checkout"))
+
+    assert output.read_text() == "VALUE"
+
+
 def test_runtime_files_pivot_creates_are_git_ignored(tmp_path: pathlib.Path) -> None:
     """Config lock, artifact locks and the agent socket must not show up as untracked files."""
     root = _project(tmp_path, {"pipeline.py": _CLONE_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"})
@@ -1781,13 +1806,12 @@ _SIZE_CHECKED_MARK = ".verified"
         ),
     ],
 )
-def test_symlink_restore_rechecks_a_stale_tree_an_older_pivot_marked_after_a_size_check(
+def test_symlink_restore_does_not_trust_a_stale_tree_an_older_pivot_marked_after_a_size_check(
     tmp_path: pathlib.Path, setup: tuple[tuple[str, ...], ...], command: tuple[str, ...]
 ) -> None:
-    """Pivot 0.3.5 to 0.5.11 marked a SYMLINK cache tree after checking its files' sizes only, so
-    a tree holding stale bytes of the recorded size can carry that mark. checkout, get and a
-    symlink commit check such a tree by content and repair it before linking it, and drop the
-    old mark."""
+    """A checkout or get never repairs from the supplied listing: an old size-only marker leaves
+    the tree untrusted and restores file by file. A forced repro hashes real output bytes, so its
+    commit may repair and mark the tree."""
     root, tree, _ = _unmarked_shards_tree_with_stale_member(tmp_path)
     old_mark = tree.with_name(tree.name + _SIZE_CHECKED_MARK)
     old_mark.touch()
@@ -1800,8 +1824,12 @@ def test_symlink_restore_rechecks_a_stale_tree_an_older_pivot_marked_after_a_siz
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (shards / "0.txt").read_text() == "11"
-    assert shards.resolve() == tree.resolve(), "the output is linked to the repaired tree"
-    assert not old_mark.exists(), "the size-only mark is dropped once the content is checked"
+    if command[0] == "repro":
+        assert shards.resolve() == tree.resolve()
+        assert not old_mark.exists()
+    else:
+        assert not shards.is_symlink()
+        assert old_mark.exists()
 
 
 @pytest.mark.skipif(not os.environ.get("CI"), reason="installs pivot 0.5.11 from PyPI; runs in CI")
