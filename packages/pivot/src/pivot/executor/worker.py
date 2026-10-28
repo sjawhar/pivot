@@ -1084,7 +1084,9 @@ def _execute_stage(
                         # Naming-lock unit (shared): the run-cache restore checks whether
                         # objects exist and creates workspace links, then the lock file names
                         # them. gc cannot delete while this unit is open.
-                        with gc_mod.naming_unit(naming_root):
+                        with gc_mod.naming_unit(
+                            naming_root, project=(project_root, project_state_dir)
+                        ):
                             run_cache_skip = _try_skip_via_run_cache_with_store(
                                 stage_name,
                                 input_hash,
@@ -1237,14 +1239,20 @@ def _execute_stage(
                         ),
                     )
                 else:
-                    # Naming-lock unit (shared): copy_to_cache checks object existence, the
-                    # checkout creates the workspace link, and the lock file names the objects.
-                    # gc cannot delete while this unit is open. The unit does NOT cover stage
-                    # execution (which already completed above).
-                    with gc_mod.naming_unit(naming_root):
+                    # Hash and publish before the naming unit, so a large output's reading and
+                    # copying holds no lock a waiting collection would turn into a stall for
+                    # every other commit on the cache.
+                    with stage_io.PIVOT_IO:
+                        prepared = _prepare_outputs_with_store(
+                            output_paths, store, project_state_dir
+                        )
+                    # Naming-lock unit (shared), the naming step only: re-check each object (one
+                    # a collection removed since is published again), link the outputs, write the
+                    # lock that names them. gc cannot delete while this unit is open.
+                    with gc_mod.naming_unit(naming_root, project=(project_root, project_state_dir)):
                         with stage_io.PIVOT_IO:
                             output_hashes = _commit_outputs_with_store(
-                                output_paths, store, project_state_dir
+                                output_paths, store, project_state_dir, prepared
                             )
                         for ref, path in output_paths.items():
                             file_hash_entries.extend(
@@ -2041,17 +2049,35 @@ def _hash_output_paths(
     return output_hashes
 
 
+def _prepare_outputs_with_store(
+    outputs_by_ref: dict[types.ArtifactRef, pathlib.Path],
+    store: store_mod.Store,
+    project_state_dir: pathlib.Path,
+) -> dict[types.ArtifactRef, HashInfo]:
+    """Hash and publish each output before the naming-lock unit (a workspace store only)."""
+    prepared = dict[types.ArtifactRef, HashInfo]()
+    for ref, path in outputs_by_ref.items():
+        if not path.exists():
+            raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
+        if isinstance(store, store_mod.WorkspaceStore):
+            prepared[ref] = store.prepare_commit(ref, path, state_dir=project_state_dir)
+    return prepared
+
+
 def _commit_outputs_with_store(
     outputs_by_ref: dict[types.ArtifactRef, pathlib.Path],
     store: store_mod.Store,
     project_state_dir: pathlib.Path,
+    prepared: dict[types.ArtifactRef, HashInfo],
 ) -> dict[str, HashInfo]:
+    """Inside the naming-lock unit: finish each prepared output, or commit it whole."""
     output_hashes = dict[str, HashInfo]()
     for ref, path in outputs_by_ref.items():
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
         if isinstance(store, store_mod.WorkspaceStore):
-            output_hash = store.commit(ref, path, state_dir=project_state_dir)
+            output_hash = prepared[ref]
+            store.finish_commit(ref, path, output_hash, state_dir=project_state_dir)
         else:
             output_hash = store.commit(ref, path)
         output_hashes[types.identity_key(ref.identity)] = output_hash

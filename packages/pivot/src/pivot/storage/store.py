@@ -213,7 +213,7 @@ class WorkspaceStore:
         cache.remove_output(path)
         return path
 
-    def commit(
+    def prepare_commit(
         self,
         ref: types.ArtifactRef,
         path: pathlib.Path,
@@ -221,10 +221,11 @@ class WorkspaceStore:
         state_dir: pathlib.Path | None = None,
         warn_left_out_symlinks: bool = True,
     ) -> types.HashInfo:
-        """Hash a written output once and, unless it is a metric, place it in the cache.
+        """Hash a written output and publish its cache objects, outside any naming-lock unit.
 
         ``warn_left_out_symlinks`` logs the warning naming the symlinks a directory output
-        leaves out; a quiet command turns it off.
+        leaves out; a quiet command turns it off. ``finish_commit`` must follow inside the
+        caller's unit before a record names the returned hash.
         """
         output_hash: types.HashInfo
         if path.is_dir():
@@ -238,13 +239,60 @@ class WorkspaceStore:
             file_hash, _ = cache.hash_file(path, None)
             output_hash = types.FileHash(hash=file_hash)
         if self._cache_dir is not None and ref.tag is not types.ArtifactTag.METRIC:
-            cache.store_hashed_output(
+            cache.publish_hashed_output(
                 path,
                 output_hash,
                 self._cache_dir,
                 self._checkout_modes,
                 state_dir=state_dir,
             )
+        return output_hash
+
+    def finish_commit(
+        self,
+        ref: types.ArtifactRef,
+        path: pathlib.Path,
+        output_hash: types.HashInfo,
+        *,
+        state_dir: pathlib.Path | None = None,
+    ) -> None:
+        """Inside the caller's naming-lock unit: re-check, publish any missing object, link.
+
+        The objects ``prepare_commit`` published may have been removed by a collection run
+        before the unit was taken. ``store_hashed_output`` finds each object that remains with a
+        cheap existence check and publishes any that is gone again from ``path`` before it links
+        the workspace output, so the record that follows names only objects in the cache.
+        """
+        if self._cache_dir is not None and ref.tag is not types.ArtifactTag.METRIC:
+            cache.store_hashed_output(
+                path,
+                output_hash,
+                self._cache_dir,
+                self._checkout_modes,
+                state_dir=state_dir,
+                verify=True,
+            )
+
+    def commit(
+        self,
+        ref: types.ArtifactRef,
+        path: pathlib.Path,
+        *,
+        state_dir: pathlib.Path | None = None,
+        warn_left_out_symlinks: bool = True,
+    ) -> types.HashInfo:
+        """Hash a written output once and, unless it is a metric, place it in the cache.
+
+        For a caller that holds no naming-lock unit. A pivot commit site calls
+        ``prepare_commit`` before its unit and ``finish_commit`` inside it.
+        """
+        output_hash = self.prepare_commit(
+            ref,
+            path,
+            state_dir=state_dir,
+            warn_left_out_symlinks=warn_left_out_symlinks,
+        )
+        self.finish_commit(ref, path, output_hash, state_dir=state_dir)
         return output_hash
 
     def restore_from_cache(

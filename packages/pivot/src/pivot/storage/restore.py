@@ -297,7 +297,9 @@ def _restore_named(
     workspace's only record in symlink mode. gc cannot delete while this unit is open.
     ``cache_dir`` is the cache root, as `pivot gc` locks it; objects are read from its ``files``.
     """
-    with gc_mod.naming_unit(cache_dir):
+    with gc_mod.naming_unit(
+        cache_dir, project=(project.get_project_root(), config.get_state_dir())
+    ):
         return cache.restore_from_cache(
             dest_path,
             output_hash,

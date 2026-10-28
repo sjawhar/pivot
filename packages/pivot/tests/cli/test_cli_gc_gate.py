@@ -243,29 +243,32 @@ def test_gc_refuses_a_projects_path_that_is_not_a_pivot_project(
 
 
 # =============================================================================
-# Finding N2: the note says the register entry was dropped, and it stays
+# Finding N2, as ruled in round 4 (R2): an absent root is never taken as deleted
 # =============================================================================
 
 
-def test_gc_drops_the_register_entry_whose_root_is_gone(
+def test_gc_refuses_and_names_the_register_entry_whose_root_is_absent(
     shared: Workspace, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """ "Dropped 1 projects from the cache register" must mean the entry is gone from the
-    register; at fa7bd0c1 the entry stays and every later run repeats the note.
-    """
+    """At fa7bd0c1 the note said the entry was dropped while it stayed. Round 4's ruling (R2)
+    goes further: an absent root may be an unmounted disk or another mount namespace, so the
+    collection never drops it on its own. It refuses, names the entry for the user to delete
+    if the project is gone for good, and keeps it; a second run says the same."""
     gone = tmp_path / "a-worktree-that-was-deleted"
     gc.register_project(shared["cache_dir"], shared["root"], shared["state_dir"])
     gc.register_project(shared["cache_dir"], gone, gone / ".pivot")
+    entry = gc.register_path(shared["cache_dir"], gone)
 
     first = _helper_run(runner, "--yes", "--grace-hours", "0")
 
-    assert first.exit_code == 0, first.output
-    assert "Dropped 1 projects from the cache register" in first.output, first.output
-    assert not gc.register_path(shared["cache_dir"], gone).exists(), "the entry is still recorded"
+    assert first.exit_code != 0, first.output
+    assert str(entry) in first.output, first.output
+    assert entry.exists(), "a refused collection dropped the entry"
 
     second = _helper_run(runner, "--yes", "--grace-hours", "0")
 
-    assert "Dropped" not in second.output, second.output
+    assert second.exit_code != 0, second.output
+    assert str(entry) in second.output, second.output
 
 
 # =============================================================================

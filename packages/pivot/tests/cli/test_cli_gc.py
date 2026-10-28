@@ -427,24 +427,32 @@ def test_gc_keeps_what_a_second_projects_locks_name(
     assert "in 2 projects" in result.output, result.output
 
 
-def test_gc_drops_a_registered_project_whose_root_is_gone(
+def test_gc_refuses_while_a_registered_projects_root_is_absent(
     shared: Workspace, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """An entry whose directory is gone took its locks and its links with it."""
-    named = _helper_publish(shared, "named")
-    _helper_write_lock(shared, outs={None: types.FileHash(hash=named)})
+    """An absent root proves nothing (the disk may not be mounted), so the collection refuses,
+    names the register entry, and removes nothing. Once the user deletes that entry for a
+    project that is gone for good, the collection runs."""
+    dead = _helper_publish(shared, "dead")
     retired = tmp_path / "retired"
     retired.mkdir()
     gc.register_project(shared["cache_dir"], retired, retired / ".pivot")
     retired.rmdir()
+    entry = gc.register_path(shared["cache_dir"], retired)
 
-    result = _helper_run(runner, "--yes", "--grace-hours", "0", "--projects", ".")
+    refused = _helper_run(runner, "--yes", "--grace-hours", "0", "--projects", ".")
 
-    assert result.exit_code == 0, result.output
-    assert "Dropped 1 projects from the cache register; their roots are gone: " in (
-        result.output
-    ), result.output
-    assert str(retired) in result.output, result.output
+    assert refused.exit_code != 0, refused.output
+    assert str(retired) in refused.output, refused.output
+    assert str(entry) in refused.output, refused.output
+    assert entry.exists(), "a refused collection dropped the entry"
+    assert dead in _helper_keys(shared), "a refused collection removed an object"
+
+    entry.unlink()
+    collected = _helper_run(runner, "--yes", "--grace-hours", "0", "--projects", ".")
+
+    assert collected.exit_code == 0, collected.output
+    assert dead not in _helper_keys(shared), "the collection did not run once the entry was gone"
 
 
 def test_gc_refuses_when_a_registered_project_cannot_be_read(
@@ -469,7 +477,7 @@ def test_gc_refuses_when_a_registered_project_cannot_be_read(
     assert f"  {other_root} (host " in result.output, result.output
     assert "Is a directory" in result.output, result.output
     assert "That project may hold outputs this run would remove." in result.output
-    assert "an entry whose directory is gone is dropped" in result.output
+    assert "delete the register entry named above" in result.output
     assert _helper_keys(shared) == {dead}, "a refusal removes nothing"
 
 
@@ -870,3 +878,61 @@ def test_gc_keeps_an_object_a_registered_peer_of_an_internal_cache_names(
     assert theirs in _helper_keys(workspace), (
         "an object named by a registered peer of an internal cache was removed"
     )
+
+
+# =============================================================================
+# --projects with a project that keeps its state outside .pivot (core.state_dir)
+# =============================================================================
+
+
+def test_gc_reads_a_named_project_from_its_configured_state_dir(
+    workspace: Workspace,
+    runner: click.testing.CliRunner,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A project named by `--projects` that sets `core.state_dir` keeps its locks there, not in
+    `.pivot`. The collection reads them from there, keeps what they name, and records the
+    project with that state directory."""
+    base = tmp_path_factory.mktemp("custom-state")
+    other = base / "other"
+    (other / ".pivot").mkdir(parents=True)
+    (other / ".pivot" / "config.yaml").write_text("core:\n  state_dir: ../other-state\n")
+    state_dir = base / "other-state"
+    (state_dir / "stages").mkdir(parents=True)
+    named = _helper_publish(workspace, "named only by a lock in a custom state directory")
+    lock.StageLock("other/stage", state_dir / "stages").write(
+        types.LockData(
+            code_manifest={"self:test": "abc123"},
+            params={},
+            dep_hashes={},
+            output_hashes={types.ArtifactIdentity("other/stage", None): types.FileHash(hash=named)},
+        )
+    )
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0", "--projects", str(other))
+
+    assert result.exit_code == 0, result.output
+    assert named in _helper_keys(workspace), "an object the named project's lock names was removed"
+    entry = json.loads(gc.register_path(workspace["cache_dir"], other.resolve()).read_text())
+    recorded = type(state_dir)(entry["state_dir"]).resolve()
+    assert recorded == state_dir.resolve(), entry
+
+
+def test_gc_refuses_a_named_project_whose_configured_state_dir_is_missing(
+    workspace: Workspace,
+    runner: click.testing.CliRunner,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A named project whose configured state directory cannot be read names records pivot
+    cannot see, so the collection refuses and removes nothing."""
+    base = tmp_path_factory.mktemp("missing-state")
+    other = base / "other"
+    (other / ".pivot").mkdir(parents=True)
+    (other / ".pivot" / "config.yaml").write_text("core:\n  state_dir: ../not-there\n")
+    dead = _helper_publish(workspace, "would be removed if the refusal were skipped")
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0", "--projects", str(other))
+
+    assert result.exit_code != 0, result.output
+    assert "state directory" in result.output, result.output
+    assert dead in _helper_keys(workspace), "a refused collection removed an object"

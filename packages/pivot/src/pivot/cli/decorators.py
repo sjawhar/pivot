@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import functools
 import logging
 import os
@@ -114,9 +113,18 @@ def pivot_command(
                 # Record this project as a user of its cache (the register), so a collection
                 # run in another project that shares the cache keeps this one's objects. gc
                 # handles registration itself (after its register-read) and does not discover.
+                # A failure never fails the command, but it is reported: a project missing from
+                # the register is invisible to another project's collection.
                 if auto_discover:
-                    with contextlib.suppress(Exception):
+                    try:
                         config.register_cache_use()
+                    except Exception as e:  # noqa: BLE001 - reported, never fatal
+                        logger.warning(
+                            "Cannot record this project as a user of its cache: %s. A `pivot gc` "
+                            + "run in another project that shares this cache will not see this "
+                            + "project's records.",
+                            e,
+                        )
                 return func(*args, **kwargs)
             finally:
                 metrics.end("cli.total", _t_total)

@@ -185,13 +185,9 @@ def gc_cmd(
     object_root = cache_dir / gc.OBJECTS_DIR
     state_dir = config.get_state_dir()
 
-    scopes, gone = gc.resolve_scopes(
-        cache_dir, project_root, state_dir, project_paths, dry_run=dry_run
-    )
+    scopes = gc.resolve_scopes(cache_dir, project_root, state_dir, project_paths, dry_run=dry_run)
     if not dry_run:
         gc.register_project(cache_dir, project_root, state_dir)
-    if gone:
-        _echo(gc.dropped_note(gone), to_stderr=notes_to_stderr)
 
     if not cache_dir.is_dir():
         # N4: a cache that has never stored anything has nothing to collect. Pivot does not
@@ -273,11 +269,7 @@ def gc_cmd(
                 # the run-cache rows that remain. The plan read before the lock only limits
                 # which objects are candidates; it never licenses a deletion on its own.
                 with gc.naming_exclusive(cache_dir):
-                    scopes, gone = gc.resolve_scopes(
-                        cache_dir, project_root, state_dir, project_paths
-                    )
-                    if gone:
-                        _echo(gc.dropped_note(gone), to_stderr=notes_to_stderr)
+                    scopes = gc.resolve_scopes(cache_dir, project_root, state_dir, project_paths)
                     roots = gc.collect_roots(scopes, cache_dir)
                     keep_all = bool(roots["unreadable"] or roots["outward_dirs"])
                     removed = gc.ObjectCount(objects=0, bytes=0)

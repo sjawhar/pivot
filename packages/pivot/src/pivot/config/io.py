@@ -344,8 +344,8 @@ def register_cache_use() -> None:
         # a user must not create it (naming_unit would). A fresh entry means nothing is
         # written, so there is nothing to order against a collection and no lock is taken.
         return
-    with gc.naming_unit(cache_dir):
-        gc.register_project(cache_dir, root, get_state_dir())
+    with gc.naming_unit(cache_dir, project=(root, get_state_dir())):
+        pass  # the unit registers the project under the shared lock
 
 
 def get_state_dir() -> pathlib.Path:
@@ -355,6 +355,25 @@ def get_state_dir() -> pathlib.Path:
     if not state_dir.is_absolute():
         state_dir = project.get_project_root() / state_dir
     return state_dir
+
+
+def project_state_dir(root: pathlib.Path) -> pathlib.Path:
+    """The state directory of the project at ``root``, from that project's own config.
+
+    For a project other than the current one, such as one `pivot gc --projects` names:
+    defaults < this user's global config < ``<root>/.pivot/config.yaml``, a relative
+    ``core.state_dir`` resolved against ``root``.
+
+    Raises:
+        exceptions.ConfigError: a config file cannot be read or parsed.
+        ValueError: the merged config is not valid.
+    """
+    merged = deep_merge(
+        models.PivotConfig.get_default().model_dump(), load_config_file(get_global_config_path())
+    )
+    merged = deep_merge(merged, load_config_file(root / ".pivot" / "config.yaml"))
+    state_dir = pathlib.Path(models.PivotConfig.model_validate(merged).core.state_dir)
+    return state_dir if state_dir.is_absolute() else root / state_dir
 
 
 def get_max_workers() -> int:

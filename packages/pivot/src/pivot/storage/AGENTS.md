@@ -141,8 +141,8 @@ turnstile to prevent starvation. **The lock order must never be inverted; any pa
 them in another order is a deadlock bug.**
 
 ```
-gc.lock (EX, gc-from-gc)  →  naming.turnstile (EX)  →  naming.lock (EX)  →  prefix .pivot_cache.lock (EX)
-                              naming.turnstile (SH)  →  naming.lock (SH)  →  (turnstile UN)
+gc:      gc.lock (EX)  →  prefix .pivot_cache.lock (EX, one at a time, to list)  →  naming.turnstile (EX)  →  naming.lock (EX)
+writer:  naming.turnstile (SH)  →  naming.lock (SH)  →  (turnstile UN)  →  prefix .pivot_cache.lock (SH, only to re-publish)
 ```
 
 - **`gc.lock`** (EX, non-blocking): excludes two gc runs on one cache. Taken first, held for the
@@ -152,17 +152,40 @@ gc.lock (EX, gc-from-gc)  →  naming.turnstile (EX)  →  naming.lock (EX)  →
   units). Writers take it shared, then naming shared, then release turnstile immediately.
 - **`naming.lock`** (EX for gc, SH for writers): the mutual-exclusion lock. While gc holds it
   exclusive, no writer can name a cache object. While a writer holds it shared, gc waits.
-- **Prefix `.pivot_cache.lock`** (EX): excludes the gc scan/delete from concurrent staging
-  publishers in one prefix directory. Taken AFTER naming.lock.
+- **Prefix `.pivot_cache.lock`** (EX for gc's listing, SH for a staging publisher): gc lists a
+  prefix only under it, so it waits for a publish in progress there before it takes any naming
+  lock. gc **never** takes a prefix lock while it holds `naming.lock` exclusive: it must not
+  wait on another process there, or every writer waits behind it. Its deletions need no prefix
+  lock, because a publisher outside a naming unit is re-checked inside one before anything
+  names its object.
 
 ### Writer commit unit
 
-A naming unit spans from the **first existence check on a cache object** to the **durable record
-that names it** (lock file, `.pvt`, run-cache row or workspace link). It must NEVER span stage
-execution — only the commit step. See `gc.naming_unit`.
+A naming unit covers only the **naming step**: from the **last existence check on each cache
+object** to the **durable record that names it** (lock file, `.pvt`, run-cache row or workspace
+link). It must NEVER span stage execution, hashing, copying or a download. Hash and publish
+before the unit; download outside it; inside it, re-check every object (publishing again any a
+collection removed since) and then link and write the record. See `gc.naming_unit`,
+`WorkspaceStore.prepare_commit` / `finish_commit`, and `cache.publish_hashed_output`.
 
 Sites: `executor/worker.py` (normal commit and run-cache skip), `executor/commit.py` (`pivot
-commit`), `cli/track.py` (`pivot track`), `storage/restore.py` (restore from revision).
+commit`), `cli/track.py` (`pivot track`), `storage/restore.py` (restore from revision), and
+`config.register_cache_use` (a register write). Every site and `pivot gc` take the lock files
+from `gc.naming_lock_paths(<cache root as configured>)`, never from a path derived from the
+resolved object root (a `files/` symlink would split the lock).
+
+**Every unit registers its project** (`naming_unit(cache_root, project=(root, state_dir))`),
+under the shared lock and before anything is named, so every process that names an object is
+in the register, whichever command it runs and whether or not the cache existed when it began.
+Only a test standing in for a writer passes `project=None`.
+
+**A re-publish inside a unit is verified.** A writer that hashed before its unit re-publishes
+with `copy_to_cache(..., verify=True)` (through `store_hashed_output(verify=True)` at the commit
+sites): the copy is hashed and refused on a mismatch, so a file that changed after it was hashed
+never lands under its old key.
+
+**An absent register root is never taken as deleted.** `read_register` reports it as
+unreadable, so the collection refuses and names the entry; only the user deletes an entry.
 
 ### Where flock is refused
 
@@ -171,3 +194,12 @@ without `flock`), `collection_lock` refuses the gc run outright — no objects a
 proceed unlocked because there is no collector to race. If a future change makes gc collect on
 such a mount, the writers must also take the lock. This pair is by design; do not change one side
 without the other.
+
+### Where the lock files cannot be opened
+
+**Writers refuse.** If a writer cannot open `naming.turnstile` or `naming.lock` (they do not
+exist yet and this user cannot create them in the cache root), `naming_unit` raises
+`CacheError` naming the file and the remedy: another user's `pivot gc` could create the files
+and delete while this writer named objects unlocked. The only exception is `EROFS`: on a
+read-only filesystem nothing, a collection included, can delete. Lock files that exist but are
+not writable are opened read-only and locked (`cache.open_cache_lock`).

@@ -89,16 +89,18 @@ project recording itself in a shared cache — holds `naming.lock` in the cache 
 while it names: from its last check that the objects it needs are in the cache to the record
 that names them. The lock lives in the cache root (the directory that holds `files/`), so it is
 one file however the cache path is spelled, even when `files/` is a symlink to another disk.
-`pivot track` hashes and copies, and `pivot get --rev` reads git and downloads, before taking
-it, then re-checks the objects under it. `pivot gc` holds the same lock exclusive while it
+Every writer hashes and copies its outputs (and `pivot get --rev` reads git and downloads)
+before taking it, then re-checks the objects under it, publishing again any a collection removed
+meanwhile, so a large output never holds the lock. `pivot gc` holds the same lock exclusive while it
 re-reads the register, prunes run history, re-reads every record and run-cache row and
 deletes, so no object can be named between that re-read and its removal. The shared lock
 never covers a stage's execution, and a turnstile keeps a stream of writers from starving a
 collection. The plan and the prompt run before the lock is taken, so a dry run or a waiting
 prompt blocks nobody; nothing read before the lock decides what is deleted.
-A collection also takes `<cache>/gc.lock`, so two collections
-never run on one cache, and each prefix directory's `.pivot_cache.lock` while it deletes
-there. It removes a directory tree with its `.content-checked` marker (and the
+A collection also takes `<cache>/gc.lock`, so two collections never run on one cache, and lists
+each prefix directory under its `.pivot_cache.lock`, waiting there for a publish in progress
+before it takes the naming lock; under the naming lock it waits for nothing. It removes a
+directory tree with its `.content-checked` marker (and the
 `.layout-checked` and `.verified` markers older pivot versions wrote), markers first, and
 never removes a lock file or a `.pivot_tmp_*` entry another process owns.
 
@@ -106,7 +108,9 @@ A symlinked directory inside the project whose target lies outside it — `data 
 or a plain `.venv -> /opt/venvs/x` — hides whatever records are beneath it, since pivot does not
 follow a link out of the project. A collection that finds one keeps every object and removes
 nothing, and names the link: point it at a directory inside the project (or remove it) to
-collect. A symlinked directory that stays inside the project is walked.
+collect. A symlinked directory that stays inside the project is walked. A link into the cache's
+own `files/` is a checkout, read as one; a link anywhere else under the cache root (which may be a
+broad scratch directory holding your data too) leaves the project like any other.
 
 What this does and does not cover: there is no timing window between pivot processes that take
 the lock. It holds when every pivot that uses the cache is this version or newer, the
@@ -130,15 +134,17 @@ cache under `projects/<digest>.json`:
  "host": "workstation", "pivot": "0.5.12", "last_write": "2026-10-27T06:43:11Z"}
 ```
 
-A command that discovers the pipeline (`repro`, `run`, `status`, `commit`, `checkout`, `track`
-and the others that load `pipeline.py`) writes this entry when it starts, at most once an hour
-per project; `pivot gc` records itself and every `--projects` path. Commands that skip
-discovery (`import`, `update`, `data`, `doctor`, `history`) do not register, so a project used
-only through them is not in the register until another command runs there. A collection reads
-every project the register names. An entry this host recorded whose root is gone (its parent is
-here, the root is not) is dropped, with a note. An entry another host recorded whose root is not
-visible here refuses the collection, since this host cannot tell whether that project still
-exists; collect from that host. `pivot gc` **refuses to remove anything** from an
+Every pivot process that names a cache object registers its project first, inside the naming
+lock described above: a stage commit, a run-cache restore, `pivot commit`, `pivot track` and
+`pivot get --rev`, whatever the command and whether or not the cache existed when it started
+(the project whose first run creates a shared cache is registered by that run). A command that
+discovers the pipeline (`repro`, `run`, `status`, `checkout` and the others that load
+`pipeline.py`) also registers when it starts. While a project's entry is under an hour old,
+registering costs one `stat`. A collection reads every project the register names. An entry
+whose root this host cannot see is never taken as deleted, because the project may be on a
+disk that is not mounted, in a container's own mount namespace, or on another host: the
+collection refuses and names the entry. Make the root visible and re-run, or, if the project is
+gone for good, delete the entry it names. `pivot gc` **refuses to remove anything** from an
 external cache that records no project, or whose records it cannot read; `pivot gc --projects
 PATH` names the projects that share it and records them, so later runs need no flag. A
 `--projects` path must be a real pivot project — a directory with a readable `.pivot` state

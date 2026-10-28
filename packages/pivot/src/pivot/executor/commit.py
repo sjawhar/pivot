@@ -155,33 +155,55 @@ def commit_stages(
                 if not decision["changed"]:
                     continue
 
-            # 6-7. Hash, cache outputs and write the lock, under the naming lock (shared):
-            # store.commit checks object existence and creates the checkout; the lock file
-            # names the objects. gc cannot delete while this unit is open.
-            with gc_mod.naming_unit(config.get_cache_dir()):
-                output_hashes_by_key = dict[str, HashInfo]()
-                output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
-                output_paths_by_identity = dict[types.ArtifactIdentity, str]()
-                file_hash_entries = list[tuple[str, int, int, int, str]]()
-                outputs_missing = False
-                for out in stage_outs:
-                    identity_key = types.identity_key(out.identity)
-                    try:
-                        out_path = store.resolve_display_path(out)
-                        hash_info = store.commit(
+            # 6. Hash and publish every output before the naming unit, so a large output's
+            # reading and copying holds no lock a waiting collection would turn into a stall for
+            # every other commit on the cache.
+            prepared = dict[types.ArtifactIdentity, tuple[pathlib.Path, HashInfo]]()
+            outputs_missing = False
+            for out in stage_outs:
+                identity_key = types.identity_key(out.identity)
+                try:
+                    out_path = store.resolve_display_path(out)
+                    prepared[out.identity] = (
+                        out_path,
+                        store.prepare_commit(
                             out,
                             out_path,
                             state_dir=default_state_dir,
                             warn_left_out_symlinks=warn_left_out_symlinks,
-                        )
-                        file_hash_entries.extend(
-                            worker.output_file_hash_entries(out_path, hash_info)
-                        )
-                        output_hashes_by_key[identity_key] = hash_info
-                        output_hashes_by_identity[out.identity] = hash_info
-                        output_paths_by_identity[out.identity] = out_path.relative_to(
-                            project_root
-                        ).as_posix()
+                        ),
+                    )
+                except FileNotFoundError:
+                    logger.error(
+                        "Stage '%s': output missing: %s — skipping", stage_name, identity_key
+                    )
+                    outputs_missing = True
+                    break
+                except OSError:
+                    logger.error(
+                        "Stage '%s': output unreadable: %s — skipping", stage_name, identity_key
+                    )
+                    outputs_missing = True
+                    break
+            if outputs_missing:
+                failed.append(stage_name)
+                continue
+
+            # 7. Under the naming lock (shared), the naming step only: re-check and link each
+            # output (an object a collection removed since is published again), then write the
+            # lock that names them. gc cannot delete while this unit is open.
+            with gc_mod.naming_unit(
+                config.get_cache_dir(), project=(project_root, config.get_state_dir())
+            ):
+                output_hashes_by_key = dict[str, HashInfo]()
+                output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
+                output_paths_by_identity = dict[types.ArtifactIdentity, str]()
+                file_hash_entries = list[tuple[str, int, int, int, str]]()
+                for out in stage_outs:
+                    identity_key = types.identity_key(out.identity)
+                    out_path, hash_info = prepared[out.identity]
+                    try:
+                        store.finish_commit(out, out_path, hash_info, state_dir=default_state_dir)
                     except FileNotFoundError:
                         logger.error(
                             "Stage '%s': output missing: %s — skipping", stage_name, identity_key
@@ -196,6 +218,12 @@ def commit_stages(
                         )
                         outputs_missing = True
                         break
+                    file_hash_entries.extend(worker.output_file_hash_entries(out_path, hash_info))
+                    output_hashes_by_key[identity_key] = hash_info
+                    output_hashes_by_identity[out.identity] = hash_info
+                    output_paths_by_identity[out.identity] = out_path.relative_to(
+                        project_root
+                    ).as_posix()
 
                 if outputs_missing:
                     failed.append(stage_name)

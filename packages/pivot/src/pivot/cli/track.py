@@ -189,9 +189,14 @@ def _track_single_path(
     # is still in the cache — one that already existed was not published above (a cache hit
     # publishes nothing), so a collection may have removed it since — publish any that is gone,
     # then write the .pvt that names them. gc cannot delete while this unit is open.
-    with gc_mod.naming_unit(config.get_cache_dir()):
+    with gc_mod.naming_unit(
+        config.get_cache_dir(), project=(project.get_project_root(), config.get_state_dir())
+    ):
         for source, key, executable in objects:
-            cache.copy_to_cache(source, cache.get_cache_path(cache_dir, key), executable=executable)
+            # verify: an object republished here must still hold the bytes that were hashed.
+            cache.copy_to_cache(
+                source, cache.get_cache_path(cache_dir, key), executable=executable, verify=True
+            )
         track_mod.write_pvt_file(pvt_path, pvt_data)
 
     # Update existing_tracked for subsequent paths

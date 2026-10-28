@@ -672,7 +672,9 @@ def staged_cache_file(cache_path: pathlib.Path) -> Generator[pathlib.Path]:
             staged.unlink(missing_ok=True)
 
 
-def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bool = False) -> None:
+def copy_to_cache(
+    src: pathlib.Path, cache_path: pathlib.Path, *, executable: bool = False, verify: bool = False
+) -> None:
     """Atomically copy file to cache with read-only permissions.
 
     ``executable`` records the source's executable bit on the cache object itself (0o555
@@ -683,12 +685,29 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bo
     The object is published with ``publish_cache_object`` and never changed afterwards, its
     mode included. An object already there is kept whatever executable bit it carries; a
     directory entry needing the other bit is checked out as a copy (``_checkout_with_fallback``).
+
+    ``verify`` hashes the staged copy and refuses to publish it under ``cache_path``'s key
+    unless it matches. A naming unit sets it when it re-publishes an object it hashed before
+    the unit: the source may have changed since, and storing new bytes under the old key would
+    hand them to every project whose record names that key.
+
+    Raises:
+        exceptions.CacheError: ``verify`` is set and the copy does not hash to the key.
     """
     if cache_path.exists():
         return
 
     with staged_cache_file(cache_path) as staged:
         shutil.copy2(src, staged)
+        if verify:
+            key = cache_path.parent.name + cache_path.name
+            copied, _ = hash_file(staged)
+            if copied != key:
+                raise exceptions.CacheError(
+                    f"{src} changed after pivot hashed it: it now hashes to {copied}, not "
+                    + f"{key}. Refusing to store it under the old key, and naming nothing. "
+                    + "Run the command again once the file is no longer being written."
+                )
         os.chmod(staged, 0o555 if executable else 0o444)
         _ = publish_cache_object(staged, cache_path)
 
@@ -1244,9 +1263,10 @@ def _store_file(
     *,
     keep_existing_copy: bool,
     state_dir: pathlib.Path | None = None,
+    verify: bool = False,
 ) -> None:
     cache_path = get_cache_path(cache_dir, file_hash)
-    copy_to_cache(path, cache_path)
+    copy_to_cache(path, cache_path, verify=verify)
     with restore_lock(path, state_dir) as lock_token:
         staging_path = restore_staging_path(path, lock_token)
         _clear_path(staging_path)
@@ -1355,13 +1375,14 @@ def _store_directory(
     *,
     keep_existing_copy: bool,
     state_dir: pathlib.Path | None = None,
+    verify: bool = False,
 ) -> None:
     manifest = output_hash["manifest"]
     # Cache individual files first
     for entry in manifest:
         file_path = path / entry["relpath"]
         cache_path = get_cache_path(cache_dir, entry["hash"])
-        copy_to_cache(file_path, cache_path, executable=entry["isexec"])
+        copy_to_cache(file_path, cache_path, executable=entry["isexec"], verify=verify)
 
     with restore_lock(path, state_dir):
         if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK:
@@ -1400,7 +1421,7 @@ def _store_directory(
                 )
 
 
-def store_hashed_output(
+def publish_hashed_output(
     path: pathlib.Path,
     output_hash: HashInfo,
     cache_dir: pathlib.Path,
@@ -1408,12 +1429,49 @@ def store_hashed_output(
     *,
     state_dir: pathlib.Path | None = None,
 ) -> None:
+    """Copy an output whose hash is known into the cache, without linking the workspace path.
+
+    A commit calls this before its naming-lock unit, so reading and copying a large output holds
+    no lock a waiting collection could turn into a stall for every other commit. Inside the unit
+    it calls ``store_hashed_output``: each object is then present (a cheap check), any a
+    collection removed meanwhile is published again, and only then is the output linked and
+    named. ``output_hash`` must be the hash of ``path``'s current contents.
+    """
+    effective_modes = _resolve_checkout_modes(None, checkout_modes)
+    if not is_dir_hash(output_hash):
+        copy_to_cache(path, get_cache_path(cache_dir, output_hash["hash"]))
+        return
+    for entry in output_hash["manifest"]:
+        copy_to_cache(
+            path / entry["relpath"],
+            get_cache_path(cache_dir, entry["hash"]),
+            executable=entry["isexec"],
+        )
+    if effective_modes and effective_modes[0] == CheckoutMode.SYMLINK:
+        cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
+        if not cache_dir_path.exists():
+            with restore_lock(path, state_dir):
+                if not cache_dir_path.exists():
+                    _publish_tree(path, cache_dir_path, output_hash, cache_dir)
+
+
+def store_hashed_output(
+    path: pathlib.Path,
+    output_hash: HashInfo,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[CheckoutMode] | None = None,
+    *,
+    state_dir: pathlib.Path | None = None,
+    verify: bool = False,
+) -> None:
     """Put an output whose hash is already known into the cache, then link it per mode.
 
     ``output_hash`` must be the hash of ``path``'s current contents; nothing is hashed again.
     Each file is copied into the cache once and the workspace path is linked to the cache entry
     with the first checkout mode that works. Reaching COPY leaves the workspace file as it is,
-    since it already holds the cached bytes.
+    since it already holds the cached bytes. ``verify`` hashes any file it has to copy and
+    refuses on a mismatch (``copy_to_cache``): a naming unit sets it, since its hash was taken
+    before the unit and the file may have changed since.
     """
     effective_modes = _resolve_checkout_modes(None, checkout_modes)
     if is_dir_hash(output_hash):
@@ -1424,6 +1482,7 @@ def store_hashed_output(
             effective_modes,
             keep_existing_copy=True,
             state_dir=state_dir,
+            verify=verify,
         )
     else:
         _store_file(
@@ -1433,6 +1492,7 @@ def store_hashed_output(
             effective_modes,
             keep_existing_copy=True,
             state_dir=state_dir,
+            verify=verify,
         )
 
 
