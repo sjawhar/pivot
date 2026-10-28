@@ -7,8 +7,8 @@ directory's tree hash and every hash in its manifest.
 
 A cache outside the project root can hold another project's outputs, whose locks this project
 cannot read. Pivot therefore keeps a register of the projects that use a cache, at
-``<cache>/projects/``, written by ``config.get_cache_dir()``, and refuses to collect an
-external cache that records nothing.
+``<cache>/projects/``, written by ``config.register_cache_use()`` when a command starts, and
+refuses to collect an external cache that records nothing.
 
 Two rules cover the window between publishing an object and writing the record that names it
 (``storage/AGENTS.md``): every object whose ``st_ctime`` is inside the grace period is kept,
@@ -287,18 +287,29 @@ def read_register(
             continue
         if root_exists:
             live.append(scope)
+        elif scope["host"] != socket.gethostname():
+            # P6: an entry another host wrote names a root this host cannot judge. It may be in
+            # that host's local storage under a parent every node has (/scratch, /mnt/data), so
+            # its absence here proves nothing: refuse rather than drop it and remove its objects.
+            unreadable.append(
+                (
+                    scope_label(scope),
+                    f"recorded by host {scope['host']}, and its root is not visible from "
+                    + f"{socket.gethostname()}; collect from that host, or from a host that "
+                    + "sees every project",
+                )
+            )
         elif scope["root"].parent.is_dir():
-            # The root's parent exists but the root does not: the project was truly deleted.
+            # Recorded by this host, and the root's parent is here but the root is not: the
+            # project was deleted.
             gone.append(scope["root"])
         else:
-            # The root is unreachable (unmounted share, another host's path, cross-host cache).
-            # The register records the host but a host mismatch does not prove deletion, so
-            # this entry is unreadable (M2: refuse rather than drop and remove its objects).
+            # The root is unreachable (an unmounted share): the absence proves nothing (M2).
             unreadable.append(
                 (
                     scope_label(scope),
                     f"the project root {scope['root']} and its parent are absent; if it is on "
-                    + "another host or an unmounted filesystem, restore access before collecting",
+                    + "an unmounted filesystem, restore access before collecting",
                 )
             )
     return live, gone, unreadable
@@ -523,17 +534,21 @@ def _walk_project(
     the cache itself, listed object by object rather than walked.
 
     A symlinked directory is walked when the place it really is lies inside ``root``
-    (``project.relative_within`` on the resolved path, BET-301's containment rule): the
-    ``data -> /mnt/big/data`` layout pivot supports would otherwise hide every record beneath
-    it, and the objects they name would be collected. A link that leaves the project is not
-    followed and is returned instead, because the records under it cannot be read and a
-    collection that cannot read a record must never licence a delete. A directory already
-    walked, by device and inode, is not walked again, so a link cycle terminates.
+    (``project.real_location_outside``, BET-301's containment rule, against ``root`` resolved
+    once for the walk), as a ``data -> data_real`` link inside the project is. A link that
+    leaves the project — ``data -> /mnt/big/data``, or a plain ``.venv -> /opt/venvs/x`` — is
+    not followed and is returned instead, because the records under it cannot be read and a
+    collection that cannot read a record must never licence a delete: one such link makes the
+    collection keep every object. A link into the cache itself is skipped (the cache is listed
+    object by object). A directory already walked, by device and inode, is not walked again,
+    so a link cycle terminates.
     """
     pvt_paths = list[pathlib.Path]()
     keys = set[str]()
     outward = list[pathlib.Path]()
     seen = set[tuple[int, int]]()
+    resolved_root = root.resolve()
+    resolved_skip = skip.resolve() if skip is not None else None
     stack = [root]
     while stack:
         directory = stack.pop()
@@ -552,9 +567,10 @@ def _walk_project(
                     elif entry.name.endswith(".pvt") and entry.is_file():
                         pvt_paths.append(path)
                     elif entry.is_dir():
-                        if _links_inside(path, root, skip):
+                        where = _link_target(path, resolved_root, resolved_skip)
+                        if where == "inside":
                             stack.append(path)
-                        else:
+                        elif where == "outside":
                             outward.append(path)
                 elif entry.is_dir(follow_symlinks=False):
                     if path != skip:
@@ -564,20 +580,21 @@ def _walk_project(
     return pvt_paths, keys, outward
 
 
-def _links_inside(path: pathlib.Path, root: pathlib.Path, skip: pathlib.Path | None) -> bool:
-    """Whether the symlinked directory ``path`` really lies inside ``root`` and is not the cache.
+def _link_target(
+    path: pathlib.Path, resolved_root: pathlib.Path, resolved_skip: pathlib.Path | None
+) -> Literal["inside", "outside", "cache"]:
+    """Where the symlinked directory ``path`` really is: inside the project, outside it, or in
+    the cache (listed object by object, never walked).
 
-    ``project.relative_within`` is BET-301's containment rule, applied to the resolved target so
-    that a link out of the project is outside however it is spelled. The cache is excluded
-    because it is listed object by object, never walked.
+    ``project.real_location_outside`` is BET-301's containment rule (#533); a link it cannot
+    resolve counts as outside, because where it leads is unknown.
     """
-    try:
-        resolved = path.resolve()
-    except (OSError, ValueError):
-        return False
-    if skip is not None and resolved.is_relative_to(skip.resolve()):
-        return False
-    return project.relative_within(resolved, root) is not None
+    outside = project.real_location_outside(path, resolved_root)
+    if resolved_skip is not None:
+        real = path.resolve() if outside is None else outside
+        if real.is_relative_to(resolved_skip):
+            return "cache"
+    return "inside" if outside is None else "outside"
 
 
 def collect_roots(
@@ -641,6 +658,28 @@ def collect_roots(
     return roots
 
 
+def reread_run_cache(roots: Roots, scopes: Iterable[ProjectScope]) -> None:
+    """Replace ``roots``' run-cache keys with every row the scopes' databases hold now.
+
+    Called under the exclusive naming lock after a run-history prune, so the rows the prune
+    dropped stop protecting their objects and every row that remains, however recent, does.
+
+    Raises:
+        ProjectUnreadableError: a scope's database cannot be read.
+    """
+    keys = set[str]()
+    rows = 0
+    for scope in scopes:
+        try:
+            scope_keys, scope_rows = _run_cache_keys(scope["state_dir"])
+        except OSError as e:
+            raise ProjectUnreadableError(scope, e.strerror or str(e)) from e
+        keys |= scope_keys
+        rows += scope_rows
+    roots["run_cache"] = keys
+    roots["counts"]["rows"] = rows
+
+
 # -----------------------------------------------------------------------------
 # Locking, scanning and removing
 # -----------------------------------------------------------------------------
@@ -687,6 +726,18 @@ def collection_lock(cache_dir: pathlib.Path) -> Generator[None]:
         os.close(fd)
 
 
+def naming_lock_paths(cache_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """The cache's naming turnstile and naming lock, the one pair every writer and `pivot gc` use.
+
+    ``cache_root`` is the cache root as configured: the directory that holds ``files/``
+    (``config.get_cache_dir()``, or the engine's ``cache_dir``), however its path is spelled. The
+    lock files live in that directory, so any spelling of it reaches the same files. Never pass a
+    path derived from the object root: ``files`` may be a symlink to another disk, and the parent
+    of where it really is would be a different directory, and so a different, unshared lock.
+    """
+    return cache_root / NAMING_TURNSTILE, cache_root / NAMING_LOCK
+
+
 @contextlib.contextmanager
 def naming_exclusive(cache_dir: pathlib.Path) -> Generator[None]:
     """Hold the naming lock exclusive: no writer can name a cache object while this is held.
@@ -695,8 +746,9 @@ def naming_exclusive(cache_dir: pathlib.Path) -> Generator[None]:
     The turnstile prevents writer starvation: gc takes it exclusive first so new commit
     units queue, then gc takes naming exclusive to wait for in-flight units to finish.
     """
-    ts_fd = cache.open_cache_lock(cache_dir / NAMING_TURNSTILE)
-    nm_fd = cache.open_cache_lock(cache_dir / NAMING_LOCK)
+    ts_path, nm_path = naming_lock_paths(cache_dir)
+    ts_fd = cache.open_cache_lock(ts_path)
+    nm_fd = cache.open_cache_lock(nm_path)
     try:
         fcntl.flock(ts_fd, fcntl.LOCK_EX)
         fcntl.flock(nm_fd, fcntl.LOCK_EX)
@@ -726,8 +778,7 @@ def naming_unit(cache_dir: pathlib.Path) -> Generator[None]:
     files cannot be opened at all (a cache this user cannot write), the unit also runs
     unlocked: such a writer cannot publish, and only re-links objects that already exist.
     """
-    ts_path = cache_dir / NAMING_TURNSTILE
-    nm_path = cache_dir / NAMING_LOCK
+    ts_path, nm_path = naming_lock_paths(cache_dir)
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         ts_fd = cache.open_cache_lock(ts_path)

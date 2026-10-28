@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import pathlib
 import sys
 import time
@@ -8,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from pivot import config, exceptions, project
+from pivot import config, display, exceptions, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.storage import gc, state
@@ -210,7 +209,7 @@ def gc_cmd(
             dry_run=dry_run,
         )
         if output_json:
-            click.echo(json.dumps(empty, indent=2))
+            click.echo(display.to_json(empty, indent=2))
             return
         if not quiet:
             click.echo(
@@ -268,15 +267,20 @@ def gc_cmd(
                     if remove_linked and plan["linked"]["objects"]:
                         _echo(_linked_disclosure(plan), to_stderr=notes_to_stderr)
                     _confirm(plan, object_root, assume_yes=assume_yes)
-                # Confirmed. Under the naming lock, re-read the register, prune, re-read
-                # every record, and delete. While this lock is held no writer can name a
-                # cache object, so the roots we read here are the truth.
+                # Confirmed. Everything a deletion depends on is read here, under the exclusive
+                # naming lock, so nothing a run named while the plan was built or the prompt
+                # waited can be missed (P7): the register, every record, and, after the prune,
+                # the run-cache rows that remain. The plan read before the lock only limits
+                # which objects are candidates; it never licenses a deletion on its own.
                 with gc.naming_exclusive(cache_dir):
                     scopes, gone = gc.resolve_scopes(
                         cache_dir, project_root, state_dir, project_paths
                     )
                     if gone:
                         _echo(gc.dropped_note(gone), to_stderr=notes_to_stderr)
+                    roots = gc.collect_roots(scopes, cache_dir)
+                    keep_all = bool(roots["unreadable"] or roots["outward_dirs"])
+                    removed = gc.ObjectCount(objects=0, bytes=0)
                     if not keep_all:
                         pruned = _apply_prune(state_dir, retention)
                         if pruned:
@@ -285,23 +289,14 @@ def gc_cmd(
                                 + "(core.run_history_retention).",
                                 to_stderr=notes_to_stderr,
                             )
-                    roots = gc.collect_roots(
-                        scopes,
-                        cache_dir,
-                        prune_state_dir=state_dir,
-                        valid_run_ids=valid_run_ids,
-                    )
-                    keep_all = bool(roots["unreadable"] or roots["outward_dirs"])
-                    removed = (
-                        gc.execute_plan(
-                            plan,
-                            roots=roots,
-                            grace_hours=grace_hours,
-                            remove_linked=remove_linked,
-                        )
-                        if plan["doomed"] and not keep_all
-                        else gc.ObjectCount(objects=0, bytes=0)
-                    )
+                            gc.reread_run_cache(roots, scopes)
+                        if plan["doomed"]:
+                            removed = gc.execute_plan(
+                                plan,
+                                roots=roots,
+                                grace_hours=grace_hours,
+                                remove_linked=remove_linked,
+                            )
         except gc.ProjectUnreadableError as e:
             raise exceptions.CacheCollectionRefusedError(
                 gc.refusal_unreadable(cache_dir, len(scopes), [(gc.scope_label(e.scope), e.reason)])
@@ -309,7 +304,7 @@ def gc_cmd(
 
     result = gc.result_document(cache_dir, plan, removed, scopes, dry_run=dry_run)
     if output_json:
-        click.echo(json.dumps(result, indent=2))
+        click.echo(display.to_json(result, indent=2))
         return
     if quiet:
         return

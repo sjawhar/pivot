@@ -1030,7 +1030,9 @@ directory entry outside the cache still hardlinks. It removes the rest. See
 [Caching](../concepts/caching.md#what-keeps-a-cache-object-alive) for the whole rule, and
 for what `pivot gc` does with a cache several projects share. A `--projects` path must be a
 real pivot project (a directory with a readable `.pivot` state directory); a path that is not
-one is refused and nothing is removed.
+one is refused and nothing is removed. A symlinked directory in a project that leads outside it
+(`data -> /mnt/big/data`, or a plain `.venv -> /opt/venvs/x`) hides the records beneath it, so
+`pivot gc` keeps every object, removes nothing, and names the link.
 
 When it collects, the run also prunes this project's run history to
 `core.run_history_retention`, as every pipeline run does, and counts the run-cache rows that

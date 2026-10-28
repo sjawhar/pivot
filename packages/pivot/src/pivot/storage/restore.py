@@ -284,6 +284,29 @@ def _skipped(dest_path: pathlib.Path, force: bool) -> RestoreResult | None:
     return None
 
 
+def _restore_named(
+    dest_path: pathlib.Path,
+    output_hash: HashInfo,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
+) -> bool:
+    """Restore ``dest_path`` from the cache inside a naming-lock unit (shared).
+
+    ``restore_from_cache`` checks each object exists and creates the workspace link or copy;
+    the record naming the objects is in git (the revision's lock), so the link is the
+    workspace's only record in symlink mode. gc cannot delete while this unit is open.
+    ``cache_dir`` is the cache root, as `pivot gc` locks it; objects are read from its ``files``.
+    """
+    with gc_mod.naming_unit(cache_dir):
+        return cache.restore_from_cache(
+            dest_path,
+            output_hash,
+            cache_dir / "files",
+            checkout_modes=checkout_modes,
+            state_dir=config.get_state_dir(),
+        )
+
+
 def restore_file(
     rel_path: str,
     output_hash: HashInfo | None,
@@ -300,7 +323,9 @@ def restore_file(
     Tries the local cache, then git, then downloads the cache objects the output still misses
     from the remote ``remote_factory`` opens; it is called only when that download is needed.
     A remote that raised ``RemoteUnreachableError`` is named in the result's
-    ``unreachable_remote``.
+    ``unreachable_remote``. Each restore from the cache runs in a naming-lock unit
+    (``_restore_named``); git reads and remote downloads run outside it, so a slow network
+    holds no lock a waiting collection would turn into a stall for every other commit.
     """
     path_str = str(dest_path)
     files_dir = cache_dir / "files"
@@ -327,13 +352,7 @@ def restore_file(
             if "manifest" not in output_hash:
                 should_try_cache = cache.get_cache_path(files_dir, output_hash["hash"]).exists()
             if should_try_cache:
-                success = cache.restore_from_cache(
-                    dest_path,
-                    output_hash,
-                    files_dir,
-                    checkout_modes=checkout_modes,
-                    state_dir=config.get_state_dir(),
-                )
+                success = _restore_named(dest_path, output_hash, cache_dir, checkout_modes)
                 if success:
                     return RestoreResult(
                         status=RestoreStatus.RESTORED,
@@ -369,27 +388,32 @@ def restore_file(
         remote: RemoteStorage | None = None
         try:
             missing_hashes = cache.missing_cache_objects(output_hash, files_dir, checkout_modes)
-            if missing_hashes:
-                source = "remote"
-                remote = remote_factory()
-                download_results = asyncio.run(
-                    remote.download_batch(
-                        [
-                            (file_hash, cache.get_cache_path(files_dir, file_hash))
-                            for file_hash in missing_hashes
-                        ],
-                        readonly=True,
+            # Two attempts: an object downloaded before the naming unit can be removed by a
+            # collection run with no grace before the unit is taken; download it again then.
+            success = False
+            for _attempt in range(2):
+                if missing_hashes:
+                    source = "remote"
+                    remote = remote or remote_factory()
+                    download_results = asyncio.run(
+                        remote.download_batch(
+                            [
+                                (file_hash, cache.get_cache_path(files_dir, file_hash))
+                                for file_hash in missing_hashes
+                            ],
+                            readonly=True,
+                        )
                     )
+                    if failed := [result for result in download_results if not result["success"]]:
+                        raise _download_error(failed)
+                success = _restore_named(dest_path, output_hash, cache_dir, checkout_modes)
+                missing_hashes = (
+                    []
+                    if success
+                    else cache.missing_cache_objects(output_hash, files_dir, checkout_modes)
                 )
-                if failed := [result for result in download_results if not result["success"]]:
-                    raise _download_error(failed)
-            success = cache.restore_from_cache(
-                dest_path,
-                output_hash,
-                files_dir,
-                checkout_modes=checkout_modes,
-                state_dir=config.get_state_dir(),
-            )
+                if not missing_hashes:
+                    break
         except exceptions.RemoteError as e:
             failure = RestoreResult(
                 status=RestoreStatus.ERROR,
@@ -491,22 +515,16 @@ def restore_targets_from_revision(
                 )
                 continue
 
-            # Naming-lock unit (shared): restore_file checks object existence and creates the
-            # workspace link. The record is in git (the revision's lock), so the unit covers
-            # only the link creation, but that link IS the workspace's only record in symlink
-            # mode. gc cannot delete while this unit is open. ``cache_dir`` here is the cache
-            # root (``restore_file`` reads objects from ``cache_dir / "files"``).
-            with gc_mod.naming_unit(cache_dir):
-                result = restore_file(
-                    rel_path=rel_path,
-                    output_hash=output_hash,
-                    rev=rev,
-                    dest_path=dest_path,
-                    cache_dir=cache_dir,
-                    checkout_modes=checkout_modes,
-                    force=force,
-                    remote_factory=reachable_remote,
-                )
+            result = restore_file(
+                rel_path=rel_path,
+                output_hash=output_hash,
+                rev=rev,
+                dest_path=dest_path,
+                cache_dir=cache_dir,
+                checkout_modes=checkout_modes,
+                force=force,
+                remote_factory=reachable_remote,
+            )
             if "unreachable_remote" in result:
                 unreachable = result["unreachable_remote"]
             results.append(result)

@@ -918,7 +918,10 @@ def _execute_stage(
     """
     # Clear metrics at start - each stage collects its own metrics
     metrics.clear()
-    _ = cache_dir
+    # ``cache_dir`` is the cache root the engine resolved from config (the directory holding
+    # ``files/``), as spelled there: the naming lock lives in it, the same file `pivot gc`
+    # locks. The store's object root is resolved, so a ``files`` symlink would move its parent.
+    naming_root = cache_dir
     ring_buffer = _OutputRingBuffer()
     state_dir = stage_info["state_dir"]
     project_state_dir = stage_info["project_state_dir"]
@@ -1079,7 +1082,7 @@ def _execute_stage(
                         # Naming-lock unit (shared): the run-cache restore checks whether
                         # objects exist and creates workspace links, then the lock file names
                         # them. gc cannot delete while this unit is open.
-                        with gc_mod.naming_unit(_naming_cache_root(store)):
+                        with gc_mod.naming_unit(naming_root):
                             run_cache_skip = _try_skip_via_run_cache_with_store(
                                 stage_name,
                                 input_hash,
@@ -1236,7 +1239,7 @@ def _execute_stage(
                     # checkout creates the workspace link, and the lock file names the objects.
                     # gc cannot delete while this unit is open. The unit does NOT cover stage
                     # execution (which already completed above).
-                    with gc_mod.naming_unit(_naming_cache_root(store)):
+                    with gc_mod.naming_unit(naming_root):
                         output_hashes = _commit_outputs_with_store(
                             output_paths, store, project_state_dir
                         )
@@ -1554,17 +1557,6 @@ def _check_skip_or_run(
 def _store_cache_dir(store: store_mod.Store) -> pathlib.Path | None:
     """The cache object root whose symlinks count as directory content for ``store``."""
     return store.cache_dir if isinstance(store, store_mod.WorkspaceStore) else None
-
-
-def _naming_cache_root(store: store_mod.Store) -> pathlib.Path:
-    """The cache root holding ``naming.lock`` for the objects ``store`` publishes.
-
-    Derived from the store's own object root (``<cache>/files``) so the worker locks the cache
-    it actually publishes into, even when the engine was given an explicit ``cache_dir`` that
-    differs from the configured one; the configured cache is the fallback for a store with none.
-    """
-    object_root = _store_cache_dir(store)
-    return object_root.parent if object_root is not None else config.get_cache_dir()
 
 
 def hash_output(

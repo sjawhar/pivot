@@ -162,46 +162,38 @@ def _track_single_path(
     if abs_path_str in existing_tracked and not force:
         raise click.ClickException(f"'{path_str}' is already tracked. Use --force to update.")
 
-    # Naming-lock unit (shared): copy_to_cache checks object existence, then write_pvt_file
-    # writes the record that names the objects. gc cannot delete while this unit is open.
-    # ``cache_dir`` is ``<cache>/files``; the naming lock lives at the cache root.
-    with gc_mod.naming_unit(cache_dir.parent):
-        # Hash and cache
-        if path.is_dir():
-            dir_hash = cache.hash_directory(
-                path, cache_dir=cache_dir, warn_left_out_symlinks=warn_left_out_symlinks
-            )
-            manifest = dir_hash["manifest"]
-            total_size = sum(e["size"] for e in manifest)
-            num_files = len(manifest)
+    # Hash and publish before the naming unit, so reading and copying a large file or directory
+    # holds no lock that a waiting collection would turn into a stall for every other commit on
+    # the cache. A newly published object is protected by the grace period in the meantime.
+    if path.is_dir():
+        dir_hash = cache.hash_directory(
+            path, cache_dir=cache_dir, warn_left_out_symlinks=warn_left_out_symlinks
+        )
+        manifest = dir_hash["manifest"]
+        objects = [(path / entry["relpath"], entry["hash"], entry["isexec"]) for entry in manifest]
+        pvt_data: track_mod.PvtData = {
+            "path": path.name,
+            "hash": dir_hash["hash"],
+            "size": sum(e["size"] for e in manifest),
+            "num_files": len(manifest),
+            "manifest": manifest,
+        }
+        if "empty_dirs" in dir_hash:
+            pvt_data["empty_dirs"] = dir_hash["empty_dirs"]
+    else:
+        file_hash, _ = cache.hash_file(path)
+        objects = [(path, file_hash, False)]
+        pvt_data = {"path": path.name, "hash": file_hash, "size": path.stat().st_size}
+    for source, key, executable in objects:
+        cache.copy_to_cache(source, cache.get_cache_path(cache_dir, key), executable=executable)
 
-            for entry in manifest:
-                file_path = path / entry["relpath"]
-                file_cache_path = cache.get_cache_path(cache_dir, entry["hash"])
-                cache.copy_to_cache(file_path, file_cache_path, executable=entry["isexec"])
-
-            pvt_data: track_mod.PvtData = {
-                "path": path.name,
-                "hash": dir_hash["hash"],
-                "size": total_size,
-                "num_files": num_files,
-                "manifest": manifest,
-            }
-            if "empty_dirs" in dir_hash:
-                pvt_data["empty_dirs"] = dir_hash["empty_dirs"]
-        else:
-            file_hash, _ = cache.hash_file(path)
-            file_size = path.stat().st_size
-            file_cache_path = cache.get_cache_path(cache_dir, file_hash)
-            cache.copy_to_cache(path, file_cache_path)
-
-            pvt_data = {
-                "path": path.name,
-                "hash": file_hash,
-                "size": file_size,
-            }
-
-        # Write .pvt file
+    # Naming-lock unit (shared), the naming step only: re-check under the lock that every object
+    # is still in the cache — one that already existed was not published above (a cache hit
+    # publishes nothing), so a collection may have removed it since — publish any that is gone,
+    # then write the .pvt that names them. gc cannot delete while this unit is open.
+    with gc_mod.naming_unit(config.get_cache_dir()):
+        for source, key, executable in objects:
+            cache.copy_to_cache(source, cache.get_cache_path(cache_dir, key), executable=executable)
         track_mod.write_pvt_file(pvt_path, pvt_data)
 
     # Update existing_tracked for subsequent paths
