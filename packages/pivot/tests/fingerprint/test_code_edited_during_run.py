@@ -773,15 +773,10 @@ def test_helper_a_loader_pivot_cannot_vouch_for_serves_is_never_cached_stale(
     )
 
 
-def test_helper_a_zip_runs_from_its_bytecode_member_is_never_cached_stale(
-    tmp_path: pathlib.Path,
-) -> None:
-    """A zip on PYTHONPATH holds `helpers.py` (v2) and a legacy `helpers.pyc` (v1) whose header
-    matches the `.py` member's zip time and size, as a zipped `compileall -b` tree or an egg
-    does. zipimport tries the `.pyc` first and runs it, so the module holds v1 while its source
-    says v2: the helper is unreadable, and no run reports `use_plain` cached with v1."""
-    archive = tmp_path / "ext" / "helpers.zip"
-    archive.parent.mkdir()
+def _zip_with_a_stale_pyc(archive: pathlib.Path) -> bytes:
+    """Write `archive` holding `helpers.py` (v2) and a legacy `helpers.pyc` (v1) whose header
+    matches the `.py` member's zip time and size, as a zipped `compileall -b` tree or an egg does;
+    return the `.py` member's bytes. zipimport runs such a `.pyc` before the `.py` member."""
     source = _HELPERS.replace("-v1", "-v2").encode()
     stamp = (2024, 1, 1, 0, 0, 0)
     code = compile(_HELPERS, f"{archive}/helpers.py", "exec", dont_inherit=True)
@@ -794,8 +789,20 @@ def test_helper_a_zip_runs_from_its_bytecode_member_is_never_cached_stale(
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr(zipfile.ZipInfo("helpers.py", date_time=stamp), source)
         zf.writestr(zipfile.ZipInfo("helpers.pyc", date_time=stamp), header + marshal.dumps(code))
+    return source
+
+
+def test_helper_a_zip_runs_from_its_bytecode_member_is_never_cached_stale(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A zip on PYTHONPATH holds `helpers.py` (v2) and a legacy `helpers.pyc` (v1) whose header
+    matches the `.py` member's zip time and size. zipimport's own finder picks the `.pyc` and
+    the module runs it, so the module holds v1 while its source says v2: the helper is
+    unreadable, and no run reports `use_plain` cached with v1."""
+    archive = tmp_path / "ext" / "helpers.zip"
+    archive.parent.mkdir()
     unpacked = tmp_path / "helpers_in_the_zip.py"
-    unpacked.write_bytes(source)
+    unpacked.write_bytes(_zip_with_a_stale_pyc(archive))
     project = _edge_project(
         tmp_path,
         "import helpers\nfrom pivot import Pipeline, stage\n",
@@ -812,6 +819,57 @@ def test_helper_a_zip_runs_from_its_bytecode_member_is_never_cached_stale(
     assert f"{_UNTRUSTED} reused: its zip importer ran the bytecode member {archive}" in first, (
         first
     )
+
+
+# `sitecustomize` puts a finder in front that builds the spec of `helpers` itself: the zip's
+# `.py` member as its origin, zipimport as its loader. The archive is not on PYTHONPATH.
+_ZIP_SPEC_FINDER = """\
+import importlib.abc
+import importlib.util
+import sys
+import zipimport
+
+ARCHIVE = {archive!r}
+
+
+class Finder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "helpers":
+            return None
+        return importlib.util.spec_from_file_location(
+            fullname, ARCHIVE + "/helpers.py", loader=zipimport.zipimporter(ARCHIVE)
+        )
+
+
+sys.meta_path.insert(0, Finder())
+"""
+
+
+def test_helper_a_finder_specs_from_its_zip_py_member_runs_the_source_pivot_recorded(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A finder builds the helper's spec itself, naming the zip's `.py` member (v2) as its
+    origin, with zipimport as its loader; the archive also holds a legacy `.pyc` (v1) whose header
+    matches. zipimport's `exec_module` ignores the origin and runs the `.pyc`, so a recorder that
+    trusted the origin recorded v2 while v1 ran, and the next run reported v1 cached. Pivot runs
+    the `.py` bytes it recorded: every run writes v2, and the stage is cached after the first."""
+    archive = tmp_path / "ext" / "helpers.zip"
+    archive.parent.mkdir()
+    unpacked = tmp_path / "helpers_in_the_zip.py"
+    unpacked.write_bytes(_zip_with_a_stale_pyc(archive))
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(_ZIP_SPEC_FINDER.format(archive=str(archive)))
+    project = _edge_project(
+        tmp_path, "import helpers\nfrom pivot import Pipeline, stage\n", _EARLY_SEED, "pass", site
+    )
+    _run(project, "config", "set", "core.max_workers", "1", pythonpath=site)
+
+    first, runs = _runs_of_use_plain(project, site, unpacked)
+
+    assert all(output == "plain-v2" for _, output, _, _ in runs), runs
+    assert all(status == "cached" and not marked for status, _, _, marked in runs), runs
+    assert "Pivot cannot trust" not in first, first
 
 
 # `sitecustomize` puts a finder in front, modelled on dd-trace-py's `ModuleWatchdog.find_spec`: it

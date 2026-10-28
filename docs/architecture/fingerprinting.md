@@ -250,26 +250,38 @@ a new loader shape is unreadable by default:
 - CPython's exact `SourceFileLoader`, which accepts mtime-checked bytecode for an edit that keeps
   the size and whole-second mtime, is replaced with `_ProjectSourceLoader`, which records the bytes
   it compiled or validated checked-hash bytecode against.
-- A zip importer (`zipimport.zipimporter`) only when it compiled the `.py` member: its origin ends
-  in `.py`, and Pivot records that member's bytes. A zip importer tries a `.pyc` member first
-  (CPython 3.13 `zipimport.py:290`) and runs it when its header matches the `.py` member's zip
-  time, to within 1 s, and size (`:658-660`, `:690-695`), or when it is hash-based and either
-  unchecked or matching the source's hash; its origin then names the `.pyc`, and the module is
-  unreadable.
+- A zip importer (`zipimport.zipimporter`) whose spec names the `.py` member as its origin: Pivot
+  compiles the member's bytes it read and runs them itself, as zipimport compiles a source member
+  (line endings normalized), and records those bytes. The spec's origin is the word of whoever
+  built the spec, not the member zipimport runs: zipimport's `exec_module` searches the archive
+  again, tries a `.pyc` member first (CPython 3.13 `zipimport.py:290`) and runs it when its header
+  matches the `.py` member's zip time, to within 1 s, and size (`:658-660`, `:690-695`), or when it
+  is hash-based and either unchecked or matching the source's hash. A finder that builds the spec
+  itself (`spec_from_file_location(name, "<archive>/m.py", loader=zipimporter(archive))`) gets a
+  `.py` origin while zipimport would run the `.pyc`; running the bytes Pivot read closes that, and
+  the gap between Pivot's read and zipimport's. A spec zipimport's own finder built with a `.pyc`
+  origin (it found such a member) is unreadable.
 - A module Pivot's own loader recorded during this execution, inside another loader that wraps it:
   a finder modelled on dd-trace-py's ModuleWatchdog finds the module through the rest of
-  `sys.meta_path`, Pivot's recorder among it, and wraps the loader it gets. A record from before
-  the execution (an earlier import, before `importlib.reload`) does not count, nor an unreadable
-  one a worker's import hook made while the module's body imported a submodule. Pivot trusts that
-  such a wrapper runs no other code into the module after its own loader.
+  `sys.meta_path`, Pivot's recorder among it, and wraps the loader it gets. The record that inner
+  recorder made stands: readable where Pivot's loader compiled the source, and unreadable, with
+  the reason that names the real loader, where it judged one Pivot does not trust. A record from
+  before the execution (an earlier import, before `importlib.reload`) does not count, nor the one
+  a worker's import hook makes while the module's body imports a submodule. Pivot trusts that such
+  a wrapper runs the code its own loader compiled for the module, and nothing else: a wrapper that
+  asks Pivot's loader for the code (which records it) and then runs other code is not detected, a
+  stated limit no known tool reaches.
 
 An unreadable module's record carries a reason that names its loader, and the first stage in each
 process that uses it logs that reason with the fix: import the module without that loader, or
-accept that the stage reruns on every run. Unreadable means the stage reruns on every run Pivot
-performs, and no run Pivot performs reports it as cached; it does not make the output current:
-each rerun runs what that loader runs, which can still be the stale bytecode. A `pivot commit`
-of outputs no run recorded (the "trust me" commit) writes a lock without the mark, and the next
-run reports the stage as cached. A loader with only PEP 302's `load_module` and no `exec_module`,
+accept that the stage reruns on every run. Once a run Pivot records has used the module, the
+stage's lock carries the `unreadable-source:` mark, so every later run reruns it and none reports
+it as cached; a lock written before that (by an earlier Pivot, or before the loader was installed)
+can still be reported cached until a run uses the module. Unreadable does not make the output
+current: each rerun runs what that loader runs, which can still be the stale bytecode. A `pivot
+commit` of outputs no run recorded (the "trust me" commit) carries the mark the stage's previous
+lock holds; with no marked previous lock it writes a lock without the mark, and the next run
+reports the stage as cached. A loader with only PEP 302's `load_module` and no `exec_module`,
 which CPython 3.13 still imports with an `ImportWarning` (its import system calls `load_module`
 "slated for removal in Python 3.15"), is left unwrapped, so the import works as without Pivot; no
 recorder sees its module compile, and it is judged as below, where its loader makes it

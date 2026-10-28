@@ -17,6 +17,7 @@ import time
 import types
 import uuid
 import zipfile
+import zipimport
 from collections.abc import Callable, Sequence
 from importlib import _bootstrap_external
 from typing import cast, final, override
@@ -276,22 +277,17 @@ def test_an_unreadable_record_made_while_the_module_ran_does_not_stand(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A worker's import hook records the modules an import names (`record_modules`), so a
-    package whose body imports its own submodule is recorded unreadable while its loader still
-    runs it. That record is not a source Pivot's loader read: the zip importer's `.py` source,
-    recorded once the module ran, stands."""
-    archive = tmp_path / "lib.zip"
-    name = f"zipped_{uuid.uuid4().hex}"
-    with zipfile.ZipFile(archive, "w") as zf:
-        zf.writestr(
-            f"{name}.py",
-            "from pivot import loaded_source\n\nloaded_source.record_modules([__name__])\n",
-        )
-    discovery.install_user_code_loader(str(tmp_path))
-    monkeypatch.syspath_prepend(str(archive))
+    module whose body imports a submodule is recorded unreadable while its loader still runs it.
+    That record is no recorder's judgment of the loader: once the module ran, its record names
+    the loader Pivot does not trust."""
+    name = f"midexec_{uuid.uuid4().hex}"
+    path = tmp_path / f"{name}.py"
+    path.write_text("from pivot import loaded_source\n\nloaded_source.record_modules([__name__])\n")
+    proxy = _ProxyLoader(importlib.machinery.SourceFileLoader(name, str(path)))
 
-    importlib.import_module(name)
+    _import_through_the_recorder(name, proxy, monkeypatch)
 
-    assert loaded_source._record_fields(loaded_source.digests()[name])[1] != "", "readable"
+    assert _reason(name).startswith(_untrusted(_ProxyLoader))
 
 
 def test_a_stage_uses_modules_its_manifest_hashes_or_it_imported(
@@ -619,14 +615,17 @@ class _FileCacheLoader(importlib.abc.FileLoader):
 
 class _ServingFinder(importlib.abc.MetaPathFinder):
     """A finder ahead of `sys.path`'s that serves one module with a given loader, as an import
-    hook does."""
+    hook does; with `location`, it builds the spec itself (`spec_from_file_location`), naming
+    that origin."""
 
     _name: str
     _loader: object
+    _location: str | None
 
-    def __init__(self, name: str, loader: object) -> None:
+    def __init__(self, name: str, loader: object, location: str | None = None) -> None:
         self._name = name
         self._loader = loader
+        self._location = location
 
     @override
     def find_spec(
@@ -637,7 +636,10 @@ class _ServingFinder(importlib.abc.MetaPathFinder):
     ) -> importlib.machinery.ModuleSpec | None:
         if fullname != self._name:
             return None
-        return importlib.util.spec_from_loader(fullname, cast("importlib.abc.Loader", self._loader))
+        loader = cast("importlib.abc.Loader", self._loader)
+        if self._location is not None:
+            return importlib.util.spec_from_file_location(fullname, self._location, loader=loader)
+        return importlib.util.spec_from_loader(fullname, loader)
 
 
 class _ChainFinder(importlib.abc.MetaPathFinder):
@@ -674,13 +676,15 @@ class _ChainFinder(importlib.abc.MetaPathFinder):
 
 
 def _import_through_the_recorder(
-    name: str, loader: object, monkeypatch: pytest.MonkeyPatch
+    name: str, loader: object, monkeypatch: pytest.MonkeyPatch, location: str | None = None
 ) -> types.ModuleType:
-    """Import `name`, served by `loader`, with the module recorder installed, as a discovery or a
-    worker imports a module an import hook serves."""
+    """Import `name`, served by `loader` (with a spec naming `location`, if given), with the
+    module recorder installed, as a discovery or a worker imports a module an import hook
+    serves."""
     monkeypatch.setitem(sys.modules, name, types.ModuleType(name))  # removed after the test
     del sys.modules[name]
-    sys.meta_path.insert(0, _ServingFinder(name, loader))  # restore_import_machinery undoes it
+    # restore_import_machinery undoes it
+    sys.meta_path.insert(0, _ServingFinder(name, loader, location))
     discovery._install_module_recorder()
     try:
         return importlib.import_module(name)
@@ -788,16 +792,35 @@ def test_a_reload_an_untrusted_loader_runs_does_not_keep_the_earlier_record(
     assert _reason(name).startswith(_untrusted(_ProxyLoader))
 
 
-def test_a_zip_module_run_from_its_bytecode_member_is_unreadable(
+def test_a_wrapper_around_a_loader_pivot_does_not_trust_names_the_inner_loader(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A zip importer tries a module's `.pyc` member before its `.py` member, and runs the `.pyc`
-    when its header matches the `.py` member's zip time and size, as in a zipped `compileall -b`
-    tree or an egg. The `.py` text is then not the code that ran: the module is unreadable, with
-    the bytecode member named. A zip with only the `.py` member stays readable
-    (`test_a_module_in_a_zip_is_recorded_from_the_zip`)."""
-    archive = tmp_path / "lib.zip"
-    name = f"zipped_{uuid.uuid4().hex}"
+    """A dd-trace-py-style wrapper finds the module through Pivot's recorder, which judges the
+    loader it finds (a `SourceFileLoader` subclass) unreadable, and wraps that recorder. The
+    record that inner recorder made stands, so the reason names the real loader, not the
+    wrapper: the user is told which import hook to remove."""
+    name = f"wrapped_{uuid.uuid4().hex}"
+    path = tmp_path / f"{name}.py"
+    path.write_text("VALUE = 1\n")
+    monkeypatch.setitem(sys.modules, name, types.ModuleType(name))  # removed after the test
+    del sys.modules[name]
+    sys.meta_path.insert(0, _ServingFinder(name, _TransformingLoader(name, str(path))))
+    sys.meta_path.insert(0, _ChainFinder(name))  # restore_import_machinery undoes both
+    discovery._install_module_recorder()
+    try:
+        module = importlib.import_module(name)
+    finally:
+        discovery._uninstall_module_recorder()
+
+    assert type(vars(module)["__spec__"].loader._loader) is _ProxyLoader
+    assert _reason(name).startswith(_untrusted(_TransformingLoader))
+
+
+def _zip_with_a_stale_pyc(archive: pathlib.Path, name: str) -> bytes:
+    """Write `archive` holding `<name>.py`, returning "bravo", and a legacy `<name>.pyc`,
+    returning "alpha", whose header matches the `.py` member's zip time and size, as a zipped
+    `compileall -b` tree or an egg does; return the `.py` member's bytes. zipimport runs such a
+    `.pyc` before the `.py` member."""
     source = b'def value():\n    return "bravo"\n'
     stamp = (2024, 1, 1, 0, 0, 0)
     code = compile(
@@ -812,6 +835,20 @@ def test_a_zip_module_run_from_its_bytecode_member_is_unreadable(
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr(zipfile.ZipInfo(f"{name}.py", date_time=stamp), source)
         zf.writestr(zipfile.ZipInfo(f"{name}.pyc", date_time=stamp), header + marshal.dumps(code))
+    return source
+
+
+def test_a_zip_module_run_from_its_bytecode_member_is_unreadable(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """zipimport's own finder picks a module's `.pyc` member over its `.py` member when the
+    `.pyc` header matches the `.py` member's zip time and size, and names it as the spec's
+    origin. The module then runs that bytecode, not the `.py` text: it is unreadable, with the
+    bytecode member named. A zip with only the `.py` member stays readable
+    (`test_a_module_in_a_zip_is_recorded_from_the_zip`)."""
+    archive = tmp_path / "lib.zip"
+    name = f"zipped_{uuid.uuid4().hex}"
+    _zip_with_a_stale_pyc(archive, name)
     discovery.install_user_code_loader(str(tmp_path))
     monkeypatch.syspath_prepend(str(archive))
 
@@ -820,6 +857,63 @@ def test_a_zip_module_run_from_its_bytecode_member_is_unreadable(
     assert module.value() == "alpha", "zipimport ran the bytecode member"
     assert _reason(name).startswith(
         f"its zip importer ran the bytecode member {archive}{os.sep}{name}.pyc"
+    )
+
+
+def test_a_zip_module_whose_spec_names_its_py_member_runs_the_source_pivot_recorded(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finder can build a zip module's spec itself, naming the `.py` member as its origin
+    (`spec_from_file_location(..., loader=zipimporter(archive))`). zipimport's own `exec_module`
+    ignores the origin: it searches the archive again and runs the matching `.pyc` member. Pivot
+    compiles and runs the `.py` member's bytes it read, so the module runs the source Pivot
+    recorded."""
+    archive = tmp_path / "lib.zip"
+    name = f"zipped_{uuid.uuid4().hex}"
+    source = _zip_with_a_stale_pyc(archive, name)
+
+    module = _import_through_the_recorder(
+        name, zipimport.zipimporter(str(archive)), monkeypatch, f"{archive}{os.sep}{name}.py"
+    )
+
+    assert module.value() == "bravo", "Pivot ran the .py member, not zipimport's .pyc"
+    assert loaded_source._record_fields(loaded_source.digests()[name])[1] == (
+        xxhash.xxh64(source).hexdigest()
+    )
+
+
+def test_a_zip_rewritten_after_pivot_read_its_member_runs_the_bytes_pivot_recorded(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The archive is rewritten in place, keeping its layout, after Pivot read the module's
+    `.py` member and before the module runs. zipimport would read the member again from the
+    rewritten file; Pivot runs the bytes it read, so the module holds the code Pivot recorded."""
+    archive = tmp_path / "lib.zip"
+    rewritten = tmp_path / "rewritten.zip"
+    name = f"zipped_{uuid.uuid4().hex}"
+    stamp = (2024, 1, 1, 0, 0, 0)
+    for path, value in ((archive, "alpha"), (rewritten, "bravo")):
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr(
+                zipfile.ZipInfo(f"{name}.py", date_time=stamp),
+                f'def value():\n    return "{value}"\n',
+            )
+    read = zipimport.zipimporter.get_data
+
+    def read_then_rewrite(self: zipimport.zipimporter, pathname: str) -> bytes:
+        data = read(self, pathname)
+        archive.write_bytes(rewritten.read_bytes())
+        return data
+
+    monkeypatch.setattr(zipimport.zipimporter, "get_data", read_then_rewrite)
+    discovery.install_user_code_loader(str(tmp_path))
+    monkeypatch.syspath_prepend(str(archive))
+
+    module = importlib.import_module(name)
+
+    assert module.value() == "alpha", "the module runs the bytes Pivot read"
+    assert loaded_source._record_fields(loaded_source.digests()[name])[1] == (
+        xxhash.xxh64(b'def value():\n    return "alpha"\n').hexdigest()
     )
 
 

@@ -47,8 +47,8 @@ Record the bytes each user module was compiled from, and fingerprint those:
   `loaded_source.record`. Every other user-code module passes the recorder
   (`discovery._RecordingLoader`), which trusts a loader's source only where Pivot can show that
   loader runs it: CPython's `SourceFileLoader` (replaced by `_ProjectSourceLoader`), a zip
-  importer whose origin is the `.py` member (it compiled that member; with a `.pyc` origin it ran
-  bytecode it checks only by the `.py` member's zip time and size), and Pivot's own loader run
+  archive's `.py` member (Pivot compiles and runs the bytes it read, since zipimport's own
+  `exec_module` runs a matching `.pyc` member whatever the spec's origin says), and Pivot's own loader run
   inside a loader that wraps it during this execution (dd-trace-py's ModuleWatchdog wraps the
   loader the rest of `sys.meta_path` returns). Every other loader's module is recorded as
   unreadable, with a reason that names the loader, so a loader shape no one listed is safe by
@@ -105,7 +105,9 @@ project keeps every recorded fingerprint.
   `importlib.abc.SourceLoader`), a `FileLoader` with its own bytecode cache, and a zip holding a
   `.pyc` beside its `.py`. Name only the loaders that can be shown to run what Pivot read, and
   record everything else as unreadable. Check a type claim against the code it implies: a zip
-  importer is no `SourceLoader`, and still runs a `.pyc` it checks only by time and size.
+  importer is no `SourceLoader`, and still runs a `.pyc` it checks only by time and size. A
+  spec's origin is the word of whoever built the spec, not the member a loader runs: zipimport's
+  `exec_module` searches the archive again, so Pivot runs the `.py` bytes it read itself.
 - Check per stage, not per worker: a worker's other stages did not use the module.
 - Test code-change detection with the edit made *after* the import and *before* the fingerprint,
   and with the stage order that leaves the function unhashed until after the edit.

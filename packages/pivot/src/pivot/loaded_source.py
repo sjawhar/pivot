@@ -13,9 +13,10 @@ bytes it compiles; every other user-code module an import finds (an editable ins
 zip on `sys.path`, `importlib.util.spec_from_file_location`, a sourceless `.pyc`) is recorded when
 its loader executes it (`discovery._RecordingLoader`), and a module the recorder loaded without
 recording it when it appears (`record_modules`, `record_user_modules`). The recorder trusts a
-loader's source only where it can show that loader runs it: CPython's `SourceFileLoader`, which
-`_ProjectSourceLoader` replaces, a zip importer that compiled the `.py` member, and a loader that
-ran Pivot's own inside it. Every other user module is recorded as unreadable, with a reason that
+loader's source only where it can show that source runs: for CPython's `SourceFileLoader`, which
+`_ProjectSourceLoader` replaces, and a zip archive's `.py` member, Pivot compiles and runs the
+bytes it records itself, and a loader that ran Pivot's own inside it keeps the record Pivot's
+loader made. Every other user module is recorded as unreadable, with a reason that
 names its loader: Pivot cannot tell which code it holds, so a stage that uses it is never
 trusted. A user module no recorder saw compile, because it was imported before the recorder was
 installed (by `sitecustomize`, a `.pth` import line or the program that runs Pivot), by a loader
@@ -167,25 +168,32 @@ def record_loaded_module(
         _store(_Loaded(filename, path, name, data, _hash(data)))
 
 
+# The reason `record_modules` gives a module the recorder loaded but has not recorded: one still
+# executing, whose body imported a submodule. Its recorder records it when the execution ends.
+_NO_SOURCE_RECORDED = "pivot's recorder loaded it but recorded no source for the code it ran"
+
+
 def record_marker(name: str) -> object:
-    """What `source_recorded_since` compares against: module `name`'s record now."""
+    """What `recorded_since` compares against: module `name`'s record now."""
     return _by_module.get(name)
 
 
-def source_recorded_since(name: str, marker: object) -> bool:
-    """Whether module `name`'s source was recorded since `record_marker(name)` returned
-    `marker`: Pivot's own loader compiled it then. A record made before, or an unreadable one,
-    is not."""
+def recorded_since(name: str, marker: object) -> bool:
+    """Whether a recorder recorded module `name` since `record_marker(name)` returned `marker`:
+    readable where Pivot's loader compiled it, or unreadable for a loader the recorder does not
+    trust. A record made before, or the one `record_modules` makes for a module still executing
+    (`_NO_SOURCE_RECORDED`), is not."""
     loaded = _by_module.get(name)
-    return loaded is not marker and loaded is not None and loaded.digest is not None
+    return loaded is not marker and loaded is not None and loaded.reason != _NO_SOURCE_RECORDED
 
 
 def record_modules(names: Iterable[str]) -> None:
     """Bring the record up to date with `sys.modules` for `names`. A module object that took the
     place of a recorded module from the same file (a module that puts a ModuleType subclass
     under its own name while it loads) keeps that record. A module loaded through the recorder
-    whose source the recorder did not capture (the unpickling path, ``importlib.reload``) is
-    unreadable. A module any other loader loaded is left to `record_unseen_modules`.
+    that its recorder has not recorded yet, one still executing whose body imported a submodule,
+    is unreadable (`_NO_SOURCE_RECORDED`) until the recorder records it as the execution ends. A
+    module any other loader loaded is left to `record_unseen_modules`.
     """
     for name in names:
         module = sys.modules.get(name)
@@ -206,16 +214,7 @@ def record_modules(names: Iterable[str]) -> None:
         if type(loader).__name__ != "_RecordingLoader":
             continue
         _recorded_objects[name] = module
-        _store(
-            _Loaded(
-                filename,
-                os.path.realpath(filename),
-                name,
-                None,
-                None,
-                "pivot's recorder loaded it but recorded no source for the code it ran",
-            )
-        )
+        _store(_Loaded(filename, os.path.realpath(filename), name, None, None, _NO_SOURCE_RECORDED))
 
 
 def record_user_modules() -> None:
@@ -307,7 +306,7 @@ def digest(file: str) -> str | None:
 
 def digests() -> dict[str, str]:
     """Every recorded user module by name: its resolved path and digest, the digest empty for an
-    unreadable module, followed by the reason for one no recorder saw compile."""
+    unreadable module, followed by the reason Pivot recorded for an unreadable one."""
     return {name: _record_text(loaded) for name, loaded in _by_module.items()}
 
 
@@ -518,7 +517,7 @@ def _record_text(loaded: _Loaded) -> str:
 
 def _record_fields(text: str) -> tuple[str, str, str]:
     """A record's resolved path, digest (empty for an unreadable module) and reason (empty unless
-    no recorder saw the module compile)."""
+    the module is unreadable and Pivot recorded why)."""
     path, _, rest = text.partition("\0")
     digest, _, reason = rest.partition("\0")
     return path, digest, reason

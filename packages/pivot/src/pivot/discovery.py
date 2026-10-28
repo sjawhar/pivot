@@ -158,38 +158,51 @@ class _RecordingLoader(importlib.abc.Loader):
     def exec_module(self, module: _stdlib_types.ModuleType) -> None:
         spec = getattr(module, "__spec__", None)
         origin = getattr(spec, "origin", None)
-        # Pivot trusts a module's recorded source only where it can show the code that ran is the
-        # code it read, and records every other loader's module unreadable, so a loader no one
-        # listed is safe by default. CPython's exact SourceFileLoader may run a timestamp-valid
-        # old pyc, so it is replaced with the checked-hash loader Pivot uses for every other user
-        # `.py`, which records the bytes it executes.
+        # Pivot trusts a module's recorded source only where the code that runs is the code it
+        # read, and records every other loader's module unreadable, so a loader no one listed is
+        # safe by default. For CPython's exact SourceFileLoader and a zip archive's `.py` member,
+        # Pivot runs the source itself. SourceFileLoader may run a timestamp-valid old pyc, so the
+        # checked-hash loader Pivot uses for every other user `.py` takes its place and records
+        # the bytes it executes.
         if type(self._loader) is importlib.machinery.SourceFileLoader and isinstance(origin, str):
             loader = _ProjectSourceLoader(module.__name__, origin)
             loader.exec_module(module)
             loaded_source.record_loaded_module(module, loader.recorded_source)
             return
-        data, reason = self._trusted_source(origin)
+        data, reason = self._zip_source(origin)
+        if data is not None and isinstance(origin, str):
+            # A zip importer's `exec_module` searches the archive again, whatever the spec's
+            # origin says (a finder may build the spec itself), and runs a matching `.pyc` member
+            # before the `.py` one. Pivot compiles the member's bytes it read, as zipimport
+            # compiles a source member (line endings normalized), and runs them: the bytes it
+            # records are the code that runs, and no rewrite of the archive falls between the two.
+            source = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            exec(compile(source, origin, "exec", dont_inherit=True), vars(module))
+            loaded_source.record_loaded_module(module, data)
+            return
         marker = loaded_source.record_marker(module.__name__)
         self._loader.exec_module(module)
         # A loader that wraps Pivot's own, as dd-trace-py's ModuleWatchdog wraps the loader it
-        # finds on `sys.meta_path` (which holds Pivot's recorder), ran it inside: the source that
-        # loader recorded during this execution stands. A record from before it (an earlier
-        # import, under `importlib.reload`) does not, nor an unreadable one a worker's import hook
-        # made while the module's body imported a submodule.
-        if not loaded_source.source_recorded_since(module.__name__, marker):
-            loaded_source.record_loaded_module(module, data, reason)
+        # finds on `sys.meta_path` (which holds Pivot's recorder), ran it inside: the record that
+        # recorder made during this execution stands. It is readable where Pivot's loader compiled
+        # the source, and unreadable, naming the real loader, where the recorder judged one it does
+        # not trust. A record from before (an earlier import, under `importlib.reload`) does not
+        # stand, nor the one a worker's import hook makes while the module's body imports a
+        # submodule.
+        if not loaded_source.recorded_since(module.__name__, marker):
+            loaded_source.record_loaded_module(module, None, reason)
 
-    def _trusted_source(self, origin: object) -> tuple[bytes | None, str | None]:
-        """The source this loader is shown to compile before it executes, or None and why Pivot
-        cannot trust the code it runs.
+    def _zip_source(self, origin: object) -> tuple[bytes | None, str | None]:
+        """The `.py` member a zip importer's module comes from, which Pivot compiles and runs
+        itself, or None and why Pivot cannot trust the code this loader runs.
 
-        A zip importer tries a module's `.pyc` member before its `.py` member, and runs a
-        timestamp `.pyc` whose header matches the `.py` member's zip time (to within 1 s) and
-        size, or a hash-based one it does not check or whose hash matches; its origin then names
-        the `.pyc`. With a `.py` origin it compiled that member, the bytes `get_data` gives. Any
-        other loader may run cached bytecode, or text other than the source it gives, which Pivot
-        cannot see: a `SourceFileLoader` subclass, a proxy around CPython's loader, or a loader
-        that caches its own bytecode.
+        A zip importer's own finder names the member it will run: a `.pyc` origin means it found
+        a timestamp `.pyc` whose header matches the `.py` member's zip time (to within 1 s) and
+        size, or a hash-based one it does not check or whose hash matches, and it runs that
+        bytecode, which Pivot cannot show is the source's code. Any other loader may run cached
+        bytecode, or text other than the source it gives, which Pivot cannot see: a
+        `SourceFileLoader` subclass, a proxy around CPython's loader, or a loader that caches its
+        own bytecode.
         """
         # Typed as `object`: typeshed's zipimporter is no `importlib.abc.Loader`.
         loader = cast("object", self._loader)
@@ -208,9 +221,9 @@ class _RecordingLoader(importlib.abc.Loader):
         return None, (
             f"its loader, {type(loader).__module__}.{type(loader).__qualname__}, is not one "
             + "pivot can show runs the source it reads (pivot trusts only CPython's source file "
-            + "loader, a zip importer that compiles the .py file, and its own loader, also "
-            + "inside another; any other loader may run cached bytecode, or text other than its "
-            + "source). Fix: import the module without that loader, or accept the reruns"
+            + "loader and a zip archive's .py member, whose source it runs itself, and its own "
+            + "loader inside another; any other loader may run cached bytecode, or text other "
+            + "than its source). Fix: import the module without that loader, or accept the reruns"
         )
 
     def __getattr__(self, name: str) -> object:
