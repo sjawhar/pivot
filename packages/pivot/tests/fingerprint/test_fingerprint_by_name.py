@@ -4290,3 +4290,320 @@ def test_a_model_dump_the_object_does_not_hold_is_canonicalized_as_a_plain_objec
         assert fingerprint._keeps_own_attribute(value, "model_dump")
         canonical = fingerprint._canonicalize_value_for_hash(value)
         assert canonical == [type(value).__name__, repr(value)], canonical
+
+
+def test_a_model_dump_that_raises_when_called_still_raises() -> None:
+    """Only reading `model_dump` is guarded. An AttributeError raised inside the call is the
+    model's own error, and it stops the fingerprint, as it does on main."""
+
+    class CallRaises:
+        def model_dump(self) -> dict[str, int]:
+            raise AttributeError("raised inside model_dump")
+
+    with pytest.raises(AttributeError, match="raised inside model_dump"):
+        fingerprint._canonicalize_value_for_hash(CallRaises())
+
+
+# ---------------------------------------------------------------------------------------------
+# A pydantic model behind a transparent proxy is dumped, as on main. Celery's `local.Proxy`,
+# `lazy_object_proxy.Proxy` and wrapt keep the model outside their own `__dict__`, forward
+# attribute reads through `__getattr__`, and report the model's class as their `__class__`. The
+# canonical form asks `isinstance(value, pydantic.BaseModel)`, which reads that `__class__`, so a
+# field the model's `repr` masks (a `SecretStr`) reaches the fingerprint, and the proxy's own
+# address does not.
+# ---------------------------------------------------------------------------------------------
+
+_R11_PIPELINE = """\
+from pivot import Pipeline, stage
+
+from lib import helpers
+
+
+@stage
+def s(text: str) -> str:
+    return f"{{helpers.RUN(len(text))}}\\n"
+
+
+with Pipeline("{name}") as pipeline:
+    s(pipeline.input("in.txt", t=str))
+"""
+
+_R11_CELERY = """\
+import functools
+
+import celery.local
+import pydantic
+
+TOKEN = "alpha"
+
+
+class S(pydantic.BaseModel):
+    token: pydantic.SecretStr
+
+
+def make() -> S:
+    return S(token=pydantic.SecretStr(TOKEN))
+
+
+def apply(value: int, cfg) -> int:
+    return value + len(cfg.token.get_secret_value())
+
+
+RUN = functools.partial(apply, cfg=celery.local.Proxy(make))
+"""
+
+_R11_LAZY = """\
+import functools
+
+import lazy_object_proxy
+import pydantic
+
+
+class Settings(pydantic.BaseModel):
+    factor: int = 3
+
+
+def scale(value: int, cfg) -> int:
+    return value * cfg.factor
+
+
+RUN = functools.partial(scale, cfg=lazy_object_proxy.Proxy(Settings))
+"""
+
+
+def _r11_project(tmp_path: pathlib.Path, name: str, helpers: str) -> pathlib.Path:
+    return _project(
+        tmp_path,
+        {
+            "lib/__init__.py": "",
+            "lib/helpers.py": helpers,
+            "pipeline.py": _R11_PIPELINE.format(name=name),
+        },
+    )
+
+
+def test_a_secret_edit_behind_a_celery_proxy_reruns_the_stage(tmp_path: pathlib.Path) -> None:
+    """A `SecretStr` field of a model held behind `celery.local.Proxy` in a partial argument:
+    an edit to it reruns the stage and the output follows, as on main."""
+    pytest.importorskip("celery.local")
+    project = _r11_project(tmp_path, "cs", _R11_CELERY)
+    out = project / "data" / "cs" / "s.txt"
+    assert _status(_run(project, "repro", "--json"), "cs/s")[0] == "ran"
+    assert _status(_run(project, "repro", "--json"), "cs/s") == ("cached", "unchanged")
+    assert out.read_text() == "22\n"
+
+    _edit(project / "lib" / "helpers.py", 'TOKEN = "alpha"', 'TOKEN = "betaXYZ"')
+    assert _status(_run(project, "repro", "--json"), "cs/s") == ("ran", "Code changed")
+    assert out.read_text() == "24\n"
+
+
+def test_a_model_behind_a_lazy_proxy_is_cached_on_the_second_repro(tmp_path: pathlib.Path) -> None:
+    """A model behind `lazy_object_proxy.Proxy` in a partial argument is fingerprinted by its
+    fields, not by the proxy's address: a second `pivot repro` keeps the stage cached, as on
+    main, and an edit to the field reruns it."""
+    pytest.importorskip("lazy_object_proxy")
+    project = _r11_project(tmp_path, "px", _R11_LAZY)
+    out = project / "data" / "px" / "s.txt"
+    assert _status(_run(project, "repro", "--json"), "px/s")[0] == "ran"
+    assert _status(_run(project, "repro", "--json"), "px/s") == ("cached", "unchanged")
+    assert out.read_text() == "51\n"
+
+    _edit(project / "lib" / "helpers.py", "factor: int = 3\n", "factor: int = 30\n")
+    assert _status(_run(project, "repro", "--json"), "px/s") == ("ran", "Code changed")
+    assert out.read_text() == "510\n"
+
+
+def _transparent_proxy(target: object) -> object:
+    """A transparent proxy as the proxy libraries build one: the target is held outside the
+    proxy's `__dict__`, attribute reads go through `__getattr__`, and `__class__` reports the
+    target's class."""
+
+    class Proxy:
+        @property
+        @typing.override
+        def __class__(self) -> type:  # pyright: ignore[reportIncompatibleMethodOverride, reportIncompatibleVariableOverride]
+            return type(target)
+
+        def __getattr__(self, name: str) -> typing.Any:
+            return getattr(target, name)
+
+    return Proxy()
+
+
+def test_a_model_behind_a_transparent_proxy_is_dumped() -> None:
+    """The canonical form of a proxied model is the model's own dump, so it follows the fields."""
+
+    class Settings(pydantic.BaseModel):
+        factor: int = 3
+
+    canonical = fingerprint._canonicalize_value_for_hash
+    assert canonical(_transparent_proxy(Settings())) == canonical(Settings())
+    assert canonical(Settings()) == canonical({"factor": 3})
+    assert canonical(_transparent_proxy(Settings(factor=4))) == canonical({"factor": 4})
+
+
+# ---------------------------------------------------------------------------------------------
+# The `model_dump` probe runs no class-side code. It reads a class's MRO and namespace through
+# `type`'s own descriptors and the instance `__dict__` through the class's C descriptor, so a
+# class-level `__dict__` property, a metaclass `__getattribute__` and a metaclass `__mro__`
+# property are not asked, and the walk ends at the real MRO. Each shape gets main's canonical
+# form. The shapes run in a child process with a timeout: a walk over an endless `__mro__`
+# would never return.
+# ---------------------------------------------------------------------------------------------
+
+_R11_CLASS_SIDE_CHILD = """\
+import itertools
+import json
+
+from pivot import fingerprint
+
+
+class HasDump:
+    def model_dump(self):
+        return {"dumped": 1}
+
+
+class Plain:
+    def __init__(self):
+        self.factor = 3
+
+
+class DictPropertyRaises:
+    @property
+    def __dict__(self):
+        raise RuntimeError("__dict__ property raises")
+
+    def __repr__(self):
+        return "DictPropertyRaises()"
+
+
+class DictPropertyNotAMapping:
+    @property
+    def __dict__(self):
+        return 5
+
+    def __repr__(self):
+        return "DictPropertyNotAMapping()"
+
+
+class RaisesForMro(type):
+    def __getattribute__(cls, name):
+        if name == "__mro__":
+            raise RuntimeError("metaclass __getattribute__ raises for __mro__")
+        return type.__getattribute__(cls, name)
+
+
+class RaisesForDict(type):
+    def __getattribute__(cls, name):
+        if name == "__dict__":
+            raise RuntimeError("metaclass __getattribute__ raises for __dict__")
+        return type.__getattribute__(cls, name)
+
+
+class MroPropertyRaises(type):
+    @property
+    def __mro__(cls):
+        raise RuntimeError("metaclass __mro__ property raises")
+
+
+class MroPropertyEndless(type):
+    @property
+    def __mro__(cls):
+        return itertools.repeat(object)
+
+
+class MroPropertyHides(type):
+    @property
+    def __mro__(cls):
+        return (object,)
+
+
+class MetaGetattributeMro(Plain, metaclass=RaisesForMro):
+    pass
+
+
+class MetaGetattributeDict(Plain, metaclass=RaisesForDict):
+    pass
+
+
+class MetaMroRaises(Plain, metaclass=MroPropertyRaises):
+    pass
+
+
+class MetaMroEndless(Plain, metaclass=MroPropertyEndless):
+    pass
+
+
+class MetaMroHidesDump(HasDump, metaclass=MroPropertyHides):
+    pass
+
+
+class DictDescriptorOfAnotherClass:
+    __dict__ = Plain.__dict__["__dict__"]  # applies to `Plain` instances only
+
+    def __repr__(self):
+        return "DictDescriptorOfAnotherClass()"
+
+
+shapes = {
+    "dict_property_raises": DictPropertyRaises(),
+    "dict_property_not_a_mapping": DictPropertyNotAMapping(),
+    "meta_getattribute_raises_for_mro": MetaGetattributeMro(),
+    "meta_getattribute_raises_for_dict": MetaGetattributeDict(),
+    "meta_mro_property_raises": MetaMroRaises(),
+    "meta_mro_property_endless": MetaMroEndless(),
+    "meta_mro_property_hides_model_dump": MetaMroHidesDump(),
+    "dict_descriptor_of_another_class": DictDescriptorOfAnotherClass(),
+}
+result = {}
+for name, value in shapes.items():
+    try:
+        result[name] = fingerprint._canonicalize_value_for_hash(value)
+    except Exception as error:
+        result[name] = f"{type(error).__name__}: {error}"
+print(json.dumps(result))
+"""
+
+
+def test_the_model_dump_probe_runs_no_class_side_code() -> None:
+    """A class-level `__dict__` property that raises or returns a non-mapping, a `__dict__`
+    descriptor that belongs to another class, a metaclass `__getattribute__` that raises for
+    `__mro__` or `__dict__`, and a metaclass `__mro__` property that raises, never ends, or
+    hides a base that keeps `model_dump`: each gets main's canonical form, and none raises or
+    hangs."""
+    done = subprocess.run(
+        [sys.executable, "-c", _R11_CLASS_SIDE_CHILD],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr[-1500:]
+    plain = ["dict", [["factor", 3]]]
+    assert json.loads(done.stdout) == {
+        "dict_property_raises": ["DictPropertyRaises", "DictPropertyRaises()"],
+        "dict_property_not_a_mapping": ["DictPropertyNotAMapping", "DictPropertyNotAMapping()"],
+        "meta_getattribute_raises_for_mro": ["__main__.MetaGetattributeMro", plain],
+        "meta_getattribute_raises_for_dict": ["__main__.MetaGetattributeDict", plain],
+        "meta_mro_property_raises": ["__main__.MetaMroRaises", plain],
+        "meta_mro_property_endless": ["__main__.MetaMroEndless", plain],
+        "meta_mro_property_hides_model_dump": ["dict", [["dumped", 1]]],
+        "dict_descriptor_of_another_class": [
+            "DictDescriptorOfAnotherClass",
+            "DictDescriptorOfAnotherClass()",
+        ],
+    }
+
+
+def test_an_exact_builtin_takes_neither_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An exact built-in container or leaf carries no mark and keeps no `model_dump`, so the
+    canonical form asks neither the mark decision nor the `model_dump` probe for it."""
+    value = {"a": [1, (2.5, frozenset({3})), b"x", None, True], "b": {"c"}}
+    expected = fingerprint._canonicalize_value_for_hash(value)
+
+    def probed(*_: object) -> typing.NoReturn:
+        raise AssertionError("an exact built-in was probed")
+
+    monkeypatch.setattr(fingerprint, "_mark_decision", probed)
+    monkeypatch.setattr(fingerprint, "_keeps_own_attribute", probed)
+    assert fingerprint._canonicalize_value_for_hash(value) == expected

@@ -26,13 +26,12 @@ import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
+import pydantic.json_schema
 import xxhash
 
 from pivot import ast_utils, exceptions, metrics
 
 if TYPE_CHECKING:
-    import pydantic.json_schema
-
     from pivot import loaders
     from pivot.storage.state import StateDB
 
@@ -239,8 +238,9 @@ _walk_path: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
 # under it, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep apart.
 _owner_ref: contextvars.ContextVar[str | None] = contextvars.ContextVar("_owner_ref", default=None)
 
-# Per-pass memo for `function_identity` and `_hint_classes`, keyed by kind and object id, and
-# for source file digests (`_source_digest`), keyed by file name.
+# Per-pass memo, keyed by kind and object id, for function identities (`function_identity`),
+# type-hint classes (`_hint_classes`), user-class members (`_user_methods`) and mark decisions
+# (`_mark_decision`), and by file name for source file digests (`_source_digest`).
 # Set only inside `fingerprint_pass()`; a reload, a mutated cell or an edit is seen by the next
 # pass.
 _pass_memo: contextvars.ContextVar[dict[tuple[str, int | str], Any] | None] = (
@@ -250,8 +250,8 @@ _pass_memo: contextvars.ContextVar[dict[tuple[str, int | str], Any] | None] = (
 
 @contextlib.contextmanager
 def fingerprint_pass() -> Iterator[None]:
-    """Share function identities, type-hint classes and source digests across one pass over
-    many stages.
+    """Share function identities, type-hint classes, user-class members, mark decisions and
+    source digests across one pass over many stages.
 
     A cache hit re-reads every recorded value, and stages of one pipeline read the same
     helpers, model classes and source files: inside the pass each is named or read once. The
@@ -1987,28 +1987,40 @@ def _attribute_or_none(value: Any, name: str) -> Any:
         return None
 
 
-def _keeps_own_attribute(obj: Any, name: str) -> bool:
-    """Whether `obj` keeps `name` of its own: in its `__dict__`, or on its class (a slot, a
-    property, a method, a class attribute). Nothing of `obj` runs: neither its `__getattr__` nor
-    a property, so an object that answers every name it lacks (a `unittest.mock.MagicMock`, an
-    attribute tree) does not read as having it.
+# `type`'s own descriptors for a class's MRO and namespace. Read through them, a class's real
+# `tp_mro` and `tp_dict` are reached without asking its metaclass: no metaclass
+# `__getattribute__`, `__mro__` property or `__dict__` property runs, and a walk over the MRO
+# ends at its real length.
+_class_mro = cast("Callable[[Any], tuple[type, ...]]", type.__dict__["__mro__"].__get__)
+_class_namespace = cast("Callable[[type], Mapping[str, Any]]", type.__dict__["__dict__"].__get__)
+# The C descriptors a class keeps for its instances' `__dict__` (a class's getset, a module's
+# member); reading the instance dict through one runs no code of the object or its class.
+_INSTANCE_DICT_DESCRIPTORS = (types.GetSetDescriptorType, types.MemberDescriptorType)
 
-    Every value the walk canonicalizes is asked for `model_dump` here, so the MRO is walked by
-    an explicit loop, not `any(... for ...)`: the loop reads each class dict directly
-    (`klass.__dict__`, not `vars(klass)`) and returns on the first hit, with no generator frame
-    per value on this path (`AGENTS.md`: fingerprint checks are cheap, O(1) shallow/static).
+
+def _keeps_own_attribute(obj: Any, name: str) -> bool:
+    """Whether `obj` keeps `name` of its own: in its instance `__dict__`, or in the namespace of
+    a class on its real MRO (a slot, a property, a method, a class attribute).
+
+    Nothing of `obj`, its class or its metaclass runs. The MRO and each class namespace are read
+    through `type`'s own descriptors (`_class_mro`, `_class_namespace`), and the instance
+    `__dict__` only through the C descriptor a class on that MRO keeps for it, so no
+    `__getattr__`, property, class-level `__dict__` property, metaclass `__getattribute__` or
+    metaclass `__mro__` property is asked, and the walk is bounded by the real MRO. An object
+    that answers every name it lacks (a `unittest.mock.MagicMock`, an attribute tree) does not
+    read as having it. Without such a descriptor on the MRO (a `__slots__` class, a built-in, a
+    class whose `__dict__` is a property) the instance dict is not read.
     """
-    try:
-        namespace: Mapping[str, Any] = object.__getattribute__(obj, "__dict__")
-    except AttributeError:
-        pass
-    else:
+    instance_dict: Any = None
+    for klass in _class_mro(type(obj)):
+        namespace = _class_namespace(klass)
         if name in namespace:
             return True
-    for klass in type(obj).__mro__:  # noqa: SIM110 - explicit loop keeps this hot check frame-free
-        if name in klass.__dict__:
-            return True
-    return False
+        if instance_dict is None and "__dict__" in namespace:
+            entry = namespace["__dict__"]
+            if type(entry) in _INSTANCE_DICT_DESCRIPTORS and entry.__objclass__ is klass:
+                instance_dict = entry
+    return instance_dict is not None and name in instance_dict.__get__(obj)
 
 
 def _is_user_class_instance(value: Any) -> bool:
@@ -2795,6 +2807,14 @@ def _annotation_classes(annotation: Any) -> list[type]:
     return []
 
 
+# Exact built-in types the canonical form takes without a probe: an exact instance has no
+# `__dict__`, and neither its type nor `object` holds a mark, a `__wrapped__` or a `model_dump`,
+# which a built-in type cannot gain.
+_BUILTIN_TYPES = frozenset(
+    {dict, list, tuple, set, frozenset, str, bytes, int, float, bool, types.NoneType}
+)
+
+
 def _serialize_value_for_hash(value: Any) -> str:
     """Serialize a value to a stable string for hashing."""
     return json.dumps(_canonicalize_value_for_hash(value))
@@ -2813,10 +2833,11 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     itself) becomes `["cycle", N]`, N steps back up the path, the same in every process. A
     library function, or a library module's own callable export,
     becomes `["external", _library_name]`: its repr can hold an address (`np.mean`). A
-    `functools.partial` is canonicalised through its function and arguments. A pydantic
-    instance, which keeps `model_dump` in its own `__dict__` or on its class
-    (`_keeps_own_attribute`), is dumped in python mode, which keeps each secret (`SecretStr`,
-    `SecretBytes`, `Secret[T]`) as its own object; a secret becomes `["secret", digest]`, the
+    `functools.partial` is canonicalised through its function and arguments. A pydantic model
+    instance (`isinstance`, which sees a transparent proxy's target through its `__class__`),
+    or another value that keeps `model_dump` of its own (`_keeps_own_attribute`), is dumped in
+    python mode, which keeps each secret (`SecretStr`, `SecretBytes`, `Secret[T]`) as its own
+    object; a secret becomes `["secret", digest]`, the
     keyed digest the lock file records for it (`parameters.secret_digest`), so changing it
     changes the hash and no fingerprint holds its value. A dataclass instance becomes
     `[module.qualname, canonical({field: value})]`, field by field, so a secret inside one
@@ -2842,18 +2863,30 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     # over a class-based decorator over the mark and drop the class. A chain with a user class
     # instance above the mark is refused. A marked instance of a class-based decorator is named
     # like a marked function: its own `__dict__` is not dumped.
-    decision = _mark_decision(value)
+    # An exact built-in (a dict, a list, bytes…) skips both probes below (`_BUILTIN_TYPES`).
+    builtin = type(value) in _BUILTIN_TYPES
+    decision = None if builtin else _mark_decision(value)
     if decision is _MarkDecision.REFUSED:
         _refuse_class_above_mark(value)
-    if not isinstance(value, type) and _keeps_own_attribute(value, "model_dump"):
+    # Main dumped every value with a `model_dump` (`hasattr`) that is not a class. A pydantic
+    # model is dumped, also behind a transparent proxy (celery's `local.Proxy`,
+    # `lazy_object_proxy`, wrapt) that forwards attribute reads through `__getattr__` and reports
+    # the model's class as its `__class__`: `isinstance` reads that `__class__`, as it does for
+    # `re.Pattern` above (pydantic's metaclass uses `type.__instancecheck__`), and asks no
+    # `__getattr__`. Any other value is dumped only if it keeps `model_dump` of its own, so an
+    # object that merely answers every name (a `MagicMock`) is neither dumped nor asked.
+    if not builtin and (
+        isinstance(value, pydantic.BaseModel)
+        or (_keeps_own_attribute(value, "model_dump") and not isinstance(value, type))
+    ):
         try:
-            dump: Any = value.model_dump
+            dump = value.model_dump
         except AttributeError:
             # A `model_dump` the class keeps but the object does not hold: an unset slot, or a
             # property that raises AttributeError. Main's `hasattr` is False there too, so the
             # value takes the branches below and is canonicalized as the plain object it is.
-            dump = _UNREAD
-        if dump is not _UNREAD:
+            pass
+        else:
             return _canonicalize_value_for_hash(dump(), (*active, id(value)))
     if inspect.isfunction(value):
         return ["function", _function_identity(value, active)]
@@ -3284,11 +3317,13 @@ _BY_NAME_MARK = "__pivot_fingerprint_by_name__"
 # freed and no other object can get its id. `fingerprinted_by_name` also checks the stored value
 # is `obj` itself, so a lookup by id alone never marks another object.
 _marked_without_dict = dict[int, Any]()
-# Whether `@pivot.fingerprint_by_name` has marked anything in this process. `mark_by_name` is
-# the only way an object is marked, so until it runs no `__wrapped__` chain can hold a mark:
-# every mark decision is None and the walk is main's. A project that marks nothing — the common
-# one — then pays one module-global read for a value the walk classifies, not a chain read and
-# an MRO walk (`AGENTS.md`: fingerprint checks are cheap, O(1) shallow/static).
+# Whether `@pivot.fingerprint_by_name` has marked anything in this process. In a process that
+# fingerprints, the decorator, run when discovery imports the pipeline's modules, is the only
+# writer of a mark (`mark_by_name`), so until it runs no `__wrapped__` chain can hold one: every
+# mark decision is None and the walk reads no chain. A project that marks nothing, the common
+# one, pays one module-global read per classified value for the mark. Two states pivot never
+# enters break that premise (an object unpickled by value with its `__dict__`, and
+# `importlib.reload` of this module); in both the walk records the body: more, never less.
 _marks_made = False
 
 
