@@ -19,6 +19,7 @@ import loky.backend.resource_tracker
 import loky.reusable_executor
 
 from pivot import config, discovery, exceptions, loaded_source, parameters, project, registry, types
+from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
@@ -368,7 +369,7 @@ def run(
     Args:
         stages: Target stages to run (and their dependencies). If None, runs all.
         single_stage: If True, run only the specified stages without dependencies.
-        cache_dir: Directory for lock files. Defaults to .pivot/cache.
+        cache_dir: Cache directory, defaulting to `<state dir>/cache`.
         parallel: If True, run independent stages in parallel (default: True).
         max_workers: Most workers, and the ``cpu`` resource capacity (default: ``core.max_workers``).
         resource_capacity: Per-run resource capacity overrides.
@@ -525,13 +526,16 @@ def prepare_worker_info(
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process.
 
-    Uses stage's state_dir if set, otherwise falls back to default_state_dir.
+    Uses stage's state_dir if set, otherwise falls back to default_state_dir. The worker gets
+    this process's resolution of the project's ``core.state_dir``, not a directory derived from
+    it, so it reads every state file where this process does.
     """
     # Use stage's state_dir if set, otherwise fall back to default
     state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
 
-    # Ensure state directory exists (workers open StateDB in readonly mode)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    # Create the state directory through the common path so a newly configured directory has
+    # its state ignore file before a worker writes under it.
+    state_dir_mod.make_state_dir(state_dir)
 
     # The fingerprint is computed first: it sets `unsafe_fingerprint`.
     fingerprint = pipeline.ensure_fingerprint(stage_info["name"])
@@ -552,7 +556,7 @@ def prepare_worker_info(
         params_arg_name=stage_info["params_arg_name"],
         project_root=project_root,
         state_dir=state_dir,
-        project_state_dir=default_state_dir,
+        state_dir_resolution=state_dir_mod.resolution_for(project_root),
         collection_params=stage_info["collection_params"],
         unsafe_fingerprint=stage_info["unsafe_fingerprint"],
         no_fingerprint=stage_info["no_fingerprint"],
@@ -612,8 +616,11 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     missing = list[str]()
     cache_dir = config.get_cache_dir() / "files"
 
+    # Located, not created: the save makes the state directory #503's resolver chose only when it
+    # has a hash to save.
+    state_dir = config.locate_state_dir()
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
-    with state_mod.open_readonly(config.get_state_dir(), create=False) as state_db:
+    with state_mod.open_readonly(state_dir, create=False) as state_db:
         for data_path, track_data in tracked_files.items():
             path = pathlib.Path(data_path)
 
@@ -645,7 +652,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                     f"Tracked file '{data_path}' has changed since tracking. "
                     + f"Run 'pivot track --force {track_data['path']}' to update."
                 )
-    state_mod.save_file_hashes(config.get_state_dir(), pending)
+    state_mod.save_file_hashes(state_dir, pending)
 
     metrics.end("core.verify_tracked_files", _t)
     if missing:

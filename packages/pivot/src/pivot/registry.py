@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 import pygtrie
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 from pivot import exceptions, fingerprint, loaded_source, project, stage_def, types
 from pivot.storage import cache
@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     from inspect import Signature
 
     from networkx import DiGraph
+
+    from pivot.state_dir import StateDirResolution
 logger = logging.getLogger(__name__)
 
 
@@ -207,6 +209,9 @@ class PipelineLike(Protocol):
 
     @property
     def state_dir(self) -> pathlib.Path: ...
+
+    @property
+    def resolved_state_dirs(self) -> Mapping[pathlib.Path, StateDirResolution]: ...
 
     @property
     def input_bindings(self) -> dict[str, str]: ...

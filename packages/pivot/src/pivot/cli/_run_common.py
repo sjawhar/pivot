@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
 import logging
 import sys
@@ -18,6 +19,7 @@ import anyio
 import click
 
 from pivot import discovery
+from pivot import state_dir as state_dir_mod
 from pivot.cli import decorators as cli_decorators
 from pivot.engine import engine, sinks
 from pivot.executor import core as executor_core
@@ -287,7 +289,12 @@ def validate_tui_log(
     tui_flag: bool,
     dry_run: bool = False,
 ) -> pathlib.Path | None:
-    """Validate --tui-log option and resolve path if valid."""
+    """Validate --tui-log option and resolve path if valid.
+
+    A log inside a configured state directory that does not exist yet is the first thing
+    written there, so its parent comes from the common creator, which makes that directory
+    with its ignore file.
+    """
     if not tui_log:
         return None
     if as_json:
@@ -299,7 +306,7 @@ def validate_tui_log(
     # Validate path upfront (fail fast)
     resolved = tui_log.expanduser().resolve()
     try:
-        resolved.parent.mkdir(parents=True, exist_ok=True)
+        state_dir_mod.make_dirs(resolved.parent)
         resolved.touch()  # Verify writable
     except OSError as e:
         raise click.ClickException(f"Cannot write to {resolved}: {e}") from e
@@ -578,7 +585,14 @@ def run_tui_with_engine(
         except Exception:
             logger.debug("Event poller stopped", exc_info=True)
 
-    engine_thread = threading.Thread(target=engine_thread_target, daemon=True)
+    # The engine thread runs in this context, so the state-directory warnings it reports belong
+    # to this invocation (and stay silent under --quiet), as on the main thread.
+    engine_thread = threading.Thread(
+        target=contextvars.copy_context().run, args=(engine_thread_target,), daemon=True
+    )
+    # A ContextVar does not cross into a new thread, so this one runs with no invocation
+    # record: it only polls events. A thread added here that reads project state copies the
+    # context as the engine thread above does.
     poller_thread = threading.Thread(
         target=poller_thread_target, name=POLLER_THREAD_NAME, daemon=True
     )

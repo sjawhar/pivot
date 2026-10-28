@@ -1,6 +1,6 @@
 [project]
 name = "pivot-workspace"
-version = "0.5.17"
+version = "0.5.18"
 requires-python = ">=3.13,<3.14"
 
 [dependency-groups]

@@ -1,9 +1,12 @@
+import os
 import pathlib
+import stat
 
 import click.testing
 import pytest
 
 from pivot import cli, ignore, project
+from pivot import state_dir as state_dir_mod
 
 # --- basic initialization tests ---
 
@@ -28,12 +31,89 @@ def test_init_creates_gitignore(runner: click.testing.CliRunner, tmp_path: pathl
         assert pathlib.Path(".pivot/.gitignore").exists()
 
 
+_PIVOT_052_GITIGNORE = b"""\
+# Cache directory (stage outputs, file hashes)
+/cache/
+
+# State database (file hashes, generation counters)
+/state.lmdb/
+
+# Artifact and restore locks (flock files for concurrent execution)
+/locks/
+
+# Agent RPC socket (left behind by TUI and --serve sessions)
+/agent.sock
+
+# Config lock (held while editing config.yaml)
+/config.yaml.lock
+
+# Generated plots gallery (pivot plots show)
+/plots/
+
+# Key for secret params' digests in lock files; never commit it
+/secret.key
+"""
+
+
+def test_default_init_writes_the_pivot_052_ignore_bytes(tmp_path: pathlib.Path) -> None:
+    """Default init must preserve the released byte-for-byte ignore contract, and its mode."""
+    runner = click.testing.CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
+        previous_umask = os.umask(0o002)
+        try:
+            result = runner.invoke(cli.cli, ["init"])
+        finally:
+            os.umask(previous_umask)
+
+        assert result.exit_code == 0, result.output
+        gitignore = pathlib.Path(".pivot/.gitignore")
+        assert gitignore.read_bytes() == _PIVOT_052_GITIGNORE
+        # 0.5.2 writes it with write_text, so the umask alone sets its mode.
+        assert stat.S_IMODE(gitignore.stat().st_mode) == 0o664
+
+
+def test_default_config_set_keeps_the_released_config_lock_file(tmp_path: pathlib.Path) -> None:
+    """Default config writes preserve the files created by Pivot 0.5.2."""
+    runner = click.testing.CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
+        initialized = runner.invoke(cli.cli, ["init"])
+        before = {
+            path.relative_to(".").as_posix()
+            for path in pathlib.Path(".").rglob("*")
+            if path.is_file()
+        }
+
+        result = runner.invoke(cli.cli, ["config", "set", "core.max_workers", "1"])
+
+        after = {
+            path.relative_to(".").as_posix()
+            for path in pathlib.Path(".").rglob("*")
+            if path.is_file()
+        }
+        assert result.exit_code == 0, initialized.output + result.output
+        assert after - before == {".pivot/config.yaml", ".pivot/config.yaml.lock"}
+
+
+def test_default_init_keeps_legacy_stages_directory(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """The default state directory keeps init's established layout and output."""
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        project._project_root_cache = None
+        result = runner.invoke(cli.cli, ["init"])
+
+        assert result.exit_code == 0, result.output
+        assert pathlib.Path(".pivot/stages").is_dir()
+        assert "  .pivot/stages/" in result.output
+
+
 @pytest.mark.parametrize(
     "expected_content",
     [
         pytest.param("/cache/", id="cache_dir"),
         pytest.param("/state.lmdb/", id="state_lmdb"),
-        pytest.param("/config.yaml.lock", id="config_lock"),
         pytest.param("/locks/", id="artifact_locks"),
         pytest.param("/agent.sock", id="agent_socket"),
         pytest.param("/plots/", id="plots_gallery"),
@@ -437,13 +517,11 @@ def test_init_force_no_warning_for_identical_gitignore(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
     """pivot init --force doesn't warn when .gitignore is identical."""
-    from pivot.cli import init as init_module
-
     with runner.isolated_filesystem(temp_dir=tmp_path):
         project._project_root_cache = None
         pathlib.Path(".pivot").mkdir()
         # Write the exact same content that init would write
-        pathlib.Path(".pivot/.gitignore").write_text(init_module._GITIGNORE_CONTENT)
+        pathlib.Path(".pivot/.gitignore").write_text(state_dir_mod.STATE_GITIGNORE_CONTENT)
 
         result = runner.invoke(cli.cli, ["init", "--force"])
 

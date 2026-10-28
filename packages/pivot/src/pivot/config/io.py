@@ -10,22 +10,16 @@ from typing import Any, cast
 
 import ruamel.yaml
 
-from pivot import exceptions, project
+from pivot import config_files, exceptions, project
+from pivot import state_dir as state_dir_mod
 from pivot.config import models
 
 logger = logging.getLogger(__name__)
-
-_NOT_FOUND: object = object()
 
 # Module-level cache for merged config to avoid repeated disk I/O
 _merged_config_cache: models.PivotConfig | None = None
 
 DEFAULT_CHECKOUT_MODE_ORDER: list[models.CheckoutMode] = list(models.CheckoutMode)
-
-
-def get_global_config_path() -> pathlib.Path:
-    """Get user-level config path (~/.config/pivot/config.yaml)."""
-    return pathlib.Path.home() / ".config" / "pivot" / "config.yaml"
 
 
 def get_local_config_path() -> pathlib.Path:
@@ -37,7 +31,7 @@ def get_config_path(scope: models.ConfigScope) -> pathlib.Path:
     """Get config path for the specified scope."""
     match scope:
         case models.ConfigScope.GLOBAL:
-            return get_global_config_path()
+            return config_files.get_global_config_path()
         case models.ConfigScope.LOCAL:
             return get_local_config_path()
 
@@ -47,34 +41,19 @@ def _config_lock_path(path: pathlib.Path) -> pathlib.Path:
     return path.with_name(f"{path.name}.lock")
 
 
-def _load_yaml(path: pathlib.Path, *, as_dict: bool) -> Any:
-    """Load YAML config with error handling."""
-    if not path.exists():
-        return {} if as_dict else None
-
-    try:
-        yaml = ruamel.yaml.YAML(typ="rt")
-        with path.open() as f:
-            data = yaml.load(f)
-            if as_dict:
-                return dict(data) if data is not None else {}
-            return data
-    except ruamel.yaml.YAMLError as e:
-        raise exceptions.ConfigError(f"Invalid YAML in {path}: {e}") from e
-    except PermissionError:
-        raise exceptions.ConfigError(f"Permission denied reading {path}") from None
-    except OSError as e:
-        raise exceptions.ConfigError(f"Error reading {path}: {e}") from e
-
-
 def _load_config_raw(path: pathlib.Path) -> dict[str, Any]:
     """Load YAML config as plain dict."""
-    return _load_yaml(path, as_dict=True)
+    return config_files.load_yaml(path, as_dict=True)
 
 
 def _load_config_preserving_structure(path: pathlib.Path) -> Any:
     """Load YAML config preserving ruamel structure for comments."""
-    return _load_yaml(path, as_dict=False)
+    return config_files.load_yaml(path, as_dict=False)
+
+
+def parse_config_yaml(raw: bytes, source: str) -> dict[str, Any]:
+    """Parse config file contents exactly as ``load_config_file`` parses a file."""
+    return config_files.parse_yaml(raw, source, as_dict=True)
 
 
 def _save_config(path: pathlib.Path, data: dict[str, Any]) -> None:
@@ -115,7 +94,7 @@ def edit_config(
 
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(lock_path, "w") as lock_file:
+    with lock_path.open("w") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             raw_data = _load_config_preserving_structure(path)
@@ -131,22 +110,6 @@ def edit_config(
 def load_config_file(path: pathlib.Path) -> dict[str, Any]:
     """Load YAML config, returns empty dict if missing."""
     return _load_config_raw(path)
-
-
-def parse_dotted_key(key: str) -> list[str]:
-    """Parse 'cache.checkout_mode' into ['cache', 'checkout_mode']."""
-    return key.split(".")
-
-
-def get_nested(data: dict[str, Any], keys: list[str]) -> Any:
-    """Traverse nested dict by key path, returns _NOT_FOUND sentinel if not found."""
-    current: Any = data
-    for k in keys:
-        if not isinstance(current, dict) or k not in current:
-            return _NOT_FOUND
-        current_dict = cast("dict[str, Any]", current)
-        current = current_dict[k]
-    return current
 
 
 def set_nested(data: dict[str, Any], keys: list[str], value: Any) -> None:
@@ -179,7 +142,7 @@ def unset_nested(data: dict[str, Any], keys: list[str]) -> bool:
     parent_keys = keys[:-1]
     final_key = keys[-1]
 
-    parent = get_nested(data, parent_keys)
+    parent = config_files.get_nested(data, parent_keys)
     if not isinstance(parent, dict) or final_key not in parent:
         return False
 
@@ -203,19 +166,35 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
     return result
 
 
+def _default_cache_dir() -> str:
+    """Return the default cache display path without resolving or warning about project state."""
+    root = project.get_project_root()
+    cache_dir = state_dir_mod.state_dir_or_default(root, warn=False) / "cache"
+    try:
+        return cache_dir.relative_to(root).as_posix()
+    except ValueError:
+        return str(cache_dir)
+
+
 def get_merged_config() -> models.PivotConfig:
     """Load and merge configs: defaults < global < local.
 
-    Results are cached to avoid repeated disk I/O within a single command.
-    Call clear_config_cache() to reset (e.g., in tests).
+    A global ``core.state_dir`` is left out, so the merged config is the one in effect. Results
+    are cached to avoid repeated disk I/O within a single command. Call clear_config_cache() to
+    reset (e.g., in tests). The cache is process-wide, so it holds nothing derived from the state
+    directory: an unset ``cache.dir`` keeps the model default and stays out of
+    ``cache.model_fields_set``, and the cache in effect is then ``<state dir>/cache``, derived
+    from the current state-directory record where it is used (``locate_cache_dir``).
     """
     global _merged_config_cache
     if _merged_config_cache is not None:
         return _merged_config_cache
 
     defaults = models.PivotConfig.get_default().model_dump()
+    del defaults["cache"]["dir"]
 
-    global_data = load_config_file(get_global_config_path())
+    global_data = load_config_file(config_files.get_global_config_path())
+    unset_nested(global_data, ["core", "state_dir"])
     merged = deep_merge(defaults, global_data)
 
     local_data = load_config_file(get_local_config_path())
@@ -225,69 +204,114 @@ def get_merged_config() -> models.PivotConfig:
     return _merged_config_cache
 
 
+def _configured_cache_dir() -> str | None:
+    """``cache.dir`` as a config file sets it, or None when unset (``get_merged_config``)."""
+    cache = get_merged_config().cache
+    return cache.dir if "dir" in cache.model_fields_set else None
+
+
 def clear_config_cache() -> None:
-    """Clear the merged config cache. Call this when config files change."""
+    """Clear cached configuration and its project state directory."""
     global _merged_config_cache
     _merged_config_cache = None
+    state_dir_mod.clear_state_dir_cache()
 
 
 def get_config_value(key: str) -> tuple[Any, models.ConfigSource]:
-    """Get value for dotted key, returns (value, source)."""
-    keys = parse_dotted_key(key)
+    """Get value for dotted key, returns (value, source).
+
+    A global ``core.state_dir`` is reported with source ``global, ignored``, and the ignored-value
+    warning is issued.
+    """
+    keys = config_files.parse_dotted_key(key)
+    if key == "core.state_dir":
+        state_dir_mod.report_ignored_global_state_dir()
 
     local_data = load_config_file(get_local_config_path())
-    local_value = get_nested(local_data, keys)
-    if local_value is not _NOT_FOUND:
+    local_value = config_files.get_nested(local_data, keys)
+    if local_value is not config_files.NOT_FOUND:
         return local_value, models.ConfigSource.LOCAL
 
-    global_data = load_config_file(get_global_config_path())
-    global_value = get_nested(global_data, keys)
-    if global_value is not _NOT_FOUND:
+    global_data = load_config_file(config_files.get_global_config_path())
+    global_value = config_files.get_nested(global_data, keys)
+    if global_value is not config_files.NOT_FOUND:
+        if key == "core.state_dir":
+            return global_value, models.ConfigSource.GLOBAL_IGNORED
         return global_value, models.ConfigSource.GLOBAL
 
-    default_value = models.get_config_default(key)
-    if default_value is not None:
-        return default_value, models.ConfigSource.DEFAULT
+    if key == "cache.dir":
+        return _default_cache_dir(), models.ConfigSource.DEFAULT
+    if key in models.CONFIG_KEY_DESCRIPTIONS:
+        return models.get_config_default(key), models.ConfigSource.DEFAULT
 
     return None, models.ConfigSource.UNKNOWN
 
 
+def _changes_local_state_dir(key: str, scope: models.ConfigScope) -> bool:
+    return key == "core.state_dir" and scope is models.ConfigScope.LOCAL
+
+
 def set_config_value(
     key: str, value: Any, scope: models.ConfigScope = models.ConfigScope.LOCAL
-) -> None:
-    """Set config value in specified scope with file locking."""
-    keys = parse_dotted_key(key)
+) -> list[str]:
+    """Set a configuration value and return any state-transition notices.
+
+    A global ``core.state_dir`` is refused: it would have no effect.
+    """
+    if key == "core.state_dir" and scope is models.ConfigScope.GLOBAL:
+        raise exceptions.ConfigValidationError(state_dir_mod.global_state_dir_refusal())
+    changes_state_dir = _changes_local_state_dir(key, scope)
+    old_state_dir: pathlib.Path | None = None
+    if changes_state_dir:
+        state_dir_mod.validate_state_dir_target(cast("str", value))
+        old_state_dir = state_dir_mod.current_state_dir()
+    keys = config_files.parse_dotted_key(key)
     with edit_config(scope) as data:
         set_nested(data, keys, value)
+    clear_config_cache()
+    if not changes_state_dir:
+        return []
+    return state_dir_mod.transition_local_state_dir(old_state_dir)
 
 
-def unset_config_value(key: str, scope: models.ConfigScope = models.ConfigScope.LOCAL) -> bool:
-    """Remove config value from specified scope. Returns True if removed."""
-    keys = parse_dotted_key(key)
+def unset_config_value(
+    key: str, scope: models.ConfigScope = models.ConfigScope.LOCAL
+) -> tuple[bool, list[str]]:
+    """Remove config value from specified scope.
+
+    Returns whether it was removed, and any state-transition notices.
+    """
+    keys = config_files.parse_dotted_key(key)
     path = get_config_path(scope)
-    lock_path = _config_lock_path(path)
 
     if not path.exists():
-        return False
+        return False, []
 
+    changes_state_dir = _changes_local_state_dir(key, scope)
+    old_state_dir: pathlib.Path | None = None
+    if changes_state_dir:
+        old_state_dir = state_dir_mod.current_state_dir()
+    lock_path = _config_lock_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(lock_path, "w") as lock_file:
+    with lock_path.open("w") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             raw_data = _load_config_preserving_structure(path)
             if raw_data is None:
-                return False
+                return False, []
 
             data: dict[str, Any] = raw_data
             removed = unset_nested(data, keys)
-
             if removed:
                 _save_config(path, data)
-
-            return removed
+                clear_config_cache()
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    if not removed or not changes_state_dir:
+        return removed, []
+    return removed, state_dir_mod.transition_local_state_dir(old_state_dir)
 
 
 def get_checkout_mode_order() -> list[models.CheckoutMode]:
@@ -303,31 +327,66 @@ def get_run_history_retention() -> int:
     return merged.core.run_history_retention
 
 
-def get_cache_dir() -> pathlib.Path:
-    """Get cache directory, checking env var first.
+def _effective_cache_dir() -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    """Resolve the effective cache without creating state or cache directories.
 
-    Precedence: PIVOT_CACHE_DIR env var > config file > default (.pivot/cache).
-    Relative paths are resolved against the project root.
+    ``PIVOT_CACHE_DIR``, then a configured ``cache.dir``, each as given. Unset, the cache is
+    ``<state dir>/cache`` of the state directory this record resolved, derived here at each use
+    and never stored, so a pipeline loaded after an edit of ``core.state_dir`` keeps its cache
+    objects beside its locks.
     """
-    env_cache = os.environ.get("PIVOT_CACHE_DIR", "").strip()
-    if env_cache:
-        cache_dir = pathlib.Path(env_cache)
+    root = project.get_project_root()
+    configured = os.environ.get("PIVOT_CACHE_DIR", "").strip() or _configured_cache_dir()
+    state_dir = state_dir_mod.state_dir_or_default(root)
+    fallback_cache_dir = state_dir / "cache"
+    if configured is None:
+        cache_dir = fallback_cache_dir
     else:
-        merged = get_merged_config()
-        cache_dir = pathlib.Path(merged.cache.dir)
+        cache_dir = pathlib.Path(configured)
+        if not cache_dir.is_absolute():
+            cache_dir = root / cache_dir
+    cache_dir = pathlib.Path(os.path.realpath(cache_dir))
+    stages_dir = state_dir / "stages"
+    if (
+        cache_dir == stages_dir
+        or cache_dir.is_relative_to(stages_dir)
+        or stages_dir.is_relative_to(cache_dir)
+    ):
+        state_dir_mod.report_cache_stage_overlap(cache_dir, stages_dir, fallback_cache_dir)
+        cache_dir = fallback_cache_dir
+    return root, state_dir, cache_dir
 
-    if not cache_dir.is_absolute():
-        cache_dir = project.get_project_root() / cache_dir
+
+def locate_cache_dir() -> pathlib.Path:
+    """Return the effective cache location without creating project state."""
+    _, _, cache_dir = _effective_cache_dir()
     return cache_dir
 
 
+def get_cache_dir() -> pathlib.Path:
+    """Return the effective writer-facing cache location, creating state only when required."""
+    root, state_dir, cache_dir = _effective_cache_dir()
+    if state_dir != root / ".pivot" and cache_dir.is_relative_to(state_dir):
+        state_dir_mod.ensure_state_dir(root)
+        if cache_dir != state_dir / "cache":
+            state_dir_mod.make_nested_cache_dir(cache_dir)
+    return cache_dir
+
+
+def locate_state_dir() -> pathlib.Path:
+    """Return the current project's configured state directory without creating it.
+
+    The merged config is loaded first, so an invalid config fails here with its own message.
+    A reader that opens the state database still creates the directory there (``StateDB``).
+    """
+    get_merged_config()
+    return state_dir_mod.locate_state_dir(project.get_project_root())
+
+
 def get_state_dir() -> pathlib.Path:
-    """Get state directory from merged config, resolved to absolute path."""
-    merged = get_merged_config()
-    state_dir = pathlib.Path(merged.core.state_dir)
-    if not state_dir.is_absolute():
-        state_dir = project.get_project_root() / state_dir
-    return state_dir
+    """``locate_state_dir``, created when absent, for a command that writes state."""
+    get_merged_config()
+    return state_dir_mod.ensure_state_dir(project.get_project_root())
 
 
 def get_max_workers() -> int:

@@ -74,7 +74,7 @@ DVC writes a single `dvc.lock` file for all stages. With many stages, this creat
 dvc.lock
 
 # Pivot: Each stage writes its own file
-.pivot/stages/<pipeline>/
+<state dir>/stages/<pipeline>/
 ├── preprocess.lock
 ├── train.lock
 └── evaluate.lock

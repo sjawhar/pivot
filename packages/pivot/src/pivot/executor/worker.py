@@ -62,6 +62,7 @@ from pivot import (
     stage_io,
     types,
 )
+from pivot import state_dir as state_dir_mod
 from pivot.storage import artifact_lock, cache, lock, state
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -872,7 +873,9 @@ class WorkerStageInfo(TypedDict):
     params_arg_name: str | None
     project_root: pathlib.Path
     state_dir: pathlib.Path
-    project_state_dir: pathlib.Path
+    # The Pivot process's resolution of the project's core.state_dir, the outcome for a path that
+    # cannot be used included: the stage's state-directory record starts with it.
+    state_dir_resolution: state_dir_mod.StateDirResolution
     collection_params: dict[str, str]
     incremental_inputs: dict[str, types.ArtifactIdentity]
     # The fingerprint downgraded a refusal to a warning: the run cache is neither read nor written.
@@ -922,8 +925,8 @@ def _execute_stage(
     _ = cache_dir
     ring_buffer = _OutputRingBuffer()
     state_dir = stage_info["state_dir"]
-    project_state_dir = stage_info["project_state_dir"]
     project_root = stage_info["project_root"]
+    project_state_dir = state_dir_mod.locate_state_dir(project_root)
     store = store_mod.store_from_spec(stage_info["store_spec"])
 
     # Set project root cache explicitly - workers in reusable pool may have
@@ -1359,8 +1362,14 @@ def execute_stage(
 
     A stage interrupted by a stop signal (``unwind_when_stopped``) fails without committing
     anything. After SIGTERM or the death of its Pivot process, the worker exits once the stage
-    has unwound instead of returning.
+    has unwound instead of returning. Each stage is one state-directory invocation that starts
+    with the resolution the Pivot process decided for the command (``state_dir_resolution``),
+    so the worker never reads ``core.state_dir`` itself and takes every state file, the secret
+    key included, from the same outcome; it reports nothing, which the Pivot process does.
     """
+    invocation = state_dir_mod.begin_invocation(
+        report=False, state_dirs={stage_info["project_root"]: stage_info["state_dir_resolution"]}
+    )
     try:
         _begin_stage()
         result = _execute_stage(stage_name, stage_info, cache_dir, output_queue)
@@ -1374,6 +1383,7 @@ def execute_stage(
         # Every way out of the stage drops its recorded failure, whose frames hold the stage's
         # locals and loaded inputs, so a warm worker does not keep them until its next stage.
         stage_io.clear()
+        state_dir_mod.end_invocation(invocation)
     if _stop.exit_requested:
         _exit_worker(1)
     result["user_code_files"] = user_code_files()
