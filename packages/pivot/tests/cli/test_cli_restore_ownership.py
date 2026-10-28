@@ -24,6 +24,8 @@ from pivot.remote import storage as remote_storage
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
+    import os
+
     from click.testing import CliRunner
     from pytest_mock import MockerFixture
 
@@ -520,16 +522,16 @@ def test_forced_restore_keeps_a_tracked_file_that_lands_in_an_output_during_its_
     landed = list[pathlib.Path]()
     checkout_with_fallback = cache._checkout_with_fallback
 
-    def stage_while_a_file_lands(path: pathlib.Path, *args: Any, **kwargs: Any) -> None:
+    def stage_while_a_file_lands(path: pathlib.Path, *args: Any, **kwargs: Any) -> os.stat_result:
         # A directory restore stages each file under a temporary name, naming the output file it
-        # becomes; the first one staged lands the user's file in that same output
+        # becomes; the first one staged lands the user's file in that same output.
         display = kwargs.get("display_path")
         if not landed and display is not None:
             (output,) = (out for out in outputs if display.resolve().is_relative_to(out))
             shutil.copy2(user, output / "u.txt")
             shutil.copy2(track.get_pvt_path(user), output / sidecar)
             landed.append(output)
-        checkout_with_fallback(path, *args, **kwargs)
+        return checkout_with_fallback(path, *args, **kwargs)
 
     monkeypatch.setattr(cache, "_checkout_with_fallback", stage_while_a_file_lands)
 

@@ -20,7 +20,7 @@ import loky.reusable_executor
 
 from pivot import config, discovery, exceptions, loaded_source, parameters, project, registry, types
 from pivot.executor import worker
-from pivot.storage import cache, lock, track
+from pivot.storage import cache, lock, ownership, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import OnError, StageStatus
@@ -573,14 +573,27 @@ def _restore_tracked_file(
     path: pathlib.Path,
     track_data: track.PvtData,
     cache_dir: pathlib.Path,
+    project_root: pathlib.Path,
+    recorded: list[tuple[pathlib.Path, os.stat_result, str]],
 ) -> bool:
-    """Restore a tracked file from cache.
+    """Restore a tracked file from cache without replacing a user file that lands while staging.
 
-    Returns True if successfully restored, False if not in cache.
+    Each restored file is appended to ``recorded`` for the caller to record in StateDB
+    (``cache.restore_from_cache``). Returns True if successful, False if not in cache.
     """
     output_hash = track.pvt_to_hash_info(track_data)
+    target = ownership.ForcedRestore(
+        replacement=ownership.tracked_restore(path),
+        restored=output_hash,
+        claims=None,
+    )
 
-    # Use default checkout modes (hardlink with copy fallback)
+    def before_swap(entry: pathlib.Path) -> None:
+        refusal = ownership.swap_refusal(project_root, target, entry)
+        if refusal is not None:
+            raise refusal
+
+    # Use default checkout modes (hardlink with copy fallback).
     checkout_modes = config.get_checkout_mode_order()
     return cache.restore_from_cache(
         path,
@@ -588,6 +601,8 @@ def _restore_tracked_file(
         cache_dir,
         checkout_modes=checkout_modes,
         state_dir=config.get_state_dir(),
+        before_swap=before_swap,
+        recorded=recorded,
     )
 
 
@@ -609,22 +624,25 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     missing = list[str]()
     cache_dir = config.get_cache_dir() / "files"
 
-    with state_mod.StateDB(config.get_state_dir()) as state_db:
+    pending = list[tuple[pathlib.Path, os.stat_result, str]]()
+    with state_mod.open_readonly(config.get_state_dir(), create=False) as state_db:
         for data_path, track_data in tracked_files.items():
             path = pathlib.Path(data_path)
 
             # Try to hash the file - handles race conditions where file disappears
             try:
                 if path.is_file():
-                    current_hash, _ = cache.hash_file(path, state_db)
+                    current_hash, _ = cache.hash_file(path, state_db, pending=pending)
                 elif path.is_dir():
-                    current_hash = cache.hash_directory(path, state_db, cache_dir=cache_dir)["hash"]
+                    current_hash = cache.hash_directory(
+                        path, state_db, cache_dir=cache_dir, pending=pending
+                    )["hash"]
                 else:
                     # Path doesn't exist
                     raise FileNotFoundError(data_path)
             except FileNotFoundError:
                 if checkout_missing:
-                    if _restore_tracked_file(path, track_data, cache_dir):
+                    if _restore_tracked_file(path, track_data, cache_dir, project_root, pending):
                         logger.info(f"Restored tracked file: {data_path}")
                     else:
                         logger.debug(f"Failed to restore tracked file from cache: {data_path}")
@@ -639,6 +657,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                     f"Tracked file '{data_path}' has changed since tracking. "
                     + f"Run 'pivot track --force {track_data['path']}' to update."
                 )
+    state_mod.save_file_hashes(config.get_state_dir(), pending)
 
     metrics.end("core.verify_tracked_files", _t)
     if missing:

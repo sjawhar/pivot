@@ -25,7 +25,7 @@ import functools
 import os
 import pathlib
 import stat
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import lmdb
 
@@ -112,14 +112,16 @@ class UnreadableOverlap(TypedDict):
 
 
 class ForcedRestore(TypedDict):
-    """A path a restore replaces (``checkout``, ``pull``, ``get``) and what decides its members."""
+    """A path a restore replaces (``checkout``, ``pull``, ``get`` or a stage write)."""
 
     replacement: Replacement
     restored: types.HashInfo | None
-    """The hash the restore writes; None for a file restored from git."""
+    """The hash the restore writes; None for a file restored from git or a stage output."""
     claims: Callable[[], StageClaims] | None
     """For a stage output restored to its own path: reads the stage's claims, called only when
     the path holds a ``*.pvt``."""
+    written: NotRequired[StageMembers]
+    """The ``*.pvt`` members a stage is about to write there."""
 
 
 # A path a replacement must not remove: a user ``.pvt`` sidecar, or a directory Pivot could not
@@ -590,7 +592,11 @@ def _restore_members(
         case ReplacementKind.STAGE_OUTPUT:
             claims = target["claims"]() if target["claims"] is not None else None
             return stage_members(
-                output_path, claims, restored=target["restored"], moved_to=moved_to
+                output_path,
+                claims,
+                restored=target["restored"],
+                returned=target.get("written"),
+                moved_to=moved_to,
             )
         case ReplacementKind.TRACKED:
             # A tracked path's own content: what the restore writes and what its sidecar lists now
@@ -602,6 +608,33 @@ def _restore_members(
             )
         case ReplacementKind.DESTINATION:
             return {}
+
+
+def _restore_overlaps(
+    project_root: pathlib.Path, target: ForcedRestore, entry: pathlib.Path
+) -> list[OutputOverlap]:
+    """Find user-owned files the restore of ``target`` removes from ``entry``.
+
+    ``entry`` is either the target path before its replacement or the old directory renamed aside
+    for its swap. In the latter case, ``moved_to`` makes each reported path read as where it was
+    beneath the target, not the temporary backup name.
+    """
+    if not (entry.exists() or entry.is_symlink()):
+        return []
+    replacement = target["replacement"]
+    output_path = normalized(replacement["path"])
+    location = normalized(entry)
+    moved_to = None if location == output_path else location
+    found = dict[pathlib.Path, OutputOverlap]()
+    _find_sidecars(str(normalized(project_root)), replacement, output_path, found, set[str]())
+    _find_in_tree(
+        output_path,
+        replacement,
+        functools.partial(_restore_members, target, moved_to=moved_to),
+        found,
+        moved_to,
+    )
+    return sorted(found.values(), key=overlap_path)
 
 
 def forced_restore_refusal(
@@ -622,12 +655,7 @@ def forced_restore_refusal(
     overlaps = dict[tuple[pathlib.Path, pathlib.Path], OutputOverlap]()
     for target in targets:
         path = target["replacement"]["path"]
-        if not (path.exists() or path.is_symlink()):
-            continue
-        found = find_output_overlaps(
-            project_root, [target["replacement"]], functools.partial(_restore_members, target)
-        )
-        for overlap in found:
+        for overlap in _restore_overlaps(project_root, target, path):
             overlaps.setdefault((overlap_path(overlap), normalized(path)), overlap)
     if not overlaps:
         return None
@@ -646,24 +674,8 @@ def swap_refusal(
     file the swap removes. Each file is still named at its place under the target's path. A file
     that replaces a file or symlink is checked in place, ``entry`` being the path itself.
     """
-    if not (entry.exists() or entry.is_symlink()):
-        return None
-    replacement = target["replacement"]
-    output_path = normalized(replacement["path"])
-    location = normalized(entry)
-    moved_to = None if location == output_path else location
-    found = dict[pathlib.Path, OutputOverlap]()
-    _find_sidecars(str(normalized(project_root)), replacement, output_path, found, set[str]())
-    _find_in_tree(
-        output_path,
-        replacement,
-        functools.partial(_restore_members, target, moved_to=moved_to),
-        found,
-        moved_to,
-    )
-    if not found:
-        return None
-    return ownership_error(project_root, sorted(found.values(), key=overlap_path))
+    overlaps = _restore_overlaps(project_root, target, entry)
+    return None if not overlaps else ownership_error(project_root, overlaps)
 
 
 def find_declared_overlap(

@@ -13,7 +13,7 @@ from pivot import config, exceptions, loaders, types
 from pivot.storage import cache, ownership, store, track
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
 
 def _helper_ref(
@@ -142,6 +142,98 @@ def test_workspace_store_commit_and_restore(tmp_path: pathlib.Path) -> None:
     restored = workspace_store.restore_from_cache(ref, output_hash)
     assert restored is True
     assert output_path.read_text() == "hello cache"
+
+
+def test_workspace_store_keeps_a_tracked_file_that_lands_during_restore_staging(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run-cache restore refuses a user file and sidecar that land while its directory
+    replacement is staged."""
+    workspace_store = store.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="pipe",
+        input_bindings={},
+        cache_dir=tmp_path / "cache" / "files",
+        checkout_modes=[config.CheckoutMode.COPY],
+    )
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
+    output_path = workspace_store.prepare_output(ref)
+    (output_path / "cached.txt").write_text("cached")
+    output_hash = workspace_store.commit(ref, output_path)
+    cache.remove_output(output_path)
+
+    original_checkout = cache._checkout_with_fallback
+    landed = False
+
+    def stage_then_copy_user_file(
+        path: pathlib.Path,
+        cache_path: pathlib.Path,
+        checkout_modes: list[cache.CheckoutMode],
+        *,
+        executable: bool | None = None,
+        staging_path: pathlib.Path | None = None,
+        keep_existing_copy: bool = False,
+        display_path: pathlib.Path | None = None,
+        before_swap: Callable[[pathlib.Path], None] | None = None,
+    ) -> os.stat_result:
+        nonlocal landed
+        staged = original_checkout(
+            path,
+            cache_path,
+            checkout_modes,
+            executable=executable,
+            staging_path=staging_path,
+            keep_existing_copy=keep_existing_copy,
+            display_path=display_path,
+            before_swap=before_swap,
+        )
+        if not landed:
+            output_path.mkdir()
+            user_file = output_path / "user.txt"
+            user_file.write_text("user bytes")
+            track.write_pvt_file(
+                track.get_pvt_path(user_file),
+                track.PvtData(path="user.txt", hash="0123456789abcdef", size=10),
+            )
+            landed = True
+        return staged
+
+    monkeypatch.setattr(cache, "_checkout_with_fallback", stage_then_copy_user_file)
+
+    with pytest.raises(exceptions.OutputOwnershipError, match="user.txt.pvt"):
+        workspace_store.restore_from_cache(ref, output_hash)
+
+    assert landed
+    assert (output_path / "user.txt").read_text() == "user bytes"
+    assert track.get_pvt_path(output_path / "user.txt").is_file()
+
+
+def test_workspace_store_names_a_late_tracked_file_before_the_stage_writer_runs(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The check after preparing a forced run's output uses the forced-restore refusal, naming
+    the copied sidecar and target instead of letting the stage writer report a directory error."""
+    workspace_store = store.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="pipe",
+        input_bindings={},
+        cache_dir=tmp_path / "cache" / "files",
+    )
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
+    output_path = workspace_store.prepare_output(ref)
+    user_file = output_path / "user.txt"
+    user_file.write_text("user bytes")
+    track.write_pvt_file(
+        track.get_pvt_path(user_file),
+        track.PvtData(path="user.txt", hash="0123456789abcdef", size=10),
+    )
+
+    with pytest.raises(exceptions.OutputOwnershipError) as error:
+        workspace_store.refuse_output_replacement_at_write(ref)
+
+    message = str(error.value)
+    assert "user.txt.pvt" in message
+    assert "data/stage" in message
 
 
 def test_workspace_store_restore_records_pvt_members_before_writing_them(

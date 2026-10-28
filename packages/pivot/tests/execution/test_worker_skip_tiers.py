@@ -221,6 +221,7 @@ class _EvictedCacheStore(store_mod.WorkspaceStore):
         state_dir: pathlib.Path | None = None,
         checkout_modes: list[cache.CheckoutMode] | None = None,
         claims: ownership.StageClaims | None = None,
+        recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
     ) -> bool:
         return False
 
@@ -557,28 +558,33 @@ def test_hash_dependencies_reports_unreadable_dependency(
     assert (hashes, missing, unreadable, entries) == ({}, [], ["raw"], [])
 
 
-def test_hash_dependencies_records_stat_write_backs_for_files_only(
-    project: pathlib.Path, state_db: state.StateDB
+def test_hash_dependencies_records_stat_write_backs_for_each_file_it_read(
+    project: pathlib.Path,
 ) -> None:
+    """A read-only check hands back an entry for each file it read, the files of a directory
+    dependency included, so the next check reads none of them; never one for a directory.
+    Workers hash with a read-only StateDB, as here."""
     store = _workspace(project, {"raw": "raw.txt", "tree": "tree"})
     (project / "raw.txt").write_text("file")
     (project / "tree").mkdir()
     (project / "tree" / "a.txt").write_text("a")
 
-    hashes, missing, unreadable, entries = worker.hash_dependencies(
-        {
-            "data": _ref("raw", tag=types.ArtifactTag.INPUT),
-            "tree": _ref("tree", tag=types.ArtifactTag.INPUT),
-        },
-        store,
-        state_db,
-    )
+    with state.StateDB(project / ".pivot", readonly=True) as readonly_db:
+        hashes, missing, unreadable, entries = worker.hash_dependencies(
+            {
+                "data": _ref("raw", tag=types.ArtifactTag.INPUT),
+                "tree": _ref("tree", tag=types.ArtifactTag.INPUT),
+            },
+            store,
+            readonly_db,
+        )
 
     assert (missing, unreadable) == ([], [])
     assert types.is_dir_hash(hashes["tree"])
-    assert [entry[0] for entry in entries] == [str(project / "raw.txt")], (
-        "the file-hash cache must only learn about files"
-    )
+    assert [entry[0] for entry in entries] == [
+        str(project / "raw.txt"),
+        str(project / "tree" / "a.txt"),
+    ], "the file-hash cache learns each file read, never a directory"
 
 
 # =============================================================================
@@ -683,3 +689,76 @@ def test_completed_run_asks_coordinator_to_bump_output_generations(
     assert "deferred_writes" in result
     deferred = result["deferred_writes"]
     assert "increment_outputs" in deferred and deferred["increment_outputs"] is True
+
+
+# =============================================================================
+# File-hash write-backs from the checks the worker makes
+# =============================================================================
+
+
+def test_worker_skipping_by_lock_hands_back_what_it_read_to_decide(
+    project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    """A stage whose lock matches is cached without running. The worker read the dependency
+    and the output to decide; both entries go back to the coordinator, so the next check reads
+    neither. Here the first run's deferred writes are not applied, so the second run finds no
+    generations and no entries, as after a concurrent run or a coordinator that handed off."""
+    raw = project.resolve() / "raw.txt"
+    raw.write_text("hello")
+    info = _stage_info(
+        _upper,
+        project,
+        worker_env,
+        deps={"data": _ref("raw", tag=types.ArtifactTag.INPUT)},
+        outs=[_ref(_STAGE)],
+        no_commit=False,
+    )
+    first = worker.execute_stage(_STAGE, info, worker_env, output_queue)
+    assert first["status"] == types.StageStatus.RAN, first["reason"]
+
+    second = worker.execute_stage(_STAGE, info, worker_env, output_queue)
+
+    assert (second["status"], second["reason"]) == (types.StageStatus.CACHED, "unchanged")
+    assert "deferred_writes" in second
+    deferred = second["deferred_writes"]
+    assert "file_hash_entries" in deferred
+    output = project.resolve() / "data" / "skip" / "consume.txt"
+    assert sorted(entry[0] for entry in deferred["file_hash_entries"]) == sorted(
+        [str(raw), str(output)]
+    ), "the dependency read to decide is handed back, with the output"
+
+
+def test_output_check_hands_back_the_files_it_read(project: pathlib.Path) -> None:
+    """Checking an output that matches its lock reads it (no entry yet) and hands its entry
+    back, so the coordinator records it."""
+    store = _workspace(project, {})
+    out = _ref(_STAGE)
+    path = store.resolve_display_path(out)
+    path.parent.mkdir(parents=True)
+    path.write_text("OUT")
+    output_hash, _ = cache.hash_file(path)
+    entries = list[types.FileHashEntry]()
+
+    with state.StateDB(project / ".pivot", readonly=True) as readonly_db:
+        restoration = worker.restore_outputs_to_hashes(
+            store,
+            [out],
+            {out.identity: FileHash(hash=output_hash)},
+            readonly_db,
+            restore=False,
+            report_changes=True,
+            file_hash_entries=entries,
+        )
+
+    assert restoration.available
+    file_stat = path.stat()
+    assert entries == [
+        (
+            str(path),
+            file_stat.st_mtime_ns,
+            file_stat.st_size,
+            file_stat.st_dev,
+            file_stat.st_ino,
+            output_hash,
+        )
+    ]

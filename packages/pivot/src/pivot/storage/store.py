@@ -28,7 +28,11 @@ class Store(Protocol):
     def commit(self, ref: types.ArtifactRef, path: pathlib.Path) -> types.HashInfo: ...
 
     def hash_artifact(
-        self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
+        self,
+        ref: types.ArtifactRef,
+        state_db: state_mod.StateDB | None = None,
+        *,
+        pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
     ) -> types.HashInfo: ...
 
     def exists(self, ref: types.ArtifactRef) -> bool: ...
@@ -122,7 +126,11 @@ class CacheStore:
         return output_hash
 
     def hash_artifact(
-        self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
+        self,
+        ref: types.ArtifactRef,
+        state_db: state_mod.StateDB | None = None,
+        *,
+        pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
     ) -> types.HashInfo:
         ref_path = self._ref_path(ref)
         if not ref_path.exists() and not ref_path.is_symlink():
@@ -130,15 +138,15 @@ class CacheStore:
 
         if state_db is not None:
             if ref_path.is_dir():
-                return cache.hash_directory(ref_path, state_db)
-            file_hash, _ = cache.hash_file(ref_path, state_db)
+                return cache.hash_directory(ref_path, state_db, pending=pending)
+            file_hash, _ = cache.hash_file(ref_path, state_db, pending=pending)
             return types.FileHash(hash=file_hash)
 
         with self._state_db() as db:
             if ref_path.is_dir():
-                return cache.hash_directory(ref_path, db)
+                return cache.hash_directory(ref_path, db, pending=pending)
 
-            file_hash, _ = cache.hash_file(ref_path, db)
+            file_hash, _ = cache.hash_file(ref_path, db, pending=pending)
             return types.FileHash(hash=file_hash)
 
     def exists(self, ref: types.ArtifactRef) -> bool:
@@ -248,6 +256,26 @@ class WorkspaceStore:
             lambda path: ownership.stage_members(path, claims, returned=written.get(path)),
         )
 
+    def refuse_output_replacement_at_write(
+        self,
+        ref: types.ArtifactRef,
+        claims: ownership.StageClaims | None = None,
+        returned: ownership.StageMembers | None = None,
+    ) -> None:
+        """Run the forced-restore refusal after an output is prepared and before its writer
+        writes, so a user file that landed in that window is named instead of becoming a loader
+        error."""
+        output_path = ownership.normalized(self._resolve_output_path(ref))
+        target = ownership.ForcedRestore(
+            replacement=ownership.stage_output(output_path, ref.identity.producer),
+            restored=None,
+            claims=None if claims is None else lambda: claims,
+            written={} if returned is None else returned,
+        )
+        refusal = ownership.forced_restore_refusal(self._project_root, [target])
+        if refusal is not None:
+            raise refusal
+
     def prepare_output(
         self,
         ref: types.ArtifactRef,
@@ -319,41 +347,62 @@ class WorkspaceStore:
         state_dir: pathlib.Path | None = None,
         checkout_modes: list[config.CheckoutMode] | None = None,
         claims: ownership.StageClaims | None = None,
+        recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
     ) -> bool:
-        """Restore an output to ``output_hash``, refusing first if that would remove a user file.
+        """Restore ``ref`` from the cache, refusing a user file at the initial and swap checks.
 
         The stage's own ``*.pvt`` files are ``ownership.stage_members`` of ``claims`` and the
-        restored hash. ``ownership.record_restored`` then records the ones ``output_hash`` writes
-        that the stage's lock does not list, before the restore writes them.
+        restored hash. ``ownership.record_restored`` records the ones ``output_hash`` writes that
+        the stage's lock does not list before the restore writes them. ``recorded`` is as
+        ``cache.restore_from_cache`` says.
         """
         if self._cache_dir is None:
             return False
         if ref.tag is types.ArtifactTag.METRIC:
             return False
         output_path = self._resolve_output_path(ref)
+        replacement = ownership.stage_output(
+            ownership.normalized(output_path), ref.identity.producer
+        )
+        target = ownership.ForcedRestore(
+            replacement=replacement,
+            restored=output_hash,
+            claims=None if claims is None else lambda: claims,
+        )
         ownership.refuse_output_replacements(
             self._project_root,
-            [ownership.stage_output(ownership.normalized(output_path), ref.identity.producer)],
+            [replacement],
             lambda path: ownership.stage_members(path, claims, restored=output_hash),
         )
         if claims is not None:
-            stage_claims = claims
-            ownership.record_restored(lambda: stage_claims, output_path, output_hash)
+            ownership.record_restored(lambda: claims, output_path, output_hash)
+
+        def before_swap(entry: pathlib.Path) -> None:
+            refusal = ownership.swap_refusal(self._project_root, target, entry)
+            if refusal is not None:
+                raise refusal
+
         return cache.restore_from_cache(
             output_path,
             output_hash,
             self._cache_dir,
             checkout_modes=checkout_modes if checkout_modes is not None else self._checkout_modes,
             state_dir=state_dir,
+            before_swap=before_swap,
+            recorded=recorded,
         )
 
     def hash_artifact(
-        self, ref: types.ArtifactRef, state_db: state_mod.StateDB | None = None
+        self,
+        ref: types.ArtifactRef,
+        state_db: state_mod.StateDB | None = None,
+        *,
+        pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
     ) -> types.HashInfo:
         path = self._resolve_path(ref)
         if ref.directory is None and (ref.tag == types.ArtifactTag.DIRECTORY or path.is_dir()):
-            return cache.hash_directory(path, state_db, cache_dir=self._cache_dir)
-        file_hash, _ = cache.hash_file(path, state_db)
+            return cache.hash_directory(path, state_db, cache_dir=self._cache_dir, pending=pending)
+        file_hash, _ = cache.hash_file(path, state_db, pending=pending)
         return types.FileHash(hash=file_hash)
 
     def cache_contains(self, ref: types.ArtifactRef, output_hash: types.HashInfo) -> bool:

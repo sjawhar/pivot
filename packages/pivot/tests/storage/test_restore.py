@@ -58,11 +58,11 @@ def _hold_checkout_restore(
         staging_path: pathlib.Path | None = None,
         keep_existing_copy: bool = False,
         before_swap: Callable[[pathlib.Path], None] | None = None,
-    ) -> None:
+    ) -> os.stat_result:
         _ = staging_path
         started.set()
         assert release.wait(10)
-        original_checkout(
+        return original_checkout(
             target,
             source,
             checkout_modes,

@@ -1999,7 +1999,20 @@ class Engine:
 
         deps = stage_info["deps"]
 
+        def _save_file_hashes(entries: list[types.FileHashEntry]) -> None:
+            """Record the file hashes this check read or restored, so the next one reads none;
+            best-effort, so a write that cannot happen never fails the run."""
+            if entries:
+                _ = state_mod.save_best_effort(
+                    stage_state_dir,
+                    lambda writable_db: writable_db.apply_deferred_writes(
+                        stage_name, [], DeferredWrites(file_hash_entries=entries)
+                    ),
+                    what=f"{len(entries)} file hashes",
+                )
+
         def _use_outputs(state_db: state_mod.StateDB) -> _SkipOutcome:
+            file_hash_entries = list[types.FileHashEntry]()
             if not restore:
                 checked = worker.restore_outputs_to_hashes(
                     store,
@@ -2009,18 +2022,19 @@ class Engine:
                     state_dir=state_dir,
                     restore=False,
                     report_changes=True,
+                    file_hash_entries=file_hash_entries,
                 )
+                _save_file_hashes(file_hash_entries)
                 if not checked.available:
                     return _SkipOutcome.RUN
                 return _SkipOutcome.NEEDS_RESTORE if checked.to_restore else _SkipOutcome.SKIPPED
-            restored_entries = list[tuple[str, int, int, int, str]]()
             restored = worker.restore_outputs_to_hashes(
                 store,
                 stage_info["outs"],
                 lock_data["output_hashes"],
                 state_db,
                 state_dir=state_dir,
-                file_hash_entries=restored_entries,
+                file_hash_entries=file_hash_entries,
                 claims=worker.stage_claims(
                     store,
                     stage_info["outs"],
@@ -2029,11 +2043,7 @@ class Engine:
                     project.get_project_root(),
                 ),
             )
-            if restored and restored_entries:
-                with state_mod.StateDB(stage_state_dir) as writable_db:
-                    writable_db.apply_deferred_writes(
-                        stage_name, [], DeferredWrites(file_hash_entries=restored_entries)
-                    )
+            _save_file_hashes(file_hash_entries)
             return _SkipOutcome.SKIPPED if restored else _SkipOutcome.RUN
 
         def _get_skip_state_db() -> state_mod.StateDB:
@@ -2088,19 +2098,19 @@ class Engine:
             )
             return generation_outcome
 
-        def _hash_deps() -> tuple[
-            dict[str, HashInfo], list[str], list[str], list[tuple[str, int, int, int, str]]
-        ]:
+        def _hash_deps() -> tuple[dict[str, HashInfo], list[str], list[str]]:
             state_db = _get_skip_state_db()
             try:
-                return worker.hash_dependencies(deps, store, state_db)
+                dep_hashes, missing, unreadable, file_hash_entries = worker.hash_dependencies(
+                    deps, store, state_db
+                )
             finally:
                 if skip_state_dbs is None:
                     state_db.close()
+            _save_file_hashes(file_hash_entries)
+            return dep_hashes, missing, unreadable
 
-        dep_hashes, missing, unreadable, _file_hash_entries = await anyio.to_thread.run_sync(
-            _hash_deps
-        )
+        dep_hashes, missing, unreadable = await anyio.to_thread.run_sync(_hash_deps)
         dep_hashes_by_identity = {
             types.identity_from_key(key): info for key, info in dep_hashes.items()
         }

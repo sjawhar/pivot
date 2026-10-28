@@ -8,10 +8,11 @@ import os
 import pathlib
 from typing import TYPE_CHECKING, NotRequired, TypedDict, TypeGuard
 
+import xxhash
 import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
-from pivot.storage import cache, lock, ownership, track
+from pivot.storage import cache, lock, ownership, state, track
 from pivot.types import HashInfo
 
 if TYPE_CHECKING:
@@ -244,8 +245,8 @@ def _write_fallback_content(
     content: bytes,
     lock_token: str | None,
     before_swap: Callable[[pathlib.Path], None],
-) -> bool:
-    """Atomically replace a cache-miss target; the caller holds its restore lock."""
+) -> os.stat_result:
+    """Atomically replace a cache-miss target; return the staged file's stat before its swap."""
 
     def write_content(fd: int) -> None:
         with os.fdopen(fd, "wb") as file:
@@ -254,10 +255,9 @@ def _write_fallback_content(
     staging_path = (
         cache.restore_staging_path(dest_path, lock_token) if lock_token is not None else None
     )
-    cache.atomic_write_file(
+    return cache.atomic_write_file(
         dest_path, write_content, staging_path=staging_path, before_swap=before_swap
     )
-    return True
 
 
 def _refuse_swap(target: ownership.ForcedRestore, entry: pathlib.Path) -> None:
@@ -268,11 +268,11 @@ def _refuse_swap(target: ownership.ForcedRestore, entry: pathlib.Path) -> None:
         raise refusal
 
 
-def _replace_checked(
+def _replace_checked[T](
     dest_path: pathlib.Path,
     target: ownership.ForcedRestore,
-    replace: Callable[[str | None, Callable[[pathlib.Path], None]], bool],
-) -> bool:
+    replace: Callable[[str | None, Callable[[pathlib.Path], None]], T],
+) -> T:
     """Run ``replace`` under ``dest_path``'s restore lock, right after checking ``target`` again
     there (``ownership.forced_restore_refusal``): a user file that appeared since the check of
     every target refuses this target alone. ``replace`` gets the lock's token and the check its
@@ -329,6 +329,7 @@ def restore_file(
     target: ownership.ForcedRestore,
     *,
     remote_factory: Callable[[], RemoteStorage],
+    recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> RestoreResult:
     """Restore a single file from revision and return its result.
 
@@ -336,7 +337,6 @@ def restore_file(
     from the remote ``remote_factory`` opens; it is called only when that download is needed.
     A remote that raised ``RemoteUnreachableError`` is named in the result's
     ``unreachable_remote``.
-
     ``target`` is what the restore replaces (``_restore_targets``). Each write checks it again
     under the restore lock, just before it builds the replacement, and once more at the swap; a
     refusal is this target's error. For a stage output restored to its own path, the ``*.pvt``
@@ -358,10 +358,11 @@ def restore_file(
             checkout_modes,
             target,
             remote_factory,
+            recorded,
         )
-    except exceptions.OutputOwnershipError as e:
+    except exceptions.OutputOwnershipError as error:
         return RestoreResult(
-            status=RestoreStatus.ERROR, path=str(dest_path), message=f"Error: {dest_path} - {e}"
+            status=RestoreStatus.ERROR, path=str(dest_path), message=f"Error: {dest_path} - {error}"
         )
 
 
@@ -374,11 +375,16 @@ def _restore_from_sources(
     checkout_modes: list[cache.CheckoutMode],
     target: ownership.ForcedRestore,
     remote_factory: Callable[[], RemoteStorage],
+    recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None,
 ) -> RestoreResult:
     """``restore_file``'s strategies, each write under ``_replace_checked``.
 
     Raises:
         exceptions.OutputOwnershipError: The check under the restore lock refused the target.
+
+    A restore appends ``(path, stat, hash)`` for each file it writes to ``recorded``, for the
+    caller to save in a StateDB, so the next status, explanation or run looks the file up instead
+    of reading it. Each stat is of what was staged, taken before the rename put it in place.
     """
     path_str = str(dest_path)
     files_dir = cache_dir / "files"
@@ -397,58 +403,68 @@ def _restore_from_sources(
     # Strategy 1: Try local cache (if hash available)
     if output_hash is not None:
         cached_hash = output_hash
+        restored = list[tuple[pathlib.Path, os.stat_result, str]]()
+        success = False
         try:
             # For directories with manifest, restore_from_cache checks each file in manifest.
             # For files, we check if the single cached file exists first.
             should_try_cache = True
             if "manifest" not in output_hash:
                 should_try_cache = cache.get_cache_path(files_dir, output_hash["hash"]).exists()
-            if should_try_cache and _replace_checked(
-                dest_path,
-                target,
-                lambda token, before_swap: cache.restore_from_cache(
+            if should_try_cache:
+                success = _replace_checked(
                     dest_path,
-                    cached_hash,
-                    files_dir,
-                    checkout_modes=checkout_modes,
-                    state_dir=state_dir,
-                    lock_token=token,
-                    before_swap=before_swap,
-                ),
-            ):
-                return RestoreResult(
-                    status=RestoreStatus.RESTORED,
-                    path=path_str,
-                    message=f"Restored: {dest_path} (from cache)",
+                    target,
+                    lambda token, before_swap: cache.restore_from_cache(
+                        dest_path,
+                        cached_hash,
+                        files_dir,
+                        checkout_modes=checkout_modes,
+                        state_dir=state_dir,
+                        lock_token=token,
+                        before_swap=before_swap,
+                        recorded=restored,
+                    ),
                 )
         except exceptions.OutputOwnershipError:
             raise
-        except (exceptions.PivotError, OSError) as e:
-            # Strategy 3 retries this restore, and reports the error if it happens again
-            logger.debug(f"Cache restore failed for {rel_path}: {e}")
-
+        except (exceptions.PivotError, OSError) as error:
+            # Strategy 3 retries this restore, and reports the error if it happens again.
+            logger.debug("Cache restore failed for %s: %s", rel_path, error)
+        if success:
+            if recorded is not None:
+                recorded.extend(restored)
+            return RestoreResult(
+                status=RestoreStatus.RESTORED,
+                path=path_str,
+                message=f"Restored: {dest_path} (from cache)",
+            )
     # Strategy 2: Try git fallback
     content = git.read_file_from_revision(rel_path, rev)
     if content is not None:
         try:
-            _replace_checked(
+            written = _replace_checked(
                 dest_path,
                 target,
                 lambda token, before_swap: _write_fallback_content(
                     dest_path, content, token, before_swap
                 ),
             )
-            return RestoreResult(
-                status=RestoreStatus.RESTORED,
-                path=path_str,
-                message=f"Restored: {dest_path} (from git)",
-            )
-        except OSError as e:
+        except exceptions.OutputOwnershipError:
+            raise
+        except OSError as error:
             return RestoreResult(
                 status=RestoreStatus.ERROR,
                 path=path_str,
-                message=f"Error: {dest_path} - failed to write from git: {e}",
+                message=f"Error: {dest_path} - failed to write from git: {error}",
             )
+        if recorded is not None:
+            recorded.append((dest_path, written, xxhash.xxh64(content).hexdigest()))
+        return RestoreResult(
+            status=RestoreStatus.RESTORED,
+            path=path_str,
+            message=f"Restored: {dest_path} (from git)",
+        )
 
     # Strategy 3: Download the cache objects the output still misses from the remote, then
     # restore from the cache. Any failure is this target's error, so the targets already
@@ -457,6 +473,7 @@ def _restore_from_sources(
         cached_hash = output_hash
         source = "cache"
         remote: RemoteStorage | None = None
+        downloaded = list[tuple[pathlib.Path, os.stat_result, str]]()
         try:
             missing_hashes = cache.missing_cache_objects(output_hash, files_dir, checkout_modes)
             if missing_hashes:
@@ -484,6 +501,7 @@ def _restore_from_sources(
                     state_dir=state_dir,
                     lock_token=token,
                     before_swap=before_swap,
+                    recorded=downloaded,
                 ),
             )
         except exceptions.OutputOwnershipError:
@@ -504,6 +522,8 @@ def _restore_from_sources(
                 message=f"Error: {dest_path} - failed to restore from {source}: {_reason(e)}",
             )
         if success:
+            if recorded is not None:
+                recorded.extend(downloaded)
             return RestoreResult(
                 status=RestoreStatus.RESTORED,
                 path=path_str,
@@ -680,36 +700,51 @@ def restore_targets_from_revision(
             )
         return open_remote()
 
-    for index, target_info in enumerate(target_infos):
-        for rel_path in target_info["paths"]:
-            output_hash = target_info["hashes"].get(rel_path)
-            dest_path = output_path if output_path is not None else proj_root / rel_path
-            if "error" in target_info:
-                # A target already in the workspace is kept, as for a valid .pvt
-                results.append(
-                    _skipped(dest_path, force)
-                    or RestoreResult(
-                        status=RestoreStatus.ERROR,
-                        path=str(dest_path),
-                        message=f"Error: {dest_path} - {target_info['error']}",
-                    )
-                )
-                continue
-
-            result = restore_file(
-                rel_path=rel_path,
-                output_hash=output_hash,
-                rev=rev,
-                dest_path=dest_path,
-                cache_dir=cache_dir,
-                checkout_modes=checkout_modes,
-                force=force,
-                target=restores[(index, rel_path)],
-                remote_factory=reachable_remote,
+    # Every target's file hashes, saved once per state directory when the loop ends, best-effort:
+    # a stage output's in its stage's state directory, any other file's in the configured one.
+    batch = state.FileHashBatch()
+    try:
+        for index, target_info in enumerate(target_infos):
+            hash_state_dir = (
+                stage_targets[target_info["original_target"]]["state_dir"]
+                if target_info["target_type"] is TargetType.STAGE
+                else config.get_state_dir()
             )
-            if "unreachable_remote" in result:
-                unreachable = result["unreachable_remote"]
-            results.append(result)
+            for rel_path in target_info["paths"]:
+                output_hash = target_info["hashes"].get(rel_path)
+                dest_path = output_path if output_path is not None else proj_root / rel_path
+                if "error" in target_info:
+                    # A target already in the workspace is kept, as for a valid .pvt, so the
+                    # check refuses nothing that get skipped before it.
+                    results.append(
+                        _skipped(dest_path, force)
+                        or RestoreResult(
+                            status=RestoreStatus.ERROR,
+                            path=str(dest_path),
+                            message=f"Error: {dest_path} - {target_info['error']}",
+                        )
+                    )
+                    continue
+
+                recorded = list[tuple[pathlib.Path, os.stat_result, str]]()
+                result = restore_file(
+                    rel_path=rel_path,
+                    output_hash=output_hash,
+                    rev=rev,
+                    dest_path=dest_path,
+                    cache_dir=cache_dir,
+                    checkout_modes=checkout_modes,
+                    force=force,
+                    target=restores[(index, rel_path)],
+                    remote_factory=reachable_remote,
+                    recorded=recorded,
+                )
+                batch.add(hash_state_dir, recorded)
+                if "unreachable_remote" in result:
+                    unreachable = result["unreachable_remote"]
+                results.append(result)
+    finally:
+        batch.save()
 
     # Format output: show all messages, with errors summarized at the end
     messages = [r["message"] for r in results]
