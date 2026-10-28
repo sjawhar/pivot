@@ -87,7 +87,7 @@ hidden, and a control character in either is escaped, in the one line and in the
 **Path arguments.** `pivot track`, `push`, `fetch` and `pull` read a relative path from the
 current directory. `diff`, `checkout`, `repro`, `dag`, `get` and `check-ignore` read it from the
 project root, so from `sub/` they take the file `data/x.csv` as `data/x.csv`, not
-`../data/x.csv`.
+`../data/x.csv`. `pivot get --output` reads its path from the current directory.
 
 An absolute path that reaches the project through a symlink outside it counts as the place it
 points to in `diff`, `checkout`, `repro`, `dag`, `push`, `fetch`, `pull` and `track`. The
@@ -163,7 +163,7 @@ pivot repro [STAGES...] [OPTIONS]
 | `--jsonl` / `--json` | Stream results as JSONL (one JSON object per line) |
 | `--show-output` | Stream stage stdout/stderr to terminal |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
-| `--no-commit` | Run stages without writing locks, cache, or StateDB |
+| `--no-commit` | Run stages without writing locks or cache; StateDB keeps only a record of the `*.pvt` files each stage wrote |
 | `--resources NAME=CAPACITY` | Override a scheduler resource capacity; may be repeated |
 | `--fail-fast` | Stop on first failure (default) |
 | `--keep-going` / `-k` | Continue running stages after failures; skip only downstream dependents |
@@ -218,7 +218,7 @@ pivot run STAGES... [OPTIONS]
 | `--jsonl` / `--json` | Stream results as JSONL (one JSON object per line) |
 | `--show-output` | Stream stage stdout/stderr to terminal |
 | `--tui-log PATH` | Write TUI messages to JSONL file for monitoring |
-| `--no-commit` | Run stages without writing locks, cache, or StateDB |
+| `--no-commit` | Run stages without writing locks or cache; StateDB keeps only a record of the `*.pvt` files each stage wrote |
 | `--resources NAME=CAPACITY` | Override a scheduler resource capacity; may be repeated |
 | `--fail-fast` | Stop on first failure |
 | `--keep-going` / `-k` | Continue running stages after failures |
@@ -298,6 +298,13 @@ pivot commit [STAGES...] [OPTIONS]
 ```
 
 Without arguments, commits all stale stages. With stage names, unconditionally commits those stages.
+
+A `.pvt` file inside an output is the stage's only when the stage's lock lists it there, or
+Pivot recorded it there before writing it (a `pivot repro` run, `--no-commit` included, or
+`pivot get` of the stage) and it is unchanged since. `pivot commit` refuses, naming it, any
+other `.pvt` in an output, such as a user's sidecar or one this version of Pivot cannot read,
+instead of recording it as the stage's output. A refusal fails that stage alone: the command
+still commits the other stages, lists the refused one under `Failed`, and exits 1.
 
 The code a lock records depends on where the outputs came from. If they are the outputs a `pivot repro --no-commit` run wrote, unchanged since, the lock records the code that run ran, so an edit made while it ran, or since, still reruns the stage. Otherwise (outputs edited by hand, or written another way) the lock records the code on disk now: the "trust me" path.
 
@@ -461,6 +468,34 @@ pivot track PATHS... [OPTIONS]
 
 Creates `.pvt` manifest files for tracking files outside of stage outputs.
 
+`pivot track` loads every pipeline in the project and refuses a new path that overlaps a
+declared output of any of them, including pipelines this directory does not select, and names
+the stage that writes that output. A `pipeline.py` that fails to load makes `pivot track` and
+`pivot import` refuse until it is fixed; one that loads but defines no Pivot pipeline declares no
+outputs. A file tracked or imported inside an output before this check stays where it is:
+`pivot status` and `pivot repro` (with `--all` for another pipeline's output) warn once per run
+naming it, `pivot track --force` updates it in place with the same warning, and any stage write,
+restore, `pivot commit`, forced checkout or forced `pivot get` that would remove it or its `.pvt`
+sidecar fails before changing anything. A forced restore of a tracked directory (or of a tracked
+file over a directory) likewise fails before it would remove another tracked file, import or
+`.pvt` sidecar beneath it. A restore requested through a stage name restores that stage's output,
+so a tracked file at that output's path makes it fail too. Move the file and its `.pvt` sidecar
+outside the output (for example under `data/raw/`). The check finds a sidecar beside its file,
+where Pivot writes it; a hand-edited `.pvt` elsewhere whose `path` points into an output is not
+protected.
+
+A stage may write a `*.pvt` file in a directory output: a member of a `directory` output, or a
+file inside a directory a `PathOnly` output returns. Pivot treats such a file as the stage's
+when the stage's lock records it at that path, or Pivot recorded it there before writing it and
+it is unchanged since. A run, a run-cache restore (also under `pivot repro --no-commit`) and
+`pivot get` of a stage record each such file before they write it; `pivot checkout` and
+`pivot pull` restore only what the lock records. After the lock changes through git (for
+example `git checkout` of an older commit), a file at a path the lock records whose content is
+in the cache is the stage's too: the stage wrote it in a run Pivot cached. Every other `.pvt`
+under an output is a user's sidecar, which a `.pvt` this version of Pivot cannot read may be.
+`pivot commit` claims no other `.pvt`: it refuses, naming the file, rather than record it as the
+stage's output, after which the next run would delete it.
+
 ---
 
 ### `pivot checkout`
@@ -486,6 +521,21 @@ pivot checkout [TARGETS...] [OPTIONS]
 
 Checkout summaries count restored, skipped, and missing **files**. Each file in a directory output
 counts separately.
+
+A checkout that would replace an existing path holding another user's file refuses: a stage
+output that holds a tracked file or `.pvt` sidecar, or a tracked path that holds another tracked
+file, import or `.pvt` sidecar beneath it. A target that names a stage restores that stage's
+outputs, so a tracked file or sidecar at one of their paths refuses it too. Only `--force` and an
+`--only-missing` directory swap replace an existing path. `--force` checks every target before it
+changes any: if it refuses one, it changes nothing and exits 1, naming every refused target and
+the files that block it. It then checks each target again before it builds that target's
+replacement, and once more at its swap, over the old output once it is moved aside, so a tracked
+file and sidecar copied into an output while the command runs, even while that output's own
+replacement is being built, refuse that target alone, named, and the command exits 1 with the
+file kept. `pivot pull --force` restores the same way.
+An `--only-missing` swap is checked when it is decided, and at its swap. A directory inside an
+output that Pivot cannot read refuses the restore too, naming that directory: a tracked file may
+hide inside where Pivot cannot look.
 
 ---
 
@@ -513,7 +563,7 @@ pivot get TARGETS... --rev REVISION [OPTIONS]
 | `--remote NAME` | Remote name (uses default if not specified). An unknown name fails before anything is restored |
 | `--output` / `-o PATH` | Output path (single file only) |
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
-| `--force` / `-f` | Overwrite existing files |
+| `--force` / `-f` | Overwrite existing files. Refuses, before changing anything, when a replaced path holds another user's file: a stage output or an `--output` path that holds a tracked file or `.pvt` sidecar, or a tracked path that holds another tracked file, import or `.pvt` sidecar beneath it. Each target is checked again before its replacement is built and once more at its swap, over the old entry once it is moved aside: one that a user's file entered meanwhile, even while its replacement was being built, fails alone, named, and the others are still restored. A target whose `.pvt` is not valid is only reported, so it refuses nothing. A tracked file restored over a file is always overwritten |
 
 A downloaded cache object has no executable bit, so an executable file in a directory output cannot be hard-linked or symlinked to it. With a mode order that has no `copy` (`--checkout-mode hardlink` or `symlink`, or a `cache.checkout_mode` without `copy`), that output fails with an error naming the file. The default order, hardlink, symlink, copy, ends with `copy`, which restores the bit.
 
@@ -526,7 +576,7 @@ pivot get demo/train --rev abc123
 # Get stage output from branch
 pivot get demo/train --rev feature-branch
 
-# Get a stage's single output to a custom path
+# Get a stage's single output to a custom path (relative to the current directory)
 pivot get demo/train --rev v1.0 --output old_train.jsonl
 
 # Get from a specific remote
@@ -830,6 +880,11 @@ pivot import https://github.com/org/data prep/split:test --out data/raw/test.csv
 ```
 
 The imported file is tracked by a `.pvt` sidecar next to it; read it in a pipeline with `pipeline.input("model.pkl")`.
+
+An import loads every pipeline in the project and refuses a **new** destination that overlaps a
+declared stage output, whether or not that pipeline is currently selected. Use an input location
+such as `data/raw/` instead. An import made there before this check can be updated with `--force`;
+Pivot warns but leaves its data and `.pvt` sidecar in place until you move them outside the output.
 
 ---
 

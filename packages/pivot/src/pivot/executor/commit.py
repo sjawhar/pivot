@@ -153,6 +153,10 @@ def _commit_stages(
             ):
                 run_manifest = run_record["code_manifest"]
                 run_outputs = run_record["output_hashes"]
+            # The stage's own *.pvt files are the ones its lock or its nocommit: record lists.
+            # Every other *.pvt in an output is a user's: the commit refuses before it would
+            # claim one, so a later run cannot delete it as the stage's.
+            claims = worker.stage_claims(store, stage_outs, previous_lock, run_record, project_root)
 
             # 5. If not force and no explicit stages, check lock — skip if unchanged
             if (
@@ -186,6 +190,7 @@ def _commit_stages(
                         out_path,
                         state_dir=default_state_dir,
                         warn_left_out_symlinks=warn_left_out_symlinks,
+                        claims=claims,
                     )
                     file_hash_entries.extend(
                         cache.deferred_file_hash_entries(
@@ -213,6 +218,12 @@ def _commit_stages(
                         stage_name,
                         identity_key,
                     )
+                    outputs_missing = True
+                    break
+                except exceptions.OutputOwnershipError as exc:
+                    # This stage's failure alone: the stages before it stay committed, and the
+                    # ones after it are still tried
+                    logger.error("Stage '%s': %s", stage_name, exc)
                     outputs_missing = True
                     break
 

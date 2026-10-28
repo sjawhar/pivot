@@ -70,7 +70,11 @@ Workers compute dependency generations via `compute_dep_generation_map()` and re
 
 ## File-Hash Write-Back
 
-Workers open StateDB in **readonly mode** during execution to avoid write contention. However, dependency hashing produces file hash entries (path, mtime_ns, size, dev, inode, hash) that should be cached in StateDB for future O(1) lookups.
+Workers open StateDB in **readonly mode** during execution to avoid write contention. (One write
+cannot wait for the coordinator: a worker adds a `*.pvt` member to the stage's `nocommit:` record
+before it writes that member, so a crash never leaves it unrecorded; see `storage/AGENTS.md`.)
+However, dependency hashing produces file hash entries (path, mtime_ns, size, dev, inode, hash)
+that should be cached in StateDB for future O(1) lookups.
 
 The solution: workers collect these entries in `file_hash_entries` (returned from `hash_dependencies()`) and include them in `DeferredWrites`. The coordinator writes them back to StateDB after stage completion via `apply_deferred_writes()`. This gives the performance benefit of hash caching without requiring workers to hold write locks on StateDB.
 

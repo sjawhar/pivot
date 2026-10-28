@@ -11,7 +11,7 @@ import pytest
 import xxhash
 
 from pivot.cli import checkout as checkout_mod
-from pivot.storage import cache
+from pivot.storage import cache, ownership
 from pivot.storage import state as state_mod
 from pivot.types import FileHash
 
@@ -211,6 +211,11 @@ def test_a_write_just_after_a_copy_restore_is_not_recorded_as_the_cached_content
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.ERROR,
         tmp_path / ".pivot",
+        target=ownership.ForcedRestore(
+            replacement=ownership.tracked_restore(target),
+            restored=FileHash(hash=file_hash),
+            claims=None,
+        ),
         batch=batch,
     )
     batch.save()
