@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import errno
 import fcntl
 import json
 import logging
@@ -1195,27 +1194,30 @@ def save_best_effort(
 def open_readonly(
     state_dir: pathlib.Path | None, *, create: bool = True
 ) -> Generator[StateDB | None]:
-    """Open ``state_dir``'s StateDB to read it, yielding None where this user cannot open it.
+    """Open ``state_dir``'s StateDB to read it, yielding None on a read-only filesystem.
 
-    LMDB opens even a read-only environment writable, so a database whose files this user cannot
-    write (``PermissionError``, ``lmdb.ReadonlyError``) or one on a read-only filesystem
-    (``EROFS``) cannot be opened: the caller then reads the files instead, as it would with no
-    database, rather than failing the command. Only those cases yield None; a damaged database
-    raises. Opening creates a database where there is none, unless ``create`` is False (a check
-    never creates one); no ``state_dir`` yields None. The caller's own errors propagate with no
-    context from the open.
+    LMDB opens even a read-only environment writable. On an existing database it can report that
+    as a plain ``lmdb.Error``, not an ``OSError``: inspect the database directory's own mount
+    flag (not its parent, which may be a different, writable mount). Only an ``OSError`` or
+    ``lmdb.Error`` on that read-only mount yields None, so the caller reads files as it would with
+    no cache. The same errors on a writable mount are a damaged database and raise. Opening
+    creates a database where there is none, unless ``create`` is False (a check never creates
+    one); no ``state_dir`` yields None. The caller's own errors propagate with no context from
+    the open.
     """
     if state_dir is None or (not create and not (state_dir / "state.lmdb").exists()):
         yield None
         return
+    lmdb_path = state_dir / "state.lmdb"
     state_db: StateDB | None
     try:
         state_db = StateDB(state_dir, readonly=True)
-    except (PermissionError, lmdb.ReadonlyError) as error:
-        logger.debug("Reading files without the state database in %s: %s", state_dir, error)
-        state_db = None
-    except OSError as error:
-        if error.errno != errno.EROFS:
+    except (OSError, lmdb.Error) as error:
+        try:
+            readonly_filesystem = bool(os.statvfs(lmdb_path).f_flag & os.ST_RDONLY)
+        except OSError:
+            raise error from None
+        if not readonly_filesystem:
             raise
         logger.debug("Reading files without the state database in %s: %s", state_dir, error)
         state_db = None

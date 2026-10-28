@@ -20,7 +20,7 @@ Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not 
 
 The rule: commands that read a file may save its hash to the cache, best-effort; no read-only command writes a lock, a run record or an output. `--no-commit` writes no lock and no `run:` history entry. It writes a `nocommit:` record holding what the run did, which a later `pivot commit` uses.
 
-Every command that writes the workspace saves the hash of each file it reads, commits or restores, so an explanation (`pivot status --explain`, `pivot verify`) finds a matching entry and reads no file. Saving file hashes never fails a command, and looking them up fails one only on a damaged database: every save of file-hash entries goes through `state.save_best_effort` (`state.save_file_hashes` for `(path, stat, hash)` entries) or `StateDB.save_many_best_effort` (`hash_file`'s and `hash_directory`'s save-on-read), which wait at most 2 s for the write lock, log a failed write at debug level and keep the command's result; and every check and explanation opens the hash cache with `state.open_readonly(..., create=False)`, which reads the files instead when this user cannot open the database (it cannot write the database's files, or the filesystem is read-only). A run's deferred writes are not a cache save: they put a stage's file hashes in the same transaction as its generations, and that transaction is the run's own commit. A new command that writes or reads workspace files must record them the same way:
+Every command that writes the workspace saves the hash of each file it reads, commits or restores, so an explanation (`pivot status --explain`, `pivot verify`) finds a matching entry and reads no file. Saving file hashes never fails a command. `state.open_readonly(..., create=False)` looks file hashes up without creating a database: on an existing database, an `OSError` or `lmdb.Error` yields no cache only when `os.statvfs(state.lmdb)` says the database itself is on a read-only filesystem (the parent may be a different writable mount); otherwise it raises (a damaged database, or one unopenable on a writable mount). `pivot checkout` catches any failure to open the hash cache and restores without it, since main's checkout never opened the database; it catches only the open, so an error inside its own block still propagates. Status and verify may raise, as on main. Every save of file-hash entries goes through `state.save_best_effort` (`state.save_file_hashes` for `(path, stat, hash)` entries) or `StateDB.save_many_best_effort` (`hash_file`'s and `hash_directory`'s save-on-read), which wait at most 2 s for the write lock, log a failed write at debug level and keep the command's result. A run's deferred writes are not a cache save: they put a stage's file hashes in the same transaction as its generations, and that transaction is the run's own commit. A new command that writes or reads workspace files must record them the same way:
 
 - `hash_file(..., pending=...)` and `hash_directory(..., pending=...)` append `(path, stat, hash)` for each file they had to read instead of saving it; the caller saves them in one `state.save_file_hashes` call. A command over many targets collects them in a `state.FileHashBatch` and saves once per state directory when it ends (`checkout`, `get`), not once per target.
 - A restore records each file with the stat of what it staged, taken before the rename puts it in place (the same inode): `cache.restore_from_cache(..., recorded=...)`, `cache.atomic_write_file`'s return value. A write that lands after the rename then changes the stat, so the entry does not vouch for it.
@@ -140,23 +140,30 @@ When multiple `pivot` processes share the same StateDB:
 - A tree's name is the XXH64 of its manifest. Content addressing by XXH64 guards against
   accident, not against a chosen-digest forgery: XXH64's finalization is invertible, so 16 free
   bytes near the end of a manifest someone commits in a `.pvt` or lock steer it to any tree's
-  name in under a second. No trust decision may rest on an attacker failing to hit an XXH64
-  digest. A tree is therefore trusted only for the manifest pivot checked it to hold: the marker
-  records the SHA-256 of that manifest's canonical JSON (`cache._canonical_manifest`: the four
-  fields pivot writes per entry, entries sorted by relpath and empty directories sorted, as
-  `hash_directory` writes them, a relpath or empty directory listed twice refused;
-  `cache._mark_tree`), and a restore trusts the tree only when the caller's canonical manifest
-  has that digest. A tree marked for another manifest is neither trusted nor changed; a tree
-  with an empty marker (an older pivot's) is checked but never repaired; an unmarked tree is
-  checked, and marked only if it holds the caller's manifest exactly, its recorded empty
-  directories included (exactly the tree's, as `hash_directory` finds them). So one tree has one
-  canonical manifest, and no other form of its entries (another order, a duplicate, a full
-  directory listed as empty) can mark it for another digest. A restore's manifest comes from a
-  `.pvt` or a lock, so it is a claim, not a source of truth: it never drives a write into the
-  cache. Repairing toward it and then comparing the result with that same manifest proves nothing
-  (a forged manifest would rewrite the bytes of every output already linked to the tree). A
-  commit repairs toward `hash_directory` of the bytes it commits, and after a repair the tree's
-  manifest is recomputed and must equal that manifest entry for entry before the tree is marked.
+  name in under a second. No **restore** trust decision may rest on an attacker failing to hit an
+  XXH64 digest: a restore's manifest is a claim and never drives a write into the cache. A commit
+  is different: its manifest is `hash_directory` of the stage-written bytes, and it may repair an
+  unmarked tree those bytes' XXH64 names. This is identical at main: a user's own stage can write
+  colliding bytes into a tree an output is linked to, where they still match the lock; closing it
+  would give up #522's automatic repair of stale legacy trees. The marker and canonical-manifest
+  rules below protect against committed `.pvt` and lock manifests, not stage-written collisions.
+  For those committed manifests, a tree is trusted only for the manifest pivot checked it to hold:
+  the marker records the SHA-256 of that manifest's canonical JSON
+  (`cache._canonical_manifest`: the four fields pivot writes per entry, entries sorted by relpath
+  and empty directories sorted, as `hash_directory` writes them, a relpath or empty directory
+  listed twice refused; `cache._mark_tree`), and a restore trusts the tree only when the caller's
+  canonical manifest has that digest. A tree marked for another manifest is neither trusted nor
+  changed; a tree with an empty marker (an older pivot's) is checked but never repaired; an
+  unmarked tree is checked, and marked only if it holds the caller's manifest exactly, its
+  recorded empty directories included (exactly the tree's, as `hash_directory` finds them). So
+  one tree has one canonical manifest, and no other form of its entries (another order, a
+  duplicate, a full directory listed as empty) can mark it for another digest. A restore's
+  manifest comes from a `.pvt` or a lock, so it is a claim, not a source of truth: it never drives
+  a write into the cache. Repairing toward it and then comparing the result with that same
+  manifest proves nothing (a forged manifest would rewrite the bytes of every output already
+  linked to the tree). A commit repairs toward `hash_directory` of the bytes it commits, and after
+  a repair the tree's manifest is recomputed and must equal that manifest entry for entry before
+  the tree is marked.
   A manifest whose XXH64 is not the tree's name, or that lacks a field pivot writes or holds one
   JSON cannot encode, is refused before anything is read; that only spares work. Any refused
   manifest restores file by file, where each restored file is the cache object its own hash
@@ -165,9 +172,13 @@ When multiple `pivot` processes share the same StateDB:
   Known limits: pivot does not re-read a marked tree, so a tree whose files someone with write
   access to the cache edits, or whose marker they rewrite, after it was marked stays trusted; an
   empty marker an older pivot wrote, which this user cannot replace, costs a content check on
-  every symlink restore through that tree until a user who can write the cache re-marks it; and
-  an unmarked tree that does not match is restored file by file until a commit of that output
-  repairs it.
+  every symlink restore through that tree until a user who can write the cache re-marks it; an
+  unmarked tree that does not match is restored file by file until a commit of that output
+  repairs it; and a symlink commit can replace an unmarked tree with stage-written bytes whose
+  `hash_directory` XXH64 collides with the tree's name. That is identical on main: an output
+  already linked to the tree then reads the stage-written bytes and still matches its lock. A
+  marked tree refuses this commit, but closing the unmarked case would remove #522's automatic
+  repair of stale legacy trees.
 
 ## Path Storage
 

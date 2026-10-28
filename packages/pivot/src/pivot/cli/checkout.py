@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
+import logging
 import os
 import pathlib
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import click
+import lmdb
 
 from pivot import config, exceptions, project, registry, types
 from pivot.cli import completion
@@ -18,10 +21,31 @@ from pivot.storage import cache, lock, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterator, Mapping
 
 RestoreResult = Literal["restored", "skipped", "missing"]
 MAX_CONCURRENT_RESTORES = 32
+
+logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _open_hash_cache_for_checkout(
+    state_dir: pathlib.Path | None,
+) -> Iterator[state.StateDB | None]:
+    """Yield ``state_dir``'s hash cache where it opens read-only, else None. Main's checkout
+    never opened the database, and the cache is best-effort, so a database checkout cannot open
+    (damaged, or unopenable on a writable filesystem, which ``state.open_readonly`` raises for)
+    must not prevent a restore: the caller reads files and restores from objects as without a
+    cache. Only the open is caught; an error inside the caller's block propagates. Other callers
+    still report a damaged database (``state.open_readonly``'s policy)."""
+    with contextlib.ExitStack() as stack:
+        try:
+            state_db = stack.enter_context(state.open_readonly(state_dir, create=False))
+        except (OSError, lmdb.Error) as error:
+            logger.debug("Restoring without the state database in %s: %s", state_dir, error)
+            state_db = None
+        yield state_db
 
 
 class RestoreOutcome(NamedTuple):
@@ -177,7 +201,7 @@ def _restore_path_locked(
         match behavior:
             case CheckoutBehavior.ERROR:
                 read = list[tuple[pathlib.Path, os.stat_result, str]]()
-                with state.open_readonly(hash_state_dir, create=False) as state_db:
+                with _open_hash_cache_for_checkout(hash_state_dir) as state_db:
                     matches = _on_disk_matches_expected(
                         path, output_hash, cache_dir, state_db, read
                     )
@@ -195,7 +219,7 @@ def _restore_path_locked(
                 if not is_dir_hash(output_hash) or path.is_symlink() or not path.is_dir():
                     return RestoreOutcome("skipped", path.name, skipped_files=total)
                 settled = list[tuple[pathlib.Path, os.stat_result, str]]()
-                with state.open_readonly(hash_state_dir, create=False) as state_db:
+                with _open_hash_cache_for_checkout(hash_state_dir) as state_db:
                     outcome = cache.restore_missing_in_directory(
                         path, output_hash, cache_dir, checkout_modes, state_db, settled
                     )

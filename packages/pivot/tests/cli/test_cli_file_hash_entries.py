@@ -9,7 +9,6 @@ The tests drive the installed `pivot` binary, as a user does.
 
 from __future__ import annotations
 
-import contextlib
 import datetime
 import errno
 import os
@@ -20,6 +19,7 @@ import uuid
 from typing import TYPE_CHECKING, cast
 
 import boto3
+import lmdb
 import pytest
 import xxhash
 import yaml
@@ -30,7 +30,7 @@ from pivot.storage import cache, state
 from tests import xxh64_forge
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable
 
     import click.testing
 
@@ -624,75 +624,43 @@ def test_a_lock_manifest_value_json_cannot_encode_does_not_fail_a_restore(
     assert len([path for path in (root / _OUTPUT).rglob("*") if path.is_file()]) == 12
 
 
-@contextlib.contextmanager
-def _helper_read_only_state(root: pathlib.Path) -> Generator[None]:
-    """``root``'s `.pivot/state.lmdb` readable but not writable, which LMDB will not open even
-    read-only, for the duration."""
-    lmdb_dir = root / ".pivot" / "state.lmdb"
-    modes = {path: path.stat().st_mode for path in [lmdb_dir, *lmdb_dir.iterdir()]}
-    for path, mode in modes.items():
-        path.chmod(mode & ~0o222)
-    try:
-        yield
-    finally:
-        for path, mode in modes.items():
-            path.chmod(mode)
-
-
-def test_checkout_restores_with_a_state_database_it_cannot_write(tmp_path: pathlib.Path) -> None:
-    """B3 (round 6): with `.pivot/state.lmdb` readable but not writable, LMDB will not open it even
-    read-only, and at 0664ea83 checkout's hash lookup failed the command where main restores. A
-    hash cache that cannot be opened is skipped: the check reads the files and checkout restores."""
+def test_checkout_restores_with_a_damaged_state_database(tmp_path: pathlib.Path) -> None:
+    """Round 7-1: a damaged `state.lmdb` raises `lmdb.Error` on a writable filesystem. Status
+    and verify may report that damage as on main, but main's checkout never opened the database,
+    so checkout must restore without the hash cache rather than fail after it has a cache object
+    for every file."""
     root = tmp_path / "project"
     files = _helper_tracked_files(root, 3)
     for path in files[1:]:
         path.unlink()
-    with _helper_read_only_state(root):
-        proc = _pivot(root, "checkout", "--checkout-mode", "copy")
+    (root / ".pivot" / "state.lmdb" / "data.mdb").write_bytes(b"\x00not an lmdb file" * 8192)
+
+    proc = _pivot(root, "checkout", "--checkout-mode", "copy")
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert [path.read_text() for path in files] == [f"tracked {i}\n" for i in range(3)]
 
 
-def test_status_reports_tracked_files_with_a_state_database_it_cannot_write(
-    tmp_path: pathlib.Path,
-) -> None:
-    """B3 at status: the tracked-file status opens the hash cache through `state.open_readonly`,
-    so a database this user cannot write leaves it reading the files instead of failing."""
+def test_checkout_restores_with_a_state_database_it_cannot_write(tmp_path: pathlib.Path) -> None:
+    """`.pivot/state.lmdb` readable but not writable, on a writable filesystem: LMDB will not open
+    it even read-only, and `state.open_readonly` raises (the mount is writable). Main's checkout
+    never opened the database, so checkout restores without the hash cache."""
     root = tmp_path / "project"
-    _helper_tracked_files(root, 3)
-    with _helper_read_only_state(root):
-        proc = _pivot(root, "status")
+    files = _helper_tracked_files(root, 3)
+    for path in files[1:]:
+        path.unlink()
+    lmdb_dir = root / ".pivot" / "state.lmdb"
+    modes = {path: path.stat().st_mode for path in [lmdb_dir, *lmdb_dir.iterdir()]}
+    for path, mode in modes.items():
+        path.chmod(mode & ~0o222)
+    try:
+        proc = _pivot(root, "checkout", "--checkout-mode", "copy")
+    finally:
+        for path, mode in modes.items():
+            path.chmod(mode)
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
-
-
-@pytest.mark.parametrize("command", [("status", "--explain"), ("verify",)])
-def test_explanations_run_with_a_state_database_it_cannot_write(
-    tmp_path: pathlib.Path, command: tuple[str, ...]
-) -> None:
-    """Round 7 (review item 1): the explanation opened the StateDB itself, so with a database this
-    user cannot write every stage explanation failed ("Failed to get explanation ... Permission
-    denied"). It opens it through `state.open_readonly` and reads the files instead."""
-    root = _helper_project(tmp_path / "project")
-    with _helper_read_only_state(root):
-        proc = _pivot(root, *command)
-
-    assert "Failed to get explanation" not in proc.stdout + proc.stderr
-
-
-def test_the_tracked_file_check_runs_with_a_state_database_it_cannot_write(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """B3 at repro's pre-flight (`executor.core.verify_tracked_files`): it opens the hash cache
-    through `state.open_readonly`, so a database this user cannot write leaves it reading the
-    tracked files instead of failing."""
-    root = tmp_path / "project"
-    _helper_tracked_files(root, 3)
-    monkeypatch.chdir(root)
-    monkeypatch.setattr(project, "_project_root_cache", None)
-    with _helper_read_only_state(root):
-        executor_core.verify_tracked_files(root)
+    assert [path.read_text() for path in files] == [f"tracked {i}\n" for i in range(3)]
 
 
 def _helper_tracked_files(root: pathlib.Path, count: int) -> list[pathlib.Path]:
@@ -724,6 +692,96 @@ def _helper_restore_args(files: list[pathlib.Path], command: str) -> tuple[str, 
     if command == "checkout":
         return ("checkout", "--checkout-mode", "copy")
     return ("get", "--rev", "HEAD", "--checkout-mode", "copy", *(path.name for path in files))
+
+
+def _helper_state_on_a_read_only_mount(monkeypatch: pytest.MonkeyPatch, root: pathlib.Path) -> None:
+    """Make ``root``'s `.pivot/state.lmdb` behave as on a read-only mount, in this process: LMDB
+    refuses to open it with a plain `lmdb.Error`, as it does for an existing database there, and
+    `statvfs` of `state.lmdb` itself (not its parent) reports `ST_RDONLY`."""
+    lmdb_path = root / ".pivot" / "state.lmdb"
+    real_statvfs = os.statvfs
+
+    class _StatVfs:
+        f_flag: int
+
+        def __init__(self, flag: int) -> None:
+            self.f_flag = flag
+
+    def lmdb_error(*_: object, **__: object) -> object:
+        raise lmdb.Error("mdb_env_open: Read-only file system")
+
+    def statvfs(path: str | os.PathLike[str]) -> object:
+        if pathlib.Path(path) == lmdb_path:
+            return _StatVfs(os.ST_RDONLY)
+        return real_statvfs(path)
+
+    monkeypatch.setattr(state, "_acquire_shared_env", lmdb_error)
+    monkeypatch.setattr(os, "statvfs", statvfs)
+
+
+def test_checkout_restores_when_its_state_database_is_on_a_read_only_filesystem(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, runner: click.testing.CliRunner
+) -> None:
+    """Round 7-1: LMDB reports an existing database on a read-only mount as plain `lmdb.Error`.
+    `state.open_readonly` checks the mount of `state.lmdb` itself, not its parent, and yields no
+    cache, so checkout compares and restores files as main does."""
+    root = tmp_path / "project"
+    files = _helper_tracked_files(root, 3)
+    for path in files[1:]:
+        path.unlink()
+    _helper_state_on_a_read_only_mount(monkeypatch, root)
+
+    result = _helper_invoke(runner, monkeypatch, root, *_helper_restore_args(files, "checkout"))
+
+    assert result.exit_code == 0, result.output
+    assert [path.read_text() for path in files] == [f"tracked {i}\n" for i in range(3)]
+
+
+def test_status_reports_tracked_files_with_its_state_database_on_a_read_only_filesystem(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, runner: click.testing.CliRunner
+) -> None:
+    """The tracked-file status opens the hash cache through `state.open_readonly`, so a state
+    database on a read-only mount leaves it reading the files instead of failing."""
+    root = tmp_path / "project"
+    _helper_tracked_files(root, 3)
+    _helper_state_on_a_read_only_mount(monkeypatch, root)
+
+    result = _helper_invoke(runner, monkeypatch, root, "status")
+
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize("command", [("status", "--explain"), ("verify",)])
+def test_explanations_run_with_their_state_database_on_a_read_only_filesystem(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runner: click.testing.CliRunner,
+    command: tuple[str, ...],
+) -> None:
+    """Review item 1: the explanation opens the hash cache through `state.open_readonly`, so a
+    state database on a read-only mount leaves every stage explanation reading the files."""
+    root = _helper_project(tmp_path / "project")
+    _helper_state_on_a_read_only_mount(monkeypatch, root)
+
+    result = _helper_invoke(runner, monkeypatch, root, *command)
+
+    assert "Failed to get explanation" not in result.output
+    assert result.exit_code == 0, result.output
+
+
+def test_the_tracked_file_check_runs_with_its_state_database_on_a_read_only_filesystem(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repro's pre-flight (`executor.core.verify_tracked_files`) opens the hash cache through
+    `state.open_readonly`, so a state database on a read-only mount leaves it reading the tracked
+    files instead of failing."""
+    root = tmp_path / "project"
+    _helper_tracked_files(root, 3)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(project, "_project_root_cache", None)
+    _helper_state_on_a_read_only_mount(monkeypatch, root)
+
+    executor_core.verify_tracked_files(root)
 
 
 @pytest.mark.parametrize("command", ["checkout", "get"])
