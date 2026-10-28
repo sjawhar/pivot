@@ -1773,12 +1773,12 @@ def _unmarked_shards_tree_with_stale_member(
     return root, tree, stale_entry["hash"]
 
 
-def test_symlink_checkout_repairs_stale_bytes_in_a_complete_unmarked_tree(
+def test_symlink_checkout_restores_file_by_file_past_stale_bytes_in_a_complete_unmarked_tree(
     tmp_path: pathlib.Path,
 ) -> None:
-    """An unmarked SYMLINK cache tree that holds every recorded file at its recorded size, one
-    with stale bytes, is checked by content before a restore links it into the workspace."""
-    root, _, _ = _unmarked_shards_tree_with_stale_member(tmp_path)
+    """An unmarked SYMLINK cache tree with stale bytes is not trusted. Checkout restores each
+    file from its object and leaves the unmarked tree unchanged."""
+    root, tree, _ = _unmarked_shards_tree_with_stale_member(tmp_path)
     shards = root / "data" / "d" / "shards.dat"
 
     proc = _pivot(root, "checkout", "--checkout-mode", "symlink", "d/shards")
@@ -1786,6 +1786,8 @@ def test_symlink_checkout_repairs_stale_bytes_in_a_complete_unmarked_tree(
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (shards / "0.txt").read_text() == "11"
     assert (shards / "1.txt").read_text() == "15"
+    assert not shards.is_symlink()
+    assert (tree / "0.txt").read_text() == "xx"
 
 
 # The mark pivot 0.3.5 to 0.5.11 put beside a tree after checking its files' sizes, not content
@@ -1833,12 +1835,11 @@ def test_symlink_restore_does_not_trust_a_stale_tree_an_older_pivot_marked_after
 
 
 @pytest.mark.skipif(not os.environ.get("CI"), reason="installs pivot 0.5.11 from PyPI; runs in CI")
-def test_symlink_checkout_repairs_a_stale_tree_pivot_0_5_11_linked_and_marked(
+def test_symlink_checkout_restores_file_by_file_past_a_stale_tree_pivot_0_5_11_linked_and_marked(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Two builds on one project. Pivot 0.5.11, the last release whose tree check compared only
-    sizes, links a stale same-size tree into the workspace and marks it; this build's checkout
-    then checks the tree by content and repairs it rather than trusting that mark."""
+    """Pivot 0.5.11 links a stale same-size tree after a size check. This build does not trust
+    that marker. It restores the directory file by file."""
     released = helpers.venv_pivot(tmp_path / "venv", "pivot==0.5.11")
     (tmp_path / "project").mkdir()
     root, tree, _ = _unmarked_shards_tree_with_stale_member(tmp_path / "project")
@@ -1854,18 +1855,18 @@ def test_symlink_checkout_repairs_a_stale_tree_pivot_0_5_11_linked_and_marked(
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (shards / "0.txt").read_text() == "11"
+    assert not shards.is_symlink()
 
 
 @pytest.mark.parametrize(
     "marks",
     [pytest.param((), id="unmarked"), pytest.param((_SIZE_CHECKED_MARK,), id="size-checked")],
 )
-def test_symlink_checkout_through_an_unrepairable_stale_tree_writes_nothing(
+def test_symlink_checkout_with_stale_tree_and_missing_object_writes_nothing(
     tmp_path: pathlib.Path, marks: tuple[str, ...]
 ) -> None:
-    """A SYMLINK tree with a stale member whose own cache object is gone cannot be repaired,
-    whether unmarked or marked by an older pivot's size check: checkout fails and leaves the
-    workspace without the output, rather than linking the stale bytes."""
+    """A stale tree is not trusted. When the stale member's cache object is missing, checkout
+    cannot restore file by file. It fails and leaves the workspace without the output."""
     root, tree, stale_hash = _unmarked_shards_tree_with_stale_member(tmp_path)
     for suffix in marks:
         tree.with_name(tree.name + suffix).touch()

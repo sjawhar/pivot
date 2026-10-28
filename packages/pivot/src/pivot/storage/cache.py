@@ -173,10 +173,10 @@ def hash_file(
 ) -> tuple[str, os.stat_result]:
     """Compute xxhash64 of file contents, using state cache if available.
 
-    A hash read from the file is saved to a writable ``state_db`` at once, unless ``pending``
-    is given: then ``(path, stat, hash)`` is appended to it instead, for the caller to save in
-    one transaction, or, when ``state_db`` is read-only, to hand to a process that can write.
-
+    A hash read from the file is saved to a writable ``state_db`` at once, best-effort (a failed
+    write is logged, never raised), unless ``pending`` is given: then ``(path, stat, hash)`` is
+    appended to it instead, for the caller to save in one transaction, or, when ``state_db`` is
+    read-only, to hand to a process that can write.
     Returns:
         Tuple of (file_hash, file_stat) where file_hash is the xxhash64 hex digest
         and file_stat is the os.stat_result for the file.
@@ -195,7 +195,7 @@ def hash_file(
     if pending is not None:
         pending.append((path, file_stat, file_hash))
     elif state_db is not None and not state_db.readonly:
-        state_db.save(path, file_stat, file_hash)
+        _ = state_db.save_many_best_effort([(path, file_stat, file_hash)])
 
     return file_hash, file_stat
 
@@ -379,8 +379,8 @@ def hash_directory(
     - Base path may be a symlink; the walk below it follows none
 
     With a ``state_db``, every file's cached hash is looked up in one read transaction. The
-    hashes read from files are saved to a writable ``state_db`` in one write transaction, unless
-    ``pending`` is given: then they are appended to it, as ``hash_file`` does.
+    hashes read from files are saved to a writable ``state_db`` in one best-effort write
+    transaction, unless ``pending`` is given: then they are appended to it, as ``hash_file`` does.
 
     Args:
         path: Directory to hash
@@ -419,7 +419,7 @@ def hash_directory(
     else:
         cached = [None] * len(stats)
 
-    # The hashes read below go to the caller's ``pending``, or are saved here in one write.
+    # The hashes read below go to the caller's ``pending``, or are saved here best-effort.
     saving = pending is None and state_db is not None and not state_db.readonly
     read = list[tuple[pathlib.Path, os.stat_result, str]]() if saving else pending
     manifest = list[DirManifestEntry]()
@@ -446,7 +446,7 @@ def hash_directory(
         )
 
     if saving and read and state_db is not None:
-        state_db.save_many(read)
+        _ = state_db.save_many_best_effort(read)
 
     if left_out and warn_left_out_symlinks:
         log_left_out_symlinks(path, left_out)
@@ -870,7 +870,7 @@ def _checkout_from_cache(
     elif checkout_mode == CheckoutMode.HARDLINK and path.exists() and not path.is_symlink():
         with contextlib.suppress(OSError):
             linked = path.stat()
-            if linked.st_ino == cache_path.stat().st_ino:
+            if _is_same_file(linked, cache_path):
                 return linked
 
     tmp_path = staging_path or path.parent / f"{_RESTORE_TEMP_PREFIX}{secrets.token_hex(8)}"
@@ -942,7 +942,7 @@ def _repair_tree_dir_isexec(cache_dir_path: pathlib.Path, files: list[DirManifes
 # user who cannot write its prefix directory cannot mark it.
 _TREE_LAYOUT_MARKER_SUFFIX = ".content-checked"
 _LEGACY_TREE_MARKER_SUFFIXES = (".layout-checked", ".verified")
-# Held exclusively while a tree is checked and repaired; never deleted.
+# Held exclusively while a tree is checked, marked, or (for a commit) repaired; never deleted.
 _TREE_LOCK_SUFFIX = ".lock"
 
 
@@ -953,17 +953,23 @@ def _tree_layout_marker(cache_dir_path: pathlib.Path) -> pathlib.Path:
     return cache_dir_path.with_name(cache_dir_path.name + _TREE_LAYOUT_MARKER_SUFFIX)
 
 
-def _tree_marker_matches(cache_dir_path: pathlib.Path, canonical: bytes) -> bool:
-    """Whether the tree's marker holds exactly the canonical listing bytes from its mark.
+def _read_tree_marker(cache_dir_path: pathlib.Path) -> bytes | None:
+    """Return a tree's canonical listing marker, or None when no marker exists.
 
-    A tree's XXH64 path is only an index: distinct listing bytes can share it. Comparing the
-    supplied listing to the bytes a commit verified before it marked this tree keeps such a
-    forged listing from selecting a tree as its own.
+    An unreadable or empty marker is not trusted. An older Pivot could leave an empty marker;
+    an empty directory therefore takes the content-check path rather than trusting that mark.
     """
     try:
-        return _tree_layout_marker(cache_dir_path).read_bytes() == canonical
+        return _tree_layout_marker(cache_dir_path).read_bytes()
+    except FileNotFoundError:
+        return None
     except OSError:
-        return False
+        return b""
+
+
+def _tree_marker_matches(cache_dir_path: pathlib.Path, canonical: bytes) -> bool:
+    """Whether a non-empty marker holds exactly the canonical listing bytes from its mark."""
+    return bool(canonical) and _read_tree_marker(cache_dir_path) == canonical
 
 
 def _mark_tree(cache_dir_path: pathlib.Path, canonical: bytes) -> None:
@@ -974,8 +980,8 @@ def _mark_tree(cache_dir_path: pathlib.Path, canonical: bytes) -> None:
         with os.fdopen(fd, "wb") as f:
             _ = f.write(canonical)
 
-    with contextlib.suppress(OSError):
-        atomic_write_file(_tree_layout_marker(cache_dir_path), write_marker)
+    with contextlib.suppress(OSError), _staging_in(cache_dir_path.parent):
+        atomic_write_file(_tree_layout_marker(cache_dir_path), write_marker, mode=0o444)
     for suffix in _LEGACY_TREE_MARKER_SUFFIXES:
         with contextlib.suppress(OSError):
             cache_dir_path.with_name(cache_dir_path.name + suffix).unlink(missing_ok=True)
@@ -1019,6 +1025,10 @@ def _tree_matches(
         return False
     if found_dirs - _restored_dirs(members) or not found_dirs.issuperset(empty_dirs):
         return False
+    file_dirs = {posixpath.dirname(entry["relpath"]) for entry in files}
+    has_child = {posixpath.dirname(directory) for directory in found_dirs}
+    if set(empty_dirs) != found_dirs - file_dirs - has_child:
+        return False
     for entry in files:
         tree_file = cache_dir_path / entry["relpath"]
         found_stat = os.lstat(tree_file)
@@ -1038,13 +1048,18 @@ def _ensure_tree_complete(
 ) -> bool:
     """Return whether a tree holds ``members`` and is marked with those canonical listing bytes.
 
-    Only a commit passes ``repair=True``: its ``members`` came from ``hash_directory`` of the
-    real output bytes. Restore and cache-missing checks pass False; their supplied listing may be
-    a forged XXH64 collision, so it can never drive a write into the cache or mark a tree.
+    A tree's XXH64 path is only an index. A non-empty marker for different listing bytes is a
+    tree another output already verified, so it is neither trusted nor changed. Only a commit
+    passes ``repair=True``: its members came from ``hash_directory`` of real output bytes.
+    Restore and cache-missing checks may verify and mark a matching tree, but never repair it
+    toward a supplied listing.
     """
     canonical = listing.encode(members)
+    marked = _read_tree_marker(cache_dir_path)
     if _tree_marker_matches(cache_dir_path, canonical):
         return True
+    if marked:
+        return False
     fd: int | None
     try:
         fd = _open_cache_lock(cache_dir_path.with_name(cache_dir_path.name + _TREE_LOCK_SUFFIX))
@@ -1059,23 +1074,27 @@ def _ensure_tree_complete(
             except OSError:  # NFS refuses an exclusive lock on a file opened read-only
                 os.close(fd)
                 fd = None
+        marked = _read_tree_marker(cache_dir_path)
         if _tree_marker_matches(cache_dir_path, canonical):
             return True
+        if marked:
+            return False
         try:
             scanned = _scan_entries(cache_dir_path)
             if not _tree_matches(cache_dir_path, members, scanned):
-                if not repair:
+                if not repair or fd is None:
                     return False
                 _repair_tree_dir_isexec(cache_dir_path, members["files"])
                 _repair_tree_dir_layout(cache_dir_path, members, scanned)
                 if not _repair_tree_dir_files(cache_dir_path, members["files"], cache_dir):
                     return False
+                repaired = hash_directory(cache_dir_path, cache_dir=cache_dir)
+                if repaired["data"] != canonical:
+                    return False
         except PermissionError:  # another user's tree, or one with a file this user cannot read
             return False
-        if not repair:
-            return False
         _mark_tree(cache_dir_path, canonical)
-        return _tree_marker_matches(cache_dir_path, canonical)
+        return True
     finally:
         if fd is not None:
             os.close(fd)
@@ -1459,8 +1478,8 @@ def _publish_tree(
 
     The tree is marked only once it is checked to hold what ``members`` records: a sweep on
     another host whose flock is not coherent with this host's can remove files from the copy
-    while it is built (see storage/AGENTS.md). An unmarked tree is checked and repaired by the
-    next commit or restore through it (``_ensure_tree_complete``).
+    while it is built (see storage/AGENTS.md). An unmarked tree is checked by the next restore
+    or commit through it. Only the commit can repair it (``_ensure_tree_complete``).
     """
     manifest = members["files"]
 
@@ -1739,11 +1758,12 @@ def _restore_directory_from_cache(
     if symlink_fast_path and not _ensure_tree_complete(
         cache_dir_path, members, cache_dir, repair=False
     ):
-        # Same check as _store_directory. A tree this user cannot check or repair is not used:
-        # the output is restored file by file from the objects instead, if they are cached.
+        # This is the same content check as _store_directory, but a restore never repairs.
+        # A tree that does not match its canonical marker is restored file by file when its
+        # individual objects are available.
         logger.warning(
-            "Cache tree %s differs from what its listing records, or cannot be read, and cannot "
-            + "be repaired; restoring %s file by file",
+            "Cache tree %s does not match its canonical listing marker, or cannot be read; "
+            + "a restore never repairs it, restoring %s file by file",
             cache_dir_path,
             path,
         )
@@ -1881,9 +1901,10 @@ def _is_cached(cache_dir: pathlib.Path, content_hash: str | None) -> bool:
 
 
 def _scan_entries(path: pathlib.Path) -> tuple[list[str], list[str]]:
-    """Return every file and symlink, and every directory, under ``path`` as relative paths.
+    """Return every non-directory entry and every directory under ``path`` as relative paths.
 
-    Symlinked directories count as symlinks and are not followed.
+    Symlinked directories count as entries and are not followed. An unlisted special file is an
+    entry too: a tree can be trusted only when it holds exactly the regular files a listing names.
     """
     files = list[str]()
     dirs = list[str]()
@@ -1898,6 +1919,8 @@ def _scan_entries(path: pathlib.Path) -> tuple[list[str], list[str]]:
                 elif entry.is_dir():
                     dirs.append(relpath)
                     _walk(entry_path)
+                else:
+                    files.append(relpath)
 
     _walk(path)
     return files, dirs

@@ -24,6 +24,7 @@ UTF-8; an empty directory's ``/`` goes inside the quotes. The listing is always 
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import operator
@@ -329,10 +330,11 @@ def _enc(value: str) -> str:
 
 
 def _short(value: str) -> str:
-    """A deterministic file-name-safe abbreviation for a listing name that would exceed
-    NAME_MAX. The original value remains in the lock or `.pvt`; only its sidecar's name changes.
+    """A deterministic collision-resistant abbreviation for an overlong listing name.
+
+    The original value remains in the lock or ``.pvt``; only its sidecar's name changes.
     """
-    return f"~{xxhash.xxh64(os.fsencode(value)).hexdigest()}"
+    return f"~{hashlib.sha256(os.fsencode(value)).hexdigest()}"
 
 
 def _checked(path: pathlib.Path, fallback: Callable[[], pathlib.Path]) -> pathlib.Path:
@@ -343,8 +345,8 @@ def _checked(path: pathlib.Path, fallback: Callable[[], pathlib.Path]) -> pathli
 def output_listing_path(stages_dir: pathlib.Path, identity: ArtifactIdentity) -> pathlib.Path:
     """``<stages_dir>/<stage_name>=<enc(key)>.listing``, beside the writing stage's lock.
 
-    A key whose encoded bytes would exceed NAME_MAX uses `~` plus its xxhash64 instead; the
-    original key remains in the lock, so this changes no artifact identity.
+    A key whose encoded bytes would exceed NAME_MAX uses ``~`` plus its SHA-256 digest instead;
+    the original key remains in the lock, so this changes no artifact identity.
     """
     key = identity.key or ""
     return _checked(
@@ -356,7 +358,7 @@ def output_listing_path(stages_dir: pathlib.Path, identity: ArtifactIdentity) ->
 def input_listing_path(stages_dir: pathlib.Path, input_path: str) -> pathlib.Path:
     """``<stages_dir>/=inputs/<enc(project-relative path)>.listing``, one per project input.
 
-    An encoded path beyond NAME_MAX uses `~` plus its xxhash64.
+    An encoded path beyond NAME_MAX uses ``~`` plus its SHA-256 digest.
     """
     inputs = stages_dir / INPUTS_DIR
     return _checked(
@@ -367,7 +369,7 @@ def input_listing_path(stages_dir: pathlib.Path, input_path: str) -> pathlib.Pat
 
 def tracked_listing_path(pvt_path: pathlib.Path) -> pathlib.Path:
     """``<path>.pvt.listing``, beside a tracked directory's ``.pvt``; a name that would exceed
-    NAME_MAX uses `.~<xxhash64>.pvt.listing` in the same directory."""
+    NAME_MAX uses ``.~<SHA-256>.pvt.listing`` in the same directory."""
     direct = pvt_path.with_name(pvt_path.name + SUFFIX)
     return _checked(
         direct,
@@ -592,17 +594,42 @@ def write(path: pathlib.Path, data: bytes) -> None:
 
 
 def store_object(cache_dir: pathlib.Path, directory_hash: str, data: bytes) -> None:
-    """Put a listing in the cache as the object at its directory's hash, read-only. Bytes that
-    do not hash to ``directory_hash`` are refused: a cache object must be what its name says."""
+    """Put a listing in the cache as the object at its directory's hash, read-only.
+
+    Bytes that do not hash to ``directory_hash`` are refused. An existing object must have the
+    same bytes: XXH64 is only an index, so two different listings with the same digest are a
+    collision, not interchangeable cache objects.
+    """
     cache_path = cache.get_cache_path(cache_dir, directory_hash)
-    if cache_path.exists():
-        return
-    if (actual := digest(data)) != directory_hash:
+    actual = digest(data)
+    if actual != directory_hash:
         raise ValueError(
             f"Listing bytes hash to {actual}, not to directory hash {directory_hash}; not cached"
         )
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def verify_existing() -> bool:
+        try:
+            existing = cache_path.read_bytes()
+        except FileNotFoundError:
+            return False
+        if existing == data:
+            return True
+        existing_hash = digest(existing)
+        if existing_hash != directory_hash:
+            raise exceptions.CorruptListingError(
+                f"{cache_path}: its bytes hash to {existing_hash}, not to directory hash "
+                + f"{directory_hash}"
+            )
+        raise exceptions.CorruptListingError(
+            f"{cache_path}: its bytes differ from a listing that also hashes to directory "
+            + f"{directory_hash}; refuse an XXH64 collision"
+        )
+
+    if verify_existing():
+        return
     with cache.staged_cache_file(cache_path) as staged:
         staged.write_bytes(data)
         os.chmod(staged, 0o444)
-        cache.publish_cache_object(staged, cache_path)
+        if cache.publish_cache_object(staged, cache_path):
+            return
+    _ = verify_existing()

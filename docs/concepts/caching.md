@@ -35,18 +35,19 @@ listing hash, total size and file count.
   state.lmdb/              # LMDB database
 ```
 
-Each prefix directory also holds a `.pivot_cache.lock` file, and while a file
-or directory is being cached a `.pivot_tmp_*` entry; in `symlink` checkout
-mode, each cached directory tree has a `<hash>.content-checked` marker and may
-have a `<hash>.lock` file beside it. Pivot keeps the lock files and removes the
-`.pivot_tmp_*` entries a killed process leaves (at most once an hour per
-prefix directory). Do not delete these files while pivot runs. A tree that
-pivot 0.5.11 or older marked `<hash>.verified` is checked by content again,
-then marked anew. A user who cannot write the cache cannot mark it, so pivot
-checks the tree on each of their symlink restores and commits, and their
-symlink commit through a stale one fails. One
-`pivot checkout --checkout-mode symlink` through the tree by a user who can
-write the cache ends this.
+Each prefix directory also holds a `.pivot_cache.lock` file. A file or directory cache operation
+uses a `.pivot_tmp_*` entry. In `symlink` mode, each cached directory tree has a
+`<hash>.content-checked` marker and can have a `<hash>.lock` file beside it. The marker contains
+the canonical listing bytes after Pivot verifies the tree. Pivot uses a tree without a check only
+when the listing bytes match that marker. It checks an unmarked tree by content first, and it does
+not use a tree marked for other listing bytes. A restore can mark a matching tree, but it never
+repairs a tree. Only a commit can repair a tree from its file objects. Pivot keeps lock files and
+removes stale `.pivot_tmp_*` entries at most once each hour per prefix directory. Do not delete
+these files while Pivot runs. A tree that Pivot 0.5.11 or older marked `<hash>.verified` is
+checked by content again. A user who cannot write the cache cannot mark or repair a tree. Pivot
+then checks the tree on each of their symlink restores and commits, and their symlink commit
+through a stale tree fails. A `pivot checkout --checkout-mode symlink` by a user who can write the
+cache marks a tree that matches. Only a symlink commit by such a user repairs a stale tree.
 
 A cache several machines share (a `cache.dir` on a network filesystem) needs
 file locks that work across those machines: NFSv4, or NFSv3 with its lock

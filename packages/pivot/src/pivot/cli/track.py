@@ -315,6 +315,4 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
                 click.echo(result["warning"], err=True)
             click.echo(f"Tracked: {result['tracked_path']}")
     # The hashes read to track, so the next status reads none of these files.
-    if read:
-        with state.StateDB(config.get_state_dir()) as state_db:
-            state_db.save_many(read)
+    state.save_file_hashes(config.get_state_dir(), read)

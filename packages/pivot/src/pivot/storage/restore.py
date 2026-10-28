@@ -293,15 +293,6 @@ def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> os.stat_
         return cache.atomic_write_file(dest_path, write_content, staging_path=staging_path)
 
 
-def _record_file_hashes(
-    state_dir: pathlib.Path | None, entries: list[tuple[pathlib.Path, os.stat_result, str]]
-) -> None:
-    """Record the hashes of files ``get`` wrote, so the next status, explanation or run looks
-    them up instead of reading the files."""
-    with state.StateDB(state_dir or config.get_state_dir()) as state_db:
-        state_db.save_many(entries)
-
-
 def _reason(error: exceptions.PivotError | OSError) -> str:
     """``error``'s message, followed on the next line by the tip a pivot error carries."""
     if isinstance(error, exceptions.PivotError) and (tip := error.get_suggestion()):
@@ -355,7 +346,7 @@ def restore_file(
     force: bool,
     *,
     remote_factory: Callable[[], RemoteStorage],
-    hash_state_dir: pathlib.Path | None = None,
+    recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
     members: listing.DirListing | None = None,
 ) -> RestoreResult:
     """Restore a single file from revision and return its result.
@@ -365,12 +356,13 @@ def restore_file(
     A remote that raised ``RemoteUnreachableError`` is named in the result's
     ``unreachable_remote``.
 
-    ``members`` is a directory's listing at the revision; None reads the cache's object, and
-    the remote's when the cache holds none.
+    ``members`` is a directory's listing at the revision; None reads the cache's object. A
+    directory with neither is not restored: no listing names the files to restore or download.
 
-    A restore records each file's hash in the StateDB of ``hash_state_dir`` (the configured
-    state directory when None; a stage output's own state directory), so the next status,
-    explanation or run looks it up instead of reading the file.
+    A restore appends ``(path, stat, hash)`` for each file it writes to ``recorded``, for the
+    caller to batch by state directory, so the next status, explanation or run looks the file up
+    instead of reading it. Each stat is of what was staged, taken before the rename put it in
+    place.
     """
     path_str = str(dest_path)
     files_dir = cache_dir / "files"
@@ -414,7 +406,8 @@ def restore_file(
             # Strategy 3 retries this restore, and reports the error if it happens again
             logger.debug(f"Cache restore failed for {rel_path}: {e}")
         if success:
-            _record_file_hashes(hash_state_dir, restored)
+            if recorded is not None:
+                recorded.extend(restored)
             return RestoreResult(
                 status=RestoreStatus.RESTORED,
                 path=path_str,
@@ -432,9 +425,8 @@ def restore_file(
                 path=path_str,
                 message=f"Error: {dest_path} - failed to write from git: {e}",
             )
-        _record_file_hashes(
-            hash_state_dir, [(dest_path, written, xxhash.xxh64(content).hexdigest())]
-        )
+        if recorded is not None:
+            recorded.append((dest_path, written, xxhash.xxh64(content).hexdigest()))
         return RestoreResult(
             status=RestoreStatus.RESTORED,
             path=path_str,
@@ -451,7 +443,8 @@ def restore_file(
             return RestoreResult(
                 status=RestoreStatus.ERROR,
                 path=path_str,
-                message=f"Error: {dest_path} - not in local cache, git, or remote",
+                message=f"Error: {dest_path} - not in local cache or git, and no committed or "
+                + "cached listing names its files to download from the remote",
             )
         source = "cache"
         remote: RemoteStorage | None = None
@@ -489,7 +482,8 @@ def restore_file(
                 message=f"Error: {dest_path} - failed to restore from {source}: {_reason(e)}",
             )
         if success:
-            _record_file_hashes(hash_state_dir, downloaded)
+            if recorded is not None:
+                recorded.extend(downloaded)
             return RestoreResult(
                 status=RestoreStatus.RESTORED,
                 path=path_str,
@@ -543,7 +537,7 @@ def restore_targets_from_revision(
 
     results = list[RestoreResult]()
     # Resolves the remote and builds its backend once per call, not once per target that misses
-    # the cache
+    # the cache.
     open_remote = functools.cache(remote_factory)
     # A remote this call could not reach is not tried again, so an unreachable remote costs one
     # connection timeout per call, not one per target. Only RemoteUnreachableError sets it: a
@@ -558,43 +552,52 @@ def restore_targets_from_revision(
             )
         return open_remote()
 
-    for target_info in target_infos:
-        hash_state_dir = (
-            stage_targets[target_info["original_target"]]["state_dir"]
-            if target_info["target_type"] is TargetType.STAGE
-            else None
-        )
-        for rel_path in target_info["paths"]:
-            output_hash = target_info["hashes"].get(rel_path)
-            dest_path = output if output is not None else proj_root / rel_path
-            if "error" in target_info:
-                # A target already in the workspace is kept, as for a valid .pvt, so the check
-                # refuses nothing that get skipped before it
-                results.append(
-                    _skipped(dest_path, force)
-                    or RestoreResult(
-                        status=RestoreStatus.ERROR,
-                        path=str(dest_path),
-                        message=f"Error: {dest_path} - {target_info['error']}",
-                    )
-                )
-                continue
-
-            result = restore_file(
-                rel_path=rel_path,
-                output_hash=output_hash,
-                rev=rev,
-                dest_path=dest_path,
-                cache_dir=cache_dir,
-                checkout_modes=checkout_modes,
-                force=force,
-                remote_factory=reachable_remote,
-                hash_state_dir=hash_state_dir,
-                members=target_info["members"].get(rel_path),
+    # Every target's file hashes are saved once per state directory when the loop ends,
+    # best-effort. A stage output uses its stage state directory; other files use the configured
+    # project state directory.
+    batch = state.FileHashBatch()
+    try:
+        for target_info in target_infos:
+            hash_state_dir = (
+                stage_targets[target_info["original_target"]]["state_dir"]
+                if target_info["target_type"] is TargetType.STAGE
+                else config.get_state_dir()
             )
-            if "unreachable_remote" in result:
-                unreachable = result["unreachable_remote"]
-            results.append(result)
+            for rel_path in target_info["paths"]:
+                output_hash = target_info["hashes"].get(rel_path)
+                dest_path = output if output is not None else proj_root / rel_path
+                if "error" in target_info:
+                    # A target already in the workspace is kept, as for a valid .pvt, so the
+                    # check refuses nothing that get skipped before it.
+                    results.append(
+                        _skipped(dest_path, force)
+                        or RestoreResult(
+                            status=RestoreStatus.ERROR,
+                            path=str(dest_path),
+                            message=f"Error: {dest_path} - {target_info['error']}",
+                        )
+                    )
+                    continue
+
+                recorded = list[tuple[pathlib.Path, os.stat_result, str]]()
+                result = restore_file(
+                    rel_path=rel_path,
+                    output_hash=output_hash,
+                    rev=rev,
+                    dest_path=dest_path,
+                    cache_dir=cache_dir,
+                    checkout_modes=checkout_modes,
+                    force=force,
+                    remote_factory=reachable_remote,
+                    recorded=recorded,
+                    members=target_info["members"].get(rel_path),
+                )
+                batch.add(hash_state_dir, recorded)
+                if "unreachable_remote" in result:
+                    unreachable = result["unreachable_remote"]
+                results.append(result)
+    finally:
+        batch.save()
 
     # Format output: show all messages, with errors summarized at the end
     messages = [r["message"] for r in results]

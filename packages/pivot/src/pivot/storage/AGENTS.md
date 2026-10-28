@@ -18,12 +18,36 @@ Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not 
 
 ## File-Hash Write-Back
 
-Every command that writes the workspace records the hash of each file it reads, commits or restores, so `pivot status --explain` and `pivot verify` (both read-only; they write nothing and go through the same explanation path) find a matching entry and read no file. The one exception is a run with `--no-commit`, which by design writes no lock, cache or StateDB entry. A new command that writes or reads workspace files must record them the same way:
+Commands that read or write workspace files may save their hashes best-effort. A hash-cache
+failure does not fail the command. Read-only commands do not write locks, run history, or outputs.
+`--no-commit` writes no lock or `run:` history entry. It records the uncommitted run in
+`nocommit:` for a later `pivot commit`. Every command that writes the workspace saves the hash
+of each file it reads, commits or restores, so `pivot status --explain` and `pivot verify` find a
+matching entry and read no file. A new command that reads or writes workspace files must record
+them the same way:
 
-- `hash_file(..., pending=...)` and `hash_directory(..., pending=...)` append `(path, stat, hash)` for each file they had to read instead of saving it; a caller with a writable StateDB saves them with one `save_many`.
-- A restore records each file with the stat of what it staged, taken before the rename puts it in place (the same inode): `cache.restore_from_cache(..., recorded=...)`, `cache.atomic_write_file`'s return value. A write that lands after the rename then changes the stat, so the entry does not vouch for it.
-- Workers open StateDB read-only. They hand back, in `DeferredWrites.file_hash_entries` (`(path, mtime_ns, size, dev, inode, hash)` tuples, `types.FileHashEntry`, from `cache.deferred_file_hash_entries`), the dependencies and outputs they read to decide (also when the stage is cached by lock comparison), the outputs they commit and the outputs they restore; the coordinator writes them after the stage. The coordinator's own skip check writes what it reads and restores.
-- `pivot checkout` (every mode, also the files `--only-missing` keeps or restores and the existing files it compares), `pivot pull`, `pivot get` (from the cache, from git or from the remote), `pivot import`, `pivot update`, `pivot track` and repro's restore of missing tracked files (`--checkout-missing`) record what they write or read. Stage outputs go in the StateDB of the output's stage state directory, which explanations read; everything else in the configured state directory.
+- `hash_file(..., pending=...)` and `hash_directory(..., pending=...)` append `(path, stat,
+  hash)` for each file they read. The caller passes these entries to `state.save_file_hashes` or
+  `state.FileHashBatch`, which writes once per state directory.
+- Every cache save goes through `state.save_best_effort` (`state.save_file_hashes`) or
+  `StateDB.save_many_best_effort` (save-on-read in `hash_file`/`hash_directory`). They wait at
+  most `_WRITE_BACK_TIMEOUT` (2 s) for the write lock, log a failed write at debug level, and keep
+  the command's result.
+- `state.open_readonly(..., create=False)` looks hashes up without creating a database. On an
+  existing database, an `OSError` or `lmdb.Error` yields no cache only when
+  `os.statvfs(state.lmdb)` reports a read-only filesystem; otherwise it raises. `pivot checkout`
+  catches a failure to open the cache and restores without it; status and verify raise.
+- A restore records each file with the stat of what it staged before the rename puts it in place
+  (`cache.restore_from_cache(..., recorded=...)`, `cache.atomic_write_file`'s return value). A
+  write after the rename changes the stat. The entry then does not vouch for the new bytes.
+- Workers open StateDB read-only. They return `DeferredWrites.file_hash_entries`
+  (`types.FileHashEntry`, from `cache.deferred_file_hash_entries`) for the coordinator to write
+  after the stage. These are not a cache save: they share one transaction with the stage's
+  generations, which is the run's own commit. The coordinator's skip check writes what it reads
+  and restores.
+- `pivot checkout`, `pivot pull`, `pivot get`, `pivot import`, `pivot update`, `pivot track`,
+  and repro's `--checkout-missing` path record what they write or read. Stage outputs use the
+  StateDB in the output stage's state directory. Other paths use the configured state directory.
 
 ## StateDB Key Prefixes
 
@@ -106,21 +130,29 @@ When multiple `pivot` processes share the same StateDB:
   NLM). With host-local locks (NFS `nolock` or `local_lock=flock`/`all`, Lustre `localflock`)
   the locks here exclude nothing across hosts: one host's sweep can remove another host's live
   temporary entry. Where `flock()` is refused (Lustre without `flock`: ENOSYS; NFS when its lock
-  manager does not answer: ENOLCK) staging still goes on without the shared lock, but it never
-  trusts a tree merely because its XXH64 name exists.
+  manager does not answer: ENOLCK) staging still goes on without the shared lock, and this
+  process neither sweeps nor repairs a tree. It never trusts a tree merely because its XXH64
+  name exists. Only where every host sharing the cache is refused does nothing sweep: an NFSv3
+  client whose own `rpc.statd` is down gets ENOLCK while other clients' locks work, and their
+  sweeps can remove its live temporary entries.
 - A lock file in the cache is created writable by whoever can write its directory, since NFS
   takes an exclusive lock only on a file opened for writing; one this user cannot write is
   opened read-only. Lock files are never deleted.
 - A whole-directory SYMLINK tree lives at `<cache root>/trees/XX/YYYY...` (`cache.tree_path`),
-  named by the directory hash. Its `<tree>.content-checked` marker holds the exact canonical
-  listing bytes a commit verified from `hash_directory` of the real output; it is not an empty
-  "the XXH64 name looked right" flag. A supplied listing is trusted for that tree only when its
-  bytes equal the marker. A restore or `missing_cache_objects` passes `repair=False`: it checks
-  but never changes an unmarked/mismatched tree, instead restoring file by file. Only the commit
-  path passes `repair=True`, because its listing came from actual output bytes; it may repair
-  from the individual objects and write the canonical marker. `_publish_tree` never marks. A tree
-  it cannot check or repair is not used: a restore goes file by file, a commit fails. Old empty
-  `.layout-checked` (pivot 0.3.4) and `.verified` (pivot 0.3.5–0.5.11) markers are never trusted.
+  named by the directory hash. Its `<tree>.content-checked` marker holds the canonical listing
+  bytes after Pivot verifies the tree. A tree is used without a check only when its non-empty
+  marker equals the supplied listing's bytes. A different non-empty marker means another
+  listing was verified for this tree, so the tree is neither used nor changed. An unmarked tree,
+  or one with an empty, `.layout-checked` (pivot 0.3.4) or `.verified` (pivot 0.3.5–0.5.11)
+  marker, is checked under the tree's exclusive `<tree>.lock`. A restore or
+  `missing_cache_objects` passes `repair=False`. It can mark a tree that already matches, but it
+  never changes that tree. Only the commit path passes `repair=True`, because its listing came
+  from actual output bytes. It can repair from individual objects, hashes the tree again, and
+  marks it only when the result equals its listing bytes. `_publish_tree` never marks. A tree
+  that cannot be checked or repaired is not used. A restore goes file by file. A commit fails.
+  The marker is staged under the prefix directory's shared lock (`_staging_in`). A user who
+  cannot write the prefix directory cannot mark a tree, so each of their symlink restores and
+  commits checks it again.
 - The object at a directory's hash under `files/` is its listing (`listing.store_object`),
   read-only like every object. Every listing read follows one rule (`listing._resolve`): a
   committed listing (workspace file, or a file at a git revision) that hashes to the recorded
