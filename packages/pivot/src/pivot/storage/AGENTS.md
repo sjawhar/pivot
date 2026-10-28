@@ -20,7 +20,7 @@ Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not 
 
 The rule: commands that read a file may save its hash to the cache, best-effort; no read-only command writes a lock, a run record or an output, and `--no-commit` writes no lock and no run record.
 
-Every command that writes the workspace saves the hash of each file it reads, commits or restores, so an explanation (`pivot status --explain`, `pivot verify`) finds a matching entry and reads no file. A hash save never fails a command: it goes through `state.save_best_effort` (`state.save_file_hashes` for `(path, stat, hash)` entries), which logs a failed write at debug level and keeps the command's result. A new command that writes or reads workspace files must record them the same way:
+Every command that writes the workspace saves the hash of each file it reads, commits or restores, so an explanation (`pivot status --explain`, `pivot verify`) finds a matching entry and reads no file. Saving or looking up file hashes never fails a command: every save of file-hash entries goes through `state.save_best_effort` (`state.save_file_hashes` for `(path, stat, hash)` entries) or `StateDB.save_many_best_effort` (`hash_file`'s and `hash_directory`'s save-on-read), which log a failed write at debug level and keep the command's result, and a check opens the hash cache with `state.open_hash_cache`, which falls back to reading the files when the database cannot be opened. A run's deferred writes are not a cache save: they put a stage's file hashes in the same transaction as its generations, and that transaction is the run's own commit. A new command that writes or reads workspace files must record them the same way:
 
 - `hash_file(..., pending=...)` and `hash_directory(..., pending=...)` append `(path, stat, hash)` for each file they had to read instead of saving it; the caller saves them in one `state.save_file_hashes` call. A command over many targets collects them in a `state.FileHashBatch` and saves once per state directory when it ends (`checkout`, `get`), not once per target.
 - A restore records each file with the stat of what it staged, taken before the rename puts it in place (the same inode): `cache.restore_from_cache(..., recorded=...)`, `cache.atomic_write_file`'s return value. A write that lands after the rename then changes the stat, so the entry does not vouch for it.
@@ -132,13 +132,26 @@ When multiple `pivot` processes share the same StateDB:
   stale one fails, until a user who can write the cache runs one
   `pivot checkout --checkout-mode symlink` through it. That cost is the price of not trusting a
   size-only mark.
-- A tree is trusted only for a manifest that hashes to the tree's name (`cache._manifest_hash`,
-  the hash `hash_directory` names a directory by), checked before the mark is read. A manifest
-  comes from a `.pvt` or lock someone committed, so without this a forged one could make the
-  symlink fast path record hashes it chose for files it named, or repair and mark an unmarked
-  tree to the forged content for every later restore. A manifest that does not match goes file by
-  file, where each restored file is the cache object its own hash names. `.pvt` manifest relpaths
-  that are absolute or hold `..` are refused (`track.pvt_field_error`, `track.read_pvt_file`).
+- A tree's name is the XXH64 of its manifest. Content addressing by XXH64 guards against
+  accident, not against a chosen-digest forgery: XXH64's finalization is invertible, so 16 free
+  bytes near the end of a manifest someone commits in a `.pvt` or lock steer it to any tree's
+  name in under a second. No trust decision may rest on an attacker failing to hit an XXH64
+  digest. A tree is therefore trusted only for the manifest pivot checked it to hold: the marker
+  records the SHA-256 of that manifest's canonical JSON (`cache._canonical_manifest`, the four
+  fields pivot writes per entry; `cache._mark_tree`), and a restore trusts the tree only when the
+  caller's canonical manifest has that digest. A tree marked for another manifest is neither
+  trusted nor changed; a tree with an empty marker (an older pivot's) is checked but not
+  repaired; an unmarked tree is checked and repaired, and after a repair its manifest is
+  recomputed with `hash_directory` and must equal the caller's entry for entry before it is
+  marked. A manifest whose XXH64 is not the tree's name, or that lacks a field pivot writes or
+  holds one JSON cannot encode, is refused before anything is read; that only spares work and
+  keeps an honest mismatch from repairing a tree. Any refused manifest restores file by file,
+  where each restored file is the cache object its own hash names. `.pvt` manifest relpaths that
+  are absolute or hold `..` are refused (`track.pvt_field_error`, `track.read_pvt_file`).
+  Known limits: pivot does not re-read a marked tree, so a tree whose files someone with write
+  access to the cache edits after it was marked stays trusted; and an empty marker an older pivot
+  wrote, which this user cannot replace, costs a content check on every symlink restore through
+  that tree until a user who can write the cache re-marks it.
 
 ## Path Storage
 

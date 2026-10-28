@@ -61,8 +61,8 @@ _REQUIRED_KEYS = frozenset({"path", "hash", "size"})
 _VALID_KEYS = frozenset({"path", "hash", "size", "num_files", "manifest", "empty_dirs", "source"})
 _REQUIRED_SOURCE_KEYS = frozenset({"repo", "rev", "rev_lock", "stage", "path", "remote"})
 # A manifest entry's fields every restore reads, and those it builds a path or cache key from.
-# `size` is not required: a manifest without it does not hash to its tree's name
-# (`cache._manifest_hash`), so it restores file by file, which never reads `size`.
+# `size` is not required: no cache tree is trusted for a manifest without it
+# (`cache._canonical_manifest`), so it restores file by file, which never reads `size`.
 _MANIFEST_ENTRY_READ_KEYS = ("relpath", "hash", "isexec")
 _MANIFEST_ENTRY_STR_KEYS = ("relpath", "hash")
 

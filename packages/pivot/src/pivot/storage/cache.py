@@ -27,7 +27,7 @@ from pivot.types import DirHash, DirManifestEntry, FileHash, FileHashEntry, Hash
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterable
+    from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 
     from pivot.storage import state as state_mod
 
@@ -166,9 +166,10 @@ def hash_file(
 ) -> tuple[str, os.stat_result]:
     """Compute xxhash64 of file contents, using state cache if available.
 
-    A hash read from the file is saved to a writable ``state_db`` at once, unless ``pending``
-    is given: then ``(path, stat, hash)`` is appended to it instead, for the caller to save in
-    one transaction, or, when ``state_db`` is read-only, to hand to a process that can write.
+    A hash read from the file is saved to a writable ``state_db`` at once, best-effort (a failed
+    write is logged, never raised), unless ``pending`` is given: then ``(path, stat, hash)`` is
+    appended to it instead, for the caller to save in one transaction, or, when ``state_db`` is
+    read-only, to hand to a process that can write.
 
     Returns:
         Tuple of (file_hash, file_stat) where file_hash is the xxhash64 hex digest
@@ -188,7 +189,7 @@ def hash_file(
     if pending is not None:
         pending.append((path, file_stat, file_hash))
     elif state_db is not None and not state_db.readonly:
-        state_db.save(path, file_stat, file_hash)
+        _ = state_db.save_many_best_effort([(path, file_stat, file_hash)])
 
     return file_hash, file_stat
 
@@ -319,12 +320,32 @@ def _recorded_empty_dirs(output_hash: DirHash) -> list[str]:
     return output_hash["empty_dirs"] if "empty_dirs" in output_hash else []
 
 
-def _manifest_hash(manifest: list[DirManifestEntry], empty_dirs: list[str]) -> str:
-    """The directory hash a manifest and its recorded empty directories name: the cache key of the
-    whole-directory tree that holds exactly them (``hash_directory`` names a directory by it)."""
+# The fields pivot writes for each manifest entry, and the only ones a manifest is compared by.
+_MANIFEST_ENTRY_FIELDS = ("hash", "isexec", "relpath", "size")
+
+
+def _manifest_json(manifest: Sequence[Mapping[str, object]], empty_dirs: list[str]) -> bytes:
+    """The JSON ``hash_directory`` names a directory by (its XXH64 is the directory's hash)."""
     hashed: object = {"empty_dirs": empty_dirs, "manifest": manifest} if empty_dirs else manifest
-    hashed_json = json.dumps(hashed, sort_keys=True, separators=(",", ":"))
-    return xxhash.xxh64(hashed_json.encode()).hexdigest()
+    return json.dumps(hashed, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _canonical_manifest(output_hash: DirHash) -> bytes | None:
+    """``output_hash``'s manifest as ``_manifest_json`` encodes it, from only the fields pivot
+    writes for each entry (``_MANIFEST_ENTRY_FIELDS``); a field pivot does not write is left out.
+
+    None when an entry lacks one of those fields or holds a value JSON cannot encode, as a
+    hand-written .pvt or lock can (``when: 2026-01-01``). No tree is trusted for such a manifest,
+    so its restore goes file by file, which reads none of those values.
+    """
+    try:
+        entries = [
+            {field: entry[field] for field in _MANIFEST_ENTRY_FIELDS}
+            for entry in output_hash["manifest"]
+        ]
+        return _manifest_json(entries, _recorded_empty_dirs(output_hash))
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _restored_dirs(output_hash: DirHash) -> set[str]:
@@ -447,7 +468,7 @@ def hash_directory(
         )
 
     if saving and read and state_db is not None:
-        state_db.save_many(read)
+        _ = state_db.save_many_best_effort(read)
 
     if left_out and warn_left_out_symlinks:
         log_left_out_symlinks(path, left_out)
@@ -458,7 +479,9 @@ def hash_directory(
     has_child = {posixpath.dirname(directory) for directory in found_dirs}
     empty_dirs = sorted(found_dirs - file_dirs - has_child)
 
-    output_hash = DirHash(hash=_manifest_hash(manifest, empty_dirs), manifest=manifest)
+    output_hash = DirHash(
+        hash=xxhash.xxh64(_manifest_json(manifest, empty_dirs)).hexdigest(), manifest=manifest
+    )
     if empty_dirs:
         output_hash["empty_dirs"] = empty_dirs
 
@@ -936,17 +959,45 @@ _TREE_LOCK_SUFFIX = ".lock"
 
 
 def _tree_layout_marker(cache_dir_path: pathlib.Path) -> pathlib.Path:
-    """Return the file beside a whole-directory SYMLINK cache tree that records the tree holds
-    exactly what its hash records. The name is never a cache key, so cache scans skip it.
+    """Return the file beside a whole-directory SYMLINK cache tree that records the manifest the
+    tree was checked to hold (``_mark_tree``). The name is never a cache key, so cache scans skip
+    it.
     """
     return cache_dir_path.with_name(cache_dir_path.name + _TREE_LAYOUT_MARKER_SUFFIX)
 
 
-def _mark_tree(cache_dir_path: pathlib.Path) -> None:
-    """Mark a tree known to hold exactly what its hash records. The marker only saves a check,
-    so a cache the user cannot write still restores without one."""
+def _manifest_digest(canonical: bytes) -> str:
+    """The SHA-256 a tree's marker records for the canonical manifest it was checked to hold
+    (``_canonical_manifest``). A second-preimage-resistant digest, unlike the XXH64 a tree is
+    named by, so no manifest an attacker writes can match another's."""
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _read_marker(cache_dir_path: pathlib.Path) -> str | None:
+    """What a tree's marker records: None without a marker, else the manifest digest it holds.
+    An empty string is a marker an older pivot wrote (empty), or one this user cannot read."""
+    try:
+        return _tree_layout_marker(cache_dir_path).read_text().strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _mark_tree(cache_dir_path: pathlib.Path, digest: str) -> None:
+    """Mark a tree checked to hold exactly the manifest whose ``_manifest_digest`` is ``digest``,
+    by writing that digest into its marker, renamed into place whole. The marker only saves a
+    check, so a cache the user cannot write still restores without one."""
     with contextlib.suppress(OSError):
-        _tree_layout_marker(cache_dir_path).touch()
+        fd, staged = tempfile.mkstemp(prefix=_CACHE_TEMP_PREFIX, dir=cache_dir_path.parent)
+        try:
+            with os.fdopen(fd, "w") as file:
+                file.write(digest)
+            os.chmod(staged, 0o444)
+            os.replace(staged, _tree_layout_marker(cache_dir_path))
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(staged)
     for suffix in _LEGACY_TREE_MARKER_SUFFIXES:
         with contextlib.suppress(OSError):
             cache_dir_path.with_name(cache_dir_path.name + suffix).unlink(missing_ok=True)
@@ -958,7 +1009,7 @@ def _tree_file_holds(
     """Whether a tree file, ``path_stat`` its ``os.lstat``, is a regular file holding ``entry``'s
     bytes: its recorded size and content hash. Hashes the file only once the cheap checks pass.
     The size is only that cheap check, so an entry without one is checked by hash alone; a tree
-    check sees only manifests that hash to the tree's name, and those record every size."""
+    check sees only manifests that hold every field pivot writes (``_canonical_manifest``)."""
     return (
         stat.S_ISREG(path_stat.st_mode)
         and ("size" not in entry or path_stat.st_size == entry["size"])
@@ -1005,27 +1056,39 @@ def _ensure_tree_complete(
     """Return whether a whole-directory SYMLINK cache tree holds exactly what ``output_hash``
     records, checking a tree once and repairing it in place from its files' own cache objects.
 
-    The tree publisher marks a tree once it is complete (``_publish_tree``). A tree without the
-    mark is checked: one an older pivot built, which can hold entries its hash does not record
-    and 0o444-everywhere files, one an older pivot marked after checking only sizes, which can
-    hold stale bytes of the recorded size, or one it copied straight to its name and was killed
-    while copying, leaving files missing or cut short under a name a restore trusts. The check, the
-    repair and the mark run under the tree's exclusive lock, so two repairers never change the
-    tree's directory modes under each other. Returns False, the tree unmarked, when the tree
-    differs and cannot be repaired, or cannot be checked: a file's object is absent, or this user
-    cannot read the tree, write it or take its lock. It also returns False, before any check or
-    repair and whatever the mark says, when ``output_hash``'s manifest does not hash to its
-    ``hash`` (``_manifest_hash``): only the tree's own manifest may vouch for it or repair it.
+    A tree's name is the XXH64 of its manifest, and XXH64 is not second-preimage resistant: a
+    manifest someone commits in a .pvt or lock can be made to hash to any tree's name. So the name
+    vouches for nothing. A tree is trusted only for the manifest it was checked to hold, recorded
+    by its marker as that manifest's SHA-256 (``_mark_tree``), and only on equality of the
+    caller's canonical manifest's digest with it:
+
+    - marked for this manifest: trusted, without reading the tree;
+    - marked for another manifest: not trusted and never changed, since its content is what
+      another manifest was checked against and an output may symlink to it;
+    - marked by an older pivot (an empty marker): checked against this manifest, not repaired;
+      re-marked if it matches;
+    - unmarked (a killed publisher, a tree an older pivot built or marked after checking only
+      layout or sizes): checked, and if it differs repaired from its files' own cache objects;
+      after a repair the tree's manifest is recomputed (``hash_directory``) and must equal the
+      caller's, entry for entry, before the tree is marked.
+
+    A manifest that is not even nominally the tree's (its XXH64 is another name) or that holds a
+    value JSON cannot encode is refused before anything is read: that only spares work and keeps
+    an honest mismatch from repairing a tree, and is not what makes a tree trustworthy. The check,
+    the repair and the mark run under the tree's exclusive lock, so two repairers never change the
+    tree's directory modes under each other. Returns False, the tree left as it was or unmarked,
+    when the tree differs and cannot be repaired, or cannot be checked: a file's object is absent,
+    or this user cannot read the tree, write it or take its lock.
     """
-    manifest_hash = _manifest_hash(output_hash["manifest"], _recorded_empty_dirs(output_hash))
-    if manifest_hash != output_hash["hash"]:
-        # Content addressing is what makes a tree trustworthy: a manifest that does not hash to
-        # the tree's name is not that tree's, so it may neither vouch for the tree's files nor
-        # rewrite and mark it (a forged .pvt or lock entry would otherwise poison the cache).
+    canonical = _canonical_manifest(output_hash)
+    if canonical is None or xxhash.xxh64(canonical).hexdigest() != output_hash["hash"]:
         return False
-    marker = _tree_layout_marker(cache_dir_path)
-    if marker.exists():
+    digest = _manifest_digest(canonical)
+    marked = _read_marker(cache_dir_path)
+    if marked == digest:
         return True
+    if marked:
+        return False
     fd: int | None
     try:
         fd = _open_cache_lock(cache_dir_path.with_name(cache_dir_path.name + _TREE_LOCK_SUFFIX))
@@ -1040,20 +1103,26 @@ def _ensure_tree_complete(
             except OSError:  # NFS refuses an exclusive lock on a file opened read-only
                 os.close(fd)
                 fd = None
-        if marker.exists():
+        marked = _read_marker(cache_dir_path)
+        if marked == digest:
             return True
+        if marked:
+            return False
         try:
             scanned = _scan_entries(cache_dir_path)
             if not _tree_matches(cache_dir_path, output_hash, scanned):
-                if fd is None:
+                if fd is None or marked is not None:
                     return False
                 _repair_tree_dir_isexec(cache_dir_path, output_hash["manifest"])
                 _repair_tree_dir_layout(cache_dir_path, output_hash, scanned)
                 if not _repair_tree_dir_files(cache_dir_path, output_hash["manifest"], cache_dir):
                     return False
+                repaired = _canonical_manifest(hash_directory(cache_dir_path, cache_dir=cache_dir))
+                if repaired != canonical:
+                    return False
         except PermissionError:  # another user's tree, or one with a file this user cannot read
             return False
-        _mark_tree(cache_dir_path)
+        _mark_tree(cache_dir_path, digest)
         return True
     finally:
         if fd is not None:
@@ -1458,8 +1527,11 @@ def _publish_tree(
                 if e.errno not in (errno.ENOTEMPTY, errno.EEXIST):
                     raise
                 return
-            if _tree_matches(cache_dir_path, output_hash, _scan_entries(cache_dir_path)):
-                _mark_tree(cache_dir_path)
+            canonical = _canonical_manifest(output_hash)
+            if canonical is not None and _tree_matches(
+                cache_dir_path, output_hash, _scan_entries(cache_dir_path)
+            ):
+                _mark_tree(cache_dir_path, _manifest_digest(canonical))
         finally:
             _clear_path(staged)
 
@@ -1690,9 +1762,8 @@ def _restore_directory_from_cache(
         # Same check as _store_directory. A tree this user cannot check or repair is not used:
         # the output is restored file by file from the objects instead, if they are cached.
         logger.warning(
-            "Cache tree %s differs from what its hash records, or cannot be read, and cannot be "
-            + "repaired, or the manifest given for it does not hash to its name; restoring %s "
-            + "file by file",
+            "Cache tree %s was not checked to hold the manifest given for it, or differs from it "
+            + "and cannot be repaired, or cannot be read; restoring %s file by file",
             cache_dir_path,
             path,
         )
