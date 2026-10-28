@@ -146,6 +146,20 @@ def test_check_digest_mismatch_names_location_and_recovery() -> None:
     assert "delete `.pivot/state.lmdb/`" in message
 
 
+def test_check_digest_names_the_configured_state_database(
+    set_project_root: pathlib.Path,
+) -> None:
+    """The repair instructions name the state database of the project's configured directory."""
+    (set_project_root / ".pivot" / "config.yaml").write_text(
+        "core:\n  state_dir: alternate-state\n"
+    )
+
+    with pytest.raises(exceptions.RemoteError) as exc_info:
+        keys.check_digest("abcdef1234567890", "0000000000000000", "gs://b/files/ab/cdef1234567890")
+
+    assert "delete `alternate-state/state.lmdb/`" in str(exc_info.value)
+
+
 # -----------------------------------------------------------------------------
 # Atomic Download Tests (every backend's download_file and download_batch)
 # -----------------------------------------------------------------------------

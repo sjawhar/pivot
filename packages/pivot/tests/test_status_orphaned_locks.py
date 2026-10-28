@@ -67,7 +67,7 @@ def test_find_orphaned_lock_files_includes_default_dir_with_only_custom_stages(
     """A custom stage dir does not suppress cleanup of stale locks in the configured default."""
     default_state_dir = set_project_root / ".pivot"
     custom_state_dir = set_project_root / "custom" / ".pivot"
-    monkeypatch.setattr(config, "get_state_dir", lambda: default_state_dir)
+    monkeypatch.setattr(config, "locate_state_dir", lambda: default_state_dir)
     all_stages = {"custom/train": _stage_info("custom/train", custom_state_dir)}
     _touch_lock(custom_state_dir, "custom/train")
     _touch_lock(default_state_dir, "deleted/train")
@@ -81,7 +81,7 @@ def test_find_orphaned_lock_files_scans_default_dir_without_stages(
 ) -> None:
     """Deleting every stage does not hide stale locks in the configured default directory."""
     default_state_dir = set_project_root / ".pivot"
-    monkeypatch.setattr(config, "get_state_dir", lambda: default_state_dir)
+    monkeypatch.setattr(config, "locate_state_dir", lambda: default_state_dir)
     _touch_lock(default_state_dir, "deleted/train")
 
     assert status.find_orphaned_lock_files({}) == ["deleted/train"]

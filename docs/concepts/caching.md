@@ -8,12 +8,12 @@ fast as possible.
 ## Content-Addressable Cache
 
 Every output file is hashed with `xxhash64` and stored under
-`.pivot/cache/files/<hash[:2]>/<hash[2:]>` (a two-level directory structure
-using the first two hex characters as a prefix). The per-stage lock file
-records each output's content hash.
+`<state dir>/cache/files/<hash[:2]>/<hash[2:]>` (a two-level directory structure using the first
+two hex characters as a prefix). The per-stage lock file records each output's content hash.
+`<state dir>` is `core.state_dir`, which defaults to `.pivot`.
 
 ```
-.pivot/
+<state dir>/
   cache/
     files/
       a1/

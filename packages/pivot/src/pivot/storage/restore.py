@@ -12,6 +12,7 @@ import xxhash
 import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
+from pivot import state_dir as state_dir_mod
 from pivot.storage import cache, lock, state, track
 from pivot.types import HashInfo
 
@@ -106,12 +107,34 @@ def _parse_pvt_data_from_bytes(content: bytes) -> PvtData | str | None:
 def get_lock_data_from_revision(
     stage_name: str, rev: str, state_dir: pathlib.Path
 ) -> StorageLockData | None:
-    """Read and parse lock file for a stage from a git revision."""
-    stages_dir = lock.get_stages_dir(state_dir)
-    rel_path = str(stages_dir.relative_to(project.get_project_root()) / f"{stage_name}.lock")
-    content = git.read_file_from_revision(rel_path, rev)
+    """Read a stage lock from a revision, including a matching 0.5.2 lock location."""
+    root = project.get_project_root()
+    try:
+        stages_dir = lock.stages_rel_path(state_dir, root)
+    except ValueError:
+        stages_dir = None
+    if stages_dir is not None:
+        content = git.read_file_from_revision(f"{stages_dir}/{stage_name}.lock", rev)
+        if content is not None:
+            return _parse_lock_data_from_bytes(content)
+
+    other_state_dir = state_dir_mod.other_state_dir_for(state_dir)
+    other_stages_dir = None
+    if other_state_dir is not None:
+        try:
+            other_stages_dir = lock.stages_rel_path(other_state_dir, root)
+        except ValueError:
+            other_stages_dir = None
+    content = None
+    if other_stages_dir is not None and other_stages_dir != stages_dir:
+        content = git.read_file_from_revision(f"{other_stages_dir}/{stage_name}.lock", rev)
     if content is None:
+        if stages_dir is None:
+            raise exceptions.ConfigError(
+                "core.state_dir is outside the project, so lock files are not in git"
+            ) from None
         return None
+    state_dir_mod.report_legacy_state_dir(state_dir)
     return _parse_lock_data_from_bytes(content)
 
 
@@ -240,15 +263,17 @@ def resolve_targets(
     return results
 
 
-def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> os.stat_result:
-    """Atomically replace a cache-miss target under the cache restore lock; return the written
-    file's stat, taken before it replaced the target."""
+def _write_fallback_content(
+    dest_path: pathlib.Path, content: bytes, state_dir: pathlib.Path
+) -> os.stat_result:
+    """Atomically replace a cache-miss target under the resolved state directory's restore lock;
+    return the written file's stat, taken before it replaced the target."""
 
     def write_content(fd: int) -> None:
         with os.fdopen(fd, "wb") as file:
             file.write(content)
 
-    with cache.restore_lock(dest_path, config.get_state_dir()) as lock_token:
+    with cache.restore_lock(dest_path, state_dir) as lock_token:
         staging_path = (
             cache.restore_staging_path(dest_path, lock_token) if lock_token is not None else None
         )
@@ -295,6 +320,7 @@ def restore_file(
     force: bool,
     *,
     remote_factory: Callable[[], RemoteStorage],
+    state_dir: pathlib.Path | None = None,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> RestoreResult:
     """Restore a single file from revision and return its result.
@@ -307,16 +333,20 @@ def restore_file(
     A restore appends ``(path, stat, hash)`` for each file it writes to ``recorded``, for the
     caller to save in a StateDB, so the next status, explanation or run looks the file up instead
     of reading it. Each stat is of what was staged, taken before the rename put it in place.
+    ``state_dir`` is the stage's own state directory for a stage target, otherwise the configured
+    directory from ``config.locate_state_dir()``.
     """
+    state_dir = state_dir or config.locate_state_dir()
     path_str = str(dest_path)
     files_dir = cache_dir / "files"
-
     if (skipped := _skipped(dest_path, force)) is not None:
         return skipped
 
-    # Ensure parent directory exists before any restore strategy
+    # Ensure parent directory exists before any restore strategy. A parent inside the
+    # configured state directory is made as Pivot makes that directory, with its ignore file,
+    # before the restore lock or the copy writes anything there.
     try:
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        state_dir_mod.make_dirs(dest_path.parent)
     except OSError as e:
         return RestoreResult(
             status=RestoreStatus.ERROR,
@@ -333,14 +363,16 @@ def restore_file(
             # For files, we check if the single cached file exists first.
             should_try_cache = True
             if "manifest" not in output_hash:
-                should_try_cache = cache.get_cache_path(files_dir, output_hash["hash"]).exists()
+                should_try_cache = (
+                    cache.resolve_cache_object_path(files_dir, output_hash["hash"]) is not None
+                )
             if should_try_cache:
                 success = cache.restore_from_cache(
                     dest_path,
                     output_hash,
                     files_dir,
                     checkout_modes=checkout_modes,
-                    state_dir=config.get_state_dir(),
+                    state_dir=state_dir,
                     recorded=restored,
                 )
         except (exceptions.PivotError, OSError) as e:
@@ -359,7 +391,7 @@ def restore_file(
     content = git.read_file_from_revision(rel_path, rev)
     if content is not None:
         try:
-            written = _write_fallback_content(dest_path, content)
+            written = _write_fallback_content(dest_path, content, state_dir)
         except OSError as e:
             return RestoreResult(
                 status=RestoreStatus.ERROR,
@@ -385,6 +417,10 @@ def restore_file(
             missing_hashes = cache.missing_cache_objects(output_hash, files_dir, checkout_modes)
             if missing_hashes:
                 source = "remote"
+                # The one write `get` makes into the cache: the creating getter prepares the
+                # cache directory, and a custom `cache.dir` inside the state directory, each with
+                # its ignore file, before any object is downloaded into it.
+                config.get_cache_dir()
                 remote = remote_factory()
                 download_results = asyncio.run(
                     remote.download_batch(
@@ -402,7 +438,7 @@ def restore_file(
                 output_hash,
                 files_dir,
                 checkout_modes=checkout_modes,
-                state_dir=config.get_state_dir(),
+                state_dir=state_dir,
                 recorded=downloaded,
             )
         except exceptions.RemoteError as e:
@@ -493,13 +529,15 @@ def restore_targets_from_revision(
 
     # Every target's file hashes, saved once per state directory when the loop ends, best-effort:
     # a stage output's in its stage's state directory, any other file's in the configured one.
+    # Located, not created: `get` creates nothing for a target it skips, and the save makes the
+    # directory #503's resolver chose only when it has a hash to save.
     batch = state.FileHashBatch()
     try:
         for target_info in target_infos:
             hash_state_dir = (
                 stage_targets[target_info["original_target"]]["state_dir"]
                 if target_info["target_type"] is TargetType.STAGE
-                else config.get_state_dir()
+                else config.locate_state_dir()
             )
             for rel_path in target_info["paths"]:
                 output_hash = target_info["hashes"].get(rel_path)
@@ -527,6 +565,7 @@ def restore_targets_from_revision(
                     checkout_modes=checkout_modes,
                     force=force,
                     remote_factory=reachable_remote,
+                    state_dir=hash_state_dir,
                     recorded=recorded,
                 )
                 batch.add(hash_state_dir, recorded)

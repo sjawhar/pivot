@@ -3,10 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
-import pathlib
 import subprocess
-import sys
 from typing import TYPE_CHECKING
 
 import pytest
@@ -14,12 +11,14 @@ import yaml
 
 from conftest import isolated_pivot_dir
 from pivot import cli, compose, discovery, git, project, stage_def
+from tests import helpers
 
 if TYPE_CHECKING:
+    import pathlib
+
     import click.testing
     from pytest_mock import MockerFixture
 
-_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 # =============================================================================
 # Module-level StageParams classes for annotation-based registration
@@ -704,20 +703,20 @@ _SECRET_PIPELINE = (
 )
 
 
-def _secret_clone(path: pathlib.Path) -> None:
+def _secret_clone(path: pathlib.Path, home: pathlib.Path) -> None:
     """A git repository with `pivot init`, the secret pipeline and its input."""
     path.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
-    subprocess.run([_PIVOT_BIN, "init"], cwd=path, check=True, capture_output=True)
+    _pivot(path, home, "init")
     (path / "data" / "raw").mkdir(parents=True)
     (path / "data" / "raw" / "numbers.csv").write_text("n\n1\n2\n")
     (path / "pipeline.py").write_text(_SECRET_PIPELINE)
 
 
-def _pivot(cwd: pathlib.Path, env: dict[str, str], *args: str) -> str:
-    ran = subprocess.run(
-        [_PIVOT_BIN, *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=180
-    )
+def _pivot(
+    cwd: pathlib.Path, home: pathlib.Path, *args: str, extra_env: dict[str, str] | None = None
+) -> str:
+    ran = helpers.run_pivot(cwd, home, *args, extra_env=extra_env)
     assert ran.returncode == 0, ran.stdout + ran.stderr
     return ran.stdout + ran.stderr
 
@@ -726,21 +725,20 @@ def test_secret_digest_needs_the_key_and_a_shared_key_gives_equal_digests(
     tmp_path: pathlib.Path,
 ) -> None:
     """A 6-digit secret behind an unkeyed hash falls to a brute-force loop over the lock."""
-    env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
-    env.pop("PIVOT_SECRET_KEY", None)
+    home = tmp_path / "home"
     own = tmp_path / "own"
-    _secret_clone(own)
-    _pivot(own, env, "repro")
+    _secret_clone(own, home)
+    _pivot(own, home, "repro")
     own_lock = (own / ".pivot" / "stages" / "smoke" / "fetch.lock").read_text()
     ignored = subprocess.run(
         ["git", "check-ignore", ".pivot/secret.key"], cwd=own, capture_output=True, text=True
     )
-    shared_env = {**env, "PIVOT_SECRET_KEY": "5e" * 32}
+    shared_env = {"PIVOT_SECRET_KEY": "5e" * 32}
     shared_locks = list[str]()
     for name in ("first", "second"):
         clone = tmp_path / name
-        _secret_clone(clone)
-        _pivot(clone, shared_env, "repro")
+        _secret_clone(clone, home)
+        _pivot(clone, home, "repro", extra_env=shared_env)
         shared_locks.append((clone / ".pivot" / "stages" / "smoke" / "fetch.lock").read_text())
         assert not (clone / ".pivot" / "secret.key").exists(), "the environment key is used"
 

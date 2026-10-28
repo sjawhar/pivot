@@ -4,42 +4,23 @@ from __future__ import annotations
 
 import json
 import os
-import pathlib
 import subprocess
 import sys
+from typing import TYPE_CHECKING
 
 import pytest
+from tests import helpers
 from tests.conftest import init_git_repo
 
 from pivot import loaders
 
-_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
+if TYPE_CHECKING:
+    import pathlib
 
 
-def _helper_pivot(
-    cwd: pathlib.Path,
-    *args: str,
-    hash_seed: int | None = None,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    full_env = {key: value for key, value in os.environ.items() if key != "VIRTUAL_ENV"}
-    if hash_seed is not None:
-        full_env["PYTHONHASHSEED"] = str(hash_seed)
-    full_env.update(env or {})
-    return subprocess.run(
-        [_PIVOT_BIN, *args],
-        cwd=cwd,
-        env=full_env,
-        capture_output=True,
-        text=True,
-        timeout=180,
-        check=False,
-    )
-
-
-def _helper_project(root: pathlib.Path, files: dict[str, str]) -> pathlib.Path:
+def _helper_project(root: pathlib.Path, home: pathlib.Path, files: dict[str, str]) -> pathlib.Path:
     init_git_repo(root)
-    init = _helper_pivot(root, "init")
+    init = helpers.run_pivot(root, home, "init")
     assert init.returncode == 0, init.stdout + init.stderr
     for rel_path, text in files.items():
         path = root / rel_path
@@ -81,11 +62,12 @@ with Pipeline("k") as pipeline:
 def test_module_level_tuple_holding_a_list_read_by_stage_is_an_error(
     tmp_path: pathlib.Path,
 ) -> None:
+    home = tmp_path / "home"
     root = _helper_project(
-        tmp_path, {"pipeline.py": _TUPLE_PIPELINE, "data/raw/t.csv": "a,b,c\n1,2,3\n"}
+        tmp_path, home, {"pipeline.py": _TUPLE_PIPELINE, "data/raw/t.csv": "a,b,c\n1,2,3\n"}
     )
 
-    proc = _helper_pivot(root, "repro")
+    proc = helpers.run_pivot(root, home, "repro")
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"tuple holding a list was accepted:\n{output}"
@@ -154,21 +136,23 @@ def test_editing_immutable_module_value_reruns_stage(
     shown_after: str,
 ) -> None:
     """A tuple, frozenset or compiled regex is tracked by value, not by its source text."""
+    home = tmp_path / "home"
     pipeline = _IMMUTABLE_CAPTURE_PIPELINE.replace("SHOW", show.format(access=access))
     root = _helper_project(
         tmp_path,
+        home,
         {"pipeline.py": pipeline, "settings.py": original, "data/raw/t.csv": "a\n1\n"},
     )
     output_path = root / "data/im/show.jsonl"
-    _helper_ok(_helper_pivot(root, "repro"))
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert _helper_rows(output_path) == [{"a": 1, "v": shown_before}]
 
     (root / "settings.py").write_text(same)
-    status = _helper_ok(_helper_pivot(root, "status"))
+    status = _helper_ok(helpers.run_pivot(root, home, "status"))
     assert "1 cached, 0 stale" in status, f"an equal value made the stage stale:\n{status}"
 
     (root / "settings.py").write_text(edited)
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert _helper_rows(output_path) == [{"a": 1, "v": shown_after}], output
 
 
@@ -190,20 +174,22 @@ with Pipeline("ms") as pipeline:
 
 
 def test_editing_sibling_module_scalar_reruns_stage(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": _MODULE_ATTR_PIPELINE,
             "settings.py": "FACTOR = 10\n",
             "data/raw/t.csv": "a\n1\n2\n",
         },
     )
-    _helper_ok(_helper_pivot(root, "repro"))
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert _helper_rows(root / "data/ms/scale.jsonl") == [{"a": 10}, {"a": 20}]
 
     # Different size, so Python's mtime+size bytecode check cannot reuse stale bytecode.
     (root / "settings.py").write_text("FACTOR = 200\n")
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert _helper_rows(root / "data/ms/scale.jsonl") == [{"a": 200}, {"a": 400}], output
 
@@ -226,18 +212,20 @@ with Pipeline("ms") as pipeline:
 
 
 def test_editing_from_imported_scalar_reruns_stage(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": _FROM_IMPORT_PIPELINE,
             "settings.py": "FACTOR = 10\n",
             "data/raw/t.csv": "a\n1\n2\n",
         },
     )
-    _helper_ok(_helper_pivot(root, "repro"))
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     (root / "settings.py").write_text("FACTOR = 200\n")
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert _helper_rows(root / "data/ms/scale.jsonl") == [{"a": 200}, {"a": 400}], output
 
@@ -260,8 +248,10 @@ with Pipeline("ms") as pipeline:
 
 
 def test_rebinding_module_attribute_callable_reruns_stage(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": _REBOUND_HELPER_PIPELINE,
             "transforms.py": "def double(df):\n    return df * 2\n\n\ndef triple(df):\n    return df * 3\n",
@@ -269,10 +259,10 @@ def test_rebinding_module_attribute_callable_reruns_stage(tmp_path: pathlib.Path
             "data/raw/t.csv": "a\n1\n2\n",
         },
     )
-    _helper_ok(_helper_pivot(root, "repro"))
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     (root / "settings.py").write_text("from transforms import triple as transform\n")
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert _helper_rows(root / "data/ms/scale.jsonl") == [{"a": 3}, {"a": 6}], output
 
@@ -296,11 +286,12 @@ with Pipeline("d") as pipeline:
 
 
 def test_non_scalar_module_value_as_stage_default_is_an_error(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
     root = _helper_project(
-        tmp_path, {"pipeline.py": _LIST_DEFAULT_PIPELINE, "data/raw/t.csv": "a,b\n1,2\n"}
+        tmp_path, home, {"pipeline.py": _LIST_DEFAULT_PIPELINE, "data/raw/t.csv": "a,b\n1,2\n"}
     )
 
-    proc = _helper_pivot(root, "repro")
+    proc = helpers.run_pivot(root, home, "repro")
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"list default was accepted:\n{output}"
@@ -385,14 +376,15 @@ with Pipeline("d") as pipeline:
 def test_editing_scalar_module_value_used_as_default_reruns_stage(
     tmp_path: pathlib.Path, files: dict[str, str], edit: tuple[str, str, str]
 ) -> None:
-    root = _helper_project(tmp_path, {**files, "data/raw/t.csv": "a\n1\n2\n"})
-    _helper_ok(_helper_pivot(root, "repro"))
+    home = tmp_path / "home"
+    root = _helper_project(tmp_path, home, {**files, "data/raw/t.csv": "a\n1\n2\n"})
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 2}, {"a": 4}]
 
     rel_path, old, new = edit
     path = root / rel_path
     path.write_text(path.read_text().replace(old, new))
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 50}, {"a": 100}], output
 
@@ -423,21 +415,23 @@ def test_same_stage_name_from_another_pipeline_file_is_not_a_cache_hit(
     tmp_path: pathlib.Path,
 ) -> None:
     """Two pipeline.py files declaring `Pipeline("rep")` must not share a cached manifest."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "a/pipeline.py": _helper_same_named_pipeline("a"),
             "b/pipeline.py": _helper_same_named_pipeline("b"),
             "data/raw/x.csv": "a\n1\n",
         },
     )
-    _helper_ok(_helper_pivot(root / "a", "repro"))
+    _helper_ok(helpers.run_pivot(root / "a", home, "repro"))
     assert (root / "data/rep/make.yaml").read_text() == "from: a\n"
 
-    explain = _helper_ok(_helper_pivot(root / "b", "status", "--explain", "rep/make"))
+    explain = _helper_ok(helpers.run_pivot(root / "b", home, "status", "--explain", "rep/make"))
     assert "Code changed" in explain, explain
 
-    output = _helper_ok(_helper_pivot(root / "b", "repro"))
+    output = _helper_ok(helpers.run_pivot(root / "b", home, "repro"))
     assert (root / "data/rep/make.yaml").read_text() == "from: b\n", output
     assert (root / "data/rep/use_b.yaml").read_text() == "saw: b\n", output
 
@@ -471,24 +465,26 @@ with Pipeline("d") as pipeline:
 def test_editing_scalar_read_by_cached_helper_reruns_stage(
     tmp_path: pathlib.Path, decorator: str
 ) -> None:
+    home = tmp_path / "home"
     pipeline = _CACHED_HELPER_PIPELINE.replace("@functools.cache", decorator)
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
-    _helper_ok(_helper_pivot(root, "repro"))
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 2}, {"a": 4}]
 
     (root / "pipeline.py").write_text(pipeline.replace("FACTOR = 2", "FACTOR = 7"))
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 7}, {"a": 14}], output
 
 
 def test_non_scalar_read_by_cached_helper_is_an_error(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
     pipeline = _CACHED_HELPER_PIPELINE.replace("FACTOR = 2", 'COLUMNS = ["a"]').replace(
         "def factor() -> int:\n    return FACTOR", "def factor() -> int:\n    return len(COLUMNS)"
     )
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
 
-    proc = _helper_pivot(root, "repro")
+    proc = helpers.run_pivot(root, home, "repro")
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"list read by a cached helper was accepted:\n{output}"
@@ -517,14 +513,21 @@ with Pipeline("sp") as pipeline:
 
 def test_set_valued_params_stay_cached_across_processes(tmp_path: pathlib.Path) -> None:
     """A frozenset field is recorded and hashed in one order, so new processes stay cached."""
+    home = tmp_path / "home"
     root = _helper_project(
-        tmp_path, {"pipeline.py": _SET_PARAMS_PIPELINE, "data/raw/t.csv": "a\n1\n"}
+        tmp_path, home, {"pipeline.py": _SET_PARAMS_PIPELINE, "data/raw/t.csv": "a\n1\n"}
     )
-    _helper_ok(_helper_pivot(root, "repro", hash_seed=0))
+    _helper_ok(helpers.run_pivot(root, home, "repro", extra_env={"PYTHONHASHSEED": str(0)}))
 
     for seed in range(1, 4):
-        _helper_ok(_helper_pivot(root, "fingerprint", "reset", hash_seed=seed))
-        status = _helper_ok(_helper_pivot(root, "status", hash_seed=seed))
+        _helper_ok(
+            helpers.run_pivot(
+                root, home, "fingerprint", "reset", extra_env={"PYTHONHASHSEED": str(seed)}
+            )
+        )
+        status = _helper_ok(
+            helpers.run_pivot(root, home, "status", extra_env={"PYTHONHASHSEED": str(seed)})
+        )
         assert "1 cached, 0 stale" in status, f"PYTHONHASHSEED={seed}:\n{status}"
 
 
@@ -555,17 +558,18 @@ with Pipeline("h") as pipeline:
 
 def test_artifact_handle_default_is_wired_as_an_input(tmp_path: pathlib.Path) -> None:
     """A handle default is a real pipeline input, not module state, so it is not refused."""
+    home = tmp_path / "home"
     root = _helper_project(
-        tmp_path, {"pipeline.py": _HANDLE_DEFAULT_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"}
+        tmp_path, home, {"pipeline.py": _HANDLE_DEFAULT_PIPELINE, "data/raw/t.csv": "a\n1\n2\n"}
     )
 
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert _helper_rows(root / "data/h/scale.jsonl") == [{"a": 3}, {"a": 6}], output
     assert _helper_rows(root / "data/h/total.jsonl") == [{"a": 1}, {"a": 2}], output
 
     (root / "data/raw/t.csv").write_text("a\n5\n")
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert _helper_rows(root / "data/h/scale.jsonl") == [{"a": 15}], output
 
 
@@ -619,18 +623,20 @@ with Pipeline("m") as pipeline:
 )
 def test_loader_config_with_model_class_stays_cached(tmp_path: pathlib.Path, loader: str) -> None:
     """A pydantic model class in a loader's config is hashed as a class, not dumped."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": _LOADER_CONFIG_PIPELINE.replace("LOADER", loader),
             "data/raw/t.json": "{}\n",
         },
     )
 
-    first = _helper_ok(_helper_pivot(root, "repro"))
+    first = _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert "1 ran" in first, first
 
-    second = _helper_ok(_helper_pivot(root, "repro"))
+    second = _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert "0 ran, 1 cached" in second, second
 
 
@@ -647,15 +653,16 @@ def test_loader_config_with_user_function_stays_cached_and_tracks_edits(
     tmp_path: pathlib.Path, loader: str
 ) -> None:
     """A function in a loader's config hashes by its name and code, not its memory address."""
+    home = tmp_path / "home"
     pipeline = "import functools\n" + _LOADER_CONFIG_PIPELINE.replace("LOADER", loader)
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
-    _helper_ok(_helper_pivot(root, "repro"))
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
 
-    second = _helper_ok(_helper_pivot(root, "repro"))
+    second = _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert "0 ran, 1 cached" in second, second
 
     (root / "pipeline.py").write_text(pipeline.replace("return {}", 'return {"n": 0}'))
-    edited = _helper_ok(_helper_pivot(root, "repro"))
+    edited = _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert "1 ran" in edited, edited
 
 
@@ -689,17 +696,18 @@ def test_loader_config_holding_a_plain_object_stays_cached_and_tracks_edits(
     tmp_path: pathlib.Path,
 ) -> None:
     """An object with the default repr hashes by its class and attributes, not its address."""
+    home = tmp_path / "home"
     root = _helper_project(
-        tmp_path, {"pipeline.py": _OBJECT_CONFIG_PIPELINE, "data/raw/t.yaml": "a: 1\n"}
+        tmp_path, home, {"pipeline.py": _OBJECT_CONFIG_PIPELINE, "data/raw/t.yaml": "a: 1\n"}
     )
-    first = _helper_ok(_helper_pivot(root, "repro"))
+    first = _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert "1 ran" in first, first
 
-    second = _helper_ok(_helper_pivot(root, "repro"))
+    second = _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert "0 ran, 1 cached" in second, second
 
     (root / "pipeline.py").write_text(_OBJECT_CONFIG_PIPELINE.replace("depth=2", "depth=3"))
-    edited = _helper_ok(_helper_pivot(root, "repro"))
+    edited = _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert "1 ran" in edited, edited
 
 
@@ -777,14 +785,15 @@ def test_value_read_by_loader_config_function_reruns_stage(
     tmp_path: pathlib.Path, transform: str, edit: tuple[str, str], before: int, after: int
 ) -> None:
     """A function in loader config is walked like a stage helper, so what it reads is tracked."""
+    home = tmp_path / "home"
     pipeline = _TRANSFORM_LOADER_PIPELINE.replace("TRANSFORM", transform)
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
-    _helper_ok(_helper_pivot(root, "repro"))
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
     (output,) = (root / "data/l").iterdir()
     assert json.loads(output.read_text()) == {"a": before}
 
     (root / "pipeline.py").write_text(pipeline.replace(*edit))
-    rerun = _helper_ok(_helper_pivot(root, "repro"))
+    rerun = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert json.loads(output.read_text()) == {"a": after}, rerun
 
@@ -847,13 +856,14 @@ def test_value_read_by_partial_argument_function_reruns_stage(
     tmp_path: pathlib.Path, binding: str
 ) -> None:
     """A function bound as a partial argument is walked like a stage helper."""
+    home = tmp_path / "home"
     pipeline = _PARTIAL_ARGUMENT_PIPELINE.replace("BINDING", binding)
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
-    _helper_ok(_helper_pivot(root, "repro"))
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, "data/raw/t.csv": "a\n1\n2\n"})
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 2}, {"a": 4}]
 
     (root / "pipeline.py").write_text(pipeline.replace("FACTOR = 2", "FACTOR = 7"))
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert _helper_rows(root / "data/d/scale.jsonl") == [{"a": 7}, {"a": 14}], output
 
@@ -876,9 +886,10 @@ def test_value_read_by_partial_argument_function_reruns_stage(
 def test_non_scalar_read_by_bound_function_is_an_error(
     tmp_path: pathlib.Path, pipeline: str, files: dict[str, str]
 ) -> None:
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, **files})
+    home = tmp_path / "home"
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, **files})
 
-    proc = _helper_pivot(root, "repro")
+    proc = helpers.run_pivot(root, home, "repro")
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"list read by a bound function was accepted:\n{output}"
@@ -908,9 +919,10 @@ def test_user_callable_instance_bound_in_config_is_an_error(
     tmp_path: pathlib.Path, pipeline: str, files: dict[str, str], stage: str, binding: str
 ) -> None:
     """A callable object's `__call__` reads are not walked, so it is refused like a stage read."""
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, **files})
+    home = tmp_path / "home"
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, **files})
 
-    proc = _helper_pivot(root, "repro")
+    proc = helpers.run_pivot(root, home, "repro")
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"callable instance was accepted:\n{output}"
@@ -919,14 +931,15 @@ def test_user_callable_instance_bound_in_config_is_an_error(
 
 
 def test_stage_and_loader_config_refusals_are_reported_together(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
     pipeline = (
         _TRANSFORM_LOADER_PIPELINE.replace("TRANSFORM", "keep_cols")
         .replace('COLS = ["a"]', 'COLS = ["a"]\nSTAGE_KEYS = ["k"]')
         .replace('return {"a": 3}', 'return {"a": len(STAGE_KEYS)}')
     )
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
 
-    proc = _helper_pivot(root, "repro")
+    proc = helpers.run_pivot(root, home, "repro")
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
@@ -936,16 +949,17 @@ def test_stage_and_loader_config_refusals_are_reported_together(tmp_path: pathli
 
 def test_editing_model_class_used_by_loader_reruns_stage(tmp_path: pathlib.Path) -> None:
     """A user class in loader config is walked, so editing its definition reruns the stage."""
+    home = tmp_path / "home"
     pipeline = _LOADER_CONFIG_PIPELINE.replace("LOADER", "ModelJSON(model=Item)")
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
-    _helper_ok(_helper_pivot(root, "repro"))
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
     (output,) = (root / "data/m").iterdir()
     assert json.loads(output.read_text()) == {"name": "x"}
 
     (root / "pipeline.py").write_text(
         pipeline.replace('    name: str = "none"\n', '    name: str = "none"\n    extra: int = 1\n')
     )
-    rerun = _helper_ok(_helper_pivot(root, "repro"))
+    rerun = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert json.loads(output.read_text()) == {"name": "x", "extra": 1}, rerun
 
@@ -995,27 +1009,29 @@ def test_editing_scalar_read_by_custom_loader_method_reruns_stage(
     tmp_path: pathlib.Path, base: str
 ) -> None:
     """A user loader's own save() is walked like a stage helper, so what it reads is tracked."""
+    home = tmp_path / "home"
     pipeline = _LOADER_METHOD_PIPELINE.replace("BASE", base).replace(
         "SAVED", '{"a": data["a"] * FACTOR}'
     )
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
-    _helper_ok(_helper_pivot(root, "repro"))
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
     (output,) = (root / "data/s").iterdir()
     assert json.loads(output.read_text()) == {"a": 6}
 
     (root / "pipeline.py").write_text(pipeline.replace("FACTOR = 2", "FACTOR = 7"))
-    rerun = _helper_ok(_helper_pivot(root, "repro"))
+    rerun = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert json.loads(output.read_text()) == {"a": 21}, rerun
 
 
 def test_non_scalar_read_by_custom_loader_method_is_an_error(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
     pipeline = _LOADER_METHOD_PIPELINE.replace("BASE", "loaders.Loader[dict, dict]").replace(
         "SAVED", "{key: data[key] for key in KEYS}"
     )
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, "data/raw/t.json": "{}\n"})
 
-    proc = _helper_pivot(root, "repro")
+    proc = helpers.run_pivot(root, home, "repro")
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"list read by a loader's save() was accepted:\n{output}"
@@ -1057,8 +1073,10 @@ with Pipeline("k") as pipeline:
 
 def test_variable_read_by_loader_on_two_inputs_is_named_once(tmp_path: pathlib.Path) -> None:
     """One refusal per variable: load() and save() on two inputs all read KEYS."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": _SHARED_LOADER_PIPELINE,
             "data/raw/first.json": '{"a": 1}\n',
@@ -1066,7 +1084,7 @@ def test_variable_read_by_loader_on_two_inputs_is_named_once(tmp_path: pathlib.P
         },
     )
 
-    proc = _helper_pivot(root, "repro")
+    proc = helpers.run_pivot(root, home, "repro")
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
@@ -1095,14 +1113,15 @@ with Pipeline("env") as pipeline:
 
 def test_scalar_read_from_environment_at_import_reruns_stage(tmp_path: pathlib.Path) -> None:
     """A cached manifest is reused only while every value the stage reads is unchanged."""
+    home = tmp_path / "home"
     root = _helper_project(
-        tmp_path, {"pipeline.py": _ENV_SCALE_PIPELINE, "data/raw/x.csv": "a\n1\n"}
+        tmp_path, home, {"pipeline.py": _ENV_SCALE_PIPELINE, "data/raw/x.csv": "a\n1\n"}
     )
-    _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+    _helper_ok(helpers.run_pivot(root, home, "repro", extra_env={"SCALE": "2"}))
     assert _helper_rows(root / "data/env/scale.jsonl") == [{"a": 2}]
 
-    status = _helper_ok(_helper_pivot(root, "status", env={"SCALE": "7"}))
-    output = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "7"}))
+    status = _helper_ok(helpers.run_pivot(root, home, "status", extra_env={"SCALE": "7"}))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro", extra_env={"SCALE": "7"}))
 
     assert "1 stale" in status, status
     assert _helper_rows(root / "data/env/scale.jsonl") == [{"a": 7}], output
@@ -1143,21 +1162,23 @@ with Pipeline("cfg") as pipeline:
 
 def test_scalar_read_from_settings_file_at_import_reruns_stages(tmp_path: pathlib.Path) -> None:
     """A settings file is not project source: the value read from it is checked on a hit."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": _SETTINGS_FILE_PIPELINE,
             "settings.json": '{"factor": 2}\n',
             "data/raw/x.csv": "a\n1\n",
         },
     )
-    _helper_ok(_helper_pivot(root, "repro"))
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert _helper_rows(root / "data/cfg/made.jsonl") == [{"a": 2}]
     assert _helper_rows(root / "data/cfg/plain.jsonl") == [{"a": 2}]
 
     (root / "settings.json").write_text('{"factor": 7}\n')
-    status = _helper_ok(_helper_pivot(root, "status"))
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    status = _helper_ok(helpers.run_pivot(root, home, "status"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert "2 stale" in status, status
     assert _helper_rows(root / "data/cfg/made.jsonl") == [{"a": 7}], output
@@ -1199,8 +1220,10 @@ _INCLUDE_BOTH = (
 
 def test_include_refuses_two_factory_closures_under_one_stage_name(tmp_path: pathlib.Path) -> None:
     """make_stage(2) and make_stage(5) share a file and qualname; their closure values differ."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "shared/stages.py": _FACTORY_STAGES,
             "left/pipeline.py": _factory_side(2),
@@ -1210,7 +1233,7 @@ def test_include_refuses_two_factory_closures_under_one_stage_name(tmp_path: pat
         },
     )
 
-    proc = _helper_pivot(root, "list")
+    proc = helpers.run_pivot(root, home, "list")
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
@@ -1267,8 +1290,10 @@ def test_include_refuses_one_stage_reading_through_two_factory_loaders(
     tmp_path: pathlib.Path,
 ) -> None:
     """A loader field holding make_scaler(2) or make_scaler(5) reads the input two ways."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "shared/stages.py": _FACTORY_LOADER_STAGES,
             "left/pipeline.py": _factory_loader_side(2),
@@ -1278,7 +1303,7 @@ def test_include_refuses_one_stage_reading_through_two_factory_loaders(
         },
     )
 
-    proc = _helper_pivot(root, "list")
+    proc = helpers.run_pivot(root, home, "list")
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
@@ -1292,8 +1317,10 @@ def test_same_named_pipelines_run_separately_keep_factory_closures_apart(
     tmp_path: pathlib.Path,
 ) -> None:
     """Right's factor=5 closure never gets left's cached factor=2 manifest."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "shared/stages.py": _FACTORY_STAGES,
             "left/pipeline.py": _factory_side(2),
@@ -1302,9 +1329,9 @@ def test_same_named_pipelines_run_separately_keep_factory_closures_apart(
         },
     )
 
-    left = _helper_ok(_helper_pivot(root / "left", "repro"))
+    left = _helper_ok(helpers.run_pivot(root / "left", home, "repro"))
     assert _helper_rows(root / "data/rep/make.jsonl") == [{"a": 2}], left
-    right = _helper_ok(_helper_pivot(root / "right", "repro"))
+    right = _helper_ok(helpers.run_pivot(root / "right", home, "repro"))
 
     assert "1 ran" in right, right
     assert _helper_rows(root / "data/rep/make.jsonl") == [{"a": 5}], right
@@ -1365,8 +1392,10 @@ with Pipeline("all") as pipeline:
 )
 def test_reimported_stage_with_a_nan_value_is_one_stage(tmp_path: pathlib.Path, prep: str) -> None:
     """`pivot repro prep/pipeline.py` imports prep again; its new NaN is the same value."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "prep/pipeline.py": prep,
             "pipeline.py": _NAN_ROOT,
@@ -1374,7 +1403,7 @@ def test_reimported_stage_with_a_nan_value_is_one_stage(tmp_path: pathlib.Path, 
         },
     )
 
-    output = _helper_ok(_helper_pivot(root, "repro", "prep/pipeline.py"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro", "prep/pipeline.py"))
 
     assert "1 ran" in output, output
 
@@ -1429,16 +1458,18 @@ def test_self_referencing_object_is_refused_not_a_crash(
     tmp_path: pathlib.Path, definition: str, variable: str
 ) -> None:
     """An object that holds itself is a D2 refusal, and unsafe mode warns and runs."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": _SELF_REFERENCE_PIPELINE.format(definition=definition),
             "data/raw/x.csv": "a\n1\n",
         },
     )
 
-    refused = _helper_pivot(root, "repro")
-    unsafe = _helper_pivot(root, "repro", env={"PIVOT_UNSAFE_FINGERPRINTING": "1"})
+    refused = helpers.run_pivot(root, home, "repro")
+    unsafe = helpers.run_pivot(root, home, "repro", extra_env={"PIVOT_UNSAFE_FINGERPRINTING": "1"})
 
     refused_output = refused.stdout + refused.stderr
     assert refused.returncode != 0, refused_output
@@ -1552,18 +1583,20 @@ def test_rebinding_a_library_function_reruns_stage(
     tmp_path: pathlib.Path, before: str, after: str
 ) -> None:
     """A module-level name bound to a library function is recorded by what it names."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": _LIBRARY_BINDING_PIPELINE.format(binding=before),
             "data/raw/x.csv": "a\n1\n2\n6\n",
         },
     )
-    _helper_ok(_helper_pivot(root, "repro"))
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert _helper_summary(root) == 3.0
 
     (root / "pipeline.py").write_text(_LIBRARY_BINDING_PIPELINE.format(binding=after))
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert "1 ran" in output, output
     assert _helper_summary(root) == 2.0, output
@@ -1571,19 +1604,21 @@ def test_rebinding_a_library_function_reruns_stage(
 
 def test_library_function_chosen_at_import_reruns_stage(tmp_path: pathlib.Path) -> None:
     """A cache hit re-reads which library function the name holds."""
+    home = tmp_path / "home"
     binding = 'agg = getattr(np, os.environ.get("AGG", "mean"))'
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": _LIBRARY_BINDING_PIPELINE.format(binding=binding),
             "data/raw/x.csv": "a\n1\n2\n6\n",
         },
     )
-    _helper_ok(_helper_pivot(root, "repro", env={"AGG": "mean"}))
+    _helper_ok(helpers.run_pivot(root, home, "repro", extra_env={"AGG": "mean"}))
     assert _helper_summary(root) == 3.0
 
-    status = _helper_ok(_helper_pivot(root, "status", env={"AGG": "median"}))
-    output = _helper_ok(_helper_pivot(root, "repro", env={"AGG": "median"}))
+    status = _helper_ok(helpers.run_pivot(root, home, "status", extra_env={"AGG": "median"}))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro", extra_env={"AGG": "median"}))
 
     assert "1 stale" in status, status
     assert _helper_summary(root) == 2.0, output
@@ -1620,13 +1655,14 @@ with Pipeline("lib") as pipeline:
 
 def test_library_function_in_loader_config_stays_cached(tmp_path: pathlib.Path) -> None:
     """A library function in loader config is named by module and qualname, not its address."""
+    home = tmp_path / "home"
     root = _helper_project(
-        tmp_path, {"pipeline.py": _LIBRARY_LOADER_PIPELINE, "data/raw/x.csv": "a\n1\n2\n6\n"}
+        tmp_path, home, {"pipeline.py": _LIBRARY_LOADER_PIPELINE, "data/raw/x.csv": "a\n1\n2\n6\n"}
     )
-    first = _helper_ok(_helper_pivot(root, "repro"))
+    first = _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert "1 ran" in first, first
 
-    second = _helper_ok(_helper_pivot(root, "repro"))
+    second = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert "0 ran, 1 cached" in second, second
     assert _helper_summary(root) == 3.0
@@ -1683,15 +1719,17 @@ def test_method_bound_to_an_instance_is_an_error(
     tmp_path: pathlib.Path, binding: str, variable: str
 ) -> None:
     """`Scaler(3).apply` carries state no code hash records, so the stage is refused."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": _BOUND_METHOD_PIPELINE.format(binding=binding),
             "data/raw/x.csv": "a\n1\n",
         },
     )
 
-    proc = _helper_pivot(root, "repro")
+    proc = helpers.run_pivot(root, home, "repro")
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
@@ -1711,12 +1749,13 @@ def test_method_bound_to_a_scalar_class_or_library_is_allowed(
     tmp_path: pathlib.Path, binding: str
 ) -> None:
     """A method bound to a scalar, a class or a library module's own state is not refused."""
+    home = tmp_path / "home"
     pipeline = _BOUND_METHOD_PIPELINE.format(binding=binding).replace(
         "float(method(1.0))", "len(str(method))"
     )
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
 
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert "1 ran" in output, output
 
@@ -1854,13 +1893,18 @@ with Pipeline("sec") as pipeline:
 )
 def test_changing_a_secret_read_by_a_stage_reruns_it(tmp_path: pathlib.Path, pipeline: str) -> None:
     """A secret in a helper default or loader config is fingerprinted by its keyed digest."""
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
+    home = tmp_path / "home"
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
     env = {"TOKEN": "first-secret"}
-    _helper_ok(_helper_pivot(root, "repro", env=env))
+    _helper_ok(helpers.run_pivot(root, home, "repro", extra_env=env))
     assert _helper_rows(root / "data/sec/measure.jsonl") == [{"a": 12}]
 
-    status = _helper_ok(_helper_pivot(root, "status", env={"TOKEN": "second-secret-x"}))
-    output = _helper_ok(_helper_pivot(root, "repro", env={"TOKEN": "second-secret-x"}))
+    status = _helper_ok(
+        helpers.run_pivot(root, home, "status", extra_env={"TOKEN": "second-secret-x"})
+    )
+    output = _helper_ok(
+        helpers.run_pivot(root, home, "repro", extra_env={"TOKEN": "second-secret-x"})
+    )
 
     assert "1 stale" in status, status
     assert _helper_rows(root / "data/sec/measure.jsonl") == [{"a": 15}], output
@@ -1919,19 +1963,21 @@ def test_value_read_through_a_class_at_import_reruns_stage(
     tmp_path: pathlib.Path, read: str, variable: str
 ) -> None:
     """`Config.SCALE`, an Enum member and a pydantic field default are re-read on a hit."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": _CLASS_ATTRIBUTE_PIPELINE.format(read=read),
             "data/raw/x.csv": "a\n1\n",
         },
     )
-    _helper_ok(_helper_pivot(root, "repro", env={variable: "2"}))
+    _helper_ok(helpers.run_pivot(root, home, "repro", extra_env={variable: "2"}))
     assert _helper_rows(root / "data/cls/scale.jsonl") == [{"a": 2}]
-    cached = _helper_ok(_helper_pivot(root, "status", env={variable: "2"}))
+    cached = _helper_ok(helpers.run_pivot(root, home, "status", extra_env={variable: "2"}))
 
-    status = _helper_ok(_helper_pivot(root, "status", env={variable: "7"}))
-    output = _helper_ok(_helper_pivot(root, "repro", env={variable: "7"}))
+    status = _helper_ok(helpers.run_pivot(root, home, "status", extra_env={variable: "7"}))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro", extra_env={variable: "7"}))
 
     assert "1 cached, 0 stale" in cached, cached
     assert "1 stale" in status, status
@@ -1940,10 +1986,11 @@ def test_value_read_through_a_class_at_import_reruns_stage(
 
 def test_non_scalar_class_attribute_is_an_error(tmp_path: pathlib.Path) -> None:
     """A tuple holding a list read as `Config.COLUMNS` is refused."""
+    home = tmp_path / "home"
     pipeline = _CLASS_ATTRIBUTE_PIPELINE.format(read="len(Config.COLUMNS)")
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
 
-    proc = _helper_pivot(root, "repro")
+    proc = helpers.run_pivot(root, home, "repro")
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
@@ -2004,11 +2051,12 @@ def test_class_attribute_the_language_or_a_library_defines_is_not_refused(
     tmp_path: pathlib.Path, read: str
 ) -> None:
     """`NamedTuple._fields`, `Enum._member_names_` and an inherited stdlib dict are not D2's."""
+    home = tmp_path / "home"
     pipeline = _LIBRARY_DEFINED_CLASS_ATTRIBUTE_PIPELINE.format(read=read)
-    root = _helper_project(tmp_path, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
+    root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, "data/raw/x.csv": "a\n1\n"})
 
-    first = _helper_ok(_helper_pivot(root, "repro"))
-    second = _helper_ok(_helper_pivot(root, "repro"))
+    first = _helper_ok(helpers.run_pivot(root, home, "repro"))
+    second = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert "1 ran" in first, first
     assert "0 ran, 1 cached" in second, second
@@ -2049,9 +2097,10 @@ with Pipeline("mod") as pipeline:
 """
 
 
-def _helper_module_read_project(tmp_path: pathlib.Path) -> pathlib.Path:
+def _helper_module_read_project(tmp_path: pathlib.Path, home: pathlib.Path) -> pathlib.Path:
     return _helper_project(
         tmp_path,
+        home,
         {
             "settings.py": _MODULE_READ_SETTINGS.format(agg="mean"),
             "pipeline.py": _MODULE_READ_PIPELINE,
@@ -2064,10 +2113,11 @@ def test_logger_partial_and_library_function_read_through_a_module_are_accepted(
     tmp_path: pathlib.Path,
 ) -> None:
     """`settings.log`, `settings.ROUND` and `settings.AGG` follow the rule their global forms do."""
-    root = _helper_module_read_project(tmp_path)
+    home = tmp_path / "home"
+    root = _helper_module_read_project(tmp_path, home)
 
-    first = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
-    second = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+    first = _helper_ok(helpers.run_pivot(root, home, "repro", extra_env={"SCALE": "2"}))
+    second = _helper_ok(helpers.run_pivot(root, home, "repro", extra_env={"SCALE": "2"}))
 
     assert "1 ran" in first, first
     assert "0 ran, 1 cached" in second, second
@@ -2076,11 +2126,12 @@ def test_logger_partial_and_library_function_read_through_a_module_are_accepted(
 
 def test_library_function_rebound_in_a_module_reruns_stage(tmp_path: pathlib.Path) -> None:
     """`settings.AGG = np.mean` → `np.median` is recorded by name, as `AGG` would be."""
-    root = _helper_module_read_project(tmp_path)
-    _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+    home = tmp_path / "home"
+    root = _helper_module_read_project(tmp_path, home)
+    _helper_ok(helpers.run_pivot(root, home, "repro", extra_env={"SCALE": "2"}))
 
     (root / "settings.py").write_text(_MODULE_READ_SETTINGS.format(agg="median"))
-    output = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro", extra_env={"SCALE": "2"}))
 
     assert "1 ran" in output, output
     assert _helper_rows(root / "data/mod/via_module.jsonl") == [{"a": 4.0}], output
@@ -2090,6 +2141,7 @@ def test_class_attribute_read_through_a_module_at_import_reruns_stage(
     tmp_path: pathlib.Path,
 ) -> None:
     """`settings.Config.SCALE` computed at import is re-read like `Config.SCALE`."""
+    home = tmp_path / "home"
     pipeline = _MODULE_READ_PIPELINE.replace(
         '    settings.log.info("hi")\n'
         + '    value = settings.ROUND(float(settings.AGG(x["a"]))) * settings.Config.SCALE\n',
@@ -2098,17 +2150,18 @@ def test_class_attribute_read_through_a_module_at_import_reruns_stage(
     assert "settings.AGG" not in pipeline
     root = _helper_project(
         tmp_path,
+        home,
         {
             "settings.py": _MODULE_READ_SETTINGS.format(agg="mean"),
             "pipeline.py": pipeline,
             "data/raw/x.csv": "a\n1\n2\n6\n",
         },
     )
-    _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "2"}))
-    cached = _helper_ok(_helper_pivot(root, "status", env={"SCALE": "2"}))
+    _helper_ok(helpers.run_pivot(root, home, "repro", extra_env={"SCALE": "2"}))
+    cached = _helper_ok(helpers.run_pivot(root, home, "status", extra_env={"SCALE": "2"}))
 
-    status = _helper_ok(_helper_pivot(root, "status", env={"SCALE": "7"}))
-    output = _helper_ok(_helper_pivot(root, "repro", env={"SCALE": "7"}))
+    status = _helper_ok(helpers.run_pivot(root, home, "status", extra_env={"SCALE": "7"}))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro", extra_env={"SCALE": "7"}))
 
     assert "1 cached, 0 stale" in cached, cached
     assert "1 stale" in status, status
@@ -2161,8 +2214,10 @@ def test_class_attribute_through_a_module_follows_the_class_rule(
     tmp_path: pathlib.Path, read: str
 ) -> None:
     """`settings.Opts._fields` is left to the class AST hash, as `Opts._fields` is."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "settings.py": _LIBRARY_DEFINED_THROUGH_MODULE_SETTINGS,
             "pipeline.py": _LIBRARY_DEFINED_THROUGH_MODULE_PIPELINE.format(read=read),
@@ -2170,8 +2225,8 @@ def test_class_attribute_through_a_module_follows_the_class_rule(
         },
     )
 
-    first = _helper_ok(_helper_pivot(root, "repro"))
-    second = _helper_ok(_helper_pivot(root, "repro"))
+    first = _helper_ok(helpers.run_pivot(root, home, "repro"))
+    second = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert "1 ran" in first, first
     assert "0 ran, 1 cached" in second, second
@@ -2179,9 +2234,11 @@ def test_class_attribute_through_a_module_follows_the_class_rule(
 
 def test_non_scalar_class_attribute_through_a_module_is_an_error(tmp_path: pathlib.Path) -> None:
     """`settings.Config.COLUMNS` holding a list is refused."""
+    home = tmp_path / "home"
     pipeline = _LIBRARY_DEFINED_THROUGH_MODULE_PIPELINE.format(read="len(settings.Config.COLUMNS)")
     root = _helper_project(
         tmp_path,
+        home,
         {
             "settings.py": _LIBRARY_DEFINED_THROUGH_MODULE_SETTINGS,
             "pipeline.py": pipeline,
@@ -2189,7 +2246,7 @@ def test_non_scalar_class_attribute_through_a_module_is_an_error(tmp_path: pathl
         },
     )
 
-    proc = _helper_pivot(root, "repro")
+    proc = helpers.run_pivot(root, home, "repro")
 
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
@@ -2215,8 +2272,10 @@ with Pipeline("sub") as pipeline:
 
 def test_submodule_read_through_its_package_is_tracked(tmp_path: pathlib.Path) -> None:
     """`pkg.sub.helper` and `pkg.sub.SCALE` are walked like `sub.helper` and `sub.SCALE`."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pkg/__init__.py": "",
             "pkg/sub.py": "SCALE = 2\n\n\ndef helper(x):\n    return x\n",
@@ -2224,11 +2283,11 @@ def test_submodule_read_through_its_package_is_tracked(tmp_path: pathlib.Path) -
             "data/raw/x.csv": "a\n1\n",
         },
     )
-    _helper_ok(_helper_pivot(root, "repro"))
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert _helper_rows(root / "data/sub/scale.jsonl") == [{"a": 2}]
 
     (root / "pkg/sub.py").write_text("SCALE = 50\n\n\ndef helper(x):\n    return x + 1\n")
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert "1 ran" in output, output
     assert _helper_rows(root / "data/sub/scale.jsonl") == [{"a": 100}], output
@@ -2305,23 +2364,25 @@ def test_rewiring_stage_inputs_reruns_and_never_restores_old_output(
     delete_lock: bool,
 ) -> None:
     """The parameter-to-artifact binding, collection kind and order belong in the manifest."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": template.format(call=before),
             "data/raw/a.txt": "A",
             "data/raw/b.txt": "B",
         },
     )
-    first = _helper_ok(_helper_pivot(root, "repro"))
+    first = _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert "1 ran" in first, first
     assert (root / "data/wire/combine.txt").read_text() == initial
 
     (root / "pipeline.py").write_text(template.format(call=after))
-    status = _helper_ok(_helper_pivot(root, "status", "--explain"))
+    status = _helper_ok(helpers.run_pivot(root, home, "status", "--explain"))
     if delete_lock:
         (root / ".pivot/stages/wire/combine.lock").unlink()
-    second = _helper_ok(_helper_pivot(root, "repro"))
+    second = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert "Inputs rewired:" in status, status
     assert "combine" in status, status
@@ -2350,22 +2411,24 @@ def test_rebinding_path_input_with_same_content_reruns_and_never_restores_old_ou
     tmp_path: pathlib.Path, delete_lock: bool
 ) -> None:
     """A PathOnly input's binding path is stage wiring even when the bytes do not change."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": _PATH_WIRING_PIPELINE.format(path="old.txt"),
             "old.txt": "same",
             "new.txt": "same",
         },
     )
-    _helper_ok(_helper_pivot(root, "repro"))
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
     assert (root / "data/path/result.txt").read_text() == "old.txt"
 
     (root / "pipeline.py").write_text(_PATH_WIRING_PIPELINE.format(path="new.txt"))
-    status = _helper_ok(_helper_pivot(root, "status", "--explain"))
+    status = _helper_ok(helpers.run_pivot(root, home, "status", "--explain"))
     if delete_lock:
         (root / ".pivot/stages/path/result.lock").unlink()
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert "Inputs rewired: file" in status, status
     assert "1 ran" in output, output
@@ -2374,18 +2437,20 @@ def test_rebinding_path_input_with_same_content_reruns_and_never_restores_old_ou
 
 def test_unchanged_wiring_stays_cached(tmp_path: pathlib.Path) -> None:
     """A wiring entry is stable when the pipeline call has not changed."""
+    home = tmp_path / "home"
     root = _helper_project(
         tmp_path,
+        home,
         {
             "pipeline.py": _DIRECT_WIRING_PIPELINE.format(call="combine(a, b)"),
             "data/raw/a.txt": "A",
             "data/raw/b.txt": "B",
         },
     )
-    _helper_ok(_helper_pivot(root, "repro"))
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
 
-    status = _helper_ok(_helper_pivot(root, "status"))
-    output = _helper_ok(_helper_pivot(root, "repro"))
+    status = _helper_ok(helpers.run_pivot(root, home, "status"))
+    output = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
     assert "1 cached, 0 stale" in status, status
     assert "0 ran, 1 cached" in output, output

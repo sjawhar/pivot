@@ -137,9 +137,9 @@ own params: a `StageParams` default on a helper, a loader's config field, or a
 `functools.partial` argument, including one inside a dataclass or pydantic model held
 there. Changing that secret re-runs the stage, and no manifest or lock holds its value.
 
-The key is `.pivot/secret.key`: 32 random bytes, created the first time a stage with a
-secret is checked, with mode 0600, and listed in `.pivot/.gitignore`. Never commit it.
-Set `PIVOT_SECRET_KEY` (64 hex digits) to use a key from the environment instead, so CI
-and teammates record the same digests. A clone without the key, and without
-`PIVOT_SECRET_KEY`, makes its own key; each stage that has a secret then re-runs once
+The key is `<state dir>/secret.key`: 32 random bytes, created the first time a stage with a
+secret is checked, with mode 0600, and listed in the state directory's `.gitignore`. `core.state_dir`
+defaults to `.pivot`. Never commit it. Set `PIVOT_SECRET_KEY` (64 hex digits) to use a key from
+the environment instead, so CI and teammates record the same digests. A clone without the key,
+and without `PIVOT_SECRET_KEY`, makes its own key; each stage that has a secret then re-runs once
 there.

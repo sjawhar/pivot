@@ -239,6 +239,34 @@ def test_an_unreadable_link_with_a_control_byte_is_escaped(tmp_path: pathlib.Pat
     assert _EXCEPTION_TEXT.search(out) is None, out
 
 
+def test_legacy_pivot_cache_objects_stay_symlink_checkout_members(
+    tmp_path: pathlib.Path,
+) -> None:
+    """#503: setting ``core.state_dir: altstate`` does not move cache objects a prior run wrote
+    under ``.pivot/cache/files``. A symlink checkout and --only-missing checkout name those
+    legacy objects, every link resolves, and status and verify pass."""
+    root = _helper_project(tmp_path)
+    legacy_cache = root / ".pivot" / "cache" / "files"
+    assert any(legacy_cache.rglob("*")), "the initial repro cached its file objects"
+    (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: altstate\n")
+    output = root / "data" / "p" / "big"
+    shutil.rmtree(output)
+
+    _ok(_pivot(root, "checkout", "--checkout-mode", "symlink", "data/p/big"))
+    links = sorted(output.iterdir())
+    assert all(link.is_symlink() and link.exists() for link in links)
+    assert all(link.resolve().is_relative_to(legacy_cache.resolve()) for link in links)
+    _ok(_pivot(root, "status"))
+    _ok(_pivot(root, "verify"))
+
+    links[1].unlink()
+    _ok(_pivot(root, "checkout", "--checkout-mode", "symlink", "--only-missing", "data/p/big"))
+    assert all(link.is_symlink() and link.exists() for link in output.iterdir())
+    assert all(link.resolve().is_relative_to(legacy_cache.resolve()) for link in output.iterdir())
+    _ok(_pivot(root, "status"))
+    _ok(_pivot(root, "verify"))
+
+
 @pytest.mark.parametrize(
     ("args", "returncode"),
     [

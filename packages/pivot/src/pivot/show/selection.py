@@ -319,7 +319,7 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
     head_hashes = dict[str, str | None]()
     workspace_hashes = dict[str, str]()
     workspace_paths = dict[str, pathlib.Path]()
-    cache_dir = config.get_cache_dir() / "files"
+    cache_dir = config.locate_cache_dir() / "files"
     selection, unresolved = _select_outputs(
         targets, outputs, paths_by_identity, stage_infos, proj_root
     )

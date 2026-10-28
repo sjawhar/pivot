@@ -9,17 +9,15 @@ any entry at its own input hash.
 """
 
 import json
-import os
 import pathlib
 import subprocess
-import sys
 
 import pytest
 import yaml
+from tests import helpers
 
 from pivot.storage import state
 
-_PIVOT = pathlib.Path(sys.executable).parent / "pivot"
 _LIB = {"helpers/__init__.py": "", "helpers/lib.py": "VALUE = 1\n"}
 _LINES = "Local Set Default Proof Using\nSet Default Proof Using\nLemma a\n"
 _RUNTIME_IMPORT = """\
@@ -65,28 +63,18 @@ outs:
 """
 
 
-def _run(project: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in ("VIRTUAL_ENV", "PIVOT_UNSAFE_FINGERPRINTING")
-    }
-    return subprocess.run(
-        [str(_PIVOT), *args], cwd=project, env=env, capture_output=True, text=True, timeout=300
-    )
-
-
 def _ok(result: subprocess.CompletedProcess[str]) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _project(tmp_path: pathlib.Path) -> pathlib.Path:
+    home = tmp_path / "home"
     project = tmp_path / "project"
     for rel, text in {**_LIB, "pipeline.py": _RUNTIME_IMPORT, "data/raw/lines.txt": _LINES}.items():
         (project / rel).parent.mkdir(parents=True, exist_ok=True)
         (project / rel).write_text(text)
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
-    _ok(_run(project, "init"))
+    _ok(helpers.run_pivot(project, home, "init"))
     return project
 
 
@@ -98,7 +86,7 @@ def _edit_lib(project: pathlib.Path) -> None:
     (project / "helpers" / "lib.py").write_text("VALUE = 100\n")
 
 
-def _leave_0_5_2_state(project: pathlib.Path) -> None:
+def _leave_0_5_2_state(project: pathlib.Path, home: pathlib.Path) -> None:
     """Leave the project as a `pivot repro` at 0.5.2 leaves it: its lock, and its run-cache entry.
 
     One run supplies the output object and the run history; then the lock is replaced by 0.5.2's
@@ -107,7 +95,7 @@ def _leave_0_5_2_state(project: pathlib.Path) -> None:
     `{"output_hashes":[{"hash":"2ad953167adbd9db","path":"t/count"}],"run_id":"<its run>"}`; the
     input hash is read back from this version's run history, which records the same one.
     """
-    _ok(_run(project, "repro"))
+    _ok(helpers.run_pivot(project, home, "repro"))
     assert _value(project) == 4
     lock = project / ".pivot" / "stages" / "t" / "count.lock"
     fixture = yaml.safe_load(_LOCK_0_5_2)
@@ -127,7 +115,7 @@ def _leave_0_5_2_state(project: pathlib.Path) -> None:
             separators=(",", ":"),
         )
         db.put_raw(f"runcache:t/count:{input_hash}".encode(), entry.encode())
-    _ok(_run(project, "repro"))
+    _ok(helpers.run_pivot(project, home, "repro"))
     assert _value(project) == 4, "the 0.5.2 lock is reused, as the docs state"
 
 
@@ -136,13 +124,14 @@ def test_d1_forced_run_after_an_edit_is_not_undone_by_a_0_5_2_run_cache_entry(
 ) -> None:
     """After a forced recheck marks a dynamically importing stage, a later `repro` must not
     restore the same-input run-cache entry that a prior Pivot version filed."""
+    home = tmp_path / "home"
     project = _project(tmp_path)
-    _leave_0_5_2_state(project)
+    _leave_0_5_2_state(project, home)
     _edit_lib(project)
 
-    _ok(_run(project, "repro", "--force", "t/count"))
+    _ok(helpers.run_pivot(project, home, "repro", "--force", "t/count"))
     assert _value(project) == 103
-    _ok(_run(project, "repro"))
+    _ok(helpers.run_pivot(project, home, "repro"))
 
     assert _value(project) == 103, "the next repro restored the 0.5.2 output over the forced run's"
 
@@ -150,12 +139,13 @@ def test_d1_forced_run_after_an_edit_is_not_undone_by_a_0_5_2_run_cache_entry(
 def test_d1_stage_a_forced_run_marked_reruns_on_the_next_edit(tmp_path: pathlib.Path) -> None:
     """A forced recheck marks the dynamically importing stage, so a later module edit reruns it
     instead of restoring an older run-cache entry."""
+    home = tmp_path / "home"
     project = _project(tmp_path)
-    _leave_0_5_2_state(project)
+    _leave_0_5_2_state(project, home)
 
-    _ok(_run(project, "repro", "--force", "t/count"))
+    _ok(helpers.run_pivot(project, home, "repro", "--force", "t/count"))
     _edit_lib(project)
-    _ok(_run(project, "repro"))
+    _ok(helpers.run_pivot(project, home, "repro"))
 
     assert _value(project) == 103, (
         "the edit after the forced re-check was served from the run cache"
@@ -165,14 +155,15 @@ def test_d1_stage_a_forced_run_marked_reruns_on_the_next_edit(tmp_path: pathlib.
 def test_d1_forced_run_after_no_commit_and_commit_is_not_undone(tmp_path: pathlib.Path) -> None:
     """A forced flagged run after `repro --no-commit` and `pivot commit` must not be undone by the
     run-cache entry that commit filed."""
+    home = tmp_path / "home"
     project = _project(tmp_path)
-    _ok(_run(project, "repro", "--no-commit"))
-    _ok(_run(project, "commit"))
+    _ok(helpers.run_pivot(project, home, "repro", "--no-commit"))
+    _ok(helpers.run_pivot(project, home, "commit"))
     _edit_lib(project)
 
-    _ok(_run(project, "repro", "--force", "t/count"))
+    _ok(helpers.run_pivot(project, home, "repro", "--force", "t/count"))
     assert _value(project) == 103
-    _ok(_run(project, "repro"))
+    _ok(helpers.run_pivot(project, home, "repro"))
 
     assert _value(project) == 103, (
         "the next repro restored the committed output over the forced run's"
@@ -184,11 +175,12 @@ def test_d1_control_without_a_prior_entry_the_flagged_stage_reruns(
     tmp_path: pathlib.Path, repeat: int
 ) -> None:
     """Without an older run-cache entry, a flagged stage reruns on every `repro` after an edit."""
+    home = tmp_path / "home"
     project = _project(tmp_path)
-    _ok(_run(project, "repro"))
+    _ok(helpers.run_pivot(project, home, "repro"))
     _edit_lib(project)
     for _ in range(repeat):
-        _ok(_run(project, "repro"))
+        _ok(helpers.run_pivot(project, home, "repro"))
     assert _value(project) == 103
 
 
@@ -206,11 +198,12 @@ def test_flagged_run_deletes_the_run_cache_entry_at_its_input_hash(
 ) -> None:
     """A forced run the stage-import check flags removes the entry 0.5.2 filed at its own input
     hash, so no later lookup without the mark can find that older result."""
+    home = tmp_path / "home"
     project = _project(tmp_path)
-    _leave_0_5_2_state(project)
+    _leave_0_5_2_state(project, home)
     assert _latest_run_cache_entry(project) is not None, "the 0.5.2 entry was not set up"
 
-    _ok(_run(project, "repro", "--force", "t/count"))
+    _ok(helpers.run_pivot(project, home, "repro", "--force", "t/count"))
 
     assert _latest_run_cache_entry(project) is None
 
@@ -222,13 +215,14 @@ def test_status_explain_reports_a_marked_stage_as_will_run_not_run_cache(
     0.5.2 run-cache entry at its input hash: the stage will run with the uncovered-import reason,
     never as cached from the run cache, and `pivot verify` fails it with that reason; `repro`
     then runs it."""
+    home = tmp_path / "home"
     project = _project(tmp_path)
-    _leave_0_5_2_state(project)
-    _ok(_run(project, "repro", "--force", "t/count"))
+    _leave_0_5_2_state(project, home)
+    _ok(helpers.run_pivot(project, home, "repro", "--force", "t/count"))
     _edit_lib(project)
 
-    explain = _run(project, "status", "--explain", "t/count")
-    verify = _run(project, "verify")
+    explain = helpers.run_pivot(project, home, "status", "--explain", "t/count")
+    verify = helpers.run_pivot(project, home, "verify")
 
     _ok(explain)
     text = " ".join((explain.stdout + explain.stderr).split())
@@ -239,7 +233,7 @@ def test_status_explain_reports_a_marked_stage_as_will_run_not_run_cache(
     assert verify.returncode == 1, verified
     assert "t/count: failed" in verified, verified
     assert "Previous run imported modules its fingerprint does not cover" in verified, verified
-    rerun = _run(project, "repro", "--json")
+    rerun = helpers.run_pivot(project, home, "repro", "--json")
     _ok(rerun)
     assert '"stage": "t/count", "status": "ran"' in rerun.stdout, rerun.stdout
     assert _value(project) == 103
@@ -260,16 +254,17 @@ def test_marked_lock_is_not_satisfied_from_an_entry_at_another_input_hash(
     """0.5.2 filed an entry for input Y. The input changes to X, the imported module is edited,
     and `repro --force` at X marks the lock (deleting only X's entry). Back at Y, the marked lock
     must not be satisfied from Y's entry: the stage runs and gives 103, not 0.5.2's 4."""
+    home = tmp_path / "home"
     project = _project(tmp_path)
-    _leave_0_5_2_state(project)
+    _leave_0_5_2_state(project, home)
     _set_lines(project, _LINES + "Lemma b\n")
     _edit_lib(project)
-    _ok(_run(project, "repro", "--force", "t/count"))
+    _ok(helpers.run_pivot(project, home, "repro", "--force", "t/count"))
     assert _value(project) == 104
     assert _run_cache_keys(project), "the entry 0.5.2 filed for Y is gone"
 
     _set_lines(project, _LINES)
-    _ok(_run(project, "repro"))
+    _ok(helpers.run_pivot(project, home, "repro"))
 
     assert _value(project) == 103, "the marked lock was satisfied from Y's 0.5.2 entry"
 
@@ -280,15 +275,16 @@ def test_commit_carrying_the_mark_deletes_the_entry_at_its_input_hash(
     """0.5.2 filed an entry for input Y. A forced run at X marks the lock; back at Y,
     `repro --no-commit` then `pivot commit` records Y's outputs and carries the mark, so it
     deletes the entry at Y's input hash: no run-cache entry for the stage remains."""
+    home = tmp_path / "home"
     project = _project(tmp_path)
-    _leave_0_5_2_state(project)
+    _leave_0_5_2_state(project, home)
     _set_lines(project, _LINES + "Lemma b\n")
-    _ok(_run(project, "repro", "--force", "t/count"))
+    _ok(helpers.run_pivot(project, home, "repro", "--force", "t/count"))
     _set_lines(project, _LINES)
-    _ok(_run(project, "repro", "--no-commit"))
+    _ok(helpers.run_pivot(project, home, "repro", "--no-commit"))
     assert _run_cache_keys(project), "the entry 0.5.2 filed for Y is gone before the commit"
 
-    _ok(_run(project, "commit"))
+    _ok(helpers.run_pivot(project, home, "commit"))
 
     assert _run_cache_keys(project) == []
     lock = (project / ".pivot" / "stages" / "t" / "count.lock").read_text()

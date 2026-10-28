@@ -12,6 +12,7 @@ import pathlib
 import pytest
 
 from pivot import discovery
+from pivot.config import io as config_io
 
 
 def _helper_write_pipeline(
@@ -340,18 +341,55 @@ def test_discover_all_pipelines_combines_stages(tmp_path: pathlib.Path) -> None:
     assert set(combined.list_stages()) == {"alpha/stage_a", "beta/stage_b"}
 
 
-def test_discover_all_pipelines_keeps_every_stage_in_the_project_state_dir(
+def test_discover_all_pipelines_keeps_every_stage_in_the_configured_state_dir(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Stages from every discovered pipeline keep their state in the project's .pivot."""
+    """Every discovered stage shares the project's configured state directory."""
+    (tmp_path / ".pivot").mkdir(exist_ok=True)
+    (tmp_path / ".pivot" / "config.yaml").write_text("core:\n  state_dir: alternate-state\n")
+    config_io.clear_config_cache()
     _helper_write_pipeline(tmp_path / "alpha", "alpha", "stage")
     _helper_write_pipeline(tmp_path / "beta", "beta", "stage")
 
     combined = discovery.discover_pipeline(project_root=tmp_path, all_pipelines=True)
 
     assert combined is not None
-    assert combined.get_stage("alpha/stage")["state_dir"] == tmp_path.resolve() / ".pivot"
-    assert combined.get_stage("beta/stage")["state_dir"] == tmp_path.resolve() / ".pivot"
+    assert combined.get_stage("alpha/stage")["state_dir"] == tmp_path.resolve() / "alternate-state"
+    assert combined.get_stage("beta/stage")["state_dir"] == tmp_path.resolve() / "alternate-state"
+
+
+def test_glob_all_pipelines_ignores_the_configured_state_dir(tmp_path: pathlib.Path) -> None:
+    """State files never become nested pipelines during an all-pipelines scan."""
+    (tmp_path / ".pivot").mkdir(exist_ok=True)
+    (tmp_path / ".pivot" / "config.yaml").write_text("core:\n  state_dir: alternate-state\n")
+    config_io.clear_config_cache()
+    _helper_write_pipeline(tmp_path / "alternate-state", "state", "write")
+
+    assert discovery.glob_all_pipelines(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("configured_state_dir", "symlink"),
+    [
+        pytest.param("nested/../actual-state", False, id="parent-segment"),
+        pytest.param("state-link", True, id="in-project-symlink"),
+    ],
+)
+def test_glob_all_pipelines_ignores_normalized_configured_state_dir(
+    tmp_path: pathlib.Path, configured_state_dir: str, symlink: bool
+) -> None:
+    """--all excludes the resolved state tree rather than its lexical spelling."""
+    (tmp_path / ".pivot").mkdir(exist_ok=True)
+    actual_state_dir = tmp_path / "actual-state"
+    if symlink:
+        (tmp_path / "state-link").symlink_to(actual_state_dir, target_is_directory=True)
+    (tmp_path / ".pivot" / "config.yaml").write_text(
+        f"core:\n  state_dir: {configured_state_dir}\n"
+    )
+    config_io.clear_config_cache()
+    _helper_write_pipeline(actual_state_dir, "state", "write")
+
+    assert discovery.glob_all_pipelines(tmp_path) == []
 
 
 def test_discover_all_pipelines_returns_none_when_empty(tmp_path: pathlib.Path) -> None:
