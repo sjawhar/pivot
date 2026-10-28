@@ -298,6 +298,7 @@ StateDB is an LMDB-backed key-value store for all pipeline state. Keys use prefi
 | `runcache:` | Run cache entries (stage name + input hash) |
 | `run:` | Run history manifests |
 | `remote:` | Remote index entries |
+| `nocommit:` | What a stage's outputs hold that no lock records yet: a `--no-commit` run's code manifest (rerun marks included) and output hashes, for `pivot commit`, and keys another feature writes; each writer replaces only its own keys |
 
 **Key strategies:** A file-hash key is the absolute path as given (`os.fsencode(os.path.abspath(path))`): building it costs no system call, and the entry's `(mtime_ns, size, device, inode)`, from a `stat()` that follows symlinks, decides whether a cached hash still applies, so a link re-pointed at another file no longer matches. Generation keys use the artifact identity, so they stay the same wherever an output's path points.
 
@@ -439,7 +440,7 @@ Without this flag, Pivot validates that all tracked outputs exist before running
 The `--no-commit` flag runs stages without writing durable state:
 
 ```bash
-# Run stages — outputs land on disk but no locks, cache, or StateDB updates
+# Run stages — outputs land on disk; no locks, no cache, only a record of what each stage ran
 pivot repro --no-commit
 
 # Inspect results, then snapshot current workspace state
@@ -448,12 +449,14 @@ pivot commit
 
 ### How It Works
 
-1. `--no-commit`: stages execute and outputs are written to disk. No lock files, no cache copies, no StateDB updates. Output hashes are computed for the `StageResult` but nothing is persisted.
-2. `pivot commit [stage_names...]`: computes current workspace state (fingerprints code, hashes deps and outputs), writes production lock files, saves outputs to cache, and updates StateDB. Without arguments, commits all stale stages. With stage names, unconditionally commits those stages.
+1. `--no-commit`: stages execute and outputs are written to disk. No lock files and no cache copies are written. StateDB keeps one record per stage that ran (`nocommit:<stage>`): the code manifest the run's lock would have held, rerun marks included, and the hashes of the outputs it wrote.
+2. `pivot commit [stage_names...]`: computes current workspace state (hashes deps and outputs), writes production lock files, saves outputs to cache, and updates StateDB. Without arguments, commits all stale stages. With stage names, unconditionally commits those stages. The code manifest it writes depends on the outputs:
+   - The outputs on disk are the ones a `--no-commit` run wrote (its record): `pivot commit` writes the manifest that run recorded. The run's code is the code the stage ran, which can differ from the code on disk now (a helper edited while the run continued), and a rerun mark the run set stays. An unmarked record files a run-cache entry under that manifest. A marked record stays non-reusable: it files no entry and deletes one at its static input hash.
+   - No record, a record without a code manifest (one that holds only another feature's key), or outputs that differ from it (edited by hand after the run): `pivot commit` fingerprints the code on disk now and records the outputs against it, as below.
 
 ### Use Case
 
-This workflow avoids caching overhead during rapid iteration. `pivot commit` is also the "trust me" path — if you change code but know outputs are still correct, `pivot commit` records the current state without re-running stages.
+This workflow avoids caching overhead during rapid iteration. `pivot commit` is also the "trust me" path — if you change code but know outputs are still correct, `pivot commit` records the current state without re-running stages. For outputs that a `--no-commit` run wrote and nobody changed since, it records the code that run ran instead, so an edit made during or after that run still reruns the stage.
 
 ## See Also
 

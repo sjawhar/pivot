@@ -458,11 +458,12 @@ def test_pivot_thread_started_inside_a_covered_import_does_not_hide_a_hooked_loa
     _assert_not_reusable(project, _run(project, "repro"))
 
 
-def test_runtime_dynamic_import_under_no_commit_warns_that_commit_records_outputs(
+def test_runtime_dynamic_import_under_no_commit_warns_that_commit_keeps_the_mark(
     tmp_path: pathlib.Path,
 ) -> None:
-    """`pivot commit` records outputs on disk against the static fingerprint, so under
-    `--no-commit` the warning says so."""
+    """The `--no-commit` run records its marked manifest, which `pivot commit` writes for the
+    outputs it wrote, so under `--no-commit` the warning says `pivot commit` keeps the mark, and
+    after the commit the stage still reruns."""
     project = _project(
         tmp_path,
         {
@@ -481,9 +482,14 @@ def test_runtime_dynamic_import_under_no_commit_warns_that_commit_records_output
     message = " ".join((result.stdout + result.stderr).split())
     assert result.returncode == 0, message
     assert message.count("imported user modules its fingerprint does not cover") == 1, message
-    assert "`pivot commit` will record these outputs as current" in message, message
-    committed = _run(project, "repro")
-    assert "`pivot commit`" not in " ".join((committed.stdout + committed.stderr).split())
+    assert "`pivot commit` keeps that when it records these outputs." in message, message
+    committed = _run(project, "commit")
+    assert committed.returncode == 0, committed.stdout + committed.stderr
+    lock = (project / ".pivot" / "stages" / "t" / "count.lock").read_text()
+    assert "uncovered-import:" in lock
+    again = _run(project, "repro")
+    assert "`pivot commit`" not in " ".join((again.stdout + again.stderr).split())
+    assert "1 ran" in " ".join((again.stdout + again.stderr).split())
 
 
 def test_import_from_a_thread_outliving_its_stage_does_not_fail_the_next_stage(

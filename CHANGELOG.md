@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.5.14 (2026-10-27)
+
+### Performance Improvements
+
+- **storage**: Stat unchanged directories instead of listing them when finding .pvt files
+  ([#513](https://github.com/sjawhar/pivot/pull/513),
+  [`7fbdfa3`](https://github.com/sjawhar/pivot/commit/7fbdfa31cbdcb01832a935f5a57335239db5ed57))
+
+
 ## v0.5.13 (2026-10-27)
 
 ### Bug Fixes

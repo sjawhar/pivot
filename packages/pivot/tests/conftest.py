@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import importlib.util
 import json
 import linecache
 import logging
@@ -27,7 +28,7 @@ import click.testing
 import pytest
 from moto import server as moto_server
 
-from pivot import project
+from pivot import discovery, project
 from pivot.compose import Pipeline
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
@@ -270,6 +271,34 @@ def reset_pivot_state(_default_project_root: pathlib.Path) -> Generator[None]:
         logging.getLogger(name).handlers.clear()
     yield
     project._project_root_cache = None
+
+
+@pytest.fixture(autouse=True)
+def restore_import_machinery(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    """Give the next test the import machinery this test started with.
+
+    One pytest-xdist worker runs many tests in one process. A test that installs Pivot's user-code
+    loader (``discovery.install_user_code_loader``, as a worker's initializer does) or runs a
+    discovery changes process-wide import state: ``sys.meta_path``, ``sys.path_hooks``,
+    ``sys.path_importer_cache``, ``importlib.util.spec_from_file_location``, and the import
+    session a discovery leaves for fingerprinting and workers, with its records of loaded source.
+    Left behind, they change what a later test imports and fingerprints. The session is ended
+    before ``monkeypatch`` undoes the test's ``sys.path`` and ``sys.modules`` changes, which this
+    fixture depends on for that order.
+    """
+    meta_path = list(sys.meta_path)
+    path_hooks = list(sys.path_hooks)
+    importer_cache = dict(sys.path_importer_cache)
+    spec_from_file_location = importlib.util.spec_from_file_location
+    session = discovery._import_session
+    yield
+    if discovery._import_session is not None and discovery._import_session is not session:
+        discovery._close_import_session(discovery._import_session)
+    sys.meta_path[:] = meta_path
+    sys.path_hooks[:] = path_hooks
+    sys.path_importer_cache.clear()
+    sys.path_importer_cache.update(importer_cache)
+    importlib.util.spec_from_file_location = spec_from_file_location
 
 
 @pytest.fixture
