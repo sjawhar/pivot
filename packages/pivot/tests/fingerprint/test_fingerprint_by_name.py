@@ -32,6 +32,7 @@ from pivot import (  # noqa: F401
     exceptions,
     fingerprint,
     fingerprint_by_name,
+    parameters,
 )
 
 # ---------------------------------------------------------------------------
@@ -4782,6 +4783,17 @@ class SomeModel(pydantic.BaseModel):
     x: int = 1
 
 
+
+class RootItem(pydantic.BaseModel):
+    name: str
+    token: pydantic.SecretStr
+    hidden: int = pydantic.Field(repr=False)
+
+
+RootItems = pydantic.RootModel[list[RootItem]]
+RootSecret = pydantic.RootModel[pydantic.SecretStr]
+RootCount = pydantic.RootModel[int]
+
 def meta_reporting(target):
     # A metaclass whose `__class__` property names another class: its classes report `target`.
     class Meta(type):
@@ -4869,6 +4881,15 @@ shapes = {
     "dict_property_none": DictPropNone(),
     "dict_property_int": DictPropInt(),
     "proxy_forwarding_by_getattribute": ForwardsByGetattribute(KeeperPlainMethod()),
+    "rootmodel_list": RootItems([RootItem(name="item", token=pydantic.SecretStr("alpha"), hidden=1)]),
+    "rootmodel_list_secret": RootItems(
+        [RootItem(name="item", token=pydantic.SecretStr("betaXYZ"), hidden=1)]
+    ),
+    "rootmodel_list_hidden": RootItems(
+        [RootItem(name="item", token=pydantic.SecretStr("alpha"), hidden=2)]
+    ),
+    "rootmodel_secret": RootSecret(pydantic.SecretStr("alpha")),
+    "rootmodel_int": RootCount(3),
 }
 KeyEqRaises.armed = True
 result = {}
@@ -4905,7 +4926,13 @@ def test_the_model_dump_probe_runs_no_class_side_code() -> None:
     )
     assert done.returncode == 0, done.stderr[-1500:]
     plain = ["dict", [["factor", 3]]]
-    assert json.loads(done.stdout) == {
+    result = json.loads(done.stdout)
+    assert result.pop("rootmodel_int") == 3
+    assert result.pop("rootmodel_secret")[0] == "secret"
+    root_list = result.pop("rootmodel_list")
+    assert root_list != result.pop("rootmodel_list_secret")
+    assert root_list != result.pop("rootmodel_list_hidden")
+    assert result == {
         "dict_property_raises": ["DictPropertyRaises", "DictPropertyRaises()"],
         "dict_property_not_a_mapping": ["DictPropertyNotAMapping", "DictPropertyNotAMapping()"],
         "meta_getattribute_raises_for_mro": ["__main__.MetaGetattributeMro", plain],
@@ -5296,6 +5323,163 @@ def test_a_forwarder_is_dumped_only_for_a_callable_answer_that_returns_an_exact_
     assert canonical(raises)[1] == canonical({"factor": 3})
     assert canonical(KeepsAndForwards())[1] == canonical({"factor": 3})
 
+
+
+_R15_ROOT_MODEL = """\
+import functools
+import json
+import pathlib
+
+import pydantic
+
+
+class Item(pydantic.BaseModel):
+    name: str
+    token: pydantic.SecretStr
+    hidden: int = pydantic.Field(repr=False)
+
+
+Items = pydantic.RootModel[list[Item]]
+
+
+def load() -> Items:
+    data = json.loads((pathlib.Path(__file__).parent / "settings.json").read_text())
+    return Items([Item(name="item", token=pydantic.SecretStr(data["token"]), hidden=data["hidden"])])
+
+
+def apply(value: int, cfg: Items) -> int:
+    item = cfg.root[0]
+    return value * len(item.token.get_secret_value()) + item.hidden
+
+
+RUN = functools.partial(apply, cfg=__CFG__)
+"""
+
+
+def test_root_model_list_keeps_secret_and_hidden_state() -> None:
+    """A RootModel's non-dict `model_dump()` returns the root list. That list holds its item's
+    secret and `repr=False` field, so either edit must change the canonical form rather than
+    taking the masked RootModel repr."""
+
+    class Item(pydantic.BaseModel):
+        name: str
+        token: pydantic.SecretStr
+        hidden: int = pydantic.Field(repr=False)
+
+    Items = pydantic.RootModel[list[Item]]
+    canonical = fingerprint._canonicalize_value_for_hash
+
+    def form(token: str, hidden: int) -> typing.Any:
+        return canonical(Items([Item(name="item", token=pydantic.SecretStr(token), hidden=hidden)]))
+
+    base = form("alpha", 1)
+    assert base != form("betaXYZ", 1)
+    assert base != form("alpha", 2)
+
+
+def test_scalar_root_models_have_mains_forms() -> None:
+    """RootModel's non-dict dump is canonicalized as main canonicalizes that root: an int stays
+    an int and a SecretStr becomes its keyed secret digest, not RootModel's masked repr."""
+
+    Secret = pydantic.RootModel[pydantic.SecretStr]
+    Count = pydantic.RootModel[int]
+    secret = pydantic.SecretStr("alpha")
+    canonical = fingerprint._canonicalize_value_for_hash
+
+    assert canonical(Count(3)) == 3
+    assert canonical(Secret(secret)) == ["secret", parameters.secret_digest(secret)]
+
+
+@pytest.mark.parametrize(
+    ("name", "cfg"),
+    [
+        ("rootpartial", "load()"),
+        ("rootcelery", "celery.local.Proxy(load)"),
+    ],
+)
+def test_root_model_list_in_a_partial_keyword_or_celery_proxy_reruns(
+    tmp_path: pathlib.Path, name: str, cfg: str
+) -> None:
+    """A RootModel list in a partial keyword or celery proxy is dumped as main dumps it. Its
+    secret and `repr=False` field therefore both rerun the stage when edited."""
+
+    if name == "rootcelery":
+        pytest.importorskip("celery.local")
+        helpers = "import celery.local\n\n" + _R15_ROOT_MODEL
+    else:
+        helpers = _R15_ROOT_MODEL
+    assert helpers.count("__CFG__") == 1
+    project = _project(
+        tmp_path,
+        {
+            "lib/__init__.py": "",
+            "lib/helpers.py": helpers.replace("__CFG__", cfg),
+            "lib/settings.json": '{"token": "alpha", "hidden": 1}\n',
+            "pipeline.py": _R11_PIPELINE.format(name=name),
+        },
+    )
+    stage = f"{name}/s"
+    out = project / "data" / name / "s.txt"
+    assert _status(_run(project, "repro", "--json"), stage)[0] == "ran"
+    assert _status(_run(project, "repro", "--json"), stage) == ("cached", "unchanged")
+    assert out.read_text() == "86\n"
+
+    _edit(project / "lib" / "settings.json", '"token": "alpha"', '"token": "betaXYZ"')
+    assert _status(_run(project, "repro", "--json"), stage) == ("ran", "Code changed")
+    assert out.read_text() == "120\n"
+
+    _edit(project / "lib" / "settings.json", '"hidden": 1', '"hidden": 30')
+    assert _status(_run(project, "repro", "--json"), stage) == ("ran", "Code changed")
+    assert out.read_text() == "149\n"
+
+
+def test_a_raising_mark_property_is_unmarked() -> None:
+    """Once any object is marked, the mark reader sees every classified value. A property named
+    as the mark that raises is not a mark and must not stop canonicalization of an unmarked
+    callable instance."""
+
+    def helper() -> int:
+        return 0
+
+    class Unmarked:
+        def __call__(self) -> int:
+            return 1
+
+        @property
+        def __pivot_fingerprint_by_name__(self) -> typing.Any:
+            raise RuntimeError("mark descriptor ran")
+
+    fingerprint.mark_by_name(helper)
+    value = Unmarked()
+    assert not fingerprint.fingerprinted_by_name(value)
+    assert fingerprint._canonicalize_value_for_hash(value) == [
+        f"{Unmarked.__module__}.{Unmarked.__qualname__}",
+        ["dict", []],
+    ]
+
+
+def test_a_mark_in_the_fallback_table_beats_a_readonly_mark_property() -> None:
+    """A read-only class property prevents the generic mark store, so the marked callable lives
+    in the identity table. That table must answer before the property returns its non-mark value."""
+
+    def helper() -> int:
+        return 0
+
+    class Decorator:
+        def __init__(self, wrapped: typing.Callable[[], int]) -> None:
+            self.__wrapped__ = wrapped
+
+        def __call__(self) -> int:
+            return self.__wrapped__()
+
+        @property
+        def __pivot_fingerprint_by_name__(self) -> None:
+            return None
+
+    value = Decorator(helper)
+    fingerprint.mark_by_name(value)
+    assert fingerprint._marked_without_dict.get(id(value)) is value
+    assert fingerprint.fingerprinted_by_name(value)
 
 _R13_CELERY_RAISING = """\
 import functools
