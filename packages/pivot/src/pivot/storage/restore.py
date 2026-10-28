@@ -284,8 +284,7 @@ def _write_fallback_content(
 
 
 def _refuse_swap(target: ownership.ForcedRestore, entry: pathlib.Path) -> None:
-    """Raise if the entry the swap of ``target`` removes, now at ``entry``, holds a user's file
-    (``ownership.swap_refusal``)."""
+    """Raise if the entry the swap of ``target`` removes holds a user's file."""
     refusal = ownership.swap_refusal(project.get_project_root(), target, entry)
     if refusal is not None:
         raise refusal
@@ -294,17 +293,11 @@ def _refuse_swap(target: ownership.ForcedRestore, entry: pathlib.Path) -> None:
 def _replace_checked[T](
     dest_path: pathlib.Path,
     target: ownership.ForcedRestore,
+    state_dir: pathlib.Path,
     replace: Callable[[str | None, Callable[[pathlib.Path], None]], T],
 ) -> T:
-    """Run ``replace`` under ``dest_path``'s restore lock, right after checking ``target`` again
-    there (``ownership.forced_restore_refusal``): a user file that appeared since the check of
-    every target refuses this target alone. ``replace`` gets the lock's token and the check its
-    swap makes over the entry it removes (``ownership.swap_refusal``).
-
-    Raises:
-        exceptions.OutputOwnershipError: Replacing ``dest_path`` would remove a user's file.
-    """
-    with cache.restore_lock(dest_path, config.get_state_dir()) as lock_token:
+    """Run ``replace`` under the target state directory's restore lock and ownership checks."""
+    with cache.restore_lock(dest_path, state_dir) as lock_token:
         refusal = ownership.forced_restore_refusal(project.get_project_root(), [target])
         if refusal is not None:
             raise refusal
@@ -352,6 +345,7 @@ def restore_file(
     target: ownership.ForcedRestore,
     *,
     remote_factory: Callable[[], RemoteStorage],
+    state_dir: pathlib.Path | None = None,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> RestoreResult:
     """Restore a single file from revision and return its result.
@@ -368,9 +362,7 @@ def restore_file(
     if (skipped := _skipped(dest_path, force)) is not None:
         return skipped
 
-    if target["claims"] is not None and output_hash is not None:
-        ownership.record_restored(target["claims"], dest_path, output_hash)
-
+    state_dir = state_dir or config.locate_state_dir()
     try:
         return _restore_from_sources(
             rel_path,
@@ -381,6 +373,7 @@ def restore_file(
             checkout_modes,
             target,
             remote_factory,
+            state_dir,
             recorded,
         )
     except exceptions.OutputOwnershipError as error:
@@ -398,20 +391,12 @@ def _restore_from_sources(
     checkout_modes: list[cache.CheckoutMode],
     target: ownership.ForcedRestore,
     remote_factory: Callable[[], RemoteStorage],
+    state_dir: pathlib.Path,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None,
 ) -> RestoreResult:
-    """``restore_file``'s strategies, each write under ``_replace_checked``.
-
-    Raises:
-        exceptions.OutputOwnershipError: The check under the restore lock refused the target.
-
-    A restore appends ``(path, stat, hash)`` for each file it writes to ``recorded``, for the
-    caller to save in a StateDB, so the next status, explanation or run looks the file up instead
-    of reading it. Each stat is of what was staged, taken before the rename put it in place.
-    """
+    """``restore_file``'s strategies, each write under ``_replace_checked``."""
     path_str = str(dest_path)
     files_dir = cache_dir / "files"
-    state_dir = config.get_state_dir()
 
     # Ensure parent directory exists before any restore strategy. A parent inside the
     # configured state directory is made as Pivot makes that directory, with its ignore file,
@@ -442,6 +427,7 @@ def _restore_from_sources(
                 success = _replace_checked(
                     dest_path,
                     target,
+                    state_dir,
                     lambda token, before_swap: cache.restore_from_cache(
                         dest_path,
                         cached_hash,
@@ -473,6 +459,7 @@ def _restore_from_sources(
             written = _replace_checked(
                 dest_path,
                 target,
+                state_dir,
                 lambda token, before_swap: _write_fallback_content(
                     dest_path, content, token, before_swap
                 ),
@@ -524,6 +511,7 @@ def _restore_from_sources(
             success = _replace_checked(
                 dest_path,
                 target,
+                state_dir,
                 lambda token, before_swap: cache.restore_from_cache(
                     dest_path,
                     cached_hash,
@@ -770,6 +758,7 @@ def restore_targets_from_revision(
                     force=force,
                     target=restores[(index, rel_path)],
                     remote_factory=reachable_remote,
+                    state_dir=hash_state_dir,
                     recorded=recorded,
                 )
                 batch.add(hash_state_dir, recorded)

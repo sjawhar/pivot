@@ -235,6 +235,33 @@ class CacheRestoreError(CacheError):
     """Raised when restoring outputs from cache fails."""
 
 
+class UnreadableLinkError(CacheError):
+    """A symlink inside a directory artifact that Pivot cannot classify: reading it, or stating
+    what it points to, failed with an error other than "no such file" (EIO, ESTALE, EACCES).
+
+    Pivot cannot tell a symlink checkout's link from a user symlink without reading it, so the
+    command refuses: leaving the link out would record the directory without one of its files,
+    and restoring the directory over it would remove a link that may be the user's. It is not an
+    OSError, so no handler that reads an OSError as "missing" or "changed" catches it.
+    """
+
+    path: str
+    reason: str
+
+    def __init__(self, path: str, reason: str) -> None:
+        self.path = path
+        self.reason = reason
+        display_path = f"'{path}'" if path.isprintable() else repr(path)
+        super().__init__(
+            f"Cannot read symlink {display_path}: {reason}. Make the link and what it points to "
+            + "readable, or remove the link."
+        )
+
+    @override
+    def __reduce__(self) -> tuple[type, tuple[str, str]]:
+        return (self.__class__, (self.path, self.reason))
+
+
 class UncachedIncrementalOutputError(CacheError):
     """Raised when an incremental output exists without a cache entry."""
 

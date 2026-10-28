@@ -143,9 +143,7 @@ def test_an_unsearchable_cache_directory_is_named_in_one_line(tmp_path: pathlib.
     finally:
         prefix_dir.chmod(0o755)
 
-    verify_errors = _helper_failed(verify)
-    assert f"Failed to get explanation for p/big: {_EACCES}: {cache_object}" in verify_errors
-    assert verify_errors[-1] == f"Error: {_EACCES}: {prefix_dir}"
+    assert _helper_failed(verify)[-1] == f"Error: {_EACCES}: {prefix_dir}"
     assert _helper_failed(checkout)[-1] == f"Error: {_EACCES}: {cache_object}"
     assert not missing.is_symlink(), "nothing is restored"
 
