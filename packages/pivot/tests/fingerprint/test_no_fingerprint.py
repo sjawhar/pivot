@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pivot import compose, decorators, executor, fingerprint, loaders, registry
+from pivot import compose, decorators, executor, fingerprint, loaders, registry, state_dir
 from pivot.storage import cache, state
 from pivot.storage import store as store_mod
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, identity_key
@@ -137,12 +137,24 @@ def repo_project_root(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -
     Here the handle starts unopened, so it opens under tmp_path, and the test closes it; cache
     writes queued for another project stay out of this one (`fingerprint._current_pending_writes`).
     """
+
+    def locate(_root: pathlib.Path) -> pathlib.Path:
+        return tmp_path / ".pivot"
+
     monkeypatch.setattr("pivot.project._project_root_cache", _REPO_ROOT)
-    monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: tmp_path / ".pivot")
+    monkeypatch.setattr(state_dir, "locate_state_dir", locate)
     monkeypatch.setattr(fingerprint, "_state_db", None)
     monkeypatch.setattr(fingerprint, "_state_db_dir", None)
-    monkeypatch.setattr(fingerprint, "_state_db_root", None)
-    monkeypatch.setattr(fingerprint, "_pending_writes", None)
+    monkeypatch.setattr(
+        fingerprint,
+        "_pending_ast_writes",
+        dict[pathlib.Path, list[fingerprint.AstHashEntry]](),
+    )
+    monkeypatch.setattr(
+        fingerprint,
+        "_pending_manifest_writes",
+        dict[pathlib.Path, list[tuple[bytes, bytes]]](),
+    )
     yield
     fingerprint._close_state_db()
 

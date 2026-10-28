@@ -687,7 +687,7 @@ def restore_targets_from_revision(
         Tuple of (messages, success) where success is False if any files failed.
     """
     proj_root = project.get_project_root()
-    output_path = pathlib.Path(os.path.abspath(output)) if output is not None else None
+    output_path = output if output is None or output.is_absolute() else pathlib.Path.cwd() / output
 
     # Validate revision exists
     commit_sha = git.resolve_revision(rev)
