@@ -59,6 +59,7 @@ from pivot import (
     run_history,
     skip,
     stage_def,
+    stage_io,
     types,
 )
 from pivot.storage import artifact_lock, cache, lock, state
@@ -978,9 +979,10 @@ def _execute_stage(
                     output_queue.put_nowait(
                         StateChange(kind=OutputMessageKind.STATE, stage=stage_name, state="running")
                     )
-                lock_data = production_lock.read()
+                with stage_io.PIVOT_IO:
+                    lock_data = production_lock.read()
 
-                with state.StateDB(state_dir, readonly=True) as state_db:
+                with _open_state_db(state_dir) as state_db:
                     outputs_unusable: str | None = None
                     if lock_data is not None and not stage_info["force"]:
                         out_paths = [types.identity_key(out.identity) for out in stage_outs]
@@ -1240,9 +1242,10 @@ def _execute_stage(
                     # gc cannot delete while this unit is open. The unit does NOT cover stage
                     # execution (which already completed above).
                     with gc_mod.naming_unit(naming_root):
-                        output_hashes = _commit_outputs_with_store(
-                            output_paths, store, project_state_dir
-                        )
+                        with stage_io.PIVOT_IO:
+                            output_hashes = _commit_outputs_with_store(
+                                output_paths, store, project_state_dir
+                            )
                         for ref, path in output_paths.items():
                             file_hash_entries.extend(
                                 output_file_hash_entries(
@@ -1259,8 +1262,9 @@ def _execute_stage(
                             output_paths=lock_output_paths(stage_outs, store, project_root),
                         )
 
-                        # Single StateDB open for post-execution work
-                        with state.StateDB(state_dir, readonly=True) as state_db:
+                        # Single StateDB open for post-execution work. _open_state_db is #530's
+                        # one-line unexpected-error boundary; keep it inside the naming unit.
+                        with _open_state_db(state_dir) as state_db:
                             _raise_if_stopped()
                             deferred = _commit_lock_and_build_deferred(
                                 stage_info,
@@ -1303,13 +1307,27 @@ def _execute_stage(
                 ring_buffer,
                 input_hash=input_hash,
             )
-        except Exception:
-            return _make_result(
+        except Exception as exc:
+            # The record keeps the traceback. The console prints one line only for a failure of
+            # pivot's own I/O on state it owns (`stage_io`): its cache, its state database, the
+            # stage's lock file, and preparing and creating the stage's output. Any other
+            # failure, out of the stage function, a loader or writer, or anything unmarked,
+            # prints its traceback as before; --verbose prints it in both cases.
+            result = _make_result(
                 StageStatus.FAILED,
                 traceback.format_exc(),
                 ring_buffer,
                 input_hash=input_hash,
             )
+            if stage_io.raised_by_pivot(exc):
+                result["display_reason"] = exceptions.describe_error(exc)
+            return result
+
+
+def _open_state_db(state_dir: pathlib.Path) -> state.StateDB:
+    """Open the stage's state database read-only; a failure to open it is pivot's own I/O."""
+    with stage_io.PIVOT_IO:
+        return state.StateDB(state_dir, readonly=True)
 
 
 def user_code_files() -> list[str]:
@@ -1363,6 +1381,9 @@ def execute_stage(
         )
     finally:
         _stop.stage_running = False
+        # Every way out of the stage drops its recorded failure, whose frames hold the stage's
+        # locals and loaded inputs, so a warm worker does not keep them until its next stage.
+        stage_io.clear()
     if _stop.exit_requested:
         _exit_worker(1)
     result["user_code_files"] = user_code_files()
@@ -1811,7 +1832,8 @@ def _write_outputs_with_store(
 def _write_output_with_store(
     ref: types.ArtifactRef, value: Any, store: store_mod.Store
 ) -> pathlib.Path:
-    output_path = store.prepare_output(ref)
+    with stage_io.PIVOT_IO:
+        output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
 
     output_label = (
@@ -1821,7 +1843,10 @@ def _write_output_with_store(
     )
 
     def save_output(output_value: Any, destination: pathlib.Path) -> None:
-        with warnings.catch_warnings(record=True) as caught:
+        with (
+            warnings.catch_warnings(record=True) as caught,
+            stage_io.writing_output(destination),
+        ):
             warnings.simplefilter("always", loaders.LossyOutputWarning)
             try:
                 writer.save(output_value, destination)
@@ -2353,7 +2378,8 @@ def _commit_lock_and_build_deferred(
     Only called in the commit (non --no-commit) path. Writes the production
     lock file and returns DeferredWrites for the coordinator to apply.
     """
-    production_lock.write(lock_data)
+    with stage_io.PIVOT_IO:
+        production_lock.write(lock_data)
     return _build_deferred_writes(
         stage_info,
         input_hash,
