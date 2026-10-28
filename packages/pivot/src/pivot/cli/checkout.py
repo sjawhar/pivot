@@ -67,7 +67,8 @@ class RestoreOutcome(NamedTuple):
 
 class Expected(NamedTuple):
     """What a tracked path or stage output should hold: its recorded hash and, for a directory,
-    how to read its listing (the committed listing file, else the cache's object)."""
+    how to read its listing (the committed listing file, else the cache's object). The reader
+    reads once per command: the ownership checks and the restore share its listing."""
 
     output_hash: HashInfo
     read_members: Callable[[], listing.DirListing] | None = None
@@ -123,11 +124,15 @@ def _get_stage_output_info(
                 resolved = str(store.resolve_display_path(ref))
                 read_members = None
                 if is_dir_hash(out_hash):
-                    read_members = functools.partial(
-                        listing.read,
-                        lock.committed_listing(lock_data, stage_lock.output_listing_path(identity)),
-                        out_hash,
-                        cache_dir,
+                    read_members = functools.cache(
+                        functools.partial(
+                            listing.read,
+                            lock.committed_listing(
+                                lock_data, stage_lock.output_listing_path(identity)
+                            ),
+                            out_hash,
+                            cache_dir,
+                        )
                     )
                 result[resolved] = Expected(out_hash, read_members)
                 state_dirs[resolved] = stage_state_dir
@@ -139,8 +144,8 @@ def _tracked_expected(data_path: str, pvt_data: track.PvtData, cache_dir: pathli
     output_hash = track.pvt_to_hash_info(pvt_data)
     read_members = None
     if is_dir_hash(output_hash):
-        read_members = functools.partial(
-            track.tracked_members, pathlib.Path(data_path), pvt_data, cache_dir
+        read_members = functools.cache(
+            functools.partial(track.tracked_members, pathlib.Path(data_path), pvt_data, cache_dir)
         )
     return Expected(output_hash, read_members)
 
@@ -191,6 +196,12 @@ def _stage_claims_readers(
                     if path in stage_outputs
                 },
                 cache_dir=cache_dir,
+                listing_readers={
+                    pathlib.Path(path): read_members
+                    for path in paths
+                    if path in stage_outputs
+                    and (read_members := stage_outputs[path].read_members) is not None
+                },
             )
         )
         readers.update(dict.fromkeys(paths, reader))
@@ -204,9 +215,11 @@ def _restore_targets(
 ) -> dict[str, ownership.ForcedRestore]:
     """What restoring each file replaces, for ``ownership.forced_restore_refusal``: a stage
     output (path -> the stage, when the target named it) as that stage's output, with its claims;
-    any other path as a tracked path's own restore."""
-    return {
-        path: ownership.ForcedRestore(
+    any other path as a tracked path's own restore. A restored directory's listing is read only
+    when a check needs it (``read_restored_members``)."""
+    targets = dict[str, ownership.ForcedRestore]()
+    for path, expected in files.items():
+        target = ownership.ForcedRestore(
             replacement=(
                 ownership.stage_output(pathlib.Path(path), stage_output_paths[path])
                 if path in stage_output_paths
@@ -215,8 +228,10 @@ def _restore_targets(
             restored=expected.output_hash,
             claims=claims.get(path) if path in stage_output_paths else None,
         )
-        for path, expected in files.items()
-    }
+        if expected.read_members is not None:
+            target["read_restored_members"] = expected.read_members
+        targets[path] = target
+    return targets
 
 
 def _refuse(targets: Iterable[ownership.ForcedRestore]) -> None:

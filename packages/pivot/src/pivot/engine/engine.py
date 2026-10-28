@@ -2081,6 +2081,7 @@ class Engine:
                     lock_data,
                     state_db.get_no_commit_record(stage_name),
                     project.get_project_root(),
+                    stage_lock=listing_lock,
                 ),
             )
             _save_file_hashes(file_hash_entries)

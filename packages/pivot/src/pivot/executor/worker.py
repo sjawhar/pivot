@@ -995,6 +995,7 @@ def _execute_stage(
                         functools.partial(
                             ownership.record_members, project_root, state_dir, stage_name
                         ),
+                        stage_lock=production_lock,
                     )
                     outputs_unusable: str | None = None
                     if lock_data is not None and not stage_info["force"]:
@@ -1505,23 +1506,26 @@ def stage_claims(
     no_commit_record: types.NoCommitRecord | None,
     project_root: pathlib.Path,
     recorder: ownership.MemberRecorder | None = None,
+    *,
+    stage_lock: lock.StageLock,
 ) -> ownership.StageClaims | None:
     """The stage's claims on the ``*.pvt`` files in its workspace outputs
-    (``ownership.StageClaims``), from its lock and its ``nocommit:`` record; None for a store
-    that writes outside the workspace."""
+    (``ownership.StageClaims``), from its lock (``stage_lock``, which read ``lock_data``; a
+    directory's members from the listing committed beside it) and its ``nocommit:`` record; None
+    for a store that writes outside the workspace."""
     if not isinstance(store, store_mod.WorkspaceStore):
         return None
     locked = lock_data["output_hashes"] if lock_data is not None else {}
+    paths = {out.identity: store.resolve_display_path(out) for out in outs}
     return ownership.stage_claims(
         project_root,
-        {
-            store.resolve_display_path(out): locked[out.identity]
-            for out in outs
-            if out.identity in locked
-        },
+        {path: locked[identity] for identity, path in paths.items() if identity in locked},
         no_commit_record,
         cache_dir=store.cache_dir,
         recorder=recorder,
+        listing_readers=ownership.lock_listing_readers(
+            stage_lock, lock_data, paths, store.cache_dir
+        ),
     )
 
 

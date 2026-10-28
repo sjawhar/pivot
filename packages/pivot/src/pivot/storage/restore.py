@@ -424,7 +424,7 @@ def restore_file(
         try:
             members = cache.cached_listing(cache_dir / "files", output_hash)
         except (exceptions.PivotError, OSError) as error:
-            # The cache strategy reads it again and reports the error if it happens again
+            # With no usable listing the cache strategy is skipped; the result names the cause
             logger.debug("Cannot read the cached listing for %s: %s", rel_path, error)
     if members is not None and "restored_members" not in target:
         # The ownership checks read the restored directory's files from the same listing
@@ -482,15 +482,13 @@ def _restore_from_sources(
         )
 
     # Strategy 1: Try local cache (if hash available). A directory needs its listing: the one
-    # committed at the revision, else the cache's object.
+    # committed at the revision, else the cache's object (``restore_file`` read it).
     if output_hash is not None:
         cached_hash = output_hash
         restored = list[tuple[pathlib.Path, os.stat_result, str]]()
         success = False
         try:
             if is_dir_hash(output_hash):
-                if members is None:
-                    members = cache.cached_listing(files_dir, output_hash)
                 should_try_cache = members is not None
             else:
                 should_try_cache = (
@@ -633,40 +631,37 @@ def _restore_from_sources(
     )
 
 
-def _current_output_hashes(stage_target: StageTarget) -> dict[str, HashInfo]:
-    """The hashes the stage's current lock records, by workspace path relative to the root."""
-    lock_data = lock.StageLock(
-        stage_target["stage_name"], lock.get_stages_dir(stage_target["state_dir"])
-    ).read()
-    if lock_data is None:
-        return {}
-    recorded_paths = (
-        lock_data["output_paths"]
-        if "output_paths" in lock_data
-        else dict[types.ArtifactIdentity, str]()
-    )
-    hashes = dict[str, HashInfo]()
-    for identity, output_hash in lock_data["output_hashes"].items():
-        path = recorded_paths.get(identity) or stage_target["paths_by_key"].get(identity.key)
-        if path is not None:
-            hashes[path] = output_hash
-    return hashes
-
-
 def _read_claims(
     proj_root: pathlib.Path, stage_target: StageTarget, files_dir: pathlib.Path
 ) -> ownership.StageClaims:
-    """The stage's claims (``ownership.StageClaims``): the hashes its current lock records, its
-    ``nocommit:`` record and the cache object root ``files_dir``, with a recorder for the
-    ``*.pvt`` members ``get`` writes."""
+    """The stage's claims (``ownership.StageClaims``): the hashes its current lock records, each
+    directory's listing committed beside that lock, its ``nocommit:`` record and the cache object
+    root ``files_dir``, with a recorder for the ``*.pvt`` members ``get`` writes."""
+    stage_lock = lock.StageLock(
+        stage_target["stage_name"], lock.get_stages_dir(stage_target["state_dir"])
+    )
+    lock_data = stage_lock.read(cache_dir=files_dir)
+    paths = dict[types.ArtifactIdentity, pathlib.Path]()
+    if lock_data is not None:
+        recorded_paths = (
+            lock_data["output_paths"]
+            if "output_paths" in lock_data
+            else dict[types.ArtifactIdentity, str]()
+        )
+        for identity in lock_data["output_hashes"]:
+            path = recorded_paths.get(identity) or stage_target["paths_by_key"].get(identity.key)
+            if path is not None:
+                paths[identity] = proj_root / path
+    locked = (
+        {path: lock_data["output_hashes"][identity] for identity, path in paths.items()}
+        if lock_data is not None
+        else {}
+    )
     return ownership.read_stage_claims(
         proj_root,
         stage_target["stage_name"],
         stage_target["state_dir"],
-        {
-            proj_root / path: output_hash
-            for path, output_hash in _current_output_hashes(stage_target).items()
-        },
+        locked,
         cache_dir=files_dir,
         recorder=functools.partial(
             ownership.record_members,
@@ -674,6 +669,7 @@ def _read_claims(
             stage_target["state_dir"],
             stage_target["stage_name"],
         ),
+        listing_readers=ownership.lock_listing_readers(stage_lock, lock_data, paths, files_dir),
     )
 
 

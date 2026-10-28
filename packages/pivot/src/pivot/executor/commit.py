@@ -157,7 +157,14 @@ def _commit_stages(
             # The stage's own *.pvt files are the ones its lock or its nocommit: record lists.
             # Every other *.pvt in an output is a user's: the commit refuses before it would
             # claim one, so a later run cannot delete it as the stage's.
-            claims = worker.stage_claims(store, stage_outs, previous_lock, run_record, project_root)
+            claims = worker.stage_claims(
+                store,
+                stage_outs,
+                previous_lock,
+                run_record,
+                project_root,
+                stage_lock=production_lock,
+            )
 
             # 5. If not force and no explicit stages, check lock — skip if unchanged
             if (
