@@ -1,10 +1,11 @@
 """Every .pvt sidecar that `pivot track` accepts stays visible to the commands that read them.
 
-`pivot track` checks overlap only against the pipeline loaded when it runs, and accepts paths under
-any directory named `.git` or `.pivot` other than the project's own state. A later command that
-loads another pipeline, or that walks the project, must still find those sidecars: list them in
-status, refuse to run while one is missing, restore them on checkout and select them on fetch and
-pull. Rows D1 and D2 of the PR #513 audit (PR513_ASTRA_DEEP.md) name each case.
+A file tracked before a pipeline declares the output around it leaves its sidecar inside that
+output, and `pivot track` accepts paths under any directory named `.git` or `.pivot` other than the
+project's own state. A later command that loads another pipeline, or that walks the project, must
+still find those sidecars: list them in status, refuse to run while one is missing, restore them on
+checkout and select them on fetch and pull. Rows D1 and D2 of the PR #513 audit
+(PR513_ASTRA_DEEP.md) name each case.
 """
 
 from __future__ import annotations
@@ -132,17 +133,18 @@ _LOADS_B = pytest.mark.parametrize(
 def _helper_missing_file_inside_b(
     runner: click.testing.CliRunner, cwd: pathlib.Path, root_after_track: str
 ) -> pathlib.Path:
-    """Track data/b/tree/f.txt with only pipeline a loaded, delete it, then write root_after_track.
+    """Track data/b/tree/f.txt before b exists, delete it, then write b and root_after_track.
 
     Pipeline b, in other/pipeline.py, declares data/b/tree/ as its stage's directory output.
+    `pivot track` refuses a path inside any pipeline's declared output, so b is written after it.
     """
     _helper_write(cwd / "pipeline.py", _ROOT_PIPELINE)
-    _helper_write(cwd / "other" / "pipeline.py", _OTHER_PIPELINE)
     tracked = cwd / "data" / "b" / "tree" / "f.txt"
     _helper_write(tracked, "tracked bytes")
     track_output = _helper_ok(runner, "track", "data/b/tree/f.txt")
     assert "Tracked: data/b/tree/f.txt" in track_output, track_output
     tracked.unlink()
+    _helper_write(cwd / "other" / "pipeline.py", _OTHER_PIPELINE)
     _helper_write(cwd / "pipeline.py", root_after_track)
     return tracked
 
@@ -156,8 +158,8 @@ def test_status_lists_a_missing_file_tracked_inside_another_pipelines_output(
 ) -> None:
     """Audit D1, second-pipeline track, status row: loading b keeps the file in status.
 
-    With root pipeline `a` selected, `pivot track` accepts a file inside pipeline b's directory
-    output. Loading b too (`--all`, or `a` including b) must not hide that file.
+    `data/b/tree/f.txt` was tracked before pipeline b declared that directory output. Loading b
+    too (`--all`, or `a` including b) must not hide that file.
     """
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         _helper_missing_file_inside_b(runner, cwd, root_after_track)

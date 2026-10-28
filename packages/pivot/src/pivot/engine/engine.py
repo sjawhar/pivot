@@ -60,6 +60,7 @@ from pivot.engine.types import (
 )
 from pivot.executor import core as executor_core
 from pivot.executor import worker
+from pivot.storage import ownership
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -1141,6 +1142,12 @@ class Engine:
             pipeline_name=pipeline.name,
             input_bindings=pipeline.input_bindings,
         )
+        # Warn once per run about a tracked file saved inside one of these outputs before track
+        # refused that; the store fails the stage before it would remove the file
+        for warning in ownership.saved_input_warnings(
+            project_root, all_stages, store, config.get_state_dir(), cache_dir / "files"
+        ):
+            _logger.warning(warning)
         runnable, dep_errors = engine_graph.get_runnable_stages(
             all_stages, store, all_pipelines=self._all_pipelines, on_error=on_error
         )
@@ -1562,6 +1569,8 @@ class Engine:
                 cache_dir=cache_dir / "files",
                 stages=all_stages,
             )
+        except pivot_exceptions.OutputOwnershipError as exc:
+            _logger.warning("Presentation symlinks skipped: %s", exc)
         except Exception:
             _logger.debug("Presentation layer failed", exc_info=True)
 
@@ -2041,6 +2050,13 @@ class Engine:
                 state_db,
                 state_dir=state_dir,
                 file_hash_entries=file_hash_entries,
+                claims=worker.stage_claims(
+                    store,
+                    stage_info["outs"],
+                    lock_data,
+                    state_db.get_no_commit_record(stage_name),
+                    project.get_project_root(),
+                ),
             )
             _save_file_hashes(file_hash_entries)
             return _SkipOutcome.SKIPPED if restored else _SkipOutcome.RUN

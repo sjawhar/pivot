@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import multiprocessing
 import os
+import pathlib
 import queue
 from typing import TYPE_CHECKING, cast
 
@@ -12,11 +13,11 @@ import yaml
 from pivot import exceptions, project
 from pivot.cli import checkout
 from pivot.remote import sync as transfer
-from pivot.storage import cache, restore, state
-from pivot.types import FileHash, TransferResult
+from pivot.storage import cache, ownership, restore, state, track
+from pivot.types import DirHash, DirManifestEntry, FileHash, TransferResult
 
 if TYPE_CHECKING:
-    import pathlib
+    from collections.abc import Callable, Mapping
     from multiprocessing.synchronize import Event
 
     from conftest import GitRepo
@@ -25,6 +26,13 @@ if TYPE_CHECKING:
 
 def _helper_unused_remote() -> RemoteStorage:
     raise AssertionError("this restore must not open the remote")
+
+
+def _own_restore(path: pathlib.Path, output_hash: FileHash) -> ownership.ForcedRestore:
+    """What a tracked path's restore to its own place replaces (``restore._restore_targets``)."""
+    return ownership.ForcedRestore(
+        replacement=ownership.tracked_restore(path), restored=output_hash, claims=None
+    )
 
 
 def _hold_checkout_restore(
@@ -49,6 +57,7 @@ def _hold_checkout_restore(
         executable: bool = False,
         staging_path: pathlib.Path | None = None,
         keep_existing_copy: bool = False,
+        before_swap: Callable[[pathlib.Path], None] | None = None,
     ) -> os.stat_result:
         _ = staging_path
         started.set()
@@ -59,6 +68,7 @@ def _hold_checkout_restore(
             checkout_modes,
             executable=executable,
             keep_existing_copy=keep_existing_copy,
+            before_swap=before_swap,
         )
 
     cache._checkout_with_fallback = _checkout_after_release
@@ -70,6 +80,7 @@ def _hold_checkout_restore(
             [cache.CheckoutMode.COPY],
             checkout.CheckoutBehavior.FORCE,
             state_dir,
+            target=_own_restore(path, output_hash),
         )
         result_queue.put(("checkout", outcome.result))
     finally:
@@ -93,6 +104,7 @@ def _get_while_checkout_restores(
         cache_dir=cache_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=True,
+        target=_own_restore(path, output_hash),
         remote_factory=_helper_unused_remote,
     )
     result_queue.put(("get", result["status"]))
@@ -554,6 +566,119 @@ def test_restore_targets_from_revision_output_with_stage(
     assert output_path.read_text() == "stage output"
 
 
+@pytest.mark.parametrize(
+    "output_arg",
+    [
+        pytest.param(None, id="workspace-output"),
+        pytest.param(pathlib.Path("restored-tree"), id="output-flag"),
+    ],
+)
+def test_restore_targets_from_revision_force_refuses_output_holding_tracked_file(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, output_arg: pathlib.Path | None
+) -> None:
+    """`pivot get --force` refuses before it removes a tracked file in a stage output or in an
+    explicit `--output` destination (relative to the working directory)."""
+    repo_path, commit = git_repo
+    cache_dir = repo_path / ".pivot" / "cache"
+    source = repo_path / "cached-stage-output"
+    source.mkdir()
+    (source / "generated.txt").write_text("generated")
+    output_hash = cache.save_to_cache(
+        source, cache_dir / "files", checkout_mode=cache.CheckoutMode.COPY
+    )
+    assert "manifest" in output_hash
+    (repo_path / ".pivot" / "stages").mkdir(parents=True)
+    lock_content = {
+        "code_manifest": {"func:main": "abc123"},
+        "params": {},
+        "deps": [],
+        "outs": [
+            {
+                "key": None,
+                "hash": output_hash["hash"],
+                "manifest": output_hash["manifest"],
+                "path": "data/b/tree",
+            }
+        ],
+    }
+    (repo_path / ".pivot" / "stages" / "tree.lock").write_text(yaml.dump(lock_content))
+    sha = commit("add lock")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.chdir(repo_path)
+    destination = (
+        repo_path / output_arg if output_arg is not None else repo_path / "data" / "b" / "tree"
+    )
+    tracked = destination / "saved.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("user input")
+    pvt_path = track.get_pvt_path(tracked)
+    track.write_pvt_file(
+        pvt_path, track.PvtData(path="saved.txt", hash="abc1230000000000", size=10)
+    )
+
+    with pytest.raises(exceptions.PivotError, match=r"saved\.txt\.pvt"):
+        restore.restore_targets_from_revision(
+            targets=["tree"],
+            rev=sha[:7],
+            output=output_arg,
+            cache_dir=cache_dir,
+            stage_targets={
+                "tree": restore.StageTarget(
+                    stage_name="tree", state_dir=repo_path / ".pivot", paths_by_key={}
+                )
+            },
+            checkout_modes=[cache.CheckoutMode.COPY],
+            force=True,
+            remote_factory=_helper_unused_remote,
+        )
+
+    assert tracked.read_text() == "user input"
+    assert pvt_path.exists()
+
+
+def test_restore_file_target_force_relative_output_refuses_tracked_directory(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative `pivot get --force -o` (from the working directory) cannot replace a directory
+    holding tracked input."""
+    repo_path, commit = git_repo
+    source = repo_path / "source.txt"
+    source.write_text("source data")
+    source_hash = cache.save_to_cache(
+        source, repo_path / ".pivot" / "cache" / "files", checkout_mode=cache.CheckoutMode.COPY
+    )
+    track.write_pvt_file(
+        track.get_pvt_path(source),
+        track.PvtData(path="source.txt", hash=source_hash["hash"], size=len("source data")),
+    )
+    sha = commit("add tracked source")
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.chdir(repo_path)
+    destination = repo_path / "data" / "b" / "tree"
+    saved = destination / "saved.txt"
+    saved.parent.mkdir(parents=True)
+    saved.write_text("user input")
+    saved_pvt = track.get_pvt_path(saved)
+    track.write_pvt_file(
+        saved_pvt, track.PvtData(path="saved.txt", hash="abc1230000000000", size=10)
+    )
+
+    with pytest.raises(exceptions.PivotError, match=r"saved\.txt\.pvt"):
+        restore.restore_targets_from_revision(
+            targets=["source.txt"],
+            rev=sha[:7],
+            output=pathlib.Path("data/b/tree"),
+            cache_dir=repo_path / ".pivot" / "cache",
+            stage_targets={},
+            checkout_modes=[cache.CheckoutMode.COPY],
+            force=True,
+            remote_factory=_helper_unused_remote,
+        )
+
+    assert saved.read_text() == "user input"
+    assert saved_pvt.exists()
+
+
 # =============================================================================
 # restore_file Tests
 # =============================================================================
@@ -870,11 +995,116 @@ def test_restore_file_force_keeps_existing_output_until_cache_swap(
         cache_dir=cache_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=True,
+        target=_own_restore(target, FileHash(hash=file_hash)),
         remote_factory=_helper_unused_remote,
     )
 
     assert result["status"] is restore.RestoreStatus.RESTORED
     assert target.read_text() == "cached content"
+
+
+def test_restore_file_records_pvt_members_before_writing_them(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`pivot get` of a stage restores the revision's output, which no lock here records: it
+    records each `*.pvt` member the restore writes, with the content it will hold, before it
+    writes anything; a target it skips records nothing."""
+    (tmp_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    cache_dir = tmp_path / "cache"
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "notes.pvt").write_text("stage notes")
+    (source / "value.txt").write_text("v")
+    output_hash = cache.save_to_cache(source, cache_dir / "files")
+    target = tmp_path / "data" / "b" / "tree"
+    recorded = list[dict[pathlib.Path, str]]()
+
+    def record(members: Mapping[pathlib.Path, str]) -> None:
+        assert not target.exists()
+        recorded.append(dict(members))
+
+    restore_target = ownership.ForcedRestore(
+        replacement=ownership.stage_output(target, "b/tree"),
+        restored=output_hash,
+        claims=lambda: ownership.StageClaims(
+            locked={}, no_commit={}, recorder=record, cache_dir=None
+        ),
+    )
+
+    result = restore.restore_file(
+        rel_path="data/b/tree",
+        output_hash=output_hash,
+        rev="HEAD",
+        dest_path=target,
+        cache_dir=cache_dir,
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+        target=restore_target,
+        remote_factory=_helper_unused_remote,
+    )
+
+    assert result["status"] is restore.RestoreStatus.RESTORED, result["message"]
+    notes = target / "notes.pvt"
+    assert recorded == [{ownership.normalized(notes): cache.hash_file(notes)[0]}]
+    assert notes.read_text() == "stage notes"
+
+    skipped = restore.restore_file(
+        rel_path="data/b/tree",
+        output_hash=output_hash,
+        rev="HEAD",
+        dest_path=target,
+        cache_dir=cache_dir,
+        checkout_modes=[cache.CheckoutMode.COPY],
+        force=False,
+        target=restore_target,
+        remote_factory=_helper_unused_remote,
+    )
+
+    assert skipped["status"] is restore.RestoreStatus.SKIPPED
+    assert len(recorded) == 1
+
+
+def test_swap_refusal_judges_the_moved_entry_and_names_files_under_the_target(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ownership.swap_refusal` walks the entry a restore renamed aside. A stage member is judged
+    by the bytes there, as the check before the swap judged them at the path: here a sidecar-shaped
+    member whose lock changed through git, its current content cached. A user's sidecar there is
+    named at its place under the target's path, never under the backup name."""
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    files = tmp_path / ".pivot" / "cache" / "files"
+    output = tmp_path / "data" / "b" / "tree"
+    output.mkdir(parents=True)
+    (output / "fake.pvt").write_text("path: value.txt\nhash: abcdef0000000001\nsize: 1\n")
+    (output / "value.txt").write_text("1")
+    _ = cache.save_to_cache(output, files, checkout_mode=cache.CheckoutMode.COPY)
+    # The lock and the restored hash list another run's member content
+    locked = DirHash(
+        hash="0123456789abcdef",
+        manifest=[
+            DirManifestEntry(relpath="fake.pvt", hash="fedcba9876543210", size=1, isexec=False)
+        ],
+    )
+    claims = ownership.StageClaims(
+        locked={ownership.normalized(output): locked}, no_commit={}, recorder=None, cache_dir=files
+    )
+    target = ownership.ForcedRestore(
+        replacement=ownership.stage_output(output, "b/tree"), restored=locked, claims=lambda: claims
+    )
+    assert ownership.forced_restore_refusal(tmp_path, [target]) is None
+    moved = output.parent / f"{cache._BACKUP_TEMP_PREFIX}test"
+    output.rename(moved)
+
+    assert ownership.swap_refusal(tmp_path, target, moved) is None
+
+    (moved / "sub").mkdir()
+    (moved / "sub" / "u.txt.pvt").write_text("path: u.txt\nhash: abcdef0000000002\nsize: 1\n")
+    refusal = ownership.swap_refusal(tmp_path, target, moved)
+
+    assert refusal is not None
+    assert "data/b/tree/sub/u.txt.pvt" in str(refusal)
+    assert moved.name not in str(refusal)
 
 
 def test_restore_file_labels_a_retried_cache_restore_from_cache(
@@ -911,6 +1141,7 @@ def test_restore_file_labels_a_retried_cache_restore_from_cache(
         cache_dir=cache_dir,
         checkout_modes=[cache.CheckoutMode.HARDLINK],
         force=False,
+        target=_own_restore(target, FileHash(hash=file_hash)),
         remote_factory=_helper_unused_remote,
     )
 

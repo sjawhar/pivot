@@ -23,7 +23,7 @@ from pivot.types import FileHashEntry
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterable
+    from collections.abc import Callable, Generator, Iterable, Mapping
 
     from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
@@ -40,7 +40,9 @@ _RUN_PREFIX = b"run:"  # Run history entries
 _RUNCACHE_PREFIX = b"runcache:"  # Run cache entries for skip detection
 _FP_PREFIX = b"fp:"  # AST fingerprint/hash cache entries
 _SM_PREFIX = b"sm:"  # Stage manifest cache entries
-_NOCOMMIT_PREFIX = b"nocommit:"  # What a --no-commit run of a stage ran, for `pivot commit`
+# Per stage, until a lock is written for it: what a --no-commit run of it ran, for `pivot commit`,
+# and the `*.pvt` files Pivot wrote into its outputs as its own (`pvt_members`)
+_NOCOMMIT_PREFIX = b"nocommit:"
 # The keys `types.NoCommitRecord` declares, each a str -> str mapping the reader validates alone.
 _NO_COMMIT_FIELDS = ("code_manifest", "output_hashes", "pvt_members")
 
@@ -1215,6 +1217,30 @@ class StateDB:
             if field in record and not _is_str_dict(record[field]):
                 del record[field]
         return typing.cast("NoCommitRecord", typing.cast("object", record))
+
+    def add_no_commit_pvt_members(self, stage_name: str, members: Mapping[str, str]) -> None:
+        """Add `members` (path relative to the project root -> content hash) to the `*.pvt`
+        members the stage's `nocommit:` record lists, keeping every other entry and field.
+
+        Pivot calls this before it writes those files, so a crash leaves at worst a record
+        without a file. An unreadable record is replaced.
+        """
+        self._check_closed()
+        self._check_write_allowed()
+        key = _NOCOMMIT_PREFIX + stage_name.encode()
+        try:
+            with self._write_transaction(timeout=self._write_timeout) as txn:
+                value = txn.get(key)
+                record = _json_object(value) or dict[str, object]()
+                pvt_members = dict[str, str]()
+                current = record.get("pvt_members")
+                if _is_str_dict(current):
+                    pvt_members.update(current)
+                pvt_members.update(members)
+                record["pvt_members"] = dict(sorted(pvt_members.items()))
+                txn.put(key, json.dumps(record).encode())
+        except lmdb.MapFullError as error:
+            raise self._database_full_error() from error
 
     def prune_run_cache(self, valid_run_ids: set[str]) -> int:
         """Remove run cache entries that reference runs not in valid_run_ids.

@@ -16,7 +16,7 @@ import pytest
 
 from pivot import loaders, run_history, types
 from pivot.executor import worker
-from pivot.storage import cache, state
+from pivot.storage import cache, ownership, state
 from pivot.storage import store as store_mod
 from pivot.types import DepEntry, DirHash, FileHash, LockData
 
@@ -220,6 +220,7 @@ class _EvictedCacheStore(store_mod.WorkspaceStore):
         *,
         state_dir: pathlib.Path | None = None,
         checkout_modes: list[cache.CheckoutMode] | None = None,
+        claims: ownership.StageClaims | None = None,
         recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
     ) -> bool:
         return False

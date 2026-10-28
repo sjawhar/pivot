@@ -298,7 +298,7 @@ StateDB is an LMDB-backed key-value store for all pipeline state. Keys use prefi
 | `runcache:` | Run cache entries (stage name + input hash) |
 | `run:` | Run history manifests |
 | `remote:` | Remote index entries |
-| `nocommit:` | What a stage's outputs hold that no lock records yet: a `--no-commit` run's code manifest (rerun marks included) and output hashes, for `pivot commit`, and keys another feature writes; each writer replaces only its own keys |
+| `nocommit:` | What a stage's outputs hold that no lock records yet: a `--no-commit` run's code manifest (rerun marks included) and output hashes, for `pivot commit`, and its `*.pvt` directory members (path → content hash), each added before the file is written; each writer replaces only its own keys, and a written lock removes the whole record |
 
 **Key strategies:** A file-hash key is the absolute path as given (`os.fsencode(os.path.abspath(path))`): building it costs no system call, and the entry's `(mtime_ns, size, device, inode)`, from a `stat()` that follows symlinks, decides whether a cached hash still applies, so a link re-pointed at another file no longer matches. Generation keys use the artifact identity, so they stay the same wherever an output's path points.
 
@@ -309,6 +309,7 @@ StateDB is an LMDB-backed key-value store for all pipeline state. Keys use prefi
 - Workers open StateDB in `readonly=True` mode (no write contention)
 - Workers collect `DeferredWrites` and return them to the coordinator
 - Coordinator applies all writes atomically in a single LMDB transaction
+- One exception: before a worker writes a `*.pvt` member into a directory output (a run or a run-cache restore), it adds that member to the stage's `nocommit:` record in its own write transaction, so a crash never leaves the stage's member unrecorded. Only a stage that writes such a member pays this write
 
 ### Generation tracking
 
@@ -352,7 +353,8 @@ Multiple simultaneous `pivot repro` invocations on the same project are safe and
 The coordinator-worker pattern ensures multi-process safety:
 
 1. **Worker processes** (readonly): Open StateDB in readonly mode, see consistent MVCC
-   snapshots. Collect deferred writes locally instead of writing directly.
+   snapshots. Collect deferred writes locally instead of writing directly. The one direct
+   write is the `nocommit:` record of a `*.pvt` member, made before the member is written.
 2. **Coordinator process** (read-write): Applies all deferred writes in a single atomic
    transaction after worker completes via `apply_deferred_writes()`.
 
@@ -440,7 +442,7 @@ Without this flag, Pivot validates that all tracked outputs exist before running
 The `--no-commit` flag runs stages without writing durable state:
 
 ```bash
-# Run stages — outputs land on disk; no locks, no cache, only a record of what each stage ran
+# Run stages — outputs land on disk; no locks, no cache, only a record of what each stage ran and wrote
 pivot repro --no-commit
 
 # Inspect results, then snapshot current workspace state
@@ -449,12 +451,8 @@ pivot commit
 
 ### How It Works
 
-1. `--no-commit`: stages execute and outputs are written to disk. No lock files, cache copies,
-   generations or run-cache entries are written. StateDB keeps one record per stage that ran
-   (`nocommit:<stage>`): the code manifest the run's lock would have held, rerun marks included,
-   and the hashes of its outputs. The stat-validated file hashes of dependencies and outputs the
-   run read are also saved best-effort, so a later status need not read them again.
-2. `pivot commit [stage_names...]`: computes current workspace state (hashes deps and outputs), writes production lock files, saves outputs to cache, and updates StateDB. Without arguments, commits all stale stages. With stage names, unconditionally commits those stages. The code manifest it writes depends on the outputs:
+1. `--no-commit`: stages execute and outputs are written to disk. No lock files, cache copies, generations or run-cache entries are written. StateDB keeps one record per stage (`nocommit:<stage>`): the code manifest the run's lock would have held, rerun marks included, and the hashes of the outputs it wrote; and the `*.pvt` files Pivot wrote in its directory outputs since its lock was last written, with their content hashes. Each `*.pvt` is added before the file is written, as every path that writes a stage's `*.pvt` member without writing its lock does (a run-cache restore, `pivot get` of the stage), so a crash leaves at worst a record without a file. Until a lock is written, each such file that still holds the recorded content is the stage's own: a later run or restore replaces it, and `status` does not warn about it. The stat-validated file hashes of dependencies and outputs the run read are also saved best-effort, so a later status need not read them again.
+2. `pivot commit [stage_names...]`: computes current workspace state (hashes deps and outputs), writes production lock files, saves outputs to cache, and updates StateDB. Without arguments, commits all stale stages. With stage names, unconditionally commits those stages. It takes as the stage's own only the `*.pvt` files its lock lists, or that its `nocommit:` record lists and that are unchanged since; it refuses, naming it, any other `.pvt` in an output, which may be a user's sidecar. A refusal fails that stage alone; the other stages are still committed, and the CLI and the RPC `commit` both report the full result. A written lock removes the record. The code manifest it writes depends on the outputs:
    - The outputs on disk are the ones a `--no-commit` run wrote (its record): `pivot commit` writes the manifest that run recorded. The run's code is the code the stage ran, which can differ from the code on disk now (a helper edited while the run continued), and a rerun mark the run set stays. An unmarked record files a run-cache entry under that manifest. A marked record stays non-reusable: it files no entry and deletes one at its static input hash.
    - No record, a record without a code manifest (one that holds only another feature's key), or outputs that differ from it (edited by hand after the run): `pivot commit` fingerprints the code on disk now and records the outputs against it, as below.
 

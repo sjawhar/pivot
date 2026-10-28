@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import functools
 import logging
 import os
 import pathlib
@@ -16,11 +17,11 @@ from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
-from pivot.storage import cache, lock, state, track
+from pivot.storage import cache, lock, ownership, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Callable, Iterable, Iterator, Mapping
 
 RestoreResult = Literal["restored", "skipped", "missing"]
 MAX_CONCURRENT_RESTORES = 32
@@ -136,6 +137,77 @@ def _on_disk_matches_expected(
     return actual_hash == expected_hash["hash"]
 
 
+def _stage_claims_readers(
+    stage_outputs: Mapping[str, HashInfo], cache_dir: pathlib.Path
+) -> dict[str, Callable[[], ownership.StageClaims]]:
+    """For each stage output path, a reader of its stage's claims (``ownership.StageClaims``):
+    the hashes its lock records (``stage_outputs``), its ``nocommit:`` record, and the cache
+    object root ``cache_dir``. Each reads once, on its first call, from any thread: a restore
+    runs in a worker thread, where the command's click context is not available."""
+    store = cli_helpers.get_workspace_store()
+    if store is None:
+        return {}
+    default_state_dir = config.get_state_dir()
+    project_root = project.get_project_root()
+    readers: dict[str, Callable[[], ownership.StageClaims]] = {}
+    for stage_name in cli_helpers.list_stages():
+        stage_info = cli_helpers.get_stage(stage_name)
+        paths = [str(store.resolve_display_path(out)) for out in stage_info["outs"]]
+        reader = functools.cache(
+            functools.partial(
+                ownership.read_stage_claims,
+                project_root,
+                stage_name,
+                registry.get_stage_state_dir(stage_info, default_state_dir),
+                {
+                    pathlib.Path(path): stage_outputs[path]
+                    for path in paths
+                    if path in stage_outputs
+                },
+                cache_dir=cache_dir,
+            )
+        )
+        readers.update(dict.fromkeys(paths, reader))
+    return readers
+
+
+def _restore_targets(
+    files: Mapping[str, HashInfo],
+    stage_output_paths: Mapping[str, str | None],
+    claims: Mapping[str, Callable[[], ownership.StageClaims]],
+) -> dict[str, ownership.ForcedRestore]:
+    """What restoring each file replaces, for ``ownership.forced_restore_refusal``: a stage
+    output (path -> the stage, when the target named it) as that stage's output, with its claims;
+    any other path as a tracked path's own restore."""
+    return {
+        path: ownership.ForcedRestore(
+            replacement=(
+                ownership.stage_output(pathlib.Path(path), stage_output_paths[path])
+                if path in stage_output_paths
+                else ownership.tracked_restore(pathlib.Path(path))
+            ),
+            restored=output_hash,
+            claims=claims.get(path) if path in stage_output_paths else None,
+        )
+        for path, output_hash in files.items()
+    }
+
+
+def _refuse(targets: Iterable[ownership.ForcedRestore]) -> None:
+    """Fail, naming every refused target, if restoring these would remove a user's file."""
+    refusal = ownership.forced_restore_refusal(project.get_project_root(), targets)
+    if refusal is not None:
+        raise click.ClickException(str(refusal))
+
+
+def _refuse_swap(target: ownership.ForcedRestore, entry: pathlib.Path) -> None:
+    """Fail, naming the target, if the entry its swap removes, now at ``entry``, holds a user's
+    file (``ownership.swap_refusal``)."""
+    refusal = ownership.swap_refusal(project.get_project_root(), target, entry)
+    if refusal is not None:
+        raise click.ClickException(str(refusal))
+
+
 def _restore_path_sync(
     path: pathlib.Path,
     output_hash: HashInfo,
@@ -145,24 +217,26 @@ def _restore_path_sync(
     state_dir: pathlib.Path | None = None,
     hash_state_dir: pathlib.Path | None = None,
     *,
+    target: ownership.ForcedRestore,
     batch: state.FileHashBatch | None = None,
 ) -> RestoreOutcome:
     """Restore a file or directory from cache (sync version).
 
-    Holds the restore lock for path across the existence check and the restore, so a
-    concurrent checkout never compares against, or deletes, a half-restored output.
-    ``hash_state_dir`` (``state_dir`` when None) is the state directory whose StateDB the
-    path's file hashes are looked up in and recorded in: a stage output's own state directory.
-    The hashes of the files it restores or reads go into ``batch``, which the command saves once
-    (``state.FileHashBatch``); without one nothing is recorded.
+    Holds the restore lock for path across the existence check, the ownership checks and the
+    restore, so a concurrent checkout never compares against, or deletes, a half-restored output.
+    ``target`` is what the restore replaces (``_restore_targets``). ``hash_state_dir``
+    (``state_dir`` when None) is the state directory whose StateDB the path's file hashes are
+    looked up in and recorded in: a stage output's own state directory. The hashes of the files it
+    restores or reads go into ``batch``, which the command saves once (``state.FileHashBatch``);
+    without one nothing is recorded.
 
     Returns:
         What the restore did, for the caller to count and report.
 
     Raises:
         click.ClickException: For immediate failures (path traversal, unknown target,
-            "already exists" without --force). Cache misses return ("missing", name)
-            instead of raising.
+            "already exists" without --force, a stage output that holds user-owned files).
+            Cache misses return ("missing", name) instead of raising.
     """
     with cache.restore_lock(path, state_dir) as lock_token:
         return _restore_path_locked(
@@ -174,7 +248,8 @@ def _restore_path_sync(
             state_dir,
             lock_token,
             hash_state_dir if hash_state_dir is not None else state_dir,
-            batch,
+            target=target,
+            batch=batch,
         )
 
 
@@ -187,6 +262,8 @@ def _restore_path_locked(
     state_dir: pathlib.Path | None,
     lock_token: str | None,
     hash_state_dir: pathlib.Path | None,
+    *,
+    target: ownership.ForcedRestore,
     batch: state.FileHashBatch | None,
 ) -> RestoreOutcome:
     """Body of _restore_path_sync; the caller holds the restore lock for path."""
@@ -220,7 +297,13 @@ def _restore_path_locked(
                 settled = list[tuple[pathlib.Path, os.stat_result, str]]()
                 with _open_hash_cache_for_checkout(hash_state_dir) as state_db:
                     outcome = cache.restore_missing_in_directory(
-                        path, output_hash, cache_dir, checkout_modes, state_db, settled
+                        path,
+                        output_hash,
+                        cache_dir,
+                        checkout_modes,
+                        state_db,
+                        settled,
+                        before_write=lambda: _refuse([target]),
                     )
                 record(settled)
                 if outcome["local_changes"]:
@@ -252,6 +335,12 @@ def _restore_path_locked(
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
                 raise ValueError(f"Unhandled checkout behavior: {behavior}")  # pyright: ignore[reportUnreachable]
 
+    # Checked here, under the restore lock, before the replacement is built: for --force again
+    # after the check of every target before the first restore, so a user file that appeared in
+    # the meantime refuses this target alone; for an --only-missing swap once it is decided. The
+    # swap checks once more, over the entry it removes, once the replacement is built.
+    if path.exists() or path.is_symlink():
+        _refuse([target])
     restored = list[tuple[pathlib.Path, os.stat_result, str]]()
     success = cache.restore_from_cache(
         path,
@@ -260,6 +349,7 @@ def _restore_path_locked(
         checkout_modes=checkout_modes,
         state_dir=state_dir,
         lock_token=lock_token,
+        before_swap=functools.partial(_refuse_swap, target),
         recorded=restored,
     )
     if not success:
@@ -277,10 +367,13 @@ async def _checkout_files_async(
     callback: Callable[[int, int, str], None] | None = None,
     state_dir: pathlib.Path | None = None,
     hash_state_dirs: Mapping[str, pathlib.Path] | None = None,
+    *,
+    targets: Mapping[str, ownership.ForcedRestore],
     batch: state.FileHashBatch | None = None,
 ) -> list[RestoreOutcome]:
     """Restore files in parallel and return what each restore did.
 
+    ``targets`` says what each file's restore replaces (``_restore_targets``).
     ``hash_state_dirs`` maps a stage output's path to its stage's state directory, which
     holds its file hashes; every other path's are in ``state_dir``.
 
@@ -304,6 +397,7 @@ async def _checkout_files_async(
                     behavior,
                     state_dir,
                     (hash_state_dirs or {}).get(abs_path_str),
+                    target=targets[abs_path_str],
                     batch=batch,
                 )
             outcomes.append(outcome)
@@ -361,8 +455,13 @@ def _validate_and_build_files(
     targets: list[str],
     tracked_files: dict[str, track.PvtData],
     stage_outputs: dict[str, HashInfo],
-) -> dict[str, HashInfo]:
-    """Validate targets and build files dict for checkout.
+) -> tuple[dict[str, HashInfo], dict[str, str | None]]:
+    """Validate targets and build the files dict for checkout, with the stage output restores
+    among them (path -> the stage, when the target named it).
+
+    A restore requested through a stage is that stage's output restore, whatever else the path
+    is. A path target restores the tracked path's own content when the path is tracked, and the
+    stage output otherwise.
 
     Targets should already have .pvt suffixes converted by _dedupe_targets().
 
@@ -370,6 +469,7 @@ def _validate_and_build_files(
         click.ClickException: For path traversal or unknown targets.
     """
     files = dict[str, HashInfo]()
+    stage_output_paths = dict[str, str | None]()
     all_stages = _all_stages_in_context()
 
     for target in targets:
@@ -389,6 +489,7 @@ def _validate_and_build_files(
                     + f"Run 'pivot repro {stage_name}' first."
                 )
             files.update(cached)
+            stage_output_paths.update(dict.fromkeys(cached, resolved["stage_name"]))
             continue
 
         # Use normalized path (preserve symlinks) to match keys in tracked_files/stage_outputs;
@@ -408,6 +509,7 @@ def _validate_and_build_files(
         # Check if it's a stage output
         if abs_path_str in stage_outputs:
             files[abs_path_str] = stage_outputs[abs_path_str]
+            stage_output_paths.setdefault(abs_path_str, None)
             continue
 
         # Unknown target
@@ -416,7 +518,7 @@ def _validate_and_build_files(
             + "Use 'pivot list' to see stages or 'pivot track' to track files."
         )
 
-    return files
+    return files, stage_output_paths
 
 
 async def _checkout_main_async(
@@ -433,11 +535,22 @@ async def _checkout_main_async(
 ) -> list[RestoreOutcome]:
     """Main async checkout logic: what restoring each tracked file and stage output did.
 
+    ``--force`` replaces every existing target, so every target is checked before any is
+    changed: if one would remove a user's file, nothing is restored and the command fails,
+    naming every refused target and the files that block it. Each target is checked again before
+    its replacement is built, and at its swap (``_restore_path_locked``).
+
     ``output_state_dirs`` maps each stage output's path to its stage's state directory.
     """
+    claims = _stage_claims_readers(stage_outputs, cache_dir)
     if targets:
         unique_targets = _dedupe_targets(targets)
-        files = _validate_and_build_files(unique_targets, tracked_files, stage_outputs)
+        files, stage_output_paths = _validate_and_build_files(
+            unique_targets, tracked_files, stage_outputs
+        )
+        restore_targets = _restore_targets(files, stage_output_paths, claims)
+        if behavior is CheckoutBehavior.FORCE:
+            _refuse(restore_targets.values())
         return await _checkout_files_async(
             files,
             cache_dir,
@@ -446,6 +559,7 @@ async def _checkout_main_async(
             callback,
             state_dir=state_dir,
             hash_state_dirs=output_state_dirs,
+            targets=restore_targets,
             batch=batch,
         )
     else:
@@ -453,6 +567,10 @@ async def _checkout_main_async(
         tracked_as_hashes: dict[str, HashInfo] = {
             path: track.pvt_to_hash_info(pvt) for path, pvt in tracked_files.items()
         }
+        tracked_targets = _restore_targets(tracked_as_hashes, {}, claims)
+        output_targets = _restore_targets(stage_outputs, dict.fromkeys(stage_outputs), claims)
+        if behavior is CheckoutBehavior.FORCE:
+            _refuse([*tracked_targets.values(), *output_targets.values()])
         combined_total = len(tracked_as_hashes) + len(stage_outputs)
         shared_completed = 0
 
@@ -472,6 +590,7 @@ async def _checkout_main_async(
                 behavior,
                 progress_cb,
                 state_dir=state_dir,
+                targets=tracked_targets,
                 batch=batch,
             )
         )
@@ -484,6 +603,7 @@ async def _checkout_main_async(
                 progress_cb,
                 state_dir=state_dir,
                 hash_state_dirs=output_state_dirs,
+                targets=output_targets,
                 batch=batch,
             )
         )
