@@ -2087,8 +2087,17 @@ def _attribute_or_none(value: Any, name: str) -> Any:
 _class_mro = cast("Callable[[Any], tuple[type, ...]]", type.__dict__["__mro__"].__get__)
 _class_namespace = cast("Callable[[type], Mapping[str, Any]]", type.__dict__["__dict__"].__get__)
 # The C descriptors a class keeps for its instances' `__dict__` (a class's getset, a module's
-# member); reading the instance dict through one runs no code of the object or its class.
-_INSTANCE_DICT_DESCRIPTORS = (types.GetSetDescriptorType, types.MemberDescriptorType)
+# member); reading the instance dict through one runs no code of the object or its class. An
+# entry's type is compared with them by identity: `==` would ask a metaclass `__eq__`.
+_GETSET_DESCRIPTOR = types.GetSetDescriptorType
+_MEMBER_DESCRIPTOR = types.MemberDescriptorType
+# `type`'s own C member for a class's instance-dict offset: 0 when its instances have no
+# `__dict__` (a `__slots__` class without one, a namedtuple), -1 for a managed dict. Read
+# through it, no metaclass code runs.
+_class_dictoffset = cast("Callable[[Any], int]", type.__dict__["__dictoffset__"].__get__)
+# The generic C attribute lookup (`object.__getattribute__`): the type's MRO, then the
+# instance dict, and no `__getattr__` fallback.
+_generic_getattribute = object.__getattribute__
 
 
 def _keeps_own_attribute(obj: Any, name: str) -> bool:
@@ -2096,24 +2105,59 @@ def _keeps_own_attribute(obj: Any, name: str) -> bool:
     a class on its real MRO (a slot, a property, a method, a class attribute).
 
     Nothing of `obj`, its class or its metaclass runs. The MRO and each class namespace are read
-    through `type`'s own descriptors (`_class_mro`, `_class_namespace`), and the instance
-    `__dict__` only through the C descriptor a class on that MRO keeps for it, so no
-    `__getattr__`, property, class-level `__dict__` property, metaclass `__getattribute__` or
-    metaclass `__mro__` property is asked, and the walk is bounded by the real MRO. An object
-    that answers every name it lacks (a `unittest.mock.MagicMock`, an attribute tree) does not
-    read as having it. Without such a descriptor on the MRO (a `__slots__` class, a built-in, a
-    class whose `__dict__` is a property) the instance dict is not read.
+    through `type`'s own descriptors (`_class_mro`, `_class_namespace`), and types are compared by
+    identity, so no metaclass `__getattribute__`, `__mro__` property, `__eq__` or `__hash__` is
+    asked, and the walk is bounded by the real MRO. The instance `__dict__` is read through the C
+    descriptor a class on that MRO keeps for it. Without one, an instance of a class with no dict
+    offset (a `__slots__` class without `__dict__`, a namedtuple) has no dict, and the answer is
+    no; any other (a class whose `__dict__` is a property) is asked through
+    `_generic_getattribute`, the generic C lookup main's `hasattr` makes minus the `__getattr__`
+    fallback. It is reached only after the walk has shown that no class on the MRO holds
+    `name`, so it finds no descriptor to run and reads the instance dict the C way, past any
+    `__dict__` property. An object that answers every name it lacks (a
+    `unittest.mock.MagicMock`, an attribute tree) does not read as having it. Only
+    `AttributeError` means no; any other error (a dict key's own `__eq__`) propagates, as it
+    does from main's `hasattr`.
     """
+    cls = type(obj)  # pyright: ignore[reportUnknownVariableType] - any class
     instance_dict: Any = None
-    for klass in _class_mro(type(obj)):
+    for klass in _class_mro(cls):
         namespace = _class_namespace(klass)
         if name in namespace:
             return True
         if instance_dict is None and "__dict__" in namespace:
             entry = namespace["__dict__"]
-            if type(entry) in _INSTANCE_DICT_DESCRIPTORS and entry.__objclass__ is klass:
+            if (
+                type(entry) is _GETSET_DESCRIPTOR or type(entry) is _MEMBER_DESCRIPTOR
+            ) and entry.__objclass__ is klass:
                 instance_dict = entry
-    return instance_dict is not None and name in instance_dict.__get__(obj)
+    if instance_dict is not None:
+        return name in instance_dict.__get__(obj)
+    if not _class_dictoffset(cls):  # no instance dict: nothing for the lookup to find
+        return False
+    try:
+        _generic_getattribute(obj, name)
+    except AttributeError:
+        return False
+    return True
+
+
+def _proxied_class_keeps(value: Any, name: str) -> bool:
+    """Whether `value` is a transparent proxy of an object whose class keeps `name`.
+
+    A proxy (celery's `local.Proxy`, `lazy_object_proxy`, wrapt) reports its target's class as
+    its `__class__` and forwards attribute reads through `__getattr__`. The class `value` reports
+    is read as `isinstance` reads it, by `getattr(value, "__class__", None)`, where only
+    `AttributeError` means none: the read the canonical form's `isinstance(value,
+    pydantic.BaseModel)` already makes, so no new kind of code runs. It counts only if it is a
+    class other than `type(value)` that holds `name` on its real MRO, read through `type`'s own
+    descriptors; `issubclass(type(reported), type)` asks the real type, not a `__class__`. A plain
+    `MagicMock` reports its own type and is not taken.
+    """
+    reported = getattr(value, "__class__", None)
+    if reported is type(value) or not issubclass(type(reported), type):
+        return False
+    return any(name in _class_namespace(klass) for klass in _class_mro(reported))
 
 
 def _is_user_class_instance(value: Any) -> bool:
@@ -2900,12 +2944,8 @@ def _annotation_classes(annotation: Any) -> list[type]:
     return []
 
 
-# Exact built-in types the canonical form takes without a probe: an exact instance has no
-# `__dict__`, and neither its type nor `object` holds a mark, a `__wrapped__` or a `model_dump`,
-# which a built-in type cannot gain.
-_BUILTIN_TYPES = frozenset(
-    {dict, list, tuple, set, frozenset, str, bytes, int, float, bool, types.NoneType}
-)
+# The exact built-in containers the canonical form takes without a probe (see its shortcut).
+_BUILTIN_TYPES = frozenset({dict, list, tuple, set, frozenset, bytes})
 
 
 def _serialize_value_for_hash(value: Any) -> str:
@@ -2956,8 +2996,15 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     # over a class-based decorator over the mark and drop the class. A chain with a user class
     # instance above the mark is refused. A marked instance of a class-based decorator is named
     # like a marked function: its own `__dict__` is not dumped.
-    # An exact built-in (a dict, a list, bytes…) skips both probes below (`_BUILTIN_TYPES`).
-    builtin = type(value) in _BUILTIN_TYPES
+    # An exact dict, list, tuple, set, frozenset or bytes skips both probes below: an exact
+    # instance has no `__dict__`, and neither its type nor `object` holds a mark, a `__wrapped__`
+    # or a `model_dump`, which a built-in type cannot gain. Scalars, `str` and None returned
+    # above. The set lookup hashes the type, so it is reached only for a type whose metaclass is
+    # `type` itself, whose `__hash__` and `__eq__` are identity in C (a class cannot override them
+    # for itself); a type with another metaclass, whose `__hash__` or `__eq__` may run code or
+    # raise, is no built-in and skips the lookup.
+    value_type = type(value)  # pyright: ignore[reportUnknownVariableType] - any class
+    builtin = type(value_type) is type and value_type in _BUILTIN_TYPES  # pyright: ignore[reportUnknownArgumentType]
     decision = None if builtin else _mark_decision(value)
     if decision is _MarkDecision.REFUSED:
         _refuse_class_above_mark(value)
@@ -2966,14 +3013,23 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     # `lazy_object_proxy`, wrapt) that forwards attribute reads through `__getattr__` and reports
     # the model's class as its `__class__`: `isinstance` reads that `__class__`, as it does for
     # `re.Pattern` above (pydantic's metaclass uses `type.__instancecheck__`), and asks no
-    # `__getattr__`. Any other value is dumped only if it keeps `model_dump` of its own, so an
-    # object that merely answers every name (a `MagicMock`) is neither dumped nor asked.
+    # `__getattr__`. Any other value is dumped if it keeps `model_dump` of its own, or if it is
+    # such a proxy of an object whose class keeps one (`_proxied_class_keeps`); an object that
+    # merely answers every name (a `MagicMock`) is neither dumped nor asked.
+    #
+    # The `isinstance` test is a fast path only; no result depends on it. A direct pydantic
+    # model keeps `model_dump` on its MRO (`_keeps_own_attribute`), and a proxied one reports a
+    # class that keeps it (`_proxied_class_keeps`, the same `__class__` read). Removing it
+    # changes no fingerprint (the mutation `mISINSTANCE` fails no test); it stays because it
+    # answers a pydantic model before any walk (about 145 ns against main's 168). Do not delete
+    # it as dead code without measuring that cost.
     if not builtin and (
         isinstance(value, pydantic.BaseModel)
         or (_keeps_own_attribute(value, "model_dump") and not isinstance(value, type))
+        or _proxied_class_keeps(value, "model_dump")
     ):
         try:
-            dump = value.model_dump
+            dump = value.model_dump  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
         except AttributeError:
             # A `model_dump` the class keeps but the object does not hold: an unset slot, or a
             # property that raises AttributeError. Main's `hasattr` is False there too, so the

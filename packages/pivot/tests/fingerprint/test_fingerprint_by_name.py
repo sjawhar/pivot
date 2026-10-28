@@ -18,6 +18,7 @@ import subprocess
 import sys
 import types
 import typing
+from unittest import mock
 
 import cloudpickle
 import pydantic
@@ -4452,6 +4453,7 @@ def test_a_model_behind_a_transparent_proxy_is_dumped() -> None:
 # ---------------------------------------------------------------------------------------------
 
 _R11_CLASS_SIDE_CHILD = """\
+import collections
 import itertools
 import json
 
@@ -4545,6 +4547,86 @@ class DictDescriptorOfAnotherClass:
         return "DictDescriptorOfAnotherClass()"
 
 
+class EqWithoutHash(type):
+    def __eq__(cls, other):  # defining __eq__ sets __hash__ to None: the class is unhashable
+        return cls is other
+
+
+class HashRaises(type):
+    def __hash__(cls):
+        raise RuntimeError("metaclass __hash__ raises")
+
+
+class EqRaises(type):
+    def __eq__(cls, other):
+        raise RuntimeError("metaclass __eq__ raises")
+
+    __hash__ = type.__hash__
+
+
+class MetaUnhashable(Plain, metaclass=EqWithoutHash):
+    pass
+
+
+class MetaHashRaises(Plain, metaclass=HashRaises):
+    pass
+
+
+class EntryTypeEqRaises(metaclass=EqRaises):
+    pass
+
+
+class DictEntryOfAnEqRaisingType:
+    __dict__ = EntryTypeEqRaises()  # not a descriptor; its type's `__eq__` raises
+
+    def __repr__(self):
+        return "DictEntryOfAnEqRaisingType()"
+
+
+class DictPropertyHoldsDump:
+    # Its only `__dict__` is a property; the real instance dict holds `model_dump`.
+    def __init__(self):
+        object.__setattr__(self, "model_dump", lambda: {"factor": 3})
+
+    @property
+    def __dict__(self):
+        return {"masked": True}
+
+
+class KeyEqRaises(str):
+    armed = False
+
+    def __hash__(self):
+        return hash("model_dump")
+
+    def __eq__(self, other):
+        if not KeyEqRaises.armed:
+            return str.__eq__(self, other)
+        raise RuntimeError("key __eq__ raises")
+
+
+def dict_property_with_a_raising_key():
+    value = DictPropertyHoldsDump()
+    state = object.__getstate__(value)  # the live instance dict, past the property
+    del state["model_dump"]
+    state[KeyEqRaises("other")] = 1
+    return value
+
+
+Pair = collections.namedtuple("Pair", "x y")
+
+
+class SlotsOnly:
+    # No instance dict: its dict offset is 0.
+    __slots__ = ("factor",)
+
+    def __init__(self):
+        self.factor = 3
+
+    def __repr__(self):
+        return "SlotsOnly()"
+
+
 shapes = {
     "dict_property_raises": DictPropertyRaises(),
     "dict_property_not_a_mapping": DictPropertyNotAMapping(),
@@ -4554,7 +4636,16 @@ shapes = {
     "meta_mro_property_endless": MetaMroEndless(),
     "meta_mro_property_hides_model_dump": MetaMroHidesDump(),
     "dict_descriptor_of_another_class": DictDescriptorOfAnotherClass(),
+    "meta_eq_without_hash": MetaUnhashable(),
+    "meta_eq_without_hash_in_a_list": [MetaUnhashable()],
+    "meta_hash_raises": MetaHashRaises(),
+    "dict_entry_whose_type_eq_raises": DictEntryOfAnEqRaisingType(),
+    "dict_property_holds_model_dump": DictPropertyHoldsDump(),
+    "dict_property_key_eq_raises": dict_property_with_a_raising_key(),
+    "namedtuple": Pair(1, 2),
+    "slots_without_dict": SlotsOnly(),
 }
+KeyEqRaises.armed = True
 result = {}
 for name, value in shapes.items():
     try:
@@ -4567,10 +4658,14 @@ print(json.dumps(result))
 
 def test_the_model_dump_probe_runs_no_class_side_code() -> None:
     """A class-level `__dict__` property that raises or returns a non-mapping, a `__dict__`
-    descriptor that belongs to another class, a metaclass `__getattribute__` that raises for
-    `__mro__` or `__dict__`, and a metaclass `__mro__` property that raises, never ends, or
-    hides a base that keeps `model_dump`: each gets main's canonical form, and none raises or
-    hangs."""
+    descriptor that belongs to another class or whose type's metaclass `__eq__` raises, a
+    metaclass `__getattribute__` that raises for `__mro__` or `__dict__`, a metaclass `__mro__`
+    property that raises, never ends, or hides a base that keeps `model_dump`, and a metaclass
+    that defines `__eq__` without `__hash__` or whose `__hash__` raises: each gets main's
+    canonical form, and none raises or hangs. A class whose only `__dict__` is a property and
+    whose real instance dict holds `model_dump` is dumped, as main's `hasattr` dumps it; and an
+    error from a key of that dict, the one error the lookup can raise, propagates as it does on
+    main."""
     done = subprocess.run(
         [sys.executable, "-c", _R11_CLASS_SIDE_CHILD],
         capture_output=True,
@@ -4592,7 +4687,222 @@ def test_the_model_dump_probe_runs_no_class_side_code() -> None:
             "DictDescriptorOfAnotherClass",
             "DictDescriptorOfAnotherClass()",
         ],
+        "meta_eq_without_hash": ["__main__.MetaUnhashable", plain],
+        "meta_eq_without_hash_in_a_list": ["list", [["__main__.MetaUnhashable", plain]]],
+        "meta_hash_raises": ["__main__.MetaHashRaises", plain],
+        "dict_entry_whose_type_eq_raises": [
+            "DictEntryOfAnEqRaisingType",
+            "DictEntryOfAnEqRaisingType()",
+        ],
+        "dict_property_holds_model_dump": plain,
+        "dict_property_key_eq_raises": "RuntimeError: key __eq__ raises",
+        "namedtuple": ["Pair", [1, 2]],
+        "slots_without_dict": ["SlotsOnly", "SlotsOnly()"],
     }
+
+
+_R11_DICT_PROPERTY = """\
+import functools
+import json
+import pathlib
+
+
+class Settings:
+    # Its only `__dict__` is a property; the state is in the real instance dict.
+    def __init__(self) -> None:
+        data = json.loads((pathlib.Path(__file__).parent / "settings.json").read_text())
+        object.__setattr__(self, "model_dump", lambda: dict(data))
+
+    @property
+    def __dict__(self):
+        return {}
+
+    def __reduce__(self):  # a worker rebuilds it from the file
+        return (Settings, ())
+
+
+def scale(value: int, cfg) -> int:
+    return value * cfg.model_dump()["factor"]
+
+
+RUN = functools.partial(scale, cfg=Settings())
+"""
+
+
+def test_a_state_change_behind_model_dump_reruns_the_stage(tmp_path: pathlib.Path) -> None:
+    """A value whose class's only `__dict__` is a property, with `model_dump` in its real
+    instance dict, reporting state read from a file: an edit to that file reruns the stage and
+    the output follows, as on main, which dumps it through `hasattr`."""
+    project = _project(
+        tmp_path,
+        {
+            "lib/__init__.py": "",
+            "lib/helpers.py": _R11_DICT_PROPERTY,
+            "lib/settings.json": '{"factor": 3}\n',
+            "pipeline.py": _R11_PIPELINE.format(name="dp"),
+        },
+    )
+    out = project / "data" / "dp" / "s.txt"
+    assert _status(_run(project, "repro", "--json"), "dp/s")[0] == "ran"
+    assert _status(_run(project, "repro", "--json"), "dp/s") == ("cached", "unchanged")
+    assert out.read_text() == "51\n"
+
+    _edit(project / "lib" / "settings.json", '"factor": 3}', '"factor": 30}')
+    assert _status(_run(project, "repro", "--json"), "dp/s") == ("ran", "Code changed")
+    assert out.read_text() == "510\n"
+
+
+_R11_CELERY_PLAIN = """\
+import functools
+import json
+import pathlib
+
+import celery.local
+
+
+class Settings:
+    # Not a pydantic model; it keeps `model_dump` and has a `repr` that holds no state.
+    def __init__(self) -> None:
+        self.data = json.loads((pathlib.Path(__file__).parent / "settings.json").read_text())
+
+    def model_dump(self) -> dict:
+        return dict(self.data)
+
+    def __repr__(self) -> str:
+        return "Settings()"
+
+
+def scale(value: int, cfg) -> int:
+    return value * cfg.model_dump()["factor"]
+
+
+RUN = functools.partial(scale, cfg=celery.local.Proxy(Settings))
+"""
+
+
+def test_a_state_change_behind_a_celery_proxy_of_a_plain_object_reruns(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A `celery.local.Proxy`, whose `repr` is its target's, of an object that is not a pydantic
+    model but keeps `model_dump`: the proxy reports the target's class as its `__class__`, that
+    class keeps `model_dump`, so the value is dumped through the proxy as on main, and an edit to
+    the state behind `model_dump` reruns the stage."""
+    pytest.importorskip("celery.local")
+    project = _project(
+        tmp_path,
+        {
+            "lib/__init__.py": "",
+            "lib/helpers.py": _R11_CELERY_PLAIN,
+            "lib/settings.json": '{"factor": 3}\n',
+            "pipeline.py": _R11_PIPELINE.format(name="cp"),
+        },
+    )
+    out = project / "data" / "cp" / "s.txt"
+    assert _status(_run(project, "repro", "--json"), "cp/s")[0] == "ran"
+    assert _status(_run(project, "repro", "--json"), "cp/s") == ("cached", "unchanged")
+    assert out.read_text() == "51\n"
+
+    _edit(project / "lib" / "settings.json", '"factor": 3}', '"factor": 30}')
+    assert _status(_run(project, "repro", "--json"), "cp/s") == ("ran", "Code changed")
+    assert out.read_text() == "510\n"
+
+
+def test_a_spec_mock_is_dumped_through_the_mock_and_a_plain_mock_is_not() -> None:
+    """A plain `MagicMock` reports its own type as `__class__`, so it is neither dumped nor asked
+    for `model_dump`. A `MagicMock(spec=X)` reports X, and an X that keeps `model_dump` makes it
+    dumped through the mock, as a `spec=` pydantic model already is: its canonical form is that
+    of what `model_dump()` returns, a child mock. That form holds the child's `id`, so a stage
+    holding such a mock reruns every time, as one holding a plain mock does; main stops on each
+    with `RecursionError`."""
+
+    class KeepsDump:
+        def model_dump(self) -> dict[str, int]:
+            return {"factor": 3}
+
+    canonical = fingerprint._canonicalize_value_for_hash
+    plain = mock.MagicMock()
+    canonical(plain)
+    assert not plain.model_dump.called
+
+    spec = mock.MagicMock(spec=KeepsDump)
+    form = canonical(spec)
+    assert spec.model_dump.called
+    assert form == canonical(spec.model_dump.return_value)
+
+
+_R11_UNHASHABLE = """\
+import functools
+
+
+class EqWithoutHash(type):
+    def __eq__(cls, other):
+        return cls is other
+
+
+class Settings(metaclass=EqWithoutHash):
+    def __init__(self) -> None:
+        self.factor = 3
+
+
+def scale(value: int, cfg) -> int:
+    return value * cfg.factor
+
+
+RUN = functools.partial(scale, cfg=Settings())
+"""
+
+
+def test_status_fingerprints_a_value_whose_metaclass_is_unhashable(tmp_path: pathlib.Path) -> None:
+    """A partial keyword whose class has a metaclass that defines `__eq__` without `__hash__`:
+    `pivot status` fingerprints it and exits 0, as on main, because the probe looks the value's
+    type up by identity and never hashes it."""
+    project = _r11_project(tmp_path, "uh", _R11_UNHASHABLE)
+    status = _run(project, "status")
+    assert status.returncode == 0, status.stdout + status.stderr
+
+
+def test_a_value_without_an_instance_dict_takes_the_dict_offset_short_cut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A namedtuple and a `__slots__` class without `__dict__` have no instance dict (dict
+    offset 0), so the probe answers no without the generic lookup, which would raise and catch
+    an AttributeError for each. A class whose only `__dict__` is a property has a managed dict
+    and is still asked, and keeps main's result (its canonical forms against main's are in the
+    class-side child above)."""
+
+    class SlotsOnly:
+        __slots__ = ("factor",)  # pyright: ignore[reportUnannotatedClassAttribute]
+
+        def __init__(self) -> None:
+            self.factor: int = 3
+
+    class DictProperty:
+        def __init__(self) -> None:
+            object.__setattr__(self, "model_dump", lambda: {"factor": 3})
+
+        @property
+        @typing.override
+        def __dict__(self) -> dict[str, bool]:  # pyright: ignore[reportIncompatibleVariableOverride, reportIncompatibleMethodOverride]
+            return {"masked": True}
+
+    class Pair(typing.NamedTuple):
+        x: int
+        y: int
+
+    pair = Pair(1, 2)
+    asked = list[str]()
+    generic = fingerprint._generic_getattribute
+
+    def recording(obj: object, name: str) -> object:
+        asked.append(type(obj).__name__)
+        return generic(obj, name)
+
+    monkeypatch.setattr(fingerprint, "_generic_getattribute", recording)
+    assert not fingerprint._keeps_own_attribute(pair, "model_dump")
+    assert not fingerprint._keeps_own_attribute(SlotsOnly(), "model_dump")
+    assert asked == []
+    assert fingerprint._keeps_own_attribute(DictProperty(), "model_dump")
+    assert asked == ["DictProperty"]
 
 
 def test_an_exact_builtin_takes_neither_probe(monkeypatch: pytest.MonkeyPatch) -> None:
