@@ -468,13 +468,18 @@ def test_forced_restore_keeps_a_tracked_file_that_lands_in_an_output_while_it_ru
     assert (restored / "g.txt").read_text() == restored.name
 
 
+_GET_BOTH_TREES = ["get", "--rev", "HEAD", "b/one", "b/two", "--force"]
+
+
 @pytest.mark.parametrize(
-    "command",
+    ("command", "sidecar"),
     [
-        pytest.param(["checkout", "--force"], id="checkout-force"),
-        pytest.param(["checkout", "--all", "--force"], id="checkout-all-force"),
-        pytest.param(["pull", "--force"], id="pull-force"),
-        pytest.param(["get", "--rev", "HEAD", "b/one", "b/two", "--force"], id="get-force"),
+        pytest.param(["checkout", "--force"], "u.txt.pvt", id="checkout-force"),
+        pytest.param(["checkout", "--all", "--force"], "u.txt.pvt", id="checkout-all-force"),
+        pytest.param(["pull", "--force"], "u.txt.pvt", id="pull-force"),
+        pytest.param(_GET_BOTH_TREES, "u.txt.pvt", id="get-force"),
+        pytest.param(["checkout", "--force"], "u\x1b[2J.txt.pvt", id="checkout-force-escape"),
+        pytest.param(_GET_BOTH_TREES, "u\x1b[2J.txt.pvt", id="get-force-escape"),
     ],
 )
 def test_forced_restore_keeps_a_tracked_file_that_lands_in_an_output_during_its_own_restore(
@@ -483,11 +488,13 @@ def test_forced_restore_keeps_a_tracked_file_that_lands_in_an_output_during_its_
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
     command: list[str],
+    sidecar: str,
 ) -> None:
     """A tracked file and its sidecar are copied into an output after its restore checked it
     again, while that restore builds its replacement from the cache. The swap checks the old
     output once it has moved it aside: it refuses that target, names the sidecar, exits 1 and
-    puts the output back with both files in it. The other output is still restored."""
+    puts the output back with both files in it. The other output is still restored. A control
+    character in the sidecar's name is printed escaped, never raw."""
     repo_path, commit = git_repo
     (repo_path / ".pivot").mkdir()
     monkeypatch.setattr(project, "_project_root_cache", repo_path)
@@ -520,7 +527,7 @@ def test_forced_restore_keeps_a_tracked_file_that_lands_in_an_output_during_its_
         if not landed and display is not None:
             (output,) = (out for out in outputs if display.resolve().is_relative_to(out))
             shutil.copy2(user, output / "u.txt")
-            shutil.copy2(track.get_pvt_path(user), output / "u.txt.pvt")
+            shutil.copy2(track.get_pvt_path(user), output / sidecar)
             landed.append(output)
         checkout_with_fallback(path, *args, **kwargs)
 
@@ -531,10 +538,12 @@ def test_forced_restore_keeps_a_tracked_file_that_lands_in_an_output_during_its_
     assert landed, result.output
     output = landed[0]
     assert (output / "u.txt").read_text() == "user bytes", result.output
-    assert (output / "u.txt.pvt").read_bytes() == user_sidecar
+    assert (output / sidecar).read_bytes() == user_sidecar
     assert (output / "g.txt").read_text() == output.name, "the output went back unchanged"
     assert result.exit_code != 0, result.output
-    assert f"data/b/{output.name}/u.txt.pvt" in " ".join(result.output.split())
+    shown = sidecar.replace("\x1b", "\\x1b")
+    assert f"data/b/{output.name}/{shown}" in " ".join(result.output.split())
+    assert "\x1b" not in result.output
     restored = outputs[0] if output == outputs[1] else outputs[1]
     assert (restored / "g.txt").read_text() == restored.name
     assert not [p.name for p in output.parent.iterdir() if p.name.startswith(".pivot_")]

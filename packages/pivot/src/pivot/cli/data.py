@@ -6,7 +6,7 @@ import pathlib
 
 import click
 
-from pivot import config, discovery, exceptions, project, registry
+from pivot import config, discovery, display, exceptions, project, registry
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -225,8 +225,9 @@ def get(
         remote_factory=lambda: transfer.create_remote_from_name(remote_name)[0],
     )
 
+    # A message names user paths and files, which may hold control characters
     for msg in messages:
-        click.echo(msg)
+        click.echo(display.safe_message(msg))
 
     if not success:
         raise SystemExit(1)
