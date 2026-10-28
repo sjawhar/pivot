@@ -6,7 +6,7 @@ from typing import TypedDict
 
 import click
 
-from pivot import config, exceptions, git, project
+from pivot import config, git, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.storage import cache, listing, state
@@ -118,7 +118,11 @@ def _foreign_listing(
     anything but a file holding the listing of the directory its .pvt records (``recorded``) or
     the bytes about to be written there (``new_data``).
 
-    Ownership is proved by byte equality with the canonical cache object, never by XXH64 alone.
+    A listing file is pivot's when the cache (configured or legacy,
+    ``cache.resolve_cache_object_path``) holds exactly its bytes at their own digest: a listing
+    pivot stored, current or stale. With no cache copy at that digest it is pivot's when its
+    bytes hash to the recorded directory, the rule ``listing._resolve`` reads it by. XXH64 alone
+    never overrides a cache copy whose bytes differ.
     """
     if not os.path.lexists(listing_path):
         return False
@@ -130,14 +134,14 @@ def _foreign_listing(
         return True
     if data == new_data:
         return False
-    if recorded is None or "nfiles" not in recorded:
-        return True
-    # Compare bytes exactly with the cached listing object, not just the digest.
-    try:
-        cached = cache.get_cache_path(cache_dir, recorded["hash"]).read_bytes()
-    except (OSError, exceptions.SecurityValidationError):
-        return True  # cache object absent or unreadable: cannot prove ownership
-    return data != cached
+    data_digest = listing.digest(data)
+    cached_path = cache.resolve_cache_object_path(cache_dir, data_digest)
+    if cached_path is not None:
+        try:
+            return cached_path.read_bytes() != data
+        except OSError:
+            return True
+    return recorded is None or "nfiles" not in recorded or data_digest != recorded["hash"]
 
 
 def _track_single_path(

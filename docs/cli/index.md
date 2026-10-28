@@ -470,6 +470,10 @@ commit both files. `track` refuses a target that is the `.pvt` or listing file
 of another tracked path, or whose own `.pvt` or listing file would be another
 tracked path, naming that path; any other name can be tracked, one ending in
 `.pvt` or `.pvt.listing` included. It warns when git ignores either sidecar.
+`--force` rewrites or removes a `<path>.pvt.listing` only when Pivot wrote it:
+the cache (also the `.pivot` cache from before `core.state_dir` was set) holds
+exactly its bytes, or, with no cached copy, its bytes hash to the directory the
+`.pvt` records. Any other file there is refused, naming it.
 
 ---
 

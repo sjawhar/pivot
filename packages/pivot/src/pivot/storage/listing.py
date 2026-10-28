@@ -603,7 +603,10 @@ def store_object(cache_dir: pathlib.Path, directory_hash: str, data: bytes) -> N
 
     Bytes that do not hash to ``directory_hash`` are refused. An existing object must have the
     same bytes: XXH64 is only an index, so two different listings with the same digest are a
-    collision, not interchangeable cache objects.
+    collision, not interchangeable cache objects. The existing object is the configured cache's,
+    or when it has none the legacy cache's (``cache.resolve_cache_object_path``), whose bytes a
+    reader takes for that hash; equal bytes from the legacy cache are still copied into the
+    configured cache.
     """
     cache_path = cache.get_cache_path(cache_dir, directory_hash)
     actual = digest(data)
@@ -612,9 +615,9 @@ def store_object(cache_dir: pathlib.Path, directory_hash: str, data: bytes) -> N
             f"Listing bytes hash to {actual}, not to directory hash {directory_hash}; not cached"
         )
 
-    def verify_existing() -> bool:
+    def matches(existing_path: pathlib.Path) -> bool:
         try:
-            existing = cache_path.read_bytes()
+            existing = existing_path.read_bytes()
         except FileNotFoundError:
             return False
         if existing == data:
@@ -622,19 +625,22 @@ def store_object(cache_dir: pathlib.Path, directory_hash: str, data: bytes) -> N
         existing_hash = digest(existing)
         if existing_hash != directory_hash:
             raise exceptions.CorruptListingError(
-                f"{cache_path}: its bytes hash to {existing_hash}, not to directory hash "
+                f"{existing_path}: its bytes hash to {existing_hash}, not to directory hash "
                 + f"{directory_hash}"
             )
         raise exceptions.CorruptListingError(
-            f"{cache_path}: its bytes differ from a listing that also hashes to directory "
+            f"{existing_path}: its bytes differ from a listing that also hashes to directory "
             + f"{directory_hash}; refuse an XXH64 collision"
         )
 
-    if verify_existing():
+    if matches(cache_path):
         return
+    legacy_path = cache.resolve_cache_object_path(cache_dir, directory_hash)
+    if legacy_path is not None and legacy_path != cache_path:
+        _ = matches(legacy_path)
     with cache.staged_cache_file(cache_path) as staged:
         staged.write_bytes(data)
         os.chmod(staged, 0o444)
         if cache.publish_cache_object(staged, cache_path):
             return
-    _ = verify_existing()
+    _ = matches(cache_path)

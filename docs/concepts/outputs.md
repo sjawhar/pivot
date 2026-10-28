@@ -152,13 +152,13 @@ directory's hash, and pushed and pulled with it.
 
 A lock that records a directory keeps its entries under `records`, and leaves
 its top-level `deps` and `outs` empty; a lock that records only files keeps them
-at the top level. Pivot 0.5.11 and earlier read the top-level lists alone, and
-would read a directory record that lists no files inside it as one file's hash.
-Finding empty lists instead, they treat the lock as one that records nothing:
-they run an ordinary stage again from its inputs, and stop at a stage with an
-incremental output ("Cache missing for incremental output", exit 1) rather than
-restart that output from empty. Run-cache entries are kept apart from theirs for
-the same reason.
+at the top level. Released versions of Pivot, up to and including 0.5.20, read
+the top-level lists alone, and would read a directory record that lists no files
+inside it as one file's hash. Finding empty lists instead, they treat the lock as
+one that records nothing: they run an ordinary stage again from its inputs, and
+stop at a stage with an incremental output ("Cache missing for incremental
+output", exit 1) rather than restart that output from empty. Run-cache entries
+are kept apart from theirs for the same reason.
 
 | Directory | Listing file |
 |---|---|

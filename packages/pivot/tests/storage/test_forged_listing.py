@@ -2,6 +2,8 @@
 
 Each test builds listing bytes whose XXH64 matches the target directory's hash, but whose
 content differs from the real listing — then verifies that the byte-equality check refuses them.
+The same checks read a listing object a project cached before ``core.state_dir`` was set from
+the legacy ``.pivot/cache``.
 """
 
 from __future__ import annotations
@@ -171,3 +173,75 @@ def test_track_force_refuses_a_forged_listing_that_shares_the_directory_xxh64(
     assert result.returncode != 0, f"track --force should refuse a forged listing:\n{out}"
     assert "in the way" in out, out
     assert pvt_listing.read_bytes() == forged, "the forged listing is not overwritten"
+
+
+def _pivot(root: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    return subprocess.run(
+        [_PIVOT, *args], cwd=root, env=env, capture_output=True, text=True, check=False
+    )
+
+
+def _tracked_before_state_dir(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, DirHash]:
+    """``_helper_project``, then ``core.state_dir`` set: the tracked directory's listing object
+    is only in the legacy ``.pivot/cache``."""
+    root, legacy_files, record = _helper_project(root)
+    configured = _pivot(root, "config", "set", "core.state_dir", "state")
+    assert configured.returncode == 0, configured.stdout + configured.stderr
+    assert cache.get_cache_path(legacy_files, record["hash"]).is_file()
+    configured_files = root / "state" / "cache" / "files"
+    assert not cache.get_cache_path(configured_files, record["hash"]).exists()
+    return root, legacy_files, record
+
+
+def test_track_force_refuses_a_listing_that_differs_from_the_legacy_cached_copy(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A listing beside the .pvt whose bytes hash to the recorded directory but differ from the
+    legacy cache's copy is not pivot's: `track --force` refuses and leaves it."""
+    root, _, record = _tracked_before_state_dir(tmp_path / "proj")
+    pvt_listing = root / "data" / "corpus.pvt.listing"
+    forged = _forge_listing(record["hash"])
+    assert xxhash.xxh64(forged).hexdigest() == record["hash"]
+    assert forged != pvt_listing.read_bytes()
+    pvt_listing.write_bytes(forged)
+    (root / "data" / "corpus" / "b.txt").write_text("beta, edited")
+
+    tracked = _pivot(root, "track", "--force", "data/corpus")
+
+    out = tracked.stdout + tracked.stderr
+    assert tracked.returncode != 0, out
+    assert "in the way" in out, out
+    assert pvt_listing.read_bytes() == forged, "the forged listing is not overwritten"
+
+
+def test_store_object_refuses_bytes_that_collide_with_the_legacy_cached_listing(
+    set_project_root: pathlib.Path,
+) -> None:
+    """With ``core.state_dir`` set, the legacy cache's listing object is the one at its hash:
+    bytes that collide with it are refused, not stored in the configured cache to shadow it."""
+    from pivot import exceptions
+
+    (set_project_root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: altstate\n")
+    canonical = listing.encode(
+        listing.DirListing(
+            files=[
+                DirManifestEntry(relpath="a.txt", hash="0123456789abcdef", size=5, isexec=False)
+            ],
+            empty_dirs=[],
+        )
+    )
+    directory_hash = listing.digest(canonical)
+    legacy = cache.get_cache_path(set_project_root / ".pivot" / "cache" / "files", directory_hash)
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(canonical)
+    forged = _forge_listing(directory_hash)
+    assert listing.digest(forged) == directory_hash
+    assert forged != canonical
+    configured_files = set_project_root / "altstate" / "cache" / "files"
+
+    with pytest.raises(exceptions.CorruptListingError, match="XXH64 collision"):
+        listing.store_object(configured_files, directory_hash, forged)
+
+    assert not cache.get_cache_path(configured_files, directory_hash).exists()
+    assert legacy.read_bytes() == canonical

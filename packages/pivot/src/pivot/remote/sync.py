@@ -63,10 +63,10 @@ def _blob_hashes(
     and its files' objects.
 
     ``read_members`` reads a directory's listing (its committed listing file, else the cache's
-    object). A listing the local cache lacks is stored from the committed file, so push sends
-    it. A directory whose listing neither holds, or whose committed listing cannot be used and
-    the cache lacks, gives its listing object alone: a pull fetches it first, then names the
-    files.
+    object). A listing neither the configured cache nor the legacy one holds is stored from the
+    committed file, so push sends it. A directory whose listing neither holds, or whose committed
+    listing cannot be used and the cache lacks, gives its listing object alone: a pull fetches it
+    first, then names the files.
 
     With ``require_members`` the caller (push) needs the member objects it would transfer, so a
     directory whose listing can be read from neither the committed file nor the cache raises
@@ -87,7 +87,7 @@ def _blob_hashes(
             raise
         logger.warning("%s; only the cache's copy of that listing is transferred", e)
         return {hash_info["hash"]}
-    if not cache.get_cache_path(files_dir, hash_info["hash"]).exists():
+    if cache.resolve_cache_object_path(files_dir, hash_info["hash"]) is None:
         listing.store_object(files_dir, hash_info["hash"], listing.encode(members))
     return {hash_info["hash"], *(entry["hash"] for entry in members["files"])}
 

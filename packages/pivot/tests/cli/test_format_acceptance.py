@@ -1146,3 +1146,96 @@ def test_a_listing_path_that_is_a_directory_is_named_and_replaced_by_a_stage_run
     _ok(_pivot(root, "repro", "--force", "t/copy"))
     assert listing_file.read_bytes() == good
     assert "Verification passed" in _ok(_pivot(root, "verify"))
+
+
+# `pivot track --force` on a tracked directory whose committed listing pivot wrote, where the
+# configured cache holds no object for that listing (docs/cli/index.md: `--force` overwrites a
+# directory's `.pvt.listing`; CorruptListingError.REMEDY names `pivot track --force <path>`).
+
+
+def _tracked_assets(root: pathlib.Path) -> pathlib.Path:
+    _project(
+        root,
+        {
+            "pipeline.py": _PLAIN_PIPELINE,
+            "data/raw/in.txt": "abc",
+            ".gitignore": "/assets/\n/state/\n/data/p/\n__pycache__/\n",
+        },
+    )
+    (root / "assets").mkdir()
+    (root / "assets" / "a.txt").write_text("alpha")
+    (root / "assets" / "b.txt").write_text("beta")
+    _ok(_pivot(root, "track", "assets"))
+    _ok(_pivot(root, "repro"))
+    _commit(root, "track assets")
+    return root
+
+
+def _clone_without_cache(src: pathlib.Path, clone: pathlib.Path) -> pathlib.Path:
+    """A fresh clone whose directory came from somewhere other than Pivot (a data refresh job, a
+    copy): its cache holds no object at all."""
+    subprocess.run(["git", "clone", "-q", str(src), str(clone)], check=True)
+    shutil.copytree(src / "assets", clone / "assets", copy_function=shutil.copyfile)
+    return clone
+
+
+def test_track_force_in_a_fresh_clone_retracks_a_changed_directory(tmp_path: pathlib.Path) -> None:
+    clone = _clone_without_cache(_tracked_assets(tmp_path / "src"), tmp_path / "clone")
+    (clone / "assets" / "b.txt").write_text("beta, refreshed")
+
+    tracked = _pivot(clone, "track", "--force", "assets")
+
+    assert tracked.returncode == 0, tracked.stdout + tracked.stderr
+
+
+def test_track_force_in_a_fresh_clone_retracks_a_directory_that_became_a_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    clone = _clone_without_cache(_tracked_assets(tmp_path / "src"), tmp_path / "clone")
+    shutil.rmtree(clone / "assets")
+    (clone / "assets").write_text("one file now")
+
+    tracked = _pivot(clone, "track", "--force", "assets")
+
+    assert tracked.returncode == 0, tracked.stdout + tracked.stderr
+    assert not (clone / "assets.pvt.listing").exists()
+
+
+def test_track_force_retracks_a_directory_tracked_before_core_state_dir_was_set(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The directory's listing object is only in the legacy `.pivot/cache`."""
+    root = _tracked_assets(tmp_path / "src")
+    _ok(_pivot(root, "config", "set", "core.state_dir", "state"))
+    (root / "assets" / "b.txt").unlink()
+    (root / "assets" / "b.txt").write_text("beta, edited")
+
+    tracked = _pivot(root, "track", "--force", "assets")
+
+    out = tracked.stdout + tracked.stderr
+    assert tracked.returncode == 0, out
+    members = listing.decode((root / "assets.pvt.listing").read_bytes())
+    sizes = {entry["relpath"]: entry["size"] for entry in members["files"]}
+    assert sizes == {"a.txt": 5, "b.txt": 12}, out
+
+
+def test_track_force_is_the_remedy_verify_names_for_a_stale_tracked_listing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A `.pvt.listing` put back from an earlier revision without its `.pvt`: `verify` refuses
+    it and names `pivot track --force <path>`; that command then rewrites it."""
+    root = _tracked_assets(tmp_path / "src")
+    (root / "assets" / "b.txt").unlink()
+    (root / "assets" / "b.txt").write_text("beta, edited")
+    _ok(_pivot(root, "track", "--force", "assets"))
+    _commit(root, "retrack assets")
+    _ok(_git(root, "checkout", "HEAD~1", "--", "assets.pvt.listing"))
+
+    refused = _pivot(root, "verify")
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert "pivot track --force <path>" in refused.stdout + refused.stderr
+
+    tracked = _pivot(root, "track", "--force", "assets")
+
+    assert tracked.returncode == 0, tracked.stdout + tracked.stderr
+    assert "Verification passed" in _ok(_pivot(root, "verify"))
