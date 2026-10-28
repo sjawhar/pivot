@@ -203,6 +203,7 @@ def test_a_write_just_after_a_copy_restore_is_not_recorded_as_the_cached_content
 
     monkeypatch.setattr(pathlib.Path, "replace", replace_then_write)
 
+    batch = state_mod.FileHashBatch()
     outcome = checkout_mod._restore_path_sync(
         target,
         FileHash(hash=file_hash),
@@ -210,7 +211,9 @@ def test_a_write_just_after_a_copy_restore_is_not_recorded_as_the_cached_content
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.ERROR,
         tmp_path / ".pivot",
+        batch=batch,
     )
+    batch.save()
 
     assert outcome.result == "restored"
     assert target.read_bytes() == b"edited"

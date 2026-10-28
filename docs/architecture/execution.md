@@ -293,14 +293,16 @@ StateDB is an LMDB-backed key-value store for all pipeline state. Keys use prefi
 | Prefix | Purpose |
 |--------|---------|
 | `hash:` | File hash cache (the absolute path as given, no symlink followed; the entry holds `stat()`'s mtime_ns, size, device and inode) |
-| `inode:` | Identity index: device and inode → the `hash:` key of one path recorded with that inode (not always the last written); a lookup that misses by path follows it only on a filesystem type `/proc/self/mountinfo` lists as keeping inode numbers unique (ext2/3/4, xfs, btrfs, tmpfs, f2fs, zfs), and serves that entry only if it matches the file's stat and its path still names the file, with the same device, inode and change time |
 | `gen:` | Output generation counters (the artifact identity, `stage` or `stage:key`) |
 | `dep:` | Stage dependency generations (stage name + dep path) |
 | `runcache:` | Run cache entries (stage name + input hash) |
 | `run:` | Run history manifests |
 | `remote:` | Remote index entries |
+| `nocommit:` | What a stage's outputs hold that no lock records yet: a `--no-commit` run's code manifest (rerun marks included) and output hashes, for `pivot commit`, and keys another feature writes; each writer replaces only its own keys |
 
 **Key strategies:** A file-hash key is the absolute path as given (`os.fsencode(os.path.abspath(path))`): building it costs no system call, and the entry's `(mtime_ns, size, device, inode)`, from a `stat()` that follows symlinks, decides whether a cached hash still applies, so a link re-pointed at another file no longer matches. Generation keys use the artifact identity, so they stay the same wherever an output's path points.
+
+**`.pvt` discovery:** finding tracked files walks the whole project, as `os.walk` does, and reads every `.pvt` it finds. The repro/run pre-flight (`verify_tracked_files`) records, for each directory that changed at least 2 s before the walk, its subdirectory and `.pvt` names under its stamp (`st_dev`, `st_ino`, `st_mtime_ns`, `st_ctime_ns`). Every later walk still stats each directory, and lists only those whose stamp changed, or changed in the last 2 s; adding, removing or renaming an entry changes its directory's stamp. Two kinds of stamp are never trusted: one whose mtime and ctime are both whole seconds, so a filesystem with one-second timestamps is always listed, and one with a time outside the stamp's signed 64-bit nanoseconds (before 1677 or after 2262). The memo is used only on ext2/3/4, xfs, btrfs (subvolumes included), tmpfs, f2fs and zfs mounts (read from `/proc/self/mountinfo`); NFS, overlayfs, FUSE and any other filesystem are listed every time. It holds no `.pvt` content, other commands only read it (a memo that cannot be read means a full listing), and a memo recorded under another project root is not used. The memo is not in the state database, which other accounts can read: it is a file of each account's own, `state.lmdb/pvt-memo-<uid>` in the state directory, created with mode 0600 in a `state.lmdb` that already exists on an allowlisted filesystem, and rewritten in place through its descriptor. A walk opens it without following a symlink and uses it only when an `fstat` of the open file shows a regular file on the same filesystem allowlist (where owner and mode are the file's own; bindfs, CIFS and NFS can report the mount's), owned by the running account, with no group or other access and one link; otherwise every directory is listed and nothing is written. A file of another account is never touched; the account's own memo that its owner loosened (group or other bits, or a second link) is emptied and replaced by a new 0600 file at the next pre-flight. So no other account reads its names, whatever the modes of the project's directories, except while the owner leaves the file loose, at the cost of one `fstat` per walk (one more when a loosened memo is replaced). A listing in which an entry's type could not be read is never recorded.
 
 ### Multi-process safety
 
@@ -435,10 +437,10 @@ Without this flag, Pivot validates that all tracked outputs exist before running
 
 ## Deferred Commit Mode
 
-The `--no-commit` flag runs stages without writing lock files or committing their outputs:
+The `--no-commit` flag runs stages without writing durable state:
 
 ```bash
-# Run stages — outputs land on disk, with no lock, cache copy, generation or run-cache entry
+# Run stages — outputs land on disk; no locks, no cache, only a record of what each stage ran
 pivot repro --no-commit
 
 # Inspect results, then snapshot current workspace state
@@ -447,12 +449,18 @@ pivot commit
 
 ### How It Works
 
-1. `--no-commit`: stages execute and outputs are written to disk. No lock files, no cache copies, no generation or run-cache entries. The hashes of the files the run reads and writes are still saved in the StateDB, best-effort, as every command saves them: a file-hash entry is a cache that its own stat check validates on every read, not a lock, so a later `pivot status` reads none of those files again.
-2. `pivot commit [stage_names...]`: computes current workspace state (fingerprints code, hashes deps and outputs), writes production lock files, saves outputs to cache, and updates StateDB. Without arguments, commits all stale stages. With stage names, unconditionally commits those stages.
+1. `--no-commit`: stages execute and outputs are written to disk. No lock files, cache copies,
+   generations or run-cache entries are written. StateDB keeps one record per stage that ran
+   (`nocommit:<stage>`): the code manifest the run's lock would have held, rerun marks included,
+   and the hashes of its outputs. The stat-validated file hashes of dependencies and outputs the
+   run read are also saved best-effort, so a later status need not read them again.
+2. `pivot commit [stage_names...]`: computes current workspace state (hashes deps and outputs), writes production lock files, saves outputs to cache, and updates StateDB. Without arguments, commits all stale stages. With stage names, unconditionally commits those stages. The code manifest it writes depends on the outputs:
+   - The outputs on disk are the ones a `--no-commit` run wrote (its record): `pivot commit` writes the manifest that run recorded. The run's code is the code the stage ran, which can differ from the code on disk now (a helper edited while the run continued), and a rerun mark the run set stays. An unmarked record files a run-cache entry under that manifest. A marked record stays non-reusable: it files no entry and deletes one at its static input hash.
+   - No record, a record without a code manifest (one that holds only another feature's key), or outputs that differ from it (edited by hand after the run): `pivot commit` fingerprints the code on disk now and records the outputs against it, as below.
 
 ### Use Case
 
-This workflow avoids caching overhead during rapid iteration. `pivot commit` is also the "trust me" path — if you change code but know outputs are still correct, `pivot commit` records the current state without re-running stages.
+This workflow avoids caching overhead during rapid iteration. `pivot commit` is also the "trust me" path — if you change code but know outputs are still correct, `pivot commit` records the current state without re-running stages. For outputs that a `--no-commit` run wrote and nobody changed since, it records the code that run ran instead, so an edit made during or after that run still reruns the stage.
 
 ## See Also
 

@@ -7,7 +7,7 @@ import pathlib
 import stat
 import struct
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import lmdb
 import pytest
@@ -728,6 +728,70 @@ def test_readonly_allows_reads(tmp_path: pathlib.Path) -> None:
         assert db.get_generation("stage:output") == 1
         assert db.get_dep_generations("stage") == {"upstream:out": 1}
         assert db.remote_hash_exists("origin", "remote_hash")
+
+
+def test_open_readonly_uses_the_database_mount_to_classify_an_lmdb_error(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 7-1: LMDB reports an existing database on a read-only filesystem as plain
+    `lmdb.Error`, not `OSError(EROFS)`. `open_readonly` calls statvfs on `state.lmdb` itself
+    (its parent can be another, writable mount) and yields None only when that mount is read-only;
+    the same error on a writable mount is a damaged database and raises."""
+    with state.StateDB(tmp_path):
+        pass
+    lmdb_path = tmp_path / "state.lmdb"
+    statvfs_paths = list[object]()
+
+    def lmdb_error(*_: object, **__: object) -> object:
+        raise lmdb.Error("Permission denied")
+
+    class _StatVfs:
+        f_flag: int
+
+        def __init__(self, flag: int) -> None:
+            self.f_flag = flag
+
+    def readonly_statvfs(path: object) -> _StatVfs:
+        statvfs_paths.append(path)
+        return _StatVfs(os.ST_RDONLY)
+
+    monkeypatch.setattr(state, "_acquire_shared_env", lmdb_error)
+    monkeypatch.setattr(os, "statvfs", cast("Any", readonly_statvfs))
+
+    with state.open_readonly(tmp_path, create=False) as state_db:
+        assert state_db is None
+
+    assert statvfs_paths == [lmdb_path]
+
+    def writable_statvfs(_: object) -> _StatVfs:
+        return _StatVfs(0)
+
+    monkeypatch.setattr(os, "statvfs", cast("Any", writable_statvfs))
+    with (
+        pytest.raises(lmdb.Error, match="Permission denied"),
+        state.open_readonly(tmp_path, create=False),
+    ):
+        pass
+
+
+def test_open_readonly_treats_a_permission_error_before_the_mount_check(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A database this user cannot open is no cache even if its mount is writable."""
+    with state.StateDB(tmp_path):
+        pass
+
+    def denied(*_: object, **__: object) -> object:
+        raise PermissionError("Permission denied")
+
+    def unexpected_statvfs(_: object) -> object:
+        raise AssertionError("the permission case must not inspect the mount")
+
+    monkeypatch.setattr(state, "_acquire_shared_env", denied)
+    monkeypatch.setattr(os, "statvfs", unexpected_statvfs)
+
+    with state.open_readonly(tmp_path, create=False) as state_db:
+        assert state_db is None
 
 
 def test_readonly_blocks_save(tmp_path: pathlib.Path) -> None:
@@ -1583,3 +1647,120 @@ def test_apply_deferred_writes_empty_output_paths_with_flag_true(
     with state.StateDB(db_path) as db:
         # Should not raise
         db.apply_deferred_writes("stage", [], deferred)
+
+
+_RAN = {"code_manifest": {"func:helpers.plain": "1f2e"}, "output_hashes": {"p/use_plain": "9a8b"}}
+# The key another feature writes into the same record: `*.pvt` directory members.
+_PVT = {"pvt_members": {"data/out/a.pvt": "77aa"}}
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        pytest.param(_RAN, _RAN, id="this-pivots-fields"),
+        pytest.param(_PVT, _PVT, id="another-field-only"),
+        pytest.param({**_RAN, **_PVT}, {**_RAN, **_PVT}, id="another-field-too"),
+        pytest.param(
+            {"code_manifest": _RAN["code_manifest"], **_PVT},
+            {"code_manifest": _RAN["code_manifest"], **_PVT},
+            id="manifest-without-outputs",
+        ),
+        pytest.param(
+            {**_RAN, "code_manifest": {"func:helpers.plain": 1}},
+            {"output_hashes": _RAN["output_hashes"]},
+            id="malformed-manifest",
+        ),
+        pytest.param(
+            {**_RAN, "output_hashes": ["p/use_plain"], **_PVT},
+            {"code_manifest": _RAN["code_manifest"], **_PVT},
+            id="malformed-outputs-and-another-field",
+        ),
+        pytest.param({**_RAN, "pvt_members": ["data/out/a.pvt"]}, _RAN, id="malformed-pvt-members"),
+        pytest.param({**_RAN, "pvt_members": 7}, _RAN, id="pvt-members-not-an-object"),
+        pytest.param(
+            {"code_manifest": 7, "output_hashes": {"p/use_plain": 9}, **_PVT},
+            _PVT,
+            id="malformed-run-keys-and-valid-pvt-members",
+        ),
+        pytest.param(
+            {**_RAN, "later_field": [1]}, {**_RAN, "later_field": [1]}, id="unknown-key-as-stored"
+        ),
+    ],
+)
+def test_a_no_commit_record_reads_each_valid_field_it_knows(
+    tmp_path: pathlib.Path, stored: object, expected: object
+) -> None:
+    """Each key the record declares (the run's code manifest and output hashes, and the
+    `pvt_members` another feature writes) is validated on its own: a malformed one is dropped
+    and hides no other. A key the record does not declare reads as stored, and a record that
+    holds only another feature's key reads as present, never as absent."""
+    with state.StateDB(tmp_path) as db:
+        db.put_raw(b"nocommit:p/use_plain", json.dumps(stored).encode())
+
+        assert db.get_no_commit_record("p/use_plain") == expected
+
+
+_OLDER_RUN = {
+    "code_manifest": {"func:helpers.plain": "0000"},
+    "output_hashes": {"p/use_plain": "11"},
+}
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        pytest.param(None, _RAN, id="no-record"),
+        pytest.param(json.dumps(_PVT).encode(), {**_RAN, **_PVT}, id="another-field-only"),
+        pytest.param(
+            json.dumps({**_OLDER_RUN, **_PVT}).encode(),
+            {**_RAN, **_PVT},
+            id="an-older-run-and-another-field",
+        ),
+        pytest.param(b"not json", _RAN, id="unreadable-record"),
+    ],
+)
+def test_applying_a_no_commit_record_replaces_its_keys_and_keeps_every_other(
+    tmp_path: pathlib.Path, stored: bytes | None, expected: dict[str, object]
+) -> None:
+    """Another feature writes its keys into the stage's `nocommit:` record during the run, before
+    the coordinator applies the run's record (the worker adds each `*.pvt` member before it writes
+    the file). Applying the run's record replaces the code manifest and output hashes, an older
+    run's included, and keeps every other key."""
+    deferred: DeferredWrites = {
+        "no_commit_record": {
+            "code_manifest": _RAN["code_manifest"],
+            "output_hashes": _RAN["output_hashes"],
+        }
+    }
+    with state.StateDB(tmp_path) as db:
+        if stored is not None:
+            db.put_raw(b"nocommit:p/use_plain", stored)
+
+        db.apply_deferred_writes("p/use_plain", [], deferred)
+
+        raw = db.get_raw(b"nocommit:p/use_plain")
+        assert raw is not None and json.loads(raw) == expected
+        assert db.get_no_commit_record("p/use_plain") == expected
+
+
+def test_a_written_lock_removes_the_whole_no_commit_record(tmp_path: pathlib.Path) -> None:
+    """A lock written for the stage supersedes the record, every feature's keys included."""
+    with state.StateDB(tmp_path) as db:
+        db.put_raw(b"nocommit:p/use_plain", json.dumps({**_RAN, **_PVT}).encode())
+
+        db.apply_deferred_writes("p/use_plain", [], {"clear_no_commit_record": True})
+
+        assert db.get_no_commit_record("p/use_plain") is None
+
+
+@pytest.mark.parametrize(
+    "value", [None, b"[]", b"not json"], ids=["absent", "not-an-object", "not-json"]
+)
+def test_a_no_commit_record_is_none_when_absent_or_not_a_json_object(
+    tmp_path: pathlib.Path, value: bytes | None
+) -> None:
+    with state.StateDB(tmp_path) as db:
+        if value is not None:
+            db.put_raw(b"nocommit:p/use_plain", value)
+
+        assert db.get_no_commit_record("p/use_plain") is None

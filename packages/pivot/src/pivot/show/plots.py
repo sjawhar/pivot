@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import functools
 import html
-import json
 import logging
 import os
 import pathlib
@@ -181,7 +180,7 @@ def format_diff_table(
 ) -> str:
     """Format diff output as plain text, JSON, or markdown."""
     if output_format == OutputFormat.JSON:
-        return json.dumps(diffs, indent=2)
+        return common.format_json(diffs)
 
     rows = list[list[str]]()
     for diff in diffs:

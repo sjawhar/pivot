@@ -43,8 +43,8 @@ Example::
 from __future__ import annotations
 
 import asyncio
-import enum
 import logging
+import os
 import pathlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, cast
@@ -53,6 +53,7 @@ import pygtrie
 
 from pivot import (
     config,
+    display,
     exceptions,
     explain,
     import_artifact,
@@ -72,6 +73,8 @@ from pivot.types import (
     CodeChange,
     DepChange,
     FileHashEntry,
+    ImportCheckStatus,
+    ImportStatusInfo,
     ParamChange,
     PipelineStatus,
     PipelineStatusInfo,
@@ -82,7 +85,6 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    import os
     from collections.abc import Callable
 
     import networkx as nx
@@ -162,12 +164,13 @@ def _get_explanations_in_parallel(
             try:
                 explanations_by_name[stage_name] = future.result()
             except Exception as e:
-                logger.warning(f"Failed to get explanation for {stage_name}: {e}")
+                message = exceptions.describe_error(e)
+                logger.warning(f"Failed to get explanation for {stage_name}: {message}")
                 explanations_by_name[stage_name] = StageExplanation(
                     stage_name=stage_name,
                     will_run=True,
                     is_forced=False,
-                    reason=f"Error: {e}",
+                    reason=f"Error: {message}",
                     code_changes=list[CodeChange](),
                     param_changes=list[ParamChange](),
                     dep_changes=list[DepChange](),
@@ -356,12 +359,12 @@ def get_tracked_files_status(
     """
     tracked = track.discover_pvt_files(project_root)
     total = len(tracked)
+    results = list[TrackedFileInfo]()
     cache_dir = config.get_cache_dir() / "files"
-
-    def _hash_tracked(
-        state_db: state_mod.StateDB | None, pending: list[tuple[pathlib.Path, os.stat_result, str]]
-    ) -> list[TrackedFileInfo]:
-        results = list[TrackedFileInfo]()
+    pending = list[tuple[pathlib.Path, os.stat_result, str]]()
+    # A damaged StateDB still fails status; an unavailable cache yields None, so status hashes
+    # files and saves those entries best-effort once after the read.
+    with state_mod.open_readonly(config.get_state_dir(), create=False) as state_db:
         for i, (abs_path_str, track_data) in enumerate(sorted(tracked.items()), 1):
             path = pathlib.Path(abs_path_str)
             rel_path = str(path.relative_to(project_root))
@@ -396,10 +399,9 @@ def get_tracked_files_status(
             )
             if on_progress is not None:
                 on_progress(i, total)
-        return results
 
-    # A damaged state database fails status, as it always has (`pivot diff` reads files instead).
-    return cache.hash_read_only(config.get_state_dir(), _hash_tracked)
+    state_mod.save_file_hashes(config.get_state_dir(), pending)
+    return results
 
 
 def get_remote_status(
@@ -418,7 +420,7 @@ def get_remote_status(
         raise exceptions.RemoteNotConfiguredError("No remotes configured")
 
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
-    url = remote_config.get_remote_url(resolved_name)
+    url = display.redact_url_credentials(remote_config.get_remote_url(resolved_name))
     local_hashes = transfer.get_local_cache_hashes(cache_dir)
 
     if not local_hashes:
@@ -505,36 +507,6 @@ def get_suggestions(
     return suggestions
 
 
-class ImportCheckStatus(enum.Enum):
-    UP_TO_DATE = "up to date"
-    UPDATE_AVAILABLE = "update available"
-    ERROR = "error"
-
-
-class ImportStatusInfo:
-    __slots__: tuple[str, ...] = ("path", "status", "current_rev", "latest_rev", "error")
-
-    path: str
-    status: ImportCheckStatus
-    current_rev: str
-    latest_rev: str
-    error: str
-
-    def __init__(
-        self,
-        path: str,
-        status: ImportCheckStatus,
-        current_rev: str = "",
-        latest_rev: str = "",
-        error: str = "",
-    ) -> None:
-        self.path = path
-        self.status = status
-        self.current_rev = current_rev
-        self.latest_rev = latest_rev
-        self.error = error
-
-
 async def _check_imports_batch(
     import_pvts: dict[str, track.PvtData],
     project_root: pathlib.Path,
@@ -555,10 +527,19 @@ async def _check_imports_batch(
     results = list[ImportStatusInfo]()
     for (rel_path, _, _), check_or_exc in zip(tasks, checks, strict=True):
         if isinstance(check_or_exc, Exception):
-            logger.warning("Failed to check import %s: %s", rel_path, check_or_exc)
+            error = display.redact_url_credentials(exceptions.describe_error(check_or_exc))
+            logger.warning(
+                "Failed to check import %s: %s",
+                display.escape_control(rel_path),
+                display.escape_control(error),
+            )
             results.append(
                 ImportStatusInfo(
-                    path=rel_path, status=ImportCheckStatus.ERROR, error=str(check_or_exc)
+                    path=rel_path,
+                    status=ImportCheckStatus.ERROR,
+                    current_rev=None,
+                    latest_rev=None,
+                    error=error,
                 )
             )
         else:
@@ -570,10 +551,19 @@ async def _check_imports_batch(
                         status=ImportCheckStatus.UPDATE_AVAILABLE,
                         current_rev=check["current_rev"][:8],
                         latest_rev=check["latest_rev"][:8],
+                        error=None,
                     )
                 )
             else:
-                results.append(ImportStatusInfo(path=rel_path, status=ImportCheckStatus.UP_TO_DATE))
+                results.append(
+                    ImportStatusInfo(
+                        path=rel_path,
+                        status=ImportCheckStatus.UP_TO_DATE,
+                        current_rev=None,
+                        latest_rev=None,
+                        error=None,
+                    )
+                )
     return results
 
 

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import pathlib
 from typing import TYPE_CHECKING, Literal, TypedDict
 
 import click
 
-from pivot import config, exceptions, project, registry, types
+from pivot import config, display, exceptions, project, registry, types
 from pivot import status as status_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
@@ -205,6 +204,7 @@ def _create_remote_if_needed(allow_missing: bool) -> protocol.RemoteStorage | No
     except exceptions.RemoteError:
         raise
     except Exception as e:
+        # pivot's own error: its cause keeps the library's text, as before
         raise exceptions.RemoteError(f"Failed to create remote connection: {e}") from e
     return remote
 
@@ -353,13 +353,13 @@ def _output_text(passed: bool, results: list[StageVerifyInfo], quiet: bool) -> N
         status_icon = "✓" if stage["status"] == "passed" else "✗"
         click.echo(f"  {status_icon} {stage['name']}: {stage['status']}")
         if stage["reason"]:
-            click.echo(f"      {stage['reason']}")
+            click.echo(f"      {display.escape_control(stage['reason'], keep_newlines=True)}")
 
 
 def _output_json(passed: bool, results: list[StageVerifyInfo]) -> None:
     """Output verification results as JSON."""
     output = VerifyOutput(passed=passed, stages=results)
-    click.echo(json.dumps(output, indent=2))
+    click.echo(display.to_json(output, indent=2))
 
 
 @cli_decorators.pivot_command(allow_all=True)

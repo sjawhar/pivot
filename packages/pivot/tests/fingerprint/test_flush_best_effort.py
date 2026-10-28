@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import pytest
 from tests import helpers
 
-from pivot import fingerprint
+from pivot import fingerprint, project
 from pivot.storage import state
 
 if TYPE_CHECKING:
@@ -30,8 +30,8 @@ def state_dir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> Iterat
     with state.StateDB(path):
         pass
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: path)
-    monkeypatch.setattr(fingerprint, "_pending_ast_writes", [])
-    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", [])
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    monkeypatch.setattr(fingerprint, "_pending_writes", None)
     yield path
 
 
@@ -45,14 +45,14 @@ def _helper_keys(path: pathlib.Path, prefix: bytes) -> list[bytes]:
     [
         pytest.param(
             fingerprint.flush_ast_hash_cache,
-            lambda: fingerprint._pending_ast_writes.append(_AST_ENTRY),
+            lambda: fingerprint._current_pending_writes()["ast"].append(_AST_ENTRY),
             b"fp:",
             "Not saving 1 AST hashes",
             id="ast-hashes",
         ),
         pytest.param(
             fingerprint.flush_manifest_cache,
-            lambda: fingerprint._pending_manifest_writes.append(_MANIFEST_ENTRY),
+            lambda: fingerprint._current_pending_writes()["manifest"].append(_MANIFEST_ENTRY),
             b"sm:",
             "Not saving 1 manifest entries",
             id="manifests",
@@ -98,13 +98,13 @@ def test_a_flush_gives_up_after_2_s_of_a_held_write_lock_and_retries_later(
     [
         pytest.param(
             fingerprint.flush_ast_hash_cache,
-            lambda: fingerprint._pending_ast_writes.append(_AST_ENTRY),
+            lambda: fingerprint._current_pending_writes()["ast"].append(_AST_ENTRY),
             b"fp:",
             id="ast-hashes",
         ),
         pytest.param(
             fingerprint.flush_manifest_cache,
-            lambda: fingerprint._pending_manifest_writes.append(_MANIFEST_ENTRY),
+            lambda: fingerprint._current_pending_writes()["manifest"].append(_MANIFEST_ENTRY),
             b"sm:",
             id="manifests",
         ),
@@ -122,5 +122,6 @@ def test_a_flush_with_a_free_lock_saves_its_entries_and_leaves_none_pending(
     flush()
 
     assert _helper_keys(state_dir, prefix) != []
-    assert fingerprint._pending_ast_writes == []
-    assert fingerprint._pending_manifest_writes == []
+    pending = fingerprint._current_pending_writes()
+    assert pending["ast"] == []
+    assert pending["manifest"] == []

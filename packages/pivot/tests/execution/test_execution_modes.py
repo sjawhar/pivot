@@ -84,6 +84,7 @@ def _make_stage_info(
         incremental_inputs={},
         unsafe_fingerprint=False,
         no_fingerprint=False,
+        loaded_sources_token="",
     )
 
 
@@ -129,11 +130,11 @@ def test_no_commit_produces_outputs_without_production_lock(
     production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert not production_lock.path.exists(), "Production lock should NOT be written"
 
-    # Nothing to commit: the deferred writes hold only the file hashes the stage read (its
-    # input) and wrote (its output), a cache the coordinator saves best-effort
+    # The deferred writes hold the record for `pivot commit` and the file hashes the stage read
+    # and wrote, which the coordinator saves best-effort.
     assert "deferred_writes" in result
     deferred = result["deferred_writes"]
-    assert list(deferred) == ["file_hash_entries"], "Only file-hash entries in no_commit mode"
+    assert set(deferred) == {"file_hash_entries", "no_commit_record"}
     assert "file_hash_entries" in deferred
     hashed = {
         pathlib.Path(path).name: file_hash
@@ -143,6 +144,10 @@ def test_no_commit_produces_outputs_without_production_lock(
         "input.txt": cache.hash_file(tmp_path / "input.txt")[0],
         "test_stage.txt": cache.hash_file(output_path)[0],
     }
+    assert "no_commit_record" in deferred
+    record = deferred["no_commit_record"]
+    assert record["code_manifest"] == stage_info["fingerprint"]
+    assert set(record["output_hashes"]) == {"test_stage"}
 
 
 def test_no_commit_does_not_write_to_cache(

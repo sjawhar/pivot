@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import json
 import logging
 import os
 import pathlib
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
 
     from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
-    from pivot.types import DeferredWrites, FileHashEntry
+    from pivot.types import DeferredWrites, FileHashEntry, NoCommitRecord
 
 # Key prefixes for different entry types
 _HASH_PREFIX = b"hash:"  # File hash entries
@@ -37,6 +38,9 @@ _RUN_PREFIX = b"run:"  # Run history entries
 _RUNCACHE_PREFIX = b"runcache:"  # Run cache entries for skip detection
 _FP_PREFIX = b"fp:"  # AST fingerprint/hash cache entries
 _SM_PREFIX = b"sm:"  # Stage manifest cache entries
+_NOCOMMIT_PREFIX = b"nocommit:"  # What a --no-commit run of a stage ran, for `pivot commit`
+# The keys `types.NoCommitRecord` declares, each a str -> str mapping the reader validates alone.
+_NO_COMMIT_FIELDS = ("code_manifest", "output_hashes", "pvt_members")
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024
@@ -447,12 +451,36 @@ def _device_allowed(mounts: _Mounts, device: int, path: str | os.PathLike[str]) 
     return False
 
 
+# What a hash-cache open or write can raise that the cache, being best-effort, absorbs: another
+# process holding the write lock too long, a full map, a database this user cannot open or write
+# (lmdb.ReadonlyError, EACCES), a read-only filesystem.
+_CACHE_ERRORS = (exceptions.PivotDBWriteTimeoutError, StateDBError, lmdb.Error, OSError)
+
+
 def _make_key_output_generation(identity: str) -> bytes:
     return _GEN_PREFIX + identity.encode()
 
 
 def _make_key_dep_generation(stage_name: str, dep_identity: str) -> bytes:
     return _DEP_PREFIX + f"{stage_name}:{dep_identity}".encode()
+
+
+def _is_str_dict(value: object) -> typing.TypeGuard[dict[str, str]]:
+    return isinstance(value, dict) and all(
+        isinstance(key, str) and isinstance(item, str)
+        for key, item in typing.cast("dict[object, object]", value).items()
+    )
+
+
+def _json_object(value: bytes | None) -> dict[str, object] | None:
+    """`value` decoded as a JSON object, or None if it is absent or not one."""
+    if value is None:
+        return None
+    try:
+        data: object = json.loads(value)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return typing.cast("dict[str, object]", data) if isinstance(data, dict) else None
 
 
 class InvalidAstHashKeyError(Exception):
@@ -707,29 +735,60 @@ class StateDB:
         """Cache file metadata and hash, as ``save_many`` does for one entry."""
         self.save_many([(path, fs_stat, file_hash)])
 
-    def save_many(self, entries: Iterable[tuple[pathlib.Path, os.stat_result, str]]) -> None:
-        """Save multiple entries atomically; ``_put_file_hashes`` says which it leaves out."""
+    def save_many(
+        self,
+        entries: Iterable[tuple[pathlib.Path, os.stat_result, str]],
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """Save multiple entries atomically, waiting at most ``timeout`` seconds (this
+        database's write timeout when None) for another process's write lock."""
         self.save_file_hash_entries(
             (
-                os.fspath(path),
-                fs_stat.st_mtime_ns,
-                fs_stat.st_size,
-                fs_stat.st_dev,
-                fs_stat.st_ino,
-                file_hash,
-            )
-            for path, fs_stat, file_hash in entries
+                (
+                    os.fspath(path),
+                    fs_stat.st_mtime_ns,
+                    fs_stat.st_size,
+                    fs_stat.st_dev,
+                    fs_stat.st_ino,
+                    file_hash,
+                )
+                for path, fs_stat, file_hash in entries
+            ),
+            timeout=timeout,
         )
 
-    def save_file_hash_entries(self, entries: Iterable[FileHashEntry]) -> None:
-        """Save ``DeferredWrites`` file-hash entries in one write transaction."""
+    def save_file_hash_entries(
+        self, entries: Iterable[FileHashEntry], *, timeout: float | None = None
+    ) -> None:
+        """Save ``DeferredWrites`` file-hash entries in one write transaction.
+
+        An entry whose key or timestamp is outside this cache's representation is left out:
+        this cache only saves a later read, so it must not fail the caller.
+        """
         self._check_closed()
         self._check_write_allowed()
         try:
-            with self._write_transaction(timeout=self._write_timeout) as txn:
+            with self._write_transaction(
+                timeout=self._write_timeout if timeout is None else timeout
+            ) as txn:
                 _put_file_hashes(txn, entries)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
+
+    def save_many_best_effort(
+        self, entries: list[tuple[pathlib.Path, os.stat_result, str]]
+    ) -> bool:
+        """``save_many``, best-effort: it waits at most ``_WRITE_BACK_TIMEOUT`` for the write
+        lock, as ``save_best_effort`` does, and a write that fails (``_CACHE_ERRORS``) is logged at
+        debug level and dropped, so a hash save never fails or stalls the command. True if it
+        saved."""
+        try:
+            self.save_many(entries, timeout=_WRITE_BACK_TIMEOUT)
+        except _CACHE_ERRORS as error:
+            logger.debug("Not saving %d file hashes: %s", len(entries), error)
+            return False
+        return True
 
     # -------------------------------------------------------------------------
     # AST hash cache for persistent fingerprint caching
@@ -1154,6 +1213,24 @@ class StateDB:
             return None
         return run_history.deserialize_run_cache_entry(value)
 
+    def get_no_commit_record(self, stage_name: str) -> NoCommitRecord | None:
+        """The stage's `nocommit:` record, or None (absent, or not a JSON object).
+
+        Each key `types.NoCommitRecord` declares (`code_manifest`, `output_hashes`,
+        `pvt_members`) is validated on its own: a malformed one is dropped and hides no other.
+        Every other key reads as stored, and a record without these keys reads as present.
+        """
+        self._check_closed()
+        with self._read_transaction() as txn:
+            value = txn.get(_NOCOMMIT_PREFIX + stage_name.encode())
+        record = _json_object(value)
+        if record is None:
+            return None
+        for field in _NO_COMMIT_FIELDS:
+            if field in record and not _is_str_dict(record[field]):
+                del record[field]
+        return typing.cast("NoCommitRecord", typing.cast("object", record))
+
     def prune_run_cache(self, valid_run_ids: set[str]) -> int:
         """Remove run cache entries that reference runs not in valid_run_ids.
 
@@ -1266,10 +1343,20 @@ class StateDB:
                         + f"{stage_name}:{deferred['run_cache_delete_input_hash']}".encode()
                     )
 
-                # File hash entries; ``_put_file_hashes`` says which it leaves out.
+                # File hash entries; ``_put_file_hashes`` leaves out cache entries that cannot
+                # be represented, then writes every `hash:` before the `inode:` index entries.
                 if "file_hash_entries" in deferred:
                     _put_file_hashes(txn, deferred["file_hash_entries"])
 
+                nocommit_key = _NOCOMMIT_PREFIX + stage_name.encode()
+                if "no_commit_record" in deferred:
+                    # Set the run's keys (`types.NoCommitRun`: both, always) and keep every other
+                    # key: another feature writes its keys into the same record.
+                    record = _json_object(txn.get(nocommit_key)) or dict[str, object]()
+                    record.update(deferred["no_commit_record"])
+                    txn.put(nocommit_key, json.dumps(record).encode())
+                elif "clear_no_commit_record" in deferred and deferred["clear_no_commit_record"]:
+                    txn.delete(nocommit_key)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
 
@@ -1307,39 +1394,6 @@ class StateDB:
         self.close()
 
 
-@contextlib.contextmanager
-def open_readonly(state_dir: pathlib.Path, *, create: bool = True) -> Generator[StateDB | None]:
-    """Open the state database to read it, yielding None where this user cannot read it safely.
-
-    A database whose lock file this user cannot write cannot register a reader against a
-    writer (``_open_env``), so its cache is not used: the caller reads files instead, as it
-    would with no database. Only that permission case yields None. A damaged database raises,
-    except where this user can write neither its data file nor its lock file: that is the
-    permission case, found first, so it yields None too. Opening creates a database where
-    there is none, unless ``create`` is False. The caller's own errors propagate with no
-    context from the open.
-    """
-    if not create and not (state_dir / "state.lmdb").exists():
-        yield None
-        return
-    state_db: StateDB | None
-    try:
-        state_db = StateDB(state_dir, readonly=True)
-    except (PermissionError, lmdb.ReadonlyError) as error:
-        logger.debug("Reading files without the state database in %s: %s", state_dir, error)
-        state_db = None
-    except OSError as error:
-        if error.errno != errno.EROFS:
-            raise
-        logger.debug("Reading files without the state database in %s: %s", state_dir, error)
-        state_db = None
-    if state_db is None:
-        yield None
-        return
-    with state_db:
-        yield state_db
-
-
 def save_best_effort(
     state_dir: pathlib.Path,
     write: Callable[[StateDB], None],
@@ -1350,25 +1404,60 @@ def save_best_effort(
 ) -> bool:
     """Run ``write`` against a writable StateDB in ``state_dir``, best-effort; True if it ran.
 
-    Every cache a read-only command fills goes through here: the file-hash entries
-    (``write_back_file_hashes``) and the fingerprint caches
-    (``fingerprint.flush_ast_hash_cache``, ``flush_manifest_cache``). Each one is a cache that
-    its own reader validates, and no decision depends on an entry being present, so a write
-    that cannot happen at once is skipped with a debug log naming ``what`` instead of failing
-    or holding up the command: another process holding the write lock for longer than
-    ``timeout`` (2 s, a fraction of a pivot write's own 30 s; 0 makes one attempt), a database
-    this user cannot write, a read-only filesystem, a full map. Without ``create``, a state
-    directory that has no database is left without one.
+    Every cache a command fills goes through here: entries commands read or materialize
+    (``save_file_hashes`` and ``write_back_file_hashes``) and the fingerprint caches
+    (``fingerprint.flush_ast_hash_cache`` and ``flush_manifest_cache``). Each reader validates
+    its entries and no decision depends on one being present, so a write that cannot happen at
+    once is skipped with a debug log naming ``what`` instead of failing or holding up the
+    command. Without ``create``, a state directory that has no database is left without one.
     """
     if not create and not (state_dir / "state.lmdb").exists():
         return False
     try:
         with StateDB(state_dir, write_timeout=timeout) as state_db:
             write(state_db)
-    except (exceptions.PivotDBWriteTimeoutError, StateDBError, lmdb.Error, OSError) as error:
+    except _CACHE_ERRORS as error:
         logger.debug("Not saving %s in %s: %s", what, state_dir, error)
         return False
     return True
+
+
+@contextlib.contextmanager
+def open_readonly(
+    state_dir: pathlib.Path | None, *, create: bool = True
+) -> Generator[StateDB | None]:
+    """Open ``state_dir``'s StateDB to read it, yielding None where its cache is unavailable.
+
+    A database this user cannot open safely (``PermissionError`` or ``lmdb.ReadonlyError``)
+    yields None first. Otherwise an open error yields None only when ``state.lmdb`` is on a
+    read-only mount; the same error on a writable mount is a damaged database and propagates.
+    Opening creates a database where there is none unless ``create`` is False; no ``state_dir``
+    yields None. The caller's own errors propagate with no context from the open.
+    """
+    if state_dir is None or (not create and not (state_dir / "state.lmdb").exists()):
+        yield None
+        return
+    lmdb_path = state_dir / "state.lmdb"
+    state_db: StateDB | None
+    try:
+        state_db = StateDB(state_dir, readonly=True)
+    except (PermissionError, lmdb.ReadonlyError) as error:
+        logger.debug("Reading files without the state database in %s: %s", state_dir, error)
+        state_db = None
+    except (OSError, lmdb.Error) as error:
+        try:
+            readonly_filesystem = bool(os.statvfs(lmdb_path).f_flag & os.ST_RDONLY)
+        except OSError:
+            raise error from None
+        if not readonly_filesystem:
+            raise
+        logger.debug("Reading files without the state database in %s: %s", state_dir, error)
+        state_db = None
+    if state_db is None:
+        yield None
+        return
+    with state_db:
+        yield state_db
 
 
 def write_back_file_hashes(
@@ -1377,20 +1466,13 @@ def write_back_file_hashes(
     *,
     timeout: float = _WRITE_BACK_TIMEOUT,
 ) -> None:
-    """Save the file-hash entries a read-only check computed, best-effort, in one transaction.
+    """Save file hashes a read-only check computed, best-effort, in one transaction.
 
-    ``pivot status``, every explanation, ``pivot diff``, ``pivot plots diff``, the engine's
-    skip check and the engine of a ``--no-commit`` run call this with the hashes they had to
-    read, so the next check reads none of those files (status's tracked files, ``pivot diff``
-    and ``pivot plots diff`` through ``cache.hash_read_only``). The write is best-effort and
-    creates no database (``save_best_effort``); with no entries it takes no lock.
+    The write is a cache that never creates a database; a concurrent newer entry merely causes
+    one later read, never a wrong hash.
     """
     if not entries:
         return
-    # A write-back can land after a concurrent `pivot repro` recorded a newer entry for one of
-    # these paths: it puts back the stat it read and drops the index entry of the inode repro
-    # recorded. Both then fail the next lookup's stat match, so that file is read once more; no
-    # wrong hash is served.
     _ = save_best_effort(
         state_dir,
         lambda state_db: state_db.save_file_hash_entries(entries),
@@ -1398,3 +1480,39 @@ def write_back_file_hashes(
         create=False,
         timeout=timeout,
     )
+
+
+def save_file_hashes(
+    state_dir: pathlib.Path, entries: list[tuple[pathlib.Path, os.stat_result, str]]
+) -> None:
+    """Save entries a command read or wrote in one best-effort transaction."""
+    if entries:
+        _ = save_best_effort(
+            state_dir,
+            lambda state_db: state_db.save_many(entries),
+            what=f"{len(entries)} file hashes",
+        )
+
+
+class FileHashBatch:
+    """The file-hash entries one command collects across its targets, by state directory."""
+
+    def __init__(self) -> None:
+        self._lock: threading.Lock = threading.Lock()
+        self._by_dir: dict[pathlib.Path, list[tuple[pathlib.Path, os.stat_result, str]]] = {}
+
+    def add(
+        self, state_dir: pathlib.Path, entries: list[tuple[pathlib.Path, os.stat_result, str]]
+    ) -> None:
+        """Collect ``entries`` for ``state_dir``'s StateDB."""
+        if not entries:
+            return
+        with self._lock:
+            self._by_dir.setdefault(state_dir, []).extend(entries)
+
+    def save(self) -> None:
+        """Save what was collected, once per state directory, and start empty again."""
+        with self._lock:
+            by_dir, self._by_dir = self._by_dir, {}
+        for state_dir, entries in by_dir.items():
+            save_file_hashes(state_dir, entries)

@@ -4,14 +4,14 @@ import asyncio
 import contextlib
 import logging
 import os
-from typing import TYPE_CHECKING, Protocol, TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 from pivot import config, exceptions
 from pivot.remote import batch, keys
 from pivot.remote import config as remote_config
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+    from collections.abc import AsyncGenerator, AsyncIterator, Callable
     from pathlib import Path
 
     import aioboto3
@@ -32,60 +32,6 @@ STREAM_READ_TIMEOUT = 60  # Seconds to wait for each chunk read
 # Safe without locking - asyncio is single-threaded, worst case race just
 # creates duplicate config (harmless).
 _cached_s3_config: AioConfig | None = None
-
-
-# =============================================================================
-# Remote Fetcher Protocol (for pivot get --rev)
-# =============================================================================
-
-
-class RemoteFetcher(Protocol):
-    """Protocol for remote cache fetchers."""
-
-    def fetch(self, file_hash: str) -> bytes | None:
-        """Fetch file content by hash from remote. Returns None if not found."""
-        ...
-
-    def fetch_many(self, file_hashes: Sequence[str]) -> dict[str, bytes]:
-        """Fetch multiple files efficiently. Returns dict mapping hash to content."""
-        ...
-
-    def exists(self, file_hash: str) -> bool:
-        """Check if file exists in remote without downloading."""
-        ...
-
-
-_default_remote: RemoteFetcher | None = None
-
-
-def set_default_remote(fetcher: RemoteFetcher | None) -> None:
-    """Set the default remote fetcher (called during configuration)."""
-    global _default_remote
-    _default_remote = fetcher
-
-
-def get_default_remote() -> RemoteFetcher | None:
-    """Get the configured default remote fetcher."""
-    return _default_remote
-
-
-def fetch_from_remote(file_hash: str) -> bytes | None:
-    """Fetch file from default remote. Returns None if no remote configured or not found."""
-    remote = get_default_remote()
-    if remote is None:
-        logger.debug("No remote configured, skipping remote fetch")
-        return None
-
-    try:
-        return remote.fetch(file_hash)
-    except exceptions.RemoteFetchError as e:
-        logger.warning(f"Remote fetch failed for {file_hash[:8]}...: {e!r}")
-        return None
-
-
-# =============================================================================
-# S3 Remote Storage (for push/pull commands)
-# =============================================================================
 
 
 class _MultipartPart(TypedDict):
@@ -156,9 +102,19 @@ async def _stream_download_to_fd(
 async def _download_verified(
     s3: S3Client, bucket: str, key: str, dest: Path, expected_hash: str
 ) -> None:
-    """Stream bucket/key into the existing file ``dest`` and check its xxh64 digest."""
+    """Stream bucket/key into the existing file ``dest`` and check its xxh64 digest.
+
+    A request that ends in botocore's ``ConnectionError`` after ``remote.retries`` retries (DNS
+    failure, refused, connect timeout, a proxy or TLS failure, or a connection reset, which
+    aiobotocore reports the same way) raises ``RemoteUnreachableError``: the remote, not this
+    object, is unusable. Any other failure is this object's error.
+    """
+    from botocore import exceptions as botocore_exc
+
     try:
         response = await s3.get_object(Bucket=bucket, Key=key)
+    except botocore_exc.ConnectionError as exc:
+        raise exceptions.RemoteUnreachableError(f"Failed to download from S3: {exc}") from exc
     except Exception as exc:
         error_str = str(exc)
         if "NoSuchKey" in error_str or "404" in error_str:
@@ -224,7 +180,8 @@ async def _stream_upload(
         try:
             await s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
         except Exception as abort_error:
-            logger.warning(f"Failed to abort multipart upload {upload_id}: {abort_error}")
+            reason = exceptions.describe_error(abort_error)
+            logger.warning(f"Failed to abort multipart upload {upload_id}: {reason}")
         raise
 
 
@@ -257,7 +214,13 @@ class S3Remote:
             )
         self._bucket = bucket
         self._prefix = prefix.rstrip("/") + "/" if prefix else ""
-        self._session = aioboto3.Session()
+        try:
+            # Reads the AWS profile, so AWS_PROFILE naming a missing profile fails here
+            self._session = aioboto3.Session()
+        except Exception as e:  # no session means no S3 access at all
+            raise exceptions.RemoteConnectionError(
+                f"Cannot set up S3 access for {self.url}: {e}"
+            ) from e
 
     @property
     def bucket(self) -> str:
@@ -274,9 +237,25 @@ class S3Remote:
             return f"s3://{self._bucket}/{self._prefix.rstrip('/')}"
         return f"s3://{self._bucket}"
 
-    def _client(self) -> contextlib.AbstractAsyncContextManager[S3Client]:
-        """An S3 client from the instance's session, for one method call."""
-        return self._session.client("s3", config=_get_s3_config())
+    @contextlib.asynccontextmanager
+    async def _client(self) -> AsyncIterator[S3Client]:
+        """An S3 client from the instance's session, for one method call.
+
+        A client that cannot start (an invalid AWS_ENDPOINT_URL, for example) raises
+        ``RemoteConnectionError``, as the GCS backend does, so a caller that reports each file's
+        result keeps reporting them.
+        """
+        client_config = _get_s3_config()
+        async with contextlib.AsyncExitStack() as stack:
+            try:
+                s3 = await stack.enter_async_context(
+                    self._session.client("s3", config=client_config)
+                )
+            except Exception as e:  # no client means no S3 access at all
+                raise exceptions.RemoteConnectionError(
+                    f"Cannot set up S3 access for {self.url}: {e}"
+                ) from e
+            yield s3
 
     async def _head_exists(self, s3: S3Client, hash_: str, error: str) -> bool:
         """HEAD the cache object ``hash_``; other failures raise ``S3 <error>: <cause>``."""

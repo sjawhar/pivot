@@ -18,12 +18,12 @@ import loky
 import loky.backend.resource_tracker
 import loky.reusable_executor
 
-from pivot import config, discovery, exceptions, parameters, project, registry, types
+from pivot import config, discovery, exceptions, loaded_source, parameters, project, registry, types
 from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
-from pivot.types import OnError, StageResult, StageStatus
+from pivot.types import OnError, StageStatus
 
 if TYPE_CHECKING:
     import concurrent.futures
@@ -136,14 +136,23 @@ def is_executor_usable(
 def _requested_reusable_executor_kwargs(
     idle_timeout_s: float | None, user_code_root: pathlib.Path | None
 ) -> dict[str, object]:
-    """Return the constructor arguments loky compares to decide whether to reuse its executor."""
+    """Return the constructor arguments loky compares to decide whether to reuse its executor.
+
+    The initializer arguments carry the digests of the user code this process loaded
+    (``loaded_source.digests()``): each worker gets them once, when it starts, and loky replaces
+    a pool whose workers started with other digests.
+    """
     return {
         "context": None,
         "timeout": idle_timeout_s,
         "job_reducers": None,
         "result_reducers": None,
         "initializer": _init_worker,
-        "initargs": (os.getpid(), None if user_code_root is None else str(user_code_root)),
+        "initargs": (
+            os.getpid(),
+            None if user_code_root is None else str(user_code_root),
+            loaded_source.digests_for_workers(),
+        ),
         "env": None,
     }
 
@@ -181,7 +190,7 @@ def _get_executor(
     """Return Pivot's reusable executor without resizing warm workers between runs.
 
     Every worker starts with ``_init_worker``. While a discovery's import session lasts, it
-    also imports user code as that session does (``discovery.install_user_code_loader``), so a
+    also imports user code as that discovery did (``discovery.install_user_code_loader``), so a
     worker never runs an edited module's previous code; loky replaces a live pool whose
     initializer arguments differ.
     """
@@ -199,7 +208,7 @@ def _get_executor(
         kill_workers=kill_workers,
         reuse=False if kill_workers else "auto",
         initializer=_init_worker,
-        initargs=(os.getpid(), None if root is None else str(root)),
+        initargs=typing.cast("tuple[object, ...]", requested_kwargs["initargs"]),
     )
 
 
@@ -241,13 +250,20 @@ def idle_worker_count(pool: loky.ProcessPoolExecutor) -> int:
     return max(0, len(pool._processes) - len(pool._pending_work_items))
 
 
-def _init_worker(parent_pid: int, user_code_root: str | None) -> None:
+def _init_worker(
+    parent_pid: int, user_code_root: str | None, coordinator_sources: dict[str, str]
+) -> None:
     """Loky worker initializer: stop the worker when it is told to or ``parent_pid`` dies
     (``worker.unwind_when_stopped``), record the user modules each stage imports
-    (``worker.install_import_hooks``), and import user code through discovery's checked loader
-    when a discovery's import session for ``user_code_root`` lasts."""
+    (``worker.install_import_hooks``), keep the digests of the user code the coordinator loaded
+    (``loaded_source.set_coordinator``), record the user modules the worker imported before this
+    ran, as ``sitecustomize`` or a ``.pth`` file does (``loaded_source.record_unseen_modules``),
+    and import user code through discovery's checked loader when a discovery's import session for
+    ``user_code_root`` lasts."""
     worker.unwind_when_stopped(parent_pid)
     worker.install_import_hooks()
+    loaded_source.set_coordinator(coordinator_sources)
+    loaded_source.record_unseen_modules()
     if user_code_root is not None:
         discovery.install_user_code_loader(user_code_root)
 
@@ -519,7 +535,7 @@ def prepare_worker_info(
 
     # The fingerprint is computed first: it sets `unsafe_fingerprint`.
     fingerprint = pipeline.ensure_fingerprint(stage_info["name"])
-    return worker.WorkerStageInfo(
+    info = worker.WorkerStageInfo(
         func=stage_info["func"],
         fingerprint=fingerprint,
         deps=stage_info["deps"],
@@ -540,20 +556,12 @@ def prepare_worker_info(
         collection_params=stage_info["collection_params"],
         unsafe_fingerprint=stage_info["unsafe_fingerprint"],
         no_fingerprint=stage_info["no_fingerprint"],
+        loaded_sources_token=loaded_source.token(),
     )
-
-
-def apply_deferred_writes(
-    stage_name: str,
-    output_paths: list[str],
-    result: StageResult,
-    state_db: state_mod.StateDB,
-) -> None:
-    """Apply deferred StateDB writes from worker result."""
-    if "deferred_writes" not in result:
-        return
-    # result["deferred_writes"] is DeferredWrites from worker
-    state_db.apply_deferred_writes(stage_name, output_paths, result["deferred_writes"])
+    # The workers started with other digests: the coordinator loaded user code since then.
+    if (digests := loaded_source.digests_for_stage()) is not None:
+        info["loaded_sources"] = digests
+    return info
 
 
 # =========================================================================
@@ -596,7 +604,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     """
     from pivot import metrics
 
-    tracked_files = track.discover_pvt_files(project_root)
+    tracked_files = track.discover_pvt_files_and_update_memo(project_root)
     if not tracked_files:
         return
 
@@ -605,7 +613,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     cache_dir = config.get_cache_dir() / "files"
 
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
-    with state_mod.StateDB(config.get_state_dir()) as state_db:
+    with state_mod.open_readonly(config.get_state_dir(), create=False) as state_db:
         for data_path, track_data in tracked_files.items():
             path = pathlib.Path(data_path)
 
@@ -637,8 +645,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                     f"Tracked file '{data_path}' has changed since tracking. "
                     + f"Run 'pivot track --force {track_data['path']}' to update."
                 )
-        if pending:
-            state_db.save_many(pending)
+    state_mod.save_file_hashes(config.get_state_dir(), pending)
 
     metrics.end("core.verify_tracked_files", _t)
     if missing:

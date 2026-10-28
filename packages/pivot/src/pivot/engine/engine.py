@@ -228,6 +228,26 @@ async def _run_in_daemon_thread[T](func: Callable[[], T]) -> T:
     return results[0]
 
 
+def _deferred_writes_to_apply(
+    result: StageResult, *, no_commit: bool
+) -> types.DeferredWrites | None:
+    """The StateDB writes a finished stage persists, or None when it persists nothing.
+
+    Only a RAN or CACHED stage writes. Under ``--no-commit`` only the record of what ran is
+    kept, for ``pivot commit``; nothing else is persisted.
+    """
+    if result["status"] not in (StageStatus.RAN, StageStatus.CACHED):
+        return None
+    if "deferred_writes" not in result:
+        return None
+    deferred = result["deferred_writes"]
+    if not no_commit:
+        return deferred
+    if "no_commit_record" not in deferred:
+        return None
+    return types.DeferredWrites(no_commit_record=deferred["no_commit_record"])
+
+
 class Engine:
     """Async coordinator for pipeline execution using anyio.
 
@@ -1315,32 +1335,52 @@ class Engine:
                                     )
                                     stage_durations[stage_name] = duration_ms
 
-                                    # Apply deferred writes for RAN and CACHED stages. A
-                                    # --no-commit run writes no lock, generation or run-cache
-                                    # entry, but a file-hash entry is a cache its own stat check
-                                    # validates, so it saves those, best-effort.
+                                    # Apply a completed stage's deferred writes. A --no-commit
+                                    # run persists its authoritative nocommit record, while the
+                                    # hashes it read are a best-effort cache saved separately.
                                     if result["status"] in (StageStatus.RAN, StageStatus.CACHED):
                                         stage_info = self._get_stage(stage_name)
                                         stage_state_dir = registry.get_stage_state_dir(
                                             stage_info, default_state_dir
                                         )
-                                        if not no_commit:
-                                            output_paths = [
-                                                types.identity_key(out.identity)
-                                                for out in stage_info["outs"]
-                                            ]
-                                            stage_db = _get_state_db(stage_state_dir)
-                                            executor_core.apply_deferred_writes(
-                                                stage_name, output_paths, result, stage_db
+                                        if no_commit:
+                                            if "deferred_writes" in result:
+                                                worker_deferred = result["deferred_writes"]
+                                                if "no_commit_record" in worker_deferred:
+                                                    output_paths = [
+                                                        types.identity_key(out.identity)
+                                                        for out in stage_info["outs"]
+                                                    ]
+                                                    _get_state_db(
+                                                        stage_state_dir
+                                                    ).apply_deferred_writes(
+                                                        stage_name,
+                                                        output_paths,
+                                                        types.DeferredWrites(
+                                                            no_commit_record=worker_deferred[
+                                                                "no_commit_record"
+                                                            ]
+                                                        ),
+                                                    )
+                                                if "file_hash_entries" in worker_deferred:
+                                                    state_mod.write_back_file_hashes(
+                                                        stage_state_dir,
+                                                        worker_deferred["file_hash_entries"],
+                                                    )
+                                        else:
+                                            deferred = _deferred_writes_to_apply(
+                                                result, no_commit=False
                                             )
-                                        elif (
-                                            "deferred_writes" in result
-                                            and "file_hash_entries" in result["deferred_writes"]
-                                        ):
-                                            state_mod.write_back_file_hashes(
-                                                stage_state_dir,
-                                                result["deferred_writes"]["file_hash_entries"],
-                                            )
+                                            if deferred is not None:
+                                                output_paths = [
+                                                    types.identity_key(out.identity)
+                                                    for out in stage_info["outs"]
+                                                ]
+                                                _get_state_db(
+                                                    stage_state_dir
+                                                ).apply_deferred_writes(
+                                                    stage_name, output_paths, deferred
+                                                )
 
                                     # Record result
                                     results[stage_name] = executor_core.ExecutionSummary(
@@ -1355,9 +1395,20 @@ class Engine:
                                     # TerminatedWorkerError so a deliberate stop is not logged
                                     # as a stage failure.
                                     await anyio.lowlevel.checkpoint_if_cancelled()
-                                    _logger.exception("Stage %s failed with exception", stage_name)
+                                    # One line names the stage and why; --verbose shows the
+                                    # traceback. The reason recorded below stays str(e), and the
+                                    # console prints no second copy under the stage line.
+                                    _logger.error(
+                                        "Stage %s failed: %s",
+                                        stage_name,
+                                        exceptions.describe_error(e),
+                                    )
+                                    _logger.debug(
+                                        "Traceback of stage %s's failure", stage_name, exc_info=True
+                                    )
                                     self._worker_pool.mark_workers_unverified()
                                     failed_result = StageResult(
+                                        display_reason="",
                                         status=StageStatus.FAILED,
                                         reason=str(e),
                                         input_hash=None,
@@ -1971,9 +2022,15 @@ class Engine:
         deps = stage_info["deps"]
 
         def _save_file_hashes(entries: list[types.FileHashEntry]) -> None:
-            """Record the file hashes this check read or restored, so the next one reads none:
-            best-effort, waiting at most 2 s for another process's write lock."""
-            state_mod.write_back_file_hashes(stage_state_dir, entries)
+            """Record the file hashes this check read or restored, best-effort."""
+            if entries:
+                _ = state_mod.save_best_effort(
+                    stage_state_dir,
+                    lambda writable_db: writable_db.apply_deferred_writes(
+                        stage_name, [], types.DeferredWrites(file_hash_entries=entries)
+                    ),
+                    what=f"{len(entries)} file hashes",
+                )
 
         def _use_outputs(state_db: state_mod.StateDB) -> _SkipOutcome:
             file_hash_entries = list[types.FileHashEntry]()
@@ -2277,20 +2334,21 @@ class Engine:
 
         # Emit StageCompleted event
         stage_index, total_stages = self._get_stage_index(stage_name)
-        await self.emit(
-            StageCompleted(
-                type="stage_completed",
-                stage=stage_name,
-                status=result["status"],
-                reason=result["reason"],
-                duration_ms=duration_ms,
-                index=stage_index,
-                total=total_stages,
-                run_id=run_id,
-                input_hash=result["input_hash"],
-                output_summary=output_summary,
-            )
+        completed = StageCompleted(
+            type="stage_completed",
+            stage=stage_name,
+            status=result["status"],
+            reason=result["reason"],
+            duration_ms=duration_ms,
+            index=stage_index,
+            total=total_stages,
+            run_id=run_id,
+            input_hash=result["input_hash"],
+            output_summary=output_summary,
         )
+        if "display_reason" in result:
+            completed["display_reason"] = result["display_reason"]
+        await self.emit(completed)
 
         # Release scheduler-held resources before downstream stages are considered.
         try:

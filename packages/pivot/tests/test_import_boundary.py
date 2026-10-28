@@ -6,11 +6,12 @@ or pivot.tui. These tests catch accidental re-introduction of those imports.
 
 from __future__ import annotations
 
-import ast
 import importlib
 import pathlib
 import re
+import subprocess
 import sys
+import tomllib
 
 # =============================================================================
 # Import boundary enforcement
@@ -54,30 +55,37 @@ def test_no_pivot_tui_imports_in_pivot_tui_package() -> None:
     assert not violations, f"pivot.tui imports found in pivot-tui package: {violations}"
 
 
-def test_pivot_tui_imports_only_pivot_types_from_pivot() -> None:
-    """pivot-tui's requirement on pivot has no lower bound, so it may import only what every
-    pivot release has: ``pivot.types``. Anything newer would install beside an older pivot and
-    then fail to import."""
-    source = pathlib.Path(__file__).resolve().parents[2] / "pivot-tui" / "src" / "pivot_tui"
-    files = sorted(source.rglob("*.py"))
-    assert files, f"no pivot-tui sources under {source}"
-    violations = list[str]()
-    for path in files:
-        for node in ast.walk(ast.parse(path.read_text("utf-8"))):
-            if isinstance(node, ast.ImportFrom) and node.module == "pivot":
-                modules = [f"pivot.{alias.name}" for alias in node.names]
-            elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("pivot."):
-                modules = [node.module or ""]
-            elif isinstance(node, ast.Import):
-                modules = [alias.name for alias in node.names if alias.name.startswith("pivot.")]
-            else:
-                continue
-            violations += [
-                f"{path.relative_to(source)}:{node.lineno}: {module}"
-                for module in modules
-                if module != "pivot.types"
-            ]
-    assert not violations, f"pivot-tui imports pivot modules beyond pivot.types: {violations}"
+def test_pivot_tui_requires_a_released_pivot() -> None:
+    """pivot-tui imports pivot modules beyond ``pivot.types``, so the pivot-tui a release
+    publishes must require the pivot released beside it.
+
+    The release writes that bound: ``[tool.semantic_release] build_command`` runs
+    ``scripts/set_tui_pivot_bound.py``, so a published pivot-tui vX requires pivot>=vX
+    (``test_release_bound.py``). What a tree carries between releases is the previous release's
+    value, and this test keeps it from naming a pivot that is not released yet — which is what
+    a hand-written ``pivot>=0.5.12`` in a 0.5.11 tree did. ``[tool.uv.sources] pivot =
+    { workspace = true }`` makes such a bound inert in the workspace, so ``uv lock --check`` and
+    every CI job stay green while a wheel of that tree is unresolvable.
+    """
+    root = pathlib.Path(__file__).resolve().parents[3]
+    pivot_version = tomllib.loads(
+        (root / "packages" / "pivot" / "pyproject.toml").read_text("utf-8")
+    )["project"]["version"]
+    dependencies = tomllib.loads(
+        (root / "packages" / "pivot-tui" / "pyproject.toml").read_text("utf-8")
+    )["project"]["dependencies"]
+    requirement = next(r for r in dependencies if re.match(r"^pivot(?![\w.\-])", r))
+
+    bound = re.fullmatch(r"pivot>=(\d+\.\d+\.\d+)", requirement)
+    assert bound, f"{requirement!r} must be pivot>=<version>, the form the release writes"
+    assert _as_numbers(bound[1]) <= _as_numbers(pivot_version), (
+        f"{requirement!r} names a pivot newer than this tree's {pivot_version}, which no release "
+        "has published; the release writes this bound, so no pull request should raise it"
+    )
+
+
+def _as_numbers(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
 
 
 # =============================================================================
@@ -168,6 +176,31 @@ def test_core_cli_imports_are_lazy() -> None:
             if mod.startswith(("pivot_tui", "textual")):
                 del sys.modules[mod]
         sys.modules.update(saved_modules)
+
+
+def test_importing_path_policy_does_not_import_rich() -> None:
+    """Every worker imports `pivot.storage.lock`, which imports `pivot.path_policy`. Rich
+    belongs to the console and the TUI: its 28 modules cost about 14 ms in each worker and
+    22 ms on `pivot --help`, which the benchmark reads as a 1-2% regression on every scenario
+    that executes a stage (run 40468802728)."""
+    probe = "import sys, pivot.path_policy; print(sorted({m.split('.')[0] for m in sys.modules} & {'rich'}))"
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "[]", f"pivot.path_policy pulled in rich: {result.stdout}"
+
+
+def test_importing_the_worker_entry_point_does_not_import_rich() -> None:
+    """The end of the same chain: `pivot.executor.worker` is what a loky worker imports, and
+    neither it nor anything it pulls in may load Rich."""
+    probe = (
+        "import sys, pivot.executor.worker; "
+        "print(sorted({m.split('.')[0] for m in sys.modules} & {'rich', 'textual'}))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "[]", f"pivot.executor.worker pulled in: {result.stdout}"
 
 
 # =============================================================================

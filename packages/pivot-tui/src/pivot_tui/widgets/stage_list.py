@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, ClassVar, override
 
-import rich.markup
 import textual.app
 import textual.binding
 import textual.containers
@@ -11,6 +10,7 @@ import textual.css.query
 import textual.message
 import textual.widgets
 
+from pivot import display
 from pivot.types import StageStatus
 from pivot_tui.widgets import status
 
@@ -127,7 +127,7 @@ class StageGroupHeader(textual.widgets.Static):
         display_name = self._base_name
         if len(display_name) > name_width:
             display_name = display_name[: name_width - 1] + "…"
-        name_escaped = rich.markup.escape(display_name)
+        name_escaped = display.escape_markup(display_name)
 
         text = f"{prefix}[bold]{name_escaped}[/]{suffix}"
         self.update(text)
@@ -190,7 +190,7 @@ class StageRow(textual.widgets.Static):
             display_name = f"@{self._info.variant}"
         else:
             display_name = self._info.name
-        name_escaped = rich.markup.escape(display_name)
+        name_escaped = display.escape_markup(display_name)
 
         # Format elapsed time (only for running/completed/failed)
         elapsed_str = ""
@@ -222,7 +222,7 @@ class StageRow(textual.widgets.Static):
         # Truncate name with ellipsis if too long
         if len(display_name) > name_width:
             truncated_name = display_name[: name_width - 1] + "…"
-            name_escaped = rich.markup.escape(truncated_name)
+            name_escaped = display.escape_markup(truncated_name)
 
         # Format: →  3  name                          1:23 ▶
         text = f"{prefix}{name_escaped:<{name_width}} {elapsed_str}[{style}]{symbol}[/]"
@@ -571,7 +571,7 @@ class StageListPanel(textual.containers.VerticalScroll):
                 ]
             )
             summary = _build_status_summary(counts)
-            text = f"[bold]Stages ({visible}/{total})[/]{summary} [dim]/{rich.markup.escape(self._filter_text)}[/]"
+            text = f"[bold]Stages ({visible}/{total})[/]{summary} [dim]/{display.escape_markup(self._filter_text)}[/]"
         else:
             text = self._format_header()
 

@@ -12,7 +12,7 @@ import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from pydantic import BaseModel, ValidationError, field_validator
 
-from pivot import exceptions, parameters, project, types, unix_socket
+from pivot import display, exceptions, parameters, project, types, unix_socket
 from pivot import explain as explain_mod
 from pivot import registry as registry_mod
 from pivot.config import io as config_io
@@ -77,7 +77,7 @@ def _to_wire(value: object) -> object:
 
 def _encode_wire(message: object) -> bytes:
     """Encode one JSON-RPC message as a newline-terminated line, as clients receive it."""
-    return json.dumps(_to_wire(message), default=_json_default).encode() + b"\n"
+    return display.to_json(_to_wire(message), default=_json_default).encode() + b"\n"
 
 
 # JSON-RPC 2.0: id can be string, number, or null (for notifications)
@@ -546,7 +546,7 @@ class AgentRpcSource:
                     with anyio.move_on_after(1.0):  # Brief timeout for error send
                         await self._send_response(
                             conn,
-                            json.dumps(error_response).encode() + b"\n",
+                            _encode_wire(error_response),
                         )
             except Exception:
                 _logger.exception("Error handling agent connection")
@@ -578,7 +578,7 @@ class AgentRpcSource:
                 }
                 if not await self._send_response(
                     conn,
-                    json.dumps(error_response).encode() + b"\n",
+                    _encode_wire(error_response),
                 ):
                     return
                 return
@@ -619,7 +619,7 @@ class AgentRpcSource:
                     }
                     if not await self._send_response(
                         conn,
-                        json.dumps(error_response).encode() + b"\n",
+                        _encode_wire(error_response),
                     ):
                         return
 

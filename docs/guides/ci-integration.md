@@ -97,9 +97,20 @@ pivot status --json --remote
 
 # Detailed explanation of why stages would run
 pivot status --json --explain
+
+# Include the update check of each imported artifact
+pivot status --json --check-imports
 ```
 
 The JSON output includes a `stages` array with status (`cached` or `stale`), a `tracked_files` array, and a `suggestions` list. With `--explain`, each stage entry includes `will_run`, `code_changes`, `param_changes`, `dep_changes`, and `upstream_stale` fields. Each `dep_changes` entry names its artifact as `"identity": {"producer": ..., "key": ...}`, with `key` null for an input or a single-output stage.
+
+With `--check-imports`, an `imports` array holds one entry per imported artifact: `path`, `status` (`up_to_date`, `update_available` or `error`), `current_rev` and `latest_rev` (the first 8 characters of each commit, set for `update_available`), and `error` (the message, or the exception's type name when it has no message, set for `error`); a field that does not apply is null.
+
+Pivot writes exactly one JSON document to standard output for every option combination. Notes such as "No remotes configured" and warnings go to standard error. A failed run (for example `--remote-only` with no remote configured) exits non-zero, with its error on standard error and nothing on standard output.
+
+Every document is valid RFC 8259 JSON, so a strict parser (JavaScript's `JSON.parse`, Go's `encoding/json`, Rust's `serde_json`) reads it as Python's `json` module and jq do. A value that JSON has no number for is written as a string: a non-finite float (for example a stage parameter set to `float("inf")`) reads as `"Infinity"`, `"-Infinity"` or `"NaN"` — the same names Python used to write bare — in every `--json` document and every `--jsonl` line. A reader that expects a number for such a field must accept these three strings.
+
+A URL that Pivot prints has its credentials hidden: `https://user:token@host/repo.git` reads as `https://***@host/repo.git`, in JSON, in text and in warnings. The configured URL itself is unchanged, and a URL without credentials is printed byte for byte.
 
 ### Quiet Mode
 

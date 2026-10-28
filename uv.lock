@@ -2184,7 +2184,7 @@ wheels = [
 
 [[package]]
 name = "pivot"
-version = "0.5.9"
+version = "0.5.17"
 source = { editable = "packages/pivot" }
 dependencies = [
     { name = "aiohttp" },
@@ -2270,7 +2270,7 @@ tui = [
 [package.metadata]
 requires-dist = [
     { name = "aioboto3", marker = "extra == 's3'", specifier = ">=13.0.0" },
-    { name = "aiohttp", specifier = ">=3.9" },
+    { name = "aiohttp", specifier = ">=3.10" },
     { name = "anyio", specifier = ">=4.11" },
     { name = "basedpyright", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "botocore-stubs", marker = "extra == 'dev'", specifier = ">=1.35.0" },
@@ -2336,7 +2336,7 @@ provides-extras = ["dvc", "gcs", "matplotlib", "s3", "tui", "docs", "dev"]
 
 [[package]]
 name = "pivot-tui"
-version = "0.5.9"
+version = "0.5.17"
 source = { editable = "packages/pivot-tui" }
 dependencies = [
     { name = "pivot" },
@@ -2362,7 +2362,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "pivot-workspace"
-version = "0.5.9"
+version = "0.5.17"
 source = { virtual = "." }
 
 [package.dev-dependencies]

@@ -37,6 +37,13 @@ def run_argv(tmp_path: pathlib.Path, pivot: pathlib.Path) -> list[str]:
 
 
 def kill_session(sid: int) -> None:
+    """SIGKILL what is left of session `sid`, the session run.measure() started for a command.
+
+    Session 0 holds the kernel's threads, session 1 is init's, and the caller's own session holds
+    the test runner, so none of them can be a measured command's session.
+    """
+    if sid <= 1 or sid == os.getsid(0):
+        raise ValueError(f"session {sid} is not a measured command's session; not killing it")
     for pid in run.session_members(sid):
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)

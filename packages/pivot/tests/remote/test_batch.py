@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import errno
+import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -221,6 +223,81 @@ async def test_transfer_batch_reports_each_item_and_never_raises(tmp_path: pathl
         {"hash": "a000000000000002", "success": False, "error": "cannot read bad"},
     ]
     assert client.opened == 1, "one client for the whole batch"
+
+
+async def test_transfer_batch_words_an_os_error_as_its_message_and_path(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A local file the transfer cannot read is reported as the OS's message and its path, which
+    push and pull print, not as Python's `[Errno 13] Permission denied: '<path>'`."""
+    local_path = tmp_path / "unreadable"
+
+    async def read(client: _Client, hash_: str, path: pathlib.Path) -> None:
+        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path))
+
+    results = await batch.transfer_batch(
+        [("a000000000000001", local_path)],
+        4,
+        None,
+        open_client=_Client(set()).open,
+        transfer_one=read,
+        metric="fake.transfer",
+    )
+
+    assert results == [
+        {
+            "hash": "a000000000000001",
+            "success": False,
+            "error": f"{os.strerror(errno.EACCES)}: {local_path}",
+        }
+    ]
+
+
+async def _copy_or_fail_on_the_remote(
+    client: _Client, hash_: str, local_path: pathlib.Path
+) -> None:
+    if local_path.name == "unreachable":
+        raise exceptions.RemoteUnreachableError("cannot reach the remote")
+    if local_path.name == "refused":
+        raise exceptions.RemoteConnectionError("permission denied to read this object")
+    await _copy(client, hash_, local_path)
+
+
+async def test_transfer_batch_marks_only_a_transfer_that_could_not_reach_the_remote(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A transfer that raised RemoteUnreachableError says so, so a caller can stop using the
+    remote; a transfer the remote refused (a RemoteConnectionError for one object) or that failed
+    for another reason does not."""
+    items = [
+        ("a000000000000001", tmp_path / "unreachable"),
+        ("a000000000000002", tmp_path / "refused"),
+        ("a000000000000003", tmp_path / "bad"),
+    ]
+
+    results = await batch.transfer_batch(
+        items,
+        4,
+        None,
+        open_client=_Client(set()).open,
+        transfer_one=_copy_or_fail_on_the_remote,
+        metric="fake.transfer",
+    )
+
+    assert results == [
+        {
+            "hash": "a000000000000001",
+            "success": False,
+            "error": "cannot reach the remote",
+            "connection_failed": True,
+        },
+        {
+            "hash": "a000000000000002",
+            "success": False,
+            "error": "permission denied to read this object",
+        },
+        {"hash": "a000000000000003", "success": False, "error": "cannot read bad"},
+    ]
 
 
 async def test_transfer_batch_calls_back_after_each_success(tmp_path: pathlib.Path) -> None:

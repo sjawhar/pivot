@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import pathlib
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
+import pytest
+
 from conftest import isolated_pivot_dir
 from pivot import cli, import_artifact, status
-from pivot.status import ImportCheckStatus
 from pivot.storage import track
+from pivot.types import ImportCheckStatus
 
 if TYPE_CHECKING:
     import click.testing
@@ -57,9 +61,9 @@ def test_status_import_update_available(tmp_path: pathlib.Path, mocker: MockerFi
     results = status.get_import_status(tmp_path)
 
     assert len(results) == 1, "Should have one import result"
-    assert results[0].status is ImportCheckStatus.UPDATE_AVAILABLE
-    assert results[0].current_rev == "abc123de"
-    assert results[0].latest_rev == "def456ab"
+    assert results[0]["status"] is ImportCheckStatus.UPDATE_AVAILABLE
+    assert results[0]["current_rev"] == "abc123de"
+    assert results[0]["latest_rev"] == "def456ab"
 
 
 def test_status_import_up_to_date(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
@@ -98,7 +102,7 @@ def test_status_import_up_to_date(tmp_path: pathlib.Path, mocker: MockerFixture)
     results = status.get_import_status(tmp_path)
 
     assert len(results) == 1, "Should have one import result"
-    assert results[0].status is ImportCheckStatus.UP_TO_DATE
+    assert results[0]["status"] is ImportCheckStatus.UP_TO_DATE
 
 
 def test_status_import_network_error(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
@@ -131,8 +135,47 @@ def test_status_import_network_error(tmp_path: pathlib.Path, mocker: MockerFixtu
     results = status.get_import_status(tmp_path)
 
     assert len(results) == 1, "Should have one import result"
-    assert results[0].status is ImportCheckStatus.ERROR
-    assert "Network unreachable" in results[0].error
+    assert results[0]["status"] is ImportCheckStatus.ERROR
+    assert results[0]["error"] is not None
+    assert "Network unreachable" in results[0]["error"]
+
+
+def test_status_import_empty_error_names_type_in_warning(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture, mocker: MockerFixture
+) -> None:
+    """An import check error without a message logs its exception type."""
+    pvt_data = track.PvtData(
+        path="model.pkl",
+        hash="ccc",
+        size=300,
+        source=track.ImportSource(
+            repo="https://github.com/org/repo",
+            rev="main",
+            rev_lock="abc123def456",
+            stage="train",
+            path="models/model.pkl",
+            remote="s3://bucket/cache",
+        ),
+    )
+    mocker.patch.object(
+        track,
+        "discover_import_pvt_files",
+        autospec=True,
+        return_value={str(tmp_path / "models" / "model.pkl"): pvt_data},
+    )
+    mocker.patch.object(
+        import_artifact,
+        "check_for_update",
+        new=AsyncMock(side_effect=TimeoutError()),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="pivot.status"):
+        results = status.get_import_status(tmp_path)
+
+    assert results[0]["error"] == "Unexpected TimeoutError"
+    assert [record.getMessage() for record in caplog.records] == [
+        "Failed to check import models/model.pkl: Unexpected TimeoutError"
+    ]
 
 
 # =============================================================================
@@ -308,3 +351,104 @@ def test_status_check_imports_network_error_doesnt_fail(
     assert result.exit_code == 0, f"Should succeed despite network error: {result.output}"
     assert "Imports" in result.output
     assert "check failed" in result.output
+
+
+@pytest.mark.parametrize(
+    ("check", "expected"),
+    [
+        pytest.param(
+            import_artifact.UpdateCheck(
+                available=True, current_rev="abc123def456", latest_rev="def456abc789"
+            ),
+            {
+                "path": "models/model.pkl",
+                "status": "update_available",
+                "current_rev": "abc123de",
+                "latest_rev": "def456ab",
+                "error": None,
+            },
+            id="update-available",
+        ),
+        pytest.param(
+            import_artifact.UpdateCheck(
+                available=False, current_rev="abc123def456", latest_rev="abc123def456"
+            ),
+            {
+                "path": "models/model.pkl",
+                "status": "up_to_date",
+                "current_rev": None,
+                "latest_rev": None,
+                "error": None,
+            },
+            id="up-to-date",
+        ),
+        pytest.param(
+            ConnectionError("Network unreachable"),
+            {
+                "path": "models/model.pkl",
+                "status": "error",
+                "current_rev": None,
+                "latest_rev": None,
+                "error": "Network unreachable",
+            },
+            id="error",
+        ),
+        pytest.param(
+            TimeoutError(),
+            {
+                "path": "models/model.pkl",
+                "status": "error",
+                "current_rev": None,
+                "latest_rev": None,
+                "error": "Unexpected TimeoutError",
+            },
+            id="error-without-message",
+        ),
+    ],
+)
+def test_status_check_imports_json_holds_import_status(
+    runner: click.testing.CliRunner,
+    mock_discovery: object,
+    mocker: MockerFixture,
+    check: import_artifact.UpdateCheck | Exception,
+    expected: dict[str, str | None],
+) -> None:
+    """--check-imports --json writes one JSON document whose imports field holds each check."""
+    from pivot import project
+
+    project_root = project.get_project_root()
+    pvt_data = track.PvtData(
+        path="model.pkl",
+        hash="aaa",
+        size=100,
+        source=track.ImportSource(
+            repo="https://github.com/org/repo",
+            rev="main",
+            rev_lock="abc123def456",
+            stage="train",
+            path="models/model.pkl",
+            remote="s3://bucket/cache",
+        ),
+    )
+    mocker.patch.object(
+        track,
+        "discover_import_pvt_files",
+        autospec=True,
+        return_value={str(project_root / "models" / "model.pkl"): pvt_data},
+    )
+    mocker.patch.object(import_artifact, "check_for_update", new=AsyncMock(side_effect=[check]))
+
+    result = runner.invoke(cli.cli, ["status", "--check-imports", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["imports"] == [expected], result.stdout
+
+
+def test_status_check_imports_json_without_imports_gives_empty_list(
+    runner: click.testing.CliRunner, mock_discovery: object
+) -> None:
+    """--check-imports --json in a project with no imports still has the field, empty."""
+    result = runner.invoke(cli.cli, ["status", "--check-imports", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["imports"] == [], result.stdout
