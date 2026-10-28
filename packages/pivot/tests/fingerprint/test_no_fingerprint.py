@@ -104,6 +104,7 @@ def _make_stage_info(
         "incremental_inputs": {},
         "unsafe_fingerprint": False,
         "no_fingerprint": True,
+        "loaded_sources_token": "",
     }
 
 
@@ -131,17 +132,19 @@ def repo_project_root(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -
     """Make _REPO_ROOT, which holds this file, the project root, so the stages defined here are
     project files, and keep Pivot's state in tmp_path, never in the checkout.
 
-    The fingerprint cache opens one StateDB per process in the project's state directory. With
-    the checkout as the project root, that left packages/.pivot/state.lmdb in the source tree.
-    Here the test opens its own StateDB under tmp_path and closes it.
+    The fingerprint cache opens one readonly StateDB for the current project's state directory.
+    With the checkout as the project root, that left packages/.pivot/state.lmdb in the source tree.
+    Here the handle starts unopened, so it opens under tmp_path, and the test closes it; cache
+    writes queued for another project stay out of this one (`fingerprint._current_pending_writes`).
     """
     monkeypatch.setattr("pivot.project._project_root_cache", _REPO_ROOT)
     monkeypatch.setattr("pivot.config.io.get_state_dir", lambda: tmp_path / ".pivot")
     monkeypatch.setattr(fingerprint, "_state_db", None)
-    monkeypatch.setattr(fingerprint, "_state_db_init_attempted", False)
+    monkeypatch.setattr(fingerprint, "_state_db_dir", None)
+    monkeypatch.setattr(fingerprint, "_state_db_root", None)
+    monkeypatch.setattr(fingerprint, "_pending_writes", None)
     yield
-    if fingerprint._state_db is not None:
-        fingerprint._state_db.close()
+    fingerprint._close_state_db()
 
 
 @pytest.mark.usefixtures("repo_project_root")

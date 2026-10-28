@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 import xxhash
 
+from pivot import loaded_source
 from pivot.executor import core as executor_core
 from pivot.executor import worker
 
@@ -89,6 +90,8 @@ class WorkerPool:
     _pings: dict[str, list[concurrent.futures.Future[None]]] = field(default_factory=dict)
     _user_code_files: dict[str, _FileStamp | None] = field(default_factory=dict)
     _code_changed: bool = False
+    # `loaded_source.token()` when this pool's workers were started: they hold those digests.
+    _sources_token: str | None = None
 
     def start(self, *, max_workers: int, idle_timeout_s: float | None = None) -> None:
         """Start a run without shrinking workers warmed by earlier runs."""
@@ -104,6 +107,7 @@ class WorkerPool:
         elif (
             self._idle_timeout_s != idle_timeout_s
             or self._has_stale_user_code()
+            or self._sources_token != loaded_source.token()
             or not executor_core.is_executor_usable(executor, self._max_workers)
         ):
             executor = self._replace_executor(idle_timeout_s)
@@ -117,6 +121,7 @@ class WorkerPool:
             self._restamp_user_code_files()
         self._stamp_coordinator_user_code()
         self._executor = executor
+        self._sources_token = loaded_source.token()
         self._idle_timeout_s = idle_timeout_s
         self._output_queue = typing.cast("mp.Queue[OutputMessage]", self._new_output_queue())
         self._shutdown_event = threading.Event()
@@ -132,6 +137,7 @@ class WorkerPool:
         """
         self._max_workers = max(self._max_workers, max_workers)
         self._executor = self._replace_executor(self._idle_timeout_s, warm_workers=max_workers)
+        self._sources_token = loaded_source.token()
         self._restamp_user_code_files()
 
     def _replace_executor(

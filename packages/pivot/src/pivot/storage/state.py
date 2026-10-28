@@ -35,7 +35,9 @@ _RUN_PREFIX = b"run:"  # Run history entries
 _RUNCACHE_PREFIX = b"runcache:"  # Run cache entries for skip detection
 _FP_PREFIX = b"fp:"  # AST fingerprint/hash cache entries
 _SM_PREFIX = b"sm:"  # Stage manifest cache entries
-_NOCOMMIT_PREFIX = b"nocommit:"  # What Pivot wrote in a stage's outputs that no lock records yet
+_NOCOMMIT_PREFIX = b"nocommit:"  # What a --no-commit run of a stage ran, for `pivot commit`
+# The keys `types.NoCommitRecord` declares, each a str -> str mapping the reader validates alone.
+_NO_COMMIT_FIELDS = ("code_manifest", "output_hashes", "pvt_members")
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024
@@ -275,10 +277,6 @@ def _json_object(value: bytes | None) -> dict[str, object] | None:
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
     return typing.cast("dict[str, object]", data) if isinstance(data, dict) else None
-
-
-# The keys of a stage's `nocommit:` record (`types.NoCommitRecord`), each a str -> str mapping
-_NO_COMMIT_FIELDS = ("code_manifest", "output_hashes", "pvt_members")
 
 
 class InvalidAstHashKeyError(Exception):
@@ -936,10 +934,9 @@ class StateDB:
     def get_no_commit_record(self, stage_name: str) -> NoCommitRecord | None:
         """The stage's `nocommit:` record, or None (absent, or not a JSON object).
 
-        The record is shared (`types.NoCommitRecord`): a `--no-commit` run writes `code_manifest`
-        and `output_hashes`, and a write of a `*.pvt` member adds to `pvt_members`. Each of the
-        three is checked on its own: a malformed one is left out and never hides another, and
-        every other key is returned as stored. A record holding none of them reads as present.
+        Each key `types.NoCommitRecord` declares (`code_manifest`, `output_hashes`,
+        `pvt_members`) is validated on its own: a malformed one is dropped and hides no other.
+        Every other key reads as stored, and a record without these keys reads as present.
         """
         self._check_closed()
         with self._read_transaction() as txn:
@@ -1103,10 +1100,15 @@ class StateDB:
                         value = _pack_value(mtime_ns, size, inode, hash_hex)
                         txn.put(key, value)
 
-                # A written lock supersedes the stage's nocommit: record
-                if "clear_no_commit_record" in deferred and deferred["clear_no_commit_record"]:
-                    txn.delete(_NOCOMMIT_PREFIX + stage_name.encode())
-
+                nocommit_key = _NOCOMMIT_PREFIX + stage_name.encode()
+                if "no_commit_record" in deferred:
+                    # Set the run's keys (`types.NoCommitRun`: both, always) and keep every other
+                    # key: another feature writes its keys into the same record.
+                    record = _json_object(txn.get(nocommit_key)) or dict[str, object]()
+                    record.update(deferred["no_commit_record"])
+                    txn.put(nocommit_key, json.dumps(record).encode())
+                elif "clear_no_commit_record" in deferred and deferred["clear_no_commit_record"]:
+                    txn.delete(nocommit_key)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
 

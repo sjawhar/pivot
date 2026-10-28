@@ -150,25 +150,32 @@ class OnError(enum.StrEnum):
 
 
 class NoCommitRecord(TypedDict, total=False):
-    """A stage's StateDB `nocommit:<stage>` record: what Pivot wrote for the stage that no lock
-    records yet. A written lock removes the whole record.
+    """What a stage's outputs hold that no lock records yet, kept under the StateDB key
+    `nocommit:<stage>`. A written lock supersedes it, and its whole record is removed.
 
-    The record is shared, and every key is optional. Each writer owns its keys and keeps every
-    other key as stored (a read-modify-write in one write transaction). The reader
-    (`StateDB.get_no_commit_record`) checks all three keys, each on its own: a malformed one is
-    left out and never hides another, and a record holding none of them still reads as present.
+    Two features write the record, each its own keys. `code_manifest` is the manifest a
+    `--no-commit` run's lock would have held, rerun marks included, and `output_hashes` the
+    outputs it wrote: the run writes both (`NoCommitRun`, `StateDB.apply_deferred_writes`), and
+    `pivot commit` writes that manifest when both are present and the outputs on disk still have
+    these hashes. `pvt_members` maps each `*.pvt` file Pivot wrote in a directory output (path
+    relative to the project root) to its content hash; the feature that keeps those files owns it.
 
-    `pvt_members` maps each `*.pvt` file Pivot wrote in a directory output (path relative to the
-    project root) to its content hash. Every path that writes one adds it before the file exists:
-    a run (`--no-commit` included), a run-cache restore and `pivot get` of a stage. Until a lock
-    records them, they are the stage's own files, which `pivot commit` claims and later runs
-    replace. `code_manifest` and `output_hashes` are what a `--no-commit` run ran and wrote, for
-    `pivot commit`.
+    Every writer replaces only its own keys and keeps every other key, in one write transaction.
+    The reader (`StateDB.get_no_commit_record`) validates each of these three keys on its own and
+    returns every other key as stored, so a record that holds only one feature's keys reads as
+    present, and a malformed key hides no other.
     """
 
     code_manifest: dict[str, str]
     output_hashes: dict[str, str]  # output identity key -> content hash
-    pvt_members: dict[str, str]
+    pvt_members: dict[str, str]  # `*.pvt` path relative to the project root -> content hash
+
+
+class NoCommitRun(TypedDict):
+    """The keys of `NoCommitRecord` a `--no-commit` run writes: always both, never one alone."""
+
+    code_manifest: dict[str, str]
+    output_hashes: dict[str, str]  # output identity key -> content hash
 
 
 class DeferredWrites(TypedDict, total=False):
@@ -185,7 +192,8 @@ class DeferredWrites(TypedDict, total=False):
     run_cache_delete_input_hash: str
     increment_outputs: bool  # True → increment output generations; False/absent → skip
     file_hash_entries: list[tuple[str, int, int, int, str]]  # (path, mtime_ns, size, inode, hash)
-    clear_no_commit_record: bool  # a lock was written: drop the stage's nocommit: record
+    no_commit_record: NoCommitRun  # a --no-commit run's keys of its `nocommit:` record
+    clear_no_commit_record: bool  # a lock was written: drop the stage's --no-commit record
 
 
 class StageResult(TypedDict):

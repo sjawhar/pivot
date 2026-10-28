@@ -253,6 +253,8 @@ other `.pvt` in an output, such as a user's sidecar or one this version of Pivot
 instead of recording it as the stage's output. A refusal fails that stage alone: the command
 still commits the other stages, lists the refused one under `Failed`, and exits 1.
 
+The code a lock records depends on where the outputs came from. If they are the outputs a `pivot repro --no-commit` run wrote, unchanged since, the lock records the code that run ran, so an edit made while it ran, or since, still reruns the stage. Otherwise (outputs edited by hand, or written another way) the lock records the code on disk now: the "trust me" path.
+
 **Options:**
 
 | Option | Description |

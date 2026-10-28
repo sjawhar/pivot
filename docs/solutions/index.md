@@ -79,6 +79,7 @@ Documented learnings from bugs, design decisions, and implementation patterns. C
 | [Exists Check Prevents Re-Resolution](logic-errors/exists-check-prevents-reresolution-20260206.md) | 2026-02-06 | `exists()` check prevents re-resolution of external deps |
 | [File Output Verification Asymmetry](logic-errors/file-output-verification-asymmetry-cache-20260131.md) | 2026-01-31 | Output verification only checked existence, not content |
 | [Output Index Shared Root](logic-errors/output-index-state-dir-shared-root-20260206.md) | 2026-02-06 | Wrong pipeline directory for shared-root pipelines |
+| [Fingerprint Read the Edited File, Worker Ran the Loaded Code](logic-errors/fingerprint-read-edited-file-not-loaded-code-20261026.md) | 2026-10-26 | A helper edited after discovery was hashed from disk while workers ran the loaded code |
 
 ## Runtime Errors
 

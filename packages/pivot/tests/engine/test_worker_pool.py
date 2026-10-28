@@ -7,14 +7,18 @@ import logging
 import os
 import pathlib
 import signal
+import sys
 import threading
 import time
+import types
+import uuid
 from typing import TYPE_CHECKING, cast
 
 import loky.reusable_executor
 import psutil
 import pytest
 
+from pivot import loaded_source
 from pivot.engine import worker_pool
 from pivot.engine.worker_pool import WorkerPool
 from pivot.executor import core as executor_core
@@ -61,6 +65,11 @@ def _helper_live_loky_workers() -> set[int]:
         except psutil.NoSuchProcess:  # exited (or a zombie) between listing and inspecting
             continue
     return found
+
+
+def _helper_coordinator_records() -> list[str]:
+    """In a worker: the names of the coordinator's loaded-source records it started with."""
+    return sorted(loaded_source._coordinator[1]) if loaded_source._coordinator else []
 
 
 def test_unknown_loky_reusable_executor_layout_names_version(
@@ -365,6 +374,37 @@ def test_run_after_an_idle_worker_died_between_runs_still_runs() -> None:
             pool.end_run()
     finally:
         pool.hard_cancel()
+
+
+def test_start_replaces_workers_that_started_with_other_loaded_source_records(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Workers get the coordinator's loaded-source records once, when they start. After the
+    coordinator loads more user code, the next run's ``start()`` must replace them, or their
+    check compares the stage's modules with records the stage was not fingerprinted against."""
+    name = f"pool_record_{uuid.uuid4().hex}"
+    path = tmp_path / f"{name}.py"
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=1, idle_timeout_s=None)
+        first = pool.submit(_helper_pid).result(timeout=60)
+        assert name not in pool.submit(_helper_coordinator_records).result(timeout=60)
+        pool.end_run()
+
+        path.write_text("VALUE = 1\n")
+        module = types.ModuleType(name)
+        module.__file__ = str(path)
+        monkeypatch.setitem(sys.modules, name, module)
+        loaded_source.record(str(path), name, b"VALUE = 1\n")
+
+        pool.start(max_workers=1, idle_timeout_s=None)
+        assert pool.submit(_helper_pid).result(timeout=60) != first
+        assert name in pool.submit(_helper_coordinator_records).result(timeout=60)
+        pool.end_run()
+    finally:
+        pool.hard_cancel()
+        monkeypatch.delitem(sys.modules, name, raising=False)
+        loaded_source.prune()
 
 
 # One more than a narrow executor's call queue (2 * max(cpu_count, 1) + 1), so the wide run

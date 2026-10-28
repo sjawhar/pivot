@@ -1,10 +1,11 @@
 import ast
 import contextlib
-import inspect
 import textwrap
 import weakref
 from collections.abc import Callable
 from typing import Any
+
+from pivot import loaded_source
 
 # Cache for extract_module_attr_usage results using weak references.
 # This avoids repeated AST parsing for the same function when processing module dependencies.
@@ -34,7 +35,7 @@ def extract_module_attr_usage(func: Callable[..., Any]) -> list[tuple[str, str]]
 def _extract_module_attr_usage_impl(func: Callable[..., Any]) -> list[tuple[str, str]]:
     """Internal implementation of extract_module_attr_usage."""
     try:
-        source = inspect.getsource(func)
+        source = loaded_source.getsource(func)
     except (OSError, TypeError):
         return []
 
@@ -66,7 +67,7 @@ def _extract_module_attr_usage_impl(func: Callable[..., Any]) -> list[tuple[str,
 def get_function_ast(func: Callable[..., Any]) -> ast.FunctionDef | ast.AsyncFunctionDef:
     """Parse function to AST node."""
     try:
-        source = inspect.getsource(func)
+        source = loaded_source.getsource(func)
     except (OSError, TypeError) as e:
         raise ValueError(f"Cannot get source for {func}") from e
 

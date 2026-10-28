@@ -84,6 +84,7 @@ def _make_stage_info(
         incremental_inputs={},
         unsafe_fingerprint=False,
         no_fingerprint=False,
+        loaded_sources_token="",
     )
 
 
@@ -129,8 +130,16 @@ def test_no_commit_produces_outputs_without_production_lock(
     production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert not production_lock.path.exists(), "Production lock should NOT be written"
 
-    # No deferred writes should be returned (no lock/cache writes to apply)
-    assert "deferred_writes" not in result, "No deferred writes in no_commit mode"
+    # The only deferred write is the record of what ran, for `pivot commit`: no lock, no cache
+    # entry, no generation.
+    assert "deferred_writes" in result
+    deferred = result["deferred_writes"]
+    assert set(deferred) == {"no_commit_record"}
+    assert "no_commit_record" in deferred
+    record = deferred["no_commit_record"]
+    assert "code_manifest" in record and "output_hashes" in record, record
+    assert record["code_manifest"] == stage_info["fingerprint"]
+    assert set(record["output_hashes"]) == {"test_stage"}
 
 
 def test_no_commit_does_not_write_to_cache(
