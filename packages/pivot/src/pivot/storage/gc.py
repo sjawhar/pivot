@@ -33,7 +33,7 @@ import secrets
 import socket
 import subprocess
 import time
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, cast
 
 import lmdb
 import yaml
@@ -67,8 +67,6 @@ NAMING_TURNSTILE = "naming.turnstile"
 # Every marker file beside a whole-directory tree object, removed with the tree.
 _TREE_MARKER_SUFFIXES = cache.TREE_MARKER_SUFFIXES
 DEFAULT_GRACE_HOURS = 24.0
-# A process rewrites its register entry at most this often while its evidence is unchanged.
-_REGISTER_REFRESH_SECONDS = 3600.0
 # A cache key as it appears in the text of a record pivot cannot parse.
 _KEY_RE = re.compile(r"(?<![0-9a-zA-Z])[0-9a-f]{16}(?![0-9a-zA-Z])")
 # A project's identity lives in its state database directory, which the state directory's
@@ -106,9 +104,8 @@ class ProjectEntry(TypedDict):
     # platform has none): with the hostname, the view this entry speaks for.
     machine: str
     mount_ns: int | None
-    # The nonce this view wrote into the state directory just before this entry; None when the
-    # state directory cannot be written.
-    nonce: str | None
+    # The entry's view nonce is not here: it rotates in every naming unit, so it lives in the
+    # fixed-size sibling file `<digest>.nonce`, rewritten in place (`_rotate_nonces`).
     # Mount points under the root and state directory; None where the mount table is unknown.
     mounts: list[str] | None
 
@@ -290,35 +287,90 @@ def _view_nonce_path(state_dir: pathlib.Path, view_key: str) -> pathlib.Path:
     return state_dir / "state.lmdb" / VIEW_NONCE_DIR / view_key
 
 
-def _write_view_nonce(state_dir: pathlib.Path, view_key: str) -> str:
-    """Write a fresh nonce for this view into the state directory and return it.
-
-    Raises OSError or ValueError. The register entry written next records the same nonce. A
-    collection in any view accepts the entry only if it reads that nonce in its own view of this
-    state directory, which proves it reads the bytes this view last wrote, not a clone or an
-    overlay copy that shares the directory's inode number.
-    """
-    nonce = secrets.token_hex(16)
+def _open_view_nonce(state_dir: pathlib.Path, view_key: str) -> int:
+    """Open (creating) this view's nonce file in the state directory. Raises OSError or
+    ValueError (a NUL byte in an unusable configured path)."""
     path = _view_nonce_path(state_dir, view_key)
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    def write(fd: int) -> None:
-        with os.fdopen(fd, "w") as file:
-            file.write(nonce + "\n")
-
-    cache.atomic_write_file(path, write)
-    return nonce
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    os.fchmod(fd, 0o644)  # other users' collections must read it, whatever the umask
+    return fd
 
 
-def _read_view_nonce(state_dir: pathlib.Path, view_key: str) -> str:
-    """Read one view's nonce without following a symlink. Raises OSError or ValueError."""
-    path = _view_nonce_path(state_dir, view_key)
+def _write_entry(path: str, document: ProjectEntry) -> None:
+    """Replace ``path`` with ``document`` atomically, readable by every user of the cache."""
+    data = (json.dumps(document, sort_keys=True) + "\n").encode()
+    head, tail = os.path.split(path)
+    staged = os.path.join(head, f".{tail}.{os.getpid()}.tmp")
+    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o644)
+    try:
+        try:
+            os.fchmod(fd, 0o644)
+            if os.write(fd, data) != len(data):
+                raise OSError(errno.EIO, "short write", str(staged))
+        finally:
+            os.close(fd)
+        os.replace(staged, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(staged)
+        raise
+
+
+def _open_nonce_file(path: pathlib.Path) -> int:
+    """Open (creating) a nonce file other users can read. Raises OSError or ValueError."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    os.fchmod(fd, 0o644)  # other users' collections must read it, whatever the umask
+    return fd
+
+
+def _entry_nonce_path(entry: pathlib.Path) -> pathlib.Path:
+    """The sibling file that holds a register entry's current view nonce."""
+    return entry.with_suffix(".nonce")
+
+
+def _rotate_nonces(state_fd: int, register_fd: int) -> None:
+    """Write one fresh nonce to this view's nonce file in the state directory, then to the
+    entry's nonce file in the register.
+
+    A collection in any view accepts the entry only if it reads that nonce in its own view of the
+    state directory, which proves it reads the bytes this view last wrote, not a clone or an
+    overlay copy that shares the directory's inode number. Both are fixed-size files rewritten in
+    place: a collection reads them only under the exclusive naming lock, and a writer writes them
+    only under the shared one. Processes of one view hold the state nonce file's lock across both
+    writes, so the register holds the nonce written last. Where the filesystem refuses the lock
+    they write unlocked: an interleaving then leaves a mismatch, which only makes a collection
+    refuse. Raises OSError.
+    """
+    data = f"{secrets.token_hex(16)}\n".encode()
+    locked = True
+    try:
+        fcntl.flock(state_fd, fcntl.LOCK_EX)
+    except OSError:
+        locked = False
+    try:
+        for fd in (state_fd, register_fd):
+            if os.pwrite(fd, data, 0) != len(data):
+                raise OSError(errno.EIO, "short write of a view nonce")
+            os.ftruncate(fd, len(data))
+    finally:
+        if locked:
+            fcntl.flock(state_fd, fcntl.LOCK_UN)
+
+
+def _read_nonce_file(path: pathlib.Path) -> str:
+    """Read a nonce file without following a symlink. Raises OSError or ValueError."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     with os.fdopen(fd) as file:
         nonce = file.read().strip()
     if not _ENTRY_ID_RE.fullmatch(nonce):
         raise ValueError(f"{path} does not hold a pivot view nonce")
     return nonce
+
+
+def _read_view_nonce(state_dir: pathlib.Path, view_key: str) -> str:
+    """Read one view's nonce in the state directory. Raises OSError or ValueError."""
+    return _read_nonce_file(_view_nonce_path(state_dir, view_key))
 
 
 def _project_id_path(state_dir: pathlib.Path) -> pathlib.Path:
@@ -371,9 +423,18 @@ def _decode_mount_point(raw: bytes) -> str:
 def _read_mount_table() -> bytes | None:
     """This mount namespace's mount table, or None where `/proc/self/mounts` cannot be read."""
     try:
-        return _MOUNTS_TABLE.read_bytes()
+        fd = os.open(_MOUNTS_TABLE, os.O_RDONLY | os.O_CLOEXEC)
     except OSError:
         return None
+    chunks = list[bytes]()
+    try:
+        while chunk := os.read(fd, 65536):
+            chunks.append(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
 
 
 def _mount_points(table: bytes | None) -> frozenset[str] | None:
@@ -398,19 +459,32 @@ def _mount_points(table: bytes | None) -> frozenset[str] | None:
     )
 
 
-# A writer-side shortcut only. Each naming unit registers its project, and a full registration
-# writes a fresh view nonce and the entry. This records, per process, the evidence an entry was
-# last written against: the mount table bytes, the entry's mtime, and the (dev, ino, mtime) of
-# the project id file and of this view's nonce file. A unit skips re-registration only while all
-# of it is unchanged, the state directory is the same and the entry is still fresh. A collection
+# A writer-side shortcut only. Each naming unit registers its project. A full registration reads
+# the id and the mount table and writes the entry. This records, per process, what it checked:
+# the mount table bytes and the identity of the project id file and of the entry, with both nonce
+# files kept open. While those are unchanged and each open nonce file is still the one at its
+# path, a unit skips the reads but never the nonce rotation (`_rotate_view_nonce`). A collection
 # never reads this: `read_register` and `collect_roots` always read the files.
 _RegistrationKey = tuple[pathlib.Path, pathlib.Path, pathlib.Path]
 _FileIdentity = tuple[int, int, int]
-_VerifiedRegistration = tuple[bytes, pathlib.Path, int, _FileIdentity, pathlib.Path, _FileIdentity]
+
+
+class _VerifiedRegistration(NamedTuple):
+    table: bytes
+    id_path: str
+    id_identity: _FileIdentity
+    entry_path: str
+    entry_identity: _FileIdentity
+    state_nonce_path: str
+    state_nonce_fd: int
+    register_nonce_path: str
+    register_nonce_fd: int
+
+
 _VERIFIED_REGISTRATIONS = dict[_RegistrationKey, _VerifiedRegistration]()
 
 
-def _file_identity(path: pathlib.Path) -> _FileIdentity | None:
+def _file_identity(path: pathlib.Path | str) -> _FileIdentity | None:
     """A file's (dev, ino, mtime), or None when it cannot be read."""
     try:
         stats = os.stat(path, follow_symlinks=False)
@@ -419,38 +493,47 @@ def _file_identity(path: pathlib.Path) -> _FileIdentity | None:
     return (stats.st_dev, stats.st_ino, stats.st_mtime_ns)
 
 
+def _still_open_at(path: str, fd: int) -> bool:
+    """Whether ``fd`` is still the file at ``path``, so a write through it lands there."""
+    try:
+        at_path = os.stat(path, follow_symlinks=False)
+        opened = os.fstat(fd)
+    except OSError:
+        return False
+    return (at_path.st_dev, at_path.st_ino) == (opened.st_dev, opened.st_ino)
+
+
 def _registration_unchanged(key: _RegistrationKey, table: bytes | None) -> bool:
     """Whether this process already registered ``key`` against the evidence it sees now."""
     verified = _VERIFIED_REGISTRATIONS.get(key)
-    if verified is None or table is None or verified[0] != table:
+    if verified is None or table is None or verified.table != table:
         return False
-    if _file_identity(_project_id_path(key[2])) != verified[3]:
+    if _file_identity(verified.id_path) != verified.id_identity:
         return False
-    if _file_identity(verified[4]) != verified[5]:
+    if _file_identity(verified.entry_path) != verified.entry_identity:
         return False
-    try:
-        stats = verified[1].stat()
-    except OSError:
-        return False
-    return (
-        stats.st_mtime_ns == verified[2]
-        and time.time() - stats.st_mtime < _REGISTER_REFRESH_SECONDS
+    return _still_open_at(verified.state_nonce_path, verified.state_nonce_fd) and _still_open_at(
+        verified.register_nonce_path, verified.register_nonce_fd
     )
 
 
-def _remember_registration(
-    key: _RegistrationKey, table: bytes | None, entry: pathlib.Path, nonce_file: pathlib.Path
-) -> None:
-    """Record the evidence ``entry`` now matches, so the next unconditional unit can skip."""
-    id_file = _file_identity(_project_id_path(key[2]))
-    nonce_identity = _file_identity(nonce_file)
-    if table is None or id_file is None or nonce_identity is None:
-        return
-    try:
-        mtime_ns = entry.stat().st_mtime_ns
-    except OSError:
-        return
-    _VERIFIED_REGISTRATIONS[key] = (table, entry, mtime_ns, id_file, nonce_file, nonce_identity)
+def _forget_registration(key: _RegistrationKey) -> None:
+    verified = _VERIFIED_REGISTRATIONS.pop(key, None)
+    if verified is not None:
+        os.close(verified.state_nonce_fd)
+        os.close(verified.register_nonce_fd)
+
+
+def _rotate_view_nonce(key: _RegistrationKey) -> None:
+    """Rotate the view nonce, for a unit the memo lets skip the rest of the registration.
+
+    The memo never skips this: a clone of the state directory taken while this process runs (a
+    VM snapshot, `docker commit`) holds the nonce of the last unit, which this unit replaces
+    before it names anything new, so the clone's collection no longer accepts this entry.
+    Raises OSError; the caller then registers in full.
+    """
+    verified = _VERIFIED_REGISTRATIONS[key]
+    _rotate_nonces(verified.state_nonce_fd, verified.register_nonce_fd)
 
 
 def _mounts_under(points: frozenset[str] | None, bases: Iterable[pathlib.Path]) -> list[str] | None:
@@ -511,27 +594,33 @@ def register_project(
     id and the nonce are best-effort: a state directory that cannot be written (#503's unusable
     layouts) gives an entry without them, which a collection refuses, while the writer keeps
     0.5.2's behaviour. Each process registers in full at its first naming unit, and again when
-    its evidence changes or the entry is ``_REGISTER_REFRESH_SECONDS`` old. The register write
-    itself must succeed before a writer names an object, so its failure refuses that writer.
-    ``EROFS`` on the cache is the one exception: no collection can delete from a read-only cache.
+    its mount table or project id changes; every other unit only rotates the nonce. The register
+    write itself must succeed before a writer names an object, so its failure refuses that
+    writer. ``EROFS`` on the cache is the one exception: no collection can delete from a
+    read-only cache.
     """
     if not cache_dir.is_dir():
         return
     table = _read_mount_table()
     key = (cache_dir, project_root, state_dir)
     if _registration_unchanged(key, table):
-        return
-    _VERIFIED_REGISTRATIONS.pop(key, None)
+        try:
+            _rotate_view_nonce(key)
+            return
+        except OSError as e:
+            logger.debug("Cannot rotate the view nonce in %s: %s", state_dir, e)
+    _forget_registration(key)
     path = cache_dir / REGISTER_DIR
     host, machine, mount_ns = _this_view()
     view_key = _view_key(host, machine, mount_ns)
+    state_fd: int | None = None
+    register_fd: int | None = None
     try:
-        project_id = _ensure_project_id(state_dir, project_root)
-        nonce: str | None = _write_view_nonce(state_dir, view_key)
+        project_id: str | None = _ensure_project_id(state_dir, project_root)
+        state_fd = _open_view_nonce(state_dir, view_key)
     except (OSError, ValueError) as e:
         logger.debug("Cannot write the project id or view nonce in %s: %s", state_dir, e)
         project_id = None
-        nonce = None
     try:
         path = register_path(cache_dir, project_root, project_id or "", view_key)
         points = _mount_points(table)
@@ -553,21 +642,44 @@ def register_project(
             project_id=project_id,
             machine=machine,
             mount_ns=mount_ns,
-            nonce=nonce,
             mounts=mounts,
         )
-        _write_json(path, entry)
+        path.parent.mkdir(exist_ok=True)
+        if project_id is not None and state_fd is not None:
+            # The nonce file first: an entry without one is refused, never read with a stale one.
+            register_fd = _open_nonce_file(_entry_nonce_path(path))
+            _rotate_nonces(state_fd, register_fd)
+        _write_entry(str(path), entry)
         _record_cache_mounts(cache_dir, points)
-        if project_id is not None:
+        if project_id is not None and state_fd is not None and register_fd is not None:
             # This view's entry without an id, written while the state directory could not
             # hold one, is superseded: the entry just written covers the same root and view.
             register_path(cache_dir, project_root, "", view_key).unlink(missing_ok=True)
-            _remember_registration(key, table, path, _view_nonce_path(state_dir, view_key))
+            id_path = str(_project_id_path(state_dir))
+            id_identity = _file_identity(id_path)
+            entry_identity = _file_identity(path)
+            if table is not None and id_identity is not None and entry_identity is not None:
+                _VERIFIED_REGISTRATIONS[key] = _VerifiedRegistration(
+                    table=table,
+                    id_path=id_path,
+                    id_identity=id_identity,
+                    entry_path=str(path),
+                    entry_identity=entry_identity,
+                    state_nonce_path=str(_view_nonce_path(state_dir, view_key)),
+                    state_nonce_fd=state_fd,
+                    register_nonce_path=str(_entry_nonce_path(path)),
+                    register_nonce_fd=register_fd,
+                )
+                state_fd = register_fd = None  # the memo owns them now
     except (OSError, ValueError) as e:
         if isinstance(e, OSError) and e.errno == errno.EROFS:
             logger.debug("%s is on a read-only filesystem; nothing can delete there", path)
             return
         raise _unrecorded_project(cache_dir, path, e) from e
+    finally:
+        for fd in (state_fd, register_fd):
+            if fd is not None:
+                os.close(fd)
 
 
 def _unrecorded_project(
@@ -599,7 +711,10 @@ def _project_from_entry(path: pathlib.Path) -> _RegisteredProject:
     mounts = entry.get("mounts")
     machine = entry.get("machine")
     mount_ns = entry.get("mount_ns")
-    nonce = entry.get("nonce")
+    try:
+        nonce: str | None = _read_nonce_file(_entry_nonce_path(path))
+    except (OSError, ValueError):
+        nonce = None
     scope = ProjectScope(
         root=pathlib.Path(root),
         # The collector resolves the project's current state directory before it reads records.
@@ -621,7 +736,7 @@ def _project_from_entry(path: pathlib.Path) -> _RegisteredProject:
         else None,
         machine=machine if isinstance(machine, str) else "",
         mount_ns=mount_ns if isinstance(mount_ns, int) and not isinstance(mount_ns, bool) else None,
-        nonce=nonce if isinstance(nonce, str) and _ENTRY_ID_RE.fullmatch(nonce) else None,
+        nonce=nonce,
         mounts=cast("list[str] | None", mounts),
         recorded_state_dir=state_dir if isinstance(state_dir, str) else str(scope["state_dir"]),
     )
@@ -728,7 +843,7 @@ def _view_nonce_reason(
     scope = registered["scope"]
     view_key = _view_key(scope["host"], registered["machine"], registered["mount_ns"])
     if registered["nonce"] is None:
-        detail = "the entry records no view nonce"
+        detail = "the entry has no readable view nonce"
     else:
         try:
             nonce = _read_view_nonce(scope["state_dir"], view_key)

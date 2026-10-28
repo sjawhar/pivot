@@ -1,5 +1,6 @@
 import json
 import pathlib
+import shutil
 
 import pytest
 
@@ -80,17 +81,89 @@ def test_a_naming_unit_reregisters_after_another_writer_replaces_the_entry(
     assert json.loads(entry.read_text())["host"] != "pivot-other-node"
 
 
-def test_a_naming_unit_reregisters_after_its_view_nonce_changes(tmp_path: pathlib.Path) -> None:
-    """Another process of this view registers in between and writes a new nonce. The next unit
-    here must not trust what it verified before: it writes a nonce and an entry that agree."""
+def test_a_naming_unit_reopens_a_view_nonce_file_that_was_replaced(tmp_path: pathlib.Path) -> None:
+    """The view's nonce file is replaced between two units (its state database was reset, or
+    another tool rewrote it). The next unit must write its nonce to the file now at that path,
+    not to the one it opened before, so the entry and the file a collection reads agree."""
     root, state_dir, cache_dir = _project(tmp_path)
     _unit(cache_dir, root, state_dir)
     entry = gc.project_register_path(cache_dir, root, state_dir)
     assert entry is not None
     nonces = state_dir / "state.lmdb" / gc.VIEW_NONCE_DIR
     (nonce_file,) = nonces.iterdir()
+    nonce_file.unlink()
     nonce_file.write_text("0" * 32 + "\n")
 
     _unit(cache_dir, root, state_dir)
 
-    assert json.loads(entry.read_text())["nonce"] == nonce_file.read_text().strip()
+    register_nonce = entry.with_suffix(".nonce").read_text().strip()
+    assert register_nonce == nonce_file.read_text().strip()
+
+
+def test_a_naming_unit_reregisters_after_its_entry_is_deleted(tmp_path: pathlib.Path) -> None:
+    """A user deletes the register entry (as a refusal tells them to, for a project they took
+    for gone). The next unit of a process that still uses the project must write it again, or
+    the project's records would be invisible to every collection."""
+    root, state_dir, cache_dir = _project(tmp_path)
+    _unit(cache_dir, root, state_dir)
+    entry = gc.project_register_path(cache_dir, root, state_dir)
+    assert entry is not None
+    entry.unlink()
+
+    _unit(cache_dir, root, state_dir)
+
+    assert entry.exists(), "a naming unit ran without its project in the register"
+
+
+def _swap(a: pathlib.Path, b: pathlib.Path) -> None:
+    """Exchange two directories' contents by renaming, so ``a``'s path shows ``b``'s copy."""
+    spare = a.with_name(a.name + ".swap")
+    a.rename(spare)
+    b.rename(a)
+    spare.rename(b)
+
+
+def test_a_clone_taken_while_a_writer_runs_holds_a_nonce_its_next_unit_replaces(
+    tmp_path: pathlib.Path,
+) -> None:
+    """P19: a long-running writer registers; its state directory is cloned (a VM snapshot or
+    `docker commit`); the same process then names something new. The clone's collection, which
+    sees its copy at the same path, must refuse the entry rather than read the stale copy."""
+    root, state_dir, cache_dir = _project(tmp_path)
+    _unit(cache_dir, root, state_dir)
+    clone = tmp_path / "clone-state"
+    shutil.copytree(state_dir, clone, symlinks=True)
+
+    _unit(cache_dir, root, state_dir)  # the same process names a new object
+
+    _swap(state_dir, clone)  # the clone's view: its copy at the same path
+    try:
+        live, unreadable = gc.read_register(cache_dir)
+    finally:
+        _swap(state_dir, clone)
+    assert live == [], "the clone's collection accepted the running writer's entry"
+    assert len(unreadable) == 1, unreadable
+
+
+def test_two_views_that_share_a_view_key_refuse_each_others_entry(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two cloned VMs that keep the hostname, machine id and initial mount namespace share a view
+    key, so the last writer's entry replaces the other's. The view that did not write last holds
+    another nonce, so its collection refuses. (The view that wrote last accepts the entry and
+    reads its own records; the other view's objects named since the clone are not in them.)"""
+    monkeypatch.setattr(gc, "_this_view", lambda: ("cloned-host", "same-machine-id", 1))
+    root, state_dir, cache_dir = _project(tmp_path)
+    _unit(cache_dir, root, state_dir)
+    clone = tmp_path / "clone-state"
+    shutil.copytree(state_dir, clone, symlinks=True)
+    _swap(state_dir, clone)
+    try:
+        _unit(cache_dir, root, state_dir)  # the clone registers last, under the same key
+    finally:
+        _swap(state_dir, clone)
+
+    live, unreadable = gc.read_register(cache_dir)
+
+    assert live == [], "the view that did not write last accepted the other's entry"
+    assert len(unreadable) == 1, unreadable

@@ -135,17 +135,19 @@ namespace, so the key holds the root, the project id and the view:
 ```json
 {"root": "/home/me/experiment", "state_dir": "/home/me/experiment/.pivot",
  "host": "workstation", "machine": "4f1c...", "mount_ns": 4026531841, "pivot": "0.5.12",
- "last_write": "2026-10-27T06:43:11Z", "project_id": "0f8c...", "nonce": "9b2e...",
+ "last_write": "2026-10-27T06:43:11Z", "project_id": "0f8c...",
  "mounts": ["/home/me/experiment/data"]}
 ```
 
 The project id is a random value in `<state dir>/state.lmdb/pivot-project-id`, so git never
 copies it to another checkout. A copy of the project (`cp -a`, a container built from an image
 that holds it, a VM cloned from its disk) keeps the id and can keep its directories' inode
-numbers, so neither proves which project a view reads. Each full registration therefore writes
-a fresh nonce into `<state dir>/state.lmdb/gc-views/<view>` first, then the entry that records
-it. A project that sets a new `core.state_dir` copies the id from its `.pivot` state. `mounts`
-lists the mount points at or below the project root and state directory that this view saw.
+numbers, so neither proves which project a view reads. Every naming step therefore writes one
+fresh nonce to `<state dir>/state.lmdb/gc-views/<view>` and to the entry's sibling
+`projects/<digest>.nonce`, so a clone taken while a writer runs holds a nonce the writer's next
+step replaces. A project that sets a new `core.state_dir` copies the id from its `.pivot` state.
+`mounts` lists the mount points at or below the project root and state directory that this view
+saw.
 
 Every pivot process that names a cache object registers its project first, inside the naming
 lock described above: a stage commit, a run-cache restore, `pivot commit`, `pivot track` and
@@ -161,7 +163,7 @@ is the one exception to a register-write failure, because no collection can dele
 
 A collection reads every entry, and an entry is live only after the collection finds its
 project id in the project's current state directory and reads there, in its own view, the
-nonce the entry records. A project shared over NFS shows another host's latest nonce, so it
+nonce in the entry's `.nonce` file. A project shared over NFS shows another host's latest nonce, so it
 stays collectable; a container's overlay or a cloned disk holds at most an older nonce, so the
 collection refuses rather than read that copy as the project. An absent or unreadable root,
 state directory, id or nonce refuses the collection and names the entry: the project may be on

@@ -368,9 +368,10 @@ under the shared lock and before anything is named, so every process that names 
 in the register, whichever command it runs and whether or not the cache existed when it began.
 Only a test standing in for a writer passes `project=None`. A full registration (a process's
 first unit, or after its evidence changed) tries to write the project id to
-`<state dir>/state.lmdb/pivot-project-id`, then a fresh nonce for this view to
-`<state dir>/state.lmdb/gc-views/<view>`, then the entry recording both, the mount points at or
-below the project root and state directory, and cache-root submounts in `<cache>/mounts/`.
+`<state dir>/state.lmdb/pivot-project-id`, then one fresh nonce to this view's
+`<state dir>/state.lmdb/gc-views/<view>` and the entry's sibling `<digest>.nonce`, then the entry
+with the mount points at or below the project root and state directory, and cache-root submounts
+in `<cache>/mounts/`.
 Entries, nonces and cache mount records are keyed per view (hostname, machine id and mount
 namespace). An id or nonce write failure leaves an entry without them, so a collection refuses
 it but the writer preserves #503's unusable-state behavior. A register write failure refuses the
@@ -387,8 +388,10 @@ directory. Any missing evidence refuses collection and names the entry. `resolve
 opens every scope's root, `.pivot` and state directory. When `core.state_dir` differs from
 `.pivot`, collection reads both state layouts so a 0.5.2 lock in `.pivot` still protects its
 object. The writer-side registration memo (`_VERIFIED_REGISTRATIONS`) only lets a naming unit
-skip re-registration while the id file, the nonce file, the entry and the mount table are
-unchanged; no collection read uses it.
+skip the id, mount and entry reads while the id file, the entry and the mount table are
+unchanged and both open nonce files are still the ones at their paths. It never skips the nonce
+rotation: every unit rewrites both fixed-size nonce files in place (`_rotate_nonces`), which a
+collection reads only under the exclusive lock. No collection read uses the memo.
 
 ### Where flock is refused
 
