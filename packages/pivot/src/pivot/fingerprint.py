@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
 import xxhash
 
-from pivot import ast_utils, exceptions, metrics
+from pivot import ast_utils, exceptions, loaded_source, metrics
 
 if TYPE_CHECKING:
     import pydantic.json_schema
@@ -78,7 +78,10 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # namespace shared with a checkout under the prefix is not reused.
 # Version 30 follows every callable user class member, dataclass defaults, and body imports of
 # user modules discovery loaded, and records the user modules each manifest covers.
-_CACHE_SCHEMA_VERSION = 30
+# Version 31 hashes a loaded module's functions from the source it was compiled from, under that
+# source's digest. Earlier entries hashed the file as `inspect` re-read it, which an edit after the
+# digest was taken could change.
+_CACHE_SCHEMA_VERSION = 31
 _REPR_SIZE_LIMIT = 10_000
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
@@ -190,13 +193,32 @@ _schema_hash_cache: weakref.WeakKeyDictionary[type, str] = weakref.WeakKeyDictio
 # Workers (via ProcessPoolExecutor) have their own memory space and don't share this
 # state - any pending writes in workers are lost, which is fine since workers use
 # readonly StateDB and fingerprinting should complete during discovery.
+# `_state_db` is the readonly StateDB the persistent caches read, opened for `_state_db_dir`, the
+# state directory of project root `_state_db_root`. It follows the state directory
+# (`_get_state_db`), so a process that moves to another project reads that project's caches; it
+# is None after a failed open, not retried for that directory.
 _state_db: "StateDB | None" = None
-_state_db_init_attempted: bool = False
-_pending_ast_writes: list[AstHashEntry] = []
+_state_db_dir: pathlib.Path | None = None
+_state_db_root: pathlib.Path | None = None
 
-# Pending manifest cache writes, flushed at process exit.
-# Format: list of (key_bytes, value_bytes) tuples.
-_pending_manifest_writes: list[tuple[bytes, bytes]] = []
+
+class _PendingCacheWrites(TypedDict):
+    """Function hashes and stage manifests waiting to be written to one project's StateDB.
+
+    Every entry names source files relative to `root`, the project root it was computed under,
+    so only that project's StateDB may hold it.
+    """
+
+    root: pathlib.Path
+    ast: list[AstHashEntry]
+    manifest: list[tuple[bytes, bytes]]  # (key, value)
+
+
+# Cache writes queued since the last flush (end of discovery, a watch-mode reload, process exit).
+# A process can be pointed at several projects in turn (`project._project_root_cache`, which tests
+# and a reused pivot worker rebind), so the writes keep the project they were queued for
+# (`_current_pending_writes`).
+_pending_writes: _PendingCacheWrites | None = None
 
 
 # Source files visited during a single stage's fingerprinting.
@@ -291,11 +313,13 @@ class FunctionIdentity(TypedDict):
 
 
 def _close_state_db() -> None:
-    """Close the readonly StateDB on process exit."""
-    global _state_db
+    """Close the readonly StateDB the persistent caches read."""
+    global _state_db, _state_db_dir, _state_db_root
     if _state_db is not None:
         _state_db.close()
-        _state_db = None
+    _state_db = None
+    _state_db_dir = None
+    _state_db_root = None
 
 
 atexit.register(_close_state_db)
@@ -313,22 +337,37 @@ def _flush_pending_caches() -> None:  # pyright: ignore[reportUnusedFunction] - 
 
 
 def _get_state_db() -> "StateDB | None":
-    """Get readonly StateDB for fingerprint caching (graceful degradation).
+    """Get the current state directory's readonly StateDB for fingerprint caching (graceful
+    degradation).
+
+    The handle is reopened when the state directory changes, as when a process moves to another
+    project, so a lookup reads only the current project's caches. A failed open is not retried
+    for the same directory. The state directory is computed again only when the project root
+    changes: its other input, the merged config, is read once per process
+    (`io.get_merged_config`), and an identity check keeps each lookup cheap.
 
     Not thread-safe, but fingerprinting runs single-threaded per process
     (see comment at line 33). Workers use separate memory spaces.
     """
-    global _state_db, _state_db_init_attempted
-    if _state_db is not None:
-        return _state_db
-    if _state_db_init_attempted:
-        return None  # Already tried and failed
-    _state_db_init_attempted = True
+    global _state_db, _state_db_dir, _state_db_root
     try:
+        from pivot import project
+
+        root = project.get_project_root()
+        if root is _state_db_root:
+            return _state_db
+
         from pivot.config import io
         from pivot.storage import state
 
-        _state_db = state.StateDB(io.get_state_dir(), readonly=True)
+        state_dir = io.get_state_dir()
+        if state_dir == _state_db_dir:
+            _state_db_root = root
+            return _state_db
+        _close_state_db()
+        _state_db_dir = state_dir
+        _state_db_root = root
+        _state_db = state.StateDB(state_dir, readonly=True)
         return _state_db
     except Exception:
         # OSError (filesystem), ImportError (module), lmdb.Error, etc.
@@ -452,6 +491,10 @@ def _source_digest(file: str) -> str:
     """Digest of source file ``file``'s content, which the function-hash and manifest caches
     record for it.
 
+    For a file this process loaded a module from, that is the content it was compiled from
+    (``loaded_source``), which ``loaded_source.getsource`` also reads: a stage's worker runs that
+    code, whatever the file holds now. Any other file is read now.
+
     An edit can keep a file's mtime, size and inode (two writes inside one kernel timestamp
     tick, or a tool that restores the mtime), so the caches compare content. Within one
     `fingerprint_pass()` each file is read once. The read also drops the lines `linecache`
@@ -460,6 +503,8 @@ def _source_digest(file: str) -> str:
 
     Raises OSError when the file cannot be read.
     """
+    if (loaded := loaded_source.digest(file)) is not None:
+        return loaded
     memo = _pass_memo.get()
     key = ("source", file)
     if memo is not None and key in memo:
@@ -864,49 +909,98 @@ def _walk_to(path: tuple[str, ...], owners: dict[tuple[str, ...], Any]) -> Any:
     return owners[path]
 
 
+def _current_pending_writes() -> _PendingCacheWrites:
+    """Return the cache writes queued for the current project.
+
+    Writes queued while another project was current are dropped: their keys and source maps
+    name that project's files, so they must never reach this project's StateDB. One comparison
+    per call, against the root the queue was opened for.
+
+    Raises:
+        ProjectNotInitializedError: If no project is current.
+    """
+    global _pending_writes
+    from pivot import project
+
+    root = project.get_project_root()
+    pending = _pending_writes
+    if pending is not None and (pending["root"] is root or pending["root"] == root):
+        return pending
+    if pending is not None and (pending["ast"] or pending["manifest"]):
+        _logger.debug(
+            "Dropping %d AST hash and %d manifest cache writes queued for project %s, not %s",
+            len(pending["ast"]),
+            len(pending["manifest"]),
+            pending["root"],
+            root,
+        )
+    pending = _pending_writes = _PendingCacheWrites(
+        root=root, ast=list[AstHashEntry](), manifest=list[tuple[bytes, bytes]]()
+    )
+    return pending
+
+
+def _queued_for_current_project() -> _PendingCacheWrites | None:
+    """Return the cache writes queued for the current project; None when nothing is queued or
+    no project is current (at exit, after a test cleared the cached project root)."""
+    pending = _pending_writes
+    if pending is None or not (pending["ast"] or pending["manifest"]):
+        return None
+    try:
+        return _current_pending_writes()
+    except (exceptions.ProjectNotInitializedError, OSError):
+        return None
+
+
 def flush_ast_hash_cache() -> None:
-    """Flush pending AST hash writes to StateDB (call from coordinator)."""
-    global _pending_ast_writes
-    if not _pending_ast_writes:
+    """Flush the current project's pending AST hash writes to its StateDB (call from coordinator).
+
+    Hashes queued while another project was current are dropped (`_current_pending_writes`).
+    """
+    pending = _queued_for_current_project()
+    if pending is None or not pending["ast"]:
         return
 
-    pending = _pending_ast_writes
-    _pending_ast_writes = []
+    entries = pending["ast"]
+    pending["ast"] = list[AstHashEntry]()
 
     try:
         from pivot.config import io
         from pivot.storage import state
 
         with state.StateDB(io.get_state_dir(), readonly=False) as db:
-            db.save_ast_hash_many(pending)
+            db.save_ast_hash_many(entries)
         metrics.count("fingerprint.ast_hash_cache.flush")
     except Exception:
         # OSError (filesystem), ImportError (module), lmdb.Error, etc.
         # Restore pending writes on failure so they can be retried on next flush.
         # This prevents permanent loss of cache entries on transient failures.
-        _pending_ast_writes.extend(pending)
-        _logger.debug("Failed to flush AST hash cache (%d entries)", len(pending), exc_info=True)
+        pending["ast"].extend(entries)
+        _logger.debug("Failed to flush AST hash cache (%d entries)", len(entries), exc_info=True)
 
 
 def flush_manifest_cache() -> None:
-    """Flush pending manifest writes to StateDB."""
-    global _pending_manifest_writes
-    if not _pending_manifest_writes:
+    """Flush the current project's pending manifest writes to its StateDB.
+
+    Manifests queued while another project was current are dropped (`_current_pending_writes`).
+    """
+    pending = _queued_for_current_project()
+    if pending is None or not pending["manifest"]:
         return
 
-    pending = _pending_manifest_writes
-    _pending_manifest_writes = []
+    entries = pending["manifest"]
+    pending["manifest"] = list[tuple[bytes, bytes]]()
 
     try:
         from pivot.config import io
         from pivot.storage import state
 
         with state.StateDB(io.get_state_dir(), readonly=False) as db:
-            db.put_raw_many(pending)
+            db.put_raw_many(entries)
         metrics.count("fingerprint.manifest_cache.flush")
     except Exception:
-        _pending_manifest_writes.extend(pending)
-        _logger.debug("Failed to flush manifest cache (%d entries)", len(pending), exc_info=True)
+        pending["manifest"].extend(entries)
+        _logger.debug("Failed to flush manifest cache (%d entries)", len(entries), exc_info=True)
 
 
 def _normalize_changed_paths(
@@ -951,8 +1045,6 @@ def invalidate_manifests_for_paths(
     paths: Sequence[str | os.PathLike[str] | pathlib.Path],
 ) -> None:
     """Invalidate cached manifests that reference changed source files."""
-    global _pending_manifest_writes
-
     if not paths:
         return
     changed_paths = _normalize_changed_paths(paths)
@@ -971,15 +1063,16 @@ def invalidate_manifests_for_paths(
     except Exception:
         _logger.debug("Failed to scan manifest cache for invalidation", exc_info=True)
 
-    if _pending_manifest_writes:
+    pending = _queued_for_current_project()
+    if pending is not None and pending["manifest"]:
         pending_keys = set[bytes]()
-        for key, raw in _pending_manifest_writes:
+        for key, raw in pending["manifest"]:
             if _manifest_references_paths(raw, changed_paths):
                 pending_keys.add(key)
         if pending_keys:
             keys_to_delete.update(pending_keys)
-            _pending_manifest_writes = [
-                (key, value) for key, value in _pending_manifest_writes if key not in pending_keys
+            pending["manifest"] = [
+                (key, value) for key, value in pending["manifest"] if key not in pending_keys
             ]
 
     if not keys_to_delete:
@@ -1109,7 +1202,7 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
                 },
                 separators=(",", ":"),
             ).encode()
-            _pending_manifest_writes.append((key, value))
+            _current_pending_writes()["manifest"].append((key, value))
 
         return manifest
     finally:
@@ -1152,7 +1245,7 @@ def _source_tree(func: Callable[..., Any]) -> ast.Module | None:
         code if hasattr(func, "__wrapped__") and isinstance(code, types.CodeType) else func
     )
     try:
-        return ast.parse(textwrap.dedent(inspect.getsource(target)))
+        return ast.parse(textwrap.dedent(loaded_source.getsource(target)))
     except (OSError, TypeError, SyntaxError):
         return None
 
@@ -1161,7 +1254,7 @@ def _wrapped_source_tree(func: Callable[..., Any]) -> ast.Module | None:
     """Parse the source `inspect.getsource(func)` returns: for a functools.wraps wrapper, the
     function at the end of its `__wrapped__` chain."""
     try:
-        return ast.parse(textwrap.dedent(inspect.getsource(func)))
+        return ast.parse(textwrap.dedent(loaded_source.getsource(func)))
     except (OSError, TypeError, SyntaxError):
         return None
 
@@ -1671,7 +1764,7 @@ def _process_class_body_dependencies(
     cls: type, manifest: dict[str, str], visited: set[int]
 ) -> None:
     try:
-        source = inspect.getsource(cls)
+        source = loaded_source.getsource(cls)
         tree = ast.parse(textwrap.dedent(source))
     except (OSError, TypeError, SyntaxError):
         return
@@ -2944,7 +3037,7 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
         # 5. Queue persistent write (if source info available and not skipping)
         if source_info is not None and qualname is not None:
             rel_path, digest = source_info
-            _pending_ast_writes.append(
+            _current_pending_writes()["ast"].append(
                 (rel_path, digest, qualname, _PYTHON_VERSION, _CACHE_SCHEMA_VERSION, result)
             )
             metrics.count("fingerprint.hash_function_ast.persistent_cache_miss")
@@ -3027,7 +3120,7 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
 
         _t_source = metrics.start()
         try:
-            source = inspect.getsource(func)
+            source = loaded_source.getsource(func)
         except (OSError, TypeError):
             metrics.end("fingerprint.inspect_getsource", _t_source)
             if hasattr(func, "__code__"):

@@ -1,6 +1,6 @@
 [project]
 name = "pivot"
-version = "0.5.9"
+version = "0.5.17"
 description = "High-performance Python pipeline tool with automatic code change detection"
 requires-python = ">=3.13,<3.14"
 readme = "README.md"
@@ -13,7 +13,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-  "aiohttp>=3.9",
+  "aiohttp>=3.10",
   "anyio>=4.11",
   "click>=8.0",
   "cloudpickle>=3.0",

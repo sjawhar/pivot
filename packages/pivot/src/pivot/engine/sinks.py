@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import sys
 import time
 from typing import TYPE_CHECKING
@@ -8,9 +9,9 @@ from typing import TYPE_CHECKING
 import anyio
 import rich.console
 import rich.live
-import rich.markup
 import rich.text
 
+from pivot import display
 from pivot.engine.types import LogLine, StageCompleted
 from pivot.types import LOSSY_OUTPUT_PHRASE, DisplayCategory, categorize_stage_result
 
@@ -22,6 +23,21 @@ __all__ = [
     "LiveConsoleSink",
     "ResultCollectorSink",
 ]
+
+
+def _console_reason(event: StageCompleted) -> str:
+    """What the console prints under a failed stage.
+
+    The one-line ``display_reason`` when the event has one, else ``reason``. Under ``--verbose``
+    (the root logger at DEBUG) a one-line display gives way to the full ``reason``, the traceback
+    of an unexpected error. An empty display means a log line already names the failure.
+    """
+    if "display_reason" not in event:
+        return event["reason"]
+    display = event["display_reason"]
+    if display and logging.getLogger().isEnabledFor(logging.DEBUG):
+        return event["reason"]
+    return display
 
 
 _CATEGORY_SYMBOL: dict[DisplayCategory, str] = {
@@ -78,7 +94,12 @@ def _format_error_detail(reason: str, *, total: int) -> list[str]:
     total_digits = len(str(total))
     counter_sample = f"[{1:>{total_digits}}/{total}]"
     indent = " " * (2 + len(counter_sample) + 3)
-    return [f"{indent}[dim red]{rich.markup.escape(line)}[/dim red]" for line in reason.split("\n")]
+    # A reason is built from values Pivot read (a lock, a `.pvt`, a remote URL), so it is
+    # escaped line by line and any URL credential in it is hidden.
+    safe = display.redact_url_credentials(reason)
+    return [
+        f"{indent}[dim red]{display.escape_markup(line)}[/dim red]" for line in safe.split("\n")
+    ]
 
 
 def _categorize(event: StageCompleted) -> DisplayCategory:
@@ -168,11 +189,11 @@ def _print_completions(
                 stage_log = logs.get(event["stage"], [])
                 if stage_log:
                     for log_line in stage_log:
-                        escaped = rich.markup.escape(log_line)
+                        escaped = display.escape_markup(log_line)
                         console.print(f"          [dim]{escaped}[/dim]")
-                if event["reason"]:
-                    for detail in _format_error_detail(event["reason"], total=total):
-                        console.print(detail)
+                if detail := _console_reason(event):
+                    for line in _format_error_detail(detail, total=total):
+                        console.print(line)
             elif event["stage"] in warnings_by_stage:
                 buffered = warnings_by_stage[event["stage"]]
                 stage_lines = [
@@ -180,7 +201,7 @@ def _print_completions(
                     for line, count in buffered.stage.items()
                 ]
                 for warning_line in [*buffered.lossy_outputs, *stage_lines]:
-                    escaped = rich.markup.escape(warning_line)
+                    escaped = display.escape_markup(warning_line)
                     console.print(f"          [yellow]{escaped}[/yellow]")
                 if buffered.dropped:
                     console.print(
@@ -255,14 +276,19 @@ class StaticConsoleSink:
                 stage = event["stage"]
                 _buffer_log_line(event, self._stage_logs, self._stage_warnings)
                 if self._show_output:
-                    line = rich.markup.escape(event["line"])
+                    line = display.escape_markup(event["line"])
                     if event["is_stderr"]:
                         self._console.print(f"[dim red]\\[{stage}] {line}[/dim red]")
                     else:
                         self._console.print(f"[dim]\\[{stage}] {line}[/dim]")
             case "engine_diagnostic":
-                msg = rich.markup.escape(event["message"])
-                detail = rich.markup.escape(event["detail"]) if event["detail"] else ""
+                msg = display.escape_markup(display.redact_url_credentials(event["message"]))
+                raw_detail = event["detail"]
+                detail = (
+                    display.escape_markup(display.redact_url_credentials(raw_detail))
+                    if raw_detail
+                    else ""
+                )
                 self._console.print(f"[yellow bold]⚠ Engine diagnostic:[/yellow bold] {msg}")
                 if detail:
                     self._console.print(f"  [dim]{detail}[/dim]")
@@ -440,14 +466,19 @@ class LiveConsoleSink:
                 stage = event["stage"]
                 _buffer_log_line(event, self._stage_logs, self._stage_warnings)
                 if self._show_output:
-                    line = rich.markup.escape(event["line"])
+                    line = display.escape_markup(event["line"])
                     if event["is_stderr"]:
                         self._console.print(f"[dim red]\\[{stage}] {line}[/dim red]")
                     else:
                         self._console.print(f"[dim]\\[{stage}] {line}[/dim]")
             case "engine_diagnostic":
-                msg = rich.markup.escape(event["message"])
-                detail = rich.markup.escape(event["detail"]) if event["detail"] else ""
+                msg = display.escape_markup(display.redact_url_credentials(event["message"]))
+                raw_detail = event["detail"]
+                detail = (
+                    display.escape_markup(display.redact_url_credentials(raw_detail))
+                    if raw_detail
+                    else ""
+                )
                 self._console.print(f"[yellow bold]⚠ Engine diagnostic:[/yellow bold] {msg}")
                 if detail:
                     self._console.print(f"  [dim]{detail}[/dim]")

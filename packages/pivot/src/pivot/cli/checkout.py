@@ -9,10 +9,9 @@ from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import click
 
-from pivot import config, exceptions, project, registry, types
+from pivot import config, project, registry, types
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
-from pivot.cli import errors as cli_errors
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
 from pivot.storage import cache, lock, state, track
@@ -298,18 +297,11 @@ async def _checkout_files_async(
         except click.ClickException as e:
             immediate_errors.append(e)
 
-    try:
-        async with asyncio.TaskGroup() as tg:
-            for abs_path_str, output_hash in files.items():
-                _ = tg.create_task(restore_one(abs_path_str, output_hash))
-    except* Exception as eg:
-        # Convert unexpected exceptions to a friendly error message, rendering a PivotError's
-        # actionable suggestion the same way the top-level CLI error handler does (cli/errors.py).
-        messages = [
-            cli_errors.format_pivot_error(e) if isinstance(e, exceptions.PivotError) else str(e)
-            for e in eg.exceptions
-        ]
-        raise click.ClickException("\n".join(messages)) from None
+    # Anything else a restore raises leaves as an exception group, which the command's error
+    # handler words (cli/decorators.py).
+    async with asyncio.TaskGroup() as tg:
+        for abs_path_str, output_hash in files.items():
+            _ = tg.create_task(restore_one(abs_path_str, output_hash))
 
     # Re-raise immediate failures (all of them, aggregated)
     if immediate_errors:
@@ -513,12 +505,7 @@ def _print_summary(outcomes: list[RestoreOutcome], quiet: bool) -> bool:
 
 @cli_decorators.pivot_command(allow_all=True)
 @click.argument("targets", nargs=-1, shell_complete=completion.complete_targets)
-@click.option(
-    "--checkout-mode",
-    type=click.Choice(["symlink", "hardlink", "copy"]),
-    default=None,
-    help="Checkout mode for restoration (default: project config or hardlink)",
-)
+@cli_decorators.checkout_mode_option
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
 @click.option(
     "--only-missing",

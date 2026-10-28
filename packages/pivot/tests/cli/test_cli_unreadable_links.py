@@ -220,6 +220,25 @@ def test_diff_refuses_an_unreadable_checkout_link(tmp_path: pathlib.Path) -> Non
     )
 
 
+def test_an_unreadable_link_with_a_control_byte_is_escaped(tmp_path: pathlib.Path) -> None:
+    """A pivot-owned unreadable-link failure has one line and escapes a control byte in its path,
+    as the unexpected-error paths do. The control byte never reaches the terminal."""
+    root = _helper_project(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n")
+    link = root / "data" / "p" / "big" / "u\x01.txt"
+    link.symlink_to(outside)
+
+    proc = _pivot(root, "diff", "data/p/big", "--json", env=_helper_unreadable(tmp_path, link))
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "\x01" not in out, out
+    assert repr(os.fspath(link)) in out, out
+    assert out.count("Cannot read symlink") == 1, out
+    assert _EXCEPTION_TEXT.search(out) is None, out
+
+
 @pytest.mark.parametrize(
     ("args", "returncode"),
     [

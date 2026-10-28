@@ -24,17 +24,6 @@ PIPELINE_CONTEXT_KEY = "_pivot_pipeline"
 ALL_PIPELINES_CONTEXT_KEY = "_pivot_all_pipelines"
 
 
-def _pivot_errors(group: BaseExceptionGroup[BaseException]) -> list[exceptions.PivotError]:
-    """Flatten PivotErrors nested in async TaskGroup exception groups."""
-    result = list[exceptions.PivotError]()
-    for error in group.exceptions:
-        if isinstance(error, exceptions.PivotError):
-            result.append(error)
-        elif isinstance(error, BaseExceptionGroup):
-            result.extend(_pivot_errors(cast("BaseExceptionGroup[BaseException]", error)))
-    return result
-
-
 def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
     """Wrap function with Pivot error handling.
 
@@ -56,16 +45,15 @@ def with_error_handling[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         except exceptions.PivotError as e:
             raise errors.handle_pivot_error(e) from e
         except BaseExceptionGroup as eg:
-            # Async TaskGroups wrap exceptions in ExceptionGroup.
-            pivot_errors = _pivot_errors(eg)
-            if pivot_errors:
-                message = "\n".join(errors.format_pivot_error(error) for error in pivot_errors)
-                raise click.ClickException(message) from eg
-            logger.debug("Unhandled ExceptionGroup in CLI command", exc_info=True)
-            raise click.ClickException(repr(eg)) from eg
+            # Async TaskGroups wrap exceptions in ExceptionGroup. A group of PivotErrors only is
+            # handled like one; any other exception in it gets its traceback logged, as below.
+            if eg.split(exceptions.PivotError)[1] is not None:
+                logger.debug("Unhandled exception in CLI command", exc_info=True)
+            raise click.ClickException(errors.format_unhandled_error(eg)) from eg
         except Exception as e:
+            # --verbose shows this traceback; the message is one line naming the problem.
             logger.debug("Unhandled exception in CLI command", exc_info=True)
-            raise click.ClickException(repr(e)) from e
+            raise click.ClickException(errors.format_unhandled_error(e)) from e
 
     return wrapper
 
@@ -174,6 +162,15 @@ resources_option = click.option(
     help="Set a scheduler resource capacity. May be repeated.",
 )
 """The ``--resources`` option of every command that runs stages, parsed to ``dict[str, int]``."""
+
+checkout_mode_option = click.option(
+    "--checkout-mode",
+    type=click.Choice(["symlink", "hardlink", "copy"]),
+    default=None,
+    help="Checkout mode (default: cache.checkout_mode, else hardlink, symlink, copy)",
+)
+"""The ``--checkout-mode`` option of every command that restores outputs: ``checkout``, ``get`` and
+``pull``. None means the configured order."""
 
 
 def store_pipeline_in_context(pipeline: PipelineLike) -> None:

@@ -3045,13 +3045,21 @@ def test_symlink_restore_refuses_a_tree_it_cannot_repair(tmp_path: pathlib.Path)
     assert not cache._tree_layout_marker(tree).exists()
 
 
+@pytest.mark.parametrize(
+    "old_suffix",
+    [
+        pytest.param(".layout-checked", id="pivot-0.3.4-layout-checked"),
+        pytest.param(".verified", id="pivot-0.5.11-size-checked"),
+    ],
+)
 def test_symlink_restore_rechecks_a_partial_tree_an_older_pivot_marked(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, old_suffix: str
 ) -> None:
     """Pivot 0.3.4 marked a tree after checking only its layout, so its mark sits beside partial
-    trees too. The restore checks such a tree again, repairs it, and replaces the old mark."""
+    trees too; pivot 0.3.5 to 0.5.11 marked one after checking only sizes. The restore checks such
+    a tree again, repairs it, and replaces the old mark."""
     cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
-    old_mark = tree.with_name(tree.name + ".layout-checked")
+    old_mark = tree.with_name(tree.name + old_suffix)
     old_mark.touch()
     out = tmp_path / "out"
 
@@ -3060,6 +3068,29 @@ def test_symlink_restore_rechecks_a_partial_tree_an_older_pivot_marked(
     )
 
     assert cache.hash_directory(out, cache_dir=cache_dir)["hash"] == output_hash["hash"]
+    assert cache._tree_layout_marker(tree).exists()
+    assert not old_mark.exists()
+
+
+def test_symlink_restore_repairs_stale_bytes_in_a_complete_tree_pivot_0_5_11_marked(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Pivot 0.3.5 to 0.5.11 marked a tree `.verified` after checking its files' sizes only, so a
+    tree holding every file at its recorded size, one with stale bytes, can carry that mark. The
+    restore checks it by content, repairs the stale file, links the tree and marks it anew."""
+    cache_dir, tree, output_hash = _helper_tree_with_files_missing(tmp_path)
+    (tree / "b.txt").write_text("b.txt " * 100)
+    (tree / "c.txt").write_text("C.TXT " * 100)  # stale bytes of the recorded size
+    old_mark = tree.with_name(tree.name + ".verified")
+    old_mark.touch()
+    out = tmp_path / "out"
+
+    assert cache.restore_from_cache(
+        out, output_hash, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    assert out.resolve() == tree.resolve()
+    assert (out / "c.txt").read_text() == "c.txt " * 100
     assert cache._tree_layout_marker(tree).exists()
     assert not old_mark.exists()
 

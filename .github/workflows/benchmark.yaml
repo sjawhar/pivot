@@ -1,9 +1,19 @@
 name: Benchmark
 
-# Pull requests run every project except the 1,000-stage ones, so each job stays well under an
-# hour. The weekly schedule and manual runs add the 1,000-stage projects.
+# A pull request runs the benchmark only when it carries the `benchmark` label (AGENTS.md says
+# when one gets it): eight jobs, about 140 job-minutes, on the hosted-job cap that every repository
+# of the sjawhar account shares. It runs every project except the 1,000-stage ones, so each job
+# stays well under an hour. The weekly schedule and manual runs add the 1,000-stage projects.
 on:
   pull_request:
+    # ready_for_review: a draft runs no job of this workflow (every job below carries the draft
+    # condition), so marking a pull request that carries `benchmark` ready is what runs them on its
+    # head. Set the repository variable CI_RUN_DRAFT_PRS to `true` to run drafts again (the same
+    # switch in pr-and-main.yaml).
+    # labeled: adding `benchmark` to a ready pull request runs the jobs on its head; adding any
+    # other label skips them. No `unlabeled`: removing `benchmark` starts no run, so a running
+    # benchmark finishes, and the pull request's later pushes skip every job.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   schedule:
     - cron: "0 6 * * 1"
   workflow_dispatch:
@@ -20,12 +30,29 @@ env:
   # 48 keeps multi below the per-PR limit; thresholds use 3x the largest absolute median A/A change across every sample, with a 2% floor.
   BENCH_REPS: 48
 
+# As in pr-and-main.yaml: the runs of one pull request cancel each other, so a push frees the
+# runners of the run it replaced. The weekly run, a workflow_dispatch run (an A/A calibration
+# sample among them) and a run that will skip every job each take a group of their own, the run
+# id, so nothing cancels them and they cancel nothing. A pull-request run skips every job when the
+# pull request is a draft, when it does not carry `benchmark`, or when the event adds another
+# label, so adding an unrelated label never cancels a running benchmark. This condition and the
+# `if` of both jobs are the same; change all three together. A test in benchmarks/test_workflow.py
+# evaluates all three for each kind of event and fails when they disagree.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && (github.event.pull_request.draft != true || vars.CI_RUN_DRAFT_PRS == 'true') && contains(github.event.pull_request.labels.*.name, 'benchmark') && (github.event.action != 'labeled' || github.event.label.name == 'benchmark') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # The jobs only read the repository, and no step after a checkout needs its git credentials.
 permissions:
   contents: read
 
 jobs:
   unit:
+    if: >-
+      github.event_name != 'pull_request' || (
+      (github.event.pull_request.draft != true || vars.CI_RUN_DRAFT_PRS == 'true') &&
+      contains(github.event.pull_request.labels.*.name, 'benchmark') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'benchmark'))
     runs-on: ubuntu-24.04
 
     steps:
@@ -52,6 +79,11 @@ jobs:
         run: uv run pytest benchmarks -p no:randomly
 
   bench:
+    if: >-
+      github.event_name != 'pull_request' || (
+      (github.event.pull_request.draft != true || vars.CI_RUN_DRAFT_PRS == 'true') &&
+      contains(github.event.pull_request.labels.*.name, 'benchmark') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'benchmark'))
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ github.event_name == 'pull_request' && 60 || 240 }}
     name: bench (${{ matrix.project }})

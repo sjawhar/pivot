@@ -5,7 +5,7 @@ import pathlib
 
 import click
 
-from pivot import config, names, project, types
+from pivot import config, display, names, project, types
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -33,7 +33,8 @@ def remote_list() -> None:
 
     for name, url in remotes.items():
         marker = " (default)" if name == default else ""
-        click.echo(f"  {name}: {url}{marker}")
+        shown_url = display.redact_url_credentials(display.escape_control(url))
+        click.echo(f"  {display.escape_control(name)}: {shown_url}{marker}")
 
 
 def _get_targets_list(targets: tuple[str, ...]) -> list[str] | None:
@@ -128,7 +129,8 @@ def push(
 
     if dry_run:
         if not quiet:
-            click.echo(f"Would push {len(local_hashes)} file(s) to '{resolved_name}'")
+            shown = display.escape_control(resolved_name)
+            click.echo(f"Would push {len(local_hashes)} file(s) to '{shown}'")
         return
 
     # Remote hash tracking is project-level (not per-stage), so use the
@@ -153,8 +155,9 @@ def push(
         transferred = result["transferred"]
         skipped = result["skipped"]
         failed = result["failed"]
+        shown = display.escape_control(resolved_name)
         click.echo(
-            f"Pushed to '{resolved_name}': {transferred} transferred, {skipped} skipped, {failed} failed"
+            f"Pushed to '{shown}': {transferred} transferred, {skipped} skipped, {failed} failed"
         )
 
     # Always print errors to stderr and exit non-zero on failures
@@ -214,7 +217,8 @@ def fetch(
         local = transfer.get_local_cache_hashes(cache_dir)
         missing = needed - local
         if not quiet:
-            click.echo(f"Would fetch {len(missing)} file(s) from '{resolved_name}'")
+            shown = display.escape_control(resolved_name)
+            click.echo(f"Would fetch {len(missing)} file(s) from '{shown}'")
         return
 
     with (
@@ -237,8 +241,9 @@ def fetch(
         transferred = result["transferred"]
         skipped = result["skipped"]
         failed = result["failed"]
+        shown = display.escape_control(resolved_name)
         click.echo(
-            f"Fetched from '{resolved_name}': {transferred} transferred, {skipped} skipped, {failed} failed"
+            f"Fetched from '{shown}': {transferred} transferred, {skipped} skipped, {failed} failed"
         )
 
     cli_helpers.print_transfer_errors(result["errors"])
@@ -259,12 +264,7 @@ def fetch(
     is_flag=True,
     help="Only restore files that don't exist in workspace",
 )
-@click.option(
-    "--checkout-mode",
-    type=click.Choice(["symlink", "hardlink", "copy"]),
-    default=None,
-    help="Checkout mode for restoration (default: project config or hardlink)",
-)
+@cli_decorators.checkout_mode_option
 @click.pass_context
 def pull(
     ctx: click.Context,
@@ -322,7 +322,8 @@ def pull(
         local = transfer.get_local_cache_hashes(cache_dir)
         missing = needed - local
         if not quiet:
-            click.echo(f"Would pull {len(missing)} file(s) from '{resolved_name}'")
+            shown = display.escape_control(resolved_name)
+            click.echo(f"Would pull {len(missing)} file(s) from '{shown}'")
         return
 
     # Step 1: Fetch from remote to cache
@@ -346,8 +347,9 @@ def pull(
         transferred = fetch_result["transferred"]
         skipped = fetch_result["skipped"]
         failed = fetch_result["failed"]
+        shown = display.escape_control(resolved_name)
         click.echo(
-            f"Fetched from '{resolved_name}': {transferred} transferred, {skipped} skipped, {failed} failed"
+            f"Fetched from '{shown}': {transferred} transferred, {skipped} skipped, {failed} failed"
         )
 
     cli_helpers.print_transfer_errors(fetch_result["errors"])

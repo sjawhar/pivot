@@ -1,3 +1,4 @@
+import os
 import pathlib
 from difflib import get_close_matches
 from typing import override
@@ -241,8 +242,9 @@ class UnreadableLinkError(CacheError):
     def __init__(self, path: str, reason: str) -> None:
         self.path = path
         self.reason = reason
+        display_path = f"'{path}'" if path.isprintable() else repr(path)
         super().__init__(
-            f"Cannot read symlink '{path}': {reason}. Make the link and what it points to "
+            f"Cannot read symlink {display_path}: {reason}. Make the link and what it points to "
             + "readable, or remove the link."
         )
 
@@ -362,6 +364,13 @@ class RemoteConnectionError(RemoteError):
         return "Check network connection and remote credentials"
 
 
+class RemoteUnreachableError(RemoteConnectionError):
+    """Raised when a connection to the remote cannot be made after the retries: a DNS failure, a
+    refused connection, a connect timeout, a TLS failure or a proxy that cannot be connected to.
+    Every object of the remote fails the same way, unlike a failure of one object on a remote
+    that answered."""
+
+
 class InvalidRemoteURLError(RemoteError):
     """Raised when remote URL is malformed or uses unsupported scheme."""
 
@@ -376,14 +385,6 @@ class RemoteTransferError(RemoteError):
     @override
     def get_suggestion(self) -> str:
         return "Check network connection and remote permissions"
-
-
-class RemoteFetchError(RemoteError):
-    """Raised when fetching from remote fails."""
-
-    @override
-    def get_suggestion(self) -> str:
-        return "Check network connection and verify the file exists on remote"
 
 
 class RemoteNotConfiguredError(RemoteError):
@@ -440,3 +441,33 @@ class PipelineNotFoundError(PivotError):
     @override
     def get_suggestion(self) -> str:
         return "Create pipeline.py to define your pipeline"
+
+
+def describe_error(error: BaseException) -> str:
+    """The text a user reads for ``error``, never a Python repr.
+
+    A PivotError keeps its own message. An OSError is the operating system's message and the
+    path or paths it names, with no exception class: ``<strerror>: <path>``,
+    ``<strerror>: <path> -> <path2>``, or ``<strerror>`` when it names no path; one raised with
+    its own message and no error number keeps that message. Any other exception is one pivot did
+    not expect, named by its type: ``Unexpected <type>: <message>``.
+    """
+    message = str(error)
+    if isinstance(error, PivotError):
+        return message or type(error).__name__
+    if isinstance(error, OSError):
+        if error.strerror:
+            names = (error.filename, error.filename2)
+            paths = [_path_text(name) for name in names if name is not None]
+            return f"{error.strerror}: {' -> '.join(paths)}" if paths else error.strerror
+        if message:
+            return message
+    kind = type(error).__name__
+    return f"Unexpected {kind}: {message}" if message else f"Unexpected {kind}"
+
+
+def _path_text(name: object) -> str:
+    """A path an OSError names, as text; one that is empty or would not print on one line is
+    quoted with its escapes, as the exception's own text quotes it."""
+    text = os.fsdecode(name) if isinstance(name, bytes) else str(name)
+    return text if text and text.isprintable() else repr(text)

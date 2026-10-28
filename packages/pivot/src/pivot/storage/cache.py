@@ -1044,10 +1044,13 @@ def _repair_tree_dir_isexec(cache_dir_path: pathlib.Path, manifest: list[DirMani
             os.chmod(f, 0o555 if entry["isexec"] else 0o444)
 
 
-# The marker's earlier name, which pivot 0.3.4 touched after checking only a tree's layout,
-# partial trees included: every tree is checked once more and the old marker dropped.
-_TREE_LAYOUT_MARKER_SUFFIX = ".verified"
-_LEGACY_TREE_MARKER_SUFFIX = ".layout-checked"
+# The marker's earlier names, which no pivot trusts: pivot 0.3.4 touched `.layout-checked` after
+# checking only a tree's layout, partial trees included, and pivot 0.3.5 to 0.5.11 touched
+# `.verified` after checking each file's size, not its content. Every tree so marked is checked
+# by content on each restore or commit until it is marked anew, which drops the old markers; a
+# user who cannot write its prefix directory cannot mark it.
+_TREE_LAYOUT_MARKER_SUFFIX = ".content-checked"
+_LEGACY_TREE_MARKER_SUFFIXES = (".layout-checked", ".verified")
 # Held exclusively while a tree is checked and repaired; never deleted.
 _TREE_LOCK_SUFFIX = ".lock"
 
@@ -1064,19 +1067,32 @@ def _mark_tree(cache_dir_path: pathlib.Path) -> None:
     so a cache the user cannot write still restores without one."""
     with contextlib.suppress(OSError):
         _tree_layout_marker(cache_dir_path).touch()
-    with contextlib.suppress(OSError):
-        cache_dir_path.with_name(cache_dir_path.name + _LEGACY_TREE_MARKER_SUFFIX).unlink(
-            missing_ok=True
-        )
+    for suffix in _LEGACY_TREE_MARKER_SUFFIXES:
+        with contextlib.suppress(OSError):
+            cache_dir_path.with_name(cache_dir_path.name + suffix).unlink(missing_ok=True)
+
+
+def _tree_file_holds(
+    path: pathlib.Path, path_stat: os.stat_result, entry: DirManifestEntry
+) -> bool:
+    """Whether a tree file, ``path_stat`` its ``os.lstat``, is a regular file holding ``entry``'s
+    bytes: its recorded size and content hash. Hashes the file only once the cheap checks pass.
+    The size is only that cheap check, so an entry without one (a hand-written ``.pvt``; every
+    lock records it) is checked by hash alone."""
+    return (
+        stat.S_ISREG(path_stat.st_mode)
+        and ("size" not in entry or path_stat.st_size == entry["size"])
+        and hash_file(path)[0] == entry["hash"]
+    )
 
 
 def _tree_matches(
     cache_dir_path: pathlib.Path, output_hash: DirHash, scanned: tuple[list[str], list[str]]
 ) -> bool:
-    """Whether a whole-directory SYMLINK cache tree holds exactly the files (each regular, at its
-    recorded size and executable bit) and the directories ``output_hash`` records. ``scanned``
-    is ``_scan_entries(cache_dir_path)``. A recorded path leading outside the tree raises:
-    ``output_hash`` may come straight from a lock file."""
+    """Whether a whole-directory SYMLINK cache tree holds exactly the files (each regular,
+    matching its recorded hash, size and executable bit) and the directories ``output_hash``
+    records. ``scanned`` is ``_scan_entries(cache_dir_path)``. A recorded path leading outside
+    the tree raises: ``output_hash`` may come straight from a lock file."""
     manifest = output_hash["manifest"]
     resolved_tree = cache_dir_path.resolve()
     for entry in manifest:
@@ -1094,11 +1110,10 @@ def _tree_matches(
     if found_dirs - _restored_dirs(output_hash) or not found_dirs.issuperset(empty_dirs):
         return False
     for entry in manifest:
-        found_stat = os.lstat(cache_dir_path / entry["relpath"])
-        if (
-            not stat.S_ISREG(found_stat.st_mode)
-            or found_stat.st_size != entry["size"]
-            or bool(found_stat.st_mode & stat.S_IXUSR) != entry["isexec"]
+        tree_file = cache_dir_path / entry["relpath"]
+        found_stat = os.lstat(tree_file)
+        if bool(found_stat.st_mode & stat.S_IXUSR) != entry["isexec"] or not _tree_file_holds(
+            tree_file, found_stat, entry
         ):
             return False
     return True
@@ -1112,12 +1127,13 @@ def _ensure_tree_complete(
 
     The tree publisher marks a tree once it is complete (``_publish_tree``). A tree without the
     mark is checked: one an older pivot built, which can hold entries its hash does not record
-    and 0o444-everywhere files, or one it copied straight to its name and was killed while
-    copying, leaving files missing or cut short under a name a restore trusts. The check, the
+    and 0o444-everywhere files, one an older pivot marked after checking only sizes, which can
+    hold stale bytes of the recorded size, or one it copied straight to its name and was killed
+    while copying, leaving files missing or cut short under a name a restore trusts. The check, the
     repair and the mark run under the tree's exclusive lock, so two repairers never change the
     tree's directory modes under each other. Returns False, the tree unmarked, when the tree
-    differs and cannot be repaired: a file's object is absent, or this user cannot write the
-    tree or take its lock.
+    differs and cannot be repaired, or cannot be checked: a file's object is absent, or this user
+    cannot read the tree, write it or take its lock.
     """
     marker = _tree_layout_marker(cache_dir_path)
     if marker.exists():
@@ -1138,17 +1154,17 @@ def _ensure_tree_complete(
                 fd = None
         if marker.exists():
             return True
-        scanned = _scan_entries(cache_dir_path)
-        if not _tree_matches(cache_dir_path, output_hash, scanned):
-            if fd is None:
-                return False
-            try:
+        try:
+            scanned = _scan_entries(cache_dir_path)
+            if not _tree_matches(cache_dir_path, output_hash, scanned):
+                if fd is None:
+                    return False
                 _repair_tree_dir_isexec(cache_dir_path, output_hash["manifest"])
                 _repair_tree_dir_layout(cache_dir_path, output_hash, scanned)
                 if not _repair_tree_dir_files(cache_dir_path, output_hash["manifest"], cache_dir):
                     return False
-            except PermissionError:  # another user's tree
-                return False
+        except PermissionError:  # another user's tree, or one with a file this user cannot read
+            return False
         _mark_tree(cache_dir_path)
         return True
     finally:
@@ -1159,9 +1175,9 @@ def _ensure_tree_complete(
 def _repair_tree_dir_files(
     cache_dir_path: pathlib.Path, manifest: list[DirManifestEntry], cache_dir: pathlib.Path
 ) -> bool:
-    """Give a whole-directory SYMLINK cache tree every file its manifest records, at its
-    recorded size, copied from the file's own cache object. Return False, changing nothing, when
-    a file is missing or the wrong size and its object is not cached.
+    """Give a whole-directory SYMLINK cache tree every file its manifest records, copied from
+    its files' own cache objects. Return False, changing nothing, when a file is missing or
+    holds the wrong content and its own cache object is absent.
 
     Each repaired file is copied beside its name and renamed in, so a reader of the tree never
     sees part of one. Changing the tree in place is safe for the reason
@@ -1180,7 +1196,7 @@ def _repair_tree_dir_files(
         except FileNotFoundError:
             pass
         else:
-            if stat.S_ISREG(target_stat.st_mode) and target_stat.st_size == entry["size"]:
+            if _tree_file_holds(target, target_stat, entry):
                 continue
         wrong.append((entry, target))
     if not wrong:
@@ -1386,10 +1402,17 @@ def _resolve_checkout_modes(
 def missing_cache_objects(
     output_hash: HashInfo, cache_dir: pathlib.Path, checkout_modes: list[CheckoutMode]
 ) -> list[str]:
-    """Return hashes required to restore an output that are absent from the cache."""
+    """Return hashes required to restore an output that are absent from the cache.
+
+    With SYMLINK first, an existing whole-directory tree for a directory output is checked, and
+    repaired and marked if it can be, before it is trusted (``_ensure_tree_complete``)."""
     if is_dir_hash(output_hash):
         tree_path = get_cache_path(cache_dir, output_hash["hash"])
-        if checkout_modes[0] == CheckoutMode.SYMLINK and tree_path.exists():
+        if (
+            checkout_modes[0] == CheckoutMode.SYMLINK
+            and tree_path.exists()
+            and _ensure_tree_complete(tree_path, output_hash, cache_dir)
+        ):
             return []
         hashes = [entry["hash"] for entry in output_hash["manifest"]]
     else:
@@ -1593,10 +1616,10 @@ def _store_directory(
             # never changes, so this branch never revisits an existing tree directory above.
             if not _ensure_tree_complete(cache_dir_path, output_hash, cache_dir):
                 raise exceptions.CacheRestoreError(
-                    f"Cache tree {cache_dir_path} differs from what its hash records and cannot "
-                    + "be repaired (a file's cache object is missing, or another user owns it); "
-                    + "remove the tree, or have its owner remove it, to let this commit publish "
-                    + "it again"
+                    f"Cache tree {cache_dir_path} differs from what its hash records, or cannot "
+                    + "be read, and cannot be repaired (a file's cache object is missing, or "
+                    + "another user owns it); remove the tree, or have its owner remove it, to "
+                    + "let this commit publish it again"
                 )
 
             _clear_path(path)
@@ -1788,11 +1811,11 @@ def _restore_directory_from_cache(
     restore_prefix = f"{_RESTORE_TEMP_PREFIX}{target_token}."
 
     if symlink_fast_path and not _ensure_tree_complete(cache_dir_path, output_hash, cache_dir):
-        # Same check as _store_directory. A tree this user cannot repair is not used: the
-        # output is restored file by file from the objects instead, if they are cached.
+        # Same check as _store_directory. A tree this user cannot check or repair is not used:
+        # the output is restored file by file from the objects instead, if they are cached.
         logger.warning(
-            "Cache tree %s differs from what its hash records and cannot be repaired; "
-            + "restoring %s file by file",
+            "Cache tree %s differs from what its hash records, or cannot be read, and cannot be "
+            + "repaired; restoring %s file by file",
             cache_dir_path,
             path,
         )

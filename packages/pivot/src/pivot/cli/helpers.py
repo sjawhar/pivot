@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import enum
 import importlib
-import json
 import sys
 from typing import TYPE_CHECKING, Any, cast, override
 
@@ -16,7 +15,7 @@ if TYPE_CHECKING:
     from pivot.registry import PipelineLike, RegistryStageInfo
     from pivot.storage.store import WorkspaceStore
 
-from pivot import exceptions, names, project
+from pivot import display, exceptions, names, project
 from pivot.cli import decorators as cli_decorators
 
 
@@ -99,10 +98,11 @@ def _json_default(obj: Any) -> Any:  # noqa: ANN401 - json.dumps default require
 def emit_jsonl(event: object) -> None:
     """Emit a single JSONL event to stdout with flush for streaming.
 
-    Handles StrEnum values automatically. Sets are converted to sorted lists.
-    Other non-serializable types will raise TypeError.
+    Handles StrEnum values automatically. Sets are converted to sorted lists. A non-finite
+    float is written as a string (``display.to_json``). Other non-serializable types will
+    raise TypeError.
     """
-    print(json.dumps(event, default=_json_default), flush=True)
+    print(display.to_json(event, default=_json_default), flush=True)
 
 
 def get_cli_context(ctx: click.Context) -> CliContext:
@@ -169,7 +169,7 @@ class TransferProgress:
                 leave=False,
                 unit="file",
             )
-        self._bar.desc = f"{self._action} {filename}"
+        self._bar.desc = f"{self._action} {display.escape_control(filename)}"
         self._bar.update(completed - self._bar.n)
 
 
@@ -178,6 +178,6 @@ def print_transfer_errors(errors: list[str], max_shown: int = 5) -> None:
     if not errors:
         return
     for err in errors[:max_shown]:
-        click.echo(f"  Error: {err}", err=True)
+        click.echo(f"  Error: {display.safe_message(err)}", err=True)
     if len(errors) > max_shown:
         click.echo(f"  ... and {len(errors) - max_shown} more errors", err=True)

@@ -707,9 +707,8 @@ def test_diff_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Path) -> No
 
 
 def test_publish_tree_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Path) -> None:
-    """Publishing a file-by-file symlink checkout as the whole-directory SYMLINK tree, with the
-    cache reached through a symlink: every member link counts, so the tree is complete and
-    marked at once, not left empty for the next commit or restore to repair from the objects."""
+    """A file-by-file symlink checkout published as a whole-directory tree through a symlinked
+    cache has every member (not copied as a user link) and is marked content-checked at once."""
     cache_dir = _helper_cache_through_symlink(tmp_path)
     restored = tmp_path / "restored"
     output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
@@ -718,7 +717,7 @@ def test_publish_tree_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Pat
     cache._publish_tree(restored, tree, output_hash, cache_dir)
 
     assert sorted(p.name for p in tree.iterdir()) == [e["relpath"] for e in output_hash["manifest"]]
-    assert tree.with_name(f"{tree.name}.verified").exists()
+    assert cache._tree_layout_marker(tree).exists()
 
 
 def _helper_refusal(call: Callable[[], str]) -> exceptions.UnreadableLinkError:

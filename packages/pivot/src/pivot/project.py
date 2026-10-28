@@ -49,15 +49,12 @@ def resolve_path(path: str | pathlib.Path) -> pathlib.Path:
 def normalize_path(path: str | pathlib.Path, base: pathlib.Path | None = None) -> pathlib.Path:
     """Make path absolute from base (default: project root), preserving symlinks.
 
-    Accepts both Unix (/) and Windows (\\) path separators.
+    Pivot runs on POSIX only, so ``/`` is the one separator: a backslash is part of a name.
     """
-    from pathlib import PureWindowsPath
-
     if base is None:
         base = get_project_root()
 
-    # Normalize Windows paths to POSIX (handles both \\ and /)
-    p = pathlib.Path(PureWindowsPath(os.fspath(path)).as_posix())
+    p = pathlib.Path(os.fspath(path))
 
     abs_path = p.absolute() if p.is_absolute() else (base / p).absolute()
     return pathlib.Path(os.path.normpath(abs_path))
@@ -88,6 +85,22 @@ def contains_symlink_in_path(path: pathlib.Path, base: pathlib.Path) -> bool:
         current = parent
 
     return False
+
+
+def real_location_outside(path: pathlib.Path, resolved_root: pathlib.Path) -> pathlib.Path | None:
+    """Where ``path`` really is, when that place lies outside ``resolved_root``, else None.
+
+    ``path`` is resolved, so a symlink anywhere on the way counts: this answers where a write
+    through ``path`` lands, which ``normalize_path`` and ``relative_within`` do not (both place a
+    path by its spelling, keeping symlinks). ``resolved_root`` is already resolved, so one walk
+    serves many paths. A ``path`` that cannot be resolved (a NUL byte, a filesystem error) counts
+    as outside and comes back as it was given, because where it leads is unknown.
+    """
+    try:
+        real = path.resolve()
+    except (OSError, ValueError):
+        return path
+    return None if real.is_relative_to(resolved_root) else real
 
 
 def resolve_path_for_comparison(path: str, context: str) -> pathlib.Path:

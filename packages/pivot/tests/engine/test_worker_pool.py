@@ -3,20 +3,26 @@ from __future__ import annotations
 
 import concurrent.futures
 import errno
+import logging
 import os
 import pathlib
 import signal
+import sys
 import threading
 import time
+import types
+import uuid
 from typing import TYPE_CHECKING, cast
 
 import loky.reusable_executor
 import psutil
 import pytest
 
+from pivot import loaded_source
 from pivot.engine import worker_pool
 from pivot.engine.worker_pool import WorkerPool
 from pivot.executor import core as executor_core
+from pivot.executor import worker
 
 if TYPE_CHECKING:
     from multiprocessing.managers import SyncManager
@@ -59,6 +65,11 @@ def _helper_live_loky_workers() -> set[int]:
         except psutil.NoSuchProcess:  # exited (or a zombie) between listing and inspecting
             continue
     return found
+
+
+def _helper_coordinator_records() -> list[str]:
+    """In a worker: the names of the coordinator's loaded-source records it started with."""
+    return sorted(loaded_source._coordinator[1]) if loaded_source._coordinator else []
 
 
 def test_unknown_loky_reusable_executor_layout_names_version(
@@ -363,6 +374,37 @@ def test_run_after_an_idle_worker_died_between_runs_still_runs() -> None:
             pool.end_run()
     finally:
         pool.hard_cancel()
+
+
+def test_start_replaces_workers_that_started_with_other_loaded_source_records(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Workers get the coordinator's loaded-source records once, when they start. After the
+    coordinator loads more user code, the next run's ``start()`` must replace them, or their
+    check compares the stage's modules with records the stage was not fingerprinted against."""
+    name = f"pool_record_{uuid.uuid4().hex}"
+    path = tmp_path / f"{name}.py"
+    pool = WorkerPool()
+    try:
+        pool.start(max_workers=1, idle_timeout_s=None)
+        first = pool.submit(_helper_pid).result(timeout=60)
+        assert name not in pool.submit(_helper_coordinator_records).result(timeout=60)
+        pool.end_run()
+
+        path.write_text("VALUE = 1\n")
+        module = types.ModuleType(name)
+        module.__file__ = str(path)
+        monkeypatch.setitem(sys.modules, name, module)
+        loaded_source.record(str(path), name, b"VALUE = 1\n")
+
+        pool.start(max_workers=1, idle_timeout_s=None)
+        assert pool.submit(_helper_pid).result(timeout=60) != first
+        assert name in pool.submit(_helper_coordinator_records).result(timeout=60)
+        pool.end_run()
+    finally:
+        pool.hard_cancel()
+        monkeypatch.delitem(sys.modules, name, raising=False)
+        loaded_source.prune()
 
 
 # One more than a narrow executor's call queue (2 * max(cpu_count, 1) + 1), so the wide run
@@ -691,3 +733,55 @@ def test_failed_manager_replacement_does_not_poison_later_runs(
         assert pool.output_queue().get(timeout=10) is None
     finally:
         pool.shutdown()
+
+
+@pytest.mark.parametrize("error", [errno.ENOSYS, errno.EPERM])
+def test_stop_workers_bounds_the_stop_when_one_send_fails(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: int
+) -> None:
+    """A send that raises still leaves every other worker signalled and the stop bounded: the
+    grace, the join and the SIGKILL below it run, and the failure names the worker. Without
+    that, one failing send leaves the pool's workers alive and `pivot repro` never exits."""
+    joined = list[int]()
+    killed = list[int]()
+
+    class _Process:
+        pid: int
+        exitcode: int | None
+
+        def __init__(self, pid: int, exitcode: int | None) -> None:
+            self.pid = pid
+            self.exitcode = exitcode
+
+        def join(self, _timeout: float | None = None) -> None:
+            joined.append(self.pid)
+
+    class _Executor:
+        _processes_management_lock: None = None
+        _processes: dict[int, _Process] = {0: _Process(101, None), 1: _Process(102, 0)}
+
+    signalled = list[int]()
+
+    def _terminate(pid: int) -> None:
+        signalled.append(pid)
+        if pid == 101:
+            raise OSError(error, os.strerror(error))
+
+    def _kill_descendants(pid: int) -> None:
+        killed.append(pid)
+
+    def _kill(pid: int, _signal: int) -> None:
+        killed.append(pid)
+
+    monkeypatch.setattr(worker, "terminate", _terminate)
+    monkeypatch.setattr(worker, "kill_descendants", _kill_descendants)
+    monkeypatch.setattr(os, "kill", _kill)
+
+    with caplog.at_level(logging.ERROR, logger=worker_pool._logger.name):
+        WorkerPool._stop_workers(cast("loky.ProcessPoolExecutor", cast("object", _Executor())))
+
+    assert signalled == [101, 102]
+    assert joined[:2] == [101, 102]
+    # 101 never exited, so it and its descendants are killed; 102 exited within the grace.
+    assert killed == [101, 101]
+    assert [r.getMessage() for r in caplog.records] == ["Could not send SIGTERM to worker 101"]

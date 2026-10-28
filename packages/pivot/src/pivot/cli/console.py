@@ -5,6 +5,7 @@ from typing import TextIO
 
 import click
 
+from pivot import display
 from pivot.types import ArtifactIdentity, StageExplanation, identity_key
 
 # ANSI color codes
@@ -114,19 +115,19 @@ class Console:
             old_val = change[old_field]
             new_val = change[new_field]
 
-            self._echo(f"    {key}")
+            self._echo(f"    {display.escape_control(str(key))}")
 
             if change_type == "modified":
-                self._echo(
-                    f"      Old: {self._color(str(old_val) if old_val is not None else 'N/A', 'red')}"
-                )
-                self._echo(
-                    f"      New: {self._color(str(new_val) if new_val is not None else 'N/A', 'green')}"
-                )
+                old_text = display.escape_control(str(old_val) if old_val is not None else "N/A")
+                new_text = display.escape_control(str(new_val) if new_val is not None else "N/A")
+                self._echo(f"      Old: {self._color(old_text, 'red')}")
+                self._echo(f"      New: {self._color(new_text, 'green')}")
             elif change_type == "added":
-                self._echo(f"      {self._color('(added)', 'green')} {new_val}")
+                added = display.escape_control(str(new_val))
+                self._echo(f"      {self._color('(added)', 'green')} {added}")
             else:
-                self._echo(f"      {self._color('(removed)', 'red')} {old_val}")
+                removed = display.escape_control(str(old_val))
+                self._echo(f"      {self._color('(removed)', 'red')} {removed}")
 
     def explain_stage(self, explanation: StageExplanation) -> None:
         """Print detailed explanation of why a stage would run."""
@@ -145,7 +146,7 @@ class Console:
         self._echo(f"  Status: {status_text}")
 
         if reason:
-            self._echo(f"  Reason: {reason}")
+            self._echo(f"  Reason: {display.escape_control(reason, keep_newlines=True)}")
 
         self._print_changes(
             "Code Changes:", explanation["code_changes"], "key", "old_hash", "new_hash"
