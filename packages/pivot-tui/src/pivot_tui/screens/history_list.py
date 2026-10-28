@@ -4,7 +4,6 @@ import logging
 import time
 from typing import TYPE_CHECKING, ClassVar, override
 
-import rich.markup
 import textual.app
 import textual.binding
 import textual.containers
@@ -12,6 +11,7 @@ import textual.css.query
 import textual.screen
 import textual.widgets
 
+from pivot import display
 from pivot_tui.widgets import status
 
 if TYPE_CHECKING:
@@ -62,7 +62,7 @@ class HistoryListScreen(textual.screen.ModalScreen[int | None]):
     def compose(self) -> textual.app.ComposeResult:  # pragma: no cover
         with textual.containers.Container(id="history-dialog"):
             yield textual.widgets.Static(
-                f"[bold]History: {rich.markup.escape(self._stage_name)}[/]", id="history-title"
+                f"[bold]History: {display.escape_markup(self._stage_name)}[/]", id="history-title"
             )
             yield textual.widgets.Static(self._render_table(), id="history-table")
             yield textual.widgets.Static("[j/k] navigate  [Enter] select  [G] live  [Esc] cancel")
@@ -89,7 +89,7 @@ class HistoryListScreen(textual.screen.ModalScreen[int | None]):
 
             # Truncate reason
             reason = entry.reason[:20] if len(entry.reason) > 20 else entry.reason
-            reason_escaped = rich.markup.escape(reason)
+            reason_escaped = display.escape_markup(reason)
 
             # Selection indicator
             is_selected = idx == self._selected_idx

@@ -1,6 +1,6 @@
 [project]
 name = "pivot-workspace"
-version = "0.5.14"
+version = "0.5.15"
 requires-python = ">=3.13,<3.14"
 
 [dependency-groups]
@@ -167,7 +167,11 @@ version_toml = [
   "packages/pivot/pyproject.toml:project.version",
   "packages/pivot-tui/pyproject.toml:project.version",
 ]
-build_command = "uv lock --upgrade-package pivot --upgrade-package pivot-tui && git add uv.lock && uv build --all-packages"
+# pivot-tui imports pivot modules, so the pivot-tui a release publishes must require the pivot
+# released beside it. semantic-release's `version_toml` writes the version; `set_tui_pivot_bound.py`
+# writes `pivot>=<that version>` into pivot-tui's requirement, and `git add` puts both in the
+# release commit. `NEW_VERSION` is the version semantic-release is releasing.
+build_command = "python3 scripts/set_tui_pivot_bound.py && git add packages/pivot-tui/pyproject.toml && uv lock --upgrade-package pivot --upgrade-package pivot-tui && git add uv.lock && uv build --all-packages"
 commit_message = "chore(release): {version}"
 major_on_zero = false
 allow_zero_version = true

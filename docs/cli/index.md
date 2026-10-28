@@ -37,6 +37,22 @@ All commands support:
 | `--quiet` / `-q` | Suppress non-essential output |
 | `--help` | Show help message |
 
+**Output.** Three rules hold for every command:
+
+- **URL credentials are hidden.** Any URL Pivot prints — an import's repository URL, a remote
+  cache URL, a URL in a warning, a log line or an error — shows `***` in place of its user-info:
+  `https://user:token@host/repo.git` prints as `https://***@host/repo.git`. The stored URL is
+  unchanged, and a URL without credentials prints byte for byte. An scp-like `git@host:path` is
+  not a URL and prints as typed.
+- **Control characters are escaped in text output.** A value Pivot read from a file (a `.pvt`
+  file, a lock file, `.pivot/config.yaml`, `params.yaml`, a remote listing) prints each control
+  character as visible text (`\x1b`), tab and newline included, so one value stays on one line
+  and a crafted repository cannot drive the terminal. `--json` output is unchanged: JSON escapes
+  these characters itself.
+- **`--json` and `--jsonl` are strict JSON.** A non-finite float prints as the string
+  `"Infinity"`, `"-Infinity"` or `"NaN"`, so a strict RFC 8259 parser reads every document. See
+  [CI Integration](../guides/ci-integration.md#pivot-status---json).
+
 **Path arguments.** `pivot track`, `push`, `fetch` and `pull` read a relative path from the
 current directory. `diff`, `checkout`, `repro`, `dag`, `get` and `check-ignore` read it from the
 project root, so from `sub/` they take the file `data/x.csv` as `data/x.csv`, not

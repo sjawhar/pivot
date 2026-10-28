@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v0.5.15 (2026-10-28)
+
+### Bug Fixes
+
+- **fingerprint**: Record the code a worker ran when user code is edited during a run
+  ([#518](https://github.com/sjawhar/pivot/pull/518),
+  [`900e30c`](https://github.com/sjawhar/pivot/commit/900e30c273ffc2d1ce1f64b8f19ddde8ceeda9a1))
+
+### Testing
+
+- **fingerprint**: Write queued fingerprint cache entries only into the project that queued them
+  ([#536](https://github.com/sjawhar/pivot/pull/536),
+  [`6c54f8d`](https://github.com/sjawhar/pivot/commit/6c54f8ddd07d6ad730df377495b541d5de57932e))
+
+
 ## v0.5.14 (2026-10-27)
 
 ### Performance Improvements
