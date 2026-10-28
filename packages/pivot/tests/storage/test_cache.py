@@ -4924,6 +4924,7 @@ def test_only_missing_refuses_a_tracked_member_that_lands_after_its_scan(
     member.write_text("cached")
     cache_dir = tmp_path / "cache"
     output_hash = cache.save_to_cache(output, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    assert is_dir_hash(output_hash)
     member.unlink()
     target = ownership.ForcedRestore(
         replacement=ownership.stage_output(output, "p/out"),
