@@ -791,8 +791,8 @@ def test_gc_keeps_an_object_a_pvt_under_a_symlinked_directory_names(
     workspace: Workspace, runner: click.testing.CliRunner
 ) -> None:
     """A project whose data directory is a symlink to another directory inside the project: the
-    walk must follow it and see the .pvt beneath it. The mutant that skips symlinked dirs misses
-    this record and removes the object."""
+    .pvt beneath it is read (the walk reaches the target directly and follows the link without
+    looping), and the object it names is kept."""
     tracked = _helper_publish(workspace, "under-symlink")
     real_dir = workspace["root"] / "data_real"
     real_dir.mkdir()
@@ -809,6 +809,32 @@ def test_gc_keeps_an_object_a_pvt_under_a_symlinked_directory_names(
     assert tracked in _helper_keys(workspace), (
         "an object named by a .pvt under a symlinked directory was removed"
     )
+
+
+def test_gc_keeps_every_object_when_a_symlinked_directory_leaves_the_project(
+    workspace: Workspace,
+    runner: click.testing.CliRunner,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """The review's BLK-2 repro: `data -> /mnt/big`, with the project's only record of an object
+    beneath it. The collection does not follow a link out of the project, so it cannot read that
+    record, and it keeps every object and removes nothing, naming the link. A mutant that stops
+    detecting the outward link collects the object the hidden record names."""
+    tracked = _helper_publish(workspace, "behind an outward link")
+    dead = _helper_publish(workspace, "named by nothing")
+    outside = tmp_path_factory.mktemp("outside-the-project")
+    track.write_pvt_file(
+        outside / "tracked.txt.pvt",
+        track.PvtData(path="tracked.txt", hash=tracked, size=len("behind an outward link")),
+    )
+    (workspace["root"] / "data").symlink_to(outside)
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code == 0, result.output
+    assert "symlinked directories that leave the project" in result.output, result.output
+    assert str(workspace["root"] / "data") in result.output, result.output
+    assert _helper_keys(workspace) >= {tracked, dead}, "a collection removed an object"
 
 
 # =============================================================================

@@ -190,6 +190,18 @@ def register_path(cache_dir: pathlib.Path, project_root: pathlib.Path) -> pathli
     return cache_dir / REGISTER_DIR / f"{digest}.json"
 
 
+def register_entry_is_fresh(cache_dir: pathlib.Path, project_root: pathlib.Path) -> bool:
+    """Whether this project's register entry was written within ``_REGISTER_REFRESH_SECONDS``.
+
+    A read only: a caller that finds the entry fresh writes nothing, so it needs no lock.
+    """
+    try:
+        mtime = register_path(cache_dir, project_root).stat().st_mtime
+    except OSError:
+        return False
+    return time.time() - mtime < _REGISTER_REFRESH_SECONDS
+
+
 def register_project(
     cache_dir: pathlib.Path, project_root: pathlib.Path, state_dir: pathlib.Path
 ) -> None:
@@ -200,14 +212,9 @@ def register_project(
     state. Nothing here may fail a command: a cache this user cannot write stays usable, and a
     cache that does not exist yet is not created to hold a register entry.
     """
-    if not cache_dir.is_dir():
+    if not cache_dir.is_dir() or register_entry_is_fresh(cache_dir, project_root):
         return
     path = register_path(cache_dir, project_root)
-    try:
-        if time.time() - path.stat().st_mtime < _REGISTER_REFRESH_SECONDS:
-            return
-    except OSError:
-        pass
 
     try:
         version = importlib.metadata.version("pivot")

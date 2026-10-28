@@ -76,25 +76,37 @@ Two more rules cover objects no record names yet:
 - **A grace period.** A stage publishes its objects before it writes the lock that names
   them, so an object younger than `--grace-hours` (24 by default) is kept. The age is the
   object's `st_ctime`: a cached file carries its source file's mtime, which says nothing
-  about when it was cached. A run that re-uses an object already in the cache publishes
-  nothing, so pivot refreshes the object's timestamp on that cache hit (git's "update the
-  mtime of an object already present"), which brings a re-used object back inside the grace.
+  about when it was cached. The grace covers objects a run newly publishes; an object a run
+  re-uses is protected by the naming lock below, not by its age.
 - **Hard links.** An object with more than one link is kept, because some directory entry
   outside the cache holds that inode. `--remove-linked` overrides this, for a worktree that
   was deleted without unlinking its outputs; the plan then says how many objects that is.
 
-A collection is safe to run while pipelines publish into the same cache. It takes each prefix
-directory's `.pivot_cache.lock` exclusively while it lists and deletes there, which excludes
-every process staging a new object, and takes `<cache>/gc.lock` for the whole run, so two
-collections never run on one cache. Before it deletes, it re-reads every record a second
-time — after the scan, immediately before the unlink — and keeps any object a run has named
-since the scan; this is what protects an object a concurrent run both re-publishes and names
-while the collection is running. The deletion protocol — including the width of the remaining
-exposure and whether a per-object re-check under the prefix lock can close it — is under a
-design consult and will be settled in a later round; the current implementation re-reads the
-records once at the start of the deletion pass. A collection removes a directory tree with its
-`.content-checked` marker (and the `.layout-checked` and `.verified` markers older pivot
-versions wrote), and never removes a lock file or a `.pivot_tmp_*` entry another process owns.
+A collection is safe to run while pipelines use the same cache, by mutual exclusion rather
+than timing. Every pivot command that names a cache object — a stage committing its outputs
+or restoring them from the run cache, `pivot commit`, `pivot track`, `pivot get --rev`, and a
+project recording itself in a shared cache — holds `<cache>/naming.lock` shared from its first
+look at an object to the record that names it. `pivot gc` holds the same lock exclusive while
+it re-reads the register, prunes run history, re-reads every record and deletes, so no object
+can be named between that re-read and its removal. The shared lock covers only those short
+commit steps, never a stage's execution, and a turnstile keeps a stream of writers from
+starving a collection. The plan and the prompt run before the lock is taken, so a dry run or a
+waiting prompt blocks nobody. A collection also takes `<cache>/gc.lock`, so two collections
+never run on one cache, and each prefix directory's `.pivot_cache.lock` while it deletes
+there. It removes a directory tree with its `.content-checked` marker (and the
+`.layout-checked` and `.verified` markers older pivot versions wrote), markers first, and
+never removes a lock file or a `.pivot_tmp_*` entry another process owns.
+
+What this does and does not cover: there is no timing window between pivot processes that take
+the lock. It holds when every pivot that uses the cache is this version or newer, the
+filesystem honours `flock` across every host that mounts the cache, and every project that
+shares the cache is in its register. A pivot older than this release that re-uses a cached
+output during a collection can have that output removed (the grace still protects what it
+newly publishes). Where the filesystem refuses `flock` (NFS mounted `nolock`, some Lustre and
+network filesystems), `pivot gc` refuses to collect at all; collect such a cache with every
+pivot process stopped, or move it to a filesystem with working locks. `pivot gc` cannot detect
+a mount that keeps locks local to each host (NFS `local_lock`), and must not be run across
+hosts on one.
 
 ### A Cache Several Projects Share
 
@@ -289,6 +301,11 @@ Record current outputs in lock files and cache without re-running:
 ```
 $ pivot commit demo/train
 ```
+
+Outputs a `pivot repro --no-commit` run wrote, unchanged since, are recorded
+against the code that run ran, so a code edit made during or after it still
+reruns the stage. Other outputs (edited by hand, or written another way) are
+recorded against the code on disk now.
 
 ### `pivot gc`
 

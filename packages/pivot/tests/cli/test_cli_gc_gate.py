@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import time
 from typing import TYPE_CHECKING, TypedDict
 
 import pytest
@@ -131,14 +130,11 @@ def _helper_keys(space: Workspace) -> set[str]:
 # =============================================================================
 
 
-# test_gc_keeps_an_object_a_concurrent_run_republished_and_named — DELETED.
-# This test's monkeypatch wrote a lock inside gc's own process while gc held the exclusive
-# naming lock, which the naming-lock protocol makes impossible by construction (a real writer
-# blocks on naming.lock shared). The INTENT — an object a concurrent run names mid-run is not
-# removed — is now guaranteed by the protocol and tested by:
-#   (a) the VM race proof (100,000 objects, --yes, victim named mid-run, 0 live removed),
-#   (b) the writer-shared-acquire mutant (dropping naming_unit from a writer site kills it).
-# Both are listed in the PR body.
+# Finding B1 (an object a concurrent run re-publishes and names is removed) is tested in
+# test_cli_gc_protocol.py, through real pivot processes: a stage commit and a run-cache skip each
+# wait while a collection holds the naming lock, and a collection proceeds while a stage runs.
+# The gate's original B1 test monkeypatched a lock write inside gc's own process while gc held
+# the exclusive lock, an interleaving the protocol rules out, so it was replaced, not kept.
 
 
 # =============================================================================

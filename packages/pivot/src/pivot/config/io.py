@@ -339,9 +339,10 @@ def register_cache_use() -> None:
     except exceptions.ProjectNotInitializedError:
         return
     cache_dir = get_cache_dir()
-    if not cache_dir.is_dir():
-        # A cache that has stored nothing has nothing a collection could remove; recording a
-        # user must not create it (naming_unit would).
+    if not cache_dir.is_dir() or gc.register_entry_is_fresh(cache_dir, root):
+        # A cache that has stored nothing has nothing a collection could remove, and recording
+        # a user must not create it (naming_unit would). A fresh entry means nothing is
+        # written, so there is nothing to order against a collection and no lock is taken.
         return
     with gc.naming_unit(cache_dir):
         gc.register_project(cache_dir, root, get_state_dir())

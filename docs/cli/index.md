@@ -50,7 +50,9 @@ project: from a `link -> project` symlink, `link/data/x.csv` names `data/x.csv`.
 inside the project is not followed: from `project/dlink -> data`, `dlink/x.csv` matches no
 output in `diff`, `checkout`, `repro`, `dag`, `push`, `fetch` and `pull`, so give the path it
 points to, `data/x.csv`. `track` tracks a file through such a symlink, with a warning that the
-file is inside a symlinked directory.
+file is inside a symlinked directory, unless the directory really lies outside the project:
+then the `.pvt` would be written outside too, where no command finds it again, so `track`
+refuses ("its .pvt would be written outside the project").
 
 `pivot get` refuses every absolute path ("Path traversal not allowed in target").
 `pivot check-ignore` keeps a path under a symlink as typed, so a pattern anchored to the project
@@ -60,6 +62,15 @@ root.
 A path that leaves the project, including `link/../x.csv`, is refused by `checkout`, `push`,
 `fetch`, `pull` and `track` (`resolves outside project root`) and matches no output in
 `diff`, `repro` and `dag`.
+
+**A `.pvt` restores its file only inside the project.** `checkout`, `pull` and
+`repro --checkout-missing` read every `.pvt` under the project root and restore the file its
+`path:` names. A `.pvt` is skipped, with a warning naming it and exit code 0, when its `path:`
+names no file (`.`, `./` or empty), holds `..`, is absolute, or names a file whose directory
+really lies outside the project, through a symlink. `pivot track` and `pivot import` write
+`path:` as the name of the file beside the `.pvt`, which is always restored; any other value
+is warned about, because `checkout x.pvt`, `get`, `update` and `push` take the file beside the
+`.pvt` while `checkout` with no target takes `path:`.
 
 ---
 
@@ -235,6 +246,8 @@ pivot commit [STAGES...] [OPTIONS]
 ```
 
 Without arguments, commits all stale stages. With stage names, unconditionally commits those stages.
+
+The code a lock records depends on where the outputs came from. If they are the outputs a `pivot repro --no-commit` run wrote, unchanged since, the lock records the code that run ran, so an edit made while it ran, or since, still reruns the stage. Otherwise (outputs edited by hand, or written another way) the lock records the code on disk now: the "trust me" path.
 
 **Options:**
 
