@@ -258,10 +258,50 @@ _pass_memo: contextvars.ContextVar[dict[tuple[str, int | str], Any] | None] = (
 )
 
 
+type _TypeAttributeProbe = tuple[bool, bool, Any, bool, bool]
+# Per real type: the type (held so its id is not reused) and its facts per attribute name.
+type _TypeAttributeMemo = dict[int, tuple[type[Any], dict[str, _TypeAttributeProbe]]]
+# Per real type whose route its MRO alone decides: the type and the route (see `_type_memo`).
+type _TypeDumpRoutes = dict[int, tuple[type[Any], _DumpRoute | None]]
+
+# The real-MRO facts of the types met while the memo lives, and the canonical form's
+# `model_dump` route for those whose MRO alone decides it: `ASK_KEPT` for a type whose MRO both
+# defines `__getattr__` and keeps `model_dump` (as a pydantic model), None for one with no
+# class-side hook for it (no `__getattr__`, no class-level `model_dump`, no `__getattribute__`
+# or `__class__` but `object`'s), whose instances main's C `hasattr` then asks, reading only the
+# real instance dict. They are separate from `_pass_memo` so the hot probe does not allocate a
+# `(kind, id)` tuple or call its generic wrapper for each value. Keyed by id with the type held,
+# never hashed: a metaclass `__hash__` or `__eq__` never runs, and an id is not reused while the
+# memo lives. It lives for one `fingerprint_pass()`, or else for one stage's fingerprint
+# (`_type_facts_scope`).
+_type_memo: contextvars.ContextVar[tuple[_TypeAttributeMemo, _TypeDumpRoutes] | None] = (
+    contextvars.ContextVar("_type_memo", default=None)
+)
+
+
+@contextlib.contextmanager
+def _type_facts_scope() -> Iterator[None]:
+    """Hold the real-MRO facts of the types met inside, unless an enclosing scope already does.
+
+    `fingerprint_pass()` holds them for a pass over many stages; a stage's fingerprint, a cache
+    hit's re-read included, holds them for itself, so a value repeated across a stage's bound
+    arguments pays the walk once. The facts are not kept past the scope, so a class changed
+    later is read again.
+    """
+    if _type_memo.get() is not None:
+        yield
+        return
+    token = _type_memo.set(({}, {}))
+    try:
+        yield
+    finally:
+        _type_memo.reset(token)
+
+
 @contextlib.contextmanager
 def fingerprint_pass() -> Iterator[None]:
-    """Share function identities, type-hint classes, user-class members, mark decisions and
-    source digests across one pass over many stages.
+    """Share function identities, type-hint classes, user-class members, mark decisions, type
+    MRO facts and source digests across one pass over many stages.
 
     A cache hit re-reads every recorded value, and stages of one pipeline read the same
     helpers, model classes and source files: inside the pass each is named or read once. The
@@ -272,9 +312,13 @@ def fingerprint_pass() -> Iterator[None]:
         yield
         return
     token = _pass_memo.set({})
+    # The pass holds the type facts itself (as `_type_facts_scope` would), without a second
+    # context manager per pass.
+    type_token = _type_memo.set(({}, {}))
     try:
         yield
     finally:
+        _type_memo.reset(type_token)
         _pass_memo.reset(token)
 
 
@@ -1100,7 +1144,7 @@ def get_stage_fingerprint(
 
     _t = metrics.start()
     try:
-        with _collected_capture_errors():
+        with _collected_capture_errors(), _type_facts_scope():
             return _get_stage_fingerprint_impl(func, visited)
     finally:
         metrics.end("fingerprint.get_stage_fingerprint", _t)
@@ -1145,7 +1189,7 @@ def stage_fingerprint_scope(stage_name: str) -> Iterator[StageFingerprintScope]:
     token = _current_stage_name.set(stage_name)
     scope_token = _stage_scope.set(scope)
     try:
-        with _collected_capture_errors():
+        with _collected_capture_errors(), _type_facts_scope():
             yield scope
     finally:
         _stage_scope.reset(scope_token)
@@ -1163,7 +1207,7 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
     from pivot import state_dir as state_dir_mod
 
     _t = metrics.start()
-    with state_dir_mod.entry_invocation():
+    with state_dir_mod.entry_invocation(), _type_facts_scope():
         # Try cache hit
         cached = _try_manifest_cache_hit(stage_name, func)
         if cached is not None:
@@ -2103,6 +2147,12 @@ class _DumpRoute(enum.Enum):
     STATIC = "static"
 
 
+# The routes the canonical form compares once per value, read as globals rather than as enum
+# members through their class.
+_ASK_KEPT = _DumpRoute.ASK_KEPT
+_STATIC = _DumpRoute.STATIC
+
+
 def _keeps_own_attribute(obj: Any, name: str) -> bool:
     """Whether `obj` keeps `name` of its own: in its instance `__dict__`, or in the namespace of
     a class on its real MRO (a slot, a property, a method, a class attribute). Nothing of `obj`,
@@ -2110,25 +2160,76 @@ def _keeps_own_attribute(obj: Any, name: str) -> bool:
     return _probe_own_attribute(obj, name, False) is not None
 
 
-def _probe_own_attribute(obj: Any, name: str, forwarding: bool) -> _DumpRoute | None:
-    """`STATIC` when `obj` keeps `name` of its own; with `forwarding`, `ASK` or `ASK_KEPT` first
-    when `obj` may answer names it does not keep; otherwise None. One walk over the real MRO
-    decides it.
+def _read_type_attribute_probe(cls: type[Any], name: str) -> _TypeAttributeProbe:
+    """Read `_probe_own_attribute`'s real-MRO facts without executing class-side code."""
+    forwards = False
+    keeps = False
+    instance_dict: Any = None
+    reports_class = False
+    for klass in _class_mro(cls):
+        namespace = _class_namespace(klass)
+        if klass is not object:
+            reports_class = reports_class or (
+                "__class__" in namespace or "__getattribute__" in namespace
+            )
+        forwards = forwards or "__getattr__" in namespace
+        if name in namespace:
+            keeps = True
+        elif instance_dict is None and "__dict__" in namespace:
+            entry = namespace["__dict__"]
+            if (
+                type(entry) is _GETSET_DESCRIPTOR or type(entry) is _MEMBER_DESCRIPTOR
+            ) and entry.__objclass__ is klass:
+                instance_dict = entry.__get__
+    has_instance_dict = instance_dict is not None or (not keeps and bool(_class_dictoffset(cls)))
+    return forwards, keeps, instance_dict, has_instance_dict, reports_class
 
-    Nothing of `obj`, its class or its metaclass runs. The MRO and each class namespace are read
-    through `type`'s own descriptors (`_class_mro`, `_class_namespace`), and types are compared by
-    identity, so no metaclass `__getattribute__`, `__mro__` property, `__eq__` or `__hash__` is
-    asked, and the walk is bounded by the real MRO. The instance `__dict__` is read through the C
-    descriptor a class on that MRO keeps for it. Without one, an instance of a class with no dict
-    offset (a `__slots__` class without `__dict__`, a namedtuple) has no dict, and the answer is
-    no; any other (a class whose `__dict__` is a property) is asked through
+
+def _type_attribute_probe(cls: type[Any], name: str) -> _TypeAttributeProbe:
+    """Read the static part of `_probe_own_attribute` once per real type and fingerprint pass.
+
+    The cache is keyed by the type's id and holds the type strongly, so it cannot be reused. It
+    never hashes the type: a metaclass may define `__hash__` or `__eq__` as user code. The
+    instance-dict read and a reported `__class__` remain per value.
+    """
+    memo = _type_memo.get()
+    if memo is None:
+        return _read_type_attribute_probe(cls, name)
+    facts = memo[0]
+    key = id(cls)
+    entry = facts.get(key)
+    if entry is None:
+        probes: dict[str, _TypeAttributeProbe] = {}
+        facts[key] = (cls, probes)
+    else:
+        probes = entry[1]
+    result = probes.get(name)
+    if result is None:
+        result = _read_type_attribute_probe(cls, name)
+        probes[name] = result
+    return result
+
+
+def _probe_own_attribute(
+    obj: Any, name: str, forwarding: bool, facts: _TypeAttributeProbe | None = None
+) -> _DumpRoute | None:
+    """`STATIC` when `obj` keeps `name` of its own; with `forwarding`, `ASK` or `ASK_KEPT` first
+    when `obj` may answer names it does not keep; otherwise None.
+
+    The real MRO and each class namespace are read through `type`'s own descriptors
+    (`_class_mro`, `_class_namespace`), and types are compared by identity, so no metaclass
+    `__getattribute__`, `__mro__` property, `__eq__` or `__hash__` is asked. That static part is
+    memoized by real type within one `fingerprint_pass()`; the memo holds the type strongly and
+    ends with the pass. The instance `__dict__` is still read from each value through the C
+    descriptor a class on that MRO keeps for it. Without one, an instance of a class with no
+    dict offset (a `__slots__` class without `__dict__`, a namedtuple) has no dict, and the
+    answer is no; any other (a class whose `__dict__` is a property) is asked through
     `_generic_getattribute`, the generic C lookup main's `hasattr` makes minus the `__getattr__`
-    fallback. It is reached only after the walk has shown that no class on the MRO holds
+    fallback. It is reached only after the static walk has shown that no class on the MRO holds
     `name`, so it finds no descriptor to run and reads the instance dict the C way, past any
-    `__dict__` property. An object that answers every name it lacks (a
-    `unittest.mock.MagicMock`, an attribute tree) does not read as keeping it. Only
-    `AttributeError` means no; any other error (a dict key's own `__eq__`) propagates, as it
-    does from main's `hasattr`.
+    `__dict__` property. An object that answers every name it lacks (a `unittest.mock.MagicMock`,
+    an attribute tree) does not read as keeping it. Only AttributeError means no; any other
+    error (a dict key's own `__eq__`) propagates, as it does from main's `hasattr`.
 
     With `forwarding`, a value whose real class defines `__getattr__` on its MRO (a pydantic
     model, whose `BaseModel` defines it; a hand-written forwarder that delegates to a target held
@@ -2136,48 +2237,32 @@ def _probe_own_attribute(obj: Any, name: str, forwarding: bool) -> _DumpRoute | 
     that reports a class other than `type(obj)` as `__class__` (a proxy that forwards through
     `__getattribute__`), keeps its data where no static read reaches it, and the canonical form
     asks it by attribute lookup: `ASK_KEPT` when a class on the real MRO or on the reported
-    class's MRO keeps `name`, `ASK` when none does (see `_DumpRoute`). The walk then runs until
-    the real MRO shows both or ends, since a later class may keep `name` or define `__getattr__`.
-    The reported class is read as `isinstance` reads it, by `getattr(obj, "__class__", None)`,
-    where only `AttributeError` means none, and `issubclass(type(reported), type)` asks the real
-    type, not a `__class__`.
+    class's MRO keeps `name`, `ASK` when none does (see `_DumpRoute`). The reported class is read
+    as `isinstance` reads it, by `getattr(obj, "__class__", None)`, where only AttributeError
+    means none, and `issubclass(type(reported), type)` asks the real type, not a `__class__`.
     """
-    cls = type(obj)  # pyright: ignore[reportUnknownVariableType] - any class
-    forwards = False
-    keeps = False
-    instance_dict: Any = None
-    for klass in _class_mro(cls):
-        namespace = _class_namespace(klass)
-        # Once the real MRO shows both `__getattr__` and `name`, the route is `ASK_KEPT` whatever
-        # the value reports as `__class__`, so the walk ends there (a pydantic model's `BaseModel`
-        # holds both) and the reported class is not read.
-        if forwarding and "__getattr__" in namespace:
-            if keeps:
-                return _DumpRoute.ASK_KEPT
-            forwards = True
-        if name in namespace:
-            if not forwarding:
-                return _DumpRoute.STATIC
-            if forwards:
-                return _DumpRoute.ASK_KEPT
-            keeps = True
-        elif instance_dict is None and "__dict__" in namespace:
-            entry = namespace["__dict__"]
-            if (
-                type(entry) is _GETSET_DESCRIPTOR or type(entry) is _MEMBER_DESCRIPTOR
-            ) and entry.__objclass__ is klass:
-                instance_dict = entry
+    cls: type[Any] = type(obj)  # pyright: ignore[reportUnknownVariableType] - any class
+    forwards, keeps, instance_dict, has_instance_dict, reports_class = (
+        _type_attribute_probe(cls, name) if facts is None else facts
+    )
     if forwarding:
-        reported = getattr(obj, "__class__", None)
-        if reported is not cls and issubclass(type(reported), type):
-            forwards = True
-            keeps = keeps or any(name in _class_namespace(k) for k in _class_mro(reported))
+        if forwards and keeps:
+            return _DumpRoute.ASK_KEPT
+        # Only a class other than `object` that defines `__class__` or `__getattribute__` can
+        # report another class; without one, `obj.__class__` is `type(obj)` and is not read.
+        if reports_class:
+            reported = getattr(obj, "__class__", None)
+            if reported is not cls and issubclass(type(reported), type):
+                forwards = True
+                if not keeps:
+                    reported_class = cast("type[Any]", reported)
+                    keeps = _type_attribute_probe(reported_class, name)[1]
         if forwards:
             return _DumpRoute.ASK_KEPT if keeps else _DumpRoute.ASK
     if keeps:
         return _DumpRoute.STATIC
     if instance_dict is not None:
-        found = instance_dict.__get__(obj)
+        found = instance_dict(obj)
         if type(found) is dict:
             holds = name in found
         # An instance `__dict__` that is a dict subclass: its own `__contains__` is class-side
@@ -2189,13 +2274,44 @@ def _probe_own_attribute(obj: Any, name: str, forwarding: bool) -> _DumpRoute | 
         else:
             holds = name in found
         return _DumpRoute.STATIC if holds else None
-    if not _class_dictoffset(cls):  # no instance dict: nothing for the lookup to find
+    if not has_instance_dict:
         return None
     try:
         _generic_getattribute(obj, name)
     except AttributeError:
         return None
     return _DumpRoute.STATIC
+
+
+def _model_dump_route(
+    value: Any, value_type: type[Any], routes: _TypeDumpRoutes | None
+) -> _DumpRoute | None:
+    """The canonical form's `model_dump` route for a value that is not an exact built-in.
+
+    A class is never dumped, whatever its metaclass reports: `isinstance(value, type)` is asked
+    before any probe. It reads the real type, then the reported `__class__`, so a type is
+    recorded in `routes` only when no class on its MRO but `object` defines `__class__` or
+    `__getattribute__`: then every instance reports its real type, which is no metaclass, and
+    the guard answers no for each without being asked again. Such a type is recorded when the
+    type alone decides the route (see `_type_memo`): `ASK_KEPT` when its MRO defines
+    `__getattr__` and keeps `model_dump`, as `_probe_own_attribute` answers first for it, or
+    main's C `hasattr` when it has no class-side hook for `model_dump` either, which reads only
+    the real instance dict, as `_probe_own_attribute` does. Later instances skip the probe.
+    """
+    if isinstance(value, type):
+        return None
+    facts = _type_attribute_probe(value_type, "model_dump")
+    forwards, keeps, _, _, reports_class = facts
+    if not reports_class:
+        if forwards and keeps:
+            if routes is not None:
+                routes[id(value_type)] = (value_type, _ASK_KEPT)
+            return _ASK_KEPT
+        if not (forwards or keeps):
+            if routes is not None:
+                routes[id(value_type)] = (value_type, None)
+            return _STATIC if hasattr(value, "model_dump") else None
+    return _probe_own_attribute(value, "model_dump", True, facts)
 
 
 def _is_user_class_instance(value: Any) -> bool:
@@ -3008,17 +3124,20 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     dumped by its `model_dump` as main dumps it, by one of two routes. A value that may answer
     names it does not keep, because its class defines `__getattr__` on its MRO (a pydantic model,
     a forwarder) or it reports a class other than its own type as `__class__` (a transparent
-    proxy), is asked by attribute lookup, as main asks, and dumped only when `model_dump` is
-    callable and returns an exact dict, so an object that answers every name with junk (a
-    `MagicMock`, an attribute tree) gets the plain form. An error other than AttributeError from
-    that lookup propagates, as from main's `hasattr`, when a class on the value's MRO or on its
-    reported class's MRO keeps `model_dump`; when none does, it is the object's "absent" signal
-    and means no. Beyond the `__class__` read each `isinstance` check makes, as main's do, that
-    lookup is the one place the probe runs the value's own code. Any other value is dumped when
-    it keeps `model_dump` of its own (`_keeps_own_attribute`, which runs none of its code). The
-    dump is in python mode, which keeps each secret (`SecretStr`, `SecretBytes`, `Secret[T]`) as
-    its own object; a secret becomes `["secret", digest]`, the
-    keyed digest the lock file records for it (`parameters.secret_digest`), so changing it
+    proxy), is asked by attribute lookup, as main asks. On ASK, where no class keeps
+    `model_dump`, it is dumped only when the answer is callable and returns an exact dict, so an
+    object that answers every name with junk (a `MagicMock`, an attribute tree) gets the plain
+    form. On ASK_KEPT, where a class keeps `model_dump`, the callable result is dumped as main
+    dumps it; RootModel returns its root, which can be a list, a secret or a scalar. An error
+    other than AttributeError from that lookup propagates, as from main's `hasattr`, when a class
+    on the value's MRO or on its reported class's MRO keeps `model_dump`; when none does, it is
+    the object's "absent" signal and means no. Beyond the `__class__` read each `isinstance`
+    check makes, as main's do, that lookup is the one place the probe runs the value's own code.
+    Any other value is dumped when it keeps `model_dump` of its own (`_keeps_own_attribute`,
+    which runs none of its code). The dump is in python mode, which keeps each secret
+    (`SecretStr`, `SecretBytes`, `Secret[T]`) as its own object; a secret becomes
+    `["secret", digest]`, the keyed digest the lock file records for it
+    (`parameters.secret_digest`), so changing it
     changes the hash and no fingerprint holds its value. A dataclass instance becomes
     `[module.qualname, canonical({field: value})]`, field by field, so a secret inside one
     reaches that leaf rather than the generated repr's mask. An object whose class keeps
@@ -3037,53 +3156,46 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         return ["re.Pattern", _canonicalize_value_for_hash(pattern.pattern), pattern.flags]
     if id(value) in active:
         return ["cycle", len(active) - active.index(id(value))]
-    # The mark decision. The canonical form is where a value bound in a loader field or a
-    # partial argument meets it (`_process_bound_values` leaves both answers here), so it comes
-    # before every branch that could name the value without it: `model_dump`, the function
-    # identity, and the library-callable test, which would name a `functools.cache` wrapper
-    # over a class-based decorator over the mark and drop the class. A chain with a user class
-    # instance above the mark is refused. A marked instance of a class-based decorator is named
-    # like a marked function: its own `__dict__` is not dumped.
-    # An exact dict, list, tuple, set, frozenset or bytes skips both probes below: an exact
-    # instance has no `__dict__`, and neither its type nor `object` holds a mark, a `__wrapped__`
-    # or a `model_dump`, which a built-in type cannot gain. Scalars, `str` and None returned
-    # above. The set lookup hashes the type, so it is reached only for a type whose metaclass is
-    # `type` itself, whose `__hash__` and `__eq__` are identity in C (a class cannot override them
-    # for itself); a type with another metaclass, whose `__hash__` or `__eq__` may run code or
-    # raise, is no built-in and skips the lookup.
-    value_type = type(value)  # pyright: ignore[reportUnknownVariableType] - any class
-    builtin = type(value_type) is type and value_type in _BUILTIN_TYPES  # pyright: ignore[reportUnknownArgumentType] - the type of any value
-    decision = None if builtin else _mark_decision(value)
-    if decision is _MarkDecision.REFUSED:
-        _refuse_class_above_mark(value)
-    # Main dumped every value with a `model_dump` (`hasattr`) that is not a class; so does this
-    # walk, by one of the routes `_probe_own_attribute` picks. A class is never dumped, whatever
-    # its metaclass reports: `not isinstance(value, type)` is asked first, so no probe asks one.
-    if not builtin and not isinstance(value, type):
-        route = _probe_own_attribute(value, "model_dump", True)
-        if route is _DumpRoute.ASK or route is _DumpRoute.ASK_KEPT:
-            # A value that may answer names it does not keep (its class defines `__getattr__`,
-            # or it reports another class) is asked by attribute lookup, as main asks: beyond the
-            # `__class__` read each `isinstance` makes, the one place the probe runs the value's
-            # code, as main does. When a class keeps `model_dump`, the attribute exists and an
-            # error from the lookup propagates, as from main's `hasattr`; when none does, an
-            # error is the object's "absent" signal and means no (`_attribute_or_none`). It is
-            # dumped only when `model_dump` is callable and returns an exact dict, pydantic's
-            # contract: an object that answers every name with junk (a `MagicMock`, whose answer
-            # returns a `MagicMock`; an attribute tree, whose answer is not callable) gets the
-            # plain form.
-            if route is _DumpRoute.ASK_KEPT:
-                dump = getattr(value, "model_dump", None)
-            else:
-                dump = _attribute_or_none(value, "model_dump")
-            if callable(dump):
-                dumped = dump()
-                if type(dumped) is dict:
-                    return _canonicalize_value_for_hash(dumped, (*active, id(value)))
-        elif route is _DumpRoute.STATIC:
-            # Any other value keeps the static probe, which runs none of its code and agrees
-            # with `hasattr` for a class that defines no `__getattr__`; it is dumped as main
-            # dumps it.
+    # An exact dict, list, tuple, set, frozenset or bytes skips every branch up to the container
+    # branches: an exact instance has no `__dict__`, is not callable, and neither its type nor
+    # `object` holds a mark, a `__wrapped__` or a `model_dump`, which a built-in type cannot gain.
+    # Scalars, `str` and None returned above. The set lookup hashes the type, so it is reached
+    # only for a type whose metaclass is `type` itself, whose `__hash__` and `__eq__` are identity
+    # in C (a class cannot override them for itself); a type with another metaclass, whose
+    # `__hash__` or `__eq__` may run code or raise, is no built-in and skips the lookup.
+    value_type: type[Any] = type(value)  # pyright: ignore[reportUnknownVariableType] - any class
+    if type(value_type) is not type or value_type not in _BUILTIN_TYPES:
+        # The mark decision. The canonical form is where a value bound in a loader field or a
+        # partial argument meets it (`_process_bound_values` leaves both answers here), so it
+        # comes before every branch that could name the value without it: `model_dump`, the
+        # function identity, and the library-callable test, which would name a `functools.cache`
+        # wrapper over a class-based decorator over the mark and drop the class. A chain with a
+        # user class instance above the mark is refused. A marked instance of a class-based
+        # decorator is named like a marked function: its own `__dict__` is not dumped.
+        # `_mark_decision` answers None before any read while no mark exists (`_marks_made`);
+        # asking the flag here keeps that common case free of a call per value.
+        if _marks_made:
+            decision = _mark_decision(value)
+            if decision is _REFUSED:
+                _refuse_class_above_mark(value)
+        else:
+            decision = None
+        # Main dumped every value with a `model_dump` (`hasattr`) that is not a class; so does
+        # this walk, by one of the routes `_probe_own_attribute` picks (`_model_dump_route`). A
+        # class is never dumped, whatever its metaclass reports. A real type whose route its MRO
+        # alone decides takes it from `_type_memo`: `ASK_KEPT`, or main's C `hasattr`, which for
+        # a type with no class-side hook reads only the real instance dict. No class's type is
+        # recorded there.
+        memo = _type_memo.get()
+        routes = None if memo is None else memo[1]
+        known = None if routes is None else routes.get(id(value_type))
+        if known is None:
+            route = _model_dump_route(value, value_type, routes)
+        elif (route := known[1]) is None:
+            route = _STATIC if hasattr(value, "model_dump") else None
+        if route is _STATIC:
+            # The static probe runs none of the value's code and agrees with `hasattr` for a
+            # class that defines no `__getattr__`; the value is dumped as main dumps it.
             try:
                 dump = value.model_dump
             except AttributeError:
@@ -3094,21 +3206,41 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
                 pass
             else:
                 return _canonicalize_value_for_hash(dump(), (*active, id(value)))
-    if inspect.isfunction(value):
-        return ["function", _function_identity(value, active)]
-    if decision is _MarkDecision.BY_NAME and not _carries_instance(value):
-        return ["external", _library_name(value)]
-    if _is_library_callable(value):
-        return ["external", _library_name(value)]
-    if isinstance(value, (functools.partial, functools.partialmethod)):
-        partial_value = cast("Any", value)
-        inner = (*active, id(partial_value))
-        return [
-            "partial",
-            _canonicalize_value_for_hash(partial_value.func, inner),
-            _canonicalize_value_for_hash(partial_value.args, inner),
-            _canonicalize_value_for_hash(partial_value.keywords, inner),
-        ]
+        elif route is not None:
+            # `ASK` or `ASK_KEPT`: a value that may answer names it does not keep (its class
+            # defines `__getattr__`, or it reports another class) is asked by attribute lookup,
+            # as main asks: beyond the `__class__` read each `isinstance` makes, the one place
+            # the probe runs the value's code, as main does. When a class keeps `model_dump`, the
+            # attribute exists and an error from the lookup propagates, as from main's `hasattr`;
+            # when none does, an error is the object's "absent" signal and means no
+            # (`_attribute_or_none`). On ASK, only an exact dict returned by a callable is
+            # dumped, so a MagicMock or attribute tree that answers every name with junk gets the
+            # plain form. On ASK_KEPT, a class really keeps the name, so its callable result is
+            # dumped as main dumps it; a RootModel can therefore return a list, a secret or a
+            # scalar root.
+            if route is _ASK_KEPT:
+                dump = getattr(value, "model_dump", None)
+            else:
+                dump = _attribute_or_none(value, "model_dump")
+            if callable(dump):
+                dumped = dump()
+                if route is _ASK_KEPT or type(dumped) is dict:
+                    return _canonicalize_value_for_hash(dumped, (*active, id(value)))
+        if inspect.isfunction(value):
+            return ["function", _function_identity(value, active)]
+        if decision is _BY_NAME and not _carries_instance(value):
+            return ["external", _library_name(value)]
+        if _is_library_callable(value):
+            return ["external", _library_name(value)]
+        if isinstance(value, (functools.partial, functools.partialmethod)):
+            partial_value = cast("Any", value)
+            inner = (*active, id(partial_value))
+            return [
+                "partial",
+                _canonicalize_value_for_hash(partial_value.func, inner),
+                _canonicalize_value_for_hash(partial_value.args, inner),
+                _canonicalize_value_for_hash(partial_value.keywords, inner),
+            ]
     if isinstance(value, dict):
         mapping = cast("dict[Any, Any]", value)
         inner = (*active, id(mapping))
@@ -3308,12 +3440,14 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
         # 0. The mark decision (`_mark_decision`): an object the walk records by name gets a
         # hash of that name, and its body is not read. A chain with a user class instance
         # above the mark is refused (a default factory, a loader method or a function identity
-        # reaches the hash without the walk's value classification).
-        decision = _mark_decision(func)
-        if decision is _MarkDecision.REFUSED:
-            _refuse_class_above_mark(func)
-        if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
-            return _by_name_hash(func)
+        # reaches the hash without the walk's value classification). While no mark exists
+        # (`_marks_made`) the decision is None, so it is not asked.
+        if _marks_made:
+            decision = _mark_decision(func)
+            if decision is _MarkDecision.REFUSED:
+                _refuse_class_above_mark(func)
+            if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
+                return _by_name_hash(func)
 
         # 1. Check in-memory WeakKeyDictionary cache first (fastest)
         # WeakKeyDictionary raises TypeError for non-weakly-referenceable functions (builtins)
@@ -3569,18 +3703,19 @@ def mark_by_name(obj: Any) -> None:
 def fingerprinted_by_name(obj: Any) -> bool:
     """Whether `@pivot.fingerprint_by_name` marked `obj` itself.
 
-    The mark is the marked object, in the instance dict of that object, read with
-    `object.__getattribute__`, the generic C lookup: no class `__getattr__`, no class-level
-    `__dict__` property and no metaclass code runs, and AttributeError means unmarked (also for
-    a callable whose `__dict__` property returns None). `functools.update_wrapper` copies the
-    instance dict into a wrapper, so the copy in a wrapper holds a different object, and the
-    wrapper is not marked. An object the mark could not be stored on is marked when
-    `_marked_without_dict` holds it.
+    The fallback table is checked first by object identity, for a marked object whose type
+    refused the generic store. Otherwise the mark is read with `object.__getattribute__`, the
+    generic C lookup: no class `__getattr__`, no class-level `__dict__` property and no metaclass
+    code runs. A class property with the mark's name can still run, so any error from that read
+    means unmarked. `functools.update_wrapper` copies the instance dict into a wrapper, so the
+    copy in a wrapper holds a different object and the wrapper is not marked.
     """
+    if _marked_without_dict.get(id(obj)) is obj:
+        return True
     try:
         mark = object.__getattribute__(obj, _BY_NAME_MARK)
-    except AttributeError:
-        return _marked_without_dict.get(id(obj)) is obj
+    except Exception:
+        return False
     return mark is obj
 
 
@@ -3693,6 +3828,11 @@ class _MarkDecision(enum.Enum):
     BY_NAME = "by_name"  # the marked object, or library wrappers over it: recorded by name
     OWN_CODE = "own_code"  # a user function above the mark: fingerprinted by its own code
     REFUSED = "refused"  # a user class instance above the mark: refused
+
+
+# The decisions the canonical form compares once per value, read as globals.
+_BY_NAME = _MarkDecision.BY_NAME
+_REFUSED = _MarkDecision.REFUSED
 
 
 def _mark_decision(obj: Any) -> _MarkDecision | None:

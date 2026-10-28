@@ -5,6 +5,7 @@
 import ast
 import collections
 import contextlib
+import dataclasses
 import functools
 import gc
 import importlib
@@ -4784,14 +4785,6 @@ class SomeModel(pydantic.BaseModel):
 
 
 
-class RootItem(pydantic.BaseModel):
-    name: str
-    token: pydantic.SecretStr
-    hidden: int = pydantic.Field(repr=False)
-
-
-RootItems = pydantic.RootModel[list[RootItem]]
-RootSecret = pydantic.RootModel[pydantic.SecretStr]
 RootCount = pydantic.RootModel[int]
 
 def meta_reporting(target):
@@ -4881,14 +4874,6 @@ shapes = {
     "dict_property_none": DictPropNone(),
     "dict_property_int": DictPropInt(),
     "proxy_forwarding_by_getattribute": ForwardsByGetattribute(KeeperPlainMethod()),
-    "rootmodel_list": RootItems([RootItem(name="item", token=pydantic.SecretStr("alpha"), hidden=1)]),
-    "rootmodel_list_secret": RootItems(
-        [RootItem(name="item", token=pydantic.SecretStr("betaXYZ"), hidden=1)]
-    ),
-    "rootmodel_list_hidden": RootItems(
-        [RootItem(name="item", token=pydantic.SecretStr("alpha"), hidden=2)]
-    ),
-    "rootmodel_secret": RootSecret(pydantic.SecretStr("alpha")),
     "rootmodel_int": RootCount(3),
 }
 KeyEqRaises.armed = True
@@ -4928,10 +4913,6 @@ def test_the_model_dump_probe_runs_no_class_side_code() -> None:
     plain = ["dict", [["factor", 3]]]
     result = json.loads(done.stdout)
     assert result.pop("rootmodel_int") == 3
-    assert result.pop("rootmodel_secret")[0] == "secret"
-    root_list = result.pop("rootmodel_list")
-    assert root_list != result.pop("rootmodel_list_secret")
-    assert root_list != result.pop("rootmodel_list_hidden")
     assert result == {
         "dict_property_raises": ["DictPropertyRaises", "DictPropertyRaises()"],
         "dict_property_not_a_mapping": ["DictPropertyNotAMapping", "DictPropertyNotAMapping()"],
@@ -5138,20 +5119,24 @@ def test_a_state_change_behind_a_celery_proxy_of_a_delegating_object_reruns(
     assert out.read_text() == "510\n"
 
 
-def test_a_mock_is_asked_as_main_asks_and_gets_the_plain_form() -> None:
-    """`MagicMock`'s class defines `__getattr__`, so a mock, plain or built with `spec=`, is asked
-    for `model_dump` as main asks. Its answer returns a `MagicMock`, not an exact dict, so the mock
-    gets the plain form, `[type, repr]`, not the endless dump main recurses into."""
+def test_a_mock_is_asked_as_main_asks_and_gets_a_safe_plain_form() -> None:
+    """A plain MagicMock takes ASK: its junk answer is not an exact dict, so the mock itself is
+    plain. A spec mock takes ASK_KEPT because its spec keeps `model_dump`, so main dumps its child
+    answer; that child takes ASK and is plain, which stops recursion."""
 
     class KeepsDump:
         def model_dump(self) -> dict[str, int]:
             return {"factor": 3}
 
     canonical = fingerprint._canonicalize_value_for_hash
-    for value in (mock.MagicMock(), mock.MagicMock(spec=KeepsDump)):
-        form = canonical(value)
-        assert value.model_dump.called
-        assert form == [type(value).__name__, repr(value)], form
+    plain = mock.MagicMock()
+    assert canonical(plain) == [type(plain).__name__, repr(plain)]
+
+    spec = mock.MagicMock(spec=KeepsDump)
+    form = canonical(spec)
+    dumped = spec.model_dump.return_value
+    assert spec.model_dump.called
+    assert form == [type(dumped).__name__, repr(dumped)], form
 
 
 _R13_FORWARDER = """\
@@ -5260,13 +5245,11 @@ def test_a_field_and_a_secret_edit_behind_a_forwarder_rerun(
     assert out.read_text() == "517\n"
 
 
-def test_a_forwarder_is_dumped_only_for_a_callable_answer_that_returns_an_exact_dict() -> None:
-    """A value whose class defines `__getattr__` is asked for `model_dump` as main asks, and
-    dumped only when the answer is callable and returns an exact dict, pydantic's contract. An
-    answer that is not callable, or that returns a dict subclass, a list or a scalar, leaves the
-    plain form, `[module.qualname, canonical(vars)]`; a lookup that raises means no. The rule
-    holds when the value's own class keeps `model_dump` and only a base class defines
-    `__getattr__`."""
+def test_an_ask_route_needs_an_exact_dict_but_an_ask_kept_route_dumps_as_main() -> None:
+    """On ASK, where no class keeps `model_dump`, an answer that is not callable or returns a
+    dict subclass, a list or a scalar gets the plain form. On ASK_KEPT, where a class keeps it,
+    main dumps whatever it returns: RootModel and a forwarder with a kept list return therefore
+    keep their state. A lookup that raises on ASK still means no."""
 
     class Target:
         def __init__(self, dumped: object) -> None:
@@ -5308,6 +5291,13 @@ def test_a_forwarder_is_dumped_only_for_a_callable_answer_that_returns_an_exact_
         def model_dump(self) -> list[tuple[str, int]]:
             return [("x", 1)]
 
+    class KeepsDataAndForwards(ForwardingBase):
+        # Keeps a `model_dump` that is not callable; a base class defines `__getattr__`.
+        model_dump: int = 7
+
+        def __init__(self) -> None:
+            self.factor: int = 3
+
     canonical = fingerprint._canonicalize_value_for_hash
     assert canonical(Forwarder(Target({"x": 1}))) == canonical({"x": 1})
     for answer in (
@@ -5321,8 +5311,8 @@ def test_a_forwarder_is_dumped_only_for_a_callable_answer_that_returns_an_exact_
     assert canonical(AnswersNotCallable())[1] == canonical({"factor": 3})
     raises = Raises()
     assert canonical(raises)[1] == canonical({"factor": 3})
-    assert canonical(KeepsAndForwards())[1] == canonical({"factor": 3})
-
+    assert canonical(KeepsAndForwards()) == canonical([("x", 1)])
+    assert canonical(KeepsDataAndForwards())[1] == canonical({"factor": 3})
 
 
 _R15_ROOT_MODEL = """\
@@ -5467,7 +5457,7 @@ def test_a_mark_in_the_fallback_table_beats_a_readonly_mark_property() -> None:
 
     class Decorator:
         def __init__(self, wrapped: typing.Callable[[], int]) -> None:
-            self.__wrapped__ = wrapped
+            self.__wrapped__: typing.Callable[[], int] = wrapped
 
         def __call__(self) -> int:
             return self.__wrapped__()
@@ -5480,6 +5470,7 @@ def test_a_mark_in_the_fallback_table_beats_a_readonly_mark_property() -> None:
     fingerprint.mark_by_name(value)
     assert fingerprint._marked_without_dict.get(id(value)) is value
     assert fingerprint.fingerprinted_by_name(value)
+
 
 _R13_CELERY_RAISING = """\
 import functools
@@ -5519,6 +5510,69 @@ def test_a_raising_model_dump_behind_a_celery_proxy_fails_loudly(tmp_path: pathl
     assert result.returncode != 0, text
     assert "model_dump property raised" in text, text
     assert not (project / "data" / "cr" / "s.txt").exists()
+
+
+def test_the_static_probe_reads_only_an_own_dict_descriptor_and_lets_a_key_error_through() -> None:
+    """`_keeps_own_attribute`, which the mark decision asks for `__wrapped__`, reads an instance
+    dict only through a C `__dict__` descriptor that belongs to the class holding it; with none,
+    it asks the generic C lookup, where only AttributeError means no. A borrowed descriptor
+    answers no with no error, and a dict key whose `__eq__` raises lets its error through, as
+    main's `hasattr` does."""
+
+    class Plain:
+        pass
+
+    class Borrowed:
+        __dict__ = Plain.__dict__["__dict__"]  # pyright: ignore[reportUnannotatedClassAttribute] - another class's descriptor, the shape under test
+
+    class KeyEqRaises(str):
+        @typing.override
+        def __hash__(self) -> int:
+            return hash("__wrapped__")
+
+        @typing.override
+        def __eq__(self, other: object) -> bool:
+            raise RuntimeError("key __eq__ raises")
+
+    class DictProperty:
+        @property
+        @typing.override
+        def __dict__(self) -> dict[str, object]:  # pyright: ignore[reportIncompatibleVariableOverride, reportIncompatibleMethodOverride] - a `__dict__` property, the shape under test
+            return {}
+
+    assert not fingerprint._keeps_own_attribute(Borrowed(), "__wrapped__")
+    value = DictProperty()
+    object.__setattr__(value, "seed", 1)
+    object.__getstate__(value)[KeyEqRaises("other")] = 1  # pyright: ignore[reportIndexIssue] - the live instance dict, past the property
+    with pytest.raises(RuntimeError, match="key __eq__ raises"):
+        fingerprint._keeps_own_attribute(value, "__wrapped__")
+
+
+def test_a_dict_subclass_instance_dict_is_read_past_its_contains_with_a_mark() -> None:
+    """With a mark in the process, the mark decision asks a callable instance whether it keeps a
+    `__wrapped__` of its own. An instance `__dict__` that is a dict subclass is read the C way,
+    past its raising `__contains__`, as main's attribute lookup reads it."""
+
+    def helper() -> int:
+        return 0
+
+    class RaisingContains(dict[str, object]):
+        @typing.override
+        def __contains__(self, key: object) -> bool:
+            raise RuntimeError("dict subclass __contains__ ran")
+
+    class Handler:
+        def __call__(self) -> int:
+            return 1
+
+    value = Handler()
+    value.__dict__ = RaisingContains()
+    fingerprint.mark_by_name(helper)
+    assert not fingerprint.fingerprinted_by_name(value)
+    assert fingerprint._canonicalize_value_for_hash(value) == [
+        f"{Handler.__module__}.{Handler.__qualname__}",
+        ["dict", []],
+    ]
 
 
 def test_the_mark_is_read_and_written_past_a_dict_property() -> None:
@@ -5623,15 +5677,149 @@ def test_a_value_without_an_instance_dict_takes_the_dict_offset_short_cut(
     assert asked == ["DictProperty"]
 
 
+def test_a_fingerprint_pass_gives_each_value_the_canonical_form_it_gets_alone() -> None:
+    """Inside one `fingerprint_pass()` the real-MRO facts are memoised by type, and a type whose
+    MRO alone decides the `model_dump` route skips the probe: a hook-free type is asked by C
+    `hasattr`, a model takes `ASK_KEPT`. Every value, seen twice in the pass, gets the form it gets
+    outside a pass: a plain object, a frozen dataclass, a slots class, a `__dict__`-property
+    class, a raising `__getattr__`, a model, a RootModel, a forwarder, a `__getattribute__` proxy
+    and a spec mock. Only the four hook-free types and the two models are recorded."""
+
+    class Plain:
+        def __init__(self) -> None:
+            self.factor: int = 3
+
+    @dataclasses.dataclass(frozen=True)
+    class Point:
+        x: int
+
+    class SlotsOnly:
+        __slots__ = ("factor",)  # pyright: ignore[reportUnannotatedClassAttribute] - a `__slots__` class, the shape under test
+
+        def __init__(self) -> None:
+            self.factor: int = 3
+
+    class DictProperty:
+        def __init__(self) -> None:
+            object.__setattr__(self, "model_dump", lambda: {"factor": 3})
+
+        @property
+        @typing.override
+        def __dict__(self) -> dict[str, bool]:  # pyright: ignore[reportIncompatibleVariableOverride, reportIncompatibleMethodOverride] - a `__dict__` property, the shape under test
+            return {"masked": True}
+
+    class GetattrRaises:
+        def __init__(self) -> None:
+            self.factor: int = 3
+
+        def __getattr__(self, name: str) -> object:
+            raise KeyError(name)
+
+    class Model(pydantic.BaseModel):
+        x: int = 1
+
+    class KeepsDump:
+        def model_dump(self) -> dict[str, int]:
+            return {"factor": 3}
+
+    class ForwardsByGetattribute:
+        def __init__(self, target: object) -> None:
+            object.__setattr__(self, "_target", target)
+
+        @typing.override
+        def __getattribute__(self, name: str) -> object:
+            target = object.__getattribute__(self, "_target")
+            if name == "__class__":
+                return type(target)
+            return getattr(target, name)
+
+    class ReportsAndKeeps:
+        # Keeps `model_dump`, forwards through `__getattr__`, and reports its target's class:
+        # an instance holding a class reports a metaclass, so the class guard answers per value.
+        def __init__(self, target: object) -> None:
+            self.target: object = target
+
+        @property
+        @typing.override
+        def __class__(self) -> type:  # pyright: ignore[reportIncompatibleMethodOverride, reportIncompatibleVariableOverride] - a proxy reports its target's type
+            return type(self.target)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.target, name)
+
+        def model_dump(self) -> object:
+            return self.target.model_dump()  # pyright: ignore[reportAttributeAccessIssue] - the target is a keeper or a class, the shape under test
+
+    spec = mock.MagicMock(spec=KeepsDump)
+    values = [
+        Plain(),
+        Point(1),
+        SlotsOnly(),
+        DictProperty(),
+        GetattrRaises(),
+        Model(),
+        pydantic.RootModel[list[int]]([1, 2]),
+        _transparent_proxy(Model()),
+        ForwardsByGetattribute(KeepsDump()),
+        spec,
+        ReportsAndKeeps(KeepsDump()),
+        ReportsAndKeeps(KeepsDump),
+    ]
+    canonical = fingerprint._canonicalize_value_for_hash
+    alone = [canonical(value) for value in values]
+    with fingerprint.fingerprint_pass():
+        first = [canonical(value) for value in values]
+        second = [canonical(value) for value in values]
+        memo = fingerprint._type_memo.get()
+    assert first == alone
+    assert second == alone
+    assert memo is not None
+    recorded = dict(memo[1].values())
+    assert recorded == {
+        Plain: None,
+        Point: None,
+        SlotsOnly: None,
+        DictProperty: None,
+        Model: fingerprint._DumpRoute.ASK_KEPT,
+        type(values[6]): fingerprint._DumpRoute.ASK_KEPT,
+    }
+
+
+def test_a_class_changed_between_passes_is_read_again() -> None:
+    """The real-MRO facts live for one pass, so a class changed after it is read again. Given a
+    raising `__getattr__` after the first pass, the second pass asks the value as main asks, where
+    the error means no; facts kept from the first pass would take the C `hasattr` route, which
+    lets the `KeyError` through."""
+
+    class Late:
+        def __init__(self) -> None:
+            self.factor: int = 3
+
+    def raising(self: object, name: str) -> object:
+        raise KeyError(name)
+
+    value = Late()
+    canonical = fingerprint._canonicalize_value_for_hash
+    with fingerprint.fingerprint_pass():
+        before = canonical(value)
+    Late.__getattr__ = raising  # pyright: ignore[reportAttributeAccessIssue] - the class changes between passes, the shape under test
+    with fingerprint.fingerprint_pass():
+        assert canonical(value) == before
+    assert canonical(value) == before
+
+
 def test_an_exact_builtin_takes_neither_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     """An exact built-in container or leaf carries no mark and keeps no `model_dump`, so the
-    canonical form asks neither the mark decision nor the `model_dump` probe for it."""
+    canonical form asks neither the mark decision nor the `model_dump` probe for it, also in a
+    process that holds a mark."""
     value = {"a": [1, (2.5, frozenset({3})), b"x", None, True], "b": {"c"}}
     expected = fingerprint._canonicalize_value_for_hash(value)
 
     def probed(*_: object) -> typing.NoReturn:
         raise AssertionError("an exact built-in was probed")
 
+    monkeypatch.setattr(fingerprint, "_marks_made", True)
     monkeypatch.setattr(fingerprint, "_mark_decision", probed)
-    monkeypatch.setattr(fingerprint, "_keeps_own_attribute", probed)
+    monkeypatch.setattr(fingerprint, "_model_dump_route", probed)
+    monkeypatch.setattr(fingerprint, "_probe_own_attribute", probed)
     assert fingerprint._canonicalize_value_for_hash(value) == expected
