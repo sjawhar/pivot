@@ -180,10 +180,10 @@ and no run-cache entry is filed. A marked lock is never satisfied from the run c
 run-cache entry at its own input hash, so an entry an earlier run filed (0.5.2, or `pivot commit`)
 cannot restore an output the check never saw. `pivot commit` carries that key into the lock it
 writes when the static fingerprint is otherwise unchanged, files no run-cache entry for it, and
-deletes any entry at its input hash (`skip.carry_uncovered_import`). `pivot verify` reports a
+deletes any entry at its input hash (`skip.carry_rerun_marks`). `pivot verify` reports a
 marked stage as failed, with the uncovered-import reason, until it reruns without an uncovered
-import. Under `--no-commit` the warning adds that `pivot commit` will record the outputs as
-current. A user class reached only through a loaded input (an object in a
+import. Under `--no-commit` the warning adds that `pivot commit` keeps the mark when it records
+these outputs. A user class reached only through a loaded input (an object in a
 `loaders.Pickle()` input whose class the stage never names) counts as a module the stage imported,
 because unpickling imports its module while the stage runs; naming the class in the parameter's
 annotation (`Annotated[Box, loaders.Pickle()]`) covers it.
@@ -215,8 +215,203 @@ a thread native code starts outside `_thread`. Each has a remedy:
 | A user module that a covered module loads at import time through `importlib.util` and `exec_module`, `EntryPoint.load()` or `importlib.__import__` | It is excused, as on main, and not fingerprinted itself: an edit to it is seen only through values the stage reads from the covered module, or when the covered module changes. Import it statically |
 | A package resource read through `importlib.resources` (`files(helpers).joinpath("table.txt")`) | It is data, not code: declare it with `pipeline.input` |
 | A module created without a source file (CPython's `pyexpat.errors`, Cython's `_cython_3_3_0`) | It has no source to fingerprint; a change to it is a change to the library or interpreter that created it |
-| `pivot repro --no-commit`, then `pivot commit` | No lock exists to carry the mark, so `pivot commit` records the outputs on disk against the static fingerprint, as it does for any output; run `pivot repro` without `--no-commit` for such a stage |
+| `pivot repro --no-commit`, then `pivot commit` of outputs edited by hand since that run | `pivot commit` records them against the static fingerprint, the "trust me" path. Outputs the run wrote, unchanged since, are recorded with the manifest the run kept in StateDB (`nocommit:<stage>`), its mark included, so the stage still reruns |
 | A result cached by an earlier Pivot version | If its static fingerprint is unchanged, it may be reused: `_CACHE_SCHEMA_VERSION` keys only the state.lmdb caches, not the lock. A stage whose static walk reaches a user class method or a user module gains entries in its manifest, so it reruns once as Code changed after the upgrade. That accepted one-time rerun writes the current manifest; later runs reuse it until code or inputs change. Run `pivot repro --force <stage>` once to re-check a stage you know imports dynamically. Upgrading from 0.5.6 or earlier, every stage with outputs reruns once as Code changed, because each output's tag (`out:<key>:tag`) joined the manifest; that run is checked, so it marks a stage that imports dynamically |
+
+### Code Edited After Discovery
+
+A stage's fingerprint describes the code its worker runs, and that code is the code discovery
+loaded, not the files as they are when the stage starts. Discovery pickles `pipeline.py` and the
+other modules under the project root by value, so a worker runs the functions the coordinator
+compiled when it imported them. Fingerprinting reads source through `inspect.getsource`, which
+reads `linecache`, and `linecache` reads a file again when its size or mtime changes. Outside
+watch mode a stage is fingerprinted when it is ready to run, so a file edited after discovery (by
+an upstream stage, or in an editor while the run continues) would be hashed as edited while the
+worker ran the loaded version, and the next run would report the old output as cached.
+
+So the record is about the module, not the loader. `discovery._ProjectSourceLoader` records the
+bytes each user module was compiled from (`loaded_source.record`). Every other user-code module
+(`fingerprint.is_user_code`) that an import finds passes the recorder, which wraps its loader
+(`discovery._RecordingLoader`): an editable install's meta-path finder, a zip on `sys.path`,
+`importlib.util.spec_from_file_location`, and the loader any finder on `sys.meta_path` returns. A
+module the recorder loaded without recording it is recorded at the end of discovery
+(`loaded_source.record_user_modules`) and in a worker at each import its hooks see
+(`loaded_source.record_modules`, also run for the modules unpickling a stage imports) and when a
+stage returns.
+
+The recorder trusts a loader's source only where Pivot can show the code that ran is the code it
+read (`discovery._RecordingLoader.exec_module`), and records every other loader's module as
+unreadable. A list of loaders to distrust leaks: each loader shape it does not name (a proxy
+around CPython's loader, a loader that runs CPython's inside it, CPython's own `SourceFileLoader`
+definition on its private bases, a `FileLoader` that caches its own bytecode, a zip holding a
+`.pyc` beside its `.py`) serves a stale result as cached. So the rule names what is trusted, and
+a new loader shape is unreadable by default:
+
+- CPython's exact `SourceFileLoader`, which accepts mtime-checked bytecode for an edit that keeps
+  the size and whole-second mtime, is replaced with `_ProjectSourceLoader`, which records the bytes
+  it compiled or validated checked-hash bytecode against.
+- A zip importer (`zipimport.zipimporter`) whose spec names the `.py` member as its origin: Pivot
+  compiles the member's bytes it read and runs them itself, as zipimport compiles a source member
+  (line endings normalized), and records those bytes. The spec's origin is the word of whoever
+  built the spec, not the member zipimport runs: zipimport's `exec_module` searches the archive
+  again, tries a `.pyc` member first (CPython 3.13 `zipimport.py:290`) and runs it when its header
+  matches the `.py` member's zip time, to within 1 s, and size (`:658-660`, `:690-695`), or when it
+  is hash-based and either unchecked or matching the source's hash. A finder that builds the spec
+  itself (`spec_from_file_location(name, "<archive>/m.py", loader=zipimporter(archive))`) gets a
+  `.py` origin while zipimport would run the `.pyc`; running the bytes Pivot read closes that, and
+  the gap between Pivot's read and zipimport's. A spec zipimport's own finder built with a `.pyc`
+  origin (it found such a member) is unreadable.
+- A module Pivot's own loader recorded during this execution, inside another loader that wraps it:
+  a finder modelled on dd-trace-py's ModuleWatchdog finds the module through the rest of
+  `sys.meta_path`, Pivot's recorder among it, and wraps the loader it gets. The record that inner
+  recorder made stands: readable where Pivot's loader compiled the source, and unreadable, with
+  the reason that names the real loader, where it judged one Pivot does not trust. A record from
+  before the execution (an earlier import, before `importlib.reload`) does not count, nor the one
+  a worker's import hook makes while the module's body imports a submodule. Pivot trusts that such
+  a wrapper runs the code its own loader compiled for the module, and nothing else: a wrapper that
+  asks Pivot's loader for the code (which records it) and then runs other code is not detected, a
+  stated limit no known tool reaches.
+
+An unreadable module's record carries a reason that names its loader, and the first stage in each
+process that uses it logs that reason with the fix: import the module without that loader, or
+accept that the stage reruns on every run. Once a run Pivot records has used the module, the
+stage's lock carries the `unreadable-source:` mark, so every later run reruns it and none reports
+it as cached; a lock written before that (by an earlier Pivot, or before the loader was installed)
+can still be reported cached until a run uses the module. Unreadable does not make the output
+current: each rerun runs what that loader runs, which can still be the stale bytecode. A `pivot
+commit` of outputs no run recorded (the "trust me" commit) carries the mark the stage's previous
+lock holds; with no marked previous lock it writes a lock without the mark, and the next run
+reports the stage as cached. A loader with only PEP 302's `load_module` and no `exec_module`,
+which CPython 3.13 still imports with an `ImportWarning` (its import system calls `load_module`
+"slated for removal in Python 3.15"), is left unwrapped, so the import works as without Pivot; no
+recorder sees its module compile, and it is judged as below, where its loader makes it
+unreadable. A loader a module calls itself (`SourceFileLoader(...).load_module()`, or
+`spec_from_loader` and `exec_module`) passes no import hook, so its module is judged as one no
+recorder saw compile.
+
+A user module that no recorder saw compile was imported before discovery installed the recorder,
+by `sitecustomize` or a `.pth` import line (in the coordinator, and in each worker before its
+initializer runs), by the program that runs Pivot or by a finder ahead of the recorder, or it was
+loaded by a loader a module called itself. `loaded_source.record_unseen_modules` runs at the end
+of discovery, in `core._init_worker`, and in a worker after each stage
+(`worker._untrusted_modules`), so a worker judges every user module it loaded, whatever loaded
+it, as the coordinator does, and marks a stage that used one whose record there is unreadable or
+differs from the coordinator's. Each such module is judged by `loaded_source._verified_source`,
+which records the module's file when those bytes are shown to be the bytes it was compiled from:
+
+- its loader is CPython's own `SourceFileLoader` (a subclass may run transformed text);
+- the file's change time (`st_ctime`) is at least 2 s older than the process start. The start is
+  read on Linux from `/proc/self/stat` against the boot clock, added to the boot's wall-clock
+  time, the smaller of its value when Pivot was imported and now, so a step of the wall clock
+  after the import cannot move the start later (psutil elsewhere). The three errors that can make
+  an edit look older than it is share those 2 s: a file system that keeps whole seconds (ext4
+  with 128-byte inodes stamps a change up to 1 s before it happened), the kernel's coarse
+  timestamps, and a forward step of the wall clock between an edit and Pivot's import, which the
+  margin covers up to 2 s where change times are exact and to about 1 s where they are whole
+  seconds. A file system that keeps change times in 2-second steps (FAT, Linux's `vfat`) spends
+  the whole margin: on a FAT32 loop mount every change time is an even second, so an edit reads
+  as up to just under 2 s early (1.7 s in eight edits measured). There the margin covers no clock
+  step and no kernel tick, and an edit made in the first milliseconds of a process, before the
+  interpreter's own startup has reached any import, can read as older than the start. Linux's FAT
+  driver also keeps no change time on disk: it sets an inode's change time to its modification
+  time when it reads the inode (`fs/fat/inode.c`, `fat_fill_inode`), so once the inode is read
+  again, an edit whose modification time a tool put back has its change time put back too, and
+  only the bytecode check below can catch it. Both are stated limits for a project on such a file
+  system. Every import in the process then read these bytes;
+- the bytecode that loader may have run instead is the code of these bytes. A cached file that
+  has not changed since the start is the one the import saw: either CPython's check rejects it
+  for this source, or its code (`marshal`) equals the source compiled now, which catches the
+  edit that keeps the size within the second its predecessor was cached. A cached file written
+  since the start must be mtime-checked bytecode of these bytes: CPython's import writes that
+  only after rejecting the file it found for this same source. With no cached file, its directory
+  must not have changed since the start.
+
+Otherwise the module is recorded as unreadable, with the reason in its record
+(`path\0\0reason`), and `check_stage` logs the reason once per process when a stage uses it, in
+addition to the stage's own warning. The cases that fall there: a file edited after
+the process started or less than 2 s before it (an edit during startup, a module a long-lived
+process loaded and then edited, or an edit just before `pivot` ran, which costs that one run), a
+module loaded by any other loader, stale or replaced bytecode, a cached file that cannot be read,
+a platform that does not report the process start, and a process forked without exec after it
+imported Pivot (`os.register_at_fork`), whose modules its parent loaded before it started. Each
+costs the same as a sourceless module: the stages that use it rerun on every run in that process
+and file no run-cache entry.
+Two cases are not detected. A process forked without exec from a parent that imported the module
+before it imported Pivot: start Pivot in a process of its own, as the `pivot` command and its
+workers are. A forward step of the system clock between an edit and the start of a pivot process
+can make that edit look older than the start once it passes what the 2 s margin leaves after the
+file system's timestamp granularity (about 1 s where change times are whole seconds, 2 s where
+they are exact, none where they are in 2-second steps); so can a file system that stamps change
+times with another machine's clock (a network file system's server) that far behind this one.
+These records belong to the import session: `loaded_source.prune` drops them when it ends, so
+the next discovery judges the modules again.
+
+Discovery's path hook and the module recorder are installed only while a discovery imports;
+`discovery._remove_import_hooks` gives CPython's machinery back when it returns, fails or is
+interrupted. The session itself (its modules, its `sys.path` entry and its records) lasts until
+the next discovery ends it. A worker installs its own loader and recorder for its life
+(`discovery.install_user_code_loader`).
+
+Fingerprinting reads the recorded bytes, not the file: `loaded_source.getsource` puts their lines
+into `linecache` as an entry without an mtime, which `linecache.checkcache` leaves alone, before
+it calls `inspect.getsource`; `fingerprint._source_digest`, which keys the `fp:` and `sm:` caches,
+returns their digest; and a `@no_fingerprint` stage's `file:` hash is their digest. A file no
+module was recorded from (a `code_deps` entry that is not a module) is read from disk, as before.
+The lines are split as `linecache` splits a file (`tokenize.open`, universal newlines, a final
+newline added), so an unedited project keeps its recorded fingerprints.
+
+A worker imports some user modules itself, from their files: a stage's module discovery does not
+send by value (outside the root, or under it in a `src` layout), a module outside the root that
+one sent by value refers to, and any module a stage body imports. Such a module holds the file as
+the worker read it, which may be before or after an edit. Each worker gets the coordinator's
+records (`loaded_source.digests()`: each module's name, resolved path and digest) once, in its
+initializer arguments (`core._init_worker`), and each stage carries only their token
+(`WorkerStageInfo.loaded_sources_token`), plus the records themselves when the coordinator loaded
+user code after the workers started. Loky replaces a pool whose initializer arguments differ, and
+`WorkerPool.start` replaces workers that started with another token.
+
+After the stage function returns, the worker judges the user modules no recorder saw compile
+(above), then checks the modules this stage used (`loaded_source.check_stage`): the modules whose
+code or values its manifest hashes (`func:`, `class:`, `const:`, `default:`, `schema:`,
+`partial:` and `loader:` entries, not an `ext:` by-name entry or a `module:` coverage entry), the
+module that defines the stage, and the modules it imported while it ran. For a `@no_fingerprint`
+stage, the modules recorded from its `file:` paths count instead of its imports. A module another
+stage on the worker used is not this stage's concern. Records compare by module name, path and
+digest, so a new package that shadows a module mid-run differs too. A stage sent with a token
+other than the one its worker started with, and without the records, cannot be compared, so
+every module it used that the worker loaded counts.
+A pipeline a program builds itself and passes to `executor.run(pipeline=...)` is never
+discovered, so the coordinator holds no record of its modules and sends none: the worker compares
+no module (`check_stage` skips a module the coordinator sent no record for), and the stage is
+fingerprinted from the files when it is ready to run, as before this check existed. An edit to
+its code during that run is not detected. This is by design for that programmatic path: the
+`pivot` command, the engine's watch and server modes, and `executor.run` without `pipeline`
+always discover the pipeline, so their modules are recorded.
+When an import session ends, the entries of the modules it removed are dropped, with the
+`linecache` lines pinned for them, and so are those `record_unseen_modules` made
+(`loaded_source.prune`).
+
+A difference means the stage ran code its fingerprint does not describe: the stage succeeds, logs
+one warning naming the modules, and its lock carries an `edited-source:<modules>` key no
+fingerprint matches, so the next run reruns it ("Previous run imported modules edited after pivot
+loaded them"). A used module that either side recorded as unreadable gives the warning "uses user
+modules whose source pivot cannot read" and an `unreadable-source:<modules>` key: the stage
+reruns on every run. Both marks behave as the `uncovered-import:` mark does: no run-cache entry is
+filed or used, and `pivot commit` carries them (`skip.rerun_mark_reason`,
+`skip.carry_rerun_marks`). Under `--no-commit` the run keeps the manifest its lock would have held,
+marks included, with the output hashes (`nocommit:<stage>` in StateDB); `pivot commit` writes that
+manifest while the outputs on disk are still those, and computes the input hash of the run-cache
+entry from it. Applying that record replaces only these two keys and keeps every other key, as
+the `*.pvt` members another feature writes into the same record during the run. A record without
+them (one that holds only another feature's key) reads as present, with that key, so
+`pivot commit` treats the stage as one with no record. A warm worker that
+imported the module before the edit holds the version the coordinator loaded, so its stages are
+not marked.
+
+A watch reload imports the modules under the root again. A module outside the root stays loaded
+in the watch or server process, so its edit is loaded when pivot starts again. Until then, a
+worker that imports the module after the edit (a fresh worker, or one a reload started) runs the
+edit: the stages that use the module are marked on every run, and rerun, until pivot restarts.
 
 ### Module-Level Instances
 

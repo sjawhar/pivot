@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import logging
 import os
 import pathlib
@@ -22,7 +23,7 @@ if TYPE_CHECKING:
 
     from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
-    from pivot.types import DeferredWrites
+    from pivot.types import DeferredWrites, NoCommitRecord
 
 # Key prefixes for different entry types
 _HASH_PREFIX = b"hash:"  # File hash entries
@@ -34,6 +35,9 @@ _RUN_PREFIX = b"run:"  # Run history entries
 _RUNCACHE_PREFIX = b"runcache:"  # Run cache entries for skip detection
 _FP_PREFIX = b"fp:"  # AST fingerprint/hash cache entries
 _SM_PREFIX = b"sm:"  # Stage manifest cache entries
+_NOCOMMIT_PREFIX = b"nocommit:"  # What a --no-commit run of a stage ran, for `pivot commit`
+# The keys `types.NoCommitRecord` declares, each a str -> str mapping the reader validates alone.
+_NO_COMMIT_FIELDS = ("code_manifest", "output_hashes", "pvt_members")
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024
@@ -255,6 +259,24 @@ def _make_key_output_generation(identity: str) -> bytes:
 
 def _make_key_dep_generation(stage_name: str, dep_identity: str) -> bytes:
     return _DEP_PREFIX + f"{stage_name}:{dep_identity}".encode()
+
+
+def _is_str_dict(value: object) -> typing.TypeGuard[dict[str, str]]:
+    return isinstance(value, dict) and all(
+        isinstance(key, str) and isinstance(item, str)
+        for key, item in typing.cast("dict[object, object]", value).items()
+    )
+
+
+def _json_object(value: bytes | None) -> dict[str, object] | None:
+    """`value` decoded as a JSON object, or None if it is absent or not one."""
+    if value is None:
+        return None
+    try:
+        data: object = json.loads(value)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return typing.cast("dict[str, object]", data) if isinstance(data, dict) else None
 
 
 class InvalidAstHashKeyError(Exception):
@@ -909,6 +931,24 @@ class StateDB:
             return None
         return run_history.deserialize_run_cache_entry(value)
 
+    def get_no_commit_record(self, stage_name: str) -> NoCommitRecord | None:
+        """The stage's `nocommit:` record, or None (absent, or not a JSON object).
+
+        Each key `types.NoCommitRecord` declares (`code_manifest`, `output_hashes`,
+        `pvt_members`) is validated on its own: a malformed one is dropped and hides no other.
+        Every other key reads as stored, and a record without these keys reads as present.
+        """
+        self._check_closed()
+        with self._read_transaction() as txn:
+            value = txn.get(_NOCOMMIT_PREFIX + stage_name.encode())
+        record = _json_object(value)
+        if record is None:
+            return None
+        for field in _NO_COMMIT_FIELDS:
+            if field in record and not _is_str_dict(record[field]):
+                del record[field]
+        return typing.cast("NoCommitRecord", typing.cast("object", record))
+
     def prune_run_cache(self, valid_run_ids: set[str]) -> int:
         """Remove run cache entries that reference runs not in valid_run_ids.
 
@@ -1036,6 +1076,15 @@ class StateDB:
                         value = _pack_value(mtime_ns, size, inode, hash_hex)
                         txn.put(key, value)
 
+                nocommit_key = _NOCOMMIT_PREFIX + stage_name.encode()
+                if "no_commit_record" in deferred:
+                    # Set the run's keys (`types.NoCommitRun`: both, always) and keep every other
+                    # key: another feature writes its keys into the same record.
+                    record = _json_object(txn.get(nocommit_key)) or dict[str, object]()
+                    record.update(deferred["no_commit_record"])
+                    txn.put(nocommit_key, json.dumps(record).encode())
+                elif "clear_no_commit_record" in deferred and deferred["clear_no_commit_record"]:
+                    txn.delete(nocommit_key)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
 

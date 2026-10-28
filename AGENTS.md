@@ -21,6 +21,7 @@ packages/pivot/src/pivot/
 ├── compose.py     # @stage, Pipeline, ArtifactHandle, metric/plot/incremental/directory tags, format inference
 ├── discovery.py   # Finds and loads pipeline.py
 ├── fingerprint.py # Code hashing, change detection
+├── loaded_source.py # Source each user module was compiled from; fingerprinting reads it, not the file
 ├── registry.py    # StageRegistry, RegistryStageInfo (built by Pipeline)
 ├── stage_def.py   # StageParams, output writing helpers
 ├── loaders.py     # File I/O (CSV, JSON, Pickle, etc.)
@@ -210,7 +211,7 @@ uv run ruff format . && uv run ruff check . && uv run basedpyright              
 
 **Run all quality checks before returning to user or pushing.**
 
-**CI runs the test suite without uv on PATH**, so a test that starts pivot runs `pathlib.Path(sys.executable).parent / "pivot"`. With `CI` set, the tests that install pivot into a fresh venv also run and need uv's path (`tests.helpers.venv_pivot`): the wheel smoke tests (`tests/integration/test_fresh_install_smoke.py`) and the pivot 0.5.11 two-build test (`tests/cli/test_cli_acceptance.py`). Run the suite as `PIVOT_TEST_UV="$(command -v uv)" uv run pytest ...`.
+**CI runs the test suite without uv on PATH**, so a test that starts pivot runs `pathlib.Path(sys.executable).parent / "pivot"`. With `CI` set, the tests that install pivot into a fresh venv also run and need uv's path (`tests.helpers.venv_pivot`): the wheel smoke tests (`tests/integration/test_fresh_install_smoke.py`) and the pivot 0.5.11 two-build test (`tests/cli/test_cli_acceptance.py`). Run the suite as `PIVOT_TEST_UV="$(command -v uv)" uv run pytest ...`. With `CI` set, `test_helper_edited_in_the_second_its_process_started_on_a_whole_second_file_system` (`tests/fingerprint/test_code_edited_during_run.py`) also runs: it needs `mkfs.ext4` and passwordless `sudo` to loop-mount an ext4 image, and fails without them.
 
 **A draft pull request runs no CI suite.** Tests (`pr-and-main.yaml`) and Benchmark (`benchmark.yaml`) skip every job on a draft, and a skipped job reads as passed, so `draft-marker.yml` sets the commit status `ci/untested-draft` to failure on the draft's head. Mark the pull request ready (`gh pr ready <n>`) to run Tests on its head, and Benchmark too when it carries the `benchmark` label; Tests' lint job then sets `ci/untested-draft` to success. To run the suites on drafts, set the repository variable `CI_RUN_DRAFT_PRS` to `true`. If a ready pull request's head still reads untested while no Tests run of that head is going (GitHub can process a push after the ready event, and then the suites run on the previous commit), push again or run `gh pr ready --undo <n> && gh pr ready <n>`. A new push to a ready pull request cancels the runs of the push it replaced; to run a cancelled run of the head you need, `gh run rerun <id>`. Runs on main, the weekly benchmark and `workflow_dispatch` runs are never cancelled.
 
