@@ -1374,9 +1374,20 @@ class Engine:
                                     # TerminatedWorkerError so a deliberate stop is not logged
                                     # as a stage failure.
                                     await anyio.lowlevel.checkpoint_if_cancelled()
-                                    _logger.exception("Stage %s failed with exception", stage_name)
+                                    # One line names the stage and why; --verbose shows the
+                                    # traceback. The reason recorded below stays str(e), and the
+                                    # console prints no second copy under the stage line.
+                                    _logger.error(
+                                        "Stage %s failed: %s",
+                                        stage_name,
+                                        exceptions.describe_error(e),
+                                    )
+                                    _logger.debug(
+                                        "Traceback of stage %s's failure", stage_name, exc_info=True
+                                    )
                                     self._worker_pool.mark_workers_unverified()
                                     failed_result = StageResult(
+                                        display_reason="",
                                         status=StageStatus.FAILED,
                                         reason=str(e),
                                         input_hash=None,
@@ -2288,20 +2299,21 @@ class Engine:
 
         # Emit StageCompleted event
         stage_index, total_stages = self._get_stage_index(stage_name)
-        await self.emit(
-            StageCompleted(
-                type="stage_completed",
-                stage=stage_name,
-                status=result["status"],
-                reason=result["reason"],
-                duration_ms=duration_ms,
-                index=stage_index,
-                total=total_stages,
-                run_id=run_id,
-                input_hash=result["input_hash"],
-                output_summary=output_summary,
-            )
+        completed = StageCompleted(
+            type="stage_completed",
+            stage=stage_name,
+            status=result["status"],
+            reason=result["reason"],
+            duration_ms=duration_ms,
+            index=stage_index,
+            total=total_stages,
+            run_id=run_id,
+            input_hash=result["input_hash"],
+            output_summary=output_summary,
         )
+        if "display_reason" in result:
+            completed["display_reason"] = result["display_reason"]
+        await self.emit(completed)
 
         # Release scheduler-held resources before downstream stages are considered.
         try:

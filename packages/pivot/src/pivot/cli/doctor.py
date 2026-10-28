@@ -10,6 +10,7 @@ import click
 import pydantic
 
 from pivot import display as display_mod
+from pivot import exceptions
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 
@@ -127,7 +128,12 @@ def _check_project_root() -> tuple[DoctorCheckEvent, pathlib.Path | None]:
         return (_check_event("project_root", CheckStatus.OK, str(root)), root)
     except Exception as e:
         return (
-            _check_event("project_root", CheckStatus.ERROR, "not found", {"error": str(e)}),
+            _check_event(
+                "project_root",
+                CheckStatus.ERROR,
+                "not found",
+                {"error": exceptions.describe_error(e)},
+            ),
             None,
         )
 
@@ -238,7 +244,14 @@ def _check_remote_connectivity(project_root: pathlib.Path | None) -> list[Doctor
     try:
         remotes = remote_config.list_remotes()
     except Exception as e:
-        return [_check_event("remote", CheckStatus.ERROR, "config error", {"error": _redacted(e)})]
+        return [
+            _check_event(
+                "remote",
+                CheckStatus.ERROR,
+                "config error",
+                {"error": _redacted(exceptions.describe_error(e))},
+            )
+        ]
 
     if not remotes:
         return [_check_event("remote", CheckStatus.OK, "none configured")]
@@ -257,7 +270,7 @@ def _check_remote_connectivity(project_root: pathlib.Path | None) -> list[Doctor
                     f"remote:{name}",
                     CheckStatus.ERROR,
                     shown_url,
-                    {"valid": False, "error": _redacted(e)},
+                    {"valid": False, "error": _redacted(exceptions.describe_error(e))},
                 )
             )
 

@@ -135,11 +135,9 @@ def _track_single_path(
             + "Tracked path may not be portable across environments."
         )
 
-    # Check for overlap with stage outputs (resolve paths to detect symlink aliasing)
-    try:
-        user_resolved = path.resolve()
-    except OSError as e:
-        raise click.ClickException(repr(e)) from e
+    # Check for overlap with stage outputs (resolve paths to detect symlink aliasing); an
+    # OSError here reaches the command's error handler, which names the path.
+    user_resolved = path.resolve()
 
     for out_norm, out_resolved in stage_outputs_resolved.items():
         if _paths_overlap(user_resolved, out_resolved):

@@ -2,6 +2,24 @@
 
 <!-- version list -->
 
+## v0.5.17 (2026-10-28)
+
+### Bug Fixes
+
+- **cli**: Print an unexpected error as one line naming the problem, not a Python repr
+  ([#530](https://github.com/sjawhar/pivot/pull/530),
+  [`21187e5`](https://github.com/sjawhar/pivot/commit/21187e5170ec0811c01c28519eee244c348cd3b2))
+
+
+## v0.5.16 (2026-10-28)
+
+### Bug Fixes
+
+- **cli**: Hide URL credentials, escape control characters, and write non-finite floats as strings
+  in --json ([#534](https://github.com/sjawhar/pivot/pull/534),
+  [`d9a112a`](https://github.com/sjawhar/pivot/commit/d9a112af03b14582b03bde17976a6304e99cb133))
+
+
 ## v0.5.15 (2026-10-28)
 
 ### Bug Fixes

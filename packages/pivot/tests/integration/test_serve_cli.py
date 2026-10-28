@@ -763,7 +763,7 @@ with pipeline:
                 proc.wait()
         stderr = stderr_path.read_text(errors="replace")
         assert "TerminatedWorkerError" not in stderr, stderr
-        assert "Stage test/slow failed with exception" not in stderr, stderr
+        assert "Stage test/slow failed" not in stderr, stderr
     finally:
         shutil.rmtree(private_tmp)
 

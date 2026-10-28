@@ -1,8 +1,9 @@
 """Worker behaviors a stage author or the coordinator relies on, through execute_stage and helpers.
 
 Covers what reaches the output queue (logs, stdout/stderr, state changes), the reasons a run or
-skip reports, params overrides, artifact locking, deferred StateDB writes, seeding and nested
-parallelism, and the value plumbing between the store and the stage function.
+skip reports, which failures print one line and what a failed stage leaves in the worker,
+params overrides, artifact locking, deferred StateDB writes, seeding and nested parallelism, and
+the value plumbing between the store and the stage function.
 """
 
 from __future__ import annotations
@@ -11,7 +12,9 @@ import array
 import ast
 import contextlib
 import dataclasses
+import errno
 import fcntl
+import gc
 import importlib
 import importlib.util
 import io
@@ -25,17 +28,20 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import termios
 import textwrap
 import threading
 import time
-from typing import TYPE_CHECKING, cast, override
+import weakref
+from typing import TYPE_CHECKING, Any, cast, override
 
 import joblib.parallel
 import numpy
+import pandas
 import pytest
 
-from pivot import exceptions, loaders, stage_def, types
+from pivot import exceptions, loaders, stage_def, stage_io, types
 from pivot import project as pivot_project
 from pivot.executor import worker
 from pivot.storage import artifact_lock, cache, lock, state
@@ -1236,7 +1242,8 @@ def test_output_the_writer_never_created_fails_the_stage(
 def test_unreadable_state_database_fails_the_stage_without_a_run_cache_key(
     project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
-    """A failure before dependency hashing reports input_hash None (types.py StageResult)."""
+    """A failure before dependency hashing reports input_hash None (types.py StageResult). Opening
+    the state database is pivot's own I/O, so the console prints the failure as one line."""
     (project / ".pivot" / "state.lmdb").write_text("not a database")
 
     result = worker.execute_stage(
@@ -1245,6 +1252,7 @@ def test_unreadable_state_database_fails_the_stage_without_a_run_cache_key(
 
     assert result["status"] == StageStatus.FAILED
     assert result["reason"].splitlines()[-1].startswith("lmdb.Error: ")
+    assert _display_line(result).startswith("Unexpected Error: "), result
     assert result["input_hash"] is None
     assert not _output_path(project).exists()
 
@@ -1270,6 +1278,328 @@ def test_worker_defers_file_hash_cache_writes_to_the_coordinator(
     assert "file_hash_entries" in deferred
     output = project.resolve() / "data" / "skip" / "consume.txt"
     assert [entry[0] for entry in deferred["file_hash_entries"]] == [str(raw), str(output)]
+
+
+# =============================================================================
+# Which failures print one line, and what a failed stage leaves behind
+# =============================================================================
+
+_EACCES = os.strerror(errno.EACCES)
+
+
+def _display_line(result: StageResult) -> str:
+    """The one line the console prints for a failed stage in place of its traceback."""
+    assert "display_reason" in result, result
+    return result["display_reason"]
+
+
+def _stage_returning(value: object) -> Callable[[str], object]:
+    def returns(data: str) -> object:
+        _ = data
+        return value
+
+    return returns
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores a read-only directory")
+@pytest.mark.parametrize(
+    ("loader", "value", "one_line"),
+    [
+        pytest.param(loaders.Text(), "x", True, id="text"),
+        pytest.param(loaders.JSONL(), [{"a": 1}], True, id="jsonl"),
+        pytest.param(
+            loaders.DataFrameJSONL(), pandas.DataFrame({"a": [1]}), True, id="dataframe-jsonl"
+        ),
+        pytest.param(loaders.JSON[dict[str, int]](), {"a": 1}, True, id="json"),
+        pytest.param(loaders.YAML[dict[str, int]](), {"a": 1}, True, id="yaml"),
+        pytest.param(loaders.Pickle[dict[str, int]](), {"a": 1}, True, id="pickle"),
+        pytest.param(
+            loaders.CSV[pandas.DataFrame](),
+            pandas.DataFrame({"a": [1]}),
+            False,
+            id="csv-opened-by-pandas",
+        ),
+    ],
+)
+def test_a_read_only_output_directory_is_one_line_where_pivot_creates_the_file(
+    project: pathlib.Path,
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    loader: loaders.Writer[object],
+    value: object,
+    one_line: bool,
+) -> None:
+    """Creating the output file is pivot's own I/O in the writers that create it themselves, so
+    a read-only output directory is one line there. pandas opens a CSV output's path itself while
+    it runs the value's code, so that failure keeps its traceback, as every unmarked one does."""
+    directory = project / "data" / "skip"
+    directory.mkdir(parents=True)
+    directory.chmod(0o555)
+    try:
+        result = worker.execute_stage(
+            _STAGE,
+            _stage_info(
+                _stage_returning(value), project, worker_env, outs=[_ref(_STAGE, loader=loader)]
+            ),
+            worker_env,
+            output_queue,
+        )
+    finally:
+        directory.chmod(0o755)
+
+    assert result["status"] == StageStatus.FAILED
+    assert result["reason"].rstrip().splitlines()[-1].startswith("PermissionError: [Errno 13]")
+    if one_line:
+        assert _display_line(result).startswith(f"{_EACCES}: "), result
+        assert "data/skip" in _display_line(result), result
+    else:
+        assert "display_reason" not in result, result
+
+
+def _read_only_data_directory(project: pathlib.Path) -> pathlib.Path:
+    """The output's directory cannot be created (pivot's preparation of the output)."""
+    data = project / "data"
+    data.mkdir()
+    data.chmod(0o555)
+    return data
+
+
+def _unreadable_lock_file(project: pathlib.Path) -> pathlib.Path:
+    """The stage's lock file cannot be read."""
+    path = lock.StageLock(_STAGE, lock.get_stages_dir(project / ".pivot")).path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x")
+    path.chmod(0)
+    return path
+
+
+def _read_only_lock_directory(project: pathlib.Path) -> pathlib.Path:
+    """The stage's lock file cannot be written."""
+    stages = lock.get_stages_dir(project / ".pivot")
+    stages.mkdir(parents=True, exist_ok=True)
+    stages.chmod(0o555)
+    return stages
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file and directory modes")
+@pytest.mark.parametrize(
+    ("break_state", "mode", "no_commit"),
+    [
+        pytest.param(_read_only_data_directory, 0o755, True, id="output-preparation"),
+        pytest.param(_unreadable_lock_file, 0o644, True, id="lock-file-read"),
+        pytest.param(_read_only_lock_directory, 0o755, False, id="lock-file-write"),
+    ],
+)
+def test_pivots_own_io_on_the_stages_state_is_one_line(
+    project: pathlib.Path,
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    break_state: Callable[[pathlib.Path], pathlib.Path],
+    mode: int,
+    no_commit: bool,
+) -> None:
+    """Preparing the output's path and reading or writing the stage's lock file are pivot's own
+    I/O on state it owns: a failure there prints one line naming the path."""
+    broken = break_state(project)
+    try:
+        result = worker.execute_stage(
+            _STAGE,
+            _stage_info(_upper, project, worker_env, no_commit=no_commit),
+            worker_env,
+            output_queue,
+        )
+    finally:
+        broken.chmod(mode)
+
+    assert result["status"] == StageStatus.FAILED
+    assert _display_line(result).startswith(f"{_EACCES}: "), result
+    assert broken.name in _display_line(result), result
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores a read-only directory")
+def test_a_directory_pivot_must_create_is_one_line_even_for_a_csv_output(
+    project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    """A CSV output's own file is pandas' to open, so its failures keep the traceback; the
+    directory pivot creates for it is pivot's own I/O, so that failure is one line."""
+    broken = _read_only_data_directory(project)
+    outs = [_ref(_STAGE, loader=loaders.CSV[pandas.DataFrame]())]
+    try:
+        result = worker.execute_stage(
+            _STAGE,
+            _stage_info(
+                _stage_returning(pandas.DataFrame({"a": [1]})), project, worker_env, outs=outs
+            ),
+            worker_env,
+            output_queue,
+        )
+    finally:
+        broken.chmod(0o755)
+
+    assert result["status"] == StageStatus.FAILED
+    assert _display_line(result) == f"{_EACCES}: {project / 'data' / 'skip'}", result
+
+
+def test_a_pivot_writer_the_stage_calls_for_a_path_of_its_own_keeps_its_traceback(
+    project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    """Creating a writer's file is pivot's own I/O only for the output pivot is writing. The
+    stage function's own call of `Text().save` for another path is the stage's failure."""
+    blocked = project / "raw.txt" / "notes.txt"
+
+    def writes_beside(data: str) -> str:
+        loaders.Text().save(data, blocked)
+        return data
+
+    result = worker.execute_stage(
+        _STAGE, _stage_info(writes_beside, project, worker_env), worker_env, output_queue
+    )
+
+    assert result["status"] == StageStatus.FAILED
+    assert result["reason"].rstrip().splitlines()[-1].startswith("FileExistsError: "), result
+    assert "display_reason" not in result, result
+
+
+@dataclasses.dataclass(frozen=True)
+class _UserText(loaders.Text):
+    """A user's subclass of a pivot loader."""
+
+
+@pytest.mark.parametrize("directory", [False, True], ids=["file", "directory-member"])
+@pytest.mark.parametrize(
+    "loader",
+    [
+        pytest.param(loaders.Text(), id="pivot-loader"),
+        pytest.param(_UserText(), id="user-subclass-of-pivot-loader"),
+    ],
+)
+def test_a_load_failure_keeps_its_traceback_whoever_wrote_the_loader(
+    project: pathlib.Path,
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    directory: bool,
+    loader: loaders.Text,
+) -> None:
+    """Loading a dependency is not pivot's I/O on state it owns: a dependency that holds no text
+    fails pivot's own Text loader with its traceback, as through a user's subclass of it."""
+    if directory:
+        group = project / "data" / "upstream"
+        group.mkdir(parents=True)
+        (group / "a.txt").write_bytes(b"\xff")
+        func: Callable[..., str] = _join_group
+        deps = {"group": _ref("upstream", tag=types.ArtifactTag.DIRECTORY, loader=loader)}
+    else:
+        (project / "raw.txt").write_bytes(b"\xff")
+        func = _upper
+        deps = {"data": _ref("raw", tag=types.ArtifactTag.INPUT, loader=loader)}
+
+    result = worker.execute_stage(
+        _STAGE, _stage_info(func, project, worker_env, deps=deps), worker_env, output_queue
+    )
+
+    assert result["status"] == StageStatus.FAILED
+    assert result["reason"].rstrip().endswith("invalid start byte"), result["reason"]
+    assert "display_reason" not in result, result
+
+
+class _Big:
+    """A 4 MB dependency value."""
+
+    data: bytearray
+
+    def __init__(self) -> None:
+        self.data = bytearray(4_000_000)
+
+
+@dataclasses.dataclass(frozen=True)
+class _LoadsBig(loaders.Reader[object]):
+    """A dependency loader whose value is 4 MB; it keeps a weak reference to each value."""
+
+    held: list[weakref.ref[_Big]] = dataclasses.field(compare=False)
+
+    @override
+    def load(self, path: pathlib.Path) -> object:
+        big = _Big()
+        self.held.append(weakref.ref(big))
+        return big
+
+
+@dataclasses.dataclass(frozen=True)
+class _SeesRecordedFailure(loaders.Reader[str]):
+    """A dependency loader that records the failure the worker holds as it runs."""
+
+    seen: list[BaseException | None] = dataclasses.field(compare=False)
+
+    @override
+    def load(self, path: pathlib.Path) -> str:
+        self.seen.append(stage_io._state.error)
+        return path.read_text()
+
+
+def _keeps_nothing(data: object) -> str:
+    _ = data
+    return "x"
+
+
+@pytest.mark.parametrize(
+    ("make_error", "display"),
+    [
+        pytest.param(
+            lambda: exceptions.OutputMissingError("pivot's own error"), None, id="pivot-error"
+        ),
+        pytest.param(lambda: SystemExit(3), None, id="system-exit"),
+        pytest.param(worker.WorkerTerminated, None, id="keyboard-interrupt"),
+        pytest.param(
+            lambda: PermissionError(errno.EACCES, _EACCES, "/out"),
+            f"{_EACCES}: /out",
+            id="unexpected-error",
+        ),
+    ],
+)
+def test_a_failed_stage_leaves_neither_its_failure_nor_its_inputs_in_the_worker(
+    project: pathlib.Path,
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    monkeypatch: pytest.MonkeyPatch,
+    make_error: Callable[[], BaseException],
+    display: str | None,
+) -> None:
+    """Creating the output file fails inside pivot's own I/O, so the worker records the failure.
+    Whichever handler the stage then fails through, a warm worker keeps nothing of it: not the
+    inputs its traceback's frames hold (a 4 MB dependency value), and not the failure the next
+    stage's loader would see."""
+    create = tempfile.mkstemp
+
+    def fails_to_create(*args: Any, **kwargs: Any) -> tuple[int, str]:
+        if kwargs.get("suffix") == ".txt.tmp":
+            raise make_error()
+        return create(*args, **kwargs)
+
+    held = list[weakref.ref[_Big]]()
+    deps = {"data": _ref("raw", tag=types.ArtifactTag.INPUT, loader=_LoadsBig(held))}
+    with monkeypatch.context() as patch:
+        patch.setattr(tempfile, "mkstemp", fails_to_create)
+        failed = worker.execute_stage(
+            _STAGE,
+            _stage_info(_keeps_nothing, project, worker_env, deps=deps),
+            worker_env,
+            output_queue,
+        )
+    _ = gc.collect()
+
+    assert failed["status"] == StageStatus.FAILED, failed["reason"]
+    if display is not None:
+        assert _display_line(failed) == display, failed
+    assert held[0]() is None, "the failed stage's 4 MB dependency value is still reachable"
+
+    seen = list[BaseException | None]()
+    deps = {"data": _ref("raw", tag=types.ArtifactTag.INPUT, loader=_SeesRecordedFailure(seen))}
+    after = worker.execute_stage(
+        _STAGE, _stage_info(_upper, project, worker_env, deps=deps), worker_env, output_queue
+    )
+
+    assert after["status"] == StageStatus.RAN, after["reason"]
+    assert seen == [None], "the next stage's loader sees the failed stage's failure"
 
 
 # =============================================================================

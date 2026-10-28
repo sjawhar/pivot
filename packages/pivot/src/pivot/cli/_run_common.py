@@ -90,7 +90,9 @@ class _HoldWhileTuiRuns(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         """Pass through before/after the TUI; hold new warning-or-higher records during it."""
         printing = self._released or not self._tui_started.is_set()
-        if record.levelno < logging.WARNING:
+        # A record with a traceback (--verbose logs a failed stage's at DEBUG) is held for after
+        # the TUI like a warning; any other sub-warning record prints only outside the TUI.
+        if record.levelno < logging.WARNING and record.exc_info is None:
             return printing
         if record.name.partition(".")[0] == "pivot_tui":
             return printing
