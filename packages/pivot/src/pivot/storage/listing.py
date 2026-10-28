@@ -439,7 +439,11 @@ def _resolve(
         except exceptions.CorruptListingError as e:
             problem = e
         else:
-            cached = None if cache_dir is None else cache.get_cache_path(cache_dir, record["hash"])
+            cached = (
+                None
+                if cache_dir is None
+                else cache.resolve_cache_object_path(cache_dir, record["hash"])
+            )
             if cached is None:
                 return checked, source
             try:
@@ -456,7 +460,9 @@ def _resolve(
             return checked, source
     if problem is not None and strict:
         raise problem
-    cached = None if cache_dir is None else cache.get_cache_path(cache_dir, record["hash"])
+    cached = (
+        None if cache_dir is None else cache.resolve_cache_object_path(cache_dir, record["hash"])
+    )
     if cached is not None:
         try:
             data = check(cached.read_bytes(), record, cached)

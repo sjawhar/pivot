@@ -112,9 +112,9 @@ def _get_stage_lock_hashes(
     CorruptListingError, naming the file, for a listing that cannot be used.
     """
     stage_info = cli_helpers.get_stage(stage_name)
-    default_state_dir = config.get_state_dir()
+    default_state_dir = config.locate_state_dir()
     state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
-    files_dir = config.get_cache_dir() / "files"
+    files_dir = config.locate_cache_dir() / "files"
     stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
     lock_data = stage_lock.read(cache_dir=files_dir)
     if lock_data is None:
@@ -487,7 +487,7 @@ def verify(
     if not all_stages:
         raise click.ClickException("No stages registered. Nothing to verify.")
 
-    cache_dir = config.get_cache_dir()
+    cache_dir = config.locate_cache_dir()
 
     # Get rich explanations so lock-only dependency mismatches identify the
     # producer artifact in verification output.

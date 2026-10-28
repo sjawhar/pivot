@@ -43,6 +43,7 @@ Example::
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 import pathlib
@@ -63,6 +64,7 @@ from pivot import (
     registry,
 )
 from pivot import fingerprint as fingerprint_mod
+from pivot import state_dir as state_dir_mod
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
@@ -125,7 +127,7 @@ def _get_explanations_in_parallel(
     tracked_trie: pygtrie.Trie[str] | None = None,
 ) -> dict[str, StageExplanation]:
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
-    default_state_dir = config.get_state_dir()
+    default_state_dir = config.locate_state_dir()
     max_workers = min(8, len(execution_order))
     locks = explain.read_locks(execution_order, all_stages, default_state_dir, store.cache_dir)
     unreadable = dict[ArtifactIdentity, str]()
@@ -138,6 +140,7 @@ def _get_explanations_in_parallel(
     )
     explanations_by_name = dict[str, StageExplanation]()
 
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = dict[Future[StageExplanation], str]()
         for stage_name in execution_order:
@@ -145,6 +148,7 @@ def _get_explanations_in_parallel(
             fingerprint = cast("dict[str, str]", stage_info["fingerprint"])
             stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
             future = pool.submit(
+                contextvars.copy_context().run,
                 explain.get_stage_explanation,
                 stage_name,
                 fingerprint,
@@ -182,6 +186,7 @@ def _get_explanations_in_parallel(
                     upstream_stale=[],
                 )
 
+
     return explanations_by_name
 
 
@@ -190,7 +195,7 @@ def _make_workspace_store(pipeline: registry.PipelineLike) -> store_mod.Workspac
         project_root=project.get_project_root(),
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
-        cache_dir=config.get_cache_dir() / "files",
+        cache_dir=config.locate_cache_dir() / "files",
     )
 
 
@@ -205,38 +210,37 @@ def get_pipeline_explanations(
 ) -> list[StageExplanation]:
     _t = metrics.start()
     try:
-        tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
-        if graph is None:
-            graph = engine_graph.build_graph(all_stages)
-        stage_graph = engine_graph.get_stage_dag(graph)
-        execution_order = engine_graph.get_execution_order(
-            stage_graph, stages, single_stage=single_stage
-        )
+        with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
+            tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
+            if graph is None:
+                graph = engine_graph.build_graph(all_stages)
+            stage_graph = engine_graph.get_stage_dag(graph)
+            execution_order = engine_graph.get_execution_order(
+                stage_graph, stages, single_stage=single_stage
+            )
 
-        if not execution_order:
-            return []
+            if not execution_order:
+                return []
 
-        with fingerprint_mod.fingerprint_pass():
-            for stage_name in execution_order:
-                pipeline.ensure_fingerprint(stage_name)
-        overrides = parameters.load_params_yaml(pipeline)
+            with fingerprint_mod.fingerprint_pass():
+                for stage_name in execution_order:
+                    pipeline.ensure_fingerprint(stage_name)
+            overrides = parameters.load_params_yaml(pipeline)
 
-        store = _make_workspace_store(pipeline)
-        explanations_by_name = _get_explanations_in_parallel(
-            execution_order,
-            overrides,
-            all_stages=all_stages,
-            force=force,
-            allow_missing=allow_missing,
-            tracked_files=tracked_files,
-            tracked_trie=tracked_trie,
-            store=store,
-        )
+            store = _make_workspace_store(pipeline)
+            explanations_by_name = _get_explanations_in_parallel(
+                execution_order,
+                overrides,
+                all_stages=all_stages,
+                force=force,
+                allow_missing=allow_missing,
+                tracked_files=tracked_files,
+                tracked_trie=tracked_trie,
+                store=store,
+            )
 
-        # Preserve original order for staleness propagation
-        explanations = [explanations_by_name[name] for name in execution_order]
-
-        return _compute_explanations_with_upstream(explanations, stage_graph)
+            explanations = [explanations_by_name[name] for name in execution_order]
+            return _compute_explanations_with_upstream(explanations, stage_graph)
     finally:
         metrics.end("status.get_pipeline_explanations", _t)
 
@@ -297,39 +301,37 @@ def get_pipeline_status(
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
     _t = metrics.start()
     try:
-        tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
-        if graph is None:
-            graph = engine_graph.build_graph(all_stages)
-        stage_graph = engine_graph.get_stage_dag(graph)
-        execution_order = engine_graph.get_execution_order(
-            stage_graph, stages, single_stage=single_stage
-        )
+        with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
+            tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
+            if graph is None:
+                graph = engine_graph.build_graph(all_stages)
+            stage_graph = engine_graph.get_stage_dag(graph)
+            execution_order = engine_graph.get_execution_order(
+                stage_graph, stages, single_stage=single_stage
+            )
 
-        if not execution_order:
-            return [], stage_graph
+            if not execution_order:
+                return [], stage_graph
 
-        with fingerprint_mod.fingerprint_pass():
-            for stage_name in execution_order:
-                pipeline.ensure_fingerprint(stage_name)
-        overrides = parameters.load_params_yaml(pipeline)
+            with fingerprint_mod.fingerprint_pass():
+                for stage_name in execution_order:
+                    pipeline.ensure_fingerprint(stage_name)
+            overrides = parameters.load_params_yaml(pipeline)
 
-        store = _make_workspace_store(pipeline)
-        explanations_by_name = _get_explanations_in_parallel(
-            execution_order,
-            overrides,
-            all_stages=all_stages,
-            allow_missing=allow_missing,
-            tracked_files=tracked_files,
-            tracked_trie=tracked_trie,
-            store=store,
-        )
+            store = _make_workspace_store(pipeline)
+            explanations_by_name = _get_explanations_in_parallel(
+                execution_order,
+                overrides,
+                all_stages=all_stages,
+                allow_missing=allow_missing,
+                tracked_files=tracked_files,
+                tracked_trie=tracked_trie,
+                store=store,
+            )
 
-        # Preserve original order for staleness propagation
-        explanations = [explanations_by_name[name] for name in execution_order]
-
-        # Reuse the shared upstream computation logic
-        enriched = _compute_explanations_with_upstream(explanations, stage_graph)
-        return _explanations_to_status(enriched), stage_graph
+            explanations = [explanations_by_name[name] for name in execution_order]
+            enriched = _compute_explanations_with_upstream(explanations, stage_graph)
+            return _explanations_to_status(enriched), stage_graph
     finally:
         metrics.end("status.get_pipeline_status", _t)
 
@@ -363,9 +365,10 @@ def get_tracked_files_status(
 
     # Look hashes up read-only and save what was read once, best-effort, so a hash cache that
     # cannot be written never fails status (open_readonly raises for a damaged database).
-    cache_dir = config.get_cache_dir() / "files"
+    cache_dir = config.locate_cache_dir() / "files"
+    state_dir = config.locate_state_dir()
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
-    with state_mod.open_readonly(config.get_state_dir(), create=False) as state_db:
+    with state_mod.open_readonly(state_dir, create=False) as state_db:
         for i, (abs_path_str, track_data) in enumerate(sorted(tracked.items()), 1):
             path = pathlib.Path(abs_path_str)
             rel_path = str(path.relative_to(project_root))
@@ -401,7 +404,7 @@ def get_tracked_files_status(
             if on_progress is not None:
                 on_progress(i, total)
 
-    state_mod.save_file_hashes(config.get_state_dir(), pending)
+    state_mod.save_file_hashes(state_dir, pending)
 
     return results
 
@@ -428,7 +431,7 @@ def get_remote_status(
     if not local_hashes:
         return RemoteSyncInfo(name=resolved_name, url=url, push_count=0, pull_count=0)
 
-    with state_mod.StateDB(config.get_state_dir()) as state_db:
+    with state_mod.StateDB(config.locate_state_dir()) as state_db:
         transfer.check_remote_url(state_db, resolved_name, remote_storage)
         status = asyncio.run(
             transfer.compare_status(local_hashes, remote_storage, state_db, resolved_name)
@@ -452,7 +455,7 @@ def find_orphaned_lock_files(
 ) -> list[str]:
     """Find lock and listing files in the registered stages' state dirs that belong to no
     registered stage, output or input."""
-    default_state_dir = config.get_state_dir()
+    default_state_dir = config.locate_state_dir()
     state_dirs = {default_state_dir} | {
         registry.get_stage_state_dir(stage_info, default_state_dir)
         for stage_info in all_stages.values()

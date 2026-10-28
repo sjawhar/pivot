@@ -11,6 +11,7 @@ import pathlib
 import re
 import stat
 import subprocess
+import sys
 import textwrap
 import typing
 from typing import TYPE_CHECKING, Any
@@ -28,6 +29,54 @@ if TYPE_CHECKING:
     from pivot.registry import PipelineLike
 
 DepValue = compose.ArtifactHandle | str | list[compose.ArtifactHandle]
+
+# The `pivot` command installed beside the interpreter running the tests. CI runs the suite
+# without uv on PATH, so tests start this path, never `uv run pivot`.
+PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
+
+
+def cli_env(home: pathlib.Path, **extra: str) -> dict[str, str]:
+    """The environment an installed-CLI test starts a command in.
+
+    This process's environment without any ``PIVOT*`` variable (a developer's
+    ``PIVOT_CACHE_DIR`` or ``PIVOT_UNSAFE_FINGERPRINTING`` never reaches the command) and
+    without ``VIRTUAL_ENV``, with ``HOME`` set to ``home`` so neither the developer's global
+    config nor ``~/.pivotignore`` applies, then ``extra``.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PIVOT") and key != "VIRTUAL_ENV"
+    }
+    env["HOME"] = str(home)
+    env.update(extra)
+    return env
+
+
+def run_cli(
+    cwd: pathlib.Path, home: pathlib.Path, *argv: str, extra_env: Mapping[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run ``argv`` (``pivot`` or a setup command such as ``git``) in ``cli_env(home)``.
+
+    Output is captured as text, with undecodable bytes replaced; the exit code is not checked.
+    """
+    return subprocess.run(
+        argv,
+        cwd=cwd,
+        env=cli_env(home, **(extra_env or {})),
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=300,
+        check=False,
+    )
+
+
+def run_pivot(
+    cwd: pathlib.Path, home: pathlib.Path, *args: str, extra_env: Mapping[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run the installed ``pivot`` with ``args`` in ``cwd``, as ``run_cli`` runs a command."""
+    return run_cli(cwd, home, PIVOT, *args, extra_env=extra_env)
 
 
 async def wait_for_socket(socket_path: pathlib.Path, timeout: float = 5.0) -> None:

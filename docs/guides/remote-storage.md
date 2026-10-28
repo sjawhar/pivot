@@ -90,7 +90,7 @@ Restored 3 file(s)
 
 After pulling, `pivot repro` skips stages whose outputs are already present and match their lock file hashes.
 
-Every downloaded file is checked against the hash it is stored under before it enters the local cache. A file that does not match is discarded and counted as failed (`Hash mismatch: expected …, got …`), and `pivot pull` exits without restoring anything. To repair the remote, delete that object from it, then run `pivot push` on a machine whose cache has a good copy and has not run `pivot push`, `pivot pull`, `pivot fetch`, or `pivot status --remote` against this remote for this object. Pivot records hashes those commands upload, download, or find, then skips recorded hashes. If every machine with a good copy has recorded it, delete `.pivot/state.lmdb/` before pushing; this also clears run history and local caches. The check catches corruption in storage or transfer. It does not authenticate who wrote the file.
+Every downloaded file is checked against the hash it is stored under before it enters the local cache. A file that does not match is discarded and counted as failed (`Hash mismatch: expected …, got …`), and `pivot pull` exits without restoring anything. To repair the remote, delete that object from it, then run `pivot push` on a machine whose cache has a good copy and has not run `pivot push`, `pivot pull`, `pivot fetch`, or `pivot status --remote` against this remote for this object. Pivot records hashes those commands upload, download, or find, then skips recorded hashes. If every machine with a good copy has recorded it, delete `<state dir>/state.lmdb/` before pushing; this also clears run history and local caches. The check catches corruption in storage or transfer. It does not authenticate who wrote the file.
 
 ### Selective Pull
 
@@ -141,9 +141,11 @@ pivot checkout --only-missing
 
 | Data | Pushed/Pulled | Version controlled |
 |------|---------------|-------------------|
-| Cache files and directory listing objects (`.pivot/cache/files/`) | Yes | No (`.gitignore`) |
-| Lock files and directory listings (`.pivot/stages/**/*.lock`, `.pivot/stages/**/*.listing`) | No | Yes (commit both) |
+| Cache files and directory listing objects (`<state dir>/cache/files/`) | Yes | No (`.gitignore`) |
+| Lock files and directory listings (`<state dir>/stages/**/*.lock`, `<state dir>/stages/**/*.listing`) | No | Yes (commit both) |
 | Config (`.pivot/config.yaml`) | No | Yes (commit this) |
+
+`<state dir>` is `core.state_dir`, which defaults to `.pivot`.
 
 **Lock files and listings are the bridge.** A lock maps each stage output to a content hash; a
 directory's members are in its committed listing file. Push uploads the listing object and the
@@ -215,7 +217,7 @@ pivot push
 # Iterate on a feature branch
 pivot repro
 pivot push
-git add .pivot/stages
+git add "<state dir>/stages"
 git commit -m "Update pipeline outputs"
 git push
 ```
@@ -251,10 +253,10 @@ A GCS permission error names the object and the missing permission, for example 
 
 **Cache miss after pull — stages re-run unexpectedly:**
 
-Lock files may be out of sync. Ensure the lock files under `.pivot/stages/` are committed:
+Lock files may be out of sync. Ensure the lock files under `<state dir>/stages/` are committed:
 
 ```bash
-git add .pivot/stages
+git add "<state dir>/stages"
 git commit -m "Sync lock files"
 ```
 

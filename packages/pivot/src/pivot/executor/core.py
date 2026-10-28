@@ -19,6 +19,7 @@ import loky.backend.resource_tracker
 import loky.reusable_executor
 
 from pivot import config, discovery, exceptions, loaded_source, parameters, project, registry, types
+from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
 from pivot.storage import cache, lock, track
 from pivot.storage import state as state_mod
@@ -525,13 +526,11 @@ def prepare_worker_info(
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process.
 
-    Uses stage's state_dir if set, otherwise falls back to default_state_dir.
+    Uses stage's state_dir if set, otherwise falls back to default_state_dir. The worker receives
+    this process's state resolution, so it reads every state file where the coordinator does.
     """
-    # Use stage's state_dir if set, otherwise fall back to default
     state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
-
-    # Ensure state directory exists (workers open StateDB in readonly mode)
-    state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir_mod.make_state_dir(state_dir)
 
     # The fingerprint is computed first: it sets `unsafe_fingerprint`.
     fingerprint = pipeline.ensure_fingerprint(stage_info["name"])
@@ -552,7 +551,7 @@ def prepare_worker_info(
         params_arg_name=stage_info["params_arg_name"],
         project_root=project_root,
         state_dir=state_dir,
-        project_state_dir=default_state_dir,
+        state_dir_resolution=state_dir_mod.resolution_for(project_root),
         collection_params=stage_info["collection_params"],
         unsafe_fingerprint=stage_info["unsafe_fingerprint"],
         no_fingerprint=stage_info["no_fingerprint"],
@@ -596,7 +595,7 @@ def _restore_tracked_file(
         output_hash,
         cache_dir,
         checkout_modes=checkout_modes,
-        state_dir=config.get_state_dir(),
+        state_dir=config.locate_state_dir(),
         members=members,
         recorded=recorded,
     )
@@ -618,10 +617,11 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
 
     _t = metrics.start()
     missing = list[str]()
-    cache_dir = config.get_cache_dir() / "files"
+    cache_dir = config.locate_cache_dir() / "files"
+    state_dir = config.locate_state_dir()
 
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
-    with state_mod.open_readonly(config.get_state_dir(), create=False) as state_db:
+    with state_mod.open_readonly(state_dir, create=False) as state_db:
         for data_path, track_data in tracked_files.items():
             path = pathlib.Path(data_path)
 
@@ -654,7 +654,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                     + f"Run 'pivot track --force {track_data['path']}' to update."
                 )
 
-    state_mod.save_file_hashes(config.get_state_dir(), pending)
+    state_mod.save_file_hashes(state_dir, pending)
 
     metrics.end("core.verify_tracked_files", _t)
     if missing:
@@ -667,9 +667,9 @@ def check_uncached_incremental_outputs(
 ) -> list[tuple[str, str]]:
     """Check for incremental artifacts that exist without a recorded cache hash."""
     uncached = list[tuple[str, str]]()
-    default_state_dir = config.get_state_dir()
+    default_state_dir = config.locate_state_dir()
     workspace = store_mod.WorkspaceStore(project.get_project_root(), "", {})
-    cache_dir = config.get_cache_dir() / "files"
+    cache_dir = config.locate_cache_dir() / "files"
 
     for stage_name in execution_order:
         stage_info = all_stages[stage_name]
@@ -698,8 +698,8 @@ def check_restarted_incremental_outputs(
     """Why each stage in ``execution_order`` whose lock an older pivot rewrote over this
     pivot's, for a stage with an incremental output, is refused (``lock.restart_proofs``)."""
     refused = list[str]()
-    default_state_dir = config.get_state_dir()
-    cache_dir = config.get_cache_dir() / "files"
+    default_state_dir = config.locate_state_dir()
+    cache_dir = config.locate_cache_dir() / "files"
     for stage_name in execution_order:
         stage_info = all_stages[stage_name]
         if not any(out.tag is types.ArtifactTag.INCREMENTAL for out in stage_info["outs"]):

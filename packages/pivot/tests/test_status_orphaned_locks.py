@@ -143,7 +143,7 @@ def test_find_orphaned_lock_files_includes_default_dir_with_only_custom_stages(
     hashed = _hashed_tree(set_project_root / "tree")
     default_state_dir = set_project_root / ".pivot"
     custom_state_dir = set_project_root / "custom" / ".pivot"
-    monkeypatch.setattr(config, "get_state_dir", lambda: default_state_dir)
+    monkeypatch.setattr(config, "locate_state_dir", lambda: default_state_dir)
     all_stages = {
         "custom/train": _stage_info(
             "custom/train", custom_state_dir, outs=[_directory_out("custom/train", "images")]
@@ -167,7 +167,7 @@ def test_find_orphaned_lock_files_detects_a_stage_moved_to_another_state_dir(
     hashed = _hashed_tree(set_project_root / "tree")
     default_state_dir = set_project_root / ".pivot"
     custom_state_dir = set_project_root / "custom" / ".pivot"
-    monkeypatch.setattr(config, "get_state_dir", lambda: default_state_dir)
+    monkeypatch.setattr(config, "locate_state_dir", lambda: default_state_dir)
     all_stages = {
         "train": _stage_info("train", custom_state_dir, outs=[_directory_out("train", "images")])
     }
@@ -188,7 +188,7 @@ def test_find_orphaned_lock_files_scans_default_dir_without_stages(
     """Deleting every stage does not hide stale locks and listings in the default directory."""
     hashed = _hashed_tree(set_project_root / "tree")
     default_state_dir = set_project_root / ".pivot"
-    monkeypatch.setattr(config, "get_state_dir", lambda: default_state_dir)
+    monkeypatch.setattr(config, "locate_state_dir", lambda: default_state_dir)
     _write_lock(
         default_state_dir,
         "deleted/train",

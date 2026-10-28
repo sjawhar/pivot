@@ -347,9 +347,10 @@ class AgentRpcHandler:
                         for ref in reg_info["deps"].values()
                         if ref.identity.producer in all_stages
                     }
-                    cache_dir = config_io.get_cache_dir() / "files"
+                    default_state_dir = config_io.locate_state_dir()
+                    cache_dir = config_io.locate_cache_dir() / "files"
                     locks = explain_mod.read_locks(
-                        [stage, *producers], all_stages, config_io.get_state_dir(), cache_dir
+                        [stage, *producers], all_stages, default_state_dir, cache_dir
                     )
                     store = store_mod.WorkspaceStore(
                         project_root=project.get_project_root(),
@@ -362,9 +363,7 @@ class AgentRpcHandler:
                         {producer: locks[producer] for producer in producers},
                         reg_info["deps"].values(),
                         {
-                            producer: explain_mod.stages_dir(
-                                all_stages[producer], config_io.get_state_dir()
-                            )
+                            producer: explain_mod.stages_dir(all_stages[producer], default_state_dir)
                             for producer in producers
                         },
                         store.cache_dir,
@@ -377,9 +376,7 @@ class AgentRpcHandler:
                         outs=list(reg_info["outs"]),
                         params_instance=reg_info["params"],
                         overrides=overrides,
-                        state_dir=registry_mod.get_stage_state_dir(
-                            reg_info, config_io.get_state_dir()
-                        ),
+                        state_dir=registry_mod.get_stage_state_dir(reg_info, default_state_dir),
                         store=store,
                         lock_data=locks[stage],
                         allow_missing=True,

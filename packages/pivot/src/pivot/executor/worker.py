@@ -62,6 +62,7 @@ from pivot import (
     stage_io,
     types,
 )
+from pivot import state_dir as state_dir_mod
 from pivot.storage import artifact_lock, cache, listing, lock, state
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -872,7 +873,7 @@ class WorkerStageInfo(TypedDict):
     params_arg_name: str | None
     project_root: pathlib.Path
     state_dir: pathlib.Path
-    project_state_dir: pathlib.Path
+    state_dir_resolution: state_dir_mod.StateDirResolution
     collection_params: dict[str, str]
     incremental_inputs: dict[str, types.ArtifactIdentity]
     # The fingerprint downgraded a refusal to a warning: the run cache is neither read nor written.
@@ -922,8 +923,8 @@ def _execute_stage(
     _ = cache_dir
     ring_buffer = _OutputRingBuffer()
     state_dir = stage_info["state_dir"]
-    project_state_dir = stage_info["project_state_dir"]
     project_root = stage_info["project_root"]
+    project_state_dir = state_dir_mod.locate_state_dir(project_root)
     store = store_mod.store_from_spec(stage_info["store_spec"])
 
     # Set project root cache explicitly - workers in reusable pool may have
@@ -1387,6 +1388,10 @@ def execute_stage(
     anything. After SIGTERM or the death of its Pivot process, the worker exits once the stage
     has unwound instead of returning.
     """
+    invocation = state_dir_mod.begin_invocation(
+        report=False,
+        state_dirs={stage_info["project_root"]: stage_info["state_dir_resolution"]},
+    )
     try:
         _begin_stage()
         result = _execute_stage(stage_name, stage_info, cache_dir, output_queue)
@@ -1400,6 +1405,7 @@ def execute_stage(
         # Every way out of the stage drops its recorded failure, whose frames hold the stage's
         # locals and loaded inputs, so a warm worker does not keep them until its next stage.
         stage_io.clear()
+        state_dir_mod.end_invocation(invocation)
     if _stop.exit_requested:
         _exit_worker(1)
     result["user_code_files"] = user_code_files()

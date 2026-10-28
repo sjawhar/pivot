@@ -137,7 +137,8 @@ Runs stages in worker processes:
 
 ### Lock Files
 
-Per-stage lock files (`.pivot/stages/<name>.lock`) enable fast, parallel writes. Each lock file records:
+Per-stage lock files (`<state dir>/stages/<name>.lock`) enable fast, parallel writes. The state
+directory comes from `core.state_dir` and defaults to `.pivot`. Each lock file records:
 
 - **Code manifest** - Hashes of the stage function and its transitive dependencies
 - **Parameters** - Current parameter values
@@ -162,6 +163,9 @@ Lock files use relative paths for portability across machines.
 
 ```
 .pivot/
+└── config.yaml          # Project configuration
+
+<state dir>/             # .pivot by default
 ├── cache/
 │   ├── files/           # Content-addressable files and directory listing objects
 │   │   ├── ab/
@@ -174,7 +178,6 @@ Lock files use relative paths for portability across machines.
 │       ├── preprocess.lock
 │       ├── preprocess=.listing
 │       └── train.lock
-├── config.yaml          # Remote configuration
 └── state.lmdb/          # LMDB database (hash cache, generations, run cache, remote index)
 ```
 

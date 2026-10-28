@@ -7,6 +7,7 @@ import pathlib
 from typing import TYPE_CHECKING
 
 from pivot import config, exceptions, metrics, names, project, registry, types
+from pivot import state_dir as state_dir_mod
 from pivot.remote import config as remote_config
 from pivot.remote import protocol
 from pivot.storage import cache, listing, lock, track
@@ -23,28 +24,29 @@ logger = logging.getLogger(__name__)
 
 
 def get_local_cache_hashes(cache_dir: pathlib.Path) -> set[str]:
-    """Scan local cache and return all content hashes.
-
-    Uses os.scandir for efficiency - DirEntry caches stat results, eliminating
-    redundant syscalls compared to pathlib.iterdir + is_file/is_dir.
-    """
+    """Scan configured and legacy cache roots for locally available content hashes."""
     _t = metrics.start()
-    files_dir = cache_dir / "files"
-    if not files_dir.exists():
-        metrics.end("sync.get_local_cache_hashes", _t)
-        return set()
+    files_dirs = [cache_dir / "files"]
+    if (other_files_dir := state_dir_mod.other_cache_files_dir_for(files_dirs[0])) is not None:
+        files_dirs.append(other_files_dir)
 
     hashes = set[str]()
-    with os.scandir(files_dir) as prefix_entries:
-        for prefix_entry in prefix_entries:
-            if not prefix_entry.is_dir() or len(prefix_entry.name) != 2:
-                continue
-            with os.scandir(prefix_entry.path) as hash_entries:
-                for hash_entry in hash_entries:
-                    if hash_entry.is_file():
+    for index, files_dir in enumerate(files_dirs):
+        if not files_dir.is_dir():
+            continue
+        with os.scandir(files_dir) as prefix_entries:
+            for prefix_entry in prefix_entries:
+                if not prefix_entry.is_dir() or len(prefix_entry.name) != 2:
+                    continue
+                with os.scandir(prefix_entry.path) as hash_entries:
+                    for hash_entry in hash_entries:
+                        if not hash_entry.is_file():
+                            continue
                         full_hash = prefix_entry.name + hash_entry.name
                         if cache.is_valid_hash(full_hash):
                             hashes.add(full_hash)
+                            if index:
+                                state_dir_mod.report_legacy_state_dir(cache_dir)
 
     metrics.end("sync.get_local_cache_hashes", _t)
     return hashes
@@ -99,11 +101,17 @@ def _output_blobs(
     *,
     require_members: bool = False,
 ) -> set[str]:
-    """The cache objects of a stage output, a directory's listing read beside its lock (unless
-    ``lock_data``, the producer's lock, is an older pivot's: ``lock.committed_listing``)."""
+    """The cache objects of a stage output, a directory's listing read beside its lock."""
     committed = listing.output_listing_path(stages_dir, identity)
     if lock_data is not None:
         committed = lock.committed_listing(lock_data, committed)
+    if committed is not None and not committed.is_file():
+        other_stages_dir = state_dir_mod.other_stages_dir_for(stages_dir)
+        if other_stages_dir is not None:
+            legacy = listing.output_listing_path(other_stages_dir, identity)
+            if legacy.is_file():
+                state_dir_mod.report_legacy_state_dir(stages_dir.parent)
+                committed = legacy
     return _blob_hashes(
         hash_info,
         lambda record: listing.read(committed, record, files_dir),
@@ -262,13 +270,13 @@ def get_target_hashes(
     """Resolve targets (stage names or file paths) to cache hashes.
 
     A directory resolves to its listing object and its files' objects. ``cache_dir`` is the
-    cache root (``config.get_cache_dir()`` when None). With ``require_members`` (push), a
+    cache root (``config.locate_cache_dir()`` when None). With ``require_members`` (push), a
     directory whose committed listing cannot be read and whose listing object the cache lacks
     raises rather than naming an object that is not there (``_blob_hashes``).
     """
     _t = metrics.start()
     proj_root = project.get_project_root()
-    files_dir = (cache_dir if cache_dir is not None else config.get_cache_dir()) / "files"
+    files_dir = (cache_dir if cache_dir is not None else config.locate_cache_dir()) / "files"
     hashes = set[str]()
     output_identities: dict[str, types.ArtifactIdentity] | None = None
     unresolved = list[str]()
@@ -516,6 +524,13 @@ async def _push_async(
     skipped_non_file = 0
     for hash_ in status["local_only"]:
         cache_path = cache.get_cache_path(files_dir, hash_)
+        if not cache_path.is_file():
+            other_files_dir = state_dir_mod.other_cache_files_dir_for(files_dir)
+            if other_files_dir is not None:
+                other_path = cache.get_cache_path(other_files_dir, hash_)
+                if other_path.is_file():
+                    state_dir_mod.report_legacy_state_dir(cache_dir)
+                    cache_path = other_path
         if cache_path.is_file():
             items.append((cache_path, hash_))
         else:

@@ -126,7 +126,13 @@ is warned about, because `checkout x.pvt`, `get`, `update` and `push` take the f
 |----------|-------------|
 | `PIVOT_CACHE_DIR` | Override cache directory location |
 
-**`PIVOT_CACHE_DIR`** takes precedence over the `cache.dir` config setting. Relative paths are resolved against the project root. Empty or whitespace-only values are treated as unset, falling back to the config file (or `.pivot/cache` if no config is set).
+**`PIVOT_CACHE_DIR`** takes precedence over the `cache.dir` config setting. Relative paths are
+resolved against the project root. Empty or whitespace-only values are treated as unset, falling
+back to the config file or `<state dir>/cache`. A cache directory that Pivot creates inside a
+configured state directory, other than `<state dir>/cache`, gets its own `.gitignore` that
+ignores everything in it. A cache directory that equals, contains, or is inside
+`<state dir>/stages` instead warns once and uses `<state dir>/cache`, so it cannot hide committed
+stage locks.
 
 ---
 
@@ -594,7 +600,7 @@ pivot plots show [TARGETS...] [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--output` / `-o PATH` | Output HTML path (default: `.pivot/plots/index.html`, ignored by git). Image paths are relative to the HTML file. |
+| `--output` / `-o PATH` | Output HTML path (default: `<state dir>/plots/index.html`, ignored by git). Image paths are relative to the HTML file. |
 | `--open` | Open browser after rendering |
 
 ---
@@ -894,6 +900,18 @@ pivot config list [OPTIONS]
 | `--local` | Show only local config |
 | `--json` | Output as JSON |
 
+Without `--global` or `--local`, `config list` shows the merged configuration after validation.
+It fails in one line when the local `core.state_dir` is not a string. It marks any other
+`core.state_dir` that is not a path, such as an empty value, with
+`invalid: core.state_dir must be a path`.
+
+`--local` and `--global` show the values stored in that one file, as written, and exit 0 for any
+stored `core.state_dir`: `core.state_dir: 5` shows as `core.state_dir = 5 (local)`. Inside a
+project, the text forms label every row of a global `core.state_dir` `(global, ignored)`, whatever
+its type: a mapping shows one row for each nested key. Only the project's own
+`.pivot/config.yaml` sets the state directory. `--json` prints the values as JSON, with no source
+labels for any key.
+
 ---
 
 ### `pivot config get`
@@ -989,11 +1007,11 @@ pivot config unset default_remote
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `cache.dir` | Cache directory | `.pivot/cache` |
+| `cache.dir` | Cache directory path | `<state dir>/cache` |
 | `cache.checkout_mode` | Checkout mode order; a hard link refused because the cache object is at the filesystem's link limit makes a copy instead | `hardlink,symlink,copy` |
 | `core.max_workers` | Most parallel workers (-1 = all CPUs); a run starts fewer when fewer of its stages can run at once | `-2` |
 | `core.run_history_retention` | Keep last N runs | `100` |
-| `core.state_dir` | State directory | `.pivot` |
+| `core.state_dir` | Where Pivot keeps lock files, the state database, the default cache, the RPC socket, secret keys and plot galleries. Set it in the project's `.pivot/config.yaml`; a global value is ignored with a warning, and `config set --global core.state_dir` is refused. Two projects must never point at the same directory | `.pivot` |
 | `resources` | Scheduler resource capacities | `{}` |
 | `remote.jobs` | Parallel transfer jobs | `20` |
 | `remote.retries` | Transfer retry count | `10` |
@@ -1019,7 +1037,7 @@ pivot init [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--force` / `-f` | Overwrite existing .pivot/.gitignore |
+| `--force` / `-f` | Overwrite `.pivot/.gitignore` only for the default state directory. A configured state directory keeps any existing entry and creates a missing one atomically. |
 
 Writes `.pivot/.gitignore`, a `.pivotignore` if there is none, and the line
 `*.listing -merge` into `.gitattributes` (created if absent), so git never

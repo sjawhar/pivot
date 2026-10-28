@@ -7,6 +7,7 @@ import tempfile
 from typing import TYPE_CHECKING, Protocol, TypedDict, runtime_checkable
 
 from pivot import config, stage_def, types
+from pivot import state_dir as state_dir_mod
 from pivot.storage import cache, listing
 from pivot.storage import state as state_mod
 
@@ -86,19 +87,23 @@ class CacheStore:
             raise FileNotFoundError(ref_path)
 
         with self._state_db() as db:
-            if ref_path.is_dir():
+            is_directory = ref_path.is_dir()
+            if is_directory:
                 ref_hash = cache.hash_directory(ref_path, db)["record"]["hash"]
-                cache_path = cache.tree_path(self._cache_dir, ref_hash)
             else:
                 ref_hash, _ = cache.hash_file(ref_path, db)
-                cache_path = cache.get_cache_path(self._cache_dir, ref_hash)
 
-        if not cache_path.exists():
-            raise FileNotFoundError(cache_path)
+        cache_path = (
+            cache.resolve_cache_tree_path(self._cache_dir, ref_hash)
+            if is_directory
+            else cache.resolve_cache_object_path(self._cache_dir, ref_hash)
+        )
+        if cache_path is None:
+            raise FileNotFoundError(ref_hash)
         return cache_path
 
     def prepare_output(self, ref: types.ArtifactRef) -> pathlib.Path:
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        state_dir_mod.make_dirs(self._cache_dir)
         if ref.tag == types.ArtifactTag.DIRECTORY:
             return pathlib.Path(tempfile.mkdtemp(prefix="pivot_cache_out_", dir=self._cache_dir))
 
@@ -347,10 +352,10 @@ class WorkspaceStore:
             if members is None:
                 members = self.cached_listing(output_hash)
             return members is not None and all(
-                cache.get_cache_path(self._cache_dir, entry["hash"]).exists()
+                cache.resolve_cache_object_path(self._cache_dir, entry["hash"]) is not None
                 for entry in members["files"]
             )
-        return cache.get_cache_path(self._cache_dir, output_hash["hash"]).exists()
+        return cache.resolve_cache_object_path(self._cache_dir, output_hash["hash"]) is not None
 
     def resolve_display_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         """Resolve the workspace path for an artifact, for display/CLI use.
@@ -414,9 +419,10 @@ def relative_output_path(ref: types.ArtifactRef) -> pathlib.Path:
 def store_from_spec(spec: StoreSpec) -> Store:
     kind = spec["kind"]
     if kind == "cache":
+        project_root = pathlib.Path(spec["project_root"])
         return CacheStore(
             cache_dir=pathlib.Path(spec["cache_dir"]),
-            state_dir=pathlib.Path(spec["project_root"]) / ".pivot",
+            state_dir=state_dir_mod.ensure_state_dir(project_root),
         )
     if kind == "workspace":
         cache_dir_str = spec.get("cache_dir")

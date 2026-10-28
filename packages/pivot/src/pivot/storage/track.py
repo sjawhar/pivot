@@ -637,8 +637,12 @@ class _Memo(TypedDict):
 
 
 def _memo_path() -> pathlib.Path:
-    """The running account's memo file, beside the state database's files."""
-    return config.get_state_dir() / "state.lmdb" / f"pvt-memo-{os.geteuid()}"
+    """The running account's memo file, beside the state database's files.
+
+    Located, never created: the memo never creates the state directory (``_create_memo``), and a
+    walk is a read, so it must not make a configured ``core.state_dir`` that does not exist yet.
+    """
+    return config.locate_state_dir() / "state.lmdb" / f"pvt-memo-{os.geteuid()}"
 
 
 def _memo_device_allowed(mounts: _Mounts, device: int, directory: pathlib.Path) -> bool:

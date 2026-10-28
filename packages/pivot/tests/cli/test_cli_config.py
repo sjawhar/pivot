@@ -6,6 +6,7 @@ import pytest
 
 from conftest import isolated_pivot_dir
 from pivot import cli
+from pivot import state_dir as state_dir_mod
 
 # --- config list tests ---
 
@@ -89,6 +90,42 @@ def test_config_get_json_output(runner: click.testing.CliRunner, tmp_path: pathl
         assert "source" in data
 
 
+def test_config_get_reports_the_pivot_052_cache_default(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """In the default layout, an unset cache.dir prints 0.5.2's exact bytes."""
+    with isolated_pivot_dir(runner, tmp_path):
+        text = runner.invoke(cli.cli, ["config", "get", "cache.dir"])
+        as_json = runner.invoke(cli.cli, ["config", "get", "cache.dir", "--json"])
+        listed = runner.invoke(cli.cli, ["config", "list"])
+        listed_json = runner.invoke(cli.cli, ["config", "list", "--json"])
+
+    assert text.exit_code == 0, text.output
+    assert text.output == "cache.dir = .pivot/cache (default)\n"
+    assert as_json.exit_code == 0, as_json.output
+    assert as_json.output == '{"key": "cache.dir", "value": ".pivot/cache", "source": "default"}\n'
+    assert "cache.dir = .pivot/cache (default)\n" in listed.output
+    assert json.loads(listed_json.output)["cache"]["dir"] == ".pivot/cache"
+
+
+def test_config_get_reports_the_configured_state_cache_default(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """With core.state_dir set, the reported cache default is the real `<state dir>/cache`."""
+    with isolated_pivot_dir(runner, tmp_path):
+        pathlib.Path(".pivot/config.yaml").write_text("core:\n  state_dir: altstate\n")
+        text = runner.invoke(cli.cli, ["config", "get", "cache.dir"])
+        as_json = runner.invoke(cli.cli, ["config", "get", "cache.dir", "--json"])
+        listed_json = runner.invoke(cli.cli, ["config", "list", "--json"])
+
+    assert text.exit_code == 0, text.output
+    assert text.output == "cache.dir = altstate/cache (default)\n"
+    data = json.loads(as_json.output)
+    assert data["value"] == "altstate/cache"
+    assert data["source"] == "default"
+    assert json.loads(listed_json.output)["cache"]["dir"] == "altstate/cache"
+
+
 def test_config_get_unknown_key_errors(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
@@ -112,6 +149,22 @@ def test_config_set_creates_value(runner: click.testing.CliRunner, tmp_path: pat
         config_file = pathlib.Path(".pivot/config.yaml")
         assert config_file.exists()
         assert "/custom" in config_file.read_text()
+
+
+def test_config_set_rejects_an_empty_state_dir_without_writing(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """An empty core.state_dir is invalid before config persistence."""
+    with isolated_pivot_dir(runner, tmp_path):
+        config_file = pathlib.Path(".pivot/config.yaml")
+        config_file.write_text("core:\n  max_workers: 2\n")
+        before = config_file.read_text()
+
+        result = runner.invoke(cli.cli, ["config", "set", "core.state_dir", ""])
+
+        assert result.exit_code != 0
+        assert "must be a path" in result.output
+        assert config_file.read_text() == before
 
 
 def test_config_set_validates_value(
@@ -142,15 +195,84 @@ def test_config_set_global_flag(
 ) -> None:
     global_config = tmp_path / ".config" / "pivot" / "config.yaml"
 
-    from pivot.config import io
+    from pivot import config_files
 
-    monkeypatch.setattr(io, "get_global_config_path", lambda: global_config)
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_config)
 
     with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "set", "--global", "display.precision", "3"])
 
         assert result.exit_code == 0
         assert global_config.exists()
+
+
+def test_config_set_global_rejects_project_state_dir(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """core.state_dir is local because it identifies one project's own state."""
+    global_config = tmp_path / ".config" / "pivot" / "config.yaml"
+
+    from pivot import config_files
+
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_config)
+
+    with isolated_pivot_dir(runner, tmp_path):
+        result = runner.invoke(cli.cli, ["config", "set", "--global", "core.state_dir", "shared"])
+
+    assert result.exit_code != 0
+    assert "is ignored; set it in" in result.output
+    assert not global_config.exists()
+
+
+def test_config_set_state_dir_updates_the_current_process(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """The state resolver drops its old value after config set."""
+    with isolated_pivot_dir(runner, tmp_path):
+        root = pathlib.Path.cwd()
+        assert state_dir_mod.get_state_dir() == root / ".pivot"
+
+        result = runner.invoke(cli.cli, ["config", "set", "core.state_dir", "alternate-state"])
+
+        assert result.exit_code == 0, result.output
+        assert state_dir_mod.get_state_dir() == root / "alternate-state"
+        assert sorted(path.name for path in (root / ".pivot").iterdir()) == [
+            "config.yaml",
+            "config.yaml.lock",
+        ]
+
+
+@pytest.mark.parametrize(
+    "target_kind",
+    [
+        pytest.param("file", id="existing-file"),
+        pytest.param("dangling-symlink", id="dangling-symlink"),
+        pytest.param("file-parent", id="file-parent"),
+    ],
+)
+def test_config_set_refuses_unusable_state_dir_without_writing(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, target_kind: str
+) -> None:
+    """State-dir validation happens before the config writer changes the marker file."""
+    with isolated_pivot_dir(runner, tmp_path):
+        root = pathlib.Path.cwd()
+        config_path = root / ".pivot" / "config.yaml"
+        config_path.write_text("core:\n  max_workers: 2\n")
+        before = config_path.read_text()
+        if target_kind == "file":
+            (root / "state").write_text("not a directory")
+            value = "state"
+        elif target_kind == "dangling-symlink":
+            (root / "state").symlink_to(root / "missing")
+            value = "state"
+        else:
+            (root / "parent").write_text("not a directory")
+            value = "parent/state"
+
+        result = runner.invoke(cli.cli, ["config", "set", "core.state_dir", value])
+
+        assert result.exit_code != 0
+        assert config_path.read_text() == before
 
 
 def test_config_set_checkout_mode_comma_separated(
@@ -231,9 +353,9 @@ def test_config_unset_global_flag(
     global_config.parent.mkdir(parents=True)
     global_config.write_text("display:\n  precision: 3\n")
 
-    from pivot.config import io
+    from pivot import config_files
 
-    monkeypatch.setattr(io, "get_global_config_path", lambda: global_config)
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_config)
 
     with isolated_pivot_dir(runner, tmp_path):
         result = runner.invoke(cli.cli, ["config", "unset", "--global", "display.precision"])
@@ -287,12 +409,9 @@ def test_config_get_global_flag(
     global_config = global_dir / "config.yaml"
     global_config.write_text("display:\n  precision: 7\n")
 
-    from pivot import config
-    from pivot.config import io
+    from pivot import config_files
 
-    # Patch both locations since CLI uses `config.get_global_config_path`
-    monkeypatch.setattr(io, "get_global_config_path", lambda: global_config)
-    monkeypatch.setattr(config, "get_global_config_path", lambda: global_config)
+    monkeypatch.setattr(config_files, "get_global_config_path", lambda: global_config)
 
     with isolated_pivot_dir(runner, tmp_path):
         # Set local value (different from global)

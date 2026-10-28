@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, NamedTuple, cast, override
 
 import yaml
 
-from pivot import exceptions, path_policy, yaml_config
+from pivot import exceptions, path_policy, state_dir as state_dir_mod, yaml_config
 from pivot.storage import cache, listing
 from pivot.types import (
     ArtifactIdentity,
@@ -83,15 +83,30 @@ _RESTART_PROOF_TEXT = """\
 """
 
 SCHEMA_VERSION = 3
-STAGES_REL_PATH = ".pivot/stages"
+
+def stages_rel_path(state_dir: pathlib.Path, root: pathlib.Path) -> str:
+    """Return the git-relative directory holding ``state_dir``'s lock files."""
+    return (state_dir / "stages").resolve().relative_to(root.resolve()).as_posix()
+
+
+def _resolved_lock_path(
+    stages_dir: pathlib.Path, stage_name: str
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Return a readable lock and its stages directory, falling back to legacy .pivot state."""
+    primary = stages_dir / f"{stage_name}{_LOCK_SUFFIX}"
+    if primary.is_file():
+        return primary, stages_dir
+    other_stages_dir = state_dir_mod.other_stages_dir_for(stages_dir)
+    if other_stages_dir is not None:
+        legacy = other_stages_dir / f"{stage_name}{_LOCK_SUFFIX}"
+        if legacy.is_file():
+            state_dir_mod.report_legacy_state_dir(stages_dir.parent)
+            return legacy, other_stages_dir
+    return primary, stages_dir
 
 
 def get_stages_dir(state_dir: pathlib.Path) -> pathlib.Path:
-    """Return the stages directory for lock files.
-
-    Lock files are stored in .pivot/stages/ (git-tracked) rather than
-    .pivot/cache/stages/ so they can be versioned for reproducibility.
-    """
+    """Return the state directory's git-tracked lock file directory."""
     return state_dir / "stages"
 
 
@@ -123,8 +138,8 @@ def stage_name_error(name: str) -> str | None:
     """Return why ``name`` cannot name a lock file, or None if it can.
 
     This is the single rule for stage, pipeline and variant names. A name is a relative path
-    of non-empty segments under ``.pivot/stages``: no leading or doubled ``/``, and no ``.``
-    or ``..`` segment, so the lock file can never land outside that directory.
+    of non-empty segments under the state directory's ``stages`` directory: no leading or doubled
+    ``/``, and no ``.`` or ``..`` segment, so the lock file can never land outside that directory.
     """
     if not name or not _VALID_STAGE_NAME.fullmatch(name):
         return "use only letters, digits and the characters _ @ . / -"
@@ -581,6 +596,7 @@ class StageLock:
     stage_name: str
     stages_dir: pathlib.Path
     path: pathlib.Path
+    _read_stages_dir: pathlib.Path
 
     def __init__(self, stage_name: str, stages_dir: pathlib.Path) -> None:
         """Initialize a stage lock for the given stage in stages_dir."""
@@ -590,16 +606,18 @@ class StageLock:
         self.stage_name = stage_name
         self.stages_dir = stages_dir
         self.path = stages_dir / f"{stage_name}{_LOCK_SUFFIX}"
+        self._read_stages_dir = stages_dir
 
     def _load(self) -> object | None:
         """The lock file's parsed YAML, or None when it is absent or unparseable."""
+        read_path, self._read_stages_dir = _resolved_lock_path(self.stages_dir, self.stage_name)
         try:
-            with open(self.path) as f:
+            with open(read_path) as f:
                 return yaml.load(f, Loader=yaml_config.Loader)
         except FileNotFoundError:
             return None  # Normal case - lock doesn't exist yet
         except (UnicodeDecodeError, yaml.YAMLError) as e:
-            logger.warning("Failed to parse lock file %s: %s", self.path, e)
+            logger.warning("Failed to parse lock file %s: %s", read_path, e)
             return None
 
     def read(
@@ -658,21 +676,21 @@ class StageLock:
         return result
 
     def _warn_format(self, *, older: bool) -> None:
+        read_path, _ = _resolved_lock_path(self.stages_dir, self.stage_name)
         try:
-            mtime_ns = self.path.stat().st_mtime_ns
+            mtime_ns = read_path.stat().st_mtime_ns
         except FileNotFoundError:
             return
-        _warn_format_once(str(self.path), mtime_ns, older)
+        _warn_format_once(str(read_path), mtime_ns, older)
 
     def output_listing_path(self, identity: ArtifactIdentity) -> pathlib.Path:
-        """Where the listing of this stage's directory output ``identity`` is committed."""
-        return listing.output_listing_path(self.stages_dir, identity)
+        """Where the listing of this stage's directory output is committed."""
+        return listing.output_listing_path(self._read_stages_dir, identity)
 
     @property
     def restart_proof_path(self) -> pathlib.Path:
-        """Where this pivot records that it wrote this stage's lock, for a stage that keeps an
-        incremental output (``restart_proof_path``)."""
-        return restart_proof_path(self.stages_dir, self.stage_name)
+        """Where the active lock's restart proof belongs."""
+        return restart_proof_path(self._read_stages_dir, self.stage_name)
 
     def write(
         self,
@@ -703,6 +721,7 @@ class StageLock:
         fails raises InvalidPathError naming it. A recorded name that holds a control character
         is written, and one warning names every such name.
         """
+        self._read_stages_dir = self.stages_dir
         incremental = any(ref.tag is ArtifactTag.INCREMENTAL for ref in outs)
         hashed_dirs = hashed_dirs or {}
         input_paths = input_paths or {}

@@ -31,6 +31,7 @@ from pivot import (
     registry,
     types,
 )
+from pivot import state_dir as state_dir_mod
 from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine import scheduler as engine_scheduler
@@ -892,24 +893,33 @@ class Engine:
     async def _run_execution_task(self, event: RunRequested) -> None:
         """Execute a run in a background task within the run task group.
 
-        Handles ACTIVE→IDLE transitions, restart coalescing, and deferred reloads.
+        Handles ACTIVE→IDLE transitions, restart coalescing, and deferred reloads. The run
+        holds a state-directory record unless an invocation already holds one. It starts with
+        the directories the pipeline resolved when it loaded, which its stages' locks are
+        recorded in, so a library caller's run keeps its locks, its run manifest and every
+        cache entry it produces in one directory, whatever a stage of the run, or the caller
+        since the load, writes to ``core.state_dir``.
         """
         try:
-            self._require_pipeline()
-
-            await self._orchestrate_execution(
-                stages=event["stages"],
-                force=event["force"],
-                single_stage=event["single_stage"],
-                parallel=event["parallel"],
-                max_workers=event["max_workers"],
-                resource_capacity=event["resource_capacity"],
-                no_commit=event["no_commit"],
-                on_error=event["on_error"],
-                cache_dir=event["cache_dir"],
-                allow_uncached_incremental=event["allow_uncached_incremental"],
-                checkout_missing=event["checkout_missing"],
+            pipeline_state_dirs = (
+                None if self._pipeline is None else self._pipeline.resolved_state_dirs
             )
+            with state_dir_mod.entry_invocation(pipeline_state_dirs):
+                self._require_pipeline()
+
+                await self._orchestrate_execution(
+                    stages=event["stages"],
+                    force=event["force"],
+                    single_stage=event["single_stage"],
+                    parallel=event["parallel"],
+                    max_workers=event["max_workers"],
+                    resource_capacity=event["resource_capacity"],
+                    no_commit=event["no_commit"],
+                    on_error=event["on_error"],
+                    cache_dir=event["cache_dir"],
+                    allow_uncached_incremental=event["allow_uncached_incremental"],
+                    checkout_missing=event["checkout_missing"],
+                )
         finally:
             self._running_request = None
             pending_reload = self._reload_pending is not None
@@ -1263,8 +1273,8 @@ class Engine:
         run_id = self._current_run_id or run_history.generate_run_id()
         self._current_run_id = run_id  # May already be set by _handle_run_requested
 
-        # Ensure state directory exists
-        default_state_dir.mkdir(parents=True, exist_ok=True)
+        # Use the common state creator so a configured directory receives its ignore file.
+        state_dir_mod.make_state_dir(default_state_dir)
 
         # Initialize orchestration state after every stage request has been validated.
         await self._initialize_orchestration(
@@ -1552,6 +1562,7 @@ class Engine:
             started_at=started_at,
             ended_at=ended_at,
             retention=retention,
+            state_dir=default_state_dir,
         )
         self._warn_ignored_committed_files(committed_before, project_root)
 
@@ -2021,10 +2032,13 @@ class Engine:
         def _save_file_hashes(entries: list[types.FileHashEntry]) -> None:
             """Record the file hashes this check read or restored, so the next one reads none."""
             if entries:
-                with state_mod.StateDB(stage_state_dir) as writable_db:
-                    writable_db.apply_deferred_writes(
+                _ = state_mod.save_best_effort(
+                    stage_state_dir,
+                    lambda writable_db: writable_db.apply_deferred_writes(
                         stage_name, [], DeferredWrites(file_hash_entries=entries)
-                    )
+                    ),
+                    what=f"{len(entries)} file hashes",
+                )
 
         def _use_outputs(state_db: state_mod.StateDB) -> _SkipOutcome:
             file_hash_entries = list[types.FileHashEntry]()
@@ -2439,8 +2453,14 @@ class Engine:
         started_at: str,
         ended_at: str,
         retention: int,
+        state_dir: pathlib.Path,
     ) -> None:
-        """Build and write run manifest to StateDB."""
+        """Write the run manifest to the state directory this run used.
+
+        The run decided that directory before its first stage, and a ``--watch`` session can
+        outlive an edit of ``core.state_dir``, so the manifest of a finished run is never sent
+        to a directory the next run would use.
+        """
         from pivot import run_history
 
         stages_records = dict[str, run_history.StageRunRecord]()
@@ -2464,7 +2484,7 @@ class Engine:
             stages=stages_records,
         )
 
-        with state_mod.StateDB(config.get_state_dir()) as state_db:
+        with state_mod.StateDB(state_dir) as state_db:
             state_db.write_run(manifest)
             state_db.prune_runs(retention)
 

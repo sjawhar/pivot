@@ -12,6 +12,7 @@ import xxhash
 import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
+from pivot import state_dir as state_dir_mod
 from pivot.storage import cache, listing, lock, state, track
 from pivot.types import HashInfo, is_dir_hash
 
@@ -97,13 +98,24 @@ def _parse_pvt_data_from_bytes(
 def get_lock_data_from_revision(
     stage_name: str, rev: str, state_dir: pathlib.Path
 ) -> lock.CommittedLock | None:
-    """Read and parse lock file for a stage from a git revision."""
-    stages_dir = lock.get_stages_dir(state_dir)
-    rel_path = str(stages_dir.relative_to(project.get_project_root()) / f"{stage_name}.lock")
-    content = git.read_file_from_revision(rel_path, rev)
-    if content is None:
-        return None
-    return _parse_lock_data_from_bytes(content)
+    """Read a lock at a revision, falling back to the legacy state directory when needed."""
+    root = project.get_project_root()
+    state_dirs = [state_dir]
+    if (other_state_dir := state_dir_mod.other_state_dir_for(state_dir)) is not None:
+        state_dirs.append(other_state_dir)
+    for candidate in state_dirs:
+        try:
+            rel_path = str(
+                lock.get_stages_dir(candidate).relative_to(root) / f"{stage_name}.lock"
+            )
+        except ValueError:
+            continue
+        content = git.read_file_from_revision(rel_path, rev)
+        if content is not None:
+            if candidate != state_dir:
+                state_dir_mod.report_legacy_state_dir(state_dir)
+            return _parse_lock_data_from_bytes(content)
+    return None
 
 
 def get_pvt_data_from_revision(
@@ -286,7 +298,7 @@ def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> os.stat_
         with os.fdopen(fd, "wb") as file:
             file.write(content)
 
-    with cache.restore_lock(dest_path, config.get_state_dir()) as lock_token:
+    with cache.restore_lock(dest_path, config.locate_state_dir()) as lock_token:
         staging_path = (
             cache.restore_staging_path(dest_path, lock_token) if lock_token is not None else None
         )
@@ -364,6 +376,7 @@ def restore_file(
     instead of reading it. Each stat is of what was staged, taken before the rename put it in
     place.
     """
+    state_dir = config.locate_state_dir()
     path_str = str(dest_path)
     files_dir = cache_dir / "files"
 
@@ -372,7 +385,7 @@ def restore_file(
 
     # Ensure parent directory exists before any restore strategy
     try:
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        state_dir_mod.make_dirs(dest_path.parent)
     except OSError as e:
         return RestoreResult(
             status=RestoreStatus.ERROR,
@@ -391,14 +404,16 @@ def restore_file(
                     members = cache.cached_listing(files_dir, output_hash)
                 should_try_cache = members is not None
             else:
-                should_try_cache = cache.get_cache_path(files_dir, output_hash["hash"]).exists()
+                should_try_cache = (
+                    cache.resolve_cache_object_path(files_dir, output_hash["hash"]) is not None
+                )
             if should_try_cache:
                 success = cache.restore_from_cache(
                     dest_path,
                     output_hash,
                     files_dir,
                     checkout_modes=checkout_modes,
-                    state_dir=config.get_state_dir(),
+                    state_dir=state_dir,
                     members=members,
                     recorded=restored,
                 )
@@ -462,7 +477,7 @@ def restore_file(
                 output_hash,
                 files_dir,
                 checkout_modes=checkout_modes,
-                state_dir=config.get_state_dir(),
+                state_dir=state_dir,
                 members=members,
                 recorded=downloaded,
             )
@@ -561,7 +576,7 @@ def restore_targets_from_revision(
             hash_state_dir = (
                 stage_targets[target_info["original_target"]]["state_dir"]
                 if target_info["target_type"] is TargetType.STAGE
-                else config.get_state_dir()
+                else config.locate_state_dir()
             )
             for rel_path in target_info["paths"]:
                 output_hash = target_info["hashes"].get(rel_path)

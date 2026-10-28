@@ -10,19 +10,18 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
-import pathlib
 import subprocess
-import sys
 import time
 from typing import TYPE_CHECKING
 
+from tests import helpers
 from tests.conftest import init_git_repo
 
 if TYPE_CHECKING:
+    import pathlib
     from collections.abc import Mapping
 
 # Resolve pivot CLI binary from the same venv as the test runner.
-_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
 
 
 # ---------------------------------------------------------------------------
@@ -203,19 +202,18 @@ def _helper_setup_project(tmp_path: pathlib.Path, pipeline_code: str) -> None:
     """Set up a minimal pivot project in tmp_path with given pipeline code."""
     init_git_repo(tmp_path)
     subprocess.run(
-        [_PIVOT_BIN, "init"],
+        [helpers.PIVOT, "init"],
         cwd=tmp_path,
+        env=_helper_make_env(tmp_path),
         check=True,
         capture_output=True,
     )
     (tmp_path / "pipeline.py").write_text(pipeline_code)
 
 
-def _helper_make_env(**extra: str) -> dict[str, str]:
-    """Create env dict for subprocess with optional extra vars."""
-    env = os.environ.copy()
-    env.update(extra)
-    return env
+def _helper_make_env(tmp_path: pathlib.Path, **extra: str) -> dict[str, str]:
+    """The installed-CLI environment for a project at ``tmp_path``, with optional extra vars."""
+    return helpers.cli_env(tmp_path / "home", **extra)
 
 
 def _helper_run_pivot(
@@ -229,9 +227,9 @@ def _helper_run_pivot(
     qualified_stage = stage if "/" in stage else f"test/{stage}"
     command = "repro" if resolve_deps else "run"
     return subprocess.Popen(
-        [_PIVOT_BIN, command, qualified_stage, "--force"],
+        [helpers.PIVOT, command, qualified_stage, "--force"],
         cwd=tmp_path,
-        env=env or os.environ.copy(),
+        env=env or _helper_make_env(tmp_path),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -323,7 +321,7 @@ def test_disjoint_runs_proceed_in_parallel(tmp_path: pathlib.Path) -> None:
 def test_overlapping_runs_block_then_continue(tmp_path: pathlib.Path) -> None:
     """A consumer waits for a concurrently running producer then reads its output."""
     _helper_setup_project(tmp_path, _PIPELINE_OVERLAPPING)
-    env = _helper_make_env(STAGE_A_SLEEP="3")
+    env = _helper_make_env(tmp_path, STAGE_A_SLEEP="3")
 
     proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
     _helper_wait_for_path(tmp_path / "stage_a_started")
@@ -350,7 +348,7 @@ def test_overlapping_runs_block_then_continue(tmp_path: pathlib.Path) -> None:
 def test_no_deadlock_deterministic_ordering(tmp_path: pathlib.Path) -> None:
     """Two disjoint writers complete concurrently without deadlock."""
     _helper_setup_project(tmp_path, _PIPELINE_CROSSED)
-    env = _helper_make_env(STAGE_X_SLEEP="1", STAGE_Y_SLEEP="1")
+    env = _helper_make_env(tmp_path, STAGE_X_SLEEP="1", STAGE_Y_SLEEP="1")
 
     proc_x = _helper_run_pivot(tmp_path, "stage_x", env=env)
     proc_y = _helper_run_pivot(tmp_path, "stage_y", env=env)
@@ -376,7 +374,7 @@ def test_no_deadlock_deterministic_ordering(tmp_path: pathlib.Path) -> None:
 def test_periodic_status_during_contention(tmp_path: pathlib.Path) -> None:
     """A lock-blocked consumer succeeds without leaking lock-wait text to console output."""
     _helper_setup_project(tmp_path, _PIPELINE_OVERLAPPING)
-    env = _helper_make_env(STAGE_A_SLEEP="4")
+    env = _helper_make_env(tmp_path, STAGE_A_SLEEP="4")
 
     proc_a = _helper_run_pivot(tmp_path, "stage_a", env=env)
     stage_a_lock = tmp_path / ".pivot" / "locks" / hashlib.sha256(b"test/stage_a").hexdigest()
@@ -405,7 +403,13 @@ def _helper_built_shared_output_project(tmp_path: pathlib.Path) -> None:
     """Build `_PIPELINE_SHARED_OUTPUT` once, so every stage is cached."""
     _helper_setup_project(tmp_path, _PIPELINE_SHARED_OUTPUT)
     (tmp_path / "release_slow_use").touch()
-    built = subprocess.run([_PIVOT_BIN, "repro"], cwd=tmp_path, capture_output=True, timeout=180)
+    built = subprocess.run(
+        [helpers.PIVOT, "repro"],
+        cwd=tmp_path,
+        env=_helper_make_env(tmp_path),
+        capture_output=True,
+        timeout=180,
+    )
     assert built.returncode == 0, built.stdout.decode() + built.stderr.decode()
     (tmp_path / "release_slow_use").unlink()
     (tmp_path / "slow_use_started").unlink()
@@ -440,8 +444,9 @@ def test_skip_of_a_cached_stage_does_not_wait_for_its_running_consumers(
     slow = _helper_start_slow_consumer(tmp_path)
     try:
         quick = subprocess.Popen(
-            [_PIVOT_BIN, "repro", "test/quick_use"],
+            [helpers.PIVOT, "repro", "test/quick_use"],
             cwd=tmp_path,
+            env=_helper_make_env(tmp_path),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -467,7 +472,7 @@ def test_racing_skips_restore_a_missing_cached_output_once(tmp_path: pathlib.Pat
     (hook_dir / "sitecustomize.py").write_text(_LOCK_AND_RESTORE_LOG_HOOK)
     hook_log = tmp_path / "hook.log"
     hook_log.touch()
-    env = _helper_make_env(PIVOT_TEST_HOOK_LOG=str(hook_log))
+    env = _helper_make_env(tmp_path, PIVOT_TEST_HOOK_LOG=str(hook_log))
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(hook_dir), env.get("PYTHONPATH")]))
     output = _helper_output(tmp_path, "make")
 
@@ -477,7 +482,7 @@ def test_racing_skips_restore_a_missing_cached_output_once(tmp_path: pathlib.Pat
         output.unlink()
         racers = [
             subprocess.Popen(
-                [_PIVOT_BIN, "repro", "test/make"],
+                [helpers.PIVOT, "repro", "test/make"],
                 cwd=tmp_path,
                 env=env,
                 stdout=subprocess.PIPE,

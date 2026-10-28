@@ -342,7 +342,10 @@ def test_output_identities_by_path_maps_display_paths_to_identities(
     }
 
 
-def test_store_spec_cache_round_trip(tmp_path: pathlib.Path) -> None:
+def test_store_spec_cache_uses_the_configured_state_dir(tmp_path: pathlib.Path) -> None:
+    """A reconstructed cache store hashes outputs through the configured StateDB."""
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / ".pivot" / "config.yaml").write_text("core:\n  state_dir: alternate-state\n")
     spec: store.StoreSpec = {
         "kind": "cache",
         "cache_dir": str(tmp_path / "cache"),
@@ -355,3 +358,9 @@ def test_store_spec_cache_round_trip(tmp_path: pathlib.Path) -> None:
     round_trip = pickle.loads(pickle.dumps(spec))
     rebuilt = store.store_from_spec(round_trip)
     assert isinstance(rebuilt, store.CacheStore)
+    ref = _helper_ref("stage", None, types.ArtifactTag.DATA, loaders.Text())
+    output = rebuilt.prepare_output(ref)
+    output.write_text("state path")
+    rebuilt.commit(ref, output)
+
+    assert (tmp_path / "alternate-state" / "state.lmdb").is_dir()
