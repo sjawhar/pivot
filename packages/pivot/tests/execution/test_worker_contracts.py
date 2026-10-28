@@ -1688,6 +1688,40 @@ def test_output_write_records_a_pvt_member_before_the_file_exists(tmp_path: path
     assert sorted(path.name for path in output_path.iterdir()) == ["notes.pvt", "value.txt"]
 
 
+def test_output_write_stages_a_pvt_member_beside_the_output_never_in_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A directory output's `PathOnly` member, a directory holding a `*.pvt`, is staged beside
+    the output while its `*.pvt` is recorded, so a worker killed then leaves no copy inside the
+    output that a later check of it would take for a user's sidecar."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    store = store_mod.WorkspaceStore(project_root, "skip", {}, cache_dir=tmp_path / "cache")
+    tree = _ref(_STAGE, "tree", tag=types.ArtifactTag.DIRECTORY, loader=loaders.PathOnly())
+    output_path = store.resolve_display_path(tree)
+    docs = tmp_path / "scratch" / "docs.d"
+    docs.mkdir(parents=True)
+    (docs / "notes.pvt").write_text("stage notes")
+    staged_at_record = list[list[pathlib.Path]]()
+
+    def record(members: Mapping[pathlib.Path, str]) -> None:
+        assert list(members) == [ownership.normalized(output_path / "docs.d" / "notes.pvt")]
+        assert not list(output_path.rglob("*pivot-staged*"))
+        staged_at_record.append(sorted(output_path.parent.glob(f".{output_path.name}.pivot-*")))
+
+    _ = worker._write_outputs_with_store(
+        {tree: {"docs.d": docs}},
+        store,
+        project_root,
+        claims=ownership.StageClaims(locked={}, no_commit={}, recorder=record, cache_dir=None),
+    )
+
+    (staged,) = staged_at_record
+    assert [path.name for path in staged] == [f".{output_path.name}.pivot-staged"]
+    assert (output_path / "docs.d" / "notes.pvt").read_text() == "stage notes"
+    assert not staged[0].exists()
+
+
 _RECORD_FAILURES = [
     pytest.param(
         exceptions.PivotDBWriteTimeoutError("Timed out after 30.0s waiting for LMDB write lock"),

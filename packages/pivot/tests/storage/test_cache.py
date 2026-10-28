@@ -723,6 +723,184 @@ def test_restore_directory_preserves_original_on_rename_failure(
     # The test_dir should have original.txt (though content may vary based on when failure occurred)
 
 
+def _helper_local_directory(
+    tmp_path: pathlib.Path, mode: cache.CheckoutMode
+) -> tuple[pathlib.Path, pathlib.Path, HashInfo]:
+    """data/out cached (as a whole tree for SYMLINK), then a real directory with a local edit."""
+    target = tmp_path / "data" / "out"
+    target.mkdir(parents=True)
+    (target / "result.txt").write_text("cached")
+    cache_dir = tmp_path / "cache"
+    output_hash = cache.save_to_cache(target, cache_dir, checkout_mode=mode)
+    cache.remove_output(target)
+    target.mkdir()
+    (target / "result.txt").write_text("local edit")
+    return target, cache_dir, output_hash
+
+
+_SWAP_MODES = [
+    pytest.param(cache.CheckoutMode.COPY, id="file-by-file"),
+    pytest.param(cache.CheckoutMode.SYMLINK, id="whole-tree-symlink"),
+]
+
+
+@pytest.mark.parametrize("mode", _SWAP_MODES)
+def test_directory_restore_checks_the_old_directory_once_it_is_moved_aside(
+    tmp_path: pathlib.Path, mode: cache.CheckoutMode
+) -> None:
+    """With ``before_swap``, a directory restore builds its replacement, renames the old
+    directory aside, beside it, and passes where it is to the check, then swaps and removes it."""
+    target, cache_dir, output_hash = _helper_local_directory(tmp_path, mode)
+    seen = list[tuple[pathlib.Path, str]]()
+
+    def check(entry: pathlib.Path) -> None:
+        assert not target.exists(), "the old directory is still at its path"
+        seen.append((entry, (entry / "result.txt").read_text()))
+
+    assert cache.restore_from_cache(
+        target,
+        output_hash,
+        cache_dir,
+        checkout_mode=mode,
+        state_dir=tmp_path / ".pivot",
+        before_swap=check,
+    )
+
+    ((entry, content),) = seen
+    assert entry.parent == target.parent
+    assert content == "local edit"
+    assert (target / "result.txt").read_text() == "cached"
+    _helper_assert_no_temp_dirs(target.parent)
+
+
+@pytest.mark.parametrize("mode", _SWAP_MODES)
+def test_directory_restore_puts_the_old_directory_back_when_its_check_refuses(
+    tmp_path: pathlib.Path, mode: cache.CheckoutMode
+) -> None:
+    """A ``before_swap`` that raises leaves the old directory at its path, unchanged, and the
+    error propagates; no temporary or backup entry is left."""
+    target, cache_dir, output_hash = _helper_local_directory(tmp_path, mode)
+
+    def refuse(_entry: pathlib.Path) -> None:
+        raise exceptions.OutputOwnershipError("refused")
+
+    with pytest.raises(exceptions.OutputOwnershipError, match="refused"):
+        cache.restore_from_cache(
+            target,
+            output_hash,
+            cache_dir,
+            checkout_mode=mode,
+            state_dir=tmp_path / ".pivot",
+            before_swap=refuse,
+        )
+
+    assert not target.is_symlink()
+    assert sorted(p.name for p in target.iterdir()) == ["result.txt"]
+    assert (target / "result.txt").read_text() == "local edit"
+    _helper_assert_no_temp_dirs(target.parent)
+
+
+def test_refused_directory_that_cannot_go_back_is_kept_under_a_name_no_restore_removes(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When a new directory with a file in it took the path while the old one was checked, the
+    refused old one cannot go back: it is renamed to `<name>.pivot-kept-<hex>` beside it, never
+    left under the backup name the next restore of the path removes, and a warning names it."""
+    target, cache_dir, output_hash = _helper_local_directory(tmp_path, cache.CheckoutMode.COPY)
+
+    def refuse_after_a_writer_took_the_path(_entry: pathlib.Path) -> None:
+        target.mkdir()
+        (target / "new.txt").write_text("written meanwhile")
+        raise exceptions.OutputOwnershipError("refused")
+
+    with (
+        caplog.at_level(logging.WARNING, logger="pivot.storage.cache"),
+        pytest.raises(exceptions.OutputOwnershipError, match="refused"),
+    ):
+        cache.restore_from_cache(
+            target,
+            output_hash,
+            cache_dir,
+            checkout_mode=cache.CheckoutMode.COPY,
+            state_dir=tmp_path / ".pivot",
+            before_swap=refuse_after_a_writer_took_the_path,
+        )
+
+    assert (target / "new.txt").read_text() == "written meanwhile"
+    (kept,) = target.parent.glob("out.pivot-kept-*")
+    assert (kept / "result.txt").read_text() == "local edit"
+    assert str(kept) in caplog.text
+    _helper_assert_no_temp_dirs(target.parent)
+
+
+def test_directory_restore_calls_no_check_when_nothing_is_at_its_path(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A restore to an empty path removes nothing, so ``before_swap`` is not called."""
+    target, cache_dir, output_hash = _helper_local_directory(tmp_path, cache.CheckoutMode.COPY)
+    cache.remove_output(target)
+
+    def unexpected(entry: pathlib.Path) -> None:
+        raise AssertionError(f"checked {entry}, but nothing was at the path")
+
+    assert cache.restore_from_cache(
+        target,
+        output_hash,
+        cache_dir,
+        checkout_mode=cache.CheckoutMode.COPY,
+        state_dir=tmp_path / ".pivot",
+        before_swap=unexpected,
+    )
+    assert (target / "result.txt").read_text() == "cached"
+
+
+def test_file_restore_checks_a_file_in_place_and_a_directory_moved_aside(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A file that replaces a file is checked at its path, just before the atomic rename; a
+    directory at a file output's path is renamed aside first, and put back when refused."""
+    source = tmp_path / "source.txt"
+    source.write_text("cached")
+    cache_dir = tmp_path / "cache"
+    output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    target = tmp_path / "data" / "out.txt"
+    target.parent.mkdir()
+    target.write_text("local edit")
+    seen = list[pathlib.Path]()
+
+    assert cache.restore_from_cache(
+        target,
+        output_hash,
+        cache_dir,
+        checkout_mode=cache.CheckoutMode.COPY,
+        state_dir=tmp_path / ".pivot",
+        before_swap=seen.append,
+    )
+    assert seen == [target]
+    assert target.read_text() == "cached"
+
+    cache.remove_output(target)
+    target.mkdir()
+    (target / "inner.txt").write_text("user bytes")
+
+    def refuse(entry: pathlib.Path) -> None:
+        assert entry != target
+        assert (entry / "inner.txt").read_text() == "user bytes"
+        raise exceptions.OutputOwnershipError("refused")
+
+    with pytest.raises(exceptions.OutputOwnershipError, match="refused"):
+        cache.restore_from_cache(
+            target,
+            output_hash,
+            cache_dir,
+            checkout_mode=cache.CheckoutMode.COPY,
+            state_dir=tmp_path / ".pivot",
+            before_swap=refuse,
+        )
+    assert (target / "inner.txt").read_text() == "user bytes"
+    _helper_assert_no_temp_dirs(target.parent)
+
+
 def test_restore_directory_validates_all_entries_before_writing(
     tmp_path: pathlib.Path,
 ) -> None:

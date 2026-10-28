@@ -240,7 +240,10 @@ def resolve_targets(
 
 
 def _write_fallback_content(
-    dest_path: pathlib.Path, content: bytes, lock_token: str | None
+    dest_path: pathlib.Path,
+    content: bytes,
+    lock_token: str | None,
+    before_swap: Callable[[pathlib.Path], None],
 ) -> bool:
     """Atomically replace a cache-miss target; the caller holds its restore lock."""
 
@@ -251,28 +254,38 @@ def _write_fallback_content(
     staging_path = (
         cache.restore_staging_path(dest_path, lock_token) if lock_token is not None else None
     )
-    cache.atomic_write_file(dest_path, write_content, staging_path=staging_path)
+    cache.atomic_write_file(
+        dest_path, write_content, staging_path=staging_path, before_swap=before_swap
+    )
     return True
+
+
+def _refuse_swap(target: ownership.ForcedRestore, entry: pathlib.Path) -> None:
+    """Raise if the entry the swap of ``target`` removes, now at ``entry``, holds a user's file
+    (``ownership.swap_refusal``)."""
+    refusal = ownership.swap_refusal(project.get_project_root(), target, entry)
+    if refusal is not None:
+        raise refusal
 
 
 def _replace_checked(
     dest_path: pathlib.Path,
-    target: ownership.ForcedRestore | None,
-    replace: Callable[[str | None], bool],
+    target: ownership.ForcedRestore,
+    replace: Callable[[str | None, Callable[[pathlib.Path], None]], bool],
 ) -> bool:
     """Run ``replace`` under ``dest_path``'s restore lock, right after checking ``target`` again
     there (``ownership.forced_restore_refusal``): a user file that appeared since the check of
-    every target refuses this target alone.
+    every target refuses this target alone. ``replace`` gets the lock's token and the check its
+    swap makes over the entry it removes (``ownership.swap_refusal``).
 
     Raises:
         exceptions.OutputOwnershipError: Replacing ``dest_path`` would remove a user's file.
     """
     with cache.restore_lock(dest_path, config.get_state_dir()) as lock_token:
-        if target is not None:
-            refusal = ownership.forced_restore_refusal(project.get_project_root(), [target])
-            if refusal is not None:
-                raise refusal
-        return replace(lock_token)
+        refusal = ownership.forced_restore_refusal(project.get_project_root(), [target])
+        if refusal is not None:
+            raise refusal
+        return replace(lock_token, functools.partial(_refuse_swap, target))
 
 
 def _reason(error: exceptions.PivotError | OSError) -> str:
@@ -313,7 +326,7 @@ def restore_file(
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
-    target: ownership.ForcedRestore | None = None,
+    target: ownership.ForcedRestore,
     *,
     remote_factory: Callable[[], RemoteStorage],
 ) -> RestoreResult:
@@ -325,14 +338,14 @@ def restore_file(
     ``unreachable_remote``.
 
     ``target`` is what the restore replaces (``_restore_targets``). Each write checks it again
-    under the restore lock, just before it replaces ``dest_path``, and a refusal is this target's
-    error. For a stage output restored to its own path, the ``*.pvt`` members ``output_hash``
-    writes are recorded as the stage's before anything is written.
+    under the restore lock, just before it builds the replacement, and once more at the swap; a
+    refusal is this target's error. For a stage output restored to its own path, the ``*.pvt``
+    members ``output_hash`` writes are recorded as the stage's before anything is written.
     """
     if (skipped := _skipped(dest_path, force)) is not None:
         return skipped
 
-    if target is not None and target["claims"] is not None and output_hash is not None:
+    if target["claims"] is not None and output_hash is not None:
         ownership.record_restored(target["claims"], dest_path, output_hash)
 
     try:
@@ -359,7 +372,7 @@ def _restore_from_sources(
     dest_path: pathlib.Path,
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
-    target: ownership.ForcedRestore | None,
+    target: ownership.ForcedRestore,
     remote_factory: Callable[[], RemoteStorage],
 ) -> RestoreResult:
     """``restore_file``'s strategies, each write under ``_replace_checked``.
@@ -393,13 +406,14 @@ def _restore_from_sources(
             if should_try_cache and _replace_checked(
                 dest_path,
                 target,
-                lambda token: cache.restore_from_cache(
+                lambda token, before_swap: cache.restore_from_cache(
                     dest_path,
                     cached_hash,
                     files_dir,
                     checkout_modes=checkout_modes,
                     state_dir=state_dir,
                     lock_token=token,
+                    before_swap=before_swap,
                 ),
             ):
                 return RestoreResult(
@@ -418,7 +432,11 @@ def _restore_from_sources(
     if content is not None:
         try:
             _replace_checked(
-                dest_path, target, lambda token: _write_fallback_content(dest_path, content, token)
+                dest_path,
+                target,
+                lambda token, before_swap: _write_fallback_content(
+                    dest_path, content, token, before_swap
+                ),
             )
             return RestoreResult(
                 status=RestoreStatus.RESTORED,
@@ -458,13 +476,14 @@ def _restore_from_sources(
             success = _replace_checked(
                 dest_path,
                 target,
-                lambda token: cache.restore_from_cache(
+                lambda token, before_swap: cache.restore_from_cache(
                     dest_path,
                     cached_hash,
                     files_dir,
                     checkout_modes=checkout_modes,
                     state_dir=state_dir,
                     lock_token=token,
+                    before_swap=before_swap,
                 ),
             )
         except exceptions.OutputOwnershipError:

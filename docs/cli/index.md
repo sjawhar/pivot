@@ -475,12 +475,14 @@ file, import or `.pvt` sidecar beneath it. A target that names a stage restores 
 outputs, so a tracked file or sidecar at one of their paths refuses it too. Only `--force` and an
 `--only-missing` directory swap replace an existing path. `--force` checks every target before it
 changes any: if it refuses one, it changes nothing and exits 1, naming every refused target and
-the files that block it. It then checks each target again just before it replaces it, so a
-tracked file and sidecar copied into an output while the command runs refuse that target alone,
-named, and the command exits 1 with the file kept. `pivot pull --force` restores the same way.
-An `--only-missing` swap is checked when it is decided. A directory inside an output that Pivot
-cannot read refuses the restore too, naming that directory: a tracked file may hide inside where
-Pivot cannot look.
+the files that block it. It then checks each target again before it builds that target's
+replacement, and once more at its swap, over the old output once it is moved aside, so a tracked
+file and sidecar copied into an output while the command runs, even while that output's own
+replacement is being built, refuse that target alone, named, and the command exits 1 with the
+file kept. `pivot pull --force` restores the same way.
+An `--only-missing` swap is checked when it is decided, and at its swap. A directory inside an
+output that Pivot cannot read refuses the restore too, naming that directory: a tracked file may
+hide inside where Pivot cannot look.
 
 ---
 
@@ -508,7 +510,7 @@ pivot get TARGETS... --rev REVISION [OPTIONS]
 | `--remote NAME` | Remote name (uses default if not specified). An unknown name fails before anything is restored |
 | `--output` / `-o PATH` | Output path (single file only) |
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
-| `--force` / `-f` | Overwrite existing files. Refuses, before changing anything, when a replaced path holds another user's file: a stage output or an `--output` path that holds a tracked file or `.pvt` sidecar, or a tracked path that holds another tracked file, import or `.pvt` sidecar beneath it. Each target is checked again just before it is replaced: one that a user's file entered meanwhile fails alone, named, and the others are still restored. A target whose `.pvt` is not valid is only reported, so it refuses nothing. A tracked file restored over a file is always overwritten |
+| `--force` / `-f` | Overwrite existing files. Refuses, before changing anything, when a replaced path holds another user's file: a stage output or an `--output` path that holds a tracked file or `.pvt` sidecar, or a tracked path that holds another tracked file, import or `.pvt` sidecar beneath it. Each target is checked again before its replacement is built and once more at its swap, over the old entry once it is moved aside: one that a user's file entered meanwhile, even while its replacement was being built, fails alone, named, and the others are still restored. A target whose `.pvt` is not valid is only reported, so it refuses nothing. A tracked file restored over a file is always overwritten |
 
 A downloaded cache object has no executable bit, so an executable file in a directory output cannot be hard-linked or symlinked to it. With a mode order that has no `copy` (`--checkout-mode hardlink` or `symlink`, or a `cache.checkout_mode` without `copy`), that output fails with an error naming the file. The default order, hardlink, symlink, copy, ends with `copy`, which restores the bit.
 

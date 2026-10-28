@@ -35,7 +35,9 @@ _RUN_PREFIX = b"run:"  # Run history entries
 _RUNCACHE_PREFIX = b"runcache:"  # Run cache entries for skip detection
 _FP_PREFIX = b"fp:"  # AST fingerprint/hash cache entries
 _SM_PREFIX = b"sm:"  # Stage manifest cache entries
-_NOCOMMIT_PREFIX = b"nocommit:"  # What a --no-commit run of a stage ran, for `pivot commit`
+# Per stage, until a lock is written for it: what a --no-commit run of it ran, for `pivot commit`,
+# and the `*.pvt` files Pivot wrote into its outputs as its own (`pvt_members`)
+_NOCOMMIT_PREFIX = b"nocommit:"
 # The keys `types.NoCommitRecord` declares, each a str -> str mapping the reader validates alone.
 _NO_COMMIT_FIELDS = ("code_manifest", "output_hashes", "pvt_members")
 

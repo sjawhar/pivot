@@ -468,6 +468,78 @@ def test_forced_restore_keeps_a_tracked_file_that_lands_in_an_output_while_it_ru
     assert (restored / "g.txt").read_text() == restored.name
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(["checkout", "--force"], id="checkout-force"),
+        pytest.param(["checkout", "--all", "--force"], id="checkout-all-force"),
+        pytest.param(["pull", "--force"], id="pull-force"),
+        pytest.param(["get", "--rev", "HEAD", "b/one", "b/two", "--force"], id="get-force"),
+    ],
+)
+def test_forced_restore_keeps_a_tracked_file_that_lands_in_an_output_during_its_own_restore(
+    runner: CliRunner,
+    git_repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    command: list[str],
+) -> None:
+    """A tracked file and its sidecar are copied into an output after its restore checked it
+    again, while that restore builds its replacement from the cache. The swap checks the old
+    output once it has moved it aside: it refuses that target, names the sidecar, exits 1 and
+    puts the output back with both files in it. The other output is still restored."""
+    repo_path, commit = git_repo
+    (repo_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.chdir(repo_path)
+    (repo_path / "pipeline.py").write_text(_TWO_TREES_PIPELINE)
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+    user = repo_path / "data" / "raw" / "u.txt"
+    user.parent.mkdir(parents=True)
+    user.write_text("user bytes")
+    assert runner.invoke(cli.cli, ["track", "data/raw/u.txt"]).exit_code == 0
+    user_sidecar = track.get_pvt_path(user).read_bytes()
+    commit("two trees")
+    outputs = [(repo_path / "data" / "b" / name).resolve() for name in ("one", "two")]
+    mocker.patch(
+        "pivot.remote.sync.create_remote_from_name",
+        return_value=(mocker.Mock(spec=remote_storage.S3Remote), "origin"),
+    )
+    mocker.patch(
+        "pivot.remote.sync.pull",
+        return_value=types.TransferSummary(transferred=0, skipped=0, failed=0, errors=[]),
+    )
+    monkeypatch.setattr(checkout_mod, "MAX_CONCURRENT_RESTORES", 1)
+    landed = list[pathlib.Path]()
+    checkout_with_fallback = cache._checkout_with_fallback
+
+    def stage_while_a_file_lands(path: pathlib.Path, *args: Any, **kwargs: Any) -> None:
+        # A directory restore stages each file under a temporary name, naming the output file it
+        # becomes; the first one staged lands the user's file in that same output
+        display = kwargs.get("display_path")
+        if not landed and display is not None:
+            (output,) = (out for out in outputs if display.resolve().is_relative_to(out))
+            shutil.copy2(user, output / "u.txt")
+            shutil.copy2(track.get_pvt_path(user), output / "u.txt.pvt")
+            landed.append(output)
+        checkout_with_fallback(path, *args, **kwargs)
+
+    monkeypatch.setattr(cache, "_checkout_with_fallback", stage_while_a_file_lands)
+
+    result = runner.invoke(cli.cli, command)
+
+    assert landed, result.output
+    output = landed[0]
+    assert (output / "u.txt").read_text() == "user bytes", result.output
+    assert (output / "u.txt.pvt").read_bytes() == user_sidecar
+    assert (output / "g.txt").read_text() == output.name, "the output went back unchanged"
+    assert result.exit_code != 0, result.output
+    assert f"data/b/{output.name}/u.txt.pvt" in " ".join(result.output.split())
+    restored = outputs[0] if output == outputs[1] else outputs[1]
+    assert (restored / "g.txt").read_text() == restored.name
+    assert not [p.name for p in output.parent.iterdir() if p.name.startswith(".pivot_")]
+
+
 _PATH_ONLY_DIRECTORY_PIPELINE = """\
 import pathlib
 import tempfile
@@ -530,6 +602,75 @@ def test_path_only_directory_output_holding_its_own_pvt_files_runs_as_at_main(
         (output,) = (root / "data" / "p").glob("build*")
         assert (output / "notes.pvt").read_text() == notes
         assert (output / "sub" / "deep.pvt").read_text() == notes
+
+
+_KILLED_MOVE_PIPELINE = """\
+import os
+import pathlib
+import signal
+import tempfile
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+KILL_MARK = {kill_mark!r}
+
+
+@stage
+def bundle() -> Annotated[dict[str, pathlib.Path], directory]:
+    if os.path.exists(KILL_MARK):
+        # The worker dies as SIGKILL or the OOM killer would stop it: while it moves the member
+        # it staged, and has recorded, into the output
+        replace = pathlib.Path.replace
+
+        def replace_or_die(self, target):
+            if ".pivot-staged" in self.name:
+                os.kill(os.getpid(), signal.SIGKILL)
+            return replace(self, target)
+
+        pathlib.Path.replace = replace_or_die
+    scratch = pathlib.Path(tempfile.mkdtemp())
+    (scratch / "docs.d").mkdir()
+    (scratch / "docs.d" / "notes.pvt").write_text("ordinary stage output")
+    (scratch / "a.txt").write_text("a")
+    return {{"docs.d": scratch / "docs.d", "a.txt": scratch / "a.txt"}}
+
+
+with Pipeline("b") as pipeline:
+    bundle()
+"""
+
+
+def test_worker_killed_while_moving_a_staged_member_leaves_nothing_that_blocks_the_output(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A directory output's `PathOnly` member is a directory holding a `*.pvt`. The worker stages
+    it, records the `*.pvt` as the stage's, and is killed while it moves it into the output. The
+    staged copy it leaves is beside the output, not in it, so the next run and a forced checkout
+    succeed and keep the stage's file, rather than refuse it as a user's sidecar."""
+    kill_mark = tmp_path / "kill-the-worker"
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_KILLED_MOVE_PIPELINE.format(kill_mark=str(kill_mark)))
+        first = runner.invoke(cli.cli, ["repro"])
+        assert first.exit_code == 0, first.output
+        (output,) = (root / "data" / "b").glob("bundle*")
+
+        kill_mark.touch()
+        killed = runner.invoke(cli.cli, ["repro", "--force"])
+        kill_mark.unlink()
+
+        assert killed.exit_code != 0, killed.output
+        assert list((root / "data" / "b").rglob("*.pivot-staged*")), "no staged copy was left"
+        assert not list(output.rglob("*.pivot-staged*")), "the staged copy is inside the output"
+        results = [
+            runner.invoke(cli.cli, command)
+            for command in (["repro", "--force"], ["checkout", "--force"])
+        ]
+        for result in results:
+            assert result.exit_code == 0, result.output
+            assert "Refusing" not in result.output, result.output
+        assert (output / "docs.d" / "notes.pvt").read_text() == "ordinary stage output"
+        assert (output / "a.txt").read_text() == "a"
 
 
 _SIDECAR_SHAPED_MEMBER_PIPELINE = """\

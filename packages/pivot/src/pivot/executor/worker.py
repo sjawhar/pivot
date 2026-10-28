@@ -1979,23 +1979,25 @@ def _write_output_with_store(
         save_output(item_value, path)
     if recorder is None or not recorded_entries:
         return output_path, {}
-    return output_path, _save_recorded(recorded_entries, save_output, recorder)
+    return output_path, _save_recorded(output_path, recorded_entries, save_output, recorder)
 
 
 def _save_recorded(
+    output_path: pathlib.Path,
     entries: list[tuple[pathlib.Path, Any]],
     save_output: Callable[[Any, pathlib.Path], None],
     recorder: ownership.MemberRecorder,
 ) -> ownership.StageMembers:
-    """Write entries that bring ``*.pvt`` files into the workspace: each under a name that is not
-    a ``*.pvt`` name, then record the ``*.pvt`` files they hold as the stage's, then move each
-    into place, so a crash leaves at worst a record without a file. Returns those files, each
-    with its recorded content."""
+    """Write entries that bring ``*.pvt`` files into the output at ``output_path``: each under a
+    name beside the output (``_staging_path``), then record the ``*.pvt`` files they hold as the
+    stage's, then move each into place. A crash leaves at worst a record without a file in the
+    output, and a staged copy beside it that no check of the output walks. Returns those files,
+    each with its recorded content."""
     staged = dict[pathlib.Path, pathlib.Path]()
     try:
         for path, item_value in entries:
             path.parent.mkdir(parents=True, exist_ok=True)
-            staged[path] = _staging_path(path)
+            staged[path] = _staging_path(output_path, staged.values())
             save_output(item_value, staged[path])
         recorded = {
             pvt: cache.hash_file(source)[0]
@@ -2030,13 +2032,20 @@ def _staged_pvt_files(
     return []
 
 
-def _staging_path(path: pathlib.Path) -> pathlib.Path:
-    """An unused name beside ``path`` that is not a ``*.pvt`` name."""
-    candidate = path.with_name(f".{path.name}.pivot-staged")
+def _staging_path(
+    output_path: pathlib.Path, taken: collections_abc.Collection[pathlib.Path]
+) -> pathlib.Path:
+    """An unused name beside ``output_path``, not in ``taken`` and not a ``*.pvt`` name.
+
+    Beside the output, never inside it: what a killed run leaves there is no file of the output,
+    so it never blocks the next write or restore of it. The rename into place stays atomic: the
+    name is in the output's parent directory, on the output's filesystem.
+    """
+    candidate = output_path.with_name(f".{output_path.name}.pivot-staged")
     count = 0
-    while candidate.exists() or candidate.is_symlink():
+    while candidate in taken or candidate.exists() or candidate.is_symlink():
         count += 1
-        candidate = path.with_name(f".{path.name}.pivot-staged-{count}")
+        candidate = output_path.with_name(f".{output_path.name}.pivot-staged-{count}")
     return candidate
 
 

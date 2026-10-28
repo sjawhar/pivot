@@ -14,7 +14,8 @@ hash a restore writes, its ``nocommit:<stage>`` record, or what this run writes 
 and it is a sidecar Pivot cannot parse or a file whose content the stage recorded there. Pivot
 adds a member to that record before it writes the file (``record_members``), so no member it
 writes is ever unrecorded. Every other ``*.pvt`` under an output is the user's, for
-``pivot commit`` too. ``forced_restore_refusal`` is the one decision behind every forced restore.
+``pivot commit`` too. ``forced_restore_refusal`` is the one decision behind every forced restore,
+and ``swap_refusal`` makes it again at each target's swap, over the entry the swap removes.
 """
 
 from __future__ import annotations
@@ -181,6 +182,7 @@ def stage_members(
     *,
     restored: types.HashInfo | None = None,
     returned: StageMembers | None = None,
+    moved_to: pathlib.Path | None = None,
 ) -> StageMembers:
     """The stage's own ``*.pvt`` files in ``output_path``: the one rule every write, restore,
     commit and warning uses.
@@ -193,15 +195,18 @@ def stage_members(
     At a path the lock or the restored hash lists, the file's current content is recorded too
     when Pivot holds it in the cache: a lock that changed through git lists the content of
     another run there, and the stage's own file from the run before is cached. Replacing such a
-    file loses nothing the cache cannot restore.
+    file loses nothing the cache cannot restore. That content is read under ``moved_to`` when a
+    restore has renamed the output there to swap the restored one in.
     """
     found = dict[pathlib.Path, set[str]]()
-    locked = claims["locked"].get(normalized(output_path)) if claims is not None else None
+    root = normalized(output_path)
+    locked = claims["locked"].get(root) if claims is not None else None
     cache_dir = claims["cache_dir"] if claims is not None else None
     for path, recorded in _hash_members(output_path, restored, locked).items():
         found[path] = set(recorded)
-        if cache_dir is not None and path.is_file():
-            content = cache.hash_file(path)[0]
+        located = path if moved_to is None else moved_to / path.relative_to(root)
+        if cache_dir is not None and located.is_file():
+            content = cache.hash_file(located)[0]
             if content not in recorded and cache.get_cache_path(cache_dir, content).exists():
                 found[path].add(content)
     sources = list[StageMembers]()
@@ -365,11 +370,93 @@ def _lstat_mode(path: str | pathlib.Path) -> int | None:
 
 
 def _is_stage_member(
-    pvt_path: pathlib.Path, data: track.PvtData | None, members: StageMembers
+    pvt_path: pathlib.Path, data: track.PvtData | None, members: StageMembers, located: pathlib.Path
 ) -> bool:
+    """Whether the ``*.pvt`` at ``pvt_path``, whose bytes are at ``located``, is a member."""
     if pvt_path not in members:
         return False
-    return data is None or cache.hash_file(pvt_path)[0] in members[pvt_path]
+    return data is None or cache.hash_file(located)[0] in members[pvt_path]
+
+
+def _find_sidecars(
+    root: str,
+    replacement: Replacement,
+    output_path: pathlib.Path,
+    found: dict[pathlib.Path, OutputOverlap],
+    checked: set[str],
+) -> None:
+    """Add to ``found`` each sidecar that claims ``output_path`` or a directory above it, up to
+    the project root ``root``; a tracked path's own restore looks at none. ``checked`` holds the
+    paths already looked at."""
+    root_prefix = os.path.join(root, "")
+    # Normalized absolute strings: is_relative_to is a prefix test, parent is dirname
+    current = str(output_path) if replacement["kind"] is not ReplacementKind.TRACKED else root
+    while current != root and current.startswith(root_prefix) and current not in checked:
+        checked.add(current)
+        # The sidecar get_pvt_path names: the path's own name with ".pvt" appended
+        if _lstat_mode(current + ".pvt") is not None:
+            current_path = pathlib.Path(current)
+            pvt_path = track.get_pvt_path(current_path)
+            if pvt_path.is_file() or pvt_path.is_symlink():
+                data = track.read_pvt_file(pvt_path)
+                if data is None or pvt_path.parent / data["path"] == current_path:
+                    found[pvt_path] = SidecarOverlap(
+                        tracked_path=None if data is None else current_path,
+                        pvt_path=pvt_path,
+                        replacement=replacement,
+                    )
+        current = os.path.dirname(current)
+
+
+def _find_in_tree(
+    output_path: pathlib.Path,
+    replacement: Replacement,
+    members_of: Callable[[pathlib.Path], StageMembers] | None,
+    found: dict[pathlib.Path, OutputOverlap],
+    moved_to: pathlib.Path | None = None,
+) -> None:
+    """Add to ``found`` each ``*.pvt`` under ``output_path`` that is not one of its members, and
+    each directory there Pivot cannot read.
+
+    ``moved_to`` is where the entry at ``output_path`` is now, when a restore has renamed it
+    aside to swap the restored one in: the walk reads it there, and still names each file at its
+    place under ``output_path``.
+    """
+    walked = output_path if moved_to is None else moved_to
+    # A file output, or nothing, is the common case: one lstat answers it
+    mode = _lstat_mode(walked)
+    if mode is None or stat.S_ISREG(mode):
+        return
+    if not stat.S_ISDIR(mode) and (not walked.is_dir() or walked.is_symlink()):
+        return
+    members: StageMembers | None = None
+    unreadable = list[OSError]()
+    for dirpath, _dirnames, filenames in os.walk(walked, onerror=unreadable.append):
+        for name in filenames:
+            if not name.endswith(".pvt"):
+                continue
+            located = pathlib.Path(dirpath) / name
+            pvt_path = located if moved_to is None else output_path / located.relative_to(moved_to)
+            data = track.read_pvt_file(located)
+            if members is None:
+                members = members_of(output_path) if members_of is not None else {}
+            if _is_stage_member(pvt_path, data, members, located):
+                continue
+            found[pvt_path] = SidecarOverlap(
+                tracked_path=None if data is None else pvt_path.parent / data["path"],
+                pvt_path=pvt_path,
+                replacement=replacement,
+            )
+    # A directory os.walk could not enter may hide a tracked file; block it, never skip it.
+    for error in unreadable:
+        if error.filename is None:
+            continue
+        blocked = pathlib.Path(error.filename)
+        if moved_to is not None:
+            blocked = output_path / blocked.relative_to(moved_to)
+        found.setdefault(
+            blocked, UnreadableOverlap(unreadable_dir=blocked, replacement=replacement)
+        )
 
 
 def find_output_overlaps(
@@ -395,64 +482,13 @@ def find_output_overlaps(
     It never walks the rest of the project, so it does not see a hand-edited ``.pvt`` elsewhere
     whose ``path`` names a file inside an output; Pivot never writes one.
     """
-    root = normalized(project_root)
-    root_str = str(root)
-    root_prefix = os.path.join(root_str, "")
+    root = str(normalized(project_root))
     found = dict[pathlib.Path, OutputOverlap]()
     checked = set[str]()
     for replacement in replacements:
         output_path = normalized(replacement["path"])
-        # Normalized absolute strings: is_relative_to is a prefix test, parent is dirname
-        current = (
-            str(output_path) if replacement["kind"] is not ReplacementKind.TRACKED else root_str
-        )
-        while current != root_str and current.startswith(root_prefix) and current not in checked:
-            checked.add(current)
-            # The sidecar get_pvt_path names: the path's own name with ".pvt" appended
-            if _lstat_mode(current + ".pvt") is not None:
-                current_path = pathlib.Path(current)
-                pvt_path = track.get_pvt_path(current_path)
-                if pvt_path.is_file() or pvt_path.is_symlink():
-                    data = track.read_pvt_file(pvt_path)
-                    if data is None or pvt_path.parent / data["path"] == current_path:
-                        found[pvt_path] = SidecarOverlap(
-                            tracked_path=None if data is None else current_path,
-                            pvt_path=pvt_path,
-                            replacement=replacement,
-                        )
-            current = os.path.dirname(current)
-
-        # A file output, or nothing, is the common case: one lstat answers it
-        mode = _lstat_mode(output_path)
-        if mode is None or stat.S_ISREG(mode):
-            continue
-        if not stat.S_ISDIR(mode) and (not output_path.is_dir() or output_path.is_symlink()):
-            continue
-        members: StageMembers | None = None
-        unreadable = list[OSError]()
-        for dirpath, _dirnames, filenames in os.walk(output_path, onerror=unreadable.append):
-            for name in filenames:
-                if not name.endswith(".pvt"):
-                    continue
-                pvt_path = pathlib.Path(dirpath) / name
-                data = track.read_pvt_file(pvt_path)
-                if members is None:
-                    members = members_of(output_path) if members_of is not None else {}
-                if _is_stage_member(pvt_path, data, members):
-                    continue
-                found[pvt_path] = SidecarOverlap(
-                    tracked_path=None if data is None else pvt_path.parent / data["path"],
-                    pvt_path=pvt_path,
-                    replacement=replacement,
-                )
-        # A directory os.walk could not enter may hide a tracked file; block it, never skip it.
-        for error in unreadable:
-            if error.filename is None:
-                continue
-            blocked = pathlib.Path(error.filename)
-            found.setdefault(
-                blocked, UnreadableOverlap(unreadable_dir=blocked, replacement=replacement)
-            )
+        _find_sidecars(root, replacement, output_path, found, checked)
+        _find_in_tree(output_path, replacement, members_of, found)
     return sorted(found.values(), key=overlap_path)
 
 
@@ -545,12 +581,17 @@ def ownership_error(
     return exceptions.OutputOwnershipError(f"{header}\n{details}\n{remedy}")
 
 
-def _restore_members(target: ForcedRestore, output_path: pathlib.Path) -> StageMembers:
-    """The ``*.pvt`` files under a restored path that its restore may replace."""
+def _restore_members(
+    target: ForcedRestore, output_path: pathlib.Path, *, moved_to: pathlib.Path | None = None
+) -> StageMembers:
+    """The ``*.pvt`` files under a restored path that its restore may replace; ``moved_to`` is
+    where the entry at the path is now (``stage_members``)."""
     match target["replacement"]["kind"]:
         case ReplacementKind.STAGE_OUTPUT:
             claims = target["claims"]() if target["claims"] is not None else None
-            return stage_members(output_path, claims, restored=target["restored"])
+            return stage_members(
+                output_path, claims, restored=target["restored"], moved_to=moved_to
+            )
         case ReplacementKind.TRACKED:
             # A tracked path's own content: what the restore writes and what its sidecar lists now
             current = track.read_pvt_file(track.get_pvt_path(output_path))
@@ -570,8 +611,9 @@ def forced_restore_refusal(
     that blocks it, or None: the one decision behind ``checkout``, ``pull`` and ``get``.
 
     A command checks every target with it before it replaces any, and checks each target again,
-    under that target's restore lock, just before it replaces it: a user file that appears in
-    the meantime refuses that target alone. Only a path that exists (or is a symlink) is
+    under that target's restore lock, just before it builds its replacement: a user file that
+    appears in the meantime refuses that target alone, before any work is spent on it. The swap
+    itself checks once more (``swap_refusal``). Only a path that exists (or is a symlink) is
     replaced, so only such a path is checked. Each target is checked on its own, so the refusal
     names every refused one. A stage output is checked with ``stage_members`` of its stage's
     claims and the restored hash; a tracked path as its own restore, whose members are its own
@@ -590,6 +632,38 @@ def forced_restore_refusal(
     if not overlaps:
         return None
     return ownership_error(project_root, [overlaps[key] for key in sorted(overlaps)])
+
+
+def swap_refusal(
+    project_root: pathlib.Path, target: ForcedRestore, entry: pathlib.Path
+) -> exceptions.OutputOwnershipError | None:
+    """The refusal for ``target`` at its swap, or None: ``forced_restore_refusal``'s check of the
+    entry the swap removes, made once the replacement is built, just before it takes the path.
+
+    ``entry`` is where that entry is now. A restore that puts a directory in place, or removes
+    one, first renames the entry at the path aside, beside it, and passes where: once renamed, a
+    writer that names its files by path can no longer add one to it, so this walk sees every
+    file the swap removes. Each file is still named at its place under the target's path. A file
+    that replaces a file or symlink is checked in place, ``entry`` being the path itself.
+    """
+    if not (entry.exists() or entry.is_symlink()):
+        return None
+    replacement = target["replacement"]
+    output_path = normalized(replacement["path"])
+    location = normalized(entry)
+    moved_to = None if location == output_path else location
+    found = dict[pathlib.Path, OutputOverlap]()
+    _find_sidecars(str(normalized(project_root)), replacement, output_path, found, set[str]())
+    _find_in_tree(
+        output_path,
+        replacement,
+        functools.partial(_restore_members, target, moved_to=moved_to),
+        found,
+        moved_to,
+    )
+    if not found:
+        return None
+    return ownership_error(project_root, sorted(found.values(), key=overlap_path))
 
 
 def find_declared_overlap(

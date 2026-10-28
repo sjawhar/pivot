@@ -14,10 +14,10 @@ from pivot import exceptions, project
 from pivot.cli import checkout
 from pivot.remote import sync as transfer
 from pivot.storage import cache, ownership, restore, track
-from pivot.types import FileHash, TransferResult
+from pivot.types import DirHash, DirManifestEntry, FileHash, TransferResult
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
     from multiprocessing.synchronize import Event
 
     from conftest import GitRepo
@@ -26,6 +26,13 @@ if TYPE_CHECKING:
 
 def _helper_unused_remote() -> RemoteStorage:
     raise AssertionError("this restore must not open the remote")
+
+
+def _own_restore(path: pathlib.Path, output_hash: FileHash) -> ownership.ForcedRestore:
+    """What a tracked path's restore to its own place replaces (``restore._restore_targets``)."""
+    return ownership.ForcedRestore(
+        replacement=ownership.tracked_restore(path), restored=output_hash, claims=None
+    )
 
 
 def _hold_checkout_restore(
@@ -50,6 +57,7 @@ def _hold_checkout_restore(
         executable: bool = False,
         staging_path: pathlib.Path | None = None,
         keep_existing_copy: bool = False,
+        before_swap: Callable[[pathlib.Path], None] | None = None,
     ) -> None:
         _ = staging_path
         started.set()
@@ -60,6 +68,7 @@ def _hold_checkout_restore(
             checkout_modes,
             executable=executable,
             keep_existing_copy=keep_existing_copy,
+            before_swap=before_swap,
         )
 
     cache._checkout_with_fallback = _checkout_after_release
@@ -71,6 +80,7 @@ def _hold_checkout_restore(
             [cache.CheckoutMode.COPY],
             checkout.CheckoutBehavior.FORCE,
             state_dir,
+            target=_own_restore(path, output_hash),
         )
         result_queue.put(("checkout", outcome.result))
     finally:
@@ -94,6 +104,7 @@ def _get_while_checkout_restores(
         cache_dir=cache_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=True,
+        target=_own_restore(path, output_hash),
         remote_factory=_helper_unused_remote,
     )
     result_queue.put(("get", result["status"]))
@@ -982,6 +993,7 @@ def test_restore_file_force_keeps_existing_output_until_cache_swap(
         cache_dir=cache_dir,
         checkout_modes=[cache.CheckoutMode.COPY],
         force=True,
+        target=_own_restore(target, FileHash(hash=file_hash)),
         remote_factory=_helper_unused_remote,
     )
 
@@ -1051,6 +1063,48 @@ def test_restore_file_records_pvt_members_before_writing_them(
     assert len(recorded) == 1
 
 
+def test_swap_refusal_judges_the_moved_entry_and_names_files_under_the_target(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ownership.swap_refusal` walks the entry a restore renamed aside. A stage member is judged
+    by the bytes there, as the check before the swap judged them at the path: here a sidecar-shaped
+    member whose lock changed through git, its current content cached. A user's sidecar there is
+    named at its place under the target's path, never under the backup name."""
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    files = tmp_path / ".pivot" / "cache" / "files"
+    output = tmp_path / "data" / "b" / "tree"
+    output.mkdir(parents=True)
+    (output / "fake.pvt").write_text("path: value.txt\nhash: abcdef0000000001\nsize: 1\n")
+    (output / "value.txt").write_text("1")
+    _ = cache.save_to_cache(output, files, checkout_mode=cache.CheckoutMode.COPY)
+    # The lock and the restored hash list another run's member content
+    locked = DirHash(
+        hash="0123456789abcdef",
+        manifest=[
+            DirManifestEntry(relpath="fake.pvt", hash="fedcba9876543210", size=1, isexec=False)
+        ],
+    )
+    claims = ownership.StageClaims(
+        locked={ownership.normalized(output): locked}, no_commit={}, recorder=None, cache_dir=files
+    )
+    target = ownership.ForcedRestore(
+        replacement=ownership.stage_output(output, "b/tree"), restored=locked, claims=lambda: claims
+    )
+    assert ownership.forced_restore_refusal(tmp_path, [target]) is None
+    moved = output.parent / f"{cache._BACKUP_TEMP_PREFIX}test"
+    output.rename(moved)
+
+    assert ownership.swap_refusal(tmp_path, target, moved) is None
+
+    (moved / "sub").mkdir()
+    (moved / "sub" / "u.txt.pvt").write_text("path: u.txt\nhash: abcdef0000000002\nsize: 1\n")
+    refusal = ownership.swap_refusal(tmp_path, target, moved)
+
+    assert refusal is not None
+    assert "data/b/tree/sub/u.txt.pvt" in str(refusal)
+    assert moved.name not in str(refusal)
+
+
 def test_restore_file_labels_a_retried_cache_restore_from_cache(
     git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1085,6 +1139,7 @@ def test_restore_file_labels_a_retried_cache_restore_from_cache(
         cache_dir=cache_dir,
         checkout_modes=[cache.CheckoutMode.HARDLINK],
         force=False,
+        target=_own_restore(target, FileHash(hash=file_hash)),
         remote_factory=_helper_unused_remote,
     )
 

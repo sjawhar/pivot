@@ -169,6 +169,14 @@ def _refuse(targets: Iterable[ownership.ForcedRestore]) -> None:
         raise click.ClickException(str(refusal))
 
 
+def _refuse_swap(target: ownership.ForcedRestore, entry: pathlib.Path) -> None:
+    """Fail, naming the target, if the entry its swap removes, now at ``entry``, holds a user's
+    file (``ownership.swap_refusal``)."""
+    refusal = ownership.swap_refusal(project.get_project_root(), target, entry)
+    if refusal is not None:
+        raise click.ClickException(str(refusal))
+
+
 def _restore_path_sync(
     path: pathlib.Path,
     output_hash: HashInfo,
@@ -177,15 +185,13 @@ def _restore_path_sync(
     behavior: CheckoutBehavior,
     state_dir: pathlib.Path | None = None,
     *,
-    target: ownership.ForcedRestore | None = None,
+    target: ownership.ForcedRestore,
 ) -> RestoreOutcome:
     """Restore a file or directory from cache (sync version).
 
-    Holds the restore lock for path across the existence check, the ownership check and the
+    Holds the restore lock for path across the existence check, the ownership checks and the
     restore, so a concurrent checkout never compares against, or deletes, a half-restored output.
-    ``target`` is what the restore replaces (``_restore_targets``); the checkout command always
-    gives one. Without one, an ``--only-missing`` swap is checked as a tracked path's own restore
-    and ``--force`` is not checked: no command checked its targets first.
+    ``target`` is what the restore replaces (``_restore_targets``).
 
     Returns:
         What the restore did, for the caller to count and report.
@@ -217,7 +223,7 @@ def _restore_path_locked(
     state_dir: pathlib.Path | None,
     lock_token: str | None,
     *,
-    target: ownership.ForcedRestore | None = None,
+    target: ownership.ForcedRestore,
 ) -> RestoreOutcome:
     """Body of _restore_path_sync; the caller holds the restore lock for path."""
     total = _file_count(output_hash)
@@ -274,22 +280,12 @@ def _restore_path_locked(
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
                 raise ValueError(f"Unhandled checkout behavior: {behavior}")  # pyright: ignore[reportUnreachable]
 
-    # Checked here, under the restore lock, just before the path is replaced: for --force again
+    # Checked here, under the restore lock, before the replacement is built: for --force again
     # after the check of every target before the first restore, so a user file that appeared in
-    # the meantime refuses this target alone; for an --only-missing swap once it is decided
+    # the meantime refuses this target alone; for an --only-missing swap once it is decided. The
+    # swap checks once more, over the entry it removes, once the replacement is built.
     if path.exists() or path.is_symlink():
-        if target is not None:
-            _refuse([target])
-        elif behavior is not CheckoutBehavior.FORCE:
-            _refuse(
-                [
-                    ownership.ForcedRestore(
-                        replacement=ownership.tracked_restore(path),
-                        restored=output_hash,
-                        claims=None,
-                    )
-                ]
-            )
+        _refuse([target])
     success = cache.restore_from_cache(
         path,
         output_hash,
@@ -297,6 +293,7 @@ def _restore_path_locked(
         checkout_modes=checkout_modes,
         state_dir=state_dir,
         lock_token=lock_token,
+        before_swap=functools.partial(_refuse_swap, target),
     )
     if not success:
         return RestoreOutcome("missing", path.name, missing_files=total)
@@ -312,12 +309,11 @@ async def _checkout_files_async(
     callback: Callable[[int, int, str], None] | None = None,
     state_dir: pathlib.Path | None = None,
     *,
-    targets: Mapping[str, ownership.ForcedRestore] | None = None,
+    targets: Mapping[str, ownership.ForcedRestore],
 ) -> list[RestoreOutcome]:
     """Restore files in parallel and return what each restore did.
 
-    ``targets`` says what each file's restore replaces (``_restore_targets``); a file it does
-    not list is a tracked path's own restore.
+    ``targets`` says what each file's restore replaces (``_restore_targets``).
 
     Raises:
         click.ClickException: For immediate failures (aggregated if multiple).
@@ -338,7 +334,7 @@ async def _checkout_files_async(
                     checkout_modes,
                     behavior,
                     state_dir,
-                    target=targets.get(abs_path_str) if targets is not None else None,
+                    target=targets[abs_path_str],
                 )
             outcomes.append(outcome)
             if callback:
@@ -482,8 +478,8 @@ async def _checkout_main_async(
 
     ``--force`` replaces every existing target, so every target is checked before any is
     changed: if one would remove a user's file, nothing is restored and the command fails,
-    naming every refused target and the files that block it. Each target is checked again just
-    before it is replaced (``_restore_path_locked``).
+    naming every refused target and the files that block it. Each target is checked again before
+    its replacement is built, and at its swap (``_restore_path_locked``).
     """
     claims = _stage_claims_readers(stage_outputs, cache_dir)
     if targets:

@@ -157,11 +157,17 @@ When multiple `pivot` processes share the same StateDB:
   never replaced, so it is not a target). The command checks every target before it changes any,
   and if it refuses one it changes nothing; each target is checked on its own, so the refusal
   names every refused target and the files that block it. Then each target is checked again,
-  under its restore lock, just before it is replaced (`checkout._restore_path_locked`,
+  under its restore lock, just before its replacement is built (`checkout._restore_path_locked`,
   `restore._replace_checked`): a user file that appeared since the first check refuses that
-  target alone, naming it, and the command exits 1. Only a path that exists is checked. An
-  `--only-missing` swap is checked there too, once the swap is decided; default checkout and
-  `--only-missing` without a swap replace nothing.
+  target alone, naming it, and the command exits 1, before any work is spent on it. Last, its
+  swap checks the entry it removes (`ownership.swap_refusal`, passed to
+  `cache.restore_from_cache` as `before_swap`): a directory restore renames the old entry aside
+  first, as does a file restore over a directory, and the check walks it there, so a file that
+  landed in the target while its replacement was built refuses it too; the entry goes back to
+  its path and nothing is removed. A file that replaces a file or symlink is checked in place,
+  just before the rename. Only a path that exists is checked. An `--only-missing` swap is checked
+  the same way, once the swap is decided; default checkout and `--only-missing` without a swap
+  replace nothing.
 - The check looks only where a replacement reaches: for a stage output or destination, the
   sidecar beside it and beside each directory above it (one that does not parse counts; one that
   parses counts when it names that path), and every `*.pvt` under a real directory. It never walks
@@ -197,10 +203,13 @@ When multiple `pivot` processes share the same StateDB:
   holds a `*.pvt`.
 - Pivot never writes a stage's `*.pvt` member into the workspace before it is recorded as the
   stage's (`ownership.record_members` adds it to the `nocommit:` record), so a crash leaves at
-  worst a record without a file. A run (`--no-commit` included) writes each output entry that
-  brings one (a `*.pvt` key, a `PathOnly` directory holding one) under a name that is not a
-  `*.pvt`, records the content of each `*.pvt` in it, then renames it into place
-  (`worker._save_recorded`). A restore records the members of the hash it writes unless the
+  worst a record without a file in the output. A run (`--no-commit` included) writes each output
+  entry that brings one (a `*.pvt` key, a `PathOnly` directory holding one) under a name beside
+  the output, never inside it, that is not a `*.pvt` (`worker._staging_path`), records the
+  content of each `*.pvt` in it, then renames it into place (`worker._save_recorded`). A run
+  killed before that rename leaves the staged copy (`.<output>.pivot-staged…`) beside the output,
+  where no check of the output looks, so the next run or restore of the output is not refused;
+  Pivot never removes that copy. A restore records the members of the hash it writes unless the
   stage's lock records that hash (`ownership.record_restored`): a run-cache restore in
   `WorkspaceStore.restore_from_cache`, `pivot get` of a stage in `restore.restore_file`.
   Generation and lock restores, incremental restores, `checkout` and `pull` write only what the
@@ -217,13 +226,23 @@ When multiple `pivot` processes share the same StateDB:
   database is full or read-only, it cannot be opened), `record_members` raises
   `MemberRecordError` naming the stage and the reason, nothing is moved into place, the staged
   copy is removed, and the stage fails.
-- A forced restore checks each target just before it replaces it, so the window in which a
-  sidecar created inside a target is not seen is that one target's own restore (building the
-  replacement from the cache, then the swap), not the whole command. Every other replacement
-  (a stage's write, a restore in a run, a symlink-mode commit, presentation) is checked when it
-  starts replacing that output, with the same window for that output. `track` and `import`
-  refuse to create a sidecar inside an output, so only a file copied or made by hand can appear
-  there during it.
+- A forced restore checks each target three times: with every target before any is changed,
+  under its restore lock before its replacement is built, and at its swap over the entry the swap
+  removes, renamed aside where a directory is involved. Once renamed, no writer that names its
+  files by path can add one to that entry, so a file copied into a target while the command runs
+  refuses that target. What it can still miss: a writer holding an open handle on a directory
+  inside the target (its working directory, or a directory descriptor), which can add a file to
+  the renamed entry after the walk; a sidecar created beside the target, or beside a directory
+  above it, in the instant between the swap's check and its rename; and a restore killed between
+  renaming the old entry aside and checking it, whose backup the next restore of that path (or a
+  directory restore in the same directory an hour later) removes unchecked
+  (`cache._cleanup_fresh_restore_orphans`, `cache._cleanup_stale_restore_temps`). An entry the
+  check refuses goes back to its path; when something took the path meanwhile, it is renamed to
+  `<name>.pivot-kept-<hex>` beside it and a warning names it, never left under the backup name a
+  later restore removes. Every other replacement (a stage's write, a restore in a run, a
+  symlink-mode commit, presentation) is checked when it starts replacing that output, so a file
+  that lands in the output after that check is removed with it. `track` and `import` refuse to
+  create a sidecar inside an output, so only a file copied or made by hand can appear there.
 - `track` and `import` load every pipeline (`discovery.declared_outputs`, as `--all` discovers
   them) and refuse a new path overlapping any declared output, naming the stage. A `pipeline.py`
   that fails to load fails them; one that loads but defines no Pivot pipeline declares nothing. A

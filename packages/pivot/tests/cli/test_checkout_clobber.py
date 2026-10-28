@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from pivot import cli, config, project, types
 from pivot.cli import checkout as checkout_mod
 from pivot.remote import storage as remote_storage
-from pivot.storage import cache, state, track
+from pivot.storage import cache, ownership, state, track
 
 if TYPE_CHECKING:
     import click.testing
@@ -262,13 +262,17 @@ def _helper_restore_only_missing(root: pathlib.Path, v2_hash: types.DirHash) -> 
     # The swap is checked for user files beneath data/ext, which needs the project root (also
     # in the spawned child that crashes mid-restore)
     project._project_root_cache = root
+    ext = root / "data" / "ext"
     outcome = checkout_mod._restore_path_sync(
-        root / "data" / "ext",
+        ext,
         v2_hash,
         root / ".pivot" / "cache" / "files",
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.SKIP_EXISTING,
         root / ".pivot",
+        target=ownership.ForcedRestore(
+            replacement=ownership.tracked_restore(ext), restored=v2_hash, claims=None
+        ),
     )
     return outcome.result
 
