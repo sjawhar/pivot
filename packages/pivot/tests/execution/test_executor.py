@@ -9,6 +9,7 @@ locks, generated outputs, and targeting.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import os
 import pathlib  # noqa: TC003 - compose resolves postponed stage annotations at runtime
 import signal
@@ -21,10 +22,11 @@ import pytest
 
 from pivot import compose, config, exceptions, executor, loaders, project
 from pivot.executor import core as executor_core
+from pivot.storage import state
 from tests import helpers
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from pytest_mock import MockerFixture
 
@@ -248,6 +250,69 @@ def test_unchanged_stages_are_skipped(
 
     assert executor.run(pipeline=test_pipeline)["test/process"]["status"] == "ran"
     assert executor.run(pipeline=test_pipeline)["test/process"]["status"] == "cached"
+
+
+class _PutRecordingTxn:
+    """A write transaction that notes each key it puts and passes everything else through."""
+
+    _txn: Any
+    _puts: list[bytes]
+
+    def __init__(self, txn: Any, puts: list[bytes]) -> None:
+        self._txn = txn
+        self._puts = puts
+
+    def put(self, key: bytes, value: bytes) -> bool:
+        self._puts.append(bytes(key))
+        return self._txn.put(key, value)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._txn, name)
+
+
+def test_a_completed_stage_writes_its_file_hashes_in_its_one_deferred_write(
+    test_pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A normal run persists a completed stage's deferred writes, its file hashes included, in
+    one StateDB open and one write transaction, as main does: the output's `hash:` entry is
+    written in the transaction that writes the stage's run-cache entry, and no separate
+    best-effort save opens the database again for it."""
+    root = _prepare(test_pipeline, monkeypatch)
+    (root / "input.txt").write_text("hello")
+    helpers.register_test_stage(_upper, name="process", deps={"data": "input.txt"})
+    transactions = list[list[bytes]]()
+    real_transaction = state.StateDB._write_transaction
+
+    @contextlib.contextmanager
+    def recording(self: state.StateDB, timeout: float = 30.0) -> Iterator[_PutRecordingTxn]:
+        with real_transaction(self, timeout) as txn:
+            puts = list[bytes]()
+            transactions.append(puts)
+            yield _PutRecordingTxn(txn, puts)
+
+    monkeypatch.setattr(state.StateDB, "_write_transaction", recording)
+    output = pathlib.Path(os.path.abspath(_output("process")))
+    best_effort_output_saves = list[pathlib.Path]()
+    real_save = state.save_file_hashes
+
+    def recording_save(state_dir: pathlib.Path, entries: Any, **kwargs: Any) -> None:
+        entries = list(entries)
+        paths = {os.path.abspath(entry[0]) for entry in entries}
+        if os.fspath(output) in paths:
+            best_effort_output_saves.append(state_dir)
+        real_save(state_dir, entries, **kwargs)
+
+    monkeypatch.setattr(state, "save_file_hashes", recording_save)
+
+    assert executor.run(pipeline=test_pipeline)["test/process"]["status"] == "ran"
+
+    output_key = b"hash:" + os.fsencode(output)
+    with_output = [puts for puts in transactions if output_key in puts]
+    assert len(with_output) == 1, "one write transaction holds the output's hash"
+    assert any(key.startswith(b"runcache:") for key in with_output[0]), (
+        "it is the stage's deferred-write transaction"
+    )
+    assert best_effort_output_saves == [], "no second open saves the completed stage's hashes"
 
 
 def test_input_change_triggers_rerun(

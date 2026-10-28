@@ -233,28 +233,26 @@ async def _run_in_daemon_thread[T](func: Callable[[], T]) -> T:
 def _deferred_writes_to_apply(
     result: StageResult, *, no_commit: bool
 ) -> tuple[types.DeferredWrites | None, list[types.FileHashEntry]]:
-    """Return a finished stage's StateDB writes and its best-effort file-hash cache entries.
+    """Return a finished stage's StateDB writes and the file hashes to save best-effort.
 
-    Only RAN/CACHED stages persist. Under ``--no-commit``, only the ``nocommit:`` record is
-    authoritative; file hashes remain a cache and are saved best-effort.
+    Only RAN/CACHED stages persist. A normal run persists its whole deferred dict, file hashes
+    included, in the one ``apply_deferred_writes`` transaction, as main does. Under
+    ``--no-commit`` only the ``nocommit:`` record is authoritative, and the file hashes are
+    returned for the best-effort ``state.save_file_hashes``.
     """
     if result["status"] not in (StageStatus.RAN, StageStatus.CACHED):
         return None, []
     if "deferred_writes" not in result:
         return None, []
     deferred = result["deferred_writes"]
-    file_hash_entries = deferred["file_hash_entries"] if "file_hash_entries" in deferred else []
-    if no_commit:
-        writes = (
-            types.DeferredWrites(no_commit_record=deferred["no_commit_record"])
-            if "no_commit_record" in deferred
-            else None
-        )
-    else:
-        persisted = deferred.copy()
-        persisted.pop("file_hash_entries", None)
-        writes = persisted or None
-    return writes, file_hash_entries
+    if not no_commit:
+        return deferred, []
+    writes = (
+        types.DeferredWrites(no_commit_record=deferred["no_commit_record"])
+        if "no_commit_record" in deferred
+        else None
+    )
+    return writes, deferred["file_hash_entries"] if "file_hash_entries" in deferred else []
 
 
 class Engine:
