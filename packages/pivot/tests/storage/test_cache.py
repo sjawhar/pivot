@@ -4913,6 +4913,52 @@ def test_restore_missing_in_directory_recreates_missing_empty_dir(tmp_path: path
     assert cache.hash_directory(output) == output_hash
 
 
+def test_only_missing_refuses_a_tracked_member_that_lands_after_its_scan(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The in-place `--only-missing` write rechecks the output after its scan, so a user file
+    and sidecar that land at a missing member are kept and named."""
+    output = tmp_path / "out"
+    output.mkdir()
+    member = output / "result.txt"
+    member.write_text("cached")
+    cache_dir = tmp_path / "cache"
+    output_hash = cache.save_to_cache(output, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    member.unlink()
+    target = ownership.ForcedRestore(
+        replacement=ownership.stage_output(output, "p/out"),
+        restored=output_hash,
+        claims=None,
+    )
+    landed = False
+
+    def land_then_refuse() -> None:
+        nonlocal landed
+        if not landed:
+            member.write_text("user bytes")
+            track.write_pvt_file(
+                track.get_pvt_path(member),
+                track.PvtData(path="result.txt", hash="0123456789abcdef", size=10),
+            )
+            landed = True
+        refusal = ownership.forced_restore_refusal(tmp_path, [target])
+        assert refusal is not None
+        raise refusal
+
+    with pytest.raises(exceptions.OutputOwnershipError, match="result.txt.pvt"):
+        cache.restore_missing_in_directory(
+            output,
+            output_hash,
+            cache_dir,
+            [cache.CheckoutMode.COPY],
+            before_write=land_then_refuse,
+        )
+
+    assert landed
+    assert member.read_text() == "user bytes"
+    assert track.get_pvt_path(member).is_file()
+
+
 def test_restore_missing_in_directory_replaces_directory_holding_extra_empty_dir(
     tmp_path: pathlib.Path,
 ) -> None:
