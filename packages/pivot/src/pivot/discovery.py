@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from importlib.abc import PathEntryFinder
 
+    from pivot.storage import track
+
 logger = logging.getLogger(__name__)
 
 PIPELINE_PY_NAME: Final = "pipeline.py"
@@ -1008,32 +1010,31 @@ def _log_skipped_module(strict: bool, message: str) -> None:
         logger.warning(message)
 
 
-def declared_outputs(project_root: pathlib.Path) -> dict[str, ownership.DeclaredOutput]:
-    """Map every output declared by every pipeline in the project to where it resolves and the
-    stage that writes it.
-
-    Pipelines are discovered as ``--all`` discovers them, so an output of a pipeline the command
-    did not load still counts: ``track`` and ``import`` refuse a path overlapping any of them. A
-    ``pipeline.py`` that fails to load fails this call; one that loads but defines no Pivot
-    pipeline declares nothing. Keys are the normalized workspace paths; resolved paths catch a
-    path that reaches an output through a symlink.
+def _discover_every_pipeline(
+    project_root: pathlib.Path,
+) -> tuple[PipelineLike, store_mod.WorkspaceStore] | None:
+    """Every pipeline in the project, discovered as ``--all`` discovers them, and its workspace.
 
     Raises:
-        exceptions.ValidationError: Naming every output path that cannot be resolved, or the
-            reason discovery failed.
+        exceptions.ValidationError: The reason discovery failed.
     """
     try:
         pipeline = discover_pipeline(project_root=project_root, all_pipelines=True, strict_all=True)
     except DiscoveryError as exc:
         raise exceptions.ValidationError(str(exc)) from exc
     if pipeline is None:
-        return {}
-
+        return None
     workspace = store_mod.WorkspaceStore(
         project_root=project_root,
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
     )
+    return pipeline, workspace
+
+
+def _resolved_outputs(
+    pipeline: PipelineLike, workspace: store_mod.WorkspaceStore
+) -> dict[str, ownership.DeclaredOutput]:
     stage_by_path = {
         str(workspace.resolve_display_path(out)): stage_name
         for stage_name in pipeline.list_stages()
@@ -1054,6 +1055,43 @@ def declared_outputs(project_root: pathlib.Path) -> dict[str, ownership.Declared
             "Cannot resolve stage outputs (fix these first):\n" + "\n".join(errors)
         )
     return resolved
+
+
+def declared_outputs(project_root: pathlib.Path) -> dict[str, ownership.DeclaredOutput]:
+    """Map every output declared by every pipeline in the project to where it resolves and the
+    stage that writes it.
+
+    Pipelines are discovered as ``--all`` discovers them, so an output of a pipeline the command
+    did not load still counts: ``track`` and ``import`` refuse a path overlapping any of them. A
+    ``pipeline.py`` that fails to load fails this call; one that loads but defines no Pivot
+    pipeline declares nothing. Keys are the normalized workspace paths; resolved paths catch a
+    path that reaches an output through a symlink.
+
+    Raises:
+        exceptions.ValidationError: Naming every output path that cannot be resolved, or the
+            reason discovery failed.
+    """
+    discovered = _discover_every_pipeline(project_root)
+    return {} if discovered is None else _resolved_outputs(*discovered)
+
+
+def declared_outputs_and_member_skip(
+    project_root: pathlib.Path, default_state_dir: pathlib.Path, cache_dir: pathlib.Path
+) -> tuple[dict[str, ownership.DeclaredOutput], track.PvtSkip | None]:
+    """``declared_outputs``, and ``ownership.own_member_skip`` over the same stages (with
+    ``cache_dir`` the cache object root), from one discovery: what ``pivot track`` checks a path
+    against.
+
+    Raises:
+        exceptions.ValidationError: As ``declared_outputs``.
+    """
+    discovered = _discover_every_pipeline(project_root)
+    if discovered is None:
+        return {}, None
+    pipeline, workspace = discovered
+    stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
+    skip = ownership.own_member_skip(project_root, stages, workspace, default_state_dir, cache_dir)
+    return _resolved_outputs(pipeline, workspace), skip
 
 
 def load_pipeline_from_path(path: pathlib.Path) -> PipelineLike | None:

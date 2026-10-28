@@ -161,10 +161,12 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
 
     # Every pipeline's outputs, not only the pipeline this directory selects: a file tracked in
     # another pipeline's output would be removed when that pipeline runs.
-    stage_outputs = discovery.declared_outputs(project_root)
+    stage_outputs, skip = discovery.declared_outputs_and_member_skip(
+        project_root, config.locate_state_dir(), cache_dir
+    )
 
-    # Discover existing .pvt files
-    existing_tracked = track_mod.discover_pvt_files(project_root)
+    # Discover existing .pvt files: a stage's own .pvt member of its output tracks nothing
+    existing_tracked = track_mod.discover_pvt_files(project_root, skip=skip)
 
     read = list[tuple[pathlib.Path, os.stat_result, str]]()
     for path_str in paths:

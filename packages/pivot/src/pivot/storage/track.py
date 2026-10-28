@@ -18,7 +18,7 @@ from pivot.storage import cache
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from pivot.types import DirManifestEntry, HashInfo
 
@@ -55,6 +55,10 @@ class PvtData(TypedDict):
     manifest: NotRequired[list[DirManifestEntry]]  # For directories only
     empty_dirs: NotRequired[list[str]]  # For directories holding any (see DirHash)
     source: NotRequired[ImportSource]  # Import source metadata
+
+
+# Whether discovery leaves out a .pvt that parses (its path, its data): ``discover_pvt_files``.
+type PvtSkip = Callable[[pathlib.Path, PvtData], bool]
 
 
 _REQUIRED_KEYS = frozenset({"path", "hash", "size"})
@@ -499,7 +503,9 @@ def _walk(
     return candidates, listings
 
 
-def _read_pvt_files(candidates: list[pathlib.Path], root: pathlib.Path) -> dict[str, PvtData]:
+def _read_pvt_files(
+    candidates: list[pathlib.Path], root: pathlib.Path, skip: PvtSkip | None
+) -> dict[str, PvtData]:
     result = dict[str, PvtData]()
     for pvt_path in candidates:
         if not pvt_path.is_file():
@@ -507,6 +513,8 @@ def _read_pvt_files(candidates: list[pathlib.Path], root: pathlib.Path) -> dict[
         data = read_pvt_file(pvt_path)
         if data is None:
             logger.warning(f"Skipping invalid .pvt file: {pvt_path}")
+            continue
+        if skip is not None and skip(pvt_path, data):
             continue
 
         data_path, warning = restore_target(pvt_path, data["path"], root)
@@ -739,24 +747,27 @@ def _trusted_listings(memo: _Memo | None, root: pathlib.Path) -> dict[str, bytes
     return memo["dirs"] if memo is not None and memo["root"] == _memo_root(root) else {}
 
 
-def discover_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
+def discover_pvt_files(root: pathlib.Path, *, skip: PvtSkip | None = None) -> dict[str, PvtData]:
     """Find all .pvt files under root, return {data_path: PvtData}.
 
     Finds what ``os.walk`` over the whole tree finds. Directories the memo vouches for are stat'ed
     instead of listed; every .pvt found is read. Never writes or creates the memo: only the
     repro/run pre-flight does (``discover_pvt_files_and_update_memo``). A .pvt whose ``path:``
     names no file, or a file outside the project, is left out with a warning, so no command it
-    feeds writes there (see ``restore_target``).
+    feeds writes there (see ``restore_target``). A .pvt ``skip`` returns True for is left out
+    too: a stage's own member of its output (``ownership.own_member_skip``) is no tracked file.
     """
     mounts = _read_mounts()
     fd, memo = _open_memo(mounts, write=False)
     if fd is not None:
         os.close(fd)
     candidates, _ = _walk(root, _trusted_listings(memo, root), mounts, record=False)
-    return _read_pvt_files(candidates, root)
+    return _read_pvt_files(candidates, root, skip)
 
 
-def discover_pvt_files_and_update_memo(root: pathlib.Path) -> dict[str, PvtData]:
+def discover_pvt_files_and_update_memo(
+    root: pathlib.Path, *, skip: PvtSkip | None = None
+) -> dict[str, PvtData]:
     """``discover_pvt_files`` for the repro/run pre-flight, the memo's one writer.
 
     Opens the account's memo file read-write (``_open_memo``: a missing memo is created with mode
@@ -778,7 +789,7 @@ def discover_pvt_files_and_update_memo(root: pathlib.Path) -> dict[str, PvtData]
     finally:
         if fd is not None:
             os.close(fd)
-    return _read_pvt_files(candidates, root)
+    return _read_pvt_files(candidates, root, skip)
 
 
 def is_import(data: PvtData) -> bool:
@@ -786,9 +797,13 @@ def is_import(data: PvtData) -> bool:
     return "source" in data
 
 
-def discover_import_pvt_files(root: pathlib.Path) -> dict[str, PvtData]:
-    """Find all import .pvt files under root."""
-    return {path: data for path, data in discover_pvt_files(root).items() if is_import(data)}
+def discover_import_pvt_files(
+    root: pathlib.Path, *, skip: PvtSkip | None = None
+) -> dict[str, PvtData]:
+    """Find all import .pvt files under root (``discover_pvt_files``, with ``skip``)."""
+    return {
+        path: data for path, data in discover_pvt_files(root, skip=skip).items() if is_import(data)
+    }
 
 
 def pvt_to_hash_info(pvt_data: PvtData) -> HashInfo:

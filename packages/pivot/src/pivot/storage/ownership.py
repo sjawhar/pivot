@@ -13,8 +13,9 @@ stage records it at that path (``stage_members``, the one rule every caller uses
 hash a restore writes, its ``nocommit:<stage>`` record, or what this run writes lists it there,
 and it is a sidecar Pivot cannot parse or a file whose content the stage recorded there. Pivot
 adds a member to that record before it writes the file (``record_members``), so no member it
-writes is ever unrecorded. Every other ``*.pvt`` under an output is the user's, for
-``pivot commit`` too. ``forced_restore_refusal`` is the one decision behind every forced restore,
+writes is ever unrecorded. A member is no tracked file: discovery leaves it out
+(``own_member_skip``). Every other ``*.pvt`` under an output is the user's, for ``pivot commit``
+too. ``forced_restore_refusal`` is the one decision behind every forced restore,
 and ``swap_refusal`` makes it again at each target's swap, over the entry the swap removes.
 """
 
@@ -717,6 +718,41 @@ def _warning(overlap: OutputOverlap, project_root: pathlib.Path) -> str:
     )
 
 
+def _output_members(
+    project_root: pathlib.Path,
+    stages: Mapping[str, RegistryStageInfo],
+    workspace: WorkspaceStore,
+    default_state_dir: pathlib.Path,
+    cache_dir: pathlib.Path,
+) -> tuple[dict[pathlib.Path, str], Callable[[pathlib.Path], StageMembers]]:
+    """Each output these stages write (``normalized``) -> its stage, and a reader of an output's
+    own ``*.pvt`` members (``stage_members`` of the claims its stage's lock and ``nocommit:``
+    record make, with ``cache_dir`` the cache object root), which reads them once per output."""
+    owners = dict[pathlib.Path, tuple[str, types.ArtifactIdentity, pathlib.Path]]()
+    for stage_name, stage_info in stages.items():
+        state_dir = stage_info["state_dir"] or default_state_dir
+        for out in stage_info["outs"]:
+            owners[normalized(workspace.resolve_display_path(out))] = (
+                stage_name,
+                out.identity,
+                state_dir,
+            )
+
+    @functools.cache
+    def members_of(output_path: pathlib.Path) -> StageMembers:
+        stage_name, identity, state_dir = owners[output_path]
+        lock_data = lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).read()
+        locked = (
+            {output_path: lock_data["output_hashes"][identity]}
+            if lock_data is not None and identity in lock_data["output_hashes"]
+            else {}
+        )
+        claims = read_stage_claims(project_root, stage_name, state_dir, locked, cache_dir=cache_dir)
+        return stage_members(output_path, claims)
+
+    return {path: owner[0] for path, owner in owners.items()}, members_of
+
+
 def saved_input_warnings(
     project_root: pathlib.Path,
     stages: Mapping[str, RegistryStageInfo],
@@ -730,27 +766,39 @@ def saved_input_warnings(
     root) draw no warning. The stage's claims are read only for an output that holds a
     ``*.pvt``, so a project with none pays one walk per directory output.
     """
-    replacements = list[Replacement]()
-    owners = dict[pathlib.Path, tuple[str, types.ArtifactIdentity, pathlib.Path]]()
-    for stage_name, stage_info in stages.items():
-        state_dir = stage_info["state_dir"] or default_state_dir
-        for out in stage_info["outs"]:
-            path = normalized(workspace.resolve_display_path(out))
-            replacements.append(stage_output(path, stage_name))
-            owners[path] = (stage_name, out.identity, state_dir)
-
-    def members_of(output_path: pathlib.Path) -> StageMembers:
-        stage_name, identity, state_dir = owners[output_path]
-        lock_data = lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).read()
-        locked = (
-            {output_path: lock_data["output_hashes"][identity]}
-            if lock_data is not None and identity in lock_data["output_hashes"]
-            else {}
-        )
-        claims = read_stage_claims(project_root, stage_name, state_dir, locked, cache_dir=cache_dir)
-        return stage_members(output_path, claims)
-
+    owners, members_of = _output_members(
+        project_root, stages, workspace, default_state_dir, cache_dir
+    )
+    replacements = [stage_output(path, stage_name) for path, stage_name in owners.items()]
     return [
         _warning(overlap, project_root)
         for overlap in find_output_overlaps(project_root, replacements, members_of)
     ]
+
+
+def own_member_skip(
+    project_root: pathlib.Path,
+    stages: Mapping[str, RegistryStageInfo],
+    workspace: WorkspaceStore,
+    default_state_dir: pathlib.Path,
+    cache_dir: pathlib.Path,
+) -> Callable[[pathlib.Path, track.PvtData], bool]:
+    """Whether a ``*.pvt`` file that parses is a member of an output these stages write
+    (``stage_members``, the rule every write, restore and commit uses): ``skip`` for
+    ``track.discover_pvt_files``, so no command reads a stage's own member as a tracked file.
+
+    Any other ``*.pvt`` in an output is the user's: discovery keeps it, and every restore of that
+    output refuses it. A stage's claims are read only for an output that holds a ``*.pvt``.
+    """
+    owners, members_of = _output_members(
+        project_root, stages, workspace, default_state_dir, cache_dir
+    )
+
+    def skip(pvt_path: pathlib.Path, data: track.PvtData) -> bool:
+        path = normalized(pvt_path)
+        return any(
+            output in owners and _is_stage_member(path, data, members_of(output), path)
+            for output in path.parents
+        )
+
+    return skip

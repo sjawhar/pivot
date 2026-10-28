@@ -1119,13 +1119,8 @@ class Engine:
         if cache_dir is None:
             cache_dir = config.get_cache_dir()
 
-        # Verify tracked files before building DAG
         project_root = project.get_project_root()
-        executor_core.verify_tracked_files(project_root, checkout_missing=checkout_missing)
-
-        # Build bipartite graph (single source of truth)
         all_stages = self._get_all_stages()
-        graph = engine_graph.build_graph(all_stages)
         pipeline = self._pipeline
         if pipeline is None:
             raise pivot_exceptions.PipelineNotFoundError("No active pipeline registered.")
@@ -1134,6 +1129,18 @@ class Engine:
             pipeline_name=pipeline.name,
             input_bindings=pipeline.input_bindings,
         )
+
+        # Verify tracked files before building DAG: a stage's own .pvt member of its output is none
+        executor_core.verify_tracked_files(
+            project_root,
+            checkout_missing=checkout_missing,
+            skip=ownership.own_member_skip(
+                project_root, all_stages, store, config.get_state_dir(), cache_dir / "files"
+            ),
+        )
+
+        # Build bipartite graph (single source of truth)
+        graph = engine_graph.build_graph(all_stages)
         # Warn once per run about a tracked file saved inside one of these outputs before track
         # refused that; the store fails the stage before it would remove the file
         for warning in ownership.saved_input_warnings(
