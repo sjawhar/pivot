@@ -296,11 +296,17 @@ def _decode_mount_point(raw: bytes) -> str:
     return os.fsdecode(_MOUNT_ESCAPE.sub(lambda match: bytes([int(match[1], 8)]), raw))
 
 
-def _mount_points() -> frozenset[str] | None:
-    """Every current mount point, or None when no mount table can be read."""
+def _read_mount_table() -> bytes | None:
+    """This mount namespace's mount table, or None where `/proc/self/mounts` cannot be read."""
     try:
-        lines = _MOUNTS_TABLE.read_bytes().splitlines()
+        return _MOUNTS_TABLE.read_bytes()
     except OSError:
+        return None
+
+
+def _mount_points(table: bytes | None) -> frozenset[str] | None:
+    """Every mount point in ``table`` (from `mount` where it is None), or None when unknown."""
+    if table is None:
         try:
             result = subprocess.run(
                 ["mount"], capture_output=True, check=True, text=True, timeout=10
@@ -314,8 +320,59 @@ def _mount_points() -> frozenset[str] | None:
                 points.add(match[1])
         return frozenset(points)
     return frozenset(
-        _decode_mount_point(fields[1]) for line in lines if len(fields := line.split()) >= 2
+        _decode_mount_point(fields[1])
+        for line in table.splitlines()
+        if len(fields := line.split()) >= 2
     )
+
+
+# A writer-side shortcut only. Each naming unit registers its project, and a full registration
+# reads the project id, the mount table and two JSON files. This records, per process, the
+# evidence an entry was last written or checked against: the mount table bytes, the entry's
+# mtime and the project id file's (dev, ino, mtime). A unit skips re-registration only while
+# all of it is unchanged, the state directory is the same and the entry is still fresh. A
+# collection never reads this: `read_register` and `collect_roots` always read the files.
+_RegistrationKey = tuple[pathlib.Path, pathlib.Path, pathlib.Path]
+_VerifiedRegistration = tuple[bytes, pathlib.Path, int, tuple[int, int, int]]
+_VERIFIED_REGISTRATIONS = dict[_RegistrationKey, _VerifiedRegistration]()
+
+
+def _id_file_identity(state_dir: pathlib.Path) -> tuple[int, int, int] | None:
+    """The project id file's (dev, ino, mtime), or None when it cannot be read."""
+    try:
+        stats = os.stat(_project_id_path(state_dir), follow_symlinks=False)
+    except (OSError, ValueError):
+        return None
+    return (stats.st_dev, stats.st_ino, stats.st_mtime_ns)
+
+
+def _registration_unchanged(key: _RegistrationKey, table: bytes | None) -> bool:
+    """Whether this process already registered ``key`` against the evidence it sees now."""
+    verified = _VERIFIED_REGISTRATIONS.get(key)
+    if verified is None or table is None or verified[0] != table:
+        return False
+    if _id_file_identity(key[2]) != verified[3]:
+        return False
+    try:
+        stats = verified[1].stat()
+    except OSError:
+        return False
+    return (
+        stats.st_mtime_ns == verified[2]
+        and time.time() - stats.st_mtime < _REGISTER_REFRESH_SECONDS
+    )
+
+
+def _remember_registration(key: _RegistrationKey, table: bytes | None, entry: pathlib.Path) -> None:
+    """Record the evidence ``entry`` now matches, so the next unconditional unit can skip."""
+    id_file = _id_file_identity(key[2])
+    if table is None or id_file is None:
+        return
+    try:
+        mtime_ns = entry.stat().st_mtime_ns
+    except OSError:
+        return
+    _VERIFIED_REGISTRATIONS[key] = (table, entry, mtime_ns, id_file)
 
 
 def _mounts_under(points: frozenset[str] | None, bases: Iterable[pathlib.Path]) -> list[str] | None:
@@ -375,6 +432,11 @@ def register_project(
     """
     if not cache_dir.is_dir():
         return
+    table = _read_mount_table()
+    key = (cache_dir, project_root, state_dir)
+    if _registration_unchanged(key, table):
+        return
+    _VERIFIED_REGISTRATIONS.pop(key, None)
     path = cache_dir / REGISTER_DIR
     try:
         project_id = _ensure_project_id(state_dir, project_root)
@@ -383,7 +445,7 @@ def register_project(
         project_id = None
     try:
         path = register_path(cache_dir, project_root, project_id or "")
-        points = _mount_points()
+        points = _mount_points(table)
         try:
             mounts = _mounts_under(points, [project_root, state_dir])
         except (OSError, ValueError) as e:
@@ -401,6 +463,7 @@ def register_project(
             and existing.get("mounts") == mounts
         ):
             _record_cache_mounts(cache_dir, points)
+            _remember_registration(key, table, path)
             return
         try:
             version = importlib.metadata.version("pivot")
@@ -417,6 +480,8 @@ def register_project(
         )
         _write_json(path, entry)
         _record_cache_mounts(cache_dir, points)
+        if project_id is not None:
+            _remember_registration(key, table, path)
     except (OSError, ValueError) as e:
         if isinstance(e, OSError) and e.errno == errno.EROFS:
             logger.debug("%s is on a read-only filesystem; nothing can delete there", path)
@@ -605,7 +670,7 @@ def read_register(
     """
     register = cache_dir / REGISTER_DIR
     live = list[ProjectScope]()
-    points = _mount_points()
+    points = _mount_points(_read_mount_table())  # always read now; never the writer memo
     unreadable = _cache_mount_reasons(cache_dir, points)
     try:
         with os.scandir(register) as entries:
