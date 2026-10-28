@@ -3,8 +3,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from pivot import loaders, types
+import pytest
+
+from pivot import exceptions, loaders, types
 from pivot.registry import RegistryStageInfo
+from pivot.storage import track
 from pivot.storage.presentation import present
 
 if TYPE_CHECKING:
@@ -108,3 +111,28 @@ def test_presentation_skips_missing_refs(tmp_path: pathlib.Path) -> None:
 
     display_path = tmp_path / "data" / "missing.csv"
     assert not display_path.exists()
+
+
+def test_presentation_refuses_to_replace_output_holding_tracked_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """present() never replaces a display directory that holds a tracked file."""
+    cache_dir = tmp_path / ".pivot" / "cache" / "files"
+    ref_path = cache_dir / "refs" / "tree" / "_single"
+    ref_path.mkdir(parents=True)
+    tracked = tmp_path / "data" / "tree" / "saved.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("user input")
+    pvt_path = track.get_pvt_path(tracked)
+    track.write_pvt_file(
+        pvt_path, track.PvtData(path="saved.txt", hash="abc1230000000000", size=10)
+    )
+    stages = {
+        "tree": _make_stage("tree", types.ArtifactTag.DIRECTORY, loaders.PathOnly(), key=None)
+    }
+
+    with pytest.raises(exceptions.PivotError, match=r"saved\.txt\.pvt"):
+        present(project_root=tmp_path, pipeline_name="default", cache_dir=cache_dir, stages=stages)
+
+    assert tracked.read_text() == "user input"
+    assert pvt_path.exists()

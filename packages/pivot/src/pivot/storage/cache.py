@@ -101,6 +101,7 @@ def atomic_write_file(
     mode: int = 0o644,
     *,
     staging_path: pathlib.Path | None = None,
+    before_swap: Callable[[pathlib.Path], None] | None = None,
 ) -> os.stat_result:
     """Atomically write to dest using a temporary file and replacement.
 
@@ -113,6 +114,8 @@ def atomic_write_file(
                   MUST close fd (typically via os.fdopen which takes ownership).
         mode: File permissions (default 0o644).
         staging_path: Optional deterministic temporary path beside ``dest``.
+        before_swap: Checks the entry at ``dest``, once the file is written, just before the
+            file replaces it (``restore_from_cache``); not called when nothing is there.
 
     Returns:
         The written file's stat, taken before it replaced ``dest`` (the same inode), so a
@@ -131,6 +134,8 @@ def atomic_write_file(
         write_fn(fd)
         fd_closed = True  # write_fn took ownership via os.fdopen
         os.chmod(tmp, mode)
+        if before_swap is not None and (dest.exists() or dest.is_symlink()):
+            before_swap(dest)
         written = _fstat_staged(tmp)
         tmp.replace(dest)
     except BaseException:
@@ -722,6 +727,13 @@ def _make_writable_and_retry(func: Callable[[str], object], path: str, exc: Base
         if chmod_exc.errno not in (errno.ENOENT, errno.EPERM):
             raise exc from chmod_exc
 
+    if func is os.open:
+        # shutil.rmtree's fd walk hands os.open here when it cannot open a directory
+        # (os.open(name, flags, dir_fd=...)); retrying it as func(path) omits the flags argument
+        # and raises TypeError. A restore refuses an unreadable directory before any delete
+        # reaches rmtree, so this is unreachable there; raise the real error if another caller
+        # lands here, never a TypeError.
+        raise exc
     func(path)
 
 
@@ -752,8 +764,19 @@ def _clear_path(path: pathlib.Path) -> None:
             path.unlink()
 
 
+def _is_real_dir(path: pathlib.Path) -> bool:
+    """Whether ``path`` is a directory, not a symlink to one."""
+    return path.is_dir() and not path.is_symlink()
+
+
 def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
-    """Remove stale restore and backup artifacts older than max age."""
+    """Remove stale restore temporaries (staged replacements) older than max age.
+
+    It takes no lock, so it never removes a backup (``_BACKUP_TEMP_PREFIX``): a backup is the
+    entry a restore renamed aside, which keeps its own old mtime and may still be under that
+    restore's check. Only the next directory restore of the same path removes a backup, under
+    that path's restore lock (``_cleanup_fresh_restore_orphans``); a file restore removes none.
+    """
     cutoff = time.time() - _RESTORE_TEMP_MAX_AGE
 
     if not parent_dir.exists():
@@ -762,10 +785,7 @@ def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
     for entry in os.scandir(parent_dir):
         if entry.name.startswith(_RESTORE_LOCK_PREFIX):
             continue
-        if not (
-            entry.name.startswith(_RESTORE_TEMP_PREFIX)
-            or entry.name.startswith(_BACKUP_TEMP_PREFIX)
-        ):
+        if not entry.name.startswith(_RESTORE_TEMP_PREFIX):
             continue
         try:
             entry_stat = entry.stat(follow_symlinks=False)
@@ -782,19 +802,30 @@ def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
             logger.debug(f"Failed to clean up temp {entry.path}: {e}")
 
 
-def _cleanup_fresh_restore_orphans(path: pathlib.Path, token: str) -> None:
-    """Remove fresh temp and backup entries left by an interrupted restore of path.
+def _cleanup_fresh_restore_orphans(
+    path: pathlib.Path,
+    token: str,
+    before_swap: Callable[[pathlib.Path], None] | None = None,
+) -> None:
+    """Remove fresh temporaries from a killed restore under ``path``'s restore lock.
 
-    The caller holds path's restore lock, so entries tagged with token cannot belong to
-    a live restore of the same target.
+    A backup is the old entry a killed directory restore had renamed aside. Before deleting one,
+    the same swap check the pending restore would run must prove that it holds no user file. A
+    refusal keeps the backup and warns with the refusal, which names the user file.
     """
-    prefixes = (
-        f"{_RESTORE_TEMP_PREFIX}{token}.",
-        f"{_BACKUP_TEMP_PREFIX}{token}.",
-    )
+    restore_prefix = f"{_RESTORE_TEMP_PREFIX}{token}."
+    backup_prefix = f"{_BACKUP_TEMP_PREFIX}{token}."
     for entry in os.scandir(path.parent):
-        if entry.name.startswith(prefixes):
-            _clear_path(pathlib.Path(entry.path))
+        if not entry.name.startswith((restore_prefix, backup_prefix)):
+            continue
+        orphan = pathlib.Path(entry.path)
+        if entry.name.startswith(backup_prefix) and before_swap is not None:
+            try:
+                before_swap(orphan)
+            except exceptions.OutputOwnershipError as error:
+                logger.warning("Keeping interrupted restore backup %s: %s", orphan, error)
+                continue
+        _clear_path(orphan)
 
 
 def _get_symlink_cache_hash(path: pathlib.Path, cache_dir: pathlib.Path) -> str | None:
@@ -1052,6 +1083,7 @@ def _checkout_from_cache(
     *,
     executable: bool | None = None,
     staging_path: pathlib.Path | None = None,
+    before_swap: Callable[[pathlib.Path], None] | None = None,
     cache_root: CacheRoot | None = None,
 ) -> os.stat_result:
     """Create link or copy at path atomically, so readers never see a partial file.
@@ -1059,6 +1091,8 @@ def _checkout_from_cache(
     Args:
         staging_path: Where to build the link or copy before renaming it over path.
             Defaults to a fresh random name beside path.
+        before_swap: Checks the entry at path once the link or copy is built (see
+            ``restore_from_cache``): a file or symlink in place, a directory renamed aside.
         cache_root: The cache directory holding ``cache_path``, resolved once by a caller
             restoring many files, so a symlink's target is not resolved per file.
 
@@ -1095,11 +1129,24 @@ def _checkout_from_cache(
                 tmp_path, cache_path, checkout_mode, executable=executable, cache_root=cache_root
             )
         staged = _fstat_staged(tmp_path)
-        try:
-            tmp_path.replace(path)
-        except IsADirectoryError:
-            _clear_path(path)
-            tmp_path.replace(path)
+        if before_swap is None:
+            try:
+                tmp_path.replace(path)
+            except IsADirectoryError:
+                _clear_path(path)
+                tmp_path.replace(path)
+            return staged
+        # A file or symlink is checked in place and replaced atomically; a directory, there
+        # from the start or made after that check, is renamed aside and checked there.
+        if not _is_real_dir(path):
+            if path.exists() or path.is_symlink():
+                before_swap(path)
+            try:
+                tmp_path.replace(path)
+                return staged
+            except IsADirectoryError:
+                pass
+        _swap_in(tmp_path, path, _backup_path(path, _restore_target_token(path)), before_swap)
     finally:
         # Also covers a replace() that did nothing: POSIX rename is a no-op when both
         # names are hardlinks to the same inode, leaving tmp_path behind.
@@ -1472,6 +1519,7 @@ def _checkout_with_fallback(
     staging_path: pathlib.Path | None = None,
     keep_existing_copy: bool = False,
     display_path: pathlib.Path | None = None,
+    before_swap: Callable[[pathlib.Path], None] | None = None,
     cache_root: CacheRoot | None = None,
 ) -> os.stat_result:
     """Try each link mode in order until one succeeds.
@@ -1499,7 +1547,8 @@ def _checkout_with_fallback(
 
     ``display_path`` names the file in a raised error when ``path`` is a restore-only staging
     location (a caller checking out into a scratch directory before an atomic swap); it
-    defaults to ``path`` for every other caller.
+    defaults to ``path`` for every other caller. ``before_swap`` checks the entry at ``path``
+    just before the made entry replaces it (``_checkout_from_cache``).
 
     ``cache_root`` is the cache directory holding ``cache_path``, resolved once by a caller
     restoring many files: a symlink then names the object's real path without resolving it per
@@ -1536,6 +1585,7 @@ def _checkout_with_fallback(
                 mode,
                 executable=executable,
                 staging_path=staging_path,
+                before_swap=before_swap,
                 cache_root=cache_root,
             )
         except OSError as e:
@@ -1549,6 +1599,7 @@ def _checkout_with_fallback(
                     CheckoutMode.COPY,
                     executable=executable,
                     staging_path=staging_path,
+                    before_swap=before_swap,
                 )
             if e.errno not in FALLBACK_ERRNO or is_last:
                 raise
@@ -1867,6 +1918,7 @@ def restore_from_cache(
     state_dir: pathlib.Path | None = None,
     *,
     lock_token: str | None = None,
+    before_swap: Callable[[pathlib.Path], None] | None = None,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> bool:
     """Restore file or directory from cache. Returns True if successful.
@@ -1881,6 +1933,12 @@ def restore_from_cache(
             refused with EMLINK is copied whatever the order is.
         state_dir: State directory for restore locks and crash cleanup.
         lock_token: Target token yielded by an already-held restore_lock for path.
+        before_swap: Checks the entry the restore removes once the replacement is built, just
+            before it takes ``path``. It is passed where that entry is: renamed aside, beside
+            ``path``, when a directory replaces it or it is a directory, so no writer that names
+            files by path can add one to it after the check; else ``path`` itself, which a file
+            replaces atomically. When it raises, the entry is left at ``path`` and the error
+            propagates. Not called when nothing is at ``path``.
         recorded: Receives ``(path, stat, hash)`` for each file restored, for the caller to
             record in a StateDB. Each stat is taken before the file is renamed into place (the
             same inode), so a write after the restore does not match it.
@@ -1897,6 +1955,7 @@ def restore_from_cache(
             effective_modes,
             state_dir,
             lock_token=lock_token,
+            before_swap=before_swap,
             recorded=recorded,
         )
     return _restore_file_from_cache(
@@ -1906,6 +1965,7 @@ def restore_from_cache(
         effective_modes,
         state_dir,
         lock_token=lock_token,
+        before_swap=before_swap,
         recorded=recorded,
     )
 
@@ -1918,6 +1978,7 @@ def _restore_file_from_cache(
     state_dir: pathlib.Path | None = None,
     *,
     lock_token: str | None = None,
+    before_swap: Callable[[pathlib.Path], None] | None = None,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> bool:
     """Restore single file from cache.
@@ -1930,7 +1991,13 @@ def _restore_file_from_cache(
         return False
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    if state_dir is not None and lock_token is None:
+    if state_dir is None:
+        staged = _checkout_with_fallback(path, cache_path, checkout_modes, before_swap=before_swap)
+        if recorded is not None:
+            recorded.append((path, staged, output_hash["hash"]))
+        return True
+
+    if lock_token is None:
         with restore_lock(path, state_dir) as held_token:
             return _restore_file_from_cache(
                 path,
@@ -1939,14 +2006,19 @@ def _restore_file_from_cache(
                 checkout_modes,
                 state_dir,
                 lock_token=held_token,
+                before_swap=before_swap,
                 recorded=recorded,
             )
 
-    staging_path = None
-    if lock_token is not None:
-        staging_path = restore_staging_path(path, lock_token)
-        _clear_path(staging_path)
-    staged = _checkout_with_fallback(path, cache_path, checkout_modes, staging_path=staging_path)
+    staging_path = restore_staging_path(path, lock_token)
+    _clear_path(staging_path)
+    staged = _checkout_with_fallback(
+        path,
+        cache_path,
+        checkout_modes,
+        staging_path=staging_path,
+        before_swap=before_swap,
+    )
     if recorded is not None:
         recorded.append((path, staged, output_hash["hash"]))
     return True
@@ -1960,6 +2032,7 @@ def _restore_directory_from_cache(
     state_dir: pathlib.Path | None = None,
     *,
     lock_token: str | None = None,
+    before_swap: Callable[[pathlib.Path], None] | None = None,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> bool:
     """Restore a directory atomically. ``recorded`` is as ``restore_from_cache`` says: each
@@ -1987,12 +2060,13 @@ def _restore_directory_from_cache(
                 checkout_modes,
                 state_dir,
                 lock_token=held_token,
+                before_swap=before_swap,
                 recorded=recorded,
             )
 
     target_token = lock_token or _restore_target_token(path)
     if lock_token is not None:
-        _cleanup_fresh_restore_orphans(path, target_token)
+        _cleanup_fresh_restore_orphans(path, target_token, before_swap)
     restore_prefix = f"{_RESTORE_TEMP_PREFIX}{target_token}."
 
     if symlink_fast_path:
@@ -2030,24 +2104,25 @@ def _restore_directory_from_cache(
                 else []
             )
             temp_symlink.symlink_to(cache_dir_path.resolve())
-            _clear_path(path)
-            temp_symlink.replace(path)
+            if before_swap is None:
+                _clear_path(path)
+                temp_symlink.replace(path)
+            else:
+                _swap_in(temp_symlink, path, _backup_path(path, target_token), before_swap)
             if recorded is not None:
                 recorded.extend(tree_files)
             return True
-        except OSError as e:
-            logger.debug(f"Symlink creation failed, will try file-by-file: {e}")
-            if temp_symlink.is_symlink():
-                temp_symlink.unlink()
+        except OSError as error:
+            logger.debug(f"Symlink creation failed, will try file-by-file: {error}")
             for entry in output_hash["manifest"]:
                 if resolve_cache_object_path(cache_dir, entry["hash"]) is None:
                     return False
+        finally:
+            if temp_symlink.is_symlink():
+                temp_symlink.unlink()
 
     temp_path = pathlib.Path(tempfile.mkdtemp(prefix=restore_prefix, dir=path.parent))
     resolved_temp = temp_path.resolve()
-    backup_path = path.parent / f"{_BACKUP_TEMP_PREFIX}{target_token}.{secrets.token_hex(4)}"
-    swap_completed = False
-    backup_restore_failed = False
     restored = list[tuple[pathlib.Path, os.stat_result, str]]()
     try:
         resolved_temp = temp_path.resolve()
@@ -2094,35 +2169,83 @@ def _restore_directory_from_cache(
             except OSError as e:
                 logger.debug(f"chmod failed (may be NFS with root_squash): {e}")
 
-        try:
-            if path.exists() or path.is_symlink():
-                path.rename(backup_path)
-        except FileNotFoundError:
-            logger.debug("Path disappeared between check and rename, proceeding")
-
-        temp_path.replace(path)
-        swap_completed = True
+        _swap_in(temp_path, path, _backup_path(path, target_token), before_swap)
         if recorded is not None:
             recorded.extend(restored)
-
-        try:
-            _clear_path(backup_path)
-        except OSError as e:
-            logger.debug(f"Backup cleanup failed (non-critical): {e}")
         return True
-    except BaseException:
-        if backup_path.exists() and not path.exists():
-            try:
-                backup_path.rename(path)
-            except OSError as e:
-                logger.debug(f"Failed to restore backup: {e}")
-                backup_restore_failed = True
-        raise
     finally:
         if temp_path.exists():
             _clear_path(temp_path)
-        if backup_path.exists() and swap_completed and not backup_restore_failed:
-            _clear_path(backup_path)
+
+
+def _backup_path(path: pathlib.Path, token: str) -> pathlib.Path:
+    """A fresh name beside ``path`` to rename it to while a restore swaps in its replacement,
+    tagged with ``path``'s restore token so the next directory restore of ``path`` removes an
+    orphan. A file restore removes none: a killed one's backup stays beside ``path``."""
+    return path.parent / f"{_BACKUP_TEMP_PREFIX}{token}.{secrets.token_hex(4)}"
+
+
+def _swap_in(
+    staged: pathlib.Path,
+    path: pathlib.Path,
+    backup_path: pathlib.Path,
+    before_swap: Callable[[pathlib.Path], None] | None,
+) -> None:
+    """Rename ``staged`` to ``path``, removing the entry there only once ``staged`` took its place.
+
+    The entry is first renamed to ``backup_path`` and checked there by ``before_swap``
+    (``restore_from_cache``): when the check raises, the entry goes back (``_put_back_checked``).
+    When ``staged`` cannot take its place, the entry goes back if ``path`` is still free. Either
+    way the error propagates and ``staged`` is left for the caller to remove.
+    """
+    try:
+        path.rename(backup_path)
+    except FileNotFoundError:
+        # Nothing at path: nothing to check or remove
+        staged.replace(path)
+        return
+    if before_swap is not None:
+        try:
+            before_swap(backup_path)
+        except BaseException:
+            _put_back_checked(backup_path, path)
+            raise
+    try:
+        staged.replace(path)
+    except BaseException:
+        _put_back_checked(backup_path, path)
+        raise
+    try:
+        _clear_path(backup_path)
+    except OSError as e:
+        logger.debug(f"Backup cleanup failed (non-critical): {e}")
+
+
+def _put_back_checked(moved: pathlib.Path, path: pathlib.Path) -> None:
+    """Rename the entry a restore moved from ``path`` to ``moved`` back, after its check refused
+    it or failed: it may hold a user's file.
+
+    A directory's rename replaces at most an empty directory made at ``path`` since; any other
+    entry goes back only while ``path`` is free. One that cannot go back is never left under its
+    backup name, which a later restore removes: it is renamed to a name no restore removes, and a
+    warning names it.
+    """
+    reason: OSError
+    try:
+        free = not (path.exists() or path.is_symlink())
+        if free or (moved.is_dir() and not moved.is_symlink()):
+            moved.rename(path)
+            return
+        reason = FileExistsError(errno.EEXIST, "a new entry took its place", str(path))
+    except OSError as e:
+        reason = e
+    kept = path.with_name(f"{path.name}.pivot-kept-{secrets.token_hex(4)}")
+    try:
+        moved.rename(kept)
+    except OSError as e:
+        logger.warning("Could not put %s back (%s), nor keep it at %s: %s", path, reason, kept, e)
+        return
+    logger.warning("Could not put %s back (%s); it is at %s", path, reason, kept)
 
 
 def remove_output(path: pathlib.Path) -> None:
@@ -2186,6 +2309,8 @@ def restore_missing_in_directory(
     checkout_modes: list[CheckoutMode],
     state_db: state_mod.StateDB | None = None,
     pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
+    *,
+    before_write: Callable[[], None] | None = None,
 ) -> MissingRestore:
     """Restore missing target files and empty directories without overwriting local changes.
 
@@ -2292,6 +2417,8 @@ def restore_missing_in_directory(
         return MissingRestore(restored=0, missing=len(missing), local_changes=[], replace=False)
 
     for entry, file_path, file_cache_path in missing:
+        if before_write is not None:
+            before_write()
         file_path.parent.mkdir(parents=True, exist_ok=True)
         staged = _checkout_with_fallback(
             file_path,

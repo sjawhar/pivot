@@ -56,6 +56,15 @@ class OutputPathConflictError(ValidationError):
         return "Rename a stage, pipeline or output so each output has its own path"
 
 
+class OutputOwnershipError(ValidationError):
+    """Raised when replacing an output would delete a user-owned path."""
+
+
+class MemberRecordError(PivotError):
+    """Raised when Pivot cannot record a stage's `*.pvt` member before writing it, so it does
+    not write the member."""
+
+
 class DAGError(PivotError):
     """Base class for DAG-related errors."""
 

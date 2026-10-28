@@ -23,8 +23,8 @@ from pivot import cli, discovery, exceptions, project
 from pivot.engine import agent_rpc, sources
 from pivot.engine import engine as engine_mod
 from pivot.engine.types import EngineState, InputEvent, OutputEvent
+from pivot.storage import cache, track
 from pivot.storage import store as store_mod
-from pivot.storage import track
 from pivot.types import StageStatus
 from pivot_tui import event_poller, rpc_client_impl
 
@@ -1657,6 +1657,90 @@ async def test_output_written_inside_the_project_does_not_recheck_a_missing_inpu
             tg.cancel_scope.cancel()
 
 
+_ROOT_KEEP_SOURCE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def keep(raw: str) -> str:
+    return raw + "-keep"
+
+
+with Pipeline("a") as pipeline:
+    keep(pipeline.input("input.txt"))
+"""
+
+
+def _helper_tree_source(name: str) -> str:
+    """other/pipeline.py: pipeline ``name`` whose stage writes the directory data/<name>/tree/."""
+    return f"""\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def tree(raw: str) -> Annotated[dict[str, str], directory]:
+    return {{"generated.txt": raw}}
+
+
+with Pipeline("{name}") as pipeline:
+    tree(pipeline.input("input.txt"))
+"""
+
+
+@pytest.mark.anyio
+async def test_reload_bringing_in_owning_pipeline_keeps_tracked_file_and_sidecar(
+    watch_project: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`repro --all --watch` with pipelines a and c: a reload renames c to b, whose directory
+    output holds a tracked file. The run warns, fails b/tree naming the file, and leaves the file
+    and its sidecar in place."""
+    caplog.set_level(logging.WARNING, logger="pivot.engine.engine")
+    tracked = watch_project / "data" / "b" / "tree" / "saved.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("user input")
+    pvt_path = track.get_pvt_path(tracked)
+    track.write_pvt_file(
+        pvt_path, track.PvtData(path="saved.txt", hash=cache.hash_file(tracked)[0], size=10)
+    )
+    (watch_project / "pipeline.py").write_text(_ROOT_KEEP_SOURCE)
+    other_py = watch_project / "other" / "pipeline.py"
+    other_py.parent.mkdir()
+    other_py.write_text(_helper_tree_source("c"))
+    pipeline = discovery.discover_pipeline(watch_project, all_pipelines=True)
+    assert pipeline is not None
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline, all_pipelines=True) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            first_idle = await recorder.wait_for(_helper_is_idle)
+            assert recorder.completed("c/tree", start=0, end=first_idle) == StageStatus.RAN
+            assert "Warning: tracked path" not in caplog.text
+
+            other_py.write_text(_helper_tree_source("b"))
+            reload_index = await recorder.wait_for(_helper_is_reload, start=first_idle)
+            tree_done = await recorder.wait_for(_helper_completes("b/tree"), start=reload_index)
+            await recorder.wait_for(_helper_is_idle, start=tree_done)
+
+            assert recorder.completed("b/tree", start=reload_index) == StageStatus.FAILED
+            assert tracked.read_text() == "user input"
+            assert pvt_path.exists()
+            assert (
+                "Warning: tracked path 'data/b/tree/saved.txt' "
+                + "(sidecar 'data/b/tree/saved.txt.pvt') is inside output 'data/b/tree' "
+                + "of stage 'b/tree'"
+            ) in caplog.text
+            tg.cancel_scope.cancel()
+
+
 _OWNERSHIP_BEFORE = """\
 from __future__ import annotations
 
@@ -1816,13 +1900,12 @@ async def test_rpc_forced_run_stops_on_a_missing_file_tracked_inside_another_pip
 ) -> None:
     """Audit D1, watch RPC row: a forced RPC `run` of a/alive stops on the missing tracked file.
 
-    The file was tracked inside b/tree's directory output while only pipeline a was loaded. With
-    a/alive and b/tree loaded in a watching engine, an RPC `run` with `force` must not run the
-    stage while that tracked file is missing.
+    The file was tracked at data/b/tree/f.txt before pipeline b declared that directory output
+    (`pivot track` refuses a path inside any pipeline's declared output). With a/alive and b/tree
+    loaded in a watching engine, an RPC `run` with `force` must not run the stage while that
+    tracked file is missing.
     """
     (watch_project / "pipeline.py").write_text(_RPC_ROOT_ALONE)
-    (watch_project / "other").mkdir()
-    (watch_project / "other" / "pipeline.py").write_text(_RPC_OTHER)
     tracked = watch_project / "data" / "b" / "tree" / "f.txt"
     tracked.parent.mkdir(parents=True)
     tracked.write_text("tracked bytes")
@@ -1830,6 +1913,8 @@ async def test_rpc_forced_run_stops_on_a_missing_file_tracked_inside_another_pip
     assert track_result.exit_code == 0, track_result.output
     pvt_path = track.get_pvt_path(tracked)
     tracked.unlink()
+    (watch_project / "other").mkdir()
+    (watch_project / "other" / "pipeline.py").write_text(_RPC_OTHER)
     (watch_project / "pipeline.py").write_text(_RPC_ROOT_INCLUDING_B)
     pipeline = _helper_discover(watch_project)
     assert sorted(pipeline.list_stages()) == ["a/alive", "b/tree"]
