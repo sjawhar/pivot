@@ -21,39 +21,57 @@ from pivot.types import (
     ParamChange,
 )
 
-# A lock's code manifest carries this prefix, followed by module names, when its run imported
-# user modules its fingerprint did not cover. No fingerprint has such a key, so the lock never
-# matches and the stage reruns.
+# A lock's code manifest carries one of these prefixes, followed by module names, when its run
+# executed user code its fingerprint does not describe: modules it imported that the fingerprint
+# does not cover, modules it used that changed after the pivot process that fingerprinted the
+# stage loaded them, or modules whose source pivot cannot read. No fingerprint has such a key, so
+# the lock never matches and the stage reruns.
 UNCOVERED_IMPORT_KEY_PREFIX = "uncovered-import:"
+EDITED_SOURCE_KEY_PREFIX = "edited-source:"
+UNREADABLE_SOURCE_KEY_PREFIX = "unreadable-source:"
+
+_RERUN_MARK_REASONS = {
+    UNCOVERED_IMPORT_KEY_PREFIX: "Previous run imported modules its fingerprint does not cover",
+    EDITED_SOURCE_KEY_PREFIX: "Previous run imported modules edited after pivot loaded them",
+    UNREADABLE_SOURCE_KEY_PREFIX: "Previous run used modules whose source pivot cannot read",
+}
 
 
-def uncovered_import_reason(manifest: dict[str, str]) -> str | None:
-    """The rerun reason for a lock written by a run that imported uncovered user modules."""
+def _is_rerun_mark(key: str) -> bool:
+    return key.startswith(tuple(_RERUN_MARK_REASONS))
+
+
+def rerun_mark_reason(manifest: dict[str, str]) -> str | None:
+    """The rerun reason for a lock written by a run that executed code its fingerprint does not
+    describe (a rerun mark), or None."""
     for key in manifest:
-        if key.startswith(UNCOVERED_IMPORT_KEY_PREFIX):
-            modules = key.removeprefix(UNCOVERED_IMPORT_KEY_PREFIX)
-            return f"Previous run imported modules its fingerprint does not cover: {modules}"
+        for prefix, reason in _RERUN_MARK_REASONS.items():
+            if key.startswith(prefix):
+                return f"{reason}: {key.removeprefix(prefix)}"
     return None
 
 
-def carry_uncovered_import(
+def strip_rerun_marks(manifest: dict[str, str]) -> dict[str, str]:
+    """`manifest` without its rerun marks: the static fingerprint a run-cache input hash uses."""
+    return {key: value for key, value in manifest.items() if not _is_rerun_mark(key)}
+
+
+def carry_rerun_marks(
     previous: dict[str, str] | None, fingerprint: dict[str, str]
 ) -> dict[str, str]:
-    """The code manifest `pivot commit` records: `fingerprint`, plus the previous lock's
-    uncovered-import key when the static fingerprint is otherwise unchanged.
+    """The code manifest `pivot commit` records: `fingerprint`, plus the previous lock's rerun
+    marks when the static fingerprint is otherwise unchanged.
 
-    That key records that the run which produced these outputs imported code its fingerprint does
-    not cover. Committing those same outputs keeps the record, so the stage still reruns; a code
-    edit since then drops it, because the next run decides afresh.
+    A mark records that the run which produced these outputs executed code its fingerprint does
+    not describe. Committing those same outputs keeps the record, so the stage still reruns; a
+    code edit since then drops it, because the next run decides afresh.
     """
     if previous is None:
         return fingerprint
-    markers = {
-        key: value for key, value in previous.items() if key.startswith(UNCOVERED_IMPORT_KEY_PREFIX)
-    }
+    markers = {key: value for key, value in previous.items() if _is_rerun_mark(key)}
     if not markers:
         return fingerprint
-    static = {key: value for key, value in previous.items() if key not in markers}
+    static = strip_rerun_marks(previous)
     if static != fingerprint:
         return fingerprint
     return {**fingerprint, **markers}
@@ -75,18 +93,16 @@ def check_stage(
     When explain=False (engine/repro), short-circuits at first detected change.
     When explain=True (status/explain), evaluates all comparisons exhaustively.
 
-    A lock written by a run that imported user modules its fingerprint does not cover (an
-    `uncovered-import:` key) is never satisfied from the run cache: an entry at the stage's input
-    hash was filed by a run the check did not see, so the stage must run.
+    A lock with a rerun mark (its run executed code its fingerprint does not describe) is never
+    satisfied from the run cache: an entry at the stage's input hash was filed by a run the check
+    did not see, so the stage must run.
 
     Callers are responsible for:
     - Tier 1 (generation check via can_skip_via_generation) before calling this
     - Tier 3 (run cache) after this returns changed=True, when run_cache_allowed
     """
-    uncovered_reason = (
-        uncovered_import_reason(lock_data["code_manifest"]) if lock_data is not None else None
-    )
-    if uncovered_reason is not None:
+    marked_reason = rerun_mark_reason(lock_data["code_manifest"]) if lock_data is not None else None
+    if marked_reason is not None:
         run_cache_allowed = False
 
     if force and not explain:
@@ -100,7 +116,7 @@ def check_stage(
     # Fast path: cheap dict equality, no detailed diffs or path conversion.
     if not explain:
         if lock_data["code_manifest"] != fingerprint:
-            reason = uncovered_reason or "Code changed"
+            reason = marked_reason or "Code changed"
             return ChangeDecision(changed=True, reason=reason, run_cache_allowed=run_cache_allowed)
         if not params_equal(lock_data["params"], params):
             return ChangeDecision(
@@ -129,7 +145,7 @@ def check_stage(
     out_changed = sorted(out_paths) != locked_out_paths
 
     changed = force or bool(code_changes or param_changes or dep_changes or out_changed)
-    reason = uncovered_reason or _first_reason(
+    reason = marked_reason or _first_reason(
         code_changes, param_changes, dep_changes, out_changed, force
     )
 
