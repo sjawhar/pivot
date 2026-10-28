@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 import logging
 from typing import TYPE_CHECKING, Any
 
 import tabulate
 import yaml
 
-from pivot import exceptions, git, project, types, yaml_config
+from pivot import display, exceptions, git, project, types, yaml_config
 from pivot.storage import lock
 from pivot.types import ChangeType, OutputFormat, StorageLockData
 
@@ -100,17 +99,22 @@ def format_table(
     output_format: OutputFormat | None,
     empty_message: str,
 ) -> str:
-    """Format rows as plain/markdown table."""
+    """Format rows as plain/markdown table.
+
+    Each cell is escaped: a table shows values read from metric files, lock files and
+    ``params.yaml``, and a control character in one of them must not reach the terminal.
+    """
     if not rows:
         return empty_message
 
+    escaped = [[display.escape_control(cell) for cell in row] for row in rows]
     tablefmt = "github" if output_format == OutputFormat.MD else "plain"
-    return tabulate.tabulate(rows, headers=headers, tablefmt=tablefmt, disable_numparse=True)
+    return tabulate.tabulate(escaped, headers=headers, tablefmt=tablefmt, disable_numparse=True)
 
 
 def format_json(data: Mapping[str, Any] | list[Any]) -> str:
     """Format data as indented JSON string."""
-    return json.dumps(data, indent=2)
+    return display.to_json(data, indent=2)
 
 
 def build_two_level_diff[V](

@@ -9,7 +9,6 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import datetime
-import json
 import logging
 import pathlib
 import signal
@@ -23,7 +22,7 @@ from typing import TYPE_CHECKING
 import anyio
 import click
 
-from pivot import config, project, registry
+from pivot import config, display, project, registry
 from pivot.cli import _run_common, completion, is_standalone_invocation
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -188,7 +187,7 @@ def _dry_run(
 
     if not explanations:
         if as_json:
-            click.echo(json.dumps(_run_common.DryRunJsonOutput(stages={})))
+            click.echo(display.to_json(_run_common.DryRunJsonOutput(stages={})))
         else:
             click.echo("No stages to run")
         return
@@ -203,12 +202,12 @@ def _dry_run(
                 for exp in explanations
             }
         )
-        click.echo(json.dumps(output, indent=2))
+        click.echo(display.to_json(output, indent=2))
     else:
         click.echo("Would run:")
         for exp in explanations:
             status = "would run" if exp["will_run"] else "would skip"
-            reason = exp["reason"] or "unchanged"
+            reason = display.escape_control(exp["reason"] or "unchanged", keep_newlines=True)
             click.echo(f"  {exp['stage_name']}: {status} ({reason})")
 
 

@@ -13,13 +13,12 @@ from __future__ import annotations
 import logging
 from typing import Literal, assert_never, override
 
-import rich.markup
 import textual.app
 import textual.containers
 import textual.css.query
 import textual.widgets
 
-from pivot import types
+from pivot import display, types
 from pivot.types import (
     ChangeType,
     CodeChange,
@@ -66,7 +65,7 @@ def _escape_padded(text: str, width: int) -> str:
     of multi-cell characters (emojis, CJK), use rich.cells.cell_len() instead.
     Kept simple since paths/identifiers rarely contain wide characters.
     """
-    return rich.markup.escape(text.ljust(width))
+    return display.escape_markup(text.ljust(width))
 
 
 def _truncate_hash(hash_str: str | None, length: int = 8) -> str:
@@ -283,8 +282,8 @@ class _SelectableExpandablePanel(textual.containers.Horizontal):
         if self._detail_expanded:
             lines.extend(
                 [
-                    f"Old hash: {rich.markup.escape(old_hash or '(none)')}",
-                    f"New hash: {rich.markup.escape(new_hash or '(none)')}",
+                    f"Old hash: {display.escape_markup(old_hash or '(none)')}",
+                    f"New hash: {display.escape_markup(new_hash or '(none)')}",
                 ]
             )
         else:
@@ -399,20 +398,18 @@ class InputDiffPanel(_SelectableExpandablePanel):
                     )
                     match change["change_type"]:
                         case ChangeType.ADDED:
-                            val_display = f"(none) -> {rich.markup.escape(new_val)}"
+                            val_display = f"(none) -> {display.escape_markup(new_val)}"
                         case ChangeType.REMOVED:
-                            val_display = f"{rich.markup.escape(old_val)} -> (deleted)"
+                            val_display = f"{display.escape_markup(old_val)} -> (deleted)"
                         case ChangeType.MODIFIED:
-                            val_display = (
-                                f"{rich.markup.escape(old_val)} -> {rich.markup.escape(new_val)}"
-                            )
+                            val_display = f"{display.escape_markup(old_val)} -> {display.escape_markup(new_val)}"
                         case _ as unreachable:  # pyright: ignore[reportUnnecessaryComparison]
                             assert_never(unreachable)
                     return f"{prefix}{indicator} {_escape_padded(str(change['key']), 25)} {val_display}{suffix}"
                 return f"{prefix}{_INDICATOR_UNCHANGED} {_escape_padded(item_key, 25)} (unknown){suffix}"
 
             case _:
-                return f"{prefix}{rich.markup.escape(item_id)}{suffix}"
+                return f"{prefix}{display.escape_markup(item_id)}{suffix}"
 
     @override
     def _render_detail_content(self, item_id: str) -> str:  # pragma: no cover
@@ -436,7 +433,7 @@ class InputDiffPanel(_SelectableExpandablePanel):
             return "[dim]No changes[/]"
 
         lines = [
-            f"[bold]{rich.markup.escape(str(change['key']))}[/]",
+            f"[bold]{display.escape_markup(str(change['key']))}[/]",
             "",
             "Type: Code fingerprint",
             f"Status: {self._format_status(change['change_type'])}",
@@ -452,10 +449,10 @@ class InputDiffPanel(_SelectableExpandablePanel):
         change = self._find_dep_change(path)
 
         if not change:
-            return f"[bold]{rich.markup.escape(path)}[/]\n\n[dim]No changes[/]"
+            return f"[bold]{display.escape_markup(path)}[/]\n\n[dim]No changes[/]"
 
         lines = [
-            f"[bold]{rich.markup.escape(path)}[/]",
+            f"[bold]{display.escape_markup(path)}[/]",
             "",
             "Type: Dependency",
             f"Status: {self._format_status(change['change_type'])}",
@@ -471,10 +468,10 @@ class InputDiffPanel(_SelectableExpandablePanel):
         change = self._find_param_change(key)
 
         if not change:
-            return f"[bold]{rich.markup.escape(key)}[/]\n\n[dim]No changes[/]"
+            return f"[bold]{display.escape_markup(key)}[/]\n\n[dim]No changes[/]"
 
         lines = [
-            f"[bold]{rich.markup.escape(str(change['key']))}[/]",
+            f"[bold]{display.escape_markup(str(change['key']))}[/]",
             "",
             "Type: Parameter",
             f"Status: {self._format_status(change['change_type'])}",
@@ -488,8 +485,8 @@ class InputDiffPanel(_SelectableExpandablePanel):
             # Show full values in expanded view
             lines.extend(
                 [
-                    f"Old value: {rich.markup.escape(repr(old_val)) if old_val is not None else '(none)'}",
-                    f"New value: {rich.markup.escape(repr(new_val)) if new_val is not None else '(none)'}",
+                    f"Old value: {display.escape_markup(repr(old_val)) if old_val is not None else '(none)'}",
+                    f"New value: {display.escape_markup(repr(new_val)) if new_val is not None else '(none)'}",
                 ]
             )
             # Add delta for numeric values
@@ -504,8 +501,8 @@ class InputDiffPanel(_SelectableExpandablePanel):
                 sign = "+" if delta >= 0 else ""
                 lines.append(f"Delta: {sign}{delta} ({sign}{pct:.1f}%)")
         else:
-            old_display = rich.markup.escape(repr(old_val)) if old_val is not None else "(none)"
-            new_display = rich.markup.escape(repr(new_val)) if new_val is not None else "(none)"
+            old_display = display.escape_markup(repr(old_val)) if old_val is not None else "(none)"
+            new_display = display.escape_markup(repr(new_val)) if new_val is not None else "(none)"
             lines.append(f"{old_display} -> {new_display}")
 
         if not self._detail_expanded:
@@ -644,7 +641,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         type_label = self._get_type_label(item_type)
 
         lines = [
-            f"[bold]{rich.markup.escape(types.identity_key(change['identity']))}[/]",
+            f"[bold]{display.escape_markup(types.identity_key(change['identity']))}[/]",
             "",
             f"Type: {type_label}",
             f"Status: {self._format_status(change['change_type'])}",
@@ -712,7 +709,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
         lines = list[str]()
 
         # Header
-        lines.append(f"[bold]{rich.markup.escape(result['path'])}[/]")
+        lines.append(f"[bold]{display.escape_markup(result['path'])}[/]")
         lines.append("")
         lines.append(f"Type: {self._get_type_label(change['output_type'])}")
         lines.append(f"Status: {self._format_status(change['change_type'])}")
@@ -752,7 +749,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
             lines.append("[bold]Schema Changes:[/]")
             for schema_change in result["schema_changes"][:20]:
                 indicator = _get_indicator(schema_change["change_type"])
-                col = rich.markup.escape(str(schema_change["column"]))
+                col = display.escape_markup(str(schema_change["column"]))
                 old_dtype = schema_change["old_dtype"] or "(none)"
                 new_dtype = schema_change["new_dtype"] or "(none)"
                 match schema_change["change_type"]:
@@ -774,7 +771,7 @@ class OutputDiffPanel(_SelectableExpandablePanel):
             lines.append(f"[bold]Row Changes:[/] ({total} shown)")
             for row_change in result["row_changes"][:50]:
                 indicator = _get_indicator(row_change["change_type"])
-                key = rich.markup.escape(str(row_change["key"]))
+                key = display.escape_markup(str(row_change["key"]))
                 lines.append(f"  {indicator} {key}")
             if total > 50:
                 lines.append(f"  [dim]... and {total - 50} more[/]")
