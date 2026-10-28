@@ -3324,6 +3324,14 @@ _marked_without_dict = dict[int, Any]()
 # one, pays one module-global read per classified value for the mark. Two states pivot never
 # enters break that premise (an object unpickled by value with its `__dict__`, and
 # `importlib.reload` of this module); in both the walk records the body: more, never less.
+#
+# `AGENTS.md` warns against module-level mutable state, and a flush of project-scoped state into
+# the wrong project caused a real bug (#536). This flag is not that kind of state, so do not
+# "fix" it into a `ContextVar` or a parameter: it records which objects the decorator marked in
+# *this interpreter*, a property of the loaded code and never of a project, it is set once and
+# never reset, it is never read as "which project am I in", and it gates only the probe's speed —
+# the decision's result is the same whether it is True or False, because an unmarked value's
+# chain holds no mark either way. Removing it returns the round 9 hot-path regression.
 _marks_made = False
 
 
