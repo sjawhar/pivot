@@ -19,6 +19,7 @@ import pytest
 
 import pivot_tui
 from pivot import discovery, fingerprint, project
+from pivot.storage import state
 from tests import conftest
 
 if TYPE_CHECKING:
@@ -293,6 +294,82 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
     assert pathlib.Path(module_file).resolve() == (second / "stages.py")
     assert str(first) not in sys.path
     assert str(second) == sys.path[0]
+
+
+_SHOUT_PIPELINE = """
+from pivot.compose import Pipeline, stage
+from shout_helpers import shout
+
+
+@stage
+def loud(text: str) -> str:
+    return shout(text)
+
+
+with Pipeline("first") as pipeline:
+    loud(pipeline.input("words.txt", t=str))
+"""
+
+
+def _helper_fingerprinted_project(root: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make `root` the current project, discover its pipeline and fingerprint its stage, as the
+    engine does after discovery: the hashes and manifest that walk computes wait for a flush."""
+    root.mkdir()
+    (root / ".pivot").mkdir()
+    (root / "shout_helpers.py").write_text(
+        "def shout(text: str) -> str:\n    return text.upper()\n"
+    )
+    (root / "pipeline.py").write_text(_SHOUT_PIPELINE)
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    pipeline = discovery.discover_pipeline(project_root=root)
+    assert pipeline is not None
+    pipeline.ensure_fingerprint("first/loud")
+
+
+def _helper_fingerprint_cache_keys(root: pathlib.Path) -> list[bytes]:
+    """The function-hash (`fp:`) and stage-manifest (`sm:`) keys in `root`'s StateDB."""
+    if not (root / ".pivot" / "state.lmdb").exists():
+        return []
+    with state.StateDB(root / ".pivot", readonly=True) as db:
+        return [key for prefix in (b"fp:", b"sm:") for key, _ in db.iter_prefix(prefix)]
+
+
+def test_discovery_writes_no_fingerprint_cache_entry_queued_in_another_project(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hashes and manifests queued in one project never reach a later project's StateDB.
+
+    A process pointed at several projects in turn, as a test process is, flushes the pending
+    cache writes at each discovery. Those queued in the first project name its files, so
+    discovery in the second drops them and writes nothing there, no write lock included.
+    """
+    _helper_fingerprinted_project(tmp_path / "first", monkeypatch)
+    second = tmp_path / "second"
+    second.mkdir()
+    (second / ".pivot").mkdir()
+    (second / "pipeline.py").write_text(
+        "from pivot.compose import Pipeline\n\nwith Pipeline('second') as pipeline:\n    pass\n"
+    )
+    monkeypatch.setattr(project, "_project_root_cache", second)
+
+    assert discovery.discover_pipeline(project_root=second) is not None
+
+    assert not list(second.rglob("*.lock")), "a write lock in a project nothing was queued for"
+    assert _helper_fingerprint_cache_keys(second) == []
+
+
+def test_flush_writes_fingerprint_cache_entries_into_the_project_that_queued_them(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The writes queued after discovery reach the StateDB of the project that queued them."""
+    first = tmp_path / "first"
+    _helper_fingerprinted_project(first, monkeypatch)
+
+    fingerprint.flush_ast_hash_cache()
+    fingerprint.flush_manifest_cache()
+
+    names = {key.split(b"\x00")[0] for key in _helper_fingerprint_cache_keys(first)}
+    assert {b"fp:shout_helpers.py", b"sm:first/loud"} <= names
 
 
 def _write_sibling_stage_project(
