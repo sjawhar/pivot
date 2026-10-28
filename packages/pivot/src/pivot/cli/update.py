@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import pathlib
-import traceback
 from typing import TYPE_CHECKING
 
 import click
 
 from pivot import display
 from pivot.cli import decorators as cli_decorators
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pivot import import_artifact
@@ -119,11 +121,8 @@ def _report_error(pvt_path: pathlib.Path, exc: BaseException) -> None:
     from pivot import exceptions
 
     shown = display.escape_control(str(pvt_path))
-    if isinstance(exc, (exceptions.PivotError, exceptions.RemoteError)):
-        click.echo(display.safe_message(f"Error updating {shown}: {exc}"), err=True)
-    else:
-        message = f"Unexpected error updating {shown}: {type(exc).__name__}: {exc}"
-        click.echo(display.safe_message(message), err=True)
-        click.echo(
-            display.safe_message("".join(traceback.format_exception(exc))), err=True, nl=False
-        )
+    if not isinstance(exc, exceptions.PivotError):
+        # Unexpected: --verbose shows the traceback; the message is one line naming the problem.
+        logger.debug("Unexpected error updating %s", shown, exc_info=exc)
+    message = f"Error updating {shown}: {exceptions.describe_error(exc)}"
+    click.echo(display.safe_message(message), err=True)

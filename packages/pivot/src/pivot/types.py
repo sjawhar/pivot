@@ -200,6 +200,11 @@ class StageResult(TypedDict):
     """Result from executing a single stage."""
 
     status: CompletionType
+    # One line the console prints in place of `reason`, which keeps its exact text for results
+    # and JSONL (a traceback, for an unexpected error in a worker). Set only for a failure of
+    # pivot's own I/O on state it owns (`stage_io`). Empty when a log line already
+    # names the failure. Absent otherwise: the console prints `reason`, traceback included.
+    display_reason: NotRequired[str]
     reason: str
     input_hash: str | None  # None only for early failures before dep hashing
     output_lines: list[tuple[str, bool]]
