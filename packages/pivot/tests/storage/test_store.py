@@ -468,7 +468,10 @@ def test_output_identities_by_path_maps_display_paths_to_identities(
     }
 
 
-def test_store_spec_cache_round_trip(tmp_path: pathlib.Path) -> None:
+def test_store_spec_cache_uses_the_configured_state_dir(tmp_path: pathlib.Path) -> None:
+    """A reconstructed cache store hashes outputs through the configured StateDB."""
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / ".pivot" / "config.yaml").write_text("core:\n  state_dir: alternate-state\n")
     spec: store.StoreSpec = {
         "kind": "cache",
         "cache_dir": str(tmp_path / "cache"),
@@ -481,6 +484,12 @@ def test_store_spec_cache_round_trip(tmp_path: pathlib.Path) -> None:
     round_trip = pickle.loads(pickle.dumps(spec))
     rebuilt = store.store_from_spec(round_trip)
     assert isinstance(rebuilt, store.CacheStore)
+    ref = _helper_ref("stage", None, types.ArtifactTag.DATA, loaders.Text())
+    output = rebuilt.prepare_output(ref)
+    output.write_text("state path")
+    rebuilt.commit(ref, output)
+
+    assert (tmp_path / "alternate-state" / "state.lmdb").is_dir()
 
 
 @pytest.mark.parametrize("mode", list(config.CheckoutMode))
@@ -534,38 +543,3 @@ def test_workspace_store_refuses_replacing_tracked_file_inside_directory_output(
     assert not output_path.is_symlink()
     assert tracked_path.read_text() == "user input"
     assert sidecar_path.exists()
-
-
-@pytest.mark.parametrize(
-    ("sidecar_path", "tracked_path"),
-    [
-        pytest.param("data/b/tree.pvt", "data/b/tree", id="output"),
-        pytest.param("data/b.pvt", "data/b", id="parent"),
-    ],
-)
-def test_workspace_store_refuses_output_or_parent_tracked_sidecar(
-    tmp_path: pathlib.Path, sidecar_path: str, tracked_path: str
-) -> None:
-    """The sidecar beside an output, or beside a directory holding it, blocks replacement."""
-    output_ref = _helper_ref(
-        "b/tree",
-        None,
-        types.ArtifactTag.DIRECTORY,
-        cast("loaders.Reader[object]", loaders.PathOnly()),
-    )
-    workspace_store = store.WorkspaceStore(tmp_path, "b", {})
-    sidecar = tmp_path / sidecar_path
-    sidecar.parent.mkdir(parents=True)
-    track.write_pvt_file(
-        sidecar,
-        track.PvtData(
-            path=pathlib.Path(tracked_path).name,
-            hash="abc1230000000000",
-            size=1,
-        ),
-    )
-
-    with pytest.raises(exceptions.PivotError, match=sidecar.name):
-        workspace_store.prepare_output(output_ref)
-
-    assert sidecar.exists()

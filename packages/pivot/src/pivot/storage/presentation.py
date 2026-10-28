@@ -31,11 +31,9 @@ def present(
 ) -> None:
     """Materialize CAS ref symlinks into workspace display paths.
 
-    For each output of each stage, creates a symlink at the conventional
-    workspace location (e.g., data/pipeline/stage.csv) pointing to the
-    CAS ref path (e.g., .pivot/cache/files/refs/stage/_single).
-
-    Only creates symlinks for outputs that have CAS refs on disk.
+    For each output of each stage, creates a symlink at the conventional workspace location
+    (e.g., data/pipeline/stage.csv) pointing to the supplied cache directory's ref path
+    (e.g., `<state dir>/cache/files/refs/stage/_single`).
     """
     refs_dir = cache_dir / "refs"
     if not refs_dir.exists():

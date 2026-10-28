@@ -3,9 +3,13 @@ from typing import Any, cast
 import click
 import pydantic
 
-from pivot import config, display, exceptions
+from pivot import config, config_files, display, exceptions
+from pivot import state_dir as state_dir_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
+
+# The key path of `core.state_dir` in a config file.
+_STATE_DIR_PATH = ("core", "state_dir")
 
 
 def _format_value(value: Any) -> str:
@@ -33,17 +37,34 @@ def _redact(value: Any) -> Any:
     return value
 
 
-def _flatten_config(data: dict[str, Any], prefix: str = "") -> dict[str, Any]:
-    """Flatten nested config dict to dotted keys."""
-    result = dict[str, Any]()
+def _flatten_config(data: dict[str, Any], path: tuple[Any, ...] = ()) -> dict[tuple[Any, ...], Any]:
+    """Flatten a nested config dict to the key path of each value, as the file nests them.
+
+    A segment keeps the value YAML read: a mapping key can be an integer, a boolean or null,
+    and the path stays a tuple so a row still says which entry it comes from. `_render_key`
+    renders each segment for display.
+    """
+    result = dict[tuple[Any, ...], Any]()
     for key, value in data.items():
-        full_key = f"{prefix}.{key}" if prefix else key
+        full_path = (*path, key)
         if isinstance(value, dict) and key != "remotes":
             nested = cast("dict[str, Any]", value)
-            result.update(_flatten_config(nested, full_key))
+            result.update(_flatten_config(nested, full_path))
         else:
-            result[full_key] = value
+            result[full_path] = value
     return result
+
+
+def _render_key(path: tuple[Any, ...]) -> str:
+    """Render a key path as the dotted key a reader sees, segment by segment."""
+    return ".".join(str(segment) for segment in path)
+
+
+def _raise_for_non_string_state_dir(data: dict[str, Any]) -> None:
+    """Keep config-list's release failure concise when its stored state value has the wrong type."""
+    value = _get_nested_value(data, "core.state_dir")
+    if value is not None and not isinstance(value, str):
+        raise click.ClickException("core.state_dir must be a string")
 
 
 @click.group()
@@ -60,12 +81,16 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
     """Display all configuration values."""
     data: dict[str, Any]
     if use_global:
-        data = config.load_config_file(config.get_global_config_path())
+        data = config.load_config_file(config_files.get_global_config_path())
     elif use_local:
         data = config.load_config_file(config.get_local_config_path())
     else:
+        _raise_for_non_string_state_dir(config.load_config_file(config.get_local_config_path()))
         merged = config.get_merged_config()
         data = merged.model_dump()
+        # As `config get cache.dir` shows it: an unset value is this invocation's
+        # `<state dir>/cache`, which the process-wide merged config does not hold.
+        data["cache"]["dir"], _ = config.get_config_value("cache.dir")
 
     if output_json:
         click.echo(display.to_json(_redact(data), indent=2))
@@ -77,17 +102,46 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
         click.echo("No configuration set")
         return
 
-    for key in sorted(flat.keys()):
-        value = flat[key]
+    # `--global` and `--local` print the stored text as 0.5.2 does; the merged listing marks a
+    # value the state directory cannot use.
+    merged_listing = not (use_global or use_local)
+    # Inside a project, every `--global` row that comes from the file's `core.state_dir` entry,
+    # whatever that value's type, is ignored: a mapping there flattens to several rows.
+    global_state_dir_ignored = (
+        use_global
+        and any(path[:2] == _STATE_DIR_PATH for path in flat)
+        and state_dir_mod.report_ignored_global_state_dir()
+    )
+    for path in sorted(flat, key=_render_key):
+        key = _render_key(path)
+        value = flat[path]
         if key == "remotes" and isinstance(value, dict):
             remotes_dict = cast("dict[str, str]", value)
             for remote_name, remote_url in remotes_dict.items():
-                _, source = config.get_config_value(f"remotes.{remote_name}")
+                if use_global:
+                    source = config.ConfigSource.GLOBAL
+                else:
+                    _, source = config.get_config_value(f"remotes.{remote_name}")
                 name = display.escape_control(remote_name)
                 click.echo(f"remotes.{name} = {_format_value(remote_url)} ({source})")
         else:
-            _, source = config.get_config_value(key)
-            click.echo(f"{display.escape_control(key)} = {_format_value(value)} ({source})")
+            if use_global:
+                # Every row comes from the global file, so every label does too.
+                source = config.ConfigSource.GLOBAL
+                if global_state_dir_ignored and path[:2] == _STATE_DIR_PATH:
+                    source = config.ConfigSource.GLOBAL_IGNORED
+            else:
+                configured_value, source = config.get_config_value(key)
+                if source == config.ConfigSource.GLOBAL_IGNORED:
+                    value = configured_value
+            row = f"{display.escape_control(key)} = {_format_value(value)} ({source})"
+            if (
+                merged_listing
+                and key == "core.state_dir"
+                and not state_dir_mod.is_valid_state_dir_value(value)
+            ):
+                row += " invalid: core.state_dir must be a path"
+            click.echo(row)
 
 
 def _get_nested_value(data: dict[str, Any], key: str) -> Any:
@@ -122,9 +176,14 @@ def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -
         raise click.ClickException(f"Unknown config key: '{key}'")
 
     if use_global:
-        data = config.load_config_file(config.get_global_config_path())
+        data = config.load_config_file(config_files.get_global_config_path())
         value = _get_nested_value(data, key)
         source = config.ConfigScope.GLOBAL
+        # Outside a project nothing ignores the value. An unreadable local config only drops
+        # the warning: labeling a global value never needs the local file.
+        global_state_dir = key == "core.state_dir" and value is not None
+        if global_state_dir and state_dir_mod.report_ignored_global_state_dir():
+            source = config.ConfigSource.GLOBAL_IGNORED
     elif use_local:
         data = config.load_config_file(config.get_local_config_path())
         value = _get_nested_value(data, key)
@@ -155,7 +214,12 @@ def config_set(key: str, value: str, use_global: bool) -> None:
         raise click.ClickException(f"Invalid value for '{key}': {errors}") from e
 
     scope = config.ConfigScope.GLOBAL if use_global else config.ConfigScope.LOCAL
-    config.set_config_value(key, validated, scope)
+    try:
+        notices = config.set_config_value(key, validated, scope)
+    except exceptions.ConfigValidationError as e:
+        raise click.ClickException(str(e)) from e
+    for notice in notices:
+        click.echo(notice)
     click.echo(f"Set {key} = {_format_value(validated)} in {scope} config")
 
 
@@ -169,7 +233,9 @@ def config_unset(key: str, use_global: bool) -> None:
         raise click.ClickException(f"Unknown config key: '{key}'")
 
     scope = config.ConfigScope.GLOBAL if use_global else config.ConfigScope.LOCAL
-    removed = config.unset_config_value(key, scope)
+    removed, notices = config.unset_config_value(key, scope)
+    for notice in notices:
+        click.echo(notice)
 
     if removed:
         click.echo(f"Removed {key} from {scope} config")

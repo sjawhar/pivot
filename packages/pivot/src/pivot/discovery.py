@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Final, cast, override
 import cloudpickle
 
 from pivot import exceptions, fingerprint, loaded_source, metrics, project, types
+from pivot import state_dir as state_dir_mod
 from pivot.registry import PipelineLike
 from pivot.storage import ownership
 from pivot.storage import store as store_mod
@@ -630,23 +631,26 @@ def _rollback_import_attempt(
 
 
 def _require_project_state(pipeline: PipelineLike, project_root: pathlib.Path) -> None:
-    """Refuse a pipeline whose stages would keep state outside the project's ``.pivot``.
+    """Refuse a pipeline whose stages keep state outside the project configuration.
 
     Inputs and outputs resolve against the project root, but ``root=`` moves a stage's lock
     files and half its StateDB, so a ``root=`` other than the project root splits one stage's
     state across two directories. Stages from another pipeline carry that pipeline's root.
+    While the project config cannot be read or its state directory cannot be used, stages keep
+    0.5.2's ``.pivot`` (``state_dir.state_dir_or_default``), and that is what is checked.
     """
     advice = (
-        f"but a pipeline always uses the project's .pivot and data/ ({project_root}); "
-        + "remove root="
+        "but a pipeline always uses the project's .pivot and data/ (with state in its configured "
+        + f"directory; {project_root}); remove root="
     )
     if pipeline.root.resolve() != project_root:
         raise exceptions.PipelineConfigError(
             f"Pipeline '{pipeline.name}' sets root={pipeline.root}, {advice}"
         )
+    expected_state_dir = state_dir_mod.state_dir_or_default(project_root).resolve()
     for stage_name in pipeline.list_stages():
         state_dir = pipeline.get_stage(stage_name)["state_dir"]
-        if state_dir is not None and state_dir.resolve() != (project_root / ".pivot").resolve():
+        if state_dir is not None and state_dir.resolve() != expected_state_dir:
             raise exceptions.PipelineConfigError(
                 f"Stage '{stage_name}' comes from a pipeline that sets root={state_dir.parent}, "
                 + advice
@@ -695,7 +699,18 @@ def discover_pipeline(
 
     Raises:
         DiscoveryError: If discovery fails, or if both config types exist
+
+    One state-directory record covers the whole discovery (``state_dir.entry_invocation``):
+    the exclusion of the state directory, the pipeline's load, the cache entries the import
+    produces and the check of its stages all read one resolution of ``core.state_dir``.
     """
+    with state_dir_mod.entry_invocation():
+        return _discover_pipeline(project_root, all_pipelines=all_pipelines, strict_all=strict_all)
+
+
+def _discover_pipeline(
+    project_root: pathlib.Path | None, *, all_pipelines: bool, strict_all: bool
+) -> PipelineLike | None:
     _t = metrics.start()
     session: _ImportSession | None = None
     loaded = False
@@ -869,9 +884,10 @@ def _discover_all_pipelines(
         if pipeline is None:
             _log_skipped_module(strict, f"--all: failed to load pipeline from {path}, skipping")
             continue
-        # A pipeline name names .pivot/stages/<name>/ and data/<name>/, so two files
-        # declaring one name would silently share stages, locks and outputs. A file that
-        # exports a pipeline object another file already gave (a re-export) declares nothing.
+        # A pipeline name names its configured state directory's stages/<name>/ and
+        # data/<name>/, so two files declaring one name would silently share stages, locks and
+        # outputs. A file that exports a pipeline object another file already gave (a re-export)
+        # declares nothing.
         first_path, first_pipeline = first_by_name.setdefault(pipeline.name, (path, pipeline))
         if first_path != path:
             if first_pipeline is not pipeline:
@@ -950,6 +966,13 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
     Returns:
         List of paths to pipeline config files.
     """
+    resolved_project_root = project_root.resolve()
+    state_dir = state_dir_mod.state_dir_or_default(project_root)
+    # A state directory at or above the root would exclude the whole project.
+    excluded_state_dir: pathlib.Path | None = None
+    if not resolved_project_root.is_relative_to(state_dir.resolve()):
+        excluded_state_dir = state_dir.resolve()
+
     # Collect all candidate paths grouped by directory
     by_dir = dict[pathlib.Path, list[pathlib.Path]]()
     for path in project_root.rglob(PIPELINE_PY_NAME):
@@ -961,6 +984,8 @@ def glob_all_pipelines(project_root: pathlib.Path) -> list[pathlib.Path]:
         except ValueError:
             continue
         if any(part in _SCAN_EXCLUDE_DIRS for part in rel_parts):
+            continue
+        if excluded_state_dir is not None and path.resolve().is_relative_to(excluded_state_dir):
             continue
         by_dir.setdefault(path.parent, list[pathlib.Path]()).append(path)
 

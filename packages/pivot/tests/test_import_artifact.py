@@ -191,9 +191,12 @@ def test_read_remote_config_success(mocker: MockerFixture) -> None:
     )
     read_file.return_value = _config_bytes(remote_url)
 
-    result = asyncio.run(import_artifact.read_remote_config(repo_url, "main", None))
+    remote_url_result, config_data = asyncio.run(
+        import_artifact.read_remote_config(repo_url, "main", None)
+    )
 
-    assert result == remote_url
+    assert remote_url_result == remote_url
+    assert config_data["remotes"] == {"origin": remote_url}
 
 
 async def test_import_artifact_creates_pvt(

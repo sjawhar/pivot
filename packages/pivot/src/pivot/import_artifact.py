@@ -14,6 +14,8 @@ import aiohttp
 import yaml
 
 from pivot import config, discovery, exceptions, project, types
+from pivot import state_dir as state_dir_mod
+from pivot.config import io as config_io
 from pivot.remote import config as remote_config
 from pivot.remote import git_archive, github, protocol
 from pivot.storage import cache, ownership, state, track
@@ -64,7 +66,7 @@ async def _download_verified(remote_url: str, file_hash: str, data_path: pathlib
     finally:
         with contextlib.suppress(FileNotFoundError):
             tmp_path.unlink()
-    state.save_file_hashes(config.get_state_dir(), [(data_path, tmp_stat, file_hash)])
+    state.save_file_hashes(config.locate_state_dir(), [(data_path, tmp_stat, file_hash)])
     return tmp_stat.st_size
 
 
@@ -118,7 +120,7 @@ async def read_remote_config(
     token: str | None,
     *,
     session: aiohttp.ClientSession | None = None,
-) -> str:
+) -> tuple[str, dict[str, object]]:
     raw = await _read_remote_file(repo_url, ".pivot/config.yaml", rev, token, session=session)
     if raw is None:
         raise exceptions.RemoteError("Remote repo is missing .pivot/config.yaml")
@@ -160,7 +162,84 @@ async def read_remote_config(
     url = str(remotes[default_remote])
     _ = remote_config.validate_remote_url(url)
     logger.info("Using source remote: %s", url)
-    return url
+
+    # Two parses on purpose: remotes are read above as 0.5.2 reads them (YAML 1.1, as the source's
+    # `pivot remote` reads them), and the returned config, which supplies core.state_dir, as every
+    # other Pivot command reads its config (YAML 1.2). Each key means what it means to the source.
+    # 0.5.2 never read core.state_dir, so a file only PyYAML accepts (a duplicate key) never
+    # refuses the import: its state directory is 0.5.2's .pivot.
+    try:
+        source_config = config_io.parse_config_yaml(raw, "remote config")
+    except exceptions.ConfigError as e:
+        _warn_source_state_dir_ignored(repo_url, str(e))
+        return url, {}
+    return url, source_config
+
+
+def _warn_source_state_dir_ignored(repo_url: str, problem: str) -> None:
+    """Report a source ``core.state_dir`` that cannot be used; the import reads ``.pivot``."""
+    logger.warning(
+        "Ignoring core.state_dir in .pivot/config.yaml of %s: %s; "
+        + "reading its locks from the default .pivot",
+        repo_url,
+        problem,
+    )
+
+
+def _normalized_source_state_dir(state_dir: object) -> str | None:
+    """``state_dir`` as a normalized path inside the source repo, or None when it is not one."""
+    if (
+        not isinstance(state_dir, str)
+        or not state_dir
+        or pathlib.PurePosixPath(state_dir).is_absolute()
+    ):
+        return None
+    normalized_parts = list[str]()
+    for part in pathlib.PurePosixPath(state_dir).parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not normalized_parts:
+                return None
+            normalized_parts.pop()
+        else:
+            normalized_parts.append(part)
+    return pathlib.PurePosixPath(*normalized_parts).as_posix()
+
+
+def _remote_state_dir(repo_url: str, config_data: dict[str, object]) -> str:
+    """Return the source repo's normalized state path at the imported revision.
+
+    0.5.2 read every source's locks from ``.pivot``, so a value that is not a path inside the
+    repo never refuses an import: it is reported and ``.pivot`` is read.
+    """
+    core = config_data.get("core")
+    if not isinstance(core, dict):
+        return ".pivot"
+    state_dir = cast("dict[str, object]", core).get("state_dir")
+    if state_dir is None:
+        return ".pivot"
+    normalized = _normalized_source_state_dir(state_dir)
+    if normalized is None:
+        _warn_source_state_dir_ignored(repo_url, f"{state_dir!r} is not a path inside the repo")
+        return ".pivot"
+    return normalized
+
+
+async def _source_state_dir(repo_url: str, rev: str, config_data: dict[str, object]) -> str:
+    """``_remote_state_dir``, with a symlinked local git source directory reported as unusable.
+
+    Its locks are not at that path in the revision's tree, so ``.pivot`` is read instead.
+    """
+    source_state_dir = _remote_state_dir(repo_url, config_data)
+    if source_state_dir in {".", ".pivot"} or github.is_github_url(repo_url):
+        return source_state_dir
+    if await _run_blocking(
+        git_archive.path_is_symlink_from_remote_repo, repo_url, source_state_dir, rev
+    ):
+        _warn_source_state_dir_ignored(repo_url, f"{source_state_dir!r} is a symlink")
+        return ".pivot"
+    return source_state_dir
 
 
 async def _list_github_lock_paths(
@@ -197,35 +276,51 @@ async def _list_github_lock_paths(
     return lock_paths
 
 
-async def list_remote_lock_files(
+async def _try_list_remote_lock_files(
     repo_url: str,
     rev: str,
     token: str | None,
+    stages_dir: str,
     *,
     session: aiohttp.ClientSession | None = None,
-) -> list[str]:
+) -> list[str] | None:
+    """List source lock files, returning None only when the lock directory cannot be listed."""
     if github.is_github_url(repo_url):
         owner, repo = github.parse_github_url(repo_url)
         entries = await _list_github_lock_paths(
-            owner, repo, ".pivot/stages", rev, _maybe_token(repo_url, token), session
+            owner, repo, stages_dir, rev, _maybe_token(repo_url, token), session
         )
     else:
         entries = await _run_blocking(
             git_archive.list_directory_from_remote_repo,
             repo_url,
-            ".pivot/stages",
+            stages_dir,
             rev,
         )
 
     if entries is None:
-        raise exceptions.RemoteError("Remote repo has no .pivot/stages directory")
+        return None
 
-    # Entries are relative to .pivot/stages, so nested paths are pipeline-prefixed names
     stage_names = [entry.removesuffix(".lock") for entry in entries if entry.endswith(".lock")]
-
     if not stage_names:
         raise exceptions.RemoteError("Remote repo has no lock files")
+    return stage_names
 
+
+async def list_remote_lock_files(
+    repo_url: str,
+    rev: str,
+    token: str | None,
+    stages_dir: str,
+    *,
+    session: aiohttp.ClientSession | None = None,
+) -> list[str]:
+    """List source lock files, reporting a missing stages directory."""
+    stage_names = await _try_list_remote_lock_files(
+        repo_url, rev, token, stages_dir, session=session
+    )
+    if stage_names is None:
+        raise exceptions.RemoteError(f"Remote repo has no {stages_dir} directory")
     return stage_names
 
 
@@ -234,10 +329,11 @@ async def read_remote_lock_file(
     stage_name: str,
     rev: str,
     token: str | None,
+    stages_dir: str,
     *,
     session: aiohttp.ClientSession | None = None,
 ) -> StorageLockData | None:
-    path = f".pivot/stages/{stage_name}.lock"
+    path = f"{stages_dir}/{stage_name}.lock"
     raw = await _read_remote_file(repo_url, path, rev, token, session=session)
     if raw is None:
         return None
@@ -324,13 +420,31 @@ async def _resolve_remote_path_with_session(
     if rev_lock is None:
         raise exceptions.RemoteError(f"Unable to resolve ref '{rev}'")
 
-    remote_url = await read_remote_config(repo_url, rev_lock, token, session=gh_session)
+    remote_url, config_data = await read_remote_config(
+        repo_url, rev_lock, token, session=gh_session
+    )
+    source_state_dir = await _source_state_dir(repo_url, rev_lock, config_data)
+    stages_dir = "stages" if source_state_dir == "." else f"{source_state_dir}/stages"
 
-    # Use resolved SHA for all subsequent reads to avoid TOCTOU race
-    stage_names = await list_remote_lock_files(repo_url, rev_lock, token, session=gh_session)
+    # Pivot 0.5.2 always wrote source locks below .pivot. A source still carrying that layout
+    # must remain importable while its configured directory cannot be read from this revision.
+    stage_names = await _try_list_remote_lock_files(
+        repo_url, rev_lock, token, stages_dir, session=gh_session
+    )
+    if stage_names is None and stages_dir != ".pivot/stages":
+        _warn_source_state_dir_ignored(
+            repo_url, f"{stages_dir!r} cannot be read at revision {rev_lock}"
+        )
+        stages_dir = ".pivot/stages"
+        stage_names = await list_remote_lock_files(
+            repo_url, rev_lock, token, stages_dir, session=gh_session
+        )
+    elif stage_names is None:
+        raise exceptions.RemoteError(f"Remote repo has no {stages_dir} directory")
+
     lock_datas = await asyncio.gather(
         *[
-            read_remote_lock_file(repo_url, stage, rev_lock, token, session=gh_session)
+            read_remote_lock_file(repo_url, stage, rev_lock, token, stages_dir, session=gh_session)
             for stage in stage_names
         ]
     )
@@ -463,8 +577,11 @@ async def import_artifact(
     if force and data_path.exists() and data_path.is_dir():
         raise exceptions.PivotError("Cannot overwrite directory with import")
 
-    pvt_path.parent.mkdir(parents=True, exist_ok=True)
-    data_path.parent.mkdir(parents=True, exist_ok=True)
+    # A destination inside a configured state directory that does not exist yet is created
+    # through the common creator, so that directory gets its ignore file before the import
+    # writes the `.pvt` file or the data under it.
+    state_dir_mod.make_dirs(pvt_path.parent)
+    state_dir_mod.make_dirs(data_path.parent)
 
     downloaded = False
     file_size = resolved["size"]

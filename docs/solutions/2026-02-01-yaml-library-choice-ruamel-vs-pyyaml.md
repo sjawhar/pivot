@@ -2,7 +2,10 @@
 tags: [python, yaml, configuration]
 category: design
 module: config
-symptoms: ["comments lost after config update", "yaml formatting changed unexpectedly"]
+symptoms:
+  - "comments lost after config update"
+  - "yaml formatting changed unexpectedly"
+  - "config value set with `config set` reads back as True, False or a number"
 ---
 
 # YAML Library Choice: ruamel.yaml vs PyYAML
@@ -38,7 +41,7 @@ PyYAML (`yaml.safe_load()`) parses YAML into plain Python dicts, discarding comm
 
 ## Solution
 
-Use **ruamel.yaml** for files users will edit (config files), and **PyYAML** for read-only parsing (pipeline definitions, lock files, data files):
+Use **ruamel.yaml** for config files, through `config_files.py` (reads) and `config/io.py` (writes), for every read and every write. Use **PyYAML** for every other YAML file (lock files, `.pvt` files, data files, params, metrics):
 
 ```python
 # EDITABLE CONFIG - preserve comments and formatting
@@ -57,11 +60,11 @@ def edit_config(path: Path) -> None:
 ```
 
 ```python
-# READ-ONLY DATA - simplicity and speed preferred
+# EVERY OTHER YAML FILE - simplicity and speed preferred
 import yaml
 from pivot import yaml_config
 
-def load_pipeline(path: Path) -> dict:
+def load_lock(path: Path) -> dict:
     with path.open() as f:
         return yaml.load(f, Loader=yaml_config.Loader)
 ```
@@ -78,16 +81,42 @@ except AttributeError:
     Dumper = yaml.SafeDumper
 ```
 
+### One reader for config files
+
+Every read of a file that `config set` writes (`.pivot/config.yaml`, `~/.config/pivot/config.yaml`) goes through the ruamel loader in `config_files.py` (`read_config_file_value`, and `config/io.py`'s `load_config_file` and `parse_config_yaml` on top of it), never PyYAML. That includes a read-only lookup of one key, such as `core.state_dir` in `state_dir.state_dir_for`.
+
+ruamel writes and reads YAML 1.2; PyYAML reads YAML 1.1. Plain scalars that YAML 1.2 keeps as strings come back from PyYAML as other types, so a value written by `config set` changes meaning when PyYAML reads it:
+
+| Written by `config set core.state_dir …` | ruamel (YAML 1.2) reads | PyYAML (YAML 1.1) reads |
+|---|---|---|
+| `on` | `'on'` | `True` |
+| `off` | `'off'` | `False` |
+| `yes` | `'yes'` | `True` |
+| `no` | `'no'` | `False` |
+| `1:20` | `'1:20'` | `80` |
+| `y` | `'y'` | `'y'` |
+
+(Probe: `ruamel.yaml.YAML(typ="rt").load(text)` against `yaml.safe_load(text)` for `core:\n  state_dir: <value>\n`; the round-trip tests are `test_a_state_dir_named_like_a_yaml_1_1_scalar_is_a_directory` in `packages/pivot/tests/cli/test_state_dir_value_resolution.py`.)
+
+The two libraries also fail differently: `config_files.py` reports `Invalid YAML in <file>` and `Permission denied reading <file>`, so one reader also means one error message.
+
+Exceptions, each kept to match release 0.5.2:
+
+- `pivot import` reads a source repository's `remotes` and `default_remote` with PyYAML (`import_artifact.read_remote_config`), as 0.5.2 does, and reads the same file's `core.state_dir` with `config_io.parse_config_yaml`. A comment at that call states that the two parses are deliberate. When the ruamel parse fails where PyYAML succeeded (a duplicate key, for one), the import warns and reads the source's locks from `.pivot`, as 0.5.2 did.
+- `remote/config.py:55` (`_load_raw_config`, behind `pivot remote` and remote lookup) and `cli/completion.py:46` (`_get_config_keys`, remote-name completion) still read config files with PyYAML, as on 0.5.2. A remote named `on` therefore reads back as `True` there.
+
 ### Where Each Library Is Used in Pivot
 
 | Library | Module | Purpose |
 |---------|--------|---------|
-| ruamel.yaml | `config/io.py` | User config (preserves comments) |
+| ruamel.yaml | `config_files.py`, `config/io.py` | Every config-file read and write, including `state_dir.state_dir_for` and import's source `core.state_dir` |
+| PyYAML | `import_artifact.py` | Source repository `remotes` and `default_remote` (0.5.2 parse, kept deliberately) |
+| PyYAML | `remote/config.py`, `cli/completion.py` | Remote names and URLs from config files (0.5.2 readers, not yet on `config_files.py`) |
 | PyYAML | `storage/lock.py` | Lock file parsing |
+| PyYAML | `storage/track.py` | `.pvt` files |
 | PyYAML | `loaders.py` | YAML data loader |
 | PyYAML | `parameters.py` | params.yaml files |
 | PyYAML | `show/metrics.py` | Metrics YAML files |
-| PyYAML | CLI modules | Completion, doctor diagnostics |
 
 ### Round-Trip Mode Specifics
 
@@ -106,9 +135,9 @@ yaml.default_flow_style = False  # Explicit for new keys
 
 ## Key Insight
 
-The choice between YAML libraries depends on the file's lifecycle:
+The choice between YAML libraries depends on the file:
 
-- **User-edited files**: Use ruamel.yaml. Preserving comments respects user investment in documenting their configuration.
-- **Machine-generated/read-only files**: Use PyYAML. Simpler API, faster parsing (with C extension), no need for round-trip overhead.
+- **Config files (`config set` writes them, users edit them)**: Use ruamel.yaml, through `config_files.py` and `config/io.py`, for reads as well as writes. Preserving comments respects the user's documentation, and reading with the writer's YAML version keeps every value meaning what it meant when written.
+- **Every other YAML file**: Use PyYAML. Simpler API, faster parsing (with C extension), no need for round-trip overhead.
 
 The performance difference is negligible for typical config file sizes. The user experience difference is significant: losing comments feels like data loss, even though the semantic content is preserved.

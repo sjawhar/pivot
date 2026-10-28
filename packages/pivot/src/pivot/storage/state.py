@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Self
 import lmdb
 
 from pivot import exceptions, run_history
+from pivot import state_dir as state_dir_mod
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +48,9 @@ _MAP_SIZE = 10 * 1024 * 1024 * 1024
 # LMDB default max key size
 _MAX_KEY_SIZE = 511
 
-# Common error message for MapFullError
-_DB_FULL_MSG = (
-    f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete .pivot/state.lmdb/ to reset."
-)
+
+def _db_full_message(path: pathlib.Path) -> str:
+    return f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete {path}/ to reset."
 
 
 class _SharedEnv(typing.TypedDict):
@@ -391,7 +391,7 @@ class StateDB:
         readonly: bool = False,
         write_timeout: float = 30.0,
     ) -> None:
-        state_dir.mkdir(parents=True, exist_ok=True)
+        state_dir_mod.make_state_dir(state_dir)
         lmdb_path = (state_dir / "state.lmdb").resolve()
 
         with _fork_gate.transaction():
@@ -429,6 +429,9 @@ class StateDB:
             raise RuntimeError(
                 "Internal error: worker attempted write to readonly StateDB. This is a bug in Pivot. Please report it."
             )
+
+    def _database_full_error(self) -> DatabaseFullError:
+        return DatabaseFullError(_db_full_message(self._lmdb_path))
 
     @contextlib.contextmanager
     def _read_transaction(self) -> Generator[lmdb.Transaction]:
@@ -531,7 +534,7 @@ class StateDB:
                     )
                     txn.put(key, value)
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
+            raise self._database_full_error() from e
 
     def save_many_best_effort(
         self, entries: list[tuple[pathlib.Path, os.stat_result, str]]
@@ -595,7 +598,7 @@ class StateDB:
                         continue  # Skip invalid entries
                     txn.put(key, hash_hex.encode("ascii"))
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
+            raise self._database_full_error() from e
 
     def clear_fingerprint_caches(self) -> int:
         """Clear all AST hash (`fp:`) and stage manifest (`sm:`) cache entries.
@@ -641,7 +644,7 @@ class StateDB:
             with self._write_transaction(timeout=self._write_timeout) as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
+            raise self._database_full_error() from e
 
     def put_raw_many(self, entries: list[tuple[bytes, bytes]]) -> None:
         """Batch put raw key-value pairs atomically."""
@@ -656,7 +659,7 @@ class StateDB:
                         continue  # Skip oversized keys
                     txn.put(key, value)
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
+            raise self._database_full_error() from e
 
     def delete_raw_many(self, keys: list[bytes]) -> None:
         """Batch delete raw key-value pairs atomically."""
@@ -669,7 +672,7 @@ class StateDB:
                 for key in keys:
                     txn.delete(key)
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
+            raise self._database_full_error() from e
 
     def iter_prefix(self, prefix: bytes) -> list[tuple[bytes, bytes]]:
         """Return all raw key-value pairs matching a prefix."""
@@ -730,7 +733,7 @@ class StateDB:
                 new_gen = (struct.unpack(">Q", value)[0] + 1) if value else 1
                 txn.put(key, struct.pack(">Q", new_gen))
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
+            raise self._database_full_error() from e
         return new_gen
 
     def get_dep_generations(self, stage_name: str) -> dict[str, int] | None:
@@ -775,7 +778,7 @@ class StateDB:
                     key = _make_key_dep_generation(stage_name, identity)
                     txn.put(key, struct.pack(">Q", gen))
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
+            raise self._database_full_error() from e
 
     # -------------------------------------------------------------------------
     # Remote index tracking for avoiding repeated HEAD requests
@@ -813,7 +816,7 @@ class StateDB:
                     key = prefix + hash_.encode()
                     txn.put(key, b"1")
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
+            raise self._database_full_error() from e
 
     def remote_hashes_remove(self, remote_name: str, hashes: Iterable[str]) -> None:
         """Mark hashes as no longer on remote."""
@@ -845,7 +848,7 @@ class StateDB:
             with self._write_transaction(timeout=self._write_timeout) as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
+            raise self._database_full_error() from e
 
     def remote_index_clear(self, remote_name: str) -> None:
         """Clear all index entries and stored URL for a remote (force re-indexing)."""
@@ -881,7 +884,7 @@ class StateDB:
             with self._write_transaction(timeout=self._write_timeout) as txn:
                 txn.put(key, value)
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
+            raise self._database_full_error() from e
 
     def read_run(self, run_id: str) -> RunManifest | None:
         """Read a run manifest by ID. Returns None if not found."""
@@ -930,6 +933,29 @@ class StateDB:
                     break
         return runs
 
+    def newest_run_id(self) -> str | None:
+        """The newest recorded run's ID, read from its key alone; None when no run is recorded.
+
+        A cheap check of whether runs were recorded since a reader last listed them.
+        """
+        self._check_closed()
+        with self._read_transaction() as txn:
+            cursor = txn.cursor()
+            end_key = _RUN_PREFIX[:-1] + b";\xff"
+            if not (cursor.prev() if cursor.set_range(end_key) else cursor.last()):
+                return None
+            key = bytes(cursor.key())
+            return key[len(_RUN_PREFIX) :].decode() if key.startswith(_RUN_PREFIX) else None
+
+    def last_change(self) -> int:
+        """The ID of the last write transaction any process committed to this database.
+
+        Read without a transaction. Two equal IDs mean nothing was written in between, so a
+        reader can keep what it read until the ID changes.
+        """
+        self._check_closed()
+        return int(self._env.info()["last_txnid"])
+
     def prune_runs(self, retention: int) -> int:
         """Remove oldest runs beyond retention limit and orphaned run cache entries.
 
@@ -970,6 +996,22 @@ class StateDB:
             return None
         return run_history.deserialize_run_cache_entry(value)
 
+    def lookup_run_cache_many(
+        self, keys: Iterable[tuple[str, str]]
+    ) -> dict[tuple[str, str], RunCacheEntry]:
+        """``lookup_run_cache`` for each ``(stage_name, input_hash)``, in one read transaction.
+
+        Keys with no entry are left out.
+        """
+        self._check_closed()
+        raw = dict[tuple[str, str], bytes]()
+        with self._read_transaction() as txn:
+            for stage_name, input_hash in keys:
+                value = txn.get(_RUNCACHE_PREFIX + f"{stage_name}:{input_hash}".encode())
+                if value is not None:
+                    raw[(stage_name, input_hash)] = value
+        return {key: run_history.deserialize_run_cache_entry(value) for key, value in raw.items()}
+
     def get_no_commit_record(self, stage_name: str) -> NoCommitRecord | None:
         """The stage's `nocommit:` record, or None (absent, or not a JSON object).
 
@@ -1009,8 +1051,8 @@ class StateDB:
                 pvt_members.update(members)
                 record["pvt_members"] = dict(sorted(pvt_members.items()))
                 txn.put(key, json.dumps(record).encode())
-        except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
+        except lmdb.MapFullError as error:
+            raise self._database_full_error() from error
 
     def prune_run_cache(self, valid_run_ids: set[str]) -> int:
         """Remove run cache entries that reference runs not in valid_run_ids.
@@ -1146,7 +1188,7 @@ class StateDB:
                 elif "clear_no_commit_record" in deferred and deferred["clear_no_commit_record"]:
                     txn.delete(nocommit_key)
         except lmdb.MapFullError as e:
-            raise DatabaseFullError(_DB_FULL_MSG) from e
+            raise self._database_full_error() from e
 
     def close(self) -> None:
         """Release this StateDB's lease on the shared environment."""
@@ -1169,7 +1211,7 @@ class StateDB:
             percent = used_bytes / _MAP_SIZE * 100
             logger.warning(
                 f"State database at {used_gb:.1f}GB ({percent:.0f}%%), approaching "
-                + f"{limit_gb:.0f}GB limit. Run `pivot gc` or delete .pivot/state.lmdb/ to free space."
+                + f"{limit_gb:.0f}GB limit. Run `pivot gc` or delete {self._lmdb_path}/ to free space."
             )
 
     def __enter__(self) -> Self:

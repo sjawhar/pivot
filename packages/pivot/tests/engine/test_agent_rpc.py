@@ -2193,7 +2193,7 @@ async def test_rpc_diff_output_answers_a_modified_file_with_a_datetime_column(
     from pivot.storage import cache
 
     cache_dir = tmp_path / "cache"
-    monkeypatch.setattr(config, "get_cache_dir", lambda: cache_dir)
+    monkeypatch.setattr(config, "locate_cache_dir", lambda: cache_dir)
     hashes = list[str]()
     for rows in (2, 3):
         frame = pandas.DataFrame({"v": range(1, rows + 1)})

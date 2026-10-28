@@ -5,7 +5,6 @@ import importlib.machinery
 import json
 import logging
 import math
-import os
 import pathlib
 import re
 import subprocess
@@ -21,9 +20,10 @@ import numpy as np
 import pandas as pd
 import pydantic
 import pytest
+from tests import helpers
 from tests.conftest import init_git_repo
 
-from pivot import exceptions, fingerprint, project, run_history
+from pivot import exceptions, fingerprint, run_history
 from pivot.config import models
 from pivot.storage import state
 
@@ -619,27 +619,17 @@ def test_unsafe_env_allows_non_scalar_capture(
 def test_unsafe_capture_does_not_populate_manifest_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cached = dict[str, dict[str, str]]()
+    writes = dict[pathlib.Path, list[tuple[bytes, bytes]]]()
 
-    class ManifestWrites(list[tuple[bytes, bytes]]):
-        @typing.override
-        def append(self, entry: tuple[bytes, bytes]) -> None:
-            cached["unsafe-cache"] = json.loads(entry[1])["m"]
+    def cache_hit(_stage_name: str, _func: Callable[..., object]) -> dict[str, str] | None:
+        return None
 
-    def cache_hit(stage_name: str, _func: Callable[..., object]) -> dict[str, str] | None:
-        return cached.get(stage_name)
-
-    pending = fingerprint._PendingCacheWrites(
-        root=project.get_project_root(),
-        ast=list[fingerprint.AstHashEntry](),
-        manifest=ManifestWrites(),
-    )
-    monkeypatch.setattr(fingerprint, "_pending_writes", pending)
+    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
     monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", cache_hit)
     monkeypatch.setenv("PIVOT_UNSAFE_FINGERPRINTING", "1")
     fingerprint.get_stage_fingerprint_cached("unsafe-cache", _stage_uses_mutable_list)
 
-    assert "unsafe-cache" not in cached
+    assert writes == {}, "an unsafe capture queues no manifest for any state directory"
 
     monkeypatch.delenv("PIVOT_UNSAFE_FINGERPRINTING")
     with pytest.raises(exceptions.StageDefinitionError):
@@ -785,8 +775,6 @@ def test_cached_helper_globals_and_defaults_are_checked() -> None:
     assert "captures non-scalar variable 'DEFAULT_COLUMNS' (type: list)" in message
 
 
-_PIVOT_BIN = str(pathlib.Path(sys.executable).parent / "pivot")
-
 _UNSAFE_LIST_PIPELINE = """\
 from pivot import Pipeline, stage
 
@@ -821,30 +809,18 @@ with Pipeline("u") as pipeline:
 
 
 def _helper_pivot_ok(
-    cwd: pathlib.Path, *args: str, env: dict[str, str] | None = None
+    cwd: pathlib.Path, home: pathlib.Path, *args: str, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
-    full_env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in ("VIRTUAL_ENV", "PIVOT_UNSAFE_FINGERPRINTING")
-    }
-    full_env.update(env or {})
-    proc = subprocess.run(
-        [_PIVOT_BIN, *args],
-        cwd=cwd,
-        env=full_env,
-        capture_output=True,
-        text=True,
-        timeout=180,
-        check=False,
-    )
+    proc = helpers.run_pivot(cwd, home, *args, extra_env=env)
     assert proc.returncode == 0, f"pivot {' '.join(args)} failed:\n{proc.stdout}{proc.stderr}"
     return proc
 
 
-def _helper_shout_project(root: pathlib.Path, pipeline_source: str) -> pathlib.Path:
+def _helper_shout_project(
+    root: pathlib.Path, home: pathlib.Path, pipeline_source: str
+) -> pathlib.Path:
     init_git_repo(root)
-    _helper_pivot_ok(root, "init")
+    _helper_pivot_ok(root, home, "init")
     (root / "pipeline.py").write_text(pipeline_source)
     (root / "data" / "raw").mkdir(parents=True, exist_ok=True)
     (root / "data" / "raw" / "input.txt").write_text("hello\n")
@@ -875,15 +851,16 @@ def test_unsafe_result_is_kept_out_of_the_run_cache(
     """A result fingerprinted with a refusal downgraded to a warning is never filed in the run
     cache, by a worker (`pivot repro`) or by `pivot commit`: the run cache would hand it to the
     next run whose fingerprint matches, though the captured list may hold other values."""
-    root = _helper_shout_project(tmp_path, _UNSAFE_LIST_PIPELINE)
+    home = tmp_path / "home"
+    root = _helper_shout_project(tmp_path, home, _UNSAFE_LIST_PIPELINE)
     env = dict[str, str]()
     if switch == "config":
         (root / ".pivot" / "config.yaml").write_text("core:\n  unsafe_fingerprinting: true\n")
     else:
         env["PIVOT_UNSAFE_FINGERPRINTING"] = "1"
     if command == "commit":
-        _helper_pivot_ok(root, "repro", "--no-commit", env=env)
-    _helper_pivot_ok(root, command, env=env)
+        _helper_pivot_ok(root, home, "repro", "--no-commit", env=env)
+    _helper_pivot_ok(root, home, command, env=env)
 
     output = root / "data" / "u" / "shout.txt"
     assert output.read_text() == "HELLO!", "the unsafe stage still runs and writes its output"
@@ -893,8 +870,9 @@ def test_unsafe_result_is_kept_out_of_the_run_cache(
 
 def test_safe_result_is_filed_in_the_run_cache(tmp_path: pathlib.Path) -> None:
     """Control: the same stage with its list in StageParams, the flag off, files one entry."""
-    root = _helper_shout_project(tmp_path, _PARAMS_LIST_PIPELINE)
-    _helper_pivot_ok(root, "repro")
+    home = tmp_path / "home"
+    root = _helper_shout_project(tmp_path, home, _PARAMS_LIST_PIPELINE)
+    _helper_pivot_ok(root, home, "repro")
 
     assert (root / "data" / "u" / "shout.txt").read_text() == "HELLO!", "the stage ran"
     entries = _helper_run_cache_entries(root, "u/shout")
@@ -903,7 +881,8 @@ def test_safe_result_is_filed_in_the_run_cache(tmp_path: pathlib.Path) -> None:
 
 def test_config_set_accepts_unsafe_fingerprinting(tmp_path: pathlib.Path) -> None:
     """The documented switch for unsafe fingerprinting can be set from the CLI."""
-    root = _helper_shout_project(tmp_path, _UNSAFE_LIST_PIPELINE)
-    _helper_pivot_ok(root, "config", "set", "core.unsafe_fingerprinting", "true")
-    got = _helper_pivot_ok(root, "config", "get", "core.unsafe_fingerprinting", "--json")
+    home = tmp_path / "home"
+    root = _helper_shout_project(tmp_path, home, _UNSAFE_LIST_PIPELINE)
+    _helper_pivot_ok(root, home, "config", "set", "core.unsafe_fingerprinting", "true")
+    got = _helper_pivot_ok(root, home, "config", "get", "core.unsafe_fingerprinting", "--json")
     assert json.loads(got.stdout)["value"] is True, got.stdout
