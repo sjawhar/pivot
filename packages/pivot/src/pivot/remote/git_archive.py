@@ -116,6 +116,41 @@ def read_file_from_remote_repo(
         return None
 
 
+def path_is_symlink_from_remote_repo(
+    repo_url: str,
+    path: str,
+    rev: str,
+    *,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> bool | None:
+    """Return whether ``path`` is a symlink at a remote revision, or None on archive failure."""
+    try:
+        result = subprocess.run(
+            ["git", "archive", f"--remote={repo_url}", rev, "--", path],
+            capture_output=True,
+            timeout=timeout,
+            check=True,
+        )
+        with tarfile.open(fileobj=io.BytesIO(result.stdout)) as tar:
+            return any(member.name == path and member.issym() for member in tar.getmembers())
+    except subprocess.CalledProcessError as e:
+        logger.debug("git archive failed: %s", e.stderr)
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "git archive timed out for %s after %ds",
+            repo_url,
+            timeout,
+        )
+        return None
+    except FileNotFoundError:
+        logger.warning("git command not found")
+        return None
+    except (tarfile.TarError, OSError) as e:
+        logger.debug("Failed to inspect archive: %s", e)
+        return None
+
+
 def list_directory_from_remote_repo(
     repo_url: str,
     path: str,

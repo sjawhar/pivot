@@ -256,8 +256,11 @@ def test_gc_refuses_and_names_the_register_entry_whose_root_is_absent(
     if the project is gone for good, and keeps it; a second run says the same."""
     gone = tmp_path / "a-worktree-that-was-deleted"
     gc.register_project(shared["cache_dir"], shared["root"], shared["state_dir"])
+    (gone / ".pivot").mkdir(parents=True)
     gc.register_project(shared["cache_dir"], gone, gone / ".pivot")
-    entry = gc.register_path(shared["cache_dir"], gone)
+    entry = gc.project_register_path(shared["cache_dir"], gone, gone / ".pivot")
+    assert entry is not None
+    shutil.rmtree(gone)
 
     first = _helper_run(runner, "--yes", "--grace-hours", "0")
 

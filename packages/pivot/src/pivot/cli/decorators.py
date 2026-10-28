@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import click
 
-from pivot import config, discovery, exceptions, metrics
+from pivot import discovery, exceptions, metrics
 from pivot.cli import errors
 
 logger = logging.getLogger(__name__)
@@ -110,21 +110,6 @@ def pivot_command(
                 # Store all_pipelines flag so Engine can use it for watch mode reload
                 if use_all:
                     _store_all_pipelines_in_context(use_all)
-                # Record this project as a user of its cache (the register), so a collection
-                # run in another project that shares the cache keeps this one's objects. gc
-                # handles registration itself (after its register-read) and does not discover.
-                # A failure never fails the command, but it is reported: a project missing from
-                # the register is invisible to another project's collection.
-                if auto_discover:
-                    try:
-                        config.register_cache_use()
-                    except Exception as e:  # noqa: BLE001 - reported, never fatal
-                        logger.warning(
-                            "Cannot record this project as a user of its cache: %s. A `pivot gc` "
-                            + "run in another project that shares this cache will not see this "
-                            + "project's records.",
-                            e,
-                        )
                 return func(*args, **kwargs)
             finally:
                 metrics.end("cli.total", _t_total)

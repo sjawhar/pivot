@@ -8,12 +8,12 @@ fast as possible.
 ## Content-Addressable Cache
 
 Every output file is hashed with `xxhash64` and stored under
-`.pivot/cache/files/<hash[:2]>/<hash[2:]>` (a two-level directory structure
-using the first two hex characters as a prefix). The per-stage lock file
-records each output's content hash.
+`<state dir>/cache/files/<hash[:2]>/<hash[2:]>` (a two-level directory structure using the first
+two hex characters as a prefix). The per-stage lock file records each output's content hash.
+`<state dir>` is `core.state_dir`, which defaults to `.pivot`.
 
 ```
-.pivot/
+<state dir>/
   cache/
     files/
       a1/
@@ -22,12 +22,13 @@ records each output's content hash.
       ...
     projects/
       3f2a1c0d9e8b7a65.json  # one project that uses this cache (see below)
+    mounts.json              # mount points below the cache root that writers saw
     gc.lock                  # held while `pivot gc` collects this cache
   stages/
     demo/
       clean.lock           # lock file for stage "demo/clean"
       train.lock           # lock file for stage "demo/train"
-  state.lmdb/              # LMDB database
+  state.lmdb/              # LMDB database and this project's pivot-project-id
 ```
 
 Each prefix directory also holds a `.pivot_cache.lock` file, and while a file
@@ -127,27 +128,42 @@ hosts on one.
 
 A `cache.dir` outside the project root (or a `PIVOT_CACHE_DIR` pointing elsewhere) can hold
 the outputs of projects whose locks this one cannot read. Each project records itself in the
-cache under `projects/<digest>.json`:
+cache under `projects/<digest>.json`, keyed by its root and project id:
 
 ```json
 {"root": "/home/me/experiment", "state_dir": "/home/me/experiment/.pivot",
- "host": "workstation", "pivot": "0.5.12", "last_write": "2026-10-27T06:43:11Z"}
+ "host": "workstation", "pivot": "0.5.12", "last_write": "2026-10-27T06:43:11Z",
+ "project_id": "0f8c...", "mounts": ["/home/me/experiment/data"]}
 ```
+
+The project id is a random value in `<state dir>/state.lmdb/pivot-project-id`, so git never
+copies it to another checkout. A project that sets a new `core.state_dir` copies the id from
+its `.pivot` state. `mounts` lists the mount points at or below the project root and state
+directory that the last writer saw.
 
 Every pivot process that names a cache object registers its project first, inside the naming
 lock described above: a stage commit, a run-cache restore, `pivot commit`, `pivot track` and
 `pivot get --rev`, whatever the command and whether or not the cache existed when it started
-(the project whose first run creates a shared cache is registered by that run). A command that
-discovers the pipeline (`repro`, `run`, `status`, `checkout` and the others that load
-`pipeline.py`) also registers when it starts. While a project's entry is under an hour old,
-registering costs one `stat`. If the register cannot be written, pivot still runs but prints one
-warning naming the entry and why: a project missing from the register is invisible to another
-project's collection. A collection reads every project the register names. An entry whose root
-this host cannot see is never taken as deleted, because the project may be on a disk that is not
-mounted, in a container's own mount namespace, or on another host: the collection refuses and
-names the entry. Make the root visible and re-run, or, if the project is gone for good, delete
-the entry it names. `pivot gc` **refuses to remove anything** from an external cache that
-records no project, or whose records it cannot read; `pivot gc --projects`
+(the project whose first run creates a shared cache is registered by that run). `checkout`,
+`pull` and a pipeline run also register before they restore workspace links. Read-only commands
+do not register. If the register cannot be written, the command refuses before it names an
+object. A project id is best-effort through #503's state resolver. If the state directory cannot
+store it, the entry has no id, the writer still follows 0.5.2 behavior, and gc refuses that
+entry with recovery instructions. A read-only cache is the one exception to a register-write
+failure, because no collection can delete from it.
+
+A collection reads every project the register names, and an entry is live only after the
+collection opens its root, `.pivot` and state directory and finds the entry's project id there.
+An absent or unreadable root, state directory or id refuses the collection and names the entry:
+the project may be on a disk that is not mounted, in another mount namespace, or on another
+host, and a different project may hold the same local path there. On the host that wrote the
+entry, every recorded mount must still be mounted. If you removed a mount on purpose, run any
+pivot command in that project. Its next naming step records the mounts it has now. A project
+visible from several hosts over one filesystem keeps one id, so another host's entry stays
+collectable. Two copies made with `cp -r` share an id, but their entries have different roots,
+and each root's records are read. If a project is gone for good, or its state database was
+reset, delete the entry the refusal names. `pivot gc` **refuses to remove anything** from an
+external cache that records no project, or whose records it cannot read; `pivot gc --projects`
 PATH names the projects that share it and records them, so later runs need no flag. A
 `--projects` path must be a real pivot project — a directory with a readable `.pivot` state
 directory. A path that is not one (the cache itself, a parent directory, a worktree that was

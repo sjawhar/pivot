@@ -6,7 +6,6 @@ from pivot.config.io import get_config_path as get_config_path
 from pivot.config.io import get_config_value as get_config_value
 from pivot.config.io import get_diff_max_rows as get_diff_max_rows
 from pivot.config.io import get_display_precision as get_display_precision
-from pivot.config.io import get_global_config_path as get_global_config_path
 from pivot.config.io import get_local_config_path as get_local_config_path
 from pivot.config.io import get_max_workers as get_max_workers
 from pivot.config.io import get_merged_config as get_merged_config
@@ -18,7 +17,8 @@ from pivot.config.io import get_run_history_retention as get_run_history_retenti
 from pivot.config.io import get_state_dir as get_state_dir
 from pivot.config.io import get_watch_debounce as get_watch_debounce
 from pivot.config.io import load_config_file as load_config_file
-from pivot.config.io import project_state_dir as project_state_dir
+from pivot.config.io import locate_cache_dir as locate_cache_dir
+from pivot.config.io import locate_state_dir as locate_state_dir
 from pivot.config.io import register_cache_use as register_cache_use
 from pivot.config.io import set_config_value as set_config_value
 from pivot.config.io import unset_config_value as unset_config_value

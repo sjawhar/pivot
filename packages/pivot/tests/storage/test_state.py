@@ -1650,9 +1650,10 @@ def test_capacity_warning_names_pivot_gc_and_prints_one_percent_sign(
     assert "%%" not in message, message
     assert "%), approaching" in message, message
     assert "Run `pivot gc` to prune run history and unused cache objects" in message, message
-    assert "the database file itself shrinks only when you delete .pivot/state.lmdb/" in (
-        message
-    ), message
+    assert (
+        "the database file itself shrinks only when you delete "
+        + f"{(tmp_path / 'state.lmdb').resolve()}/"
+    ) in message, message
 
 
 _RAN = {"code_manifest": {"func:helpers.plain": "1f2e"}, "output_hashes": {"p/use_plain": "9a8b"}}
@@ -1770,3 +1771,22 @@ def test_a_no_commit_record_is_none_when_absent_or_not_a_json_object(
             db.put_raw(b"nocommit:p/use_plain", value)
 
         assert db.get_no_commit_record("p/use_plain") is None
+
+
+def test_a_best_effort_save_skips_a_state_directory_holding_a_nul_byte(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A path holding a NUL byte cannot become a directory: creating it fails with an OSError,
+    which a best-effort save absorbs, so a file-hash save never fails the command on it."""
+    state_dir = tmp_path / "state\0dir"
+    data = tmp_path / "data.txt"
+    data.write_text("data\n")
+
+    with pytest.raises(OSError, match="NUL byte"):
+        state.StateDB(state_dir)
+    saved = state.save_best_effort(
+        state_dir, lambda db: db.save(data, data.stat(), "0123456789abcdef"), what="a hash"
+    )
+    state.save_file_hashes(state_dir, [(data, data.stat(), "0123456789abcdef")])
+
+    assert saved is False

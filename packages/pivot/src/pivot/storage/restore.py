@@ -12,6 +12,7 @@ import xxhash
 import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
+from pivot import state_dir as state_dir_mod
 from pivot.storage import cache, lock, state, track
 from pivot.storage import gc as gc_mod
 from pivot.types import HashInfo
@@ -107,12 +108,34 @@ def _parse_pvt_data_from_bytes(content: bytes) -> PvtData | str | None:
 def get_lock_data_from_revision(
     stage_name: str, rev: str, state_dir: pathlib.Path
 ) -> StorageLockData | None:
-    """Read and parse lock file for a stage from a git revision."""
-    stages_dir = lock.get_stages_dir(state_dir)
-    rel_path = str(stages_dir.relative_to(project.get_project_root()) / f"{stage_name}.lock")
-    content = git.read_file_from_revision(rel_path, rev)
+    """Read a stage lock from a revision, including a matching 0.5.2 lock location."""
+    root = project.get_project_root()
+    try:
+        stages_dir = lock.stages_rel_path(state_dir, root)
+    except ValueError:
+        stages_dir = None
+    if stages_dir is not None:
+        content = git.read_file_from_revision(f"{stages_dir}/{stage_name}.lock", rev)
+        if content is not None:
+            return _parse_lock_data_from_bytes(content)
+
+    other_state_dir = state_dir_mod.other_state_dir_for(state_dir)
+    other_stages_dir = None
+    if other_state_dir is not None:
+        try:
+            other_stages_dir = lock.stages_rel_path(other_state_dir, root)
+        except ValueError:
+            other_stages_dir = None
+    content = None
+    if other_stages_dir is not None and other_stages_dir != stages_dir:
+        content = git.read_file_from_revision(f"{other_stages_dir}/{stage_name}.lock", rev)
     if content is None:
+        if stages_dir is None:
+            raise exceptions.ConfigError(
+                "core.state_dir is outside the project, so lock files are not in git"
+            ) from None
         return None
+    state_dir_mod.report_legacy_state_dir(state_dir)
     return _parse_lock_data_from_bytes(content)
 
 
@@ -346,9 +369,11 @@ def restore_file(
     if (skipped := _skipped(dest_path, force)) is not None:
         return skipped
 
-    # Ensure parent directory exists before any restore strategy
+    # Ensure parent directory exists before any restore strategy. A parent inside the
+    # configured state directory is made as Pivot makes that directory, with its ignore file,
+    # before the restore lock or the copy writes anything there.
     try:
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        state_dir_mod.make_dirs(dest_path.parent)
     except OSError as e:
         return RestoreResult(
             status=RestoreStatus.ERROR,
@@ -365,7 +390,9 @@ def restore_file(
             # For files, we check if the single cached file exists first.
             should_try_cache = True
             if "manifest" not in output_hash:
-                should_try_cache = cache.get_cache_path(files_dir, output_hash["hash"]).exists()
+                should_try_cache = (
+                    cache.resolve_cache_object_path(files_dir, output_hash["hash"]) is not None
+                )
             if should_try_cache:
                 success = _restore_named(
                     dest_path, output_hash, cache_dir, checkout_modes, recorded=restored
@@ -416,6 +443,10 @@ def restore_file(
             for _attempt in range(2):
                 if missing_hashes:
                     source = "remote"
+                    # The one write `get` makes into the cache: the creating getter prepares the
+                    # cache directory, and a custom `cache.dir` inside the state directory, each
+                    # with its ignore file, before any object is downloaded into it.
+                    config.get_cache_dir()
                     remote = remote or remote_factory()
                     download_results = asyncio.run(
                         remote.download_batch(
@@ -526,13 +557,15 @@ def restore_targets_from_revision(
 
     # Every target's file hashes, saved once per state directory when the loop ends, best-effort:
     # a stage output's in its stage's state directory, any other file's in the configured one.
+    # Located, not created: `get` creates nothing for a target it skips, and the save makes the
+    # directory #503's resolver chose only when it has a hash to save.
     batch = state.FileHashBatch()
     try:
         for target_info in target_infos:
             hash_state_dir = (
                 stage_targets[target_info["original_target"]]["state_dir"]
                 if target_info["target_type"] is TargetType.STAGE
-                else config.get_state_dir()
+                else config.locate_state_dir()
             )
             for rel_path in target_info["paths"]:
                 output_hash = target_info["hashes"].get(rel_path)

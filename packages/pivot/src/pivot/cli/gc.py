@@ -239,11 +239,13 @@ def gc_cmd(
                 )
             if roots["outward_dirs"]:
                 _echo(
-                    "Warning: could not follow symlinked directories that leave the project: "
+                    "Warning: could not follow symlinked directories that leave the project, or "
+                    + "symlinks whose target is missing: "
                     + ", ".join(roots["outward_dirs"])
                     + ". The records under them are invisible, so this run keeps every cache "
-                    + "object and removes nothing. Move the directory inside the project, or "
-                    + "point the link at a path inside the project. Nothing was removed.",
+                    + "object and removes nothing. Move the directory inside the project, point "
+                    + "the link at a path inside the project, or mount its target. Nothing was "
+                    + "removed.",
                     to_stderr=True,
                 )
             plan = gc.build_plan(

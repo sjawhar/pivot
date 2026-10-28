@@ -230,15 +230,19 @@ resolved object root (a `files/` symlink would split the lock).
 **Every unit registers its project** (`naming_unit(cache_root, project=(root, state_dir))`),
 under the shared lock and before anything is named, so every process that names an object is
 in the register, whichever command it runs and whether or not the cache existed when it began.
-Only a test standing in for a writer passes `project=None`.
+Only a test standing in for a writer passes `project=None`. Registration tries to write the
+project id to `<state dir>/state.lmdb/pivot-project-id`, records mount points at or below the
+project root and state directory, and records cache-root submounts in `<cache>/mounts.json`.
+An id write failure leaves an id-less entry, so a collection refuses it but the writer preserves
+#503's unusable-state behavior. A register write failure refuses the writer. The only exception
+is `EROFS` on the cache: a read-only cache cannot be collected either.
 
-**A re-publish inside a unit is verified.** A writer that hashed before its unit re-publishes
-with `copy_to_cache(..., verify=True)` (through `store_hashed_output(verify=True)` at the commit
-sites): the copy is hashed and refused on a mismatch, so a file that changed after it was hashed
-never lands under its old key.
-
-**An absent register root is never taken as deleted.** `read_register` reports it as
-unreadable, so the collection refuses and names the entry; only the user deletes an entry.
+**A registered project is live only after a real read.** `read_register` opens its root,
+`.pivot` marker, and state directory resolved from that project's own `core.state_dir`, then
+requires the entry's project id there. On the registering host, every recorded mount must still
+be mounted. Any missing evidence refuses collection and names the entry. When `core.state_dir`
+differs from `.pivot`, collection reads both state layouts so a 0.5.2 lock in `.pivot` still
+protects its object.
 
 ### Where flock is refused
 

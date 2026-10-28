@@ -380,6 +380,33 @@ class ConfigError(PivotError):
     """Base class for configuration errors."""
 
 
+class EmptyStateDirError(ConfigError):
+    """Raised when a project config's ``core.state_dir`` is the empty string."""
+
+
+class StateDirTargetError(ConfigError):
+    """``core.state_dir`` names a path that cannot become a directory this process writes.
+
+    A state-directory record keeps it as the root's resolution, with the outcome decided once
+    with the value: the stages keep their state in ``.pivot``, and ``fallback`` says what a
+    command that needs the configured directory gets. True: ``.pivot`` as well, so every reader
+    uses ``.pivot``; it is true only where Pivot 0.5.2 ran such a command. False: ``path``,
+    where the command fails as 0.5.2 failed. ``path`` is the directory the value names.
+    """
+
+    path: pathlib.Path
+    fallback: bool
+
+    def __init__(self, message: str, path: pathlib.Path, fallback: bool) -> None:
+        super().__init__(message)
+        self.path = path
+        self.fallback = fallback
+
+    @override
+    def __reduce__(self) -> tuple[type, tuple[str, pathlib.Path, bool]]:
+        return (self.__class__, (str(self), self.path, self.fallback))
+
+
 class ConfigValidationError(ConfigError):
     """Raised when config value fails validation."""
 

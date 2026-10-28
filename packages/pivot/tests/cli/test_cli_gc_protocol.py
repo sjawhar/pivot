@@ -99,7 +99,7 @@ def _ok(proc: subprocess.CompletedProcess[str]) -> str:
 
 
 def _project(path: pathlib.Path) -> pathlib.Path:
-    path.mkdir()
+    path.mkdir(exist_ok=True)
     root = path.resolve()
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     _ok(_run(root, "init"))
@@ -115,12 +115,19 @@ def _locks(root: pathlib.Path) -> dict[str, str]:
     return {str(p.relative_to(stages)): p.read_text() for p in sorted(stages.rglob("*.lock"))}
 
 
+def _entry(cache_dir: pathlib.Path, root: pathlib.Path) -> pathlib.Path:
+    """The register entry of a project whose state is in `.pivot`."""
+    path = gc.project_register_path(cache_dir, root, root / ".pivot")
+    assert path is not None, f"{root} has no project id"
+    return path
+
+
 def _register_fresh(root: pathlib.Path) -> pathlib.Path:
     """Write this project's register entry now, so the command entry takes no lock, and return
     the cache. The tests then hold the exclusive lock against the writer sites alone."""
     cache_dir = root / ".pivot" / "cache"
     gc.register_project(cache_dir, root, root / ".pivot")
-    assert gc.register_entry_is_fresh(cache_dir, root)
+    assert gc.register_entry_is_fresh(cache_dir, root, root / ".pivot")
     return cache_dir
 
 
@@ -668,7 +675,7 @@ def test_pivot_gc_refuses_when_another_hosts_project_is_not_visible(tmp_path: pa
     elsewhere = tmp_path / "node-local"  # the parent exists here; the root does not
     elsewhere.mkdir()
     other_root = elsewhere / "project-on-another-node"
-    entry = gc.register_path(cache_dir, other_root)
+    entry = cache_dir / gc.REGISTER_DIR / "project-on-another-node.json"
     entry.write_text(
         json.dumps(
             {
@@ -735,10 +742,8 @@ def test_the_first_commit_into_a_new_cache_takes_the_naming_lock(tmp_path: pathl
     assert naming.exists() and turnstile.exists(), "the first commit took no naming lock"
 
 
-def test_a_project_that_cannot_register_says_so_once(tmp_path: pathlib.Path) -> None:
-    """A command that cannot write its project's register entry still runs, but warns once,
-    naming the path and the reason: a project missing from the register is invisible to a
-    `pivot gc` run from another project that shares the cache."""
+def test_a_command_refuses_when_it_cannot_register(tmp_path: pathlib.Path) -> None:
+    """A writer cannot name objects when its register entry cannot be written."""
     root = _project(tmp_path / "project")
     _ok(_run(root, "repro"))
     cache_dir = root / ".pivot" / "cache"
@@ -749,11 +754,12 @@ def test_a_project_that_cannot_register_says_so_once(tmp_path: pathlib.Path) -> 
         register.rmdir()
     register.write_text("not a directory\n")  # no entry can be written beneath it
 
-    status = _run(root, "status")
+    (root / "notes.txt").write_text("would name an object\n")
+    refused = _run(root, "track", "notes.txt")
 
-    out = status.stdout + status.stderr
-    assert status.returncode == 0, out
-    assert out.count("Cannot record this project in the cache register") == 1, out
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert "Cannot record this project in the cache register" in out, out
     assert str(register) in out, out
 
 
@@ -837,7 +843,8 @@ def test_pivot_get_rev_registers_its_project(tmp_path: pathlib.Path) -> None:
     subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True, env=git_env)
     # The producer is not a user of this cache (it ran elsewhere). Before round 4b it was never
     # registered at all (P13), so the entry may be absent.
-    gc.register_path(shared, origin).unlink(missing_ok=True)
+    if (origin_entry := gc.project_register_path(shared, origin, origin / ".pivot")) is not None:
+        origin_entry.unlink(missing_ok=True)
     other = _shared_project(tmp_path / "other", shared)
     (other / "data" / "raw" / "input.txt").write_text("an unrelated project\n")
     _ok(_run(other, "repro"))
@@ -879,7 +886,6 @@ def test_pivot_gc_refuses_when_this_hosts_project_is_not_visible(tmp_path: pathl
     assert output.resolve().exists(), "gc removed an object a project on an unmounted disk names"
 
 
-
 # =============================================================================
 # Round 6: a registered project proves it is readable; a writer proves it registered
 # =============================================================================
@@ -902,7 +908,7 @@ def test_pivot_gc_refuses_when_a_registered_project_root_is_an_empty_mountpoint(
     _ok(_run(here, "repro"))
     _ok(_run(away, "repro"))
     output = away / "data" / "shadow" / "shout.txt"
-    entry = gc.register_path(shared, away)
+    entry = _entry(shared, away)
     assert output.is_symlink() and output.resolve().exists()
     assert entry.exists()
 
@@ -951,6 +957,309 @@ def test_a_writer_that_cannot_register_refuses_before_naming_objects(
     assert "Cannot record this project in the cache register" in out, out
     assert not output.is_symlink(), "an unregistered writer named an object in its workspace"
     assert collected.returncode == 0, collected.stdout + collected.stderr
+
+
+def test_pivot_gc_reads_the_current_state_dir_after_a_project_reconfigures(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The register's old state-dir field cannot override a project's current configuration.
+
+    A project registers while its state is `.pivot`, then changes `core.state_dir` and writes a
+    new lock there. The workspace link is removed, leaving that current lock as the only record
+    that can keep the new object during another project's real collection.
+    """
+    shared = tmp_path / "shared-cache"
+    collector = _shared_project(tmp_path / "collector", shared)
+    writer = _shared_project(tmp_path / "writer", shared)
+    _ok(_run(collector, "repro"))
+    _ok(_run(writer, "repro"))
+    entry = _entry(shared, writer)
+    stale_entry = entry.read_text()
+    (writer / ".pivot" / "config.yaml").write_text(
+        (writer / ".pivot" / "config.yaml").read_text() + "core:\n  state_dir: state\n"
+    )
+    (writer / "data" / "raw" / "input.txt").write_text("new configured state\n")
+    _ok(_run(writer, "repro"))
+    entry.write_text(stale_entry)  # An older host has not refreshed its state-dir field yet.
+    output = writer / "data" / "shadow" / "shout.txt"
+    assert output.is_symlink()
+    current_object = output.resolve()
+    assert current_object.exists()
+    output.unlink()
+
+    collected = _run(collector, "gc", "--yes", "--grace-hours", "0")
+
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert current_object.exists(), "gc ignored the reconfigured project's current state directory"
+
+
+def test_pivot_gc_reads_both_supported_state_directory_layouts(tmp_path: pathlib.Path) -> None:
+    """A 0.5.2-upgraded project can hold live locks in `.pivot` and `core.state_dir`.
+
+    The first real run creates the legacy lock, and a run after setting `core.state_dir` creates
+    the configured one. With their workspace link gone, collection must preserve the object each
+    lock names rather than inspecting only the newer directory.
+    """
+    shared = tmp_path / "shared-cache"
+    collector = _shared_project(tmp_path / "collector", shared)
+    writer = _shared_project(tmp_path / "writer", shared)
+    (writer / "data" / "raw" / "input.txt").write_text("legacy state\n")
+    _ok(_run(collector, "repro"))
+    _ok(_run(writer, "repro"))
+    output = writer / "data" / "shadow" / "shout.txt"
+    assert output.is_symlink()
+    legacy_object = output.resolve()
+    assert legacy_object.exists()
+    (writer / ".pivot" / "config.yaml").write_text(
+        (writer / ".pivot" / "config.yaml").read_text() + "core:\n  state_dir: state\n"
+    )
+    (writer / "data" / "raw" / "input.txt").write_text("configured state\n")
+    _ok(_run(writer, "repro"))
+    assert output.is_symlink()
+    current_object = output.resolve()
+    assert current_object.exists()
+    output.unlink()
+
+    collected = _run(collector, "gc", "--yes", "--grace-hours", "0")
+
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert legacy_object.exists(), "gc ignored the legacy state directory"
+    assert current_object.exists(), "gc ignored the configured state directory"
+
+
+@contextlib.contextmanager
+def _tmpfs_mount(path: pathlib.Path) -> Iterator[Callable[[], None]]:
+    """Mount a real tmpfs at ``path`` and yield a function that unmounts it."""
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True, check=False).returncode:
+        pytest.skip("mounting a real tmpfs needs passwordless sudo")
+    path.mkdir(parents=True, exist_ok=True)
+    options = f"mode=0700,uid={os.getuid()},gid={os.getgid()}"
+    subprocess.run(
+        ["sudo", "-n", "mount", "-t", "tmpfs", "-o", options, "tmpfs", str(path)], check=True
+    )
+    mounted = True
+
+    def unmount() -> None:
+        nonlocal mounted
+        if mounted:
+            subprocess.run(["sudo", "-n", "umount", str(path)], check=True)
+            mounted = False
+
+    try:
+        yield unmount
+    finally:
+        unmount()
+
+
+def _cached_link(
+    root: pathlib.Path, cache_dir: pathlib.Path, relative: str, text: str
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Track one file and return its `.pvt` record and the cache object only it names."""
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    _ok(_run(root, "track", relative))
+    record = track.get_pvt_path(path)
+    data = track.read_pvt_file(record)
+    assert data is not None, f"{record} is not a valid .pvt"
+    obj = cache.get_cache_path(cache_dir / "files", data["hash"])
+    assert obj.exists(), "track did not cache the file"
+    return record, obj
+
+
+def test_pivot_gc_refuses_when_a_registered_project_root_mount_is_unmounted(
+    tmp_path: pathlib.Path,
+) -> None:
+    """P14 with a real tmpfs: an unmounted project root has no project id or records."""
+    shared = tmp_path / "shared-cache"
+    here = _shared_project(tmp_path / "here", shared)
+    _ok(_run(here, "status"))
+    mount_point = tmp_path / "project-volume"
+    with _tmpfs_mount(mount_point) as unmount:
+        away = _shared_project(mount_point, shared)
+        _, obj = _cached_link(away, shared, "data.txt", "only the mounted root names this\n")
+        entry = _entry(shared, away)
+        unmount()
+
+        refused = _run(here, "gc", "--yes", "--grace-hours", "0")
+
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert str(entry) in out, out
+    assert obj.exists(), "gc removed an object named only on the unmounted project root"
+
+
+def test_pivot_gc_refuses_when_a_registered_project_subdirectory_mount_is_unmounted(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A project data mount can hide `.pvt` records while the project root stays visible."""
+    shared = tmp_path / "shared-cache"
+    here = _shared_project(tmp_path / "here", shared)
+    away = _shared_project(tmp_path / "away", shared)
+    _ok(_run(here, "status"))
+    with _tmpfs_mount(away / "mounted-data") as unmount:
+        _, obj = _cached_link(
+            away, shared, "mounted-data/data.txt", "named under a project mount\n"
+        )
+        entry = _entry(shared, away)
+        unmount()
+
+        refused = _run(here, "gc", "--yes", "--grace-hours", "0")
+
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert str(entry) in out and str(away / "mounted-data") in out, out
+    assert "run any pivot command in the project" in out, out
+    assert obj.exists(), "gc removed an object named under an unmounted project mount"
+
+
+def test_pivot_gc_refuses_a_cache_mount_that_is_unmounted(tmp_path: pathlib.Path) -> None:
+    """A cache ref directory on its own mount can hide the ref that keeps an object."""
+    shared = tmp_path / "shared-cache"
+    here = _shared_project(tmp_path / "here", shared)
+    _cached_link(here, shared, "first.txt", "makes the cache\n")
+    refs = shared / "files" / "refs"
+    with _tmpfs_mount(refs) as unmount:
+        key = _publish(shared / "files", tmp_path, "named only by a mounted cache ref\n")
+        (refs / "store").symlink_to(cache.get_cache_path(shared / "files", key))
+        _cached_link(here, shared, "second.txt", "records the cache mounts\n")
+        unmount()
+
+        refused = _run(here, "gc", "--yes", "--grace-hours", "0")
+
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert str(refs) in out, out
+    assert cache.get_cache_path(shared / "files", key).exists(), "gc removed a ref-named object"
+
+
+def _rewrite_entry_host(entry: pathlib.Path, host: str) -> None:
+    data = json.loads(entry.read_text())
+    data["host"] = host
+    entry.write_text(json.dumps(data))
+
+
+def test_pivot_gc_refuses_another_hosts_root_when_this_path_is_a_different_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A host-local path can exist on two hosts and hold two different projects."""
+    shared = tmp_path / "shared-cache"
+    here = _shared_project(tmp_path / "here", shared)
+    away = _shared_project(tmp_path / "same-path", shared)
+    _ok(_run(here, "status"))
+    _, obj = _cached_link(away, shared, "data.txt", "named only on another host\n")
+    entry = _entry(shared, away)
+    _rewrite_entry_host(entry, "pivot-other-node")
+    away.rename(tmp_path / "project-on-other-host")
+    _shared_project(away, shared)
+    _cached_link(away, shared, "local.txt", "a different project at the same local path\n")
+
+    refused = _run(here, "gc", "--yes", "--grace-hours", "0")
+
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert str(entry) in out and "project id" in out, out
+    assert obj.exists(), "gc read a different project at another host's registered path"
+
+
+def test_pivot_gc_collects_a_shared_project_registered_by_another_host(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A project visible from two hosts has one id, so another host's entry stays usable."""
+    shared = tmp_path / "shared-cache"
+    here = _shared_project(tmp_path / "here", shared)
+    away = _shared_project(tmp_path / "shared-project", shared)
+    _ok(_run(here, "status"))
+    _, kept = _cached_link(away, shared, "data.txt", "named by the shared project\n")
+    entry = _entry(shared, away)
+    _rewrite_entry_host(entry, "pivot-other-node")
+    dead = _publish(shared / "files", tmp_path, "an orphan in a shared cache\n")
+
+    collected = _run(here, "gc", "--yes", "--grace-hours", "0")
+
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert kept.exists(), "gc removed an object the shared project names"
+    assert not cache.get_cache_path(shared / "files", dead).exists(), "gc did not collect"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can list a directory without read permission")
+def test_pivot_gc_refuses_when_the_register_cannot_be_listed(tmp_path: pathlib.Path) -> None:
+    """A register this user cannot list hides peers of an internal cache."""
+    here = _project(tmp_path / "here")
+    _ok(_run(here, "repro"))
+    internal = here / ".pivot" / "cache"
+    peer = _shared_project(tmp_path / "peer", internal)
+    _, obj = _cached_link(peer, internal, "data.txt", "named by a peer of an internal cache\n")
+    register = internal / gc.REGISTER_DIR
+    mode = register.stat().st_mode
+    register.chmod(0o300)
+    try:
+        refused = _run(here, "gc", "--yes", "--grace-hours", "0")
+    finally:
+        register.chmod(mode)
+
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert str(register) in out, out
+    assert obj.exists(), "gc removed a peer object while its register could not be listed"
+
+
+def test_pivot_gc_keeps_everything_for_a_dangling_project_symlink(tmp_path: pathlib.Path) -> None:
+    """A dangling directory link can point to records on a disk that is not mounted."""
+    root = _project(tmp_path / "project")
+    _ok(_run(root, "repro"))
+    objects = root / ".pivot" / "cache" / "files"
+    key = _publish(objects, tmp_path, "named under an external disk\n")
+    external = tmp_path / "external-disk" / "datasets"
+    external.mkdir(parents=True)
+    track.write_pvt_file(
+        external / "data.txt.pvt", track.PvtData(path="data.txt", hash=key, size=29)
+    )
+    (root / "datasets").symlink_to(external)
+    (tmp_path / "external-disk").rename(tmp_path / "external-disk-unmounted")
+
+    collected = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode == 0, out
+    assert "whose target is missing" in out, out
+    assert cache.get_cache_path(objects, key).exists(), "gc ignored a dangling record link"
+
+
+def test_pivot_gc_reads_a_symlinked_stage_lock_directory(tmp_path: pathlib.Path) -> None:
+    """A symlinked directory below `stages` still holds stage locks."""
+    root = _project(tmp_path / "project")
+    _ok(_run(root, "repro"))
+    objects = root / ".pivot" / "cache" / "files"
+    key = _publish(objects, tmp_path, "named by a linked stage directory\n")
+    store = root / ".pivot" / "stage-store"
+    _name_in_lock(store, "other/stage", key)
+    (root / ".pivot" / "stages" / "other").symlink_to(store / "other")
+
+    collected = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert cache.get_cache_path(objects, key).exists(), "gc skipped a symlinked stage directory"
+
+
+def test_pivot_gc_refuses_a_registered_project_with_an_unreadable_database(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A damaged state database hides run-cache rows, so collection must refuse cleanly."""
+    shared = tmp_path / "shared-cache"
+    here = _shared_project(tmp_path / "here", shared)
+    peer = _shared_project(tmp_path / "peer", shared)
+    _ok(_run(here, "status"))
+    _ok(_run(peer, "repro"))
+    database = peer / ".pivot" / "state.lmdb" / "data.mdb"
+    database.write_bytes(b"not an lmdb file" * 4096)
+
+    refused = _run(here, "gc", "--yes", "--grace-hours", "0")
+
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert str(peer) in out and "That project may hold outputs" in out, out
+
 
 def test_pivot_gc_keeps_everything_for_a_link_into_the_cache_root_but_not_its_objects(
     tmp_path: pathlib.Path,

@@ -23,11 +23,13 @@ pivot init
 
 `pivot init` creates:
 
-- `.pivot/`: cache, state, and per-stage lock files (`.pivot/stages/`)
-- `.pivot/.gitignore`: keeps the cache, state database, artifact locks and agent socket out of git
+- `.pivot/`: the project marker and its `config.yaml`
+- `<state dir>/.gitignore`: keeps the cache, state database, artifact locks and agent socket out
+  of git; `<state dir>` is `core.state_dir` and defaults to `.pivot`
 - `.pivotignore`: patterns for files watch mode ignores
 
-Commit the lock files under `.pivot/stages/`; they record what ran and what it produced.
+`core.state_dir` selects where Pivot writes state. Commit the lock files under
+`<state dir>/stages/`; they record what ran and what it produced.
 
 ## 2. Add Input Data
 
@@ -102,7 +104,8 @@ Pivot will:
 1. Find `pipeline.py` and run it to build the DAG
 2. Run `quickstart/clean`, then `quickstart/summarize`
 3. Write `data/quickstart/clean.jsonl` and `data/quickstart/summarize.yaml`
-4. Record each stage's code, parameters and input hashes in `.pivot/stages/quickstart/`
+4. Record each stage's code, parameters and input hashes in
+   `<state dir>/stages/quickstart/`
 
 ```bash
 cat data/quickstart/summarize.yaml

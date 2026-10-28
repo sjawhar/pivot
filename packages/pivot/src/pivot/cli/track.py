@@ -245,5 +245,6 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
             if result["warning"]:
                 click.echo(result["warning"], err=True)
             click.echo(f"Tracked: {result['tracked_path']}")
-    # The hashes read to track, so the next status reads none of these files.
-    state.save_file_hashes(config.get_state_dir(), read)
+    # The hashes read to track, so the next status reads none of these files. Saved where #503's
+    # resolver writes state, which the save creates only when it has a hash to save.
+    state.save_file_hashes(config.locate_state_dir(), read)

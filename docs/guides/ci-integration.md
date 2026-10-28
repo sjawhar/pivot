@@ -164,9 +164,10 @@ jobs:
 
 If a stage's params hold a secret (`pydantic.SecretStr` and friends), the lock file
 records a digest keyed by the project's secret key. Set `PIVOT_SECRET_KEY` in CI to the
-key the lock files were written with (the contents of a developer's `.pivot/secret.key`,
+key the lock files were written with (the contents of a developer's `<state dir>/secret.key`,
 stored as a CI secret); without it, CI makes its own key and those stages show as stale.
-See [secret parameters](../concepts/parameters.md#secret-parameters).
+`core.state_dir` defaults to `.pivot`. See
+[secret parameters](../concepts/parameters.md#secret-parameters).
 
 ### Post-Merge Cache Push
 
@@ -194,7 +195,9 @@ Common causes:
 
 ## Tips
 
-- **Always commit lock files to version control.** Lock files (in `.pivot/stages/`) record what was executed. Without them, `verify` has nothing to check against.
+- **Always commit lock files to version control.** Lock files (in
+  `<state dir>/stages/`, where `core.state_dir` defaults to `.pivot`) record what was executed.
+  Without them, `verify` has nothing to check against.
 - **Use `--allow-missing` in CI.** It avoids downloading large data files while still confirming reproducibility.
 - **Run `pivot push` as part of your local workflow.** The CI verify step depends on outputs being available on remote.
 - **Separate verify from execution.** CI should never run `pivot repro` — that belongs in the development workflow. CI only checks that developers did their job.

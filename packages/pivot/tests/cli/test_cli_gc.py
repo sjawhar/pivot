@@ -6,6 +6,7 @@ import errno
 import fcntl
 import json
 import os
+import shutil
 import threading
 import time
 from typing import TYPE_CHECKING, TypedDict
@@ -435,10 +436,11 @@ def test_gc_refuses_while_a_registered_projects_root_is_absent(
     project that is gone for good, the collection runs."""
     dead = _helper_publish(shared, "dead")
     retired = tmp_path / "retired"
-    retired.mkdir()
+    (retired / ".pivot").mkdir(parents=True)
     gc.register_project(shared["cache_dir"], retired, retired / ".pivot")
-    retired.rmdir()
-    entry = gc.register_path(shared["cache_dir"], retired)
+    entry = gc.project_register_path(shared["cache_dir"], retired, retired / ".pivot")
+    assert entry is not None
+    shutil.rmtree(retired)
 
     refused = _helper_run(runner, "--yes", "--grace-hours", "0", "--projects", ".")
 
@@ -486,7 +488,7 @@ def test_gc_refuses_when_a_register_entry_cannot_be_read(
 ) -> None:
     """A register entry pivot cannot parse hides a project that may own these objects."""
     dead = _helper_publish(shared, "dead")
-    entry = gc.register_path(shared["cache_dir"], shared["root"])
+    entry = shared["cache_dir"] / gc.REGISTER_DIR / "unreadable.json"
     entry.parent.mkdir(parents=True, exist_ok=True)
     entry.write_text("{not json")
 
@@ -913,7 +915,9 @@ def test_gc_reads_a_named_project_from_its_configured_state_dir(
 
     assert result.exit_code == 0, result.output
     assert named in _helper_keys(workspace), "an object the named project's lock names was removed"
-    entry = json.loads(gc.register_path(workspace["cache_dir"], other.resolve()).read_text())
+    entry_path = gc.project_register_path(workspace["cache_dir"], other.resolve(), state_dir)
+    assert entry_path is not None
+    entry = json.loads(entry_path.read_text())
     recorded = type(state_dir)(entry["state_dir"]).resolve()
     assert recorded == state_dir.resolve(), entry
 

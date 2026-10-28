@@ -578,6 +578,9 @@ def checkout(
         stage_outputs, output_state_dirs = _get_stage_output_info()
 
     state_dir = config.get_state_dir()
+    # Checkout links objects from records already on disk, outside a publishing naming unit,
+    # so the project must be in the cache register before any link exists (`pull` comes here).
+    config.register_cache_use()
 
     # Run async checkout. The file hashes every restore read or wrote are saved once per state
     # directory when it ends, also when a target failed, best-effort.
