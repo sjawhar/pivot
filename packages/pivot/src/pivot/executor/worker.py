@@ -68,6 +68,7 @@ from pivot.storage import store as store_mod
 from pivot.types import (
     DeferredWrites,
     FileHash,
+    FileHashEntry,
     HashInfo,
     LockData,
     LogMessage,
@@ -893,7 +894,7 @@ def _make_result(
     reason: str,
     ring_buffer: _OutputRingBuffer,
     input_hash: str | None = None,
-    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
 ) -> StageResult:
     """Build StageResult with collected metrics for cross-process transfer."""
     result = StageResult(
@@ -1002,7 +1003,7 @@ def _execute_stage(
                                 lock_data["dep_hashes"],
                                 stage_outs,
                             )
-                            restored_entries = list[tuple[str, int, int, int, str]]()
+                            restored_entries = list[FileHashEntry]()
                             restoration = restore_outputs_to_hashes(
                                 store,
                                 stage_outs,
@@ -1058,7 +1059,7 @@ def _execute_stage(
                         run_reason = "forced"
 
                     if skip_reason is not None and lock_data is not None:
-                        restored_entries = list[tuple[str, int, int, int, str]]()
+                        restored_entries = list[FileHashEntry]()
                         restoration = restore_outputs_to_hashes(
                             store,
                             stage_outs,
@@ -1069,12 +1070,13 @@ def _execute_stage(
                             file_hash_entries=restored_entries,
                         )
                         if restoration.available:
+                            # The dependencies read to decide, and the outputs read or restored
                             return _make_result(
                                 StageStatus.CACHED,
                                 skip_reason,
                                 ring_buffer,
                                 input_hash=input_hash,
-                                file_hash_entries=restored_entries,
+                                file_hash_entries=file_hash_entries + restored_entries,
                             )
                         run_reason = _outputs_unusable_reason(restoration)
 
@@ -1218,8 +1220,10 @@ def _execute_stage(
                         )
                     for ref, path in output_paths.items():
                         file_hash_entries.extend(
-                            output_file_hash_entries(
-                                path, output_hashes[types.identity_key(ref.identity)]
+                            cache.deferred_file_hash_entries(
+                                cache.known_file_hashes(
+                                    path, output_hashes[types.identity_key(ref.identity)]
+                                )
                             )
                         )
 
@@ -1456,7 +1460,7 @@ def restore_outputs_to_hashes(
     state_dir: pathlib.Path | None = None,
     restore: bool = True,
     report_changes: Literal[False] = False,
-    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
 ) -> bool: ...
 
 
@@ -1470,7 +1474,7 @@ def restore_outputs_to_hashes(
     state_dir: pathlib.Path | None = None,
     restore: bool = True,
     report_changes: Literal[True],
-    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
 ) -> OutputRestoreResult: ...
 
 
@@ -1483,12 +1487,13 @@ def restore_outputs_to_hashes(
     state_dir: pathlib.Path | None = None,
     restore: bool = True,
     report_changes: bool = False,
-    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
 ) -> bool | OutputRestoreResult:
     """Verify outputs match recorded hashes and restore cacheable mismatches.
 
-    ``file_hash_entries``, when given, receives a StateDB file-hash entry for every file
-    restored from the cache, so the next check finds it without reading it.
+    ``file_hash_entries``, when given, receives a StateDB file-hash entry for every file the
+    check had to read and every file restored from the cache, so the next check finds each
+    without reading it.
     """
     unavailable = list[types.ArtifactRef]()
     empty_dirs_unrecorded = list[types.ArtifactRef]()
@@ -1501,10 +1506,18 @@ def restore_outputs_to_hashes(
             expected_hash = output_hashes.get(ref.identity)
             if expected_hash is not None:
                 output_path = store.resolve_display_path(ref)
+                read = list[tuple[pathlib.Path, os.stat_result, str]]()
                 try:
-                    actual_hash = hash_output(output_path, state_db, cache_dir=store.cache_dir)
+                    actual_hash = hash_output(
+                        output_path,
+                        state_db,
+                        cache_dir=store.cache_dir,
+                        pending=None if file_hash_entries is None else read,
+                    )
                 except OSError:
                     actual_hash = None
+                if file_hash_entries is not None:
+                    file_hash_entries.extend(cache.deferred_file_hash_entries(read))
                 if actual_hash == expected_hash:
                     continue
                 if actual_hash is not None and unrecorded_empty_dirs_only(
@@ -1518,12 +1531,13 @@ def restore_outputs_to_hashes(
                     to_restore.append(ref)
                     if not restore:
                         continue
-                    if store.restore_from_cache(ref, expected_hash, state_dir=state_dir):
+                    restored = list[tuple[pathlib.Path, os.stat_result, str]]()
+                    if store.restore_from_cache(
+                        ref, expected_hash, state_dir=state_dir, recorded=restored
+                    ):
                         outputs_restored = True
                         if file_hash_entries is not None:
-                            file_hash_entries.extend(
-                                output_file_hash_entries(output_path, expected_hash)
-                            )
+                            file_hash_entries.extend(cache.deferred_file_hash_entries(restored))
                         continue
             unavailable.append(ref)
             if restore:
@@ -1581,41 +1595,17 @@ def hash_output(
     state_db: state.StateDB | None = None,
     *,
     cache_dir: pathlib.Path | None = None,
+    pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> HashInfo:
     """Compute output hash without saving to cache.
 
     ``cache_dir`` is the cache object root whose symlinks count as directory content.
+    ``pending`` receives the file-hash entry of each file read, as ``cache.hash_file`` says.
     """
     if path.is_dir():
-        return cache.hash_directory(path, state_db, cache_dir=cache_dir)
-    file_hash, _ = cache.hash_file(path, state_db)
+        return cache.hash_directory(path, state_db, cache_dir=cache_dir, pending=pending)
+    file_hash, _ = cache.hash_file(path, state_db, pending=pending)
     return FileHash(hash=file_hash)
-
-
-def output_file_hash_entries(
-    path: pathlib.Path, output_hash: HashInfo
-) -> list[tuple[str, int, int, int, str]]:
-    """StateDB file-hash entries for an output whose hash is already known.
-
-    Stats each file (each manifest entry, for a directory) and pairs it with its known hash;
-    nothing is read. Call it once the output has its final inode: a hardlink checkout
-    replaces the file the stage wrote. An output whose file-hash StateDB key exceeds LMDB's
-    limit is omitted: this cache only avoids a later hash and must not fail the stage.
-    """
-    if is_dir_hash(output_hash):
-        files = [(path / entry["relpath"], entry["hash"]) for entry in output_hash["manifest"]]
-    else:
-        files = [(path, output_hash["hash"])]
-    entries = list[tuple[str, int, int, int, str]]()
-    for file_path, file_hash in files:
-        if not state.file_hash_key_fits(file_path):
-            logger.debug("Skipping oversized output file-hash cache entry: %s", file_path)
-            continue
-        fs_stat = file_path.stat()
-        entries.append(
-            (str(file_path), fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash)
-        )
-    return entries
 
 
 def lock_output_paths(
@@ -2215,33 +2205,26 @@ def hash_dependencies(
     deps: dict[str, types.ArtifactRef] | list[str],
     store: store_mod.Store | None = None,
     state_db: state.StateDB | None = None,
-) -> tuple[dict[str, HashInfo], list[str], list[str], list[tuple[str, int, int, int, str]]]:
-    """Hash all dependencies and collect file-hash cache write-backs."""
+) -> tuple[dict[str, HashInfo], list[str], list[str], list[FileHashEntry]]:
+    """Hash all dependencies and collect file-hash cache write-backs.
+
+    With a read-only (or no) ``state_db``, the write-backs are the StateDB file-hash entries of
+    every file read, a file of a directory dependency included, for the coordinator to save; a
+    writable ``state_db`` saves them itself.
+    """
     _t = metrics.start()
     hashes = dict[str, HashInfo]()
     missing = list[str]()
     unreadable = list[str]()
-    file_hash_entries = list[tuple[str, int, int, int, str]]()
+    read = list[tuple[pathlib.Path, os.stat_result, str]]()
+    pending = read if state_db is None or state_db.readonly else None
     if isinstance(deps, dict):
         if store is None:
             raise ValueError("store is required for artifact dependency hashing")
         for ref in deps.values():
             key = types.identity_key(ref.identity)
             try:
-                hash_info = store.hash_artifact(ref, state_db)
-                hashes[key] = hash_info
-                if not is_dir_hash(hash_info) and isinstance(store, store_mod.WorkspaceStore):
-                    path = store.checkout(ref)
-                    fs_stat = path.stat()
-                    file_hash_entries.append(
-                        (
-                            str(path),
-                            fs_stat.st_mtime_ns,
-                            fs_stat.st_size,
-                            fs_stat.st_ino,
-                            hash_info["hash"],
-                        )
-                    )
+                hashes[key] = store.hash_artifact(ref, state_db, pending=pending)
             except FileNotFoundError:
                 missing.append(key)
             except IsADirectoryError:
@@ -2251,29 +2234,19 @@ def hash_dependencies(
                 unreadable.append(key)
     else:
         for dep in deps:
-            normalized_path = project.normalize_path(dep)
-            path = pathlib.Path(normalized_path)
+            path = pathlib.Path(project.normalize_path(dep))
             try:
                 if path.is_dir():
-                    hashes[dep] = cache.hash_directory(path, state_db)
+                    hashes[dep] = cache.hash_directory(path, state_db, pending=pending)
                 else:
-                    file_hash, fs_stat = cache.hash_file(path, state_db)
+                    file_hash, _ = cache.hash_file(path, state_db, pending=pending)
                     hashes[dep] = FileHash(hash=file_hash)
-                    file_hash_entries.append(
-                        (
-                            str(normalized_path),
-                            fs_stat.st_mtime_ns,
-                            fs_stat.st_size,
-                            fs_stat.st_ino,
-                            file_hash,
-                        )
-                    )
             except FileNotFoundError:
                 missing.append(dep)
             except OSError:
                 unreadable.append(dep)
     metrics.end("worker.hash_dependencies", _t)
-    return hashes, missing, unreadable, file_hash_entries
+    return hashes, missing, unreadable, cache.deferred_file_hash_entries(read)
 
 
 # -----------------------------------------------------------------------------
@@ -2366,7 +2339,7 @@ def _commit_lock_and_build_deferred(
     state_db: state.StateDB,
     *,
     reusable: bool = True,
-    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
     increment_outputs: bool = True,
 ) -> DeferredWrites:
     """Commit lock file and build deferred writes for StateDB.
@@ -2394,7 +2367,7 @@ def _build_deferred_writes(
     state_db: state.StateDB,
     *,
     reusable: bool = True,
-    file_hash_entries: list[tuple[str, int, int, int, str]] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
     increment_outputs: bool = True,
 ) -> DeferredWrites:
     """Build deferred writes for coordinator to apply.
@@ -2460,7 +2433,7 @@ class RunCacheSkipResult(TypedDict):
 
     output_hashes: dict[str, HashInfo]
     outputs_restored: bool
-    file_hash_entries: list[tuple[str, int, int, int, str]]
+    file_hash_entries: list[FileHashEntry]
 
 
 def _try_skip_via_run_cache_with_store(
@@ -2487,7 +2460,7 @@ def _try_skip_via_run_cache_with_store(
         return None
     identity_hashes = _to_identity_hashes(output_hashes)
 
-    restored_entries = list[tuple[str, int, int, int, str]]()
+    restored_entries = list[FileHashEntry]()
     restoration = restore_outputs_to_hashes(
         store,
         stage_outs,

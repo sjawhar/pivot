@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import logging
+import os
 import pathlib
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import click
+import lmdb
 
 from pivot import config, project, registry, types
 from pivot.cli import completion
@@ -17,10 +20,31 @@ from pivot.storage import cache, lock, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterator, Mapping
 
 RestoreResult = Literal["restored", "skipped", "missing"]
 MAX_CONCURRENT_RESTORES = 32
+
+logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _open_hash_cache_for_checkout(
+    state_dir: pathlib.Path | None,
+) -> Iterator[state.StateDB | None]:
+    """Yield ``state_dir``'s hash cache where it opens read-only, else None. Main's checkout
+    never opened the database, and the cache is best-effort, so a database checkout cannot open
+    (damaged, or unopenable on a writable filesystem, which ``state.open_readonly`` raises for)
+    must not prevent a restore: the caller reads files and restores from objects as without a
+    cache. Only the open is caught; an error inside the caller's block propagates. Other callers
+    still report a damaged database (``state.open_readonly``'s policy)."""
+    with contextlib.ExitStack() as stack:
+        try:
+            state_db = stack.enter_context(state.open_readonly(state_dir, create=False))
+        except (OSError, lmdb.Error) as error:
+            logger.debug("Restoring without the state database in %s: %s", state_dir, error)
+            state_db = None
+        yield state_db
 
 
 class RestoreOutcome(NamedTuple):
@@ -50,18 +74,21 @@ class CheckoutBehavior(enum.StrEnum):
     FORCE = "force"  # Overwrite existing files (--force)
 
 
-def _get_stage_output_info() -> dict[str, HashInfo]:
+def _get_stage_output_info() -> tuple[dict[str, HashInfo], dict[str, pathlib.Path]]:
     """Get output hash info from lock files for cached stage outputs only.
 
     Non-cached outputs (e.g. Metric with cache=False) are excluded —
     they are git-tracked and not Pivot's responsibility to restore.
 
-    Uses per-stage state_dir from the registry for lock file lookup.
+    Uses per-stage state_dir from the registry for lock file lookup. Also returns each
+    output's stage state_dir, whose StateDB holds the file hashes the stage's runs and
+    explanations look up.
     """
     result = dict[str, HashInfo]()
+    state_dirs = dict[str, pathlib.Path]()
     store = cli_helpers.get_workspace_store()
     if store is None:
-        return result
+        return result, state_dirs
 
     for stage_name in cli_helpers.list_stages():
         stage_info = cli_helpers.get_stage(stage_name)
@@ -80,19 +107,24 @@ def _get_stage_output_info() -> dict[str, HashInfo]:
                 ref = ref_by_identity.get(identity)
                 if ref is None:
                     continue
-                resolved = store.resolve_display_path(ref)
-                result[str(resolved)] = out_hash
+                resolved = str(store.resolve_display_path(ref))
+                result[resolved] = out_hash
+                state_dirs[resolved] = stage_state_dir
 
-    return result
+    return result, state_dirs
 
 
 def _on_disk_matches_expected(
-    path: pathlib.Path, expected_hash: HashInfo, cache_dir: pathlib.Path
+    path: pathlib.Path,
+    expected_hash: HashInfo,
+    cache_dir: pathlib.Path,
+    state_db: state.StateDB | None,
+    pending: list[tuple[pathlib.Path, os.stat_result, str]],
 ) -> bool:
     if is_dir_hash(expected_hash):
         if not path.is_dir():
             return False
-        actual = cache.hash_directory(path, cache_dir=cache_dir)
+        actual = cache.hash_directory(path, state_db, cache_dir=cache_dir, pending=pending)
         # A hash pivot 0.3.3 recorded lists no empty directories, and repro still honors it.
         # When only empty directories differ, checkout would change no file, so it matches.
         return actual["hash"] == expected_hash["hash"] or (
@@ -100,7 +132,7 @@ def _on_disk_matches_expected(
         )
     if not path.is_file():
         return False
-    actual_hash, _ = cache.hash_file(path)
+    actual_hash, _ = cache.hash_file(path, state_db, pending=pending)
     return actual_hash == expected_hash["hash"]
 
 
@@ -111,11 +143,18 @@ def _restore_path_sync(
     checkout_modes: list[cache.CheckoutMode],
     behavior: CheckoutBehavior,
     state_dir: pathlib.Path | None = None,
+    hash_state_dir: pathlib.Path | None = None,
+    *,
+    batch: state.FileHashBatch | None = None,
 ) -> RestoreOutcome:
     """Restore a file or directory from cache (sync version).
 
     Holds the restore lock for path across the existence check and the restore, so a
     concurrent checkout never compares against, or deletes, a half-restored output.
+    ``hash_state_dir`` (``state_dir`` when None) is the state directory whose StateDB the
+    path's file hashes are looked up in and recorded in: a stage output's own state directory.
+    The hashes of the files it restores or reads go into ``batch``, which the command saves once
+    (``state.FileHashBatch``); without one nothing is recorded.
 
     Returns:
         What the restore did, for the caller to count and report.
@@ -127,7 +166,15 @@ def _restore_path_sync(
     """
     with cache.restore_lock(path, state_dir) as lock_token:
         return _restore_path_locked(
-            path, output_hash, cache_dir, checkout_modes, behavior, state_dir, lock_token
+            path,
+            output_hash,
+            cache_dir,
+            checkout_modes,
+            behavior,
+            state_dir,
+            lock_token,
+            hash_state_dir if hash_state_dir is not None else state_dir,
+            batch,
         )
 
 
@@ -139,13 +186,26 @@ def _restore_path_locked(
     behavior: CheckoutBehavior,
     state_dir: pathlib.Path | None,
     lock_token: str | None,
+    hash_state_dir: pathlib.Path | None,
+    batch: state.FileHashBatch | None,
 ) -> RestoreOutcome:
     """Body of _restore_path_sync; the caller holds the restore lock for path."""
+
+    def record(entries: list[tuple[pathlib.Path, os.stat_result, str]]) -> None:
+        if batch is not None and hash_state_dir is not None:
+            batch.add(hash_state_dir, entries)
+
     total = _file_count(output_hash)
     if path.exists():
         match behavior:
             case CheckoutBehavior.ERROR:
-                if _on_disk_matches_expected(path, output_hash, cache_dir):
+                read = list[tuple[pathlib.Path, os.stat_result, str]]()
+                with _open_hash_cache_for_checkout(hash_state_dir) as state_db:
+                    matches = _on_disk_matches_expected(
+                        path, output_hash, cache_dir, state_db, read
+                    )
+                record(read)
+                if matches:
                     return RestoreOutcome("skipped", path.name, skipped_files=total)
                 raise click.ClickException(
                     f"'{path.name}' already exists with different content. "
@@ -157,15 +217,12 @@ def _restore_path_locked(
                 # Never overwrite content the cache lacks (a local change).
                 if not is_dir_hash(output_hash) or path.is_symlink() or not path.is_dir():
                     return RestoreOutcome("skipped", path.name, skipped_files=total)
-                # Reuse hashes `pivot status` and `pivot track` recorded; never create the DB.
-                with (
-                    state.StateDB(state_dir, readonly=True)
-                    if state_dir is not None and (state_dir / "state.lmdb").exists()
-                    else contextlib.nullcontext(None)
-                ) as state_db:
+                settled = list[tuple[pathlib.Path, os.stat_result, str]]()
+                with _open_hash_cache_for_checkout(hash_state_dir) as state_db:
                     outcome = cache.restore_missing_in_directory(
-                        path, output_hash, cache_dir, checkout_modes, state_db
+                        path, output_hash, cache_dir, checkout_modes, state_db, settled
                     )
+                record(settled)
                 if outcome["local_changes"]:
                     raise click.ClickException(
                         f"'{path.name}' has local changes that are not in the cache: "
@@ -195,6 +252,7 @@ def _restore_path_locked(
             case _:  # pyright: ignore[reportUnnecessaryComparison] - defensive for future enum values
                 raise ValueError(f"Unhandled checkout behavior: {behavior}")  # pyright: ignore[reportUnreachable]
 
+    restored = list[tuple[pathlib.Path, os.stat_result, str]]()
     success = cache.restore_from_cache(
         path,
         output_hash,
@@ -202,10 +260,12 @@ def _restore_path_locked(
         checkout_modes=checkout_modes,
         state_dir=state_dir,
         lock_token=lock_token,
+        recorded=restored,
     )
     if not success:
         return RestoreOutcome("missing", path.name, missing_files=total)
 
+    record(restored)
     return RestoreOutcome("restored", path.name, restored_files=total)
 
 
@@ -216,8 +276,13 @@ async def _checkout_files_async(
     behavior: CheckoutBehavior,
     callback: Callable[[int, int, str], None] | None = None,
     state_dir: pathlib.Path | None = None,
+    hash_state_dirs: Mapping[str, pathlib.Path] | None = None,
+    batch: state.FileHashBatch | None = None,
 ) -> list[RestoreOutcome]:
     """Restore files in parallel and return what each restore did.
+
+    ``hash_state_dirs`` maps a stage output's path to its stage's state directory, which
+    holds its file hashes; every other path's are in ``state_dir``.
 
     Raises:
         click.ClickException: For immediate failures (aggregated if multiple).
@@ -238,6 +303,8 @@ async def _checkout_files_async(
                     checkout_modes,
                     behavior,
                     state_dir,
+                    (hash_state_dirs or {}).get(abs_path_str),
+                    batch=batch,
                 )
             outcomes.append(outcome)
             if callback:
@@ -361,8 +428,13 @@ async def _checkout_main_async(
     behavior: CheckoutBehavior,
     callback: Callable[[int, int, str], None] | None = None,
     state_dir: pathlib.Path | None = None,
+    output_state_dirs: dict[str, pathlib.Path] | None = None,
+    batch: state.FileHashBatch | None = None,
 ) -> list[RestoreOutcome]:
-    """Main async checkout logic: what restoring each tracked file and stage output did."""
+    """Main async checkout logic: what restoring each tracked file and stage output did.
+
+    ``output_state_dirs`` maps each stage output's path to its stage's state directory.
+    """
     if targets:
         unique_targets = _dedupe_targets(targets)
         files = _validate_and_build_files(unique_targets, tracked_files, stage_outputs)
@@ -373,6 +445,8 @@ async def _checkout_main_async(
             behavior,
             callback,
             state_dir=state_dir,
+            hash_state_dirs=output_state_dirs,
+            batch=batch,
         )
     else:
         # Checkout all tracked files and stage outputs
@@ -398,6 +472,7 @@ async def _checkout_main_async(
                 behavior,
                 progress_cb,
                 state_dir=state_dir,
+                batch=batch,
             )
         )
         t2 = asyncio.create_task(
@@ -408,6 +483,8 @@ async def _checkout_main_async(
                 behavior,
                 progress_cb,
                 state_dir=state_dir,
+                hash_state_dirs=output_state_dirs,
+                batch=batch,
             )
         )
         tracked, outputs = await asyncio.gather(t1, t2)
@@ -495,24 +572,34 @@ def checkout(
 
     # Get stage output info from lock files (cached outputs only)
     pipeline = cli_decorators.get_pipeline_from_context()
-    stage_outputs = {} if pipeline is None else _get_stage_output_info()
+    stage_outputs = dict[str, HashInfo]()
+    output_state_dirs = dict[str, pathlib.Path]()
+    if pipeline is not None:
+        stage_outputs, output_state_dirs = _get_stage_output_info()
 
     state_dir = config.get_state_dir()
 
-    # Run async checkout
-    with cli_helpers.TransferProgress("Restoring", quiet=quiet) as progress:
-        outcomes = asyncio.run(
-            _checkout_main_async(
-                targets,
-                tracked_files,
-                stage_outputs,
-                cache_dir,
-                checkout_modes,
-                behavior,
-                callback=progress.callback,
-                state_dir=state_dir,
+    # Run async checkout. The file hashes every restore read or wrote are saved once per state
+    # directory when it ends, also when a target failed, best-effort.
+    batch = state.FileHashBatch()
+    try:
+        with cli_helpers.TransferProgress("Restoring", quiet=quiet) as progress:
+            outcomes = asyncio.run(
+                _checkout_main_async(
+                    targets,
+                    tracked_files,
+                    stage_outputs,
+                    cache_dir,
+                    checkout_modes,
+                    behavior,
+                    callback=progress.callback,
+                    state_dir=state_dir,
+                    output_state_dirs=output_state_dirs,
+                    batch=batch,
+                )
             )
-        )
+    finally:
+        batch.save()
 
     success = _print_summary(outcomes, quiet)
     if not success:

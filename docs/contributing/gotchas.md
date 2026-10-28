@@ -141,8 +141,8 @@ Copy mode prevents in-place changes from corrupting the cached version.
 
 ### Path Strategies in StateDB
 
-- Use `resolve()` for hash keys (deduplication - `/foo/../bar` and `/bar` are same file)
-- Use `normpath()` for generation keys (logical paths for user display)
+- File-hash keys are the absolute path as given, with no symlink followed; the entry's `(mtime_ns, size, device, inode)` from `stat()` decides whether a cached hash still applies. Never add ctime: a new hard link changes it
+- Generation keys are the artifact identity, not a path
 
 ### Atomic Writes: Track fd Closure
 

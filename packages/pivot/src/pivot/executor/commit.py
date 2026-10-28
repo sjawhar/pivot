@@ -13,7 +13,7 @@ import pathlib
 from pivot import config, exceptions, parameters, project, registry, run_history, skip, types
 from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
-from pivot.storage import lock
+from pivot.storage import cache, lock
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import ArtifactTag, DeferredWrites, HashInfo, LockData
@@ -175,7 +175,7 @@ def _commit_stages(
             output_hashes_by_key = dict[str, HashInfo]()
             output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
             output_paths_by_identity = dict[types.ArtifactIdentity, str]()
-            file_hash_entries = list[tuple[str, int, int, int, str]]()
+            file_hash_entries = list[types.FileHashEntry]()
             outputs_missing = False
             for out in stage_outs:
                 identity_key = types.identity_key(out.identity)
@@ -187,7 +187,11 @@ def _commit_stages(
                         state_dir=default_state_dir,
                         warn_left_out_symlinks=warn_left_out_symlinks,
                     )
-                    file_hash_entries.extend(worker.output_file_hash_entries(out_path, hash_info))
+                    file_hash_entries.extend(
+                        cache.deferred_file_hash_entries(
+                            cache.known_file_hashes(out_path, hash_info)
+                        )
+                    )
                     output_hashes_by_key[identity_key] = hash_info
                     output_hashes_by_identity[out.identity] = hash_info
                     output_paths_by_identity[out.identity] = out_path.relative_to(

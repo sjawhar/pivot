@@ -512,7 +512,13 @@ def test_command_exits_as_on_052(
     # unwritable `s1` holding only an empty database, Pivot reads the runs of both state
     # directories (10-28); every other command there keeps 0.5.2's code, `checkout`'s 1 included.
     show_reads_pivot_runs = command == "show" and case in {"empty", "unwritable-empty-database"}
-    expected = 0 if show_reads_pivot_runs else _052_EXIT_CODES[case][command]
+    # Ruling (coordinator, 10-28): #516 makes `status` read the hash cache read-only and
+    # best-effort, so a configured path whose parent is read-only, or that runs through a regular
+    # file, no longer fails it. Main 27488ddc exits 0 there too; 0.5.2 exits 1.
+    status_reads_no_state = command == "status" and case in {"regular-file", "read-only-parent"}
+    expected = (
+        0 if show_reads_pivot_runs or status_reads_no_state else _052_EXIT_CODES[case][command]
+    )
     assert result.returncode == expected, output
     if result.returncode != 0:
         errors = [line for line in result.stderr.splitlines() if line.startswith("Error")]

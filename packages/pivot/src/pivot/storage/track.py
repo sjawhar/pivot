@@ -61,8 +61,8 @@ _REQUIRED_KEYS = frozenset({"path", "hash", "size"})
 _VALID_KEYS = frozenset({"path", "hash", "size", "num_files", "manifest", "empty_dirs", "source"})
 _REQUIRED_SOURCE_KEYS = frozenset({"repo", "rev", "rev_lock", "stage", "path", "remote"})
 # A manifest entry's fields every restore reads, and those it builds a path or cache key from.
-# `size` is not required: only a symlink restore through a tree no pivot has checked reads it,
-# and it then checks the content by hash alone (`cache._tree_file_holds`).
+# `size` is not required: no cache tree is trusted for a manifest without it
+# (`cache._canonical_manifest`), so it restores file by file, which never reads `size`.
 _MANIFEST_ENTRY_READ_KEYS = ("relpath", "hash", "isexec")
 _MANIFEST_ENTRY_STR_KEYS = ("relpath", "hash")
 
@@ -98,9 +98,11 @@ def pvt_field_error(data: Mapping[str, object]) -> str | None:
     entry and a cache key from ``hash`` and each entry's ``hash``, and reads each entry's
     ``isexec``. So a hand-written .pvt whose all-digit hash YAML reads as an integer, whose
     manifest entry has no hash, or whose relpath or empty directory holds a NUL byte would stop
-    the restore with a raw TypeError, KeyError or ValueError. Only those fields are checked: a
-    restore never builds a path from ``path`` (``get`` names the file by its target), and other
-    fields, the types of ``size`` and ``isexec`` included, restore whatever they hold.
+    the restore with a raw TypeError, KeyError or ValueError. A manifest relpath that is absolute
+    or holds ``..`` names a file outside the output, so it is refused too, as lock reading refuses
+    it (``path_policy.recorded_path_error``). Only those fields are checked: a restore never builds
+    a path from ``path`` (``get`` names the file by its target), and other fields, the types of
+    ``size`` and ``isexec`` included, restore whatever they hold.
     """
     for key in ("path", "hash"):
         if not isinstance(data[key], str):
@@ -124,9 +126,27 @@ def pvt_field_error(data: Mapping[str, object]) -> str | None:
         for key in _MANIFEST_ENTRY_STR_KEYS:
             if not isinstance(entry[key], str):
                 return f"field 'manifest[{index}].{key}' is not a string"
-        if "\0" in cast("str", entry["relpath"]):
+        relpath = cast("str", entry["relpath"])
+        if "\0" in relpath:
             return f"field 'manifest[{index}].relpath' holds a NUL byte"
+        if has_path_traversal(relpath):
+            return f"field 'manifest[{index}].relpath' is absolute or holds '..'"
     return None
+
+
+def _has_unsafe_member_path(data: Mapping[str, object]) -> bool:
+    """Whether a manifest entry's relpath is absolute or holds ``..``: a restore joins each one
+    to the output, so it would name a file outside it. The same containment ``read_pvt_file``
+    applies to ``path``; ``pvt_field_error`` names the entry."""
+    manifest = data.get("manifest")
+    if not isinstance(manifest, list):
+        return False
+    for raw in cast("list[object]", manifest):
+        if isinstance(raw, dict):
+            relpath = cast("dict[object, object]", raw).get("relpath")
+            if isinstance(relpath, str) and has_path_traversal(relpath):
+                return True
+    return False
 
 
 def _is_empty_dirs(data: dict[str, object]) -> bool:
@@ -172,7 +192,7 @@ def read_pvt_file(pvt_path: pathlib.Path) -> PvtData | None:
             data: object = yaml.load(f, Loader=_Loader)
         if not is_pvt_data(data):
             return None
-        if has_path_traversal(data["path"]):
+        if has_path_traversal(data["path"]) or _has_unsafe_member_path(data):
             return None
         return data
     except (FileNotFoundError, PermissionError, UnicodeDecodeError, yaml.YAMLError):

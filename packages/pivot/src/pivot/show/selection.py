@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import os
 import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
@@ -266,11 +267,11 @@ def _workspace_members(
         return {}
 
     result = dict[str, tuple[str, pathlib.Path]]()
+    files = list[tuple[str, os.DirEntry[str]]]()
     left_out = list[pathlib.Path]()
-    dirs = list[pathlib.Path]()
-    for entry in cache.scandir_artifact_members(location, cache_dir, left_out, dirs):
+    cache.walk_artifact_members(os.fspath(location), "", cache_dir, files, [], left_out)
+    for relpath, entry in files:
         file_path = pathlib.Path(entry.path)
-        relpath = file_path.relative_to(location).as_posix()
         if not _member_selected(relpath, prefixes):
             continue
         if data_module.detect_format(file_path) is DataFileFormat.UNKNOWN:

@@ -20,7 +20,7 @@ from pivot import state_dir as state_dir_mod
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Callable, Generator, Iterable
 
     from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
@@ -238,19 +238,22 @@ class DatabaseFullError(StateDBError):
     """Raised when the state database reaches its size limit."""
 
 
+# What a hash-cache open or write can raise that the cache, being best-effort, absorbs: another
+# process holding the write lock too long, a full map, a database this user cannot open or write
+# (lmdb.ReadonlyError, EACCES), a read-only filesystem.
+_CACHE_ERRORS = (exceptions.PivotDBWriteTimeoutError, StateDBError, lmdb.Error, OSError)
+
+
 def _make_key_file_hash(path: pathlib.Path) -> bytes:
-    """Create LMDB key for file hash entry (follows symlinks for physical deduplication).
+    """Create the LMDB key for a file-hash entry: the absolute path as given, as bytes.
 
-    Uses resolve() to follow symlinks because hash caching is about physical file identity.
-    Multiple symlinks pointing to the same file should share one cached hash.
-    Contrast with _make_key_output_generation() which preserves symlinks for logical path tracking.
+    Symlinks are not followed: the entry's value holds the (mtime_ns, size, device, inode) of
+    ``path.stat()``, which follows them. An entry read through a link retargeted at another
+    file, on this filesystem or on another one (where an inode number can repeat), no longer
+    matches, and the file is hashed again. ``os.fsencode`` keeps names that are not UTF-8.
+    Contrast with _make_key_output_generation(), which keys an artifact identity.
     """
-    return _HASH_PREFIX + str(path.resolve()).encode()
-
-
-def file_hash_key_fits(path: pathlib.Path) -> bool:
-    """Whether ``path`` fits the LMDB key reserved for a file-hash entry."""
-    return len(_make_key_file_hash(path)) <= _MAX_KEY_SIZE
+    return _HASH_PREFIX + os.fsencode(os.path.abspath(path))
 
 
 def _make_key_output_generation(identity: str) -> bytes:
@@ -321,24 +324,41 @@ def _make_key_ast_hash(
     return key
 
 
-def _pack_value(mtime_ns: int, size: int, inode: int, hash_hex: str) -> bytes:
-    """Pack metadata and hash into binary value."""
-    return struct.pack(">QQQ", mtime_ns, size, inode) + hash_hex.encode("ascii")
+_FILE_HASH_STAT = struct.Struct(">QQQQ")
 
 
-def _unpack_value(data: bytes) -> tuple[int, int, int, str]:
-    """Unpack binary value into metadata and hash."""
-    mtime_ns, size, inode = struct.unpack(">QQQ", data[:24])
-    hash_hex = data[24:].decode("ascii")
-    return mtime_ns, size, inode, hash_hex
+def _pack_value(mtime_ns: int, size: int, dev: int, inode: int, hash_hex: str) -> bytes:
+    """Pack a file's stat fields and hash into a file-hash entry's value.
+
+    The entry holds no ctime: a new hard link changes the inode's ctime, so every hardlink
+    checkout, and every replica that hard-links pivot's files, would invalidate its entries.
+    """
+    return _FILE_HASH_STAT.pack(mtime_ns, size, dev, inode) + hash_hex.encode("ascii")
+
+
+def _unpack_value(data: bytes) -> tuple[int, int, int, int, str]:
+    """Unpack a file-hash entry's value into (mtime_ns, size, dev, inode, hash)."""
+    mtime_ns, size, dev, inode = _FILE_HASH_STAT.unpack(data[: _FILE_HASH_STAT.size])
+    hash_hex = data[_FILE_HASH_STAT.size :].decode("ascii")
+    return mtime_ns, size, dev, inode, hash_hex
 
 
 def _match_cached_hash(value: bytes | None, fs_stat: os.stat_result) -> str | None:
-    """Return cached hash if stored metadata matches fs_stat, else None."""
-    if value is None:
+    """Return the cached hash if the entry's stat fields match ``fs_stat``, else None.
+
+    An entry an earlier pivot wrote, (mtime_ns, size, inode) with no device, reads here with
+    its inode as the device and its hash's first characters as the inode, so it matches no
+    file: the file is read once again and recorded anew.
+    """
+    if value is None or len(value) < _FILE_HASH_STAT.size:
         return None
-    mtime_ns, size, inode, hash_hex = _unpack_value(value)
-    if fs_stat.st_mtime_ns == mtime_ns and fs_stat.st_size == size and fs_stat.st_ino == inode:
+    mtime_ns, size, dev, inode, hash_hex = _unpack_value(value)
+    if (
+        fs_stat.st_mtime_ns == mtime_ns
+        and fs_stat.st_size == size
+        and fs_stat.st_dev == dev
+        and fs_stat.st_ino == inode
+    ):
         return hash_hex
     return None
 
@@ -477,39 +497,56 @@ class StateDB:
         return results
 
     def save(self, path: pathlib.Path, fs_stat: os.stat_result, file_hash: str) -> None:
-        """Cache file metadata and hash."""
-        self._check_closed()
-        self._check_write_allowed()
-        key = _make_key_file_hash(path)
-        if len(key) > _MAX_KEY_SIZE:
-            raise PathTooLongError(
-                f"Path too long for state cache ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path}"
-            )
-        value = _pack_value(fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash)
-        try:
-            with self._write_transaction(timeout=self._write_timeout) as txn:
-                txn.put(key, value)
-        except lmdb.MapFullError as e:
-            raise self._database_full_error() from e
+        """Cache file metadata and hash, as ``save_many`` does for one entry."""
+        self.save_many([(path, fs_stat, file_hash)])
 
-    def save_many(self, entries: list[tuple[pathlib.Path, os.stat_result, str]]) -> None:
-        """Batch save multiple entries atomically."""
+    def save_many(
+        self,
+        entries: Iterable[tuple[pathlib.Path, os.stat_result, str]],
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """Batch save multiple entries atomically, waiting at most ``timeout`` seconds (this
+        database's write timeout when None) for another process's write lock.
+
+        An entry whose key exceeds LMDB's limit is left out: this cache only saves a later
+        hash, so a path too long for it must not fail the caller.
+        """
         self._check_closed()
         self._check_write_allowed()
         try:
-            with self._write_transaction(timeout=self._write_timeout) as txn:
+            with self._write_transaction(
+                timeout=self._write_timeout if timeout is None else timeout
+            ) as txn:
                 for path, fs_stat, file_hash in entries:
                     key = _make_key_file_hash(path)
                     if len(key) > _MAX_KEY_SIZE:
-                        raise PathTooLongError(
-                            f"Path too long for state cache ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path}"
-                        )
+                        logger.debug("Not caching the hash of %s: path too long", path)
+                        continue
                     value = _pack_value(
-                        fs_stat.st_mtime_ns, fs_stat.st_size, fs_stat.st_ino, file_hash
+                        fs_stat.st_mtime_ns,
+                        fs_stat.st_size,
+                        fs_stat.st_dev,
+                        fs_stat.st_ino,
+                        file_hash,
                     )
                     txn.put(key, value)
         except lmdb.MapFullError as e:
             raise self._database_full_error() from e
+
+    def save_many_best_effort(
+        self, entries: list[tuple[pathlib.Path, os.stat_result, str]]
+    ) -> bool:
+        """``save_many``, best-effort: it waits at most ``_WRITE_BACK_TIMEOUT`` for the write
+        lock, as ``save_best_effort`` does, and a write that fails (``_CACHE_ERRORS``) is logged at
+        debug level and dropped, so a hash save never fails or stalls the command. True if it
+        saved."""
+        try:
+            self.save_many(entries, timeout=_WRITE_BACK_TIMEOUT)
+        except _CACHE_ERRORS as error:
+            logger.debug("Not saving %d file hashes: %s", len(entries), error)
+            return False
+        return True
 
     # -------------------------------------------------------------------------
     # AST hash cache for persistent fingerprint caching
@@ -1064,14 +1101,6 @@ class StateDB:
                         + f"({len(key)} bytes, max {_MAX_KEY_SIZE}): {identity}"
                     )
 
-        if "file_hash_entries" in deferred:
-            for path_str, _, _, _, _ in deferred["file_hash_entries"]:
-                key = _make_key_file_hash(pathlib.Path(path_str))
-                if len(key) > _MAX_KEY_SIZE:
-                    raise PathTooLongError(
-                        f"Path too long for state cache ({len(key)} bytes, max {_MAX_KEY_SIZE}): {path_str}"
-                    )
-
         try:
             with self._write_transaction(timeout=self._write_timeout) as txn:
                 # Dependency generations (clear old entries first, like record_dep_generations)
@@ -1111,12 +1140,17 @@ class StateDB:
                         + f"{stage_name}:{deferred['run_cache_delete_input_hash']}".encode()
                     )
 
-                # File hash entries
+                # File hash entries; one whose key exceeds LMDB's limit is left out, as
+                # save_many leaves it out: this cache only saves a later hash.
                 if "file_hash_entries" in deferred:
-                    for path_str, mtime_ns, size, inode, hash_hex in deferred["file_hash_entries"]:
+                    for path_str, mtime_ns, size, dev, inode, hash_hex in deferred[
+                        "file_hash_entries"
+                    ]:
                         key = _make_key_file_hash(pathlib.Path(path_str))
-                        value = _pack_value(mtime_ns, size, inode, hash_hex)
-                        txn.put(key, value)
+                        if len(key) > _MAX_KEY_SIZE:
+                            logger.debug("Not caching the hash of %s: path too long", path_str)
+                            continue
+                        txn.put(key, _pack_value(mtime_ns, size, dev, inode, hash_hex))
 
                 nocommit_key = _NOCOMMIT_PREFIX + stage_name.encode()
                 if "no_commit_record" in deferred:
@@ -1162,3 +1196,118 @@ class StateDB:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+# How long a best-effort cache write waits for another process's write lock: a fraction of a
+# pivot write's own 30 s, so a busy database costs a command a missed cache entry, not a stall.
+_WRITE_BACK_TIMEOUT = 2.0
+
+
+def save_best_effort(
+    state_dir: pathlib.Path,
+    write: Callable[[StateDB], None],
+    *,
+    what: str,
+    create: bool = True,
+    timeout: float = _WRITE_BACK_TIMEOUT,
+) -> bool:
+    """Run ``write`` against a writable StateDB in ``state_dir``, best-effort; True if it ran.
+
+    Every file-hash entry a command records goes through here (``save_file_hashes``). The hash
+    cache is a cache its own reader validates, and no decision depends on an entry being present,
+    so a write that cannot happen is skipped with a debug log naming ``what`` instead of failing
+    the command after it has already written the workspace: another process holding the write
+    lock for longer than ``timeout`` (0 makes one attempt), a database this user cannot write, a
+    read-only filesystem, a full map. Without ``create``, a state directory that has no database
+    is left without one.
+    """
+    if not create and not (state_dir / "state.lmdb").exists():
+        return False
+    try:
+        with StateDB(state_dir, write_timeout=timeout) as state_db:
+            write(state_db)
+    except _CACHE_ERRORS as error:
+        logger.debug("Not saving %s in %s: %s", what, state_dir, error)
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def open_readonly(
+    state_dir: pathlib.Path | None, *, create: bool = True
+) -> Generator[StateDB | None]:
+    """Open ``state_dir``'s StateDB to read it, yielding None on a read-only filesystem.
+
+    LMDB opens even a read-only environment writable. On an existing database it can report that
+    as a plain ``lmdb.Error``, not an ``OSError``: inspect the database directory's own mount
+    flag (not its parent, which may be a different, writable mount). Only an ``OSError`` or
+    ``lmdb.Error`` on that read-only mount yields None, so the caller reads files as it would with
+    no cache. The same errors on a writable mount are a damaged database and raise. Opening
+    creates a database where there is none, unless ``create`` is False (a check never creates
+    one); no ``state_dir`` yields None. The caller's own errors propagate with no context from
+    the open.
+    """
+    if state_dir is None or (not create and not (state_dir / "state.lmdb").exists()):
+        yield None
+        return
+    lmdb_path = state_dir / "state.lmdb"
+    state_db: StateDB | None
+    try:
+        state_db = StateDB(state_dir, readonly=True)
+    except (OSError, lmdb.Error) as error:
+        try:
+            readonly_filesystem = bool(os.statvfs(lmdb_path).f_flag & os.ST_RDONLY)
+        except OSError:
+            raise error from None
+        if not readonly_filesystem:
+            raise
+        logger.debug("Reading files without the state database in %s: %s", state_dir, error)
+        state_db = None
+    if state_db is None:
+        yield None
+        return
+    with state_db:
+        yield state_db
+
+
+def save_file_hashes(
+    state_dir: pathlib.Path, entries: list[tuple[pathlib.Path, os.stat_result, str]]
+) -> None:
+    """Save ``(path, stat, hash)`` entries a command read or wrote in one write transaction,
+    best-effort (``save_best_effort``), so the next status, explanation or run looks the files up
+    instead of reading them. With no entries it takes no lock."""
+    if entries:
+        _ = save_best_effort(
+            state_dir,
+            lambda state_db: state_db.save_many(entries),
+            what=f"{len(entries)} file hashes",
+        )
+
+
+class FileHashBatch:
+    """The file-hash entries one command collects across its targets, by state directory.
+
+    ``save`` writes each directory's entries once (``save_file_hashes``), so a checkout or get of
+    many targets costs one write transaction and one fdatasync per state directory, not one per
+    target. Restores running in several threads may ``add`` at once.
+    """
+
+    def __init__(self) -> None:
+        self._lock: threading.Lock = threading.Lock()
+        self._by_dir: dict[pathlib.Path, list[tuple[pathlib.Path, os.stat_result, str]]] = {}
+
+    def add(
+        self, state_dir: pathlib.Path, entries: list[tuple[pathlib.Path, os.stat_result, str]]
+    ) -> None:
+        """Collect ``entries`` for ``state_dir``'s StateDB."""
+        if not entries:
+            return
+        with self._lock:
+            self._by_dir.setdefault(state_dir, []).extend(entries)
+
+    def save(self) -> None:
+        """Save what was collected, once per state directory, and start empty again."""
+        with self._lock:
+            by_dir, self._by_dir = self._by_dir, {}
+        for state_dir, entries in by_dir.items():
+            save_file_hashes(state_dir, entries)

@@ -8,6 +8,7 @@ state-directory transitions and effective cache; nothing here imports ``pivot.co
 import contextlib
 import contextvars
 import copy
+import errno
 import logging
 import os
 import pathlib
@@ -743,7 +744,15 @@ def create_gitignore_if_absent(path: pathlib.Path) -> bool:
 
 
 def make_state_dir(state_dir: pathlib.Path) -> pathlib.Path:
-    """Create ``state_dir`` and its default ignore file when this call makes the directory."""
+    """Create ``state_dir`` and its default ignore file when this call makes the directory.
+
+    A path holding a NUL byte cannot become a directory, so creating it fails with an
+    ``OSError``, as for any path that cannot (``state_dir_target_problem``), not with the
+    ``ValueError`` the kernel interface raises: a best-effort writer then skips it as it skips
+    every other unusable state directory.
+    """
+    if "\0" in os.fspath(state_dir):
+        raise OSError(errno.EINVAL, "core.state_dir holds a NUL byte", os.fspath(state_dir))
     try:
         state_dir.mkdir(parents=True)
     except FileExistsError:

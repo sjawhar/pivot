@@ -577,8 +577,10 @@ def _restore_tracked_file(
     path: pathlib.Path,
     track_data: track.PvtData,
     cache_dir: pathlib.Path,
+    recorded: list[tuple[pathlib.Path, os.stat_result, str]],
 ) -> bool:
-    """Restore a tracked file from cache.
+    """Restore a tracked file from cache, appending each file restored to ``recorded`` for the
+    caller to record in the StateDB (``cache.restore_from_cache``).
 
     Returns True if successfully restored, False if not in cache.
     """
@@ -592,6 +594,7 @@ def _restore_tracked_file(
         cache_dir,
         checkout_modes=checkout_modes,
         state_dir=config.get_state_dir(),
+        recorded=recorded,
     )
 
 
@@ -613,22 +616,28 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     missing = list[str]()
     cache_dir = config.get_cache_dir() / "files"
 
-    with state_mod.StateDB(config.get_state_dir()) as state_db:
+    # Located, not created: the save makes the state directory #503's resolver chose only when it
+    # has a hash to save.
+    state_dir = config.locate_state_dir()
+    pending = list[tuple[pathlib.Path, os.stat_result, str]]()
+    with state_mod.open_readonly(state_dir, create=False) as state_db:
         for data_path, track_data in tracked_files.items():
             path = pathlib.Path(data_path)
 
             # Try to hash the file - handles race conditions where file disappears
             try:
                 if path.is_file():
-                    current_hash, _ = cache.hash_file(path, state_db)
+                    current_hash, _ = cache.hash_file(path, state_db, pending=pending)
                 elif path.is_dir():
-                    current_hash = cache.hash_directory(path, state_db, cache_dir=cache_dir)["hash"]
+                    current_hash = cache.hash_directory(
+                        path, state_db, cache_dir=cache_dir, pending=pending
+                    )["hash"]
                 else:
                     # Path doesn't exist
                     raise FileNotFoundError(data_path)
             except FileNotFoundError:
                 if checkout_missing:
-                    if _restore_tracked_file(path, track_data, cache_dir):
+                    if _restore_tracked_file(path, track_data, cache_dir, pending):
                         logger.info(f"Restored tracked file: {data_path}")
                     else:
                         logger.debug(f"Failed to restore tracked file from cache: {data_path}")
@@ -643,6 +652,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                     f"Tracked file '{data_path}' has changed since tracking. "
                     + f"Run 'pivot track --force {track_data['path']}' to update."
                 )
+    state_mod.save_file_hashes(state_dir, pending)
 
     metrics.end("core.verify_tracked_files", _t)
     if missing:

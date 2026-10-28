@@ -48,10 +48,10 @@ Each data type gets methods that use the appropriate prefix:
 
 ```python
 def _make_key_file_hash(path: pathlib.Path) -> bytes:
-    return _HASH_PREFIX + str(path.resolve()).encode()
+    return _HASH_PREFIX + os.fsencode(os.path.abspath(path))
 
-def _make_key_output_generation(path: pathlib.Path) -> bytes:
-    return _GEN_PREFIX + os.path.normpath(path.absolute()).encode()
+def _make_key_output_generation(identity: str) -> bytes:
+    return _GEN_PREFIX + identity.encode()
 
 def _make_key_dep_generation(stage_name: str, dep_path: str) -> bytes:
     return _DEP_PREFIX + f"{stage_name}:{dep_path}".encode()

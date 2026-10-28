@@ -70,11 +70,11 @@ Workers compute dependency generations via `compute_dep_generation_map()` and re
 
 ## File-Hash Write-Back
 
-Workers open StateDB in **readonly mode** during execution to avoid write contention. However, dependency hashing produces file hash entries (path, mtime_ns, size, inode, hash) that should be cached in StateDB for future O(1) lookups.
+Workers open StateDB in **readonly mode** during execution to avoid write contention. However, dependency hashing produces file hash entries (path, mtime_ns, size, dev, inode, hash) that should be cached in StateDB for future O(1) lookups.
 
 The solution: workers collect these entries in `file_hash_entries` (returned from `hash_dependencies()`) and include them in `DeferredWrites`. The coordinator writes them back to StateDB after stage completion via `apply_deferred_writes()`. This gives the performance benefit of hash caching without requiring workers to hold write locks on StateDB.
 
-`DeferredWrites.file_hash_entries` is a list of `(path, mtime_ns, size, inode, hash)` tuples. The coordinator writes these entries back to StateDB as provided. If a file changed between the worker's read and the coordinator's write, the entry may contain stale metadata — the next run will detect the mismatch and re-hash (self-healing).
+`DeferredWrites.file_hash_entries` is a list of `(path, mtime_ns, size, dev, inode, hash)` tuples (`types.FileHashEntry`). The coordinator writes these entries back to StateDB as provided. If a file changed between the worker's read and the coordinator's write, the entry may contain stale metadata — the next run will detect the mismatch and re-hash (self-healing).
 
 ## Logical Path vs Physical Identity
 
@@ -82,9 +82,9 @@ Lock files and StateDB use different path semantics:
 
 - **Lock files** store project-relative paths. In memory, paths are first normalized to absolute form via `project.normalize_path()`, and `storage/lock.py` converts between those absolute paths and the project-relative paths written to (and read from) the lock file. Symlinks are preserved. Using project-relative paths ensures portability across machines and stable lock file content.
 
-- **StateDB file hash cache** uses `path.resolve()` (follows symlinks) for the key. This means multiple symlinks to the same physical file share one cached hash entry, avoiding redundant hashing.
+- **StateDB file hash cache** keys an entry by the absolute path as given (`os.fsencode(os.path.abspath(path))`), with no symlink followed. The entry holds the `(mtime_ns, size, device, inode)` of a `stat()` that follows symlinks, so two links to one file hold two entries, and a link re-pointed at another file, on this filesystem or another, no longer matches.
 
-- **StateDB generation counters** use `os.path.normpath(path.absolute())` (preserves symlinks). This tracks the *logical* path the user declared, not where symlinks point. This is important because Pivot outputs become symlinks to cache after execution — `resolve()` would follow them to cache paths that change per-run.
+- **StateDB generation counters** are keyed by the artifact identity (`stage` or `stage:key`), not a path, so a key never moves when an output becomes a symlink into the cache.
 
 ## Manifest Cache
 

@@ -149,14 +149,14 @@ restored.
 Pivot uses a two-level strategy for detecting file changes in dependencies and
 outputs Pivot committed:
 
-1. **Stat check** — compare `(mtime_ns, size, inode)` against the
-   StateDB cache. If all three match, reuse the cached hash (no I/O).
+1. **Stat check** — compare `(mtime_ns, size, device, inode)` against the
+   StateDB cache. If all four match, reuse the cached hash (no I/O).
 2. **Content hash** — if stat differs, read the file and compute
    `xxhash64`. Store the new stat + hash in StateDB for next time.
 
 This gives O(1) skip detection for unchanged files while remaining
 correct when files do change (content hash is the source of truth).
-The fast path cannot detect an edit that preserves the size, inode, and
+The fast path cannot detect an edit that preserves the size, inode, device and
 mtime, such as a tool that restores the original mtime. Pivot detects the
 file after its metadata changes. Run `pivot repro --force <stage>` to rewrite
 the stage's output.

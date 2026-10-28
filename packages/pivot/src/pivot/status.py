@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+import os
 import pathlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, cast
@@ -358,18 +359,24 @@ def get_tracked_files_status(
     total = len(tracked)
     results = list[TrackedFileInfo]()
 
-    # Use state_db for hash caching (mtime-based)
+    # Look hashes up read-only and save what was read once, best-effort, so a hash cache that
+    # cannot be opened or written never fails status. Both directories are located, not created:
+    # the save makes the state directory #503's resolver chose only when it has a hash to save.
     cache_dir = config.locate_cache_dir() / "files"
-    with state_mod.StateDB(config.locate_state_dir()) as state_db:
+    state_dir = config.locate_state_dir()
+    pending = list[tuple[pathlib.Path, os.stat_result, str]]()
+    with state_mod.open_readonly(state_dir, create=False) as state_db:
         for i, (abs_path_str, track_data) in enumerate(sorted(tracked.items()), 1):
             path = pathlib.Path(abs_path_str)
             rel_path = str(path.relative_to(project_root))
 
             try:
                 if path.is_dir():
-                    current_hash = cache.hash_directory(path, state_db, cache_dir=cache_dir)["hash"]
+                    current_hash = cache.hash_directory(
+                        path, state_db, cache_dir=cache_dir, pending=pending
+                    )["hash"]
                 else:
-                    current_hash, _ = cache.hash_file(path, state_db)
+                    current_hash, _ = cache.hash_file(path, state_db, pending=pending)
             except FileNotFoundError:
                 results.append(
                     TrackedFileInfo(
@@ -393,6 +400,7 @@ def get_tracked_files_status(
             )
             if on_progress is not None:
                 on_progress(i, total)
+    state_mod.save_file_hashes(state_dir, pending)
 
     return results
 

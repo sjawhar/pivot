@@ -754,3 +754,20 @@ def test_fetch_and_pull_download_under_an_empty_state_dir(
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
     assert "1 transferred" in output, output
+
+
+def test_track_under_a_nul_byte_value_tracks_as_on_052(tmp_path: pathlib.Path) -> None:
+    """A ``core.state_dir`` holding a NUL byte names a path that cannot become a directory, so
+    ``track`` tracks, as 0.5.2 does: the hash cache it would have written there is skipped, with
+    no ``ValueError`` from creating the directory."""
+    home = tmp_path / "home"
+    root = _project(home, tmp_path / "project", "input\n")
+    (root / ".pivot" / "config.yaml").write_text('core:\n  state_dir: "state\\0dir"\n')
+
+    result = helpers.run_pivot(root, home, "track", "data/raw/input.txt")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "Tracked: data/raw/input.txt" in result.stdout, output
+    assert "ValueError" not in output, output
+    assert (root / "data" / "raw" / "input.txt.pvt").is_file()
