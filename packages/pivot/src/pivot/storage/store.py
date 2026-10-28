@@ -260,6 +260,22 @@ class WorkspaceStore:
             lambda path: ownership.stage_members(path, claims, returned=written.get(path)),
         )
 
+    def _write_target(
+        self,
+        ref: types.ArtifactRef,
+        claims: ownership.StageClaims | None,
+        returned: ownership.StageMembers | None,
+    ) -> ownership.ForcedRestore:
+        """The forced-restore target for a stage write of ``ref``: its own ``*.pvt`` files are
+        ``ownership.stage_members`` of ``claims`` and of what this run writes (``returned``)."""
+        output_path = ownership.normalized(self._resolve_output_path(ref))
+        return ownership.ForcedRestore(
+            replacement=ownership.stage_output(output_path, ref.identity.producer),
+            restored=None,
+            claims=None if claims is None else lambda: claims,
+            written={} if returned is None else returned,
+        )
+
     def refuse_output_replacement_at_write(
         self,
         ref: types.ArtifactRef,
@@ -269,13 +285,7 @@ class WorkspaceStore:
         """Run the forced-restore refusal after an output is prepared and before its writer
         writes, so a user file that landed in that window is named instead of becoming a loader
         error."""
-        output_path = ownership.normalized(self._resolve_output_path(ref))
-        target = ownership.ForcedRestore(
-            replacement=ownership.stage_output(output_path, ref.identity.producer),
-            restored=None,
-            claims=None if claims is None else lambda: claims,
-            written={} if returned is None else returned,
-        )
+        target = self._write_target(ref, claims, returned)
         refusal = ownership.forced_restore_refusal(self._project_root, [target])
         if refusal is not None:
             raise refusal
@@ -289,10 +299,9 @@ class WorkspaceStore:
         """Clear the output's path for the stage to write, refusing first if that would remove
         a user's file (``refuse_output_replacements``).
 
-        A user's file copied into a directory output after that check, while the output is being
-        removed, keeps the directory from being removed. When the removal fails, the forced-restore
-        refusal runs on what remains and names that file; only if it finds none does the removal's
-        own error propagate. Nothing more is deleted to make the removal succeed.
+        The old output is renamed aside before it is removed, and checked again there
+        (``cache.remove_output_checked``, ``ownership.swap_refusal``), so a user's file copied
+        into it after the first check is named and put back with the output, never deleted.
         """
         self.refuse_output_replacements(
             [ref], claims, None if returned is None else {ref: returned}
@@ -300,11 +309,14 @@ class WorkspaceStore:
         path = self._resolve_path(ref)
         if ref.tag != types.ArtifactTag.DIRECTORY:
             path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            cache.remove_output(path)
-        except OSError:
-            self.refuse_output_replacement_at_write(ref, claims, returned)
-            raise
+        target = self._write_target(ref, claims, returned)
+
+        def refuse_moved(entry: pathlib.Path) -> None:
+            refusal = ownership.swap_refusal(self._project_root, target, entry)
+            if refusal is not None:
+                raise refusal
+
+        cache.remove_output_checked(path, refuse_moved)
         if ref.tag == types.ArtifactTag.DIRECTORY:
             path.mkdir(parents=True, exist_ok=True)
         return path

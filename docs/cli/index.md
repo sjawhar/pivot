@@ -476,11 +476,12 @@ outputs. A file tracked or imported inside an output before this check stays whe
 `pivot status` and `pivot repro` (with `--all` for another pipeline's output) warn once per run
 naming it, `pivot track --force` updates it in place with the same warning, and any stage write,
 restore, `pivot commit`, forced checkout or forced `pivot get` that would remove it or its `.pvt`
-sidecar fails before changing anything. A tracked file and sidecar copied into a stage's directory
-output while a run is clearing that output fail the stage the same way, naming them; both stay,
-though part of the old output may already be gone. A forced restore of a tracked directory (or of
-a tracked file over a directory) likewise fails before it would remove another tracked file,
-import or `.pvt` sidecar beneath it. A restore requested through a stage name restores that
+sidecar fails before changing anything. A tracked file and sidecar copied into a stage's output
+while a run is clearing that output fail the stage the same way, naming them: Pivot renames the
+old output aside and checks it again before deleting it, and puts it back, with both files, when
+it finds them. A forced restore of a tracked directory (or of a tracked file over a directory)
+likewise fails before it would remove another tracked file, import or `.pvt` sidecar beneath it.
+A restore requested through a stage name restores that
 stage's output, so a tracked file at that output's path makes it fail too. Move the file and its
 `.pvt` sidecar outside the output (for example under `data/raw/`). The check finds a sidecar
 beside its file, where Pivot writes it; a hand-edited `.pvt` elsewhere whose `path` points into an

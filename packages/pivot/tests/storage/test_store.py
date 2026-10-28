@@ -14,7 +14,7 @@ from pivot import config, exceptions, loaders, types
 from pivot.storage import cache, ownership, store, track
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterable, Mapping
 
 
 def _helper_ref(
@@ -239,33 +239,21 @@ def test_workspace_store_names_a_late_tracked_file_before_the_stage_writer_runs(
     assert "data/stage" in message
 
 
-def _land_during_output_removal(
-    monkeypatch: pytest.MonkeyPatch, land: Callable[[], object]
-) -> Callable[[], bool]:
-    """Run ``land`` at the removal's first unlink: ``shutil.rmtree`` has listed the output's
-    entries by then, so what ``land`` adds is not removed and the output's ``rmdir`` fails."""
-    original_unlink = os.unlink
-    landed = False
-
-    def unlink_after_landing(
-        path: str | bytes | os.PathLike[str] | os.PathLike[bytes], *, dir_fd: int | None = None
-    ) -> None:
-        nonlocal landed
-        if not landed:
-            landed = True
-            land()
-        original_unlink(path, dir_fd=dir_fd)
-
-    monkeypatch.setattr(os, "unlink", unlink_after_landing)
-    return lambda: landed
+def _copy_user_file(user_file: pathlib.Path) -> None:
+    """Copy a user's tracked file and its sidecar to ``user_file``, as a user would by hand."""
+    user_file.write_text("user bytes")
+    track.write_pvt_file(
+        track.get_pvt_path(user_file),
+        track.PvtData(path=user_file.name, hash="0123456789abcdef", size=10),
+    )
 
 
-def test_workspace_store_names_a_tracked_file_that_lands_while_its_output_is_removed(
+def test_workspace_store_keeps_a_tracked_file_copied_in_after_the_prepare_check(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A user file and sidecar copied into a directory output after prepare_output's check, while
-    the old output is being removed, stop the removal: the store refuses with the forced-restore
-    message naming them and the output, not "Directory not empty", and keeps both."""
+    """A user file and sidecar copied into a directory output after prepare_output's first check,
+    before the old output is removed, are found once the output is renamed aside: the store
+    refuses naming them and the output, and puts them back with the output, never deleted."""
     workspace_store = store.WorkspaceStore(
         project_root=tmp_path,
         pipeline_name="pipe",
@@ -277,49 +265,92 @@ def test_workspace_store_names_a_tracked_file_that_lands_while_its_output_is_rem
     for index in range(3):
         (output_path / f"f{index}.txt").write_text(f"stage {index}")
     user_file = output_path / "user.txt"
+    first_check = workspace_store.refuse_output_replacements
 
-    def copy_user_file() -> None:
-        user_file.write_text("user bytes")
-        track.write_pvt_file(
-            track.get_pvt_path(user_file),
-            track.PvtData(path="user.txt", hash="0123456789abcdef", size=10),
-        )
+    def check_then_copy_user_file(
+        refs: Iterable[types.ArtifactRef],
+        claims: ownership.StageClaims | None = None,
+        returned: Mapping[types.ArtifactRef, ownership.StageMembers] | None = None,
+    ) -> None:
+        first_check(refs, claims, returned)
+        _copy_user_file(user_file)
 
-    landed = _land_during_output_removal(monkeypatch, copy_user_file)
+    monkeypatch.setattr(workspace_store, "refuse_output_replacements", check_then_copy_user_file)
 
-    with pytest.raises(exceptions.OutputOwnershipError) as error:
+    refusal: exceptions.OutputOwnershipError | None = None
+    try:
         workspace_store.prepare_output(ref)
+    except exceptions.OutputOwnershipError as error:
+        refusal = error
 
-    assert landed()
-    message = str(error.value)
+    left = sorted(path.name for path in output_path.iterdir()) if output_path.is_dir() else []
+    assert user_file.is_file(), f"the user file was deleted; the output holds {left}"
+    assert track.get_pvt_path(user_file).is_file(), f"the sidecar was deleted; output: {left}"
+    assert user_file.read_text() == "user bytes"
+    assert refusal is not None
+    message = str(refusal)
     assert "user.txt.pvt" in message
     assert "data/stage" in message
-    assert "Directory not empty" not in message
-    assert user_file.read_text() == "user bytes"
-    assert track.get_pvt_path(user_file).is_file()
-    assert sorted(path.name for path in output_path.iterdir()) == ["user.txt", "user.txt.pvt"]
+    assert left == ["f0.txt", "f1.txt", "f2.txt", "user.txt", "user.txt.pvt"]
+    assert not list(output_path.parent.glob(".pivot_backup_*"))
 
 
-def test_workspace_store_raises_the_removal_error_when_no_user_file_blocks_it(
+def test_workspace_store_puts_the_output_back_when_its_removal_fails(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A file that is no user's (no sidecar) landing in the output while it is removed is not a
-    refusal: the removal's own error propagates."""
+    """When removing the renamed-aside output fails with no user file in it (here a file added to
+    it through an open handle after its check), the output goes back to its path and the
+    removal's own error propagates."""
     workspace_store = store.WorkspaceStore(
         project_root=tmp_path, pipeline_name="pipe", input_bindings={}
     )
     ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
     output_path = workspace_store.prepare_output(ref)
     (output_path / "f0.txt").write_text("stage")
-    stray = output_path / "stray.txt"
-    landed = _land_during_output_removal(monkeypatch, lambda: stray.write_text("stray"))
+    original_unlink = os.unlink
+    landed = list[pathlib.Path]()
+
+    def unlink_after_a_stray_file_lands(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes], *, dir_fd: int | None = None
+    ) -> None:
+        if not landed:
+            # shutil.rmtree has listed the backup: a file added to it now fails its rmdir
+            (backup,) = output_path.parent.glob(".pivot_backup_*")
+            landed.append(backup)
+            (backup / "stray.txt").write_text("stray")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", unlink_after_a_stray_file_lands)
 
     with pytest.raises(OSError, match="Directory not empty") as error:
         workspace_store.prepare_output(ref)
 
-    assert landed()
+    assert len(landed) == 1
+    # The restore token's backup name: the next directory restore of the path checks a killed
+    # run's backup before removing it (cache._cleanup_fresh_restore_orphans)
+    assert landed[0].name.startswith(f".pivot_backup_{cache._restore_target_token(output_path)}.")
     assert error.value.errno == errno.ENOTEMPTY
-    assert stray.read_text() == "stray"
+    assert (output_path / "stray.txt").read_text() == "stray"
+    assert not list(output_path.parent.glob(".pivot_backup_*"))
+
+
+def test_prepare_output_clears_a_directory_output_in_a_read_only_parent(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Renaming the old output aside makes a read-only parent writable, as removing it did."""
+    workspace_store = store.WorkspaceStore(tmp_path, "pipe", {})
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
+    output_path = workspace_store.prepare_output(ref)
+    (output_path / "old.txt").write_text("old")
+    parent_mode = output_path.parent.stat().st_mode
+    os.chmod(output_path.parent, stat.S_IRUSR | stat.S_IXUSR)
+    try:
+        result = workspace_store.prepare_output(ref)
+    finally:
+        os.chmod(output_path.parent, parent_mode)
+
+    assert result == output_path
+    assert list(output_path.iterdir()) == []
 
 
 def test_workspace_store_restore_records_pvt_members_before_writing_them(

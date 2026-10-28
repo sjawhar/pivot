@@ -2248,6 +2248,44 @@ def _put_back_checked(moved: pathlib.Path, path: pathlib.Path) -> None:
     logger.warning("Could not put %s back (%s); it is at %s", path, reason, kept)
 
 
+def remove_output_checked(
+    path: pathlib.Path, before_remove: Callable[[pathlib.Path], None]
+) -> None:
+    """Remove the entry at ``path`` once ``before_remove`` has checked it, renamed aside.
+
+    The entry is first renamed beside ``path`` under the backup name a restore of ``path`` uses
+    (``_backup_path``): once renamed, no writer that names its files by path can add one to it,
+    so ``before_remove`` sees every file the removal deletes. When the check raises, the entry
+    goes back (``_put_back_checked``) and the error propagates. Otherwise the backup is removed;
+    if that fails, what is left of it goes back and the error propagates. A process killed in
+    between leaves the backup beside ``path``, where the next directory restore of ``path``
+    checks it before removing it (``_cleanup_fresh_restore_orphans``).
+    """
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        # Nothing at path, the common case of a first run: one lstat answers it
+        return
+    backup_path = _backup_path(path, _restore_target_token(path))
+    try:
+        path.rename(backup_path)
+    except FileNotFoundError:
+        return
+    except PermissionError:
+        # As _clear_path does: make the parent directory writable, never the entry itself
+        parent_mode = path.parent.stat().st_mode
+        if parent_mode & stat.S_IWUSR:
+            raise
+        os.chmod(path.parent, parent_mode | stat.S_IWUSR)
+        path.rename(backup_path)
+    try:
+        before_remove(backup_path)
+        _clear_path(backup_path)
+    except BaseException:
+        _put_back_checked(backup_path, path)
+        raise
+
+
 def remove_output(path: pathlib.Path) -> None:
     """Remove output file or directory before execution."""
     _clear_path(path)

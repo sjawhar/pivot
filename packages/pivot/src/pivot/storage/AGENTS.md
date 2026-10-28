@@ -282,14 +282,17 @@ When multiple `pivot` processes share the same StateDB:
 - A forced restore checks each target three times: with every target before any is changed, under
   its restore lock before its replacement is built, and at its swap over the entry it removes,
   renamed aside where a directory is involved. A run-cache, generation or incremental output
-  restore and repro's restore of a missing tracked file make the same swap check. A stage writer
-  calls `WorkspaceStore.refuse_output_replacement_at_write` after `prepare_output` and before
-  its loader writes, so a user file that lands in that window is refused with the same target and
-  sidecar message rather than leaking a loader's "Directory not empty" error. `prepare_output`
-  makes the same check when its removal of the old output fails, as it does when a user file
-  copied in during the removal keeps the directory from being removed: it refuses naming that
-  file, raises the removal's own error only when the check finds none, and never deletes more to
-  make the removal succeed. Once a swap renames an entry aside, no writer that names its files by
+  restore and repro's restore of a missing tracked file make the same swap check. A stage write
+  clears its old output the same way: `WorkspaceStore.prepare_output` renames the entry at the
+  output's path aside, beside it, under the path's backup name (`cache.remove_output_checked`,
+  `cache._backup_path`), checks it there (`ownership.swap_refusal`), and removes it only when the
+  check finds no user file; when the check refuses, the entry goes back to its path
+  (`cache._put_back_checked`) and the refusal names the file. When removing the backup fails, what
+  is left of it goes back and the removal's own error propagates. A stage writer then calls
+  `WorkspaceStore.refuse_output_replacement_at_write` after `prepare_output` and before its
+  loader writes, so a user file that lands in the new, empty output is refused with the same
+  target and sidecar message rather than leaking a loader's "Directory not empty" error. Once a
+  swap or a stage write renames an entry aside, no writer that names its files by
   path can add one to that entry, so a file copied into a target while the command runs refuses
   that target. What the swap can still miss: a writer holding an open handle on a directory inside
   the target (its working directory, or a directory descriptor), which can add a file to the
@@ -309,9 +312,11 @@ When multiple `pivot` processes share the same StateDB:
   at its path is renamed aside and checked, including one made after a file target's check. An
   entry the check refuses goes back to its path; when something took the path meanwhile, it is
   renamed to `<name>.pivot-kept-<hex>` beside it and a warning names it, never left under the
-  backup name a later restore considers. Stage writes, symlink-mode commits and presentation still
-  check when they start replacing an output; `track` and `import` refuse to create a sidecar inside
-  an output, so only a file copied or made by hand can appear there.
+  backup name a later restore considers. A stage write killed between renaming its old output
+  aside and removing it leaves the same backup, which the next directory restore of that path
+  checks the same way. Symlink-mode commits and presentation still check when they start
+  replacing an output; `track` and `import` refuse to create a sidecar inside an output, so only a
+  file copied or made by hand can appear there.
 - `track` and `import` load every pipeline (`discovery.declared_outputs`, as `--all` discovers
   them) and refuse a new path overlapping any declared output, naming the stage. A `pipeline.py`
   that fails to load fails them; one that loads but defines no Pivot pipeline declares nothing. A
