@@ -58,7 +58,7 @@ more, until a command that writes the workspace records it.
 ## Replicas: finding an entry by the file's identity
 
 A replica of a project made outside pivot holds the original's state database: BET's replica
-hard-links pivot's read-only outputs and copies the rest, `.pivot/state.lmdb` included, and
+hard-links pivot's read-only outputs and copies the rest, `<state dir>/state.lmdb` included, and
 `cp -al` hard-links even the database, so the two share it. Its `hash:` keys name the
 original's paths. The replica's hard-linked outputs are the very inodes those entries
 describe, yet a lookup by the replica's path misses, so on BET's 180,000-file replicas every

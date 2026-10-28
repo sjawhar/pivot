@@ -22,6 +22,7 @@ import lmdb
 import xxhash
 
 from pivot import exceptions, metrics
+from pivot import state_dir as state_dir_mod
 from pivot.config import CheckoutMode as CheckoutMode
 from pivot.types import DirHash, DirManifestEntry, FileHash, FileHashEntry, HashInfo, is_dir_hash
 
@@ -60,7 +61,7 @@ def restore_staging_path(path: pathlib.Path, token: str | None = None) -> pathli
 def _get_lock_path_from_token(token: str, state_dir: pathlib.Path) -> pathlib.Path:
     """Get a restore lock path from a previously resolved target token."""
     lock_dir = state_dir / "locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
+    state_dir_mod.make_dirs(lock_dir)
     return lock_dir / f"{_RESTORE_LOCK_PREFIX}{token}"
 
 
@@ -118,7 +119,7 @@ def atomic_write_file(
         The written file's stat, taken before it replaced ``dest`` (the same inode), so a
         write after the replacement does not match it.
     """
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    state_dir_mod.make_dirs(dest.parent)
     if staging_path is None:
         fd, tmp_path = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
         tmp = pathlib.Path(tmp_path)
@@ -525,15 +526,52 @@ def is_valid_hash(value: object) -> bool:
 
 
 def get_cache_path(cache_dir: pathlib.Path, file_hash: str) -> pathlib.Path:
-    """Get cache path for a hash (XX/XXXX... structure)."""
+    """Return the configured cache path for a hash, for writers and primary-cache reads."""
     if len(file_hash) != XXHASH64_HEX_LENGTH:
         raise exceptions.SecurityValidationError(
             f"Hash must be exactly {XXHASH64_HEX_LENGTH} characters, got {len(file_hash)}"
         )
-    # Prevents path traversal via malicious hashes
     if not is_valid_hash(file_hash):
         raise exceptions.SecurityValidationError(f"Hash contains invalid characters: {file_hash!r}")
     return cache_dir / file_hash[:2] / file_hash[2:]
+
+
+# The errnos for which `Path.exists()` reports a path as missing: CPython 3.13
+# `pathlib/_abc.py:31` (`_IGNORED_ERRNOS`). A prefix that is a regular file (ENOTDIR) or a symlink
+# loop (ELOOP) makes the object missing, as it did on 0.5.2; any other error, such as EACCES, raises.
+_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
+
+
+def is_cache_object_path(path: pathlib.Path, *, directory: bool = False) -> bool:
+    """Whether a resolver or scan may treat a final cache file or tree root as present."""
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError as e:
+        if e.errno in _ABSENT_ERRNOS:
+            return False
+        raise
+    expected = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected(mode):
+        kind = "directory tree" if directory else "regular file"
+        logger.debug("Ignoring cache object %s: expected %s", path, kind)
+        return False
+    return True
+
+
+def resolve_cache_object_path(
+    cache_dir: pathlib.Path, file_hash: str, *, directory: bool = False
+) -> pathlib.Path | None:
+    """Return an existing regular object or requested tree root, or ``None`` when absent."""
+    cache_path = get_cache_path(cache_dir, file_hash)
+    if is_cache_object_path(cache_path, directory=directory):
+        return cache_path
+    other_files_dir = state_dir_mod.other_cache_files_dir_for(cache_dir)
+    if other_files_dir is not None:
+        other_path = get_cache_path(other_files_dir, file_hash)
+        if is_cache_object_path(other_path, directory=directory):
+            state_dir_mod.report_legacy_state_dir(cache_dir.parent.parent)
+            return other_path
+    return None
 
 
 def _make_writable_and_retry(func: Callable[[str], object], path: str, exc: BaseException) -> None:
@@ -807,7 +845,7 @@ def staged_cache_file(cache_path: pathlib.Path) -> Generator[pathlib.Path]:
     """An empty temporary file beside cache object ``cache_path`` to publish it from
     (``publish_cache_object``), removed on exit. A killed process's is swept (``_staging_in``).
     """
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    state_dir_mod.make_dirs(cache_path.parent)
     with _staging_in(cache_path.parent):
         fd, name = tempfile.mkstemp(prefix=_CACHE_TEMP_PREFIX, dir=cache_path.parent)
         os.close(fd)
@@ -1197,8 +1235,8 @@ def _repair_tree_dir_files(
         wrong.append((entry, target))
     if not wrong:
         return True
-    objects = [get_cache_path(cache_dir, entry["hash"]) for entry, _ in wrong]
-    if not all(obj.is_file() for obj in objects):
+    objects = [resolve_cache_object_path(cache_dir, entry["hash"]) for entry, _ in wrong]
+    if not all(obj is not None and obj.is_file() for obj in objects):
         return False
     modes = dict[pathlib.Path, int]()
 
@@ -1209,6 +1247,7 @@ def _repair_tree_dir_files(
 
     try:
         for (entry, target), obj in zip(wrong, objects, strict=True):
+            assert obj is not None
             existing = target.parent
             while not existing.exists():
                 existing = existing.parent
@@ -1390,12 +1429,13 @@ def missing_cache_objects(
 ) -> list[str]:
     """Return hashes required to restore an output that are absent from the cache.
 
-    With SYMLINK first, an existing whole-directory tree for a directory output is checked, and
-    repaired and marked if it can be, before it is trusted (``_ensure_tree_complete``)."""
+    With SYMLINK first, an existing whole-directory tree for a directory output is checked, never
+    repaired, before it is trusted (``_ensure_tree_complete``)."""
     if is_dir_hash(output_hash):
-        tree_path = get_cache_path(cache_dir, output_hash["hash"])
+        tree_path = resolve_cache_object_path(cache_dir, output_hash["hash"], directory=True)
         if (
             checkout_modes[0] == CheckoutMode.SYMLINK
+            and tree_path is not None
             and tree_path.exists()
             and _ensure_tree_complete(tree_path, output_hash, cache_dir, repair=False)
         ):
@@ -1403,7 +1443,12 @@ def missing_cache_objects(
         hashes = [entry["hash"] for entry in output_hash["manifest"]]
     else:
         hashes = [output_hash["hash"]]
-    return [file_hash for file_hash in hashes if not get_cache_path(cache_dir, file_hash).exists()]
+    return [
+        file_hash
+        for file_hash in hashes
+        if (cache_path := resolve_cache_object_path(cache_dir, file_hash)) is None
+        or not cache_path.exists()
+    ]
 
 
 def save_to_cache(
@@ -1493,13 +1538,16 @@ def _save_directory_to_cache(
 ) -> DirHash:
     """Save directory to cache."""
     output_hash = hash_directory(path, state_db, cache_dir=cache_dir)
-    # Idempotency check for SYMLINK mode: already linked to the tree its content hashes to
     if (
         checkout_modes
         and checkout_modes[0] == CheckoutMode.SYMLINK
         and path.is_symlink()
         and _get_symlink_cache_hash(path, cache_dir) == output_hash["hash"]
-        and get_cache_path(cache_dir, output_hash["hash"]).exists()
+        and (
+            cache_path := resolve_cache_object_path(cache_dir, output_hash["hash"], directory=True)
+        )
+        is not None
+        and cache_path.exists()
     ):
         return output_hash
 
@@ -1547,7 +1595,7 @@ def _publish_tree(
             and _cache_object_key(link, cache_dir) is None
         ]
 
-    cache_dir_path.parent.mkdir(parents=True, exist_ok=True)
+    state_dir_mod.make_dirs(cache_dir_path.parent)
     with _staging_in(cache_dir_path.parent):
         staged = pathlib.Path(
             tempfile.mkdtemp(prefix=_CACHE_TEMP_PREFIX, dir=cache_dir_path.parent)
@@ -1726,8 +1774,8 @@ def _restore_file_from_cache(
     With a state_dir, holds path's restore lock and stages the file under one name
     tagged with path's token, so the next restore removes what a killed one left.
     """
-    cache_path = get_cache_path(cache_dir, output_hash["hash"])
-    if not cache_path.exists():
+    cache_path = resolve_cache_object_path(cache_dir, output_hash["hash"])
+    if cache_path is None or not cache_path.exists():
         return False
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1765,11 +1813,15 @@ def _restore_directory_from_cache(
 ) -> bool:
     """Restore a directory atomically. ``recorded`` is as ``restore_from_cache`` says: each
     file's stat is taken in the tree or staging directory, before the swap puts it in place."""
-    cache_dir_path = get_cache_path(cache_dir, output_hash["hash"])
-    symlink_fast_path = checkout_modes[0] == CheckoutMode.SYMLINK and cache_dir_path.exists()
+    cache_dir_path = resolve_cache_object_path(cache_dir, output_hash["hash"], directory=True)
+    symlink_fast_path = (
+        checkout_modes[0] == CheckoutMode.SYMLINK
+        and cache_dir_path is not None
+        and cache_dir_path.exists()
+    )
     if not symlink_fast_path:
         for entry in output_hash["manifest"]:
-            if not get_cache_path(cache_dir, entry["hash"]).exists():
+            if resolve_cache_object_path(cache_dir, entry["hash"]) is None:
                 return False
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1792,24 +1844,26 @@ def _restore_directory_from_cache(
         _cleanup_fresh_restore_orphans(path, target_token)
     restore_prefix = f"{_RESTORE_TEMP_PREFIX}{target_token}."
 
-    if symlink_fast_path and not _ensure_tree_complete(
-        cache_dir_path, output_hash, cache_dir, repair=False
-    ):
-        # A restore only checks the tree, never repairs it toward the manifest it was given. A tree
-        # that does not hold that manifest exactly, or that this user cannot check, is not used:
-        # the output is restored file by file from the objects instead, if they are cached.
-        logger.warning(
-            "Cache tree %s was not checked to hold the manifest given for it, or differs from it, "
-            + "or cannot be read; restoring %s file by file",
-            cache_dir_path,
-            path,
-        )
-        symlink_fast_path = False
-        for entry in output_hash["manifest"]:
-            if not get_cache_path(cache_dir, entry["hash"]).exists():
-                return False
+    if symlink_fast_path:
+        assert cache_dir_path is not None
+        if not _ensure_tree_complete(cache_dir_path, output_hash, cache_dir, repair=False):
+            # A restore only checks the tree, never repairs it toward the manifest it was given. A
+            # tree that does not hold that manifest exactly, or that this user cannot check, is not
+            # used: the output is restored file by file from the objects instead, if they are
+            # cached.
+            logger.warning(
+                "Cache tree %s was not checked to hold the manifest given for it, or differs from "
+                + "it, or cannot be read; restoring %s file by file",
+                cache_dir_path,
+                path,
+            )
+            symlink_fast_path = False
+            for entry in output_hash["manifest"]:
+                if resolve_cache_object_path(cache_dir, entry["hash"]) is None:
+                    return False
 
     if symlink_fast_path:
+        assert cache_dir_path is not None
         temp_symlink = path.parent / f"{restore_prefix}symlink_{secrets.token_hex(4)}"
         try:
             tree_files = (
@@ -1835,18 +1889,20 @@ def _restore_directory_from_cache(
             if temp_symlink.is_symlink():
                 temp_symlink.unlink()
             for entry in output_hash["manifest"]:
-                if not get_cache_path(cache_dir, entry["hash"]).exists():
+                if resolve_cache_object_path(cache_dir, entry["hash"]) is None:
                     return False
 
     temp_path = pathlib.Path(tempfile.mkdtemp(prefix=restore_prefix, dir=path.parent))
+    resolved_temp = temp_path.resolve()
     backup_path = path.parent / f"{_BACKUP_TEMP_PREFIX}{target_token}.{secrets.token_hex(4)}"
     swap_completed = False
     backup_restore_failed = False
     restored = list[tuple[pathlib.Path, os.stat_result, str]]()
     try:
-        resolved_temp = temp_path.resolve()
         for file_count, entry in enumerate(output_hash["manifest"], start=1):
-            file_cache_path = get_cache_path(cache_dir, entry["hash"])
+            file_cache_path = resolve_cache_object_path(cache_dir, entry["hash"])
+            if file_cache_path is None:
+                return False
             file_path = temp_path / entry["relpath"]
             if not file_path.resolve().is_relative_to(resolved_temp):
                 raise exceptions.SecurityValidationError(
@@ -1930,11 +1986,10 @@ class MissingRestore(TypedDict):
 
 
 def _is_cached(cache_dir: pathlib.Path, content_hash: str | None) -> bool:
-    return (
-        content_hash is not None
-        and is_valid_hash(content_hash)
-        and get_cache_path(cache_dir, content_hash).exists()
-    )
+    if content_hash is None or not is_valid_hash(content_hash):
+        return False
+    cache_path = resolve_cache_object_path(cache_dir, content_hash)
+    return cache_path is not None and cache_path.exists()
 
 
 def _scan_entries(path: pathlib.Path) -> tuple[list[str], list[str]]:
@@ -2011,13 +2066,14 @@ def restore_missing_in_directory(
                 f"Manifest contains path traversal: {relpath!r}"
             )
 
-        file_cache_path = get_cache_path(cache_dir, entry["hash"])
+        resolved_cache_path = resolve_cache_object_path(cache_dir, entry["hash"])
+        file_cache_path = resolved_cache_path or get_cache_path(cache_dir, entry["hash"])
         if file_path.is_symlink():
             if not file_path.parent.resolve().is_relative_to(resolved_base):
                 raise exceptions.SecurityValidationError(
                     f"Manifest contains path traversal: {relpath!r}"
                 )
-            if file_path.resolve() == file_cache_path.resolve():
+            if resolved_cache_path is not None and file_path.resolve() == file_cache_path.resolve():
                 if not file_cache_path.exists():
                     missing.append((entry, file_path, file_cache_path))
                 elif pending is not None:
@@ -2030,7 +2086,7 @@ def restore_missing_in_directory(
                 changed[relpath] = None
                 continue
             file_stat = file_path.stat()
-            if _is_same_file(file_stat, file_cache_path):
+            if resolved_cache_path is not None and _is_same_file(file_stat, file_cache_path):
                 if pending is not None:
                     pending.append((file_path, file_stat, entry["hash"]))
                 continue

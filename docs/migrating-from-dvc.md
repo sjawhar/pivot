@@ -22,7 +22,7 @@ and the change detection of neither.
 | `foreach` / `matrix` stages | A Python loop in the `with Pipeline` block, optionally inside `pipeline.variant(name)` |
 | `vars:` and `${...}` interpolation | Python values in `pipeline.py` and `StageParams` fields |
 | Several `dvc.yaml` files | Several `pipeline.py` files; one imports another's handles |
-| `dvc.lock` | Per-stage lock files in `.pivot/stages/` |
+| `dvc.lock` | Per-stage lock files in `<state dir>/stages/` (`core.state_dir` defaults to `.pivot`) |
 | `dvc remote add` / `dvc push` / `dvc pull` | `pivot config set remotes.<name>` / `pivot push` / `pivot pull` |
 | `dvc repro`, `dvc status`, `dvc dag` | `pivot repro`, `pivot status`, `pivot dag` |
 | `dvc metrics show`, `dvc plots show`, `dvc params diff` | `pivot metrics show`, `pivot plots show`, `pivot params diff` |

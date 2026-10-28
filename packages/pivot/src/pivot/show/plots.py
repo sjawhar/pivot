@@ -8,6 +8,7 @@ import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
 from pivot import config, project, registry, types
+from pivot import state_dir as state_dir_mod
 from pivot.show import common
 from pivot.storage import cache, state
 from pivot.types import ChangeType, OutputFormat
@@ -81,7 +82,7 @@ def plot_state_dirs() -> dict[str, pathlib.Path]:
 
     store = cli_helpers.require_workspace_store()
     proj_root = project.get_project_root()
-    default_state_dir = config.get_state_dir()
+    default_state_dir = config.locate_state_dir()
     state_dirs = dict[str, pathlib.Path]()
     for stage_name, plot_outs in _plot_outs_by_stage().items():
         stage_info = cli_helpers.get_stage(stage_name)
@@ -105,7 +106,7 @@ def get_plot_hashes_from_workspace(
     best-effort write per state directory.
     """
     proj_root = project.get_project_root()
-    default_state_dir = config.get_state_dir()
+    default_state_dir = config.locate_state_dir()
     by_state_dir = dict[pathlib.Path, list[tuple[str, pathlib.Path]]]()
     for path_str in paths:
         path = proj_root / path_str
@@ -203,7 +204,7 @@ def render_plots_html(
     output_path: pathlib.Path,
 ) -> pathlib.Path:
     """Generate simple HTML image gallery."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    state_dir_mod.make_dirs(output_path.parent)
     proj_root = project.get_project_root()
 
     plot_divs = list[str]()

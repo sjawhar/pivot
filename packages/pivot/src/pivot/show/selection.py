@@ -103,7 +103,7 @@ def _diff_outputs(
             outs_by_stage[stage_name] = outs
 
     lock_data_by_stage = common.read_lock_files_from_head(list(outs_by_stage))
-    default_state_dir = config.get_state_dir()
+    default_state_dir = config.locate_state_dir()
     moved_heads = dict[str, tuple[types.HashInfo, list[str]]]()
     current = list[
         tuple[types.ArtifactRef, pathlib.Path, str, types.HashInfo | None, pathlib.Path]
@@ -364,7 +364,7 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
     head_hashes = dict[str, str | None]()
     workspace_hashes = dict[str, str]()
     workspace_paths = dict[str, pathlib.Path]()
-    cache_dir = config.get_cache_dir() / "files"
+    cache_dir = config.locate_cache_dir() / "files"
     selection, unresolved = _select_outputs(
         targets, outputs, paths_by_identity, stage_infos, proj_root
     )

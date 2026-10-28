@@ -8,12 +8,12 @@ fast as possible.
 ## Content-Addressable Cache
 
 Every output file is hashed with `xxhash64` and stored under
-`.pivot/cache/files/<hash[:2]>/<hash[2:]>` (a two-level directory structure
-using the first two hex characters as a prefix). The per-stage lock file
-records each output's content hash.
+`<state dir>/cache/files/<hash[:2]>/<hash[2:]>` (a two-level directory structure using the first
+two hex characters as a prefix). The per-stage lock file records each output's content hash.
+`<state dir>` is `core.state_dir`, which defaults to `.pivot`.
 
 ```
-.pivot/
+<state dir>/
   cache/
     files/
       a1/
@@ -162,7 +162,7 @@ file after its metadata changes. Run `pivot repro --force <stage>` to rewrite
 the stage's output.
 
 The StateDB entry is keyed by the file's path. A copy of a project made outside
-Pivot holds the original's `.pivot/state.lmdb`, whose entries name the original's
+Pivot holds the original's `<state dir>/state.lmdb`, whose entries name the original's
 paths: a copy that hard-links Pivot's read-only outputs and copies the database,
 or `cp -al`, which hard-links the database too, so the two share it. Pivot also
 finds an entry by the file's device and inode: a hard-linked output reuses the

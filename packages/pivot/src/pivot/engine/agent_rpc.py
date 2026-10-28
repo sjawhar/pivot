@@ -348,8 +348,9 @@ class AgentRpcHandler:
                         for ref in reg_info["deps"].values()
                         if ref.identity.producer in all_stages
                     }
+                    default_state_dir = config_io.locate_state_dir()
                     locks = explain_mod.read_locks(
-                        [stage, *producers], all_stages, config_io.get_state_dir()
+                        [stage, *producers], all_stages, default_state_dir
                     )
                     producer_hashes = explain_mod.producer_output_hashes(
                         locks[producer] for producer in producers
@@ -358,11 +359,9 @@ class AgentRpcHandler:
                         project_root=project.get_project_root(),
                         pipeline_name=pipeline.name,
                         input_bindings=pipeline.input_bindings,
-                        cache_dir=config_io.get_cache_dir() / "files",
+                        cache_dir=config_io.locate_cache_dir() / "files",
                     )
-                    state_dir = registry_mod.get_stage_state_dir(
-                        reg_info, config_io.get_state_dir()
-                    )
+                    state_dir = registry_mod.get_stage_state_dir(reg_info, default_state_dir)
                     file_hash_entries = list[types.FileHashEntry]()
                     explanation = explain_mod.get_stage_explanation(
                         stage_name=stage,

@@ -549,15 +549,18 @@ with Pipeline("show") as pipeline:
 def test_with_the_state_dir_elsewhere_each_command_saves_where_status_reads(
     tmp_path: pathlib.Path,
 ) -> None:
-    """With ``core.state_dir`` set elsewhere a stage keeps its state in ``.pivot``. `pivot diff`
-    (a directory output and a single-file output), `pivot plots diff` and a `--no-commit` run
-    save the hashes they read there, so the next diff and `pivot status` read none of them."""
+    """With ``core.state_dir`` set to ``.state``, every state file is there: the stage locks and
+    the state database (#503). `pivot diff` (a directory output and a single-file output),
+    `pivot plots diff` and a `--no-commit` run save the hashes they read in that database, so
+    the next diff and `pivot status` read none of them, and none creates a ``.pivot`` one."""
     root = (tmp_path / "live").resolve()
     root.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     _ok(_pivot(root, "init"))
     (root / "pipeline.py").write_text(_STATE_DIR_PIPELINE)
-    (root / ".gitignore").write_text("/data/\n/plots/\n/.state/\n__pycache__/\n")
+    # ``.state/.gitignore`` (written when the directory is made) keeps its database out of git
+    # and its stage locks in, as ``.pivot``'s does, so `pivot diff` reads the committed locks.
+    (root / ".gitignore").write_text("/data/\n/plots/\n__pycache__/\n")
     _ok(_pivot(root, "config", "set", "core.state_dir", ".state"))
     _ok(_pivot(root, "repro"))
     subprocess.run(["git", "add", "-A"], cwd=root, check=True)
@@ -568,6 +571,7 @@ def test_with_the_state_dir_elsewhere_each_command_saves_where_status_reads(
     )
     replica = tmp_path / "replica"
     _cp_r(root, replica)
+    assert (replica / ".state" / "stages").is_dir(), "The stage locks are in .state"
 
     first, _ = _helper_opens(replica, "data", tmp_path, "diff", "--no-tui", ".")
     assert len(first) == _FILES + 1, "A copy is a new file"
@@ -577,6 +581,8 @@ def test_with_the_state_dir_elsewhere_each_command_saves_where_status_reads(
 
     _ok(_pivot(replica, "repro", "--no-commit", "--force"))
     assert _helper_outputs_status_opens(replica, tmp_path) == [], "Status reads no output"
+    assert (replica / ".state" / "state.lmdb").is_dir()
+    assert not (replica / ".pivot" / "state.lmdb").exists(), "No command made a .pivot database"
 
 
 def _helper_outputs_status_opens(root: pathlib.Path, tmp_path: pathlib.Path) -> list[str]:

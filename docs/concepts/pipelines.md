@@ -37,10 +37,10 @@ Rules for `pipeline.py`:
 - Errors in the block (unsupported argument types, wrong arity) are collected
   and reported together when the block exits.
 
-`Pipeline(name, root=None)` takes the pipeline name. A pipeline always keeps its
-lock files and state in the project's `.pivot/` and its outputs in the project's
-`data/`, so `root` may only be the project root (the top-most directory that
-contains `.pivot/`) or omitted; discovery refuses any other `root`.
+`Pipeline(name, root=None)` takes the pipeline name. A pipeline keeps its lock files and state in
+the project's configured state directory and its outputs in the project's `data/`, so `root` may
+only be the project root (the top-most directory that contains `.pivot/`) or omitted; discovery
+refuses any other `root`.
 
 ### Where Pivot looks
 
@@ -105,9 +105,9 @@ variant and a full name overrides one (see [Parameters](parameters.md)).
 
 ## Several Pipelines
 
-Pipeline names must be unique within a project. A pipeline's name is the
-directory of its lock files (`.pivot/stages/<pipeline>/`) and outputs
-(`data/<pipeline>/`), so two pipelines with one name would share both.
+Pipeline names must be unique within a project. A pipeline's name is the directory of its lock
+files (`<state dir>/stages/<pipeline>/`) and outputs (`data/<pipeline>/`), so two pipelines with
+one name would share both.
 `pivot repro --all` refuses two `pipeline.py` files that declare the same
 name, and names both files.
 
@@ -147,11 +147,87 @@ and output formats, params, resources, variant and fingerprint settings; the
 error names the first difference and the source files. A pipeline cannot include
 itself.
 
+A pipeline resolves `core.state_dir` when it loads, and its stages, runs and
+caches all use that directory. That includes the fallback to `.pivot` when the
+value, or the path it names, cannot be used: a pipeline loaded while the path
+could not be used (a regular file, a dangling link, a directory it cannot write)
+keeps `.pivot` for everything it writes, whether or not the path can be used
+when it runs. A program that loads it gets the warning a `pivot` command prints,
+once per load, so `discover_pipeline(all_pipelines=True)` prints one line per
+pipeline file it loads. So `include()` refuses a pipeline loaded before an edit of
+`core.state_dir` (or of a symbolic link it names, or of whether the path it
+names can be used) into one loaded after it: the error names both directories.
+Load both pipelines after the change. The pipelines of one `pivot` command, or
+of one discovery, always share one directory.
+
 ## State and Cache Layout
+
+`core.state_dir` selects the state directory and defaults to `.pivot`. The `.pivot/` marker stays
+at the project root and holds the project configuration.
+
+A state directory belongs to one project. Set `core.state_dir` in the project's own
+`.pivot/config.yaml`: a value in the global config is ignored, with a warning. Never point two
+projects at the same directory, including with an absolute path. They would share lock files
+and overwrite each other's records of what ran, so each would see the other's stages as stale.
+
+`config get core.state_dir` shows the stored configuration value. It does not resolve the state
+directory, create anything, or warn when that stored value is unusable. `config list` likewise
+does not resolve state; it displays a validated merged configuration. As in Pivot 0.5.2, a
+non-string `core.state_dir` makes `config list` fail in one line that names the key and its
+expected string type. A command that reads or writes state does resolve it. If
+`.pivot/config.yaml` cannot be read, or its `core.state_dir` cannot be used or created as a
+writable, searchable directory (including a read-only directory), that command prints one
+warning naming the file and the problem. Pivot creates a configured state directory on its first
+write. Every state-using command that Pivot 0.5.2 ran keeps its exit code and uses the default
+`.pivot`; a state-using command that 0.5.2 failed still fails in one error line. The exception
+is a hand-edited empty value: `show` returns 0 because it reads the retained `.pivot` run
+history, and `history` reports that same history. `--quiet` silences the warning.
+
+A command decides once, when it first resolves the value, what a path that cannot be used
+means, and every part of the command, its worker processes included, takes that answer. A
+path Pivot 0.5.2 ran such a command with — one that already holds the database and the lock
+directory 0.5.2 opened, as a state directory that lost its write permission after a run does —
+falls back to `.pivot` for everything the command writes. Any other unusable path, including one
+whose lock directory 0.5.2 would have had to create, stays the command's state directory, so a
+command that opens it fails there with 0.5.2's error, as on 0.5.2.
+
+The fallback decides where Pivot **writes**; it never decides where Pivot **reads** state that
+already exists, because reading needs no write permission. So one project has at most two state
+directories to read, and Pivot reads the state that is current, whichever directory holds it:
+`pivot history` and `pivot show` merge the runs of both, newest first, and when both hold a lock
+for one stage, the current lock is the one the project's run records name (the newest run that
+ran or kept the stage, matched to a lock by the outputs its run-cache entry records), never the
+first directory's or the newer file's. So a run made while a configured directory had lost its
+write permission stays the current one after the permission returns, and `pivot status`,
+`pivot checkout` and a restore read its lock, not the older one left in that directory.
+
+When `core.state_dir` names another directory but `.pivot` holds stage locks or cache objects,
+Pivot reads a stage lock missing from the configured directory, and its cached objects, from
+`.pivot`. Earlier Pivot releases kept them there, and so does a run while `core.state_dir` is
+unset or cannot be used (an empty value, or a path that is not a writable directory). Pivot
+warns once per command and directs new writes to the configured state directory. The warning
+says how to move the locks: `mv <project>/.pivot/stages "<state dir>/stages"`, which works
+whether or not git tracks them, or, when `<state dir>/stages` already exists or `<state dir>`
+does not, to move the lock files into `<state dir>/stages`. Delete them instead if a run that
+could not use `core.state_dir` made them.
+
+When a stage's lock is in both directories and the one in the configured directory is current,
+the `.pivot` lock is never used again, but Pivot still reads both directories' run records to
+tell the two apart on every command that reads that stage. After the command, Pivot warns once
+and names every such `.pivot` lock with the command that removes them: `rm -r
+<project>/.pivot/stages` when every lock there is one of them, or `rm` of each one otherwise,
+run before moving any other lock out of `.pivot/stages`.
+
+Each of these warnings reports one cause, once per command. The notice about an ignored global
+`core.state_dir`, the notice about locks in `.pivot` and the notice about older `.pivot` locks
+report different facts, so a command can print more than one; a project value or path that
+cannot be used is the one exception, as its warning replaces the global notice.
 
 ```
 <project_root>/
   .pivot/
+    config.yaml
+  <state dir>/
     cache/files/       # Content-addressable cache (shared across pipelines)
     stages/<pipeline>/ # Per-stage lock files (commit these)
     state.lmdb/        # LMDB database (hashes, generations, run cache)
