@@ -1551,19 +1551,156 @@ outs:
 }
 
 
-def test_upgrade_from_0_5_8_reruns_nothing(tmp_path: pathlib.Path) -> None:
-    """A project with no mark that 0.5.8 ran to completion is all cached under this version,
-    from a fresh `.pivot/state.lmdb`. The comparison is of whole manifests, value by value, so
-    a change to any unmarked manifest value fails it."""
-    assert _LOCKS_0_5_8, "the 0.5.8 locks are not recorded"
+# The locks `pivot repro` with main 27488ddc wrote for `_UPGRADE`, in a fresh tree with a fresh
+# `.pivot/state.lmdb`. Pivot 0.5.17 and 0.5.18 from PyPI write the same locks.
+_LOCKS_MAIN_27488DDC = {
+    "area": """\
+schema_version: 2
+code_manifest:
+  class:lib.util.Box: 545ea4838dab4252
+  default:lib.util.Box.width: 6021b5621680598b
+  dep:text:loader:pivot.loaders.Text:empty: f346543fc28fb29c
+  dep:text:loader:pivot.loaders.Text:load: 69b78870ffe7932d
+  dep:text:loader:pivot.loaders.Text:save: 952962a56fe6457b
+  func:lib.util.Box.area: 99e24a5dad70eace
+  module:lib: ''
+  module:lib.util: ''
+  out:up/area:loader:pivot.loaders.YAML:config: cfc61af456ae42e3
+  out:up/area:loader:pivot.loaders.YAML:empty: a66d45b00a1a3a57
+  out:up/area:loader:pivot.loaders.YAML:load: 4a31bd3a307ad2f0
+  out:up/area:loader:pivot.loaders.YAML:save: c6f24c0f671b1819
+  out:up/area:tag: data
+  self:area: 3e6cc2221e9ed6c5
+  wire:text: in.txt
+  wire:text:path: data/raw/in.txt
+params: {}
+deps:
+- producer: in.txt
+  key: null
+  hash: d014bdbeea62a8b9
+outs:
+- key: null
+  hash: 15c3ec44bec25f26
+  path: data/up/area.yaml
+""",
+    "count": """\
+schema_version: 2
+code_manifest:
+  class:pipeline.CountParams: 11b98d3f45f56c21
+  const:lib.util.PATTERN: '["re.Pattern", "\\\\w+", 32]'
+  const:lib.util.SCALE: '3'
+  default:lib.util.scaled.factor: '3'
+  dep:text:loader:pivot.loaders.Text:empty: f346543fc28fb29c
+  dep:text:loader:pivot.loaders.Text:load: 69b78870ffe7932d
+  dep:text:loader:pivot.loaders.Text:save: 952962a56fe6457b
+  ext:contextlib._GeneratorContextManager: contextlib._GeneratorContextManager
+  func:lib.util.guard: e05da719ea96cb62
+  func:lib.util.scaled: d6cf10ce59ab5b3f
+  func:lib.util.words: 8e7304dd2c0f8fbf
+  func:pipeline.guard.<wrapper>: 927552b05dc91bbb
+  module:lib: ''
+  module:lib.util: ''
+  module:pipeline: ''
+  out:up/count:loader:pivot.loaders.YAML:config: cfc61af456ae42e3
+  out:up/count:loader:pivot.loaders.YAML:empty: a66d45b00a1a3a57
+  out:up/count:loader:pivot.loaders.YAML:load: 4a31bd3a307ad2f0
+  out:up/count:loader:pivot.loaders.YAML:save: c6f24c0f671b1819
+  out:up/count:tag: data
+  schema:pipeline.CountParams: 7da5beb5efe4a65a
+  self:count: 66d0a83d97c551ad
+  wire:text: in.txt
+  wire:text:path: data/raw/in.txt
+params:
+  factor: 2
+  tags:
+  - x
+  - y
+deps:
+- producer: in.txt
+  key: null
+  hash: d014bdbeea62a8b9
+outs:
+- key: null
+  hash: d3f61ff182894f6a
+  path: data/up/count.yaml
+""",
+    "split": """\
+schema_version: 2
+code_manifest:
+  class:pipeline.Split: c7db050b60e18908
+  const:lib.util.PATTERN: '["re.Pattern", "\\\\w+", 32]'
+  dep:text:loader:pivot.loaders.Text:empty: f346543fc28fb29c
+  dep:text:loader:pivot.loaders.Text:load: 69b78870ffe7932d
+  dep:text:loader:pivot.loaders.Text:save: 952962a56fe6457b
+  func:lib.util.vocab: b46760a3301568d7
+  func:lib.util.words: 8e7304dd2c0f8fbf
+  module:lib: ''
+  module:lib.util: ''
+  module:pipeline: ''
+  out:up/split:stats:loader:pivot.loaders.YAML:config: cfc61af456ae42e3
+  out:up/split:stats:loader:pivot.loaders.YAML:empty: a66d45b00a1a3a57
+  out:up/split:stats:loader:pivot.loaders.YAML:load: 4a31bd3a307ad2f0
+  out:up/split:stats:loader:pivot.loaders.YAML:save: c6f24c0f671b1819
+  out:up/split:stats:tag: metric
+  out:up/split:words:loader:pivot.loaders.YAML:config: cfc61af456ae42e3
+  out:up/split:words:loader:pivot.loaders.YAML:empty: a66d45b00a1a3a57
+  out:up/split:words:loader:pivot.loaders.YAML:load: 4a31bd3a307ad2f0
+  out:up/split:words:loader:pivot.loaders.YAML:save: c6f24c0f671b1819
+  out:up/split:words:tag: data
+  self:split: 49663be953ae81c5
+  wire:text: in.txt
+  wire:text:path: data/raw/in.txt
+params: {}
+deps:
+- producer: in.txt
+  key: null
+  hash: d014bdbeea62a8b9
+outs:
+- key: stats
+  hash: 9f688aaee9660f88
+  path: metrics/up/split/stats.yaml
+- key: words
+  hash: 5b955e9ae8aa08d4
+  path: data/up/split/words.yaml
+""",
+}
+
+# The only lock entries main changed for `_UPGRADE` since 0.5.8: #530 (21187e51) changed the
+# source of `pivot.loaders.Text.save` and `pivot.loaders.YAML.save`.
+_CHANGED_ON_MAIN_SINCE_0_5_8 = (
+    ":loader:pivot.loaders.Text:save",
+    ":loader:pivot.loaders.YAML:save",
+)
+
+
+def test_an_unmarked_project_gets_mains_locks_and_an_upgrade_reruns_nothing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A project with no mark gets, entry by entry, the locks main wrote for it, so this pull
+    request changes no unmarked lock value. Main's locks equal 0.5.8's, value by value, except
+    the entries of the two loader methods main changed. A project that main ran to completion
+    is all cached under this version, from a fresh `.pivot/state.lmdb`."""
     project = _project(tmp_path, _UPGRADE)
     first = _statuses(_run(project, "repro", "--json"))
-    assert sorted(first) == sorted(f"up/{name}" for name in _LOCKS_0_5_8), first
+    assert sorted(first) == sorted(f"up/{name}" for name in _LOCKS_MAIN_27488DDC), first
     stages = project / ".pivot" / "stages" / "up"
-    for name, text in _LOCKS_0_5_8.items():
-        head = yaml.safe_load((stages / f"{name}.lock").read_text())["code_manifest"]
-        assert head == yaml.safe_load(text)["code_manifest"], f"{name}: manifest differs"
-        (stages / f"{name}.lock").write_text(text)
+    for name, text in _LOCKS_MAIN_27488DDC.items():
+        main = yaml.safe_load(text)
+        written = (stages / f"{name}.lock").read_text()
+        head = yaml.safe_load(written)
+        assert head["code_manifest"] == main["code_manifest"], f"{name}: manifest differs"
+        assert head == main, f"{name}: lock differs"
+        assert written == text, f"{name}: lock text differs"
+        old = yaml.safe_load(_LOCKS_0_5_8[name])
+        changed = {
+            key
+            for key in old["code_manifest"].keys() | main["code_manifest"].keys()
+            if old["code_manifest"].get(key) != main["code_manifest"].get(key)
+        }
+        named = {key for key in main["code_manifest"] if key.endswith(_CHANGED_ON_MAIN_SINCE_0_5_8)}
+        assert named, name
+        assert changed == named, f"{name}: main changed {sorted(changed - named)} since 0.5.8"
+        assert {**old, "code_manifest": None} == {**main, "code_manifest": None}, name
     shutil.rmtree(project / ".pivot" / "state.lmdb")
     upgraded = _statuses(_run(project, "repro", "--json"))
     assert {status for status, _ in upgraded.values()} == {"cached"}, upgraded
