@@ -5,10 +5,13 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import decimal
+import errno
 import json
 import math
+import os
 import pathlib
 import pickle
+import tempfile
 import typing
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -20,7 +23,7 @@ import pytz
 import yaml
 from dateutil import tz as dateutil_tz
 
-from pivot import loaders
+from pivot import loaders, stage_io
 
 # ==============================================================================
 # Loader base class tests
@@ -1499,3 +1502,106 @@ def test_dataframe_jsonl_refuses_an_unknown_header_version(tmp_path: pathlib.Pat
 
     with pytest.raises(ValueError, match="Unsupported DataFrameJSONL metadata version"):
         loaders.DataFrameJSONL().load(jsonl_file)
+
+
+# ==============================================================================
+# Which part of a writer's work is pivot's own I/O (`stage_io`)
+# ==============================================================================
+
+_FULL = pathlib.Path("/dev/full")
+_needs_full_device = pytest.mark.skipif(
+    not _FULL.exists(), reason="needs /dev/full, which fails every write with ENOSPC"
+)
+
+
+def _save_on_a_full_disk(
+    loader: loaders.Writer[Any], value: Any, path: pathlib.Path
+) -> BaseException:
+    """Save ``value`` where every write fails, as the output pivot is writing, and return the
+    error, with the record of whether pivot's own I/O raised it left for the caller to read."""
+    stage_io.clear()
+    with pytest.raises(OSError) as raised, stage_io.writing_output(path):
+        loader.save(value, path)
+    assert raised.value.errno == errno.ENOSPC, raised.value
+    return raised.value
+
+
+@_needs_full_device
+@pytest.mark.parametrize(
+    ("loader", "value", "pivots"),
+    [
+        pytest.param(loaders.Text(), "x", True, id="text"),
+        pytest.param(
+            loaders.DataFrameJSONL(), pandas.DataFrame({"a": [1]}), True, id="dataframe-jsonl"
+        ),
+        pytest.param(loaders.JSONL(), [{"a": 1}], False, id="jsonl"),
+    ],
+)
+def test_a_disk_that_fills_mid_write_is_pivots_own_only_where_it_wrote_its_own_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    loader: loaders.Writer[Any],
+    value: Any,
+    pivots: bool,
+) -> None:
+    """A writer that writes through a temporary file: the disk fills after the file is created.
+    Text and DataFrameJSONL hand the write text they encoded, so the failure is pivot's own; JSONL
+    encodes each item as it writes, where the value's own code runs, so it is not."""
+
+    def mkstemp_on_a_full_disk(*_args: object, **_kwargs: object) -> tuple[int, str]:
+        return os.open(_FULL, os.O_WRONLY), str(tmp_path / "out.tmp")
+
+    path = tmp_path / "out.txt"
+    with monkeypatch.context() as patch:
+        patch.setattr(tempfile, "mkstemp", mkstemp_on_a_full_disk)
+        error = _save_on_a_full_disk(loader, value, path)
+
+    assert stage_io.raised_by_pivot(error) is pivots
+    stage_io.clear()
+
+
+@_needs_full_device
+@pytest.mark.parametrize(
+    ("loader", "value", "pivots"),
+    [
+        pytest.param(loaders.YAML[dict[str, str]](), {"a": "x" * 100_000}, True, id="yaml"),
+        pytest.param(loaders.JSON[dict[str, str]](), {"a": "x" * 100_000}, False, id="json"),
+        pytest.param(loaders.Pickle[dict[str, str]](), {"a": "x" * 100_000}, False, id="pickle"),
+    ],
+)
+def test_a_disk_that_fills_mid_write_is_not_pivots_own_where_the_format_encodes_as_it_writes(
+    loader: loaders.Writer[Any], value: Any, pivots: bool
+) -> None:
+    """A writer that opens the output path itself, with a value large enough that the write
+    reaches the disk while the format is still encoding it. YAML writes text it encoded first, so
+    the failure is pivot's own; `json.dump` and `pickle.dump` encode the value as they write it,
+    where a `__getstate__`, a `__reduce__` or a container of the user's runs, so those are not."""
+    error = _save_on_a_full_disk(loader, value, _FULL)
+
+    assert stage_io.raised_by_pivot(error) is pivots
+    stage_io.clear()
+
+
+@pytest.mark.parametrize(
+    ("loader", "value"),
+    [
+        pytest.param(loaders.Text(), "x", id="text"),
+        pytest.param(loaders.JSONL(), [{"a": 1}], id="jsonl"),
+        pytest.param(loaders.DataFrameJSONL(), pandas.DataFrame({"a": [1]}), id="dataframe-jsonl"),
+    ],
+)
+def test_putting_the_written_file_in_place_is_pivots_own_io(
+    tmp_path: pathlib.Path, loader: loaders.Writer[Any], value: Any
+) -> None:
+    """A writer that writes beside the output and renames it: the rename is pivot's own work on
+    its own path, whoever encoded the text, so a failure there is pivot's."""
+    path = tmp_path / "out.txt"
+    path.mkdir()
+    (path / "in the way.txt").write_text("x")
+
+    stage_io.clear()
+    with pytest.raises(OSError) as raised, stage_io.writing_output(path):
+        loader.save(value, path)
+
+    assert stage_io.raised_by_pivot(raised.value) is True
+    stage_io.clear()

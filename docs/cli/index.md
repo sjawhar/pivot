@@ -40,16 +40,28 @@ All commands support:
 **Errors.** A failure pivot recognizes prints its own message, often with a tip. Any other failure
 prints one line: an operating-system error as its message and the path it names (for example
 `Error: Permission denied: /home/me/proj/.pivot/cache/files/c9`), anything else as
-`Error: Unexpected <type>: <message>`. In `run` and `repro`, a stage prints that one line under its
-name only when pivot's own file operations on the files it manages failed: storing the stage's
-outputs in the cache, opening the state database, reading or writing the stage's lock file, or
-creating the stage's output file in a format pivot writes itself (text, JSON, JSON Lines, YAML,
-pickle), as in a read-only output directory. Every other stage failure prints its traceback, as
-before: one in your stage function, in a loader or writer (pivot's own included, with any code of
-yours it runs, such as a plot's tick formatter or an object's `__str__` that pandas calls), and
-any failure pivot did not classify. The `--json` record keeps the stage's full reason in both
-cases, unchanged. `pivot --verbose <command>` also prints the traceback, after the TUI exits for
-`--tui`.
+`Error: Unexpected <type>: <message>`. In `run` and `repro`, a stage prints that one line under
+its name only when pivot's own file operation on the files it manages failed: storing the stage's
+outputs in the cache, opening the state database, reading or writing the stage's lock file,
+preparing the stage's output path, and creating the output file and renaming it into place in a
+format pivot writes itself (text, JSON, JSON Lines, YAML, pickle, DataFrame JSON Lines). Every
+other stage failure prints its traceback, as before: one in your stage function, in a loader or
+writer (pivot's own included, with any code of yours it runs), and any failure pivot did not
+classify. The `--json` record keeps the stage's full reason in both cases, unchanged.
+`pivot --verbose <command>` also prints the traceback, after the TUI exits for `--tui`.
+
+The same cause therefore reads differently by output format, because a format that encodes your
+value as it writes it runs your value's own code inside the write:
+
+- **A disk that fills while the file is written** is one line for a text, YAML or DataFrame JSON
+  Lines output, where pivot writes text it has already encoded. It prints the traceback for a
+  JSON, JSON Lines or pickle output, where `json` and `pickle` encode your value as they write
+  it, so a `__getstate__`, a `__reduce__` or a container of yours may be what failed.
+- **A read-only output directory** is one line for those six formats, which pivot opens itself.
+  It prints the traceback for a CSV output, a plot and a `pathlib.Path` output, where pandas,
+  matplotlib and the move open the path while running your value's code.
+- **A directory pivot has to create for the output** is one line for every format, including CSV
+  and a plot: pivot creates it before the writer runs.
 
 **Path arguments.** `pivot track`, `push`, `fetch` and `pull` read a relative path from the
 current directory. `diff`, `checkout`, `repro`, `dag`, `get` and `check-ignore` read it from the
