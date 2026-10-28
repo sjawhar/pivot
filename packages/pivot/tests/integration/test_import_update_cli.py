@@ -875,6 +875,33 @@ def test_update_of_an_import_under_the_old_name_of_a_directory_file_names_the_fi
 
 
 # =============================================================================
+# file-hash entries: import and update record what they write
+# =============================================================================
+
+
+def _helper_recorded_hash(root: pathlib.Path, data_path: pathlib.Path) -> str | None:
+    """The hash the project's StateDB holds for ``data_path`` at its current stat, if any."""
+    with state.StateDB(root / ".pivot", readonly=True) as state_db:
+        return state_db.get(data_path, data_path.stat())
+
+
+def test_import_and_update_record_the_hash_of_the_file_they_write(
+    runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
+) -> None:
+    """The downloaded file's hash is recorded, so the next status reads none of it."""
+    _helper_publish(source, bucket, "smoke/total", b"v1", "v1")
+
+    data_path = _helper_import(runner, source, "smoke/total", "total.txt")
+    assert _helper_recorded_hash(consumer, data_path) == xxhash.xxh64(b"v1").hexdigest()
+
+    _helper_publish(source, bucket, "smoke/total", b"version two", "v2")
+    result = runner.invoke(cli.cli, ["update"])
+    assert result.exit_code == 0, result.output
+
+    assert _helper_recorded_hash(consumer, data_path) == xxhash.xxh64(b"version two").hexdigest()
+
+
+# =============================================================================
 # status
 # =============================================================================
 

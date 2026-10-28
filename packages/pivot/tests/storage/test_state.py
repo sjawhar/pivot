@@ -7,7 +7,7 @@ import pathlib
 import stat
 import struct
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import lmdb
 import pytest
@@ -728,6 +728,50 @@ def test_readonly_allows_reads(tmp_path: pathlib.Path) -> None:
         assert db.get_generation("stage:output") == 1
         assert db.get_dep_generations("stage") == {"upstream:out": 1}
         assert db.remote_hash_exists("origin", "remote_hash")
+
+
+def test_open_readonly_uses_the_database_mount_to_classify_an_lmdb_error(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 7-1: LMDB reports an existing database on a read-only filesystem as plain
+    `lmdb.Error`, not `OSError(EROFS)`. `open_readonly` calls statvfs on `state.lmdb` itself
+    (its parent can be another, writable mount) and yields None only when that mount is read-only;
+    the same error on a writable mount is a damaged database and raises."""
+    with state.StateDB(tmp_path):
+        pass
+    lmdb_path = tmp_path / "state.lmdb"
+    statvfs_paths = list[object]()
+
+    def lmdb_error(*_: object, **__: object) -> object:
+        raise lmdb.Error("Permission denied")
+
+    class _StatVfs:
+        f_flag: int
+
+        def __init__(self, flag: int) -> None:
+            self.f_flag = flag
+
+    def readonly_statvfs(path: object) -> _StatVfs:
+        statvfs_paths.append(path)
+        return _StatVfs(os.ST_RDONLY)
+
+    monkeypatch.setattr(state, "_acquire_shared_env", lmdb_error)
+    monkeypatch.setattr(os, "statvfs", cast("Any", readonly_statvfs))
+
+    with state.open_readonly(tmp_path, create=False) as state_db:
+        assert state_db is None
+
+    assert statvfs_paths == [lmdb_path]
+
+    def writable_statvfs(_: object) -> _StatVfs:
+        return _StatVfs(0)
+
+    monkeypatch.setattr(os, "statvfs", cast("Any", writable_statvfs))
+    with (
+        pytest.raises(lmdb.Error, match="Permission denied"),
+        state.open_readonly(tmp_path, create=False),
+    ):
+        pass
 
 
 def test_readonly_blocks_save(tmp_path: pathlib.Path) -> None:

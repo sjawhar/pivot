@@ -708,7 +708,8 @@ def test_diff_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Path) -> No
 
 def test_publish_tree_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Path) -> None:
     """A file-by-file symlink checkout published as a whole-directory tree through a symlinked
-    cache has every member (not copied as a user link) and is marked content-checked at once."""
+    cache has every member (not copied as a user link). Publishing leaves its tree unmarked; the
+    commit's `_ensure_tree_complete` verifies the layout and writes the content-checked marker."""
     cache_dir = _helper_cache_through_symlink(tmp_path)
     restored = tmp_path / "restored"
     output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
@@ -717,6 +718,8 @@ def test_publish_tree_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Pat
     cache._publish_tree(restored, tree, output_hash, cache_dir)
 
     assert sorted(p.name for p in tree.iterdir()) == [e["relpath"] for e in output_hash["manifest"]]
+    assert not cache._tree_layout_marker(tree).exists()
+    assert cache._ensure_tree_complete(tree, output_hash, cache_dir, repair=True)
     assert cache._tree_layout_marker(tree).exists()
 
 

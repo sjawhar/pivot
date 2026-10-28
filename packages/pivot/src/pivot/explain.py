@@ -6,7 +6,6 @@ showing specific code, param, and dependency changes.
 
 from __future__ import annotations
 
-import contextlib
 import pathlib
 from typing import TYPE_CHECKING
 
@@ -144,11 +143,6 @@ def _find_tracked_hash(
     return None  # Path not found in manifest
 
 
-def _state_db_exists(state_dir: pathlib.Path) -> bool:
-    """Return True when the LMDB directory already exists."""
-    return (state_dir / "state.lmdb").exists()
-
-
 def get_stage_explanation(
     stage_name: str,
     fingerprint: dict[str, str],
@@ -201,12 +195,7 @@ def get_stage_explanation(
             upstream_stale=[],
         )
 
-    state_context: contextlib.AbstractContextManager[state.StateDB | None]
-    if _state_db_exists(state_dir):
-        state_context = state.StateDB(state_dir, readonly=True)
-    else:
-        state_context = contextlib.nullcontext(None)
-    with state_context as state_db:
+    with state.open_readonly(state_dir, create=False) as state_db:
         known_hashes = producer_hashes or {}
         pending_deps = {name: ref for name, ref in deps.items() if ref.identity not in known_hashes}
         str_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(

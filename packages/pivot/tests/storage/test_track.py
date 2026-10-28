@@ -1,6 +1,7 @@
 import pathlib
 
 import pytest
+import yaml
 
 from pivot.exceptions import SecurityValidationError
 from pivot.storage import track
@@ -180,6 +181,16 @@ _ENTRY = {"relpath": "a.txt", "hash": "0123456789abcdef", "size": 1, "isexec": F
             id="manifest-entry-nul-relpath",
         ),
         pytest.param(
+            _helper_pvt(manifest=[_ENTRY, {**_ENTRY, "relpath": "/etc/passwd"}]),
+            "field 'manifest[1].relpath' is absolute or holds '..'",
+            id="manifest-entry-absolute-relpath",
+        ),
+        pytest.param(
+            _helper_pvt(manifest=[{**_ENTRY, "relpath": "sub/../../outside.txt"}]),
+            "field 'manifest[0].relpath' is absolute or holds '..'",
+            id="manifest-entry-dotdot-relpath",
+        ),
+        pytest.param(
             _helper_pvt(manifest=[_ENTRY], empty_dirs=["e", "f\0"]),
             "field 'empty_dirs[1]' holds a NUL byte",
             id="nul-empty-dir",
@@ -192,6 +203,20 @@ def test_pvt_field_error_names_a_field_a_restore_cannot_use(data: object, error:
     by field."""
     assert track.is_pvt_data(data), "the field check runs on data is_pvt_data accepts"
     assert track.pvt_field_error(data) == error
+
+
+@pytest.mark.parametrize("relpath", ["/etc/passwd", "../outside.txt"], ids=["absolute", "dotdot"])
+def test_read_pvt_file_refuses_a_manifest_entry_outside_its_output(
+    tmp_path: pathlib.Path, relpath: str
+) -> None:
+    """Round 5, B1: a restore joins each manifest relpath to the output, so one that is absolute
+    or holds '..' names a file outside it. The .pvt is refused, as one whose ``path`` does, so
+    `pivot checkout` skips it instead of restoring or recording through it."""
+    pvt_path = tmp_path / "evil.pvt"
+    pvt = _helper_pvt(manifest=[_ENTRY, {**_ENTRY, "relpath": relpath}])
+    pvt_path.write_text(yaml.safe_dump(pvt))
+
+    assert track.read_pvt_file(pvt_path) is None
 
 
 def test_pvt_field_error_skips_what_no_restore_needs() -> None:

@@ -613,7 +613,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
     cache_dir = config.get_cache_dir() / "files"
 
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
-    with state_mod.StateDB(config.get_state_dir()) as state_db:
+    with state_mod.open_readonly(config.get_state_dir(), create=False) as state_db:
         for data_path, track_data in tracked_files.items():
             path = pathlib.Path(data_path)
 
@@ -645,8 +645,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                     f"Tracked file '{data_path}' has changed since tracking. "
                     + f"Run 'pivot track --force {track_data['path']}' to update."
                 )
-        if pending:
-            state_db.save_many(pending)
+    state_mod.save_file_hashes(config.get_state_dir(), pending)
 
     metrics.end("core.verify_tracked_files", _t)
     if missing:
