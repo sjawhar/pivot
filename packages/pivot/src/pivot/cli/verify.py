@@ -71,7 +71,7 @@ def _get_stage_lock_hashes(
     they are git-tracked, not in cache.
     """
     stage_info = cli_helpers.get_stage(stage_name)
-    state_dir = registry.get_stage_state_dir(stage_info, config.get_state_dir())
+    state_dir = registry.get_stage_state_dir(stage_info, config.locate_state_dir())
     stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
     lock_data = stage_lock.read()
     if lock_data is None:
@@ -397,7 +397,7 @@ def verify(
     if not all_stages:
         raise click.ClickException("No stages registered. Nothing to verify.")
 
-    cache_dir = config.get_cache_dir()
+    cache_dir = config.locate_cache_dir()
 
     # Get rich explanations so lock-only dependency mismatches identify the
     # producer artifact in verification output.

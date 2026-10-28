@@ -1,3 +1,5 @@
+"""GitHub Contents and ref API client."""
+
 from __future__ import annotations
 
 import base64
@@ -5,6 +7,7 @@ import logging
 import os
 import re
 import typing
+import urllib.parse
 
 import aiohttp
 
@@ -99,6 +102,13 @@ async def _get(
         return resp.status, await resp.json()
 
 
+def _contents_url(owner: str, repo: str, path: str, ref: str) -> str:
+    """Build a Contents API URL that treats every supplied path component as data."""
+    encoded_path = "/".join(urllib.parse.quote(segment, safe="") for segment in path.split("/"))
+    encoded_ref = urllib.parse.quote(ref, safe="")
+    return f"{_API_BASE}/repos/{owner}/{repo}/contents/{encoded_path}?ref={encoded_ref}"
+
+
 async def read_file(
     owner: str,
     repo: str,
@@ -108,7 +118,7 @@ async def read_file(
     *,
     session: aiohttp.ClientSession | None = None,
 ) -> bytes | None:
-    url = f"{_API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={ref}"
+    url = _contents_url(owner, repo, path, ref)
     if session is not None:
         status, data = await _get(session, url, token)
     else:
@@ -134,7 +144,7 @@ async def list_directory(
     *,
     session: aiohttp.ClientSession | None = None,
 ) -> list[DirectoryEntry] | None:
-    url = f"{_API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={ref}"
+    url = _contents_url(owner, repo, path, ref)
     if session is not None:
         status, data = await _get(session, url, token)
     else:

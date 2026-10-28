@@ -38,13 +38,14 @@ from . import (
     types,
 )
 from . import loaders as loaders_mod
+from . import state_dir as state_dir_mod
 from .storage import lock
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import collections.abc
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from networkx import DiGraph
 
@@ -409,6 +410,36 @@ def _require_same_stage(
     )
 
 
+def _require_one_state_dir(
+    including: str,
+    included: str,
+    root: pathlib.Path,
+    holder: str,
+    held: state_dir_mod.StateDirResolution,
+    incoming: state_dir_mod.StateDirResolution,
+) -> None:
+    """Refuse to combine pipelines that keep one project's state in two directories.
+
+    Each pipeline resolves ``core.state_dir`` when it loads, the ``.pivot`` fallback for a value
+    or a path it names that cannot be used included, and records the outcome on its stages.
+    When the value, a link it names, or whether the path it names can be used changed between
+    two loads, a run of the combined pipeline would put some stages' locks in one directory and
+    its run record and caches in the other. So the outcomes are compared, not the values.
+    Inside one discovery or one CLI invocation every pipeline loads under one record and
+    resolves one directory, so ``--all`` and ``repro`` of several pipeline files are unaffected.
+    """
+    held_dir = state_dir_mod.resolved_state_dir(root, held)
+    incoming_dir = state_dir_mod.resolved_state_dir(root, incoming)
+    if held_dir == incoming_dir:
+        return
+    raise exceptions.PipelineConfigError(
+        f"Pipeline '{including}' cannot include '{included}': '{holder}' keeps the state of "
+        + f"the project at {root} in {held_dir}, and '{included}' in {incoming_dir}. "
+        + "core.state_dir, or the path it names, changed between their loads; load both "
+        + "pipelines after the change."
+    )
+
+
 def _emit_stage_info(
     node: _StageNode,
     qualified_name: str,
@@ -520,6 +551,10 @@ class Pipeline:
     _previous_markers: list[_PreviousOutputMarker]
     _constructing: bool
     _loaded_pipelines: set[str]
+    # Each project root's resolution: this pipeline's load, then each included pipeline's.
+    _resolved_state_dirs: dict[pathlib.Path, state_dir_mod.StateDirResolution]
+    # The resolutions the included pipelines brought, with the name of the first to bring each.
+    _included_state_dirs: dict[pathlib.Path, tuple[str, state_dir_mod.StateDirResolution]]
 
     def __init__(self, name: str, *, root: pathlib.Path | None = None) -> None:
         reason = lock.stage_name_error(name)
@@ -538,6 +573,10 @@ class Pipeline:
         self._included_stages = dict[str, registry.RegistryStageInfo]()
         self._constructing = False
         self._loaded_pipelines = {name}
+        self._resolved_state_dirs = dict[pathlib.Path, state_dir_mod.StateDirResolution]()
+        self._included_state_dirs = dict[
+            pathlib.Path, tuple[str, state_dir_mod.StateDirResolution]
+        ]()
 
         if root is not None:
             self._root = root.resolve()
@@ -554,7 +593,35 @@ class Pipeline:
 
     @property
     def state_dir(self) -> pathlib.Path:
-        return self._root / ".pivot"
+        return state_dir_mod.ensure_state_dir(self._root)
+
+    @property
+    def resolved_state_dirs(self) -> Mapping[pathlib.Path, state_dir_mod.StateDirResolution]:
+        """Each project root's ``core.state_dir``, as this pipeline resolved it when it loaded.
+
+        Its stages' locks are recorded in these directories (``state_dir.resolved_state_dir``).
+        Its fingerprints and its runs start their state-directory record with them
+        (``state_dir.entry_invocation``), so a ``core.state_dir`` edited after the load leaves
+        this pipeline in one directory; a caller who wants the new one loads the pipeline again.
+        A value that could not be used is kept as its error, so the entry points fall back to
+        ``.pivot`` (or fail) as at the load, without reading the configuration again. A path that
+        could not become a directory is kept as its fallback (``state_dir.kept_by_pipeline``):
+        the stages' locks are in ``.pivot``, so every reader in its fingerprints and runs uses
+        ``.pivot`` too, whether or not the path can be used by then.
+        Read-only: ``include()`` alone adds to it.
+        """
+        return _stdlib_types.MappingProxyType(self._resolved_state_dirs)
+
+    def _stage_state_dir(self) -> pathlib.Path:
+        """The state directory recorded on this pipeline's stages; loading never creates it.
+
+        While the project config cannot be read, its ``core.state_dir`` cannot be used, or the
+        path it names cannot become a directory, the stages keep 0.5.2's ``.pivot``
+        (``state_dir.state_dir_or_default``), so listing them runs as it did there; commands
+        that use the configured directory fail on it themselves. The outcome is the load's
+        record's, which the pipeline keeps (``resolved_state_dirs``).
+        """
+        return state_dir_mod.state_dir_or_default(self._root)
 
     @property
     def input_bindings(self) -> dict[str, str]:
@@ -586,7 +653,8 @@ class Pipeline:
 
     def ensure_fingerprint(self, name: str) -> dict[str, str]:
         self._require_materialized()
-        return self._registry.ensure_fingerprint(name)
+        with state_dir_mod.entry_invocation(self._resolved_state_dirs):
+            return self._registry.ensure_fingerprint(name)
 
     def build_dag(self) -> DiGraph[str]:
         self._require_materialized()
@@ -604,6 +672,13 @@ class Pipeline:
             from pivot.exceptions import PipelineConfigError
 
             raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
+
+        # One project's state stays in one directory; checked before anything changes.
+        for root, resolution in other.resolved_state_dirs.items():
+            held = self._held_state_dir(root)
+            if held is not None:
+                holder, current = held
+                _require_one_state_dir(self._name, other.name, root, holder, current, resolution)
 
         # Own stages are checked against included ones at materialization.
         registered = self._included_stages if self._constructing else self._registry.snapshot()
@@ -641,7 +716,25 @@ class Pipeline:
         if not self._constructing:
             self._check_inputs_against_outputs(self._registry)
         self._loaded_pipelines.update(other.loaded_pipelines)
+        for root, resolution in other.resolved_state_dirs.items():
+            self._included_state_dirs.setdefault(root, (other.name, resolution))
+            if not self._constructing:
+                self._resolved_state_dirs.setdefault(root, resolution)
         self._registry.invalidate_dag_cache()
+
+    def _held_state_dir(
+        self, root: pathlib.Path
+    ) -> tuple[str, state_dir_mod.StateDirResolution] | None:
+        """The resolution this pipeline already holds for ``root``, and who it came from.
+
+        Inside its ``with`` block the pipeline has not loaded yet, so only the pipelines it
+        included hold one; its load checks them against its own (``_materialize_stages``).
+        """
+        if self._constructing:
+            return self._included_state_dirs.get(root)
+        if root in self._resolved_state_dirs:
+            return self._name, self._resolved_state_dirs[root]
+        return None
 
     def __enter__(self) -> Pipeline:
         if self._token is not None:
@@ -665,11 +758,29 @@ class Pipeline:
     def _materialize_stages(self) -> None:
         new_registry = registry.StageRegistry()
         closure = self._upstream_closure()
+        # One record for the load: each project root's state directory is read and resolved
+        # once, recorded on its stages, and kept for this pipeline's fingerprints and runs. A
+        # library caller is told once per load that a path it cannot use sends them to `.pivot`.
+        with state_dir_mod.entry_invocation() as resolved:
+            stage_state_dirs = {self._root: self._stage_state_dir()}
+            for foreign_pipeline, _ in closure:
+                if foreign_pipeline._root not in stage_state_dirs:
+                    stage_state_dirs[foreign_pipeline._root] = foreign_pipeline._stage_state_dir()
+            for root in stage_state_dirs:
+                state_dir_mod.report_unusable_path_to_library(root, resolved[root])
+            resolved_state_dirs = {
+                root: state_dir_mod.kept_by_pipeline(resolved[root]) for root in stage_state_dirs
+            }
+        for root, (included, resolution) in self._included_state_dirs.items():
+            if root in resolved_state_dirs:
+                _require_one_state_dir(
+                    self._name, included, root, self._name, resolved_state_dirs[root], resolution
+                )
 
         for foreign_pipeline, foreign_node in closure:
             qualified_name = f"{foreign_pipeline._name}/{foreign_node.name}"
             stage_info = _emit_stage_info(
-                foreign_node, qualified_name, foreign_pipeline._root / ".pivot"
+                foreign_node, qualified_name, stage_state_dirs[foreign_pipeline._root]
             )
             new_registry.add_existing(stage_info)
 
@@ -677,7 +788,7 @@ class Pipeline:
 
         for node in self._stages:
             qualified_name = f"{self._name}/{node.name}"
-            stage_info = _emit_stage_info(node, qualified_name, self._root / ".pivot")
+            stage_info = _emit_stage_info(node, qualified_name, stage_state_dirs[self._root])
             new_registry.add_existing(stage_info)
 
         materialized_stages = set(new_registry.list_stages())
@@ -694,6 +805,9 @@ class Pipeline:
 
         # Atomic swap — if any step above raises, self._registry is unchanged
         self._registry = new_registry
+        for root, (_, resolution) in self._included_state_dirs.items():
+            resolved_state_dirs.setdefault(root, resolution)
+        self._resolved_state_dirs = resolved_state_dirs
 
     def _check_inputs_against_outputs(self, reg: registry.StageRegistry) -> None:
         """Refuse an input named like a stage, or whose path overlaps a registered output.

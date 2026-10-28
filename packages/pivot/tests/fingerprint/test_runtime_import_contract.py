@@ -2,29 +2,16 @@
 
 """Runtime-import contracts exercised through the installed ``pivot`` CLI and shipped docs."""
 
-import os
 import pathlib
 import subprocess
-import sys
 
 import pytest
 import yaml
+from tests import helpers
 
-_PIVOT = pathlib.Path(sys.executable).parent / "pivot"
 _REPO = pathlib.Path(__file__).resolve().parents[4]
 _UNCOVERED = "imported user modules its fingerprint does not cover"
 _LIB = {"helpers/__init__.py": "", "helpers/lib.py": "VALUE = 1\n"}
-
-
-def _run(project: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in ("VIRTUAL_ENV", "PIVOT_UNSAFE_FINGERPRINTING")
-    }
-    return subprocess.run(
-        [str(_PIVOT), *args], cwd=project, env=env, capture_output=True, text=True, timeout=300
-    )
 
 
 def _flat(result: subprocess.CompletedProcess[str]) -> str:
@@ -32,12 +19,13 @@ def _flat(result: subprocess.CompletedProcess[str]) -> str:
 
 
 def _project(tmp_path: pathlib.Path, files: dict[str, str]) -> pathlib.Path:
+    home = tmp_path / "home"
     project = tmp_path / "project"
     for rel, text in {**files, "data/raw/lines.txt": "a\nb\nc\n"}.items():
         (project / rel).parent.mkdir(parents=True, exist_ok=True)
         (project / rel).write_text(text)
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
-    init = _run(project, "init")
+    init = helpers.run_pivot(project, home, "init")
     assert init.returncode == 0, init.stdout + init.stderr
     return project
 
@@ -80,20 +68,21 @@ def test_d1_no_fingerprint_stage_with_body_import_is_reused(
 ) -> None:
     """A `@no_fingerprint(code_deps=[...])` stage tracks its declared files, not its imports.
     It reuses unchanged outputs and reruns after a declared file changes."""
+    home = tmp_path / "home"
     project = _project(
         tmp_path, {**_LIB, "pipeline.py": _NO_FINGERPRINT.format(module_import=module_import)}
     )
 
-    first = _run(project, "repro")
+    first = helpers.run_pivot(project, home, "repro")
     assert first.returncode == 0, first.stdout + first.stderr
     assert _UNCOVERED not in _flat(first)
-    again = _run(project, "repro", "--json")
+    again = helpers.run_pivot(project, home, "repro", "--json")
     assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
-    verify = _run(project, "verify")
+    verify = helpers.run_pivot(project, home, "verify")
     assert verify.returncode == 0, verify.stdout + verify.stderr
     _edit_lib(project)
 
-    edited = _run(project, "repro", "--json")
+    edited = helpers.run_pivot(project, home, "repro", "--json")
 
     assert '"stage": "t/count", "status": "ran"' in edited.stdout, edited.stdout
     assert yaml.safe_load(_output(project))["v"] == 103
@@ -174,18 +163,19 @@ def test_d2_user_loader_body_import_of_loaded_module_is_covered(
 ) -> None:
     """A user loader's loaded body import is covered by the loader manifest, so it emits no
     uncovered-import warning, reuses unchanged output, and reruns when its module changes."""
+    home = tmp_path / "home"
     project = _project(tmp_path, {**_LIB, "helpers/myloader.py": loader, "pipeline.py": pipeline})
 
-    first = _run(project, "repro")
+    first = helpers.run_pivot(project, home, "repro")
     assert first.returncode == 0, first.stdout + first.stderr
     assert _UNCOVERED not in _flat(first)
-    again = _run(project, "repro", "--json")
+    again = helpers.run_pivot(project, home, "repro", "--json")
     assert '"stage": "t/count", "status": "cached"' in again.stdout, again.stdout
-    verify = _run(project, "verify")
+    verify = helpers.run_pivot(project, home, "verify")
     assert verify.returncode == 0, verify.stdout + verify.stderr
     _edit_lib(project)
 
-    edited = _run(project, "repro", "--json")
+    edited = helpers.run_pivot(project, home, "repro", "--json")
 
     assert '"stage": "t/count", "status": "ran"' in edited.stdout, edited.stdout
     assert _output(project) == after_edit
@@ -212,15 +202,16 @@ with Pipeline("t") as pipeline:
 def test_d3_commit_after_a_flagged_committing_repro_is_described(tmp_path: pathlib.Path) -> None:
     """A `pivot commit` after a flagged `repro` preserves the mark, so an edit to the dynamically
     imported module reruns the stage instead of restoring a stale result."""
+    home = tmp_path / "home"
     project = _project(tmp_path, {**_LIB, "pipeline.py": _RUNTIME_IMPORT})
-    flagged = _run(project, "repro")
+    flagged = helpers.run_pivot(project, home, "repro")
     assert flagged.returncode == 0, flagged.stdout + flagged.stderr
     assert _UNCOVERED in _flat(flagged)
-    committed = _run(project, "commit")
+    committed = helpers.run_pivot(project, home, "commit")
     assert committed.returncode == 0, committed.stdout + committed.stderr
     _edit_lib(project)
 
-    edited = _run(project, "repro", "--json")
+    edited = helpers.run_pivot(project, home, "repro", "--json")
 
     if '"stage": "t/count", "status": "ran"' in edited.stdout:
         assert yaml.safe_load(_output(project))["v"] == 103
@@ -255,9 +246,10 @@ with Pipeline("t") as pipeline:
 def test_d4_uncovered_import_warning_names_a_fix_that_applies(tmp_path: pathlib.Path) -> None:
     """The warning's static-import remedy requires reading the module by name in the stage's own
     code, or moving the value into `StageParams`; a `pipeline.py` import alone does not cover it."""
+    home = tmp_path / "home"
     project = _project(tmp_path, {**_LIB, "pipeline.py": _ALREADY_IMPORTED})
 
-    first = _run(project, "repro")
+    first = helpers.run_pivot(project, home, "repro")
 
     assert first.returncode == 0, first.stdout + first.stderr
     message = _flat(first)
@@ -277,7 +269,8 @@ def test_d4_uncovered_import_warning_names_a_fix_that_applies(tmp_path: pathlib.
 
 def test_d5_concepts_doc_names_a_command_that_exists(tmp_path: pathlib.Path) -> None:
     """The concepts documentation names only commands that can explain a marked stage."""
-    explain = _run(tmp_path, "explain", "--help")
+    home = tmp_path / "home"
+    explain = helpers.run_pivot(tmp_path, home, "explain", "--help")
     if explain.returncode == 0:
         return
     concepts = (_REPO / "docs" / "concepts" / "fingerprinting.md").read_text()

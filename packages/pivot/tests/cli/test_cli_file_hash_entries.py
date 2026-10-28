@@ -110,12 +110,13 @@ def _helper_project(root: pathlib.Path, env: dict[str, str] | None = None) -> pa
     return root
 
 
-def _helper_unrecorded(root: pathlib.Path) -> list[str]:
-    """Files of the output with no StateDB entry giving their content's hash at their stat."""
+def _helper_unrecorded(root: pathlib.Path, state_dir: pathlib.Path | None = None) -> list[str]:
+    """Files of the output with no entry in ``state_dir``'s StateDB (``.pivot``'s when None)
+    giving their content's hash at their stat."""
     output = root / _OUTPUT
     files = sorted(path for path in output.rglob("*") if path.is_file())
     assert len(files) == 12, f"The output holds every file: {files}"
-    with state.StateDB(root / ".pivot", readonly=True) as state_db:
+    with state.StateDB(state_dir or root / ".pivot", readonly=True) as state_db:
         found = state_db.get_many([(path, path.stat()) for path in files])
     return [
         str(path.relative_to(output))
@@ -260,15 +261,17 @@ def test_checkout_of_an_existing_output_records_what_it_read(tmp_path: pathlib.P
 def test_checkout_records_in_the_stage_state_directory_explain_reads(
     tmp_path: pathlib.Path,
 ) -> None:
-    """With ``core.state_dir`` set elsewhere, a stage still keeps its state in ``.pivot``,
-    and explanations look its outputs up there, so that is where checkout records them."""
+    """With ``core.state_dir`` set, a stage keeps its state in that directory, and explanations
+    look its outputs up there, so that is where checkout records them, not in ``.pivot``."""
     root = _helper_project(tmp_path / "project")
     _ok(_pivot(root, "config", "set", "core.state_dir", ".state"))
     _helper_delete_output(root)
 
     _ok(_pivot(root, "checkout", "--checkout-mode", "copy"))
 
-    assert _helper_unrecorded(root) == [], "Every restored file's hash is in the stage StateDB"
+    assert _helper_unrecorded(root, root / ".state") == [], (
+        "Every restored file's hash is in the stage StateDB"
+    )
 
 
 # One stage reading one raw input and writing one file: nothing else reads its output, so only

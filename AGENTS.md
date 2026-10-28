@@ -12,6 +12,7 @@
 packages/pivot/src/pivot/
 ├── cli/           # Click commands, decorators, helpers (see cli/AGENTS.md)
 ├── config/        # YAML parsing, validation
+├── config_files.py # Reading one config file (ruamel parser, dotted keys, global path); a leaf
 ├── dag/           # DAG rendering for `pivot dag` (ASCII, DOT, Mermaid)
 ├── engine/        # Execution coordinator, watch mode, RPC server
 ├── executor/      # Worker process execution (see executor/AGENTS.md)
@@ -24,6 +25,7 @@ packages/pivot/src/pivot/
 ├── loaded_source.py # Source each user module was compiled from; fingerprinting reads it, not the file
 ├── registry.py    # StageRegistry, RegistryStageInfo (built by Pipeline)
 ├── stage_def.py   # StageParams, output writing helpers
+├── state_dir.py   # core.state_dir: resolution, creation, per-invocation warnings, 0.5.2 layout
 ├── loaders.py     # File I/O (CSV, JSON, Pickle, etc.)
 └── types.py       # TypedDicts, enums, type aliases, ArtifactIdentity
 
