@@ -1835,15 +1835,40 @@ def test_symlink_restore_does_not_trust_a_stale_tree_an_older_pivot_marked_after
 
 
 @pytest.mark.skipif(not os.environ.get("CI"), reason="installs pivot 0.5.11 from PyPI; runs in CI")
-def test_symlink_checkout_restores_file_by_file_past_a_stale_tree_pivot_0_5_11_linked_and_marked(
+def test_symlink_checkout_restores_file_by_file_past_a_stale_tree_pivot_0_5_11_built_and_marked(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Pivot 0.5.11 links a stale same-size tree after a size check. This build does not trust
-    that marker. It restores the directory file by file."""
+    """Pivot 0.5.11 builds a project, then links a stale same-size SYMLINK tree after a size
+    check and marks it. After the upgrade, this build does not trust that marker: it restores the
+    directory file by file and leaves the tree as it is.
+
+    The other order fails loudly: pivot 0.5.11 cannot read the lock this build writes for a
+    directory, so on a project this build made its checkout refuses the stage and writes
+    nothing."""
     released = helpers.venv_pivot(tmp_path / "venv", "pivot==0.5.11")
-    (tmp_path / "project").mkdir()
-    root, tree, _ = _unmarked_shards_tree_with_stale_member(tmp_path / "project")
+    root = tmp_path / "project"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    _ok(_pivot(root, "init", executable=released))
+    (root / "pipeline.py").write_text(_DIROUT_PIPELINE)
+    (root / "data" / "raw").mkdir(parents=True)
+    (root / "data" / "raw" / "t.csv").write_text("a,b\n5,6\n7,8\n")
+    (root / ".gitignore").write_text("/data/d/\n__pycache__/\n")
+    _ok(_pivot(root, "repro", executable=released))
+
+    out = yaml.safe_load((root / ".pivot" / "stages" / "d" / "shards.lock").read_text())["outs"][0]
+    assert "manifest" in out, "precondition: pivot 0.5.11 lists the directory inline"
+    files_dir = root / ".pivot" / "cache" / "files"
+    tree = cache.get_cache_path(files_dir, out["hash"])  # where pivot 0.5.11 keeps a tree
+    assert not tree.exists(), "precondition: hardlink mode builds no tree"
+    tree.mkdir(parents=True)
+    for entry in out["manifest"]:
+        (tree / entry["relpath"]).write_bytes(
+            cache.get_cache_path(files_dir, entry["hash"]).read_bytes()
+        )
+    (tree / "0.txt").write_text("xx")  # stale, the size of "11"
     shards = root / "data" / "d" / "shards.dat"
+    shutil.rmtree(shards)
     old = _pivot(root, "checkout", "--checkout-mode", "symlink", "d/shards", executable=released)
     assert old.returncode == 0, old.stdout + old.stderr
     assert (shards / "0.txt").read_text() == "xx", "precondition: pivot 0.5.11 links stale bytes"
@@ -1855,7 +1880,32 @@ def test_symlink_checkout_restores_file_by_file_past_a_stale_tree_pivot_0_5_11_l
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (shards / "0.txt").read_text() == "11"
+    assert (shards / "1.txt").read_text() == "15"
     assert not shards.is_symlink()
+    assert (tree / "0.txt").read_text() == "xx", "the stale tree is left as it is"
+
+    built = tmp_path / "built"
+    built.mkdir()
+    built = _project(
+        built,
+        {
+            "pipeline.py": _DIROUT_PIPELINE,
+            "data/raw/t.csv": "a,b\n5,6\n7,8\n",
+            ".gitignore": "/data/d/\n__pycache__/\n",
+        },
+    )
+    _ok(_pivot(built, "repro"))
+    built_shards = built / "data" / "d" / "shards.dat"
+    shutil.rmtree(built_shards)
+
+    refused = _pivot(
+        built, "checkout", "--checkout-mode", "symlink", "d/shards", executable=released
+    )
+
+    refusal = refused.stdout + refused.stderr
+    assert refused.returncode != 0, refusal
+    assert "Stage 'd/shards' has no cached outputs" in refusal, refusal
+    assert not built_shards.exists() and not built_shards.is_symlink(), refusal
 
 
 @pytest.mark.parametrize(

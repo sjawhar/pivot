@@ -21,6 +21,8 @@ import sys
 
 import pytest
 
+from tests import helpers
+
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
 _PIPELINE = """\
@@ -182,9 +184,10 @@ def test_this_pivot_refuses_an_incremental_file_output_an_older_pivot_restarted(
     tmp_path: pathlib.Path, version: str
 ):
     """A teammate on an older pivot clones the project and runs `pivot repro` with new inputs.
-    Their pivot stops at the incremental stages, and offers to remove the lock and rerun; they
-    do that for `p/log`, whose incremental output is a file, so their pivot restarts the log
-    from empty and they commit it.
+    Their pivot stops at the incremental stages without running `p/log`: one stage refuses with
+    its cache-missing message and offers to remove the lock and rerun, and `p/log` refuses too or
+    is blocked behind that failure. The teammate removes `p/log`'s lock and reruns it; their
+    pivot restarts the log from empty and they commit it.
 
     This pivot must not take that output as the stage's history: `status` reports the stage,
     `verify` fails it, and `repro` refuses, each naming `p/log`, why, and how to settle it -
@@ -196,9 +199,15 @@ def test_this_pivot_refuses_an_incremental_file_output_an_older_pivot_restarted(
     clone = _clone_with_cache(src, tmp_path / "clone")
     _run(clone, *old, "checkout")
     _set_inputs(clone, "three")
+    before = _log_lines(clone)
     stopped = _run(clone, *old, "repro")
-    assert stopped.returncode != 0, stopped.stdout + stopped.stderr
-    assert "Cache missing for incremental output 'p/log" in stopped.stdout + stopped.stderr
+    stopped_out = stopped.stdout + stopped.stderr
+    assert stopped.returncode != 0, stopped_out
+    stops = {stage: helpers.incremental_stop(stopped_out, stage) for stage in ("p/acc", "p/log")}
+    assert stops["p/log"] is not None, (stops, stopped_out)
+    assert "refused" in stops.values(), (stops, stopped_out)
+    assert _log_lines(clone) == before, stopped_out
+    assert _git(clone, "status", "--porcelain", "--", _LOG_LOCK) == "", stopped_out
 
     (clone / _LOG_LOCK).unlink()  # what that message offers, for p/log only
     _ok(_run(clone, *old, "repro", "p/log"))

@@ -19,6 +19,8 @@ import uuid
 import boto3
 import pytest
 
+from tests import helpers
+
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
 _PIPELINE = """\
@@ -186,8 +188,10 @@ def test_an_older_pivot_stops_instead_of_restarting_an_incremental_output(
     """A lock this pivot writes for a stage that records a directory keeps its records under
     `records`, with `deps` and `outs` empty. A released pivot reads that as a lock that records
     nothing: in a fresh clone (`pivot checkout`, then `pivot repro` with new inputs) it stops at
-    the incremental stages acc and log ("Cache missing for incremental output"), exit 1, instead
-    of restarting them from empty, and rewrites neither lock."""
+    the incremental stages acc and log, exit 1, instead of restarting them from empty, and
+    rewrites neither lock. One of them refuses ("Cache missing for incremental output"); the
+    other refuses too, or is blocked behind that failure, depending on which a worker reaches
+    first."""
     old = _released(version)
     src = _project(tmp_path / "src")
     clone = _clone_with_cache(src, tmp_path / "clone")
@@ -199,8 +203,9 @@ def test_an_older_pivot_stops_instead_of_restarting_an_incremental_output(
 
     out = repro.stdout + repro.stderr
     assert repro.returncode != 0, out
-    assert "Cache missing for incremental output 'p/acc" in out, out
-    assert "Cache missing for incremental output 'p/log" in out, out
+    stops = {stage: helpers.incremental_stop(out, stage) for stage in ("p/acc", "p/log")}
+    assert None not in stops.values(), (stops, out)
+    assert "refused" in stops.values(), (stops, out)
     assert _acc_values(clone) == [], out
     assert not (clone / _LOG).exists(), out
     changed = _git(clone, "status", "--porcelain", "--", _ACC_LOCK, _LOG_LOCK)
