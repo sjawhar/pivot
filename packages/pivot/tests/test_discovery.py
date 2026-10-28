@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import _imp
+import contextlib
 import importlib
 import importlib.machinery
 import importlib.util
 import json
+import linecache
 import os
 import pathlib
 import py_compile
@@ -18,7 +20,8 @@ import cloudpickle
 import pytest
 
 import pivot_tui
-from pivot import discovery, fingerprint, project
+from pivot import discovery, fingerprint, loaded_source, project
+from pivot.storage import state
 from tests import conftest
 
 if TYPE_CHECKING:
@@ -295,6 +298,82 @@ with Pipeline("test", root=pathlib.Path(__file__).parent) as pipeline:
     assert str(second) == sys.path[0]
 
 
+_SHOUT_PIPELINE = """
+from pivot.compose import Pipeline, stage
+from shout_helpers import shout
+
+
+@stage
+def loud(text: str) -> str:
+    return shout(text)
+
+
+with Pipeline("first") as pipeline:
+    loud(pipeline.input("words.txt", t=str))
+"""
+
+
+def _helper_fingerprinted_project(root: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make `root` the current project, discover its pipeline and fingerprint its stage, as the
+    engine does after discovery: the hashes and manifest that walk computes wait for a flush."""
+    root.mkdir()
+    (root / ".pivot").mkdir()
+    (root / "shout_helpers.py").write_text(
+        "def shout(text: str) -> str:\n    return text.upper()\n"
+    )
+    (root / "pipeline.py").write_text(_SHOUT_PIPELINE)
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    pipeline = discovery.discover_pipeline(project_root=root)
+    assert pipeline is not None
+    pipeline.ensure_fingerprint("first/loud")
+
+
+def _helper_fingerprint_cache_keys(root: pathlib.Path) -> list[bytes]:
+    """The function-hash (`fp:`) and stage-manifest (`sm:`) keys in `root`'s StateDB."""
+    if not (root / ".pivot" / "state.lmdb").exists():
+        return []
+    with state.StateDB(root / ".pivot", readonly=True) as db:
+        return [key for prefix in (b"fp:", b"sm:") for key, _ in db.iter_prefix(prefix)]
+
+
+def test_discovery_writes_no_fingerprint_cache_entry_queued_in_another_project(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hashes and manifests queued in one project never reach a later project's StateDB.
+
+    A process pointed at several projects in turn, as a test process is, flushes the pending
+    cache writes at each discovery. Those queued in the first project name its files, so
+    discovery in the second drops them and writes nothing there, no write lock included.
+    """
+    _helper_fingerprinted_project(tmp_path / "first", monkeypatch)
+    second = tmp_path / "second"
+    second.mkdir()
+    (second / ".pivot").mkdir()
+    (second / "pipeline.py").write_text(
+        "from pivot.compose import Pipeline\n\nwith Pipeline('second') as pipeline:\n    pass\n"
+    )
+    monkeypatch.setattr(project, "_project_root_cache", second)
+
+    assert discovery.discover_pipeline(project_root=second) is not None
+
+    assert not list(second.rglob("*.lock")), "a write lock in a project nothing was queued for"
+    assert _helper_fingerprint_cache_keys(second) == []
+
+
+def test_flush_writes_fingerprint_cache_entries_into_the_project_that_queued_them(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The writes queued after discovery reach the StateDB of the project that queued them."""
+    first = tmp_path / "first"
+    _helper_fingerprinted_project(first, monkeypatch)
+
+    fingerprint.flush_ast_hash_cache()
+    fingerprint.flush_manifest_cache()
+
+    names = {key.split(b"\x00")[0] for key in _helper_fingerprint_cache_keys(first)}
+    assert {b"fp:shout_helpers.py", b"sm:first/loud"} <= names
+
+
 def _write_sibling_stage_project(
     root: pathlib.Path, value: str, *, broken: bool = False
 ) -> pathlib.Path:
@@ -494,6 +573,78 @@ def test_never_checked_mode_still_replaces_bytecode_another_tool_cached(
     assert other_process.stdout.strip() == "bravo"
 
 
+def test_stage_fingerprint_is_of_the_helper_source_discovery_loaded(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stage's fingerprint describes its helper as discovery loaded it, the code a worker
+    receives by value, even when the helper file is edited before the fingerprint is computed."""
+    root = tmp_path / "project"
+    root.mkdir()
+    helper = root / "edited_helper.py"
+    alpha = 'def value() -> str:\n    return "alpha"\n'
+    bravo = 'def value() -> str:\n    return "bravo, edited after discovery"\n'
+    (root / "pipeline.py").write_text(
+        "import edited_helper\n"
+        + "from pivot.compose import Pipeline, stage\n\n\n"
+        + "@stage\n"
+        + "def build() -> str:\n"
+        + "    return edited_helper.value()\n\n\n"
+        + 'with Pipeline("project") as pipeline:\n'
+        + "    build()\n"
+    )
+    monkeypatch.setattr(project, "_project_root_cache", root)
+
+    def discover_and_fingerprint(text: str, *, then_edit_to: str | None = None) -> dict[str, str]:
+        helper.write_text(text)
+        pipeline = discovery.discover_pipeline(project_root=root)
+        assert pipeline is not None
+        if then_edit_to is not None:
+            helper.write_text(then_edit_to)
+        return pipeline.ensure_fingerprint("project/build")
+
+    as_alpha = discover_and_fingerprint(alpha)
+    as_bravo = discover_and_fingerprint(bravo)
+    assert as_alpha != as_bravo, "the fingerprint tracks the helper's body"
+
+    assert discover_and_fingerprint(alpha, then_edit_to=bravo) == as_alpha
+
+
+def test_a_later_discovery_forgets_the_earlier_projects_loaded_source(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Discovering project B ends project A's import session: A's recorded source and the
+    `linecache` lines pinned for it go, so a later load of A's edited helper outside a session is
+    fingerprinted from the edited text, not the text A's session compiled."""
+    for name in ("a", "b"):
+        root = tmp_path / name
+        (root / ".pivot").mkdir(parents=True)
+        (root / f"pinned_{name}.py").write_text('def value():\n    return "v1"\n')
+        (root / "pipeline.py").write_text(
+            f"import pinned_{name}\nfrom pivot.compose import Pipeline, stage\n\n\n@stage\n"
+            + f"def s() -> str:\n    return pinned_{name}.value()\n\n\n"
+            + f'with Pipeline("{name}") as pipeline:\n    s()\n'
+        )
+    helper = (tmp_path / "a" / "pinned_a.py").resolve()
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path / "a")
+    first = discovery.discover_pipeline(project_root=tmp_path / "a")
+    assert first is not None
+    first.ensure_fingerprint("a/s")
+    assert loaded_source.digest(str(helper)) is not None
+    assert str(helper) in linecache.cache, "fingerprinting pinned the loaded lines"
+
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path / "b")
+    assert discovery.discover_pipeline(project_root=tmp_path / "b") is not None
+
+    assert loaded_source.digest(str(helper)) is None
+    assert str(helper) not in linecache.cache
+    helper.write_text('def value():\n    return "v2, edited"\n')
+    spec = importlib.util.spec_from_file_location("pinned_a_again", helper)
+    assert spec is not None and spec.loader is not None
+    edited = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(edited)
+    assert "v2, edited" in loaded_source.getsource(edited.value)
+
+
 _MODULES_BY_KIND = {
     "nested package": "pkg.sub.mod",
     "namespace package": "nspkg.inner.leaf",
@@ -682,32 +833,142 @@ def test_pivot_tui_imported_during_a_session_keeps_its_bytecode(
 def test_session_end_gives_user_code_cpythons_loader_back(
     import_layout: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
-    """The loader is installed from a discovery until the next discovery ends its session; after
-    that, sys.path_hooks is as it was and an import from a user-code directory gets CPython's
-    loader again."""
+    """A discovery installs the loader only while it imports. Once it returns, sys.path_hooks,
+    sys.meta_path and spec_from_file_location are as they were and an import from a user-code
+    directory gets CPython's loader, while the modules the discovery imported stay loaded until
+    the next discovery ends its session."""
     root = import_layout
     empty = tmp_path / "empty"
     empty.mkdir()
     assert discovery.discover_pipeline(project_root=empty) is None, "ends any earlier session"
     hooks_before = list(sys.path_hooks)
+    meta_path_before = list(sys.meta_path)
     assert discovery.discover_pipeline(project_root=root) is not None
-    assert len(sys.path_hooks) == len(hooks_before) + 1
+    assert sys.path_hooks == hooks_before
+    assert sys.meta_path == meta_path_before
+    assert importlib.util.spec_from_file_location is discovery._original_spec_from_file_location
+    assert discovery.import_session_root() == root.resolve()
+    nested = sys.modules[_MODULES_BY_KIND["nested package"]]
+    assert type(nested.__loader__).__name__ == "_ProjectSourceLoader", "imported in the discovery"
     (tmp_path / "outside" / "late_mod.py").write_text("VALUE = 6\n")
     importlib.invalidate_caches()
     try:
-        assert type(importlib.import_module("late_mod").__loader__).__name__ == (
-            "_ProjectSourceLoader"
-        ), "a module imported while the session lasts gets the loader"
+        assert type(importlib.import_module("late_mod").__loader__) is (
+            importlib.machinery.SourceFileLoader
+        ), "a module imported after the discovery returned gets CPython's loader"
         del sys.modules["late_mod"]
 
         assert discovery.discover_pipeline(project_root=empty) is None
 
         assert sys.path_hooks == hooks_before
+        assert _MODULES_BY_KIND["nested package"] not in sys.modules, "the session ended"
         assert type(importlib.import_module("late_mod").__loader__) is (
             importlib.machinery.SourceFileLoader
         )
     finally:
         sys.modules.pop("late_mod", None)
+
+
+def _helper_pivot_finders() -> list[str]:
+    """The import path entries whose cached finder loads source with Pivot's checked loader."""
+    return [
+        entry
+        for entry, finder in sys.path_importer_cache.items()
+        if isinstance(finder, importlib.machinery.FileFinder)
+        and any(loader is discovery._ProjectSourceLoader for _, loader in vars(finder)["_loaders"])
+    ]
+
+
+_BROKEN = "raise ValueError('broken pipeline')\n"
+_EXITS = "import sys\nsys.exit(3)\n"
+_INTERRUPTED = "raise KeyboardInterrupt\n"
+
+
+@pytest.mark.parametrize(
+    ("load", "body", "raises"),
+    [
+        pytest.param("discover", "", None, id="discover-loaded"),
+        pytest.param("discover", _BROKEN, discovery.DiscoveryError, id="discover-error"),
+        pytest.param("discover", _EXITS, discovery.DiscoveryError, id="discover-exit"),
+        pytest.param("discover", _INTERRUPTED, KeyboardInterrupt, id="discover-interrupt"),
+        pytest.param("path", "", None, id="path-loaded"),
+        # load_pipeline_from_path logs an Exception from pipeline.py and returns None.
+        pytest.param("path", _BROKEN, None, id="path-error"),
+        pytest.param("path", _EXITS, SystemExit, id="path-exit"),
+        pytest.param("path", _INTERRUPTED, KeyboardInterrupt, id="path-interrupt"),
+    ],
+)
+def test_a_finished_discovery_leaves_no_import_hook_installed(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    load: str,
+    body: str,
+    raises: type[BaseException] | None,
+) -> None:
+    """A discovery that returns, fails or is interrupted leaves sys.meta_path, sys.path_hooks,
+    spec_from_file_location and the finders cached for user-code directories as it found them,
+    so a later import in the process, or a later test, is not recorded or loaded by Pivot."""
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "helper.py").write_text("VALUE = 1\n")
+    (root / "pipeline.py").write_text(
+        "import helper\n\nfrom pivot.compose import Pipeline\n\n"
+        + body
+        + "with Pipeline('hooks') as pipeline:\n    pass\n"
+    )
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    meta_path_before = list(sys.meta_path)
+    hooks_before = list(sys.path_hooks)
+    pivot_finders_before = _helper_pivot_finders()
+    try:
+        with pytest.raises(raises) if raises is not None else contextlib.nullcontext():
+            if load == "discover":
+                assert discovery.discover_pipeline(project_root=root) is not None
+            else:
+                pipeline = discovery.load_pipeline_from_path(root / "pipeline.py")
+                assert (pipeline is None) == (body == _BROKEN)
+
+        assert sys.meta_path == meta_path_before
+        assert sys.path_hooks == hooks_before
+        assert importlib.util.spec_from_file_location is (
+            discovery._original_spec_from_file_location
+        )
+        assert _helper_pivot_finders() == pivot_finders_before
+    finally:
+        sys.modules.pop("helper", None)
+
+
+def test_a_module_that_replaces_itself_in_sys_modules_keeps_its_record(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A module can put another module object under its name while it loads (a ModuleType
+    subclass, for module-level properties). Discovery's loader recorded the bytes it compiled for
+    the name; the end of discovery links that record to the object ``sys.modules`` now holds
+    (``loaded_source.record_user_modules``), so the module is not judged again as one no recorder
+    saw compile, which would make every stage that uses it untrusted."""
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "self_replacing.py").write_text(
+        "import sys\nimport types\n\n\nclass _Module(types.ModuleType):\n    pass\n\n\n"
+        + "VALUE = 1\n_replacement = _Module(__name__)\n"
+        + "_replacement.__dict__.update(globals())\nsys.modules[__name__] = _replacement\n"
+    )
+    (root / "pipeline.py").write_text(
+        "import self_replacing\n\nfrom pivot.compose import Pipeline\n\n"
+        + "with Pipeline('replacing') as pipeline:\n    pass\n"
+    )
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    try:
+        assert discovery.discover_pipeline(project_root=root) is not None
+        assert type(sys.modules["self_replacing"]).__name__ == "_Module"
+
+        path, digest, reason = loaded_source._record_fields(
+            loaded_source.digests()["self_replacing"]
+        )
+        assert (path, reason) == (str((root / "self_replacing.py").resolve()), "")
+        assert digest, "recorded with the bytes discovery's loader compiled"
+    finally:
+        sys.modules.pop("self_replacing", None)
 
 
 def test_discovery_reuses_the_bytecode_of_an_unchanged_project_file(

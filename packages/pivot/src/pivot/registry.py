@@ -11,7 +11,7 @@ import pygtrie
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-from pivot import exceptions, fingerprint, project, stage_def, types
+from pivot import exceptions, fingerprint, loaded_source, project, stage_def, types
 from pivot.storage import cache
 from pivot.storage import store as store_mod
 
@@ -333,13 +333,16 @@ def _compute_file_fingerprint(func: Callable[..., Any], code_deps: list[str]) ->
     Returns dict with keys like ``file:path/to/module.py`` -> hash.
     Includes the stage function's source file and each of ``code_deps``.
     Uses ``fingerprint.unwrap`` (``inspect.unwrap``'s reading) to handle stacked decorators.
+
+    A file this process loaded a module from is hashed as it was loaded (``loaded_source``), the
+    code a worker receives, not as it is on disk now.
     """
     result = dict[str, str]()
 
     # Unwrap decorators so inspect.getfile returns the actual stage source
     unwrapped = fingerprint.unwrap(func)
     source_file = pathlib.Path(inspect.getfile(unwrapped))
-    file_hash, _ = cache.hash_file(source_file)
+    file_hash = loaded_source.digest(str(source_file)) or cache.hash_file(source_file)[0]
     rel_path = project.to_relative_path(source_file)
     result[f"file:{rel_path}"] = file_hash
 
@@ -348,7 +351,7 @@ def _compute_file_fingerprint(func: Callable[..., Any], code_deps: list[str]) ->
         abs_path = (root / dep_path).resolve()
         if not abs_path.exists():
             raise FileNotFoundError(f"code_deps file not found: {dep_path}")
-        dep_hash, _ = cache.hash_file(abs_path)
+        dep_hash = loaded_source.digest(str(abs_path)) or cache.hash_file(abs_path)[0]
         # Normalize key to project-relative path for stable lockfiles
         dep_rel = project.to_relative_path(abs_path)
         result[f"file:{dep_rel}"] = dep_hash
