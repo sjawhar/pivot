@@ -4,10 +4,9 @@ import enum
 import logging
 import os
 import pathlib
-import re
 from typing import TypedDict
 
-from pivot import exceptions
+from pivot import display, exceptions
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +84,9 @@ def recorded_path_error(value: str) -> str | None:
     return None
 
 
-# Unicode category Cc is exactly these code points: C0 controls, DEL and C1 controls.
-_CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-
-
 def has_control_character(value: str) -> bool:
     """Whether ``value`` holds a control character (Unicode category Cc: C0, DEL or C1)."""
-    return _CONTROL_CHARACTER.search(value) is not None
+    return display.CONTROL_CHARACTER.search(value) is not None
 
 
 def validate_path(

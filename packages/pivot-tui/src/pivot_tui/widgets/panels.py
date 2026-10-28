@@ -4,13 +4,13 @@ import logging
 import time
 from typing import TYPE_CHECKING, override
 
-import rich.markup
 import textual.app
 import textual.containers
 import textual.css.query
 import textual.timer
 import textual.widgets
 
+from pivot import display
 from pivot_tui.diff_panels import InputDiffPanel, OutputDiffPanel
 from pivot_tui.widgets import status
 from pivot_tui.widgets.logs import LogSearchEscapePressed, LogSearchInput, StageLogPanel
@@ -153,7 +153,7 @@ class TabbedDetailPanel(textual.containers.Vertical):
         left_visible_len = 0
 
         # Stage name
-        left_parts.append(f"[bold]{rich.markup.escape(self._stage.name)}[/]")
+        left_parts.append(f"[bold]{display.escape_markup(self._stage.name)}[/]")
         left_visible_len += len(self._stage.name)
         left_parts.append("  ")
         left_visible_len += 2

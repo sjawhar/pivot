@@ -13,10 +13,10 @@ from typing import TYPE_CHECKING, TypedDict, cast
 import aiohttp
 import yaml
 
-from pivot import exceptions, project, types
+from pivot import config, exceptions, project, types
 from pivot.remote import config as remote_config
 from pivot.remote import git_archive, github, protocol
-from pivot.storage import cache, track
+from pivot.storage import cache, state, track
 from pivot.storage import lock as storage_lock
 
 if TYPE_CHECKING:
@@ -47,7 +47,8 @@ async def _download_verified(remote_url: str, file_hash: str, data_path: pathlib
 
     The file is downloaded to a temp file in the destination directory and moved over
     ``data_path`` after its hash is checked, so a corrupt remote copy leaves any existing
-    file (the last good import) untouched.
+    file (the last good import) untouched. Its hash is recorded in the StateDB with the stat
+    taken before the move (the same inode), so a write after the move is not recorded as it.
     """
     fd, tmp_name = tempfile.mkstemp(
         dir=data_path.parent, prefix=f".{data_path.name}.", suffix=".tmp"
@@ -56,15 +57,15 @@ async def _download_verified(remote_url: str, file_hash: str, data_path: pathlib
     tmp_path = pathlib.Path(tmp_name)
     try:
         await protocol.open_remote(remote_url).download_file(file_hash, tmp_path)
-        actual_hash, _ = cache.hash_file(tmp_path)
+        actual_hash, tmp_stat = cache.hash_file(tmp_path)
         if actual_hash != file_hash:
             raise exceptions.RemoteError(f"Hash mismatch: expected {file_hash}, got {actual_hash}")
-        size = tmp_path.stat().st_size
         os.replace(tmp_path, data_path)
     finally:
         with contextlib.suppress(FileNotFoundError):
             tmp_path.unlink()
-    return size
+    state.save_file_hashes(config.get_state_dir(), [(data_path, tmp_stat, file_hash)])
+    return tmp_stat.st_size
 
 
 def _maybe_token(repo_url: str, token: str | None) -> str | None:

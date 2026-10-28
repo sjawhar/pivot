@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import pathlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, cast
@@ -52,6 +53,7 @@ import pygtrie
 
 from pivot import (
     config,
+    display,
     exceptions,
     explain,
     import_artifact,
@@ -157,12 +159,13 @@ def _get_explanations_in_parallel(
             try:
                 explanations_by_name[stage_name] = future.result()
             except Exception as e:
-                logger.warning(f"Failed to get explanation for {stage_name}: {e}")
+                message = exceptions.describe_error(e)
+                logger.warning(f"Failed to get explanation for {stage_name}: {message}")
                 explanations_by_name[stage_name] = StageExplanation(
                     stage_name=stage_name,
                     will_run=True,
                     is_forced=False,
-                    reason=f"Error: {e}",
+                    reason=f"Error: {message}",
                     code_changes=list[CodeChange](),
                     param_changes=list[ParamChange](),
                     dep_changes=list[DepChange](),
@@ -348,18 +351,22 @@ def get_tracked_files_status(
     total = len(tracked)
     results = list[TrackedFileInfo]()
 
-    # Use state_db for hash caching (mtime-based)
+    # Look hashes up read-only and save what was read once, best-effort, so a hash cache that
+    # cannot be opened or written never fails status
     cache_dir = config.get_cache_dir() / "files"
-    with state_mod.StateDB(config.get_state_dir()) as state_db:
+    pending = list[tuple[pathlib.Path, os.stat_result, str]]()
+    with state_mod.open_readonly(config.get_state_dir(), create=False) as state_db:
         for i, (abs_path_str, track_data) in enumerate(sorted(tracked.items()), 1):
             path = pathlib.Path(abs_path_str)
             rel_path = str(path.relative_to(project_root))
 
             try:
                 if path.is_dir():
-                    current_hash = cache.hash_directory(path, state_db, cache_dir=cache_dir)["hash"]
+                    current_hash = cache.hash_directory(
+                        path, state_db, cache_dir=cache_dir, pending=pending
+                    )["hash"]
                 else:
-                    current_hash, _ = cache.hash_file(path, state_db)
+                    current_hash, _ = cache.hash_file(path, state_db, pending=pending)
             except FileNotFoundError:
                 results.append(
                     TrackedFileInfo(
@@ -383,6 +390,7 @@ def get_tracked_files_status(
             )
             if on_progress is not None:
                 on_progress(i, total)
+    state_mod.save_file_hashes(config.get_state_dir(), pending)
 
     return results
 
@@ -403,7 +411,7 @@ def get_remote_status(
         raise exceptions.RemoteNotConfiguredError("No remotes configured")
 
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
-    url = remote_config.get_remote_url(resolved_name)
+    url = display.redact_url_credentials(remote_config.get_remote_url(resolved_name))
     local_hashes = transfer.get_local_cache_hashes(cache_dir)
 
     if not local_hashes:
@@ -510,8 +518,12 @@ async def _check_imports_batch(
     results = list[ImportStatusInfo]()
     for (rel_path, _, _), check_or_exc in zip(tasks, checks, strict=True):
         if isinstance(check_or_exc, Exception):
-            error = str(check_or_exc) or type(check_or_exc).__name__
-            logger.warning("Failed to check import %s: %s", rel_path, error)
+            error = display.redact_url_credentials(exceptions.describe_error(check_or_exc))
+            logger.warning(
+                "Failed to check import %s: %s",
+                display.escape_control(rel_path),
+                display.escape_control(error),
+            )
             results.append(
                 ImportStatusInfo(
                     path=rel_path,

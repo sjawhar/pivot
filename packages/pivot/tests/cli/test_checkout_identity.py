@@ -120,10 +120,13 @@ def test_get_stage_output_info_uses_store_paths(mock_discovery: PipelineLike) ->
     output_hash = types.FileHash(hash="a" * 16)
     _helper_write_lock("train", mock_discovery.state_dir, {ref.identity: output_hash})
 
-    result = checkout_mod._get_stage_output_info()
+    hashes, state_dirs = checkout_mod._get_stage_output_info()
     expected_path = str(store_instance.resolve_display_path(ref))
 
-    assert result == {expected_path: output_hash}
+    assert hashes == {expected_path: output_hash}
+    assert state_dirs == {expected_path: mock_discovery.state_dir}, (
+        "Each output's file hashes live in its stage's state directory"
+    )
     assert expected_path == str(project.get_project_root() / "data" / "train.csv")
 
 

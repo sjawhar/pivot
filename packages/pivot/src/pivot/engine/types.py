@@ -181,6 +181,8 @@ class StageCompleted(TypedDict):
     """A stage finished (ran, cached, blocked, cancelled, or failed)."""
 
     type: Literal["stage_completed"]
+    # StageResult's display_reason: what the console prints in place of `reason`.
+    display_reason: NotRequired[str]
     seq: NotRequired[int]
     stage: str
     status: CompletionType

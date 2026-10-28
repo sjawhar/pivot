@@ -168,9 +168,10 @@ async def transfer_batch[C](
 ) -> list[TransferResult]:
     """Run ``transfer_one`` for every ``(hash, local_path)`` in parallel on one client.
 
-    A transfer that raises becomes ``TransferResult(success=False, error=str(exc))``, so one
-    failed file never stops the rest; a ``RemoteUnreachableError`` (no connection to the remote
-    could be made) also sets ``connection_failed``.
+    A transfer that raises becomes ``TransferResult(success=False, error=...)``, so one failed file
+    never stops the rest: a generic exception is worded by ``exceptions.describe_error``, and a
+    ``RemoteUnreachableError`` (no connection to the remote could be made) keeps its message and
+    also sets ``connection_failed``.
     ``callback(completed, total, file_name)`` runs after each success.
 
     Raises:
@@ -205,7 +206,8 @@ async def transfer_batch[C](
                             hash=hash_, success=False, error=str(e), connection_failed=True
                         )
                     except Exception as e:
-                        return TransferResult(hash=hash_, success=False, error=str(e))
+                        error = exceptions.describe_error(e)
+                        return TransferResult(hash=hash_, success=False, error=error)
 
             return await asyncio.gather(*[transfer(h, p) for h, p in items])
     finally:
