@@ -1,6 +1,6 @@
 [project]
 name = "pivot-tui"
-version = "0.5.15"
+version = "0.5.17"
 description = "Textual-based TUI for the Pivot pipeline framework"
 requires-python = ">=3.13,<3.14"
 readme = "README.md"
@@ -13,7 +13,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "pivot>=0.5.11",
+    "pivot>=0.5.17",
     "textual>=7.0",
 ]
 

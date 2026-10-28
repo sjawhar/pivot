@@ -2,99 +2,61 @@
 tags: [python, paths, database, caching]
 category: design
 module: storage
-symptoms: ["duplicate cache entries", "generation lookup misses", "symlink path confusion"]
+symptoms: ["duplicate cache entries", "generation lookup misses", "symlink path confusion", "slow warm hash lookups"]
 ---
 
-# StateDB Path Strategies: `resolve()` for Hashes, `normpath()` for Generations
+# StateDB Key Strategies: the Absolute Path for Hashes, the Artifact Identity for Generations
 
 ## Problem
 
-Pivot's StateDB stores two types of path-keyed data with fundamentally different requirements:
+Pivot's StateDB stores two kinds of keyed data with different requirements:
 
-1. **File hash cache** - Maps paths to content hashes for skip detection
-2. **Generation counters** - Tracks how many times each output has been produced
+1. **File hash cache** - maps a file to its content hash, so an unchanged file is not read again
+2. **Generation counters** - count how many times each output has been produced
 
-Using the same path resolution strategy for both causes subtle bugs:
+A generation key must not move when an output's bytes move. After a symlink checkout,
+`output.csv` points into `.pivot/cache/...`; a key built from `resolve()` would change with
+every new content hash, and each run would look like a new output.
 
-```python
-# Project structure after stage execution:
-# output.csv -> .pivot/cache/abc123/output.csv  (symlink to cache)
-
-# If we use resolve() for both:
-path = Path("output.csv")
-path.resolve()  # Returns .pivot/cache/abc123/output.csv
-
-# Hash lookup: CORRECT - deduplicates symlinks pointing to same file
-# Generation lookup: WRONG - key changes every time hash changes!
-```
-
-The generation counter key would change from `gen:output.csv` to `gen:.pivot/cache/abc123/output.csv` after the first run, then to `gen:.pivot/cache/def456/output.csv` after the content changes. Each run creates a "new" output path as far as generation tracking is concerned.
-
-Conversely, using `normpath()` for hash lookups:
-
-```python
-# Two symlinks to same physical file:
-# data/input.csv -> /shared/datasets/sales.csv
-# archive/sales.csv -> /shared/datasets/sales.csv
-
-# If we use normpath() for hash lookups:
-path1 = Path("data/input.csv")      # normpath: data/input.csv
-path2 = Path("archive/sales.csv")   # normpath: archive/sales.csv
-
-# We compute and store the same hash TWICE - wasted work
-```
+A file-hash key must be cheap, because every warm lookup builds one. It must also be
+correct when a path is a symlink that is later pointed elsewhere.
 
 ## Solution
 
-Use different path resolution strategies based on the semantic meaning of the lookup:
-
 ```python
 def _make_key_file_hash(path: pathlib.Path) -> bytes:
-    """Create LMDB key for file hash entry (follows symlinks for physical deduplication).
-
-    Uses resolve() to follow symlinks because hash caching is about physical file identity.
-    Multiple symlinks pointing to the same file should share one cached hash.
-    """
-    return _HASH_PREFIX + str(path.resolve()).encode()
+    return _HASH_PREFIX + os.fsencode(os.path.abspath(path))
 
 
-def _make_key_output_generation(path: pathlib.Path) -> bytes:
-    """Create LMDB key for output generation entry (preserves symlinks for logical path tracking).
-
-    Uses normpath(absolute()), NOT resolve(), because Pivot outputs become symlinks
-    to cache after execution. resolve() would follow these symlinks to cache paths
-    that change per-run. We track the LOGICAL path the user declared.
-    """
-    return _GEN_PREFIX + os.path.normpath(path.absolute()).encode()
+def _make_key_output_generation(identity: str) -> bytes:
+    return _GEN_PREFIX + identity.encode()
 ```
 
-The key difference:
+| Key | Built from | Why |
+|-----|------------|-----|
+| `hash:` | `os.fsencode(os.path.abspath(path))` | Cheap, and keeps names that are not UTF-8 |
+| `gen:` | the artifact identity | Stays the same whatever the output's path points to |
 
-| Strategy | Function | Purpose | Example |
-|----------|----------|---------|---------|
-| `resolve()` | File hash lookup | Physical identity dedup | Symlinks to same file share one hash |
-| `normpath(absolute())` | Generation tracking | Logical path identity | `output.csv` stays `output.csv` even when symlinked to cache |
+The hash key does not follow symlinks. Correctness rests on the entry's value, not the key:
+it holds the `(mtime_ns, size, device, inode)` of `path.stat()`, which follows symlinks. A
+link pointed at another file on the same filesystem stats to another inode. A link pointed at
+another filesystem can find a file with the same inode number, size and mtime_ns (two tmpfs
+mounts, fresh images, block-level clones), so the device is part of the entry too: either way
+the entry no longer matches and the file is read again. Two links to one file hold two
+entries and the file is read once for each, which costs less than resolving every lookup.
 
-In practice for Pivot:
+The entry holds no ctime. It would catch a rewrite that puts mtime back, but a new hard link
+changes the inode's ctime: every hardlink checkout, and every replica that hard-links pivot's
+files, would invalidate the entries of every file it links.
 
-```python
-# After stage execution, output.csv is a symlink:
-# output.csv -> .pivot/cache/abc123/output.csv
-
-# Hash lookup (resolve):
-hash_key = "hash:/home/user/project/.pivot/cache/abc123/output.csv"
-# Correct! If another file links here, they share the cached hash.
-
-# Generation lookup (normpath):
-gen_key = "gen:/home/user/project/output.csv"
-# Correct! Tracks the declared output path, not where it points.
-```
+Earlier keys called `path.resolve()`. That cost more per warm lookup (16.2 µs) than reading
+and hashing a small file cold (8.8 µs), measured on main for BET-36 plan Task 1.10e, and
+`str(...).encode()` failed on a file name that is not UTF-8. Moving to the lexical key re-keys
+every path that passes through a symlink, so after an upgrade each such file is read once
+more, until a command that writes the workspace records it.
 
 ## Key Insight
 
-Path resolution strategy must match the **semantic meaning** of the operation:
-
-- **Content-addressed lookups** (hashes) care about **physical identity** - use `resolve()` to follow symlinks and deduplicate
-- **Logical path lookups** (generations, dependencies) care about **declared identity** - use `normpath()` to preserve the path as the user/system specified it
-
-This is why Pivot outputs become symlinks to the cache: it allows the same physical content to be reused across runs while maintaining stable logical paths for tracking. The two path strategies work together to make this transparent.
+A cache key only has to name the place a reader will look again; the value proves whether the
+cached hash still applies. Put the validity check in the value (`stat` follows symlinks) and
+keep the key lexical, so building it costs no system call.

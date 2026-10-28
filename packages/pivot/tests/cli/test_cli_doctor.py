@@ -1,4 +1,6 @@
+import errno
 import json
+import os
 import pathlib
 import subprocess
 
@@ -8,6 +10,7 @@ import pytest
 from pivot import project
 from pivot.cli import cli
 from pivot.cli import doctor as doctor_module
+from pivot.remote import config as remote_config
 
 # =============================================================================
 # Human-Readable Output Tests
@@ -195,6 +198,24 @@ def test_check_project_root_returns_path_when_found(
     assert event["status"] == doctor_module.CheckStatus.OK
     assert root is not None
     assert str(tmp_path) in event["value"]
+
+
+def test_check_remote_connectivity_words_an_os_error_as_its_message_and_path(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A remote config the check cannot read is reported as the OS's message and its path, which
+    `pivot doctor` prints and `--json` holds, not as Python's `[Errno 13] ...: '<path>'`."""
+    config_file = tmp_path / ".pivot" / "config.yaml"
+
+    def unreadable() -> dict[str, str]:
+        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(config_file))
+
+    monkeypatch.setattr(remote_config, "list_remotes", unreadable)
+
+    [event] = doctor_module._check_remote_connectivity(tmp_path)
+
+    assert event["status"] == doctor_module.CheckStatus.ERROR
+    assert event["details"] == {"error": f"{os.strerror(errno.EACCES)}: {config_file}"}
 
 
 def test_check_pipeline_config_ok_with_pipeline_py(

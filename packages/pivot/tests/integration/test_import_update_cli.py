@@ -23,7 +23,7 @@ import yaml
 import conftest
 from pivot import cli, project, types
 from pivot.remote import keys
-from pivot.storage import lock, track
+from pivot.storage import lock, state, track
 
 if TYPE_CHECKING:
     import pathlib
@@ -766,9 +766,10 @@ def test_update_failure_of_one_import_does_not_stop_the_others(
     result = runner.invoke(cli.cli, ["update"])
 
     assert result.exit_code == 1
-    assert f"Unexpected error updating {track.get_pvt_path(a_path)}: IsADirectoryError" in (
-        result.output
-    )
+    # The OS's words and the path, without the exception class or a traceback (--verbose logs it)
+    assert f"Error updating {track.get_pvt_path(a_path)}: Is a directory: " in result.output
+    assert "IsADirectoryError" not in result.output
+    assert "Traceback" not in result.output
     assert f"Updated: {b_path}" in result.output
     assert b_path.read_bytes() == b"b2"
 
@@ -871,6 +872,33 @@ def test_update_of_an_import_under_the_old_name_of_a_directory_file_names_the_fi
     after = runner.invoke(cli.cli, ["update"])
     assert after.exit_code == 0, after.output
     assert f"Up to date: {data_path}" in after.output
+
+
+# =============================================================================
+# file-hash entries: import and update record what they write
+# =============================================================================
+
+
+def _helper_recorded_hash(root: pathlib.Path, data_path: pathlib.Path) -> str | None:
+    """The hash the project's StateDB holds for ``data_path`` at its current stat, if any."""
+    with state.StateDB(root / ".pivot", readonly=True) as state_db:
+        return state_db.get(data_path, data_path.stat())
+
+
+def test_import_and_update_record_the_hash_of_the_file_they_write(
+    runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
+) -> None:
+    """The downloaded file's hash is recorded, so the next status reads none of it."""
+    _helper_publish(source, bucket, "smoke/total", b"v1", "v1")
+
+    data_path = _helper_import(runner, source, "smoke/total", "total.txt")
+    assert _helper_recorded_hash(consumer, data_path) == xxhash.xxh64(b"v1").hexdigest()
+
+    _helper_publish(source, bucket, "smoke/total", b"version two", "v2")
+    result = runner.invoke(cli.cli, ["update"])
+    assert result.exit_code == 0, result.output
+
+    assert _helper_recorded_hash(consumer, data_path) == xxhash.xxh64(b"version two").hexdigest()
 
 
 # =============================================================================

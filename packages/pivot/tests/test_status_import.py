@@ -172,9 +172,9 @@ def test_status_import_empty_error_names_type_in_warning(
     with caplog.at_level(logging.WARNING, logger="pivot.status"):
         results = status.get_import_status(tmp_path)
 
-    assert results[0]["error"] == "TimeoutError"
+    assert results[0]["error"] == "Unexpected TimeoutError"
     assert [record.getMessage() for record in caplog.records] == [
-        "Failed to check import models/model.pkl: TimeoutError"
+        "Failed to check import models/model.pkl: Unexpected TimeoutError"
     ]
 
 
@@ -400,7 +400,7 @@ def test_status_check_imports_network_error_doesnt_fail(
                 "status": "error",
                 "current_rev": None,
                 "latest_rev": None,
-                "error": "TimeoutError",
+                "error": "Unexpected TimeoutError",
             },
             id="error-without-message",
         ),

@@ -149,6 +149,11 @@ class OnError(enum.StrEnum):
     KEEP_GOING = "keep_going"
 
 
+FileHashEntry = tuple[str, int, int, int, int, str]
+"""A StateDB file-hash entry handed to a process that can write: (path, mtime_ns, size, dev,
+inode, hash), the path absolute and the stat fields from ``stat()``, which follows symlinks."""
+
+
 class NoCommitRecord(TypedDict, total=False):
     """What a stage's outputs hold that no lock records yet, kept under the StateDB key
     `nocommit:<stage>`. A written lock supersedes it, and its whole record is removed.
@@ -191,7 +196,7 @@ class DeferredWrites(TypedDict, total=False):
     # A run the stage-import check flagged: delete any run-cache entry at this input hash.
     run_cache_delete_input_hash: str
     increment_outputs: bool  # True → increment output generations; False/absent → skip
-    file_hash_entries: list[tuple[str, int, int, int, str]]  # (path, mtime_ns, size, inode, hash)
+    file_hash_entries: list[FileHashEntry]
     no_commit_record: NoCommitRun  # a --no-commit run's keys of its `nocommit:` record
     clear_no_commit_record: bool  # a lock was written: drop the stage's --no-commit record
 
@@ -200,6 +205,11 @@ class StageResult(TypedDict):
     """Result from executing a single stage."""
 
     status: CompletionType
+    # One line the console prints in place of `reason`, which keeps its exact text for results
+    # and JSONL (a traceback, for an unexpected error in a worker). Set only for a failure of
+    # pivot's own I/O on state it owns (`stage_io`). Empty when a log line already
+    # names the failure. Absent otherwise: the console prints `reason`, traceback included.
+    display_reason: NotRequired[str]
     reason: str
     input_hash: str | None  # None only for early failures before dep hashing
     output_lines: list[tuple[str, bool]]

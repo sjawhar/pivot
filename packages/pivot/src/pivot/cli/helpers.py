@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import importlib
+import pathlib
 import sys
 from typing import TYPE_CHECKING, Any, cast, override
 
@@ -175,18 +176,21 @@ class TransferProgress:
         self._bar.update(completed - self._bar.n)
 
 
-def get_stage_output_info() -> dict[str, HashInfo]:
+def get_stage_output_info() -> tuple[dict[str, HashInfo], dict[str, pathlib.Path]]:
     """Get output hash info from lock files for cached stage outputs only.
 
     Non-cached outputs (e.g. Metric with cache=False) are excluded —
     they are git-tracked and not Pivot's responsibility to restore.
 
-    Uses per-stage state_dir from the registry for lock file lookup.
+    Uses per-stage state_dir from the registry for lock file lookup. Also returns each
+    output's stage state_dir, whose StateDB holds the file hashes the stage's runs and
+    explanations look up.
     """
     result = dict[str, HashInfo]()
+    state_dirs = dict[str, pathlib.Path]()
     store = get_workspace_store()
     if store is None:
-        return result
+        return result, state_dirs
 
     for stage_name in list_stages():
         stage_info = get_stage(stage_name)
@@ -205,10 +209,11 @@ def get_stage_output_info() -> dict[str, HashInfo]:
                 ref = ref_by_identity.get(identity)
                 if ref is None:
                     continue
-                resolved = store.resolve_display_path(ref)
-                result[str(resolved)] = out_hash
+                resolved = str(store.resolve_display_path(ref))
+                result[resolved] = out_hash
+                state_dirs[resolved] = stage_state_dir
 
-    return result
+    return result, state_dirs
 
 
 def get_locally_tracked_targets() -> list[str]:
@@ -218,7 +223,7 @@ def get_locally_tracked_targets() -> list[str]:
 
     pipeline = cli_decorators.get_pipeline_from_context()
     if pipeline is not None:
-        targets.extend(get_stage_output_info())
+        targets.extend(get_stage_output_info()[0])
 
     return targets
 

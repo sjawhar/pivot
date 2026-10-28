@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 import pivot_tui.event_poller
 import pivot_tui.rpc_client_impl
 from conftest import isolated_pivot_dir
-from pivot import cli, compose
+from pivot import cli, compose, exceptions
 from pivot.cli import _run_common
 from pivot.engine import engine as engine_mod
 
@@ -1244,10 +1244,8 @@ def test_defer_console_logging_prints_each_distinct_failure(
     try:
         with _run_common.defer_console_logging():
             for error in (ValueError("first failure"), KeyError("second failure")):
-                try:
-                    raise error
-                except (ValueError, KeyError):
-                    logger.exception("Stage %s failed with exception", "demo/train")
+                # As the engine logs a stage whose worker raised
+                logger.error("Stage %s failed: %s", "demo/train", exceptions.describe_error(error))
         after = capsys.readouterr()
     finally:
         root.removeHandler(handler)

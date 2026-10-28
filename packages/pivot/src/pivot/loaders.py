@@ -14,7 +14,7 @@ import pickle
 import shutil
 import tempfile
 import warnings
-from typing import TYPE_CHECKING, Any, Literal, cast, override
+from typing import IO, TYPE_CHECKING, Any, Literal, cast, override
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 import numpy
 import pandas
 import yaml
+
+from pivot import stage_io
 
 
 class LossyOutputWarning(UserWarning):
@@ -160,7 +162,7 @@ class JSON[T](Loader[T, T]):
 
     @override
     def save(self, data: T, path: pathlib.Path) -> None:
-        with open(path, "w") as f:
+        with _create_output_file(path, "w") as f:
             json.dump(data, f, indent=self.indent)
 
     @override
@@ -249,8 +251,11 @@ class YAML[T](Loader[T, T]):
                 LossyOutputWarning,
                 stacklevel=2,
             )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        # The text is encoded, so writing it runs no code of the value's: the whole write is
+        # pivot's own I/O.
+        with stage_io.output_io(path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
 
     @override
     def empty(self) -> T:
@@ -275,18 +280,9 @@ class Text(Loader[str, str]):
         if not isinstance(data, str):  # pyright: ignore[reportUnnecessaryIsInstance] - runtime validation for misuse
             raise TypeError(f"Text save expects str, got {type(data).__name__}")  # pyright: ignore[reportUnreachable]
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".txt.tmp")
-        try:
-            with os.fdopen(fd, "w", newline="") as f:
-                f.write(data)
-            os.rename(tmp_path_str, path)
-        except Exception:
-            tmp_path = pathlib.Path(tmp_path_str)
-            if tmp_path.exists():
-                tmp_path.unlink()
-            raise
+        # The text is the value itself, so the whole write is pivot's own I/O.
+        with stage_io.output_io(path):
+            _write_text_atomically(path, [data], suffix=".txt.tmp", newline="")
 
     @override
     def empty(self) -> str:
@@ -317,19 +313,11 @@ class JSONL(Loader[list[dict[str, Any]], list[dict[str, Any]]]):
         if not isinstance(data, list):  # pyright: ignore[reportUnnecessaryIsInstance] - runtime validation for misuse
             raise TypeError(f"JSONL save expects list, got {type(data).__name__}")  # pyright: ignore[reportUnreachable]
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                for item in data:
-                    f.write(json.dumps(item) + "\n")
-            os.rename(tmp_path_str, path)
-        except Exception:
-            tmp_path = pathlib.Path(tmp_path_str)
-            if tmp_path.exists():
-                tmp_path.unlink()
-            raise
+        # `json.dumps` of each item runs the value's own code, so only creating the file and
+        # putting it in place are pivot's own I/O.
+        _write_text_atomically(
+            path, (json.dumps(item) + "\n" for item in data), suffix=".jsonl.tmp"
+        )
 
     @override
     def empty(self) -> list[dict[str, Any]]:
@@ -541,13 +529,37 @@ def _parse_jsonl_header(record: object, path: pathlib.Path) -> _JsonlHeader | No
     return columns, temporal_columns
 
 
-def _write_text_atomically(path: pathlib.Path, chunks: collections_abc.Iterable[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=".jsonl.tmp")
+def _create_output_file(path: pathlib.Path, mode: str) -> IO[Any]:
+    """Open ``path`` for a writer that encodes its value as it writes it.
+
+    Creating the file is pivot's own I/O; what the caller writes into it is not, because that
+    encoding runs the value's own code.
+    """
+    with stage_io.output_io(path):
+        return open(path, mode)  # noqa: SIM115 - the caller closes it; only creating it is marked
+
+
+def _write_text_atomically(
+    path: pathlib.Path,
+    chunks: collections_abc.Iterable[str],
+    *,
+    suffix: str,
+    newline: str | None = None,
+) -> None:
+    """Write ``chunks`` to ``path`` through a temporary file beside it, then rename it into place.
+
+    Creating the file and renaming it are pivot's own I/O. Writing ``chunks`` is pivot's own only
+    when the caller already holds the text (it brackets this call with ``stage_io.output_io``);
+    a caller that encodes as it writes leaves it unmarked, because that runs the value's code.
+    """
+    with stage_io.output_io(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, suffix=suffix)
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", newline=newline) as f:
             f.writelines(chunks)
-        os.rename(tmp_path_str, path)
+        with stage_io.output_io(path):
+            os.rename(tmp_path_str, path)
     except Exception:
         tmp_path = pathlib.Path(tmp_path_str)
         if tmp_path.exists():
@@ -577,7 +589,9 @@ def _write_old_jsonl_format(
         LossyOutputWarning,
         stacklevel=3,
     )
-    _write_text_atomically(path, [content])
+    # pandas rendered the text already, so the whole write is pivot's own I/O.
+    with stage_io.output_io(path):
+        _write_text_atomically(path, [content], suffix=".jsonl.tmp")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -762,7 +776,13 @@ class DataFrameJSONL(Loader[pandas.DataFrame, pandas.DataFrame]):
             "{" + ",".join(map(operator.add, keys, cells)) + "}\n"
             for cells in zip(*columns, strict=True)
         )
-        _write_text_atomically(path, itertools.chain([encoder.encode(metadata) + "\n"], rows))
+        # Every chunk is text this writer already encoded, so the whole write is pivot's own I/O.
+        with stage_io.output_io(path):
+            _write_text_atomically(
+                path,
+                itertools.chain([encoder.encode(metadata) + "\n"], rows),
+                suffix=".jsonl.tmp",
+            )
 
     @override
     def empty(self) -> pandas.DataFrame:
@@ -793,7 +813,9 @@ class Pickle[T](Loader[T, T]):
 
     @override
     def save(self, data: T, path: pathlib.Path) -> None:
-        with open(path, "wb") as f:
+        # Pickling runs the value's own `__reduce__` and `__getstate__` as it writes, so only
+        # creating the file is pivot's own I/O.
+        with _create_output_file(path, "wb") as f:
             pickle.dump(data, f, protocol=self.protocol)
 
 

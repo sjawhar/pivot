@@ -180,7 +180,8 @@ async def _stream_upload(
         try:
             await s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
         except Exception as abort_error:
-            logger.warning(f"Failed to abort multipart upload {upload_id}: {abort_error}")
+            reason = exceptions.describe_error(abort_error)
+            logger.warning(f"Failed to abort multipart upload {upload_id}: {reason}")
         raise
 
 
