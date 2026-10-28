@@ -37,6 +37,22 @@ All commands support:
 | `--quiet` / `-q` | Suppress non-essential output |
 | `--help` | Show help message |
 
+**Output.** Three rules hold for every command:
+
+- **URL credentials are hidden.** Any URL Pivot prints — an import's repository URL, a remote
+  cache URL, a URL in a warning, a log line or an error — shows `***` in place of its user-info:
+  `https://user:token@host/repo.git` prints as `https://***@host/repo.git`. The stored URL is
+  unchanged, and a URL without credentials prints byte for byte. An scp-like `git@host:path` is
+  not a URL and prints as typed.
+- **Control characters are escaped in text output.** A value Pivot read from a file (a `.pvt`
+  file, a lock file, `.pivot/config.yaml`, `params.yaml`, a remote listing) prints each control
+  character as visible text (`\x1b`), tab and newline included, so one value stays on one line
+  and a crafted repository cannot drive the terminal. `--json` output is unchanged: JSON escapes
+  these characters itself.
+- **`--json` and `--jsonl` are strict JSON.** A non-finite float prints as the string
+  `"Infinity"`, `"-Infinity"` or `"NaN"`, so a strict RFC 8259 parser reads every document. See
+  [CI Integration](../guides/ci-integration.md#pivot-status---json).
+
 **Errors.** A failure pivot recognizes prints its own message, often with a tip. Any other failure
 prints one line: an operating-system error as its message and the path it names (for example
 `Error: Permission denied: /home/me/proj/.pivot/cache/files/c9`), anything else as
@@ -47,7 +63,8 @@ preparing the stage's output path, and creating the output file and renaming it 
 format pivot writes itself (text, JSON, JSON Lines, YAML, pickle, DataFrame JSON Lines). Every
 other stage failure prints its traceback, as before: one in your stage function, in a loader or
 writer (pivot's own included, with any code of yours it runs), and any failure pivot did not
-classify. The `--json` record keeps the stage's full reason in both cases, unchanged.
+classify. The `--json` record keeps the stage's full reason in both cases: its last line and your
+own frames are what they were, and pivot may add a frame of its own above them.
 `pivot --verbose <command>` also prints the traceback, after the TUI exits for `--tui`.
 
 The same cause therefore reads differently by output format, because a format that encodes your
@@ -58,10 +75,14 @@ value as it writes it runs your value's own code inside the write:
   JSON, JSON Lines or pickle output, where `json` and `pickle` encode your value as they write
   it, so a `__getstate__`, a `__reduce__` or a container of yours may be what failed.
 - **A read-only output directory** is one line for those six formats, which pivot opens itself.
-  It prints the traceback for a CSV output, a plot and a `pathlib.Path` output, where pandas,
-  matplotlib and the move open the path while running your value's code.
+  It prints the traceback for a CSV output and a plot, where pandas and matplotlib open the path
+  while running your value's code, and for a `pathlib.Path` output, whose move pivot has not
+  classified.
 - **A directory pivot has to create for the output** is one line for every format, including CSV
   and a plot: pivot creates it before the writer runs.
+
+The first two rules above hold for these lines too: a credential in a path or a message is
+hidden, and a control character in either is escaped, in the one line and in the traceback alike.
 
 **Path arguments.** `pivot track`, `push`, `fetch` and `pull` read a relative path from the
 current directory. `diff`, `checkout`, `repro`, `dag`, `get` and `check-ignore` read it from the

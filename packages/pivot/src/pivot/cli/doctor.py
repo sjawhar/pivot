@@ -5,11 +5,11 @@ import os
 import subprocess
 import sys
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
-from urllib.parse import urlparse, urlunparse
 
 import click
 import pydantic
 
+from pivot import display as display_mod
 from pivot import exceptions
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -72,21 +72,9 @@ def _skipped_check(name: str, reason: str = "no project root") -> DoctorCheckEve
     return _check_event(name, CheckStatus.ERROR, "skipped", {"reason": reason})
 
 
-def _sanitize_url(url: str) -> str:
-    """Remove password from URL if present, preserve everything else."""
-    parsed = urlparse(url)
-    if not parsed.password:
-        return url
-
-    # Rebuild netloc without password
-    netloc = parsed.username or ""
-    if netloc:
-        netloc += "@"
-    netloc += parsed.hostname or ""
-    if parsed.port:
-        netloc += f":{parsed.port}"
-
-    return urlunparse(parsed._replace(netloc=netloc))
+def _redacted(value: object) -> str:
+    """``value`` as text, with the credentials of any URL in it hidden."""
+    return display_mod.redact_url_credentials(str(value))
 
 
 def _find_invalid_remote(
@@ -111,8 +99,9 @@ def _format_config_validation_error(error: pydantic.ValidationError) -> str:
     value = detail["input"]
     if location == "remotes" and isinstance(value, dict) and value:
         name, remote, message = _find_invalid_remote(cast("dict[object, object]", value))
-        return f"Invalid config remotes.{name}: {remote!r}; {message}"
-    return f"Invalid config {location}: {value!r}; expected {detail['msg'].removeprefix('Value error, ')}"
+        return _redacted(f"Invalid config remotes.{name}: {remote!r}; {message}")
+    expected = detail["msg"].removeprefix("Value error, ")
+    return _redacted(f"Invalid config {location}: {value!r}; expected {expected}")
 
 
 def _relative_path(path: pathlib.Path, project_root: pathlib.Path) -> str:
@@ -257,7 +246,10 @@ def _check_remote_connectivity(project_root: pathlib.Path | None) -> list[Doctor
     except Exception as e:
         return [
             _check_event(
-                "remote", CheckStatus.ERROR, "config error", {"error": exceptions.describe_error(e)}
+                "remote",
+                CheckStatus.ERROR,
+                "config error",
+                {"error": _redacted(exceptions.describe_error(e))},
             )
         ]
 
@@ -266,19 +258,19 @@ def _check_remote_connectivity(project_root: pathlib.Path | None) -> list[Doctor
 
     results = list[DoctorCheckEvent]()
     for name, url in remotes.items():
-        sanitized_url = _sanitize_url(url)
+        shown_url = _redacted(url)
         try:
             remote_config.validate_remote_url(url)
             results.append(
-                _check_event(f"remote:{name}", CheckStatus.OK, sanitized_url, {"valid": True})
+                _check_event(f"remote:{name}", CheckStatus.OK, shown_url, {"valid": True})
             )
         except Exception as e:
             results.append(
                 _check_event(
                     f"remote:{name}",
                     CheckStatus.ERROR,
-                    sanitized_url,
-                    {"valid": False, "error": exceptions.describe_error(e)},
+                    shown_url,
+                    {"valid": False, "error": _redacted(exceptions.describe_error(e))},
                 )
             )
 
@@ -301,37 +293,32 @@ def _print_check_human(check: DoctorCheckEvent) -> None:
         indicator = "[ERROR]"
 
     # Format value with details
-    if name == "python_version" or name == "project_root":
-        display = value
-    elif name == "pipeline_config":
-        if details and "stages" in details:
-            display = f"{value} ({details['stages']} stages)"
-        else:
-            display = value
+    if name == "pipeline_config" and details and "stages" in details:
+        shown = f"{value} ({details['stages']} stages)"
     elif name == "cache_directory":
         if details and details.get("writable"):
-            display = f"{value} (writable)"
+            shown = f"{value} (writable)"
         elif details and not details.get("exists"):
-            display = f"{value} (will be created)"
+            shown = f"{value} (will be created)"
         else:
-            display = f"{value} (not writable)"
-    elif name == "git_repository":
-        if details and "branch" in details:
-            clean_str = ", clean" if details.get("clean") else ", uncommitted changes"
-            display = f"{details['branch']} branch{clean_str}"
-        else:
-            display = value
+            shown = f"{value} (not writable)"
+    elif name == "git_repository" and details and "branch" in details:
+        clean_str = ", clean" if details.get("clean") else ", uncommitted changes"
+        shown = f"{details['branch']} branch{clean_str}"
     else:
         # Default for python_version, project_root, remote:*, and any future checks
-        display = value
+        shown = value
 
-    # Print with padding
+    # Print with padding; a value read from a file cannot reach the terminal raw
     label = name.replace("_", " ").replace(":", ": ")
-    click.echo(f"  {label.capitalize():.<30} {display} {indicator}")
+    click.echo(
+        f"  {display_mod.escape_control(label.capitalize()):.<30} "
+        + f"{display_mod.escape_control(shown)} {indicator}"
+    )
 
     # Print error details on next line if present
     if status == CheckStatus.ERROR and details and "error" in details:
-        click.echo(f"    Error: {details['error']}")
+        click.echo(f"    Error: {display_mod.escape_control(str(details['error']))}")
 
 
 @cli_decorators.pivot_command(auto_discover=False)

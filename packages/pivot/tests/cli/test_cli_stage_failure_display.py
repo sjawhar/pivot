@@ -291,6 +291,98 @@ def test_a_user_stage_keeps_its_traceback_and_pivots_own_error_is_one_line(
     assert "PermissionError: [Errno" not in out, out
 
 
+_ESCAPE = "\x1b"
+
+_RAISES_AN_ESCAPE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def bad() -> str:
+    raise ValueError("bad \\x1b[31mred\\x1b[0m")
+
+
+with Pipeline("p") as pipeline:
+    bad()
+"""
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores mode 000")
+def test_a_pivot_side_one_line_escapes_a_control_character_in_the_path(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The one line a pivot-owned failure prints is terminal-safe: a control character in the
+    project's own path is written as visible text, never sent to the terminal. `describe_error`
+    quotes a path that would not print on one line, and #534's escaping covers the rest."""
+    root = tmp_path / f"pro{_ESCAPE}ject"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    assert _pivot(root, "init").returncode == 0
+    (root / "pipeline.py").write_text(_BIG)
+    assert _pivot(root, "repro").returncode == 0
+    (root / "pipeline.py").write_text(_BIG.replace('f"{index}\\n"', 'f"{index} again\\n"'))
+    files = root / ".pivot" / "cache" / "files"
+    files.chmod(0)
+    try:
+        proc = _pivot(root, "repro", "--force")
+    finally:
+        files.chmod(0o755)
+
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out
+    assert "Traceback" not in out, out
+    assert f"{_EACCES}: '{tmp_path}/pro\\x1bject/.pivot/cache/files/" in out, out
+    assert _ESCAPE not in out, "a control character reached the terminal"
+
+
+def test_a_user_stages_traceback_escapes_the_control_characters_it_carries(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A failure out of the user's code keeps its traceback, and that traceback is terminal-safe
+    too: the escape bytes in the message print as visible text."""
+    root = _project(tmp_path, _BIG)
+    (root / "pipeline.py").write_text(_RAISES_AN_ESCAPE)
+
+    proc = _pivot(root, "repro")
+
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out
+    assert "Traceback (most recent call last)" in out, out
+    assert "ValueError: bad \\x1b[31mred\\x1b[0m" in out, out
+    assert _ESCAPE not in out, "a control character reached the terminal"
+
+
+def test_a_remote_urls_credentials_are_hidden_in_the_one_line(tmp_path: pathlib.Path) -> None:
+    """A pivot error naming a remote URL prints that URL with its user-info hidden (#534), and
+    keeps the cause's own text (#530's rule for a PivotError)."""
+    root = _project(tmp_path, _BIG)
+    url = "s3://reader:sesame@bucket/prefix"
+    assert _pivot(root, "config", "set", "remotes.origin", url).returncode == 0
+    assert _pivot(root, "config", "set", "default_remote", "origin").returncode == 0
+    files = root / ".pivot" / "cache" / "files"
+    for prefix in files.iterdir():
+        for obj in prefix.iterdir():
+            obj.chmod(0o644)
+            obj.unlink()
+
+    proc = _pivot(
+        root,
+        "verify",
+        "--allow-missing",
+        env={
+            "AWS_PROFILE": "pr530-no-such-profile",
+            "AWS_CONFIG_FILE": str(tmp_path / "none"),
+        },
+    )
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "sesame" not in proc.stdout + proc.stderr, "the password reached the terminal"
+    assert (
+        "Error: Cannot set up S3 access for s3://***@bucket/prefix: "
+        + "The config profile (pr530-no-such-profile) could not be found"
+    ) in proc.stderr.splitlines(), proc.stderr
+
+
 _USER_CODE = """\
 import dataclasses
 import functools

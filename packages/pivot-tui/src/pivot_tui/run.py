@@ -18,7 +18,6 @@ from typing import (
 )
 
 import anyio
-import rich.markup
 import textual  # for textual.work decorator
 import textual.app
 import textual.binding
@@ -30,6 +29,7 @@ import textual.timer
 import textual.widget
 import textual.widgets
 
+from pivot import display
 from pivot.types import (
     StageStatus,
     TuiLogMessage,
@@ -579,9 +579,9 @@ class PivotApp(textual.app.App[None]):
             case WatchStatus.RESTARTING:
                 self.title = f"{prefix}[↻] Reloading code..."
             case WatchStatus.DETECTING:
-                self.title = f"{prefix}[▶] {rich.markup.escape(msg['message'])}"
+                self.title = f"{prefix}[▶] {display.escape_markup(msg['message'])}"
             case WatchStatus.ERROR:
-                self.title = f"{prefix}[!] {rich.markup.escape(msg['message'])}"
+                self.title = f"{prefix}[!] {display.escape_markup(msg['message'])}"
 
     def _show_pipeline_error(self) -> None:
         """Show why the pipeline is invalid under the header, or hide the line once it is fixed."""
