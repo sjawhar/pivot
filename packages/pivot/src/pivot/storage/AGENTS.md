@@ -18,7 +18,7 @@ Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not 
 
 ## File-Hash Write-Back
 
-The rule: commands that read a file may save its hash to the cache, best-effort; no read-only command writes a lock, a run record or an output, and `--no-commit` writes no lock and no run record.
+The rule: commands that read a file may save its hash to the cache, best-effort; no read-only command writes a lock, a run record or an output. `--no-commit` writes no lock and no `run:` history entry. It writes a `nocommit:` record holding what the run did, which a later `pivot commit` uses.
 
 Every command that writes the workspace saves the hash of each file it reads, commits or restores, so an explanation (`pivot status --explain`, `pivot verify`) finds a matching entry and reads no file. Saving or looking up file hashes never fails a command: every save of file-hash entries goes through `state.save_best_effort` (`state.save_file_hashes` for `(path, stat, hash)` entries) or `StateDB.save_many_best_effort` (`hash_file`'s and `hash_directory`'s save-on-read), which log a failed write at debug level and keep the command's result, and a check opens the hash cache with `state.open_hash_cache`, which falls back to reading the files when the database cannot be opened. A run's deferred writes are not a cache save: they put a stage's file hashes in the same transaction as its generations, and that transaction is the run's own commit. A new command that writes or reads workspace files must record them the same way:
 
