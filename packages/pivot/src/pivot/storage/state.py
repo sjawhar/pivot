@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import pathlib
-import re
 import struct
 import threading
 import time
@@ -18,6 +17,8 @@ import lmdb
 
 from pivot import exceptions, run_history
 from pivot import state_dir as state_dir_mod
+from pivot.storage import mounts
+from pivot.types import FileHashEntry
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
 
     from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
-    from pivot.types import DeferredWrites, FileHashEntry, NoCommitRecord
+    from pivot.types import DeferredWrites, NoCommitRecord
 
 # Key prefixes for different entry types
 _HASH_PREFIX = b"hash:"  # File hash entries
@@ -56,16 +57,6 @@ def _db_full_message(path: pathlib.Path) -> str:
 
 # How long a best-effort write-back waits for another process's write lock
 _WRITE_BACK_TIMEOUT = 2.0
-
-# Filesystem types on which one (st_dev, st_ino) names one live file, so a file there may be
-# looked up by identity (``_make_key_file_identity``). ext2 and ext3 keep ext2's on-disk inode
-# tables (kernel Documentation/filesystems/ext2.rst). #513's `.pvt` walk memo reads the same
-# list; whichever of the two merges second moves both to one shared helper.
-_IDENTITY_FS_TYPES = frozenset(
-    {b"ext2", b"ext3", b"ext4", b"xfs", b"btrfs", b"tmpfs", b"f2fs", b"zfs"}
-)
-_MOUNTINFO = pathlib.Path("/proc/self/mountinfo")
-_MOUNTINFO_ESCAPE = re.compile(rb"\\([0-7]{3})")
 
 
 class _SharedEnv(typing.TypedDict):
@@ -324,11 +315,10 @@ def _make_key_file_identity(dev: int, inode: int) -> bytes:
     make inode numbers up. No stat field tells two such files apart, the change time
     included: one command that changes both (`touch -d @T a b`, `chmod -R`, `chown -R`) gives
     them one change time to the nanosecond. So a file is looked up by identity only when
-    ``/proc/self/mountinfo`` mounts its device with a type on ``_IDENTITY_FS_TYPES`` (ext2,
-    ext3, ext4, xfs, btrfs, tmpfs, f2fs, zfs; ``_device_allowed``). Any other type, every
-    ``fuse.*`` among them, an unknown type, or no mountinfo (macOS) gets the path lookup only:
-    such a filesystem loses the replica speedup, never correctness. The change time in (2)
-    stays a second check.
+    ``/proc/self/mountinfo`` says its device keeps live identities unique
+    (``storage.mounts.device_allowed``). Any other type, every ``fuse.*`` among them, an unknown
+    type, or no mountinfo (macOS) gets the path lookup only: such a filesystem loses the replica
+    speedup, never correctness. The change time in (2) stays a second check.
 
     Both change times in (2) are read at lookup time, from what should be one inode, so a hard
     link made before the lookup, which changes the inode's change time, invalidates nothing;
@@ -398,58 +388,6 @@ def _identity_candidate(
         return None
     other_hash = _match_cached_hash(txn.get(other_key), fs_stat)
     return None if other_hash is None else (other_key[len(_HASH_PREFIX) :], other_hash)
-
-
-class _Mounts(typing.TypedDict):
-    """What ``/proc/self/mountinfo`` says about the identity lookup's allowlist."""
-
-    allowed: frozenset[int]  # devices mounted only with an allowlisted type
-    refused: frozenset[int]  # devices mounted with any type off the allowlist
-    points: list[tuple[bytes, bytes]]  # (mount point, type), deepest first
-
-
-def _read_mounts() -> _Mounts:
-    """Read the mounts; without the file (not Linux) no device is allowed."""
-    try:
-        lines = _MOUNTINFO.read_bytes().splitlines()
-    except OSError:
-        return _Mounts(allowed=frozenset(), refused=frozenset(), points=[])
-    allowed = set[int]()
-    refused = set[int]()
-    points = list[tuple[bytes, bytes]]()
-    for line in lines:
-        # id parent major:minor root mount-point options [optional fields...] - type source ...
-        fields = line.split()
-        try:
-            fstype = fields[fields.index(b"-", 6) + 1]
-            major, minor = fields[2].split(b":")
-            device = os.makedev(int(major), int(minor))
-        except (ValueError, IndexError):
-            continue
-        (allowed if fstype in _IDENTITY_FS_TYPES else refused).add(device)
-        point = _MOUNTINFO_ESCAPE.sub(lambda match: bytes([int(match[1], 8)]), fields[4])
-        points.append((point, fstype))
-    points.sort(key=lambda mount: len(mount[0]), reverse=True)
-    return _Mounts(allowed=frozenset(allowed - refused), refused=frozenset(refused), points=points)
-
-
-def _device_allowed(mounts: _Mounts, device: int, path: str | os.PathLike[str]) -> bool:
-    """Whether a file on ``device``, at ``path``, may be looked up by identity.
-
-    A device mounted with any type off the allowlist (FUSE, NFS, overlayfs, an unknown type)
-    is refused. A device the file does not list is a btrfs subvolume, which reports a device
-    of its own: it is allowed when the deepest mount holding ``path`` is btrfs, and refused
-    otherwise.
-    """
-    if device in mounts["allowed"]:
-        return True
-    if device in mounts["refused"]:
-        return False
-    real_path = os.fsencode(os.path.realpath(path))
-    for point, fstype in mounts["points"]:
-        if real_path == point or real_path.startswith(point.rstrip(b"/") + b"/"):
-            return fstype == b"btrfs"
-    return False
 
 
 # What a hash-cache open or write can raise that the cache, being best-effort, absorbs: another
@@ -585,7 +523,7 @@ class StateDB:
     _readonly: bool
     _write_timeout: float
     _write_lock_path: pathlib.Path
-    _mounts: _Mounts | None
+    _mounts: mounts.Mounts | None
     _identity_devices: dict[int, bool]
 
     def __init__(
@@ -705,9 +643,9 @@ class StateDB:
             return {}
         results = dict[pathlib.Path, str | None]()
         by_identity = list[tuple[pathlib.Path, os.stat_result, bytes, str]]()
-        # Decided before the transaction: _read_mounts reads /proc and _device_allowed may
-        # resolve a path, and neither may run while a read transaction pins a snapshot. Each
-        # device is decided once, so the call inside the transaction is one dict read.
+        # Decided before the transaction: storage.mounts reads /proc and may resolve a path, and
+        # neither may run while a read transaction pins a snapshot. Each device is decided once,
+        # so the call inside the transaction is one dict read.
         for path, fs_stat in items:
             self._identity_allowed(fs_stat.st_dev, path)
         with self._read_transaction() as txn:
@@ -725,14 +663,18 @@ class StateDB:
         return results
 
     def _identity_allowed(self, device: int, path: pathlib.Path) -> bool:
-        """Whether a file on ``device`` may be looked up by identity (``_device_allowed``).
+        """Whether a file on ``device`` may be looked up by identity.
+
         The mount table is read on this StateDB's first identity lookup, and each device is
-        decided once, so a lookup costs one dict read."""
+        decided once, so a lookup costs one dict read.
+        """
         allowed = self._identity_devices.get(device)
         if allowed is None:
             if self._mounts is None:
-                self._mounts = _read_mounts()
-            allowed = self._identity_devices[device] = _device_allowed(self._mounts, device, path)
+                self._mounts = mounts.read_mounts()
+            allowed = self._identity_devices[device] = mounts.device_allowed(
+                self._mounts, device, path
+            )
         return allowed
 
     def save(self, path: pathlib.Path, fs_stat: os.stat_result, file_hash: str) -> None:
@@ -1447,12 +1389,12 @@ def save_best_effort(
 ) -> bool:
     """Run ``write`` against a writable StateDB in ``state_dir``, best-effort; True if it ran.
 
-    Every cache a command fills goes through here: entries commands read or materialize
-    (``save_file_hashes`` and ``write_back_file_hashes``) and the fingerprint caches
-    (``fingerprint.flush_ast_hash_cache`` and ``flush_manifest_cache``). Each reader validates
-    its entries and no decision depends on one being present, so a write that cannot happen at
-    once is skipped with a debug log naming ``what`` instead of failing or holding up the
-    command. Without ``create``, a state directory that has no database is left without one.
+    Every cache a command fills goes through here: file-hash entries (``save_file_hashes``) and
+    the fingerprint caches (``fingerprint.flush_ast_hash_cache`` and ``flush_manifest_cache``).
+    Each reader validates its entries and no decision depends on one being present, so a write
+    that cannot happen at once is skipped with a debug log naming ``what`` instead of failing or
+    holding up the command. Without ``create``, a state directory that has no database is left
+    without one.
     """
     if not create and not (state_dir / "state.lmdb").exists():
         return False
@@ -1503,38 +1445,53 @@ def open_readonly(
         yield state_db
 
 
-def write_back_file_hashes(
-    state_dir: pathlib.Path,
-    entries: list[FileHashEntry],
-    *,
-    timeout: float = _WRITE_BACK_TIMEOUT,
-) -> None:
-    """Save file hashes a read-only check computed, best-effort, in one transaction.
+FileHashSaveEntry = tuple[str, int, int, int, int, str] | tuple[pathlib.Path, os.stat_result, str]
 
-    The write is a cache that never creates a database; a concurrent newer entry merely causes
-    one later read, never a wrong hash.
-    """
-    if not entries:
-        return
-    _ = save_best_effort(
-        state_dir,
-        lambda state_db: state_db.save_file_hash_entries(entries),
-        what=f"{len(entries)} file hashes",
-        create=False,
-        timeout=timeout,
-    )
+
+def _file_hash_entries(entries: Iterable[FileHashSaveEntry]) -> list[FileHashEntry]:
+    """Normalize read-path entries and deferred worker entries for one cache write."""
+    result = list[FileHashEntry]()
+    for entry in entries:
+        if len(entry) == 3:
+            path, file_stat, file_hash = entry
+            result.append(
+                (
+                    os.fspath(path),
+                    file_stat.st_mtime_ns,
+                    file_stat.st_size,
+                    file_stat.st_dev,
+                    file_stat.st_ino,
+                    file_hash,
+                )
+            )
+        else:
+            result.append(entry)
+    return result
 
 
 def save_file_hashes(
-    state_dir: pathlib.Path, entries: list[tuple[pathlib.Path, os.stat_result, str]]
+    state_dir: pathlib.Path,
+    entries: Iterable[FileHashSaveEntry],
+    *,
+    create: bool,
+    timeout: float = _WRITE_BACK_TIMEOUT,
 ) -> None:
-    """Save entries a command read or wrote in one best-effort transaction."""
-    if entries:
-        _ = save_best_effort(
-            state_dir,
-            lambda state_db: state_db.save_many(entries),
-            what=f"{len(entries)} file hashes",
-        )
+    """Save file hashes best-effort in ``state_dir``.
+
+    ``create`` makes each caller's database-creation policy explicit. Entries from a read-only
+    comparison pass False; status's tracked-file pass and commands that materialize files pass
+    True. A skipped write only costs one later file read.
+    """
+    normalized = _file_hash_entries(entries)
+    if not normalized:
+        return
+    _ = save_best_effort(
+        state_dir,
+        lambda state_db: state_db.save_file_hash_entries(normalized),
+        what=f"{len(normalized)} file hashes",
+        create=create,
+        timeout=timeout,
+    )
 
 
 class FileHashBatch:
@@ -1542,7 +1499,7 @@ class FileHashBatch:
 
     def __init__(self) -> None:
         self._lock: threading.Lock = threading.Lock()
-        self._by_dir: dict[pathlib.Path, list[tuple[pathlib.Path, os.stat_result, str]]] = {}
+        self._by_dir: dict[pathlib.Path, list[FileHashSaveEntry]] = {}
 
     def add(
         self, state_dir: pathlib.Path, entries: list[tuple[pathlib.Path, os.stat_result, str]]
@@ -1558,4 +1515,4 @@ class FileHashBatch:
         with self._lock:
             by_dir, self._by_dir = self._by_dir, {}
         for state_dir, entries in by_dir.items():
-            save_file_hashes(state_dir, entries)
+            save_file_hashes(state_dir, entries, create=True)

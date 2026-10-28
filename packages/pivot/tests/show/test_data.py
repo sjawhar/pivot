@@ -784,6 +784,30 @@ def test_select_data_files_hashes_a_workspace_output(
     assert selection["workspace_paths"] == {"data/process_data.csv": output}
 
 
+def test_select_data_files_hashes_stage_outputs_in_the_resolved_state_dir(
+    mock_discovery: PipelineLike, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The diff fallback is the configured state directory, never a hard-coded `.pivot`."""
+    _register_csv_stage(mock_discovery)
+    _mock_head_lock(monkeypatch, None)
+    output = mock_discovery.root / "data" / "process_data.csv"
+    output.parent.mkdir(parents=True)
+    output.write_text("id,name\n1,alice\n")
+    resolved = mock_discovery.root / ".state"
+    seen = list[object]()
+
+    def hash_in(state_dir: object, hasher: typing.Any) -> object:
+        seen.append(state_dir)
+        return hasher(None, [])
+
+    monkeypatch.setattr("pivot.config.locate_state_dir", lambda: resolved)
+    monkeypatch.setattr("pivot.storage.cache.hash_read_only", hash_in)
+
+    _ = _select(["process_data"])
+
+    assert seen == [resolved]
+
+
 def test_select_data_files_leaves_a_missing_workspace_output_absent(
     mock_discovery: PipelineLike, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -80,18 +80,17 @@ that: mergerfs with `inodecalc=passthrough` reports each branch's inode number u
 device, and other FUSE, network and union filesystems make inode numbers up. The change time
 cannot tell two such files apart: one command that changes both (`touch -d @T a b`,
 `chmod -R`) gives them one change time to the nanosecond, and with it one size and mtime: on
-mergerfs that let `pivot repro` keep a stale output. So
-the identity lookup runs only on a device that `/proc/self/mountinfo` mounts with a type on
-`state._IDENTITY_FS_TYPES` (ext2, ext3, ext4, xfs, btrfs, tmpfs, f2fs, zfs; a btrfs
-subvolume's own device counts as btrfs). Any other filesystem, and macOS, which has no
-mountinfo, gets the path lookup only: it loses the replica speedup, never correctness. The
-`.pvt` walk memo (#513) reads the same list; whichever merges second moves both to one helper.
+mergerfs that let `pivot repro` keep a stale output. So the identity lookup runs only where
+`storage.mounts` says a device keeps live identities unique: ext2, ext3, ext4, xfs, btrfs, f2fs
+and zfs, or tmpfs only with the `inode64` super option. A btrfs subvolume's own device counts as
+btrfs. Any other filesystem, and macOS, which has no mountinfo, gets the path lookup only: it
+loses the replica speedup, never correctness. The `.pvt` walk memo uses the same helper.
 
-`pivot status`, every explanation, `pivot diff` and `pivot plots diff` open the database
-read-only, then save the hashes they had to read with `state.write_back_file_hashes`,
-best-effort, so a copied replica's second status reads nothing. A `--no-commit` run saves the
-hashes its workers read the same way: a hash entry is a cache its stat check validates, not
-part of the commit.
+`pivot status`, every explanation, `pivot diff` and `pivot plots diff` read their selected
+database, then save what they had to hash with `state.save_file_hashes`, best-effort. The tracked
+file pass of status may create its selected database; explanation, diff and plots diff do not.
+A `--no-commit` run saves the hashes its workers read the same way: a hash entry is a cache its
+stat check validates, not part of the commit.
 
 ## Key Insight
 

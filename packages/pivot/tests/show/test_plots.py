@@ -22,6 +22,8 @@ from pivot.types import (
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
     from conftest import GitRepo
     from pivot.compose import Pipeline
 
@@ -205,6 +207,17 @@ def test_get_plot_hashes_from_head_no_lock_in_head(
     assert result == {"plots/test_stage.png": None}
 
 
+def test_plot_state_dirs_uses_the_resolved_default(
+    mock_discovery: PipelineLike, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plot stage without its own override inherits the configured state directory."""
+    _register_plot_stage(mock_discovery, "test_stage")
+    resolved = mock_discovery.root / ".state"
+    monkeypatch.setattr("pivot.config.locate_state_dir", lambda: resolved)
+
+    assert plots.plot_state_dirs() == {"plots/test_stage.png": resolved}
+
+
 # =============================================================================
 # get_plot_hashes_from_workspace Tests
 # =============================================================================
@@ -215,7 +228,7 @@ def test_get_plot_hashes_from_workspace_existing_file(tmp_path: Path) -> None:
     plot_file = tmp_path / "plot.png"
     plot_file.write_bytes(b"fake png data")
 
-    result = plots.get_plot_hashes_from_workspace([str(plot_file)])
+    result = plots.get_plot_hashes_from_workspace([str(plot_file)], {str(plot_file): tmp_path})
 
     assert str(plot_file) in result
     assert len(result[str(plot_file)]) == 16  # xxhash64 hex length
@@ -225,7 +238,7 @@ def test_get_plot_hashes_from_workspace_missing_file(tmp_path: Path) -> None:
     """Missing files are not included in result."""
     missing_path = str(tmp_path / "nonexistent.png")
 
-    result = plots.get_plot_hashes_from_workspace([missing_path])
+    result = plots.get_plot_hashes_from_workspace([missing_path], {})
 
     assert missing_path not in result
 
@@ -237,10 +250,34 @@ def test_get_plot_hashes_from_workspace_multiple_files(tmp_path: Path) -> None:
     file1.write_bytes(b"data1")
     file2.write_bytes(b"data2")
 
-    result = plots.get_plot_hashes_from_workspace([str(file1), str(file2)])
+    result = plots.get_plot_hashes_from_workspace(
+        [str(file1), str(file2)], {str(file1): tmp_path, str(file2): tmp_path}
+    )
 
     assert len(result) == 2
     assert result[str(file1)] != result[str(file2)]
+
+
+def test_get_plot_hashes_from_workspace_uses_the_resolved_dir_for_an_unowned_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plot file no stage produces is looked up and saved in `config.locate_state_dir()`."""
+    plot_file = tmp_path / "plot.png"
+    plot_file.write_bytes(b"fake png data")
+    resolved = tmp_path / ".state"
+    seen = list[object]()
+
+    def hash_in(state_dir: object, hasher: typing.Any) -> object:
+        seen.append(state_dir)
+        return hasher(None, [])
+
+    monkeypatch.setattr("pivot.config.locate_state_dir", lambda: resolved)
+    monkeypatch.setattr("pivot.storage.cache.hash_read_only", hash_in)
+
+    result = plots.get_plot_hashes_from_workspace([str(plot_file)], {})
+
+    assert seen == [resolved]
+    assert str(plot_file) in result
 
 
 # =============================================================================

@@ -231,22 +231,29 @@ async def _run_in_daemon_thread[T](func: Callable[[], T]) -> T:
 
 def _deferred_writes_to_apply(
     result: StageResult, *, no_commit: bool
-) -> types.DeferredWrites | None:
-    """The StateDB writes a finished stage persists, or None when it persists nothing.
+) -> tuple[types.DeferredWrites | None, list[types.FileHashEntry]]:
+    """Return a finished stage's StateDB writes and its best-effort file-hash cache entries.
 
-    Only a RAN or CACHED stage writes. Under ``--no-commit`` only the record of what ran is
-    kept, for ``pivot commit``; nothing else is persisted.
+    Only RAN/CACHED stages persist. Under ``--no-commit``, only the ``nocommit:`` record is
+    authoritative; file hashes remain a cache and are saved best-effort.
     """
     if result["status"] not in (StageStatus.RAN, StageStatus.CACHED):
-        return None
+        return None, []
     if "deferred_writes" not in result:
-        return None
+        return None, []
     deferred = result["deferred_writes"]
-    if not no_commit:
-        return deferred
-    if "no_commit_record" not in deferred:
-        return None
-    return types.DeferredWrites(no_commit_record=deferred["no_commit_record"])
+    file_hash_entries = deferred["file_hash_entries"] if "file_hash_entries" in deferred else []
+    if no_commit:
+        writes = (
+            types.DeferredWrites(no_commit_record=deferred["no_commit_record"])
+            if "no_commit_record" in deferred
+            else None
+        )
+    else:
+        persisted = deferred.copy()
+        persisted.pop("file_hash_entries", None)
+        writes = persisted or None
+    return writes, file_hash_entries
 
 
 class Engine:
@@ -1345,52 +1352,26 @@ class Engine:
                                     )
                                     stage_durations[stage_name] = duration_ms
 
-                                    # Apply a completed stage's deferred writes. A --no-commit
-                                    # run persists its authoritative nocommit record, while the
-                                    # hashes it read are a best-effort cache saved separately.
-                                    if result["status"] in (StageStatus.RAN, StageStatus.CACHED):
+                                    writes, file_hash_entries = _deferred_writes_to_apply(
+                                        result, no_commit=no_commit
+                                    )
+                                    if writes is not None or file_hash_entries:
                                         stage_info = self._get_stage(stage_name)
                                         stage_state_dir = registry.get_stage_state_dir(
                                             stage_info, default_state_dir
                                         )
-                                        if no_commit:
-                                            if "deferred_writes" in result:
-                                                worker_deferred = result["deferred_writes"]
-                                                if "no_commit_record" in worker_deferred:
-                                                    output_paths = [
-                                                        types.identity_key(out.identity)
-                                                        for out in stage_info["outs"]
-                                                    ]
-                                                    _get_state_db(
-                                                        stage_state_dir
-                                                    ).apply_deferred_writes(
-                                                        stage_name,
-                                                        output_paths,
-                                                        types.DeferredWrites(
-                                                            no_commit_record=worker_deferred[
-                                                                "no_commit_record"
-                                                            ]
-                                                        ),
-                                                    )
-                                                if "file_hash_entries" in worker_deferred:
-                                                    state_mod.write_back_file_hashes(
-                                                        stage_state_dir,
-                                                        worker_deferred["file_hash_entries"],
-                                                    )
-                                        else:
-                                            deferred = _deferred_writes_to_apply(
-                                                result, no_commit=False
+                                        if writes is not None:
+                                            output_paths = [
+                                                types.identity_key(out.identity)
+                                                for out in stage_info["outs"]
+                                            ]
+                                            _get_state_db(stage_state_dir).apply_deferred_writes(
+                                                stage_name, output_paths, writes
                                             )
-                                            if deferred is not None:
-                                                output_paths = [
-                                                    types.identity_key(out.identity)
-                                                    for out in stage_info["outs"]
-                                                ]
-                                                _get_state_db(
-                                                    stage_state_dir
-                                                ).apply_deferred_writes(
-                                                    stage_name, output_paths, deferred
-                                                )
+                                        if file_hash_entries:
+                                            state_mod.save_file_hashes(
+                                                stage_state_dir, file_hash_entries, create=False
+                                            )
 
                                     # Record result
                                     results[stage_name] = executor_core.ExecutionSummary(
@@ -2033,15 +2014,8 @@ class Engine:
         deps = stage_info["deps"]
 
         def _save_file_hashes(entries: list[types.FileHashEntry]) -> None:
-            """Record the file hashes this check read or restored, best-effort."""
-            if entries:
-                _ = state_mod.save_best_effort(
-                    stage_state_dir,
-                    lambda writable_db: writable_db.apply_deferred_writes(
-                        stage_name, [], types.DeferredWrites(file_hash_entries=entries)
-                    ),
-                    what=f"{len(entries)} file hashes",
-                )
+            """Record file hashes this check read or restored, without creating a database."""
+            state_mod.save_file_hashes(stage_state_dir, entries, create=False)
 
         def _use_outputs(state_db: state_mod.StateDB) -> _SkipOutcome:
             file_hash_entries = list[types.FileHashEntry]()
@@ -2259,7 +2233,9 @@ class Engine:
             )
             # One attempt, no wait: the run is starting its stages, and the worker hands the
             # dependency hashes it reads back to the coordinator anyway.
-            state_mod.write_back_file_hashes(worker_info["state_dir"], file_hash_entries, timeout=0)
+            state_mod.save_file_hashes(
+                worker_info["state_dir"], file_hash_entries, create=False, timeout=0
+            )
             return explanation
 
         try:

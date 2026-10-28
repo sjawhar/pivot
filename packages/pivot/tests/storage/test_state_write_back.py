@@ -30,6 +30,16 @@ def _helper_entries(path: pathlib.Path) -> list[FileHashEntry]:
     return cache.deferred_file_hash_entries([(path, file_stat, file_hash)])
 
 
+def _save(
+    state_dir: pathlib.Path,
+    entries: list[FileHashEntry],
+    *,
+    timeout: float = state._WRITE_BACK_TIMEOUT,
+) -> None:
+    """The no-create policy read-only callers use."""
+    state.save_file_hashes(state_dir, entries, create=False, timeout=timeout)
+
+
 def _helper_new_state_dir(tmp_path: pathlib.Path) -> pathlib.Path:
     state_dir = tmp_path / ".pivot"
     with state.StateDB(state_dir):
@@ -53,7 +63,7 @@ def test_write_back_saves_entries_and_their_identity(
     with state.StateDB(tmp_path / ".pivot"):
         pass
 
-    state.write_back_file_hashes(tmp_path / ".pivot", _helper_entries(data))
+    _save(tmp_path / ".pivot", _helper_entries(data))
 
     with state.StateDB(tmp_path / ".pivot", readonly=True) as state_db:
         expected = cache.hash_file(data)[0]
@@ -68,9 +78,21 @@ def test_write_back_never_creates_a_state_database(tmp_path: pathlib.Path) -> No
     state_dir = tmp_path / ".pivot"
     state_dir.mkdir()
 
-    state.write_back_file_hashes(state_dir, _helper_entries(data))
+    _save(state_dir, _helper_entries(data))
 
     assert not (state_dir / "state.lmdb").exists()
+
+
+def test_file_hash_saver_creates_a_database_when_requested(tmp_path: pathlib.Path) -> None:
+    """Materializing/tracking callers pass create=True and persist their file hash."""
+    data = tmp_path / "data.txt"
+    data.write_text("data")
+    state_dir = tmp_path / ".pivot"
+
+    state.save_file_hashes(state_dir, _helper_entries(data), create=True)
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        assert state_db.get(data, data.stat()) == cache.hash_file(data)[0]
 
 
 def test_write_back_keeps_the_stat_taken_when_the_file_was_read(tmp_path: pathlib.Path) -> None:
@@ -82,7 +104,7 @@ def test_write_back_keeps_the_stat_taken_when_the_file_was_read(tmp_path: pathli
     entries = _helper_entries(data)
     data.write_text("changed, longer")
 
-    state.write_back_file_hashes(state_dir, entries)
+    _save(state_dir, entries)
 
     with state.StateDB(state_dir, readonly=True) as state_db:
         assert state_db.get(data, data.stat()) is None
@@ -102,9 +124,7 @@ def test_write_back_leaves_out_entries_the_cache_cannot_hold(tmp_path: pathlib.P
     kept.write_text("kept")
     state_dir = _helper_new_state_dir(tmp_path)
 
-    state.write_back_file_hashes(
-        state_dir, _helper_entries(long_path) + _helper_entries(old) + _helper_entries(kept)
-    )
+    _save(state_dir, _helper_entries(long_path) + _helper_entries(old) + _helper_entries(kept))
 
     with state.StateDB(state_dir, readonly=True) as state_db:
         assert state_db.get(kept, kept.stat()) == cache.hash_file(kept)[0]
@@ -121,7 +141,7 @@ def test_write_back_leaves_out_an_mtime_after_2554(tmp_path: pathlib.Path) -> No
     path, _, size, dev, inode, file_hash = _helper_entries(kept)[0]
     far_future = (f"{path}.future", 32_000_000_000_000_000_000, size, dev, inode + 1, file_hash)
 
-    state.write_back_file_hashes(state_dir, [far_future, *_helper_entries(kept)])
+    _save(state_dir, [far_future, *_helper_entries(kept)])
 
     with state.StateDB(state_dir, readonly=True) as state_db:
         assert state_db.get(kept, kept.stat()) == cache.hash_file(kept)[0]
@@ -180,7 +200,7 @@ def test_write_back_saves_its_batch_in_one_transaction(
     state_dir = _helper_new_state_dir(tmp_path)
     transactions = _helper_record_write_transactions(monkeypatch)
 
-    state.write_back_file_hashes(state_dir, [e for p in paths for e in _helper_entries(p)])
+    _save(state_dir, [e for p in paths for e in _helper_entries(p)])
 
     assert len(transactions) == 1
     assert sorted(key for key in transactions[0] if key.startswith(b"hash:")) == sorted(
@@ -199,7 +219,7 @@ def test_a_write_puts_every_hash_entry_before_the_first_index_entry(
     state_dir = _helper_new_state_dir(tmp_path)
     transactions = _helper_record_write_transactions(monkeypatch)
 
-    state.write_back_file_hashes(state_dir, [e for p in paths for e in _helper_entries(p)])
+    _save(state_dir, [e for p in paths for e in _helper_entries(p)])
 
     puts = [key for transaction in transactions for key in transaction]
     assert [key.split(b":", 1)[0] for key in puts] == [b"hash"] * 3 + [b"inode"] * 3
@@ -238,7 +258,7 @@ def test_a_read_only_state_database_serves_reads_and_skips_the_write_back(
         with state.open_readonly(state_dir) as state_db:
             assert state_db is not None
             assert state_db.get(recorded, recorded.stat()) == recorded_hash
-        state.write_back_file_hashes(state_dir, _helper_entries(unrecorded))
+        _save(state_dir, _helper_entries(unrecorded))
         with pytest.raises(state.StateDBError, match="cannot be written"):
             state.StateDB(state_dir)
         with state.StateDB(state_dir, readonly=True) as state_db:
@@ -263,7 +283,7 @@ def test_a_state_database_whose_lock_file_is_read_only_is_not_used(
     try:
         with state.open_readonly(state_dir) as state_db:
             assert state_db is None
-        state.write_back_file_hashes(state_dir, _helper_entries(unrecorded))
+        _save(state_dir, _helper_entries(unrecorded))
     finally:
         for path, mode in modes.items():
             path.chmod(mode)
@@ -335,11 +355,11 @@ def test_write_back_waits_no_longer_than_its_budget_for_a_held_lock(
         assert held.wait(30), "The holder took the write lock"
         started = time.monotonic()
         with caplog.at_level(logging.DEBUG, logger="pivot.storage.state"):
-            state.write_back_file_hashes(state_dir, _helper_entries(data))
+            _save(state_dir, _helper_entries(data))
         budget = time.monotonic() - started
         started = time.monotonic()
-        state.write_back_file_hashes(state_dir, [])
-        state.write_back_file_hashes(state_dir, _helper_entries(data), timeout=0)
+        _save(state_dir, [])
+        _save(state_dir, _helper_entries(data), timeout=0)
         no_wait = time.monotonic() - started
     finally:
         release.set()
@@ -383,48 +403,41 @@ def test_hash_read_only_saves_what_its_body_read_in_one_write_back(
     data = tmp_path / "data.txt"
     data.write_text("data")
     state_dir = _helper_new_state_dir(tmp_path)
-    write_back = mocker.spy(state, "write_back_file_hashes")
+    saved = mocker.spy(state, "save_file_hashes")
     seen = list[state.StateDB | None]()
 
     assert cache.hash_read_only(state_dir, _helper_hasher(data, seen)) == cache.hash_file(data)[0]
     assert seen[0] is not None and seen[0].readonly
-    assert write_back.call_count == 1
+    assert saved.call_count == 1
     with state.StateDB(state_dir, readonly=True) as state_db:
         assert state_db.get(data, data.stat()) == cache.hash_file(data)[0]
 
 
-def test_hash_read_only_reads_the_files_past_a_database_lmdb_cannot_open_when_asked(
+def test_hash_read_only_reads_the_files_past_a_database_lmdb_cannot_open(
     tmp_path: pathlib.Path, mocker: MockerFixture, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """With ``read_files_if_damaged`` (`pivot diff`, `pivot plots diff`) a damaged database is
-    not used: the body runs with none, every file is read, and nothing is written to the
-    database. Without it (status) the error propagates, as it always has."""
+    """A damaged database is not used: the body runs with none and the bytes are unchanged."""
     data = tmp_path / "data.txt"
     data.write_text("data")
     state_dir = _helper_new_state_dir(tmp_path)
     data_file = _helper_damage(state_dir)
     before = data_file.read_bytes()
-    write_back = mocker.spy(state, "write_back_file_hashes")
+    saved = mocker.spy(state, "save_file_hashes")
     seen = list[state.StateDB | None]()
 
     with caplog.at_level(logging.DEBUG, logger="pivot.storage.cache"):
-        result = cache.hash_read_only(
-            state_dir, _helper_hasher(data, seen), read_files_if_damaged=True
-        )
+        result = cache.hash_read_only(state_dir, _helper_hasher(data, seen))
     assert result == cache.hash_file(data)[0]
     assert seen == [None]
-    assert write_back.call_count == 0
+    assert saved.call_count == 0
     assert data_file.read_bytes() == before
     assert "Reading files without the state database" in caplog.text
-    with pytest.raises(lmdb.Error):
-        cache.hash_read_only(state_dir, _helper_hasher(data, seen))
 
 
 def test_hash_read_only_reads_the_files_again_after_a_lookup_fails(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
 ) -> None:
-    """A database that opens but fails a lookup (a damaged page) is not used either: with
-    ``read_files_if_damaged`` the body runs again with no database, and nothing is saved."""
+    """A database that opens but fails a lookup is not used either, and nothing is saved."""
     data = tmp_path / "data.txt"
     data.write_text("data")
     state_dir = _helper_new_state_dir(tmp_path)
@@ -435,12 +448,10 @@ def test_hash_read_only_reads_the_files_again_after_a_lookup_fails(
         raise lmdb.Error("MDB_CORRUPTED: Located page was wrong type")
 
     monkeypatch.setattr(state.StateDB, "get_many", _corrupted)
-    write_back = mocker.spy(state, "write_back_file_hashes")
+    saved = mocker.spy(state, "save_file_hashes")
     seen = list[state.StateDB | None]()
 
-    result = cache.hash_read_only(state_dir, _helper_hasher(data, seen), read_files_if_damaged=True)
+    result = cache.hash_read_only(state_dir, _helper_hasher(data, seen))
     assert result == cache.hash_file(data)[0]
     assert [state_db is None for state_db in seen] == [False, True]
-    assert write_back.call_count == 0
-    with pytest.raises(lmdb.Error):
-        cache.hash_read_only(state_dir, _helper_hasher(data, seen))
+    assert saved.call_count == 0

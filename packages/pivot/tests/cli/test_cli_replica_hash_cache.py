@@ -7,7 +7,7 @@ copied output is a new file: the first status reads it and saves its hash, so th
 status reads nothing. `pivot diff` and `pivot plots diff` look files up and save what they read
 the same way. The tests drive the installed `pivot` binary and record every file of the
 replica's outputs that the process opens, so the hard-link tests need the temporary directory
-on a filesystem type the identity lookup trusts (``state._IDENTITY_FS_TYPES``; ext4 in CI).
+on a filesystem type the identity lookup trusts (``storage.mounts``; ext4 in CI).
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 import lmdb
 import pytest
 
-from pivot.storage import state
+from pivot.storage import mounts
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -186,27 +186,26 @@ def _cp_r(src: pathlib.Path, dst: pathlib.Path) -> None:
 
 
 def _skip_if_identity_refused(tmp_path: pathlib.Path) -> None:
-    """Skip when ``tmp_path``'s filesystem is off the identity allowlist
-    (``state._IDENTITY_FS_TYPES``), so a hard link there is not served by identity and a test
-    that pins an identity-served read cannot hold. pytest's temporary directory can land on
-    such a filesystem — a container's own overlayfs root among them — and the documented test
-    command (``uv run pytest packages/pivot/tests ...``) must not go red there on correct code.
+    """Skip when ``tmp_path``'s filesystem is off the shared identity allowlist, so a hard link
+    there is not served by identity and a test that pins an identity-served read cannot hold.
+    pytest's temporary directory can land on such a filesystem — a container's own overlayfs
+    root among them — and the documented test command must not go red there on correct code.
     CI keeps this coverage on ext4; the skip reason names the filesystem."""
-    mounts = state._read_mounts()
-    if state._device_allowed(mounts, os.stat(tmp_path).st_dev, tmp_path):
+    mount_table = mounts.read_mounts()
+    if mounts.device_allowed(mount_table, os.stat(tmp_path).st_dev, tmp_path):
         return
     real = os.fsencode(os.path.realpath(tmp_path))
     fstype = next(
         (
             os.fsdecode(mount_type)
-            for point, mount_type in mounts["points"]
+            for point, mount_type in mount_table["points"]
             if real == point or real.startswith(point.rstrip(b"/") + b"/")
         ),
         "an unlisted filesystem",
     )
     pytest.skip(
-        f"the temporary directory is on {fstype}, off the identity allowlist "
-        + "(state._IDENTITY_FS_TYPES); a hard-linked replica is not served by identity there"
+        f"the temporary directory is on {fstype}, off the shared identity allowlist; "
+        + "a hard-linked replica is not served by identity there"
     )
 
 

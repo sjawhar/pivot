@@ -2083,7 +2083,7 @@ async def test_compute_explanation_saves_the_file_hashes_it_read(
         default_state_dir=tmp_path / ".pivot",
         store_spec=_helper_store_spec(cache_dir, tmp_path),
     )
-    write_back = mocker.spy(state_mod, "write_back_file_hashes")
+    write_back = mocker.spy(state_mod, "save_file_hashes")
 
     async with Engine(pipeline=pipeline) as engine:
         explanation = await engine._compute_explanation(
@@ -2095,4 +2095,5 @@ async def test_compute_explanation_saves_the_file_hashes_it_read(
     with state_mod.StateDB(tmp_path / ".pivot", readonly=True) as state_db:
         saved = state_db.get(raw, raw.stat())
     assert write_back.call_args.kwargs["timeout"] == 0
+    assert write_back.call_args.kwargs["create"] is False
     assert saved == cache.hash_file(raw)[0]

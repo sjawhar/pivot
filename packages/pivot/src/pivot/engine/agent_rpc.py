@@ -377,7 +377,7 @@ class AgentRpcHandler:
                         producer_hashes=producer_hashes,
                         file_hash_entries=file_hash_entries,
                     )
-                    state_mod.write_back_file_hashes(state_dir, file_hash_entries)
+                    state_mod.save_file_hashes(state_dir, file_hash_entries, create=False)
                     return explanation
 
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue

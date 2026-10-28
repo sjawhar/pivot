@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from pivot.storage import cache, state
+from pivot.storage import cache, mounts, state
 from pivot.types import DeferredWrites
 from tests import helpers
 
@@ -340,7 +340,7 @@ def _helper_linked_replica(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Pa
     return state_dir, link, live_hash
 
 
-@pytest.mark.parametrize("fstype", ["ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs", "f2fs", "zfs"])
+@pytest.mark.parametrize("fstype", ["ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "zfs"])
 def test_an_allowlisted_filesystem_serves_a_hard_link_by_identity(
     tmp_path: pathlib.Path,
     mounted_as_ext4: pathlib.Path,
@@ -359,10 +359,29 @@ def test_an_allowlisted_filesystem_serves_a_hard_link_by_identity(
     assert reads.call_count == 0
 
 
+def test_tmpfs_inode64_serves_a_hard_link_by_identity(
+    tmp_path: pathlib.Path,
+    mounted_as_ext4: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """tmpfs joins the allowlist only with mountinfo's full-width inode64 option."""
+    state_dir, link, live_hash = _helper_linked_replica(tmp_path)
+    helpers.mount_table(
+        monkeypatch, mounted_as_ext4, [(os.stat(tmp_path).st_dev, "/", "tmpfs", "rw,inode64")]
+    )
+    reads = mocker.spy(cache, "_hash_contents")
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        assert cache.hash_file(link, state_db)[0] == live_hash
+    assert reads.call_count == 0
+
+
 @pytest.mark.parametrize(
     "fstype",
     [
         pytest.param("fuse.mergerfs", id="mergerfs"),
+        pytest.param("tmpfs", id="tmpfs,inode32"),
         pytest.param("fuse.sshfs", id="sshfs"),
         pytest.param("nfs4", id="nfs"),
         pytest.param("overlay", id="overlayfs"),
@@ -400,7 +419,7 @@ def test_without_mountinfo_no_file_is_looked_up_by_identity(
 ) -> None:
     """No /proc/self/mountinfo (macOS, or /proc not mounted): every lookup is by path."""
     state_dir, link, _ = _helper_linked_replica(tmp_path)
-    monkeypatch.setattr(state, "_MOUNTINFO", tmp_path / "no-such-mountinfo")
+    monkeypatch.setattr(mounts, "_MOUNTINFO", tmp_path / "no-such-mountinfo")
 
     with state.StateDB(state_dir, readonly=True) as state_db:
         assert state_db.get(link, link.stat()) is None
@@ -469,7 +488,7 @@ def test_the_mount_table_is_read_once_per_state_db(
         link.parent.mkdir(exist_ok=True)
         os.link(live, link)
         links.append((link, _helper_record(state_dir, live)))
-    mounts_read = mocker.spy(state, "_read_mounts")
+    mounts_read = mocker.spy(mounts, "read_mounts")
 
     with state.StateDB(state_dir, readonly=True) as state_db:
         for link, live_hash in links:

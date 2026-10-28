@@ -21,6 +21,7 @@ import pytest
 
 from pivot import compose, exceptions, project, stage_def
 from pivot import names as stage_names
+from pivot.storage import mounts as mounts_module
 from pivot.storage import state, store
 
 if TYPE_CHECKING:
@@ -416,19 +417,26 @@ def create_pipeline_py(
 
 
 def mount_table(
-    monkeypatch: pytest.MonkeyPatch, path: pathlib.Path, mounts: Sequence[tuple[int, str, str]]
+    monkeypatch: pytest.MonkeyPatch,
+    path: pathlib.Path,
+    mount_entries: Sequence[tuple[int, str, str] | tuple[int, str, str, str]],
 ) -> None:
-    """Point the identity lookup at a ``/proc/self/mountinfo`` written to ``path`` that lists
-    ``mounts``, each (device, mount point, filesystem type), with the kernel's escaping."""
+    """Point the shared mount parser at mountinfo entries.
+
+    Each entry is ``(device, mount point, filesystem type[, super options])``; options default
+    to ``rw``. Tests use ``tmpfs,inode32`` and ``tmpfs,inode64`` to exercise tmpfs's inode rule.
+    """
     lines = list[str]()
-    for mount_id, (device, point, fstype) in enumerate(mounts, 90):
+    for mount_id, entry in enumerate(mount_entries, 90):
+        device, point, fstype, *rest = entry
+        super_options = rest[0] if rest else "rw"
         escaped = point.replace("\\", "\\134").replace(" ", "\\040")
         lines.append(
             f"{mount_id} 1 {os.major(device)}:{os.minor(device)} / {escaped} "
-            + f"rw,relatime shared:{mount_id} - {fstype} /dev/fake{mount_id} rw\n"
+            + f"rw,relatime shared:{mount_id} - {fstype} /dev/fake{mount_id} {super_options}\n"
         )
     path.write_text("".join(lines))
-    monkeypatch.setattr(state, "_MOUNTINFO", path)
+    monkeypatch.setattr(mounts_module, "_MOUNTINFO", path)
 
 
 def hold_write_lock(state_dir: str, held: Event, release: Event) -> None:

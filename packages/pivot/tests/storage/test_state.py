@@ -1780,6 +1780,6 @@ def test_a_best_effort_save_skips_a_state_directory_holding_a_nul_byte(
     saved = state.save_best_effort(
         state_dir, lambda db: db.save(data, data.stat(), "0123456789abcdef"), what="a hash"
     )
-    state.save_file_hashes(state_dir, [(data, data.stat(), "0123456789abcdef")])
+    state.save_file_hashes(state_dir, [(data, data.stat(), "0123456789abcdef")], create=True)
 
     assert saved is False

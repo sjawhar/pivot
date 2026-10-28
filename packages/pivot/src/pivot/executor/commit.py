@@ -75,7 +75,7 @@ def _commit_stages(
     else:
         targets = all_stage_names
 
-    default_state_dir = config.get_state_dir()
+    default_state_dir = config.locate_state_dir()
     project_root = project.get_project_root()
     store = store_mod.WorkspaceStore(
         project_root=project_root,
@@ -201,6 +201,10 @@ def _commit_stages(
                     logger.error(
                         "Stage '%s': output missing: %s — skipping", stage_name, identity_key
                     )
+                    outputs_missing = True
+                    break
+                except exceptions.UnreadableLinkError as exc:
+                    logger.error("Stage '%s': %s — skipping", stage_name, exc)
                     outputs_missing = True
                     break
                 except OSError:

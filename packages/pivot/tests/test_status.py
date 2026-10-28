@@ -235,7 +235,7 @@ def test_pipeline_status_saves_each_stages_reads_in_its_own_state_dir(
     mocker.patch.object(
         explain, "get_stage_explanation", side_effect=_helper_explain_reading_one_file
     )
-    write_back = mocker.patch.object(state_mod, "write_back_file_hashes")
+    write_back = mocker.patch.object(state_mod, "save_file_hashes")
 
     status.get_pipeline_status(
         None, single_stage=False, all_stages=all_stages, pipeline=test_pipeline
@@ -247,6 +247,7 @@ def test_pipeline_status_saves_each_stages_reads_in_its_own_state_dir(
         stage_a_dir: [("/read-by/test/stage_a", 1, 2, 3, 4, "0" * 16)],
         custom_state_dir: [("/read-by/test/stage_b", 1, 2, 3, 4, "0" * 16)],
     }
+    assert {call.kwargs["create"] for call in write_back.call_args_list} == {False}
     assert write_back.call_count == 2
 
 
@@ -264,7 +265,7 @@ def test_pipeline_status_saves_stages_sharing_a_state_dir_in_one_write(
     mocker.patch.object(
         explain, "get_stage_explanation", side_effect=_helper_explain_reading_one_file
     )
-    write_back = mocker.patch.object(state_mod, "write_back_file_hashes")
+    write_back = mocker.patch.object(state_mod, "save_file_hashes")
 
     status.get_pipeline_status(
         None, single_stage=False, all_stages=all_stages, pipeline=test_pipeline
@@ -276,6 +277,7 @@ def test_pipeline_status_saves_stages_sharing_a_state_dir_in_one_write(
     )
     write_back.assert_called_once()
     assert write_back.call_args.args[0] == state_dir
+    assert write_back.call_args.kwargs["create"] is False
     assert sorted(write_back.call_args.args[1]) == [
         ("/read-by/test/stage_a", 1, 2, 3, 4, "0" * 16),
         ("/read-by/test/stage_b", 1, 2, 3, 4, "0" * 16),
@@ -303,6 +305,25 @@ def test_tracked_files_clean(set_project_root: pathlib.Path) -> None:
     assert len(results) == 1
     assert results[0]["path"] == "data.txt"
     assert results[0]["status"] == "clean"
+
+
+def test_tracked_files_status_creates_its_resolved_state_database(
+    set_project_root: pathlib.Path,
+) -> None:
+    """Status's tracked-file cache may create the configured database after it reads a file."""
+    (set_project_root / ".git").mkdir(exist_ok=True)
+    data_file = set_project_root / "data.txt"
+    data_file.write_text("content")
+    track.write_pvt_file(
+        set_project_root / "data.txt.pvt",
+        track.PvtData(path="data.txt", hash=cache.hash_file(data_file)[0], size=7),
+    )
+    state_dir = config.locate_state_dir()
+    assert not (state_dir / "state.lmdb").exists()
+
+    _ = status.get_tracked_files_status(set_project_root)
+
+    assert (state_dir / "state.lmdb").is_dir()
 
 
 def test_tracked_files_status_saves_the_hashes_it_read(
@@ -342,8 +363,9 @@ def test_tracked_files_status_fails_on_a_damaged_state_database(
     set_project_root: pathlib.Path,
 ) -> None:
     """Status reports a damaged state database (here its first 8 KiB zeroed) instead of reading
-    past it, as it always has; only `pivot diff` and `pivot plots diff` read the files instead
-    (``cache.hash_read_only``'s ``read_files_if_damaged``)."""
+    past it, as it always has; the read-only comparison helper belongs only to `pivot diff` and
+    `pivot plots diff`.
+    """
     (set_project_root / ".git").mkdir(exist_ok=True)
     data_file = set_project_root / "data.txt"
     data_file.write_text("content")

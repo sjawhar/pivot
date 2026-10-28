@@ -283,7 +283,8 @@ def _workspace_members(
     result = dict[str, tuple[str, pathlib.Path]]()
     files = list[tuple[str, os.DirEntry[str]]]()
     left_out = list[pathlib.Path]()
-    cache.walk_artifact_members(os.fspath(location), "", cache_dir, files, [], left_out)
+    cache_root = cache.resolve_cache_root(cache_dir)
+    cache.walk_artifact_members(os.fspath(location), "", cache_root, files, [], left_out)
     members = list[tuple[str, pathlib.Path, os.stat_result]]()
     for relpath, entry in files:
         file_path = pathlib.Path(entry.path)
@@ -301,7 +302,7 @@ def _workspace_members(
         file_hash = cached.get(file_path)
         if file_hash is None:
             file_hash, _ = cache.hash_file(file_path, pending=pending)
-        if not cache.is_artifact_member_content(file_path, file_hash, cache_dir):
+        if not cache.is_artifact_member_content(file_path, file_hash, cache_root):
             left_out.append(file_path)
             continue
         result[f"{output['path']}/{relpath}"] = (file_hash, file_path)
@@ -347,10 +348,9 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
     either side is named in one warning. Returns None when no registered stage has an output
     `pivot diff` can compare.
 
-    Workspace files are hashed as ``pivot status`` hashes them (``cache.hash_read_only``): each
-    output's stage StateDB is read read-only (none is created; a damaged one is not used), and
-    the hashes read from files are saved afterwards with one best-effort write per state
-    directory, so the next diff, or status, reads none of them.
+    Workspace files are hashed through `cache.hash_read_only`: each output's stage StateDB is read
+    without creating one; a damaged one is not used, and hashes read from files are saved
+    afterwards best-effort in that same state directory.
     """
     from pivot.cli import helpers as cli_helpers
 
@@ -385,9 +385,7 @@ def select_data_files(targets: Sequence[str]) -> DataSelection | None:
             by_state_dir.setdefault(output["state_dir"], []).append((output, prefixes))
     for state_dir, selected in by_state_dir.items():
         hash_members = functools.partial(_selected_members, selected, proj_root, cache_dir)
-        for member, (file_hash, file_path) in cache.hash_read_only(
-            state_dir, hash_members, create=False, read_files_if_damaged=True
-        ).items():
+        for member, (file_hash, file_path) in cache.hash_read_only(state_dir, hash_members).items():
             workspace_hashes[member] = file_hash
             workspace_paths[member] = file_path
 

@@ -94,16 +94,14 @@ def plot_state_dirs() -> dict[str, pathlib.Path]:
 
 
 def get_plot_hashes_from_workspace(
-    paths: Sequence[str],
-    state_dirs: Mapping[str, pathlib.Path] | None = None,
+    paths: Sequence[str], state_dirs: Mapping[str, pathlib.Path]
 ) -> dict[str, str]:
-    """Compute current file hashes for plot files.
+    """Compute current file hashes for plot files with their stage StateDBs.
 
-    Paths are relative to project root. Each file is hashed as ``pivot status`` hashes it
-    (``cache.hash_read_only``): the StateDB of ``state_dirs[path]`` (``plot_state_dirs``; the
-    configured state directory for a path not in it) is read read-only, none is created and a
-    damaged one is not used, and the hashes read from files are saved afterwards with one
-    best-effort write per state directory.
+    Paths are relative to project root. ``state_dirs`` (``plot_state_dirs``) maps each stage's
+    plot to its stage's state directory; a file no stage produces uses the configured one. Each
+    file is read through that StateDB without creating one; a damaged database is treated as
+    absent. Hashes read from files are saved afterwards best-effort in that same directory.
     """
     proj_root = project.get_project_root()
     default_state_dir = config.locate_state_dir()
@@ -111,18 +109,11 @@ def get_plot_hashes_from_workspace(
     for path_str in paths:
         path = proj_root / path_str
         if path.exists() and path.is_file():
-            state_dir = (state_dirs or {}).get(path_str, default_state_dir)
+            state_dir = state_dirs.get(path_str, default_state_dir)
             by_state_dir.setdefault(state_dir, []).append((path_str, path))
     result = dict[str, str]()
     for state_dir, files in by_state_dir.items():
-        result.update(
-            cache.hash_read_only(
-                state_dir,
-                functools.partial(_hash_plots, files),
-                create=False,
-                read_files_if_damaged=True,
-            )
-        )
+        result.update(cache.hash_read_only(state_dir, functools.partial(_hash_plots, files)))
     return result
 
 

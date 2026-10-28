@@ -185,7 +185,7 @@ def _get_explanations_in_parallel(
     for state_dir, entries in entries_per_stage:
         entries_by_state_dir.setdefault(state_dir, []).extend(entries)
     for state_dir, entries in entries_by_state_dir.items():
-        state_mod.write_back_file_hashes(state_dir, entries)
+        state_mod.save_file_hashes(state_dir, entries, create=False)
     return explanations_by_name
 
 
@@ -412,7 +412,7 @@ def get_tracked_files_status(
             if on_progress is not None:
                 on_progress(i, total)
 
-    state_mod.save_file_hashes(state_dir, pending)
+    state_mod.save_file_hashes(state_dir, pending, create=True)
     return results
 
 

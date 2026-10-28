@@ -30,7 +30,7 @@ from pivot.storage import cache, state
 from tests import xxh64_forge
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     import click.testing
 
@@ -802,15 +802,19 @@ def test_restoring_many_targets_saves_their_hashes_once_per_state_directory(
     for path in files:
         path.unlink()
     saves = list[int]()
-    real_save_many = state.StateDB.save_many
+    real_save_file_hash_entries = state.StateDB.save_file_hash_entries
 
-    def counting_save_many(
-        self: state.StateDB, entries: list[tuple[pathlib.Path, os.stat_result, str]]
+    def counting_save_file_hash_entries(
+        self: state.StateDB,
+        entries: Iterable[types.FileHashEntry],
+        *,
+        timeout: float | None = None,
     ) -> None:
-        saves.append(len(entries))
-        real_save_many(self, entries)
+        entry_list = list(entries)
+        saves.append(len(entry_list))
+        real_save_file_hash_entries(self, entry_list, timeout=timeout)
 
-    monkeypatch.setattr(state.StateDB, "save_many", counting_save_many)
+    monkeypatch.setattr(state.StateDB, "save_file_hash_entries", counting_save_file_hash_entries)
 
     result = _helper_invoke(runner, monkeypatch, root, *_helper_restore_args(files, command))
 

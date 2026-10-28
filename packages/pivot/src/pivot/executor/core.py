@@ -577,6 +577,7 @@ def _restore_tracked_file(
     path: pathlib.Path,
     track_data: track.PvtData,
     cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]],
 ) -> bool:
     """Restore a tracked file from cache, appending each file restored to ``recorded`` for the
@@ -593,7 +594,7 @@ def _restore_tracked_file(
         output_hash,
         cache_dir,
         checkout_modes=checkout_modes,
-        state_dir=config.get_state_dir(),
+        state_dir=state_dir,
         recorded=recorded,
     )
 
@@ -637,7 +638,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                     raise FileNotFoundError(data_path)
             except FileNotFoundError:
                 if checkout_missing:
-                    if _restore_tracked_file(path, track_data, cache_dir, pending):
+                    if _restore_tracked_file(path, track_data, cache_dir, state_dir, pending):
                         logger.info(f"Restored tracked file: {data_path}")
                     else:
                         logger.debug(f"Failed to restore tracked file from cache: {data_path}")
@@ -652,7 +653,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                     f"Tracked file '{data_path}' has changed since tracking. "
                     + f"Run 'pivot track --force {track_data['path']}' to update."
                 )
-    state_mod.save_file_hashes(state_dir, pending)
+    state_mod.save_file_hashes(state_dir, pending, create=True)
 
     metrics.end("core.verify_tracked_files", _t)
     if missing:
@@ -665,7 +666,7 @@ def check_uncached_incremental_outputs(
 ) -> list[tuple[str, str]]:
     """Check for incremental artifacts that exist without a recorded cache hash."""
     uncached = list[tuple[str, str]]()
-    default_state_dir = config.get_state_dir()
+    default_state_dir = config.locate_state_dir()
     workspace = store_mod.WorkspaceStore(project.get_project_root(), "", {})
 
     for stage_name in execution_order:
