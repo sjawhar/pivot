@@ -43,7 +43,6 @@ Example::
 from __future__ import annotations
 
 import asyncio
-import enum
 import logging
 import pathlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -53,6 +52,7 @@ import pygtrie
 
 from pivot import (
     config,
+    display,
     exceptions,
     explain,
     import_artifact,
@@ -71,6 +71,8 @@ from pivot.storage import store as store_mod
 from pivot.types import (
     CodeChange,
     DepChange,
+    ImportCheckStatus,
+    ImportStatusInfo,
     ParamChange,
     PipelineStatus,
     PipelineStatusInfo,
@@ -402,7 +404,7 @@ def get_remote_status(
         raise exceptions.RemoteNotConfiguredError("No remotes configured")
 
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
-    url = remote_config.get_remote_url(resolved_name)
+    url = display.redact_url_credentials(remote_config.get_remote_url(resolved_name))
     local_hashes = transfer.get_local_cache_hashes(cache_dir)
 
     if not local_hashes:
@@ -489,36 +491,6 @@ def get_suggestions(
     return suggestions
 
 
-class ImportCheckStatus(enum.Enum):
-    UP_TO_DATE = "up to date"
-    UPDATE_AVAILABLE = "update available"
-    ERROR = "error"
-
-
-class ImportStatusInfo:
-    __slots__: tuple[str, ...] = ("path", "status", "current_rev", "latest_rev", "error")
-
-    path: str
-    status: ImportCheckStatus
-    current_rev: str
-    latest_rev: str
-    error: str
-
-    def __init__(
-        self,
-        path: str,
-        status: ImportCheckStatus,
-        current_rev: str = "",
-        latest_rev: str = "",
-        error: str = "",
-    ) -> None:
-        self.path = path
-        self.status = status
-        self.current_rev = current_rev
-        self.latest_rev = latest_rev
-        self.error = error
-
-
 async def _check_imports_batch(
     import_pvts: dict[str, track.PvtData],
     project_root: pathlib.Path,
@@ -539,10 +511,19 @@ async def _check_imports_batch(
     results = list[ImportStatusInfo]()
     for (rel_path, _, _), check_or_exc in zip(tasks, checks, strict=True):
         if isinstance(check_or_exc, Exception):
-            logger.warning("Failed to check import %s: %s", rel_path, check_or_exc)
+            error = display.redact_url_credentials(str(check_or_exc) or type(check_or_exc).__name__)
+            logger.warning(
+                "Failed to check import %s: %s",
+                display.escape_control(rel_path),
+                display.escape_control(error),
+            )
             results.append(
                 ImportStatusInfo(
-                    path=rel_path, status=ImportCheckStatus.ERROR, error=str(check_or_exc)
+                    path=rel_path,
+                    status=ImportCheckStatus.ERROR,
+                    current_rev=None,
+                    latest_rev=None,
+                    error=error,
                 )
             )
         else:
@@ -554,10 +535,19 @@ async def _check_imports_batch(
                         status=ImportCheckStatus.UPDATE_AVAILABLE,
                         current_rev=check["current_rev"][:8],
                         latest_rev=check["latest_rev"][:8],
+                        error=None,
                     )
                 )
             else:
-                results.append(ImportStatusInfo(path=rel_path, status=ImportCheckStatus.UP_TO_DATE))
+                results.append(
+                    ImportStatusInfo(
+                        path=rel_path,
+                        status=ImportCheckStatus.UP_TO_DATE,
+                        current_rev=None,
+                        latest_rev=None,
+                        error=None,
+                    )
+                )
     return results
 
 

@@ -149,6 +149,35 @@ class OnError(enum.StrEnum):
     KEEP_GOING = "keep_going"
 
 
+class NoCommitRecord(TypedDict, total=False):
+    """What a stage's outputs hold that no lock records yet, kept under the StateDB key
+    `nocommit:<stage>`. A written lock supersedes it, and its whole record is removed.
+
+    Two features write the record, each its own keys. `code_manifest` is the manifest a
+    `--no-commit` run's lock would have held, rerun marks included, and `output_hashes` the
+    outputs it wrote: the run writes both (`NoCommitRun`, `StateDB.apply_deferred_writes`), and
+    `pivot commit` writes that manifest when both are present and the outputs on disk still have
+    these hashes. `pvt_members` maps each `*.pvt` file Pivot wrote in a directory output (path
+    relative to the project root) to its content hash; the feature that keeps those files owns it.
+
+    Every writer replaces only its own keys and keeps every other key, in one write transaction.
+    The reader (`StateDB.get_no_commit_record`) validates each of these three keys on its own and
+    returns every other key as stored, so a record that holds only one feature's keys reads as
+    present, and a malformed key hides no other.
+    """
+
+    code_manifest: dict[str, str]
+    output_hashes: dict[str, str]  # output identity key -> content hash
+    pvt_members: dict[str, str]  # `*.pvt` path relative to the project root -> content hash
+
+
+class NoCommitRun(TypedDict):
+    """The keys of `NoCommitRecord` a `--no-commit` run writes: always both, never one alone."""
+
+    code_manifest: dict[str, str]
+    output_hashes: dict[str, str]  # output identity key -> content hash
+
+
 class DeferredWrites(TypedDict, total=False):
     """Deferred StateDB writes from worker for coordinator to apply.
 
@@ -163,6 +192,8 @@ class DeferredWrites(TypedDict, total=False):
     run_cache_delete_input_hash: str
     increment_outputs: bool  # True → increment output generations; False/absent → skip
     file_hash_entries: list[tuple[str, int, int, int, str]]  # (path, mtime_ns, size, inode, hash)
+    no_commit_record: NoCommitRun  # a --no-commit run's keys of its `nocommit:` record
+    clear_no_commit_record: bool  # a lock was written: drop the stage's --no-commit record
 
 
 class StageResult(TypedDict):
@@ -533,6 +564,9 @@ class TransferResult(TypedDict):
     hash: str
     success: bool
     error: NotRequired[str]
+    # Present when the transfer failed with RemoteUnreachableError: no connection to the remote
+    # could be made, so every other transfer to it would fail the same way
+    connection_failed: NotRequired[Literal[True]]
 
 
 class TransferSummary(TypedDict):
@@ -579,6 +613,14 @@ class TrackedFileStatus(enum.StrEnum):
     MISSING = "missing"
 
 
+class ImportCheckStatus(enum.StrEnum):
+    """Update check result for an imported artifact."""
+
+    UP_TO_DATE = "up_to_date"
+    UPDATE_AVAILABLE = "update_available"
+    ERROR = "error"
+
+
 class PipelineStatusInfo(TypedDict):
     """Status info for a single stage in pivot status output."""
 
@@ -605,12 +647,28 @@ class RemoteSyncInfo(TypedDict):
     pull_count: int
 
 
+class ImportStatusInfo(TypedDict):
+    """One imported artifact's update check, for pivot status --check-imports output.
+
+    The revisions are the first 8 characters of each commit. A field that does not apply to
+    the status is None (null in JSON): both revisions for up_to_date and error, error for the
+    others.
+    """
+
+    path: str
+    status: ImportCheckStatus
+    current_rev: str | None
+    latest_rev: str | None
+    error: str | None
+
+
 class StatusOutput(TypedDict, total=False):
     """JSON output structure for pivot status command."""
 
     stages: list[PipelineStatusInfo]
     tracked_files: list[TrackedFileInfo]
     remote: RemoteSyncInfo
+    imports: list[ImportStatusInfo]
     suggestions: list[str]
 
 
@@ -652,6 +710,7 @@ class ExplainOutput(TypedDict, total=False):
     stages: list[ExplainStageJson]
     tracked_files: list[TrackedFileInfo]
     remote: RemoteSyncInfo
+    imports: list[ImportStatusInfo]
     suggestions: list[str]
 
 

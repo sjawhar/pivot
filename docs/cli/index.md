@@ -37,6 +37,22 @@ All commands support:
 | `--quiet` / `-q` | Suppress non-essential output |
 | `--help` | Show help message |
 
+**Output.** Three rules hold for every command:
+
+- **URL credentials are hidden.** Any URL Pivot prints — an import's repository URL, a remote
+  cache URL, a URL in a warning, a log line or an error — shows `***` in place of its user-info:
+  `https://user:token@host/repo.git` prints as `https://***@host/repo.git`. The stored URL is
+  unchanged, and a URL without credentials prints byte for byte. An scp-like `git@host:path` is
+  not a URL and prints as typed.
+- **Control characters are escaped in text output.** A value Pivot read from a file (a `.pvt`
+  file, a lock file, `.pivot/config.yaml`, `params.yaml`, a remote listing) prints each control
+  character as visible text (`\x1b`), tab and newline included, so one value stays on one line
+  and a crafted repository cannot drive the terminal. `--json` output is unchanged: JSON escapes
+  these characters itself.
+- **`--json` and `--jsonl` are strict JSON.** A non-finite float prints as the string
+  `"Infinity"`, `"-Infinity"` or `"NaN"`, so a strict RFC 8259 parser reads every document. See
+  [CI Integration](../guides/ci-integration.md#pivot-status---json).
+
 **Path arguments.** `pivot track`, `push`, `fetch` and `pull` read a relative path from the
 current directory. `diff`, `checkout`, `repro`, `dag`, `get` and `check-ignore` read it from the
 project root, so from `sub/` they take the file `data/x.csv` as `data/x.csv`, not
@@ -49,7 +65,9 @@ project: from a `link -> project` symlink, `link/data/x.csv` names `data/x.csv`.
 inside the project is not followed: from `project/dlink -> data`, `dlink/x.csv` matches no
 output in `diff`, `checkout`, `repro`, `dag`, `push`, `fetch` and `pull`, so give the path it
 points to, `data/x.csv`. `track` tracks a file through such a symlink, with a warning that the
-file is inside a symlinked directory.
+file is inside a symlinked directory, unless the directory really lies outside the project:
+then the `.pvt` would be written outside too, where no command finds it again, so `track`
+refuses ("its .pvt would be written outside the project").
 
 `pivot get` refuses every absolute path ("Path traversal not allowed in target").
 `pivot check-ignore` keeps a path under a symlink as typed, so a pattern anchored to the project
@@ -59,6 +77,15 @@ root.
 A path that leaves the project, including `link/../x.csv`, is refused by `checkout`, `push`,
 `fetch`, `pull` and `track` (`resolves outside project root`) and matches no output in
 `diff`, `repro` and `dag`.
+
+**A `.pvt` restores its file only inside the project.** `checkout`, `pull` and
+`repro --checkout-missing` read every `.pvt` under the project root and restore the file its
+`path:` names. A `.pvt` is skipped, with a warning naming it and exit code 0, when its `path:`
+names no file (`.`, `./` or empty), holds `..`, is absolute, or names a file whose directory
+really lies outside the project, through a symlink. `pivot track` and `pivot import` write
+`path:` as the name of the file beside the `.pvt`, which is always restored; any other value
+is warned about, because `checkout x.pvt`, `get`, `update` and `push` take the file beside the
+`.pvt` while `checkout` with no target takes `path:`.
 
 ---
 
@@ -215,12 +242,12 @@ pivot status [STAGES...] [OPTIONS]
 |--------|-------------|
 | `--verbose` / `-v` | Show all stages, not just stale |
 | `--explain` / `-e` | Show detailed breakdown of why stages would run |
-| `--json` | Output as JSON |
+| `--json` | Output as JSON. Writes one document to stdout; notes go to stderr. |
 | `--stages-only` | Show only pipeline status |
 | `--tracked-only` | Show only tracked files |
 | `--remote-only` | Show only remote status |
 | `--remote` / `-r` | Include remote sync status |
-| `--check-imports` | Check for import updates (requires network) |
+| `--check-imports` | Check for import updates (requires network). JSON adds an `imports` field. |
 | `--all` | Show status across all pipelines in the project |
 
 ---
@@ -234,6 +261,8 @@ pivot commit [STAGES...] [OPTIONS]
 ```
 
 Without arguments, commits all stale stages. With stage names, unconditionally commits those stages.
+
+The code a lock records depends on where the outputs came from. If they are the outputs a `pivot repro --no-commit` run wrote, unchanged since, the lock records the code that run ran, so an edit made while it ran, or since, still reruns the stage. Otherwise (outputs edited by hand, or written another way) the lock records the code on disk now: the "trust me" path.
 
 **Options:**
 
@@ -427,34 +456,44 @@ counts separately.
 
 Retrieve files or stage outputs from a specific git revision.
 
+Each output comes from the local cache, then git, then the remote: `get` downloads the cache objects the output is missing and restores it from the cache. An output that fails is reported with its reason; `get` still restores and reports the other targets. An object the remote does not serve (missing, corrupt, refused with an HTTP status, or a download that breaks off) fails only the outputs that need it. If no connection to the remote can be made (a DNS failure, a refused connection, a connect timeout, a TLS failure or a proxy that cannot be connected to, after `remote.retries` retries; on S3 also a connection reset on every retry), `get` stops using the remote for the rest of the command: each later output that needs it fails naming the remote, even if the remote would answer by then, so run `get` again. Missing or refused credentials do not stop it: each output that needs the remote tries again.
+
+A target whose `.pvt` file at the revision has a field `get` cannot use fails naming the file and that field: a `path` or `hash` that is not a string, a `manifest` that is not a list, a manifest entry that is not a mapping, lacks `relpath`, `hash` or `isexec`, or whose `relpath` or `hash` is not a string, and a manifest `relpath` or an `empty_dirs` entry holding a NUL byte. A target already in the workspace is skipped first, as for a valid `.pvt` file. A `.pvt` file that is not the shape pivot writes (a mapping with `path`, `hash` and `size`, and only keys pivot writes) is not read as a `.pvt` file, nor is one whose fields `get` can use but whose `path` is absolute or holds `..`: `get` looks the target up in git, and stops before restoring anything if git does not track it.
+
 ```bash
 pivot get TARGETS... --rev REVISION [OPTIONS]
 ```
 
 **Arguments:**
 
-- `TARGETS` - File paths or stage names (required)
+- `TARGETS` - Stage names (`demo/train`, or `demo/train:key` for one output), or paths of tracked (`.pvt`) or git-tracked files (required). A stage output's workspace path, such as `data/demo/train.jsonl`, works only if git tracks that file; name the stage instead.
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
 | `--rev` / `-r REV` | Git revision (SHA, branch, tag) - required |
+| `--remote NAME` | Remote name (uses default if not specified). An unknown name fails before anything is restored |
 | `--output` / `-o PATH` | Output path (single file only) |
 | `--checkout-mode MODE` | `symlink`, `hardlink`, or `copy` |
 | `--force` / `-f` | Overwrite existing files |
 
+A downloaded cache object has no executable bit, so an executable file in a directory output cannot be hard-linked or symlinked to it. With a mode order that has no `copy` (`--checkout-mode hardlink` or `symlink`, or a `cache.checkout_mode` without `copy`), that output fails with an error naming the file. The default order, hardlink, symlink, copy, ends with `copy`, which restores the bit.
+
 **Examples:**
 
 ```bash
-# Get file from specific commit
-pivot get data/demo/train.jsonl --rev abc123
+# Get a stage's outputs from a specific commit
+pivot get demo/train --rev abc123
 
 # Get stage output from branch
 pivot get demo/train --rev feature-branch
 
-# Get with custom output path
-pivot get data/demo/train.jsonl --rev v1.0 --output old_train.jsonl
+# Get a stage's single output to a custom path
+pivot get demo/train --rev v1.0 --output old_train.jsonl
+
+# Get from a specific remote
+pivot get demo/train --rev abc123 --remote origin
 ```
 
 ---

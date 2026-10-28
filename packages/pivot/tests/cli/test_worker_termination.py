@@ -10,6 +10,7 @@ once and leaves its worker idle, so pivot runs two workers.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import dataclasses
 import os
 import pathlib
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
+# Stops only a hung test: a worker whose pivot died exits about TERMINATION_GRACE_S later.
+_HUNG_TEST_S = 120.0
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="reads the /proc process table"
@@ -73,33 +76,40 @@ def hold() -> str:
     child = subprocess.Popen(["sleep", "300"], start_new_session=True)
     _mark("worker.pid", str(os.getpid()))
     _mark("child.pid", str(child.pid))
-    _mark("started")
+    # Each branch writes `started` inside its `try`: a stop the test sends once it sees
+    # `started` must find the cleanup armed.
     if CLEANUP in ("none", "own-sigterm-handler"):
+        _mark("started")
         time.sleep(300)
         return "done"
     if CLEANUP == "blocked-in-c":
+        _mark("started")
         _block_in_c()
         return "done"
     if CLEANUP == "except-keyboard-interrupt":
         try:
+            _mark("started")
             time.sleep(300)
         except KeyboardInterrupt:
+            _mark("cleanup-started")
             _stop_child(child)
             _mark("cleaned")
             raise
         return "done"
     if CLEANUP == "swallow":
         try:
+            _mark("started")
             time.sleep(300)
         except BaseException:
             _stop_child(child)
         return "fallback"
     try:
+        _mark("started")
         time.sleep(5 if CLEANUP == "short" else 300)
         return "done"
     finally:
+        _mark("cleanup-started")
         if CLEANUP == "hang":
-            _mark("cleanup-started")
             time.sleep(600)
         _stop_child(child)
         _mark("cleaned")
@@ -136,6 +146,38 @@ def _helper_wait_until(predicate: Callable[[], bool], timeout: float) -> bool:
     return predicate()
 
 
+_PTRACE_SEIZE = 0x4206
+_PTRACE_INTERRUPT = 0x4207
+_PTRACE_DETACH = 17
+_PTRACE_EVENT_STOP = 128
+_WALL = 0x40000000  # waitpid's __WALL: also wait for a thread that is not a child
+
+
+def _helper_ptrace(request: int, tid: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.ptrace.argtypes = (ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)
+    libc.ptrace.restype = ctypes.c_long
+    if libc.ptrace(request, tid, None, None) == -1:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+@contextlib.contextmanager
+def _helper_main_thread_held(pid: int) -> Iterator[None]:
+    """Keep process ``pid``'s main thread stopped, as a loaded machine keeps a thread that a
+    signal woke waiting for a CPU, and let it run on exit. ptrace stops only the thread it
+    attaches to, so the process's other threads run on, and Linux gives a signal sent to the
+    process to one of them (``complete_signal`` in the kernel's ``kernel/signal.c``)."""
+    _helper_ptrace(_PTRACE_SEIZE, pid)
+    try:
+        _helper_ptrace(_PTRACE_INTERRUPT, pid)
+        _, status = os.waitpid(pid, _WALL)
+        assert os.WIFSTOPPED(status) and status >> 16 == _PTRACE_EVENT_STOP, hex(status)
+        yield
+    finally:
+        _helper_ptrace(_PTRACE_DETACH, pid)
+
+
 @dataclasses.dataclass
 class _Run:
     """A `pivot repro` in its own session, with its stages started."""
@@ -149,10 +191,9 @@ class _Run:
     def pid(self, name: str) -> int:
         return int((self.markers / f"{name}.pid").read_text())
 
-    def stop(self, how: str) -> None:
+    def send_stop(self, how: str) -> None:
         """SIGKILL pivot alone, SIGINT pivot alone (its cancel), or SIGINT pivot's whole
-        process group (Ctrl-C at a terminal); then wait for pivot to exit. An interrupted
-        pivot must exit cleanly, reporting no error."""
+        process group (Ctrl-C at a terminal)."""
         if how == "kill":
             self.proc.send_signal(signal.SIGKILL)
         elif how == "interrupt":
@@ -160,11 +201,19 @@ class _Run:
         else:
             assert how == "ctrl-c"
             os.killpg(self.proc.pid, signal.SIGINT)
+
+    def wait_for_exit(self, how: str) -> None:
+        """Wait for pivot, stopped ``how``, to exit. An interrupted pivot must exit cleanly,
+        reporting no error."""
         self.proc.wait(timeout=worker.TERMINATION_GRACE_S + 20)
         if how != "kill":
             output = self.log.read_text()
             assert self.proc.returncode == 0, output
             assert "Error:" not in output, output
+
+    def stop(self, how: str) -> None:
+        self.send_stop(how)
+        self.wait_for_exit(how)
 
     def assert_workers_and_child_gone(self) -> None:
         for name in self.pid_names:
@@ -172,6 +221,30 @@ class _Run:
             assert _helper_wait_until(
                 lambda pid=pid: not _helper_alive(pid), worker.TERMINATION_GRACE_S + 5
             ), f"{name} process {pid} survived"
+
+
+def _helper_assert_cleaned_up(run: _Run, how: str, marker: str = "cleaned") -> None:
+    """Require the stage's cleanup ``marker`` once pivot has been stopped ``how``.
+
+    After SIGINT, pivot exits only once it has stopped its workers, so the marker is written
+    by then or never. After SIGKILL, the worker unwinds on its own when it sees pivot gone:
+    wait until it writes the marker or exits. A failure says whether the cleanup started
+    (`cleanup-started`) and shows pivot's log.
+    """
+    path = run.markers / marker
+    if how == "kill":
+        worker_pid = run.pid("worker")
+        start = time.monotonic()
+        settled = _helper_wait_until(
+            lambda: path.exists() or not _helper_alive(worker_pid), _HUNG_TEST_S
+        )
+        print(f"waited {time.monotonic() - start:.1f}s for {marker} or the worker's exit")
+        if not settled:
+            pytest.fail(f"the worker neither wrote {marker} nor exited:\n{run.log.read_text()}")
+    if not path.exists():
+        began = (run.markers / "cleanup-started").exists()
+        cleanup = "started but did not finish" if began else "never started"
+        pytest.fail(f"no {marker}: the stage's cleanup {cleanup}\n{run.log.read_text()}")
 
 
 @contextlib.contextmanager
@@ -245,9 +318,7 @@ def test_stopped_pivot_lets_the_running_stage_clean_up(
     with _helper_running(tmp_path, cleanup) as run:
         run.stop(how)
 
-        assert _helper_wait_until(lambda: (run.markers / "cleaned").exists(), 15), (
-            "the stage's cleanup never finished"
-        )
+        _helper_assert_cleaned_up(run, how)
         run.assert_workers_and_child_gone()
 
 
@@ -256,9 +327,7 @@ def test_ctrl_c_in_watch_mode_lets_the_running_stage_clean_up(tmp_path: pathlib.
     with _helper_running(tmp_path, "finally", watch=True) as run:
         run.stop("ctrl-c")
 
-        assert _helper_wait_until(lambda: (run.markers / "cleaned").exists(), 15), (
-            "the stage's cleanup never finished"
-        )
+        _helper_assert_cleaned_up(run, "ctrl-c")
         run.assert_workers_and_child_gone()
 
 
@@ -271,7 +340,7 @@ def test_cleanup_that_hangs_is_cut_off_and_its_child_killed(
     with _helper_running(tmp_path, "hang") as run:
         run.stop(how)
 
-        assert _helper_wait_until(lambda: (run.markers / "cleanup-started").exists(), 15)
+        _helper_assert_cleaned_up(run, how, "cleanup-started")
         run.assert_workers_and_child_gone()
 
 
@@ -334,3 +403,48 @@ def test_sigint_inherited_as_ignored_does_not_interrupt_the_stage(tmp_path: path
         output = run.log.read_text()
         assert run.proc.returncode == 0, output
         assert (run.root / "data" / "t" / "hold.txt").read_text() == "done", output
+
+
+_SIGTERM_BIT = 1 << (signal.SIGTERM - 1)
+
+
+def _helper_sigterm_pending_on_thread(pid: int, tid: int) -> bool:
+    """Whether SIGTERM waits for thread ``tid`` alone (``SigPnd``), not for the process
+    (``ShdPnd``, which any of its threads may take)."""
+    try:
+        status = pathlib.Path(f"/proc/{pid}/task/{tid}/status").read_text()
+    except OSError:
+        return False
+    for line in status.splitlines():
+        if line.startswith("SigPnd:"):
+            return bool(int(line.split()[1], 16) & _SIGTERM_BIT)
+    return False
+
+
+@pytest.mark.parametrize("how", ["interrupt", "ctrl-c"])
+def test_stop_is_queued_on_the_stage_thread_while_it_waits_for_a_cpu(
+    tmp_path: pathlib.Path, how: str
+) -> None:
+    """Pivot's stop waits for the stage's own thread, not for whichever thread of the worker
+    is running. The test holds that thread stopped, as a loaded machine does, and releases it
+    only once SIGTERM is pending for it alone; then the stage's cleanup must finish.
+
+    A signal sent to the process lands in the process's pending set, which any thread may take,
+    and the kernel never queues one on a thread it refuses to wake (``kernel/signal.c:946-961``,
+    ``:975-980``, ``:4131`` at v7.0), so no stall in pivot can make this pass without the fix."""
+    with _helper_running(tmp_path, "except-keyboard-interrupt") as run:
+        worker_pid = run.pid("worker")
+        with _helper_main_thread_held(worker_pid):
+            run.send_stop(how)
+            pending = _helper_wait_until(
+                lambda: _helper_sigterm_pending_on_thread(worker_pid, worker_pid),
+                worker.TERMINATION_GRACE_S / 2,
+            )
+            assert pending, (
+                "pivot never queued SIGTERM on the stage's thread "
+                f"(worker {worker_pid})\n{run.log.read_text()}"
+            )
+        run.wait_for_exit(how)
+
+        _helper_assert_cleaned_up(run, how)
+        run.assert_workers_and_child_gone()

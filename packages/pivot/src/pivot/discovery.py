@@ -4,6 +4,7 @@ import _imp
 import contextlib
 import dataclasses
 import importlib
+import importlib.abc
 import importlib.machinery
 import importlib.util
 import logging
@@ -12,15 +13,16 @@ import pathlib
 import py_compile
 import sys
 import types as _stdlib_types
-from typing import TYPE_CHECKING, Final, override
+import zipimport
+from typing import TYPE_CHECKING, Final, cast, override
 
 import cloudpickle
 
-from pivot import exceptions, fingerprint, metrics, project, types
+from pivot import exceptions, fingerprint, loaded_source, metrics, project, types
 from pivot.registry import PipelineLike
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
     from importlib.abc import PathEntryFinder
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,9 @@ class DiscoveryError(Exception):
 # Import machinery is process-global. This session record is the narrow ownership boundary:
 # a new public discovery/load restores only modules and sys.path entries that the prior session
 # displaced or inserted, while the active pipeline stays importable for fingerprinting/workers.
+# The session's import hooks (its path hook and the module recorder) are installed only while a
+# discovery imports: a discovery that returns, or fails, leaves CPython's import machinery as it
+# found it.
 _MISSING_MODULE = object()
 
 # A cached bytecode file's flags word (PEP 552): bit 0 marks it hash-based, bit 1 has every
@@ -74,13 +79,45 @@ class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
     A file whose resolved path is a library's (``fingerprint.is_library_path``: pivot's own
     packages included), as a library package symlinked into the project root, loads as CPython
     loads it, and its bytecode is left alone.
+
+    Every other file's code comes from source bytes this loader read, and it records those bytes
+    (``loaded_source.record``): a stage's fingerprint describes that code, which a worker receives
+    by value, even when the file is edited after the import.
     """
+
+    # The bytes the last ``get_data`` call read from this loader's source file.
+    _source_read: bytes | None = None
+
+    @override
+    def get_data(self, path: str) -> bytes:
+        data = super().get_data(path)
+        if path == self.path:
+            self._source_read = data
+        return data
+
+    @property
+    def recorded_source(self) -> bytes | None:
+        """The bytes this loader compiled or validated the checked-hash bytecode against."""
+        return self._source_read
 
     @override
     def get_code(self, fullname: str) -> _stdlib_types.CodeType | None:
         source = self.get_filename(fullname)
         if fingerprint.is_library_path(pathlib.Path(source).resolve()):
             return super().get_code(fullname)
+        self._source_read = None
+        code = self._user_code(fullname, source)
+        data = self._source_read
+        if data is None:
+            # The import accepted bytecode without reading the source: another process replaced
+            # the checked cache with one no import checks. Compile the source this loader reads.
+            data = self.get_data(source)
+            code = self.source_to_code(data, source)
+        loaded_source.record(source, fullname, data)
+        return code
+
+    def _user_code(self, fullname: str, source: str) -> _stdlib_types.CodeType | None:
+        """Compile ``source``, or load bytecode checked against the source bytes it reads."""
         cached = importlib.util.cache_from_source(source)
         if not _is_checked_hash_pyc(cached):
             if sys.dont_write_bytecode:
@@ -99,6 +136,193 @@ class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
         if _imp.check_hash_based_pycs == "never":
             return self.source_to_code(self.get_data(source), source)
         return super().get_code(fullname)
+
+
+class _RecordingLoader(importlib.abc.Loader):
+    """Wrap a non-Pivot loader so Pivot records the source of the code it runs, or records the
+    module unreadable where it cannot show which code that is (`exec_module`)."""
+
+    _loader: importlib.abc.Loader
+
+    def __init__(self, loader: importlib.abc.Loader) -> None:
+        self._loader = loader
+
+    @override
+    def create_module(
+        self, spec: importlib.machinery.ModuleSpec
+    ) -> _stdlib_types.ModuleType | None:
+        create = getattr(self._loader, "create_module", None)
+        return None if create is None else create(spec)
+
+    @override
+    def exec_module(self, module: _stdlib_types.ModuleType) -> None:
+        spec = getattr(module, "__spec__", None)
+        origin = getattr(spec, "origin", None)
+        # Pivot trusts a module's recorded source only where the code that runs is the code it
+        # read, and records every other loader's module unreadable, so a loader no one listed is
+        # safe by default. For CPython's exact SourceFileLoader and a zip archive's `.py` member,
+        # Pivot runs the source itself. SourceFileLoader may run a timestamp-valid old pyc, so the
+        # checked-hash loader Pivot uses for every other user `.py` takes its place and records
+        # the bytes it executes.
+        if type(self._loader) is importlib.machinery.SourceFileLoader and isinstance(origin, str):
+            loader = _ProjectSourceLoader(module.__name__, origin)
+            loader.exec_module(module)
+            loaded_source.record_loaded_module(module, loader.recorded_source)
+            return
+        data, reason = self._zip_source(origin)
+        if data is not None and isinstance(origin, str):
+            # A zip importer's `exec_module` searches the archive again, whatever the spec's
+            # origin says (a finder may build the spec itself), and runs a matching `.pyc` member
+            # before the `.py` one. Pivot compiles the member's bytes it read, as zipimport
+            # compiles a source member (line endings normalized), and runs them: the bytes it
+            # records are the code that runs, and no rewrite of the archive falls between the two.
+            source = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            exec(compile(source, origin, "exec", dont_inherit=True), vars(module))
+            loaded_source.record_loaded_module(module, data)
+            return
+        marker = loaded_source.record_marker(module.__name__)
+        self._loader.exec_module(module)
+        # A loader that wraps Pivot's own, as dd-trace-py's ModuleWatchdog wraps the loader it
+        # finds on `sys.meta_path` (which holds Pivot's recorder), ran it inside: the record that
+        # recorder made during this execution stands. It is readable where Pivot's loader compiled
+        # the source, and unreadable, naming the real loader, where the recorder judged one it does
+        # not trust. A record from before (an earlier import, under `importlib.reload`) does not
+        # stand, nor the one a worker's import hook makes while the module's body imports a
+        # submodule.
+        if not loaded_source.recorded_since(module.__name__, marker):
+            loaded_source.record_loaded_module(module, None, reason)
+
+    def _zip_source(self, origin: object) -> tuple[bytes | None, str | None]:
+        """The `.py` member a zip importer's module comes from, which Pivot compiles and runs
+        itself, or None and why Pivot cannot trust the code this loader runs.
+
+        A zip importer's own finder names the member it will run: a `.pyc` origin means it found
+        a timestamp `.pyc` whose header matches the `.py` member's zip time (to within 1 s) and
+        size, or a hash-based one it does not check or whose hash matches, and it runs that
+        bytecode, which Pivot cannot show is the source's code. Any other loader may run cached
+        bytecode, or text other than the source it gives, which Pivot cannot see: a
+        `SourceFileLoader` subclass, a proxy around CPython's loader, or a loader that caches its
+        own bytecode.
+        """
+        # Typed as `object`: typeshed's zipimporter is no `importlib.abc.Loader`.
+        loader = cast("object", self._loader)
+        if type(loader) is zipimport.zipimporter and isinstance(origin, str):
+            if not origin.endswith(".py"):
+                return None, (
+                    f"its zip importer ran the bytecode member {origin} instead of compiling the "
+                    + ".py source pivot reads, and pivot cannot show that bytecode is that "
+                    + "source's code. Fix: remove the .pyc member from the archive, or accept "
+                    + "the reruns"
+                )
+            try:
+                return loader.get_data(origin), None
+            except (ImportError, OSError):
+                return None, f"its zip importer could not read {origin}"
+        return None, (
+            f"its loader, {type(loader).__module__}.{type(loader).__qualname__}, is not one "
+            + "pivot can show runs the source it reads (pivot trusts only CPython's source file "
+            + "loader and a zip archive's .py member, whose source it runs itself, and its own "
+            + "loader inside another; any other loader may run cached bytecode, or text other "
+            + "than its source). Fix: import the module without that loader, or accept the reruns"
+        )
+
+    def __getattr__(self, name: str) -> object:
+        try:
+            loader = object.__getattribute__(self, "_loader")
+        except AttributeError as exc:
+            raise AttributeError(name) from exc
+        return getattr(loader, name)
+
+
+class _RecordingFinder(importlib.abc.MetaPathFinder):
+    """A meta-path front wrapper that replaces a found loader with `_RecordingLoader`."""
+
+    @override
+    def find_spec(
+        self,
+        fullname: str,
+        path: Sequence[str] | None = None,
+        target: _stdlib_types.ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        for finder in tuple(sys.meta_path):
+            if finder is self:
+                continue
+            find_spec = getattr(finder, "find_spec", None)
+            if find_spec is None:
+                continue
+            spec = find_spec(fullname, path, target)
+            if spec is not None:
+                _record_spec_loader(spec)
+                return spec
+        return None
+
+
+_recording_finder = _RecordingFinder()
+_original_spec_from_file_location = importlib.util.spec_from_file_location
+_wrapped_spec_from_file_location: object | None = None
+
+
+def _should_record_origin(origin: str) -> bool:
+    """Whether the recording finder should wrap this origin's loader."""
+    try:
+        return not fingerprint.is_library_path(pathlib.Path(origin).resolve())
+    except OSError:
+        return True
+
+
+def _record_spec_loader(spec: importlib.machinery.ModuleSpec | None) -> None:
+    """Replace a user-code spec's loader with ``_RecordingLoader``, so Pivot records the source
+    the module is compiled from. Both seams the recorder installs decide here:
+    ``_RecordingFinder.find_spec`` and the wrapped ``importlib.util.spec_from_file_location``.
+
+    A loader without ``exec_module`` (PEP 302's ``load_module`` only, which CPython 3.13 still
+    imports with an ``ImportWarning``) is left as it is: wrapped, the import would call the
+    wrapper's ``exec_module`` and fail. Its module is judged as one no recorder saw compile.
+    """
+    if (
+        spec is not None
+        and spec.loader is not None
+        and hasattr(spec.loader, "exec_module")
+        and isinstance(spec.origin, str)
+        and _should_record_origin(spec.origin)
+        and not isinstance(spec.loader, (_ProjectSourceLoader, _RecordingLoader))
+    ):
+        spec.loader = _RecordingLoader(spec.loader)
+
+
+def _install_module_recorder() -> None:
+    """Install the module recorder: while a discovery imports, or for a worker's life."""
+    global _wrapped_spec_from_file_location
+    if _recording_finder in sys.meta_path:
+        return
+
+    def spec_from_file_location(
+        name: str,
+        location: str | os.PathLike[str] | None = None,
+        *,
+        loader: importlib.abc.Loader | None = None,
+        submodule_search_locations: list[str] | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        spec = _original_spec_from_file_location(
+            name,
+            location,
+            loader=loader,
+            submodule_search_locations=submodule_search_locations,
+        )
+        _record_spec_loader(spec)
+        return spec
+
+    _wrapped_spec_from_file_location = spec_from_file_location
+    sys.meta_path.insert(0, _recording_finder)
+    importlib.util.spec_from_file_location = spec_from_file_location
+
+
+def _uninstall_module_recorder() -> None:
+    """Remove the module recorder when a discovery returns."""
+    if _recording_finder in sys.meta_path:
+        sys.meta_path.remove(_recording_finder)
+    if importlib.util.spec_from_file_location is _wrapped_spec_from_file_location:
+        importlib.util.spec_from_file_location = _original_spec_from_file_location
 
 
 _project_finder_for = importlib.machinery.FileFinder.path_hook(
@@ -150,6 +374,7 @@ def _forget_user_code_finders(root: pathlib.Path) -> None:
 
 def _install_path_hook(root: pathlib.Path) -> Callable[[str], PathEntryFinder]:
     """Import user code through ``_ProjectSourceLoader`` from now on; return the hook."""
+    _install_module_recorder()
     path_hook = _project_path_hook(root)
     sys.path_hooks.insert(0, path_hook)
     _forget_user_code_finders(root)
@@ -177,6 +402,16 @@ class _ImportSession:
 _import_session: _ImportSession | None = None
 
 
+def _remove_import_hooks(session: _ImportSession) -> None:
+    """Give imports CPython's machinery back: drop the session's path hook, the finders it cached
+    and the module recorder. The session's modules, sys.path entry and records stay."""
+    if session.path_hook in sys.path_hooks:
+        sys.path_hooks.remove(session.path_hook)
+    _forget_user_code_finders(session.root)
+    importlib.invalidate_caches()
+    _uninstall_module_recorder()
+
+
 def _end_import_session(session: _ImportSession) -> None:
     """Remove session-owned imports and restore modules/sys.path displaced for it."""
     for module_name, module in session.owned_modules.items():
@@ -196,10 +431,16 @@ def _end_import_session(session: _ImportSession) -> None:
         sys.path.remove(session.path_entry)
     for index, entry in session.caller_path_entries:
         sys.path.insert(min(index, len(sys.path)), entry)
-    if session.path_hook in sys.path_hooks:
-        sys.path_hooks.remove(session.path_hook)
-    _forget_user_code_finders(session.root)
-    importlib.invalidate_caches()
+    _remove_import_hooks(session)
+    loaded_source.prune()
+
+
+def _close_import_session(session: _ImportSession) -> None:
+    """End ``session``, and forget it when it is the current one."""
+    global _import_session
+    _end_import_session(session)
+    if _import_session is session:
+        _import_session = None
 
 
 def _start_import_session(root: pathlib.Path) -> _ImportSession:
@@ -226,7 +467,7 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
         root_str,
         caller_path_entries,
         preexisting_root_modules,
-        # User code imports through _ProjectSourceLoader while the session lasts.
+        # User code imports through _ProjectSourceLoader while the discovery imports.
         _install_path_hook(root),
         file_under_root,
         preexisting_pickle_by_value_modules=cloudpickle.list_registry_pickle_by_value(),
@@ -240,12 +481,14 @@ def import_session_root() -> pathlib.Path | None:
 
 
 def install_user_code_loader(root: str) -> None:
-    """Import user code through ``_ProjectSourceLoader`` in this process from now on, as the
-    import session for ``root`` does: the initializer of each worker (``executor.core``).
+    """Import user code through ``_ProjectSourceLoader`` in this process from now on, and record
+    the source of every user module another loader loads (the module recorder), as a discovery
+    for ``root`` does while it imports: the initializer of each worker (``executor.core``), for
+    the worker's life.
 
     A worker imports user code by name: a stage's module that discovery could not send by
     value (one outside the root, or under it in a ``src`` layout) and any module a stage body
-    imports. The session's loader is installed only in the process that discovered.
+    imports.
     """
     _install_path_hook(pathlib.Path(root))
 
@@ -494,10 +737,11 @@ def discover_pipeline(
         loaded = result is not None
         return result
     finally:
-        if session is not None and not loaded:
-            _end_import_session(session)
-            if _import_session is session:
-                globals()["_import_session"] = None
+        if session is not None:
+            if loaded:
+                _remove_import_hooks(session)
+            else:
+                _close_import_session(session)
         metrics.end("discovery.total", _t)
 
 
@@ -539,6 +783,8 @@ def _load_pipeline_from_module(
             session.owned_modules[module_name] = module
             spec.loader.exec_module(module)
         _track_root_modules(session)
+        loaded_source.record_user_modules()
+        loaded_source.record_unseen_modules()
         module_dict = vars(module)
 
         pipeline_obj = module_dict.get("pipeline")
@@ -574,10 +820,11 @@ def _load_pipeline_from_module(
             pickle_by_value_before,
         )
         if owns_session:
-            _end_import_session(session)
-            if _import_session is session:
-                globals()["_import_session"] = None
+            _close_import_session(session)
         raise
+    finally:
+        if owns_session:
+            _remove_import_hooks(session)
 
 
 def _discover_all_pipelines(root: pathlib.Path, session: _ImportSession) -> PipelineLike | None:
@@ -723,22 +970,22 @@ def load_pipeline_from_path(path: pathlib.Path) -> PipelineLike | None:
     session = _start_import_session(import_root)
     loaded = False
     try:
-        pipeline = _load_pipeline_from_module(resolved_path, session)
-    except DiscoveryError as e:
-        logger.warning(f"Pipeline discovery issue in {path}: {e}")
-        pipeline = None
-    except Exception as e:
-        logger.debug(f"Failed to load pipeline from {path}: {e}")
-        pipeline = None
-    try:
+        try:
+            pipeline = _load_pipeline_from_module(resolved_path, session)
+        except DiscoveryError as e:
+            logger.warning(f"Pipeline discovery issue in {path}: {e}")
+            pipeline = None
+        except Exception as e:
+            logger.debug(f"Failed to load pipeline from {path}: {e}")
+            pipeline = None
         if pipeline is not None:
             _require_project_state(pipeline, project_root)
         loaded = pipeline is not None
         return pipeline
     finally:
-        if not loaded:
-            _end_import_session(session)
-            if _import_session is session:
-                globals()["_import_session"] = None
+        if loaded:
+            _remove_import_hooks(session)
+        else:
+            _close_import_session(session)
         fingerprint.flush_ast_hash_cache()
         fingerprint.flush_manifest_cache()

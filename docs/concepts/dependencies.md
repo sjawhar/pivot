@@ -163,6 +163,29 @@ example) and writes a `.pvt` sidecar to commit in their place:
 pivot track data/raw/values.csv
 ```
 
+The sidecar sits beside its data, and its `path:` is the data's name
+(`values.csv` in `data/raw/values.csv.pvt`). `pivot checkout`, `pivot pull` and
+`pivot repro --checkout-missing` restore the file that `path:` names, under the
+directory holding the `.pvt`.
+
+**A `.pvt` restores its file only inside the project.** A sidecar whose `path:`
+names no file (`.`, `./` or empty), holds `..`, is absolute, or names a file
+whose directory really lies outside the project through a symlink, is skipped
+with a warning that names it; the command keeps going and exits 0. Move such a
+sidecar beside its data inside the project and set `path:` to the data's name.
+
+`pivot track` refuses a path whose directory really lies outside the project, as
+from a `data -> /mnt/external` symlink: the `.pvt` would be written beside the
+data, outside the project, where no Pivot command reads it again.
+
+The check reads "inside the project" from the resolved path, so it does not see
+a bind mount inside the project that points outside: `resolve()` cannot detect a
+bind mount, and a `.pvt` restored under it lands outside the project (git and DVC
+share this limit, and setting a bind mount up needs `CAP_SYS_ADMIN`). The check
+and the write are separate steps, so a local process that can already write in
+the project can replace a checked directory with a symlink pointing outside
+between the two and land the file there.
+
 ---
 
 **See also:** [Artifacts & the DAG](artifacts-and-dag.md) | [Outputs](outputs.md) | [Loaders](loaders.md)

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
 from typing import TypedDict
 
 import click
 
-from pivot import project, types
+from pivot import display, project, types
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -47,7 +46,7 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
 
     if not stage_list:
         if as_json:
-            click.echo(json.dumps(ListJsonOutput(stages=[])))
+            click.echo(display.to_json(ListJsonOutput(stages=[])))
         elif not quiet:
             click.echo("No stages registered.")
             click.echo("Create a pipeline.py with stage functions.")
@@ -66,7 +65,7 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
                     variant=info["variant"],
                 )
             )
-        click.echo(json.dumps(ListJsonOutput(stages=stages), indent=2))
+        click.echo(display.to_json(ListJsonOutput(stages=stages), indent=2))
         return
 
     # Quiet mode: no output, just exit code

@@ -2,6 +2,107 @@
 
 <!-- version list -->
 
+## v0.5.15 (2026-10-28)
+
+### Bug Fixes
+
+- **fingerprint**: Record the code a worker ran when user code is edited during a run
+  ([#518](https://github.com/sjawhar/pivot/pull/518),
+  [`900e30c`](https://github.com/sjawhar/pivot/commit/900e30c273ffc2d1ce1f64b8f19ddde8ceeda9a1))
+
+### Testing
+
+- **fingerprint**: Write queued fingerprint cache entries only into the project that queued them
+  ([#536](https://github.com/sjawhar/pivot/pull/536),
+  [`6c54f8d`](https://github.com/sjawhar/pivot/commit/6c54f8ddd07d6ad730df377495b541d5de57932e))
+
+
+## v0.5.14 (2026-10-27)
+
+### Performance Improvements
+
+- **storage**: Stat unchanged directories instead of listing them when finding .pvt files
+  ([#513](https://github.com/sjawhar/pivot/pull/513),
+  [`7fbdfa3`](https://github.com/sjawhar/pivot/commit/7fbdfa31cbdcb01832a935f5a57335239db5ed57))
+
+
+## v0.5.13 (2026-10-27)
+
+### Bug Fixes
+
+- **executor**: Send a stopped worker's SIGTERM to its main thread, where its stage runs
+  ([#528](https://github.com/sjawhar/pivot/pull/528),
+  [`e463210`](https://github.com/sjawhar/pivot/commit/e46321080a2a95a8dd803bb1753c0efd79e850b4))
+
+- **track**: Restore a .pvt's file only inside the project
+  ([#533](https://github.com/sjawhar/pivot/pull/533),
+  [`361a6e8`](https://github.com/sjawhar/pivot/commit/361a6e876be9771de8ca642826e8756a1b885827))
+
+
+## v0.5.12 (2026-10-27)
+
+### Bug Fixes
+
+- **cli**: Restore get targets from remote ([#522](https://github.com/sjawhar/pivot/pull/522),
+  [`f3b8a3f`](https://github.com/sjawhar/pivot/commit/f3b8a3f9b01fb572711eec54f73ea38ea5090917))
+
+### Continuous Integration
+
+- Run no suite on a draft and cancel superseded pull-request runs
+  ([#526](https://github.com/sjawhar/pivot/pull/526),
+  [`7aba10b`](https://github.com/sjawhar/pivot/commit/7aba10b480c5bc52432f6c609ca8c20c299afc7a))
+
+- Run the benchmark on a pull request only when it carries the benchmark label
+  ([#531](https://github.com/sjawhar/pivot/pull/531),
+  [`1d362ee`](https://github.com/sjawhar/pivot/commit/1d362eee9076a32bb22a0d5d8a335cf26a4c4c36))
+
+### Testing
+
+- Read watch outputs once so a rerunning stage cannot race the check
+  ([#529](https://github.com/sjawhar/pivot/pull/529),
+  [`25759f8`](https://github.com/sjawhar/pivot/commit/25759f8d43ede6bd9fe2ec7d38b56f8c2c05c5b8))
+
+- Restore permissions a test removes so a rerun can delete its temporary tree
+  ([#532](https://github.com/sjawhar/pivot/pull/532),
+  [`8eae480`](https://github.com/sjawhar/pivot/commit/8eae48051222fc24800916de787fe3f7e61087d0))
+
+
+## v0.5.11 (2026-10-27)
+
+### Bug Fixes
+
+- **storage**: Keep a backslash in a file or directory name instead of reading it as a separator
+  ([#520](https://github.com/sjawhar/pivot/pull/520),
+  [`0ab4b1f`](https://github.com/sjawhar/pivot/commit/0ab4b1f8d2ddd566d4a7e098a9452afd29e2d9cc))
+
+### Testing
+
+- Wait on what the serve and worker-termination tests check, not on timing
+  ([#527](https://github.com/sjawhar/pivot/pull/527),
+  [`efbd180`](https://github.com/sjawhar/pivot/commit/efbd180345a01048b62756d369be2f9e0b1bc832))
+
+
+## v0.5.10 (2026-10-26)
+
+### Bug Fixes
+
+- **cli**: Keep pivot status --json output to one JSON document
+  ([#517](https://github.com/sjawhar/pivot/pull/517),
+  [`a9c6280`](https://github.com/sjawhar/pivot/commit/a9c62800d67f12e012b6e8d413e1ef161c1ba864))
+
+### Build System
+
+- **ruff**: Keep ruff's default excludes so a fixer never enters .venv
+  ([#515](https://github.com/sjawhar/pivot/pull/515),
+  [`d3bb6d5`](https://github.com/sjawhar/pivot/commit/d3bb6d569eda3f9f891f6d6ac0e798719da05176))
+
+### Testing
+
+- **benchmarks**: Find the measured session without racing /proc or killing session 0
+  ([#524](https://github.com/sjawhar/pivot/pull/524),
+  [`959c922`](https://github.com/sjawhar/pivot/commit/959c922681d5814505960cdd8497be8614dd3a87))
+
+
 ## v0.5.9 (2026-10-25)
 
 ### Bug Fixes

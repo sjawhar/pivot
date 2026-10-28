@@ -163,11 +163,37 @@ discovery's checked loader):
   that detached from that tree is not reached.
 
 `WorkerPool.hard_cancel` (an Engine leaving on an exception, such as Ctrl-C) takes the workers
-out of the executor's `_processes` first, for the reason above, then sends each SIGTERM, waits up
-to the same grace, and SIGKILLs any worker left with its descendants (by pid: loky's process
-object has no `kill()`). Once `_processes` is cleared, only `executor.shutdown` wakes loky's
-manager thread, so `hard_cancel` calls it in a `finally`: a coordinator whose manager thread is
-left waiting never exits. Start any new long-lived child process with one of these initializers.
+out of the executor's `_processes` first, for the reason above, then sends each worker's main
+thread SIGTERM (`worker.terminate`), waits up to the same grace, and SIGKILLs any worker left with
+its descendants (by pid: loky's process object has no `kill()`). Once `_processes` is cleared,
+only `executor.shutdown` wakes loky's manager thread, so `hard_cancel` calls it in a `finally`: a
+coordinator whose manager thread is left waiting never exits. Start any new long-lived child
+process with one of these initializers.
+
+The SIGTERM goes to the main thread (`tgkill`), not to the process (`os.kill`), because the stage
+runs there and Python runs a signal handler only there. A worker has other threads: NumPy, which
+Pivot imports, starts an OpenBLAS thread for each CPU but one. Linux gives a signal sent to a
+process to its main thread only while that thread is on a CPU or has no signal pending
+(`complete_signal` in the kernel's `kernel/signal.c`). After Ctrl-C has woken the main thread
+and load keeps it waiting for a CPU, Linux gives the SIGTERM to an OpenBLAS thread, which takes
+the Ctrl-C as well. CPython's C handler there only marks both signals for the main thread, which
+then finds no signal and goes back into the call it was blocked in, such as `time.sleep`: the
+stage never stops, and the SIGKILL after the grace cuts its cleanup off. A signal sent to one
+thread can wake only that thread. `worker.terminate` calls the tgkill system call through the C
+library's `syscall()` (glibc and musl both export it), with tgkill's number for the process's
+ABI from `worker._TGKILL_SYSCALLS`: x86-64, i386, arm64, 32-bit ARM, ppc64le, s390x, riscv64 and
+loongarch64, each number cited from the Linux v7.0 syscall table. On any other ABI, macOS
+included, it uses `os.kill` and logs that once at debug level; so does a tgkill that fails for
+anything but a process that is gone, with a warning naming the worker, and `_stop_workers` goes
+on to the other workers whatever one send raises, so the grace and the SIGKILL still bound the
+stop. macOS gives a signal sent to a process to its first thread that does not block it, the main
+thread (XNU `get_signalthread`; read from the source, not run).
+`test_tgkill_system_call_number_fits_this_architecture` fails on an ABI whose number is wrong.
+
+One behaviour narrows: a stage that keeps SIGTERM blocked on the worker's main thread and never
+unblocks it now holds the stop pending until the SIGKILL after the grace, where a process-directed
+signal went to a thread that did not block it and the worker exited sooner. The stage's cleanup
+still runs, from Ctrl-C's own SIGINT, and the grace bounds the stop.
 
 ## Key Insight
 
