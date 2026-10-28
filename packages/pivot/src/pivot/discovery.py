@@ -673,6 +673,7 @@ def discover_pipeline(
     project_root: pathlib.Path | None = None,
     *,
     all_pipelines: bool = False,
+    strict_all: bool = False,
 ) -> PipelineLike | None:
     """Discover and return Pipeline from pipeline.py.
 
@@ -691,6 +692,8 @@ def discover_pipeline(
     Args:
         project_root: Override project root (default: auto-detect)
         all_pipelines: If True, discover and combine all pipelines in project.
+        strict_all: If True, fail instead of skipping an un-loadable pipeline when discovering
+            all pipelines.
 
     Returns:
         Pipeline instance, or None if nothing found
@@ -703,11 +706,11 @@ def discover_pipeline(
     produces and the check of its stages all read one resolution of ``core.state_dir``.
     """
     with state_dir_mod.entry_invocation():
-        return _discover_pipeline(project_root, all_pipelines=all_pipelines)
+        return _discover_pipeline(project_root, all_pipelines=all_pipelines, strict_all=strict_all)
 
 
 def _discover_pipeline(
-    project_root: pathlib.Path | None, *, all_pipelines: bool
+    project_root: pathlib.Path | None, *, all_pipelines: bool, strict_all: bool
 ) -> PipelineLike | None:
     _t = metrics.start()
     session: _ImportSession | None = None
@@ -721,7 +724,7 @@ def _discover_pipeline(
         session = _start_import_session(root)
 
         if all_pipelines:
-            result = _discover_all_pipelines(root, session)
+            result = _discover_all_pipelines(root, session, strict=strict_all)
             if result is not None:
                 _require_project_state(result, root)
             loaded = result is not None
