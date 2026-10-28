@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.5.19 (2026-10-28)
+
+### Bug Fixes
+
+- **config**: Keep every state file in the configured state directory
+  ([#503](https://github.com/sjawhar/pivot/pull/503),
+  [`81378cf`](https://github.com/sjawhar/pivot/commit/81378cfecb5b9712b17ee6f9a55c0fbdebae04da))
+
+
 ## v0.5.18 (2026-10-28)
 
 ### Performance Improvements
