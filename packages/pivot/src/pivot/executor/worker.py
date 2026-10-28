@@ -2428,11 +2428,14 @@ class _QueueWriter:
 
 
 def hash_dependencies(
-    deps: dict[str, types.ArtifactRef] | list[str],
-    store: store_mod.Store | None = None,
+    deps: dict[str, types.ArtifactRef],
+    store: store_mod.Store,
     state_db: state.StateDB | None = None,
 ) -> tuple[dict[str, HashInfo], list[str], list[str], list[FileHashEntry]]:
     """Hash all dependencies and collect file-hash cache write-backs.
+
+    Every dependency hash is ``store.hash_artifact``'s, so a directory input leaves out the
+    files ``.pivotignore`` names wherever a stage's staleness is decided.
 
     With a read-only (or no) ``state_db``, the write-backs are the StateDB file-hash entries of
     every file read, a file of a directory dependency included, for the coordinator to save; a
@@ -2444,35 +2447,19 @@ def hash_dependencies(
     unreadable = list[str]()
     read = list[tuple[pathlib.Path, os.stat_result, str]]()
     pending = read if state_db is None or state_db.readonly else None
-    if isinstance(deps, dict):
-        if store is None:
-            raise ValueError("store is required for artifact dependency hashing")
-        for ref in deps.values():
-            key = types.identity_key(ref.identity)
-            try:
-                hashes[key] = store.hash_artifact(ref, state_db, pending=pending)
-            except FileNotFoundError:
-                missing.append(key)
-            except IsADirectoryError:
-                # One file of a directory output names a directory the producer wrote there
-                unreadable.append(f"{key} (a directory, not a file)")
-            except exceptions.UnreadableLinkError as exc:
-                unreadable.append(f"{key} ({exc})")
-            except OSError:
-                unreadable.append(key)
-    else:
-        for dep in deps:
-            path = pathlib.Path(project.normalize_path(dep))
-            try:
-                if path.is_dir():
-                    hashes[dep] = cache.hash_directory(path, state_db, pending=pending)
-                else:
-                    file_hash, _ = cache.hash_file(path, state_db, pending=pending)
-                    hashes[dep] = FileHash(hash=file_hash)
-            except FileNotFoundError:
-                missing.append(dep)
-            except OSError:
-                unreadable.append(dep)
+    for ref in deps.values():
+        key = types.identity_key(ref.identity)
+        try:
+            hashes[key] = store.hash_artifact(ref, state_db, pending=pending)
+        except FileNotFoundError:
+            missing.append(key)
+        except IsADirectoryError:
+            # One file of a directory output names a directory the producer wrote there
+            unreadable.append(f"{key} (a directory, not a file)")
+        except exceptions.UnreadableLinkError as exc:
+            unreadable.append(f"{key} ({exc})")
+        except OSError:
+            unreadable.append(key)
     metrics.end("worker.hash_dependencies", _t)
     return hashes, missing, unreadable, cache.deferred_file_hash_entries(read)
 

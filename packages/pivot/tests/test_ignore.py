@@ -6,6 +6,8 @@ import time
 import unicodedata
 from typing import TYPE_CHECKING, Any
 
+import pytest
+
 from pivot import ignore
 
 if TYPE_CHECKING:
@@ -89,37 +91,23 @@ def test_project_pivotignore_patterns(tmp_path: pathlib.Path) -> None:
     assert not filter_instance.is_ignored("important.txt")
 
 
-def test_user_pivotignore_patterns(tmp_path: pathlib.Path) -> None:
-    """Should load patterns from user ~/.pivotignore file."""
-    user_ignore = tmp_path / "user_pivotignore"
-    user_ignore.write_text("*.bak\n")
+def test_user_level_pivotignore_is_not_read(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the project's .pivotignore counts: a ~/.pivotignore would change dependency hashes
+    on one machine and not on another."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".pivotignore").write_text("*.bak\n")
+    monkeypatch.setenv("HOME", str(home))
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".pivotignore").write_text("*.log\n")
 
-    filter_instance = ignore.IgnoreFilter(
-        project_root=tmp_path,
-        user_ignore_path=user_ignore,
-    )
+    filter_instance = ignore.IgnoreFilter(project_root=project)
 
-    assert filter_instance.is_ignored("data.bak")
-
-
-def test_patterns_are_additive(tmp_path: pathlib.Path) -> None:
-    """Patterns from all sources should combine (additive semantics)."""
-    # Project ignores *.log
-    pivotignore = tmp_path / ".pivotignore"
-    pivotignore.write_text("*.log\n")
-
-    # User ignores *.tmp
-    user_ignore = tmp_path / "user_pivotignore"
-    user_ignore.write_text("*.tmp\n")
-
-    filter_instance = ignore.IgnoreFilter(
-        project_root=tmp_path,
-        user_ignore_path=user_ignore,
-    )
-
-    # Both should be ignored (additive)
     assert filter_instance.is_ignored("app.log")
-    assert filter_instance.is_ignored("cache.tmp")
+    assert not filter_instance.is_ignored("data.bak"), "~/.pivotignore must not apply"
 
 
 def test_negation_patterns(tmp_path: pathlib.Path) -> None:
@@ -377,19 +365,14 @@ def test_pattern_ending_in_a_lone_backslash_is_skipped_as_in_gitignore(
     assert "Invalid pattern on line 1 of .pivotignore: 'build\\'" in caplog.text
 
 
-def test_gitignore_backslash_escapes_cover_project_and_user_patterns(
+def test_gitignore_backslash_escapes_are_kept_in_patterns(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Project and user patterns retain gitignore backslash escapes."""
+    """Patterns retain gitignore backslash escapes."""
     project_ignore = tmp_path / ".pivotignore"
-    user_ignore = tmp_path / "user_pivotignore"
-    project_ignore.write_text("\\!keep\ntrailing\\ \ndata\\raw\\*\n")
-    user_ignore.write_text("\\#user.txt\n")
+    project_ignore.write_text("\\!keep\ntrailing\\ \ndata\\raw\\*\n\\#user.txt\n")
 
-    filter_instance = ignore.IgnoreFilter(
-        project_root=tmp_path,
-        user_ignore_path=user_ignore,
-    )
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
 
     assert filter_instance.is_ignored("sub/!keep")
     assert filter_instance.is_ignored("trailing ")
@@ -573,14 +556,129 @@ def test_works_without_pivotignore(tmp_path: pathlib.Path) -> None:
     assert not filter_instance.is_ignored("any/path/file.log")
 
 
-def test_works_without_user_pivotignore(tmp_path: pathlib.Path) -> None:
-    """Should work when user ~/.pivotignore doesn't exist."""
-    nonexistent = tmp_path / "nonexistent_user_ignore"
+# =============================================================================
+# gitignore's parent-directory rule
+# =============================================================================
 
-    filter_instance = ignore.IgnoreFilter(
-        project_root=tmp_path,
-        user_ignore_path=nonexistent,
-    )
 
-    # Should not raise, just have no user patterns
-    assert not filter_instance.is_ignored("any_file.txt")
+def test_negation_cannot_reinclude_a_file_inside_an_ignored_directory(
+    tmp_path: pathlib.Path,
+) -> None:
+    """As in gitignore, a file under an ignored directory stays ignored whatever follows, and
+    check_ignore names the pattern that ignores the directory."""
+    (tmp_path / ".pivotignore").write_text("build/\n!build/keep.txt\n")
+
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+    result = filter_instance.check_ignore("build/keep.txt")
+
+    assert filter_instance.is_ignored("build/keep.txt"), "build/ is ignored, so is its file"
+    assert (result.ignored, result.pattern, result.source) == (True, "build/", ".pivotignore:1")
+
+
+# =============================================================================
+# Member filters (directory dependencies)
+# =============================================================================
+
+
+def test_member_filter_matches_the_members_path_inside_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A member is matched as ``<directory>/<relpath>``, so anchored patterns work."""
+    (tmp_path / ".pivotignore").write_text("*.pyc\n__pycache__/\n/src/lane/scratch/\n")
+
+    member_filter = ignore.IgnoreFilter(project_root=tmp_path).member_filter("src/lane")
+
+    assert member_filter is not None
+    assert member_filter("__pycache__", True)
+    assert member_filter("x.cpython-312.pyc", False)
+    assert member_filter("scratch", True), "the anchored pattern names src/lane/scratch/"
+    assert not member_filter("grade.py", False)
+    assert not member_filter("scratch", False), "a directory pattern names no file"
+
+
+def test_member_filter_takes_an_absolute_directory_under_the_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    (tmp_path / ".pivotignore").write_text("/inputs/tmp/\n")
+
+    member_filter = ignore.IgnoreFilter(project_root=tmp_path).member_filter(tmp_path / "inputs")
+
+    assert member_filter is not None
+    assert member_filter("tmp", True)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [pytest.param(None, id="no-file"), pytest.param("# only a comment\n\n", id="no-pattern")],
+)
+def test_member_filter_is_none_without_patterns(
+    tmp_path: pathlib.Path, content: str | None
+) -> None:
+    """With nothing to leave out, the walk gets no filter and costs what it did."""
+    if content is not None:
+        (tmp_path / ".pivotignore").write_text(content)
+
+    assert ignore.IgnoreFilter(project_root=tmp_path).member_filter("inputs") is None
+
+
+@pytest.mark.parametrize(
+    "directory",
+    [pytest.param("build", id="the-directory"), pytest.param("build/gen", id="inside-it")],
+)
+def test_member_filter_is_none_for_an_ignored_directory_and_warns_once(
+    tmp_path: pathlib.Path, caplog: LogCaptureFixture, directory: str
+) -> None:
+    """Leaving out every file of an input would hide every change to it, so a directory that
+    .pivotignore ignores (itself or a directory above it) keeps every file, with one warning."""
+    (tmp_path / ".pivotignore").write_text("*.pyc\nbuild/\n")
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+
+    with caplog.at_level("WARNING", logger="pivot.ignore"):
+        first = filter_instance.member_filter(directory)
+        second = filter_instance.member_filter(directory)
+
+    assert (first, second) == (None, None)
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 1, warnings
+    assert f"Input directory {directory} is ignored by .pivotignore" in warnings[0]
+    assert "'build/' at .pivotignore:2" in warnings[0]
+
+
+def test_member_filter_never_ignores_a_protected_path(tmp_path: pathlib.Path) -> None:
+    (tmp_path / ".pivotignore").write_text("*.py\n")
+
+    member_filter = ignore.IgnoreFilter(project_root=tmp_path).member_filter(".")
+
+    assert member_filter is not None
+    assert not member_filter("pipeline.py", False), "pipeline.py is protected"
+    assert member_filter("stages.py", False)
+
+
+def test_member_filter_normalizes_a_member_name_to_nfc(tmp_path: pathlib.Path) -> None:
+    (tmp_path / ".pivotignore").write_text("café.log\n")
+
+    member_filter = ignore.IgnoreFilter(project_root=tmp_path).member_filter("inputs")
+
+    assert member_filter is not None
+    assert member_filter(unicodedata.normalize("NFD", "café.log"), False)
+
+
+@pytest.mark.parametrize(
+    ("relpath", "is_dir", "expected"),
+    [
+        pytest.param("pkg/__pycache__/m.cpython-312.pyc", False, True, id="under-ignored-dir"),
+        pytest.param("pkg/__pycache__", True, True, id="the-ignored-dir"),
+        pytest.param("pkg/m.py", False, False, id="kept-file"),
+        pytest.param("build/keep.txt", False, True, id="negation-under-ignored-dir"),
+        pytest.param("pkg/m.pyc", False, True, id="ignored-file"),
+    ],
+)
+def test_member_ignored_checks_every_directory_above(
+    tmp_path: pathlib.Path, relpath: str, is_dir: bool, expected: bool
+) -> None:
+    """``member_ignored`` decides what the pruning walk decides for a path met on its own."""
+    (tmp_path / ".pivotignore").write_text("*.pyc\n__pycache__/\nbuild/\n!build/keep.txt\n")
+    member_filter = ignore.IgnoreFilter(project_root=tmp_path).member_filter("inputs")
+    assert member_filter is not None
+
+    assert ignore.member_ignored(member_filter, relpath, is_dir=is_dir) is expected

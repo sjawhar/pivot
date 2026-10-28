@@ -31,6 +31,7 @@ def _make_stage_info(
     outs: list[types.ArtifactRef],
     *,
     state_dir: pathlib.Path | None = None,
+    input_paths: dict[str, str] | None = None,
 ) -> RegistryStageInfo:
     info: RegistryStageInfo = {  # type: ignore[assignment] - test helper
         "func": lambda: None,
@@ -48,7 +49,7 @@ def _make_stage_info(
         "collection_params": {},
         "no_fingerprint": False,
         "code_deps": [],
-        "input_paths": {},
+        "input_paths": input_paths or {},
         "unsafe_fingerprint": False,
     }
     return info
@@ -317,7 +318,12 @@ def test_get_target_hashes_include_deps_keeps_pvt_tracked_inputs(
     """A `pivot track` input is in the local cache, so push sends it and pull fetches it."""
     total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
     all_stages = {
-        "smoke/total": _make_stage_info("smoke/total", [total_ref], state_dir=set_project_root),
+        "smoke/total": _make_stage_info(
+            "smoke/total",
+            [total_ref],
+            state_dir=set_project_root,
+            input_paths={"numbers.csv": "data/raw/numbers.csv"},
+        ),
     }
     raw_dir = set_project_root / "data" / "raw"
     raw_dir.mkdir(parents=True)
@@ -343,6 +349,73 @@ def test_get_target_hashes_include_deps_keeps_pvt_tracked_inputs(
     assert hashes == {"7074a10000000000", "7cacced000000000"}
 
 
+def test_get_target_hashes_include_deps_fetches_every_file_of_a_tracked_directory_input(
+    set_project_root: pathlib.Path,
+) -> None:
+    """A lock's hash of a directory input leaves out what .pivotignore names, but restoring the
+    tracked directory needs those files too, so they come from its .pvt, not from the lock."""
+    total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
+    all_stages = {
+        "smoke/total": _make_stage_info(
+            "smoke/total",
+            [total_ref],
+            state_dir=set_project_root,
+            input_paths={"src": "data/raw/src", "cats": "data/raw/images/cats"},
+        ),
+    }
+    raw_dir = set_project_root / "data" / "raw"
+    raw_dir.mkdir(parents=True)
+    kept = types.DirManifestEntry(relpath="m.py", hash="0000000000000a01", size=1, isexec=False)
+    pyc = types.DirManifestEntry(
+        relpath="__pycache__/m.cpython-312.pyc", hash="0000000000000a02", size=1, isexec=False
+    )
+    track.write_pvt_file(
+        raw_dir / "src.pvt",
+        track.PvtData(path="src", hash="00000000000000a0", size=2, manifest=[pyc, kept]),
+    )
+    cat = types.DirManifestEntry(
+        relpath="cats/a.png", hash="0000000000000b01", size=1, isexec=False
+    )
+    dog = types.DirManifestEntry(
+        relpath="dogs/b.png", hash="0000000000000b02", size=1, isexec=False
+    )
+    track.write_pvt_file(
+        raw_dir / "images.pvt",
+        track.PvtData(path="images", hash="00000000000000b0", size=2, manifest=[cat, dog]),
+    )
+    _helper_write_lock_with_deps(
+        "smoke/total",
+        set_project_root,
+        dep_hashes={
+            types.ArtifactIdentity("src", None): types.DirHash(
+                hash="00000000000000c0", manifest=[kept]
+            ),
+            types.ArtifactIdentity("cats", None): types.DirHash(
+                hash="00000000000000d0",
+                manifest=[
+                    types.DirManifestEntry(
+                        relpath="a.png", hash="0000000000000b01", size=1, isexec=False
+                    )
+                ],
+            ),
+        },
+        output_hashes={
+            types.ArtifactIdentity("smoke/total", None): types.FileHash(hash="7074a10000000000"),
+        },
+    )
+
+    hashes = sync.get_target_hashes(
+        ["smoke/total"], set_project_root, include_deps=True, all_stages=all_stages
+    )
+
+    assert hashes == {
+        "7074a10000000000",
+        "0000000000000a01",
+        "0000000000000a02",
+        "0000000000000b01",
+    }, "Every file the src .pvt tracks, and only images/cats from the images .pvt"
+
+
 def test_get_target_hashes_include_deps_skips_imported_inputs(
     set_project_root: pathlib.Path,
 ) -> None:
@@ -350,7 +423,12 @@ def test_get_target_hashes_include_deps_skips_imported_inputs(
     pushed to this project's remote, so pull must not fetch it."""
     total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
     all_stages = {
-        "smoke/total": _make_stage_info("smoke/total", [total_ref], state_dir=set_project_root),
+        "smoke/total": _make_stage_info(
+            "smoke/total",
+            [total_ref],
+            state_dir=set_project_root,
+            input_paths={"numbers.csv": "data/raw/numbers.csv"},
+        ),
     }
     raw_dir = set_project_root / "data" / "raw"
     raw_dir.mkdir(parents=True)

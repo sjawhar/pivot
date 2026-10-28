@@ -21,7 +21,6 @@ from pivot.types import OutputMessage
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    import pathlib
 
 
 def _queue_lines(output_queue: mp.Queue[OutputMessage]) -> list[tuple[str, bool]]:
@@ -130,38 +129,6 @@ def test_ring_buffer_thread_safe() -> None:
         thread.join()
 
     assert len(ring.snapshot()) == 400
-
-
-def test_hash_dependencies_files_and_missing(tmp_path: pathlib.Path) -> None:
-    """Legacy external path list hashes files and reports only missing entries."""
-    existing = tmp_path / "existing.txt"
-    existing.write_text("content")
-    missing = tmp_path / "missing.txt"
-
-    hashes, missing_paths, unreadable, entries = worker.hash_dependencies(
-        [str(existing), str(missing)]
-    )
-
-    assert str(existing) in hashes
-    assert missing_paths == [str(missing)]
-    assert unreadable == []
-    assert entries[0][0] == str(existing)
-
-
-def test_hash_dependencies_directory_has_manifest(tmp_path: pathlib.Path) -> None:
-    """Directory hashing returns a tree hash with every file in its manifest."""
-    directory = tmp_path / "data"
-    directory.mkdir()
-    (directory / "a.txt").write_text("a")
-    (directory / "b.txt").write_text("b")
-
-    hashes, missing, unreadable, _ = worker.hash_dependencies([str(directory)])
-
-    assert missing == []
-    assert unreadable == []
-    hash_info = hashes[str(directory)]
-    assert "manifest" in hash_info
-    assert {entry["relpath"] for entry in hash_info["manifest"]} == {"a.txt", "b.txt"}
 
 
 def _double(value: int) -> int:

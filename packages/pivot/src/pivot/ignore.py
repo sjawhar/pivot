@@ -6,9 +6,11 @@ import os
 import pathlib
 import threading
 import unicodedata
-from typing import NamedTuple
+from collections.abc import Callable
+from typing import TYPE_CHECKING, NamedTuple, override
 
-import pathspec
+if TYPE_CHECKING:
+    import pathspec
 
 logger = logging.getLogger(__name__)
 
@@ -54,13 +56,34 @@ def get_default_patterns() -> list[str]:
     return list(_DEFAULT_PATTERNS)
 
 
+# Whether .pivotignore names one entry of a directory dependency, given its relpath under that
+# directory and whether it is a directory. It tests that entry alone; ``member_ignored`` adds
+# the directories above it.
+type MemberFilter = Callable[[str, bool], bool]
+
+
+def member_ignored(ignored: MemberFilter, relpath: str, *, is_dir: bool) -> bool:
+    """Whether ``ignored`` names ``relpath`` or a directory above it.
+
+    A walk that never enters an ignored directory (``cache.walk_artifact_members``) decides the
+    same for every entry it meets; this decides it for a path met without that walk: a watched
+    change, an entry of a recorded manifest.
+    """
+    end = relpath.find("/")
+    while end != -1:
+        if ignored(relpath[:end], True):
+            return True
+        end = relpath.find("/", end + 1)
+    return ignored(relpath, is_dir)
+
+
 class CheckIgnoreResult(NamedTuple):
     """Result of checking if a path is ignored."""
 
     path: str
     ignored: bool
     pattern: str | None
-    source: str | None  # e.g., ".pivotignore:5" or "~/.pivotignore:3"
+    source: str | None  # e.g., ".pivotignore:5"
 
 
 class _PatternInfo(NamedTuple):
@@ -72,44 +95,47 @@ class _PatternInfo(NamedTuple):
 
 
 class IgnoreFilter:
-    """Thread-safe ignore filter with mtime-based caching.
+    """Thread-safe filter over the project's ``.pivotignore``, reloaded when its mtime changes.
 
-    Loads patterns from project .pivotignore and user ~/.pivotignore files.
-    Patterns are additive - a file is ignored if it matches ANY pattern.
+    Matching follows gitignore: a path is ignored when the last pattern that matches it is not a
+    negation, or when a directory above it is ignored, which no negation undoes. This one rule
+    decides ``pivot check-ignore``, the files a directory input's hash leaves out
+    (``member_filter``) and the input changes watch mode skips. No user-level file is read: an
+    ignore rule changes dependency hashes, and lock files carry those to every machine.
     """
 
     _lock: threading.Lock
     _project_root: pathlib.Path | None
-    _user_ignore_path: pathlib.Path
     _spec: pathspec.PathSpec | None
     _pattern_infos: list[_PatternInfo]
     _project_mtime: float | None
-    _user_mtime: float | None
+    _warned_dirs: set[str]
 
-    def __init__(
-        self,
-        project_root: pathlib.Path | None = None,
-        user_ignore_path: pathlib.Path | None = None,
-    ) -> None:
+    def __init__(self, project_root: pathlib.Path | None = None) -> None:
         self._lock = threading.Lock()
         self._project_root = project_root
-        self._user_ignore_path = user_ignore_path or pathlib.Path.home() / ".pivotignore"
 
         # Cached state
         self._spec = None
         self._pattern_infos = []
         self._project_mtime = None
-        self._user_mtime = None
+        self._warned_dirs = set()
+
+    @override
+    def __reduce__(self) -> tuple[type[IgnoreFilter], tuple[pathlib.Path | None]]:
+        """A copy (a store sent to a worker) is a filter for the same project that reads the
+        file again; the lock and the loaded patterns stay with this process."""
+        return IgnoreFilter, (self._project_root,)
 
     def is_ignored(self, path: str | pathlib.Path, *, is_dir: bool | None = None) -> bool:
         """Check if path should be ignored.
 
         Args:
-            path: Path to check (relative or absolute)
+            path: Path to check (relative to the project root, or absolute)
             is_dir: Override directory detection. If None, auto-detects.
 
         Returns:
-            True if path matches any ignore pattern and is not protected.
+            True if path, or a directory above it, is ignored and path is not protected.
         """
         path_str = self._normalize_path(path)
 
@@ -121,14 +147,7 @@ class IgnoreFilter:
         if is_dir is None:
             is_dir = self._detect_is_dir(path)
 
-        spec = self._get_spec()
-
-        # Add trailing slash for directory matching
-        match_path = path_str
-        if is_dir and not match_path.endswith("/"):
-            match_path += "/"
-
-        return spec.match_file(match_path)
+        return _ignored_at(self._get_spec(), path_str, is_dir) is not None
 
     def check_ignore(self, path: str | pathlib.Path) -> CheckIgnoreResult:
         """Check if path is ignored and return detailed match info.
@@ -137,7 +156,8 @@ class IgnoreFilter:
             path: Path to check
 
         Returns:
-            CheckIgnoreResult with path, ignored status, matching pattern, and source.
+            CheckIgnoreResult with path, ignored status, matching pattern, and source. When a
+            directory above path is what is ignored, the pattern is the one that ignores it.
         """
         path_str = self._normalize_path(path)
 
@@ -145,53 +165,50 @@ class IgnoreFilter:
         if self._is_protected(path_str):
             return CheckIgnoreResult(path=path_str, ignored=False, pattern=None, source=None)
 
-        # Auto-detect is_dir
-        is_dir = self._detect_is_dir(path)
-
-        # Use is_ignored() for the authoritative decision (single algorithm)
-        ignored = self.is_ignored(path, is_dir=is_dir)
-
-        # If not ignored, no need to find the pattern
-        if not ignored:
+        spec, pattern_infos = self._snapshot()
+        match_path = _ignored_at(spec, path_str, self._detect_is_dir(path))
+        if match_path is None:
             return CheckIgnoreResult(path=path_str, ignored=False, pattern=None, source=None)
 
-        # Get pattern infos to find which pattern caused the match
-        with self._lock:
-            if self._is_stale():
-                self._reload_spec()
-            pattern_infos = list(self._pattern_infos)
+        pattern, source = _deciding_pattern(pattern_infos, match_path)
+        return CheckIgnoreResult(path=path_str, ignored=True, pattern=pattern, source=source)
 
-        # Add trailing slash for directory matching
-        match_path = path_str
-        if is_dir and not match_path.endswith("/"):
-            match_path += "/"
+    def member_filter(self, directory: str | pathlib.Path) -> MemberFilter | None:
+        """The rule for the members of the directory dependency at ``directory``.
 
-        # Find the last matching pattern in declaration order (the one that caused this path to be ignored)
-        matched_pattern: str | None = None
-        matched_source: str | None = None
+        ``directory`` is relative to the project root, or absolute under it. The filter takes a
+        member's relpath under ``directory`` and whether it is a directory, and tests that entry
+        alone (``member_ignored`` adds the directories above it). Patterns match the member's
+        path inside the project, ``directory/relpath``, never a symlink target, so a directory
+        linked in from outside the project gets the answer a local one gets. The patterns are
+        read once here: the filter does not reload them.
 
-        for info in reversed(pattern_infos):
-            try:
-                pattern_to_check = info.pattern
-                is_negation = pattern_to_check.startswith("!")
-                if is_negation:
-                    pattern_to_check = pattern_to_check[1:]
+        None when no member can be left out: ``.pivotignore`` holds no pattern, or it ignores
+        ``directory`` itself or a directory above it. Such a directory is hashed whole, with a
+        warning, since leaving out every file in it would hide every change to it.
+        """
+        directory_str = self._normalize_path(directory)
+        spec, pattern_infos = self._snapshot()
+        if not spec.patterns or self._is_protected(directory_str):
+            return None
+        at_root = directory_str == "."
+        match_path = None if at_root else _ignored_at(spec, directory_str, True)
+        if match_path is not None:
+            pattern, source = _deciding_pattern(pattern_infos, match_path)
+            self._warn_ignored_directory(directory_str, pattern, source)
+            return None
 
-                single_spec = pathspec.PathSpec.from_lines("gitwildmatch", [pattern_to_check])
-                if single_spec.match_file(match_path):
-                    # Found the last matching pattern
-                    matched_pattern = info.pattern
-                    matched_source = f"{info.source}:{info.line_number}"
-                    break
-            except ValueError:
-                continue
+        prefix = "" if at_root else directory_str + "/"
+        match_file = spec.match_file
+        is_protected = self._is_protected
 
-        return CheckIgnoreResult(
-            path=path_str,
-            ignored=True,
-            pattern=matched_pattern,
-            source=matched_source,
-        )
+        def ignored(relpath: str, is_dir: bool) -> bool:
+            member = prefix + unicodedata.normalize("NFC", relpath)
+            if is_protected(member):
+                return False
+            return match_file(member + "/" if is_dir else member)
+
+        return ignored
 
     def invalidate(self) -> None:
         """Force reload of patterns on next access."""
@@ -199,7 +216,31 @@ class IgnoreFilter:
             self._spec = None
             self._pattern_infos = []
             self._project_mtime = None
-            self._user_mtime = None
+
+    def _warn_ignored_directory(
+        self, directory: str, pattern: str | None, source: str | None
+    ) -> None:
+        """Warn once per directory that .pivotignore ignores it, so its hash keeps every file."""
+        with self._lock:
+            if directory in self._warned_dirs:
+                return
+            self._warned_dirs.add(directory)
+        logger.warning(
+            "Input directory %s is ignored by .pivotignore (pattern %r at %s), so Pivot hashes "
+            + "every file in it: .pivotignore leaves files out only inside a directory it does "
+            + "not ignore. Narrow the pattern to name only files inside it.",
+            directory,
+            pattern,
+            source,
+        )
+
+    def _snapshot(self) -> tuple[pathspec.PathSpec, list[_PatternInfo]]:
+        """The compiled patterns and their sources, reloaded first if stale, read together."""
+        with self._lock:
+            if self._is_stale():
+                self._reload_spec()
+            assert self._spec is not None
+            return self._spec, list(self._pattern_infos)
 
     def _get_spec(self) -> pathspec.PathSpec:
         """Get compiled PathSpec, reloading if stale."""
@@ -214,7 +255,6 @@ class IgnoreFilter:
         if self._spec is None:
             return True
 
-        # Check project .pivotignore
         if self._project_root is not None:
             project_path = self._project_root / ".pivotignore"
             try:
@@ -226,49 +266,27 @@ class IgnoreFilter:
                 if self._project_mtime is not None:
                     return True
 
-        # Check user .pivotignore
-        try:
-            current_mtime = self._user_ignore_path.stat().st_mtime
-            if current_mtime != self._user_mtime:
-                return True
-        except OSError:
-            # File deleted, permissions changed, or other access error - reload to handle gracefully
-            if self._user_mtime is not None:
-                return True
-
         return False
 
     def _reload_spec(self) -> None:
-        """Reload patterns from all sources."""
+        """Reload patterns from the project .pivotignore."""
         patterns: list[str] = []
         pattern_infos: list[_PatternInfo] = []
 
-        # Load project .pivotignore
         if self._project_root is not None:
             project_path = self._project_root / ".pivotignore"
-            project_patterns, project_infos, project_mtime = self._load_ignore_file(
+            patterns, pattern_infos, self._project_mtime = self._load_ignore_file(
                 project_path, ".pivotignore"
             )
-            patterns.extend(project_patterns)
-            pattern_infos.extend(project_infos)
-            self._project_mtime = project_mtime
         else:
             self._project_mtime = None
 
-        # Load user .pivotignore
-        user_patterns, user_infos, user_mtime = self._load_ignore_file(
-            self._user_ignore_path, "~/.pivotignore"
-        )
-        patterns.extend(user_patterns)
-        pattern_infos.extend(user_infos)
-        self._user_mtime = user_mtime
-
         # Compile PathSpec
         try:
-            self._spec = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+            self._spec = _compile(patterns)
         except ValueError as e:
             logger.warning(f"Failed to compile ignore patterns: {e}")
-            self._spec = pathspec.PathSpec.from_lines("gitwildmatch", [])
+            self._spec = _compile([])
 
         self._pattern_infos = pattern_infos
 
@@ -301,7 +319,7 @@ class IgnoreFilter:
 
                 # Validate pattern
                 try:
-                    pathspec.PathSpec.from_lines("gitwildmatch", [line])
+                    _compile([line])
                     patterns.append(line)
                     pattern_infos.append(
                         _PatternInfo(pattern=line, source=source_name, line_number=line_num)
@@ -356,3 +374,46 @@ class IgnoreFilter:
         # Check original path for trailing slash (pathlib strips it during normalization)
         original = path if isinstance(path, str) else str(path)
         return original.endswith("/")
+
+
+def _ignored_at(spec: pathspec.PathSpec, path_str: str, is_dir: bool) -> str | None:
+    """The path gitignore's rule finds ignored for ``path_str``, or None if it is not ignored.
+
+    That is the first directory above ``path_str`` the patterns match (with its trailing slash),
+    else ``path_str`` itself (with a trailing slash for a directory) if they match it.
+    """
+    end = path_str.find("/", 1)
+    while end != -1:
+        parent = path_str[: end + 1]
+        if spec.match_file(parent):
+            return parent
+        end = path_str.find("/", end + 1)
+    match_path = path_str + "/" if is_dir and not path_str.endswith("/") else path_str
+    return match_path if spec.match_file(match_path) else None
+
+
+def _deciding_pattern(
+    pattern_infos: list[_PatternInfo], match_path: str
+) -> tuple[str | None, str | None]:
+    """The last pattern, in declaration order, that matches ``match_path``, and its source."""
+    for info in reversed(pattern_infos):
+        pattern_to_check = info.pattern.removeprefix("!")
+        try:
+            single_spec = _compile([pattern_to_check])
+        except ValueError:
+            continue
+        if single_spec.match_file(match_path):
+            return info.pattern, f"{info.source}:{info.line_number}"
+    return None, None
+
+
+def _compile(lines: list[str]) -> pathspec.PathSpec:
+    """Compile gitwildmatch patterns.
+
+    pathspec is imported here rather than with this module: importing it costs about 10 ms in
+    each process, and only a command that hashes a directory input, plans watch changes or
+    runs ``check-ignore`` compiles patterns.
+    """
+    import pathspec
+
+    return pathspec.PathSpec.from_lines("gitwildmatch", lines)

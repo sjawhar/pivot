@@ -221,6 +221,10 @@ def get_stage_explanation(
                         tracked_files,
                         tracked_trie,
                     )
+                if tracked_hash is not None:
+                    # A .pvt keeps every file; the dependency hash leaves out what
+                    # .pivotignore names, as hashing the restored input would.
+                    tracked_hash = store.recorded_input_hash(ref, tracked_hash)
                 fallback_hash = tracked_hash or lock_data["dep_hashes"].get(ref.identity)
                 if fallback_hash is None:
                     unresolved.append(dep_key)

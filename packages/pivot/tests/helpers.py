@@ -40,8 +40,8 @@ def cli_env(home: pathlib.Path, **extra: str) -> dict[str, str]:
 
     This process's environment without any ``PIVOT*`` variable (a developer's
     ``PIVOT_CACHE_DIR`` or ``PIVOT_UNSAFE_FINGERPRINTING`` never reaches the command) and
-    without ``VIRTUAL_ENV``, with ``HOME`` set to ``home`` so neither the developer's global
-    config nor ``~/.pivotignore`` applies, then ``extra``.
+    without ``VIRTUAL_ENV``, with ``HOME`` set to ``home`` so the developer's global config
+    does not apply, then ``extra``.
     """
     env = {
         key: value

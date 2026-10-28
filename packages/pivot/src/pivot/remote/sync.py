@@ -189,18 +189,42 @@ def _get_file_hash_from_pvt(rel_path: str, proj_root: pathlib.Path) -> HashInfo 
     return track.pvt_to_hash_info(track_data)
 
 
-def _get_tracked_hashes(proj_root: pathlib.Path) -> set[str]:
-    """Blob hashes of every `pivot track`-ed file or directory in the project.
+def _get_tracked_artifacts(proj_root: pathlib.Path) -> dict[pathlib.PurePosixPath, HashInfo]:
+    """Every `pivot track`-ed file or directory in the project, by its project-relative path.
 
     Imports are left out: `pivot import` writes the file straight to the workspace, so its
     blob never enters the local cache and push never sends it to this project's remote.
     """
-    hashes = set[str]()
-    for pvt_data in track.discover_pvt_files(proj_root).values():
-        if track.is_import(pvt_data):
-            continue
-        hashes |= _extract_file_hashes_from_hash_info(track.pvt_to_hash_info(pvt_data))
-    return hashes
+    return {
+        pathlib.PurePosixPath(project.to_relative_path(data_path, proj_root)): (
+            track.pvt_to_hash_info(pvt_data)
+        )
+        for data_path, pvt_data in track.discover_pvt_files(proj_root).items()
+        if not track.is_import(pvt_data)
+    }
+
+
+def _tracked_blobs_under(
+    tracked: dict[pathlib.PurePosixPath, HashInfo], input_path: str
+) -> set[str]:
+    """Blob hashes of every tracked file at or under the project-relative ``input_path``.
+
+    Taken from the ``.pvt`` files, which keep every file, not from a lock's dependency hash,
+    which leaves out what ``.pivotignore`` names: a restore of the tracked data needs those too.
+    """
+    target = pathlib.PurePosixPath(input_path)
+    blobs = set[str]()
+    for path, hash_info in tracked.items():
+        if path.is_relative_to(target):
+            blobs |= _extract_file_hashes_from_hash_info(hash_info)
+        elif target.is_relative_to(path) and is_dir_hash(hash_info):
+            inner = target.relative_to(path)
+            blobs |= {
+                entry["hash"]
+                for entry in hash_info["manifest"]
+                if pathlib.PurePosixPath(entry["relpath"]).is_relative_to(inner)
+            }
+    return blobs
 
 
 def _is_cached_stage_output(
@@ -225,7 +249,7 @@ def get_target_hashes(
     hashes = set[str]()
     output_identities: dict[str, types.ArtifactIdentity] | None = None
     unresolved = list[str]()
-    tracked_hashes: set[str] | None = None
+    tracked: dict[pathlib.PurePosixPath, HashInfo] | None = None
 
     for target in targets:
         original_target = target
@@ -261,16 +285,19 @@ def get_target_hashes(
                             # Only deps whose blobs pivot caches (and so pushes) can be fetched:
                             # upstream stage outputs and `pivot track` inputs. Raw inputs
                             # committed to git and `pivot import` inputs are never in the remote.
+                            input_paths = stage_info["input_paths"]
                             for dep_identity, dep_hash in lock_data["dep_hashes"].items():
-                                dep_blobs = _extract_file_hashes_from_hash_info(dep_hash)
                                 producer_info = all_stages.get(dep_identity.producer)
                                 if producer_info is not None:
                                     if _is_cached_stage_output(dep_identity, producer_info):
-                                        hashes |= dep_blobs
+                                        hashes |= _extract_file_hashes_from_hash_info(dep_hash)
                                     continue
-                                if tracked_hashes is None:
-                                    tracked_hashes = _get_tracked_hashes(proj_root)
-                                hashes |= dep_blobs & tracked_hashes
+                                input_path = input_paths.get(types.identity_key(dep_identity))
+                                if input_path is None:
+                                    continue
+                                if tracked is None:
+                                    tracked = _get_tracked_artifacts(proj_root)
+                                hashes |= _tracked_blobs_under(tracked, input_path)
                         continue
             else:
                 resolved_identity = types.ArtifactIdentity(stage_name, target_identity.key)

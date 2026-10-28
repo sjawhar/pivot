@@ -27,6 +27,13 @@ Every command that writes the workspace saves the hash of each file it reads, co
 - Workers open StateDB read-only. They hand back, in `DeferredWrites.file_hash_entries` (`(path, mtime_ns, size, dev, inode, hash)` tuples, `types.FileHashEntry`, from `cache.deferred_file_hash_entries`), the dependencies and outputs they read to decide (also when the stage is cached by lock comparison), the outputs they commit and the outputs they restore; the coordinator writes them after the stage. The coordinator's own skip check writes what it reads and restores.
 - `pivot checkout` (every mode, also the files `--only-missing` keeps or restores and the existing files it compares), `pivot pull`, `pivot get` (from the cache, from git or from the remote), `pivot import`, `pivot update`, `pivot track` and repro's restore of missing tracked files (`--checkout-missing`) record what they write or read. Stage outputs go in the StateDB of the output's stage state directory, which explanations read; everything else in the configured state directory.
 
+## Directory Input Hashes and `.pivotignore`
+
+- Only `WorkspaceStore.hash_artifact` passes `ignored` to `cache.hash_directory`, and only for a `pipeline.input` directory: the entries the project's `.pivotignore` names (`ignore.IgnoreFilter.member_filter`, matched by their path inside the project) are left out of that dependency hash. Outputs, tracked data, `save_to_cache`, restores and checkout comparisons hash every file; a file left out there is lost on restore.
+- A dependency on a stage's directory output is the producer's whole output hash: `explain.producer_output_hashes` reuses producer lock hashes and `sync.get_target_hashes` fetches dependency blobs from the lock.
+- An input hash taken from a record (a `.pvt`, in explain's `--allow-missing` fallback) goes through `WorkspaceStore.recorded_input_hash`, which applies `cache.filter_dir_hash`: the hash the filtered walk gives the recorded tree.
+- The `hash:` cache holds one content hash per file, so filtered and whole walks share it; no directory hash is cached by path.
+
 ## StateDB Key Prefixes
 
 StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/state.py`:

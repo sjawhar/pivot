@@ -26,6 +26,7 @@ from pivot import (
     config,
     exceptions,
     fingerprint,
+    ignore,
     parameters,
     project,
     registry,
@@ -274,6 +275,7 @@ class Engine:
     _graph: nx.DiGraph[str] | None
     _watch_coordinator: engine_watch.WatchCoordinator | None
     _watch_output_stats: dict[pathlib.Path, _WatchOutputSnapshot]
+    _ignore_filter: ignore.IgnoreFilter | None
     _scheduler: engine_scheduler.Scheduler
     _cancel_event: anyio.Event
     _stage_indices: dict[str, tuple[int, int]]
@@ -348,6 +350,7 @@ class Engine:
         self._graph = None
         self._watch_coordinator = None
         self._watch_output_stats = dict[pathlib.Path, _WatchOutputSnapshot]()
+        self._ignore_filter = None
         self._scheduler = engine_scheduler.Scheduler()
         self._cancel_event = anyio.Event()
         self._stage_indices = dict[str, tuple[int, int]]()
@@ -1908,7 +1911,7 @@ class Engine:
             return False
 
         stage_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
-        store = store_mod.store_from_spec(store_spec)
+        store = store_mod.store_from_spec(store_spec, ignore_filter=self._get_ignore_filter())
 
         def _read_lock() -> LockData | None:
             stages_dir = lock.get_stages_dir(stage_state_dir)
@@ -2224,6 +2227,7 @@ class Engine:
                 pipeline_name=pipeline.name,
                 input_bindings=pipeline.input_bindings,
                 cache_dir=pathlib.Path(worker_info["store_spec"]["cache_dir"]),
+                ignore_filter=self._get_ignore_filter(),
             )
             lock_data = lock.StageLock(
                 stage_name, lock.get_stages_dir(worker_info["state_dir"])
@@ -2849,12 +2853,22 @@ class Engine:
                 project_root=project.get_project_root(),
                 pipeline_name=pipeline.name,
                 input_bindings=pipeline.input_bindings,
+                ignore_filter=self._get_ignore_filter(),
             )
             self._watch_coordinator = engine_watch.WatchCoordinator(
                 self._graph,
                 engine_watch.build_artifact_paths(self._get_all_stages(), store),
+                store,
             )
         return self._watch_coordinator
+
+    def _get_ignore_filter(self) -> ignore.IgnoreFilter:
+        """The project's ``.pivotignore`` filter, one for this engine: its skip checks, its
+        explanations and its watch planning all read the file through it, and it reloads the
+        file when its mtime changes."""
+        if self._ignore_filter is None:
+            self._ignore_filter = ignore.IgnoreFilter(project.get_project_root())
+        return self._ignore_filter
 
     def _should_filter_path(self, path: pathlib.Path) -> bool:
         """Check if path should be filtered (output of executing stage)."""

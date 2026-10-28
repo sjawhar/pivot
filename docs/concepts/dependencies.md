@@ -58,6 +58,38 @@ An input whose file does not exist fails before anything runs:
 `Stage 'demo/keep' depends on 'missing.csv' which is not produced by any stage
 and does not exist on disk`.
 
+### Directory inputs and `.pivotignore`
+
+A directory input (`t=pathlib.Path` on a directory) is hashed file by file, and
+any change to it makes its consumers stale, except for the files and
+directories the project's `.pivotignore` names. `pivot init` writes a starter
+`.pivotignore` (`pivot check-ignore --show-defaults` lists it): compiled Python
+(`*.pyc`, `__pycache__/`), virtual environments, version-control and editor
+files, build directories. So a Python process that imports from an input
+directory and writes `__pycache__/*.pyc` there leaves the stage cached.
+
+- Patterns use gitignore syntax. Each file is matched by its path inside the
+  project (the input's path plus the file's path under it), never by where a
+  symlink points, so a directory linked in from outside the project is treated
+  as a local one. A file under an ignored directory stays ignored, as in git:
+  a later `!` pattern cannot bring it back.
+- `.pivotignore` decides two things: which files of a directory input count
+  for its hash (so whether its consumers rerun), and which changes inside a
+  directory input `pivot repro --watch` skips. `pivot check-ignore` answers by
+  the same rules.
+- It does not apply to stage outputs, to data you `pivot track`, or to the
+  cache: every file in a directory output or a tracked directory is hashed,
+  cached and restored, a `.pyc` included. A stage that reads another stage's
+  directory output depends on that output's whole hash.
+- An input file you declare by name is always hashed, whatever `.pivotignore`
+  says. An input directory that `.pivotignore` ignores itself (or that lies in
+  a directory it ignores, such as an input under `build/`) is hashed whole,
+  with a warning: leaving out every file in it would hide every change to it.
+- Only the project's `.pivotignore` counts, not one in your home directory:
+  lock files carry input hashes to every machine.
+- Changing `.pivotignore` changes the hash of every directory input holding a
+  file whose status it changes, so those stages run once.
+
 ## Example
 
 ```python

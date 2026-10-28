@@ -1178,6 +1178,10 @@ pivot check-ignore [TARGETS...] [OPTIONS]
 
 Exit code 0 if any target is ignored, 1 if none are ignored.
 
+It reads only the project's `.pivotignore` and applies the rules Pivot uses when it hashes a
+directory input: a path under an ignored directory is ignored, whatever later `!` patterns say.
+See [Directory inputs and `.pivotignore`](../concepts/dependencies.md#directory-inputs-and-pivotignore).
+
 **Examples:**
 
 ```bash

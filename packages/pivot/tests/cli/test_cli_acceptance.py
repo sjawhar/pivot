@@ -2899,11 +2899,9 @@ with Pipeline("d") as pipeline:
 """
 
 
-@pytest.mark.parametrize("relpath", ["__pycache__/x.pyc", "build/y"])
-def test_editing_any_file_in_directory_input_reruns_consumer(
-    tmp_path: pathlib.Path, relpath: str
-) -> None:
-    """A directory input's hash covers every file, whatever its name."""
+def _directory_input_project(tmp_path: pathlib.Path, *, pivotignore: bool) -> pathlib.Path:
+    """A stage listing every file of ``data/raw/tree``; ``pivotignore`` keeps the starter
+    ``.pivotignore`` `pivot init` writes (it names ``__pycache__/`` and ``build/``)."""
     root = _project(
         tmp_path,
         {
@@ -2913,14 +2911,48 @@ def test_editing_any_file_in_directory_input_reruns_consumer(
             "data/raw/tree/build/y": "v1",
         },
     )
-    output = root / "data" / "d" / "listing.txt"
+    if not pivotignore:
+        (root / ".pivotignore").unlink()
     _ok(_pivot(root, "repro"))
+    output = root / "data" / "d" / "listing.txt"
     assert output.read_text() == "__pycache__/x.pyc=v1;build/y=v1;keep.txt=keep"
+    return root
+
+
+@pytest.mark.parametrize(
+    ("relpath", "pivotignore"),
+    [
+        pytest.param("keep.txt", True, id="file-pivotignore-does-not-name"),
+        pytest.param("__pycache__/x.pyc", False, id="pyc-without-pivotignore"),
+        pytest.param("build/y", False, id="build-without-pivotignore"),
+    ],
+)
+def test_editing_a_file_that_counts_in_a_directory_input_reruns_consumer(
+    tmp_path: pathlib.Path, relpath: str, pivotignore: bool
+) -> None:
+    """A directory input's hash covers every file .pivotignore does not name, whatever its name."""
+    root = _directory_input_project(tmp_path, pivotignore=pivotignore)
 
     (root / "data" / "raw" / "tree" / relpath).write_text("v2")
     out = _ok(_pivot(root, "repro"))
 
-    assert f"{relpath}=v2" in output.read_text(), out
+    assert f"{relpath}=v2" in (root / "data" / "d" / "listing.txt").read_text(), out
+
+
+@pytest.mark.parametrize("relpath", ["__pycache__/x.pyc", "build/y"])
+def test_editing_a_file_pivotignore_names_in_a_directory_input_reruns_nothing(
+    tmp_path: pathlib.Path, relpath: str
+) -> None:
+    """A directory input's hash leaves out what .pivotignore names, so editing it runs nothing."""
+    root = _directory_input_project(tmp_path, pivotignore=True)
+
+    (root / "data" / "raw" / "tree" / relpath).write_text("v2")
+    out = _ok(_pivot(root, "repro"))
+
+    assert "0 ran, 1 cached" in out, out
+    assert (root / "data" / "d" / "listing.txt").read_text() == (
+        "__pycache__/x.pyc=v1;build/y=v1;keep.txt=keep"
+    )
 
 
 _DIRECTORY_OUTPUT_PIPELINE = """\

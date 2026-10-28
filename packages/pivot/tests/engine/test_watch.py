@@ -14,6 +14,7 @@ from pivot.engine import graph as engine_graph
 from pivot.engine import sources
 from pivot.engine.types import InputEvent, NodeType, StageExecutionState
 from pivot.engine.watch import WatchCoordinator
+from pivot.storage import store as store_mod
 
 
 def _helper_build_graph(
@@ -255,6 +256,72 @@ def test_symlink_event_refreshes_retargeted_input_alias(
     assert coord.get_affected_stages([alias]) == ["aliasdir"]
 
     assert coord.get_affected_stages([second_input]) == ["aliasdir"]
+
+
+def _helper_ignore_project(
+    root: pathlib.Path, *, linked: bool
+) -> tuple[WatchCoordinator, pathlib.Path, pathlib.Path]:
+    """A project whose stage ``lane`` reads input directory ``tasks/server`` (local, or a
+    symlink to a directory outside the project) and writes directory ``data/p/lane``, read
+    by ``report``. Returns the planner, the input's real directory and the output."""
+    (root / ".pivotignore").write_text("*.pyc\n__pycache__/\n/tasks/server/scratch/\n")
+    (root / "tasks").mkdir()
+    source = root.parent / f"{root.name}-elsewhere" if linked else root / "tasks" / "server"
+    source.mkdir()
+    if linked:
+        (root / "tasks" / "server").symlink_to(source, target_is_directory=True)
+    output = root / "data" / "p" / "lane"
+    output.mkdir(parents=True)
+    server = pivot_types.ArtifactIdentity("server", None)
+    built = pivot_types.ArtifactIdentity("p/lane", None)
+    graph: nx.DiGraph[str] = nx.DiGraph()
+    for stage, deps, outs in (("p/lane", [server], [built]), ("p/report", [built], [])):
+        graph.add_node(engine_graph.stage_node(stage), type=NodeType.STAGE)
+        for dep in deps:
+            graph.add_node(engine_graph.artifact_node(dep), type=NodeType.ARTIFACT)
+            graph.add_edge(engine_graph.artifact_node(dep), engine_graph.stage_node(stage))
+        for out in outs:
+            graph.add_node(engine_graph.artifact_node(out), type=NodeType.ARTIFACT)
+            graph.add_edge(engine_graph.stage_node(stage), engine_graph.artifact_node(out))
+    artifact_paths = {
+        project.normalize_path(root / "tasks" / "server"): server,
+        project.normalize_path(output): built,
+    }
+    workspace = store_mod.WorkspaceStore(root, "p", {"server": "tasks/server"})
+    return WatchCoordinator(graph, artifact_paths, workspace), source, output
+
+
+@pytest.mark.parametrize("linked", [False, True], ids=["local", "symlinked-from-outside"])
+def test_affected_stages_skip_a_change_pivotignore_names_inside_an_input_directory(
+    set_project_root: pathlib.Path, linked: bool
+) -> None:
+    """The input's hash leaves out what .pivotignore names, so a change there runs nothing;
+    a change to any other file of the input runs its consumers."""
+    coord, source, _ = _helper_ignore_project(set_project_root, linked=linked)
+    (source / "__pycache__").mkdir()
+    (source / "__pycache__" / "grade.cpython-312.pyc").write_bytes(b"pyc")
+    (source / "scratch").mkdir()
+    (source / "scratch" / "notes.txt").write_text("notes")
+    (source / "grade.py").write_text("grade")
+    logical = set_project_root / "tasks" / "server"
+
+    for base in {source, logical}:
+        assert coord.get_affected_stages([base / "__pycache__" / "grade.cpython-312.pyc"]) == []
+        assert coord.get_affected_stages([base / "__pycache__"]) == []
+        assert coord.get_affected_stages([base / "stray.pyc"]) == [], "a deleted ignored file"
+        assert coord.get_affected_stages([base / "scratch" / "notes.txt"]) == []
+        assert coord.get_affected_stages([base / "grade.py"]) == ["p/lane", "p/report"]
+
+
+def test_affected_stages_keep_every_change_inside_a_directory_output(
+    set_project_root: pathlib.Path,
+) -> None:
+    """A dependency on an upstream directory output is its whole hash, so .pivotignore leaves
+    no change inside it out."""
+    coord, _, output = _helper_ignore_project(set_project_root, linked=False)
+    (output / "x.pyc").write_bytes(b"pyc")
+
+    assert coord.get_affected_stages([output / "x.pyc"]) == ["p/report"]
 
 
 # =============================================================================

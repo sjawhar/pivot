@@ -4,7 +4,8 @@ The WatchCoordinator decides *what* should happen in response to file changes.
 Engine performs the actual *execution* (state mutations, event emission, run lifecycle).
 
 Responsibilities owned by WatchCoordinator:
-- Affected-stage computation (which stages to run after a file change)
+- Affected-stage computation (which stages to run after a file change), leaving out a change
+  inside an input directory that `.pivotignore` names, since the input's hash leaves it out
 - Path filtering (should events for this path be deferred/ignored?)
 - Worker restart policy (should workers restart after code reload?)
 
@@ -17,10 +18,12 @@ Responsibilities retained by Engine:
 
 from __future__ import annotations
 
+import os
 import pathlib
+import stat
 from typing import TYPE_CHECKING
 
-from pivot import project
+from pivot import ignore, project
 from pivot import types as pivot_types
 from pivot.engine import graph as engine_graph
 from pivot.engine.types import StageExecutionState
@@ -84,6 +87,8 @@ class WatchCoordinator:
 
     _graph: nx.DiGraph[str]
     _artifact_paths: dict[pathlib.Path, pivot_types.ArtifactIdentity]
+    _identity_paths: dict[pivot_types.ArtifactIdentity, pathlib.Path]
+    _store: WorkspaceStore | None
     _resolved_output_paths: dict[tuple[pathlib.Path, str], list[pivot_types.ArtifactIdentity]]
     _resolved_input_paths: dict[pathlib.Path, list[pivot_types.ArtifactIdentity]]
 
@@ -91,9 +96,15 @@ class WatchCoordinator:
         self,
         graph: nx.DiGraph[str],
         artifact_paths: dict[pathlib.Path, pivot_types.ArtifactIdentity],
+        store: WorkspaceStore | None = None,
     ) -> None:
+        """``store`` decides which files of an input directory ``.pivotignore`` leaves out of
+        the input's hash (``WorkspaceStore.input_member_filter``); a change to one affects no
+        stage. None leaves out nothing."""
         self._graph = graph
         self._artifact_paths = artifact_paths
+        self._identity_paths = {identity: path for path, identity in artifact_paths.items()}
+        self._store = store
         self._rebuild_resolved_path_indexes()
 
     def _rebuild_resolved_path_indexes(self) -> None:
@@ -208,11 +219,36 @@ class WatchCoordinator:
                 ):
                     identities.update(self._matching_resolved_input_identities(path))
             for identity in identities:
+                if self._is_ignored_input_change(identity, path):
+                    continue
                 consumers = engine_graph.get_consumers(self._graph, identity)
                 affected.update(consumers)
                 for stage in consumers:
                     affected.update(engine_graph.get_downstream_stages(self._graph, stage))
         return sorted(affected)
+
+    def _is_ignored_input_change(
+        self, identity: pivot_types.ArtifactIdentity, path: pathlib.Path
+    ) -> bool:
+        """Whether ``path`` lies inside input directory ``identity`` at a file or directory
+        ``.pivotignore`` names: the input's hash leaves it out, so no consumer can be stale."""
+        if self._store is None or engine_graph.get_producer(self._graph, identity) is not None:
+            return False
+        root = self._identity_paths.get(identity)
+        if root is None:
+            return False
+        relpath = _member_relpath(root, path)
+        if relpath is None:
+            return False
+        ignored = self._store.input_member_filter(identity)
+        if ignored is None:
+            return False
+        # The hash's walk tests a symlink as a file, so test the change's own entry, unfollowed
+        try:
+            is_dir = stat.S_ISDIR(os.lstat(path).st_mode)
+        except OSError:
+            is_dir = False
+        return ignore.member_ignored(ignored, relpath, is_dir=is_dir)
 
     def get_producer(self, path: pathlib.Path) -> str | None:
         """Get the stage that produces a given artifact path."""
@@ -224,3 +260,18 @@ class WatchCoordinator:
     def should_restart_workers(self, *, parallel: bool) -> bool:
         """Decide whether a parallel reload replaces its workers before its re-run."""
         return parallel
+
+
+def _member_relpath(root: pathlib.Path, path: pathlib.Path) -> str | None:
+    """``path``'s relpath inside directory ``root``, or None when it is not strictly inside.
+
+    By the logical path first; for a change reported through a directory linked in from
+    elsewhere, by the real paths of both.
+    """
+    logical = project.normalize_path(path)
+    if logical != root and logical.is_relative_to(root):
+        return logical.relative_to(root).as_posix()
+    real, real_root = path.resolve(), root.resolve()
+    if real != real_root and real.is_relative_to(real_root):
+        return real.relative_to(real_root).as_posix()
+    return None
