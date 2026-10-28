@@ -5,6 +5,7 @@ import importlib.abc
 import importlib.machinery
 import importlib.util
 import inspect
+import io
 import linecache
 import logging
 import marshal
@@ -1114,7 +1115,21 @@ def test_a_step_of_the_wall_clock_after_import_never_moves_the_start_later(
     made before the step could read as older than the start: the boot's wall-clock time stays as
     it was at import. A backward step moves the start earlier, which only makes more files count
     as changed since it."""
-    wall_at_boot = time.time_ns() - time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    # Both calls read one instant: the wall clock, the boot clock and the process start are fixed.
+    wall_ns = time.time_ns()
+    boot_clock_ns = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    stat = pathlib.Path("/proc/self/stat").read_text()
+
+    def boot_clock(clock: int) -> int:
+        return boot_clock_ns
+
+    def open_stat(path: str) -> io.StringIO:
+        return io.StringIO(stat)
+
+    monkeypatch.setattr(time, "time_ns", lambda: wall_ns)
+    monkeypatch.setattr(time, "clock_gettime_ns", boot_clock)
+    monkeypatch.setattr(loaded_source, "open", open_stat, raising=False)
+    wall_at_boot = wall_ns - boot_clock_ns
     monkeypatch.setattr(loaded_source, "_WALL_AT_BOOT_ON_IMPORT_NS", wall_at_boot)
     started = loaded_source._process_start_ns()
     # The wall clock read `step_s` less at import than now: it stepped by `step_s` since.
@@ -1124,7 +1139,7 @@ def test_a_step_of_the_wall_clock_after_import_never_moves_the_start_later(
     stepped = loaded_source._process_start_ns()
 
     assert started is not None and stepped is not None
-    assert abs(started - stepped - earlier_s * 1_000_000_000) < 1_000_000, (started, stepped)
+    assert started - stepped == earlier_s * 1_000_000_000, (started, stepped)
 
 
 def test_a_forked_process_cannot_vouch_for_modules_its_parent_loaded() -> None:
