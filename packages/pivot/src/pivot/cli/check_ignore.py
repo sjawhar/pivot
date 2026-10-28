@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
 import sys
 
 import click
 
-from pivot import ignore, project
+from pivot import display, ignore, project
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 
@@ -66,7 +65,7 @@ def _show_default_patterns(as_json: bool) -> None:
     patterns = ignore.get_default_patterns()
 
     if as_json:
-        click.echo(json.dumps({"default_patterns": patterns}))
+        click.echo(display.to_json({"default_patterns": patterns}))
     else:
         click.echo("Default patterns for .pivotignore:\n")
         for pattern in patterns:
@@ -84,7 +83,7 @@ def _output_json(results: list[ignore.CheckIgnoreResult]) -> None:
         }
         for r in results
     ]
-    click.echo(json.dumps(data))
+    click.echo(display.to_json(data))
 
 
 def _output_text(results: list[ignore.CheckIgnoreResult], details: bool) -> None:
@@ -92,6 +91,8 @@ def _output_text(results: list[ignore.CheckIgnoreResult], details: bool) -> None
     for result in results:
         if result.ignored:
             if details:
-                click.echo(f"{result.source}\t{result.pattern}\t{result.path}")
+                source = display.escape_control(result.source or "")
+                pattern = display.escape_control(result.pattern or "")
+                click.echo(f"{source}\t{pattern}\t{display.escape_control(result.path)}")
             else:
-                click.echo(result.path)
+                click.echo(display.escape_control(result.path))

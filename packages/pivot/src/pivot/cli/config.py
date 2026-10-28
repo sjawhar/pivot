@@ -1,10 +1,9 @@
-import json
 from typing import Any, cast
 
 import click
 import pydantic
 
-from pivot import config, config_files, exceptions
+from pivot import config, config_files, display, exceptions
 from pivot import state_dir as state_dir_mod
 from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
@@ -14,13 +13,28 @@ _STATE_DIR_PATH = ("core", "state_dir")
 
 
 def _format_value(value: Any) -> str:
-    """Format a config value for display."""
+    """Format a config value for display: URL credentials hidden, control characters escaped."""
     if value is None:
         return "(not set)"
     if isinstance(value, list):
         items = cast("list[Any]", value)
-        return ", ".join(str(v) for v in items)
-    return str(value)
+        text = ", ".join(str(v) for v in items)
+    else:
+        text = str(value)
+    return display.redact_url_credentials(display.escape_control(text))
+
+
+def _redact(value: Any) -> Any:
+    """``value`` with URL credentials hidden in every string it holds, for JSON output."""
+    if isinstance(value, str):
+        return display.redact_url_credentials(value)
+    if isinstance(value, dict):
+        mapping = cast("dict[Any, Any]", value)
+        return {key: _redact(item) for key, item in mapping.items()}
+    if isinstance(value, list):
+        items = cast("list[Any]", value)
+        return [_redact(item) for item in items]
+    return value
 
 
 def _flatten_config(data: dict[str, Any], path: tuple[Any, ...] = ()) -> dict[tuple[Any, ...], Any]:
@@ -79,7 +93,7 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
         data["cache"]["dir"], _ = config.get_config_value("cache.dir")
 
     if output_json:
-        click.echo(json.dumps(data, indent=2))
+        click.echo(display.to_json(_redact(data), indent=2))
         return
 
     flat = _flatten_config(data)
@@ -108,7 +122,8 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
                     source = config.ConfigSource.GLOBAL
                 else:
                     _, source = config.get_config_value(f"remotes.{remote_name}")
-                click.echo(f"remotes.{remote_name} = {remote_url} ({source})")
+                name = display.escape_control(remote_name)
+                click.echo(f"remotes.{name} = {_format_value(remote_url)} ({source})")
         else:
             if use_global:
                 # Every row comes from the global file, so every label does too.
@@ -119,7 +134,7 @@ def config_list(use_global: bool, use_local: bool, output_json: bool) -> None:
                 configured_value, source = config.get_config_value(key)
                 if source == config.ConfigSource.GLOBAL_IGNORED:
                     value = configured_value
-            row = f"{key} = {_format_value(value)} ({source})"
+            row = f"{display.escape_control(key)} = {_format_value(value)} ({source})"
             if (
                 merged_listing
                 and key == "core.state_dir"
@@ -177,7 +192,7 @@ def config_get(key: str, use_global: bool, use_local: bool, output_json: bool) -
         value, source = config.get_config_value(key)
 
     if output_json:
-        click.echo(json.dumps({"key": key, "value": value, "source": str(source)}))
+        click.echo(display.to_json({"key": key, "value": _redact(value), "source": str(source)}))
         return
 
     click.echo(f"{key} = {_format_value(value)} ({source})")

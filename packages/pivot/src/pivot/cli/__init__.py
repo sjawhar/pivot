@@ -8,6 +8,8 @@ from typing import TextIO, TypedDict, override
 
 import click
 
+from pivot import display
+
 # Command categories for organized help output
 COMMAND_CATEGORIES = {
     "Pipeline": ["run", "repro", "status", "verify", "commit"],
@@ -114,6 +116,16 @@ class PivotGroup(click.Group):
         return getattr(module, attr_name)
 
     @override
+    def invoke(self, ctx: click.Context) -> object:
+        """Run the command; an error it raises is printed with control characters escaped and
+        URL credentials hidden, wherever its message came from."""
+        try:
+            return super().invoke(ctx)
+        except click.ClickException as e:
+            e.message = display.safe_message(e.message)
+            raise
+
+    @override
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         """Format commands grouped by category using cached help strings."""
         # Build reverse lookup: command name -> category
@@ -164,6 +176,15 @@ class _StderrHandler(logging.StreamHandler[TextIO]):
         return sys.stderr
 
 
+class _SafeFormatter(logging.Formatter):
+    """Formats a record as its message (and traceback), safe to print: control characters
+    escaped except line breaks, URL credentials hidden."""
+
+    @override
+    def format(self, record: logging.LogRecord) -> str:
+        return display.safe_message(super().format(record))
+
+
 def _setup_logging(verbose: bool, quiet: bool) -> None:
     """Configure logging for CLI output."""
     if quiet:
@@ -173,7 +194,7 @@ def _setup_logging(verbose: bool, quiet: bool) -> None:
     else:
         level = logging.INFO
     handler = _StderrHandler()
-    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setFormatter(_SafeFormatter("%(message)s"))
     logging.basicConfig(level=level, handlers=[handler], force=True)
 
 

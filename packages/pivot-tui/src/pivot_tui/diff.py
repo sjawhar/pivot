@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar, override
 
-import rich.markup
 import textual.app
 import textual.binding
 import textual.containers
 import textual.widgets
 
+from pivot import display
 from pivot.types import ChangeType, DataDiffResult, RowChange, SchemaChange
 
 # Rich markup symbols for change types
@@ -35,7 +35,7 @@ class DiffSummaryPanel(textual.widgets.Static):
         summary_lines = list[str]()
 
         # File path and status
-        escaped_path = rich.markup.escape(self._result["path"])
+        escaped_path = display.escape_markup(self._result["path"])
         if self._result["reorder_only"]:
             summary_lines.append(f"[bold blue]{escaped_path}[/] - REORDER ONLY")
             summary_lines.append("[dim]Same content, different row order[/]")

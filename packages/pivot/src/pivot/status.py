@@ -53,6 +53,7 @@ import pygtrie
 
 from pivot import (
     config,
+    display,
     exceptions,
     explain,
     import_artifact,
@@ -411,7 +412,7 @@ def get_remote_status(
         raise exceptions.RemoteNotConfiguredError("No remotes configured")
 
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
-    url = remote_config.get_remote_url(resolved_name)
+    url = display.redact_url_credentials(remote_config.get_remote_url(resolved_name))
     local_hashes = transfer.get_local_cache_hashes(cache_dir)
 
     if not local_hashes:
@@ -518,8 +519,12 @@ async def _check_imports_batch(
     results = list[ImportStatusInfo]()
     for (rel_path, _, _), check_or_exc in zip(tasks, checks, strict=True):
         if isinstance(check_or_exc, Exception):
-            error = str(check_or_exc) or type(check_or_exc).__name__
-            logger.warning("Failed to check import %s: %s", rel_path, error)
+            error = display.redact_url_credentials(str(check_or_exc) or type(check_or_exc).__name__)
+            logger.warning(
+                "Failed to check import %s: %s",
+                display.escape_control(rel_path),
+                display.escape_control(error),
+            )
             results.append(
                 ImportStatusInfo(
                     path=rel_path,
