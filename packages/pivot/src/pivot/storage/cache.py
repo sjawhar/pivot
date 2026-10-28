@@ -319,6 +319,14 @@ def _recorded_empty_dirs(output_hash: DirHash) -> list[str]:
     return output_hash["empty_dirs"] if "empty_dirs" in output_hash else []
 
 
+def _manifest_hash(manifest: list[DirManifestEntry], empty_dirs: list[str]) -> str:
+    """The directory hash a manifest and its recorded empty directories name: the cache key of the
+    whole-directory tree that holds exactly them (``hash_directory`` names a directory by it)."""
+    hashed: object = {"empty_dirs": empty_dirs, "manifest": manifest} if empty_dirs else manifest
+    hashed_json = json.dumps(hashed, sort_keys=True, separators=(",", ":"))
+    return xxhash.xxh64(hashed_json.encode()).hexdigest()
+
+
 def _restored_dirs(output_hash: DirHash) -> set[str]:
     """Every directory a restore of ``output_hash`` creates under its root, as relpaths."""
     empty_dirs = _recorded_empty_dirs(output_hash)
@@ -450,9 +458,7 @@ def hash_directory(
     has_child = {posixpath.dirname(directory) for directory in found_dirs}
     empty_dirs = sorted(found_dirs - file_dirs - has_child)
 
-    hashed: object = {"empty_dirs": empty_dirs, "manifest": manifest} if empty_dirs else manifest
-    hashed_json = json.dumps(hashed, sort_keys=True, separators=(",", ":"))
-    output_hash = DirHash(hash=xxhash.xxh64(hashed_json.encode()).hexdigest(), manifest=manifest)
+    output_hash = DirHash(hash=_manifest_hash(manifest, empty_dirs), manifest=manifest)
     if empty_dirs:
         output_hash["empty_dirs"] = empty_dirs
 
@@ -849,7 +855,7 @@ def _checkout_from_cache(
     elif checkout_mode == CheckoutMode.HARDLINK and path.exists() and not path.is_symlink():
         with contextlib.suppress(OSError):
             linked = path.stat()
-            if linked.st_ino == cache_path.stat().st_ino:
+            if _is_same_file(linked, cache_path):
                 return linked
 
     tmp_path = staging_path or path.parent / f"{_RESTORE_TEMP_PREFIX}{secrets.token_hex(8)}"
@@ -951,8 +957,8 @@ def _tree_file_holds(
 ) -> bool:
     """Whether a tree file, ``path_stat`` its ``os.lstat``, is a regular file holding ``entry``'s
     bytes: its recorded size and content hash. Hashes the file only once the cheap checks pass.
-    The size is only that cheap check, so an entry without one (a hand-written ``.pvt``; every
-    lock records it) is checked by hash alone."""
+    The size is only that cheap check, so an entry without one is checked by hash alone; a tree
+    check sees only manifests that hash to the tree's name, and those record every size."""
     return (
         stat.S_ISREG(path_stat.st_mode)
         and ("size" not in entry or path_stat.st_size == entry["size"])
@@ -1007,8 +1013,16 @@ def _ensure_tree_complete(
     repair and the mark run under the tree's exclusive lock, so two repairers never change the
     tree's directory modes under each other. Returns False, the tree unmarked, when the tree
     differs and cannot be repaired, or cannot be checked: a file's object is absent, or this user
-    cannot read the tree, write it or take its lock.
+    cannot read the tree, write it or take its lock. It also returns False, before any check or
+    repair and whatever the mark says, when ``output_hash``'s manifest does not hash to its
+    ``hash`` (``_manifest_hash``): only the tree's own manifest may vouch for it or repair it.
     """
+    manifest_hash = _manifest_hash(output_hash["manifest"], _recorded_empty_dirs(output_hash))
+    if manifest_hash != output_hash["hash"]:
+        # Content addressing is what makes a tree trustworthy: a manifest that does not hash to
+        # the tree's name is not that tree's, so it may neither vouch for the tree's files nor
+        # rewrite and mark it (a forged .pvt or lock entry would otherwise poison the cache).
+        return False
     marker = _tree_layout_marker(cache_dir_path)
     if marker.exists():
         return True
@@ -1677,7 +1691,8 @@ def _restore_directory_from_cache(
         # the output is restored file by file from the objects instead, if they are cached.
         logger.warning(
             "Cache tree %s differs from what its hash records, or cannot be read, and cannot be "
-            + "repaired; restoring %s file by file",
+            + "repaired, or the manifest given for it does not hash to its name; restoring %s "
+            + "file by file",
             cache_dir_path,
             path,
         )

@@ -18,7 +18,7 @@ import pytest
 
 from pivot import exceptions
 from pivot.storage import cache, state
-from pivot.types import DirHash, FileHash, HashInfo, is_dir_hash
+from pivot.types import DirHash, DirManifestEntry, FileHash, HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
@@ -2210,9 +2210,10 @@ def test_restore_from_cache_symlink_fast_path_rejects_manifest_traversal(
     tmp_path: pathlib.Path,
 ) -> None:
     """The symlink fast path in `_restore_directory_from_cache` must reject a lock-supplied
-    manifest with a traversal relpath before it checks or repairs a tree it did not mark, the
-    same way the file-by-file branch already does."""
-    from pivot import exceptions
+    manifest with a traversal relpath before it checks or repairs a tree it did not mark. The
+    manifest does not hash to the tree's name, so it is refused before any check or repair, and
+    the file-by-file restore finds no object for the traversal entry: nothing outside the output
+    is touched and the tree is left unmarked."""
     from pivot.types import DirHash, DirManifestEntry
 
     cache_dir = tmp_path / "cache"
@@ -2242,10 +2243,10 @@ def test_restore_from_cache_symlink_fast_path_rejects_manifest_traversal(
     )
 
     cache.remove_output(output)
-    with pytest.raises(exceptions.SecurityValidationError, match="path traversal"):
-        cache.restore_from_cache(output, tampered_hash, cache_dir, checkout_modes=modes)
+    assert not cache.restore_from_cache(output, tampered_hash, cache_dir, checkout_modes=modes)
 
     assert victim.stat().st_mode & 0o777 == 0o644, "victim file must be untouched"
+    assert not cache._tree_layout_marker(tree_path).exists(), "a forged manifest marks nothing"
 
 
 def test_directory_output_restore_isexec_mismatch_without_copy_fallback_raises(
@@ -3130,6 +3131,129 @@ def test_symlink_restore_records_repaired_bytes_not_stale_same_size_bytes(
             assert state_db.get(member, member.stat()) == cache.hash_file(member)[0], (
                 f"{name}'s recorded hash vouches for the bytes it now holds, not stale bytes"
             )
+
+
+_FORGED_HASH = "0123456789abcdef"
+
+
+def _helper_marked_tree(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, DirHash]:
+    """A SYMLINK cache tree this pivot built and marked, holding ``a.txt`` = ``AAAA``."""
+    cache_dir = tmp_path / "cache"
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_bytes(b"AAAA")
+    output_hash = cache.save_to_cache(src, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK])
+    assert is_dir_hash(output_hash)
+    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+    assert cache._tree_layout_marker(tree).exists(), "the tree is marked"
+    return cache_dir, tree, output_hash
+
+
+@pytest.mark.parametrize("forge", ["hash-inside-the-tree", "absolute-path"])
+def test_symlink_restore_records_no_hash_a_forged_manifest_chose(
+    tmp_path: pathlib.Path, forge: str
+) -> None:
+    """Round 5, B1: a manifest that does not hash to a marked tree's name (a forged .pvt or lock
+    entry) made the symlink fast path record the hashes it supplied, for files inside the output
+    or, by absolute path, anywhere. Such a manifest is not the tree's, so the fast path is not
+    taken and nothing it names is vouched for."""
+    cache_dir, tree, honest = _helper_marked_tree(tmp_path)
+    victim = tmp_path / "victim.txt"
+    victim.write_bytes(b"victim bytes")
+    forged_entry = (
+        DirManifestEntry(relpath="a.txt", hash=_FORGED_HASH, size=4, isexec=False)
+        if forge == "hash-inside-the-tree"
+        else DirManifestEntry(relpath=str(victim), hash=_FORGED_HASH, size=12, isexec=False)
+    )
+    manifest = (
+        [forged_entry] if forge == "hash-inside-the-tree" else [*honest["manifest"], forged_entry]
+    )
+    out = tmp_path / "out"
+    recorded = list[tuple[pathlib.Path, os.stat_result, str]]()
+
+    _ = cache.restore_from_cache(
+        out,
+        DirHash(hash=honest["hash"], manifest=manifest),
+        cache_dir,
+        checkout_modes=[cache.CheckoutMode.SYMLINK],
+        recorded=recorded,
+    )
+
+    assert [str(path) for path, _, file_hash in recorded if file_hash == _FORGED_HASH] == []
+    assert [str(path) for path, _, _ in recorded if not path.is_relative_to(out)] == []
+    assert (tree / "a.txt").read_bytes() == b"AAAA", "the tree is untouched"
+
+
+def test_a_forged_manifest_cannot_rewrite_an_unmarked_tree(tmp_path: pathlib.Path) -> None:
+    """Defect on main (7fbdfa31, #522's tree check), closed here: a manifest under an honest tree's
+    name but naming other bytes made `_ensure_tree_complete` repair the unmarked tree to those
+    bytes and mark it, so every later honest restore of that hash served the forged content."""
+    cache_dir, tree, honest = _helper_marked_tree(tmp_path)
+    cache._tree_layout_marker(tree).unlink()
+    other = tmp_path / "other.txt"
+    other.write_bytes(b"BBBB")
+    other_hash = cache.hash_file(other)[0]
+    cache.copy_to_cache(other, cache.get_cache_path(cache_dir, other_hash))
+    forged = DirHash(
+        hash=honest["hash"],
+        manifest=[DirManifestEntry(relpath="a.txt", hash=other_hash, size=4, isexec=False)],
+    )
+    _ = cache.restore_from_cache(
+        tmp_path / "evil", forged, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    legit = tmp_path / "legit"
+    assert cache.restore_from_cache(
+        legit, honest, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    assert (tree / "a.txt").read_bytes() == b"AAAA", "the forged restore did not rewrite the tree"
+    assert (legit / "a.txt").read_bytes() == b"AAAA"
+    assert cache.hash_directory(legit, cache_dir=cache_dir)["hash"] == honest["hash"]
+
+
+def test_hardlink_no_op_check_compares_the_device_too(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5, B2: a workspace file holding other bytes but whose inode number equals the cache
+    object's, on another device, is a different file. The HARDLINK no-op check compared the inode
+    alone, kept the stale bytes and recorded the cached hash for them; it is replaced."""
+    content = b"cached bytes"
+    cache_dir = tmp_path / "cache"
+    src = tmp_path / "src.bin"
+    src.write_bytes(content)
+    file_hash = cache.hash_file(src)[0]
+    cache_object = cache.get_cache_path(cache_dir, file_hash)
+    cache.copy_to_cache(src, cache_object)
+    out = tmp_path / "out.csv"
+    out.write_bytes(b"stale bytes!")
+    object_inode = cache_object.stat().st_ino
+    real_stat = pathlib.Path.stat
+
+    def same_inode_on_another_device(
+        self: pathlib.Path, *, follow_symlinks: bool = True
+    ) -> os.stat_result:
+        found = real_stat(self, follow_symlinks=follow_symlinks)
+        if self != out:
+            return found
+        fields = list(found)
+        fields[stat.ST_INO] = object_inode
+        fields[stat.ST_DEV] = found.st_dev + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(pathlib.Path, "stat", same_inode_on_another_device)
+    recorded = list[tuple[pathlib.Path, os.stat_result, str]]()
+    assert cache.restore_from_cache(
+        out,
+        FileHash(hash=file_hash),
+        cache_dir,
+        checkout_modes=[cache.CheckoutMode.HARDLINK, cache.CheckoutMode.COPY],
+        recorded=recorded,
+    )
+    monkeypatch.undo()
+
+    assert out.read_bytes() == content, "the stale file was replaced"
+    assert [(path, recorded_hash) for path, _, recorded_hash in recorded] == [(out, file_hash)]
 
 
 def test_symlink_restore_repairs_a_tree_with_a_file_cut_short(tmp_path: pathlib.Path) -> None:

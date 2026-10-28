@@ -18,9 +18,11 @@ Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not 
 
 ## File-Hash Write-Back
 
-Every command that writes the workspace records the hash of each file it reads, commits or restores, so `pivot status --explain` and `pivot verify` (both read-only; they write nothing and go through the same explanation path) find a matching entry and read no file. The one exception is a run with `--no-commit`, which by design writes no lock, cache or StateDB entry. A new command that writes or reads workspace files must record them the same way:
+The rule: commands that read a file may save its hash to the cache, best-effort; no read-only command writes a lock, a run record or an output, and `--no-commit` writes no lock and no run record.
 
-- `hash_file(..., pending=...)` and `hash_directory(..., pending=...)` append `(path, stat, hash)` for each file they had to read instead of saving it; a caller with a writable StateDB saves them with one `save_many`.
+Every command that writes the workspace saves the hash of each file it reads, commits or restores, so an explanation (`pivot status --explain`, `pivot verify`) finds a matching entry and reads no file. A hash save never fails a command: it goes through `state.save_best_effort` (`state.save_file_hashes` for `(path, stat, hash)` entries), which logs a failed write at debug level and keeps the command's result. A new command that writes or reads workspace files must record them the same way:
+
+- `hash_file(..., pending=...)` and `hash_directory(..., pending=...)` append `(path, stat, hash)` for each file they had to read instead of saving it; the caller saves them in one `state.save_file_hashes` call. A command over many targets collects them in a `state.FileHashBatch` and saves once per state directory when it ends (`checkout`, `get`), not once per target.
 - A restore records each file with the stat of what it staged, taken before the rename puts it in place (the same inode): `cache.restore_from_cache(..., recorded=...)`, `cache.atomic_write_file`'s return value. A write that lands after the rename then changes the stat, so the entry does not vouch for it.
 - Workers open StateDB read-only. They hand back, in `DeferredWrites.file_hash_entries` (`(path, mtime_ns, size, dev, inode, hash)` tuples, `types.FileHashEntry`, from `cache.deferred_file_hash_entries`), the dependencies and outputs they read to decide (also when the stage is cached by lock comparison), the outputs they commit and the outputs they restore; the coordinator writes them after the stage. The coordinator's own skip check writes what it reads and restores.
 - `pivot checkout` (every mode, also the files `--only-missing` keeps or restores and the existing files it compares), `pivot pull`, `pivot get` (from the cache, from git or from the remote), `pivot import`, `pivot update`, `pivot track` and repro's restore of missing tracked files (`--checkout-missing`) record what they write or read. Stage outputs go in the StateDB of the output's stage state directory, which explanations read; everything else in the configured state directory.
@@ -130,6 +132,13 @@ When multiple `pivot` processes share the same StateDB:
   stale one fails, until a user who can write the cache runs one
   `pivot checkout --checkout-mode symlink` through it. That cost is the price of not trusting a
   size-only mark.
+- A tree is trusted only for a manifest that hashes to the tree's name (`cache._manifest_hash`,
+  the hash `hash_directory` names a directory by), checked before the mark is read. A manifest
+  comes from a `.pvt` or lock someone committed, so without this a forged one could make the
+  symlink fast path record hashes it chose for files it named, or repair and mark an unmarked
+  tree to the forged content for every later restore. A manifest that does not match goes file by
+  file, where each restored file is the cache object its own hash names. `.pvt` manifest relpaths
+  that are absolute or hold `..` are refused (`track.pvt_field_error`, `track.read_pvt_file`).
 
 ## Path Storage
 

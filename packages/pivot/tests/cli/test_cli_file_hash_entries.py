@@ -20,12 +20,15 @@ from typing import TYPE_CHECKING
 import boto3
 import pytest
 import xxhash
+import yaml
 
-from pivot import types
+from pivot import cli, project, types
 from pivot.storage import cache, state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    import click.testing
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 _OUTPUT = pathlib.Path("data", "syn", "make_tree.dat")
@@ -126,6 +129,14 @@ def _helper_delete_one_subdirectorys_files(root: pathlib.Path) -> None:
         path.unlink()
 
 
+def _helper_commit_a_tree_then_delete_output(root: pathlib.Path) -> None:
+    """Rerun in symlink mode, which commits the output as a marked whole-directory cache tree,
+    then delete it, so a symlink checkout takes the tree fast path, not a file-by-file restore."""
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "symlink"))
+    _ok(_pivot(root, "repro", "--force"))
+    cache.remove_output(root / _OUTPUT)
+
+
 @pytest.mark.parametrize(
     ("delete", "command"),
     [
@@ -137,6 +148,11 @@ def _helper_delete_one_subdirectorys_files(root: pathlib.Path) -> None:
             _helper_delete_output,
             ("checkout", "--checkout-mode", "symlink"),
             id="checkout-symlink",
+        ),
+        pytest.param(
+            _helper_commit_a_tree_then_delete_output,
+            ("checkout", "--checkout-mode", "symlink"),
+            id="checkout-symlink-tree",
         ),
         pytest.param(
             _helper_delete_one_subdirectorys_files,
@@ -156,9 +172,12 @@ def test_restoring_an_output_records_every_file_hash(
     command: tuple[str, ...],
 ) -> None:
     """After a restore, every file of the output has a StateDB entry for its content, so the
-    next explanation reads none of them."""
+    next explanation reads none of them. The run's entries are dropped first: a hardlink or
+    symlink restore leaves files the run's entries still match, so only this command's own
+    recording can make the check pass."""
     root = _helper_project(tmp_path / "project")
     delete(root)
+    cache.remove_output(root / ".pivot" / "state.lmdb")
 
     _ok(_pivot(root, *command))
 
@@ -408,3 +427,173 @@ def test_known_file_hashes_skips_a_member_it_cannot_stat(
         (str(path), file_hash) for path, _, file_hash in expected
     ]
     assert str(bad) not in {str(path) for path, _, _ in skipped}
+
+
+_FORGE_PIPELINE = """\
+import pathlib
+import tempfile
+
+from pivot import Pipeline, stage
+
+
+@stage
+def make_tree() -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "tree"
+    out.mkdir(parents=True)
+    (out / "a.txt").write_text("tree a\\n")
+    return out
+
+
+@stage
+def shout(raw: str) -> str:
+    return raw.upper()
+
+
+with Pipeline("fg") as pipeline:
+    make_tree()
+    shout(pipeline.input("words.txt", t=str))
+"""
+
+
+def test_a_forged_pvt_manifest_cannot_record_a_hash_for_a_project_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Round 5, B1, the reviewer's reproduction: in symlink mode the user edits a stage's input,
+    then checks out a committed .pvt naming the marked tree's hash with its manifest plus that
+    input by absolute path and its old hash. The symlink fast path recorded the old hash for the
+    edited input, so repro skipped the stage and kept the stale output. The .pvt is refused and
+    repro reruns the stage."""
+    root = tmp_path / "project"
+    root.mkdir()
+    root = root.resolve()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    _ok(_pivot(root, "init"))
+    (root / "pipeline.py").write_text(_FORGE_PIPELINE)
+    (root / ".gitignore").write_text("/data/fg/\n__pycache__/\n/evil\n")
+    words = root / "data" / "raw" / "words.txt"
+    words.parent.mkdir(parents=True)
+    words.write_text("hello\n")
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "symlink"))
+    _ok(_pivot(root, "repro"))
+    _helper_commit(root, "run")
+    tree_lock = yaml.safe_load((root / ".pivot" / "stages" / "fg" / "make_tree.lock").read_text())
+    tree_out = tree_lock["outs"][0]
+    old_hash = xxhash.xxh64(b"hello\n").hexdigest()
+    words.write_text("world\n")
+    forged = {"relpath": str(words), "hash": old_hash, "size": 6, "isexec": False}
+    (root / "evil.pvt").write_text(
+        yaml.safe_dump(
+            {
+                "path": "evil",
+                "hash": tree_out["hash"],
+                "size": 7,
+                "num_files": 2,
+                "manifest": [*tree_out["manifest"], forged],
+            }
+        )
+    )
+
+    _ = _pivot(root, "checkout")
+
+    with state.StateDB(root / ".pivot", readonly=True) as state_db:
+        assert state_db.get(words, words.stat()) != old_hash, "the forged hash is not recorded"
+    _ok(_pivot(root, "repro"))
+    assert (root / "data" / "fg" / "shout.txt").read_text() == "WORLD\n"
+
+
+def _helper_tracked_files(root: pathlib.Path, count: int) -> list[pathlib.Path]:
+    """A project with ``count`` tracked single files, committed, and no pipeline."""
+    root.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    _ok(_pivot(root, "init"))
+    files = [root / f"t{index}.txt" for index in range(count)]
+    for index, path in enumerate(files):
+        path.write_text(f"tracked {index}\n")
+    _ok(_pivot(root, "track", *(path.name for path in files)))
+    _helper_commit(root, "track")
+    return files
+
+
+def _helper_invoke(
+    runner: click.testing.CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    root: pathlib.Path,
+    *args: str,
+) -> click.testing.Result:
+    """Run ``pivot <args>`` in this process in ``root``, so a test can patch the StateDB."""
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(project, "_project_root_cache", None)
+    return runner.invoke(cli.cli, list(args))
+
+
+def _helper_restore_args(files: list[pathlib.Path], command: str) -> tuple[str, ...]:
+    if command == "checkout":
+        return ("checkout", "--checkout-mode", "copy")
+    return ("get", "--rev", "HEAD", "--checkout-mode", "copy", *(path.name for path in files))
+
+
+@pytest.mark.parametrize("command", ["checkout", "get"])
+def test_restoring_many_targets_saves_their_hashes_once_per_state_directory(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runner: click.testing.CliRunner,
+    command: str,
+) -> None:
+    """Round 5, B3: checkout and get committed one StateDB write transaction and fdatasync per
+    target (500 targets: 500 writes where main did none; +52% on a 2,000-file checkout). They
+    collect every target's entries and save each state directory's once."""
+    root = tmp_path / "project"
+    files = _helper_tracked_files(root, 5)
+    for path in files:
+        path.unlink()
+    saves = list[int]()
+    real_save_many = state.StateDB.save_many
+
+    def counting_save_many(
+        self: state.StateDB, entries: list[tuple[pathlib.Path, os.stat_result, str]]
+    ) -> None:
+        saves.append(len(entries))
+        real_save_many(self, entries)
+
+    monkeypatch.setattr(state.StateDB, "save_many", counting_save_many)
+
+    result = _helper_invoke(runner, monkeypatch, root, *_helper_restore_args(files, command))
+
+    assert result.exit_code == 0, result.output
+    assert saves == [len(files)], "one write for the one state directory, holding every file"
+    assert all(_helper_recorded(root, path) for path in files)
+
+
+@pytest.mark.parametrize("command", ["checkout", "get", "track"])
+def test_a_failed_hash_save_leaves_the_command_result_as_without_the_cache(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runner: click.testing.CliRunner,
+    command: str,
+) -> None:
+    """Round 5: the hash cache is best-effort, so a StateDB write that fails (here a full map)
+    after the command has written the workspace is logged and dropped; the command's exit code
+    and the workspace are what they would be with no cache."""
+    root = tmp_path / "project"
+    files = _helper_tracked_files(root, 3)
+    if command == "track":
+        extra = root / "extra.txt"
+        extra.write_text("extra\n")
+        args: tuple[str, ...] = ("track", extra.name)
+    else:
+        for path in files:
+            path.unlink()
+        args = _helper_restore_args(files, command)
+
+    def full_save_many(*_: object) -> None:
+        raise state.DatabaseFullError("state database is full")
+
+    monkeypatch.setattr(state.StateDB, "save_many", full_save_many)
+
+    result = _helper_invoke(runner, monkeypatch, root, *args)
+
+    assert result.exit_code == 0, result.output
+    if command == "track":
+        assert (root / "extra.txt.pvt").is_file()
+    else:
+        assert [path.read_text() for path in files] == [f"tracked {i}\n" for i in range(3)]

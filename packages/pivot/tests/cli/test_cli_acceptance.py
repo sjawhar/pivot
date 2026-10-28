@@ -1672,9 +1672,11 @@ def test_get_reports_earlier_targets_when_a_tracked_file_has_an_invalid_pvt(
 def test_get_restores_a_pvt_whose_manifest_entries_have_no_size(
     tmp_path: pathlib.Path, mode: str
 ) -> None:
-    """A hand-edited directory .pvt whose manifest entries have no size restores in every mode.
-    A symlink restore through a tree no pivot has checked by content checks each file by hash
-    alone, where it stopped get with a raw KeyError('size') that hid the earlier target."""
+    """A hand-edited directory .pvt whose manifest entries have no size restores in every mode,
+    where a symlink restore through a tree no pivot had checked stopped get with a raw
+    KeyError('size') that hid the earlier target. Such a manifest does not hash to the tree's name
+    (round 5: only the tree's own manifest is trusted), so it restores file by file, each file
+    linked or copied by the mode."""
     root = _project(
         tmp_path, {".gitignore": "first.txt\n/d\n", "first.txt": "first\n", "d/a.txt": "a\n"}
     )
@@ -1694,7 +1696,7 @@ def test_get_restores_a_pvt_whose_manifest_entries_have_no_size(
     assert proc.returncode == 0, out
     assert "first.txt (from cache)" in out, out
     assert (root / "d" / "a.txt").read_text() == "a\n"
-    assert (root / "d").is_symlink() == (mode == "symlink")
+    assert (root / "d" / "a.txt").is_symlink() == (mode == "symlink")
 
 
 @pytest.mark.parametrize(

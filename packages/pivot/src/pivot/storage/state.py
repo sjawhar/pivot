@@ -18,7 +18,7 @@ from pivot import exceptions, run_history
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Callable, Generator, Iterable
 
     from pivot.fingerprint import AstHashEntry
     from pivot.run_history import RunCacheEntry, RunManifest
@@ -1077,3 +1077,80 @@ class StateDB:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+# How long a best-effort cache write waits for another process's write lock: a fraction of a
+# pivot write's own 30 s, so a busy database costs a command a missed cache entry, not a stall.
+_WRITE_BACK_TIMEOUT = 2.0
+
+
+def save_best_effort(
+    state_dir: pathlib.Path,
+    write: Callable[[StateDB], None],
+    *,
+    what: str,
+    create: bool = True,
+    timeout: float = _WRITE_BACK_TIMEOUT,
+) -> bool:
+    """Run ``write`` against a writable StateDB in ``state_dir``, best-effort; True if it ran.
+
+    Every file-hash entry a command records goes through here (``save_file_hashes``). The hash
+    cache is a cache its own reader validates, and no decision depends on an entry being present,
+    so a write that cannot happen is skipped with a debug log naming ``what`` instead of failing
+    the command after it has already written the workspace: another process holding the write
+    lock for longer than ``timeout`` (0 makes one attempt), a database this user cannot write, a
+    read-only filesystem, a full map. Without ``create``, a state directory that has no database
+    is left without one.
+    """
+    if not create and not (state_dir / "state.lmdb").exists():
+        return False
+    try:
+        with StateDB(state_dir, write_timeout=timeout) as state_db:
+            write(state_db)
+    except (exceptions.PivotDBWriteTimeoutError, StateDBError, lmdb.Error, OSError) as error:
+        logger.debug("Not saving %s in %s: %s", what, state_dir, error)
+        return False
+    return True
+
+
+def save_file_hashes(
+    state_dir: pathlib.Path, entries: list[tuple[pathlib.Path, os.stat_result, str]]
+) -> None:
+    """Save ``(path, stat, hash)`` entries a command read or wrote in one write transaction,
+    best-effort (``save_best_effort``), so the next status, explanation or run looks the files up
+    instead of reading them. With no entries it takes no lock."""
+    if entries:
+        _ = save_best_effort(
+            state_dir,
+            lambda state_db: state_db.save_many(entries),
+            what=f"{len(entries)} file hashes",
+        )
+
+
+class FileHashBatch:
+    """The file-hash entries one command collects across its targets, by state directory.
+
+    ``save`` writes each directory's entries once (``save_file_hashes``), so a checkout or get of
+    many targets costs one write transaction and one fdatasync per state directory, not one per
+    target. Restores running in several threads may ``add`` at once.
+    """
+
+    def __init__(self) -> None:
+        self._lock: threading.Lock = threading.Lock()
+        self._by_dir: dict[pathlib.Path, list[tuple[pathlib.Path, os.stat_result, str]]] = {}
+
+    def add(
+        self, state_dir: pathlib.Path, entries: list[tuple[pathlib.Path, os.stat_result, str]]
+    ) -> None:
+        """Collect ``entries`` for ``state_dir``'s StateDB."""
+        if not entries:
+            return
+        with self._lock:
+            self._by_dir.setdefault(state_dir, []).extend(entries)
+
+    def save(self) -> None:
+        """Save what was collected, once per state directory, and start empty again."""
+        with self._lock:
+            by_dir, self._by_dir = self._by_dir, {}
+        for state_dir, entries in by_dir.items():
+            save_file_hashes(state_dir, entries)

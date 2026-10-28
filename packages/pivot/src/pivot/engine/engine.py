@@ -1963,12 +1963,16 @@ class Engine:
         deps = stage_info["deps"]
 
         def _save_file_hashes(entries: list[types.FileHashEntry]) -> None:
-            """Record the file hashes this check read or restored, so the next one reads none."""
+            """Record the file hashes this check read or restored, so the next one reads none;
+            best-effort, so a write that cannot happen never fails the run."""
             if entries:
-                with state_mod.StateDB(stage_state_dir) as writable_db:
-                    writable_db.apply_deferred_writes(
+                _ = state_mod.save_best_effort(
+                    stage_state_dir,
+                    lambda writable_db: writable_db.apply_deferred_writes(
                         stage_name, [], DeferredWrites(file_hash_entries=entries)
-                    )
+                    ),
+                    what=f"{len(entries)} file hashes",
+                )
 
         def _use_outputs(state_db: state_mod.StateDB) -> _SkipOutcome:
             file_hash_entries = list[types.FileHashEntry]()
