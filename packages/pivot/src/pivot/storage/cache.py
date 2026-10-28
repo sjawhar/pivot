@@ -333,18 +333,28 @@ def _manifest_json(manifest: Sequence[Mapping[str, object]], empty_dirs: list[st
 def _canonical_manifest(output_hash: DirHash) -> bytes | None:
     """``output_hash``'s manifest as ``_manifest_json`` encodes it, from only the fields pivot
     writes for each entry (``_MANIFEST_ENTRY_FIELDS``); a field pivot does not write is left out.
+    Entries are sorted by relpath and empty directories sorted, the order ``hash_directory``
+    writes, so one set of entries has one canonical form whatever order a .pvt or lock lists
+    them in: no ordering can mark a tree for a manifest other than its own.
 
     None when an entry lacks one of those fields or holds a value JSON cannot encode, as a
-    hand-written .pvt or lock can (``when: 2026-01-01``), or nests too deep to encode. No tree is
-    trusted for such a manifest, so its restore goes file by file, which reads none of those
-    values.
+    hand-written .pvt or lock can (``when: 2026-01-01``), or nests too deep to encode, and when two
+    entries name one relpath or an empty directory is listed twice, which ``hash_directory`` never
+    writes. No tree is trusted for such a manifest, so its restore goes file by file, which reads
+    none of those values.
     """
     try:
         entries = [
             {field: entry[field] for field in _MANIFEST_ENTRY_FIELDS}
             for entry in output_hash["manifest"]
         ]
-        return _manifest_json(entries, _recorded_empty_dirs(output_hash))
+        entries.sort(key=operator.itemgetter("relpath"))
+        empty_dirs = sorted(_recorded_empty_dirs(output_hash))
+        if len({entry["relpath"] for entry in entries}) < len(entries):
+            return None
+        if len(set(empty_dirs)) < len(empty_dirs):
+            return None
+        return _manifest_json(entries, empty_dirs)
     except (KeyError, TypeError, ValueError, RecursionError):
         return None
 
@@ -1025,8 +1035,10 @@ def _tree_matches(
 ) -> bool:
     """Whether a whole-directory SYMLINK cache tree holds exactly the files (each regular,
     matching its recorded hash, size and executable bit) and the directories ``output_hash``
-    records. ``scanned`` is ``_scan_entries(cache_dir_path)``. A recorded path leading outside
-    the tree raises: ``output_hash`` may come straight from a lock file."""
+    records, its empty directories exactly the tree's (as ``hash_directory`` finds them), so only
+    one canonical manifest matches a tree. ``scanned`` is ``_scan_entries(cache_dir_path)``. A
+    recorded path leading outside the tree raises: ``output_hash`` may come straight from a lock
+    file."""
     manifest = output_hash["manifest"]
     resolved_tree = cache_dir_path.resolve()
     for entry in manifest:
@@ -1042,6 +1054,10 @@ def _tree_matches(
     if set(found_files) != {entry["relpath"] for entry in manifest}:
         return False
     if found_dirs - _restored_dirs(output_hash) or not found_dirs.issuperset(empty_dirs):
+        return False
+    file_dirs = {posixpath.dirname(entry["relpath"]) for entry in manifest}
+    has_child = {posixpath.dirname(directory) for directory in found_dirs}
+    if set(empty_dirs) != found_dirs - file_dirs - has_child:
         return False
     for entry in manifest:
         tree_file = cache_dir_path / entry["relpath"]

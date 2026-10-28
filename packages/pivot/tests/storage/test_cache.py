@@ -3503,6 +3503,99 @@ def test_a_best_effort_save_waits_at_most_the_best_effort_timeout(
     assert waited == [state._WRITE_BACK_TIMEOUT]
 
 
+def _helper_marked_tree_with_dirs(
+    tmp_path: pathlib.Path,
+) -> tuple[pathlib.Path, pathlib.Path, DirHash]:
+    """A marked SYMLINK cache tree holding three files, two in a subdirectory, and two empty
+    directories, so its manifest has an entry order and an empty-directory order to vary."""
+    cache_dir = tmp_path / "cache"
+    src = tmp_path / "src"
+    _helper_write_tree_with_dirs(src)
+    output_hash = cache.save_to_cache(src, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK])
+    assert is_dir_hash(output_hash)
+    assert "empty_dirs" in output_hash and output_hash["empty_dirs"] == ["e1", "e2"]
+    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+    assert cache._tree_layout_marker(tree).exists(), "the tree is marked"
+    return cache_dir, tree, output_hash
+
+
+def _helper_write_tree_with_dirs(root: pathlib.Path) -> None:
+    (root / "sub").mkdir(parents=True)
+    (root / "a.txt").write_bytes(b"AAAA")
+    (root / "sub" / "b.txt").write_bytes(b"BBBB")
+    (root / "sub" / "c.txt").write_bytes(b"CCCC")
+    (root / "e1").mkdir()
+    (root / "e2").mkdir()
+
+
+def _helper_manifest(honest: DirHash, manifest: list[Any], empty_dirs: list[str]) -> DirHash:
+    return cast(
+        "DirHash",
+        cast("object", {"hash": honest["hash"], "manifest": manifest, "empty_dirs": empty_dirs}),
+    )
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marked", "unmarked"])
+def test_a_manifest_in_another_order_is_the_tree_s_own_manifest(
+    tmp_path: pathlib.Path, marked: bool
+) -> None:
+    """Round 7: the canonical form sorts entries by relpath and empty directories, the order
+    `hash_directory` writes. The same entries listed in another order (as a hand-edited .pvt or
+    lock can) are so the tree's own manifest: a restore through the marked tree takes the fast
+    path, and a check of the unmarked tree marks it for its own digest. No ordering, not even one
+    brute-forced to hit the tree's XXH64 name, can mark the tree for another digest and so make
+    an honest symlink commit fail with "remove the tree"."""
+    cache_dir, tree, honest = _helper_marked_tree_with_dirs(tmp_path)
+    if not marked:
+        cache._tree_layout_marker(tree).unlink()
+    assert "empty_dirs" in honest
+    reordered = _helper_manifest(
+        honest, list(reversed(honest["manifest"])), list(reversed(honest["empty_dirs"]))
+    )
+    assert cache._canonical_manifest(reordered) == cache._canonical_manifest(honest)
+    out = tmp_path / "out"
+
+    assert cache.restore_from_cache(
+        out, reordered, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK]
+    )
+
+    assert out.resolve() == tree.resolve(), "the fast path is taken"
+    assert cache._read_marker(tree) == _helper_digest(honest)
+    committed = tmp_path / "committed"
+    _helper_write_tree_with_dirs(committed)
+    assert (
+        cache.save_to_cache(committed, cache_dir, checkout_modes=[cache.CheckoutMode.SYMLINK])
+        == honest
+    )
+
+
+@pytest.mark.parametrize("form", ["entry-twice", "empty-dir-twice", "full-dir-as-empty"])
+def test_a_manifest_naming_the_tree_s_bytes_in_another_form_is_not_its_manifest(
+    tmp_path: pathlib.Path, form: str
+) -> None:
+    """Round 7: besides another order, a manifest can name a tree's bytes in another form that the
+    tree check let through: an entry listed twice, an empty directory listed twice, or a directory
+    holding files listed as empty. `hash_directory` writes none of them, so none is the tree's
+    manifest: the first two have no canonical form, and the tree check requires the recorded
+    empty directories to be exactly the tree's. So none can mark the tree for another digest."""
+    _, tree, honest = _helper_marked_tree_with_dirs(tmp_path)
+    assert "empty_dirs" in honest
+    manifest: list[Any] = list(honest["manifest"])
+    empty_dirs = list(honest["empty_dirs"])
+    if form == "entry-twice":
+        manifest.append(manifest[0])
+    elif form == "empty-dir-twice":
+        empty_dirs.append(empty_dirs[0])
+    else:
+        empty_dirs.append("sub")
+    other = _helper_manifest(honest, manifest, empty_dirs)
+
+    if form == "full-dir-as-empty":
+        assert not cache._tree_matches(tree, other, cache._scan_entries(tree))
+    else:
+        assert cache._canonical_manifest(other) is None
+
+
 def test_a_manifest_nested_too_deep_to_encode_restores_file_by_file(
     tmp_path: pathlib.Path,
 ) -> None:

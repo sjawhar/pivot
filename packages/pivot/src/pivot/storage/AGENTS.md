@@ -142,21 +142,26 @@ When multiple `pivot` processes share the same StateDB:
   bytes near the end of a manifest someone commits in a `.pvt` or lock steer it to any tree's
   name in under a second. No trust decision may rest on an attacker failing to hit an XXH64
   digest. A tree is therefore trusted only for the manifest pivot checked it to hold: the marker
-  records the SHA-256 of that manifest's canonical JSON (`cache._canonical_manifest`, the four
-  fields pivot writes per entry; `cache._mark_tree`), and a restore trusts the tree only when the
-  caller's canonical manifest has that digest. A tree marked for another manifest is neither
-  trusted nor changed; a tree with an empty marker (an older pivot's) is checked but never
-  repaired; an unmarked tree is checked, and marked only if it holds the caller's manifest
-  exactly. A restore's manifest comes from a `.pvt` or a lock, so it is a claim, not a source of
-  truth: it never drives a write into the cache. Repairing toward it and then comparing the result
-  with that same manifest proves nothing (a forged manifest would rewrite the bytes of every
-  output already linked to the tree). A commit repairs toward `hash_directory` of the bytes it
-  commits, and after a repair the tree's manifest is recomputed and must equal that manifest
-  entry for entry before the tree is marked. A manifest whose XXH64 is not the tree's name, or
-  that lacks a field pivot writes or holds one JSON cannot encode, is refused before anything is
-  read; that only spares work. Any refused manifest restores file by file, where each restored
-  file is the cache object its own hash names. `.pvt` manifest relpaths that are absolute or hold
-  `..` are refused (`track.pvt_field_error`, `track.read_pvt_file`).
+  records the SHA-256 of that manifest's canonical JSON (`cache._canonical_manifest`: the four
+  fields pivot writes per entry, entries sorted by relpath and empty directories sorted, as
+  `hash_directory` writes them, a relpath or empty directory listed twice refused;
+  `cache._mark_tree`), and a restore trusts the tree only when the caller's canonical manifest
+  has that digest. A tree marked for another manifest is neither trusted nor changed; a tree
+  with an empty marker (an older pivot's) is checked but never repaired; an unmarked tree is
+  checked, and marked only if it holds the caller's manifest exactly, its recorded empty
+  directories included (exactly the tree's, as `hash_directory` finds them). So one tree has one
+  canonical manifest, and no other form of its entries (another order, a duplicate, a full
+  directory listed as empty) can mark it for another digest. A restore's manifest comes from a
+  `.pvt` or a lock, so it is a claim, not a source of truth: it never drives a write into the
+  cache. Repairing toward it and then comparing the result with that same manifest proves nothing
+  (a forged manifest would rewrite the bytes of every output already linked to the tree). A
+  commit repairs toward `hash_directory` of the bytes it commits, and after a repair the tree's
+  manifest is recomputed and must equal that manifest entry for entry before the tree is marked.
+  A manifest whose XXH64 is not the tree's name, or that lacks a field pivot writes or holds one
+  JSON cannot encode, is refused before anything is read; that only spares work. Any refused
+  manifest restores file by file, where each restored file is the cache object its own hash
+  names. `.pvt` manifest relpaths that are absolute or hold `..` are refused
+  (`track.pvt_field_error`, `track.read_pvt_file`).
   Known limits: pivot does not re-read a marked tree, so a tree whose files someone with write
   access to the cache edits, or whose marker they rewrite, after it was marked stays trusted; an
   empty marker an older pivot wrote, which this user cannot replace, costs a content check on

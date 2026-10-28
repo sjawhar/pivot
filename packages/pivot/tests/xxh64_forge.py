@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import random
 import string
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import xxhash
 
@@ -20,6 +20,8 @@ from pivot.storage import cache
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from pivot.types import DirHash
 
 _M = (1 << 64) - 1
 _P1 = 0x9E3779B185EBCA87
@@ -119,9 +121,20 @@ def forge_value(build: Callable[[str], bytes], target_hex: str, *, prefix: str =
 
 
 def _encode(entries: list[dict[str, object]], empty_dirs: list[str] | None) -> bytes:
-    """A manifest as pivot names a directory by it: pivot's own encoding, imported, so a change to
-    it changes what these forgeries target instead of leaving them testing a copy."""
+    """A manifest as written, in pivot's own JSON encoding (imported, so a change to it changes
+    what the forgery targets): what the round-5 gate hashed."""
     return cache._manifest_json(entries, empty_dirs or [])
+
+
+def _canonical(entries: list[dict[str, object]], empty_dirs: list[str] | None) -> bytes:
+    """What pivot's own XXH64 gate hashes for a manifest: ``cache._canonical_manifest``, imported,
+    so the forgery targets exactly the gate's bytes, its order and fields included."""
+    output_hash: dict[str, object] = {"hash": "", "manifest": entries}
+    if empty_dirs:
+        output_hash["empty_dirs"] = empty_dirs
+    canonical = cache._canonical_manifest(cast("DirHash", cast("object", output_hash)))
+    assert canonical is not None, "a canonical forgery has a canonical form"
+    return canonical
 
 
 def pad_to(
@@ -144,11 +157,12 @@ def steer_with_relpath(
     empty_dirs: list[str] | None = None,
 ) -> list[dict[str, object]]:
     """``entries`` plus ``extra`` as their last entry, its relpath ``zz`` and 16 free characters
-    chosen so the manifest hashes to ``target_hex``, with no key pivot does not write: a forgery
-    that survives dropping unknown keys, but names a file the tree lacks."""
+    chosen so pivot's canonical form of the manifest hashes to ``target_hex``, with no key pivot
+    does not write: a forgery that survives dropping unknown keys, but names a file the tree
+    lacks. ``zz`` sorts the entry last in the canonical form, where the free characters must be."""
 
     def build(value: str) -> bytes:
-        return _encode([*entries, {**extra, "relpath": value}], empty_dirs)
+        return _canonical([*entries, {**extra, "relpath": value}], empty_dirs)
 
     return [*entries, {**extra, "relpath": forge_value(build, target_hex, prefix="zz")}]
 
@@ -156,12 +170,14 @@ def steer_with_relpath(
 def steer_with_size(
     entries: list[dict[str, object]], target_hex: str, empty_dirs: list[str] | None = None
 ) -> list[dict[str, object]]:
-    """``entries`` with the last one's ``size`` replaced by a string of 16 free characters chosen
-    so the manifest hashes to ``target_hex``: only pivot's four fields, and every relpath one the
-    tree holds, so nothing but the tree's marker tells it from the tree's manifest. A `.pvt`
-    accepts a string size; lock reading refuses it."""
+    """``entries``, sorted by relpath as pivot's canonical form lists them, with the last one's
+    ``size`` replaced by a string of 16 free characters chosen so that canonical form hashes to
+    ``target_hex``: only pivot's four fields, and every relpath one the tree holds, so nothing
+    but the tree's marker tells it from the tree's manifest. A `.pvt` accepts a string size; lock
+    reading refuses it."""
+    ordered = sorted(entries, key=lambda entry: str(entry["relpath"]))
 
     def build(value: str) -> bytes:
-        return _encode([*entries[:-1], {**entries[-1], "size": value}], empty_dirs)
+        return _canonical([*ordered[:-1], {**ordered[-1], "size": value}], empty_dirs)
 
-    return [*entries[:-1], {**entries[-1], "size": forge_value(build, target_hex)}]
+    return [*ordered[:-1], {**ordered[-1], "size": forge_value(build, target_hex)}]
