@@ -1209,6 +1209,177 @@ def test_apply_deferred_writes_path_too_long_output(tmp_path: pathlib.Path) -> N
         db.apply_deferred_writes("stage", [long_output], deferred)
 
 
+def test_no_commit_record_is_kept_until_a_lock_clears_it(tmp_path: pathlib.Path) -> None:
+    """The stage's record stays through deferred writes that write no lock for it, until a
+    deferred write for its written lock clears it; other stages have none."""
+    cleared: DeferredWrites = {"clear_no_commit_record": True}
+
+    with state.StateDB(tmp_path) as db:
+        assert db.get_no_commit_record("s") is None
+        db.add_no_commit_pvt_members("s", {"data/s/a.pvt": "aaa"})
+        assert db.get_no_commit_record("s") == {"pvt_members": {"data/s/a.pvt": "aaa"}}
+        assert db.get_no_commit_record("other") is None
+        db.apply_deferred_writes("s", [], {"dep_generations": {"dep": 1}})
+        assert db.get_no_commit_record("s") == {"pvt_members": {"data/s/a.pvt": "aaa"}}
+        db.apply_deferred_writes("other", [], cleared)
+        assert db.get_no_commit_record("s") == {"pvt_members": {"data/s/a.pvt": "aaa"}}
+        db.apply_deferred_writes("s", [], cleared)
+        assert db.get_no_commit_record("s") is None
+        db.apply_deferred_writes("s", [], cleared)
+        assert db.get_no_commit_record("s") is None
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        pytest.param(b"\xff not json", id="not-json"),
+        pytest.param(b"[1, 2]", id="not-an-object"),
+    ],
+)
+def test_unreadable_no_commit_record_reads_as_none(tmp_path: pathlib.Path, stored: bytes) -> None:
+    """A record this Pivot cannot read at all lists no member, so nothing is claimed through it."""
+    _helper_store_no_commit_record(tmp_path, stored)
+
+    with state.StateDB(tmp_path, readonly=True) as db:
+        assert db.get_no_commit_record("s") is None
+
+
+_RUN_FIELDS = {"code_manifest": {"func:tree": "a1b2"}, "output_hashes": {"b/tree": "c3d4"}}
+_MEMBERS = {"pvt_members": {"data/s/a.pvt": "aaa"}}
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        pytest.param({"pvt_members": {"data/s/a.pvt": 1}}, {}, id="hash-not-a-string"),
+        pytest.param({"pvt_members": ["data/s/a.pvt"]}, {}, id="members-not-a-mapping"),
+        pytest.param(
+            {**_RUN_FIELDS, "pvt_members": ["data/s/a.pvt"]},
+            _RUN_FIELDS,
+            id="members-malformed-run-fields-valid",
+        ),
+        pytest.param(
+            {"code_manifest": "a1b2", "output_hashes": {"b/tree": 3}, **_MEMBERS},
+            _MEMBERS,
+            id="run-fields-malformed-members-valid",
+        ),
+        pytest.param(
+            {"code_manifest": ["func:tree"], "output_hashes": _RUN_FIELDS["output_hashes"]},
+            {"output_hashes": _RUN_FIELDS["output_hashes"]},
+            id="code-manifest-malformed",
+        ),
+        pytest.param(
+            {"code_manifest": _RUN_FIELDS["code_manifest"], "output_hashes": None, **_MEMBERS},
+            {"code_manifest": _RUN_FIELDS["code_manifest"], **_MEMBERS},
+            id="output-hashes-malformed",
+        ),
+        pytest.param(
+            {"later_key": [1], "pvt_members": 5},
+            {"later_key": [1]},
+            id="other-key-kept-as-stored",
+        ),
+    ],
+)
+def test_each_malformed_field_is_left_out_and_hides_no_other(
+    tmp_path: pathlib.Path, stored: dict[str, object], expected: dict[str, object]
+) -> None:
+    """The reader checks `code_manifest`, `output_hashes` and `pvt_members` each on its own: a
+    malformed one is left out (a malformed `pvt_members` lists no member, so nothing is claimed
+    through it), every valid one still reads, and any other key is returned as stored."""
+    _helper_store_no_commit_record(tmp_path, json.dumps(stored).encode())
+
+    with state.StateDB(tmp_path, readonly=True) as db:
+        assert db.get_no_commit_record("s") == expected
+
+
+def test_record_holding_only_run_fields_reads_as_present_and_survives_adding_members(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The `nocommit:` record is shared with a `--no-commit` run's own writer, which keeps
+    `code_manifest` and `output_hashes` in it. A record holding only those reads as present with
+    them unchanged, and recording `*.pvt` members keeps them as stored."""
+    _helper_store_no_commit_record(tmp_path, json.dumps(_RUN_FIELDS).encode())
+    members = {"pvt_members": {"data/s/a.pvt": "aaa"}}
+
+    with state.StateDB(tmp_path) as db:
+        assert db.get_no_commit_record("s") == _RUN_FIELDS
+        db.add_no_commit_pvt_members("s", {"data/s/a.pvt": "aaa"})
+        assert db.get_no_commit_record("s") == {**_RUN_FIELDS, **members}
+    env = lmdb.open(str(tmp_path / "state.lmdb"))
+    with env.begin() as txn:
+        stored = txn.get(b"nocommit:s")
+    env.close()
+    assert stored is not None
+    assert json.loads(stored) == {**_RUN_FIELDS, **members}
+
+
+def _helper_store_no_commit_record(tmp_path: pathlib.Path, stored: bytes) -> None:
+    with state.StateDB(tmp_path):
+        pass
+    env = lmdb.open(str(tmp_path / "state.lmdb"))
+    with env.begin(write=True) as txn:
+        txn.put(b"nocommit:s", stored)
+    env.close()
+
+
+def test_adding_pvt_members_keeps_the_record_and_its_other_fields(tmp_path: pathlib.Path) -> None:
+    """Members Pivot records before it writes them join the stage's record: earlier members stay,
+    a member written again takes its new hash, a field another writer keeps in the record (the
+    shared `nocommit:` record) stays, and a written lock still clears the whole record."""
+    with state.StateDB(tmp_path) as db:
+        db.add_no_commit_pvt_members("s", {"data/s/b.pvt": "bbb"})
+        assert db.get_no_commit_record("s") == {"pvt_members": {"data/s/b.pvt": "bbb"}}
+        db.add_no_commit_pvt_members("s", {"data/s/a.pvt": "aaa", "data/s/b.pvt": "ccc"})
+        assert db.get_no_commit_record("s") == {
+            "pvt_members": {"data/s/a.pvt": "aaa", "data/s/b.pvt": "ccc"}
+        }
+        assert db.get_no_commit_record("other") is None
+    env = lmdb.open(str(tmp_path / "state.lmdb"))
+    with env.begin(write=True) as txn:
+        txn.put(b"nocommit:s", b'{"output_hashes": {"s": "h"}, "pvt_members": {"x.pvt": "x"}}')
+    env.close()
+
+    with state.StateDB(tmp_path) as db:
+        db.add_no_commit_pvt_members("s", {"data/s/a.pvt": "aaa"})
+    env = lmdb.open(str(tmp_path / "state.lmdb"))
+    with env.begin() as txn:
+        stored = txn.get(b"nocommit:s")
+    env.close()
+    assert stored is not None
+    assert json.loads(stored) == {
+        "output_hashes": {"s": "h"},
+        "pvt_members": {"data/s/a.pvt": "aaa", "x.pvt": "x"},
+    }
+
+    with state.StateDB(tmp_path) as db:
+        db.apply_deferred_writes("s", [], {"clear_no_commit_record": True})
+        assert db.get_no_commit_record("s") is None
+
+
+def test_adding_pvt_members_replaces_an_unreadable_record(tmp_path: pathlib.Path) -> None:
+    """A record this Pivot cannot read claims nothing; recording members starts a new one."""
+    with state.StateDB(tmp_path):
+        pass
+    env = lmdb.open(str(tmp_path / "state.lmdb"))
+    with env.begin(write=True) as txn:
+        txn.put(b"nocommit:s", b'{"pvt_members": ["data/s/a.pvt"]}')
+    env.close()
+
+    with state.StateDB(tmp_path) as db:
+        db.add_no_commit_pvt_members("s", {"data/s/b.pvt": "bbb"})
+        assert db.get_no_commit_record("s") == {"pvt_members": {"data/s/b.pvt": "bbb"}}
+
+
+def test_readonly_statedb_refuses_to_add_pvt_members(tmp_path: pathlib.Path) -> None:
+    with state.StateDB(tmp_path):
+        pass
+    with (
+        state.StateDB(tmp_path, readonly=True) as db,
+        pytest.raises(RuntimeError, match="readonly"),
+    ):
+        db.add_no_commit_pvt_members("s", {"data/s/b.pvt": "bbb"})
+
+
 # -----------------------------------------------------------------------------
 # AST hash cache tests
 # -----------------------------------------------------------------------------

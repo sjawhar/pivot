@@ -63,7 +63,7 @@ from pivot import (
     types,
 )
 from pivot import state_dir as state_dir_mod
-from pivot.storage import artifact_lock, cache, lock, state
+from pivot.storage import artifact_lock, cache, lock, ownership, state
 from pivot.storage import gc as gc_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -987,6 +987,19 @@ def _execute_stage(
                     lock_data = production_lock.read()
 
                 with _open_state_db(state_dir) as state_db:
+                    # The *.pvt files the stage claims in its outputs: its lock's, and its
+                    # nocommit: record's until a lock is written (a restore or a later run
+                    # replaces them, as it does the lock's).
+                    claims = stage_claims(
+                        store,
+                        stage_outs,
+                        lock_data,
+                        state_db.get_no_commit_record(stage_name),
+                        project_root,
+                        functools.partial(
+                            ownership.record_members, project_root, state_dir, stage_name
+                        ),
+                    )
                     outputs_unusable: str | None = None
                     if lock_data is not None and not stage_info["force"]:
                         out_paths = [types.identity_key(out.identity) for out in stage_outs]
@@ -1019,6 +1032,7 @@ def _execute_stage(
                                 register=lambda: _register_before_restore(
                                     naming_root, project_root, project_state_dir
                                 ),
+                                claims=claims,
                             )
                             if restoration.available:
                                 return _make_result(
@@ -1078,6 +1092,7 @@ def _execute_stage(
                             register=lambda: _register_before_restore(
                                 naming_root, project_root, project_state_dir
                             ),
+                            claims=claims,
                         )
                         if restoration.available:
                             # The dependencies read to decide, and the outputs read or restored
@@ -1105,6 +1120,7 @@ def _execute_stage(
                                 store,
                                 state_db,
                                 state_dir=project_state_dir,
+                                claims=claims,
                             )
                             if run_cache_skip is not None:
                                 if no_commit:
@@ -1148,7 +1164,7 @@ def _execute_stage(
 
                 covered_modules = frozenset(fingerprint.covered_user_modules(current_fingerprint))
                 with _track_stage_imports(covered_modules) as stage_imports:
-                    output_paths = _run_stage_function_with_store(
+                    written = _run_stage_function_with_store(
                         stage_info["func"],
                         stage_name,
                         output_queue,
@@ -1164,7 +1180,9 @@ def _execute_stage(
                         state_dir,
                         project_state_dir,
                         project_root,
+                        claims,
                     )
+                output_paths = written["paths"]
                 # A @no_fingerprint stage declares its code as files (`code_deps`); that
                 # declaration is its contract, so its imports are not checked.
                 uncovered = (
@@ -1232,11 +1250,10 @@ def _execute_stage(
                     output_hashes = _hash_output_paths(
                         output_paths, cache_dir=_store_cache_dir(store)
                     )
-                    # For --no-commit, write no lock and no cache entry. Leave the record of what
-                    # ran, which `pivot commit` writes if the outputs are still these.
-
                 # For --no-commit, write no lock and no cache entry. Leave the record of what
-                # ran, which `pivot commit` writes if the outputs are still these.
+                # ran, which `pivot commit` writes if the outputs are still these. The same record
+                # already lists the `*.pvt` members this run wrote: each was recorded before it was
+                # written, and the record stays until a lock is written.
                 if no_commit:
                     return StageResult(
                         status=StageStatus.RAN,
@@ -1260,7 +1277,11 @@ def _execute_stage(
                     # every other commit on the cache.
                     with stage_io.PIVOT_IO:
                         prepared = _prepare_outputs_with_store(
-                            output_paths, store, project_state_dir
+                            output_paths,
+                            store,
+                            project_state_dir,
+                            claims,
+                            written["pvt_members"],
                         )
                     # Naming-lock unit (shared), the naming step only: re-check each object (one
                     # a collection removed since is published again), link the outputs, write the
@@ -1315,6 +1336,8 @@ def _execute_stage(
             exceptions.CacheError,
             exceptions.StageDefinitionError,
             exceptions.InvalidPathError,
+            exceptions.OutputOwnershipError,
+            exceptions.MemberRecordError,
         ) as exc:
             return _make_result(
                 StageStatus.FAILED, exc.format_user_message(), ring_buffer, input_hash=input_hash
@@ -1497,6 +1520,33 @@ def _outputs_unusable_reason(restoration: OutputRestoreResult) -> str:
     return "outputs missing from cache"
 
 
+def stage_claims(
+    store: store_mod.Store,
+    outs: list[types.ArtifactRef],
+    lock_data: LockData | None,
+    no_commit_record: types.NoCommitRecord | None,
+    project_root: pathlib.Path,
+    recorder: ownership.MemberRecorder | None = None,
+) -> ownership.StageClaims | None:
+    """The stage's claims on the ``*.pvt`` files in its workspace outputs
+    (``ownership.StageClaims``), from its lock and its ``nocommit:`` record; None for a store
+    that writes outside the workspace."""
+    if not isinstance(store, store_mod.WorkspaceStore):
+        return None
+    locked = lock_data["output_hashes"] if lock_data is not None else {}
+    return ownership.stage_claims(
+        project_root,
+        {
+            store.resolve_display_path(out): locked[out.identity]
+            for out in outs
+            if out.identity in locked
+        },
+        no_commit_record,
+        cache_dir=store.cache_dir,
+        recorder=recorder,
+    )
+
+
 @overload
 def restore_outputs_to_hashes(
     store: store_mod.Store,
@@ -1509,6 +1559,7 @@ def restore_outputs_to_hashes(
     report_changes: Literal[False] = False,
     file_hash_entries: list[FileHashEntry] | None = None,
     register: Callable[[], None] | None = None,
+    claims: ownership.StageClaims | None = None,
 ) -> bool: ...
 
 
@@ -1524,6 +1575,7 @@ def restore_outputs_to_hashes(
     report_changes: Literal[True],
     file_hash_entries: list[FileHashEntry] | None = None,
     register: Callable[[], None] | None = None,
+    claims: ownership.StageClaims | None = None,
 ) -> OutputRestoreResult: ...
 
 
@@ -1538,6 +1590,7 @@ def restore_outputs_to_hashes(
     report_changes: bool = False,
     file_hash_entries: list[FileHashEntry] | None = None,
     register: Callable[[], None] | None = None,
+    claims: ownership.StageClaims | None = None,
 ) -> bool | OutputRestoreResult:
     """Verify outputs match recorded hashes and restore cacheable mismatches.
 
@@ -1545,6 +1598,9 @@ def restore_outputs_to_hashes(
     check had to read and every file restored from the cache, so the next check finds each
     without reading it. ``register``, when given, runs once before the first restore: a restore
     links cache objects into the workspace, so the project must be in the cache register first.
+    ``claims`` (the stage's) decide which ``*.pvt`` files in an output are the stage's own, and
+    record the ones a restore writes that the lock does not list
+    (``store.WorkspaceStore.restore_from_cache``).
     """
     unavailable = list[types.ArtifactRef]()
     empty_dirs_unrecorded = list[types.ArtifactRef]()
@@ -1590,7 +1646,11 @@ def restore_outputs_to_hashes(
                         register()
                         register = None
                     if store.restore_from_cache(
-                        ref, expected_hash, state_dir=state_dir, recorded=restored
+                        ref,
+                        expected_hash,
+                        state_dir=state_dir,
+                        recorded=restored,
+                        claims=claims,
                     ):
                         outputs_restored = True
                         if file_hash_entries is not None:
@@ -1854,29 +1914,106 @@ def _check_output_value(
     return value
 
 
+class WrittenOutputs(TypedDict):
+    """A stage's written outputs, and in each the ``*.pvt`` files it wrote, with their content."""
+
+    paths: dict[types.ArtifactRef, pathlib.Path]
+    pvt_members: dict[types.ArtifactRef, ownership.StageMembers]
+
+
+def _output_entries(
+    ref: types.ArtifactRef, value: Any, output_path: pathlib.Path
+) -> list[tuple[pathlib.Path, Any]]:
+    """Each path writing an output's checked value fills, with what it writes there: a directory
+    output's keys, else the output path itself."""
+    if ref.tag is types.ArtifactTag.DIRECTORY:
+        return [
+            (output_path / relpath, item_value)
+            for relpath, item_value in cast("list[tuple[str, Any]]", value)
+        ]
+    return [(output_path, value)]
+
+
+def _brought_pvt_files(
+    ref: types.ArtifactRef, path: pathlib.Path, value: Any
+) -> list[pathlib.Path]:
+    """The ``*.pvt`` files writing ``value`` at ``path`` puts there: ``path`` itself when it is a
+    ``*.pvt`` name, and each one inside a directory a ``PathOnly`` value moves there."""
+    if path.name.endswith(".pvt"):
+        return [path]
+    if (
+        not isinstance(ref.format, loaders.PathOnly)
+        or not isinstance(value, pathlib.Path)
+        or value.is_symlink()
+        or not value.is_dir()
+    ):
+        return []
+    return [
+        path / pathlib.Path(dirpath, name).relative_to(value)
+        for dirpath, _dirnames, filenames in os.walk(value)
+        for name in filenames
+        if name.endswith(".pvt")
+    ]
+
+
 def _write_outputs_with_store(
     output_values: dict[types.ArtifactRef, Any],
     store: store_mod.Store,
     project_root: pathlib.Path,
     dependency_paths: collections_abc.Collection[pathlib.Path] = (),
-) -> dict[types.ArtifactRef, pathlib.Path]:
+    claims: ownership.StageClaims | None = None,
+) -> WrittenOutputs:
     """Write a stage's outputs once every one of them has passed its checks.
 
     A refused value (a directory output's key, a PathOnly path inside the project) fails the
     stage before any output is prepared, so the previous run's outputs stay as they were.
+    ``claims`` (the stage's, for a workspace store) decide which ``*.pvt`` files already in an
+    output are the stage's, and record each one this run writes before it lands there.
     """
     checked = {
         ref: _check_output_value(ref, value, project_root, dependency_paths)
         for ref, value in output_values.items()
     }
-    return {ref: _write_output_with_store(ref, value, store) for ref, value in checked.items()}
+    returned = dict[types.ArtifactRef, ownership.StageMembers]()
+    if isinstance(store, store_mod.WorkspaceStore):
+        # A `*.pvt` this run writes at a path is the stage's there if it does not parse as a
+        # sidecar; any other is the stage's only if its lock or nocommit: record lists it
+        for ref, value in checked.items():
+            output_path = ownership.normalized(store.resolve_display_path(ref))
+            brought = [
+                pvt
+                for path, item_value in _output_entries(ref, value, output_path)
+                for pvt in _brought_pvt_files(ref, path, item_value)
+            ]
+            if brought:
+                returned[ref] = {pvt: frozenset[str]() for pvt in brought}
+        # Check all workspace outputs first, so an ownership refusal changes none of the stage's
+        # previous outputs. Each output is prepared immediately before its writer runs, preserving
+        # sibling outputs if that writer raises. prepare_output checks the output it clears, so a
+        # single output needs no check before it: nothing happens between the two.
+        if len(checked) > 1:
+            store.refuse_output_replacements(checked, claims, returned)
+    paths = dict[types.ArtifactRef, pathlib.Path]()
+    written = dict[types.ArtifactRef, ownership.StageMembers]()
+    for ref, value in checked.items():
+        paths[ref], members = _write_output_with_store(ref, value, store, claims, returned.get(ref))
+        if members:
+            written[ref] = members
+    return WrittenOutputs(paths=paths, pvt_members=written)
 
 
 def _write_output_with_store(
-    ref: types.ArtifactRef, value: Any, store: store_mod.Store
-) -> pathlib.Path:
+    ref: types.ArtifactRef,
+    value: Any,
+    store: store_mod.Store,
+    claims: ownership.StageClaims | None = None,
+    returned: ownership.StageMembers | None = None,
+) -> tuple[pathlib.Path, ownership.StageMembers]:
+    """Write one output; return its path and the ``*.pvt`` files written in it, with content."""
     with stage_io.PIVOT_IO:
-        output_path = store.prepare_output(ref)
+        output_path = store.prepare_output(ref, claims, returned)
+    if isinstance(store, store_mod.WorkspaceStore):
+        store.refuse_output_replacement_at_write(ref, claims, returned)
     writer = cast("Any", ref.format)
 
     output_label = (
@@ -1917,18 +2054,86 @@ def _write_output_with_store(
                     source=caught_warning.source,
                 )
 
-    if ref.tag is types.ArtifactTag.DIRECTORY:
-        # The directory was just created empty and no key lies inside another key's path, so
-        # every directory on the way to a file is one created here, never a returned path
-        for relpath, item_value in cast("list[tuple[str, Any]]", value):
-            full_path = output_path / relpath
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-            save_output(item_value, full_path)
-        return output_path
+    # A directory output was just created empty and no key lies inside another key's path, so
+    # every directory on the way to a file is one created here, never a returned path
+    recorder = claims["recorder"] if claims is not None else None
+    recorded_entries = list[tuple[pathlib.Path, Any]]()
+    for path, item_value in _output_entries(ref, value, output_path):
+        if recorder is not None and _brought_pvt_files(ref, path, item_value):
+            recorded_entries.append((path, item_value))
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_output(item_value, path)
+    if recorder is None or not recorded_entries:
+        return output_path, {}
+    return output_path, _save_recorded(output_path, recorded_entries, save_output, recorder)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    save_output(value, output_path)
-    return output_path
+
+def _save_recorded(
+    output_path: pathlib.Path,
+    entries: list[tuple[pathlib.Path, Any]],
+    save_output: Callable[[Any, pathlib.Path], None],
+    recorder: ownership.MemberRecorder,
+) -> ownership.StageMembers:
+    """Write entries that bring ``*.pvt`` files into the output at ``output_path``: each under a
+    name beside the output (``_staging_path``), then record the ``*.pvt`` files they hold as the
+    stage's, then move each into place. A crash leaves at worst a record without a file in the
+    output, and a staged copy beside it that no check of the output walks. Returns those files,
+    each with its recorded content."""
+    staged = dict[pathlib.Path, pathlib.Path]()
+    try:
+        for path, item_value in entries:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            staged[path] = _staging_path(output_path, staged.values())
+            save_output(item_value, staged[path])
+        recorded = {
+            pvt: cache.hash_file(source)[0]
+            for path, staged_path in staged.items()
+            for pvt, source in _staged_pvt_files(path, staged_path)
+        }
+        recorder(recorded)
+        for path, staged_path in staged.items():
+            staged_path.replace(path)
+        staged.clear()
+    finally:
+        for staged_path in staged.values():
+            cache.remove_output(staged_path)
+    return {ownership.normalized(pvt): frozenset([content]) for pvt, content in recorded.items()}
+
+
+def _staged_pvt_files(
+    path: pathlib.Path, staged_path: pathlib.Path
+) -> list[tuple[pathlib.Path, pathlib.Path]]:
+    """Each ``*.pvt`` file ``staged_path`` holds, as (its path once moved to ``path``, where it
+    is now)."""
+    if staged_path.is_dir() and not staged_path.is_symlink():
+        found = list[tuple[pathlib.Path, pathlib.Path]]()
+        for dirpath, _dirnames, filenames in os.walk(staged_path):
+            for name in filenames:
+                source = pathlib.Path(dirpath, name)
+                if name.endswith(".pvt") and source.is_file():
+                    found.append((path / source.relative_to(staged_path), source))
+        return found
+    if path.name.endswith(".pvt") and staged_path.is_file():
+        return [(path, staged_path)]
+    return []
+
+
+def _staging_path(
+    output_path: pathlib.Path, taken: collections_abc.Collection[pathlib.Path]
+) -> pathlib.Path:
+    """An unused name beside ``output_path``, not in ``taken`` and not a ``*.pvt`` name.
+
+    Beside the output, never inside it: what a killed run leaves there is no file of the output,
+    so it never blocks the next write or restore of it. The rename into place stays atomic: the
+    name is in the output's parent directory, on the output's filesystem.
+    """
+    candidate = output_path.with_name(f".{output_path.name}.pivot-staged")
+    count = 0
+    while candidate in taken or candidate.exists() or candidate.is_symlink():
+        count += 1
+        candidate = output_path.with_name(f".{output_path.name}.pivot-staged-{count}")
+    return candidate
 
 
 def _reconstruct_list_kwargs(
@@ -1965,6 +2170,7 @@ def _prepare_incremental_inputs(
     store: store_mod.Store,
     stage_state_dir: pathlib.Path,
     project_state_dir: pathlib.Path,
+    claims: ownership.StageClaims | None = None,
 ) -> dict[str, Any]:
     """Restore previous incremental outputs and load them for the stage call."""
     if not incremental_inputs:
@@ -1990,12 +2196,14 @@ def _prepare_incremental_inputs(
                 + "to reset this incremental output."
             )
         output_path = store.resolve_display_path(ref)
+        store.refuse_output_replacements([ref], claims)
         cache.remove_output(output_path)
         if not store.restore_from_cache(
             ref,
             output_hash,
             state_dir=project_state_dir,
             checkout_modes=[config.CheckoutMode.COPY],
+            claims=claims,
         ):
             raise exceptions.CacheRestoreError(
                 f"Cache missing for incremental output '{types.identity_key(identity)}'. "
@@ -2022,7 +2230,8 @@ def _run_stage_function_with_store(
     state_dir: pathlib.Path,
     project_state_dir: pathlib.Path,
     project_root: pathlib.Path,
-) -> dict[types.ArtifactRef, pathlib.Path]:
+    claims: ownership.StageClaims | None = None,
+) -> WrittenOutputs:
     with (
         _QueueWriter(stage_name, output_queue, is_stderr=False, ring_buffer=ring_buffer),
         _QueueWriter(stage_name, output_queue, is_stderr=True, ring_buffer=ring_buffer),
@@ -2050,6 +2259,7 @@ def _run_stage_function_with_store(
                 store,
                 state_dir,
                 project_state_dir,
+                claims,
             )
         )
 
@@ -2061,7 +2271,9 @@ def _run_stage_function_with_store(
         _raise_if_stopped()
 
         output_values = _resolve_output_values(result, outs, stage_name)
-        return _write_outputs_with_store(output_values, store, project_root, dependency_paths)
+        return _write_outputs_with_store(
+            output_values, store, project_root, dependency_paths, claims
+        )
 
 
 def _hash_output_paths(
@@ -2088,14 +2300,23 @@ def _prepare_outputs_with_store(
     outputs_by_ref: dict[types.ArtifactRef, pathlib.Path],
     store: store_mod.Store,
     project_state_dir: pathlib.Path,
+    claims: ownership.StageClaims | None = None,
+    written: dict[types.ArtifactRef, ownership.StageMembers] | None = None,
 ) -> dict[types.ArtifactRef, HashInfo]:
-    """Hash and publish each output before the naming-lock unit (a workspace store only)."""
+    """Hash and publish each output before the naming-lock unit (a workspace store only),
+    refusing first an output whose link would replace a user's ``*.pvt`` file."""
     prepared = dict[types.ArtifactRef, HashInfo]()
     for ref, path in outputs_by_ref.items():
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
         if isinstance(store, store_mod.WorkspaceStore):
-            prepared[ref] = store.prepare_commit(ref, path, state_dir=project_state_dir)
+            prepared[ref] = store.prepare_commit(
+                ref,
+                path,
+                state_dir=project_state_dir,
+                claims=claims,
+                written=written.get(ref) if written is not None else None,
+            )
     return prepared
 
 
@@ -2454,7 +2675,8 @@ def _build_deferred_writes(
     and deletes any entry at its input hash; its lock carries a key no fingerprint has and
     `skip.check_stage` never consults the run cache for it, so no tier skips it.
     """
-    # A lock written now supersedes any record a --no-commit run left for `pivot commit`.
+    # A lock written now supersedes the stage's whole nocommit: record: what a --no-commit run
+    # left for `pivot commit`, and the `*.pvt` members it lists.
     result = DeferredWrites(clear_no_commit_record=True)
 
     if increment_outputs:
@@ -2521,8 +2743,13 @@ def _try_skip_via_run_cache_with_store(
     state_db: state.StateDB,
     *,
     state_dir: pathlib.Path,
+    claims: ownership.StageClaims | None = None,
 ) -> RunCacheSkipResult | None:
-    """Restore all cached outputs from a matching run-cache entry."""
+    """Restore all cached outputs from a matching run-cache entry.
+
+    No lock records the entry's outputs until one is written (never, under ``--no-commit``), so
+    each restore records the ``*.pvt`` members it writes as the stage's (``claims``) first.
+    """
     if any(out.tag is types.ArtifactTag.METRIC for out in stage_outs):
         return None
     entry = state_db.lookup_run_cache(stage_name, input_hash)
@@ -2546,6 +2773,7 @@ def _try_skip_via_run_cache_with_store(
         state_dir=state_dir,
         report_changes=True,
         file_hash_entries=restored_entries,
+        claims=claims,
     )
     if not restoration.available:
         return None

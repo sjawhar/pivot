@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from pivot import project
 from pivot.cli import checkout as checkout_mod
-from pivot.storage import cache
+from pivot.storage import cache, ownership
 from pivot.types import HashInfo
 
 if TYPE_CHECKING:
@@ -49,7 +50,15 @@ def _helper_cache_outputs(root: pathlib.Path) -> dict[str, HashInfo]:
     return hashes
 
 
+def _helper_own_restore(path: pathlib.Path, output_hash: HashInfo) -> ownership.ForcedRestore:
+    """What checkout replaces restoring a tracked path to its own place (``_restore_targets``)."""
+    return ownership.ForcedRestore(
+        replacement=ownership.tracked_restore(path), restored=output_hash, claims=None
+    )
+
+
 def _helper_checkout_all_at_barrier(
+    root: pathlib.Path,
     hashes: dict[str, HashInfo],
     cache_dir: pathlib.Path,
     state_dir: pathlib.Path,
@@ -58,6 +67,7 @@ def _helper_checkout_all_at_barrier(
     barrier: Barrier,
 ) -> list[str]:
     """Check out every output from 8 threads, like one `pivot checkout` process."""
+    project._project_root_cache = root
     barrier.wait()
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         futures = [
@@ -69,6 +79,7 @@ def _helper_checkout_all_at_barrier(
                 checkout_modes,
                 behavior,
                 state_dir,
+                target=_helper_own_restore(pathlib.Path(path), output_hash),
             )
             for path, output_hash in hashes.items()
         ]
@@ -135,6 +146,7 @@ def test_checkout_recovers_fresh_crash_orphans_under_outer_lock(tmp_path: pathli
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.SKIP_EXISTING,
         state_dir,
+        target=_helper_own_restore(target, output_hash),
     )
     assert (outcome.result, outcome.name) == ("restored", "out")
     assert (target / "result.txt").read_text() == "cached content"
@@ -142,12 +154,14 @@ def test_checkout_recovers_fresh_crash_orphans_under_outer_lock(tmp_path: pathli
 
 
 def _helper_checkout_file_crash_before_replace(
+    root: pathlib.Path,
     path: pathlib.Path,
     output_hash: HashInfo,
     cache_dir: pathlib.Path,
     state_dir: pathlib.Path,
 ) -> None:
     """Simulate a file checkout killed after it staged its temp file, before the rename."""
+    project._project_root_cache = root
 
     def _replace_and_crash(self: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
         os._exit(73)
@@ -160,6 +174,7 @@ def _helper_checkout_file_crash_before_replace(
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.FORCE,
         state_dir,
+        target=_helper_own_restore(path, output_hash),
     )
 
 
@@ -177,7 +192,7 @@ def test_file_checkout_removes_staging_file_left_by_killed_checkout(
 
     process = multiprocessing.get_context("spawn").Process(
         target=_helper_checkout_file_crash_before_replace,
-        args=(target, output_hash, cache_dir, state_dir),
+        args=(tmp_path, target, output_hash, cache_dir, state_dir),
     )
     process.start()
     process.join(timeout=60)
@@ -192,6 +207,7 @@ def test_file_checkout_removes_staging_file_left_by_killed_checkout(
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.FORCE,
         state_dir,
+        target=_helper_own_restore(target, output_hash),
     )
     assert (outcome.result, outcome.name) == ("restored", "out.txt")
 
@@ -225,6 +241,7 @@ def test_file_checkout_computes_restore_token_once(
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.FORCE,
         state_dir,
+        target=_helper_own_restore(target, output_hash),
     )
     assert (outcome.result, outcome.name) == ("restored", "out.txt")
     assert calls == [target]
@@ -263,7 +280,8 @@ def test_concurrent_checkouts_of_same_outputs(
         for _ in range(5):
             results = pool.starmap(
                 _helper_checkout_all_at_barrier,
-                [(hashes, cache_dir, state_dir, checkout_modes, behavior, barrier)] * n_procs,
+                [(tmp_path, hashes, cache_dir, state_dir, checkout_modes, behavior, barrier)]
+                * n_procs,
             )
             failures.extend(f for result in results for f in result)
             for i in range(_N_FILES):
