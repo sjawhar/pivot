@@ -130,32 +130,37 @@ def _commit_stages(
                 failed.append(stage_name)
                 continue
 
-            # 4. Compute input_hash
             dep_hashes_by_identity = {
                 types.identity_from_key(key): info for key, info in dep_hashes.items()
             }
             stage_outs = stage_info["outs"]
-            input_hash = run_history.stage_input_hash(
-                fingerprint,
-                current_params,
-                stage_info["deps"].values(),
-                dep_hashes_by_identity,
-                stage_outs,
-            )
 
             # Compute normalized output paths once (used for skip check, lock data, and StateDB)
             out_paths = [types.identity_key(out.identity) for out in stage_outs]
             production_lock = lock.StageLock(stage_name, stages_dir)
             previous_lock = production_lock.read()
-            # A run that imported code the fingerprint misses marked its lock; committing the
-            # same outputs keeps that mark, so the stage is still not reusable.
-            code_manifest = skip.carry_uncovered_import(
-                previous_lock["code_manifest"] if previous_lock is not None else None, fingerprint
-            )
-            reusable = skip.uncovered_import_reason(code_manifest) is None
+            # A --no-commit run left a record of the code it ran; it decides once the outputs are
+            # hashed, so a stage with one is never skipped here. The run writes its two keys
+            # together and the reader drops a malformed key on its own, so a record without both
+            # (one holding only another feature's key) decides nothing.
+            run_record = stage_db.get_no_commit_record(stage_name)
+            run_manifest: dict[str, str] | None = None
+            run_outputs: dict[str, str] | None = None
+            if (
+                run_record is not None
+                and "code_manifest" in run_record
+                and "output_hashes" in run_record
+            ):
+                run_manifest = run_record["code_manifest"]
+                run_outputs = run_record["output_hashes"]
 
             # 5. If not force and no explicit stages, check lock — skip if unchanged
-            if not force and stage_names is None and previous_lock is not None:
+            if (
+                not force
+                and stage_names is None
+                and previous_lock is not None
+                and run_manifest is None
+            ):
                 decision = skip.check_stage(
                     lock_data=previous_lock,
                     fingerprint=fingerprint,
@@ -207,6 +212,30 @@ def _commit_stages(
                 failed.append(stage_name)
                 continue
 
+            # The outputs a --no-commit run wrote came from the code that run fingerprinted, which
+            # may differ from the code on disk now: record that run's manifest, its marks
+            # included. Otherwise (no record, or outputs edited since) record the outputs on disk
+            # against the current code, the "trust me" commit. A run that executed code the
+            # fingerprint does not describe marked its lock; committing the same outputs keeps
+            # that mark, so the stage is still not reusable.
+            if run_manifest is not None and run_outputs == {
+                key: hash_info["hash"] for key, hash_info in output_hashes_by_key.items()
+            }:
+                code_manifest = run_manifest
+            else:
+                code_manifest = skip.carry_rerun_marks(
+                    previous_lock["code_manifest"] if previous_lock is not None else None,
+                    fingerprint,
+                )
+            reusable = skip.rerun_mark_reason(code_manifest) is None
+            input_hash = run_history.stage_input_hash(
+                skip.strip_rerun_marks(code_manifest),
+                current_params,
+                stage_info["deps"].values(),
+                dep_hashes_by_identity,
+                stage_outs,
+            )
+
             # 7. Write production lock
             new_lock_data = LockData(
                 code_manifest=code_manifest,
@@ -228,9 +257,9 @@ def _commit_stages(
             dep_gen_map = worker.compute_dep_generation_map(stage_info["deps"], stage_db)
 
             # An unsafe fingerprint may match a run whose captured values differed, and a carried
-            # uncovered-import mark means the outputs came from code the fingerprint misses: never
+            # rerun mark means the outputs came from code the fingerprint does not describe: never
             # file either. A carried mark also removes any entry an earlier run filed at this key.
-            deferred = DeferredWrites()
+            deferred = DeferredWrites(clear_no_commit_record=True)
             if dep_gen_map:
                 deferred["dep_generations"] = dep_gen_map
             if reusable and not stage_info["unsafe_fingerprint"]:

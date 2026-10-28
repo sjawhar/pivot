@@ -157,6 +157,7 @@ def test_stage_returning_external_path_dependency_does_not_move_user_file(
         incremental_inputs={},
         unsafe_fingerprint=False,
         no_fingerprint=False,
+        loaded_sources_token="",
     )
 
     result = worker.execute_stage("pathret/passthrough", stage_info, worker_env, output_queue)

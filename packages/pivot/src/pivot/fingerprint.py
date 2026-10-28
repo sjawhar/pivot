@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
 import xxhash
 
-from pivot import ast_utils, exceptions, metrics
+from pivot import ast_utils, exceptions, loaded_source, metrics
 
 if TYPE_CHECKING:
     import pydantic.json_schema
@@ -78,7 +78,10 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # namespace shared with a checkout under the prefix is not reused.
 # Version 30 follows every callable user class member, dataclass defaults, and body imports of
 # user modules discovery loaded, and records the user modules each manifest covers.
-_CACHE_SCHEMA_VERSION = 30
+# Version 31 hashes a loaded module's functions from the source it was compiled from, under that
+# source's digest. Earlier entries hashed the file as `inspect` re-read it, which an edit after the
+# digest was taken could change.
+_CACHE_SCHEMA_VERSION = 31
 _REPR_SIZE_LIMIT = 10_000
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
@@ -505,6 +508,10 @@ def _source_digest(file: str) -> str:
     """Digest of source file ``file``'s content, which the function-hash and manifest caches
     record for it.
 
+    For a file this process loaded a module from, that is the content it was compiled from
+    (``loaded_source``), which ``loaded_source.getsource`` also reads: a stage's worker runs that
+    code, whatever the file holds now. Any other file is read now.
+
     An edit can keep a file's mtime, size and inode (two writes inside one kernel timestamp
     tick, or a tool that restores the mtime), so the caches compare content. Within one
     `fingerprint_pass()` each file is read once. The read also drops the lines `linecache`
@@ -513,6 +520,8 @@ def _source_digest(file: str) -> str:
 
     Raises OSError when the file cannot be read.
     """
+    if (loaded := loaded_source.digest(file)) is not None:
+        return loaded
     memo = _pass_memo.get()
     key = ("source", file)
     if memo is not None and key in memo:
@@ -1223,7 +1232,7 @@ def _source_tree(func: Callable[..., Any]) -> ast.Module | None:
         code if hasattr(func, "__wrapped__") and isinstance(code, types.CodeType) else func
     )
     try:
-        return ast.parse(textwrap.dedent(inspect.getsource(target)))
+        return ast.parse(textwrap.dedent(loaded_source.getsource(target)))
     except (OSError, TypeError, SyntaxError):
         return None
 
@@ -1232,7 +1241,7 @@ def _wrapped_source_tree(func: Callable[..., Any]) -> ast.Module | None:
     """Parse the source `inspect.getsource(func)` returns: for a functools.wraps wrapper, the
     function at the end of its `__wrapped__` chain."""
     try:
-        return ast.parse(textwrap.dedent(inspect.getsource(func)))
+        return ast.parse(textwrap.dedent(loaded_source.getsource(func)))
     except (OSError, TypeError, SyntaxError):
         return None
 
@@ -1742,7 +1751,7 @@ def _process_class_body_dependencies(
     cls: type, manifest: dict[str, str], visited: set[int]
 ) -> None:
     try:
-        source = inspect.getsource(cls)
+        source = loaded_source.getsource(cls)
         tree = ast.parse(textwrap.dedent(source))
     except (OSError, TypeError, SyntaxError):
         return
@@ -3101,7 +3110,7 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
 
         _t_source = metrics.start()
         try:
-            source = inspect.getsource(func)
+            source = loaded_source.getsource(func)
         except (OSError, TypeError):
             metrics.end("fingerprint.inspect_getsource", _t_source)
             if hasattr(func, "__code__"):

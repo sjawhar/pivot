@@ -104,6 +104,7 @@ def _make_stage_info(
         "incremental_inputs": {},
         "unsafe_fingerprint": False,
         "no_fingerprint": True,
+        "loaded_sources_token": "",
     }
 
 

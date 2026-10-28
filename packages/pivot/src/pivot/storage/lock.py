@@ -9,6 +9,7 @@ For runtime mutual exclusion during concurrent execution, see
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 import os
@@ -30,6 +31,7 @@ from pivot.types import (
     HashInfo,
     LockData,
     OutEntry,
+    StageStatus,
     StorageLockData,
     identity_from_key,
     identity_key,
@@ -39,6 +41,8 @@ from pivot.types import (
 if TYPE_CHECKING:
     import pathlib
     from collections.abc import Iterator
+
+    from pivot.storage import state
 
 logger = logging.getLogger(__name__)
 
@@ -61,18 +65,143 @@ def get_stages_dir(state_dir: pathlib.Path) -> pathlib.Path:
 
 
 def resolve_stage_lock_path(stages_dir: pathlib.Path, stage_name: str) -> pathlib.Path:
-    """Return an existing stage lock, falling back to the project's other stages directory."""
+    """Return the stage's current lock, in ``stages_dir`` or the project's other stages directory.
+
+    A lock in only one of them is that one: 0.5.2's layout, a run made before ``core.state_dir``
+    was set, or one made while it could not be written. When both hold one, the current lock is
+    the one the project's run records name (``_other_lock_is_current``), never the first
+    directory's: a run made while the configured directory could not be written leaves its lock
+    in ``.pivot`` beside an older one in the configured directory, and the older one would
+    restore stale outputs once that directory can be written again.
+    """
     primary_path = stages_dir / f"{stage_name}.lock"
-    if primary_path.exists():
-        return primary_path
     other_stages_dir = state_dir_mod.other_stages_dir_for(stages_dir)
     if other_stages_dir is None:
         return primary_path
     other_path = other_stages_dir / f"{stage_name}.lock"
-    if other_path.exists():
-        state_dir_mod.report_legacy_state_dir(stages_dir.parent)
-        return other_path
-    return primary_path
+    if not other_path.exists():
+        return primary_path
+    if primary_path.exists() and not _other_lock_is_current(
+        stage_name, primary_path, other_path, stages_dir.parent, other_stages_dir.parent
+    ):
+        return primary_path
+    state_dir_mod.report_legacy_state_dir(stages_dir.parent)
+    return other_path
+
+
+# list_runs reads at most this many runs: every run a database keeps (`prune_runs`).
+_ALL_RUNS = 1 << 31
+
+
+def _other_lock_is_current(
+    stage_name: str,
+    primary_path: pathlib.Path,
+    other_path: pathlib.Path,
+    primary_state_dir: pathlib.Path,
+    other_state_dir: pathlib.Path,
+) -> bool:
+    """Whether, of a stage's locks in both state directories, the other directory's is current.
+
+    The run records of both directories' databases answer: the stage's runs that ran or kept it,
+    newest first, ordered by their timestamp-prefixed IDs across the two databases; a lock file's
+    modification time is never read. The first of them whose run-cache entry holds one lock's
+    outputs names that lock. A run whose outputs are in neither lock (a ``--no-commit`` run) defers
+    to an older one. When a run has no run-cache entry (a result that is not reusable, or a pruned
+    one), the newest run decides: the other lock is current when that run ran the stage there,
+    since a run writes its lock where it records itself. Any failure to read keeps the first lock.
+    """
+    import lmdb
+
+    from pivot.storage import state
+
+    try:
+        with contextlib.ExitStack() as stack:
+            dbs = [
+                (state_dir, stack.enter_context(state.StateDB(state_dir, readonly=True)))
+                for state_dir in (primary_state_dir, other_state_dir)
+                if (state_dir / "state.lmdb").is_dir()
+            ]
+            mentions = sorted(
+                (
+                    (mention, state_dir)
+                    for state_dir, db in dbs
+                    for mention in _stage_runs(state_dir, db).get(stage_name, ())
+                ),
+                key=lambda item: item[0]["run_id"],
+                reverse=True,
+            )
+            if not mentions:
+                return False
+            primary_outputs = _lock_output_hashes(primary_path)
+            other_outputs = _lock_output_hashes(other_path)
+            for mention, _state_dir in mentions:
+                outputs = _run_cache_outputs(stage_name, mention["input_hash"], dbs)
+                if outputs is None:
+                    break
+                if outputs == primary_outputs:
+                    return False
+                if outputs == other_outputs:
+                    return True
+            newest, newest_dir = mentions[0]
+            return newest["ran"] and newest_dir == other_state_dir
+    except (exceptions.PivotError, state.StateDBError, lmdb.Error, OSError, ValueError):
+        logger.debug("Cannot order the locks of %s; reading %s", stage_name, primary_path)
+        return False
+
+
+def _stage_runs(
+    state_dir: pathlib.Path, db: state.StateDB
+) -> dict[str, list[state_dir_mod.StageRunMention]]:
+    """Each stage's runs in ``db`` that ran or kept it, newest first.
+
+    Read once per state-directory record for each newest run the database holds, so a command
+    lists the runs once, and a ``--watch`` session lists them again after it records one.
+    """
+    newest = db.newest_run_id()
+    if newest is None:
+        return {}
+    cache = state_dir_mod.stage_run_cache()
+    if cache is not None and state_dir in cache and cache[state_dir][0] == newest:
+        return cache[state_dir][1]
+    runs = dict[str, list[state_dir_mod.StageRunMention]]()
+    for manifest in db.list_runs(limit=_ALL_RUNS):
+        for name, record in manifest["stages"].items():
+            input_hash = record["input_hash"]
+            if input_hash is None or record["status"] not in (StageStatus.RAN, StageStatus.CACHED):
+                continue
+            runs.setdefault(name, []).append(
+                state_dir_mod.StageRunMention(
+                    run_id=manifest["run_id"],
+                    input_hash=input_hash,
+                    ran=record["status"] == StageStatus.RAN,
+                )
+            )
+    if cache is not None:
+        cache[state_dir] = (newest, runs)
+    return runs
+
+
+def _run_cache_outputs(
+    stage_name: str, input_hash: str, dbs: list[tuple[pathlib.Path, state.StateDB]]
+) -> list[str] | None:
+    """The output hashes a run-cache entry records for ``input_hash``, from either database."""
+    for _state_dir, db in dbs:
+        entry = db.lookup_run_cache(stage_name, input_hash)
+        if entry is not None:
+            return sorted(output["hash"] for output in entry["output_hashes"])
+    return None
+
+
+def _lock_output_hashes(path: pathlib.Path) -> list[str] | None:
+    """The output hashes the lock at ``path`` records; None when it cannot be read."""
+    try:
+        with open(path) as f:
+            data: object = yaml.load(f, Loader=yaml_config.Loader)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return None
+    if not is_lock_data(data):
+        return None
+    return sorted(out["hash"] for out in data["outs"])
 
 
 def stage_name_error(name: str) -> str | None:
@@ -385,7 +514,7 @@ class StageLock:
         self.path = stages_dir / f"{stage_name}.lock"
 
     def read(self) -> LockData | None:
-        """Read the configured lock, using its legacy location only on a primary miss."""
+        """Read the stage's current lock, in either state directory (resolve_stage_lock_path)."""
         path = resolve_stage_lock_path(self.stages_dir, self.stage_name)
         try:
             with open(path) as f:

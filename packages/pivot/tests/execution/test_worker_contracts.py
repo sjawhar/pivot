@@ -122,6 +122,7 @@ def _stage_info(
         incremental_inputs={},
         unsafe_fingerprint=unsafe_fingerprint,
         no_fingerprint=False,
+        loaded_sources_token="",
     )
 
 

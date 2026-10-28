@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from pivot import config, project
+from pivot import config
 from pivot import state_dir as state_dir_mod
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -21,21 +21,16 @@ if TYPE_CHECKING:
 def _run_history_dirs() -> list[pathlib.Path]:
     """The directories whose ``state.lmdb`` can hold this project's runs, the command's first.
 
-    A run record is read where it was written. A command that fell back to ``.pivot`` because
-    the configured path cannot be written reads that path too, where its own earlier runs are
-    (``state_dir.other_state_dir_for``); reading one needs no write permission. The other
-    direction is left alone: Pivot 0.5.2 read the database of the configured directory, so a
-    project whose runs are in ``.pivot`` because they were made before the value was set reports
-    them exactly as 0.5.2 does, from the configured directory alone.
+    A run record is read where it was written, and a project can have runs in both of its state
+    directories (``state_dir.other_state_dir_for``): in the configured one, and in ``.pivot`` from
+    a run made before ``core.state_dir`` was set or while the configured path could not be
+    written, whether or not it can be written now. Reading needs no write permission, so both are
+    read whenever both hold a database, and the commands merge their runs newest first.
     """
     state_dir = config.locate_state_dir()
     dirs = [state_dir]
     other = state_dir_mod.other_state_dir_for(state_dir)
-    if (
-        other is not None
-        and other != project.get_project_root() / ".pivot"
-        and (other / "state.lmdb").is_dir()
-    ):
+    if other is not None and (other / "state.lmdb").is_dir():
         dirs.append(other)
     return dirs
 

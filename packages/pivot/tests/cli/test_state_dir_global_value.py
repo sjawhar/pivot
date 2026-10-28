@@ -105,9 +105,10 @@ def _case_id(value: object) -> str | None:
         (("list",), True),
         (("dag",), True),
         (("plots", "show"), True),
-        # These read remotes, imports or another key, never state, so they stay quiet.
+        # Finds the import .pvt files through the walk memo kept in the state directory.
+        (("update", "--dry-run"), True),
+        # These read remotes or another key, never state, so they stay quiet.
         (("remote", "list"), False),
-        (("update", "--dry-run"), False),
         (("config", "set", "core.max_workers", "2"), False),
         (("config", "unset", "core.max_workers"), False),
     ],

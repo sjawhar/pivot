@@ -42,6 +42,15 @@ class StateDirWarnings(typing.TypedDict):
 type StateDirResolution = pathlib.Path | exceptions.ConfigError | UnicodeDecodeError
 
 
+class StageRunMention(typing.TypedDict):
+    """One run's record of a stage in one state directory's database."""
+
+    run_id: str
+    input_hash: str
+    # Whether that run ran the stage (and wrote its lock), rather than keeping or restoring it.
+    ran: bool
+
+
 class StateDirInvocation(typing.TypedDict):
     """One invocation's state-directory record: what it resolved, and what it reported."""
 
@@ -58,6 +67,10 @@ class StateDirInvocation(typing.TypedDict):
     # A library entry point's record (``entry_invocation``): it reports only a path that cannot
     # become a directory, once per pipeline load (``report_unusable_path_to_library``).
     library: bool
+    # Per state directory: the newest run ID its database held when it was read, and each stage's
+    # run records there, newest first (``lock.resolve_stage_lock_path``). Read again when a newer
+    # run is recorded there, as during a ``--watch`` session.
+    stage_runs: dict[pathlib.Path, tuple[str, dict[str, list[StageRunMention]]]]
 
 
 # Set by the CLI callback for one CLI invocation, by a worker for one stage, and by a library
@@ -75,6 +88,12 @@ _invocation = contextvars.ContextVar[StateDirInvocation | None](
 def _reported() -> StateDirWarnings | None:
     invocation = _invocation.get()
     return None if invocation is None else invocation["reported"]
+
+
+def stage_run_cache() -> dict[pathlib.Path, tuple[str, dict[str, list[StageRunMention]]]] | None:
+    """The current record's stage run records per state directory; None outside a record."""
+    invocation = _invocation.get()
+    return None if invocation is None else invocation["stage_runs"]
 
 
 STATE_GITIGNORE_CONTENT = """\
@@ -106,8 +125,12 @@ def resolve_state_dir_value(root: pathlib.Path, value: str) -> pathlib.Path:
 
     Existing components are resolved, symbolic links included, so ``link/../state`` names the
     link target's sibling; ``..`` after a missing component applies to the path so far. Every
-    reader and writer uses this result, never a lexical spelling of the value.
+    reader and writer uses this result, never a lexical spelling of the value. A value holding a
+    NUL byte names nothing the kernel can open, so it is kept as spelled
+    (``state_dir_target_problem`` reports it).
     """
+    if "\0" in value:
+        return root / value
     return pathlib.Path(os.path.realpath(root / value))
 
 
@@ -310,8 +333,11 @@ def state_dir_target_problem(target: pathlib.Path) -> str | None:
     """Why ``target`` cannot become a state directory, or None when it is or can be one.
 
     Its nearest existing entry must be a directory this process can create entries in and
-    search (``W_OK | X_OK``).
+    search (``W_OK | X_OK``). A path holding a NUL byte cannot be opened at all, as 0.5.2 found
+    where it created it.
     """
+    if "\0" in os.fspath(target):
+        return f"core.state_dir holds a NUL byte, which no path can: {os.fspath(target)!r}"
     for candidate in (target, *target.parents):
         if not os.path.lexists(candidate):
             continue
@@ -473,6 +499,7 @@ def begin_invocation(
             fallback=dict[pathlib.Path, pathlib.Path](),
             reported=reported,
             library=library,
+            stage_runs=dict[pathlib.Path, tuple[str, dict[str, list[StageRunMention]]]](),
         )
     )
 

@@ -193,9 +193,13 @@ command that opens it fails there with 0.5.2's error, as on 0.5.2.
 
 The fallback decides where Pivot **writes**; it never decides where Pivot **reads** state that
 already exists, because reading needs no write permission. So one project has at most two state
-directories to read, and a reader that misses an entry in the one it writes to looks in the
-other: `pivot history`, `pivot show` and a restore still find the runs, locks and cache objects
-that a run recorded in a configured directory which has since lost its write permission.
+directories to read, and Pivot reads the state that is current, whichever directory holds it:
+`pivot history` and `pivot show` merge the runs of both, newest first, and when both hold a lock
+for one stage, the current lock is the one the project's run records name (the newest run that
+ran or kept the stage, matched to a lock by the outputs its run-cache entry records), never the
+first directory's or the newer file's. So a run made while a configured directory had lost its
+write permission stays the current one after the permission returns, and `pivot status`,
+`pivot checkout` and a restore read its lock, not the older one left in that directory.
 
 When `core.state_dir` names another directory but `.pivot` holds stage locks or cache objects,
 Pivot reads a stage lock missing from the configured directory, and its cached objects, from

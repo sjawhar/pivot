@@ -506,9 +506,13 @@ def test_command_exits_as_on_052(
     result = helpers.run_pivot(root, home, *_COMMANDS[command])
     output = result.stdout + result.stderr
     assert "Traceback" not in output, output
-    # Ruling (main, 11:16Z): 0.5.2 treats '' as the project root, so show sees no runs;
-    # head uses .pivot and retains its run history.
-    expected = 0 if (case, command) == ("empty", "show") else _052_EXIT_CODES[case][command]
+    # Rulings (coordinator): `show` exits 0 where the base project's run is in `.pivot` and the
+    # directory 0.5.2 reads holds none, where 0.5.2 finds no runs and exits 1: it reads a run that
+    # exists and creates no state. Under '', 0.5.2 reads the project root (11:16Z). Under an
+    # unwritable `s1` holding only an empty database, Pivot reads the runs of both state
+    # directories (10-28); every other command there keeps 0.5.2's code, `checkout`'s 1 included.
+    show_reads_pivot_runs = command == "show" and case in {"empty", "unwritable-empty-database"}
+    expected = 0 if show_reads_pivot_runs else _052_EXIT_CODES[case][command]
     assert result.returncode == expected, output
     if result.returncode != 0:
         errors = [line for line in result.stderr.splitlines() if line.startswith("Error")]

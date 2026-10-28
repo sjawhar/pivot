@@ -24,7 +24,7 @@ import xxhash
 from pydantic import BaseModel
 
 import pivot_tui.stats
-from pivot import ast_utils, exceptions, fingerprint, loaders
+from pivot import ast_utils, exceptions, fingerprint, loaders, project
 from pivot.storage import state as state_mod
 
 
@@ -3631,3 +3631,38 @@ def test_cached_manifest_misses_when_a_recorded_file_changes_keeping_its_stat(
         assert fingerprint._try_manifest_cache_hit("same/stage", stage) is None
     finally:
         sys.modules.pop("same_stat_stage", None)
+
+
+def test_function_hash_lookup_reads_the_current_projects_state_db(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process that moves to another project looks function hashes up in that project's
+    StateDB, not in the one its first lookup opened."""
+    source = "def build():\n    return 1\n"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    for root in (first, second):
+        (root / ".pivot").mkdir(parents=True)
+        (root / "moved_stage.py").write_text(source)
+    planted: fingerprint.AstHashEntry = (
+        "moved_stage.py",
+        xxhash.xxh64(source.encode()).hexdigest(),
+        "build",
+        fingerprint._PYTHON_VERSION,
+        fingerprint._CACHE_SCHEMA_VERSION,
+        "5ec0d5ec0d5ec0d0",
+    )
+    with state_mod.StateDB(second / ".pivot") as db:
+        db.save_ast_hash_many([planted])
+    try:
+        monkeypatch.setattr(project, "_project_root_cache", first)
+        built = _helper_import_fresh("moved_stage", first / "moved_stage.py").build
+        fingerprint.hash_function_ast(built)
+
+        monkeypatch.setattr(project, "_project_root_cache", second)
+        moved = _helper_import_fresh("moved_stage", second / "moved_stage.py").build
+
+        assert fingerprint.hash_function_ast(moved) == "5ec0d5ec0d5ec0d0"
+    finally:
+        sys.modules.pop("moved_stage", None)
+        fingerprint._close_state_db()

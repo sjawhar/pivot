@@ -11,6 +11,7 @@ import subprocess
 import sys
 import types
 import typing
+import weakref
 from collections.abc import Callable
 from typing import ClassVar
 from unittest import mock
@@ -513,16 +514,23 @@ def test_editing_immutable_capture_changes_fingerprint(
     same: object,
     edited: object,
 ) -> None:
-    fingerprint._getclosurevars_cache.clear()
+    # The closure-variable cache holds the values it read. monkeypatch puts the module's values
+    # back after the test, so the patched values must stay in a cache of this test's own.
+    cache = weakref.WeakKeyDictionary[Callable[..., object], object]()
+    monkeypatch.setattr(fingerprint, "_getclosurevars_cache", cache)
     original = fingerprint.get_stage_fingerprint(func)
+    try:
+        monkeypatch.setattr(sys.modules[__name__], variable, same)
+        fingerprint._getclosurevars_cache.clear()
+        assert fingerprint.get_stage_fingerprint(func) == original, "an equal value is not a change"
 
-    monkeypatch.setattr(sys.modules[__name__], variable, same)
-    fingerprint._getclosurevars_cache.clear()
-    assert fingerprint.get_stage_fingerprint(func) == original, "an equal value is not a change"
-
-    monkeypatch.setattr(sys.modules[__name__], variable, edited)
-    fingerprint._getclosurevars_cache.clear()
-    assert fingerprint.get_stage_fingerprint(func) != original
+        monkeypatch.setattr(sys.modules[__name__], variable, edited)
+        fingerprint._getclosurevars_cache.clear()
+        assert fingerprint.get_stage_fingerprint(func) != original
+    finally:
+        # The cache holds the edited value's closure; a later test in this process fingerprints
+        # `func` after monkeypatch puts the module's value back.
+        fingerprint._getclosurevars_cache.clear()
 
 
 def test_common_function_and_class_references_are_allowed() -> None:
