@@ -349,10 +349,11 @@ def get_tracked_files_status(
     total = len(tracked)
     results = list[TrackedFileInfo]()
 
-    # Use state_db for hash caching (mtime-based)
+    # Look hashes up read-only and save what was read once, best-effort, so a hash cache that
+    # cannot be opened or written never fails status
     cache_dir = config.get_cache_dir() / "files"
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
-    with state_mod.StateDB(config.get_state_dir()) as state_db:
+    with state_mod.open_hash_cache(config.get_state_dir()) as state_db:
         for i, (abs_path_str, track_data) in enumerate(sorted(tracked.items()), 1):
             path = pathlib.Path(abs_path_str)
             rel_path = str(path.relative_to(project_root))
@@ -387,8 +388,7 @@ def get_tracked_files_status(
             )
             if on_progress is not None:
                 on_progress(i, total)
-        if pending:
-            state_db.save_many(pending)
+    state_mod.save_file_hashes(config.get_state_dir(), pending)
 
     return results
 

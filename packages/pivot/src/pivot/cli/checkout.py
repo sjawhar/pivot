@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import enum
 import os
 import pathlib
@@ -92,16 +91,6 @@ def _get_stage_output_info() -> tuple[dict[str, HashInfo], dict[str, pathlib.Pat
     return result, state_dirs
 
 
-def _hash_cache(
-    state_dir: pathlib.Path | None,
-) -> contextlib.AbstractContextManager[state.StateDB | None]:
-    """``state_dir``'s StateDB, read-only, so a check reuses the hashes runs and earlier
-    checkouts recorded; None when it has none yet, so a check never creates it."""
-    if state_dir is not None and (state_dir / "state.lmdb").exists():
-        return state.StateDB(state_dir, readonly=True)
-    return contextlib.nullcontext(None)
-
-
 def _on_disk_matches_expected(
     path: pathlib.Path,
     expected_hash: HashInfo,
@@ -188,7 +177,7 @@ def _restore_path_locked(
         match behavior:
             case CheckoutBehavior.ERROR:
                 read = list[tuple[pathlib.Path, os.stat_result, str]]()
-                with _hash_cache(hash_state_dir) as state_db:
+                with state.open_hash_cache(hash_state_dir) as state_db:
                     matches = _on_disk_matches_expected(
                         path, output_hash, cache_dir, state_db, read
                     )
@@ -206,7 +195,7 @@ def _restore_path_locked(
                 if not is_dir_hash(output_hash) or path.is_symlink() or not path.is_dir():
                     return RestoreOutcome("skipped", path.name, skipped_files=total)
                 settled = list[tuple[pathlib.Path, os.stat_result, str]]()
-                with _hash_cache(hash_state_dir) as state_db:
+                with state.open_hash_cache(hash_state_dir) as state_db:
                     outcome = cache.restore_missing_in_directory(
                         path, output_hash, cache_dir, checkout_modes, state_db, settled
                     )

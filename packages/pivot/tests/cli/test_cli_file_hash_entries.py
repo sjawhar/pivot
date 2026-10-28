@@ -9,6 +9,7 @@ The tests drive the installed `pivot` binary, as a user does.
 
 from __future__ import annotations
 
+import datetime
 import errno
 import os
 import pathlib
@@ -24,6 +25,7 @@ import yaml
 
 from pivot import cli, project, types
 from pivot.storage import cache, state
+from tests import xxh64_forge
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -429,7 +431,7 @@ def test_known_file_hashes_skips_a_member_it_cannot_stat(
     assert str(bad) not in {str(path) for path, _, _ in skipped}
 
 
-_FORGE_PIPELINE = """\
+_CORPUS_PIPELINE = """\
 import pathlib
 import tempfile
 
@@ -439,66 +441,172 @@ from pivot import Pipeline, stage
 @stage
 def make_tree() -> pathlib.Path:
     out = pathlib.Path(tempfile.mkdtemp()) / "tree"
-    out.mkdir(parents=True)
-    (out / "a.txt").write_text("tree a\\n")
+    for i in range(12):
+        (out / f"d{i % 3}").mkdir(parents=True, exist_ok=True)
+        text = "file 0 v2\\n" if i == 0 else f"file {i}\\n"
+        (out / f"d{i % 3}" / f"f{i:02d}.txt").write_text(text)
     return out
 
 
 @stage
-def shout(raw: str) -> str:
-    return raw.upper()
+def count(corpus: pathlib.Path) -> str:
+    return (corpus / "d0" / "f00.txt").read_text().upper()
 
 
-with Pipeline("fg") as pipeline:
+with Pipeline("syn") as pipeline:
     make_tree()
-    shout(pipeline.input("words.txt", t=str))
+    count(pipeline.input("corpus"))
 """
 
 
-def test_a_forged_pvt_manifest_cannot_record_a_hash_for_a_project_file(
+def _helper_write_corpus(corpus: pathlib.Path, version: str) -> None:
+    for i in range(12):
+        path = corpus / f"d{i % 3}" / f"f{i:02d}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"file 0 {version}\n" if i == 0 else f"file {i}\n")
+
+
+def _helper_recorded_lies(root: pathlib.Path, directory: pathlib.Path) -> list[str]:
+    """Files under ``directory`` whose StateDB entry, at their current stat, names other bytes."""
+    if not directory.exists():
+        return []
+    files = sorted(path for path in directory.rglob("*") if path.is_file())
+    with state.StateDB(root / ".pivot", readonly=True) as state_db:
+        found = state_db.get_many([(path, path.stat()) for path in files])
+    return [
+        str(path.relative_to(directory))
+        for path in files
+        if found[path] is not None and found[path] != xxhash.xxh64(path.read_bytes()).hexdigest()
+    ]
+
+
+def test_a_forged_pvt_manifest_cannot_vouch_for_an_input_it_does_not_hold(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Round 5, B1, the reviewer's reproduction: in symlink mode the user edits a stage's input,
-    then checks out a committed .pvt naming the marked tree's hash with its manifest plus that
-    input by absolute path and its old hash. The symlink fast path recorded the old hash for the
-    edited input, so repro skipped the stage and kept the stale output. The .pvt is refused and
-    repro reruns the stage."""
+    """B1, the reviewer's reproduction: in symlink mode a tracked directory input goes from v1 to
+    v2, and someone commits its .pvt with one file's hash set back to v1, padded so the manifest
+    hashes to the marked v2 tree's name. At 0664ea83 checkout took the fast path and recorded
+    the v1 hash for a file holding v2, so repro kept a stale output. The forged manifest is not
+    the one the tree was checked to hold, so it restores file by file, writing exactly what it
+    names: every recorded hash matches its file, and repro's output matches its input."""
     root = tmp_path / "project"
     root.mkdir()
     root = root.resolve()
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     _ok(_pivot(root, "init"))
-    (root / "pipeline.py").write_text(_FORGE_PIPELINE)
-    (root / ".gitignore").write_text("/data/fg/\n__pycache__/\n/evil\n")
-    words = root / "data" / "raw" / "words.txt"
-    words.parent.mkdir(parents=True)
-    words.write_text("hello\n")
+    (root / "pipeline.py").write_text(_CORPUS_PIPELINE)
+    (root / ".gitignore").write_text("/data/syn/\n__pycache__/\n/data/raw/corpus/\n")
+    corpus = root / "data" / "raw" / "corpus"
+    _helper_write_corpus(corpus, "v1")
     _ok(_pivot(root, "config", "set", "cache.checkout_mode", "symlink"))
+    _ok(_pivot(root, "track", "data/raw/corpus"))
     _ok(_pivot(root, "repro"))
-    _helper_commit(root, "run")
-    tree_lock = yaml.safe_load((root / ".pivot" / "stages" / "fg" / "make_tree.lock").read_text())
-    tree_out = tree_lock["outs"][0]
-    old_hash = xxhash.xxh64(b"hello\n").hexdigest()
-    words.write_text("world\n")
-    forged = {"relpath": str(words), "hash": old_hash, "size": 6, "isexec": False}
-    (root / "evil.pvt").write_text(
-        yaml.safe_dump(
-            {
-                "path": "evil",
-                "hash": tree_out["hash"],
-                "size": 7,
-                "num_files": 2,
-                "manifest": [*tree_out["manifest"], forged],
-            }
-        )
-    )
+    _helper_commit(root, "v1")
+    cache.remove_output(corpus)
+    _helper_write_corpus(corpus, "v2")
+    _ok(_pivot(root, "track", "--force", "data/raw/corpus"))
+    _helper_commit(root, "v2")
+    pvt_path = root / "data" / "raw" / "corpus.pvt"
+    honest = yaml.safe_load(pvt_path.read_text())
+    manifest = [dict(entry) for entry in honest["manifest"]]
+    manifest[0]["hash"] = xxhash.xxh64(b"file 0 v1\n").hexdigest()
+    forged = xxh64_forge.pad_to(manifest, honest["hash"], honest.get("empty_dirs"))
+    pvt_path.write_text(yaml.safe_dump({**honest, "manifest": forged}, sort_keys=False))
+    _helper_commit(root, "attack")
+    cache.remove_output(corpus)
 
     _ = _pivot(root, "checkout")
 
-    with state.StateDB(root / ".pivot", readonly=True) as state_db:
-        assert state_db.get(words, words.stat()) != old_hash, "the forged hash is not recorded"
+    assert _helper_recorded_lies(root, corpus) == []
     _ok(_pivot(root, "repro"))
-    assert (root / "data" / "fg" / "shout.txt").read_text() == "WORLD\n"
+    f00 = corpus / "d0" / "f00.txt"
+    assert (root / "data" / "syn" / "count.txt").read_text() == f00.read_text().upper()
+
+
+def _helper_symlink_project(root: pathlib.Path) -> pathlib.Path:
+    """A project whose two stages ran once in symlink mode, so the directory output is a marked
+    cache tree, with its locks committed."""
+    root.mkdir(parents=True)
+    root = root.resolve()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    _ok(_pivot(root, "init"))
+    (root / "pipeline.py").write_text(_PIPELINE)
+    (root / ".gitignore").write_text("/data/\n__pycache__/\n")
+    _ok(_pivot(root, "config", "set", "cache.checkout_mode", "symlink"))
+    _ok(_pivot(root, "repro"))
+    _helper_commit(root, "run")
+    return root
+
+
+_TREE_LOCK = pathlib.Path(".pivot", "stages", "syn", "make_tree.lock")
+
+
+def test_a_forged_lock_manifest_cannot_vouch_for_bytes_it_does_not_name(
+    tmp_path: pathlib.Path,
+) -> None:
+    """B1 through a committed lock: one member's hash replaced and the manifest padded to the
+    marked tree's name made checkout take the fast path and record the forged hash for that
+    member. The forged manifest is not the tree's checked one, so the fast path is not taken."""
+    root = _helper_symlink_project(tmp_path / "project")
+    lock_path = root / _TREE_LOCK
+    data = yaml.safe_load(lock_path.read_text())
+    out_entry = data["outs"][0]
+    manifest = [dict(entry) for entry in out_entry["manifest"]]
+    manifest[0]["hash"] = xxhash.xxh64(b"forged bytes\n").hexdigest()
+    out_entry["manifest"] = xxh64_forge.pad_to(
+        manifest, out_entry["hash"], out_entry.get("empty_dirs")
+    )
+    lock_path.write_text(yaml.safe_dump(data))
+    cache.remove_output(root / _OUTPUT)
+    cache.remove_output(root / ".pivot" / "state.lmdb")
+
+    _ = _pivot(root, "checkout", "--checkout-mode", "symlink")
+
+    assert not (root / _OUTPUT).is_symlink(), "the forged manifest did not take the fast path"
+    assert _helper_recorded_lies(root, root / _OUTPUT) == []
+
+
+@pytest.mark.parametrize(
+    "command", [("checkout", "--checkout-mode", "symlink"), ("repro",)], ids=["checkout", "repro"]
+)
+def test_a_lock_manifest_value_json_cannot_encode_does_not_fail_a_restore(
+    tmp_path: pathlib.Path, command: tuple[str, ...]
+) -> None:
+    """B2 (round 6): a hand-edited lock whose manifest entry holds a date (`when: 2026-01-01`)
+    made checkout and repro exit 1 at 0664ea83 (`Object of type date is not JSON serializable`),
+    where 322f304b restores. A field pivot does not write is not compared, so both restore."""
+    root = _helper_symlink_project(tmp_path / "project")
+    lock_path = root / _TREE_LOCK
+    data = yaml.safe_load(lock_path.read_text())
+    data["outs"][0]["manifest"][0]["when"] = datetime.date(2026, 1, 1)
+    lock_path.write_text(yaml.safe_dump(data))
+    cache.remove_output(root / _OUTPUT)
+
+    _ok(_pivot(root, *command))
+
+    assert len([path for path in (root / _OUTPUT).rglob("*") if path.is_file()]) == 12
+
+
+def test_checkout_restores_with_a_state_database_it_cannot_write(tmp_path: pathlib.Path) -> None:
+    """B3 (round 6): with `.pivot/state.lmdb` readable but not writable, LMDB will not open it even
+    read-only, and at 0664ea83 checkout's hash lookup failed the command where main restores. A
+    hash cache that cannot be opened is skipped: the check reads the files and checkout restores."""
+    root = tmp_path / "project"
+    files = _helper_tracked_files(root, 3)
+    for path in files[1:]:
+        path.unlink()
+    lmdb_dir = root / ".pivot" / "state.lmdb"
+    modes = {path: path.stat().st_mode for path in [lmdb_dir, *lmdb_dir.iterdir()]}
+    for path, mode in modes.items():
+        path.chmod(mode & ~0o222)
+    try:
+        proc = _pivot(root, "checkout", "--checkout-mode", "copy")
+    finally:
+        for path, mode in modes.items():
+            path.chmod(mode)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert [path.read_text() for path in files] == [f"tracked {i}\n" for i in range(3)]
 
 
 def _helper_tracked_files(root: pathlib.Path, count: int) -> list[pathlib.Path]:
@@ -564,22 +672,26 @@ def test_restoring_many_targets_saves_their_hashes_once_per_state_directory(
     assert all(_helper_recorded(root, path) for path in files)
 
 
-@pytest.mark.parametrize("command", ["checkout", "get", "track"])
+@pytest.mark.parametrize("command", ["checkout", "get", "track", "status"])
 def test_a_failed_hash_save_leaves_the_command_result_as_without_the_cache(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     runner: click.testing.CliRunner,
     command: str,
 ) -> None:
-    """Round 5: the hash cache is best-effort, so a StateDB write that fails (here a full map)
-    after the command has written the workspace is logged and dropped; the command's exit code
-    and the workspace are what they would be with no cache."""
+    """The hash cache is best-effort, so a StateDB write that fails (here a full map) is logged
+    and dropped; the command's exit code and the workspace are what they would be with no cache.
+    `status` (round 6, B4) saves the hashes of the tracked files it read the same way: their
+    entries are dropped first, so it has some to save."""
     root = tmp_path / "project"
     files = _helper_tracked_files(root, 3)
     if command == "track":
         extra = root / "extra.txt"
         extra.write_text("extra\n")
         args: tuple[str, ...] = ("track", extra.name)
+    elif command == "status":
+        cache.remove_output(root / ".pivot" / "state.lmdb")
+        args = ("status",)
     else:
         for path in files:
             path.unlink()

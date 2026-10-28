@@ -234,6 +234,12 @@ class DatabaseFullError(StateDBError):
     """Raised when the state database reaches its size limit."""
 
 
+# What a hash-cache open or write can raise that the cache, being best-effort, absorbs: another
+# process holding the write lock too long, a full map, a database this user cannot open or write
+# (lmdb.ReadonlyError, EACCES), a read-only filesystem.
+_CACHE_ERRORS = (exceptions.PivotDBWriteTimeoutError, StateDBError, lmdb.Error, OSError)
+
+
 def _make_key_file_hash(path: pathlib.Path) -> bytes:
     """Create the LMDB key for a file-hash entry: the absolute path as given, as bytes.
 
@@ -494,6 +500,19 @@ class StateDB:
                     txn.put(key, value)
         except lmdb.MapFullError as e:
             raise DatabaseFullError(_DB_FULL_MSG) from e
+
+    def save_many_best_effort(
+        self, entries: list[tuple[pathlib.Path, os.stat_result, str]]
+    ) -> bool:
+        """``save_many``, best-effort: a write that fails (``_CACHE_ERRORS``) is logged at debug
+        level and dropped, so a hash save never fails the command (``save_best_effort``). True if
+        it saved."""
+        try:
+            self.save_many(entries)
+        except _CACHE_ERRORS as error:
+            logger.debug("Not saving %d file hashes: %s", len(entries), error)
+            return False
+        return True
 
     # -------------------------------------------------------------------------
     # AST hash cache for persistent fingerprint caching
@@ -1107,10 +1126,26 @@ def save_best_effort(
     try:
         with StateDB(state_dir, write_timeout=timeout) as state_db:
             write(state_db)
-    except (exceptions.PivotDBWriteTimeoutError, StateDBError, lmdb.Error, OSError) as error:
+    except _CACHE_ERRORS as error:
         logger.debug("Not saving %s in %s: %s", what, state_dir, error)
         return False
     return True
+
+
+def open_hash_cache(
+    state_dir: pathlib.Path | None,
+) -> contextlib.AbstractContextManager[StateDB | None]:
+    """``state_dir``'s StateDB opened read-only, for a check to look file hashes up in; None when
+    it has no database yet (a check never creates one) or cannot be opened (``_CACHE_ERRORS``: a
+    database this user cannot write, which LMDB will not open even read-only, or another user's).
+    The check then reads the files, as it does with no cache, instead of failing the command."""
+    if state_dir is None or not (state_dir / "state.lmdb").exists():
+        return contextlib.nullcontext(None)
+    try:
+        return StateDB(state_dir, readonly=True)
+    except _CACHE_ERRORS as error:
+        logger.debug("Not looking file hashes up in %s: %s", state_dir, error)
+        return contextlib.nullcontext(None)
 
 
 def save_file_hashes(
