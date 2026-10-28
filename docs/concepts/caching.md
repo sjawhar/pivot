@@ -140,13 +140,15 @@ lock described above: a stage commit, a run-cache restore, `pivot commit`, `pivo
 (the project whose first run creates a shared cache is registered by that run). A command that
 discovers the pipeline (`repro`, `run`, `status`, `checkout` and the others that load
 `pipeline.py`) also registers when it starts. While a project's entry is under an hour old,
-registering costs one `stat`. A collection reads every project the register names. An entry
-whose root this host cannot see is never taken as deleted, because the project may be on a
-disk that is not mounted, in a container's own mount namespace, or on another host: the
-collection refuses and names the entry. Make the root visible and re-run, or, if the project is
-gone for good, delete the entry it names. `pivot gc` **refuses to remove anything** from an
-external cache that records no project, or whose records it cannot read; `pivot gc --projects
-PATH` names the projects that share it and records them, so later runs need no flag. A
+registering costs one `stat`. If the register cannot be written, pivot still runs but prints one
+warning naming the entry and why: a project missing from the register is invisible to another
+project's collection. A collection reads every project the register names. An entry whose root
+this host cannot see is never taken as deleted, because the project may be on a disk that is not
+mounted, in a container's own mount namespace, or on another host: the collection refuses and
+names the entry. Make the root visible and re-run, or, if the project is gone for good, delete
+the entry it names. `pivot gc` **refuses to remove anything** from an external cache that
+records no project, or whose records it cannot read; `pivot gc --projects`
+PATH names the projects that share it and records them, so later runs need no flag. A
 `--projects` path must be a real pivot project — a directory with a readable `.pivot` state
 directory. A path that is not one (the cache itself, a parent directory, a worktree that was
 deleted and re-created, a typo) names no records, so pivot refuses the whole run rather than
@@ -248,14 +250,14 @@ restored.
 Pivot uses a two-level strategy for detecting file changes in dependencies and
 outputs Pivot committed:
 
-1. **Stat check** — compare `(mtime_ns, size, inode)` against the
-   StateDB cache. If all three match, reuse the cached hash (no I/O).
+1. **Stat check** — compare `(mtime_ns, size, device, inode)` against the
+   StateDB cache. If all four match, reuse the cached hash (no I/O).
 2. **Content hash** — if stat differs, read the file and compute
    `xxhash64`. Store the new stat + hash in StateDB for next time.
 
 This gives O(1) skip detection for unchanged files while remaining
 correct when files do change (content hash is the source of truth).
-The fast path cannot detect an edit that preserves the size, inode, and
+The fast path cannot detect an edit that preserves the size, inode, device and
 mtime, such as a tool that restores the original mtime. Pivot detects the
 file after its metadata changes. Run `pivot repro --force <stage>` to rewrite
 the stage's output.

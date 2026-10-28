@@ -12,8 +12,8 @@ import pathlib
 
 from pivot import config, exceptions, parameters, project, registry, run_history, skip, types
 from pivot.executor import worker
+from pivot.storage import cache, lock
 from pivot.storage import gc as gc_mod
-from pivot.storage import lock
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import ArtifactTag, DeferredWrites, HashInfo, LockData
@@ -190,15 +190,15 @@ def commit_stages(
                 continue
 
             # 7. Under the naming lock (shared), the naming step only: re-check and link each
-            # output (an object a collection removed since is published again), then write the
-            # lock that names them. gc cannot delete while this unit is open.
+            # output (an object a collection removed since is published again), record its
+            # materialized file hash (#516), then write the lock that names the objects.
             with gc_mod.naming_unit(
                 config.get_cache_dir(), project=(project_root, config.get_state_dir())
             ):
                 output_hashes_by_key = dict[str, HashInfo]()
                 output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
                 output_paths_by_identity = dict[types.ArtifactIdentity, str]()
-                file_hash_entries = list[tuple[str, int, int, int, str]]()
+                file_hash_entries = list[types.FileHashEntry]()
                 for out in stage_outs:
                     identity_key = types.identity_key(out.identity)
                     out_path, hash_info = prepared[out.identity]
@@ -218,7 +218,11 @@ def commit_stages(
                         )
                         outputs_missing = True
                         break
-                    file_hash_entries.extend(worker.output_file_hash_entries(out_path, hash_info))
+                    file_hash_entries.extend(
+                        cache.deferred_file_hash_entries(
+                            cache.known_file_hashes(out_path, hash_info)
+                        )
+                    )
                     output_hashes_by_key[identity_key] = hash_info
                     output_hashes_by_identity[out.identity] = hash_info
                     output_paths_by_identity[out.identity] = out_path.relative_to(

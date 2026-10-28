@@ -16,7 +16,7 @@ materialization via hardlink/symlink/copy.
 - StateDB is LMDB-backed with a single-writer constraint; workers open readonly and
   return deferred writes for coordinator commit.
 - Skip detection relies on generation counters (O(1)) and hash caching keyed by
-  `(mtime_ns, size, inode)` to avoid re-hashing unchanged files.
+  `(mtime_ns, size, dev, inode)` to avoid re-hashing unchanged files.
 - Cache restoration supports `hardlink`, `symlink`, and `copy` modes; incremental
   outputs intentionally use `copy` to avoid cache corruption.
 - CAS uses a 2-level directory fanout from hash prefixes.

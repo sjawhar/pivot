@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.5.17 (2026-10-28)
+
+### Bug Fixes
+
+- **cli**: Print an unexpected error as one line naming the problem, not a Python repr
+  ([#530](https://github.com/sjawhar/pivot/pull/530),
+  [`21187e5`](https://github.com/sjawhar/pivot/commit/21187e5170ec0811c01c28519eee244c348cd3b2))
+
+
 ## v0.5.16 (2026-10-28)
 
 ### Bug Fixes

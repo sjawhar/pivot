@@ -235,13 +235,14 @@ Tier 3:   │  Check run cache       │──── Hit? ─────▶ SKI
 
 ### Dependency Hash Lookup
 
-Before skip checks, dependency hashes are looked up via StateDB. Each cached hash entry stores file metadata:
+Before skip checks, dependency hashes are looked up via StateDB. Each cached hash entry stores file metadata from a `stat()` that follows symlinks:
 
 - `mtime_ns` - Modification time in nanoseconds
 - `size` - File size in bytes
+- `dev` - The device of the filesystem that holds the file
 - `inode` - Filesystem inode number
 
-When all three match the current file's `stat()` result, the cached hash is returned in O(1) without re-reading the file. The inode check detects file replacement (delete + create with same name), which keeps mtime/size but changes inode. Only files with changed metadata require actual hashing.
+When all four match the current file's `stat()` result, the cached hash is returned in O(1) without re-reading the file. The inode check detects file replacement (delete + create with same name), which keeps mtime/size but changes inode. The device check detects a path that now reaches another filesystem (a directory symlink re-pointed at another mount), where an inode number can repeat. The entry holds no ctime: a new hard link changes it, so every hardlink checkout would invalidate the entries of the files it links. Only files with changed metadata require actual hashing.
 
 ### Tier 1: Generation Check (O(1))
 
@@ -263,7 +264,7 @@ A dependency on one file of a directory output follows its directory's counter, 
 
 This provides instant O(1) skip detection when nothing has changed.
 
-**File metadata verification:** In addition to generation comparison, Tier 1 optionally verifies that cached file hashes still match the current file metadata (mtime, size, inode). This catches external modifications that generation tracking alone wouldn't detect—for example, if an external tool modified a dependency file without going through Pivot.
+**File metadata verification:** In addition to generation comparison, Tier 1 optionally verifies that cached file hashes still match the current file metadata (mtime_ns, size, device, inode). This catches external modifications that generation tracking alone wouldn't detect—for example, if an external tool modified a dependency file without going through Pivot.
 
 ### Tier 2: Lock File Comparison
 
@@ -291,15 +292,15 @@ StateDB is an LMDB-backed key-value store for all pipeline state. Keys use prefi
 
 | Prefix | Purpose |
 |--------|---------|
-| `hash:` | File hash cache (uses resolved paths, follows symlinks for deduplication) |
-| `gen:` | Output generation counters (uses normalized paths, preserves symlinks) |
+| `hash:` | File hash cache (the absolute path as given, no symlink followed; the entry holds `stat()`'s mtime_ns, size, device and inode) |
+| `gen:` | Output generation counters (the artifact identity, `stage` or `stage:key`) |
 | `dep:` | Stage dependency generations (stage name + dep path) |
 | `runcache:` | Run cache entries (stage name + input hash) |
 | `run:` | Run history manifests |
 | `remote:` | Remote index entries |
 | `nocommit:` | What a stage's outputs hold that no lock records yet: a `--no-commit` run's code manifest (rerun marks included) and output hashes, for `pivot commit`, and keys another feature writes; each writer replaces only its own keys |
 
-**Path handling strategies:** Hash keys use `resolve()` (follows symlinks) so that symlinked files deduplicate to the same cache entry. Generation keys use `normpath()` (preserves symlinks) so that logical path identity is maintained for dependency tracking.
+**Key strategies:** A file-hash key is the absolute path as given (`os.fsencode(os.path.abspath(path))`): building it costs no system call, and the entry's `(mtime_ns, size, device, inode)`, from a `stat()` that follows symlinks, decides whether a cached hash still applies, so a link re-pointed at another file no longer matches. Generation keys use the artifact identity, so they stay the same wherever an output's path points.
 
 **`.pvt` discovery:** finding tracked files walks the whole project, as `os.walk` does, and reads every `.pvt` it finds. The repro/run pre-flight (`verify_tracked_files`) records, for each directory that changed at least 2 s before the walk, its subdirectory and `.pvt` names under its stamp (`st_dev`, `st_ino`, `st_mtime_ns`, `st_ctime_ns`). Every later walk still stats each directory, and lists only those whose stamp changed, or changed in the last 2 s; adding, removing or renaming an entry changes its directory's stamp. Two kinds of stamp are never trusted: one whose mtime and ctime are both whole seconds, so a filesystem with one-second timestamps is always listed, and one with a time outside the stamp's signed 64-bit nanoseconds (before 1677 or after 2262). The memo is used only on ext2/3/4, xfs, btrfs (subvolumes included), tmpfs, f2fs and zfs mounts (read from `/proc/self/mountinfo`); NFS, overlayfs, FUSE and any other filesystem are listed every time. It holds no `.pvt` content, other commands only read it (a memo that cannot be read means a full listing), and a memo recorded under another project root is not used. The memo is not in the state database, which other accounts can read: it is a file of each account's own, `state.lmdb/pvt-memo-<uid>` in the state directory, created with mode 0600 in a `state.lmdb` that already exists on an allowlisted filesystem, and rewritten in place through its descriptor. A walk opens it without following a symlink and uses it only when an `fstat` of the open file shows a regular file on the same filesystem allowlist (where owner and mode are the file's own; bindfs, CIFS and NFS can report the mount's), owned by the running account, with no group or other access and one link; otherwise every directory is listed and nothing is written. A file of another account is never touched; the account's own memo that its owner loosened (group or other bits, or a second link) is emptied and replaced by a new 0600 file at the next pre-flight. So no other account reads its names, whatever the modes of the project's directories, except while the owner leaves the file loose, at the cost of one `fstat` per walk (one more when a loosened memo is replaced). A listing in which an entry's type could not be read is never recorded.
 

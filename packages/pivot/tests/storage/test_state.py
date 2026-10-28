@@ -5,8 +5,10 @@ import logging
 import multiprocessing
 import os
 import pathlib
+import stat
+import struct
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import lmdb
 import pytest
@@ -278,11 +280,11 @@ def test_state_get_many_empty(tmp_path: pathlib.Path) -> None:
     assert results == {}
 
 
-def test_state_path_too_long_error(tmp_path: pathlib.Path) -> None:
-    """PathTooLongError raised for paths exceeding LMDB key limit."""
+def test_state_save_skips_a_path_too_long_for_a_key(tmp_path: pathlib.Path) -> None:
+    """save leaves out an entry whose key exceeds LMDB's limit, as save_many does: this cache
+    only saves a later hash, so a path too long for it must not fail the caller
+    (``pivot commit`` and ``pivot track`` hash through a writable StateDB)."""
     db_path = tmp_path
-    # Create a deeply nested path that exceeds 511 bytes when encoded
-    # Each segment is 50 chars, need ~10 segments to exceed limit
     nested = tmp_path
     for i in range(12):
         nested = nested / ("d" * 50 + str(i))
@@ -291,15 +293,16 @@ def test_state_path_too_long_error(tmp_path: pathlib.Path) -> None:
     long_path.write_text("content")
     file_stat = long_path.stat()
 
-    with state.StateDB(db_path) as db, pytest.raises(state.PathTooLongError) as exc_info:
+    with state.StateDB(db_path) as db:
         db.save(long_path, file_stat, "hash123")
+        assert db.get(long_path, file_stat) is None, "Too long to cache"
+        file_hash, _ = cache.hash_file(long_path, db)
 
-    assert "Path too long" in str(exc_info.value)
-    assert "511" in str(exc_info.value)
+    assert file_hash == cache.hash_file(long_path)[0], "Hashing through the StateDB succeeds"
 
 
-def test_state_path_too_long_error_save_many(tmp_path: pathlib.Path) -> None:
-    """PathTooLongError raised in save_many for paths exceeding limit."""
+def test_state_save_many_skips_a_path_too_long_for_a_key(tmp_path: pathlib.Path) -> None:
+    """save_many leaves out an entry whose key exceeds LMDB's limit and saves the rest."""
     db_path = tmp_path
     nested = tmp_path
     for i in range(12):
@@ -307,10 +310,15 @@ def test_state_path_too_long_error_save_many(tmp_path: pathlib.Path) -> None:
     nested.mkdir(parents=True)
     long_path = nested / "file.txt"
     long_path.write_text("content")
-    file_stat = long_path.stat()
+    short_path = tmp_path / "short.txt"
+    short_path.write_text("short")
 
-    with state.StateDB(db_path) as db, pytest.raises(state.PathTooLongError):
-        db.save_many([(long_path, file_stat, "hash123")])
+    with state.StateDB(db_path) as db:
+        db.save_many(
+            [(long_path, long_path.stat(), "hash123"), (short_path, short_path.stat(), "hash456")]
+        )
+        assert db.get(long_path, long_path.stat()) is None, "Too long to cache"
+        assert db.get(short_path, short_path.stat()) == "hash456", "The rest is saved"
 
 
 def test_state_raises_after_close(tmp_path: pathlib.Path) -> None:
@@ -723,6 +731,50 @@ def test_readonly_allows_reads(tmp_path: pathlib.Path) -> None:
         assert db.remote_hash_exists("origin", "remote_hash")
 
 
+def test_open_readonly_uses_the_database_mount_to_classify_an_lmdb_error(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 7-1: LMDB reports an existing database on a read-only filesystem as plain
+    `lmdb.Error`, not `OSError(EROFS)`. `open_readonly` calls statvfs on `state.lmdb` itself
+    (its parent can be another, writable mount) and yields None only when that mount is read-only;
+    the same error on a writable mount is a damaged database and raises."""
+    with state.StateDB(tmp_path):
+        pass
+    lmdb_path = tmp_path / "state.lmdb"
+    statvfs_paths = list[object]()
+
+    def lmdb_error(*_: object, **__: object) -> object:
+        raise lmdb.Error("Permission denied")
+
+    class _StatVfs:
+        f_flag: int
+
+        def __init__(self, flag: int) -> None:
+            self.f_flag = flag
+
+    def readonly_statvfs(path: object) -> _StatVfs:
+        statvfs_paths.append(path)
+        return _StatVfs(os.ST_RDONLY)
+
+    monkeypatch.setattr(state, "_acquire_shared_env", lmdb_error)
+    monkeypatch.setattr(os, "statvfs", cast("Any", readonly_statvfs))
+
+    with state.open_readonly(tmp_path, create=False) as state_db:
+        assert state_db is None
+
+    assert statvfs_paths == [lmdb_path]
+
+    def writable_statvfs(_: object) -> _StatVfs:
+        return _StatVfs(0)
+
+    monkeypatch.setattr(os, "statvfs", cast("Any", writable_statvfs))
+    with (
+        pytest.raises(lmdb.Error, match="Permission denied"),
+        state.open_readonly(tmp_path, create=False),
+    ):
+        pass
+
+
 def test_readonly_blocks_save(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks save operation."""
     db_path = tmp_path
@@ -955,6 +1007,7 @@ def test_apply_deferred_writes_file_hash_entries(tmp_path: pathlib.Path) -> None
                 str(file_path),
                 file_stat.st_mtime_ns,
                 file_stat.st_size,
+                file_stat.st_dev,
                 file_stat.st_ino,
                 file_hash,
             )
@@ -966,6 +1019,85 @@ def test_apply_deferred_writes_file_hash_entries(tmp_path: pathlib.Path) -> None
         result = db.get(file_path, file_stat)
 
     assert result == file_hash
+
+
+def _helper_stat_on_device(fs_stat: os.stat_result, device: int) -> os.stat_result:
+    """``fs_stat`` with only its device changed: the same inode number, size and mtime_ns, as
+    a file on another filesystem can have."""
+    visible = list(fs_stat)
+    visible[stat.ST_DEV] = device
+    hidden = {
+        name: getattr(fs_stat, name)
+        for name in (
+            "st_atime",
+            "st_mtime",
+            "st_ctime",
+            "st_atime_ns",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+    }
+    return os.stat_result(visible, hidden)
+
+
+def test_state_cache_miss_on_another_device(tmp_path: pathlib.Path) -> None:
+    """A file on another filesystem can repeat the inode number, size and mtime_ns of the file
+    an entry recorded (a directory symlink re-pointed at another mount). The entry records the
+    device too, so it does not match and the file is read again."""
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    file_stat = test_file.stat()
+    elsewhere = _helper_stat_on_device(file_stat, file_stat.st_dev + 1)
+    assert (elsewhere.st_ino, elsewhere.st_size, elsewhere.st_mtime_ns) == (
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+    )
+
+    with state.StateDB(tmp_path / ".pivot") as db:
+        db.save(test_file, file_stat, "abc123")
+        db.save_many([(tmp_path / "other.txt", file_stat, "def456")])
+        db.apply_deferred_writes(
+            "stage",
+            [],
+            {
+                "file_hash_entries": [
+                    (
+                        str(tmp_path / "deferred.txt"),
+                        file_stat.st_mtime_ns,
+                        file_stat.st_size,
+                        file_stat.st_dev,
+                        file_stat.st_ino,
+                        "0123456789abcdef",
+                    )
+                ]
+            },
+        )
+        assert db.get(test_file, file_stat) == "abc123", "The same device still matches"
+        assert db.get(test_file, elsewhere) is None, "save records the device"
+        assert db.get(tmp_path / "other.txt", elsewhere) is None, "save_many records the device"
+        assert db.get_many([(tmp_path / "deferred.txt", elsewhere)]) == {
+            tmp_path / "deferred.txt": None
+        }, "apply_deferred_writes records the device"
+
+
+def test_state_entry_written_before_the_device_field_never_matches(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An entry an earlier pivot wrote holds (mtime_ns, size, inode) and the hash, with no
+    device. Read with the device field it never matches a file, so the file is read once again
+    and recorded anew."""
+    test_file = tmp_path / "file.txt"
+    test_file.write_text("content")
+    file_stat = test_file.stat()
+    old_value = (
+        struct.pack(">QQQ", file_stat.st_mtime_ns, file_stat.st_size, file_stat.st_ino)
+        + b"0123456789abcdef"
+    )
+
+    with state.StateDB(tmp_path / ".pivot") as db:
+        db.put_raw(b"hash:" + os.fsencode(test_file.absolute()), old_value)
+        assert db.get(test_file, file_stat) is None
 
 
 def test_apply_deferred_writes_run_cache(tmp_path: pathlib.Path) -> None:
@@ -1012,6 +1144,7 @@ def test_apply_deferred_writes_all_fields(tmp_path: pathlib.Path) -> None:
                 str(input_path),
                 input_stat.st_mtime_ns,
                 input_stat.st_size,
+                input_stat.st_dev,
                 input_stat.st_ino,
                 input_hash,
             )

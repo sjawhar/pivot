@@ -1,4 +1,5 @@
 # pyright: reportMissingImports=false
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -79,8 +80,10 @@ class _DependencyStore:
         self,
         ref: ArtifactRef,
         state_db: state_mod.StateDB | None = None,
+        *,
+        pending: list[tuple[Path, os.stat_result, str]] | None = None,
     ) -> HashInfo:
-        raise AssertionError(f"not used by dependency validation: {ref} {state_db}")
+        raise AssertionError(f"not used by dependency validation: {ref} {state_db} {pending}")
 
 
 # --- Basic DAG construction tests ---
