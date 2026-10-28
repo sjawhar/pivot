@@ -7,7 +7,8 @@ directory's tree hash and every hash in its manifest.
 
 A cache outside the project root can hold another project's outputs, whose locks this project
 cannot read. Pivot therefore keeps a register of the projects that use a cache, at
-``<cache>/projects/``, written by ``config.register_cache_use()`` when a command starts, and
+``<cache>/projects/``, written by every naming unit (``naming_unit``, and through it by
+``config.register_cache_use()`` before a restore links objects), and
 refuses to collect an external cache that records nothing.
 
 Two rules cover the window between publishing an object and writing the record that names it
@@ -71,12 +72,20 @@ _REGISTER_REFRESH_SECONDS = 3600.0
 # A cache key as it appears in the text of a record pivot cannot parse.
 _KEY_RE = re.compile(r"(?<![0-9a-zA-Z])[0-9a-f]{16}(?![0-9a-zA-Z])")
 # A project's identity lives in its state database directory, which the state directory's
-# ignore file keeps out of git, so two checkouts of one repository never share it.
+# ignore file keeps out of git, so two checkouts of one repository never share it. The file
+# holds the id and the inode of the state directory it was made in: a copy (`cp -a`, rsync) has
+# another inode, so it is another project. The inode, not the device, is compared: an NFS client
+# reports the server's inode but its own device number, so a project shared over NFS keeps its id.
 PROJECT_ID_FILE = "pivot-project-id"
-_PROJECT_ID_RE = re.compile(r"[0-9a-f]{32}")
-# Mount points under the cache root that writers saw, read by a collection before it trusts the
-# register: a register or ref directory on a mount that is not mounted holds no entries.
-CACHE_MOUNTS_FILE = "mounts.json"
+_PROJECT_ID_RE = re.compile(r"([0-9a-f]{32}) ([0-9]+)")
+_ENTRY_ID_RE = re.compile(r"[0-9a-f]{32}")
+# This process's mount namespace. Entries are keyed by it and the hostname, so each view of a
+# project (another host, a container that keeps the hostname) keeps its own mount evidence.
+_MOUNT_NAMESPACE = pathlib.Path("/proc/self/ns/mnt")
+# Mount points under the cache root that each view of the cache (host and mount namespace) saw,
+# one file per view, read by a collection before it trusts the register: a register or ref
+# directory on a mount that is not mounted holds no entries.
+CACHE_MOUNTS_DIR = "mounts"
 _MOUNTS_TABLE = pathlib.Path("/proc/self/mounts")
 _MOUNT_ESCAPE = re.compile(rb"\\([0-7]{3})")
 _MOUNT_COMMAND_LINE = re.compile(r"^.* on (.*) \([^()]*\)$")
@@ -92,6 +101,8 @@ class ProjectEntry(TypedDict):
     last_write: str
     # None when the state directory cannot be written; a collection refuses such an entry.
     project_id: str | None
+    # The writer's mount namespace inode; None where the platform has none.
+    mount_ns: int | None
     # Mount points under the root and state directory; None where the mount table is unknown.
     mounts: list[str] | None
 
@@ -110,7 +121,10 @@ class _RegisteredProject(TypedDict):
 
     scope: ProjectScope
     project_id: str | None
+    mount_ns: int | None
     mounts: list[str] | None
+    # The state directory the writer recorded, as its mounts are spelled in its view.
+    recorded_state_dir: str
 
 
 class RootCounts(TypedDict):
@@ -212,32 +226,49 @@ class ProjectUnreadableError(exceptions.CacheError):
 # -----------------------------------------------------------------------------
 
 
-def register_path(
-    cache_dir: pathlib.Path, project_root: pathlib.Path, project_id: str
-) -> pathlib.Path:
-    """Return the register entry a project owns in a cache.
+def _mount_namespace() -> int | None:
+    """This process's mount namespace inode, or None where there is none to read."""
+    try:
+        return os.stat(_MOUNT_NAMESPACE).st_ino
+    except OSError:
+        return None
 
-    The key holds the root and the project id, so two hosts with different projects at one
-    local path never replace each other's entries.
+
+def register_path(
+    cache_dir: pathlib.Path,
+    project_root: pathlib.Path,
+    project_id: str,
+    host: str,
+    mount_ns: int | None,
+) -> pathlib.Path:
+    """Return the register entry one view of a project owns in a cache.
+
+    The key holds the root, the project id, the hostname and the mount namespace. Each host and
+    each mount view of a project writes its own entry, so no writer replaces another's mount
+    evidence, and host-local projects at one path keep separate entries.
     """
-    digest = hashlib.sha256(f"{project_root}\0{project_id}".encode()).hexdigest()[:16]
+    key = f"{project_root}\0{project_id}\0{host}\0{mount_ns}"
+    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
     return cache_dir / REGISTER_DIR / f"{digest}.json"
 
 
 def project_register_path(
     cache_dir: pathlib.Path, project_root: pathlib.Path, state_dir: pathlib.Path
 ) -> pathlib.Path | None:
-    """Return the entry for the project id in ``state_dir``, or None when it has no id."""
+    """Return this view's entry for the project id in ``state_dir``, or None without an id."""
     try:
-        return register_path(cache_dir, project_root, _read_project_id(state_dir))
+        project_id = _read_project_id(state_dir)
     except (OSError, ValueError):
         return None
+    return register_path(
+        cache_dir, project_root, project_id, socket.gethostname(), _mount_namespace()
+    )
 
 
 def register_entry_is_fresh(
     cache_dir: pathlib.Path, project_root: pathlib.Path, state_dir: pathlib.Path
 ) -> bool:
-    """Whether this project's register entry was written within ``_REGISTER_REFRESH_SECONDS``.
+    """Whether this view's register entry was written within ``_REGISTER_REFRESH_SECONDS``.
 
     A read only: a caller that finds the entry fresh writes nothing, so it needs no lock.
     """
@@ -255,38 +286,61 @@ def _project_id_path(state_dir: pathlib.Path) -> pathlib.Path:
     return state_dir / "state.lmdb" / PROJECT_ID_FILE
 
 
+class _CopiedProjectIdError(ValueError):
+    """A project id file made in another state directory: the project was copied."""
+
+
 def _read_project_id(state_dir: pathlib.Path) -> str:
-    """Read the project id without following a symlink. Raises OSError or ValueError."""
-    fd = os.open(_project_id_path(state_dir), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    """Read the project id without following a symlink. Raises OSError or ValueError.
+
+    The id counts only in the state directory it was made in; in a copy, whose state directory
+    has another inode, it raises ``_CopiedProjectIdError``.
+    """
+    path = _project_id_path(state_dir)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     with os.fdopen(fd) as file:
-        project_id = file.read().strip()
-    if not _PROJECT_ID_RE.fullmatch(project_id):
-        raise ValueError(f"{_project_id_path(state_dir)} does not hold a pivot project id")
-    return project_id
+        match = _PROJECT_ID_RE.fullmatch(file.read().strip())
+    if match is None:
+        raise ValueError(f"{path} does not hold a pivot project id")
+    if int(match[2]) != os.stat(state_dir).st_ino:
+        raise _CopiedProjectIdError(
+            f"{path} was made in another state directory (this one is a copy)"
+        )
+    return match[1]
 
 
 def _ensure_project_id(state_dir: pathlib.Path, project_root: pathlib.Path) -> str:
     """Return this state directory's project id, creating it once. Raises OSError or ValueError.
 
     A new configured state directory takes the id from the project's `.pivot` state, so changing
-    ``core.state_dir`` does not leave the project's current entry under a different identity.
+    ``core.state_dir`` does not leave the project's current entry under a different identity. A
+    copied state directory gets a new id: it is another project, with its own records.
     """
-    with contextlib.suppress(FileNotFoundError):
+    copied = False
+    try:
         return _read_project_id(state_dir)
+    except FileNotFoundError:
+        pass
+    except _CopiedProjectIdError:
+        copied = True
     if not state_dir.is_dir():
         raise FileNotFoundError(errno.ENOENT, "state directory does not exist", str(state_dir))
     legacy = project_root / ".pivot"
     try:
-        project_id = _read_project_id(legacy) if legacy != state_dir else None
-    except FileNotFoundError:
+        project_id = _read_project_id(legacy) if legacy != state_dir and not copied else None
+    except (FileNotFoundError, _CopiedProjectIdError):
         project_id = None
     database_dir = state_dir / "state.lmdb"
     database_dir.mkdir(exist_ok=True)
     staged = database_dir / f".{PROJECT_ID_FILE}.{secrets.token_hex(8)}"
+    content = f"{project_id or secrets.token_hex(16)} {os.stat(state_dir).st_ino}\n"
     try:
-        staged.write_text((project_id or secrets.token_hex(16)) + "\n")
-        with contextlib.suppress(FileExistsError):
-            os.link(staged, _project_id_path(state_dir))
+        staged.write_text(content)
+        if copied:
+            os.replace(staged, _project_id_path(state_dir))
+        else:
+            with contextlib.suppress(FileExistsError):
+                os.link(staged, _project_id_path(state_dir))
     finally:
         staged.unlink(missing_ok=True)
     return _read_project_id(state_dir)
@@ -405,15 +459,23 @@ def _write_json(path: pathlib.Path, value: object) -> None:
     cache.atomic_write_file(path, write)
 
 
+def _cache_mounts_path(cache_dir: pathlib.Path, host: str, mount_ns: int | None) -> pathlib.Path:
+    digest = hashlib.sha256(f"{host}\0{mount_ns}".encode()).hexdigest()[:16]
+    return cache_dir / CACHE_MOUNTS_DIR / f"{digest}.json"
+
+
 def _record_cache_mounts(cache_dir: pathlib.Path, points: frozenset[str] | None) -> None:
-    """Record the mount points below the cache root that a register read depends on."""
-    path = cache_dir / CACHE_MOUNTS_FILE
+    """Record, for this view, the mount points below the cache root a register read depends on."""
+    host = socket.gethostname()
+    mount_ns = _mount_namespace()
+    path = _cache_mounts_path(cache_dir, host, mount_ns)
     real_cache = os.path.realpath(cache_dir)
     mounts = _mounts_under(points, [cache_dir])
     if mounts is not None:
         mounts = [mount for mount in mounts if mount != real_cache]
-    desired = {"host": socket.gethostname(), "mounts": mounts}
+    desired = {"host": host, "mount_ns": mount_ns, "mounts": mounts}
     if _entry_from_file(path) != desired:
+        path.parent.mkdir(exist_ok=True)
         _write_json(path, desired)
 
 
@@ -444,7 +506,10 @@ def register_project(
         logger.debug("Cannot write the project id in %s: %s", state_dir, e)
         project_id = None
     try:
-        path = register_path(cache_dir, project_root, project_id or "")
+        mount_ns = _mount_namespace()
+        path = register_path(
+            cache_dir, project_root, project_id or "", socket.gethostname(), mount_ns
+        )
         points = _mount_points(table)
         try:
             mounts = _mounts_under(points, [project_root, state_dir])
@@ -460,6 +525,7 @@ def register_project(
             and existing.get("state_dir") == str(state_dir)
             and existing.get("host") == socket.gethostname()
             and existing.get("project_id") == project_id
+            and existing.get("mount_ns") == mount_ns
             and existing.get("mounts") == mounts
         ):
             _record_cache_mounts(cache_dir, points)
@@ -476,11 +542,16 @@ def register_project(
             pivot=version,
             last_write=datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             project_id=project_id,
+            mount_ns=mount_ns,
             mounts=mounts,
         )
         _write_json(path, entry)
         _record_cache_mounts(cache_dir, points)
         if project_id is not None:
+            # This view's entry without an id, written while the state directory could not
+            # hold one, is superseded: the entry just written covers the same root and view.
+            idless = register_path(cache_dir, project_root, "", socket.gethostname(), mount_ns)
+            idless.unlink(missing_ok=True)
             _remember_registration(key, table, path)
     except (OSError, ValueError) as e:
         if isinstance(e, OSError) and e.errno == errno.EROFS:
@@ -516,6 +587,7 @@ def _project_from_entry(path: pathlib.Path) -> _RegisteredProject:
     last_write = entry.get("last_write")
     project_id = entry.get("project_id")
     mounts = entry.get("mounts")
+    mount_ns = entry.get("mount_ns")
     scope = ProjectScope(
         root=pathlib.Path(root),
         # The collector resolves the project's current state directory before it reads records.
@@ -533,9 +605,11 @@ def _project_from_entry(path: pathlib.Path) -> _RegisteredProject:
     return _RegisteredProject(
         scope=scope,
         project_id=project_id
-        if isinstance(project_id, str) and _PROJECT_ID_RE.fullmatch(project_id)
+        if isinstance(project_id, str) and _ENTRY_ID_RE.fullmatch(project_id)
         else None,
+        mount_ns=mount_ns if isinstance(mount_ns, int) and not isinstance(mount_ns, bool) else None,
         mounts=cast("list[str] | None", mounts),
+        recorded_state_dir=state_dir if isinstance(state_dir, str) else str(scope["state_dir"]),
     )
 
 
@@ -585,7 +659,7 @@ def _identity_reason(
         return (
             scope_label(scope),
             "its entry records no project id, because its state directory could not be written "
-            + "when it registered. Make that state directory writable and run any pivot command "
+            + "when it registered. Make that state directory writable and run `pivot checkout` "
             + f"there, then delete {entry} and re-run; if the project is gone for good, delete "
             + f"{entry} and re-run",
         )
@@ -604,13 +678,13 @@ def _identity_reason(
             + f"project is gone for good or its state database was reset, delete {entry} and "
             + "re-run",
         )
-    if scope["host"] != socket.gethostname():
-        return None
+    if scope["host"] != socket.gethostname() or registered["mount_ns"] != _mount_namespace():
+        return _other_view_reason(entry, registered)
     mounts = registered["mounts"]
     if mounts is None or points is None:
         return (
             scope_label(scope),
-            "its mount points cannot be checked on this host. Run any pivot command there to "
+            "its mount points cannot be checked on this host. Run `pivot checkout` there to "
             + f"register it again; if the project is gone for good, delete {entry} and re-run",
         )
     missing = [mount for mount in mounts if mount not in points]
@@ -618,43 +692,102 @@ def _identity_reason(
         return (
             scope_label(scope),
             f"recorded mount point {', '.join(missing)} is not mounted (entry {entry}). Mount it "
-            + "and re-run. If you removed that mount on purpose, run any pivot command in the "
-            + "project; its next naming step records the mounts it has now",
+            + "and re-run. If you removed that mount on purpose, run `pivot checkout` in the "
+            + "project; its naming step records the mounts it has now",
         )
     return None
+
+
+def _other_view_reason(
+    entry: pathlib.Path, registered: _RegisteredProject
+) -> tuple[str, str] | None:
+    """Why an entry from another host or mount namespace cannot be trusted here, or None.
+
+    This view cannot see that writer's mounts. A mount at the project root or the state
+    directory is the project's own filesystem, which the project id check above confirmed this
+    view reads. Any other recorded mount (a disk mounted under the project in that view) may
+    hold records this view does not have, so the collection refuses.
+    """
+    scope = registered["scope"]
+    mounts = registered["mounts"]
+    own = {str(scope["root"]), registered["recorded_state_dir"]}
+    hidden = None if mounts is None else [mount for mount in mounts if mount not in own]
+    if hidden == []:
+        return None
+    what = (
+        "its mount points are unknown"
+        if hidden is None
+        else f"it records mount point {', '.join(hidden)}"
+    )
+    return (
+        scope_label(scope),
+        f"{_recorded_where(scope)} in another mount view, and {what}, which this host cannot "
+        + "check: records there may not be visible here. Run `pivot gc` where that mount is "
+        + f"visible; if that view of the project is gone for good, delete {entry} and re-run",
+    )
 
 
 def _cache_mount_reasons(
     cache_dir: pathlib.Path, points: frozenset[str] | None
 ) -> list[tuple[str, str]]:
-    """Why the cache's register or refs may be hidden by an unmounted mount, if they may."""
-    path = cache_dir / CACHE_MOUNTS_FILE
-    if not path.exists() and not path.is_symlink():
+    """Why the cache's register or refs may be hidden by a mount this view cannot confirm.
+
+    Each view's record is checked: this view's recorded mounts must be mounted now, and another
+    view's record may name no mount under the cache root, since this view cannot check it.
+    """
+    directory = cache_dir / CACHE_MOUNTS_DIR
+    try:
+        with os.scandir(directory) as entries:
+            paths = sorted(pathlib.Path(e.path) for e in entries if e.name.endswith(".json"))
+    except FileNotFoundError:
         return []
-    recorded = _entry_from_file(path)
-    if recorded is None:
-        return [(str(path), "the cache's mount record cannot be read")]
-    host = recorded.get("host")
-    mounts = recorded.get("mounts")
-    if host != socket.gethostname():
-        return []
-    if mounts is None or points is None:
-        return [(str(path), "the cache's mount points cannot be checked on this host")]
-    if not isinstance(mounts, list) or not all(
-        isinstance(mount, str) for mount in cast("list[object]", mounts)
-    ):
-        return [(str(path), "the cache's mount record is not a list of paths")]
-    missing = [mount for mount in cast("list[str]", mounts) if mount not in points]
-    if not missing:
-        return []
-    return [
-        (
-            str(path),
-            f"recorded cache mount point {', '.join(missing)} is not mounted. Mount it and re-run. "
-            + "If you removed that mount on purpose, run any pivot command that uses this cache; "
-            + "its next naming step records the mounts it has now",
+    except OSError as e:
+        return [(str(directory), _error_text(e))]
+    reasons = list[tuple[str, str]]()
+    for path in paths:
+        recorded = _entry_from_file(path)
+        mounts = None if recorded is None else recorded.get("mounts")
+        if recorded is None or (
+            mounts is not None
+            and (
+                not isinstance(mounts, list)
+                or not all(isinstance(m, str) for m in cast("list[object]", mounts))
+            )
+        ):
+            reasons.append((str(path), "the cache's mount record cannot be read"))
+            continue
+        recorded_mounts = cast("list[str] | None", mounts)
+        same_view = (
+            recorded.get("host") == socket.gethostname()
+            and recorded.get("mount_ns") == _mount_namespace()
         )
-    ]
+        if not same_view:
+            if recorded_mounts != []:
+                what = "unknown" if recorded_mounts is None else ", ".join(recorded_mounts)
+                reasons.append(
+                    (
+                        str(path),
+                        f"another host or mount view of this cache records mount points {what} "
+                        + "under the cache root, which this host cannot check. Run `pivot gc` "
+                        + f"there; if that view is gone for good, delete {path} and re-run",
+                    )
+                )
+            continue
+        if recorded_mounts is None or points is None:
+            reasons.append((str(path), "the cache's mount points cannot be checked on this host"))
+            continue
+        missing = [mount for mount in recorded_mounts if mount not in points]
+        if missing:
+            reasons.append(
+                (
+                    str(path),
+                    f"recorded cache mount point {', '.join(missing)} is not mounted. Mount it "
+                    + "and re-run. If you removed that mount on purpose, run `pivot checkout` "
+                    + "in a project that uses this cache; its naming step records the mounts "
+                    + "it has now",
+                )
+            )
+    return reasons
 
 
 def read_register(

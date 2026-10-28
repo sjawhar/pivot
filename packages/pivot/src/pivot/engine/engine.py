@@ -2038,6 +2038,7 @@ class Engine:
                 state_db,
                 state_dir=state_dir,
                 file_hash_entries=file_hash_entries,
+                register=config.register_cache_use,
             )
             _save_file_hashes(file_hash_entries)
             return _SkipOutcome.SKIPPED if restored else _SkipOutcome.RUN

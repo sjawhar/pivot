@@ -376,9 +376,10 @@ def get_cache_dir() -> pathlib.Path:
 def register_cache_use() -> None:
     """Register this project in a naming unit before a command links cache objects.
 
-    `checkout` and `pull` restore workspace links from records already on disk, outside the
-    naming units that publish objects. They call this first, so a collection reads those records.
-    Read-only commands never call it. It creates neither the cache nor the state
+    `checkout`, `pull`, a skipped stage's restore in the engine and `--checkout-missing` restore
+    workspace links from records already on disk, outside the naming units that publish objects.
+    They call this first, so a collection reads those records. Read-only commands never call it.
+    It creates neither the cache nor the state
     directory: a cache that does not exist holds nothing to collect, and a state directory that
     cannot be written gives an entry without a project id, which a collection refuses.
     """

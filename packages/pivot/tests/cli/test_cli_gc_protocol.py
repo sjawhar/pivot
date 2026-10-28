@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import getpass
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import sys
 import threading
@@ -1109,7 +1111,7 @@ def test_pivot_gc_refuses_when_a_registered_project_subdirectory_mount_is_unmoun
     out = refused.stdout + refused.stderr
     assert refused.returncode != 0, out
     assert str(entry) in out and str(away / "mounted-data") in out, out
-    assert "run any pivot command in the project" in out, out
+    assert "run `pivot checkout` in the project" in out, out
     assert obj.exists(), "gc removed an object named under an unmounted project mount"
 
 
@@ -1385,3 +1387,228 @@ def test_pivot_commit_refuses_to_republish_an_output_that_changed_since_it_was_h
     assert "changed after pivot hashed it" in out, out
     assert _locks(root) == before, "a lock names bytes that do not match its key"
     assert not obj.exists() or cache.hash_file(obj)[0] == obj.parent.name + obj.name
+
+
+# =============================================================================
+# Round 7: every restore registers; one register entry per host and mount view
+# =============================================================================
+
+
+def _git(root: pathlib.Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_a_clone_whose_repro_only_restores_registers_before_it_links(
+    tmp_path: pathlib.Path,
+) -> None:
+    """P16: a fresh clone whose `pivot repro` only restores a stage output from its committed
+    lock links that cache object into its workspace. Its project must be registered first, or
+    another project's `pivot gc` never reads the clone's lock and removes the object."""
+    shared = tmp_path / "shared-cache"
+    origin = _shared_project(tmp_path / "origin", shared)
+    config = origin / ".pivot" / "config.yaml"
+    config.write_text(config.read_text() + "core:\n  run_history_retention: 1\n")
+    (origin / ".gitignore").write_text("data/shadow/\n__pycache__/\n")
+    for version in ("v1", "v2"):
+        (origin / "data" / "raw" / "input.txt").write_text(f"{version}\n")
+        _ok(_run(origin, "repro"))
+        _git(origin, "add", "-A")
+        _git(origin, "commit", "-qm", version)
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(origin), str(clone))
+    _git(clone, "checkout", "-q", "HEAD~1")
+    _ok(_run(clone, "repro"))
+    output = clone / "data" / "shadow" / "shout.txt"
+    assert output.is_symlink() and output.read_text() == "V1\n"
+    obj = output.resolve()
+
+    collected = _run(origin, "gc", "--yes", "--grace-hours", "0")
+
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert obj.exists(), "gc removed the object a clone's restore linked"
+
+
+def test_a_clone_whose_repro_restores_a_tracked_file_registers_before_it_links(
+    tmp_path: pathlib.Path,
+) -> None:
+    """P16, the tracked-file restore: `pivot repro --checkout-missing` in a fresh clone links
+    the tracked file its committed `.pvt` names. The stage output is committed, so the run
+    restores nothing else; the tracked restore alone must register the clone."""
+    shared = tmp_path / "shared-cache"
+    origin = _shared_project(tmp_path / "origin", shared)
+    (origin / ".gitignore").write_text("data.txt\n__pycache__/\n")
+    _ok(_run(origin, "repro"))
+    for version in ("v1", "v2"):
+        (origin / "data.txt").unlink(missing_ok=True)
+        (origin / "data.txt").write_text(f"tracked {version}\n")
+        _ok(_run(origin, "track", "--force", "data.txt"))
+        _git(origin, "add", "-A")
+        _git(origin, "commit", "-qm", version)
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(origin), str(clone))
+    _git(clone, "checkout", "-q", "HEAD~1")
+    _ok(_run(clone, "repro", "--checkout-missing"))
+    restored = clone / "data.txt"
+    assert restored.is_symlink() and restored.read_text() == "tracked v1\n"
+    obj = restored.resolve()
+
+    collected = _run(origin, "gc", "--yes", "--grace-hours", "0")
+
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert obj.exists(), "gc removed the tracked object a clone's restore linked"
+
+
+def _in_view(
+    root: pathlib.Path, *args: str, hostname: str | None = None, setup: str = ""
+) -> subprocess.CompletedProcess[str]:
+    """Run `pivot ARGS` in ``root`` as this user in a new mount namespace, after root runs
+    ``setup`` there: another host's (with ``hostname``) or a container's view of the project."""
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True, check=False).returncode:
+        pytest.skip("a mount namespace needs passwordless sudo")
+    user_command = shlex.join(
+        [
+            "sudo",
+            "-n",
+            "-u",
+            getpass.getuser(),
+            "env",
+            f"HOME={os.environ['HOME']}",
+            f"PATH={os.environ['PATH']}",
+            _PIVOT,
+            *args,
+        ]
+    )
+    script = "\n".join(
+        [
+            "set -e",
+            f"hostname {shlex.quote(hostname)}" if hostname else "",
+            setup,
+            f"cd {shlex.quote(str(root))}",
+            f"exec {user_command}",
+        ]
+    )
+    namespaces = ["-m", "-u"] if hostname else ["-m"]
+    return subprocess.run(
+        ["sudo", "-n", "unshare", *namespaces, "--", "bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+
+def _tracked_object(record: pathlib.Path, cache_dir: pathlib.Path) -> pathlib.Path:
+    data = track.read_pvt_file(record)
+    assert data is not None, f"{record} is not a valid .pvt"
+    return cache.get_cache_path(cache_dir / "files", data["hash"])
+
+
+def test_pivot_gc_refuses_another_hosts_view_with_a_mount_it_cannot_see(
+    tmp_path: pathlib.Path,
+) -> None:
+    """P17a: a project shared by two hosts. node2 mounts its local disk under the project and
+    tracks a file there; this host sees an empty directory at that path. node2's entry records
+    the mount, which this host cannot check, so a collection here must refuse."""
+    shared = tmp_path / "shared-cache"
+    root = _shared_project(tmp_path / "project", shared)
+    local = tmp_path / "node2-local"
+    local.mkdir()
+    (local / "big.csv").write_text("only on node2's local disk\n")
+    (root / "data" / "node2").mkdir()
+    setup = f"mount --bind {shlex.quote(str(local))} {shlex.quote(str(root / 'data' / 'node2'))}"
+    _ok(_in_view(root, "track", "data/node2/big.csv", hostname="pivot-node2", setup=setup))
+    obj = _tracked_object(local / "big.csv.pvt", shared)
+    assert obj.exists()
+
+    collected = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode != 0, out
+    assert "pivot-node2" in out and str(root / "data" / "node2") in out, out
+    assert obj.exists(), "gc removed an object named under another host's mount"
+
+
+def test_pivot_gc_keeps_a_mount_views_evidence_after_this_host_writes(
+    tmp_path: pathlib.Path,
+) -> None:
+    """P17b: the same, from a mount namespace that keeps this hostname (a container with host
+    UTS). This host then names an object of its own in the project; its registration must not
+    replace the other view's evidence, so a collection still refuses."""
+    shared = tmp_path / "shared-cache"
+    root = _shared_project(tmp_path / "project", shared)
+    local = tmp_path / "view-local"
+    local.mkdir()
+    (local / "big.csv").write_text("only in the other mount view\n")
+    (root / "data" / "view").mkdir()
+    setup = f"mount --bind {shlex.quote(str(local))} {shlex.quote(str(root / 'data' / 'view'))}"
+    _ok(_in_view(root, "track", "data/view/big.csv", setup=setup))
+    obj = _tracked_object(local / "big.csv.pvt", shared)
+    (root / "other.txt").write_text("this host's own file\n")
+    _ok(_run(root, "track", "other.txt"))
+
+    collected = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode != 0, out
+    assert str(root / "data" / "view") in out, out
+    assert obj.exists(), "this host's write erased the other view's mount evidence"
+
+
+def test_pivot_gc_refuses_a_host_local_copy_at_the_same_path(tmp_path: pathlib.Path) -> None:
+    """P15: node2 holds a `cp -a` copy of the project at the same path, project id included,
+    and runs a new output there. The copy is another project: its id must not stand for this
+    host's project, whose records do not name node2's new output."""
+    shared = tmp_path / "shared-cache"
+    work = tmp_path / "work"
+    work.mkdir()
+    root = _shared_project(work / "project", shared)
+    _ok(_run(root, "repro"))
+    node2_work = tmp_path / "node2-work"
+    subprocess.run(["cp", "-a", str(work), str(node2_work)], check=True)
+    (node2_work / "project" / "data" / "raw" / "input.txt").write_text("node2 run\n")
+    setup = f"mount --bind {shlex.quote(str(node2_work))} {shlex.quote(str(work))}"
+    _ok(_in_view(root, "repro", hostname="pivot-node2", setup=setup))
+    node2_output = node2_work / "project" / "data" / "shadow" / "shout.txt"
+    assert node2_output.is_symlink()
+    obj = pathlib.Path(os.readlink(node2_output))
+    assert obj.exists()
+
+    collected = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode != 0, out
+    assert "pivot-node2" in out, out
+    assert obj.exists(), "gc read this host's copy for node2's project"
+
+
+def test_pivot_gc_refuses_another_views_cache_mount(tmp_path: pathlib.Path) -> None:
+    """The cache's own mounts, per view: another host mounts a disk at the cache's ref
+    directory and publishes a ref there. This host cannot see that mount, so a collection
+    refuses rather than collect the object the ref keeps."""
+    shared = tmp_path / "shared-cache"
+    root = _shared_project(tmp_path / "project", shared)
+    _cached_link(root, shared, "first.txt", "makes the cache\n")
+    key = _publish(shared / "files", tmp_path, "kept only by node2's ref\n")
+    refs = shared / "files" / "refs"
+    refs.mkdir()
+    target = cache.get_cache_path(shared / "files", key)
+    (root / "second.txt").write_text("registers node2's view\n")
+    setup = "\n".join(
+        [
+            f"mount -t tmpfs -o uid={os.getuid()},gid={os.getgid()} tmpfs {shlex.quote(str(refs))}",
+            f"ln -s {shlex.quote(str(target))} {shlex.quote(str(refs / 'store'))}",
+        ]
+    )
+    _ok(_in_view(root, "track", "second.txt", hostname="pivot-node2", setup=setup))
+
+    collected = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode != 0, out
+    assert str(refs) in out, out
+    assert target.exists(), "gc removed an object another view's cache mount keeps"

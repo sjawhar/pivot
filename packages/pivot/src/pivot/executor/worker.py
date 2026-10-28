@@ -1016,6 +1016,9 @@ def _execute_stage(
                                 state_dir=project_state_dir,
                                 report_changes=True,
                                 file_hash_entries=restored_entries,
+                                register=lambda: _register_before_restore(
+                                    naming_root, project_root, project_state_dir
+                                ),
                             )
                             if restoration.available:
                                 return _make_result(
@@ -1072,6 +1075,9 @@ def _execute_stage(
                             state_dir=project_state_dir,
                             report_changes=True,
                             file_hash_entries=restored_entries,
+                            register=lambda: _register_before_restore(
+                                naming_root, project_root, project_state_dir
+                            ),
                         )
                         if restoration.available:
                             # The dependencies read to decide, and the outputs read or restored
@@ -1344,6 +1350,20 @@ def _execute_stage(
             return result
 
 
+def _register_before_restore(
+    naming_root: pathlib.Path, project_root: pathlib.Path, project_state_dir: pathlib.Path
+) -> None:
+    """Register the project before a skipped stage restores outputs its lock already names.
+
+    The restore links cache objects outside a publishing naming unit, as `pivot checkout` does,
+    so the project must be in the register first, or another project's collection would not
+    read the lock that names them (a fresh clone whose run only restores). The unit holds the
+    naming lock only for the registration; the restore's I/O runs after it.
+    """
+    with gc_mod.naming_unit(naming_root, project=(project_root, project_state_dir)):
+        pass
+
+
 def _open_state_db(state_dir: pathlib.Path) -> state.StateDB:
     """Open the stage's state database read-only; a failure to open it is pivot's own I/O."""
     with stage_io.PIVOT_IO:
@@ -1488,6 +1508,7 @@ def restore_outputs_to_hashes(
     restore: bool = True,
     report_changes: Literal[False] = False,
     file_hash_entries: list[FileHashEntry] | None = None,
+    register: Callable[[], None] | None = None,
 ) -> bool: ...
 
 
@@ -1502,6 +1523,7 @@ def restore_outputs_to_hashes(
     restore: bool = True,
     report_changes: Literal[True],
     file_hash_entries: list[FileHashEntry] | None = None,
+    register: Callable[[], None] | None = None,
 ) -> OutputRestoreResult: ...
 
 
@@ -1515,12 +1537,14 @@ def restore_outputs_to_hashes(
     restore: bool = True,
     report_changes: bool = False,
     file_hash_entries: list[FileHashEntry] | None = None,
+    register: Callable[[], None] | None = None,
 ) -> bool | OutputRestoreResult:
     """Verify outputs match recorded hashes and restore cacheable mismatches.
 
     ``file_hash_entries``, when given, receives a StateDB file-hash entry for every file the
     check had to read and every file restored from the cache, so the next check finds each
-    without reading it.
+    without reading it. ``register``, when given, runs once before the first restore: a restore
+    links cache objects into the workspace, so the project must be in the cache register first.
     """
     unavailable = list[types.ArtifactRef]()
     empty_dirs_unrecorded = list[types.ArtifactRef]()
@@ -1562,6 +1586,9 @@ def restore_outputs_to_hashes(
                     if not restore:
                         continue
                     restored = list[tuple[pathlib.Path, os.stat_result, str]]()
+                    if register is not None:
+                        register()
+                        register = None
                     if store.restore_from_cache(
                         ref, expected_hash, state_dir=state_dir, recorded=restored
                     ):

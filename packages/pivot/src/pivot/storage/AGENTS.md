@@ -231,18 +231,25 @@ resolved object root (a `files/` symlink would split the lock).
 under the shared lock and before anything is named, so every process that names an object is
 in the register, whichever command it runs and whether or not the cache existed when it began.
 Only a test standing in for a writer passes `project=None`. Registration tries to write the
-project id to `<state dir>/state.lmdb/pivot-project-id`, records mount points at or below the
-project root and state directory, and records cache-root submounts in `<cache>/mounts.json`.
-An id write failure leaves an id-less entry, so a collection refuses it but the writer preserves
-#503's unusable-state behavior. A register write failure refuses the writer. The only exception
-is `EROFS` on the cache: a read-only cache cannot be collected either.
+project id, with the inode of the state directory it was made in, to
+`<state dir>/state.lmdb/pivot-project-id` (a copy gets a new id), records mount points at or
+below the project root and state directory, and records cache-root submounts in
+`<cache>/mounts/`. Entries and cache mount records are keyed per view (hostname and mount
+namespace). An id write failure leaves an id-less entry, so a collection refuses it but the
+writer preserves #503's unusable-state behavior. A register write failure refuses the writer.
+The only exception is `EROFS` on the cache: a read-only cache cannot be collected either. A
+restore that links a cache object into a workspace outside a naming unit (`checkout`, a skipped
+stage's restore, `--checkout-missing`) runs a registering unit first.
 
-**A registered project is live only after a real read.** `read_register` opens its root,
-`.pivot` marker, and state directory resolved from that project's own `core.state_dir`, then
-requires the entry's project id there. On the registering host, every recorded mount must still
-be mounted. Any missing evidence refuses collection and names the entry. When `core.state_dir`
-differs from `.pivot`, collection reads both state layouts so a 0.5.2 lock in `.pivot` still
-protects its object.
+**A registered project is live only after a real read.** `read_register` resolves the state
+directory from that project's own `core.state_dir` and requires the entry's project id there,
+made in that state directory. For this view's entries every recorded mount must be mounted;
+another view's entry may record only its root and state directory. Any missing evidence
+refuses collection and names the entry. `resolve_scopes` then opens every scope's root,
+`.pivot` and state directory. When `core.state_dir` differs from `.pivot`, collection reads
+both state layouts so a 0.5.2 lock in `.pivot` still protects its object. The writer-side
+registration memo (`_VERIFIED_REGISTRATIONS`) only lets a naming unit skip re-registration; no
+collection read uses it.
 
 ### Where flock is refused
 
