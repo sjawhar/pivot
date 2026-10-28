@@ -199,7 +199,7 @@ def get_stage_output_info() -> tuple[dict[str, HashInfo], dict[str, pathlib.Path
             out.identity for out in stage_info["outs"] if out.tag is not types.ArtifactTag.METRIC
         }
 
-        stage_state_dir = registry.get_stage_state_dir(stage_info, config.get_state_dir())
+        stage_state_dir = registry.get_stage_state_dir(stage_info, config.locate_state_dir())
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         lock_data = stage_lock.read()
         if lock_data:

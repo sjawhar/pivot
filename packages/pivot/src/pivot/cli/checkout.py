@@ -537,7 +537,7 @@ def checkout(
     if pipeline is not None:
         stage_outputs, output_state_dirs = cli_helpers.get_stage_output_info()
 
-    state_dir = config.get_state_dir()
+    state_dir = config.locate_state_dir()
 
     # Run async checkout. The file hashes every restore read or wrote are saved once per state
     # directory when it ends, also when a target failed, best-effort.
