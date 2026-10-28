@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.5.20 (2026-10-28)
+
+### Performance Improvements
+
+- **storage**: Check a symlink checkout's links without resolving every path
+  ([#519](https://github.com/sjawhar/pivot/pull/519),
+  [`a71c001`](https://github.com/sjawhar/pivot/commit/a71c00185f917032497521a116051c117b8721af))
+
+
 ## v0.5.19 (2026-10-28)
 
 ### Bug Fixes
