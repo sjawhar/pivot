@@ -462,8 +462,19 @@ def _clear_path(path: pathlib.Path) -> None:
             path.unlink()
 
 
+def _is_real_dir(path: pathlib.Path) -> bool:
+    """Whether ``path`` is a directory, not a symlink to one."""
+    return path.is_dir() and not path.is_symlink()
+
+
 def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
-    """Remove stale restore and backup artifacts older than max age."""
+    """Remove stale restore temporaries (staged replacements) older than max age.
+
+    It takes no lock, so it never removes a backup (``_BACKUP_TEMP_PREFIX``): a backup is the
+    entry a restore renamed aside, which keeps its own old mtime and may still be under that
+    restore's check. Only the next restore of the same path removes a backup, under that path's
+    restore lock (``_cleanup_fresh_restore_orphans``).
+    """
     cutoff = time.time() - _RESTORE_TEMP_MAX_AGE
 
     if not parent_dir.exists():
@@ -472,10 +483,7 @@ def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
     for entry in os.scandir(parent_dir):
         if entry.name.startswith(_RESTORE_LOCK_PREFIX):
             continue
-        if not (
-            entry.name.startswith(_RESTORE_TEMP_PREFIX)
-            or entry.name.startswith(_BACKUP_TEMP_PREFIX)
-        ):
+        if not entry.name.startswith(_RESTORE_TEMP_PREFIX):
             continue
         try:
             entry_stat = entry.stat(follow_symlinks=False)
@@ -768,17 +776,24 @@ def _checkout_from_cache(
                 raise
             os.chmod(path.parent, parent_mode | stat.S_IWUSR)
             _stage_checkout(tmp_path, cache_path, checkout_mode, executable=executable)
-        if before_swap is not None and (path.exists() or path.is_symlink()):
-            if path.is_dir() and not path.is_symlink():
-                backup_path = path.parent / f"{_BACKUP_TEMP_PREFIX}{secrets.token_hex(8)}"
-                _swap_in(tmp_path, path, backup_path, before_swap)
+        if before_swap is None:
+            try:
+                tmp_path.replace(path)
+            except IsADirectoryError:
+                _clear_path(path)
+                tmp_path.replace(path)
+            return
+        # A file or symlink is checked in place and replaced atomically; a directory, there
+        # from the start or made after that check, is renamed aside and checked there
+        if not _is_real_dir(path):
+            if path.exists() or path.is_symlink():
+                before_swap(path)
+            try:
+                tmp_path.replace(path)
                 return
-            before_swap(path)
-        try:
-            tmp_path.replace(path)
-        except IsADirectoryError:
-            _clear_path(path)
-            tmp_path.replace(path)
+            except IsADirectoryError:
+                pass
+        _swap_in(tmp_path, path, _backup_path(path, _restore_target_token(path)), before_swap)
     finally:
         # Also covers a replace() that did nothing: POSIX rename is a no-op when both
         # names are hardlinks to the same inode, leaving tmp_path behind.

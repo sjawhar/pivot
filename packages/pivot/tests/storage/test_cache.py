@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-from pivot import exceptions
-from pivot.storage import cache, state
+from pivot import exceptions, project
+from pivot.storage import cache, ownership, state
 from pivot.types import DirHash, FileHash, HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
@@ -898,6 +898,94 @@ def test_file_restore_checks_a_file_in_place_and_a_directory_moved_aside(
             before_swap=refuse,
         )
     assert (target / "inner.txt").read_text() == "user bytes"
+    _helper_assert_no_temp_dirs(target.parent)
+
+
+def test_a_siblings_sweep_never_removes_a_backup_under_its_check(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two outputs side by side, untouched for two hours. A user's tracked file lands in one's
+    `sub/`, which leaves that output's own mtime old. While its restore checks it, renamed aside,
+    a sibling restore starts and sweeps the parent: the sweep removes no backup, so the check sees
+    the file and refuses, and the file is kept."""
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
+    data = tmp_path / "data"
+    cache_dir = tmp_path / "cache"
+    hashes = dict[str, HashInfo]()
+    for name in ("one", "two"):
+        out = data / name
+        (out / "sub").mkdir(parents=True)
+        (out / "sub" / "g.txt").write_text(name)
+        hashes[name] = cache.save_to_cache(out, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+        (out / "sub" / "g.txt").write_text("local edit")
+    one = data / "one"
+    (one / "sub" / "u.txt").write_text("user bytes")
+    (one / "sub" / "u.txt.pvt").write_text("path: u.txt\nhash: abcdef0000000002\nsize: 10\n")
+    two_hours_ago = time.time() - 7200
+    for name in ("one", "two"):
+        os.utime(data / name, (two_hours_ago, two_hours_ago))
+    target = ownership.ForcedRestore(
+        replacement=ownership.stage_output(one, "b/one"), restored=hashes["one"], claims=None
+    )
+
+    def sibling_sweeps_then_check(entry: pathlib.Path) -> None:
+        cache._cleanup_stale_restore_temps(data)
+        refusal = ownership.swap_refusal(tmp_path, target, entry)
+        if refusal is not None:
+            raise refusal
+
+    with pytest.raises(exceptions.OutputOwnershipError, match="u.txt.pvt"):
+        cache.restore_from_cache(
+            one,
+            hashes["one"],
+            cache_dir,
+            checkout_mode=cache.CheckoutMode.COPY,
+            state_dir=tmp_path / ".pivot",
+            before_swap=sibling_sweeps_then_check,
+        )
+
+    assert (one / "sub" / "u.txt").read_text() == "user bytes"
+    assert (one / "sub" / "u.txt.pvt").is_file()
+    _helper_assert_no_temp_dirs(data)
+
+
+def test_file_restore_checks_a_directory_made_after_its_check(tmp_path: pathlib.Path) -> None:
+    """A file target is checked in place. When a directory holding a user's sidecar takes its
+    path before the rename, that directory is renamed aside and checked as well, never removed
+    unchecked; refused, it stays at the path."""
+    source = tmp_path / "source.txt"
+    source.write_text("cached")
+    cache_dir = tmp_path / "cache"
+    output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    target = tmp_path / "data" / "out.txt"
+    target.parent.mkdir()
+    target.write_text("local edit")
+    seen = list[pathlib.Path]()
+
+    def check(entry: pathlib.Path) -> None:
+        seen.append(entry)
+        if entry == target:
+            # The check in place passes; then a writer makes a directory at the path
+            target.unlink()
+            target.mkdir()
+            (target / "u.txt.pvt").write_text("user sidecar")
+            return
+        if (entry / "u.txt.pvt").exists():
+            raise exceptions.OutputOwnershipError("refused")
+
+    with pytest.raises(exceptions.OutputOwnershipError, match="refused"):
+        cache.restore_from_cache(
+            target,
+            output_hash,
+            cache_dir,
+            checkout_mode=cache.CheckoutMode.COPY,
+            state_dir=tmp_path / ".pivot",
+            before_swap=check,
+        )
+
+    assert seen[0] == target
+    assert seen[1] != target
+    assert (target / "u.txt.pvt").read_text() == "user sidecar"
     _helper_assert_no_temp_dirs(target.parent)
 
 

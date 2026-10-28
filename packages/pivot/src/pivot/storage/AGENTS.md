@@ -234,10 +234,14 @@ When multiple `pivot` processes share the same StateDB:
   inside the target (its working directory, or a directory descriptor), which can add a file to
   the renamed entry after the walk; a sidecar created beside the target, or beside a directory
   above it, in the instant between the swap's check and its rename; and a restore killed between
-  renaming the old entry aside and checking it, whose backup the next restore of that path (or a
-  directory restore in the same directory an hour later) removes unchecked
-  (`cache._cleanup_fresh_restore_orphans`, `cache._cleanup_stale_restore_temps`). An entry the
-  check refuses goes back to its path; when something took the path meanwhile, it is renamed to
+  renaming the old entry aside and checking it, whose backup the next restore of that path
+  removes unchecked (`cache._cleanup_fresh_restore_orphans`). Every backup is named with its
+  path's restore token, and only that cleanup, under that path's restore lock, removes one: the
+  unlocked sweep a directory restore runs in its parent (`cache._cleanup_stale_restore_temps`)
+  removes only staged replacements, since a backup keeps the old entry's mtime and may be under
+  another restore's check. Every directory a forced restore meets at its path is renamed aside
+  and checked, including one made after a file target's check. An entry the check refuses goes
+  back to its path; when something took the path meanwhile, it is renamed to
   `<name>.pivot-kept-<hex>` beside it and a warning names it, never left under the backup name a
   later restore removes. Every other replacement (a stage's write, a restore in a run, a
   symlink-mode commit, presentation) is checked when it starts replacing that output, so a file
