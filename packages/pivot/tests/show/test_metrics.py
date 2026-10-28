@@ -721,12 +721,12 @@ def test_collect_metrics_from_head_from_cache(
     """Collect metrics from cache when hash is available."""
     cache_dir = tmp_path / ".pivot" / "cache" / "files" / "ab"
     cache_dir.mkdir(parents=True)
-    cached_file = cache_dir / "c123"
+    cached_file = cache_dir / "c1230000000000"
     cached_file.write_text(json.dumps({"accuracy": 0.95}))
 
     result = metrics.collect_metrics_from_head(
         paths=["metrics.json"],
-        head_hashes={"metrics.json": "abc123"},
+        head_hashes={"metrics.json": "abc1230000000000"},
     )
 
     assert "metrics.json" in result
@@ -766,7 +766,7 @@ def test_collect_metrics_from_head_cache_read_error(
 
     cache_dir = tmp_path / ".pivot" / "cache" / "files" / "ab"
     cache_dir.mkdir(parents=True)
-    cached_file = cache_dir / "c123"
+    cached_file = cache_dir / "c1230000000000"
     cached_file.write_text("{invalid json}")
 
     mocker.patch.object(
@@ -777,7 +777,7 @@ def test_collect_metrics_from_head_cache_read_error(
 
     result = metrics.collect_metrics_from_head(
         paths=["metrics.json"],
-        head_hashes={"metrics.json": "abc123"},
+        head_hashes={"metrics.json": "abc1230000000000"},
     )
 
     assert "metrics.json" in result

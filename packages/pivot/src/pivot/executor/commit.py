@@ -11,6 +11,7 @@ import logging
 import pathlib
 
 from pivot import config, exceptions, parameters, project, registry, run_history, skip, types
+from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
 from pivot.storage import cache, lock
 from pivot.storage import state as state_mod
@@ -44,7 +45,24 @@ def commit_stages(
 
     Returns:
         Tuple of (committed, failed) stage name lists.
+
+    A library caller's commit holds one state-directory record, started with the directories
+    the pipeline resolved when it loaded (``state_dir.entry_invocation``), so its locks, its
+    database writes and its fingerprints use the directory its stages' locks are in.
     """
+    with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
+        return _commit_stages(
+            pipeline, stage_names, force, warn_left_out_symlinks=warn_left_out_symlinks
+        )
+
+
+def _commit_stages(
+    pipeline: registry.PipelineLike,
+    stage_names: list[str] | None,
+    force: bool,
+    *,
+    warn_left_out_symlinks: bool,
+) -> tuple[list[str], list[str]]:
     all_stage_names = pipeline.list_stages()
 
     # Resolve target stages
@@ -75,7 +93,6 @@ def commit_stages(
 
     def _get_state_db(stage_state_dir: pathlib.Path) -> state_mod.StateDB:
         if stage_state_dir not in state_dbs:
-            stage_state_dir.mkdir(parents=True, exist_ok=True)
             state_dbs[stage_state_dir] = state_mod.StateDB(stage_state_dir)
         return state_dbs[stage_state_dir]
 

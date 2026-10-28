@@ -8,7 +8,7 @@ When running in watch mode with the TUI, Pivot starts an Agent Server that expos
 
 ## Protocol
 
-**Transport:** Unix domain socket. `pivot repro --watch --serve` and `pivot repro --watch --tui` listen on `.pivot/agent.sock` in the project root; the one-shot `pivot repro --tui` and `pivot run --tui` listen on `agent.sock` in the state directory (`core.state_dir`, `.pivot` by default). A socket address holds at most 108 bytes on Linux and 104 on macOS; Pivot serves a project at any depth, and a client of a deeper project connects by the relative path `.pivot/agent.sock` from the project root, as in the example below. The `pivot` command's serve mode stops on SIGTERM as it does on Ctrl-C, including a stop sent more than once or to its whole process group (GNU `timeout`, `systemctl stop`): it removes the socket and its worker pool's temporary directory and exits 0. A SIGKILL leaves the socket, which the next start removes. Serve takes a stop signal only if it is at its default when `pivot` starts. A signal that whatever launched `pivot` ignored (`env --ignore-signal`, `trap ''`) or gave a handler (a C program that embeds Python, an `LD_PRELOAD` library, Python startup code) belongs to that launcher, and serve leaves it alone. Serve run in-process (`pivot.cli.main()` or the Click group) changes no signal state: the caller's own handlers decide what SIGTERM does, and the caller owns shutdown.
+**Transport:** Unix domain socket. `pivot repro --watch --serve`, `pivot repro --watch --tui` and the one-shot `pivot repro --tui` and `pivot run --tui` all listen on `agent.sock` in the state directory (`core.state_dir`, `.pivot` by default). A socket address holds at most 108 bytes on Linux and 104 on macOS; Pivot serves a project at any depth, and a client of a deeper project connects by the state directory's path relative to the project root, `.pivot/agent.sock` in the default layout, as in the example below. The `pivot` command's serve mode stops on SIGTERM as it does on Ctrl-C, including a stop sent more than once or to its whole process group (GNU `timeout`, `systemctl stop`): it removes the socket and its worker pool's temporary directory and exits 0. A SIGKILL leaves the socket, which the next start removes. Serve takes a stop signal only if it is at its default when `pivot` starts. A signal that whatever launched `pivot` ignored (`env --ignore-signal`, `trap ''`) or gave a handler (a C program that embeds Python, an `LD_PRELOAD` library, Python startup code) belongs to that launcher, and serve leaves it alone. Serve run in-process (`pivot.cli.main()` or the Click group) changes no signal state: the caller's own handlers decide what SIGTERM does, and the caller owns shutdown.
 
 **Protocol:** JSON-RPC 2.0
 
@@ -196,7 +196,8 @@ The Engine uses locks to protect atomic state transitions. When a `run` request 
 
 ## Client Example
 
-Using Python with raw sockets:
+The socket is `<state dir>/agent.sock`, where `core.state_dir` defaults to `.pivot`. Using Python
+with raw sockets:
 
 ```python
 import socket
@@ -204,7 +205,7 @@ import json
 
 def call_agent(method: str, params: dict | None = None) -> dict:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(".pivot/agent.sock")
+    sock.connect("<state dir>/agent.sock")
 
     request = {
         "jsonrpc": "2.0",

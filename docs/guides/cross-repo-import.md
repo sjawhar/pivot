@@ -13,7 +13,8 @@ Import a stage output produced by another Pivot project without copying its pipe
 The **source** repo must:
 
 1. Have a Pivot project with a stage that produces the artifact you want
-2. Have its lock files committed (`.pivot/stages/`)
+2. Have its lock files committed (`<state dir>/stages/`, where `core.state_dir` defaults to
+   `.pivot`)
 3. Have a [remote configured](./remote-storage.md) with cached outputs pushed to it
 
 ## Import an Artifact
@@ -59,7 +60,7 @@ model = pipeline.input("model.pkl")
 ### What Happens
 
 1. Pivot resolves the git ref to a commit SHA
-2. Reads the source repo's `.pivot/config.yaml` to find its remote storage URL
+2. Reads the source repo's `.pivot/config.yaml` to find its remote storage URL and its `core.state_dir`. A `core.state_dir` that cannot be read, is not a directory path inside the repo, or has no readable `stages` directory at the imported revision is reported in one warning, and the locks are read from the default `.pivot`
 3. Reads the source lock files to find the artifact and its content hash
 4. Downloads the file from the source's remote, S3 or GCS (hash-verified)
 5. Creates a `.pvt` file tracking the import source
@@ -151,7 +152,7 @@ If the file isn't in your local cache, run `pivot update` to re-download it from
 # Train and push outputs
 pivot repro
 pivot push
-git add .pivot/stages && git commit -m "Update model"
+git add "<state dir>/stages" && git commit -m "Update model"
 git push
 ```
 

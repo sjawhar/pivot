@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import click
 from click.shell_completion import CompletionItem
 
+from pivot import state_dir as state_dir_mod
 from pivot.config.models import CONFIG_KEY_DESCRIPTIONS, VALID_REMOTE_NAME
 
 logger = logging.getLogger(__name__)
@@ -172,7 +173,7 @@ def _get_stages_from_cache(root: pathlib.Path) -> list[str] | None:
     Returns stage names if cache exists and is valid, None otherwise.
     Cache is valid when version matches and config file mtime unchanged.
     """
-    cache_path = root / ".pivot" / "cache" / "stages.cache"
+    cache_path = state_dir_mod.state_dir_or_default(root) / "cache" / "stages.cache"
     try:
         lines = cache_path.read_text().splitlines()
     except OSError:
@@ -206,9 +207,15 @@ def _write_stages_cache(
 
     Uses temp file + rename for atomic write on POSIX.
     Cleans up temp file on failure before re-raising OSError.
-    Caller is responsible for handling write failures.
+    Caller is responsible for handling write failures. While the project config cannot be read
+    or its state directory cannot be used, the cache stays in 0.5.2's ``.pivot/cache``. A
+    configured state directory that does not exist yet is left for a command that uses it to
+    create, so nothing is cached.
     """
-    cache_dir = root / ".pivot" / "cache"
+    state_dir = state_dir_mod.state_dir_or_default(root)
+    if state_dir != root / ".pivot" and not state_dir.is_dir():
+        return
+    cache_dir = state_dir / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     cache_path = cache_dir / "stages.cache"

@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.5.18 (2026-10-28)
+
+### Performance Improvements
+
+- **storage**: Record file hashes wherever pivot materializes an output
+  ([#516](https://github.com/sjawhar/pivot/pull/516),
+  [`27488dd`](https://github.com/sjawhar/pivot/commit/27488ddcebfb019cf50764eaf4d76ca9c3e782b7))
+
+
 ## v0.5.17 (2026-10-28)
 
 ### Bug Fixes

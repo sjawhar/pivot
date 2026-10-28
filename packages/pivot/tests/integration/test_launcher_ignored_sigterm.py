@@ -25,9 +25,8 @@ import time
 
 import pytest
 
+from tests import helpers
 from tests.integration import serve_test_support
-
-_PIVOT = pathlib.Path(sys.executable).parent / "pivot"
 
 
 def _answers(socket_path: pathlib.Path) -> bool:
@@ -49,7 +48,9 @@ def test_pivot_command_keeps_sigterm_ignored_when_its_launcher_ignores_it(
     serve_test_support.create_noop_project(project)
     # Short, because multiprocessing binds its manager's socket under TMPDIR.
     private_tmp = pathlib.Path(tempfile.mkdtemp(prefix="t", dir="/tmp"))
-    env = {**os.environ, "TMPDIR": str(private_tmp), "PIVOT_CACHE_DIR": str(tmp_path / "cache")}
+    env = helpers.cli_env(
+        tmp_path / "home", TMPDIR=str(private_tmp), PIVOT_CACHE_DIR=str(tmp_path / "cache")
+    )
     stderr_path = tmp_path / "serve.stderr"
     socket_path = pathlib.Path(".pivot", "agent.sock")
     try:
@@ -58,7 +59,7 @@ def test_pivot_command_keeps_sigterm_ignored_when_its_launcher_ignores_it(
         try:
             with stderr_path.open("wb") as stderr_file:
                 proc = subprocess.Popen(
-                    [str(_PIVOT), "repro", "--watch", "--serve"],
+                    [helpers.PIVOT, "repro", "--watch", "--serve"],
                     cwd=project,
                     env=env,
                     stdin=subprocess.DEVNULL,
