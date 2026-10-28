@@ -879,6 +879,79 @@ def test_pivot_gc_refuses_when_this_hosts_project_is_not_visible(tmp_path: pathl
     assert output.resolve().exists(), "gc removed an object a project on an unmounted disk names"
 
 
+
+# =============================================================================
+# Round 6: a registered project proves it is readable; a writer proves it registered
+# =============================================================================
+
+
+def test_pivot_gc_refuses_when_a_registered_project_root_is_an_empty_mountpoint(
+    tmp_path: pathlib.Path,
+) -> None:
+    """P14: an unmounted volume leaves its project-root mount point as an empty directory.
+
+    The cache register still names that root, but none of its state or workspace records are
+    visible. The collection must refuse rather than read that absence as an empty project and
+    remove the volume's symlink-checkout object. Renaming the project and leaving an empty
+    directory models the unmounted mount point without requiring mount privileges.
+    """
+    shared = tmp_path / "shared-cache"
+    here = _shared_project(tmp_path / "here", shared)
+    away = _shared_project(tmp_path / "away", shared)
+    (away / "data" / "raw" / "input.txt").write_text("on the mounted project volume\n")
+    _ok(_run(here, "repro"))
+    _ok(_run(away, "repro"))
+    output = away / "data" / "shadow" / "shout.txt"
+    entry = gc.register_path(shared, away)
+    assert output.is_symlink() and output.resolve().exists()
+    assert entry.exists()
+
+    hidden = tmp_path / "project-volume-unmounted"
+    away.rename(hidden)
+    away.mkdir()  # The mount point remains, but it has no .pivot state directory.
+    try:
+        refused = _run(here, "gc", "--yes", "--grace-hours", "0")
+    finally:
+        away.rmdir()
+        hidden.rename(away)
+
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert str(entry) in out, out
+    assert output.resolve().exists(), "gc removed an object from the unmounted project"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can create files in a read-only directory")
+def test_a_writer_that_cannot_register_refuses_before_naming_objects(
+    tmp_path: pathlib.Path,
+) -> None:
+    """M3: a shared-cache writer whose register is unwritable must not make a live link.
+
+    A real `pivot repro` from the unregistered project must fail before its naming unit writes
+    the stage lock or symlink checkout. Another project's real collection therefore cannot
+    remove an output the unregistered writer was allowed to name.
+    """
+    shared = tmp_path / "shared-cache"
+    collector = _shared_project(tmp_path / "collector", shared)
+    writer = _shared_project(tmp_path / "writer", shared)
+    (writer / "data" / "raw" / "input.txt").write_text("writer cannot register\n")
+    _ok(_run(collector, "repro"))
+    register = shared / gc.REGISTER_DIR
+    mode = register.stat().st_mode
+    register.chmod(0o555)
+    try:
+        refused = _run(writer, "repro")
+    finally:
+        register.chmod(mode)
+    collected = _run(collector, "gc", "--yes", "--grace-hours", "0")
+
+    out = refused.stdout + refused.stderr
+    output = writer / "data" / "shadow" / "shout.txt"
+    assert refused.returncode != 0, out
+    assert "Cannot record this project in the cache register" in out, out
+    assert not output.is_symlink(), "an unregistered writer named an object in its workspace"
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+
 def test_pivot_gc_keeps_everything_for_a_link_into_the_cache_root_but_not_its_objects(
     tmp_path: pathlib.Path,
 ) -> None:
