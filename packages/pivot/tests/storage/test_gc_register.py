@@ -78,3 +78,19 @@ def test_a_naming_unit_reregisters_after_another_writer_replaces_the_entry(
     _unit(cache_dir, root, state_dir)
 
     assert json.loads(entry.read_text())["host"] != "pivot-other-node"
+
+
+def test_a_naming_unit_reregisters_after_its_view_nonce_changes(tmp_path: pathlib.Path) -> None:
+    """Another process of this view registers in between and writes a new nonce. The next unit
+    here must not trust what it verified before: it writes a nonce and an entry that agree."""
+    root, state_dir, cache_dir = _project(tmp_path)
+    _unit(cache_dir, root, state_dir)
+    entry = gc.project_register_path(cache_dir, root, state_dir)
+    assert entry is not None
+    nonces = state_dir / "state.lmdb" / gc.VIEW_NONCE_DIR
+    (nonce_file,) = nonces.iterdir()
+    nonce_file.write_text("0" * 32 + "\n")
+
+    _unit(cache_dir, root, state_dir)
+
+    assert json.loads(entry.read_text())["nonce"] == nonce_file.read_text().strip()

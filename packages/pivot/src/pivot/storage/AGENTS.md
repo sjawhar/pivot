@@ -366,26 +366,29 @@ resolved object root (a `files/` symlink would split the lock).
 **Every unit registers its project** (`naming_unit(cache_root, project=(root, state_dir))`),
 under the shared lock and before anything is named, so every process that names an object is
 in the register, whichever command it runs and whether or not the cache existed when it began.
-Only a test standing in for a writer passes `project=None`. Registration tries to write the
-project id, with the inode of the state directory it was made in, to
-`<state dir>/state.lmdb/pivot-project-id` (a copy gets a new id), records mount points at or
-below the project root and state directory, and records cache-root submounts in
-`<cache>/mounts/`. Entries and cache mount records are keyed per view (hostname and mount
-namespace). An id write failure leaves an id-less entry, so a collection refuses it but the
-writer preserves #503's unusable-state behavior. A register write failure refuses the writer.
-The only exception is `EROFS` on the cache: a read-only cache cannot be collected either. A
-restore that links a cache object into a workspace outside a naming unit (`checkout`, a skipped
-stage's restore, `--checkout-missing`) runs a registering unit first.
+Only a test standing in for a writer passes `project=None`. A full registration (a process's
+first unit, or after its evidence changed) tries to write the project id to
+`<state dir>/state.lmdb/pivot-project-id`, then a fresh nonce for this view to
+`<state dir>/state.lmdb/gc-views/<view>`, then the entry recording both, the mount points at or
+below the project root and state directory, and cache-root submounts in `<cache>/mounts/`.
+Entries, nonces and cache mount records are keyed per view (hostname, machine id and mount
+namespace). An id or nonce write failure leaves an entry without them, so a collection refuses
+it but the writer preserves #503's unusable-state behavior. A register write failure refuses the
+writer. The only exception is `EROFS` on the cache: a read-only cache cannot be collected
+either. A restore that links a cache object into a workspace outside a naming unit
+(`checkout`, a skipped stage's restore, `--checkout-missing`) runs a registering unit first.
 
 **A registered project is live only after a real read.** `read_register` resolves the state
-directory from that project's own `core.state_dir` and requires the entry's project id there,
-made in that state directory. For this view's entries every recorded mount must be mounted;
-another view's entry may record only its root and state directory. Any missing evidence
-refuses collection and names the entry. `resolve_scopes` then opens every scope's root,
-`.pivot` and state directory. When `core.state_dir` differs from `.pivot`, collection reads
-both state layouts so a 0.5.2 lock in `.pivot` still protects its object. The writer-side
-registration memo (`_VERIFIED_REGISTRATIONS`) only lets a naming unit skip re-registration; no
-collection read uses it.
+directory from that project's own `core.state_dir`, requires the entry's project id there, and
+requires the entry's nonce in that view's nonce file, read in the collector's own view: an
+inode number is not proof (an overlay copy or a cloned disk shares it). For this view's entries
+every recorded mount must be mounted; another view's entry may record only its root and state
+directory. Any missing evidence refuses collection and names the entry. `resolve_scopes` then
+opens every scope's root, `.pivot` and state directory. When `core.state_dir` differs from
+`.pivot`, collection reads both state layouts so a 0.5.2 lock in `.pivot` still protects its
+object. The writer-side registration memo (`_VERIFIED_REGISTRATIONS`) only lets a naming unit
+skip re-registration while the id file, the nonce file, the entry and the mount table are
+unchanged; no collection read uses it.
 
 ### Where flock is refused
 

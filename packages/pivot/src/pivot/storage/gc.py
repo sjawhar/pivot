@@ -72,16 +72,17 @@ _REGISTER_REFRESH_SECONDS = 3600.0
 # A cache key as it appears in the text of a record pivot cannot parse.
 _KEY_RE = re.compile(r"(?<![0-9a-zA-Z])[0-9a-f]{16}(?![0-9a-zA-Z])")
 # A project's identity lives in its state database directory, which the state directory's
-# ignore file keeps out of git, so two checkouts of one repository never share it. The file
-# holds the id and the inode of the state directory it was made in: a copy (`cp -a`, rsync) has
-# another inode, so it is another project. The inode, not the device, is compared: an NFS client
-# reports the server's inode but its own device number, so a project shared over NFS keeps its id.
+# ignore file keeps out of git, so two checkouts of one repository never share it. A copy (`cp
+# -a`, a container image, a cloned disk) keeps the id; the view nonce tells it apart.
 PROJECT_ID_FILE = "pivot-project-id"
-_PROJECT_ID_RE = re.compile(r"([0-9a-f]{32}) ([0-9]+)")
 _ENTRY_ID_RE = re.compile(r"[0-9a-f]{32}")
 # This process's mount namespace. Entries are keyed by it and the hostname, so each view of a
 # project (another host, a container that keeps the hostname) keeps its own mount evidence.
 _MOUNT_NAMESPACE = pathlib.Path("/proc/self/ns/mnt")
+# The machine id, so two machines that share a hostname (cloned VMs) are different views.
+_MACHINE_ID = pathlib.Path("/etc/machine-id")
+# One nonce file per view in a project's state directory: proof of what that view last wrote.
+VIEW_NONCE_DIR = "gc-views"
 # Mount points under the cache root that each view of the cache (host and mount namespace) saw,
 # one file per view, read by a collection before it trusts the register: a register or ref
 # directory on a mount that is not mounted holds no entries.
@@ -101,8 +102,13 @@ class ProjectEntry(TypedDict):
     last_write: str
     # None when the state directory cannot be written; a collection refuses such an entry.
     project_id: str | None
-    # The writer's mount namespace inode; None where the platform has none.
+    # The writer's machine id ("" where there is none) and mount namespace inode (None where the
+    # platform has none): with the hostname, the view this entry speaks for.
+    machine: str
     mount_ns: int | None
+    # The nonce this view wrote into the state directory just before this entry; None when the
+    # state directory cannot be written.
+    nonce: str | None
     # Mount points under the root and state directory; None where the mount table is unknown.
     mounts: list[str] | None
 
@@ -121,7 +127,9 @@ class _RegisteredProject(TypedDict):
 
     scope: ProjectScope
     project_id: str | None
+    machine: str
     mount_ns: int | None
+    nonce: str | None
     mounts: list[str] | None
     # The state directory the writer recorded, as its mounts are spelled in its view.
     recorded_state_dir: str
@@ -234,20 +242,33 @@ def _mount_namespace() -> int | None:
         return None
 
 
+def _machine_id() -> str:
+    """This machine's systemd machine id, or "" where there is none to read."""
+    try:
+        return _MACHINE_ID.read_text().strip()
+    except OSError:
+        return ""
+
+
+def _view_key(host: str, machine: str, mount_ns: int | None) -> str:
+    """The key of one view of a project: a hostname, a machine id and a mount namespace."""
+    return hashlib.sha256(f"{host}\0{machine}\0{mount_ns}".encode()).hexdigest()[:16]
+
+
+def _this_view() -> tuple[str, str, int | None]:
+    return socket.gethostname(), _machine_id(), _mount_namespace()
+
+
 def register_path(
-    cache_dir: pathlib.Path,
-    project_root: pathlib.Path,
-    project_id: str,
-    host: str,
-    mount_ns: int | None,
+    cache_dir: pathlib.Path, project_root: pathlib.Path, project_id: str, view_key: str
 ) -> pathlib.Path:
     """Return the register entry one view of a project owns in a cache.
 
-    The key holds the root, the project id, the hostname and the mount namespace. Each host and
-    each mount view of a project writes its own entry, so no writer replaces another's mount
-    evidence, and host-local projects at one path keep separate entries.
+    The key holds the root, the project id and the view (hostname, machine id and mount
+    namespace). Each host and each mount view of a project writes its own entry, so no writer
+    replaces another's mount evidence, and host-local projects at one path keep separate entries.
     """
-    key = f"{project_root}\0{project_id}\0{host}\0{mount_ns}"
+    key = f"{project_root}\0{project_id}\0{view_key}"
     digest = hashlib.sha256(key.encode()).hexdigest()[:16]
     return cache_dir / REGISTER_DIR / f"{digest}.json"
 
@@ -260,53 +281,59 @@ def project_register_path(
         project_id = _read_project_id(state_dir)
     except (OSError, ValueError):
         return None
-    return register_path(
-        cache_dir, project_root, project_id, socket.gethostname(), _mount_namespace()
-    )
+    return register_path(cache_dir, project_root, project_id, _view_key(*_this_view()))
 
 
-def register_entry_is_fresh(
-    cache_dir: pathlib.Path, project_root: pathlib.Path, state_dir: pathlib.Path
-) -> bool:
-    """Whether this view's register entry was written within ``_REGISTER_REFRESH_SECONDS``.
+def _view_nonce_path(state_dir: pathlib.Path, view_key: str) -> pathlib.Path:
+    """Where one view's latest registration nonce lives in a project's state directory (inside
+    ``state.lmdb``, which the state directory's ignore file keeps out of git)."""
+    return state_dir / "state.lmdb" / VIEW_NONCE_DIR / view_key
 
-    A read only: a caller that finds the entry fresh writes nothing, so it needs no lock.
+
+def _write_view_nonce(state_dir: pathlib.Path, view_key: str) -> str:
+    """Write a fresh nonce for this view into the state directory and return it.
+
+    Raises OSError or ValueError. The register entry written next records the same nonce. A
+    collection in any view accepts the entry only if it reads that nonce in its own view of this
+    state directory, which proves it reads the bytes this view last wrote, not a clone or an
+    overlay copy that shares the directory's inode number.
     """
-    path = project_register_path(cache_dir, project_root, state_dir)
-    if path is None:
-        return False
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        return False
-    return time.time() - mtime < _REGISTER_REFRESH_SECONDS
+    nonce = secrets.token_hex(16)
+    path = _view_nonce_path(state_dir, view_key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(fd: int) -> None:
+        with os.fdopen(fd, "w") as file:
+            file.write(nonce + "\n")
+
+    cache.atomic_write_file(path, write)
+    return nonce
+
+
+def _read_view_nonce(state_dir: pathlib.Path, view_key: str) -> str:
+    """Read one view's nonce without following a symlink. Raises OSError or ValueError."""
+    path = _view_nonce_path(state_dir, view_key)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(fd) as file:
+        nonce = file.read().strip()
+    if not _ENTRY_ID_RE.fullmatch(nonce):
+        raise ValueError(f"{path} does not hold a pivot view nonce")
+    return nonce
 
 
 def _project_id_path(state_dir: pathlib.Path) -> pathlib.Path:
     return state_dir / "state.lmdb" / PROJECT_ID_FILE
 
 
-class _CopiedProjectIdError(ValueError):
-    """A project id file made in another state directory: the project was copied."""
-
-
 def _read_project_id(state_dir: pathlib.Path) -> str:
-    """Read the project id without following a symlink. Raises OSError or ValueError.
-
-    The id counts only in the state directory it was made in; in a copy, whose state directory
-    has another inode, it raises ``_CopiedProjectIdError``.
-    """
+    """Read the project id without following a symlink. Raises OSError or ValueError."""
     path = _project_id_path(state_dir)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     with os.fdopen(fd) as file:
-        match = _PROJECT_ID_RE.fullmatch(file.read().strip())
-    if match is None:
+        project_id = file.read().strip()
+    if not _ENTRY_ID_RE.fullmatch(project_id):
         raise ValueError(f"{path} does not hold a pivot project id")
-    if int(match[2]) != os.stat(state_dir).st_ino:
-        raise _CopiedProjectIdError(
-            f"{path} was made in another state directory (this one is a copy)"
-        )
-    return match[1]
+    return project_id
 
 
 def _ensure_project_id(state_dir: pathlib.Path, project_root: pathlib.Path) -> str:
@@ -314,33 +341,24 @@ def _ensure_project_id(state_dir: pathlib.Path, project_root: pathlib.Path) -> s
 
     A new configured state directory takes the id from the project's `.pivot` state, so changing
     ``core.state_dir`` does not leave the project's current entry under a different identity. A
-    copied state directory gets a new id: it is another project, with its own records.
+    copy of a project keeps the id; what tells a copy from the project is the view nonce.
     """
-    copied = False
-    try:
+    with contextlib.suppress(FileNotFoundError):
         return _read_project_id(state_dir)
-    except FileNotFoundError:
-        pass
-    except _CopiedProjectIdError:
-        copied = True
     if not state_dir.is_dir():
         raise FileNotFoundError(errno.ENOENT, "state directory does not exist", str(state_dir))
     legacy = project_root / ".pivot"
     try:
-        project_id = _read_project_id(legacy) if legacy != state_dir and not copied else None
-    except (FileNotFoundError, _CopiedProjectIdError):
+        project_id = _read_project_id(legacy) if legacy != state_dir else None
+    except FileNotFoundError:
         project_id = None
     database_dir = state_dir / "state.lmdb"
     database_dir.mkdir(exist_ok=True)
     staged = database_dir / f".{PROJECT_ID_FILE}.{secrets.token_hex(8)}"
-    content = f"{project_id or secrets.token_hex(16)} {os.stat(state_dir).st_ino}\n"
     try:
-        staged.write_text(content)
-        if copied:
-            os.replace(staged, _project_id_path(state_dir))
-        else:
-            with contextlib.suppress(FileExistsError):
-                os.link(staged, _project_id_path(state_dir))
+        staged.write_text((project_id or secrets.token_hex(16)) + "\n")
+        with contextlib.suppress(FileExistsError):
+            os.link(staged, _project_id_path(state_dir))
     finally:
         staged.unlink(missing_ok=True)
     return _read_project_id(state_dir)
@@ -381,20 +399,21 @@ def _mount_points(table: bytes | None) -> frozenset[str] | None:
 
 
 # A writer-side shortcut only. Each naming unit registers its project, and a full registration
-# reads the project id, the mount table and two JSON files. This records, per process, the
-# evidence an entry was last written or checked against: the mount table bytes, the entry's
-# mtime and the project id file's (dev, ino, mtime). A unit skips re-registration only while
-# all of it is unchanged, the state directory is the same and the entry is still fresh. A
-# collection never reads this: `read_register` and `collect_roots` always read the files.
+# writes a fresh view nonce and the entry. This records, per process, the evidence an entry was
+# last written against: the mount table bytes, the entry's mtime, and the (dev, ino, mtime) of
+# the project id file and of this view's nonce file. A unit skips re-registration only while all
+# of it is unchanged, the state directory is the same and the entry is still fresh. A collection
+# never reads this: `read_register` and `collect_roots` always read the files.
 _RegistrationKey = tuple[pathlib.Path, pathlib.Path, pathlib.Path]
-_VerifiedRegistration = tuple[bytes, pathlib.Path, int, tuple[int, int, int]]
+_FileIdentity = tuple[int, int, int]
+_VerifiedRegistration = tuple[bytes, pathlib.Path, int, _FileIdentity, pathlib.Path, _FileIdentity]
 _VERIFIED_REGISTRATIONS = dict[_RegistrationKey, _VerifiedRegistration]()
 
 
-def _id_file_identity(state_dir: pathlib.Path) -> tuple[int, int, int] | None:
-    """The project id file's (dev, ino, mtime), or None when it cannot be read."""
+def _file_identity(path: pathlib.Path) -> _FileIdentity | None:
+    """A file's (dev, ino, mtime), or None when it cannot be read."""
     try:
-        stats = os.stat(_project_id_path(state_dir), follow_symlinks=False)
+        stats = os.stat(path, follow_symlinks=False)
     except (OSError, ValueError):
         return None
     return (stats.st_dev, stats.st_ino, stats.st_mtime_ns)
@@ -405,7 +424,9 @@ def _registration_unchanged(key: _RegistrationKey, table: bytes | None) -> bool:
     verified = _VERIFIED_REGISTRATIONS.get(key)
     if verified is None or table is None or verified[0] != table:
         return False
-    if _id_file_identity(key[2]) != verified[3]:
+    if _file_identity(_project_id_path(key[2])) != verified[3]:
+        return False
+    if _file_identity(verified[4]) != verified[5]:
         return False
     try:
         stats = verified[1].stat()
@@ -417,16 +438,19 @@ def _registration_unchanged(key: _RegistrationKey, table: bytes | None) -> bool:
     )
 
 
-def _remember_registration(key: _RegistrationKey, table: bytes | None, entry: pathlib.Path) -> None:
+def _remember_registration(
+    key: _RegistrationKey, table: bytes | None, entry: pathlib.Path, nonce_file: pathlib.Path
+) -> None:
     """Record the evidence ``entry`` now matches, so the next unconditional unit can skip."""
-    id_file = _id_file_identity(key[2])
-    if table is None or id_file is None:
+    id_file = _file_identity(_project_id_path(key[2]))
+    nonce_identity = _file_identity(nonce_file)
+    if table is None or id_file is None or nonce_identity is None:
         return
     try:
         mtime_ns = entry.stat().st_mtime_ns
     except OSError:
         return
-    _VERIFIED_REGISTRATIONS[key] = (table, entry, mtime_ns, id_file)
+    _VERIFIED_REGISTRATIONS[key] = (table, entry, mtime_ns, id_file, nonce_file, nonce_identity)
 
 
 def _mounts_under(points: frozenset[str] | None, bases: Iterable[pathlib.Path]) -> list[str] | None:
@@ -459,21 +483,19 @@ def _write_json(path: pathlib.Path, value: object) -> None:
     cache.atomic_write_file(path, write)
 
 
-def _cache_mounts_path(cache_dir: pathlib.Path, host: str, mount_ns: int | None) -> pathlib.Path:
-    digest = hashlib.sha256(f"{host}\0{mount_ns}".encode()).hexdigest()[:16]
-    return cache_dir / CACHE_MOUNTS_DIR / f"{digest}.json"
+def _cache_mounts_path(cache_dir: pathlib.Path, view_key: str) -> pathlib.Path:
+    return cache_dir / CACHE_MOUNTS_DIR / f"{view_key}.json"
 
 
 def _record_cache_mounts(cache_dir: pathlib.Path, points: frozenset[str] | None) -> None:
     """Record, for this view, the mount points below the cache root a register read depends on."""
-    host = socket.gethostname()
-    mount_ns = _mount_namespace()
-    path = _cache_mounts_path(cache_dir, host, mount_ns)
+    host, machine, mount_ns = _this_view()
+    path = _cache_mounts_path(cache_dir, _view_key(host, machine, mount_ns))
     real_cache = os.path.realpath(cache_dir)
     mounts = _mounts_under(points, [cache_dir])
     if mounts is not None:
         mounts = [mount for mount in mounts if mount != real_cache]
-    desired = {"host": host, "mount_ns": mount_ns, "mounts": mounts}
+    desired = {"host": host, "machine": machine, "mount_ns": mount_ns, "mounts": mounts}
     if _entry_from_file(path) != desired:
         path.parent.mkdir(exist_ok=True)
         _write_json(path, desired)
@@ -484,13 +506,14 @@ def register_project(
 ) -> None:
     """Record this project as a user of ``cache_dir`` with evidence a collection can verify.
 
-    The entry records the project id in its state directory and the mount points below its root
-    and state directory. The id is best-effort: a state directory that cannot be written (#503's
-    unusable layouts) gives an entry without an id, which a collection refuses, while the
-    writer keeps 0.5.2's behaviour. An unchanged entry is rewritten at most once per
-    ``_REGISTER_REFRESH_SECONDS``; changed evidence is written at once. The register write itself
-    must succeed before a writer names an object, so its failure refuses that writer. ``EROFS``
-    on the cache is the one exception: no collection can delete from a read-only cache.
+    The entry records the project id in its state directory, the mount points below its root
+    and state directory, and a fresh nonce this view writes into the state directory first. The
+    id and the nonce are best-effort: a state directory that cannot be written (#503's unusable
+    layouts) gives an entry without them, which a collection refuses, while the writer keeps
+    0.5.2's behaviour. Each process registers in full at its first naming unit, and again when
+    its evidence changes or the entry is ``_REGISTER_REFRESH_SECONDS`` old. The register write
+    itself must succeed before a writer names an object, so its failure refuses that writer.
+    ``EROFS`` on the cache is the one exception: no collection can delete from a read-only cache.
     """
     if not cache_dir.is_dir():
         return
@@ -500,37 +523,23 @@ def register_project(
         return
     _VERIFIED_REGISTRATIONS.pop(key, None)
     path = cache_dir / REGISTER_DIR
+    host, machine, mount_ns = _this_view()
+    view_key = _view_key(host, machine, mount_ns)
     try:
         project_id = _ensure_project_id(state_dir, project_root)
+        nonce: str | None = _write_view_nonce(state_dir, view_key)
     except (OSError, ValueError) as e:
-        logger.debug("Cannot write the project id in %s: %s", state_dir, e)
+        logger.debug("Cannot write the project id or view nonce in %s: %s", state_dir, e)
         project_id = None
+        nonce = None
     try:
-        mount_ns = _mount_namespace()
-        path = register_path(
-            cache_dir, project_root, project_id or "", socket.gethostname(), mount_ns
-        )
+        path = register_path(cache_dir, project_root, project_id or "", view_key)
         points = _mount_points(table)
         try:
             mounts = _mounts_under(points, [project_root, state_dir])
         except (OSError, ValueError) as e:
             logger.debug("Cannot record mounts for %s: %s", project_root, e)
             mounts = None
-        existing = _entry_from_file(path)
-        if (
-            existing is not None
-            and project_id is not None
-            and register_entry_is_fresh(cache_dir, project_root, state_dir)
-            and existing.get("root") == str(project_root)
-            and existing.get("state_dir") == str(state_dir)
-            and existing.get("host") == socket.gethostname()
-            and existing.get("project_id") == project_id
-            and existing.get("mount_ns") == mount_ns
-            and existing.get("mounts") == mounts
-        ):
-            _record_cache_mounts(cache_dir, points)
-            _remember_registration(key, table, path)
-            return
         try:
             version = importlib.metadata.version("pivot")
         except importlib.metadata.PackageNotFoundError:  # pragma: no cover - always installed
@@ -538,11 +547,13 @@ def register_project(
         entry = ProjectEntry(
             root=str(project_root),
             state_dir=str(state_dir),
-            host=socket.gethostname(),
+            host=host,
             pivot=version,
             last_write=datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             project_id=project_id,
+            machine=machine,
             mount_ns=mount_ns,
+            nonce=nonce,
             mounts=mounts,
         )
         _write_json(path, entry)
@@ -550,9 +561,8 @@ def register_project(
         if project_id is not None:
             # This view's entry without an id, written while the state directory could not
             # hold one, is superseded: the entry just written covers the same root and view.
-            idless = register_path(cache_dir, project_root, "", socket.gethostname(), mount_ns)
-            idless.unlink(missing_ok=True)
-            _remember_registration(key, table, path)
+            register_path(cache_dir, project_root, "", view_key).unlink(missing_ok=True)
+            _remember_registration(key, table, path, _view_nonce_path(state_dir, view_key))
     except (OSError, ValueError) as e:
         if isinstance(e, OSError) and e.errno == errno.EROFS:
             logger.debug("%s is on a read-only filesystem; nothing can delete there", path)
@@ -587,7 +597,9 @@ def _project_from_entry(path: pathlib.Path) -> _RegisteredProject:
     last_write = entry.get("last_write")
     project_id = entry.get("project_id")
     mounts = entry.get("mounts")
+    machine = entry.get("machine")
     mount_ns = entry.get("mount_ns")
+    nonce = entry.get("nonce")
     scope = ProjectScope(
         root=pathlib.Path(root),
         # The collector resolves the project's current state directory before it reads records.
@@ -607,7 +619,9 @@ def _project_from_entry(path: pathlib.Path) -> _RegisteredProject:
         project_id=project_id
         if isinstance(project_id, str) and _ENTRY_ID_RE.fullmatch(project_id)
         else None,
+        machine=machine if isinstance(machine, str) else "",
         mount_ns=mount_ns if isinstance(mount_ns, int) and not isinstance(mount_ns, bool) else None,
+        nonce=nonce if isinstance(nonce, str) and _ENTRY_ID_RE.fullmatch(nonce) else None,
         mounts=cast("list[str] | None", mounts),
         recorded_state_dir=state_dir if isinstance(state_dir, str) else str(scope["state_dir"]),
     )
@@ -678,7 +692,10 @@ def _identity_reason(
             + f"project is gone for good or its state database was reset, delete {entry} and "
             + "re-run",
         )
-    if scope["host"] != socket.gethostname() or registered["mount_ns"] != _mount_namespace():
+    if (nonce_reason := _view_nonce_reason(entry, registered)) is not None:
+        return nonce_reason
+    host, machine, mount_ns = _this_view()
+    if (scope["host"], registered["machine"], registered["mount_ns"]) != (host, machine, mount_ns):
         return _other_view_reason(entry, registered)
     mounts = registered["mounts"]
     if mounts is None or points is None:
@@ -696,6 +713,39 @@ def _identity_reason(
             + "project; its naming step records the mounts it has now",
         )
     return None
+
+
+def _view_nonce_reason(
+    entry: pathlib.Path, registered: _RegisteredProject
+) -> tuple[str, str] | None:
+    """Why this view cannot prove it reads the state the entry's view last wrote, or None.
+
+    An inode number is not proof: containers from one image (overlayfs) and VMs cloned from one
+    disk show different state directories with the same inode. The entry's view wrote a fresh
+    nonce into its state directory just before the entry; reading the same nonce here proves this
+    view reads those bytes (one directory, as over NFS), not a clone or an overlay copy.
+    """
+    scope = registered["scope"]
+    view_key = _view_key(scope["host"], registered["machine"], registered["mount_ns"])
+    if registered["nonce"] is None:
+        detail = "the entry records no view nonce"
+    else:
+        try:
+            nonce = _read_view_nonce(scope["state_dir"], view_key)
+        except (OSError, ValueError) as e:
+            detail = f"no nonce for that view readable here: {_error_text(e)}"
+        else:
+            if nonce == registered["nonce"]:
+                return None
+            detail = "this state directory holds an older or different nonce for that view"
+    return (
+        scope_label(scope),
+        f"{_recorded_where(scope)}, and this host cannot prove it reads the state that view last "
+        + f"wrote in {scope['state_dir']} ({detail}). This path may hold a copy of that project "
+        + "(a container's overlay, a cloned disk) rather than the project itself. Run `pivot gc` "
+        + "where that view's state directory is visible; if that view is gone for good, delete "
+        + f"{entry} and re-run",
+    )
 
 
 def _other_view_reason(
@@ -758,9 +808,10 @@ def _cache_mount_reasons(
             continue
         recorded_mounts = cast("list[str] | None", mounts)
         same_view = (
-            recorded.get("host") == socket.gethostname()
-            and recorded.get("mount_ns") == _mount_namespace()
-        )
+            recorded.get("host"),
+            recorded.get("machine"),
+            recorded.get("mount_ns"),
+        ) == _this_view()
         if not same_view:
             if recorded_mounts != []:
                 what = "unknown" if recorded_mounts is None else ", ".join(recorded_mounts)

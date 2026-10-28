@@ -129,7 +129,7 @@ def _register_fresh(root: pathlib.Path) -> pathlib.Path:
     the cache. The tests then hold the exclusive lock against the writer sites alone."""
     cache_dir = root / ".pivot" / "cache"
     gc.register_project(cache_dir, root, root / ".pivot")
-    assert gc.register_entry_is_fresh(cache_dir, root, root / ".pivot")
+    assert _entry(cache_dir, root).exists()
     return cache_dir
 
 
@@ -976,13 +976,15 @@ def test_pivot_gc_reads_the_current_state_dir_after_a_project_reconfigures(
     _ok(_run(collector, "repro"))
     _ok(_run(writer, "repro"))
     entry = _entry(shared, writer)
-    stale_entry = entry.read_text()
+    stale_state_dir = json.loads(entry.read_text())["state_dir"]
     (writer / ".pivot" / "config.yaml").write_text(
         (writer / ".pivot" / "config.yaml").read_text() + "core:\n  state_dir: state\n"
     )
     (writer / "data" / "raw" / "input.txt").write_text("new configured state\n")
     _ok(_run(writer, "repro"))
-    entry.write_text(stale_entry)  # An older host has not refreshed its state-dir field yet.
+    # The entry's recorded state directory is stale (its nonce is current): gc must not use it.
+    current = json.loads(entry.read_text())
+    entry.write_text(json.dumps({**current, "state_dir": stale_state_dir}))
     output = writer / "data" / "shadow" / "shout.txt"
     assert output.is_symlink()
     current_object = output.resolve()
@@ -1167,14 +1169,15 @@ def test_pivot_gc_refuses_another_hosts_root_when_this_path_is_a_different_proje
 def test_pivot_gc_collects_a_shared_project_registered_by_another_host(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A project visible from two hosts has one id, so another host's entry stays usable."""
+    """A project another host reads through the same filesystem (as over NFS) has one id, and
+    this host reads the nonce that host wrote in it, so that host's entry stays usable."""
     shared = tmp_path / "shared-cache"
     here = _shared_project(tmp_path / "here", shared)
     away = _shared_project(tmp_path / "shared-project", shared)
-    _ok(_run(here, "status"))
-    _, kept = _cached_link(away, shared, "data.txt", "named by the shared project\n")
-    entry = _entry(shared, away)
-    _rewrite_entry_host(entry, "pivot-other-node")
+    _cached_link(here, shared, "first.txt", "makes the cache\n")
+    (away / "data.txt").write_text("named by the shared project\n")
+    _ok(_in_view(away, "track", "data.txt", hostname="pivot-other-node"))
+    kept = _tracked_object(away / "data.txt.pvt", shared)
     dead = _publish(shared / "files", tmp_path, "an orphan in a shared cache\n")
 
     collected = _run(here, "gc", "--yes", "--grace-hours", "0")
@@ -1612,3 +1615,152 @@ def test_pivot_gc_refuses_another_views_cache_mount(tmp_path: pathlib.Path) -> N
     assert collected.returncode != 0, out
     assert str(refs) in out, out
     assert target.exists(), "gc removed an object another view's cache mount keeps"
+
+
+# =============================================================================
+# Round 8: an inode number is not proof; each view proves what it last wrote
+# =============================================================================
+
+
+def _sudo(*args: str) -> None:
+    subprocess.run(["sudo", "-n", *args], check=True, capture_output=True)
+
+
+def _image_project(path: pathlib.Path, shared: pathlib.Path) -> pathlib.Path:
+    """A project built in an image layer that ran `pivot repro` at build time, so its state
+    directory, project id and view nonce are part of the image."""
+    root = _shared_project(path, shared)
+    (root / "data" / "raw" / "input.txt").write_text("image\n")
+    _ok(_run(root, "repro"))
+    return root
+
+
+def _shared_object(shared: pathlib.Path, scratch: pathlib.Path, text: str) -> pathlib.Path:
+    """Where the object holding ``text`` lives in the shared cache."""
+    probe = scratch / "object-probe"
+    probe.write_text(text)
+    key, _ = cache.hash_file(probe)
+    probe.unlink()
+    return cache.get_cache_path(shared / "files", key)
+
+
+def test_pivot_gc_refuses_another_containers_project_from_the_same_image(
+    tmp_path: pathlib.Path,
+) -> None:
+    """P18c: two containers from one image (an overlay over a lower layer that holds the
+    project). Their state directories show the same inode, but each container writes its own
+    upper layer. c1's collection must not read its own layer as c2's project."""
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True, check=False).returncode:
+        pytest.skip("an overlay mount needs passwordless sudo")
+    shared = tmp_path / "shared-cache"
+    image = tmp_path / "image"
+    image.mkdir()
+    _image_project(image / "project", shared)
+    work = tmp_path / "work"
+    work.mkdir()
+    root = work / "project"
+
+    def overlay(name: str) -> str:
+        (tmp_path / name / "upper").mkdir(parents=True)
+        (tmp_path / name / "work").mkdir()
+        options = f"lowerdir={image},upperdir={tmp_path / name / 'upper'},workdir={tmp_path / name / 'work'}"
+        return f"mount -t overlay overlay -o {shlex.quote(options)} {shlex.quote(str(work))}"
+
+    c1, c2 = overlay("c1"), overlay("c2")
+    try:
+        write_c2 = f"{c2}\necho c2 > {shlex.quote(str(root / 'data' / 'raw' / 'input.txt'))}"
+        _ok(_in_view(root, "repro", hostname="pivot-c2", setup=write_c2))
+        c2_output = tmp_path / "c2" / "upper" / "project" / "data" / "shadow" / "shout.txt"
+        obj = pathlib.Path(os.readlink(c2_output))
+        assert obj.exists()
+
+        collected = _in_view(
+            root, "gc", "--yes", "--grace-hours", "0", hostname="pivot-c1", setup=c1
+        )
+    finally:
+        # overlayfs leaves a root-owned directory in each workdir that pytest cannot remove.
+        _sudo("rm", "-rf", str(tmp_path / "c1" / "work"), str(tmp_path / "c2" / "work"))
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode != 0, out
+    assert "pivot-c2" in out, out
+    assert obj.exists(), "c1's gc read its own layer as c2's project"
+
+
+@contextlib.contextmanager
+def _disk_images(tmp_path: pathlib.Path, shared: pathlib.Path) -> Iterator[pathlib.Path]:
+    """An ext4 image holding a project, loop-mounted at ``tmp_path/work`` (this host's view);
+    yields the mount point and unmounts it at the end."""
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True, check=False).returncode:
+        pytest.skip("loop-mounting a disk image needs passwordless sudo")
+    work = tmp_path / "work"
+    work.mkdir()
+    disk = tmp_path / "disk1.img"
+    subprocess.run(["truncate", "-s", "128M", str(disk)], check=True)
+    subprocess.run(["/usr/sbin/mkfs.ext4", "-q", "-F", str(disk)], check=True)
+    _sudo("mount", "-o", "loop", str(disk), str(work))
+    try:
+        _sudo("chown", f"{os.getuid()}:{os.getgid()}", str(work))
+        yield work
+    finally:
+        _sudo("umount", str(work))
+
+
+def _clone_disk(tmp_path: pathlib.Path) -> str:
+    """Clone disk1 (unmounted for the copy, then mounted again) and return the setup that
+    mounts the clone at the same path in another view: a VM created from node1's disk."""
+    work = tmp_path / "work"
+    subprocess.run(["sync"], check=True)
+    _sudo("umount", str(work))
+    subprocess.run(
+        ["cp", "--sparse=always", str(tmp_path / "disk1.img"), str(tmp_path / "disk2.img")],
+        check=True,
+    )
+    _sudo("mount", "-o", "loop", str(tmp_path / "disk1.img"), str(work))
+    return f"mount -o loop {shlex.quote(str(tmp_path / 'disk2.img'))} {shlex.quote(str(work))}"
+
+
+def test_pivot_gc_refuses_a_vm_cloned_from_this_disk(tmp_path: pathlib.Path) -> None:
+    """P18v: node2 is a VM created from node1's disk image: the same path, the same inode
+    numbers, the same project id. node2 runs a new output; node1's collection must not read
+    node1's own records as node2's project."""
+    shared = tmp_path / "shared-cache"
+    with _disk_images(tmp_path, shared) as work:
+        root = _image_project(work / "project", shared)
+        node2 = _clone_disk(tmp_path)
+        write = f"{node2}\necho node2 > {shlex.quote(str(root / 'data' / 'raw' / 'input.txt'))}"
+        repro = _in_view(root, "repro", hostname="pivot-node2", setup=write)
+        _ok(repro)
+        obj = _shared_object(shared, tmp_path, "NODE2\n")
+        assert obj.exists()
+
+        collected = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode != 0, out
+    assert "pivot-node2" in out, out
+    assert obj.exists(), "node1's gc read node1's records as node2's project"
+
+
+def test_pivot_gc_refuses_a_stale_clone_after_the_original_writes_again(
+    tmp_path: pathlib.Path,
+) -> None:
+    """P18v, clone after write: node1 registers, node2 is cloned from node1's disk, then node1
+    registers again and runs a new output. node2's clone holds node1's old nonce, so node2's
+    collection must refuse node1's entry instead of reading its stale copy as node1's records."""
+    shared = tmp_path / "shared-cache"
+    with _disk_images(tmp_path, shared) as work:
+        root = _image_project(work / "project", shared)
+        node2 = _clone_disk(tmp_path)
+        (root / "data" / "raw" / "input.txt").write_text("node1 again\n")
+        _ok(_run(root, "repro"))
+        obj = _shared_object(shared, tmp_path, "NODE1 AGAIN\n")
+        assert obj.exists()
+
+        collected = _in_view(
+            root, "gc", "--yes", "--grace-hours", "0", hostname="pivot-node2", setup=node2
+        )
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode != 0, out
+    assert obj.exists(), "node2's gc read its stale clone as node1's project"

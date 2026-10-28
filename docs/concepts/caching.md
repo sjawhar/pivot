@@ -129,22 +129,23 @@ hosts on one.
 
 A `cache.dir` outside the project root (or a `PIVOT_CACHE_DIR` pointing elsewhere) can hold
 the outputs of projects whose locks this one cannot read. Each view of a project records itself
-in the cache under `projects/<digest>.json`. A view is one host and mount namespace, so the key
-holds the root, the project id, the hostname and the mount namespace:
+in the cache under `projects/<digest>.json`. A view is one hostname, machine id and mount
+namespace, so the key holds the root, the project id and the view:
 
 ```json
 {"root": "/home/me/experiment", "state_dir": "/home/me/experiment/.pivot",
- "host": "workstation", "pivot": "0.5.12", "last_write": "2026-10-27T06:43:11Z",
- "project_id": "0f8c...", "mount_ns": 4026531841, "mounts": ["/home/me/experiment/data"]}
+ "host": "workstation", "machine": "4f1c...", "mount_ns": 4026531841, "pivot": "0.5.12",
+ "last_write": "2026-10-27T06:43:11Z", "project_id": "0f8c...", "nonce": "9b2e...",
+ "mounts": ["/home/me/experiment/data"]}
 ```
 
 The project id is a random value in `<state dir>/state.lmdb/pivot-project-id`, so git never
-copies it to another checkout. The file also holds the inode of the state directory it was
-made in. A copy made with `cp -a` or rsync has another inode, so its first writer gives it a
-new id: it is another project. A project shared over NFS keeps one inode on every client, so
-it keeps its id. Two separately mounted copies do not. A project that sets a new
-`core.state_dir` copies the id from its `.pivot` state. `mounts` lists the mount points at or
-below the project root and state directory that this view saw.
+copies it to another checkout. A copy of the project (`cp -a`, a container built from an image
+that holds it, a VM cloned from its disk) keeps the id and can keep its directories' inode
+numbers, so neither proves which project a view reads. Each full registration therefore writes
+a fresh nonce into `<state dir>/state.lmdb/gc-views/<view>` first, then the entry that records
+it. A project that sets a new `core.state_dir` copies the id from its `.pivot` state. `mounts`
+lists the mount points at or below the project root and state directory that this view saw.
 
 Every pivot process that names a cache object registers its project first, inside the naming
 lock described above: a stage commit, a run-cache restore, `pivot commit`, `pivot track` and
@@ -159,10 +160,13 @@ follows 0.5.2 behavior, and gc refuses that entry with recovery instructions. A 
 is the one exception to a register-write failure, because no collection can delete from it.
 
 A collection reads every entry, and an entry is live only after the collection finds its
-project id, made in that very state directory, in the project's current state directory. An
-absent or unreadable root, state directory or id refuses the collection and names the entry:
-the project may be on a disk that is not mounted, in another mount namespace, or on another
-host, and a different project may hold the same local path there. For an entry from this view,
+project id in the project's current state directory and reads there, in its own view, the
+nonce the entry records. A project shared over NFS shows another host's latest nonce, so it
+stays collectable; a container's overlay or a cloned disk holds at most an older nonce, so the
+collection refuses rather than read that copy as the project. An absent or unreadable root,
+state directory, id or nonce refuses the collection and names the entry: the project may be on
+a disk that is not mounted, in another mount namespace, or on another host, and a different
+project may hold the same local path there. For an entry from this view,
 every recorded mount must still be mounted. If you removed a mount on purpose, run
 `pivot checkout` in that project; its naming step records the mounts it has now. An entry from
 another host or mount namespace may record only the project root and state directory as
