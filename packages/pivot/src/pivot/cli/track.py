@@ -74,17 +74,14 @@ def _track_single_path(
             + "Tracked path may not be portable across environments."
         )
 
-    # Check for duplicate tracking
+    # Check for duplicate tracking.
     pvt_path = track_mod.get_pvt_path(path)
     already_tracked = abs_path_str in existing_tracked
     if already_tracked and not force:
         raise click.ClickException(f"'{path_str}' is already tracked. Use --force to update.")
 
-    # Check for overlap with stage outputs (resolve paths to detect symlink aliasing)
-    try:
-        overlap = ownership.find_declared_overlap(path, stage_outputs, project_root)
-    except OSError as e:
-        raise click.ClickException(repr(e)) from e
+    # Check every pipeline output. OSError reaches the command error handler, which names path.
+    overlap = ownership.find_declared_overlap(path, stage_outputs, project_root)
     if overlap is not None:
         if not already_tracked:
             raise click.ClickException(
@@ -92,7 +89,7 @@ def _track_single_path(
                 + "it runs. Move it outside every stage output (for example under data/raw/) "
                 + "and track it there."
             )
-        # A file tracked there before this check existed: update it, and warn, as status does
+        # A file tracked there before this check existed: update it, and warn, as status does.
         warnings.append(
             f"Warning: '{path_str}' is tracked inside a stage output: {overlap}. Move it and "
             + "its .pvt sidecar outside every stage output (for example under data/raw/); until "

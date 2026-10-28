@@ -7,7 +7,7 @@
 The `pivot_command` decorator wraps Click commands with two essential behaviors:
 
 1. **Auto-discovery** - Discovers `pipeline.py` (`discovery.discover_pipeline()`) and stores the Pipeline in the Click context before the command runs
-2. **Error handling** - Converts `PivotError` exceptions to user-friendly `ClickException` messages
+2. **Error handling** - Converts `PivotError` exceptions to user-friendly `ClickException` messages. Any other exception becomes one line from `exceptions.describe_error`, never a Python repr: an `OSError` as `<strerror>: <path>` (`<strerror>: <path> -> <path2>` for two paths, `<strerror>` for none), anything else as `Unexpected <type>: <message>`; `pivot --verbose` logs its traceback. Let an unexpected exception reach this handler rather than printing `str(e)` or `repr(e)` yourself; `ctx.exit(code)` passes through with its exit code.
 
 ```python
 from pivot.cli import decorators as cli_decorators
