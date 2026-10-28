@@ -23,6 +23,7 @@ import enum
 import functools
 import os
 import pathlib
+import stat
 from typing import TYPE_CHECKING, TypedDict
 
 import lmdb
@@ -347,6 +348,22 @@ def paths_overlap(path_a: pathlib.Path, path_b: pathlib.Path) -> bool:
     )
 
 
+def _lstat_mode(path: str | pathlib.Path) -> int | None:
+    """``os.lstat(path).st_mode``, None when nothing is at ``path``, or 0 when ``lstat`` fails
+    otherwise.
+
+    The walk below asks this first, so a path where nothing is costs one system call. Every
+    other answer goes on to the ``pathlib`` predicates the walk has always used, which decide
+    (and raise) as before: 0 is no file type, so it always goes on.
+    """
+    try:
+        return os.lstat(path).st_mode
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return 0
+
+
 def _is_stage_member(
     pvt_path: pathlib.Path, data: track.PvtData | None, members: StageMembers
 ) -> bool:
@@ -379,25 +396,37 @@ def find_output_overlaps(
     whose ``path`` names a file inside an output; Pivot never writes one.
     """
     root = normalized(project_root)
+    root_str = str(root)
+    root_prefix = os.path.join(root_str, "")
     found = dict[pathlib.Path, OutputOverlap]()
-    checked = set[pathlib.Path]()
+    checked = set[str]()
     for replacement in replacements:
         output_path = normalized(replacement["path"])
-        current = output_path if replacement["kind"] is not ReplacementKind.TRACKED else root
-        while current != root and current.is_relative_to(root) and current not in checked:
+        # Normalized absolute strings: is_relative_to is a prefix test, parent is dirname
+        current = (
+            str(output_path) if replacement["kind"] is not ReplacementKind.TRACKED else root_str
+        )
+        while current != root_str and current.startswith(root_prefix) and current not in checked:
             checked.add(current)
-            pvt_path = track.get_pvt_path(current)
-            if pvt_path.is_file() or pvt_path.is_symlink():
-                data = track.read_pvt_file(pvt_path)
-                if data is None or pvt_path.parent / data["path"] == current:
-                    found[pvt_path] = SidecarOverlap(
-                        tracked_path=None if data is None else current,
-                        pvt_path=pvt_path,
-                        replacement=replacement,
-                    )
-            current = current.parent
+            # The sidecar get_pvt_path names: the path's own name with ".pvt" appended
+            if _lstat_mode(current + ".pvt") is not None:
+                current_path = pathlib.Path(current)
+                pvt_path = track.get_pvt_path(current_path)
+                if pvt_path.is_file() or pvt_path.is_symlink():
+                    data = track.read_pvt_file(pvt_path)
+                    if data is None or pvt_path.parent / data["path"] == current_path:
+                        found[pvt_path] = SidecarOverlap(
+                            tracked_path=None if data is None else current_path,
+                            pvt_path=pvt_path,
+                            replacement=replacement,
+                        )
+            current = os.path.dirname(current)
 
-        if not output_path.is_dir() or output_path.is_symlink():
+        # A file output, or nothing, is the common case: one lstat answers it
+        mode = _lstat_mode(output_path)
+        if mode is None or stat.S_ISREG(mode):
+            continue
+        if not stat.S_ISDIR(mode) and (not output_path.is_dir() or output_path.is_symlink()):
             continue
         members: StageMembers | None = None
         unreadable = list[OSError]()

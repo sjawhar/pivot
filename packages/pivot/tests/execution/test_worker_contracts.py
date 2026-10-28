@@ -1605,6 +1605,34 @@ def test_output_write_refuses_every_output_before_removing_any(tmp_path: pathlib
     assert pvt_path.exists()
 
 
+def test_single_output_write_refuses_before_removing_it(tmp_path: pathlib.Path) -> None:
+    """A stage with one output is refused at that output, which only ``prepare_output`` checks.
+
+    A stage that writes several outputs is checked over all of them first, so a refusal changes
+    none of them; one output needs that pass no more than the check ``prepare_output`` makes
+    just before it clears the output, since nothing happens between the two.
+    """
+    store = store_mod.WorkspaceStore(tmp_path, "skip", {}, cache_dir=tmp_path / "cache")
+    tree = _ref(
+        _STAGE,
+        "tree",
+        tag=types.ArtifactTag.DIRECTORY,
+        loader=cast("loaders.Loader[object, object]", loaders.Text()),
+    )
+    output_path = store.resolve_display_path(tree)
+    tracked = output_path / "saved.txt"
+    pvt_path = _helper_track_in_place(tracked, "user input")
+    (output_path / "previous.txt").write_text("previous run")
+
+    with pytest.raises(exceptions.PivotError, match=r"saved\.txt\.pvt"):
+        worker._write_outputs_with_store({tree: {"generated.txt": "generated"}}, store, tmp_path)
+
+    assert tracked.read_text() == "user input"
+    assert pvt_path.exists()
+    assert (output_path / "previous.txt").read_text() == "previous run"
+    assert not (output_path / "generated.txt").exists()
+
+
 def test_writer_failure_keeps_later_sibling_output_unchanged(tmp_path: pathlib.Path) -> None:
     """A writer exception must not clear a sibling output before that sibling's writer runs."""
     store = store_mod.WorkspaceStore(tmp_path, "skip", {}, cache_dir=tmp_path / "cache")

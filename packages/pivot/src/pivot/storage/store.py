@@ -157,6 +157,7 @@ class WorkspaceStore:
     _pipeline_name: str
     _input_bindings: dict[str, str]
     _path_map: dict[str, types.ArtifactIdentity]
+    _output_paths: dict[types.ArtifactRef, pathlib.Path]
     _cache_dir: pathlib.Path | None
     _checkout_modes: list[config.CheckoutMode] | None
 
@@ -173,6 +174,7 @@ class WorkspaceStore:
         self._pipeline_name = pipeline_name
         self._input_bindings = input_bindings.copy()
         self._path_map = {}
+        self._output_paths = {}
         self._cache_dir = cache_dir.resolve() if cache_dir is not None else None
         self._checkout_modes = checkout_modes
 
@@ -188,12 +190,18 @@ class WorkspaceStore:
         return self._project_root / "data" / "raw" / name
 
     def _resolve_output_path(self, ref: types.ArtifactRef) -> pathlib.Path:
+        # A stage asks for each output's path several times (its write, each ownership check,
+        # its commit), and the placement depends on the ref alone: compute it once per ref
+        cached = self._output_paths.get(ref)
+        if cached is not None:
+            return cached
         path = self._project_root / relative_output_path(ref)
         logical_path = pathlib.Path(os.path.normpath(path))
         if not logical_path.is_relative_to(self._project_root):
             raise ValueError(
                 f"Output {types.identity_key(ref.identity)!r} maps outside project root: {path}"
             )
+        self._output_paths[ref] = path
         return path
 
     def _resolve_path(self, ref: types.ArtifactRef) -> pathlib.Path:

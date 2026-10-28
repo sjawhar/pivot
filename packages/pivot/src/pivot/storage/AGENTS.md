@@ -133,10 +133,11 @@ When multiple `pivot` processes share the same StateDB:
   are the user's, even when one sits inside a stage output.
 - Every path that removes or replaces a stage output in the workspace calls
   `ownership.refuse_output_replacements` (or `find_output_overlaps`) before it removes anything
-  and raises `OutputOwnershipError` naming each file. A stage's output write checks all of the
-  stage's outputs first (`worker._write_outputs_with_store` →
-  `WorkspaceStore.refuse_output_replacements`), then each one again in
-  `WorkspaceStore.prepare_output` just before clearing it. Also checked:
+  and raises `OutputOwnershipError` naming each file. A stage that writes more than one output
+  checks all of them first (`worker._write_outputs_with_store` →
+  `WorkspaceStore.refuse_output_replacements`), so a refusal changes none of them, and then each
+  one again in `WorkspaceStore.prepare_output` just before clearing it. A stage with one output
+  gets the `prepare_output` check alone: nothing happens between the two. Also checked:
   `WorkspaceStore.restore_from_cache` (generation, lock and run-cache restores),
   `WorkspaceStore.commit` (the stage's own commit and `pivot commit`), an incremental output's
   restore, `pivot checkout` and `pivot pull`, `pivot get --force` and the presentation layer. Add
@@ -167,6 +168,13 @@ When multiple `pivot` processes share the same StateDB:
   the project, so it does not see a `.pvt` outside an output whose `path` field names a file inside
   it. Pivot never writes one (`track`, `import` and `update` write the data file's own name), and
   catching a hand-edited one would need a project-wide walk on every output write.
+- The common case, a project where no output holds or sits under a `.pvt`, costs one `lstat` per
+  path the check looks at: `ownership._lstat_mode` answers "nothing there" for a sidecar and
+  "a regular file" for an output, and a `.pvt` that does exist, or an output that is not a plain
+  file, goes on to the `pathlib` predicates, which decide (and raise) as before. Keep it that way:
+  a `.pvt` the walk would read, or a claim it would build, is work every run of every project
+  pays. `WorkspaceStore` resolves each output's path once per ref, since a stage asks for it at
+  its write, at each ownership check and at its commit.
 - A directory under a replacement that Pivot cannot read is a blocking overlap
   (`ownership.UnreadableOverlap`): `os.walk` reports it through `onerror`, and Pivot refuses,
   naming it, rather than skip it, because a tracked file may hide inside where it cannot look.

@@ -1775,8 +1775,10 @@ def _write_outputs_with_store(
                 returned[ref] = {pvt: frozenset[str]() for pvt in brought}
         # Check all workspace outputs first, so an ownership refusal changes none of the stage's
         # previous outputs. Each output is prepared immediately before its writer runs, preserving
-        # sibling outputs if that writer raises.
-        store.refuse_output_replacements(checked, claims, returned)
+        # sibling outputs if that writer raises. prepare_output checks the output it clears, so a
+        # single output needs no check before it: nothing happens between the two.
+        if len(checked) > 1:
+            store.refuse_output_replacements(checked, claims, returned)
     paths = dict[types.ArtifactRef, pathlib.Path]()
     written = dict[types.ArtifactRef, ownership.StageMembers]()
     for ref, value in checked.items():
