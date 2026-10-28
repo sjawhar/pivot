@@ -13,7 +13,7 @@ import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
 from pivot import state_dir as state_dir_mod
-from pivot.storage import cache, listing, lock, state, track
+from pivot.storage import cache, listing, lock, ownership, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
@@ -298,20 +298,44 @@ def resolve_targets(
 
 
 def _write_fallback_content(
-    dest_path: pathlib.Path, content: bytes, state_dir: pathlib.Path
+    dest_path: pathlib.Path,
+    content: bytes,
+    lock_token: str | None,
+    before_swap: Callable[[pathlib.Path], None],
 ) -> os.stat_result:
-    """Atomically replace a cache-miss target under the resolved state directory's restore lock;
-    return the written file's stat, taken before it replaced the target."""
+    """Atomically replace a cache-miss target; return the staged file's stat before its swap."""
 
     def write_content(fd: int) -> None:
         with os.fdopen(fd, "wb") as file:
             file.write(content)
 
+    staging_path = (
+        cache.restore_staging_path(dest_path, lock_token) if lock_token is not None else None
+    )
+    return cache.atomic_write_file(
+        dest_path, write_content, staging_path=staging_path, before_swap=before_swap
+    )
+
+
+def _refuse_swap(target: ownership.ForcedRestore, entry: pathlib.Path) -> None:
+    """Raise if the entry the swap of ``target`` removes holds a user's file."""
+    refusal = ownership.swap_refusal(project.get_project_root(), target, entry)
+    if refusal is not None:
+        raise refusal
+
+
+def _replace_checked[T](
+    dest_path: pathlib.Path,
+    target: ownership.ForcedRestore,
+    state_dir: pathlib.Path,
+    replace: Callable[[str | None, Callable[[pathlib.Path], None]], T],
+) -> T:
+    """Run ``replace`` under the target state directory's restore lock and ownership checks."""
     with cache.restore_lock(dest_path, state_dir) as lock_token:
-        staging_path = (
-            cache.restore_staging_path(dest_path, lock_token) if lock_token is not None else None
-        )
-        return cache.atomic_write_file(dest_path, write_content, staging_path=staging_path)
+        refusal = ownership.forced_restore_refusal(project.get_project_root(), [target])
+        if refusal is not None:
+            raise refusal
+        return replace(lock_token, functools.partial(_refuse_swap, target))
 
 
 def _reason(error: exceptions.PivotError | OSError) -> str:
@@ -365,6 +389,7 @@ def restore_file(
     cache_dir: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     force: bool,
+    target: ownership.ForcedRestore,
     *,
     remote_factory: Callable[[], RemoteStorage],
     state_dir: pathlib.Path | None = None,
@@ -377,9 +402,14 @@ def restore_file(
     from the remote ``remote_factory`` opens; it is called only when that download is needed.
     A remote that raised ``RemoteUnreachableError`` is named in the result's
     ``unreachable_remote``.
+    ``target`` is what the restore replaces (``_restore_targets``). Each write checks it again
+    under the restore lock, just before it builds the replacement, and once more at the swap; a
+    refusal is this target's error. For a stage output restored to its own path, the ``*.pvt``
+    members ``output_hash`` writes are recorded as the stage's before anything is written.
 
-    ``members`` is a directory's listing at the revision; None reads the cache's object. A
-    directory with neither is not restored: no listing names the files to restore or download.
+    ``members`` is a directory's listing at the revision; None reads the cache's object, once,
+    here, for the ``*.pvt`` record and the restore. A directory with neither is not restored: no
+    listing names the files to restore or download.
 
     A restore appends ``(path, stat, hash)`` for each file it writes to ``recorded``, for the
     caller to batch by state directory, so the next status, explanation or run looks the file up
@@ -387,11 +417,59 @@ def restore_file(
     place. ``state_dir`` is the stage's own state directory for a stage target, otherwise the
     configured directory from ``config.locate_state_dir()``.
     """
-    state_dir = state_dir or config.locate_state_dir()
-    path_str = str(dest_path)
-    files_dir = cache_dir / "files"
     if (skipped := _skipped(dest_path, force)) is not None:
         return skipped
+
+    if members is None and output_hash is not None and is_dir_hash(output_hash):
+        try:
+            members = cache.cached_listing(cache_dir / "files", output_hash)
+        except (exceptions.PivotError, OSError) as error:
+            # The cache strategy reads it again and reports the error if it happens again
+            logger.debug("Cannot read the cached listing for %s: %s", rel_path, error)
+    if members is not None and "restored_members" not in target:
+        # The ownership checks read the restored directory's files from the same listing
+        target = target.copy()
+        target["restored_members"] = members
+    if target["claims"] is not None and output_hash is not None:
+        ownership.record_restored(target["claims"], dest_path, output_hash, members)
+
+    state_dir = state_dir or config.locate_state_dir()
+    try:
+        return _restore_from_sources(
+            rel_path,
+            output_hash,
+            rev,
+            dest_path,
+            cache_dir,
+            checkout_modes,
+            target,
+            remote_factory,
+            state_dir,
+            recorded,
+            members,
+        )
+    except exceptions.OutputOwnershipError as error:
+        return RestoreResult(
+            status=RestoreStatus.ERROR, path=str(dest_path), message=f"Error: {dest_path} - {error}"
+        )
+
+
+def _restore_from_sources(
+    rel_path: str,
+    output_hash: HashInfo | None,
+    rev: str,
+    dest_path: pathlib.Path,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
+    target: ownership.ForcedRestore,
+    remote_factory: Callable[[], RemoteStorage],
+    state_dir: pathlib.Path,
+    recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None,
+    members: listing.DirListing | None,
+) -> RestoreResult:
+    """``restore_file``'s strategies, each write under ``_replace_checked``."""
+    path_str = str(dest_path)
+    files_dir = cache_dir / "files"
 
     # Ensure parent directory exists before any restore strategy
     try:
@@ -406,6 +484,7 @@ def restore_file(
     # Strategy 1: Try local cache (if hash available). A directory needs its listing: the one
     # committed at the revision, else the cache's object.
     if output_hash is not None:
+        cached_hash = output_hash
         restored = list[tuple[pathlib.Path, os.stat_result, str]]()
         success = False
         try:
@@ -418,18 +497,27 @@ def restore_file(
                     cache.resolve_cache_object_path(files_dir, output_hash["hash"]) is not None
                 )
             if should_try_cache:
-                success = cache.restore_from_cache(
+                success = _replace_checked(
                     dest_path,
-                    output_hash,
-                    files_dir,
-                    checkout_modes=checkout_modes,
-                    state_dir=state_dir,
-                    members=members,
-                    recorded=restored,
+                    target,
+                    state_dir,
+                    lambda token, before_swap: cache.restore_from_cache(
+                        dest_path,
+                        cached_hash,
+                        files_dir,
+                        checkout_modes=checkout_modes,
+                        state_dir=state_dir,
+                        lock_token=token,
+                        members=members,
+                        before_swap=before_swap,
+                        recorded=restored,
+                    ),
                 )
-        except (exceptions.PivotError, OSError) as e:
-            # Strategy 3 retries this restore, and reports the error if it happens again
-            logger.debug(f"Cache restore failed for {rel_path}: {e}")
+        except exceptions.OutputOwnershipError:
+            raise
+        except (exceptions.PivotError, OSError) as error:
+            # Strategy 3 retries this restore, and reports the error if it happens again.
+            logger.debug("Cache restore failed for %s: %s", rel_path, error)
         if success:
             if recorded is not None:
                 recorded.extend(restored)
@@ -438,17 +526,25 @@ def restore_file(
                 path=path_str,
                 message=f"Restored: {dest_path} (from cache)",
             )
-
     # Strategy 2: Try git fallback
     content = git.read_file_from_revision(rel_path, rev)
     if content is not None:
         try:
-            written = _write_fallback_content(dest_path, content, state_dir)
-        except OSError as e:
+            written = _replace_checked(
+                dest_path,
+                target,
+                state_dir,
+                lambda token, before_swap: _write_fallback_content(
+                    dest_path, content, token, before_swap
+                ),
+            )
+        except exceptions.OutputOwnershipError:
+            raise
+        except OSError as error:
             return RestoreResult(
                 status=RestoreStatus.ERROR,
                 path=path_str,
-                message=f"Error: {dest_path} - failed to write from git: {e}",
+                message=f"Error: {dest_path} - failed to write from git: {error}",
             )
         if recorded is not None:
             recorded.append((dest_path, written, xxhash.xxh64(content).hexdigest()))
@@ -471,6 +567,7 @@ def restore_file(
                 message=f"Error: {dest_path} - not in local cache or git, and no committed or "
                 + "cached listing names its files to download from the remote",
             )
+        cached_hash = output_hash
         source = "cache"
         remote: RemoteStorage | None = None
         downloaded = list[tuple[pathlib.Path, os.stat_result, str]]()
@@ -482,15 +579,24 @@ def restore_file(
                 source = "remote"
                 remote = remote_factory()
                 _download(remote, files_dir, missing_hashes)
-            success = cache.restore_from_cache(
+            success = _replace_checked(
                 dest_path,
-                output_hash,
-                files_dir,
-                checkout_modes=checkout_modes,
-                state_dir=state_dir,
-                members=members,
-                recorded=downloaded,
+                target,
+                state_dir,
+                lambda token, before_swap: cache.restore_from_cache(
+                    dest_path,
+                    cached_hash,
+                    files_dir,
+                    checkout_modes=checkout_modes,
+                    state_dir=state_dir,
+                    lock_token=token,
+                    members=members,
+                    before_swap=before_swap,
+                    recorded=downloaded,
+                ),
             )
+        except exceptions.OutputOwnershipError:
+            raise
         except exceptions.RemoteError as e:
             failure = RestoreResult(
                 status=RestoreStatus.ERROR,
@@ -527,6 +633,106 @@ def restore_file(
     )
 
 
+def _current_output_hashes(stage_target: StageTarget) -> dict[str, HashInfo]:
+    """The hashes the stage's current lock records, by workspace path relative to the root."""
+    lock_data = lock.StageLock(
+        stage_target["stage_name"], lock.get_stages_dir(stage_target["state_dir"])
+    ).read()
+    if lock_data is None:
+        return {}
+    recorded_paths = (
+        lock_data["output_paths"]
+        if "output_paths" in lock_data
+        else dict[types.ArtifactIdentity, str]()
+    )
+    hashes = dict[str, HashInfo]()
+    for identity, output_hash in lock_data["output_hashes"].items():
+        path = recorded_paths.get(identity) or stage_target["paths_by_key"].get(identity.key)
+        if path is not None:
+            hashes[path] = output_hash
+    return hashes
+
+
+def _read_claims(
+    proj_root: pathlib.Path, stage_target: StageTarget, files_dir: pathlib.Path
+) -> ownership.StageClaims:
+    """The stage's claims (``ownership.StageClaims``): the hashes its current lock records, its
+    ``nocommit:`` record and the cache object root ``files_dir``, with a recorder for the
+    ``*.pvt`` members ``get`` writes."""
+    return ownership.read_stage_claims(
+        proj_root,
+        stage_target["stage_name"],
+        stage_target["state_dir"],
+        {
+            proj_root / path: output_hash
+            for path, output_hash in _current_output_hashes(stage_target).items()
+        },
+        cache_dir=files_dir,
+        recorder=functools.partial(
+            ownership.record_members,
+            proj_root,
+            stage_target["state_dir"],
+            stage_target["stage_name"],
+        ),
+    )
+
+
+def _restore_targets(
+    proj_root: pathlib.Path,
+    target_infos: list[TargetInfo],
+    output: pathlib.Path | None,
+    stage_targets: Mapping[str, StageTarget],
+    files_dir: pathlib.Path,
+) -> dict[tuple[int, str], ownership.ForcedRestore]:
+    """What restoring each path of each target replaces, keyed by (target index, path), for
+    ``ownership.forced_restore_refusal``. A target whose ``.pvt`` is not valid is only reported,
+    never restored, so it is left out.
+
+    A tracked or git file restored to its own path is its own restore: it may replace its own
+    content, never another tracked file, import or sidecar beneath it. A stage output restored to
+    its own path is that stage's output, checked with the stage's claims and the revision's hash.
+    An ``--output`` path is a destination the user named.
+    """
+    restores = dict[tuple[int, str], ownership.ForcedRestore]()
+    for index, target_info in enumerate(target_infos):
+        if "error" in target_info:
+            continue
+        stage_target = (
+            stage_targets[target_info["original_target"]]
+            if target_info["target_type"] is TargetType.STAGE
+            else None
+        )
+        claims = (
+            functools.cache(functools.partial(_read_claims, proj_root, stage_target, files_dir))
+            if stage_target is not None
+            else None
+        )
+        for rel_path in target_info["paths"]:
+            own_path = proj_root / rel_path
+            dest_path = output if output is not None else own_path
+            restored = target_info["hashes"].get(rel_path)
+            if dest_path != own_path:
+                restore = ownership.ForcedRestore(
+                    replacement=ownership.destination(dest_path), restored=restored, claims=None
+                )
+            elif stage_target is not None:
+                restore = ownership.ForcedRestore(
+                    replacement=ownership.stage_output(dest_path, stage_target["stage_name"]),
+                    restored=restored,
+                    claims=claims,
+                )
+            else:
+                restore = ownership.ForcedRestore(
+                    replacement=ownership.tracked_restore(dest_path), restored=restored, claims=None
+                )
+            # The listing at the revision names a restored directory's files
+            members = target_info["members"].get(rel_path)
+            if members is not None:
+                restore["restored_members"] = members
+            restores[(index, rel_path)] = restore
+    return restores
+
+
 def restore_targets_from_revision(
     targets: Sequence[str],
     rev: str,
@@ -540,10 +746,13 @@ def restore_targets_from_revision(
 ) -> tuple[list[str], bool]:
     """Restore targets from a git revision.
 
+    A relative ``output`` is relative to the working directory.
+
     Returns:
         Tuple of (messages, success) where success is False if any files failed.
     """
     proj_root = project.get_project_root()
+    output_path = output if output is None or output.is_absolute() else pathlib.Path.cwd() / output
 
     # Validate revision exists
     commit_sha = git.resolve_revision(rev)
@@ -559,6 +768,16 @@ def restore_targets_from_revision(
             raise exceptions.GetError("--output/-o can only be used with a single target")
         if len(target_infos[0]["paths"]) != 1:
             raise exceptions.GetError("--output/-o can only be used with a single output")
+
+    restores = _restore_targets(
+        proj_root, target_infos, output_path, stage_targets, cache_dir / "files"
+    )
+    # Only --force replaces an existing path; check every one before any is replaced. Each is
+    # checked again just before it is replaced (`restore_file`).
+    if force:
+        refusal = ownership.forced_restore_refusal(proj_root, restores.values())
+        if refusal is not None:
+            raise refusal
 
     results = list[RestoreResult]()
     # Resolves the remote and builds its backend once per call, not once per target that misses
@@ -582,7 +801,7 @@ def restore_targets_from_revision(
     # project state directory.
     batch = state.FileHashBatch()
     try:
-        for target_info in target_infos:
+        for index, target_info in enumerate(target_infos):
             hash_state_dir = (
                 stage_targets[target_info["original_target"]]["state_dir"]
                 if target_info["target_type"] is TargetType.STAGE
@@ -590,7 +809,7 @@ def restore_targets_from_revision(
             )
             for rel_path in target_info["paths"]:
                 output_hash = target_info["hashes"].get(rel_path)
-                dest_path = output if output is not None else proj_root / rel_path
+                dest_path = output_path if output_path is not None else proj_root / rel_path
                 if "error" in target_info:
                     # A target already in the workspace is kept, as for a valid .pvt, so the
                     # check refuses nothing that get skipped before it.
@@ -613,6 +832,7 @@ def restore_targets_from_revision(
                     cache_dir=cache_dir,
                     checkout_modes=checkout_modes,
                     force=force,
+                    target=restores[(index, rel_path)],
                     remote_factory=reachable_remote,
                     state_dir=hash_state_dir,
                     recorded=recorded,

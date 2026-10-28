@@ -539,11 +539,15 @@ with Pipeline("p") as pipeline:
 def _helper_import_into_declared_output(
     runner: click.testing.CliRunner, source: _Source, bucket: _Bucket, consumer: pathlib.Path
 ) -> None:
-    """Import smoke/total to data/p/tree/imported.txt, inside stage p/tree's directory output."""
-    (consumer / "pipeline.py").write_text(_DIRECTORY_OUTPUT_PIPELINE)
+    """Import smoke/total to data/p/tree/imported.txt, then declare stage p/tree's output around it.
+
+    `pivot import` refuses a destination inside any declared output, so pipeline.py, whose stage
+    p/tree declares data/p/tree/ as a directory output, is written after the import.
+    """
     _helper_publish(source, bucket, "smoke/total", b"sum: 6\n", "v1")
     data_path = _helper_import(runner, source, "smoke/total", "data/p/tree/imported.txt")
     assert data_path.read_bytes() == b"sum: 6\n"
+    (consumer / "pipeline.py").write_text(_DIRECTORY_OUTPUT_PIPELINE)
 
 
 def test_import_into_a_declared_directory_output_stays_listed_as_tracked(
@@ -551,8 +555,8 @@ def test_import_into_a_declared_directory_output_stays_listed_as_tracked(
 ) -> None:
     """Audit D1, `pivot import --out` into a declared output: the tracked view lists it.
 
-    `pivot import` checks no stage overlap, so its sidecar can sit inside a stage's directory
-    output; `pivot status --tracked-only` must still list it.
+    An import made before a pipeline declares the output around it leaves its sidecar inside that
+    stage's directory output; `pivot status --tracked-only` must still list it.
     """
     _helper_import_into_declared_output(runner, source, bucket, consumer)
 

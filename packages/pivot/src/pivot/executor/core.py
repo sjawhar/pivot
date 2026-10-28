@@ -21,7 +21,7 @@ import loky.reusable_executor
 from pivot import config, discovery, exceptions, loaded_source, parameters, project, registry, types
 from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
-from pivot.storage import cache, lock, track
+from pivot.storage import cache, lock, ownership, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import OnError, StageStatus
@@ -572,14 +572,16 @@ def _restore_tracked_file(
     path: pathlib.Path,
     track_data: track.PvtData,
     cache_dir: pathlib.Path,
+    project_root: pathlib.Path,
     state_dir: pathlib.Path,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]],
 ) -> bool:
-    """Restore a tracked file or directory from cache, appending each file restored to
-    ``recorded`` for the caller to record in the StateDB.
+    """Restore a tracked file or directory from cache without replacing a user file that lands
+    while staging.
 
-    Returns True if successfully restored, False if not in cache. A directory is restored from
-    its committed listing file, else the cache's listing object.
+    Each restored file is appended to ``recorded`` for the caller to record in StateDB
+    (``cache.restore_from_cache``). Returns True if successful, False if not in cache. A
+    directory is restored from its committed listing file, else the cache's listing object.
     """
     output_hash = track.pvt_to_hash_info(track_data)
     members = None
@@ -588,8 +590,20 @@ def _restore_tracked_file(
             members = track.tracked_members(path, track_data, cache_dir)
         except exceptions.ListingMissingError:
             return False
+    target = ownership.ForcedRestore(
+        replacement=ownership.tracked_restore(path),
+        restored=output_hash,
+        claims=None,
+    )
+    if members is not None:
+        target["restored_members"] = members
 
-    # Use default checkout modes (hardlink with copy fallback)
+    def before_swap(entry: pathlib.Path) -> None:
+        refusal = ownership.swap_refusal(project_root, target, entry)
+        if refusal is not None:
+            raise refusal
+
+    # Use default checkout modes (hardlink with copy fallback).
     checkout_modes = config.get_checkout_mode_order()
     return cache.restore_from_cache(
         path,
@@ -598,6 +612,7 @@ def _restore_tracked_file(
         checkout_modes=checkout_modes,
         state_dir=state_dir,
         members=members,
+        before_swap=before_swap,
         recorded=recorded,
     )
 
@@ -639,7 +654,9 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                     raise FileNotFoundError(data_path)
             except FileNotFoundError:
                 if checkout_missing:
-                    if _restore_tracked_file(path, track_data, cache_dir, state_dir, pending):
+                    if _restore_tracked_file(
+                        path, track_data, cache_dir, project_root, state_dir, pending
+                    ):
                         logger.info(f"Restored tracked file: {data_path}")
                     else:
                         logger.debug(f"Failed to restore tracked file from cache: {data_path}")

@@ -10,10 +10,12 @@ import pytest
 import xxhash
 
 from pivot import cli, exceptions, executor, project
+from pivot.executor import core as executor_core
 from pivot.storage import cache, track
 from tests import helpers
 
 if TYPE_CHECKING:
+    import os
     from collections.abc import Callable
 
     import click.testing
@@ -267,6 +269,68 @@ def test_checkout_missing_restores_tracked_directory_from_its_listing_file(
     assert (data_dir / "a.jpg").read_bytes() == b"image1", "a.jpg is back in the workspace"
     assert (data_dir / "b.jpg").read_bytes() == b"image2", "b.jpg is back in the workspace"
     assert _output("count_images").read_text() == "2"
+
+
+def test_checkout_missing_keeps_a_tracked_file_that_lands_during_directory_restore(
+    test_pipeline: Pipeline,
+    pipeline_dir: pathlib.Path,
+    runner: click.testing.CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user file and sidecar copied into a missing tracked directory while its cache restore
+    stages its replacement are refused and left in place."""
+    data_dir = pipeline_dir / "data"
+    data_dir.mkdir()
+    (data_dir / "cached.txt").write_text("cached data")
+    assert runner.invoke(cli.cli, ["track", "data"]).exit_code == 0
+    cache.remove_output(data_dir)
+
+    original_checkout = cache._checkout_with_fallback
+    landed = False
+
+    def stage_then_copy_user_file(
+        path: pathlib.Path,
+        cache_path: pathlib.Path,
+        checkout_modes: list[cache.CheckoutMode],
+        *,
+        executable: bool | None = None,
+        staging_path: pathlib.Path | None = None,
+        keep_existing_copy: bool = False,
+        display_path: pathlib.Path | None = None,
+        before_swap: Callable[[pathlib.Path], None] | None = None,
+        cache_root: cache.CacheRoot | None = None,
+    ) -> os.stat_result:
+        nonlocal landed
+        staged = original_checkout(
+            path,
+            cache_path,
+            checkout_modes,
+            executable=executable,
+            staging_path=staging_path,
+            keep_existing_copy=keep_existing_copy,
+            display_path=display_path,
+            before_swap=before_swap,
+            cache_root=cache_root,
+        )
+        if not landed:
+            data_dir.mkdir()
+            user_file = data_dir / "user.txt"
+            user_file.write_text("user bytes")
+            track.write_pvt_file(
+                track.get_pvt_path(user_file),
+                track.PvtData(path="user.txt", hash="0123456789abcdef", size=10),
+            )
+            landed = True
+        return staged
+
+    monkeypatch.setattr(cache, "_checkout_with_fallback", stage_then_copy_user_file)
+
+    with pytest.raises(exceptions.OutputOwnershipError, match="user.txt.pvt"):
+        executor_core.verify_tracked_files(pipeline_dir, checkout_missing=True)
+
+    assert landed
+    assert (data_dir / "user.txt").read_text() == "user bytes"
+    assert track.get_pvt_path(data_dir / "user.txt").is_file()
 
 
 def test_checkout_missing_reports_tracked_input_absent_from_cache(

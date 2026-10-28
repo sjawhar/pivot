@@ -6,10 +6,10 @@ from typing import TypedDict
 
 import click
 
-from pivot import config, git, project
+from pivot import config, discovery, git, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
-from pivot.storage import cache, listing, state
+from pivot.storage import cache, listing, ownership, state
 from pivot.storage import track as track_mod
 
 
@@ -18,67 +18,6 @@ class TrackResult(TypedDict):
 
     warning: str | None
     tracked_path: str
-
-
-def _paths_overlap(path_a: pathlib.Path, path_b: pathlib.Path) -> bool:
-    """Check if two paths overlap (same location or parent/child relationship)."""
-    # Exact match - use samefile if both exist (handles hardlinks, case-insensitivity)
-    if path_a.exists() and path_b.exists():
-        try:
-            if path_a.samefile(path_b):
-                return True
-        except OSError:
-            pass
-
-    if path_a == path_b:
-        return True
-
-    return path_a.is_relative_to(path_b) or path_b.is_relative_to(path_a)
-
-
-def _get_all_stage_outputs() -> dict[str, pathlib.Path]:
-    """Get stage outputs with resolved paths for overlap detection.
-
-    Returns:
-        Dict mapping normalized path -> resolved path
-
-    Raises:
-        click.ClickException: If any stage output has unresolvable issues
-            (permission errors, circular symlinks, etc.)
-
-    Note:
-        Resolves all paths upfront and fails fast if any are problematic.
-        This provides clear error messages showing ALL issues at once.
-    """
-    store = cli_helpers.get_workspace_store()
-    if store is None:
-        return {}
-
-    # Workspace paths of every declared output (the same resolution checkout/verify use)
-    outputs_normalized = set[str]()
-    for stage_name in cli_helpers.list_stages():
-        info = cli_helpers.get_stage(stage_name)
-        outputs_normalized.update(str(store.resolve_display_path(out)) for out in info["outs"])
-
-    # Pre-resolve all stage outputs with explicit error handling
-    outputs_resolved = dict[str, pathlib.Path]()
-    resolution_errors = list[str]()
-
-    for norm_path in outputs_normalized:
-        try:
-            resolved = project.resolve_path_for_comparison(norm_path, "stage output")
-            outputs_resolved[norm_path] = resolved
-        except (PermissionError, RuntimeError, OSError) as e:
-            # Collect errors to show all problems at once
-            resolution_errors.append(f"  - {norm_path}: {e}")
-
-    if resolution_errors:
-        raise click.ClickException(
-            "Cannot resolve stage outputs (fix these before tracking):\n"
-            + "\n".join(resolution_errors)
-        )
-
-    return outputs_resolved
 
 
 def _tracking_files(data_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
@@ -147,7 +86,7 @@ def _foreign_listing(
 def _track_single_path(
     path_str: str,
     cache_dir: pathlib.Path,
-    stage_outputs_resolved: dict[str, pathlib.Path],
+    stage_outputs: dict[str, ownership.DeclaredOutput],
     existing_tracked: dict[str, track_mod.PvtData],
     force: bool,
     *,
@@ -191,7 +130,7 @@ def _track_single_path(
     # Check if tracking file inside symlinked directory. The .pvt is written beside the data
     # (get_pvt_path), so a directory that really lies outside the project takes the .pvt with
     # it, where no command finds it again: refuse before anything is cached or written.
-    warning: str | None = None
+    warnings = list[str]()
     if project.contains_symlink_in_path(path, project_root):
         outside = project.real_location_outside(path.parent, project_root.resolve())
         if outside is not None:
@@ -200,35 +139,34 @@ def _track_single_path(
                 + f"in '{outside}', where pivot does not find it. Track the file where it "
                 + "really is, inside the project."
             )
-        warning = (
+        warnings.append(
             f"Warning: '{path_str}' is inside a symlinked directory. "
             + "Tracked path may not be portable across environments."
         )
 
-    # Check for overlap with stage outputs (resolve paths to detect symlink aliasing); an
-    # OSError here reaches the command's error handler, which names the path.
-    user_resolved = path.resolve()
-
-    for out_norm, out_resolved in stage_outputs_resolved.items():
-        if _paths_overlap(user_resolved, out_resolved):
-            # Provide helpful error showing both normalized and resolved if different
-            if str(user_resolved) != abs_path_str or str(out_resolved) != out_norm:
-                # Symlink aliasing detected
-                raise click.ClickException(
-                    f"Cannot track '{path_str}' (resolves to '{user_resolved}'): "
-                    + f"overlaps with stage output '{out_norm}' (resolves to '{out_resolved}')"
-                )
-            else:
-                # Direct overlap
-                raise click.ClickException(
-                    f"Cannot track '{path_str}': overlaps with stage output '{out_norm}'"
-                )
-
-    # Check for duplicate tracking
+    # Check for duplicate tracking.
     pvt_path = track_mod.get_pvt_path(path)
-    if abs_path_str in existing_tracked and not force:
+    already_tracked = abs_path_str in existing_tracked
+    if already_tracked and not force:
         raise click.ClickException(f"'{path_str}' is already tracked. Use --force to update.")
     track_mod.validate_pvt_path_name(path.name)
+
+    # Check every pipeline output. OSError reaches the command error handler, which names path.
+    overlap = ownership.find_declared_overlap(path, stage_outputs, project_root)
+    if overlap is not None:
+        if not already_tracked:
+            raise click.ClickException(
+                f"Cannot track '{path_str}': {overlap}, and that stage replaces its output when "
+                + "it runs. Move it outside every stage output (for example under data/raw/) "
+                + "and track it there."
+            )
+        # A file tracked there before this check existed: update it, and warn, as status does.
+        warnings.append(
+            f"Warning: '{path_str}' is tracked inside a stage output: {overlap}. Move it and "
+            + "its .pvt sidecar outside every stage output (for example under data/raw/); until "
+            + "then Pivot refuses to replace that output."
+        )
+    warning = "\n".join(warnings) if warnings else None
 
     # Hash and cache
     listing_path = listing.tracked_listing_path(pvt_path)
@@ -294,7 +232,7 @@ def _track_single_path(
     return TrackResult(warning=warning, tracked_path=path_str)
 
 
-@cli_decorators.pivot_command()
+@cli_decorators.pivot_command(auto_discover=False)
 @click.argument("paths", nargs=-1, required=True)
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing .pvt files")
 @click.pass_context
@@ -309,9 +247,9 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
     project_root = project.get_project_root()
     cache_dir = config.get_cache_dir() / "files"
 
-    # Get all stage outputs for overlap detection
-    pipeline = cli_decorators.get_pipeline_from_context()
-    stage_outputs = {} if pipeline is None else _get_all_stage_outputs()
+    # Every pipeline's outputs, not only the pipeline this directory selects: a file tracked in
+    # another pipeline's output would be removed when that pipeline runs.
+    stage_outputs = discovery.declared_outputs(project_root)
 
     # Discover existing .pvt files
     existing_tracked = track_mod.discover_pvt_files(project_root)

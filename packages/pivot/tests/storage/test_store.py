@@ -5,12 +5,15 @@ import os
 import pathlib
 import pickle
 import stat
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from pivot import config, loaders, types
-from pivot.storage import listing, store
+from pivot import config, exceptions, loaders, types
+from pivot.storage import cache, listing, ownership, store, track
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
 
 
 def _helper_ref(
@@ -142,6 +145,134 @@ def test_workspace_store_commit_and_restore(tmp_path: pathlib.Path) -> None:
     restored = workspace_store.restore_from_cache(ref, output_hash)
     assert restored is True
     assert output_path.read_text() == "hello cache"
+
+
+def test_workspace_store_keeps_a_tracked_file_that_lands_during_restore_staging(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run-cache restore refuses a user file and sidecar that land while its directory
+    replacement is staged."""
+    workspace_store = store.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="pipe",
+        input_bindings={},
+        cache_dir=tmp_path / "cache" / "files",
+        checkout_modes=[config.CheckoutMode.COPY],
+    )
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
+    output_path = workspace_store.prepare_output(ref)
+    (output_path / "cached.txt").write_text("cached")
+    output_hash = workspace_store.commit(ref, output_path)
+    cache.remove_output(output_path)
+
+    original_checkout = cache._checkout_with_fallback
+    landed = False
+
+    def stage_then_copy_user_file(
+        path: pathlib.Path,
+        cache_path: pathlib.Path,
+        checkout_modes: list[cache.CheckoutMode],
+        *,
+        executable: bool | None = None,
+        staging_path: pathlib.Path | None = None,
+        keep_existing_copy: bool = False,
+        display_path: pathlib.Path | None = None,
+        before_swap: Callable[[pathlib.Path], None] | None = None,
+        cache_root: cache.CacheRoot | None = None,
+    ) -> os.stat_result:
+        nonlocal landed
+        staged = original_checkout(
+            path,
+            cache_path,
+            checkout_modes,
+            executable=executable,
+            staging_path=staging_path,
+            keep_existing_copy=keep_existing_copy,
+            display_path=display_path,
+            before_swap=before_swap,
+            cache_root=cache_root,
+        )
+        if not landed:
+            output_path.mkdir()
+            user_file = output_path / "user.txt"
+            user_file.write_text("user bytes")
+            track.write_pvt_file(
+                track.get_pvt_path(user_file),
+                track.PvtData(path="user.txt", hash="0123456789abcdef", size=10),
+            )
+            landed = True
+        return staged
+
+    monkeypatch.setattr(cache, "_checkout_with_fallback", stage_then_copy_user_file)
+
+    with pytest.raises(exceptions.OutputOwnershipError, match="user.txt.pvt"):
+        workspace_store.restore_from_cache(ref, output_hash)
+
+    assert landed
+    assert (output_path / "user.txt").read_text() == "user bytes"
+    assert track.get_pvt_path(output_path / "user.txt").is_file()
+
+
+def test_workspace_store_names_a_late_tracked_file_before_the_stage_writer_runs(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The check after preparing a forced run's output uses the forced-restore refusal, naming
+    the copied sidecar and target instead of letting the stage writer report a directory error."""
+    workspace_store = store.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="pipe",
+        input_bindings={},
+        cache_dir=tmp_path / "cache" / "files",
+    )
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
+    output_path = workspace_store.prepare_output(ref)
+    user_file = output_path / "user.txt"
+    user_file.write_text("user bytes")
+    track.write_pvt_file(
+        track.get_pvt_path(user_file),
+        track.PvtData(path="user.txt", hash="0123456789abcdef", size=10),
+    )
+
+    with pytest.raises(exceptions.OutputOwnershipError) as error:
+        workspace_store.refuse_output_replacement_at_write(ref)
+
+    message = str(error.value)
+    assert "user.txt.pvt" in message
+    assert "data/stage" in message
+
+
+def test_workspace_store_restore_records_pvt_members_before_writing_them(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A restore of a hash no lock records (a run-cache restore) records each `*.pvt` member it
+    writes, with the content it will hold, after the ownership check and before it writes
+    anything."""
+    workspace_store = store.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="pipe",
+        input_bindings={},
+        cache_dir=tmp_path / "cache" / "files",
+    )
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.Text())
+    output_path = workspace_store.prepare_output(ref)
+    notes = output_path / "notes.pvt"
+    notes.write_text("stage notes")
+    (output_path / "value.txt").write_text("v")
+    output_hash = workspace_store.commit(
+        ref, output_path, written={ownership.normalized(notes): frozenset[str]()}
+    )
+    cache.remove_output(output_path)
+    recorded = list[dict[pathlib.Path, str]]()
+
+    def record(members: Mapping[pathlib.Path, str]) -> None:
+        assert not output_path.exists()
+        recorded.append(dict(members))
+
+    claims = ownership.StageClaims(locked={}, no_commit={}, recorder=record, cache_dir=None)
+    assert workspace_store.restore_from_cache(ref, output_hash, claims=claims) is True
+
+    assert recorded == [{ownership.normalized(notes): cache.hash_file(notes)[0]}]
+    assert notes.read_text() == "stage notes"
 
 
 def test_workspace_store_pickle_round_trip(tmp_path: pathlib.Path) -> None:
@@ -364,3 +495,56 @@ def test_store_spec_cache_uses_the_configured_state_dir(tmp_path: pathlib.Path) 
     rebuilt.commit(ref, output)
 
     assert (tmp_path / "alternate-state" / "state.lmdb").is_dir()
+
+
+@pytest.mark.parametrize("mode", list(config.CheckoutMode))
+def test_workspace_store_refuses_replacing_tracked_file_inside_directory_output(
+    tmp_path: pathlib.Path, mode: config.CheckoutMode
+) -> None:
+    """Writing, restoring or committing a directory output leaves a tracked child and its
+    sidecar where they are, in every checkout mode."""
+    output_ref = _helper_ref(
+        "b/tree",
+        None,
+        types.ArtifactTag.DIRECTORY,
+        cast("loaders.Reader[object]", loaders.PathOnly()),
+    )
+    workspace_store = store.WorkspaceStore(
+        project_root=tmp_path,
+        pipeline_name="b",
+        input_bindings={},
+        cache_dir=tmp_path / "cache" / "files",
+        checkout_modes=[mode],
+    )
+    output_path = workspace_store.prepare_output(output_ref)
+    (output_path / "generated.txt").write_text("generated")
+    output_hash = workspace_store.commit(output_ref, output_path)
+    cache.remove_output(output_path)
+    tracked_path = output_path / "saved.txt"
+    tracked_path.parent.mkdir(parents=True)
+    tracked_path.write_text("user input")
+    sidecar_path = track.get_pvt_path(tracked_path)
+    track.write_pvt_file(
+        sidecar_path,
+        track.PvtData(path="saved.txt", hash="abc1230000000000", size=10),
+    )
+
+    with pytest.raises(exceptions.PivotError, match="user-owned"):
+        workspace_store.restore_from_cache(output_ref, output_hash)
+
+    assert tracked_path.read_text() == "user input"
+    assert sidecar_path.exists()
+
+    with pytest.raises(exceptions.PivotError, match="user-owned"):
+        workspace_store.prepare_output(output_ref)
+
+    assert tracked_path.read_text() == "user input"
+    assert sidecar_path.exists()
+
+    # `pivot commit` of an output that holds a tracked file links it into the cache: refused
+    with pytest.raises(exceptions.PivotError, match="user-owned"):
+        workspace_store.commit(output_ref, output_path)
+
+    assert not output_path.is_symlink()
+    assert tracked_path.read_text() == "user input"
+    assert sidecar_path.exists()

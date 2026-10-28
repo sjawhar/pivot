@@ -9,7 +9,7 @@ from pivot import loaders
 from pivot.engine import graph as engine_graph
 from pivot.exceptions import CyclicGraphError
 from pivot.registry import RegistryStageInfo
-from pivot.storage import listing
+from pivot.storage import listing, ownership
 from pivot.storage import state as state_mod
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, HashInfo
 
@@ -71,8 +71,13 @@ class _DependencyStore:
             raise FileNotFoundError(ref)
         return self.checkout_path
 
-    def prepare_output(self, ref: ArtifactRef) -> Path:
-        raise AssertionError(f"not used by dependency validation: {ref}")
+    def prepare_output(
+        self,
+        ref: ArtifactRef,
+        claims: ownership.StageClaims | None = None,
+        returned: ownership.StageMembers | None = None,
+    ) -> Path:
+        raise AssertionError(f"not used by dependency validation: {ref} {claims} {returned}")
 
     def commit(
         self,

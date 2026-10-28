@@ -350,6 +350,128 @@ def test_import_artifact_no_download(tmp_path: pathlib.Path, mocker: MockerFixtu
     assert pvt_data["source"]["path"] == "train"
 
 
+_OTHER_TREE_PIPELINE = """\
+import pathlib
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def tree() -> Annotated[dict[str, str], directory]:
+    return {"generated.txt": "generated"}
+
+
+with Pipeline("b", root=pathlib.Path(__file__).parent.parent) as pipeline:
+    tree()
+"""
+
+
+def _helper_mock_resolved_import(mocker: MockerFixture) -> None:
+    resolved = import_artifact.ResolvedImport(
+        stage="source/build",
+        path="source/build",
+        hash="abc1230000000000",
+        size=7,
+        remote_url="s3://bucket/prefix",
+        rev_lock="deadbeef",
+    )
+    mocker.patch("pivot.import_artifact.resolve_remote_path", autospec=True, return_value=resolved)
+
+
+@pytest.mark.parametrize("no_download", [False, True])
+async def test_import_artifact_refuses_destination_inside_any_pipeline_output(
+    tmp_path: pathlib.Path, mocker: MockerFixture, no_download: bool
+) -> None:
+    """An import cannot create data or metadata inside another pipeline's directory output."""
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "pipeline.py").write_text(_OTHER_TREE_PIPELINE)
+    _helper_mock_resolved_import(mocker)
+
+    with pytest.raises(exceptions.PivotError, match="stage output"):
+        await import_artifact.import_artifact(
+            "https://github.com/org/source",
+            "source/build",
+            out="data/b/tree/imported.txt",
+            no_download=no_download,
+            project_root=tmp_path,
+        )
+
+    assert not (tmp_path / "data" / "b" / "tree" / "imported.txt").exists()
+    assert not (tmp_path / "data" / "b" / "tree" / "imported.txt.pvt").exists()
+
+
+@pytest.mark.parametrize("no_download", [False, True])
+async def test_import_artifact_refuses_when_a_pipeline_fails_to_load(
+    tmp_path: pathlib.Path, mocker: MockerFixture, no_download: bool
+) -> None:
+    """A pipeline.py that fails to load may declare the destination as an output, so the import
+    refuses, naming that file, and writes nothing."""
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "pipeline.py").write_text('raise RuntimeError("broken pipeline")\n')
+    _helper_mock_resolved_import(mocker)
+
+    with pytest.raises(exceptions.PivotError, match=r"Failed to load pipeline .*other"):
+        await import_artifact.import_artifact(
+            "https://github.com/org/source",
+            "source/build",
+            out="data/raw/imported.txt",
+            no_download=no_download,
+            project_root=tmp_path,
+        )
+
+    assert not (tmp_path / "data" / "raw" / "imported.txt").exists()
+    assert not (tmp_path / "data" / "raw" / "imported.txt.pvt").exists()
+
+
+@pytest.mark.parametrize("no_download", [False, True])
+async def test_import_artifact_force_updates_an_import_saved_inside_an_output(
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    caplog: pytest.LogCaptureFixture,
+    no_download: bool,
+) -> None:
+    """An import made inside an output before the check is saved input: --force updates it in
+    place and warns, naming the output. The downloading and metadata-only forms both work."""
+    (tmp_path / ".pivot").mkdir()
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "pipeline.py").write_text(_OTHER_TREE_PIPELINE)
+    _helper_mock_resolved_import(mocker)
+    pvt_path = tmp_path / "data" / "b" / "tree" / "imported.txt.pvt"
+    pvt_path.parent.mkdir(parents=True)
+    track.write_pvt_file(pvt_path, track.PvtData(path="imported.txt", hash="0" * 16, size=1))
+
+    async def _download(_url: str, _hash: str, data_path: pathlib.Path) -> int:
+        data_path.write_bytes(b"downloaded")
+        return 10
+
+    mocker.patch("pivot.import_artifact._download_verified", autospec=True, side_effect=_download)
+
+    result = await import_artifact.import_artifact(
+        "https://github.com/org/source",
+        "source/build",
+        out="data/b/tree/imported.txt",
+        force=True,
+        no_download=no_download,
+        project_root=tmp_path,
+    )
+
+    assert pathlib.Path(result["pvt_path"]) == pvt_path
+    pvt_data = track.read_pvt_file(pvt_path)
+    assert pvt_data is not None
+    assert pvt_data["hash"] == "abc1230000000000"
+    assert (
+        "'data/b/tree/imported.txt' was imported inside a stage output: it is inside output "
+        + "'data/b/tree' of stage 'b/tree'"
+    ) in caplog.text
+    if no_download:
+        assert not (tmp_path / "data" / "b" / "tree" / "imported.txt").exists()
+    else:
+        assert (tmp_path / "data" / "b" / "tree" / "imported.txt").read_bytes() == b"downloaded"
+
+
 async def test_import_artifact_force_overwrites(
     tmp_path: pathlib.Path,
     mocker: MockerFixture,

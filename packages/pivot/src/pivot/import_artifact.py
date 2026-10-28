@@ -13,12 +13,12 @@ from typing import TYPE_CHECKING, TypedDict, cast
 import aiohttp
 import yaml
 
-from pivot import config, exceptions, project, types
+from pivot import config, discovery, exceptions, project, types
 from pivot import state_dir as state_dir_mod
 from pivot.config import io as config_io
 from pivot.remote import config as remote_config
 from pivot.remote import git_archive, github, protocol
-from pivot.storage import cache, listing, state, track
+from pivot.storage import cache, listing, ownership, state, track
 from pivot.storage import lock as storage_lock
 
 if TYPE_CHECKING:
@@ -573,6 +573,27 @@ async def import_artifact(
         raise exceptions.PivotError(f"'{data_path}' already exists. Use --force to overwrite.")
     if pvt_path.exists() and not force:
         raise exceptions.PivotError(f"'{pvt_path}' already exists. Use --force to overwrite.")
+
+    # Any pipeline's output, loaded or not: running it would remove the import and its sidecar
+    overlap = ownership.find_declared_overlap(
+        data_path, discovery.declared_outputs(project_root), project_root
+    )
+    shown = project.relative_within(data_path, project_root) or data_path
+    if overlap is not None:
+        if not pvt_path.exists():
+            raise exceptions.OutputOwnershipError(
+                f"Cannot import to '{shown}': {overlap}, and that stage replaces its output "
+                + "when it runs. Import to a path outside every stage output (for example under "
+                + "data/raw/)."
+            )
+        # An import made there before this check existed: update it, and warn, as status does
+        logger.warning(
+            "'%s' was imported inside a stage output: %s. Move it and its .pvt sidecar outside "
+            + "every stage output (for example under data/raw/); until then Pivot refuses to "
+            + "replace that output.",
+            shown,
+            overlap,
+        )
 
     if force and data_path.exists() and data_path.is_dir():
         raise exceptions.PivotError("Cannot overwrite directory with import")
