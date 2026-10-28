@@ -211,10 +211,17 @@ whether or not git tracks them, or, when `<state dir>/stages` already exists or 
 does not, to move the lock files into `<state dir>/stages`. Delete them instead if a run that
 could not use `core.state_dir` made them.
 
+When a stage's lock is in both directories and the one in the configured directory is current,
+the `.pivot` lock is never used again, but Pivot still reads both directories' run records to
+tell the two apart on every command that reads that stage. After the command, Pivot warns once
+and names every such `.pivot` lock with the command that removes them: `rm -r
+<project>/.pivot/stages` when every lock there is one of them, or `rm` of each one otherwise,
+run before moving any other lock out of `.pivot/stages`.
+
 Each of these warnings reports one cause, once per command. The notice about an ignored global
-`core.state_dir` and the notice about locks in `.pivot` report different facts, so a command can
-print both; a project value or path that cannot be used is the one exception, as its warning
-replaces the global notice.
+`core.state_dir`, the notice about locks in `.pivot` and the notice about older `.pivot` locks
+report different facts, so a command can print more than one; a project value or path that
+cannot be used is the one exception, as its warning replaces the global notice.
 
 ```
 <project_root>/

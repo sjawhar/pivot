@@ -908,6 +908,15 @@ class StateDB:
             key = bytes(cursor.key())
             return key[len(_RUN_PREFIX) :].decode() if key.startswith(_RUN_PREFIX) else None
 
+    def last_change(self) -> int:
+        """The ID of the last write transaction any process committed to this database.
+
+        Read without a transaction. Two equal IDs mean nothing was written in between, so a
+        reader can keep what it read until the ID changes.
+        """
+        self._check_closed()
+        return int(self._env.info()["last_txnid"])
+
     def prune_runs(self, retention: int) -> int:
         """Remove oldest runs beyond retention limit and orphaned run cache entries.
 
@@ -947,6 +956,22 @@ class StateDB:
         if value is None:
             return None
         return run_history.deserialize_run_cache_entry(value)
+
+    def lookup_run_cache_many(
+        self, keys: Iterable[tuple[str, str]]
+    ) -> dict[tuple[str, str], RunCacheEntry]:
+        """``lookup_run_cache`` for each ``(stage_name, input_hash)``, in one read transaction.
+
+        Keys with no entry are left out.
+        """
+        self._check_closed()
+        raw = dict[tuple[str, str], bytes]()
+        with self._read_transaction() as txn:
+            for stage_name, input_hash in keys:
+                value = txn.get(_RUNCACHE_PREFIX + f"{stage_name}:{input_hash}".encode())
+                if value is not None:
+                    raw[(stage_name, input_hash)] = value
+        return {key: run_history.deserialize_run_cache_entry(value) for key, value in raw.items()}
 
     def get_no_commit_record(self, stage_name: str) -> NoCommitRecord | None:
         """The stage's `nocommit:` record, or None (absent, or not a JSON object).

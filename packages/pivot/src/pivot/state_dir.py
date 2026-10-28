@@ -13,9 +13,12 @@ import os
 import pathlib
 import shlex
 import typing
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 
 from pivot import config_files, exceptions, project
+
+if typing.TYPE_CHECKING:
+    from pivot.storage.state import StateDB
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,8 @@ class StateDirWarnings(typing.TypedDict):
     legacy: set[pathlib.Path]
     # Effective cache directories reported as overlapping the stage-lock directory.
     cache_stage_overlap: set[tuple[pathlib.Path, pathlib.Path]]
+    # Configured state directories whose stale ``.pivot`` locks were reported.
+    stale: set[pathlib.Path]
 
 
 # One project root's ``core.state_dir`` as a record resolved it: the directory the value names
@@ -49,6 +54,51 @@ class StageRunMention(typing.TypedDict):
     input_hash: str
     # Whether that run ran the stage (and wrote its lock), rather than keeping or restoring it.
     ran: bool
+    # The state directory whose database recorded the run.
+    state_dir: str
+
+
+class OrderingView(typing.TypedDict):
+    """A project's run records in both of its state databases, as one record read them."""
+
+    # The state directories whose database exists, in the order their entries are looked up.
+    dirs: tuple[str, ...]
+    # Each database's newest run ID when its runs were listed.
+    newest: tuple[str | None, ...]
+    # Each stage's runs that ran or kept it, newest first across both databases.
+    mentions: dict[str, list[StageRunMention]]
+    # Each database's last committed write when the view was read or last checked.
+    markers: tuple[int, ...]
+    # Per stage, the output hashes the run-cache entry of its newest run records, from the first
+    # database that has one (None when none has). None as a whole after a write that recorded no
+    # run, as during a run: the entries are then looked up per stage.
+    first_outputs: dict[str, list[str] | None] | None
+
+
+class LockOrdering(typing.TypedDict):
+    """What one record keeps to tell which of a stage's two locks is current.
+
+    A lock in both of a project's state directories is ordered by the run records of both
+    databases (``lock.resolve_stage_lock_path``). The record keeps what that reads, so a command
+    opens each database at most once, lists its runs once, and, while nothing writes, orders
+    every stage without a database transaction.
+    """
+
+    # Each state directory's database, opened read-only at most once per record by the process
+    # that holds the entry (its ID, then the data file's inode, then the database), and closed
+    # when the record ends. A replaced data file adds an entry; the last one is current.
+    databases: "dict[str, list[tuple[int, int, StateDB]]]"
+    # Per pair of state directories, both databases' run records (``OrderingView``). Kept while
+    # neither database commits a write; listed again when either records a new run, as during a
+    # ``--watch`` session.
+    views: dict[tuple[str, ...], OrderingView]
+    # Per lock in the configured directory: what its answer was read from (both lock files'
+    # identities and both databases' last committed writes) and whether the other directory's
+    # lock is the current one. A changed file or any write reads the answer again.
+    decisions: dict[str, tuple[object, bool]]
+    # Configured state directories with a stage whose ``.pivot`` lock is not the current one; the
+    # notice naming every such lock is printed once, when the record ends.
+    stale: set[pathlib.Path]
 
 
 class StateDirInvocation(typing.TypedDict):
@@ -67,10 +117,9 @@ class StateDirInvocation(typing.TypedDict):
     # A library entry point's record (``entry_invocation``): it reports only a path that cannot
     # become a directory, once per pipeline load (``report_unusable_path_to_library``).
     library: bool
-    # Per state directory: the newest run ID its database held when it was read, and each stage's
-    # run records there, newest first (``lock.resolve_stage_lock_path``). Read again when a newer
-    # run is recorded there, as during a ``--watch`` session.
-    stage_runs: dict[pathlib.Path, tuple[str, dict[str, list[StageRunMention]]]]
+    # What ordering a stage's two locks needs, kept for the whole record
+    # (``lock.resolve_stage_lock_path``).
+    lock_ordering: LockOrdering
 
 
 # Set by the CLI callback for one CLI invocation, by a worker for one stage, and by a library
@@ -90,10 +139,20 @@ def _reported() -> StateDirWarnings | None:
     return None if invocation is None else invocation["reported"]
 
 
-def stage_run_cache() -> dict[pathlib.Path, tuple[str, dict[str, list[StageRunMention]]]] | None:
-    """The current record's stage run records per state directory; None outside a record."""
+def lock_ordering() -> LockOrdering | None:
+    """The current record's lock-ordering state; None outside a record."""
     invocation = _invocation.get()
-    return None if invocation is None else invocation["stage_runs"]
+    return None if invocation is None else invocation["lock_ordering"]
+
+
+# Called with a record as it ends (``end_invocation``), before the record it replaced returns.
+# ``storage.lock`` reports the stale locks the record found and closes the databases it held.
+_record_end_hooks = list[Callable[["StateDirInvocation"], None]]()
+
+
+def on_record_end(hook: Callable[["StateDirInvocation"], None]) -> None:
+    """Call ``hook`` with each record as it ends."""
+    _record_end_hooks.append(hook)
 
 
 STATE_GITIGNORE_CONTENT = """\
@@ -449,6 +508,55 @@ def report_legacy_state_dir(state_dir: pathlib.Path) -> None:
     )
 
 
+def report_stale_locks(
+    state_dir: pathlib.Path,
+    find_stale: Callable[[pathlib.Path, pathlib.Path], tuple[list[pathlib.Path], bool] | None],
+) -> None:
+    """Warn once per invocation that ``.pivot/stages`` holds locks the configured ones replaced.
+
+    ``find_stale(stages_dir, legacy_stages_dir)`` names each lock in ``<root>/.pivot/stages``
+    whose stage also has a lock in ``<state_dir>/stages`` and whose run records make that one
+    current, and says whether those are every lock there; None when it cannot tell. A run made
+    before ``core.state_dir`` was set, or while it could not be used, left such a lock. Pivot
+    reads neither outputs nor parameters from it, but reads both directories' run records to
+    find which lock is current, on every command that reads the stage. So the notice gives the
+    exact command that removes them: ``rm -r`` of ``.pivot/stages`` when every lock there is
+    stale, or ``rm`` of each stale lock, which has to come before moving any other lock out of
+    ``.pivot/stages`` (``report_legacy_state_dir``) so that none replaces a current one. It is
+    looked for only once per invocation, and only in this direction: a configured lock older
+    than its ``.pivot`` lock is the notice about locks in ``.pivot``.
+    """
+    reported = _reported()
+    if reported is None or state_dir in reported["stale"]:
+        return
+    legacy = other_state_dir_for(state_dir)
+    if legacy is None or legacy != project.get_project_root() / ".pivot":
+        return
+    reported["stale"].add(state_dir)
+    source = legacy / "stages"
+    found = find_stale(state_dir / "stages", source)
+    if found is None or not found[0]:
+        return
+    stale, every_lock = found
+    if every_lock:
+        command = f"rm -r {shlex.quote(str(source))}"
+        order = ""
+    else:
+        command = "rm " + " ".join(shlex.quote(str(path)) for path in stale)
+        order = f", before moving any other lock out of {source}"
+    stages = "stage" if len(stale) == 1 else "stages"
+    logger.warning(
+        "core.state_dir is %s, and %s also holds older locks of %d %s whose current lock is in %s: a run made before core.state_dir was set, or while it could not be used, left them. Pivot uses none of them, but reads both directories' run records to tell which lock is current on every command that reads these stages; remove them with `%s`%s.",
+        state_dir,
+        source,
+        len(stale),
+        stages,
+        state_dir / "stages",
+        command,
+        order,
+    )
+
+
 def report_cache_stage_overlap(
     cache_dir: pathlib.Path, stages_dir: pathlib.Path, fallback_cache_dir: pathlib.Path
 ) -> None:
@@ -489,6 +597,7 @@ def begin_invocation(
             unusable=set[pathlib.Path](),
             legacy=set[pathlib.Path](),
             cache_stage_overlap=set[tuple[pathlib.Path, pathlib.Path]](),
+            stale=set[pathlib.Path](),
         )
         if report
         else None
@@ -499,14 +608,28 @@ def begin_invocation(
             fallback=dict[pathlib.Path, pathlib.Path](),
             reported=reported,
             library=library,
-            stage_runs=dict[pathlib.Path, tuple[str, dict[str, list[StageRunMention]]]](),
+            lock_ordering=LockOrdering(
+                databases=dict[str, list[tuple[int, int, "StateDB"]]](),
+                views=dict[tuple[str, ...], OrderingView](),
+                decisions=dict[str, tuple[object, bool]](),
+                stale=set[pathlib.Path](),
+            ),
         )
     )
 
 
 def end_invocation(token: contextvars.Token[StateDirInvocation | None]) -> None:
-    """End an invocation, restoring whatever record ``begin_invocation`` replaced."""
-    _invocation.reset(token)
+    """End an invocation, restoring whatever record ``begin_invocation`` replaced.
+
+    The record's end hooks (``on_record_end``) run first, while it is still the current record.
+    """
+    invocation = _invocation.get()
+    try:
+        if invocation is not None:
+            for hook in _record_end_hooks:
+                hook(invocation)
+    finally:
+        _invocation.reset(token)
 
 
 @contextlib.contextmanager
