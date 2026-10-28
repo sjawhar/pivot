@@ -233,20 +233,26 @@ When multiple `pivot` processes share the same StateDB:
   refuses that target. What it can still miss: a writer holding an open handle on a directory
   inside the target (its working directory, or a directory descriptor), which can add a file to
   the renamed entry after the walk; a sidecar created beside the target, or beside a directory
-  above it, in the instant between the swap's check and its rename; and a restore killed between
-  renaming the old entry aside and checking it, whose backup the next restore of that path
-  removes unchecked (`cache._cleanup_fresh_restore_orphans`). Every backup is named with its
-  path's restore token, and only that cleanup, under that path's restore lock, removes one: the
-  unlocked sweep a directory restore runs in its parent (`cache._cleanup_stale_restore_temps`)
-  removes only staged replacements, since a backup keeps the old entry's mtime and may be under
-  another restore's check. Every directory a forced restore meets at its path is renamed aside
-  and checked, including one made after a file target's check. An entry the check refuses goes
-  back to its path; when something took the path meanwhile, it is renamed to
-  `<name>.pivot-kept-<hex>` beside it and a warning names it, never left under the backup name a
-  later restore removes. Every other replacement (a stage's write, a restore in a run, a
-  symlink-mode commit, presentation) is checked when it starts replacing that output, so a file
-  that lands in the output after that check is removed with it. `track` and `import` refuse to
-  create a sidecar inside an output, so only a file copied or made by hand can appear there.
+  above it, in the instant between the swap's check and its rename; and a directory restore
+  killed between renaming the old entry aside and checking it, whose backup the next directory
+  restore of that path removes unchecked (`cache._cleanup_fresh_restore_orphans`). Every backup
+  is named with its path's restore token, and only that cleanup, under that path's restore lock,
+  removes one: the unlocked sweep a directory restore runs in its parent
+  (`cache._cleanup_stale_restore_temps`) removes only staged replacements, since a backup keeps
+  the old entry's mtime and may be under another restore's check. A file restore never runs
+  that cleanup (`cache._restore_file_from_cache`), so when one is killed after renaming a
+  directory at its path aside, that directory stays beside the path as
+  `.pivot_backup_<token>.<hex>`, with everything in it: no file restore removes it (only a later
+  directory restore at that path would), and it is the user's to delete. That leftover is the
+  safe failure; removing it would be an unchecked removal. Every directory a forced restore
+  meets at its path is renamed aside and checked, including one made after a file target's
+  check. An entry the check refuses goes back to its path; when something took the path
+  meanwhile, it is renamed to `<name>.pivot-kept-<hex>` beside it and a warning names it, never
+  left under the backup name a later restore removes. Every other replacement (a stage's write,
+  a restore in a run, a symlink-mode commit, presentation) is checked when it starts replacing
+  that output, so a file that lands in the output after that check is removed with it. `track`
+  and `import` refuse to create a sidecar inside an output, so only a file copied or made by
+  hand can appear there.
 - `track` and `import` load every pipeline (`discovery.declared_outputs`, as `--all` discovers
   them) and refuse a new path overlapping any declared output, naming the stage. A `pipeline.py`
   that fails to load fails them; one that loads but defines no Pivot pipeline declares nothing. A

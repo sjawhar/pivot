@@ -472,8 +472,8 @@ def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
 
     It takes no lock, so it never removes a backup (``_BACKUP_TEMP_PREFIX``): a backup is the
     entry a restore renamed aside, which keeps its own old mtime and may still be under that
-    restore's check. Only the next restore of the same path removes a backup, under that path's
-    restore lock (``_cleanup_fresh_restore_orphans``).
+    restore's check. Only the next directory restore of the same path removes a backup, under
+    that path's restore lock (``_cleanup_fresh_restore_orphans``); a file restore removes none.
     """
     cutoff = time.time() - _RESTORE_TEMP_MAX_AGE
 
@@ -1686,7 +1686,8 @@ def _restore_directory_from_cache(
 
 def _backup_path(path: pathlib.Path, token: str) -> pathlib.Path:
     """A fresh name beside ``path`` to rename it to while a restore swaps in its replacement,
-    tagged with ``path``'s restore token so the next restore of ``path`` removes an orphan."""
+    tagged with ``path``'s restore token so the next directory restore of ``path`` removes an
+    orphan. A file restore removes none: a killed one's backup stays beside ``path``."""
     return path.parent / f"{_BACKUP_TEMP_PREFIX}{token}.{secrets.token_hex(4)}"
 
 
