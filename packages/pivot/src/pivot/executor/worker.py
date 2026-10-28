@@ -53,6 +53,7 @@ from pivot import (
     run_history,
     skip,
     stage_def,
+    stage_io,
     types,
 )
 from pivot.storage import artifact_lock, cache, lock, state
@@ -794,7 +795,7 @@ def _execute_stage(
                     output_queue.put_nowait(
                         StateChange(kind=OutputMessageKind.STATE, stage=stage_name, state="running")
                     )
-                with exceptions.PIVOT_IO:
+                with stage_io.PIVOT_IO:
                     lock_data = production_lock.read()
 
                 with _open_state_db(state_dir) as state_db:
@@ -991,7 +992,7 @@ def _execute_stage(
                         output_paths, cache_dir=_store_cache_dir(store)
                     )
                 else:
-                    with exceptions.PIVOT_IO:
+                    with stage_io.PIVOT_IO:
                         output_hashes = _commit_outputs_with_store(
                             output_paths, store, project_state_dir
                         )
@@ -1066,24 +1067,24 @@ def _execute_stage(
             )
         except Exception as exc:
             # The record keeps the traceback. The console prints one line only for a failure of
-            # pivot's own I/O on state it owns (`exceptions.PIVOT_IO`): the gate's unreadable
-            # cache, a read-only output directory, a full disk. Any other failure, out of the
-            # stage function, a loader or writer, or anything unmarked, prints its traceback as
-            # before; --verbose prints it in both cases.
+            # pivot's own I/O on state it owns (`stage_io`): its cache, its state database, the
+            # stage's lock file, and preparing and creating the stage's output. Any other
+            # failure, out of the stage function, a loader or writer, or anything unmarked,
+            # prints its traceback as before; --verbose prints it in both cases.
             result = _make_result(
                 StageStatus.FAILED,
                 traceback.format_exc(),
                 ring_buffer,
                 input_hash=input_hash,
             )
-            if exceptions.raised_by_pivot_io(exc):
+            if stage_io.raised_by_pivot(exc):
                 result["display_reason"] = exceptions.describe_error(exc)
             return result
 
 
 def _open_state_db(state_dir: pathlib.Path) -> state.StateDB:
     """Open the stage's state database read-only; a failure to open it is pivot's own I/O."""
-    with exceptions.PIVOT_IO:
+    with stage_io.PIVOT_IO:
         return state.StateDB(state_dir, readonly=True)
 
 
@@ -1140,7 +1141,7 @@ def execute_stage(
         _stop.stage_running = False
         # Every way out of the stage drops its recorded failure, whose frames hold the stage's
         # locals and loaded inputs, so a warm worker does not keep them until its next stage.
-        exceptions.clear_pivot_io()
+        stage_io.clear()
     if _stop.exit_requested:
         _exit_worker(1)
     result["user_code_files"] = user_code_files()
@@ -1589,7 +1590,7 @@ def _write_outputs_with_store(
 def _write_output_with_store(
     ref: types.ArtifactRef, value: Any, store: store_mod.Store
 ) -> pathlib.Path:
-    with exceptions.PIVOT_IO:
+    with stage_io.PIVOT_IO:
         output_path = store.prepare_output(ref)
     writer = cast("Any", ref.format)
 
@@ -1602,7 +1603,7 @@ def _write_output_with_store(
     def save_output(output_value: Any, destination: pathlib.Path) -> None:
         with (
             warnings.catch_warnings(record=True) as caught,
-            exceptions.writing_output(destination),
+            stage_io.writing_output(destination),
         ):
             warnings.simplefilter("always", loaders.LossyOutputWarning)
             try:
@@ -2135,7 +2136,7 @@ def _commit_lock_and_build_deferred(
     Only called in the commit (non --no-commit) path. Writes the production
     lock file and returns DeferredWrites for the coordinator to apply.
     """
-    with exceptions.PIVOT_IO:
+    with stage_io.PIVOT_IO:
         production_lock.write(lock_data)
     return _build_deferred_writes(
         stage_info,

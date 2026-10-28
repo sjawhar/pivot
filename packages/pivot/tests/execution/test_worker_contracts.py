@@ -41,7 +41,7 @@ import numpy
 import pandas
 import pytest
 
-from pivot import exceptions, loaders, stage_def, types
+from pivot import exceptions, loaders, stage_def, stage_io, types
 from pivot import project as pivot_project
 from pivot.executor import worker
 from pivot.storage import artifact_lock, cache, lock, state
@@ -1415,6 +1415,30 @@ def test_pivots_own_io_on_the_stages_state_is_one_line(
     assert broken.name in _display_line(result), result
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores a read-only directory")
+def test_a_directory_pivot_must_create_is_one_line_even_for_a_csv_output(
+    project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
+) -> None:
+    """A CSV output's own file is pandas' to open, so its failures keep the traceback; the
+    directory pivot creates for it is pivot's own I/O, so that failure is one line."""
+    broken = _read_only_data_directory(project)
+    outs = [_ref(_STAGE, loader=loaders.CSV[pandas.DataFrame]())]
+    try:
+        result = worker.execute_stage(
+            _STAGE,
+            _stage_info(
+                _stage_returning(pandas.DataFrame({"a": [1]})), project, worker_env, outs=outs
+            ),
+            worker_env,
+            output_queue,
+        )
+    finally:
+        broken.chmod(0o755)
+
+    assert result["status"] == StageStatus.FAILED
+    assert _display_line(result) == f"{_EACCES}: {project / 'data' / 'skip'}", result
+
+
 def test_a_pivot_writer_the_stage_calls_for_a_path_of_its_own_keeps_its_traceback(
     project: pathlib.Path, worker_env: pathlib.Path, output_queue: mp.Queue[OutputMessage]
 ) -> None:
@@ -1507,7 +1531,7 @@ class _SeesRecordedFailure(loaders.Reader[str]):
 
     @override
     def load(self, path: pathlib.Path) -> str:
-        self.seen.append(exceptions._pivot_io.error)
+        self.seen.append(stage_io._state.error)
         return path.read_text()
 
 
@@ -1517,12 +1541,18 @@ def _keeps_nothing(data: object) -> str:
 
 
 @pytest.mark.parametrize(
-    "make_error",
+    ("make_error", "display"),
     [
-        pytest.param(lambda: exceptions.OutputMissingError("pivot's own error"), id="pivot-error"),
-        pytest.param(lambda: SystemExit(3), id="system-exit"),
-        pytest.param(worker.WorkerTerminated, id="keyboard-interrupt"),
-        pytest.param(lambda: PermissionError(errno.EACCES, _EACCES, "/out"), id="unexpected-error"),
+        pytest.param(
+            lambda: exceptions.OutputMissingError("pivot's own error"), None, id="pivot-error"
+        ),
+        pytest.param(lambda: SystemExit(3), None, id="system-exit"),
+        pytest.param(worker.WorkerTerminated, None, id="keyboard-interrupt"),
+        pytest.param(
+            lambda: PermissionError(errno.EACCES, _EACCES, "/out"),
+            f"{_EACCES}: /out",
+            id="unexpected-error",
+        ),
     ],
 )
 def test_a_failed_stage_leaves_neither_its_failure_nor_its_inputs_in_the_worker(
@@ -1531,6 +1561,7 @@ def test_a_failed_stage_leaves_neither_its_failure_nor_its_inputs_in_the_worker(
     output_queue: mp.Queue[OutputMessage],
     monkeypatch: pytest.MonkeyPatch,
     make_error: Callable[[], BaseException],
+    display: str | None,
 ) -> None:
     """Creating the output file fails inside pivot's own I/O, so the worker records the failure.
     Whichever handler the stage then fails through, a warm worker keeps nothing of it: not the
@@ -1556,8 +1587,8 @@ def test_a_failed_stage_leaves_neither_its_failure_nor_its_inputs_in_the_worker(
     _ = gc.collect()
 
     assert failed["status"] == StageStatus.FAILED, failed["reason"]
-    if isinstance(make_error(), PermissionError):
-        assert _display_line(failed) == f"{_EACCES}: /out", failed
+    if display is not None:
+        assert _display_line(failed) == display, failed
     assert held[0]() is None, "the failed stage's 4 MB dependency value is still reachable"
 
     seen = list[BaseException | None]()
