@@ -351,7 +351,7 @@ def test_body_import_of_library_module_is_accepted(module_dir: pathlib.Path) -> 
 def test_non_callable_is_refused() -> None:
     """@fingerprint_by_name raises TypeError for a non-callable."""
     with pytest.raises(TypeError, match="requires a callable"):
-        decorators.fingerprint_by_name(42)  # pyright: ignore[reportArgumentType]
+        decorators.fingerprint_by_name(42)  # pyright: ignore[reportArgumentType] - the refusal under test
 
 
 def test_class_is_refused() -> None:
@@ -361,7 +361,7 @@ def test_class_is_refused() -> None:
         pass
 
     with pytest.raises(TypeError, match="module-level function"):
-        decorators.fingerprint_by_name(Foo)  # pyright: ignore[reportArgumentType]
+        decorators.fingerprint_by_name(Foo)  # pyright: ignore[reportArgumentType] - the refusal under test
 
 
 def test_module_level_lambda_is_refused() -> None:
@@ -378,7 +378,7 @@ def test_module_level_lambda_is_refused() -> None:
     qualname = getattr(fn, "__qualname__", "")
     assert "<locals>" not in qualname, "This lambda must be module-level for the test"
     with pytest.raises(TypeError, match="lambda"):
-        decorators.fingerprint_by_name(fn)  # pyright: ignore[reportArgumentType]
+        decorators.fingerprint_by_name(fn)  # pyright: ignore[reportArgumentType] - the refusal under test
 
 
 def test_nested_function_is_refused() -> None:
@@ -417,7 +417,7 @@ def test_builtin_is_refused() -> None:
     The mark needs a Python function to name. A builtin has no module-level definition.
     """
     with pytest.raises(TypeError, match="requires a function"):
-        decorators.fingerprint_by_name(len)  # pyright: ignore[reportArgumentType]
+        decorators.fingerprint_by_name(len)  # pyright: ignore[reportArgumentType] - the refusal under test
 
 
 def test_callable_instance_is_refused() -> None:
@@ -459,7 +459,7 @@ def test_staticmethod_is_refused() -> None:
     sm = Foo.__dict__["bar"]
     assert isinstance(sm, staticmethod)
     with pytest.raises(TypeError, match="module-level function"):
-        decorators.fingerprint_by_name(sm)  # pyright: ignore[reportArgumentType]
+        decorators.fingerprint_by_name(sm)  # pyright: ignore[reportArgumentType] - the refusal under test
 
 
 def test_classmethod_is_refused() -> None:
@@ -473,7 +473,7 @@ def test_classmethod_is_refused() -> None:
     cm = Foo.__dict__["bar"]
     assert isinstance(cm, classmethod)
     with pytest.raises(TypeError, match="callable|module-level function"):
-        decorators.fingerprint_by_name(cm)  # pyright: ignore[reportArgumentType]
+        decorators.fingerprint_by_name(cm)  # pyright: ignore[reportArgumentType] - the refusal under test
 
 
 # ---------------------------------------------------------------------------
@@ -842,7 +842,7 @@ def test_unreadable_source_at_decoration_is_accepted() -> None:
     exec(code, ns)  # noqa: S102
     fn = ns["helper"]
     assert callable(fn)
-    result = decorators.fingerprint_by_name(fn)  # pyright: ignore[reportArgumentType]
+    result = decorators.fingerprint_by_name(fn)  # pyright: ignore[reportArgumentType] - `fn` comes from a namespace dict typed `object`
     assert result is fn
     assert fingerprint.fingerprinted_by_name(fn)
 
@@ -4278,10 +4278,10 @@ def test_a_model_dump_the_object_does_not_hold_is_canonicalized_as_a_plain_objec
     main, and the value takes the plain-object branch."""
 
     class SlotModelDump:  # the class keeps `model_dump`; the instance never assigns the slot
-        __slots__ = ("model_dump",)  # pyright: ignore[reportUnannotatedClassAttribute, reportUninitializedInstanceVariable]
+        __slots__ = ("model_dump",)  # pyright: ignore[reportUnannotatedClassAttribute, reportUninitializedInstanceVariable] - the slot is left unset on purpose
 
     class RaisingModelDump:
-        __slots__ = ()  # pyright: ignore[reportUnannotatedClassAttribute]
+        __slots__ = ()  # pyright: ignore[reportUnannotatedClassAttribute] - an empty `__slots__`, the shape under test
 
         @property
         def model_dump(self) -> typing.Callable[[], dict[str, int]]:
@@ -4422,7 +4422,7 @@ def _transparent_proxy(target: object) -> object:
     class Proxy:
         @property
         @typing.override
-        def __class__(self) -> type:  # pyright: ignore[reportIncompatibleMethodOverride, reportIncompatibleVariableOverride]
+        def __class__(self) -> type:  # pyright: ignore[reportIncompatibleMethodOverride, reportIncompatibleVariableOverride] - a proxy reports its target's type
             return type(target)
 
         def __getattr__(self, name: str) -> typing.Any:
@@ -4456,6 +4456,8 @@ _R11_CLASS_SIDE_CHILD = """\
 import collections
 import itertools
 import json
+
+import pydantic
 
 from pivot import fingerprint
 
@@ -4627,6 +4629,70 @@ class SlotsOnly:
         return "SlotsOnly()"
 
 
+class Keeper:
+    @classmethod
+    def model_dump(cls):
+        return {"state": "class-level"}
+
+
+class KeeperPlainMethod:
+    def model_dump(self):
+        return {"state": "instance"}
+
+
+class SomeModel(pydantic.BaseModel):
+    x: int = 1
+
+
+def meta_reporting(target):
+    # A metaclass whose `__class__` property names another class: its classes report `target`.
+    class Meta(type):
+        @property
+        def __class__(cls):
+            return target
+
+    return Meta
+
+
+ClassKeeperClassmethod = meta_reporting(Keeper)(
+    "ClassKeeperClassmethod", (), {"model_dump": classmethod(lambda cls: {"state": "class-level"})}
+)
+ClassKeeperPlain = meta_reporting(KeeperPlainMethod)(
+    "ClassKeeperPlain", (), {"model_dump": lambda self: {"state": "instance"}}
+)
+ClassReportsModel = meta_reporting(SomeModel)(
+    "ClassReportsModel", (), {"model_dump": lambda self: {"state": "instance"}}
+)
+
+
+class RaisingContains(dict):
+    def __contains__(self, key):
+        raise RuntimeError("__contains__ raises")
+
+
+class DictSubclassAsDict:
+    def __init__(self):
+        self.factor = 3
+
+
+def dict_subclass_as_dict():
+    value = DictSubclassAsDict()
+    value.__dict__ = RaisingContains(factor=3)
+    return value
+
+
+class DictPropNone:
+    @property
+    def __dict__(self):
+        return None
+
+
+class DictPropInt:
+    @property
+    def __dict__(self):
+        return 5
+
+
 shapes = {
     "dict_property_raises": DictPropertyRaises(),
     "dict_property_not_a_mapping": DictPropertyNotAMapping(),
@@ -4644,6 +4710,13 @@ shapes = {
     "dict_property_key_eq_raises": dict_property_with_a_raising_key(),
     "namedtuple": Pair(1, 2),
     "slots_without_dict": SlotsOnly(),
+    "class_meta_reports_classmethod_keeper": ClassKeeperClassmethod,
+    "class_meta_reports_plain_keeper": ClassKeeperPlain,
+    "class_meta_reports_pydantic_model": ClassReportsModel,
+    "class_meta_reports_keeper_as_a_value": {"cfg": ClassKeeperClassmethod},
+    "dict_subclass_with_raising_contains": dict_subclass_as_dict(),
+    "dict_property_none": DictPropNone(),
+    "dict_property_int": DictPropInt(),
 }
 KeyEqRaises.armed = True
 result = {}
@@ -4665,7 +4738,10 @@ def test_the_model_dump_probe_runs_no_class_side_code() -> None:
     canonical form, and none raises or hangs. A class whose only `__dict__` is a property and
     whose real instance dict holds `model_dump` is dumped, as main's `hasattr` dumps it; and an
     error from a key of that dict, the one error the lookup can raise, propagates as it does on
-    main."""
+    main. A class whose metaclass reports a `model_dump` keeper or a pydantic model as its
+    `__class__` is a class, never dumped as an instance (alone or as a value); an instance whose
+    `__dict__` is a dict subclass with a raising `__contains__` is read past it; and a `__dict__`
+    property that returns None or an int gives main's form."""
     done = subprocess.run(
         [sys.executable, "-c", _R11_CLASS_SIDE_CHILD],
         capture_output=True,
@@ -4698,6 +4774,19 @@ def test_the_model_dump_probe_runs_no_class_side_code() -> None:
         "dict_property_key_eq_raises": "RuntimeError: key __eq__ raises",
         "namedtuple": ["Pair", [1, 2]],
         "slots_without_dict": ["SlotsOnly", "SlotsOnly()"],
+        "class_meta_reports_classmethod_keeper": [
+            "Meta",
+            "<class '__main__.ClassKeeperClassmethod'>",
+        ],
+        "class_meta_reports_plain_keeper": ["Meta", "<class '__main__.ClassKeeperPlain'>"],
+        "class_meta_reports_pydantic_model": ["Meta", "<class '__main__.ClassReportsModel'>"],
+        "class_meta_reports_keeper_as_a_value": [
+            "dict",
+            [["cfg", ["Meta", "<class '__main__.ClassKeeperClassmethod'>"]]],
+        ],
+        "dict_subclass_with_raising_contains": ["__main__.DictSubclassAsDict", plain],
+        "dict_property_none": ["__main__.DictPropNone", None],
+        "dict_property_int": ["__main__.DictPropInt", 5],
     }
 
 
@@ -4784,9 +4873,9 @@ def test_a_state_change_behind_a_celery_proxy_of_a_plain_object_reruns(
     tmp_path: pathlib.Path,
 ) -> None:
     """A `celery.local.Proxy`, whose `repr` is its target's, of an object that is not a pydantic
-    model but keeps `model_dump`: the proxy reports the target's class as its `__class__`, that
-    class keeps `model_dump`, so the value is dumped through the proxy as on main, and an edit to
-    the state behind `model_dump` reruns the stage."""
+    model but keeps `model_dump`: the proxy reports the target's class as its `__class__`, so it
+    is asked for `model_dump` through the proxy as on main and dumped, and an edit to the state
+    behind `model_dump` reruns the stage."""
     pytest.importorskip("celery.local")
     project = _project(
         tmp_path,
@@ -4804,6 +4893,66 @@ def test_a_state_change_behind_a_celery_proxy_of_a_plain_object_reruns(
 
     _edit(project / "lib" / "settings.json", '"factor": 3}', '"factor": 30}')
     assert _status(_run(project, "repro", "--json"), "cp/s") == ("ran", "Code changed")
+    assert out.read_text() == "510\n"
+
+
+_R12_CELERY_DELEGATING = """\
+import functools
+import json
+import pathlib
+
+import celery.local
+
+
+class Inner:
+    def __init__(self) -> None:
+        self.data = json.loads((pathlib.Path(__file__).parent / "settings.json").read_text())
+
+    def model_dump(self) -> dict:
+        return dict(self.data)
+
+
+class Holder:
+    # Keeps `model_dump` only in its own `__dict__`, by delegation; its `repr` hides its state.
+    def __init__(self) -> None:
+        self.model_dump = Inner().model_dump
+
+    def __repr__(self) -> str:
+        return "Holder()"
+
+
+def scale(value: int, cfg) -> int:
+    return value * cfg.model_dump()["factor"]
+
+
+RUN = functools.partial(scale, cfg=celery.local.Proxy(Holder))
+"""
+
+
+def test_a_state_change_behind_a_celery_proxy_of_a_delegating_object_reruns(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A `celery.local.Proxy` of an object that keeps `model_dump` only in its own `__dict__`
+    (by delegation) and whose `repr` hides its state: no class on any MRO holds `model_dump`, so
+    only asking the proxy, as main asks, finds it. The value is dumped, and an edit to the state
+    behind `model_dump` reruns the stage."""
+    pytest.importorskip("celery.local")
+    project = _project(
+        tmp_path,
+        {
+            "lib/__init__.py": "",
+            "lib/helpers.py": _R12_CELERY_DELEGATING,
+            "lib/settings.json": '{"factor": 3}\n',
+            "pipeline.py": _R11_PIPELINE.format(name="cd"),
+        },
+    )
+    out = project / "data" / "cd" / "s.txt"
+    assert _status(_run(project, "repro", "--json"), "cd/s")[0] == "ran"
+    assert _status(_run(project, "repro", "--json"), "cd/s") == ("cached", "unchanged")
+    assert out.read_text() == "51\n"
+
+    _edit(project / "lib" / "settings.json", '"factor": 3}', '"factor": 30}')
+    assert _status(_run(project, "repro", "--json"), "cd/s") == ("ran", "Code changed")
     assert out.read_text() == "510\n"
 
 
@@ -4871,7 +5020,7 @@ def test_a_value_without_an_instance_dict_takes_the_dict_offset_short_cut(
     class-side child above)."""
 
     class SlotsOnly:
-        __slots__ = ("factor",)  # pyright: ignore[reportUnannotatedClassAttribute]
+        __slots__ = ("factor",)  # pyright: ignore[reportUnannotatedClassAttribute] - a `__slots__` class, the shape under test
 
         def __init__(self) -> None:
             self.factor: int = 3
@@ -4882,7 +5031,7 @@ def test_a_value_without_an_instance_dict_takes_the_dict_offset_short_cut(
 
         @property
         @typing.override
-        def __dict__(self) -> dict[str, bool]:  # pyright: ignore[reportIncompatibleVariableOverride, reportIncompatibleMethodOverride]
+        def __dict__(self) -> dict[str, bool]:  # pyright: ignore[reportIncompatibleVariableOverride, reportIncompatibleMethodOverride] - a `__dict__` property, the shape under test
             return {"masked": True}
 
     class Pair(typing.NamedTuple):

@@ -2132,7 +2132,15 @@ def _keeps_own_attribute(obj: Any, name: str) -> bool:
             ) and entry.__objclass__ is klass:
                 instance_dict = entry
     if instance_dict is not None:
-        return name in instance_dict.__get__(obj)
+        found = instance_dict.__get__(obj)
+        if type(found) is dict:
+            return name in found
+        # An instance `__dict__` that is a dict subclass: its own `__contains__` is class-side
+        # code, so the dict is asked the C way, as main's attribute lookup asks it. (A class's
+        # namespace, a `mappingproxy`, is no dict; no caller asks a class.)
+        if issubclass(type(found), dict):
+            return dict.__contains__(found, name)  # pyright: ignore[reportUnknownMemberType] - a dict subclass with unknown item types
+        return name in found
     if not _class_dictoffset(cls):  # no instance dict: nothing for the lookup to find
         return False
     try:
@@ -2142,22 +2150,26 @@ def _keeps_own_attribute(obj: Any, name: str) -> bool:
     return True
 
 
-def _proxied_class_keeps(value: Any, name: str) -> bool:
-    """Whether `value` is a transparent proxy of an object whose class keeps `name`.
+def _proxy_has_attribute(value: Any, name: str) -> bool:
+    """Whether `value` is a transparent proxy that has `name`, asked as main asks every value.
 
     A proxy (celery's `local.Proxy`, `lazy_object_proxy`, wrapt) reports its target's class as
-    its `__class__` and forwards attribute reads through `__getattr__`. The class `value` reports
-    is read as `isinstance` reads it, by `getattr(value, "__class__", None)`, where only
-    `AttributeError` means none: the read the canonical form's `isinstance(value,
-    pydantic.BaseModel)` already makes, so no new kind of code runs. It counts only if it is a
-    class other than `type(value)` that holds `name` on its real MRO, read through `type`'s own
-    descriptors; `issubclass(type(reported), type)` asks the real type, not a `__class__`. A plain
-    `MagicMock` reports its own type and is not taken.
+    its `__class__` and forwards attribute reads through `__getattr__`, whether the target keeps
+    `name` on its class or only in its own `__dict__` (a target that delegates
+    `self.model_dump = inner.model_dump`). No static read reaches the target, so a value that
+    reports a class other than `type(value)` is asked by `_has_attribute`: main's `hasattr`,
+    where any error means no. Beyond the `__class__` read every `isinstance` check makes (main
+    makes it too), this is the one place the probe runs code of the value: its attribute lookup,
+    which a proxy needs in order to be transparent and which main always ran.
+    The reported class is read as `isinstance` reads it, by `getattr(value, "__class__", None)`,
+    where only `AttributeError` means none: the read the canonical form's `isinstance(value,
+    pydantic.BaseModel)` already makes. `issubclass(type(reported), type)` asks the real type,
+    not a `__class__`. A plain `MagicMock` reports its own type and is not asked.
     """
     reported = getattr(value, "__class__", None)
     if reported is type(value) or not issubclass(type(reported), type):
         return False
-    return any(name in _class_namespace(klass) for klass in _class_mro(reported))
+    return _has_attribute(value, name)
 
 
 def _is_user_class_instance(value: Any) -> bool:
@@ -2966,11 +2978,17 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     itself) becomes `["cycle", N]`, N steps back up the path, the same in every process. A
     library function, or a library module's own callable export,
     becomes `["external", _library_name]`: its repr can hold an address (`np.mean`). A
-    `functools.partial` is canonicalised through its function and arguments. A pydantic model
-    instance (`isinstance`, which sees a transparent proxy's target through its `__class__`),
-    or another value that keeps `model_dump` of its own (`_keeps_own_attribute`), is dumped in
-    python mode, which keeps each secret (`SecretStr`, `SecretBytes`, `Secret[T]`) as its own
-    object; a secret becomes `["secret", digest]`, the
+    `functools.partial` is canonicalised through its function and arguments. A value is dumped
+    by its `model_dump` when it is a pydantic model instance (`isinstance`), when it keeps
+    `model_dump` of its own (`_keeps_own_attribute`, which runs none of its code), or when it is
+    a transparent proxy, a value that reports a class other than its own type as `__class__`,
+    and has `model_dump` when asked as main asks (`_proxy_has_attribute`: `hasattr`, any error
+    meaning no). Beyond the `__class__` read each `isinstance` check makes, as main's do, that
+    proxy lookup is the one place the probe runs the value's own code (its attribute lookup, as
+    main does), because no static read reaches a proxy's target. A class is
+    never dumped, whatever it reports. The dump is in python mode, which keeps each secret
+    (`SecretStr`, `SecretBytes`, `Secret[T]`) as its own object; a secret becomes
+    `["secret", digest]`, the
     keyed digest the lock file records for it (`parameters.secret_digest`), so changing it
     changes the hash and no fingerprint holds its value. A dataclass instance becomes
     `[module.qualname, canonical({field: value})]`, field by field, so a secret inside one
@@ -3004,7 +3022,7 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     # for itself); a type with another metaclass, whose `__hash__` or `__eq__` may run code or
     # raise, is no built-in and skips the lookup.
     value_type = type(value)  # pyright: ignore[reportUnknownVariableType] - any class
-    builtin = type(value_type) is type and value_type in _BUILTIN_TYPES  # pyright: ignore[reportUnknownArgumentType]
+    builtin = type(value_type) is type and value_type in _BUILTIN_TYPES  # pyright: ignore[reportUnknownArgumentType] - the type of any value
     decision = None if builtin else _mark_decision(value)
     if decision is _MarkDecision.REFUSED:
         _refuse_class_above_mark(value)
@@ -3014,22 +3032,33 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     # the model's class as its `__class__`: `isinstance` reads that `__class__`, as it does for
     # `re.Pattern` above (pydantic's metaclass uses `type.__instancecheck__`), and asks no
     # `__getattr__`. Any other value is dumped if it keeps `model_dump` of its own, or if it is
-    # such a proxy of an object whose class keeps one (`_proxied_class_keeps`); an object that
-    # merely answers every name (a `MagicMock`) is neither dumped nor asked.
+    # such a proxy and has `model_dump` when asked as main asks (`_proxy_has_attribute`: beyond
+    # the `__class__` reads of the `isinstance` checks, the one place the probe runs a value's
+    # attribute lookup); an object that merely answers every name (a
+    # plain `MagicMock`) reports its own type, so it is neither dumped nor asked.
     #
-    # The `isinstance` test is a fast path only; no result depends on it. A direct pydantic
-    # model keeps `model_dump` on its MRO (`_keeps_own_attribute`), and a proxied one reports a
-    # class that keeps it (`_proxied_class_keeps`, the same `__class__` read). Removing it
-    # changes no fingerprint (the mutation `mISINSTANCE` fails no test); it stays because it
-    # answers a pydantic model before any walk (about 145 ns against main's 168). Do not delete
-    # it as dead code without measuring that cost.
-    if not builtin and (
-        isinstance(value, pydantic.BaseModel)
-        or (_keeps_own_attribute(value, "model_dump") and not isinstance(value, type))
-        or _proxied_class_keeps(value, "model_dump")
+    # The `isinstance` test is chiefly a fast path. A direct pydantic model keeps `model_dump` on
+    # its MRO (`_keeps_own_attribute`), and a proxied one has it when asked
+    # (`_proxy_has_attribute`, after the same `__class__` read), so without the test every value
+    # a test checks gets the same fingerprint, and no test fails when it is removed. It answers a
+    # pydantic model before the own-attribute walk and the proxy lookup, and in one shape it is
+    # also main's answer: a proxy that reports a pydantic class while its own lookup of
+    # `model_dump` raises an error other than AttributeError stops with that error here, as
+    # `hasattr` stops on main, where `_proxy_has_attribute` alone would take the error as no. Do
+    # not delete it as dead code.
+    # A class is never dumped as an instance (main's `not isinstance(value, type)`), whatever
+    # its metaclass reports as `__class__`; the test comes first, so no probe asks a class.
+    if (
+        not builtin
+        and not isinstance(value, type)
+        and (
+            isinstance(value, pydantic.BaseModel)
+            or _keeps_own_attribute(value, "model_dump")
+            or _proxy_has_attribute(value, "model_dump")
+        )
     ):
         try:
-            dump = value.model_dump  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
+            dump = value.model_dump
         except AttributeError:
             # A `model_dump` the class keeps but the object does not hold: an unset slot, or a
             # property that raises AttributeError. Main's `hasattr` is False there too, so the
@@ -3081,7 +3110,8 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     if type(value).__repr__ is object.__repr__ and _has_attribute(value, "__dict__"):
         inner = (*active, id(value))
         attributes = vars(value)
-        if _BY_NAME_MARK in attributes:
+        # A `__dict__` property may return anything (None, an int); only a dict holds the mark.
+        if type(attributes) is dict and _BY_NAME_MARK in attributes:
             attributes = {name: item for name, item in attributes.items() if name != _BY_NAME_MARK}
         return [_definition_ref(type(value)), _canonicalize_value_for_hash(attributes, inner)]
     return [type(value).__name__, repr(value)]
@@ -3480,7 +3510,8 @@ _marked_without_dict = dict[int, Any]()
 # *this interpreter*, a property of the loaded code and never of a project, it is set once and
 # never reset, it is never read as "which project am I in", and it gates only the probe's speed —
 # the decision's result is the same whether it is True or False, because an unmarked value's
-# chain holds no mark either way. Removing it returns the round 9 hot-path regression.
+# chain holds no mark either way. Removing it puts a chain read and an MRO walk back on every
+# classified value of every project, marked or not: the cost the benchmark gate caught.
 _marks_made = False
 
 
