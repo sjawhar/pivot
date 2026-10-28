@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import importlib
+import pathlib
 import sys
 from typing import TYPE_CHECKING, Any, cast, override
 
@@ -15,8 +16,10 @@ if TYPE_CHECKING:
     from pivot.registry import PipelineLike, RegistryStageInfo
     from pivot.storage.store import WorkspaceStore
 
-from pivot import display, exceptions, names, project
+from pivot import config, display, exceptions, names, project, registry, types
 from pivot.cli import decorators as cli_decorators
+from pivot.storage import lock, track
+from pivot.types import HashInfo
 
 
 class NoPipelineError(exceptions.PivotError):
@@ -171,6 +174,58 @@ class TransferProgress:
             )
         self._bar.desc = f"{self._action} {display.escape_control(filename)}"
         self._bar.update(completed - self._bar.n)
+
+
+def get_stage_output_info() -> tuple[dict[str, HashInfo], dict[str, pathlib.Path]]:
+    """Get output hash info from lock files for cached stage outputs only.
+
+    Non-cached outputs (e.g. Metric with cache=False) are excluded —
+    they are git-tracked and not Pivot's responsibility to restore.
+
+    Uses per-stage state_dir from the registry for lock file lookup. Also returns each
+    output's stage state_dir, whose StateDB holds the file hashes the stage's runs and
+    explanations look up.
+    """
+    result = dict[str, HashInfo]()
+    state_dirs = dict[str, pathlib.Path]()
+    store = get_workspace_store()
+    if store is None:
+        return result, state_dirs
+
+    for stage_name in list_stages():
+        stage_info = get_stage(stage_name)
+        ref_by_identity = {out.identity: out for out in stage_info["outs"]}
+        cached_identities = {
+            out.identity for out in stage_info["outs"] if out.tag is not types.ArtifactTag.METRIC
+        }
+
+        stage_state_dir = registry.get_stage_state_dir(stage_info, config.locate_state_dir())
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
+        lock_data = stage_lock.read()
+        if lock_data:
+            for identity, out_hash in lock_data["output_hashes"].items():
+                if identity not in cached_identities:
+                    continue
+                ref = ref_by_identity.get(identity)
+                if ref is None:
+                    continue
+                resolved = str(store.resolve_display_path(ref))
+                result[resolved] = out_hash
+                state_dirs[resolved] = stage_state_dir
+
+    return result, state_dirs
+
+
+def get_locally_tracked_targets() -> list[str]:
+    """Return paths of all files tracked locally via .pvt files and stage lockfiles."""
+    proj_root = project.get_project_root()
+    targets = list(track.discover_pvt_files(proj_root))
+
+    pipeline = cli_decorators.get_pipeline_from_context()
+    if pipeline is not None:
+        targets.extend(get_stage_output_info()[0])
+
+    return targets
 
 
 def print_transfer_errors(errors: list[str], max_shown: int = 5) -> None:

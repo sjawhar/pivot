@@ -7,7 +7,6 @@ import typing
 from typing import TYPE_CHECKING
 
 from pivot import cli, config, loaders, project, types
-from pivot.cli import checkout as checkout_mod
 from pivot.cli import helpers as cli_helpers
 from pivot.registry import PipelineLike, RegistryStageInfo
 from pivot.storage import cache, lock, store, track
@@ -120,7 +119,7 @@ def test_get_stage_output_info_uses_store_paths(mock_discovery: PipelineLike) ->
     output_hash = types.FileHash(hash="a" * 16)
     _helper_write_lock("train", mock_discovery.state_dir, {ref.identity: output_hash})
 
-    hashes, state_dirs = checkout_mod._get_stage_output_info()
+    hashes, state_dirs = cli_helpers.get_stage_output_info()
     expected_path = str(store_instance.resolve_display_path(ref))
 
     assert hashes == {expected_path: output_hash}

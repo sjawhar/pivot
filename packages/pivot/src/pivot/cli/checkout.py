@@ -17,7 +17,7 @@ from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
-from pivot.storage import cache, lock, ownership, state, track
+from pivot.storage import cache, ownership, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
@@ -73,46 +73,6 @@ class CheckoutBehavior(enum.StrEnum):
     ERROR = "error"  # Error if file already exists (default)
     SKIP_EXISTING = "skip_existing"  # Skip files that already exist (--only-missing)
     FORCE = "force"  # Overwrite existing files (--force)
-
-
-def _get_stage_output_info() -> tuple[dict[str, HashInfo], dict[str, pathlib.Path]]:
-    """Get output hash info from lock files for cached stage outputs only.
-
-    Non-cached outputs (e.g. Metric with cache=False) are excluded —
-    they are git-tracked and not Pivot's responsibility to restore.
-
-    Uses per-stage state_dir from the registry for lock file lookup. Also returns each
-    output's stage state_dir, whose StateDB holds the file hashes the stage's runs and
-    explanations look up.
-    """
-    result = dict[str, HashInfo]()
-    state_dirs = dict[str, pathlib.Path]()
-    store = cli_helpers.get_workspace_store()
-    if store is None:
-        return result, state_dirs
-
-    for stage_name in cli_helpers.list_stages():
-        stage_info = cli_helpers.get_stage(stage_name)
-        ref_by_identity = {out.identity: out for out in stage_info["outs"]}
-        cached_identities = {
-            out.identity for out in stage_info["outs"] if out.tag is not types.ArtifactTag.METRIC
-        }
-
-        stage_state_dir = registry.get_stage_state_dir(stage_info, config.locate_state_dir())
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
-        lock_data = stage_lock.read()
-        if lock_data:
-            for identity, out_hash in lock_data["output_hashes"].items():
-                if identity not in cached_identities:
-                    continue
-                ref = ref_by_identity.get(identity)
-                if ref is None:
-                    continue
-                resolved = str(store.resolve_display_path(ref))
-                result[resolved] = out_hash
-                state_dirs[resolved] = stage_state_dir
-
-    return result, state_dirs
 
 
 def _on_disk_matches_expected(
@@ -695,7 +655,7 @@ def checkout(
     stage_outputs = dict[str, HashInfo]()
     output_state_dirs = dict[str, pathlib.Path]()
     if pipeline is not None:
-        stage_outputs, output_state_dirs = _get_stage_output_info()
+        stage_outputs, output_state_dirs = cli_helpers.get_stage_output_info()
 
     state_dir = config.locate_state_dir()
 
