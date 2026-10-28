@@ -164,9 +164,8 @@ def _track_single_path(
 
     # Naming-lock unit (shared): copy_to_cache checks object existence, then write_pvt_file
     # writes the record that names the objects. gc cannot delete while this unit is open.
-    with gc_mod.naming_unit(
-        cache_dir.parent
-    ):  # cache_dir is <cache>/files; naming.lock is at <cache>
+    # ``cache_dir`` is ``<cache>/files``; the naming lock lives at the cache root.
+    with gc_mod.naming_unit(cache_dir.parent):
         # Hash and cache
         if path.is_dir():
             dir_hash = cache.hash_directory(

@@ -2,12 +2,12 @@
 
 `pivot gc` holds ``naming.lock`` exclusive while it deletes; every writer holds it shared for one
 commit unit, from its first look at a cache object to the record that names it. These tests hold
-the exclusive side themselves and run real ``pivot repro`` processes against it: a writer site
-that stops taking the shared side lets its commit land while the test holds the lock, and the
-test fails. Each writer site has its own test, so a site that loses its lock is caught by the
-test for that site and not by another's. The last test pins the other side of the bargain: the
-shared lock covers only the commit, never a stage's execution, so a collection proceeds while a
-long stage runs.
+the exclusive side themselves and run real pivot processes against it: a writer site that stops
+taking the shared side lets its record land while the test holds the lock, and the test fails.
+Each writer site has its own test — a stage commit, a run-cache skip, `pivot commit`, `pivot
+track` and `pivot get --rev` — so a site that loses its lock is caught by the test for that site
+and not by another's. The last test pins the other side of the bargain: the shared lock covers
+only the commit, never a stage's execution, so a collection proceeds while a long stage runs.
 """
 
 from __future__ import annotations
@@ -17,8 +17,12 @@ import pathlib
 import subprocess
 import sys
 import time
+from typing import TYPE_CHECKING
 
 from pivot.storage import gc
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
@@ -127,6 +131,35 @@ def _finish(proc: subprocess.Popen[str]) -> str:
     return out
 
 
+def _assert_waits_for_a_collection(
+    root: pathlib.Path,
+    cache_dir: pathlib.Path,
+    args: tuple[str, ...],
+    *,
+    unblocked: float,
+    landed: Callable[[], bool],
+) -> str:
+    """Run ``pivot <args>`` while holding the naming lock exclusive: its record must not land
+    until the lock is released, then must. ``unblocked`` is how long the same kind of command
+    took without the lock; the test waits three times that before judging it blocked."""
+    what = f"pivot {' '.join(args)}"
+    assert not landed(), f"{what}: its record is there before it ran"
+    with gc.naming_exclusive(cache_dir):
+        proc = _start(root, *args, env=_env())
+        try:
+            deadline = time.monotonic() + max(3 * unblocked, 5.0)
+            while proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert proc.poll() is None, f"{what} did not wait for the collection"
+            assert not landed(), f"{what} wrote its record during the collection"
+        except BaseException:
+            proc.kill()
+            raise
+    out = _finish(proc)
+    assert landed(), f"{what} never wrote its record after the collection"
+    return out
+
+
 def test_a_stage_commit_waits_while_a_collection_holds_the_naming_lock(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -190,6 +223,78 @@ def test_a_run_cache_skip_waits_while_a_collection_holds_the_naming_lock(
     # skip leaves the lock as it was, and a run would be reported as ran).
     assert "0 ran, 1 cached" in out, f"the stage was not restored from the run cache: {out}"
     assert _locks(root) != before, "the run-cache skip never landed after the collection"
+
+
+def test_pivot_commit_waits_while_a_collection_holds_the_naming_lock(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The `pivot commit` site: committing a `--no-commit` run's outputs caches them and writes
+    the stage lock only once the collection releases the naming lock."""
+    root = _project(tmp_path / "project")
+    _ok(_run(root, "repro"))
+    (root / "data" / "raw" / "input.txt").write_text("not committed yet\n")
+    started = time.monotonic()
+    _ok(_run(root, "repro", "--no-commit"))
+    unblocked = time.monotonic() - started
+    cache_dir = _register_fresh(root)
+    before = _locks(root)
+
+    _assert_waits_for_a_collection(
+        root, cache_dir, ("commit",), unblocked=unblocked, landed=lambda: _locks(root) != before
+    )
+
+
+def test_pivot_track_waits_while_a_collection_holds_the_naming_lock(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The `pivot track` site: tracking a file caches it and writes its `.pvt` only once the
+    collection releases the naming lock."""
+    root = _project(tmp_path / "project")
+    (root / "first.txt").write_text("tracked first\n")
+    started = time.monotonic()
+    _ok(_run(root, "track", "first.txt"))
+    unblocked = time.monotonic() - started
+    cache_dir = _register_fresh(root)
+    (root / "notes.txt").write_text("tracked during a collection\n")
+
+    _assert_waits_for_a_collection(
+        root,
+        cache_dir,
+        ("track", "notes.txt"),
+        unblocked=unblocked,
+        landed=(root / "notes.txt.pvt").exists,
+    )
+
+
+def test_pivot_get_rev_waits_while_a_collection_holds_the_naming_lock(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The `pivot get --rev` site: restoring an output from a revision checks its cache object
+    and links it out only once the collection releases the naming lock."""
+    root = _project(tmp_path / "project")
+    _ok(_run(root, "repro"))
+    git_env = _env(
+        GIT_AUTHOR_NAME="t",
+        GIT_AUTHOR_EMAIL="t@t",
+        GIT_COMMITTER_NAME="t",
+        GIT_COMMITTER_EMAIL="t@t",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, env=git_env)
+    subprocess.run(["git", "commit", "-q", "-m", "outputs"], cwd=root, check=True, env=git_env)
+    target = "data/shadow/shout.txt"
+    started = time.monotonic()
+    _ok(_run(root, "get", "--rev", "HEAD", target, "-o", str(tmp_path / "first.txt")))
+    unblocked = time.monotonic() - started
+    cache_dir = _register_fresh(root)
+    restored = tmp_path / "restored.txt"
+
+    _assert_waits_for_a_collection(
+        root,
+        cache_dir,
+        ("get", "--rev", "HEAD", target, "-o", str(restored)),
+        unblocked=unblocked,
+        landed=restored.exists,
+    )
 
 
 def test_a_collection_runs_while_a_stage_executes(tmp_path: pathlib.Path) -> None:
