@@ -1306,6 +1306,7 @@ def _execute_stage(
             exceptions.CorruptListingError,
             exceptions.StageDefinitionError,
             exceptions.InvalidPathError,
+            exceptions.UnreadableLinkError,
         ) as exc:
             return _make_result(
                 StageStatus.FAILED, exc.format_user_message(), ring_buffer, input_hash=input_hash
@@ -1542,6 +1543,9 @@ def restore_outputs_to_hashes(
                         pending=None if file_hash_entries is None else read,
                     )
                 except OSError:
+                    # An output the check cannot read differs from its lock. A symlink it cannot
+                    # classify raises UnreadableLinkError instead, so a caller refuses rather
+                    # than restoring over a link that may be a user's.
                     actual_hash, actual_listing = None, None
                 if file_hash_entries is not None:
                     file_hash_entries.extend(cache.deferred_file_hash_entries(read))
@@ -2298,6 +2302,8 @@ def hash_dependencies(
             except IsADirectoryError:
                 # One file of a directory output names a directory the producer wrote there
                 unreadable.append(f"{key} (a directory, not a file)")
+            except exceptions.UnreadableLinkError as exc:
+                unreadable.append(f"{key} ({exc})")
             except OSError:
                 unreadable.append(key)
     else:

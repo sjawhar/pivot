@@ -242,7 +242,17 @@ link.txt`; replace the link with a real file or directory. A later release
 refuses these symlinks. The one exception is a link Pivot made itself: a
 symlink-mode checkout links each file to an object in the configured cache
 (`cache.dir`), and that link counts as the file it points to. A link to a
-hash-named file anywhere else is a user symlink.
+hash-named file anywhere else is a user symlink. A symlink Pivot can see but
+not read (reading it, or what it points to, fails, as on a faulty FUSE or NFS
+mount) is an error, not a left-out link: Pivot cannot tell whether it made the
+link, and leaving it out could record the directory without one of its files.
+A command that hashes the directory reports an error that names the link, and
+changes nothing: `pivot status`, `pivot verify` and `pivot repro --dry-run`
+give it as the reason of the stage that writes the directory, and the other
+commands stop with it. `pivot repro` fails that stage when the stage would
+otherwise be cached; a stage that runs replaces its output. A tracked directory
+holding such a link stops `pivot status`, `pivot run` and `pivot repro`. Make
+the link and what it points to readable, or remove the link.
 
 A lock records each file of a directory artifact by its path inside the
 directory, and Pivot reads back every path it writes. Any character a file name

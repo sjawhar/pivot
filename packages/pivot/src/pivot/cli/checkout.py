@@ -110,7 +110,7 @@ def _get_stage_output_info(
             out.identity for out in stage_info["outs"] if out.tag is not types.ArtifactTag.METRIC
         }
 
-        stage_state_dir = registry.get_stage_state_dir(stage_info, config.get_state_dir())
+        stage_state_dir = registry.get_stage_state_dir(stage_info, config.locate_state_dir())
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         lock_data = stage_lock.read(cache_dir=cache_dir)
         if lock_data:
@@ -620,7 +620,7 @@ def checkout(
     if pipeline is not None:
         stage_outputs, output_state_dirs = _get_stage_output_info(cache_dir)
 
-    state_dir = config.get_state_dir()
+    state_dir = config.locate_state_dir()
 
     # Every target adds its read or restored file hashes to one thread-safe batch. Saving once
     # per state directory keeps a many-target checkout from serializing one LMDB write per file.

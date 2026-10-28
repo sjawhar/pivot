@@ -101,6 +101,44 @@ def test_no_lock_is_written_when_writing_its_listing_fails(
     assert stage_lock.path.read_bytes() == old_lock, "the lock moved on before its listing"
 
 
+def test_write_refuses_two_listings_that_map_to_the_same_short_name(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When two overlong output keys both hash to the same XXH64 short name, StageLock.write
+    refuses before writing anything, naming both paths."""
+    from pivot import exceptions
+    from xxh64_forge import forge_value
+
+    # Build two distinct overlong keys whose XXH64 short names collide.
+    target_hex = xxhash.xxh64(b"seed").hexdigest()
+    key_a = forge_value(lambda v: os.fsencode(listing._enc(v)), target_hex, prefix="a" * 250)
+    key_b = forge_value(lambda v: os.fsencode(listing._enc(v)), target_hex, prefix="b" * 250)
+    assert key_a != key_b
+    assert xxhash.xxh64(os.fsencode(listing._enc(key_a))).hexdigest() == target_hex
+    assert xxhash.xxh64(os.fsencode(listing._enc(key_b))).hexdigest() == target_hex
+
+    hashed_a = _helper_hashed("a.csv")
+    hashed_b = _helper_hashed("b.csv")
+
+    stage_lock = lock.StageLock("p/stage", tmp_path)
+    with pytest.raises(exceptions.InvalidPathError, match="two listings to the same file"):
+        stage_lock.write(
+            LockData(
+                code_manifest={},
+                params={},
+                dep_hashes={},
+                output_hashes={
+                    ArtifactIdentity("p/stage", key_a): hashed_a["record"],
+                    ArtifactIdentity("p/stage", key_b): hashed_b["record"],
+                },
+            ),
+            hashed_dirs={
+                hashed_a["record"]["hash"]: hashed_a,
+                hashed_b["record"]["hash"]: hashed_b,
+            },
+        )
+
+
 # =============================================================================
 # M13b: `pivot track` no longer warns when git ignores a file it wrote
 # =============================================================================

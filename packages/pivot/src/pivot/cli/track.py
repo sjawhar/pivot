@@ -6,7 +6,7 @@ from typing import TypedDict
 
 import click
 
-from pivot import config, git, project
+from pivot import config, exceptions, git, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.storage import cache, listing, state
@@ -109,11 +109,17 @@ def _tracking_file_collision(
 
 
 def _foreign_listing(
-    listing_path: pathlib.Path, recorded: track_mod.PvtData | None, new_data: bytes | None
+    listing_path: pathlib.Path,
+    recorded: track_mod.PvtData | None,
+    new_data: bytes | None,
+    cache_dir: pathlib.Path,
 ) -> bool:
     """Whether something stands at ``listing_path`` that pivot did not write for this target:
     anything but a file holding the listing of the directory its .pvt records (``recorded``) or
-    the bytes about to be written there (``new_data``)."""
+    the bytes about to be written there (``new_data``).
+
+    Ownership is proved by byte equality with the canonical cache object, never by XXH64 alone.
+    """
     if not os.path.lexists(listing_path):
         return False
     if listing_path.is_symlink() or not listing_path.is_file():
@@ -124,7 +130,14 @@ def _foreign_listing(
         return True
     if data == new_data:
         return False
-    return recorded is None or "nfiles" not in recorded or listing.digest(data) != recorded["hash"]
+    if recorded is None or "nfiles" not in recorded:
+        return True
+    # Compare bytes exactly with the cached listing object, not just the digest.
+    try:
+        cached = cache.get_cache_path(cache_dir, recorded["hash"]).read_bytes()
+    except (OSError, exceptions.SecurityValidationError):
+        return True  # cache object absent or unreadable: cannot prove ownership
+    return data != cached
 
 
 def _track_single_path(
@@ -247,7 +260,7 @@ def _track_single_path(
         )
 
     # Pivot writes or removes only a listing it wrote for this target.
-    if _foreign_listing(listing_path, existing_tracked.get(abs_path_str), listing_data):
+    if _foreign_listing(listing_path, existing_tracked.get(abs_path_str), listing_data, cache_dir):
         shown = project.to_relative_path(listing_path, project_root)
         raise click.ClickException(
             f"Cannot track '{path_str}': '{shown}' is in the way, and it is not a listing pivot "

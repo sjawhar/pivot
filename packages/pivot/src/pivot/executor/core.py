@@ -572,6 +572,7 @@ def _restore_tracked_file(
     path: pathlib.Path,
     track_data: track.PvtData,
     cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]],
 ) -> bool:
     """Restore a tracked file or directory from cache, appending each file restored to
@@ -595,7 +596,7 @@ def _restore_tracked_file(
         output_hash,
         cache_dir,
         checkout_modes=checkout_modes,
-        state_dir=config.locate_state_dir(),
+        state_dir=state_dir,
         members=members,
         recorded=recorded,
     )
@@ -638,7 +639,7 @@ def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = Fa
                     raise FileNotFoundError(data_path)
             except FileNotFoundError:
                 if checkout_missing:
-                    if _restore_tracked_file(path, track_data, cache_dir, pending):
+                    if _restore_tracked_file(path, track_data, cache_dir, state_dir, pending):
                         logger.info(f"Restored tracked file: {data_path}")
                     else:
                         logger.debug(f"Failed to restore tracked file from cache: {data_path}")

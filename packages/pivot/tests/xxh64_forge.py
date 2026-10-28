@@ -33,8 +33,10 @@ _P1I = pow(_P1, -1, 1 << 64)
 _P2I = pow(_P2, -1, 1 << 64)
 _ALPHABET = (string.ascii_letters + string.digits).encode()
 _ALLOWED = frozenset(_ALPHABET)
-_SENTINEL = "\x00" * 16  # Pivot's listing format escapes each NUL as four ASCII bytes.
-_ENCODED_SENTINEL = b"\\000" * 16
+# A sentinel that listing.encode writes verbatim (alphanumeric characters are never escaped or
+# quoted), so forge_value can find it in the encoded bytes and replace it.
+_SENTINEL = "Z" * 16
+_ENCODED_SENTINEL = b"Z" * 16
 
 
 def _rotl(x: int, r: int) -> int:
@@ -94,7 +96,8 @@ def forge_value(build: Callable[[str], bytes], target_hex: str, *, prefix: str =
     """A string starting with ``prefix`` for which ``xxh64(build(value))`` is ``target_hex``.
 
     ``build`` embeds its argument contiguously and unescaped (alphanumeric characters are), with
-    fewer than 16 bytes after it, as ``json.dumps`` does for a manifest's last string field.
+    fewer than 16 bytes after it, as listing.encode does for a file's relpath at the end of a
+    line (only ``\\n`` follows).
     """
     probe = build(prefix + _SENTINEL)
     start = probe.index(_ENCODED_SENTINEL) - len(prefix.encode())

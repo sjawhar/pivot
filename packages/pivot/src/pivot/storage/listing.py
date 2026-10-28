@@ -344,7 +344,7 @@ def _checked(path: pathlib.Path, fallback: Callable[[], pathlib.Path]) -> pathli
 def output_listing_path(stages_dir: pathlib.Path, identity: ArtifactIdentity) -> pathlib.Path:
     """``<stages_dir>/<stage_name>=<enc(key)>.listing``, beside the writing stage's lock.
 
-    A key whose encoded bytes would exceed NAME_MAX uses ``~`` plus its SHA-256 digest instead;
+    A key whose encoded bytes would exceed NAME_MAX uses ``~`` plus its XXH64 digest instead;
     the original key remains in the lock, so this changes no artifact identity.
     """
     key = identity.key or ""
@@ -357,7 +357,7 @@ def output_listing_path(stages_dir: pathlib.Path, identity: ArtifactIdentity) ->
 def input_listing_path(stages_dir: pathlib.Path, input_path: str) -> pathlib.Path:
     """``<stages_dir>/=inputs/<enc(project-relative path)>.listing``, one per project input.
 
-    An encoded path beyond NAME_MAX uses ``~`` plus its SHA-256 digest.
+    An encoded path beyond NAME_MAX uses ``~`` plus its XXH64 digest.
     """
     inputs = stages_dir / INPUTS_DIR
     return _checked(
@@ -368,7 +368,7 @@ def input_listing_path(stages_dir: pathlib.Path, input_path: str) -> pathlib.Pat
 
 def tracked_listing_path(pvt_path: pathlib.Path) -> pathlib.Path:
     """``<path>.pvt.listing``, beside a tracked directory's ``.pvt``; a name that would exceed
-    NAME_MAX uses ``.~<SHA-256>.pvt.listing`` in the same directory."""
+    NAME_MAX uses ``.~<XXH64>.pvt.listing`` in the same directory."""
     direct = pvt_path.with_name(pvt_path.name + SUFFIX)
     return _checked(
         direct,

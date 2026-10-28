@@ -1150,6 +1150,23 @@ class StageLock:
                 )
             )
 
+        # Refuse before writing anything when two overlong names alias to the same short target.
+        targets = dict[pathlib.Path, str]()
+        for item in to_write:
+            prior = targets.get(item.target)
+            if prior is not None:
+                this = item.out_path or item.dependency or "?"
+                raise exceptions.InvalidPathError(
+                    f"Stage '{self.stage_name}' cannot write two listings to the same file "
+                    + f"'{item.target.name}': '{prior}' and '{this}' both map to it because "
+                    + "their XXH64 short names collide; rename one of the outputs"
+                )
+            targets[item.target] = (
+                item.out_path
+                or item.dependency
+                or identity_key(ArtifactIdentity(self.stage_name, None))
+            )
+
         storage_data = _convert_to_storage_format(data)
         with_control = list[str]()
         for recorded, out_path, dependency in _recorded_paths(storage_data["outs"], to_write):

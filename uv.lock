@@ -2184,7 +2184,7 @@ wheels = [
 
 [[package]]
 name = "pivot"
-version = "0.5.18"
+version = "0.5.19"
 source = { editable = "packages/pivot" }
 dependencies = [
     { name = "aiohttp" },
@@ -2336,7 +2336,7 @@ provides-extras = ["dvc", "gcs", "matplotlib", "s3", "tui", "docs", "dev"]
 
 [[package]]
 name = "pivot-tui"
-version = "0.5.18"
+version = "0.5.19"
 source = { editable = "packages/pivot-tui" }
 dependencies = [
     { name = "pivot" },
@@ -2362,7 +2362,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "pivot-workspace"
-version = "0.5.18"
+version = "0.5.19"
 source = { virtual = "." }
 
 [package.dev-dependencies]

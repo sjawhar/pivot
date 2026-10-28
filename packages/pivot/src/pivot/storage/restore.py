@@ -297,15 +297,17 @@ def resolve_targets(
     return results
 
 
-def _write_fallback_content(dest_path: pathlib.Path, content: bytes) -> os.stat_result:
-    """Atomically replace a cache-miss target under the cache restore lock; return the written
-    file's stat, taken before it replaced the target."""
+def _write_fallback_content(
+    dest_path: pathlib.Path, content: bytes, state_dir: pathlib.Path
+) -> os.stat_result:
+    """Atomically replace a cache-miss target under the resolved state directory's restore lock;
+    return the written file's stat, taken before it replaced the target."""
 
     def write_content(fd: int) -> None:
         with os.fdopen(fd, "wb") as file:
             file.write(content)
 
-    with cache.restore_lock(dest_path, config.locate_state_dir()) as lock_token:
+    with cache.restore_lock(dest_path, state_dir) as lock_token:
         staging_path = (
             cache.restore_staging_path(dest_path, lock_token) if lock_token is not None else None
         )
@@ -365,6 +367,7 @@ def restore_file(
     force: bool,
     *,
     remote_factory: Callable[[], RemoteStorage],
+    state_dir: pathlib.Path | None = None,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
     members: listing.DirListing | None = None,
 ) -> RestoreResult:
@@ -381,12 +384,12 @@ def restore_file(
     A restore appends ``(path, stat, hash)`` for each file it writes to ``recorded``, for the
     caller to batch by state directory, so the next status, explanation or run looks the file up
     instead of reading it. Each stat is of what was staged, taken before the rename put it in
-    place.
+    place. ``state_dir`` is the stage's own state directory for a stage target, otherwise the
+    configured directory from ``config.locate_state_dir()``.
     """
-    state_dir = config.locate_state_dir()
+    state_dir = state_dir or config.locate_state_dir()
     path_str = str(dest_path)
     files_dir = cache_dir / "files"
-
     if (skipped := _skipped(dest_path, force)) is not None:
         return skipped
 
@@ -440,7 +443,7 @@ def restore_file(
     content = git.read_file_from_revision(rel_path, rev)
     if content is not None:
         try:
-            written = _write_fallback_content(dest_path, content)
+            written = _write_fallback_content(dest_path, content, state_dir)
         except OSError as e:
             return RestoreResult(
                 status=RestoreStatus.ERROR,
@@ -611,6 +614,7 @@ def restore_targets_from_revision(
                     checkout_modes=checkout_modes,
                     force=force,
                     remote_factory=reachable_remote,
+                    state_dir=hash_state_dir,
                     recorded=recorded,
                     members=target_info["members"].get(rel_path),
                 )
