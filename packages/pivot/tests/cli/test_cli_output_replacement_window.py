@@ -1,5 +1,5 @@
 """A user's tracked file that lands in a stage output while the installed `pivot` binary replaces
-that output, and a stage write or restore killed while its old output is renamed aside.
+that output, and a stage write or restore killed while its old directory output is renamed aside.
 
 A sitecustomize hook on PYTHONPATH runs in the pivot process and in every worker it starts:
 
@@ -21,6 +21,8 @@ import subprocess
 import sys
 
 import pytest
+
+from pivot.storage import cache
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
@@ -204,7 +206,9 @@ def _helper_refused(proc: subprocess.CompletedProcess[str], sidecar: str) -> str
 
 def _helper_backups(directory: pathlib.Path) -> list[str]:
     return sorted(
-        entry.name for entry in directory.iterdir() if entry.name.startswith(".pivot_backup_")
+        entry.name
+        for entry in directory.iterdir()
+        if entry.name.startswith(cache._BACKUP_TEMP_PREFIX)
     )
 
 
@@ -264,32 +268,29 @@ def test_symlink_commit_keeps_a_tracked_file_copied_into_the_output_after_its_ch
 
 
 @pytest.mark.parametrize(
-    ("output_name", "then"),
+    "then",
     [
-        pytest.param("note.txt", ("repro", "k/note"), id="file-then-restore"),
-        pytest.param("note.txt", ("repro", "--force", "k/note"), id="file-then-write"),
-        pytest.param("tree", ("repro", "--force", "k/tree"), id="directory-then-write"),
+        pytest.param(("repro", "k/tree"), id="then-restore"),
+        pytest.param(("repro", "--force", "k/tree"), id="then-write"),
     ],
 )
 def test_the_backup_a_killed_stage_write_leaves_goes_with_the_next_replacement(
-    tmp_path: pathlib.Path, output_name: str, then: tuple[str, ...]
+    tmp_path: pathlib.Path, then: tuple[str, ...]
 ) -> None:
-    """A stage write killed right after it renamed its old output aside leaves that output beside
-    the path as a backup. The next command that writes or restores the output (a file output
-    restored from the cache, a stage write of either kind) checks the backup under the path's
-    restore lock and removes it. A file output's backup used to stay forever, and so did a
-    directory output's until a restore of it."""
+    """A stage write killed right after it renamed its old directory output aside leaves that
+    output beside the path as a backup. The next command that writes or restores the output (a
+    restore from the cache, a stage write) checks the backup under the path's restore lock and
+    removes it. A rerun used to keep it until a restore of the output."""
     root = _helper_project(tmp_path, _KILL_PIPELINE)
     _ok(_pivot(root, "repro"))
-    stage = "k/note" if output_name == "note.txt" else "k/tree"
-    output = root / "data" / "k" / output_name
+    output = root / "data" / "k" / "tree"
 
     killed = _pivot(
         root,
         "repro",
         "--force",
-        stage,
-        env=_helper_hooked(tmp_path, root, "kill", PIVOT_TEST_LATE_OUTPUT=output_name),
+        "k/tree",
+        env=_helper_hooked(tmp_path, root, "kill", PIVOT_TEST_LATE_OUTPUT="tree"),
     )
 
     out = killed.stdout + killed.stderr
@@ -302,7 +303,30 @@ def test_the_backup_a_killed_stage_write_leaves_goes_with_the_next_replacement(
     _ok(_pivot(root, *then))
 
     assert _helper_backups(output.parent) == []
-    assert output.exists()
+    assert sorted(path.name for path in output.iterdir()) == [f"f{index}.txt" for index in range(5)]
+
+
+def test_a_file_outputs_rerun_renames_nothing_aside(tmp_path: pathlib.Path) -> None:
+    """A stage's file output is checked in place and unlinked, never renamed aside (on overlayfs a
+    rename copies a lower-layer file up whole first): the hook that kills the process at a rename
+    to a backup name never fires, and the rerun succeeds."""
+    root = _helper_project(tmp_path, _KILL_PIPELINE)
+    _ok(_pivot(root, "repro"))
+    output = root / "data" / "k" / "note.txt"
+
+    _ok(
+        _pivot(
+            root,
+            "repro",
+            "--force",
+            "k/note",
+            env=_helper_hooked(tmp_path, root, "kill", PIVOT_TEST_LATE_OUTPUT="note.txt"),
+        )
+    )
+
+    assert not (root / ".late-landed").exists()
+    assert output.read_text() == "note\n"
+    assert _helper_backups(output.parent) == []
 
 
 def test_forced_checkout_keeps_a_killed_restores_backup_that_holds_a_user_file(

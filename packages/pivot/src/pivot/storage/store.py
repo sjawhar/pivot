@@ -325,12 +325,12 @@ class WorkspaceStore:
         """Clear the output's path for the stage to write, refusing first if that would remove
         a user's file (``refuse_output_replacements``).
 
-        The old output is renamed aside before it is removed, and checked again there
-        (``cache.remove_output_checked``, ``ownership.swap_refusal``), so a user's file copied
-        into it after the first check is named and put back with the output, never deleted.
-        Only the first check sees a sidecar that names a path holding nothing. With
-        ``state_dir`` the removal holds the path's restore lock and first removes, once checked
-        the same way, the backup a killed stage write of the path left.
+        The old output is checked again just before it is removed (``cache.remove_output_checked``,
+        ``ownership.swap_refusal``): a directory renamed aside, so a user's file copied into it
+        after the first check is named and put back with the output, never deleted; a file in
+        place, just before it is unlinked. Only the first check sees a sidecar that names a path
+        holding nothing. With ``state_dir`` the removal holds the path's restore lock and first
+        removes, once checked the same way, the backup a killed stage write of the path left.
         """
         self.refuse_output_replacements(
             [ref], claims, None if returned is None else {ref: returned}

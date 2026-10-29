@@ -493,15 +493,18 @@ restore, `pivot commit`, forced checkout or forced `pivot get` that would remove
 sidecar fails before changing anything. A tracked file and sidecar copied into a stage's output
 while a run replaces that output fail the stage the same way, naming them: before the stage
 writes, and when a symlink-mode commit links a directory output to its cache tree, Pivot renames
-the old output aside and checks it again before deleting it, and puts it back, with both files,
-when it finds them. An incremental stage's previous output is restored over the old one, with
-nothing removed before the restore's checks. Not covered: on a filesystem that cannot rename the
-old output (overlayfs with `redirect_dir` off), Pivot checks it in place, and a file copied in
-after that check is deleted with it; a file moved over a file output in the instant between a
-restore's last check and its replacement is replaced; a commit in hardlink mode (or symlink mode,
-for a file output) checks the output once, before it links each file the stage wrote to the
-cache; and the links a run makes at output paths for outputs kept only in the cache (the
-presentation layer) are checked once, before they replace what is there. A forced restore of a
+an old directory output aside and checks it again before deleting it, and puts it back, with both
+files, when it finds them; it checks an old file output again in place, just before it removes
+it. An incremental stage's previous output is restored over the old one, with nothing removed
+before the restore's checks. Not covered: a file moved over a file output in the instant between
+Pivot's last check and its removal (a stage write) or replacement (a restore) is removed; a file
+moved over a file output while the stage's own writer writes it is replaced by the stage's
+output, and the commit then fails the stage, naming the sidecar; on a filesystem that cannot
+rename a directory aside (overlayfs with `redirect_dir` off), Pivot checks the old directory in
+place, and a file copied in after that check is deleted with it; a commit in hardlink mode (or
+symlink mode, for a file output) checks the output once, before it links each file the stage
+wrote to the cache; and the links a run makes at output paths for outputs kept only in the cache
+(the presentation layer) are checked once, before they replace what is there. A forced restore of a
 tracked directory (or of a tracked file over a directory) likewise fails before it would remove
 another tracked file, import or `.pvt` sidecar beneath it. A restore requested through a stage
 name restores that stage's output, so a tracked file at that output's path makes it fail too.

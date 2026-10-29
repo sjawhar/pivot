@@ -104,12 +104,11 @@ When multiple `pivot` processes share the same StateDB:
 - File restores stage their link or copy beside the target, under a name tagged with the
   target's token, and atomically replace it. Directory restores build in a private
   temporary directory and swap it. Both run under the target's restore lock, and each
-  first removes the token-tagged entries a killed restore of the same target left (a file
-  restore: its staged file, and a killed stage write's backup).
+  first removes the token-tagged entries a killed restore of the same target left.
 - A stage write with a `state_dir` (the worker passes the project's to
-  `WorkspaceStore.prepare_output`) and a symlink-mode commit hold the same lock while they rename
-  the old output aside, check it and remove it, so no restore's cleanup removes that backup
-  while they check it.
+  `WorkspaceStore.prepare_output`) and a symlink-mode commit hold the same lock while they
+  replace an old output (a directory renamed aside, checked and removed; a file checked in place
+  and unlinked), so no restore's cleanup removes a backup while they check it.
 
 ## Publishing Cache Objects
 
@@ -301,29 +300,40 @@ When multiple `pivot` processes share the same StateDB:
   renamed aside where a directory is involved. A run-cache, generation or incremental output
   restore and repro's restore of a missing tracked file make the same swap check; an incremental
   output's restore removes nothing before it. A stage write clears its old output the same way:
-  `WorkspaceStore.prepare_output` renames the entry at the output's path aside, beside it
-  (`cache.remove_output_checked`: to `cache._locked_backup_path` under the path's restore lock,
-  else to a fresh `cache._backup_path`), checks it there (`ownership.swap_refusal`), and removes
-  it only when the check finds no user file; when the check refuses, the entry goes back to its
-  path (`cache._put_back_checked`) and the refusal names the file. When removing the backup
-  fails, what is left of it goes back and the removal's own error propagates. A symlink-mode
-  commit replaces a directory output with its link to the cache tree the same way
-  (`WorkspaceStore.commit` passes the check to `cache.store_hashed_output`). A stage writer then
-  calls `WorkspaceStore.refuse_output_replacement_at_write` after `prepare_output` and before its
-  loader writes, so a user file that lands in the new, empty output is refused with the same
-  target and sidecar message rather than leaking a loader's "Directory not empty" error. Once a
-  swap or a stage write renames an entry aside, no writer that names its files by
-  path can add one to that entry, so a file copied into a target while the command runs refuses
-  that target. What the swap can still miss: a writer holding an open handle on a directory inside
-  the target (its working directory, or a directory descriptor), which can add a file to the
-  renamed entry after the walk; or a sidecar created beside the target, or beside a directory above
-  it, in the instant between the swap's check and its rename.
-- Where the filesystem cannot rename the entry aside (`cache._rename_aside`: EXDEV from overlayfs
-  with `redirect_dir` off, the default on many kernels, for a directory on a lower layer; ENOTSUP
-  or EOPNOTSUPP), a swap, a stage write and a symlink-mode commit check the entry in place and
-  remove it there, as before the rename aside existed: on such a filesystem a file copied into it
-  after that check is removed with it. Any other rename error (EBUSY for an output that is a mount
-  point) fails before anything is removed.
+  `WorkspaceStore.prepare_output` calls `cache.remove_output_checked`, which renames an old
+  directory at the output's path aside, beside it (to `cache._locked_backup_path` under the
+  path's restore lock, else to a fresh `cache._backup_path`), checks it there
+  (`ownership.swap_refusal`), and removes it only when the check finds no user file; when the
+  check refuses, the directory goes back to its path (`cache._put_back_checked`) and the refusal
+  names the file. When removing the backup fails, what is left of it goes back and the removal's
+  own error propagates. An old file or symlink is checked in place and unlinked, as a restore
+  checks a file it replaces: renaming it aside would close only the instant between the check and
+  the unlink, and on overlayfs renaming a file on the lower layer copies all of it up into the
+  writable layer first. The unlink fails, removing nothing, on a directory that took the path
+  after the check. A symlink-mode commit replaces a directory output with its link to the cache
+  tree the same way (`WorkspaceStore.commit` passes the check to `cache.store_hashed_output`). A
+  stage writer then calls `WorkspaceStore.refuse_output_replacement_at_write` after
+  `prepare_output` and before its loader writes, so a user file that lands in the new, empty
+  output is refused with the same target and sidecar message rather than leaking a loader's
+  "Directory not empty" error. Once a swap or a stage write renames a directory aside, no writer
+  that names its files by path can add one to it, so a file copied into a target while the
+  command runs refuses that target. What the checks can still miss: a writer holding an open
+  handle on a directory inside the target (its working directory, or a directory descriptor),
+  which can add a file to the renamed entry after the walk; a sidecar created beside the target,
+  or beside a directory above it, in the instant between the swap's check and its rename; a file
+  moved over a file output in the instant between the last check and its unlink (a stage write)
+  or the rename that replaces it (a restore); and a file moved over a file output while the
+  stage's own writer writes it (after `refuse_output_replacement_at_write`, before the loader's
+  or `worker._save_recorded`'s rename over the path), which the stage's output replaces; the
+  commit's check then refuses, naming the sidecar. A directory output loses nothing in that last
+  window: the writer adds its files beside the user's, and the commit refuses.
+- Where the filesystem cannot rename a directory aside (`cache._rename_aside`: EXDEV from
+  overlayfs with `redirect_dir` off, the default on many kernels, for a directory on a lower
+  layer; ENOTSUP or EOPNOTSUPP), a swap, a stage write and a symlink-mode commit check it in place
+  and remove it there, as before the rename aside existed: on such a filesystem a file copied into
+  it after that check is removed with it. A rename refused for want of write permission on the
+  parent is retried once the parent is made writable; any other rename error (EBUSY for an output
+  that is a mount point) fails before anything is removed.
 - A directory restore killed between renaming the old entry aside and checking it leaves a backup.
   The next directory restore of that path holds the same restore lock and checks that backup
   before removing it. If the check finds a user file, Pivot keeps the backup and warns, naming the
@@ -341,18 +351,19 @@ When multiple `pivot` processes share the same StateDB:
   at its path is renamed aside and checked, including one made after a file target's check. An
   entry the check refuses goes back to its path; when something took the path meanwhile, it is
   renamed to `<name>.pivot-kept-<hex>` beside it and a warning names it, never left under the
-  backup name a later restore considers. A stage write killed between renaming its old output
-  aside and removing it leaves the backup at `.pivot_backup_<token>.old`
-  (`cache._locked_backup_path`), a file or a directory. The next stage write or file restore of
-  that path, under the same restore lock, checks that backup first and removes it, or keeps it
-  and warns, naming the file, as a directory restore does with every backup; a stage write that
-  keeps it renames its own old output to a fresh `cache._backup_path`, which only a directory
-  restore considers. A directory restore of the path considers it like any other backup. Commits
-  other than a symlink-mode commit of a directory output, and presentation, still check only when
-  they start replacing an output: a commit in hardlink mode (or symlink mode, for a file output)
-  replaces each file the stage wrote with its link to the cache after that one check. `track` and
-  `import` refuse to create a sidecar inside an output, so only a file copied or made by hand can
-  appear there.
+  backup name a later restore considers. A stage write killed between renaming its old directory
+  output aside and removing it leaves the backup at `.pivot_backup_<token>.old`
+  (`cache._locked_backup_path`); only a stage write or a symlink-mode commit of a directory makes
+  one, since a file output is never renamed aside. The next stage write of that path, under the
+  same restore lock, checks that backup first and removes it, or keeps it and warns, naming the
+  file, as a directory restore does with every backup; a stage write that keeps it renames its own
+  old output to a fresh `cache._backup_path`, which only a directory restore considers. A
+  directory restore of the path considers it like any other backup. Commits other than a
+  symlink-mode commit of a directory output, and presentation, still check only when they start
+  replacing an output: a commit in hardlink mode (or symlink mode, for a file output) replaces
+  each file the stage wrote with its link to the cache after that one check. `track` and `import`
+  refuse to create a sidecar inside an output, so only a file copied or made by hand can appear
+  there.
 - `track` and `import` load every pipeline (`discovery.declared_outputs`, as `--all` discovers
   them) and refuse a new path overlapping any declared output, naming the stage. A `pipeline.py`
   that fails to load fails them; one that loads but defines no Pivot pipeline declares nothing. A

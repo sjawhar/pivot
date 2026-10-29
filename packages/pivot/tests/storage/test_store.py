@@ -319,9 +319,9 @@ def test_workspace_store_keeps_a_tracked_file_copied_in_after_the_prepare_check(
 def test_workspace_store_keeps_a_tracked_file_moved_over_a_file_output_after_the_check(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A file output is renamed aside too: a user's tracked file written over it, with its
-    sidecar beside it, after prepare_output's first check is found there, refused, and put back
-    at the output's path."""
+    """A file output is checked again in place, just before it is unlinked: a user's tracked file
+    written over it, with its sidecar beside it, after prepare_output's first check is found
+    there, refused, and kept at the output's path."""
     workspace_store = store.WorkspaceStore(tmp_path, "pipe", {})
     ref = _helper_ref("stage", None, types.ArtifactTag.DATA, loaders.Text())
     output_path = workspace_store.prepare_output(ref)
@@ -337,6 +337,66 @@ def test_workspace_store_keeps_a_tracked_file_moved_over_a_file_output_after_the
         "stage.txt",
         "stage.txt.pvt",
     ]
+
+
+def _record_renames(monkeypatch: pytest.MonkeyPatch) -> list[tuple[pathlib.Path, pathlib.Path]]:
+    """Record every ``pathlib.Path.rename`` from now on, and let each one go ahead."""
+    original_rename = pathlib.Path.rename
+    renames = list[tuple[pathlib.Path, pathlib.Path]]()
+
+    def rename(source: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+        renames.append((source, pathlib.Path(target)))
+        return original_rename(source, target)
+
+    monkeypatch.setattr(pathlib.Path, "rename", rename)
+    return renames
+
+
+def test_prepare_output_unlinks_a_file_output_without_renaming_it(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file output is checked in place and unlinked, never renamed aside: on overlayfs,
+    renaming a file on the lower layer first copies all of it into the writable layer. Under the
+    restore lock no backup is made either."""
+    workspace_store = store.WorkspaceStore(tmp_path, "pipe", {})
+    ref = _helper_ref("stage", None, types.ArtifactTag.DATA, loaders.Text())
+    output_path = workspace_store.prepare_output(ref)
+    output_path.write_text("stage")
+    renames = _record_renames(monkeypatch)
+
+    assert workspace_store.prepare_output(ref, state_dir=tmp_path / ".pivot") == output_path
+
+    assert renames == []
+    assert not output_path.exists()
+    assert _helper_backups(output_path.parent) == []
+
+
+def test_prepare_output_never_removes_a_directory_that_takes_a_file_outputs_path(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory a user puts at a file output's path right after its in-place check is not
+    removed: the unlink fails on it, the stage write fails, and the directory keeps its files."""
+    workspace_store = store.WorkspaceStore(tmp_path, "pipe", {})
+    ref = _helper_ref("stage", None, types.ArtifactTag.DATA, loaders.Text())
+    output_path = workspace_store.prepare_output(ref)
+    output_path.write_text("stage")
+    original_check = ownership.swap_refusal
+
+    def check_then_replace_with_a_directory(
+        project_root: pathlib.Path, target: ownership.ForcedRestore, entry: pathlib.Path
+    ) -> exceptions.OutputOwnershipError | None:
+        refusal = original_check(project_root, target, entry)
+        output_path.unlink()
+        output_path.mkdir()
+        _copy_user_file(output_path / "user.txt")
+        return refusal
+
+    monkeypatch.setattr(ownership, "swap_refusal", check_then_replace_with_a_directory)
+
+    with pytest.raises(IsADirectoryError):
+        workspace_store.prepare_output(ref)
+
+    assert sorted(path.name for path in output_path.iterdir()) == ["user.txt", "user.txt.pvt"]
 
 
 def test_workspace_store_puts_the_output_back_when_its_removal_fails(
@@ -572,14 +632,11 @@ def test_workspace_store_restore_refuses_a_tracked_file_in_a_directory_it_cannot
     assert (output_path / "user.txt").read_text() == "user bytes"
 
 
-def _helper_ref_of(tag: types.ArtifactTag) -> types.ArtifactRef:
-    if tag is types.ArtifactTag.DIRECTORY:
-        return _helper_ref("stage", None, tag, loaders.PathOnly())
-    return _helper_ref("stage", None, tag, loaders.Text())
+_DIRECTORY_REF = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
 
 
 def _helper_prepare_output_killed_after_its_rename(
-    project_root: pathlib.Path, tag: types.ArtifactTag, state_dir: pathlib.Path
+    project_root: pathlib.Path, state_dir: pathlib.Path
 ) -> None:
     """Run in a child process: a stage write killed the moment it renamed the old output aside."""
     original_rename = pathlib.Path.rename
@@ -592,46 +649,42 @@ def _helper_prepare_output_killed_after_its_rename(
 
     pathlib.Path.rename = rename_and_die
     workspace_store = store.WorkspaceStore(project_root, "pipe", {})
-    workspace_store.prepare_output(_helper_ref_of(tag), state_dir=state_dir)
+    workspace_store.prepare_output(_DIRECTORY_REF, state_dir=state_dir)
 
 
 def _helper_killed_stage_write(
-    project_root: pathlib.Path, tag: types.ArtifactTag, state_dir: pathlib.Path
+    project_root: pathlib.Path, state_dir: pathlib.Path
 ) -> tuple[pathlib.Path, pathlib.Path]:
-    """Write an old output, then kill a stage write of it right after it renamed the output
-    aside; return the output's path and the backup the killed write left."""
+    """Write an old directory output, then kill a stage write of it right after it renamed the
+    output aside; return the output's path and the backup the killed write left."""
     output_path = store.WorkspaceStore(project_root, "pipe", {}).prepare_output(
-        _helper_ref_of(tag), state_dir=state_dir
+        _DIRECTORY_REF, state_dir=state_dir
     )
-    if tag is types.ArtifactTag.DIRECTORY:
-        (output_path / "old.txt").write_text("old")
-    else:
-        output_path.write_text("old")
+    (output_path / "old.txt").write_text("old")
     process = multiprocessing.get_context("spawn").Process(
-        target=_helper_prepare_output_killed_after_its_rename, args=(project_root, tag, state_dir)
+        target=_helper_prepare_output_killed_after_its_rename, args=(project_root, state_dir)
     )
     process.start()
     process.join(timeout=60)
     assert process.exitcode == 73
     assert not output_path.exists()
     (backup,) = _helper_backups(output_path.parent)
+    token = cache._restore_target_token(output_path)
+    assert backup.name == f"{cache._BACKUP_TEMP_PREFIX}{token}.old"
     return output_path, backup
 
 
-@pytest.mark.parametrize(
-    "tag", [types.ArtifactTag.DATA, types.ArtifactTag.DIRECTORY], ids=["file", "directory"]
-)
 def test_prepare_output_removes_the_backup_a_killed_stage_write_left(
-    tmp_path: pathlib.Path, tag: types.ArtifactTag
+    tmp_path: pathlib.Path,
 ) -> None:
-    """A stage write killed between renaming its old output aside and removing it leaves the
-    output beside its path. The next stage write of that path, under its restore lock, checks
-    that backup, finds no user file, and removes it, even though nothing is at the path."""
+    """A stage write killed between renaming its old directory output aside and removing it
+    leaves the output beside its path. The next stage write of that path, under its restore lock,
+    checks that backup, finds no user file, and removes it, even though nothing is at the path."""
     state_dir = tmp_path / ".pivot"
-    output_path, _ = _helper_killed_stage_write(tmp_path, tag, state_dir)
+    output_path, _ = _helper_killed_stage_write(tmp_path, state_dir)
     workspace_store = store.WorkspaceStore(tmp_path, "pipe", {})
 
-    assert workspace_store.prepare_output(_helper_ref_of(tag), state_dir=state_dir) == output_path
+    assert workspace_store.prepare_output(_DIRECTORY_REF, state_dir=state_dir) == output_path
 
     assert _helper_backups(output_path.parent) == []
 
@@ -643,46 +696,20 @@ def test_prepare_output_keeps_a_killed_stage_writes_backup_that_holds_a_user_fil
     renamed it aside) keeps the backup, with a warning naming the sidecar; the stage write still
     clears its path, through another backup it removes."""
     state_dir = tmp_path / ".pivot"
-    output_path, backup = _helper_killed_stage_write(
-        tmp_path, types.ArtifactTag.DIRECTORY, state_dir
-    )
+    output_path, backup = _helper_killed_stage_write(tmp_path, state_dir)
     _copy_user_file(backup / "user.txt")
     output_path.mkdir()
     (output_path / "new.txt").write_text("a later run's file")
     workspace_store = store.WorkspaceStore(tmp_path, "pipe", {})
-    ref = _helper_ref_of(types.ArtifactTag.DIRECTORY)
 
     with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
-        assert workspace_store.prepare_output(ref, state_dir=state_dir) == output_path
+        assert workspace_store.prepare_output(_DIRECTORY_REF, state_dir=state_dir) == output_path
 
     assert list(output_path.iterdir()) == []
     assert _helper_backups(output_path.parent) == [backup]
     assert sorted(path.name for path in backup.iterdir()) == ["old.txt", "user.txt", "user.txt.pvt"]
     assert "Keeping interrupted restore backup" in caplog.text
     assert "user.txt.pvt" in caplog.text
-
-
-def test_file_restore_removes_the_backup_a_killed_stage_write_left(tmp_path: pathlib.Path) -> None:
-    """A file restore of the path (a stage restored from the cache) is a replacement of it too:
-    under the path's restore lock it checks the killed stage write's backup and removes it."""
-    state_dir = tmp_path / ".pivot"
-    workspace_store = store.WorkspaceStore(
-        tmp_path,
-        "pipe",
-        {},
-        cache_dir=tmp_path / "cache" / "files",
-        checkout_modes=[config.CheckoutMode.COPY],
-    )
-    ref = _helper_ref_of(types.ArtifactTag.DATA)
-    output_path = workspace_store.prepare_output(ref)
-    output_path.write_text("cached")
-    output_hash = workspace_store.commit(ref, output_path, state_dir=state_dir)
-    _, _ = _helper_killed_stage_write(tmp_path, types.ArtifactTag.DATA, state_dir)
-
-    assert workspace_store.restore_from_cache(ref, output_hash, state_dir=state_dir) is True
-
-    assert output_path.read_text() == "cached"
-    assert _helper_backups(output_path.parent) == []
 
 
 def test_workspace_store_restore_records_pvt_members_before_writing_them(

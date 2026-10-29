@@ -753,20 +753,31 @@ def _clear_path(path: pathlib.Path) -> None:
     if path.is_dir() and not path.is_symlink():
         shutil.rmtree(path, onexc=_make_writable_and_retry)
     else:
-        try:
-            path.unlink()
-        except PermissionError as perm_err:
-            # Make parent directory writable, not the file itself.
-            # Files may be hardlinks to read-only cache - chmod would corrupt cache.
-            parent = path.parent
-            try:
-                parent_perm = parent.stat().st_mode
-            except FileNotFoundError:
-                # Parent was deleted concurrently - re-raise original error
-                raise perm_err from None
-            if not (parent_perm & stat.S_IWUSR):
-                os.chmod(parent, parent_perm | stat.S_IWUSR)
-            path.unlink()
+        _unlink(path)
+
+
+def _unlink(path: pathlib.Path) -> None:
+    """Unlink the file or symlink at ``path``, making a read-only parent writable first if that
+    is what refuses it. Never chmod the file: it may be a hardlink to the read-only cache. A
+    directory at ``path`` is never removed: unlink fails on it."""
+    try:
+        path.unlink()
+    except PermissionError as perm_err:
+        _make_parent_writable(path, perm_err)
+        path.unlink()
+
+
+def _make_parent_writable(path: pathlib.Path, error: PermissionError) -> None:
+    """Make ``path``'s parent directory writable after ``error`` refused removing or renaming
+    ``path``; raise ``error`` when the parent is gone or was writable already."""
+    try:
+        parent_mode = path.parent.stat().st_mode
+    except FileNotFoundError:
+        # Parent was deleted concurrently - re-raise original error
+        raise error from None
+    if parent_mode & stat.S_IWUSR:
+        raise error
+    os.chmod(path.parent, parent_mode | stat.S_IWUSR)
 
 
 def _is_real_dir(path: pathlib.Path) -> bool:
@@ -778,11 +789,11 @@ def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
     """Remove stale restore temporaries (staged replacements) older than max age.
 
     It takes no lock, so it never removes a backup (``_BACKUP_TEMP_PREFIX``): a backup is the
-    entry a restore or a stage write renamed aside, which keeps its own old mtime and may still be
-    under that command's check. Only a command holding the same path's restore lock removes a
-    backup a killed one left: the next directory restore of the path removes every one
-    (``_cleanup_fresh_restore_orphans``), and the next stage write or file restore of the path
-    removes the one at ``_locked_backup_path``.
+    directory (or, for a restore, any entry) a restore or a stage write renamed aside, which keeps
+    its own old mtime and may still be under that command's check. Only a command holding the
+    same path's restore lock removes a backup a killed one left, once it is checked: the next
+    directory restore of the path considers every one (``_cleanup_fresh_restore_orphans``), and
+    the next stage write of the path the one at ``_locked_backup_path``.
     """
     cutoff = time.time() - _RESTORE_TEMP_MAX_AGE
 
@@ -2010,9 +2021,7 @@ def _restore_file_from_cache(
     """Restore single file from cache.
 
     With a state_dir, holds path's restore lock and stages the file under one name
-    tagged with path's token, so the next restore removes what a killed one left. Under the lock
-    it first removes the backup a killed stage write left at ``_locked_backup_path``, once
-    ``before_swap`` finds no user file in it (``_remove_backup_left``).
+    tagged with path's token, so the next restore removes what a killed one left.
     """
     cache_path = resolve_cache_object_path(cache_dir, output_hash["hash"])
     if cache_path is None:
@@ -2040,9 +2049,6 @@ def _restore_file_from_cache(
 
     staging_path = restore_staging_path(path, lock_token)
     _clear_path(staging_path)
-    left = _locked_backup_path(path, lock_token)
-    if os.path.lexists(left):
-        _ = _remove_backup_left(left, before_swap)
     staged = _checkout_with_fallback(
         path,
         cache_path,
@@ -2216,10 +2222,10 @@ def _backup_path(path: pathlib.Path, token: str) -> pathlib.Path:
 
 
 def _locked_backup_path(path: pathlib.Path, token: str) -> pathlib.Path:
-    """The one name beside ``path`` that a stage write holding ``path``'s restore lock renames
-    the old output to (``_remove_checked``), so the next stage write or file restore of ``path``
-    finds a killed one's backup with one ``lstat``. It carries the restore token too, so a
-    directory restore of ``path`` removes it like any other backup."""
+    """The one name beside ``path`` that a stage write holding ``path``'s restore lock renames an
+    old directory output to (``_remove_checked``), so the next stage write of ``path`` finds a
+    killed one's backup with one ``lstat``. It carries the restore token too, so a directory
+    restore of ``path`` considers it like any other backup."""
     return path.parent / f"{_BACKUP_TEMP_PREFIX}{token}.old"
 
 
@@ -2323,8 +2329,8 @@ def remove_output_checked(
     before_remove: Callable[[pathlib.Path], None],
     state_dir: pathlib.Path | None = None,
 ) -> None:
-    """Remove the entry at ``path`` once ``before_remove`` has checked it, renamed aside
-    (``_remove_checked``), holding ``path``'s restore lock when ``state_dir`` is given."""
+    """Remove the entry at ``path`` once ``before_remove`` has checked it (``_remove_checked``),
+    holding ``path``'s restore lock when ``state_dir`` is given."""
     with restore_lock(path, state_dir) as token:
         _remove_checked(path, before_remove, token)
 
@@ -2332,22 +2338,28 @@ def remove_output_checked(
 def _remove_checked(
     path: pathlib.Path, before_remove: Callable[[pathlib.Path], None], token: str | None
 ) -> None:
-    """Remove the entry at ``path`` once ``before_remove`` has checked it, renamed aside.
+    """Remove the entry at ``path`` once ``before_remove`` has checked it.
 
-    ``token`` is ``path``'s restore token when the caller holds its restore lock, else None. The
-    entry is first renamed beside ``path``: once renamed, no writer that names its files by path
-    can add one to it, so ``before_remove`` sees every file the removal deletes. When the check
-    raises, the entry goes back (``_put_back_checked``) and the error propagates. Otherwise the
-    backup is removed; if that fails, what is left of it goes back and the error propagates.
+    A file or symlink is checked in place and unlinked, as a restore checks a file it replaces:
+    a file moved over it in the instant between the check and the unlink is removed. Renaming it
+    aside would close only that instant, and on overlayfs renaming a lower-layer file first copies
+    all of it up into the writable layer. The unlink never removes a directory that took the path
+    after the check; it fails instead.
 
-    Under the lock the backup is ``_locked_backup_path``. The backup a killed removal left there
-    is checked first and removed (``_remove_backup_left``), even when nothing is at ``path``; if
-    it holds a user's file it is kept, with a warning, and this removal takes a fresh
+    A directory is first renamed beside ``path``: once renamed, no writer that names its files by
+    path can add one to it, so ``before_remove`` sees every file the removal deletes. When the
+    check raises, the directory goes back (``_put_back_checked``) and the error propagates.
+    Otherwise the backup is removed; if that fails, what is left of it goes back and the error
+    propagates. Where the filesystem cannot rename it (``_rename_aside``), ``before_remove``
+    checks it in place and it is removed there.
+
+    ``token`` is ``path``'s restore token when the caller holds its restore lock, else None. Under
+    the lock the backup is ``_locked_backup_path``. The backup a killed removal left there is
+    checked first and removed (``_remove_backup_left``), even when nothing is at ``path``; if it
+    holds a user's file it is kept, with a warning, and this removal takes a fresh
     ``_backup_path``, as it does without the lock. A process killed between the rename and the
-    removal leaves the backup beside ``path``, for the next stage write or restore of ``path``.
-
-    Where the filesystem cannot rename the entry (``_rename_aside``), ``before_remove`` checks it
-    in place and it is removed there.
+    removal leaves the backup beside ``path``, for the next stage write or directory restore of
+    ``path``.
     """
     backup_path = None
     if token is not None:
@@ -2355,26 +2367,26 @@ def _remove_checked(
         if os.path.lexists(backup_path) and not _remove_backup_left(backup_path, before_remove):
             backup_path = _backup_path(path, token)
     try:
-        os.lstat(path)
+        mode = os.lstat(path).st_mode
     except (FileNotFoundError, NotADirectoryError):
         # Nothing at path, the common case of a first run: one lstat answers it
+        return
+    if not stat.S_ISDIR(mode):
+        before_remove(path)
+        with contextlib.suppress(FileNotFoundError):
+            _unlink(path)
         return
     if backup_path is None:
         backup_path = _backup_path(path, _restore_target_token(path))
     try:
-        renamed = _rename_aside(path, backup_path)
+        try:
+            renamed = _rename_aside(path, backup_path)
+        except PermissionError as perm_err:
+            # As _unlink does: make the parent directory writable, never the entry itself
+            _make_parent_writable(path, perm_err)
+            renamed = _rename_aside(path, backup_path)
     except FileNotFoundError:
         return
-    except PermissionError as perm_err:
-        # As _clear_path does: make the parent directory writable, never the entry itself
-        try:
-            parent_mode = path.parent.stat().st_mode
-        except FileNotFoundError:
-            raise perm_err from None
-        if parent_mode & stat.S_IWUSR:
-            raise
-        os.chmod(path.parent, parent_mode | stat.S_IWUSR)
-        renamed = _rename_aside(path, backup_path)
     if not renamed:
         before_remove(path)
         _clear_path(path)
