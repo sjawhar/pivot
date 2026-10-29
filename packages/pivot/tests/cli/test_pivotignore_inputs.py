@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import shutil
-from typing import TYPE_CHECKING
+import uuid
+from typing import TYPE_CHECKING, Protocol, cast
 
+import boto3
 import pytest
 
 from tests import helpers
@@ -16,6 +18,13 @@ from tests import helpers
 if TYPE_CHECKING:
     import pathlib
     import subprocess
+
+
+class _S3Client(Protocol):
+    """The one boto3 S3 call this module makes; boto3 ships no stubs."""
+
+    def create_bucket(self, **kwargs: object) -> object: ...
+
 
 _PYC_IGNORE = "*.pyc\n__pycache__/\n"
 
@@ -173,14 +182,79 @@ def test_a_tracked_directory_holding_bytecode_restores_it_after_checkout(
     (tracked / "mod.py").write_text("x = 1\n")
     (tracked / "__pycache__" / "mod.cpython-312.pyc").write_bytes(b"\x00bytecode")
     _ok(helpers.run_pivot(root, home, "track", "data/raw/pkg"))
-    pvt = (root / "data" / "raw" / "pkg.pvt").read_text()
-    assert "__pycache__/mod.cpython-312.pyc" in pvt, pvt
+    members = (root / "data" / "raw" / "pkg.pvt.listing").read_text()
+    assert "__pycache__/mod.cpython-312.pyc" in members, members
 
     shutil.rmtree(tracked)
     _ok(helpers.run_pivot(root, home, "checkout", "data/raw/pkg"))
 
     assert (tracked / "__pycache__" / "mod.cpython-312.pyc").read_bytes() == b"\x00bytecode"
     assert (tracked / "mod.py").read_text() == "x = 1\n"
+
+
+def test_bytecode_in_an_input_directory_changes_neither_its_listing_nor_its_lock(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A directory input's committed listing holds the members its dependency hash counts, so
+    it leaves out what .pivotignore names, as the hash in the lock beside it does. Writing a
+    .pyc into the input changes neither file."""
+    home, root = _project(tmp_path, _INPUT_PIPELINE)
+    source = _source_dir(tmp_path, root, linked=False)
+    assert _ran(root, home) == {"p/lane": "ran"}
+    stages = root / ".pivot" / "stages"
+    input_listing = stages / "=inputs" / "tasks%2Fserver.listing"
+    stage_lock = stages / "p" / "lane.lock"
+    before = (input_listing.read_text(), stage_lock.read_text())
+    assert "grade.py" in before[0], before[0]
+
+    (source / "__pycache__").mkdir()
+    (source / "__pycache__" / "grade.cpython-312.pyc").write_bytes(b"\x00bytecode")
+    assert _ran(root, home) == {"p/lane": "cached"}
+
+    assert (input_listing.read_text(), stage_lock.read_text()) == before
+    assert "__pycache__" not in input_listing.read_text()
+
+
+def test_pull_fetches_every_file_of_a_tracked_directory_input(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """A stage's lock leaves out what .pivotignore names, but a tracked directory restores
+    whole, so `pivot pull <stage>` fetches every file of its .pvt, the ignored ones too."""
+    bucket = f"pivotignore-{uuid.uuid4().hex[:8]}"
+    s3 = cast(
+        "_S3Client",
+        boto3.client(
+            "s3",
+            endpoint_url=moto_services["s3"],
+            region_name="us-east-1",
+            aws_access_key_id="x",
+            aws_secret_access_key="x",
+        ),
+    )
+    s3.create_bucket(Bucket=bucket)
+    env = {
+        "AWS_ENDPOINT_URL": moto_services["s3"],
+        "AWS_ACCESS_KEY_ID": "x",
+        "AWS_SECRET_ACCESS_KEY": "x",
+        "AWS_DEFAULT_REGION": "us-east-1",
+    }
+    home, root = _project(tmp_path, _INPUT_PIPELINE.replace("tasks/server", "data/raw/server"))
+    tracked = root / "data" / "raw" / "server"
+    (tracked / "__pycache__").mkdir(parents=True)
+    (tracked / "grade.py").write_text("print('grade')\n")
+    (tracked / "__pycache__" / "grade.cpython-312.pyc").write_bytes(b"\x00bytecode")
+    _ok(helpers.run_pivot(root, home, "track", "data/raw/server"))
+    _ok(helpers.run_pivot(root, home, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    assert _ran(root, home) == {"p/lane": "ran"}
+    _ok(helpers.run_pivot(root, home, "push", extra_env=env))
+
+    shutil.rmtree(root / ".pivot" / "cache")
+    shutil.rmtree(tracked)
+    _ok(helpers.run_pivot(root, home, "pull", "p/lane", extra_env=env))
+    _ok(helpers.run_pivot(root, home, "checkout", "data/raw/server"))
+
+    assert (tracked / "__pycache__" / "grade.cpython-312.pyc").read_bytes() == b"\x00bytecode"
+    assert (tracked / "grade.py").read_text() == "print('grade')\n"
 
 
 def test_a_downstream_stage_depends_on_a_directory_output_whole(tmp_path: pathlib.Path) -> None:

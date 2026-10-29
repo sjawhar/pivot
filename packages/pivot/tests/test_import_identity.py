@@ -202,15 +202,28 @@ async def test_resolve_remote_path_walks_nested_github_lock_dirs(
 async def test_resolve_remote_path_walks_github_directory_named_lock(
     tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
-    """A GitHub Contents directory named `*.lock` is descended into, not read as a lock file."""
+    """A GitHub Contents directory named `*.lock` is descended into, not read as a lock file.
+
+    Pivot no longer names a stage with a `.lock` part (`lock.stage_name_error`), so the source
+    repo's schema-3 lock for `foo.lock/render` is written by hand.
+    """
     pivot_dir = tmp_path / ".pivot"
     pivot_dir.mkdir()
     (pivot_dir / "config.yaml").write_text(
         yaml.safe_dump({"remotes": {"origin": _REMOTE_URL}, "default_remote": "origin"})
     )
-    stages_dir = lock.get_stages_dir(pivot_dir)
-    lock.StageLock("foo.lock/render", stages_dir).write(
-        _helper_lock_data("foo.lock/render", {None: _TOTAL_HASH})
+    render_lock = lock.get_stages_dir(pivot_dir) / "foo.lock" / "render.lock"
+    render_lock.parent.mkdir(parents=True)
+    render_lock.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 3,
+                "code_manifest": {"self:stage": "0123456789abcdef"},
+                "params": {},
+                "deps": [],
+                "outs": [{"key": None, "hash": _TOTAL_HASH}],
+            }
+        )
     )
     repo_files = {
         str(path.relative_to(tmp_path)): path.read_bytes()

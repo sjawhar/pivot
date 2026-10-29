@@ -11,7 +11,7 @@ import pytest
 from hypothesis import strategies as st
 
 from pivot import ignore, loaders, types
-from pivot.storage import cache, store
+from pivot.storage import cache, listing, store
 
 _PYC_PATTERNS = "*.pyc\n__pycache__/\n"
 _SETTINGS = hypothesis.settings(max_examples=200, deadline=None, derandomize=True, database=None)
@@ -68,7 +68,7 @@ def test_hash_directory_with_a_filter_hashes_the_tree_without_the_ignored_files(
         root, ignored=_helper_member_filter(tmp_path, "src", _PYC_PATTERNS)
     )
 
-    assert [entry["relpath"] for entry in filtered["manifest"]] == ["grade.py", "pkg/m.py"]
+    assert [entry["relpath"] for entry in filtered["listing"]["files"]] == ["grade.py", "pkg/m.py"]
     assert filtered == cache.hash_directory(clean), "Same hash as the tree with no bytecode"
     assert cache.hash_directory(root) != filtered, "Without the filter every file counts"
 
@@ -127,11 +127,11 @@ def test_hash_directory_leaves_out_an_ignored_symlink_without_warning(
         )
 
     assert "link.pyc" not in caplog.text
-    assert "link.pyc" not in [entry["relpath"] for entry in filtered["manifest"]]
+    assert "link.pyc" not in [entry["relpath"] for entry in filtered["listing"]["files"]]
 
 
 # =============================================================================
-# cache.filter_dir_hash: the same hash from a record as from a walk
+# cache.filter_listing: the same listing and hash from a record as from a walk
 # =============================================================================
 
 _TREE_NAMES = ("a", "b.pyc", "__pycache__", "build", "keep.txt", "x.log", "caf\u00e9")
@@ -173,7 +173,7 @@ def _helper_build_tree(root: pathlib.Path, files: list[str], empty_dirs: list[st
     st.lists(_relpaths, max_size=3),
     st.lists(st.sampled_from(_TREE_PATTERNS), min_size=1, max_size=5),
 )
-def test_filter_dir_hash_of_the_whole_hash_equals_the_filtered_walk(
+def test_filter_listing_of_the_whole_listing_equals_the_filtered_walk(
     files: list[str], empty_dirs: list[str], patterns: list[str]
 ) -> None:
     """An input's dependency hash taken from a record (a .pvt, the whole hash) is the one a
@@ -188,7 +188,7 @@ def test_filter_dir_hash_of_the_whole_hash_equals_the_filtered_walk(
         assert member_filter is not None
 
         walked = cache.hash_directory(root, ignored=member_filter)
-        recorded = cache.filter_dir_hash(cache.hash_directory(root), member_filter)
+        recorded = cache.filter_listing(cache.hash_directory(root)["listing"], member_filter)
 
         assert recorded == walked
 
@@ -219,7 +219,7 @@ def test_workspace_store_leaves_ignored_files_out_of_a_directory_input(
 
     dep_hash = workspace.hash_artifact(_helper_ref("server", None, types.ArtifactTag.INPUT))
 
-    assert dep_hash == cache.hash_directory(clean)
+    assert dep_hash == cache.hash_directory(clean)["record"]
 
 
 def test_workspace_store_hashes_a_directory_output_whole_as_a_dependency(
@@ -236,44 +236,47 @@ def test_workspace_store_hashes_a_directory_output_whole_as_a_dependency(
     dep_hash = workspace.hash_artifact(ref)
     recorded = workspace.commit(ref, output)
 
-    assert dep_hash == recorded == cache.hash_directory(output)
+    assert dep_hash == recorded == cache.hash_directory(output)["record"]
     assert types.is_dir_hash(dep_hash)
     assert "pkg/__pycache__/m.cpython-312.pyc" in [
-        entry["relpath"] for entry in dep_hash["manifest"]
+        entry["relpath"] for entry in cache.hash_directory(output)["listing"]["files"]
     ]
 
 
 def test_recorded_input_hash_is_the_hash_of_the_input_holding_that_record(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A tracked input missing from the workspace is judged by its .pvt: the whole hash
-    recorded there, less what .pivotignore names, is the hash the restored input would give."""
+    """A tracked input missing from the workspace is judged by its .pvt: the whole listing
+    recorded there, less what .pivotignore names, gives the hash the restored input would."""
     (tmp_path / ".pivotignore").write_text(_PYC_PATTERNS)
     source = tmp_path / "data" / "raw" / "src"
     _helper_source_tree(source, bytecode=True)
     workspace = store.WorkspaceStore(tmp_path, "p", {})
     ref = _helper_ref("src", None, types.ArtifactTag.INPUT)
-    pvt_hash = cache.hash_directory(source)
+    tracked = cache.hash_directory(source)
 
-    from_record = workspace.recorded_input_hash(ref, pvt_hash)
+    from_record = workspace.recorded_input_hash(ref, tracked["record"], lambda: tracked["listing"])
 
     assert from_record == workspace.hash_artifact(ref)
-    assert from_record != pvt_hash
+    assert from_record != tracked["record"]
 
 
-def test_recorded_input_hash_keeps_a_file_hash_and_an_output_hash(tmp_path: pathlib.Path) -> None:
+def test_recorded_input_hash_keeps_an_output_hash_without_reading_its_listing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A directory no filter applies to keeps its record, and its listing is never read."""
     (tmp_path / ".pivotignore").write_text(_PYC_PATTERNS)
     workspace = store.WorkspaceStore(tmp_path, "p", {})
     directory = tmp_path / "tree"
     _helper_source_tree(directory, bytecode=True)
-    whole = cache.hash_directory(directory)
-    file_hash = types.FileHash(hash="0123456789abcdef")
+    whole = cache.hash_directory(directory)["record"]
+
+    def unread() -> listing.DirListing:
+        raise AssertionError("a directory with no filter must not read its listing")
 
     assert (
-        workspace.recorded_input_hash(_helper_ref("f", None, types.ArtifactTag.INPUT), file_hash)
-        == file_hash
-    )
-    assert (
-        workspace.recorded_input_hash(_helper_ref("p/o", None, types.ArtifactTag.DIRECTORY), whole)
+        workspace.recorded_input_hash(
+            _helper_ref("p/o", None, types.ArtifactTag.DIRECTORY), whole, unread
+        )
         == whole
     )

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from pivot import config, exceptions, loaders, types
-from pivot.storage import cache, ownership, store, track
+from pivot.storage import cache, listing, ownership, store, track
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -89,9 +89,12 @@ def test_cache_store_hash_artifact_types(tmp_path: pathlib.Path) -> None:
     (dir_path / "a.txt").write_text("a")
     cache_store.commit(dir_ref, dir_path)
 
-    dir_hash = cache_store.hash_artifact(dir_ref)
-    assert "hash" in dir_hash
-    assert "manifest" in dir_hash
+    hashed_dirs = dict[str, listing.HashedDirectory]()
+    dir_hash = cache_store.hash_artifact(dir_ref, hashed_dirs=hashed_dirs)
+    assert types.is_dir_hash(dir_hash)
+    assert {entry["relpath"] for entry in hashed_dirs[dir_hash["hash"]]["listing"]["files"]} == {
+        "a.txt"
+    }
 
 
 def test_workspace_store_round_trip(tmp_path: pathlib.Path) -> None:

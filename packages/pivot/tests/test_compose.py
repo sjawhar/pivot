@@ -39,7 +39,7 @@ from pivot.executor import core as executor_core
 from pivot.executor import worker
 from pivot.executor.worker import _reconstruct_list_kwargs
 from pivot.registry import RegistryStageInfo, _compute_fingerprint
-from pivot.storage import cache, lock
+from pivot.storage import cache, listing, lock
 from pivot.storage import store as store_mod
 
 if TYPE_CHECKING:
@@ -2195,13 +2195,15 @@ def test_stage_returning_path_takes_ownership_of_file_and_directory(
     assert (bundle_path / "a.txt").read_text() == "alpha"
     assert (bundle_path / "sub" / "b.txt").read_text() == "beta"
 
-    dir_lock = lock.StageLock(
+    stage_lock = lock.StageLock(
         "pathret/_helper_path_write_dir", lock.get_stages_dir(tmp_path / ".pivot")
-    ).read()
+    )
+    dir_lock = stage_lock.read()
     assert dir_lock is not None, "Directory-returning stage should write a lock file"
-    dir_hash = next(iter(dir_lock["output_hashes"].values()))
-    assert types.is_dir_hash(dir_hash), "Directory output should be recorded with a manifest"
-    assert sorted(e["relpath"] for e in dir_hash["manifest"]) == ["a.txt", "sub/b.txt"]
+    dir_identity, dir_hash = next(iter(dir_lock["output_hashes"].items()))
+    assert types.is_dir_hash(dir_hash), "Directory output should be recorded as a listing record"
+    members = listing.read(stage_lock.output_listing_path(dir_identity), dir_hash, None)
+    assert sorted(entry["relpath"] for entry in members["files"]) == ["a.txt", "sub/b.txt"]
 
     read_result = _helper_execute_compose_stage(
         pipeline, "pathret/_helper_path_read_back", tmp_path, output_queue

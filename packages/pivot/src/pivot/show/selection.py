@@ -8,19 +8,23 @@ import os
 import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
-from pivot import config, loaders, project, types
+from pivot import config, exceptions, git, loaders, project, registry, types
 from pivot.show import common
 from pivot.show import data as data_module
-from pivot.storage import cache, lock
+from pivot.storage import cache, listing, lock
 from pivot.types import DataFileFormat
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from pivot.registry import RegistryStageInfo
     from pivot.storage import store as store_mod
 
 logger = logging.getLogger(__name__)
+
+
+# A directory's listing at git HEAD: where its committed listing file is (relative to the
+# project root), or the listing an older pivot's HEAD lock holds inline.
+type _HeadListing = str | listing.DirListing
 
 
 class _DiffOutput(TypedDict):
@@ -28,6 +32,7 @@ class _DiffOutput(TypedDict):
 
     path: str
     head: types.HashInfo | None
+    head_listing: _HeadListing
     in_workspace: bool
     is_directory: bool
     changed_kind: tuple[str, str] | None
@@ -73,7 +78,7 @@ def _kind(is_directory: bool) -> str:
 
 
 def _diff_outputs(
-    stage_infos: Mapping[str, RegistryStageInfo],
+    stage_infos: Mapping[str, registry.RegistryStageInfo],
     store: store_mod.WorkspaceStore,
     proj_root: pathlib.Path,
 ) -> tuple[dict[str, _DiffOutput], dict[types.ArtifactIdentity, list[str]]]:
@@ -83,7 +88,7 @@ def _diff_outputs(
     side at its current path, so an output that moved is compared as removed at the old path
     and added at the new one. A moved entry is dropped when its HEAD path is a current output's
     path that has its own HEAD entry, or an earlier moved entry's HEAD path. A path compares as a
-    directory when the registry tags its output DIRECTORY, its HEAD entry records a manifest, or
+    directory when the registry tags its output DIRECTORY, its HEAD entry records a directory, or
     it is a directory on disk. Any other path is comparable when its loader or extension is CSV,
     JSON or JSONL. Also returns the paths each output identity owns, at HEAD and now, for stage
     targets.
@@ -99,30 +104,45 @@ def _diff_outputs(
             outs_by_stage[stage_name] = outs
 
     lock_data_by_stage = common.read_lock_files_from_head(list(outs_by_stage))
-    moved_heads = dict[str, tuple[types.HashInfo, list[str]]]()
-    current = list[tuple[types.ArtifactRef, pathlib.Path, str, types.HashInfo | None]]()
+    moved_heads = dict[str, tuple[types.HashInfo, list[str], _HeadListing]]()
+    current = list[
+        tuple[types.ArtifactRef, pathlib.Path, str, types.HashInfo | None, _HeadListing]
+    ]()
     paths_by_identity = dict[types.ArtifactIdentity, list[str]]()
     for stage_name, outs in outs_by_stage.items():
-        lock_data = lock_data_by_stage[stage_name]
-        entries = {} if lock_data is None else {entry["key"]: entry for entry in lock_data["outs"]}
+        committed = lock_data_by_stage[stage_name]
+        entries = (
+            {} if committed is None else {entry["key"]: entry for entry in committed.data["outs"]}
+        )
+        stages_dir = lock.get_stages_dir(
+            registry.get_stage_state_dir(stage_infos[stage_name], config.locate_state_dir())
+        )
         for out in outs:
             output_path = store.resolve_display_path(out)
             rel_path = project.to_relative_path(output_path, proj_root)
             paths = paths_by_identity.setdefault(out.identity, [rel_path])
             entry = entries.get(out.identity.key)
             head = None if entry is None else lock.entry_hash_info(entry)
+            listing_at_head: _HeadListing = ""
+            if head is not None and types.is_dir_hash(head):
+                listing_at_head = project.to_relative_path(
+                    listing.output_listing_path(stages_dir, out.identity), proj_root
+                )
+                if committed is not None and out.identity.key in committed.listings:
+                    listing_at_head = committed.listings[out.identity.key]
             head_path = rel_path if entry is None or "path" not in entry else entry["path"]
             if head is not None and head_path != rel_path:
-                moved_heads.setdefault(head_path, (head, paths))
+                moved_heads.setdefault(head_path, (head, paths, listing_at_head))
                 head = None
-            current.append((out, output_path, rel_path, head))
+            current.append((out, output_path, rel_path, head, listing_at_head))
 
     result = dict[str, _DiffOutput]()
-    for out, output_path, rel_path, own_head in current:
+    for out, output_path, rel_path, own_head, own_listing in current:
         moved = moved_heads.pop(rel_path, None)
         head = own_head
+        head_listing = own_listing
         if head is None and moved is not None:
-            head, moved_paths = moved
+            head, moved_paths, head_listing = moved
             moved_paths.append(rel_path)
         head_is_directory = head is not None and types.is_dir_hash(head)
         workspace_is_directory = output_path.is_dir()
@@ -144,12 +164,13 @@ def _diff_outputs(
             result[rel_path] = _DiffOutput(
                 path=rel_path,
                 head=head,
+                head_listing=head_listing,
                 in_workspace=True,
                 is_directory=is_directory,
                 changed_kind=changed_kind,
             )
 
-    for head_path, (head, moved_paths) in moved_heads.items():
+    for head_path, (head, moved_paths, head_listing) in moved_heads.items():
         head_is_directory = types.is_dir_hash(head)
         if (
             head_is_directory
@@ -159,6 +180,7 @@ def _diff_outputs(
             result[head_path] = _DiffOutput(
                 path=head_path,
                 head=head,
+                head_listing=head_listing,
                 in_workspace=False,
                 is_directory=head_is_directory,
                 changed_kind=None,
@@ -170,7 +192,7 @@ def _select_outputs(
     targets: Sequence[str],
     outputs: Mapping[str, _DiffOutput],
     paths_by_identity: Mapping[types.ArtifactIdentity, list[str]],
-    stage_infos: Mapping[str, RegistryStageInfo],
+    stage_infos: Mapping[str, registry.RegistryStageInfo],
     proj_root: pathlib.Path,
 ) -> tuple[dict[str, frozenset[str] | None], list[tuple[str, str | None]]]:
     """Map each selected output to its selected member prefixes, or None for every member.
@@ -227,15 +249,33 @@ def _select_outputs(
     return selection, unresolved
 
 
+def _head_listing(at_head: _HeadListing, record: types.DirHash) -> listing.DirListing | None:
+    """A directory's listing at git HEAD: the inline one an older pivot's lock held, else its
+    committed listing file there or the cache's object (``listing.read_found``); None when
+    none holds it."""
+    if not isinstance(at_head, str):
+        return at_head
+    content = git.read_file_from_revision(at_head, "HEAD")
+    try:
+        return listing.read_found(
+            content, f"{at_head} at HEAD", record, config.locate_cache_dir() / "files"
+        )
+    except exceptions.ListingMissingError:
+        return None
+
+
 def _head_members(output: _DiffOutput, prefixes: frozenset[str] | None) -> dict[str, str | None]:
     """The selected output's comparable files and hashes at git HEAD."""
     if not output["is_directory"]:
         return {output["path"]: None if output["head"] is None else output["head"]["hash"]}
     if output["head"] is None or not types.is_dir_hash(output["head"]):
         return {}
+    members = _head_listing(output["head_listing"], output["head"])
+    if members is None:
+        return {}
     return {
         f"{output['path']}/{entry['relpath']}": entry["hash"]
-        for entry in output["head"]["manifest"]
+        for entry in members["files"]
         if _member_selected(entry["relpath"], prefixes)
         and data_module.detect_format(pathlib.Path(entry["relpath"])) is not DataFileFormat.UNKNOWN
     }

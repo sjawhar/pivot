@@ -81,6 +81,11 @@ directory and writes `__pycache__/*.pyc` there leaves the stage cached.
   cache: every file in a directory output or a tracked directory is hashed,
   cached and restored, a `.pyc` included. A stage that reads another stage's
   directory output depends on that output's whole hash.
+- The listing committed for a directory input
+  ([Listing files](outputs.md#listing-files)) holds the files its hash counts,
+  so it leaves out what `.pivotignore` names too. A tracked directory's
+  `.pvt.listing` keeps every file, and `pivot pull <stage>` fetches every one
+  of them, so `pivot checkout` restores the directory as it was.
 - An input file you declare by name is always hashed, whatever `.pivotignore`
   says. An input directory that `.pivotignore` ignores itself (or that lies in
   a directory it ignores, such as an input under `build/`) is hashed whole,
