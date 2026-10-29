@@ -1081,7 +1081,7 @@ def test_verbose_traceback_on_unhandled_error(
     with isolated_pivot_dir(runner, tmp_path):
         _setup_test_project()
 
-        def _raise_on_discover(_root: pathlib.Path) -> dict[str, track.PvtData]:
+        def _raise_on_discover(_root: pathlib.Path, **_kwargs: object) -> dict[str, track.PvtData]:
             raise RuntimeError("boom")
 
         monkeypatch.setattr(track, "discover_pvt_files", _raise_on_discover)

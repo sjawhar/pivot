@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import pathlib
 from typing import TYPE_CHECKING
@@ -49,8 +50,8 @@ def update(targets: tuple[str, ...], rev: str | None, dry_run: bool) -> None:
 
     If no TARGETS specified, updates all imports found in the project.
     """
-    from pivot import project
-    from pivot.storage import track
+    from pivot import config, project
+    from pivot.storage import member_skip, track
 
     root = project.get_project_root()
 
@@ -71,7 +72,19 @@ def update(targets: tuple[str, ...], rev: str | None, dry_run: bool) -> None:
                 continue
             pairs.append((pvt_path, pvt_data))
     else:
-        imports = track.discover_import_pvt_files(root)
+        # A stage's own .pvt member of its output is no import. The command loads no pipeline,
+        # so the directory outputs the stages' locks record decide; it reads no config until an
+        # import .pvt is found.
+        @functools.cache
+        def own_member_skip() -> track.PvtSkip:
+            return member_skip.own_member_skip(
+                root, {}, config.locate_state_dir(), config.locate_cache_dir() / "files"
+            )
+
+        def skip(path: pathlib.Path, data: track.PvtData) -> bool:
+            return own_member_skip()(path, data)
+
+        imports = track.discover_import_pvt_files(root, skip=skip)
         pairs = list[tuple[pathlib.Path, track.PvtData]]()
         for data_path_str, pvt_data in imports.items():
             pvt_path = track.get_pvt_path(pathlib.Path(data_path_str))

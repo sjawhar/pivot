@@ -224,7 +224,7 @@ def test_a_listing_that_does_not_match_its_record_falls_back_to_the_cache_object
         first = listing.read(committed, record, cache_dir)
         second = listing.read(committed, record, cache_dir)
     with pytest.raises(exceptions.CorruptListingError, match=r"data\.listing"):
-        listing.read(committed, record, cache_dir, strict=True)
+        listing.read(committed, record, cache_dir, on_stale=listing.OnStale.REFUSE)
 
     assert first == second == listing.decode(old_data)
     warnings = [r.getMessage() for r in caplog.records if "data.listing" in r.getMessage()]

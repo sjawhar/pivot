@@ -671,12 +671,14 @@ def _is_cache_object_path(path: pathlib.Path, *, directory: bool = False) -> boo
 
 
 def resolve_cache_object_path(
-    cache_dir: pathlib.Path, file_hash: str, *, directory: bool = False
+    cache_dir: pathlib.Path, file_hash: str, *, directory: bool = False, notice: bool = True
 ) -> pathlib.Path | None:
     """Return a cache object from the configured or legacy state directory.
 
     Cache writes still use ``get_cache_path``. This resolver is only for reads, so a configured
-    state directory never recreates legacy cache paths while it reads migration-era objects.
+    state directory never recreates legacy cache paths while it reads migration-era objects. An
+    object found only in the legacy directory reports it once (``report_legacy_state_dir``),
+    unless ``notice`` is off: a read for a stage the command does not run says nothing.
     """
     cache_path = get_cache_path(cache_dir, file_hash)
     if _is_cache_object_path(cache_path, directory=directory):
@@ -687,7 +689,8 @@ def resolve_cache_object_path(
     other_path = get_cache_path(other_files_dir, file_hash)
     if not _is_cache_object_path(other_path, directory=directory):
         return None
-    state_dir_mod.report_legacy_state_dir(cache_dir.parent.parent)
+    if notice:
+        state_dir_mod.report_legacy_state_dir(cache_dir.parent.parent)
     return other_path
 
 

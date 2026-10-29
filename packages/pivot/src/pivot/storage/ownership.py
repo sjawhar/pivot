@@ -13,7 +13,8 @@ stage records it at that path (``stage_members``, the one rule every caller uses
 hash a restore writes, its ``nocommit:<stage>`` record, or what this run writes lists it there,
 and it is a sidecar Pivot cannot parse or a file whose content the stage recorded there. Pivot
 adds a member to that record before it writes the file (``record_members``), so no member it
-writes is ever unrecorded. Every other ``*.pvt`` under an output is the user's, for
+writes is ever unrecorded. A member is no tracked file: discovery leaves it out
+(``member_skip.own_member_skip``). Every other ``*.pvt`` under an output is the user's, for
 ``pivot commit`` too. ``forced_restore_refusal`` is the one decision behind every forced restore,
 and ``swap_refusal`` makes it again at each target's swap, over the entry the swap removes.
 """
@@ -22,15 +23,18 @@ from __future__ import annotations
 
 import enum
 import functools
+import logging
 import os
 import pathlib
 import stat
-from typing import TYPE_CHECKING, NotRequired, TypedDict
+from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict
 
 import lmdb
 
 from pivot import config, exceptions, project, types
 from pivot.storage import cache, listing, lock, state, track
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -396,11 +400,19 @@ def read_stage_claims(
     listing_readers: Mapping[pathlib.Path, Callable[[], listing.DirListing]] | None = None,
 ) -> StageClaims:
     """``stage_claims``, reading the stage's ``nocommit:`` record from the StateDB in
-    ``state_dir`` (opened read-only, never created)."""
+    ``state_dir`` (opened read-only, never created; ``state.open_readonly``).
+
+    A record that cannot be read (a damaged or unwritable database) is taken as absent: a
+    ``*.pvt`` only it lists is then the user's, which every restore refuses, and the members the
+    lock lists are still the stage's. A command never fails for want of the record.
+    """
     record: types.NoCommitRecord | None = None
-    if (state_dir / "state.lmdb").exists():
-        with state.StateDB(state_dir, readonly=True) as state_db:
-            record = state_db.get_no_commit_record(stage_name)
+    try:
+        with state.open_readonly(state_dir, create=False) as state_db:
+            if state_db is not None:
+                record = state_db.get_no_commit_record(stage_name)
+    except (OSError, lmdb.Error) as error:
+        logger.debug("No nocommit: record for %s in %s: %s", stage_name, state_dir, error)
     return stage_claims(
         project_root,
         locked,
@@ -471,7 +483,7 @@ def _lstat_mode(path: str | pathlib.Path) -> int | None:
         return 0
 
 
-def _is_stage_member(
+def is_stage_member(
     pvt_path: pathlib.Path, data: track.PvtData | None, members: StageMembers, located: pathlib.Path
 ) -> bool:
     """Whether the ``*.pvt`` at ``pvt_path``, whose bytes are at ``located``, is a member."""
@@ -542,7 +554,7 @@ def _find_in_tree(
             data = track.read_pvt_file(located)
             if members is None:
                 members = members_of(output_path) if members_of is not None else {}
-            if _is_stage_member(pvt_path, data, members, located):
+            if is_stage_member(pvt_path, data, members, located):
                 continue
             found[pvt_path] = SidecarOverlap(
                 tracked_path=None if data is None else pvt_path.parent / data["path"],
@@ -594,13 +606,14 @@ def find_output_overlaps(
     return sorted(found.values(), key=overlap_path)
 
 
-def _display(path: pathlib.Path, project_root: pathlib.Path) -> str:
+def display_path(path: pathlib.Path, project_root: pathlib.Path) -> str:
+    """``path`` relative to ``project_root`` when it lies inside it, else as given."""
     relative = project.relative_within(path, project_root)
     return str(path if relative is None else relative)
 
 
 def _label(replacement: Replacement, project_root: pathlib.Path) -> str:
-    path = _display(replacement["path"], project_root)
+    path = display_path(replacement["path"], project_root)
     match replacement["kind"]:
         case ReplacementKind.DESTINATION:
             return f"destination '{path}'"
@@ -624,16 +637,16 @@ def _describe(overlap: OutputOverlap, project_root: pathlib.Path) -> str:
     label = _label(overlap["replacement"], project_root)
     replaced = normalized(overlap["replacement"]["path"])
     if "unreadable_dir" in overlap:
-        directory = _display(overlap["unreadable_dir"], project_root)
+        directory = display_path(overlap["unreadable_dir"], project_root)
         relation = _relation(normalized(overlap["unreadable_dir"]), replaced)
         return (
             f"directory '{directory}', which Pivot cannot read, {relation} {label}; "
             + "Pivot cannot tell whether a tracked file is inside it"
         )
-    pvt = _display(overlap["pvt_path"], project_root)
+    pvt = display_path(overlap["pvt_path"], project_root)
     tracked_path = overlap["tracked_path"]
     if tracked_path is not None:
-        tracked = _display(tracked_path, project_root)
+        tracked = display_path(tracked_path, project_root)
         relation = _relation(normalized(tracked_path), replaced)
         return f"tracked path '{tracked}' (sidecar '{pvt}') {relation} {label}"
     unreadable = f"sidecar '{pvt}', which this version of Pivot cannot read,"
@@ -642,7 +655,8 @@ def _describe(overlap: OutputOverlap, project_root: pathlib.Path) -> str:
     data_path = track.get_data_path(overlap["pvt_path"])
     if data_path == replaced:
         return f"{unreadable} may track {label} itself"
-    return f"{unreadable} may track '{_display(data_path, project_root)}', which contains {label}"
+    shown = display_path(data_path, project_root)
+    return f"{unreadable} may track '{shown}', which contains {label}"
 
 
 def refuse_output_replacements(
@@ -813,7 +827,7 @@ def find_declared_overlap(
         else:
             relation = "contains"
         text = (
-            f"it {relation} output '{_display(pathlib.Path(output), project_root)}' "
+            f"it {relation} output '{display_path(pathlib.Path(output), project_root)}' "
             + f"of stage '{declared['stage']}'"
         )
         if resolved != normalized(path) or out_resolved != pathlib.Path(output):
@@ -833,6 +847,84 @@ def _warning(overlap: OutputOverlap, project_root: pathlib.Path) -> str:
     )
 
 
+class LockedOutput(NamedTuple):
+    """What a stage's lock records for one of its outputs, for ``members_reader``."""
+
+    stage_name: str
+    state_dir: pathlib.Path
+    """The state directory holding the stage's lock and ``nocommit:`` record."""
+    output_hash: types.HashInfo | None
+    """The hash the lock records for the output; None when it records none."""
+    read_listing: Callable[[], listing.DirListing] | None
+    """A reader of the directory's listing (committed beside the lock, else the cache's copy)."""
+
+
+def members_reader(
+    project_root: pathlib.Path,
+    locked: Callable[[pathlib.Path], LockedOutput],
+    cache_dir: pathlib.Path,
+) -> Callable[[pathlib.Path], StageMembers]:
+    """A reader of an output's own ``*.pvt`` members: ``stage_members`` of the claims that
+    ``locked`` gives for the output (the hash its stage's lock records and that directory's
+    listing) and the stage's ``nocommit:`` record, with ``cache_dir`` the cache object root.
+    Each output's claims are read once, when asked."""
+
+    @functools.cache
+    def members_of(output_path: pathlib.Path) -> StageMembers:
+        output = locked(output_path)
+        claims = read_stage_claims(
+            project_root,
+            output.stage_name,
+            output.state_dir,
+            {} if output.output_hash is None else {output_path: output.output_hash},
+            cache_dir=cache_dir,
+            listing_readers=(
+                {} if output.read_listing is None else {output_path: output.read_listing}
+            ),
+        )
+        return stage_members(output_path, claims)
+
+    return members_of
+
+
+class RegistryOutput(NamedTuple):
+    """An output a registered stage writes (``registry_outputs``)."""
+
+    stage_name: str
+    identity: types.ArtifactIdentity
+    state_dir: pathlib.Path
+
+
+def registry_outputs(
+    stages: Mapping[str, RegistryStageInfo],
+    placed: Callable[[types.ArtifactRef], pathlib.Path],
+    default_state_dir: pathlib.Path,
+) -> dict[pathlib.Path, RegistryOutput]:
+    """Each output these stages write, ``normalized`` at the path ``placed`` gives."""
+    return {
+        normalized(placed(out)): RegistryOutput(
+            stage_name, out.identity, stage_info["state_dir"] or default_state_dir
+        )
+        for stage_name, stage_info in stages.items()
+        for out in stage_info["outs"]
+    }
+
+
+def locked_output(
+    output_path: pathlib.Path, output: RegistryOutput, cache_dir: pathlib.Path
+) -> LockedOutput:
+    """What the stage's lock (``StageLock.read``) records for a registered output."""
+    stage_lock = lock.StageLock(output.stage_name, lock.get_stages_dir(output.state_dir))
+    lock_data = stage_lock.read(cache_dir=cache_dir)
+    output_hash = (
+        lock_data["output_hashes"][output.identity]
+        if lock_data is not None and output.identity in lock_data["output_hashes"]
+        else None
+    )
+    readers = lock_listing_readers(stage_lock, lock_data, {output.identity: output_path}, cache_dir)
+    return LockedOutput(output.stage_name, output.state_dir, output_hash, readers.get(output_path))
+
+
 def saved_input_warnings(
     project_root: pathlib.Path,
     stages: Mapping[str, RegistryStageInfo],
@@ -846,36 +938,11 @@ def saved_input_warnings(
     root) draw no warning. The stage's claims are read only for an output that holds a
     ``*.pvt``, so a project with none pays one walk per directory output.
     """
-    replacements = list[Replacement]()
-    owners = dict[pathlib.Path, tuple[str, types.ArtifactIdentity, pathlib.Path]]()
-    for stage_name, stage_info in stages.items():
-        state_dir = stage_info["state_dir"] or default_state_dir
-        for out in stage_info["outs"]:
-            path = normalized(workspace.resolve_display_path(out))
-            replacements.append(stage_output(path, stage_name))
-            owners[path] = (stage_name, out.identity, state_dir)
-
-    def members_of(output_path: pathlib.Path) -> StageMembers:
-        stage_name, identity, state_dir = owners[output_path]
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
-        lock_data = stage_lock.read(cache_dir=cache_dir)
-        locked = (
-            {output_path: lock_data["output_hashes"][identity]}
-            if lock_data is not None and identity in lock_data["output_hashes"]
-            else {}
-        )
-        claims = read_stage_claims(
-            project_root,
-            stage_name,
-            state_dir,
-            locked,
-            cache_dir=cache_dir,
-            listing_readers=lock_listing_readers(
-                stage_lock, lock_data, {identity: output_path}, cache_dir
-            ),
-        )
-        return stage_members(output_path, claims)
-
+    outputs = registry_outputs(stages, workspace.resolve_display_path, default_state_dir)
+    members_of = members_reader(
+        project_root, lambda path: locked_output(path, outputs[path], cache_dir), cache_dir
+    )
+    replacements = [stage_output(path, output.stage_name) for path, output in outputs.items()]
     return [
         _warning(overlap, project_root)
         for overlap in find_output_overlaps(project_root, replacements, members_of)

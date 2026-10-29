@@ -113,3 +113,28 @@ def test_checkout_force_of_the_stage_restores_over_its_own_pvt(
         assert forced.exit_code == 0, forced.output
         _no_ownership_text(forced.output)
         assert (root / "data" / "b" / "tree" / "value.txt").read_text() == "1"
+
+
+def test_targetless_checkout_force_skips_the_stages_own_pvt(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, drop: bool
+) -> None:
+    """`pivot checkout --force` with no target also restores every tracked file, so it discovers
+    the project's ``*.pvt`` files. The stage's own ``fake.pvt`` is not one of them, and the rule
+    that says so reads the listing committed beside the lock: with the lock's listing object
+    gone from the cache (a teammate's lock that arrived through `git pull`, without
+    `pivot pull`), the checkout still restores the output whole and writes nothing `fake.pvt`
+    names (BET-412)."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        _built_without_cached_listing(runner, root, drop)
+        tree = root / "data" / "b" / "tree"
+        written = (tree / "fake.pvt").read_text()
+        (tree / "value.txt").unlink()
+
+        forced = runner.invoke(cli.cli, ["checkout", "--force"])
+
+        assert forced.exit_code == 0, forced.output
+        _no_ownership_text(forced.output)
+        assert "Restored 2 file(s)" in forced.output, forced.output
+        assert "Missing" not in forced.output, forced.output
+        assert (tree / "value.txt").read_text() == "1"
+        assert (tree / "fake.pvt").read_text() == written

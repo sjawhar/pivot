@@ -1009,8 +1009,9 @@ class _TrackedCorpus(TypedDict):
 
 
 def _discover_corpus(root: pathlib.Path) -> _TrackedCorpus:
-    """Discover the tracked paths under ``root`` as ``pivot status --allow-missing`` does."""
-    tracked_files, tracked_trie = status._discover_tracked_files(allow_missing=True)
+    """Discover the tracked paths under ``root`` as ``pivot status --allow-missing`` does. These
+    tests register no stage, so no ``*.pvt`` there is a stage's own member."""
+    tracked_files, tracked_trie = status._discover_tracked_files(allow_missing=True, all_stages={})
     assert tracked_files is not None and tracked_trie is not None
     return _TrackedCorpus(
         tracked_files=tracked_files,

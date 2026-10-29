@@ -14,13 +14,13 @@ import py_compile
 import sys
 import types as _stdlib_types
 import zipimport
-from typing import TYPE_CHECKING, Final, cast, override
+from typing import TYPE_CHECKING, Final, NamedTuple, cast, override
 
 import cloudpickle
 
 from pivot import exceptions, fingerprint, loaded_source, metrics, project, types
 from pivot import state_dir as state_dir_mod
-from pivot.registry import PipelineLike
+from pivot.registry import PipelineLike, RegistryStageInfo
 from pivot.storage import ownership
 from pivot.storage import store as store_mod
 
@@ -1008,9 +1008,16 @@ def _log_skipped_module(strict: bool, message: str) -> None:
         logger.warning(message)
 
 
-def declared_outputs(project_root: pathlib.Path) -> dict[str, ownership.DeclaredOutput]:
+class DeclaredOutputs(NamedTuple):
+    """Every pipeline's outputs (``declared_outputs``) and the stages that declare them."""
+
+    outputs: dict[str, ownership.DeclaredOutput]
+    stages: dict[str, RegistryStageInfo]
+
+
+def declared_outputs(project_root: pathlib.Path) -> DeclaredOutputs:
     """Map every output declared by every pipeline in the project to where it resolves and the
-    stage that writes it.
+    stage that writes it, beside every pipeline's stages.
 
     Pipelines are discovered as ``--all`` discovers them, so an output of a pipeline the command
     did not load still counts: ``track`` and ``import`` refuse a path overlapping any of them. A
@@ -1027,7 +1034,7 @@ def declared_outputs(project_root: pathlib.Path) -> dict[str, ownership.Declared
     except DiscoveryError as exc:
         raise exceptions.ValidationError(str(exc)) from exc
     if pipeline is None:
-        return {}
+        return DeclaredOutputs({}, {})
 
     workspace = store_mod.WorkspaceStore(
         project_root=project_root,
@@ -1053,7 +1060,8 @@ def declared_outputs(project_root: pathlib.Path) -> dict[str, ownership.Declared
         raise exceptions.ValidationError(
             "Cannot resolve stage outputs (fix these first):\n" + "\n".join(errors)
         )
-    return resolved
+    stages = {stage_name: pipeline.get_stage(stage_name) for stage_name in pipeline.list_stages()}
+    return DeclaredOutputs(resolved, stages)
 
 
 def load_pipeline_from_path(path: pathlib.Path) -> PipelineLike | None:

@@ -9,6 +9,7 @@ target again just before it replaces it.
 from __future__ import annotations
 
 import contextlib
+import json
 import pathlib
 import shutil
 import stat
@@ -799,6 +800,102 @@ def test_stage_sidecar_shaped_member_stays_the_stages_after_its_lock_changes_thr
     assert fake.read_text() == first
 
 
+@pytest.mark.parametrize("value_present", [False, True], ids=["value-deleted", "value-present"])
+def test_targetless_forced_checkout_restores_an_output_whose_own_member_is_sidecar_shaped(
+    runner: CliRunner, tmp_path: pathlib.Path, value_present: bool
+) -> None:
+    """`fake.pvt` parses as a sidecar naming `value.txt`, with a hash no cache holds, and the
+    stage's lock lists it: it is the stage's own member, not a tracked file. A checkout with no
+    target restores `b/tree` whole, as `checkout b/tree` does, and restores nothing `fake.pvt`
+    names."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_SIDECAR_SHAPED_MEMBER_PIPELINE)
+        assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+        tree = root / "data" / "b" / "tree"
+        fake = tree / "fake.pvt"
+        written = fake.read_text()
+        assert track.read_pvt_file(fake) is not None
+        if not value_present:
+            (tree / "value.txt").unlink()
+
+        result = runner.invoke(cli.cli, ["checkout", "--force"])
+
+        assert result.exit_code == 0, result.output
+        assert "Restored 2 file(s)" in result.output, result.output
+        assert "Missing" not in result.output, result.output
+        assert (tree / "value.txt").read_text() == "1"
+        assert fake.read_text() == written
+
+
+def test_repro_and_status_read_no_tracked_file_from_a_stages_own_sidecar_shaped_member(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """The repro pre-flight and `status` discover tracked files as checkout does: `fake.pvt`,
+    the stage's own member, names no tracked file, so a deleted `value.txt` is no missing tracked
+    file, and status lists none."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_SIDECAR_SHAPED_MEMBER_PIPELINE)
+        assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+        tree = root / "data" / "b" / "tree"
+        (tree / "value.txt").unlink()
+
+        status = runner.invoke(cli.cli, ["status", "--tracked-only", "--json"])
+        result = runner.invoke(cli.cli, ["repro"])
+
+        assert status.exit_code == 0, status.output
+        assert json.loads(status.stdout)["tracked_files"] == [], status.stdout
+        assert result.exit_code == 0, result.output
+        assert (tree / "value.txt").read_text() == "1"
+
+
+def test_track_force_refuses_a_path_only_a_stages_own_sidecar_shaped_member_names(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """`fake.pvt`, the stage's own member, names `value.txt` but tracks nothing: `track --force`
+    refuses `value.txt` as a path inside the stage's output, and writes no sidecar there."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_SIDECAR_SHAPED_MEMBER_PIPELINE)
+        assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+        tree = root / "data" / "b" / "tree"
+
+        result = runner.invoke(cli.cli, ["track", "--force", "data/b/tree/value.txt"])
+
+        assert result.exit_code != 0, result.output
+        assert "Cannot track 'data/b/tree/value.txt'" in result.output, result.output
+        assert not track.get_pvt_path(tree / "value.txt").exists()
+
+
+def test_targetless_forced_checkout_still_refuses_a_users_tracked_file_beside_a_member(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A user's tracked file and its `.pvt`, copied into the output beside the stage's own
+    `fake.pvt`, are no member: discovery still finds the file, and the forced checkout refuses
+    the output, naming the sidecar, and changes nothing."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_SIDECAR_SHAPED_MEMBER_PIPELINE)
+        assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+        raw = root / "data" / "raw" / "saved.txt"
+        raw.parent.mkdir(parents=True)
+        raw.write_text("user bytes")
+        assert runner.invoke(cli.cli, ["track", "data/raw/saved.txt"]).exit_code == 0
+        tree = root / "data" / "b" / "tree"
+        shutil.copy2(raw, tree / "saved.txt")
+        shutil.copy2(track.get_pvt_path(raw), tree / "saved.txt.pvt")
+
+        status = runner.invoke(cli.cli, ["status", "--tracked-only", "--json"])
+        result = runner.invoke(cli.cli, ["checkout", "--force"])
+
+        assert status.exit_code == 0, status.output
+        tracked = [info["path"] for info in json.loads(status.stdout)["tracked_files"]]
+        assert sorted(tracked) == ["data/b/tree/saved.txt", "data/raw/saved.txt"]
+        assert result.exit_code != 0, result.output
+        assert "Refusing to replace" in result.output, result.output
+        assert "data/b/tree/saved.txt.pvt" in result.output, result.output
+        assert (tree / "saved.txt").read_text() == "user bytes"
+        assert (tree / "saved.txt.pvt").is_file()
+        assert (tree / "value.txt").read_text() == "1"
+
+
 def test_run_cache_restore_after_the_lock_changes_through_git_keeps_the_stages_pvt(
     runner: CliRunner, git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -863,3 +960,41 @@ def test_forced_get_restores_the_other_targets_beside_one_whose_pvt_is_not_valid
     assert other.read_text() == "v1", result.output
     assert tracked.read_text() == "user bytes"
     assert track.get_pvt_path(tracked).is_file()
+
+
+_DIRECTORY_SHAPED_MEMBER_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def tree() -> Annotated[dict[str, str], directory]:
+    return {
+        "value.txt": "1",
+        "d.pvt": "path: d\\nhash: abcdef0000000001\\nsize: 1\\nnfiles: 1\\n",
+        "d.pvt.listing": "stage output, not a listing\\n",
+    }
+
+
+with Pipeline("b") as pipeline:
+    tree()
+"""
+
+
+def test_verify_checks_no_listing_of_a_stages_own_directory_shaped_member(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """`pivot verify` with no stage named refuses every tracked directory whose committed
+    `.pvt.listing` does not hash to its `.pvt`. `d.pvt` and the file beside it are the stage's
+    own output, not a tracked directory: a restore of `b/tree` reads the lock's listing, so
+    verify must not read them and must pass."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_DIRECTORY_SHAPED_MEMBER_PIPELINE)
+        assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+
+        result = runner.invoke(cli.cli, ["verify"])
+
+        assert result.exit_code == 0, result.output
+        assert "Verification passed" in result.output, result.output
+        assert (root / "data" / "b" / "tree" / "d.pvt").is_file()

@@ -91,6 +91,13 @@ def status(
     show_tracked = show_all or tracked_only
     show_remote = remote_only or remote
 
+    # A stage's own .pvt member of its output, in any pipeline, is no tracked file or import
+    skip = (
+        cli_helpers.own_member_skip(resolved_cache_dir / "files")
+        if show_tracked or check_imports
+        else None
+    )
+
     # When --explain is used, fetch detailed explanations instead of basic status
     pipeline_status = list[PipelineStatusInfo]()
     pipeline_explanations = list[StageExplanation]()
@@ -141,7 +148,9 @@ def status(
             pbar.update(1)
 
         try:
-            tracked_status = status_mod.get_tracked_files_status(project_root, on_progress)
+            tracked_status = status_mod.get_tracked_files_status(
+                project_root, on_progress, skip=skip
+            )
         finally:
             if pbar is not None:
                 pbar.close()
@@ -161,7 +170,7 @@ def status(
 
     import_statuses = list[ImportStatusInfo]()
     if check_imports:
-        import_statuses = status_mod.get_import_status(project_root)
+        import_statuses = status_mod.get_import_status(project_root, skip=skip)
 
     # Compute counts once for suggestions and output
     if explain and pipeline_explanations:

@@ -57,7 +57,7 @@ def _object_hashes(
     if not is_dir_hash(hash_info):
         return result
     try:
-        members = listing.read(committed, hash_info, files_dir, strict=True)
+        members = listing.read(committed, hash_info, files_dir, on_stale=listing.OnStale.REFUSE)
     except exceptions.ListingMissingError:
         return result
     for entry in members["files"]:
@@ -73,18 +73,22 @@ def _check_tracked_listing(
     if pvt_data is None or "nfiles" not in pvt_data:
         return
     try:
-        track.tracked_members(data_path, pvt_data, files_dir, strict=True)
+        track.tracked_members(data_path, pvt_data, files_dir, on_stale=listing.OnStale.REFUSE)
     except exceptions.ListingMissingError:
         return
 
 
-def _tracked_listing_failures(files_dir: pathlib.Path) -> list[StageVerifyInfo]:
+def _tracked_listing_failures(
+    files_dir: pathlib.Path, skip: track.PvtSkip | None
+) -> list[StageVerifyInfo]:
     """A failed result, named by its path, for each tracked directory in the project whose
     committed ``.pvt.listing`` cannot be used (``_check_tracked_listing``), whether or not a
-    stage reads it: a fresh clone would have no cache to restore it from."""
+    stage reads it: a fresh clone would have no cache to restore it from. ``skip`` leaves out a
+    stage's own ``*.pvt`` member of its output, which tracks nothing and whose directory a
+    restore of that output reads from the lock's listing."""
     project_root = project.get_project_root()
     failures = list[StageVerifyInfo]()
-    for path, pvt_data in sorted(track.discover_pvt_files(project_root).items()):
+    for path, pvt_data in sorted(track.discover_pvt_files(project_root, skip=skip).items()):
         try:
             _check_tracked_listing(pathlib.Path(path), pvt_data, files_dir)
         except exceptions.CorruptListingError as e:
@@ -506,7 +510,10 @@ def verify(
     # Verify stages
     passed, results = _verify_stages(pipeline_status, cache_dir, allow_missing)
     if stages_list is None:
-        tracked_failures = _tracked_listing_failures(cache_dir / "files")
+        # A stage's own .pvt member of its output, in any pipeline, is no tracked directory
+        tracked_failures = _tracked_listing_failures(
+            cache_dir / "files", cli_helpers.own_member_skip(cache_dir / "files")
+        )
         results.extend(tracked_failures)
         passed = passed and not tracked_failures
 
