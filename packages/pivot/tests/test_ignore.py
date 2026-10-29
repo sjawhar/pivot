@@ -735,6 +735,12 @@ def test_member_ignored_checks_every_directory_above(
             id="consecutive-starstar-components-match-as-one",
         ),
         pytest.param(
+            "a**/**/b\n!a**/**/keep.txt\n",
+            ["x/a/b", "a/keep.txt", "a/x/keep.txt", "ax/y/keep.txt", "a/c"],
+            ["a/b", "a/x/b", "a/x/y/b", "ax/b", "ax/y/b"],
+            id="non-whole-star-before-a-whole-starstar",
+        ),
+        pytest.param(
             "a/**\\/b\n",
             ["a/b", "x/a/b"],
             ["a/x/b", "a/x/y/b"],

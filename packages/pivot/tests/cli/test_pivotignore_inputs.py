@@ -375,6 +375,33 @@ def test_a_file_a_negation_of_257_starstar_components_keeps_reruns_its_stage(
     assert _ran(root, home) == {"p/lane": "ran"}
 
 
+def test_an_over_limit_directory_negation_keeps_an_ignored_input_whole(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An input at build is ignored by the starter rule. A directory-only negation over the
+    limit falls back to matching every *member*, but cannot decide that the input directory is
+    not ignored: the input is hashed whole, so counted.txt makes its stage stale when it changes.
+    At e5821017 member_filter used that fallback for the input too, filtered the directory and
+    left counted.txt out, so the edit read cached."""
+    home, root = _project(tmp_path, _INPUT_PIPELINE.replace("tasks/server", "build"))
+    (root / ".pivotignore").write_text(
+        "\n".join(ignore.get_default_patterns()) + "\n*.txt\n!" + "*a" * 257 + "/\n"
+    )
+    source = root / "build"
+    source.mkdir()
+    (source / "grade.py").write_text("print('grade')\n")
+    (source / "counted.txt").write_text("one\n")
+    assert _ran(root, home) == {"p/lane": "ran"}
+
+    (source / "counted.txt").write_text("two\n")
+
+    # The fallback warning follows the JSON in this command's combined test output.
+    status_output = _ok(helpers.run_pivot(root, home, "-q", "status", "--json"))
+    status, _ = json.JSONDecoder().raw_decode(status_output[status_output.index("{") :])
+    assert {stage["name"]: stage["status"] for stage in status["stages"]} == {"p/lane": "stale"}
+    assert _ran(root, home) == {"p/lane": "ran"}
+
+
 def test_a_pivotignore_that_is_not_utf8_fails_no_command(tmp_path: pathlib.Path) -> None:
     """git reads .gitignore as bytes, and so Pivot reads .pivotignore: an undecodable line
     matches the same bytes in a name, and status and repro run."""

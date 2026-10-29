@@ -31,8 +31,9 @@ never ignored (``PROTECTED_PATHS``). The project root itself is never ignored ei
 walk never tests it. And a line with more than ``_MAX_STAR_RUNS`` runs of ``*`` that make
 ``dowild`` recurse (``_recursing_runs``: not one at the end of the line, nor one that is not a
 whole ``**`` right before a ``/``; after that merge) is not matched as git would, with a
-warning: a negation is taken to match every path, so it keeps every file git might keep, and
-any other line is not used.
+warning: a negation is taken to match every member, so it keeps every file git might keep, and
+any other line is not used. That fallback does not decide whether an input directory itself is
+ignored, so an earlier ``build/`` still makes it hash whole.
 """
 
 from __future__ import annotations
@@ -134,6 +135,7 @@ class _Pattern(NamedTuple):
     dir_only: bool  # a trailing "/": it matches a directory only
     basename: bool  # no "/" in it: it matches an entry's own name, at any depth
     match: Callable[[bytes], bool]  # tests the entry's name (basename) or its whole path
+    fallback: bool  # a negation over _MAX_STAR_RUNS, taken to match every member
 
 
 def _encode(path: str) -> bytes:
@@ -141,11 +143,16 @@ def _encode(path: str) -> bytes:
     return os.fsencode(unicodedata.normalize("NFC", path) if _PRECOMPOSE else path)
 
 
-def _deciding(patterns: tuple[_Pattern, ...], path: bytes, is_dir: bool) -> _Pattern | None:
+def _deciding(
+    patterns: tuple[_Pattern, ...], path: bytes, is_dir: bool, *, skip_fallback: bool = False
+) -> _Pattern | None:
     """The last pattern that matches ``path`` alone (git's ``last_matching_pattern_from_list``),
-    if any."""
+    if any. ``skip_fallback`` leaves an over-limit negation out: a fallback that matches every
+    path makes no safe decision about whether an input directory itself is ignored."""
     name = path[path.rfind(b"/") + 1 :]
     for pattern in reversed(patterns):
+        if skip_fallback and pattern.fallback:
+            continue
         if pattern.dir_only and not is_dir:
             continue
         if pattern.match(name if pattern.basename else path):
@@ -153,13 +160,17 @@ def _deciding(patterns: tuple[_Pattern, ...], path: bytes, is_dir: bool) -> _Pat
     return None
 
 
-def _excluding(patterns: tuple[_Pattern, ...], path: bytes, is_dir: bool) -> _Pattern | None:
+def _excluding(
+    patterns: tuple[_Pattern, ...], path: bytes, is_dir: bool, *, skip_fallback: bool = False
+) -> _Pattern | None:
     """The pattern that excludes ``path`` itself, or None when no pattern does."""
-    deciding = _deciding(patterns, path, is_dir)
+    deciding = _deciding(patterns, path, is_dir, skip_fallback=skip_fallback)
     return None if deciding is None or deciding.negated else deciding
 
 
-def _ignored_at(patterns: tuple[_Pattern, ...], path_str: str, is_dir: bool) -> _Pattern | None:
+def _ignored_at(
+    patterns: tuple[_Pattern, ...], path_str: str, is_dir: bool, *, skip_fallback: bool = False
+) -> _Pattern | None:
     """The pattern that ignores ``path_str``: the one that ignores the first directory above it
     that is ignored, else the one that ignores it, else None (git's parent rule). The project
     root, ``.``, is never ignored: git's walk never tests it (the module docstring names how
@@ -169,10 +180,12 @@ def _ignored_at(patterns: tuple[_Pattern, ...], path_str: str, is_dir: bool) -> 
     path = _encode(path_str)
     end = path.find(b"/", 1)
     while end != -1:
-        if (excluding := _excluding(patterns, path[:end], True)) is not None:
+        if (
+            excluding := _excluding(patterns, path[:end], True, skip_fallback=skip_fallback)
+        ) is not None:
             return excluding
         end = path.find(b"/", end + 1)
-    return _excluding(patterns, path, is_dir)
+    return _excluding(patterns, path, is_dir, skip_fallback=skip_fallback)
 
 
 class IgnoreFilter:
@@ -267,7 +280,14 @@ class IgnoreFilter:
         if not patterns or self._is_protected(directory_str):
             return None
         at_root = directory_str == "."
-        excluding = None if at_root else _ignored_at(patterns, directory_str, True)
+        # An over-limit negation matches every *member* to avoid leaving out a file git keeps.
+        # It cannot decide whether this input (or a directory above it) is ignored: taking its
+        # every-path fallback there would turn a whole input into a filtered one and make an
+        # earlier pattern such as ``build/`` drop a counted file. Leave it out here, so the
+        # input is hashed whole (a rerun too many is safe).
+        excluding = (
+            None if at_root else _ignored_at(patterns, directory_str, True, skip_fallback=True)
+        )
         if excluding is not None:
             self._warn_ignored_directory(directory_str, excluding)
             return None
@@ -435,17 +455,22 @@ def _parse(data: bytes, source_name: str) -> tuple[_Pattern, ...]:
         classes, star_runs = compiled
         start = 0 if basename else _wildmatch_start(_literal_length(body))
         recursing = _recursing_runs(body, star_runs, start, not basename)
+        fallback = False
         if recursing <= _MAX_STAR_RUNS:
             match = _name_matcher(body, classes) if basename else _path_matcher(body, classes)
         elif negated:
-            # Taken to match every path, it can only keep a file git would leave out (a rerun
-            # too many), never leave out a file git keeps (a stage that should rerun)
+            # Taken to match every *member*, it can only keep a file git would leave out (a
+            # rerun too many), never leave out a file git keeps (a stage that should rerun).
+            # IgnoreFilter.member_filter leaves it out when it decides whether an input
+            # directory is itself ignored: there its every-path fallback could turn a whole
+            # input into a filtered one and leave out a counted member.
             logger.warning(
                 f"Negation on line {line_number} of {source_name} ('{text}') has {recursing} "
                 + "runs of '*' that try more than one place; Pivot matches at most "
                 + f"{_MAX_STAR_RUNS}, so it takes it to match every path. Shorten it."
             )
             match = _matches_everything
+            fallback = True
         else:
             logger.warning(
                 f"Pattern on line {line_number} of {source_name} ('{text}') has {recursing} "
@@ -461,6 +486,7 @@ def _parse(data: bytes, source_name: str) -> tuple[_Pattern, ...]:
                 dir_only=dir_only,
                 basename=basename,
                 match=match,
+                fallback=fallback,
             )
         )
     return tuple(patterns)

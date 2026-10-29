@@ -92,9 +92,11 @@ directory and writes `__pycache__/*.pyc` there leaves the stage cached.
   place. A run at the end of the line does not count, nor a lone `*` right
   before a `/` (it matches the rest of one name), and consecutive `**/` count
   as one. Pivot matches a longer line differently from git, with a warning
-  that quotes it: a negation (`!...`) is taken to match every path, so it keeps
-  every file git might keep (at worst a stage reruns when git's rule would not
-  count the file), and any other such line is not used.
+  that quotes it: a negation (`!...`) is taken to match every *member*, so it
+  keeps every file git might keep (at worst a stage reruns when git's rule
+  would not count the file), and any other such line is not used. It is not
+  used to decide whether an input directory itself is ignored: an earlier
+  `build/` rule still makes that input hash whole.
 - It does not apply to stage outputs, to data you `pivot track`, or to the
   cache: every file in a directory output or a tracked directory is hashed,
   cached and restored, a `.pyc` included. A stage that reads another stage's

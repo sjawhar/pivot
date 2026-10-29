@@ -78,14 +78,15 @@ _ESCAPES = [
     *(b"\\*", b"\\?", b"\\[a]", b"\\[ab]", b"a\\ ", b"\\#c", b"\\!n", b"\\\\", b"a\\\\b"),
     *(b"a\\b", b"\\a", b"f\\*o", b"\\**", b"*\\*"),
 ]
-_KINDS = (_LITERALS, _STARS, _QUESTIONS, _CLASSES, _ESCAPES)
-_KIND_WEIGHTS = (3, 3, 2, 3, 1)
 _PREFIXES = [
     *(b"", b"", b"", b"/", b"data/raw/in/", b"/data/raw/in/", b"**/", b"raw/in/"),
     *(b"data/**/", b"data/raw/in/**/", b"data/raw/i*/", b"d**/raw/in/", b"data**/"),
     *(b"**/**/", b"data/**/**/raw/", b"data/raw/in/**/***/"),  # merged into one "**/"
     *(b"**\\/", b"data/raw/in/**\\/", b"data/**\\/raw/"),  # a "**" before an escaped "/"
+    b"a**/**/",  # a non-whole star component followed by a whole "**/"
 ]
+_KINDS = (_LITERALS, _STARS, _QUESTIONS, _CLASSES, _ESCAPES)
+_KIND_WEIGHTS = (3, 3, 2, 3, 1)
 # The literal tails of a line that is "*" and a tail, which git tests as a suffix
 _ENDSWITH_TAILS = [b".txt", b"a", b"b", b".pyc", b"~", b"ab", b"txt", b"o", b" a", b"b.txt"]
 _SUFFIXES = [
