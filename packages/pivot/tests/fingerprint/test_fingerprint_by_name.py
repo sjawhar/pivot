@@ -35,7 +35,6 @@ from pivot import (  # noqa: F401
     fingerprint_by_name,
     parameters,
 )
-from pivot.storage import lock
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1554,11 +1553,14 @@ outs:
 }
 
 
-# The locks `pivot repro` with main 27488ddc wrote for `_UPGRADE`, in a fresh tree with a fresh
-# `.pivot/state.lmdb`. Pivot 0.5.17 and 0.5.18 from PyPI write the same locks.
-_LOCKS_MAIN_27488DDC = {
+# The locks `pivot repro` with main 187c037e wrote for `_UPGRADE`, in a fresh tree with a fresh
+# `.pivot/state.lmdb`. First recorded at main 27488ddc, where `schema_version` was 2; #523
+# (0df62272, directories recorded by a committed listing) raised it to 3 and left every entry of
+# a lock that records only files as it was, so these are those locks with that one line changed.
+# Pivot 0.5.17 and 0.5.18 from PyPI write the same values under schema 2.
+_LOCKS_MAIN = {
     "area": """\
-schema_version: 2
+schema_version: 3
 code_manifest:
   class:lib.util.Box: 545ea4838dab4252
   default:lib.util.Box.width: 6021b5621680598b
@@ -1587,7 +1589,7 @@ outs:
   path: data/up/area.yaml
 """,
     "count": """\
-schema_version: 2
+schema_version: 3
 code_manifest:
   class:pipeline.CountParams: 11b98d3f45f56c21
   const:lib.util.PATTERN: '["re.Pattern", "\\\\w+", 32]'
@@ -1628,7 +1630,7 @@ outs:
   path: data/up/count.yaml
 """,
     "split": """\
-schema_version: 2
+schema_version: 3
 code_manifest:
   class:pipeline.Split: c7db050b60e18908
   const:lib.util.PATTERN: '["re.Pattern", "\\\\w+", 32]'
@@ -1674,44 +1676,46 @@ _CHANGED_ON_MAIN_SINCE_0_5_8 = (
     ":loader:pivot.loaders.Text:save",
     ":loader:pivot.loaders.YAML:save",
 )
-# Both records above were written when a lock held `schema_version: 2`. #523 raised it to 3,
-# which records a directory's files in a listing file beside the lock; it changed no other
-# field of a lock, and these stages have no directory output. The comparisons below take each
-# record as pivot writes it today: the same values under the current schema version.
-_SCHEMA_VERSION_THEN = 2
 
 
-def _at_current_schema(text: str) -> str:
-    """A recorded lock text with the schema version pivot writes today."""
-    assert text.startswith(f"schema_version: {_SCHEMA_VERSION_THEN}\n"), text[:40]
-    return text.replace(
-        f"schema_version: {_SCHEMA_VERSION_THEN}\n",
-        f"schema_version: {lock.SCHEMA_VERSION}\n",
-        1,
-    )
+def _lock_records(document: dict[str, typing.Any]) -> dict[str, typing.Any]:
+    """What a lock says about a run, free of what the storage format decides: its params, and
+    each dependency and output by identity, hash and path.
+
+    The raw bytes and the layout are left out on purpose, because a format change must alter
+    them: #523 (0df62272) raised ``schema_version`` from 2 to 3 and moved a directory's members
+    into its committed listing. These locks record only files, whose entries it left as they
+    were, so what the run produced is comparable across that change.
+    """
+    return {
+        "params": document["params"],
+        "deps": sorted(
+            (entry["producer"], entry["key"], entry["hash"]) for entry in document["deps"]
+        ),
+        "outs": sorted((entry["key"], entry["hash"], entry["path"]) for entry in document["outs"]),
+    }
 
 
 def test_an_unmarked_project_gets_mains_locks_and_an_upgrade_reruns_nothing(
     tmp_path: pathlib.Path,
 ) -> None:
     """A project with no mark gets, entry by entry, the locks main wrote for it, so this pull
-    request changes no unmarked lock value. Main's locks equal 0.5.8's, value by value, except
-    the entries of the two loader methods main changed, and each is read at the schema version
-    pivot writes today (`_at_current_schema`). A project that main ran to completion is all
-    cached under this version, from a fresh `.pivot/state.lmdb`."""
+    request changes no unmarked lock value: its manifests, its dependency hashes and its output
+    hashes are main's. Main's are 0.5.8's too, value by value, except the entries of the two
+    loader methods main changed, and except what the lock format decides (``_lock_records``). A
+    project that main ran to completion is all cached under this version, from a fresh
+    `.pivot/state.lmdb`."""
     project = _project(tmp_path, _UPGRADE)
     first = _statuses(_run(project, "repro", "--json"))
-    assert sorted(first) == sorted(f"up/{name}" for name in _LOCKS_MAIN_27488DDC), first
+    assert sorted(first) == sorted(f"up/{name}" for name in _LOCKS_MAIN), first
     stages = project / ".pivot" / "stages" / "up"
-    for name, recorded in _LOCKS_MAIN_27488DDC.items():
-        text = _at_current_schema(recorded)
+    for name, text in _LOCKS_MAIN.items():
         main = yaml.safe_load(text)
-        written = (stages / f"{name}.lock").read_text()
-        head = yaml.safe_load(written)
+        head = yaml.safe_load((stages / f"{name}.lock").read_text())
         assert head["code_manifest"] == main["code_manifest"], f"{name}: manifest differs"
-        assert head == main, f"{name}: lock differs"
-        assert written == text, f"{name}: lock text differs"
-        old = yaml.safe_load(_at_current_schema(_LOCKS_0_5_8[name]))
+        assert _lock_records(head) == _lock_records(main), f"{name}: lock record differs"
+        assert head["schema_version"] == main["schema_version"], f"{name}: schema version differs"
+        old = yaml.safe_load(_LOCKS_0_5_8[name])
         changed = {
             key
             for key in old["code_manifest"].keys() | main["code_manifest"].keys()
@@ -1720,10 +1724,23 @@ def test_an_unmarked_project_gets_mains_locks_and_an_upgrade_reruns_nothing(
         named = {key for key in main["code_manifest"] if key.endswith(_CHANGED_ON_MAIN_SINCE_0_5_8)}
         assert named, name
         assert changed == named, f"{name}: main changed {sorted(changed - named)} since 0.5.8"
-        assert {**old, "code_manifest": None} == {**main, "code_manifest": None}, name
+        assert _lock_records(old) == _lock_records(main), f"{name}: 0.5.8 recorded another run"
     shutil.rmtree(project / ".pivot" / "state.lmdb")
     upgraded = _statuses(_run(project, "repro", "--json"))
     assert {status for status, _ in upgraded.values()} == {"cached"}, upgraded
+
+
+def test_the_upgrade_comparison_catches_a_changed_manifest_entry() -> None:
+    """The comparison above is not vacuous: one changed ``code_manifest`` entry fails it, even
+    though the lock records the same run."""
+    recorded = yaml.safe_load(_LOCKS_MAIN["area"])
+    mutated = yaml.safe_load(_LOCKS_MAIN["area"])
+    mutated["code_manifest"]["self:area"] = "0000000000000000"
+
+    assert mutated["code_manifest"] != recorded["code_manifest"], "the mutant changed an entry"
+    assert _lock_records(mutated) == _lock_records(recorded), (
+        "the records are the same run, so only the manifest comparison catches the mutant"
+    )
 
 
 # ---------------------------------------------------------------------------------------------
