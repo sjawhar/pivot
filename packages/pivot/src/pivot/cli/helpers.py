@@ -89,20 +89,15 @@ def require_workspace_store() -> WorkspaceStore:
 def own_member_skip(cache_dir: pathlib.Path) -> track.PvtSkip:
     """The skip that leaves a stage's own ``*.pvt`` member out of what this command discovers
     (``ownership.own_member_skip``): the loaded pipeline's stages (none without a pipeline)
-    decide their outputs, and the locks in the state directory decide every other.
-    ``cache_dir`` is the cache object root. Output paths depend on each stage's name alone, so a
-    workspace with no pipeline name places them."""
+    decide their outputs, and the index of the other locks' recorded directory outputs decides
+    every other. ``cache_dir`` is the cache object root."""
     from pivot import config
     from pivot.storage import ownership
 
-    store_mod = importlib.import_module("pivot.storage.store")
-
     pipeline = cli_decorators.get_pipeline_from_context()
-    project_root = project.get_project_root()
     return ownership.own_member_skip(
-        project_root,
+        project.get_project_root(),
         get_all_stages() if pipeline is not None else {},
-        store_mod.WorkspaceStore(project_root, "", {}),
         config.locate_state_dir(),
         cache_dir,
     )

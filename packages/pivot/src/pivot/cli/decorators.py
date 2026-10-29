@@ -10,6 +10,7 @@ import click
 
 from pivot import discovery, exceptions, metrics
 from pivot.cli import errors
+from pivot.storage import ownership
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,9 @@ def pivot_command(
                 # Store all_pipelines flag so Engine can use it for watch mode reload
                 if use_all:
                     _store_all_pipelines_in_context(use_all)
-                return func(*args, **kwargs)
+                # Every member skip this command builds shares one index of recorded outputs
+                with ownership.index_per_command():
+                    return func(*args, **kwargs)
             finally:
                 metrics.end("cli.total", _t_total)
                 if os.environ.get("PIVOT_METRICS"):

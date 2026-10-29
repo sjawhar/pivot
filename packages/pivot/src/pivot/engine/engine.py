@@ -1135,19 +1135,14 @@ class Engine:
             cache_dir = config.get_cache_dir()
 
         # Verify tracked files before building DAG: a stage's own .pvt member of its output is
-        # none, this pipeline's by its stages and any other's by its lock. Output paths depend on
-        # each stage's name alone, so a workspace with no pipeline name places them.
+        # none, this run's stages' by the registry and any other's by its lock
         project_root = project.get_project_root()
         all_stages = self._get_all_stages()
         executor_core.verify_tracked_files(
             project_root,
             checkout_missing=checkout_missing,
             skip=ownership.own_member_skip(
-                project_root,
-                all_stages,
-                store_mod.WorkspaceStore(project_root, "", {}),
-                config.get_state_dir(),
-                cache_dir / "files",
+                project_root, all_stages, config.get_state_dir(), cache_dir / "files"
             ),
         )
 

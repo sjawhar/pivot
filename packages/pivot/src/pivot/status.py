@@ -107,8 +107,7 @@ def _discover_tracked_files(
     allow_missing: bool, all_stages: dict[str, RegistryStageInfo]
 ) -> tuple[dict[str, PvtData] | None, pygtrie.Trie[str] | None]:
     """Discover tracked files for .pvt hash lookup when allow_missing is set. A stage's own
-    ``*.pvt`` member of its output is none (``ownership.own_member_skip``; output paths depend on
-    each stage's name alone, so a workspace with no pipeline name places them)."""
+    ``*.pvt`` member of its output is none (``ownership.own_member_skip``)."""
     if not allow_missing:
         return None, None
 
@@ -118,7 +117,6 @@ def _discover_tracked_files(
         skip=ownership.own_member_skip(
             project_root,
             all_stages,
-            store_mod.WorkspaceStore(project_root, "", {}),
             config.locate_state_dir(),
             config.locate_cache_dir() / "files",
         ),

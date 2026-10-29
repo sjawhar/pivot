@@ -972,6 +972,18 @@ class _ListingWrite(NamedTuple):
     dependency: str | None  # the directory dependency's name, for messages
 
 
+def _parse_lock_file(path: pathlib.Path) -> object | None:
+    """A lock file's parsed YAML, or None when it is absent or unparseable."""
+    try:
+        with open(path) as f:
+            return yaml.load(f, Loader=yaml_config.Loader)
+    except FileNotFoundError:
+        return None  # Normal case - lock doesn't exist yet
+    except (UnicodeDecodeError, yaml.YAMLError) as e:
+        logger.warning("Failed to parse lock file %s: %s", path, e)
+        return None
+
+
 class StageLock:
     """Manages lock file for a single pipeline stage."""
 
@@ -1000,14 +1012,7 @@ class StageLock:
         self._read_path = read_path
         if ordered is not None:
             return ordered
-        try:
-            with open(read_path) as f:
-                return yaml.load(f, Loader=yaml_config.Loader)
-        except FileNotFoundError:
-            return None  # Normal case - lock doesn't exist yet
-        except (UnicodeDecodeError, yaml.YAMLError) as e:
-            logger.warning("Failed to parse lock file %s: %s", read_path, e)
-            return None
+        return _parse_lock_file(read_path)
 
     def read(
         self, *, cache_dir: pathlib.Path | None = None, warn_old_format: bool = True
@@ -1023,7 +1028,17 @@ class StageLock:
         for each such lock; a worker reads without it, since the process that dispatched the
         stage has already warned.
         """
-        data = self._load()
+        return self._lock_data(self._load(), cache_dir=cache_dir, warn_old_format=warn_old_format)
+
+    def read_sole_file(self, *, cache_dir: pathlib.Path | None = None) -> LockData | None:
+        """``read`` of ``self.path`` for a stage that has no lock in the project's other state
+        directory, which the caller has listed: that directory is not resolved again."""
+        return self._lock_data(_parse_lock_file(self.path), cache_dir=cache_dir)
+
+    def _lock_data(
+        self, data: object | None, *, cache_dir: pathlib.Path | None, warn_old_format: bool = True
+    ) -> LockData | None:
+        """The parsed lock document ``data`` as ``read`` returns it."""
         if data is None:
             return None
         version = _schema_version(data)
@@ -1270,6 +1285,27 @@ def restarted_reason(stage_lock: StageLock, proofs: list[pathlib.Path]) -> str:
         + f"`pivot repro --force {stage}`. "
         + "Everyone who works on a project upgrades pivot together"
     )
+
+
+def stage_lock_names(stages_dir: pathlib.Path) -> set[str]:
+    """The stage name of each regular lock file under ``stages_dir`` (``<stage name>.lock``);
+    none in a directory that cannot be listed (absent, unreadable, or a configured path no
+    directory can have). Each entry's type comes from the directory listing (``os.scandir``),
+    so listing costs no ``stat`` per lock."""
+    names = set[str]()
+    pending = [(os.fspath(stages_dir), "")]
+    while pending:
+        directory, prefix = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except (OSError, ValueError):  # ValueError: a path holding a NUL byte
+            continue
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                pending.append((entry.path, f"{prefix}{entry.name}/"))
+            elif entry.is_file(follow_symlinks=False) and entry.name.endswith(_LOCK_SUFFIX):
+                names.add(f"{prefix}{entry.name[: -len(_LOCK_SUFFIX)]}")
+    return names
 
 
 def find_orphaned_locks(

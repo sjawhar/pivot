@@ -297,9 +297,7 @@ def get_target_hashes(
     output_identities: dict[str, types.ArtifactIdentity] | None = None
     unresolved = list[str]()
     tracked_blobs: dict[str, set[str]] | None = None
-    # Display paths depend only on qualified stage names, not the pipeline name.
-    workspace = store_mod.WorkspaceStore(proj_root, "", {})
-    skip = ownership.own_member_skip(proj_root, all_stages or {}, workspace, state_dir, files_dir)
+    skip = ownership.own_member_skip(proj_root, all_stages or {}, state_dir, files_dir)
 
     for target in targets:
         original_target = target
@@ -405,6 +403,8 @@ def get_target_hashes(
         # A workspace path of a stage output stands for that output's identity.
         if all_stages is not None:
             if output_identities is None:
+                # Display paths depend only on qualified stage names, not the pipeline name.
+                workspace = store_mod.WorkspaceStore(proj_root, "", {})
                 output_identities = workspace.output_identities_by_path(
                     out for stage_info in all_stages.values() for out in stage_info["outs"]
                 )

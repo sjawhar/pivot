@@ -86,7 +86,7 @@ def _foreign_listing(
 def _track_single_path(
     path_str: str,
     cache_dir: pathlib.Path,
-    stage_outputs: dict[str, ownership.DeclaredOutput],
+    checks: discovery.TrackChecks,
     existing_tracked: dict[str, track_mod.PvtData],
     force: bool,
     *,
@@ -152,7 +152,7 @@ def _track_single_path(
     track_mod.validate_pvt_path_name(path.name)
 
     # Check every pipeline output. OSError reaches the command error handler, which names path.
-    overlap = ownership.find_declared_overlap(path, stage_outputs, project_root)
+    overlap = ownership.find_declared_overlap(path, checks.outputs, project_root)
     if overlap is not None:
         if not already_tracked:
             raise click.ClickException(
@@ -165,6 +165,15 @@ def _track_single_path(
             f"Warning: '{path_str}' is tracked inside a stage output: {overlap}. Move it and "
             + "its .pvt sidecar outside every stage output (for example under data/raw/); until "
             + "then Pivot refuses to replace that output."
+        )
+    # A sidecar a stage that no longer exists recorded at this path: every command reads it as
+    # that stage's own file, by its lock, so a sidecar written there could be one none reads
+    orphan = checks.orphaned_member(path)
+    if orphan is not None:
+        raise click.ClickException(
+            f"Cannot track '{path_str}': {orphan}. Pivot reads that stage's files there as its "
+            + "own, not as tracked files. If the stage is gone for good, remove that lock, then "
+            + "track the path again."
         )
     warning = "\n".join(warnings) if warnings else None
 
@@ -249,19 +258,17 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
 
     # Every pipeline's outputs, not only the pipeline this directory selects: a file tracked in
     # another pipeline's output would be removed when that pipeline runs.
-    stage_outputs, skip = discovery.declared_outputs_and_member_skip(
-        project_root, config.locate_state_dir(), cache_dir
-    )
+    checks = discovery.track_checks(project_root, config.locate_state_dir(), cache_dir)
 
     # Discover existing .pvt files: a stage's own .pvt member of its output tracks nothing
-    existing_tracked = track_mod.discover_pvt_files(project_root, skip=skip)
+    existing_tracked = track_mod.discover_pvt_files(project_root, skip=checks.skip)
 
     read = list[tuple[pathlib.Path, os.stat_result, str]]()
     for path_str in paths:
         result = _track_single_path(
             path_str,
             cache_dir,
-            stage_outputs,
+            checks,
             existing_tracked,
             force,
             warn_left_out_symlinks=not quiet,

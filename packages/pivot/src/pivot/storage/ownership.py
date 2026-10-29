@@ -21,24 +21,26 @@ and ``swap_refusal`` makes it again at each target's swap, over the entry the sw
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import enum
 import functools
 import logging
 import os
 import pathlib
-import posixpath
 import stat
-from typing import TYPE_CHECKING, NotRequired, TypedDict
+from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict
 
 import lmdb
 
 from pivot import config, exceptions, project, types
+from pivot import state_dir as state_dir_mod
 from pivot.storage import cache, listing, lock, state, track
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 
     from pivot.registry import RegistryStageInfo
     from pivot.storage.store import WorkspaceStore
@@ -846,25 +848,16 @@ def _warning(overlap: OutputOverlap, project_root: pathlib.Path) -> str:
     )
 
 
-def _output_members(
-    project_root: pathlib.Path,
-    stages: Mapping[str, RegistryStageInfo],
-    workspace: WorkspaceStore,
-    default_state_dir: pathlib.Path,
-    cache_dir: pathlib.Path,
-) -> tuple[dict[pathlib.Path, str], Callable[[pathlib.Path], StageMembers]]:
-    """Each output these stages write (``normalized``) -> its stage, and a reader of an output's
-    own ``*.pvt`` members (``stage_members`` of the claims its stage's lock and ``nocommit:``
-    record make, with ``cache_dir`` the cache object root), which reads them once per output."""
-    owners = dict[pathlib.Path, tuple[str, types.ArtifactIdentity, pathlib.Path]]()
-    for stage_name, stage_info in stages.items():
-        state_dir = stage_info["state_dir"] or default_state_dir
-        for out in stage_info["outs"]:
-            owners[normalized(workspace.resolve_display_path(out))] = (
-                stage_name,
-                out.identity,
-                state_dir,
-            )
+# An output's stage, the output's identity, and the state directory the stage's lock is in
+type _Owner = tuple[str, types.ArtifactIdentity, pathlib.Path]
+
+
+def _members_reader(
+    project_root: pathlib.Path, owners: Mapping[pathlib.Path, _Owner], cache_dir: pathlib.Path
+) -> Callable[[pathlib.Path], StageMembers]:
+    """A reader of an output's own ``*.pvt`` members: ``stage_members`` of the claims its
+    stage's lock, the listing committed beside it and the stage's ``nocommit:`` record make, with
+    ``cache_dir`` the cache object root. Each output's claims are read once, when asked."""
 
     @functools.cache
     def members_of(output_path: pathlib.Path) -> StageMembers:
@@ -888,82 +881,167 @@ def _output_members(
         )
         return stage_members(output_path, claims)
 
-    return {path: owner[0] for path, owner in owners.items()}, members_of
+    return members_of
 
 
-# Where ``store.relative_output_path`` puts every stage output: ``<prefix>/<stage name>[/<key>]``
-_OUTPUT_PREFIXES = frozenset({"data", "metrics", "plots"})
+def _registry_owners(
+    stages: Mapping[str, RegistryStageInfo],
+    placed: Callable[[types.ArtifactRef], pathlib.Path],
+    default_state_dir: pathlib.Path,
+) -> dict[pathlib.Path, _Owner]:
+    """Each output these stages write (``normalized``, at the path ``placed`` gives) -> its
+    owner."""
+    return {
+        normalized(placed(out)): (
+            stage_name,
+            out.identity,
+            stage_info["state_dir"] or default_state_dir,
+        )
+        for stage_name, stage_info in stages.items()
+        for out in stage_info["outs"]
+    }
+
+
+class RecordedOutput(NamedTuple):
+    """A directory output a stage lock records at a path (``recorded_directory_outputs``)."""
+
+    stage_name: str
+    identity: types.ArtifactIdentity
+    lock_files: tuple[pathlib.Path, ...]
+    """Every lock file of the stage found in the state directory (one per directory of the
+    0.5.2 layout that holds one)."""
+
+
+type _IndexKey = tuple[pathlib.Path, pathlib.Path, pathlib.Path, frozenset[str]]
+
+# The indexes the member skips of one command build, shared between them (``index_per_command``)
+_command_indexes: contextvars.ContextVar[
+    dict[_IndexKey, dict[pathlib.Path, RecordedOutput]] | None
+] = contextvars.ContextVar("pivot_recorded_output_indexes", default=None)
+
+
+@contextlib.contextmanager
+def index_per_command() -> Iterator[None]:
+    """Share the index of recorded directory outputs (``recorded_directory_outputs``) between
+    every member skip built in this block: it is built once, by the first that needs it. The CLI
+    holds one for each command. A skip built outside one builds its own index."""
+    token = _command_indexes.set({})
+    try:
+        yield
+    finally:
+        _command_indexes.reset(token)
+
+
+def recorded_directory_outputs(
+    project_root: pathlib.Path,
+    default_state_dir: pathlib.Path,
+    cache_dir: pathlib.Path,
+    declared: Collection[str],
+) -> dict[pathlib.Path, RecordedOutput]:
+    """Every directory output a stage lock in ``default_state_dir`` records at a path (the
+    lock's ``output_paths``), by its ``normalized`` path, for each stage not in ``declared``.
+
+    The locks are those of both directories of the 0.5.2 layout. A stage with a lock in one of
+    them has that file read (``StageLock.read_sole_file``); one with a lock in each has the
+    current one read (``StageLock.read``). The path is the one the run recorded, never
+    re-derived, so any placement (a ``PathOnly`` directory at ``<stage>.<ext>``, a keyed or
+    variant output) is found. A directory output whose lock records no path (an older pivot's)
+    is left out. Only what runs left behind is read, never a stage definition. When every stage
+    is declared (``--all``, ``track``), only the locks of stages no pipeline declares are read.
+    Built once per command (``index_per_command``).
+    """
+    key: _IndexKey = (normalized(project_root), default_state_dir, cache_dir, frozenset(declared))
+    shared = _command_indexes.get()
+    if shared is not None and key in shared:
+        return shared[key]
+    root, _, _, excluded = key
+    root_str = os.fspath(root)
+    stages_dir = lock.get_stages_dir(default_state_dir)
+    other_dir = state_dir_mod.other_stages_dir_for(stages_dir)
+    scanned = [stages_dir] if other_dir is None else [stages_dir, other_dir]
+    found = [lock.stage_lock_names(directory) - excluded for directory in scanned]
+    index = dict[pathlib.Path, RecordedOutput]()
+    for stage_name in set[str]().union(*found):
+        try:
+            locks = [
+                lock.StageLock(stage_name, directory)
+                for directory, names in zip(scanned, found, strict=True)
+                if stage_name in names
+            ]
+        except ValueError:  # a file named like a lock that no stage name can have
+            continue
+        lock_data = (
+            locks[0].read_sole_file(cache_dir=cache_dir)
+            if len(locks) == 1
+            else locks[0].read(cache_dir=cache_dir)
+        )
+        if lock_data is None or "output_paths" not in lock_data:
+            continue
+        lock_files = tuple(stage_lock.path for stage_lock in locks)
+        for identity, output_hash in lock_data["output_hashes"].items():
+            if not types.is_dir_hash(output_hash) or identity not in lock_data["output_paths"]:
+                continue
+            path = os.path.normpath(os.path.join(root_str, lock_data["output_paths"][identity]))
+            if path.startswith(root_str + os.sep):
+                index[pathlib.Path(path)] = RecordedOutput(stage_name, identity, lock_files)
+    if shared is not None:
+        shared[key] = index
+    return index
 
 
 def _recorded_members(
-    project_root: pathlib.Path, default_state_dir: pathlib.Path, cache_dir: pathlib.Path
-) -> Callable[[pathlib.Path], list[StageMembers]]:
-    """A reader, for a ``normalized`` path, of the ``*.pvt`` members of each directory output
-    that a stage lock in ``default_state_dir`` records around it (``stage_members`` of the claims
-    that lock, the listing committed beside it and the stage's ``nocommit:`` record make).
+    project_root: pathlib.Path,
+    default_state_dir: pathlib.Path,
+    cache_dir: pathlib.Path,
+    declared: Collection[str],
+) -> tuple[dict[pathlib.Path, RecordedOutput], Callable[[pathlib.Path], StageMembers]]:
+    """The index of recorded directory outputs (``recorded_directory_outputs``) and a reader of
+    each indexed output's own ``*.pvt`` members (``_members_reader``)."""
+    index = recorded_directory_outputs(project_root, default_state_dir, cache_dir, declared)
+    owners = {
+        output: (recorded.stage_name, recorded.identity, default_state_dir)
+        for output, recorded in index.items()
+    }
+    return index, _members_reader(project_root, owners, cache_dir)
 
-    The locks are found by the path: an output lies at ``<prefix>/<stage name>[/<key>]``, so only
-    the locks of the stage names the path spells are read (``StageLock`` resolves both
-    directories of the 0.5.2 layout), each at most once. A path outside those prefixes, such as a
-    tracked file in ``data/raw``, reads none. Where a lock records no output path, the output is
-    placed as ``store.relative_output_path`` places it, under the path's own prefix.
+
+def orphaned_member_claim(
+    project_root: pathlib.Path,
+    default_state_dir: pathlib.Path,
+    cache_dir: pathlib.Path,
+    declared: Collection[str],
+) -> Callable[[pathlib.Path], str | None]:
+    """A reader that says, for a path ``pivot track`` is asked to track, which lock of a stage
+    no pipeline ``declared`` lists that path's sidecar (``<path>.pvt``) among the members of its
+    output, or returns None.
+
+    Every command skips such a stage's members by its lock (``own_member_skip``). A sidecar
+    ``track`` wrote at a listed path could carry the bytes the lock records, and would then be
+    one no command reads, so the listed path decides, whatever is there now. Any other path in
+    that output tracks as before. The index is built at the first path asked about, and a
+    stage's claims are read only for an output that holds the sidecar's path.
     """
-    root = normalized(project_root)
-    stages_dir = lock.get_stages_dir(default_state_dir)
 
-    @functools.cache
-    def outputs_of(stage_name: str, prefix: str) -> tuple[tuple[pathlib.Path, StageMembers], ...]:
-        try:
-            stage_lock = lock.StageLock(stage_name, stages_dir)
-        except ValueError:  # the path spells no stage name a lock can have
-            return ()
-        lock_data = stage_lock.read(cache_dir=cache_dir)
-        if lock_data is None:
-            return ()
-        recorded = (
-            lock_data["output_paths"]
-            if "output_paths" in lock_data
-            else dict[types.ArtifactIdentity, str]()
-        )
+    recorded = functools.cache(
+        functools.partial(_recorded_members, project_root, default_state_dir, cache_dir, declared)
+    )
 
-        def placed(identity: types.ArtifactIdentity) -> pathlib.Path:
-            if identity in recorded:
-                return normalized(root / recorded[identity])
-            key = [] if identity.key is None else [identity.key]
-            return normalized(root / posixpath.join(prefix, stage_name, *key))
+    def claim(path: pathlib.Path) -> str | None:
+        index, members_of = recorded()
+        sidecar = normalized(track.get_pvt_path(path))
+        for output in sidecar.parents:
+            if output not in index or sidecar not in members_of(output):
+                continue
+            locks = " and ".join(
+                f"'{_display(found, project_root)}'" for found in index[output].lock_files
+            )
+            return (
+                f"the lock {locks} records '{_display(sidecar, project_root)}' as a file of stage "
+                + f"'{index[output].stage_name}', a stage that no longer exists in any pipeline"
+            )
+        return None
 
-        paths = {
-            identity: placed(identity)
-            for identity, output_hash in lock_data["output_hashes"].items()
-            if types.is_dir_hash(output_hash)
-        }
-        if not paths:
-            return ()
-        claims = read_stage_claims(
-            project_root,
-            stage_name,
-            default_state_dir,
-            {path: lock_data["output_hashes"][identity] for identity, path in paths.items()},
-            cache_dir=cache_dir,
-            listing_readers=lock_listing_readers(stage_lock, lock_data, paths, cache_dir),
-        )
-        return tuple((path, stage_members(path, claims)) for path in paths.values())
-
-    def members_around(path: pathlib.Path) -> list[StageMembers]:
-        if not path.is_relative_to(root):
-            return []
-        parts = path.relative_to(root).parts
-        if len(parts) < 4 or parts[0] not in _OUTPUT_PREFIXES:
-            return []
-        # A stage name has at least two parts (``<pipeline>/<stage>``), and the file lies below it
-        return [
-            members
-            for end in range(3, len(parts))
-            for output, members in outputs_of("/".join(parts[1:end]), parts[0])
-            if output in path.parents
-        ]
-
-    return members_around
+    return claim
 
 
 def saved_input_warnings(
@@ -979,10 +1057,9 @@ def saved_input_warnings(
     root) draw no warning. The stage's claims are read only for an output that holds a
     ``*.pvt``, so a project with none pays one walk per directory output.
     """
-    owners, members_of = _output_members(
-        project_root, stages, workspace, default_state_dir, cache_dir
-    )
-    replacements = [stage_output(path, stage_name) for path, stage_name in owners.items()]
+    owners = _registry_owners(stages, workspace.resolve_display_path, default_state_dir)
+    members_of = _members_reader(project_root, owners, cache_dir)
+    replacements = [stage_output(path, owner[0]) for path, owner in owners.items()]
     return [
         _warning(overlap, project_root)
         for overlap in find_output_overlaps(project_root, replacements, members_of)
@@ -992,7 +1069,6 @@ def saved_input_warnings(
 def own_member_skip(
     project_root: pathlib.Path,
     stages: Mapping[str, RegistryStageInfo],
-    workspace: WorkspaceStore,
     default_state_dir: pathlib.Path,
     cache_dir: pathlib.Path,
 ) -> track.PvtSkip:
@@ -1000,27 +1076,39 @@ def own_member_skip(
     (``stage_members``, the rule every write, restore and commit uses): ``skip`` for
     ``track.discover_pvt_files``, so no command reads a stage's own member as a tracked file.
 
-    A ``*.pvt`` in an output of these stages (the loaded pipeline's) is decided by the registry.
-    Any other is decided by recorded state alone (``_recorded_members``): it is a member when a
-    stage lock in ``default_state_dir`` records a directory output holding it and the listing
-    committed beside that lock (byte-checked, else the cache's copy), or that stage's
-    ``nocommit:`` record, lists it with its current content. Whether a stage run wrote this file
-    is execution state, not a stage definition, so no other pipeline is imported; a pipeline that
-    fails to load, or a stage that no longer exists, is decided the same way.
+    A ``*.pvt`` in an output of these stages (the command's) is decided by the registry. Any
+    other is decided from recorded state alone: it is a member when a directory output that a
+    stage lock records holds it (``recorded_directory_outputs``, built at the first such
+    ``*.pvt`` and never for a command that meets none), and the listing committed beside that
+    lock (byte-checked, else the cache's copy) or that stage's ``nocommit:`` record lists it
+    with its current content. Whether a stage run wrote this file is execution state, not a
+    stage definition, so no other pipeline is imported; a pipeline that fails to load, or a
+    stage that no longer exists, is decided the same way.
 
     Any other ``*.pvt`` in an output is the user's: discovery keeps it, and every restore of that
     output refuses it. A stage's claims are read only for an output that holds a ``*.pvt``.
     """
-    owners, members_of = _output_members(
-        project_root, stages, workspace, default_state_dir, cache_dir
+    from pivot.storage import store as store_mod  # store imports this module
+
+    owners = _registry_owners(
+        stages, lambda out: project_root / store_mod.relative_output_path(out), default_state_dir
     )
-    recorded_around = _recorded_members(project_root, default_state_dir, cache_dir)
+    members_of = _members_reader(project_root, owners, cache_dir)
+
+    recorded = functools.cache(
+        functools.partial(_recorded_members, project_root, default_state_dir, cache_dir, stages)
+    )
 
     def skip(pvt_path: pathlib.Path, data: track.PvtData) -> bool:
         path = normalized(pvt_path)
         outputs = [output for output in path.parents if output in owners]
         if outputs:
             return any(_is_stage_member(path, data, members_of(output), path) for output in outputs)
-        return any(_is_stage_member(path, data, members, path) for members in recorded_around(path))
+        recorded_owners, recorded_members_of = recorded()
+        return any(
+            _is_stage_member(path, data, recorded_members_of(output), path)
+            for output in path.parents
+            if output in recorded_owners
+        )
 
     return skip
