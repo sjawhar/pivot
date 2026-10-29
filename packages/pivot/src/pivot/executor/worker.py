@@ -1123,11 +1123,15 @@ def _execute_stage(
                         )
                         if run_cache_skip is not None:
                             if no_commit:
+                                # Nothing is committed; the coordinator saves only the file
+                                # hashes, the dependencies read and the outputs restored.
                                 return _make_result(
                                     StageStatus.CACHED,
                                     "unchanged (run cache)",
                                     ring_buffer,
                                     input_hash=input_hash,
+                                    file_hash_entries=file_hash_entries
+                                    + run_cache_skip["file_hash_entries"],
                                 )
                             new_lock_data = LockData(
                                 code_manifest=current_fingerprint,
@@ -1245,9 +1249,11 @@ def _execute_stage(
                         f"{skip.UNREADABLE_SOURCE_KEY_PREFIX}{unreadable_modules}": "",
                     }
                 if no_commit:
+                    read = list[tuple[pathlib.Path, os.stat_result, str]]()
                     output_hashes = _hash_output_paths(
-                        output_paths, cache_dir=store_cache_dir(store)
+                        output_paths, cache_dir=store_cache_dir(store), pending=read
                     )
+                    file_hash_entries.extend(cache.deferred_file_hash_entries(read))
                 else:
                     with stage_io.PIVOT_IO:
                         output_hashes = _commit_outputs_with_store(
@@ -1272,10 +1278,12 @@ def _execute_stage(
                             )
                         )
 
-                # For --no-commit, write no lock and no cache entry. Leave the record of what
-                # ran, which `pivot commit` writes if the outputs are still these. The same record
-                # already lists the `*.pvt` members this run wrote: each was recorded before it was
-                # written, and the record stays until a lock is written.
+                # Under --no-commit, write no lock, cache object, generation or run-cache
+                # entry. Leave the record of what ran, which `pivot commit` writes if the outputs
+                # are still these, and hand file-hash cache entries to the coordinator for its
+                # best-effort save. The same record already lists the `*.pvt` members this run
+                # wrote: each was recorded before it was written, and the record stays until a
+                # lock is written.
                 if no_commit:
                     return StageResult(
                         status=StageStatus.RAN,
@@ -1284,13 +1292,14 @@ def _execute_stage(
                         output_lines=ring_buffer.snapshot(),
                         metrics=metrics.get_entries(),
                         deferred_writes=DeferredWrites(
+                            file_hash_entries=file_hash_entries,
                             no_commit_record=NoCommitRun(
                                 code_manifest=lock_manifest,
                                 output_hashes={
                                     key: hash_info["hash"]
                                     for key, hash_info in sorted(output_hashes.items())
                                 },
-                            )
+                            ),
                         ),
                     )
 
@@ -2296,6 +2305,7 @@ def _hash_output_paths(
     state_db: state.StateDB | None = None,
     *,
     cache_dir: pathlib.Path | None = None,
+    pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> dict[str, HashInfo]:
     output_hashes = dict[str, HashInfo]()
     for ref, path in outputs_by_ref.items():
@@ -2303,10 +2313,10 @@ def _hash_output_paths(
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
         if path.is_dir():
             output_hashes[types.identity_key(ref.identity)] = cache.hash_directory(
-                path, state_db, cache_dir=cache_dir, warn_left_out_symlinks=True
+                path, state_db, cache_dir=cache_dir, warn_left_out_symlinks=True, pending=pending
             )["record"]
         else:
-            file_hash, _ = cache.hash_file(path, state_db)
+            file_hash, _ = cache.hash_file(path, state_db, pending=pending)
             output_hashes[types.identity_key(ref.identity)] = FileHash(hash=file_hash)
     return output_hashes
 

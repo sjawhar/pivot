@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import functools
 import html
 import logging
 import os
 import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
-from pivot import project, types
+from pivot import config, project, registry, types
 from pivot import state_dir as state_dir_mod
 from pivot.show import common
-from pivot.storage import cache
+from pivot.storage import cache, state
 from pivot.types import ChangeType, OutputFormat
 
 if TYPE_CHECKING:
@@ -74,21 +75,57 @@ def get_plot_hashes_from_head() -> dict[str, str | None]:
     )
 
 
-def get_plot_hashes_from_workspace(
-    paths: Sequence[str],
-) -> dict[str, str]:
-    """Compute current file hashes for plot files.
+def plot_state_dirs() -> dict[str, pathlib.Path]:
+    """Map each plot output's workspace path to its stage's state directory, whose StateDB
+    holds the output's file-hash entry."""
+    from pivot.cli import helpers as cli_helpers
 
-    Paths are relative to project root.
+    store = cli_helpers.require_workspace_store()
+    proj_root = project.get_project_root()
+    default_state_dir = config.locate_state_dir()
+    state_dirs = dict[str, pathlib.Path]()
+    for stage_name, plot_outs in _plot_outs_by_stage().items():
+        stage_info = cli_helpers.get_stage(stage_name)
+        state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
+        for out in plot_outs:
+            path = project.to_relative_path(store.resolve_display_path(out), proj_root)
+            state_dirs[path] = state_dir
+    return state_dirs
+
+
+def get_plot_hashes_from_workspace(
+    paths: Sequence[str], state_dirs: Mapping[str, pathlib.Path]
+) -> dict[str, str]:
+    """Compute current file hashes for plot files with their stage StateDBs.
+
+    Paths are relative to project root. ``state_dirs`` (``plot_state_dirs``) maps each stage's
+    plot to its stage's state directory; a file no stage produces uses the configured one. Each
+    file is read through that StateDB without creating one; a damaged database is treated as
+    absent. Hashes read from files are saved afterwards best-effort in that same directory.
     """
     proj_root = project.get_project_root()
-    result = dict[str, str]()
+    default_state_dir = config.locate_state_dir()
+    by_state_dir = dict[pathlib.Path, list[tuple[str, pathlib.Path]]]()
     for path_str in paths:
         path = proj_root / path_str
         if path.exists() and path.is_file():
-            file_hash, _ = cache.hash_file(path)
-            result[path_str] = file_hash
+            state_dir = state_dirs.get(path_str, default_state_dir)
+            by_state_dir.setdefault(state_dir, []).append((path_str, path))
+    result = dict[str, str]()
+    for state_dir, files in by_state_dir.items():
+        result.update(cache.hash_read_only(state_dir, functools.partial(_hash_plots, files)))
     return result
+
+
+def _hash_plots(
+    files: list[tuple[str, pathlib.Path]],
+    state_db: state.StateDB | None,
+    pending: list[tuple[pathlib.Path, os.stat_result, str]],
+) -> dict[str, str]:
+    """Each plot file's hash, keyed by its project-relative path."""
+    return {
+        path_str: cache.hash_file(path, state_db, pending=pending)[0] for path_str, path in files
+    }
 
 
 def diff_plots(

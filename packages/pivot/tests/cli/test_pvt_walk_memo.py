@@ -17,6 +17,7 @@ import pytest
 from pivot import cli, compose
 from pivot.storage import cache, track
 from pivot.types import TrackedFileStatus
+from tests import helpers
 
 if TYPE_CHECKING:
     import pathlib
@@ -43,12 +44,8 @@ def memo_project(
     raw_dir = root / "data" / "raw"
     raw_dir.mkdir(parents=True)
     (raw_dir / "input.txt").write_text("original")
-    device = os.stat(root).st_dev
     mountinfo = tmp_path_factory.mktemp("mounts") / "mountinfo"
-    mountinfo.write_text(
-        f"91 1 {os.major(device)}:{os.minor(device)} / / rw,relatime shared:1 - ext4 /dev/sdz1 rw\n"
-    )
-    monkeypatch.setattr(track, "_MOUNTINFO", mountinfo)
+    helpers.mount_table(monkeypatch, mountinfo, [(os.stat(root).st_dev, "/", "ext4")])
     with mock_discovery:
         shout(mock_discovery.input("input.txt", t=str))
     return root

@@ -21,10 +21,12 @@ import pytest
 
 from pivot import compose, exceptions, project, stage_def
 from pivot import names as stage_names
-from pivot.storage import store
+from pivot.storage import mounts as mounts_module
+from pivot.storage import state, store
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+    from multiprocessing.synchronize import Event
 
     from pivot.registry import PipelineLike
 
@@ -429,3 +431,35 @@ def create_pipeline_py(
 
     pipeline_path.write_text("\n".join(lines))
     return pipeline_path
+
+
+def mount_table(
+    monkeypatch: pytest.MonkeyPatch,
+    path: pathlib.Path,
+    mount_entries: Sequence[tuple[int, str, str] | tuple[int, str, str, str]],
+) -> None:
+    """Point the shared mount parser at mountinfo entries.
+
+    Each entry is ``(device, mount point, filesystem type[, super options])``; options default
+    to ``rw``. Tests use ``tmpfs,inode32`` and ``tmpfs,inode64`` to exercise tmpfs's inode rule.
+    """
+    lines = list[str]()
+    for mount_id, entry in enumerate(mount_entries, 90):
+        device, point, fstype, *rest = entry
+        super_options = rest[0] if rest else "rw"
+        escaped = point.replace("\\", "\\134").replace(" ", "\\040")
+        lines.append(
+            f"{mount_id} 1 {os.major(device)}:{os.minor(device)} / {escaped} "
+            + f"rw,relatime shared:{mount_id} - {fstype} /dev/fake{mount_id} {super_options}\n"
+        )
+    path.write_text("".join(lines))
+    monkeypatch.setattr(mounts_module, "_MOUNTINFO", path)
+
+
+def hold_write_lock(state_dir: str, held: Event, release: Event) -> None:
+    """Hold the state database's write lock in ``state_dir`` until ``release`` is set; the
+    target of a spawned process, so it lives in this importable module."""
+    db = state.StateDB(pathlib.Path(state_dir))
+    with db, db._write_transaction(timeout=10.0):
+        held.set()
+        release.wait(120)
