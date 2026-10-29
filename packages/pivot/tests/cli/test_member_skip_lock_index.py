@@ -1,13 +1,14 @@
 """A member of a pipeline the command did not load is found by the directory output its stage's
-lock records (``ownership.recorded_directory_outputs``), wherever that output was placed.
+lock records (``lock.recorded_directories``), wherever that output was placed.
 
 - A ``PathOnly`` output that returns a directory lies at ``data/<pipeline>/<stage>.dat/``; its
   member is skipped from another pipeline too.
 - A member below the top of another pipeline's output, or in its keyed directory output, is
   found by the output that holds it, not by its own directory.
 - A lock outlives its stage, and its members stay skipped, so ``pivot track`` refuses a path
-  inside the output of a stage that no longer exists.
+  whose sidecar the lock of a stage that no longer exists records.
 - ``status --check-imports`` and ``pivot update`` read no import from a stage's own member.
+- A lock file is parsed once per state-directory record, and again when it changes.
 
 The first three tests are the review's of sjawhar/pivot#540 at 4f145295; the track test requires
 the refusal where the review's accepted either outcome. ``_pivot`` keeps ``PYTHONPATH``, so a
@@ -26,7 +27,8 @@ import click.testing
 import pytest
 
 from pivot import cli, project
-from pivot.storage import cache, lock, ownership, track
+from pivot import state_dir as state_dir_mod
+from pivot.storage import cache, lock, member_skip, track
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 
@@ -299,51 +301,60 @@ def test_update_and_check_imports_read_no_import_from_a_stages_own_member(
     assert "No imports found to update." in update.stdout, update.stdout + update.stderr
 
 
-def test_the_lock_index_is_built_once_per_command(
+def test_a_lock_is_parsed_once_per_record_and_again_when_it_changes(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """From the root, b's `fake.pvt` lies outside every output of the loaded pipeline `a`, so a
-    command that discovers the `.pvt` files needs the index of recorded outputs.
+    command that discovers the `.pvt` files reads the directory outputs b's lock records.
 
-    - Every skip built in one command shares one index: three callers (two member skips and
-      `track`'s orphan check) asking about b's member list the locks once.
-    - `verify` and `repro` (its pre-flight) each build it once; a second command builds its
-      own, since locks change between commands.
+    - In one state-directory record, every skip and `track`'s orphan check share what a lock
+      file records: b/tree's lock is parsed once for three callers.
+    - A lock file written since is parsed again in the same record, as a `--watch` run needs.
+    - `verify` and `repro` (its pre-flight) each parse it once.
     """
     root = _project(tmp_path, _NESTED_MEMBER_PIPELINE.replace("HASH_OF_2", "abcdef0000000002"))
     monkeypatch.chdir(root)
     monkeypatch.setattr(project, "_project_root_cache", None)
-    builds = list[pathlib.Path]()
-    names_in = lock.stage_lock_names
+    b_lock = root / ".pivot" / "stages" / "b" / "tree.lock"
+    parsed = list[pathlib.Path]()
+    read_recorded = lock._read_recorded
 
-    def counted_names(stages_dir: pathlib.Path) -> set[str]:
-        builds.append(stages_dir)
-        return names_in(stages_dir)
+    def counted(stage_name: str, path: pathlib.Path, *args: object) -> object:
+        parsed.append(path)
+        return read_recorded(stage_name, path, *args)  # pyright: ignore[reportArgumentType]
 
-    monkeypatch.setattr(lock, "stage_lock_names", counted_names)
+    monkeypatch.setattr(lock, "_read_recorded", counted)
     member = root / "data" / "b" / "tree" / "sub" / "deep" / "fake.pvt"
     member_data = track.read_pvt_file(member)
     assert member_data is not None
     state_dir, files_dir = root / ".pivot", root / ".pivot" / "cache" / "files"
 
-    with ownership.index_per_command():
-        first = ownership.own_member_skip(root, {}, state_dir, files_dir)
-        second = ownership.own_member_skip(root, {}, state_dir, files_dir)
-        claim = ownership.orphaned_member_claim(root, state_dir, files_dir, ())
+    token = state_dir_mod.begin_invocation(report=False)
+    try:
+        first = member_skip.own_member_skip(root, {}, state_dir, files_dir)
+        second = member_skip.own_member_skip(root, {}, state_dir, files_dir)
+        claim = member_skip.orphaned_member(root, state_dir, files_dir, ())
         skipped = [first(member, member_data), second(member, member_data)]
         claimed = claim(member.with_suffix(""))
+        once = parsed.count(b_lock)
+        b_lock.write_text(b_lock.read_text() + "\n")  # a run rewrote the lock
+        third = member_skip.own_member_skip(root, {}, state_dir, files_dir)
+        skipped.append(third(member, member_data))
+    finally:
+        state_dir_mod.end_invocation(token)
 
-    assert skipped == [True, True]
-    assert claimed is not None and "b/tree" in claimed, claimed
-    assert len(builds) == 1, builds
+    assert skipped == [True, True, True]
+    assert claimed is not None and claimed.stage_name == "b/tree", claimed
+    assert once == 1, parsed
+    assert parsed.count(b_lock) == 2, parsed
 
-    builds.clear()
+    parsed.clear()
     runner = click.testing.CliRunner()
     verified = runner.invoke(cli.cli, ["verify"])
-    verify_builds = len(builds)
+    verify_parses = parsed.count(b_lock)
     rerun = runner.invoke(cli.cli, ["repro"])
 
     assert verified.exit_code == 0, verified.output
-    assert verify_builds == 1, builds
+    assert verify_parses == 1, parsed
     assert rerun.exit_code == 0, rerun.output
-    assert len(builds) == 2, builds
+    assert parsed.count(b_lock) == 2, parsed

@@ -797,7 +797,7 @@ def discover_pvt_files(root: pathlib.Path, *, skip: PvtSkip | None = None) -> di
     repro/run pre-flight does (``discover_pvt_files_and_update_memo``). A .pvt whose ``path:``
     names no file, or a file outside the project, is left out with a warning, so no command it
     feeds writes there (see ``restore_target``). A .pvt ``skip`` returns True for is left out
-    too: a stage's own member of its output (``ownership.own_member_skip``) is no tracked file.
+    too: a stage's own member of its output (``member_skip.own_member_skip``) is no tracked file.
     """
     mount_table = mounts.read_mounts()
     fd, memo = _open_memo(mount_table, write=False)
@@ -844,7 +844,7 @@ def discover_import_pvt_files(
 ) -> dict[str, PvtData]:
     """Find all import .pvt files under root (``discover_pvt_files``). ``skip`` is asked about
     import .pvt files alone, so one that reads more than the file (a stage's own member,
-    ``ownership.own_member_skip``) does so only once an import is found."""
+    ``member_skip.own_member_skip``) does so only once an import is found."""
 
     def other_or_skipped(path: pathlib.Path, data: PvtData) -> bool:
         return not is_import(data) or (skip is not None and skip(path, data))

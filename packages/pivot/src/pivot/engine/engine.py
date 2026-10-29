@@ -60,7 +60,7 @@ from pivot.engine.types import (
 )
 from pivot.executor import core as executor_core
 from pivot.executor import worker
-from pivot.storage import ownership
+from pivot.storage import member_skip, ownership
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -1135,13 +1135,13 @@ class Engine:
             cache_dir = config.get_cache_dir()
 
         # Verify tracked files before building DAG: a stage's own .pvt member of its output is
-        # none, this run's stages' by the registry and any other's by its lock
+        # none, the loaded pipeline's by the registry and any other's by its lock
         project_root = project.get_project_root()
         all_stages = self._get_all_stages()
         executor_core.verify_tracked_files(
             project_root,
             checkout_missing=checkout_missing,
-            skip=ownership.own_member_skip(
+            skip=member_skip.own_member_skip(
                 project_root, all_stages, config.get_state_dir(), cache_dir / "files"
             ),
         )

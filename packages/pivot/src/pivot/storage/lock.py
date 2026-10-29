@@ -52,7 +52,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping
+    from collections.abc import Collection, Iterable, Iterator, Mapping
 
     from pivot.storage import state
 
@@ -972,18 +972,6 @@ class _ListingWrite(NamedTuple):
     dependency: str | None  # the directory dependency's name, for messages
 
 
-def _parse_lock_file(path: pathlib.Path) -> object | None:
-    """A lock file's parsed YAML, or None when it is absent or unparseable."""
-    try:
-        with open(path) as f:
-            return yaml.load(f, Loader=yaml_config.Loader)
-    except FileNotFoundError:
-        return None  # Normal case - lock doesn't exist yet
-    except (UnicodeDecodeError, yaml.YAMLError) as e:
-        logger.warning("Failed to parse lock file %s: %s", path, e)
-        return None
-
-
 class StageLock:
     """Manages lock file for a single pipeline stage."""
 
@@ -1012,7 +1000,14 @@ class StageLock:
         self._read_path = read_path
         if ordered is not None:
             return ordered
-        return _parse_lock_file(read_path)
+        try:
+            with open(read_path) as f:
+                return yaml.load(f, Loader=yaml_config.Loader)
+        except FileNotFoundError:
+            return None  # Normal case - lock doesn't exist yet
+        except (UnicodeDecodeError, yaml.YAMLError) as e:
+            logger.warning("Failed to parse lock file %s: %s", read_path, e)
+            return None
 
     def read(
         self, *, cache_dir: pathlib.Path | None = None, warn_old_format: bool = True
@@ -1028,17 +1023,7 @@ class StageLock:
         for each such lock; a worker reads without it, since the process that dispatched the
         stage has already warned.
         """
-        return self._lock_data(self._load(), cache_dir=cache_dir, warn_old_format=warn_old_format)
-
-    def read_sole_file(self, *, cache_dir: pathlib.Path | None = None) -> LockData | None:
-        """``read`` of ``self.path`` for a stage that has no lock in the project's other state
-        directory, which the caller has listed: that directory is not resolved again."""
-        return self._lock_data(_parse_lock_file(self.path), cache_dir=cache_dir)
-
-    def _lock_data(
-        self, data: object | None, *, cache_dir: pathlib.Path | None, warn_old_format: bool = True
-    ) -> LockData | None:
-        """The parsed lock document ``data`` as ``read`` returns it."""
+        data = self._load()
         if data is None:
             return None
         version = _schema_version(data)
@@ -1287,12 +1272,13 @@ def restarted_reason(stage_lock: StageLock, proofs: list[pathlib.Path]) -> str:
     )
 
 
-def stage_lock_names(stages_dir: pathlib.Path) -> set[str]:
-    """The stage name of each regular lock file under ``stages_dir`` (``<stage name>.lock``);
-    none in a directory that cannot be listed (absent, unreadable, or a configured path no
-    directory can have). Each entry's type comes from the directory listing (``os.scandir``),
-    so listing costs no ``stat`` per lock."""
-    names = set[str]()
+def stage_lock_files(stages_dir: pathlib.Path) -> dict[str, pathlib.Path]:
+    """Each lock file under ``stages_dir`` (``<stage name>.lock``, a regular file or a symlink
+    to one), by its stage name; none in a directory that cannot be listed (absent, unreadable,
+    or a configured path no directory can have). Symlinked directories are not entered. Each
+    entry's type comes from the directory listing (``os.scandir``), so only a symlink costs a
+    ``stat``."""
+    found = dict[str, pathlib.Path]()
     pending = [(os.fspath(stages_dir), "")]
     while pending:
         directory, prefix = pending.pop()
@@ -1303,9 +1289,148 @@ def stage_lock_names(stages_dir: pathlib.Path) -> set[str]:
         for entry in entries:
             if entry.is_dir(follow_symlinks=False):
                 pending.append((entry.path, f"{prefix}{entry.name}/"))
-            elif entry.is_file(follow_symlinks=False) and entry.name.endswith(_LOCK_SUFFIX):
-                names.add(f"{prefix}{entry.name[: -len(_LOCK_SUFFIX)]}")
-    return names
+            elif entry.name.endswith(_LOCK_SUFFIX) and entry.is_file():
+                found[f"{prefix}{entry.name[: -len(_LOCK_SUFFIX)]}"] = pathlib.Path(entry.path)
+    return found
+
+
+class RecordedDirectory(NamedTuple):
+    """A directory output a stage lock records at a path (``recorded_directories``)."""
+
+    stage_name: str
+    identity: ArtifactIdentity
+    output_hash: DirHash
+    lock_files: tuple[pathlib.Path, ...]
+    """Every lock file of the stage: one per state directory of the 0.5.2 layout holding one."""
+    state_dir: pathlib.Path
+    """The state directory of the lock this was read from (its ``nocommit:`` record is there)."""
+    committed: pathlib.Path | None
+    """The listing committed beside that lock (``listing.read``); None for an older pivot's
+    lock, which listed the directory inline (``inline``)."""
+    inline: listing.DirListing | None
+
+    def read_listing(self, cache_dir: pathlib.Path | None) -> listing.DirListing:
+        """The directory's listing: the older lock's inline one, else ``listing.read``."""
+        if self.inline is not None:
+            return self.inline
+        return listing.read(self.committed, self.output_hash, cache_dir)
+
+
+def recorded_directories(
+    stages_dir: pathlib.Path, exclude: Collection[str]
+) -> dict[str, RecordedDirectory]:
+    """Every directory output that a lock in ``stages_dir``, or in the project's other stages
+    directory (``state_dir.other_stages_dir_for``), records at a path, by that path as the lock
+    records it (relative to the project root), for each stage not in ``exclude``.
+
+    This reads what runs left behind, for stages the command does not run, so it reads them
+    quietly and never fails: no format warning, nothing written to the cache, and a lock that
+    cannot be read or parsed (unreadable, damaged, a newer pivot's) records nothing here. A
+    stage with a lock in both directories is read from the current one, as ``StageLock`` picks
+    it. Within one state-directory record (``state_dir.recorded_locks``) a lock file is parsed
+    again only when it changed, so a ``--watch`` run sees every lock written since the last.
+    """
+    other_dir = state_dir_mod.other_stages_dir_for(stages_dir)
+    listed = [(stages_dir, stage_lock_files(stages_dir))]
+    if other_dir is not None:
+        listed.append((other_dir, stage_lock_files(other_dir)))
+    names = {name for _, files in listed for name in files} - set(exclude)
+    kept = state_dir_mod.recorded_locks()
+    found = dict[str, RecordedDirectory]()
+    for stage_name in names:
+        holders = [
+            (directory, files[stage_name]) for directory, files in listed if stage_name in files
+        ]
+        directory, path = holders[0]
+        if len(holders) == 2:
+            primary = _lock_file(holders[0][1])
+            other = _lock_file(holders[1][1])
+            if primary is not None and other is not None:
+                if _other_lock_is_current(
+                    stage_name, primary, other, holders[0][0].parent, holders[1][0].parent
+                ):
+                    directory, path = holders[1]
+            elif primary is None:
+                directory, path = holders[1]
+        lock_files = tuple(found_path for _, found_path in holders)
+        for record in _recorded_in(stage_name, path, directory, lock_files, kept):
+            found[record[0]] = record[1]
+    return found
+
+
+def _lock_file(path: pathlib.Path) -> _LockFile | None:
+    identity = _lock_identity(path)
+    return None if identity is None else _LockFile(path, identity)
+
+
+type _Recorded = tuple[tuple[str, RecordedDirectory], ...]
+
+
+def _recorded_in(
+    stage_name: str,
+    path: pathlib.Path,
+    stages_dir: pathlib.Path,
+    lock_files: tuple[pathlib.Path, ...],
+    kept: dict[str, tuple[_LockIdentity, object]] | None,
+) -> _Recorded:
+    """The directory outputs the lock at ``path`` records at a path, each with that path; read
+    again only when the file's identity changed since ``kept`` recorded it."""
+    identity = _lock_identity(path)
+    if identity is None:
+        return ()
+    key = os.fspath(path)
+    if kept is not None and key in kept and kept[key][0] == identity:
+        return cast("_Recorded", kept[key][1])
+    try:
+        recorded = _read_recorded(stage_name, path, stages_dir, lock_files)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, ValueError, exceptions.PivotError) as e:
+        logger.debug("Reading no recorded directory from %s: %s", path, e)
+        recorded = ()
+    if kept is not None:
+        kept[key] = (identity, recorded)
+    return recorded
+
+
+def _read_recorded(
+    stage_name: str,
+    path: pathlib.Path,
+    stages_dir: pathlib.Path,
+    lock_files: tuple[pathlib.Path, ...],
+) -> _Recorded:
+    with open(path) as f:
+        data: object = yaml.load(f, Loader=yaml_config.Loader)
+    version = _schema_version(data)
+    inline = dict[str | None, listing.DirListing]()
+    if version is not None and version < SCHEMA_VERSION:
+        converted = _convert_old(data)
+        if converted is None:
+            return ()
+        data, inline = converted.document, converted.output_listings
+    if lock_data_error(data) is not None:
+        return ()
+    lock_data = _convert_from_storage_format(_from_document(data), stage_name=stage_name)
+    if "output_paths" not in lock_data:
+        return ()
+    recorded = list[tuple[str, RecordedDirectory]]()
+    for identity, output_hash in lock_data["output_hashes"].items():
+        if not is_dir_hash(output_hash) or identity not in lock_data["output_paths"]:
+            continue
+        older = identity.key in inline
+        recorded.append(
+            (
+                lock_data["output_paths"][identity],
+                RecordedDirectory(
+                    stage_name=stage_name,
+                    identity=identity,
+                    output_hash=output_hash,
+                    lock_files=lock_files,
+                    state_dir=stages_dir.parent,
+                    committed=None if older else listing.output_listing_path(stages_dir, identity),
+                    inline=inline[identity.key] if older else None,
+                ),
+            )
+        )
+    return tuple(recorded)
 
 
 def find_orphaned_locks(
@@ -1330,15 +1455,7 @@ def find_orphaned_locks(
     if not stages_dir.is_dir():
         return []
 
-    orphaned = list[str]()
-    for lock_file in stages_dir.rglob(f"*{_LOCK_SUFFIX}"):
-        if not lock_file.is_file():
-            continue
-        # Derive stage name from relative path (e.g., "base/stage_name.lock" -> "base/stage_name")
-        rel = lock_file.relative_to(stages_dir)
-        stage_name = str(rel)[: -len(_LOCK_SUFFIX)]
-        if stage_name not in registered_stages:
-            orphaned.append(stage_name)
+    orphaned = [name for name in stage_lock_files(stages_dir) if name not in registered_stages]
 
     for proof_file in stages_dir.rglob(f"*{_RESTART_PROOF_SUFFIX}"):
         rel = str(proof_file.relative_to(stages_dir))

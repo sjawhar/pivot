@@ -630,7 +630,7 @@ def verify_tracked_files(
         checkout_missing: If True, restore missing tracked files from cache before validating.
             Only restores files that don't exist - never overwrites existing files.
         skip: Leaves a .pvt out of the tracked files (``track.discover_pvt_files``): a stage's
-            own member of its output (``ownership.own_member_skip``).
+            own member of its output (``member_skip.own_member_skip``).
     """
     from pivot import metrics
 

@@ -14,7 +14,7 @@ import py_compile
 import sys
 import types as _stdlib_types
 import zipimport
-from typing import TYPE_CHECKING, Final, NamedTuple, cast, override
+from typing import TYPE_CHECKING, Final, cast, override
 
 import cloudpickle
 
@@ -27,8 +27,6 @@ from pivot.storage import store as store_mod
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from importlib.abc import PathEntryFinder
-
-    from pivot.storage import track
 
 logger = logging.getLogger(__name__)
 
@@ -1075,44 +1073,21 @@ def declared_outputs(project_root: pathlib.Path) -> dict[str, ownership.Declared
     return {} if discovered is None else _resolved_outputs(*discovered)
 
 
-class TrackChecks(NamedTuple):
-    """What ``pivot track`` checks a path against, from one every-pipeline discovery."""
-
-    outputs: dict[str, ownership.DeclaredOutput]
-    """Every declared output (``declared_outputs``)."""
-    skip: track.PvtSkip
-    """``ownership.own_member_skip`` over every declared stage."""
-    orphaned_member: Callable[[pathlib.Path], str | None]
-    """Which lock of a stage no pipeline declares records a path's sidecar as that stage's file
-    (``ownership.orphaned_member_claim``): such a sidecar is skipped as pivot's, so the path
-    cannot be tracked while the lock stays."""
-
-
-def track_checks(
-    project_root: pathlib.Path, default_state_dir: pathlib.Path, cache_dir: pathlib.Path
-) -> TrackChecks:
-    """What ``pivot track`` checks a path against (``TrackChecks``), with ``cache_dir`` the
-    cache object root. A project with no pipeline declares no stage, so every lock is a stage's
-    that no longer exists.
+def declared_outputs_and_stages(
+    project_root: pathlib.Path,
+) -> tuple[dict[str, ownership.DeclaredOutput], dict[str, RegistryStageInfo]]:
+    """``declared_outputs``, and every pipeline's stages, from one discovery: what ``pivot
+    track`` checks a path against. A project with no pipeline declares no stage.
 
     Raises:
         exceptions.ValidationError: As ``declared_outputs``.
     """
     discovered = _discover_every_pipeline(project_root)
     if discovered is None:
-        stages = dict[str, RegistryStageInfo]()
-        outputs = dict[str, ownership.DeclaredOutput]()
-    else:
-        pipeline, workspace = discovered
-        stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
-        outputs = _resolved_outputs(pipeline, workspace)
-    return TrackChecks(
-        outputs=outputs,
-        skip=ownership.own_member_skip(project_root, stages, default_state_dir, cache_dir),
-        orphaned_member=ownership.orphaned_member_claim(
-            project_root, default_state_dir, cache_dir, stages
-        ),
-    )
+        return {}, {}
+    pipeline, workspace = discovered
+    stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
+    return _resolved_outputs(pipeline, workspace), stages
 
 
 def load_pipeline_from_path(path: pathlib.Path) -> PipelineLike | None:

@@ -68,7 +68,7 @@ from pivot import state_dir as state_dir_mod
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
-from pivot.storage import cache, listing, lock, ownership, track
+from pivot.storage import cache, listing, lock, member_skip, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -107,14 +107,14 @@ def _discover_tracked_files(
     allow_missing: bool, all_stages: dict[str, RegistryStageInfo]
 ) -> tuple[dict[str, PvtData] | None, pygtrie.Trie[str] | None]:
     """Discover tracked files for .pvt hash lookup when allow_missing is set. A stage's own
-    ``*.pvt`` member of its output is none (``ownership.own_member_skip``)."""
+    ``*.pvt`` member of its output is none (``member_skip.own_member_skip``)."""
     if not allow_missing:
         return None, None
 
     project_root = project.get_project_root()
     tracked_files = track.discover_pvt_files(
         project_root,
-        skip=ownership.own_member_skip(
+        skip=member_skip.own_member_skip(
             project_root,
             all_stages,
             config.locate_state_dir(),
@@ -379,7 +379,7 @@ def get_tracked_files_status(
         project_root: Project root directory.
         on_progress: Optional callback called with (completed, total) after each file.
         skip: Leaves a .pvt out of the tracked files (``track.discover_pvt_files``): a stage's
-            own member of its output (``ownership.own_member_skip``).
+            own member of its output (``member_skip.own_member_skip``).
     """
     tracked = track.discover_pvt_files(project_root, skip=skip)
     total = len(tracked)

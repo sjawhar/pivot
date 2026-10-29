@@ -486,7 +486,11 @@ exactly its bytes, or, with no cached copy, its bytes hash to the directory the
 declared output of any of them, including pipelines this directory does not select, and names
 the stage that writes that output. A `pipeline.py` that fails to load makes `pivot track` and
 `pivot import` refuse until it is fixed; one that loads but defines no Pivot pipeline declares no
-outputs. A file tracked or imported inside an output before this check stays where it is:
+outputs. `pivot track` also refuses a path whose `.pvt` sidecar the lock of a stage that no longer
+exists in any pipeline records as that stage's file: every command reads such a stage's files as
+its own, by the lock it left, so a sidecar written there would not be read as tracking anything.
+The error names the lock; remove it if the stage is gone for good, then track the path again. A
+file tracked or imported inside an output before this check stays where it is:
 `pivot status` and `pivot repro` (with `--all` for another pipeline's output) warn once per run
 naming it, `pivot track --force` updates it in place with the same warning, and any stage write,
 restore, `pivot commit`, forced checkout or forced `pivot get` that would remove it or its `.pvt`

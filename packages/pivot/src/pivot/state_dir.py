@@ -121,6 +121,10 @@ class StateDirInvocation(typing.TypedDict):
     # What ordering a stage's two locks needs, kept for the whole record
     # (``lock.resolve_stage_lock_path``).
     lock_ordering: LockOrdering
+    # Per lock file read for the directory outputs it records (``lock.recorded_directories``):
+    # the file's identity when it was read (device, inode, size, change time) and what it
+    # recorded. A file whose identity changed is read again, as during a ``--watch`` session.
+    recorded_locks: dict[str, tuple[tuple[int, int, int, int], object]]
 
 
 # Set by the CLI callback for one CLI invocation, by a worker for one stage, and by a library
@@ -144,6 +148,13 @@ def lock_ordering() -> LockOrdering | None:
     """The current record's lock-ordering state; None outside a record."""
     invocation = _invocation.get()
     return None if invocation is None else invocation["lock_ordering"]
+
+
+def recorded_locks() -> dict[str, tuple[tuple[int, int, int, int], object]] | None:
+    """The current record's lock files read for their recorded directory outputs; None outside
+    a record."""
+    invocation = _invocation.get()
+    return None if invocation is None else invocation["recorded_locks"]
 
 
 # Called with a record as it ends (``end_invocation``), before the record it replaced returns.
@@ -615,6 +626,7 @@ def begin_invocation(
                 decisions=dict[str, tuple[object, bool]](),
                 stale=set[pathlib.Path](),
             ),
+            recorded_locks=dict[str, tuple[tuple[int, int, int, int], object]](),
         )
     )
 

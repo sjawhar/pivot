@@ -37,7 +37,7 @@ Set `auto_discover=False` only for commands that don't use the stage registry:
 | run | True (default) | Need registry to find stages |
 | list, dag | True (default), allow_all=True | Need registry; --all for multi-pipeline |
 | checkout | True (default) | Need registry; handles None pipeline gracefully |
-| track | False | Discovers every pipeline itself (`discovery.track_checks`, as `--all` does) and refuses a new path overlapping any of their outputs, or the recorded output of a stage that no longer exists |
+| track | False | Discovers every pipeline itself (`discovery.declared_outputs_and_stages`, as `--all` does) and refuses a new path overlapping any of their outputs, or one whose `.pvt` sidecar the lock of a stage that no longer exists records as that stage's file |
 | status | True (default), allow_all=True | Handles None pipeline gracefully (skips stages section) |
 | init, doctor, check-ignore | False | No stage data needed |
 | history, show | False | Read run history only |

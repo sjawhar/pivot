@@ -51,7 +51,7 @@ def update(targets: tuple[str, ...], rev: str | None, dry_run: bool) -> None:
     If no TARGETS specified, updates all imports found in the project.
     """
     from pivot import config, project
-    from pivot.storage import ownership, track
+    from pivot.storage import member_skip, track
 
     root = project.get_project_root()
 
@@ -73,16 +73,16 @@ def update(targets: tuple[str, ...], rev: str | None, dry_run: bool) -> None:
             pairs.append((pvt_path, pvt_data))
     else:
         # A stage's own .pvt member of its output is no import. The command loads no pipeline,
-        # so the index of recorded directory outputs decides; it reads no config until an import
-        # .pvt is found.
+        # so the directory outputs the stages' locks record decide; it reads no config until an
+        # import .pvt is found.
         @functools.cache
-        def member_skip() -> track.PvtSkip:
-            return ownership.own_member_skip(
+        def own_member_skip() -> track.PvtSkip:
+            return member_skip.own_member_skip(
                 root, {}, config.locate_state_dir(), config.locate_cache_dir() / "files"
             )
 
         def skip(path: pathlib.Path, data: track.PvtData) -> bool:
-            return member_skip()(path, data)
+            return own_member_skip()(path, data)
 
         imports = track.discover_import_pvt_files(root, skip=skip)
         pairs = list[tuple[pathlib.Path, track.PvtData]]()

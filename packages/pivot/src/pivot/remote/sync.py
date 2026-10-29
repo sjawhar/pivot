@@ -10,7 +10,7 @@ from pivot import config, exceptions, metrics, names, project, registry, types
 from pivot import state_dir as state_dir_mod
 from pivot.remote import config as remote_config
 from pivot.remote import protocol
-from pivot.storage import cache, listing, lock, ownership, track
+from pivot.storage import cache, listing, lock, member_skip, track
 from pivot.storage import store as store_mod
 from pivot.types import HashInfo, LockData, RemoteStatus, TransferSummary, is_dir_hash
 
@@ -287,8 +287,8 @@ def get_target_hashes(
     cache root (``config.locate_cache_dir()`` when None). With ``require_members`` (push), a
     directory whose committed listing cannot be read and whose listing object the cache lacks
     raises rather than naming an object that is not there (``_blob_hashes``). A ``*.pvt`` file a
-    stage wrote as its own member resolves nothing (``ownership.own_member_skip``: the stages of
-    ``all_stages`` by the registry, any other by its lock in ``state_dir``).
+    stage wrote as its own member resolves nothing (``member_skip.own_member_skip``: the stages
+    of ``all_stages`` by the registry, any other by its lock in ``state_dir``).
     """
     _t = metrics.start()
     proj_root = project.get_project_root()
@@ -297,7 +297,7 @@ def get_target_hashes(
     output_identities: dict[str, types.ArtifactIdentity] | None = None
     unresolved = list[str]()
     tracked_blobs: dict[str, set[str]] | None = None
-    skip = ownership.own_member_skip(proj_root, all_stages or {}, state_dir, files_dir)
+    skip = member_skip.own_member_skip(proj_root, all_stages or {}, state_dir, files_dir)
 
     for target in targets:
         original_target = target
