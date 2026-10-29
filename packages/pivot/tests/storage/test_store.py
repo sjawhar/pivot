@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import errno
+import logging
+import multiprocessing
 import os
 import pathlib
 import pickle
@@ -251,6 +253,33 @@ def _copy_user_file(user_file: pathlib.Path) -> None:
     )
 
 
+def _copy_user_file_after_the_first_check(
+    monkeypatch: pytest.MonkeyPatch, workspace_store: store.WorkspaceStore, user_file: pathlib.Path
+) -> None:
+    """Copy a user's tracked file and sidecar to ``user_file`` right after prepare_output's first
+    ownership check returns, before the old output is removed."""
+    first_check = workspace_store.refuse_output_replacements
+
+    def check_then_copy_user_file(
+        refs: Iterable[types.ArtifactRef],
+        claims: ownership.StageClaims | None = None,
+        returned: Mapping[types.ArtifactRef, ownership.StageMembers] | None = None,
+    ) -> None:
+        first_check(refs, claims, returned)
+        _copy_user_file(user_file)
+
+    monkeypatch.setattr(workspace_store, "refuse_output_replacements", check_then_copy_user_file)
+
+
+def _helper_backups(directory: pathlib.Path) -> list[pathlib.Path]:
+    return sorted(directory.glob(f"{cache._BACKUP_TEMP_PREFIX}*"))
+
+
+def _helper_stage_files(output_path: pathlib.Path) -> None:
+    for index in range(3):
+        (output_path / f"f{index}.txt").write_text(f"stage {index}")
+
+
 def test_workspace_store_keeps_a_tracked_file_copied_in_after_the_prepare_check(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -265,20 +294,9 @@ def test_workspace_store_keeps_a_tracked_file_copied_in_after_the_prepare_check(
     )
     ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
     output_path = workspace_store.prepare_output(ref)
-    for index in range(3):
-        (output_path / f"f{index}.txt").write_text(f"stage {index}")
+    _helper_stage_files(output_path)
     user_file = output_path / "user.txt"
-    first_check = workspace_store.refuse_output_replacements
-
-    def check_then_copy_user_file(
-        refs: Iterable[types.ArtifactRef],
-        claims: ownership.StageClaims | None = None,
-        returned: Mapping[types.ArtifactRef, ownership.StageMembers] | None = None,
-    ) -> None:
-        first_check(refs, claims, returned)
-        _copy_user_file(user_file)
-
-    monkeypatch.setattr(workspace_store, "refuse_output_replacements", check_then_copy_user_file)
+    _copy_user_file_after_the_first_check(monkeypatch, workspace_store, user_file)
 
     refusal: exceptions.OutputOwnershipError | None = None
     try:
@@ -295,7 +313,30 @@ def test_workspace_store_keeps_a_tracked_file_copied_in_after_the_prepare_check(
     assert "user.txt.pvt" in message
     assert "data/stage" in message
     assert left == ["f0.txt", "f1.txt", "f2.txt", "user.txt", "user.txt.pvt"]
-    assert not list(output_path.parent.glob(".pivot_backup_*"))
+    assert _helper_backups(output_path.parent) == []
+
+
+def test_workspace_store_keeps_a_tracked_file_moved_over_a_file_output_after_the_check(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file output is renamed aside too: a user's tracked file written over it, with its
+    sidecar beside it, after prepare_output's first check is found there, refused, and put back
+    at the output's path."""
+    workspace_store = store.WorkspaceStore(tmp_path, "pipe", {})
+    ref = _helper_ref("stage", None, types.ArtifactTag.DATA, loaders.Text())
+    output_path = workspace_store.prepare_output(ref)
+    output_path.write_text("stage")
+    _copy_user_file_after_the_first_check(monkeypatch, workspace_store, output_path)
+
+    with pytest.raises(exceptions.OutputOwnershipError, match=r"data/stage\.txt\.pvt"):
+        workspace_store.prepare_output(ref)
+
+    assert output_path.read_text() == "user bytes"
+    assert track.get_pvt_path(output_path).is_file()
+    assert sorted(path.name for path in output_path.parent.iterdir()) == [
+        "stage.txt",
+        "stage.txt.pvt",
+    ]
 
 
 def test_workspace_store_puts_the_output_back_when_its_removal_fails(
@@ -318,7 +359,7 @@ def test_workspace_store_puts_the_output_back_when_its_removal_fails(
     ) -> None:
         if not landed:
             # shutil.rmtree has listed the backup: a file added to it now fails its rmdir
-            (backup,) = output_path.parent.glob(".pivot_backup_*")
+            (backup,) = _helper_backups(output_path.parent)
             landed.append(backup)
             (backup / "stray.txt").write_text("stray")
         original_unlink(path, dir_fd=dir_fd)
@@ -331,10 +372,12 @@ def test_workspace_store_puts_the_output_back_when_its_removal_fails(
     assert len(landed) == 1
     # The restore token's backup name: the next directory restore of the path checks a killed
     # run's backup before removing it (cache._cleanup_fresh_restore_orphans)
-    assert landed[0].name.startswith(f".pivot_backup_{cache._restore_target_token(output_path)}.")
+    assert landed[0].name.startswith(
+        f"{cache._BACKUP_TEMP_PREFIX}{cache._restore_target_token(output_path)}."
+    )
     assert error.value.errno == errno.ENOTEMPTY
     assert (output_path / "stray.txt").read_text() == "stray"
-    assert not list(output_path.parent.glob(".pivot_backup_*"))
+    assert _helper_backups(output_path.parent) == []
 
 
 def test_prepare_output_clears_a_directory_output_in_a_read_only_parent(
@@ -354,6 +397,292 @@ def test_prepare_output_clears_a_directory_output_in_a_read_only_parent(
 
     assert result == output_path
     assert list(output_path.iterdir()) == []
+
+
+def _rename_failing_aside(monkeypatch: pytest.MonkeyPatch, error_number: int) -> list[pathlib.Path]:
+    """Make every rename to a backup name fail with ``error_number``, as overlayfs with
+    redirect_dir off fails a directory on its lower layer with EXDEV; return the entries refused."""
+    original_rename = pathlib.Path.rename
+    refused = list[pathlib.Path]()
+
+    def rename(source: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+        if pathlib.Path(target).name.startswith(cache._BACKUP_TEMP_PREFIX):
+            refused.append(source)
+            raise OSError(error_number, os.strerror(error_number), str(source), str(target))
+        return original_rename(source, target)
+
+    monkeypatch.setattr(pathlib.Path, "rename", rename)
+    return refused
+
+
+@pytest.mark.parametrize("error_number", [errno.EXDEV, errno.ENOTSUP], ids=["EXDEV", "ENOTSUP"])
+def test_prepare_output_clears_an_output_it_cannot_rename_aside(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, error_number: int
+) -> None:
+    """Where the filesystem cannot rename the old output aside, prepare_output checks it in place
+    and removes it, rather than fail every stage with an existing directory output."""
+    workspace_store = store.WorkspaceStore(tmp_path, "pipe", {})
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
+    output_path = workspace_store.prepare_output(ref)
+    _helper_stage_files(output_path)
+    refused = _rename_failing_aside(monkeypatch, error_number)
+
+    assert workspace_store.prepare_output(ref) == output_path
+
+    assert refused == [output_path]
+    assert list(output_path.iterdir()) == []
+    assert _helper_backups(output_path.parent) == []
+
+
+def test_prepare_output_refuses_a_tracked_file_in_an_output_it_cannot_rename_aside(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check made in place of the rename still finds a user file and sidecar copied into the
+    output after the first check, refuses naming them, and removes nothing."""
+    workspace_store = store.WorkspaceStore(tmp_path, "pipe", {})
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
+    output_path = workspace_store.prepare_output(ref)
+    _helper_stage_files(output_path)
+    _copy_user_file_after_the_first_check(monkeypatch, workspace_store, output_path / "user.txt")
+    refused = _rename_failing_aside(monkeypatch, errno.EXDEV)
+
+    with pytest.raises(exceptions.OutputOwnershipError, match=r"user\.txt\.pvt"):
+        workspace_store.prepare_output(ref)
+
+    assert refused == [output_path]
+    assert sorted(path.name for path in output_path.iterdir()) == [
+        "f0.txt",
+        "f1.txt",
+        "f2.txt",
+        "user.txt",
+        "user.txt.pvt",
+    ]
+
+
+def test_prepare_output_fails_on_any_other_rename_error_and_keeps_the_output(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a filesystem that cannot rename the entry gets the in-place removal: any other rename
+    error (EBUSY: the output is a mount point) fails before anything is removed."""
+    workspace_store = store.WorkspaceStore(tmp_path, "pipe", {})
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
+    output_path = workspace_store.prepare_output(ref)
+    _helper_stage_files(output_path)
+    _ = _rename_failing_aside(monkeypatch, errno.EBUSY)
+
+    with pytest.raises(OSError) as error:
+        workspace_store.prepare_output(ref)
+
+    assert error.value.errno == errno.EBUSY
+    assert sorted(path.name for path in output_path.iterdir()) == ["f0.txt", "f1.txt", "f2.txt"]
+
+
+def _helper_cached_directory_output(
+    workspace_store: store.WorkspaceStore, ref: types.ArtifactRef
+) -> tuple[pathlib.Path, types.HashInfo]:
+    """A committed directory output whose workspace copy then changed: a restore replaces it."""
+    output_path = workspace_store.prepare_output(ref)
+    (output_path / "cached.txt").write_text("cached")
+    output_hash = workspace_store.commit(ref, output_path)
+    (output_path / "cached.txt").write_text("changed")
+    (output_path / "extra.txt").write_text("extra")
+    return output_path, output_hash
+
+
+def test_workspace_store_restores_over_a_directory_it_cannot_rename_aside(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restore's swap over a directory the filesystem cannot rename aside (a forced checkout on
+    overlayfs) checks it in place, removes it, and puts the restored directory there."""
+    workspace_store = store.WorkspaceStore(
+        tmp_path,
+        "pipe",
+        {},
+        cache_dir=tmp_path / "cache" / "files",
+        checkout_modes=[config.CheckoutMode.COPY],
+    )
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
+    output_path, output_hash = _helper_cached_directory_output(workspace_store, ref)
+    refused = _rename_failing_aside(monkeypatch, errno.EXDEV)
+
+    assert workspace_store.restore_from_cache(ref, output_hash) is True
+
+    assert refused == [output_path]
+    assert sorted(path.name for path in output_path.iterdir()) == ["cached.txt"]
+    assert (output_path / "cached.txt").read_text() == "cached"
+    assert _helper_backups(output_path.parent) == []
+
+
+def test_workspace_store_restore_refuses_a_tracked_file_in_a_directory_it_cannot_rename_aside(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The swap's check made in place of the rename finds a user file and sidecar copied into
+    the output while its replacement was built, refuses naming them, and removes nothing."""
+    workspace_store = store.WorkspaceStore(
+        tmp_path,
+        "pipe",
+        {},
+        cache_dir=tmp_path / "cache" / "files",
+        checkout_modes=[config.CheckoutMode.COPY],
+    )
+    ref = _helper_ref("stage", None, types.ArtifactTag.DIRECTORY, loaders.PathOnly())
+    output_path, output_hash = _helper_cached_directory_output(workspace_store, ref)
+    original_checkout = cache._checkout_with_fallback
+
+    def stage_then_copy_user_file(
+        path: pathlib.Path,
+        cache_path: pathlib.Path,
+        checkout_modes: list[cache.CheckoutMode],
+        *,
+        executable: bool | None = None,
+        staging_path: pathlib.Path | None = None,
+        keep_existing_copy: bool = False,
+        display_path: pathlib.Path | None = None,
+        before_swap: Callable[[pathlib.Path], None] | None = None,
+        cache_root: cache.CacheRoot | None = None,
+    ) -> os.stat_result:
+        staged = original_checkout(
+            path,
+            cache_path,
+            checkout_modes,
+            executable=executable,
+            staging_path=staging_path,
+            keep_existing_copy=keep_existing_copy,
+            display_path=display_path,
+            before_swap=before_swap,
+            cache_root=cache_root,
+        )
+        if not (output_path / "user.txt").exists():
+            _copy_user_file(output_path / "user.txt")
+        return staged
+
+    monkeypatch.setattr(cache, "_checkout_with_fallback", stage_then_copy_user_file)
+    refused = _rename_failing_aside(monkeypatch, errno.EXDEV)
+
+    with pytest.raises(exceptions.OutputOwnershipError, match=r"user\.txt\.pvt"):
+        workspace_store.restore_from_cache(ref, output_hash)
+
+    assert refused == [output_path]
+    assert sorted(path.name for path in output_path.iterdir()) == [
+        "cached.txt",
+        "extra.txt",
+        "user.txt",
+        "user.txt.pvt",
+    ]
+    assert (output_path / "user.txt").read_text() == "user bytes"
+
+
+def _helper_ref_of(tag: types.ArtifactTag) -> types.ArtifactRef:
+    if tag is types.ArtifactTag.DIRECTORY:
+        return _helper_ref("stage", None, tag, loaders.PathOnly())
+    return _helper_ref("stage", None, tag, loaders.Text())
+
+
+def _helper_prepare_output_killed_after_its_rename(
+    project_root: pathlib.Path, tag: types.ArtifactTag, state_dir: pathlib.Path
+) -> None:
+    """Run in a child process: a stage write killed the moment it renamed the old output aside."""
+    original_rename = pathlib.Path.rename
+
+    def rename_and_die(source: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+        result = original_rename(source, target)
+        if pathlib.Path(target).name.startswith(cache._BACKUP_TEMP_PREFIX):
+            os._exit(73)
+        return result
+
+    pathlib.Path.rename = rename_and_die
+    workspace_store = store.WorkspaceStore(project_root, "pipe", {})
+    workspace_store.prepare_output(_helper_ref_of(tag), state_dir=state_dir)
+
+
+def _helper_killed_stage_write(
+    project_root: pathlib.Path, tag: types.ArtifactTag, state_dir: pathlib.Path
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Write an old output, then kill a stage write of it right after it renamed the output
+    aside; return the output's path and the backup the killed write left."""
+    output_path = store.WorkspaceStore(project_root, "pipe", {}).prepare_output(
+        _helper_ref_of(tag), state_dir=state_dir
+    )
+    if tag is types.ArtifactTag.DIRECTORY:
+        (output_path / "old.txt").write_text("old")
+    else:
+        output_path.write_text("old")
+    process = multiprocessing.get_context("spawn").Process(
+        target=_helper_prepare_output_killed_after_its_rename, args=(project_root, tag, state_dir)
+    )
+    process.start()
+    process.join(timeout=60)
+    assert process.exitcode == 73
+    assert not output_path.exists()
+    (backup,) = _helper_backups(output_path.parent)
+    return output_path, backup
+
+
+@pytest.mark.parametrize(
+    "tag", [types.ArtifactTag.DATA, types.ArtifactTag.DIRECTORY], ids=["file", "directory"]
+)
+def test_prepare_output_removes_the_backup_a_killed_stage_write_left(
+    tmp_path: pathlib.Path, tag: types.ArtifactTag
+) -> None:
+    """A stage write killed between renaming its old output aside and removing it leaves the
+    output beside its path. The next stage write of that path, under its restore lock, checks
+    that backup, finds no user file, and removes it, even though nothing is at the path."""
+    state_dir = tmp_path / ".pivot"
+    output_path, _ = _helper_killed_stage_write(tmp_path, tag, state_dir)
+    workspace_store = store.WorkspaceStore(tmp_path, "pipe", {})
+
+    assert workspace_store.prepare_output(_helper_ref_of(tag), state_dir=state_dir) == output_path
+
+    assert _helper_backups(output_path.parent) == []
+
+
+def test_prepare_output_keeps_a_killed_stage_writes_backup_that_holds_a_user_file(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A user's tracked file in that backup (copied into the output just before the killed write
+    renamed it aside) keeps the backup, with a warning naming the sidecar; the stage write still
+    clears its path, through another backup it removes."""
+    state_dir = tmp_path / ".pivot"
+    output_path, backup = _helper_killed_stage_write(
+        tmp_path, types.ArtifactTag.DIRECTORY, state_dir
+    )
+    _copy_user_file(backup / "user.txt")
+    output_path.mkdir()
+    (output_path / "new.txt").write_text("a later run's file")
+    workspace_store = store.WorkspaceStore(tmp_path, "pipe", {})
+    ref = _helper_ref_of(types.ArtifactTag.DIRECTORY)
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.cache"):
+        assert workspace_store.prepare_output(ref, state_dir=state_dir) == output_path
+
+    assert list(output_path.iterdir()) == []
+    assert _helper_backups(output_path.parent) == [backup]
+    assert sorted(path.name for path in backup.iterdir()) == ["old.txt", "user.txt", "user.txt.pvt"]
+    assert "Keeping interrupted restore backup" in caplog.text
+    assert "user.txt.pvt" in caplog.text
+
+
+def test_file_restore_removes_the_backup_a_killed_stage_write_left(tmp_path: pathlib.Path) -> None:
+    """A file restore of the path (a stage restored from the cache) is a replacement of it too:
+    under the path's restore lock it checks the killed stage write's backup and removes it."""
+    state_dir = tmp_path / ".pivot"
+    workspace_store = store.WorkspaceStore(
+        tmp_path,
+        "pipe",
+        {},
+        cache_dir=tmp_path / "cache" / "files",
+        checkout_modes=[config.CheckoutMode.COPY],
+    )
+    ref = _helper_ref_of(types.ArtifactTag.DATA)
+    output_path = workspace_store.prepare_output(ref)
+    output_path.write_text("cached")
+    output_hash = workspace_store.commit(ref, output_path, state_dir=state_dir)
+    _, _ = _helper_killed_stage_write(tmp_path, types.ArtifactTag.DATA, state_dir)
+
+    assert workspace_store.restore_from_cache(ref, output_hash, state_dir=state_dir) is True
+
+    assert output_path.read_text() == "cached"
+    assert _helper_backups(output_path.parent) == []
 
 
 def test_workspace_store_restore_records_pvt_members_before_writing_them(

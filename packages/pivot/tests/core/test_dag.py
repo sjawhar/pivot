@@ -76,8 +76,12 @@ class _DependencyStore:
         ref: ArtifactRef,
         claims: ownership.StageClaims | None = None,
         returned: ownership.StageMembers | None = None,
+        *,
+        state_dir: Path | None = None,
     ) -> Path:
-        raise AssertionError(f"not used by dependency validation: {ref} {claims} {returned}")
+        raise AssertionError(
+            f"not used by dependency validation: {ref} {claims} {returned} {state_dir}"
+        )
 
     def commit(
         self,
