@@ -1,5 +1,5 @@
 """The project's ``.pivotignore``, read and matched as git reads and matches a root
-``.gitignore``: a port of git's own code (``dir.c`` and ``wildmatch.c``, git 2.43).
+``.gitignore``: a port of git's own code (``dir.c`` and ``wildmatch.c``, git 2.52).
 
 - The file is bytes, a UTF-8 byte order mark at its start dropped. Lines split on ``\\n``; a
   ``\\r`` before it is dropped, and a line ends at a NUL, as a C string does. An empty line or
@@ -8,28 +8,30 @@
   directories only.
 - A pattern with no other ``/`` matches an entry's own name at any depth. Any other pattern
   matches the whole path from the project root, a leading ``/`` dropped: its literal prefix (up
-  to the first of ``*?[\\``) byte for byte, and the rest by wildmatch with ``WM_PATHNAME``.
-  ``*``, ``?`` and ``[...]`` never match ``/``; ``**`` matches any number of directories only as
-  a whole path component (``**/``, ``/**/``, a trailing ``/**``) or at the start of what
-  wildmatch sees (so in ``data/docs**`` the ``**`` spans directories), and is a ``*``
-  anywhere else. A backslash makes the next byte literal.
+  to the first of ``*?[\\``) byte for byte, and wildmatch with ``WM_PATHNAME`` the rest, from
+  the prefix's last byte. ``*``, ``?`` and ``[...]`` never match ``/``; ``**`` matches any
+  number of directories only as a whole path component (``**/``, ``/**/``, a trailing
+  ``/**``), and is a ``*`` anywhere else: ``foo**/bar`` ignores ``foo/bar`` and ``foox/bar``,
+  not ``foobar`` or ``foo/x/bar``. A backslash makes the next byte literal.
 - The last pattern that matches a path decides it. A path is ignored when that pattern is not
   a negation, or when a directory above it is ignored: git never looks inside an ignored
-  directory, so no later negation can bring a file back from one. The project root itself is
-  never ignored.
+  directory, so no later negation can bring a file back from one.
 
 Matching is on bytes and case-sensitive, as git's is with ``core.ignorecase`` false. On macOS,
 where git precomposes the names it reads (``core.precomposeunicode``, true by default there), a
 path is first put in Unicode NFC; a pattern never is. Wildmatch is ``dowild`` itself, not a
-regular expression, so a pattern costs what it costs in git; consecutive whole ``**/``
-components are first merged into one, which matches the same paths. Only the project's own
-file is read: a ``.pivotignore`` in a subdirectory is data like any other file.
+regular expression, so it gives up where git gives up and no pattern backtracks further than in
+git (each step is Python's, not C's); consecutive whole ``**/`` components are first merged into
+one, which matches the same paths. Only the project's own file is read: a ``.pivotignore`` in a
+subdirectory is data like any other file.
 
-Pivot departs from git in two places: ``pipeline.py`` and ``.pivot/`` at the project root are
-never ignored (``PROTECTED_PATHS``), and a line with more than ``_MAX_STAR_RUNS`` runs of ``*``
-that make ``dowild`` recurse (``_recursing_runs``: not one at the end of the line, nor one that
-is not a whole ``**`` right before a ``/``; after that merge) is not matched as git would, with
-a warning: a negation is taken to match every path, so it keeps every file git might keep, and
+Pivot departs from git in three places. ``pipeline.py`` and ``.pivot/`` at the project root are
+never ignored (``PROTECTED_PATHS``). The project root itself is never ignored either, though
+``git check-ignore .`` matches it, as an empty name, against a pattern such as ``*``; git's own
+walk never tests it. And a line with more than ``_MAX_STAR_RUNS`` runs of ``*`` that make
+``dowild`` recurse (``_recursing_runs``: not one at the end of the line, nor one that is not a
+whole ``**`` right before a ``/``; after that merge) is not matched as git would, with a
+warning: a negation is taken to match every path, so it keeps every file git might keep, and
 any other line is not used.
 """
 
@@ -160,7 +162,8 @@ def _excluding(patterns: tuple[_Pattern, ...], path: bytes, is_dir: bool) -> _Pa
 def _ignored_at(patterns: tuple[_Pattern, ...], path_str: str, is_dir: bool) -> _Pattern | None:
     """The pattern that ignores ``path_str``: the one that ignores the first directory above it
     that is ignored, else the one that ignores it, else None (git's parent rule). The project
-    root, ``.``, is never ignored: git matches no pattern against it."""
+    root, ``.``, is never ignored: git's walk never tests it (the module docstring names how
+    ``git check-ignore .`` differs)."""
     if path_str == ".":
         return None
     path = _encode(path_str)
@@ -430,7 +433,7 @@ def _parse(data: bytes, source_name: str) -> tuple[_Pattern, ...]:
             )
             continue
         classes, star_runs = compiled
-        start = 0 if basename else _literal_length(body)
+        start = 0 if basename else _wildmatch_start(_literal_length(body))
         recursing = _recursing_runs(body, star_runs, start, not basename)
         if recursing <= _MAX_STAR_RUNS:
             match = _name_matcher(body, classes) if basename else _path_matcher(body, classes)
@@ -568,17 +571,26 @@ def _path_matcher(body: bytes, classes: dict[int, _Class]) -> Callable[[bytes], 
     dropped), against a path from the project root.
 
     The literal prefix (up to the first of ``*?[\\``) is compared as is, and wildmatch with
-    ``WM_PATHNAME`` sees only the rest. So a ``**`` right after the prefix starts the pattern
-    wildmatch sees and spans directories: ``data/docs**`` names ``data/docs/sub/a.txt``.
+    ``WM_PATHNAME`` sees the rest and the prefix's last byte, as git 2.52 gives it (git commit
+    1940a02dc1, "match_pathname(): give fnmatch one char of prefix context"): so a ``**`` right
+    after a byte that is not ``/`` starts no whole component, and ``foo**/bar`` does not name
+    ``foobar``. Before 2.52, git gave wildmatch no byte of the prefix, and that ``**`` spanned
+    directories.
     """
     literal = _literal_length(body)
     if literal == len(body):
         return lambda path: path == body
     prefix = body[:literal]
+    start = _wildmatch_start(literal)
     return lambda path: (
-        path.startswith(prefix)
-        and _dowild(body, classes, literal, path, literal, True) == _WM_MATCH
+        path.startswith(prefix) and _dowild(body, classes, start, path, start, True) == _WM_MATCH
     )
+
+
+def _wildmatch_start(literal: int) -> int:
+    """Where git 2.52's ``match_pathname`` starts wildmatch in a pattern whose literal prefix is
+    ``literal`` bytes long: at the prefix's last byte, so it sees where its components start."""
+    return literal - 1 if literal else 0
 
 
 class _Class(NamedTuple):
@@ -750,8 +762,8 @@ _WM_ABORT_TO_STARSTAR = -2
 def _dowild(
     pattern: bytes, classes: dict[int, _Class], start: int, text: bytes, t: int, pathname: bool
 ) -> int:
-    """git's ``dowild`` (wildmatch.c, git 2.43), line for line: ``pattern[start:]`` against
-    ``text[t:]``, with ``WM_PATHNAME`` when ``pathname``.
+    """git's ``dowild`` (wildmatch.c, git 2.52, as in 2.43 but for a refactor), line for line:
+    ``pattern[start:]`` against ``text[t:]``, with ``WM_PATHNAME`` when ``pathname``.
 
     Its abort results are what keep it fast: a ``*`` that cannot match by taking the rest of the
     text tells every ``*`` further out to stop (``WM_ABORT_ALL``), so no pattern backtracks

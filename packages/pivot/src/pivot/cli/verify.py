@@ -23,7 +23,8 @@ if TYPE_CHECKING:
     from pivot.remote import protocol
 
     # The project's tracked files by data path (``track.discover_pvt_files``), read when first
-    # asked for, and once per command
+    # asked for, and once for all of verify's own checks (the status explanations verify reads
+    # scan once more, in ``status``)
     TrackedFiles = Callable[[], dict[str, track.PvtData]]
 
 
@@ -569,7 +570,7 @@ def verify(
     if not pipeline_status:
         raise click.ClickException("No stages to verify.")
 
-    # Verify stages; the project's .pvt files are scanned once for the whole command
+    # Verify stages; verify's own checks share one scan of the project's .pvt files
     tracked_files = _project_tracked_files()
     passed, results = _verify_stages(pipeline_status, cache_dir, allow_missing, tracked_files)
     if stages_list is None:

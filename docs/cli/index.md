@@ -1212,15 +1212,18 @@ pivot check-ignore [TARGETS...] [OPTIONS]
 
 Exit code 0 if any target is ignored, 1 if none are ignored.
 
-It reads only the project's `.pivotignore` and answers as `git check-ignore` answers for the same
-patterns in a root `.gitignore`: a path under an ignored directory is ignored, whatever later `!`
-patterns say, a symlink is tested as a file even when it points to a directory, and the project
-root is never ignored. It differs from `git check-ignore` in three ways: a relative path is taken
-from the project root, not the current directory; `pipeline.py` and `.pivot/` at the project
-root are never ignored, whatever the patterns say; and a line with more than 256 runs of `*` tried
-at more than one place (not one at the end of the line, nor a lone `*` right before a `/`;
-consecutive `**/` count as one) is matched differently, with a warning: a negation is taken to
-match every path, and any other such line is not used. Hashing applies the same rules to a
+It reads only the project's `.pivotignore` and answers as `git check-ignore` (git 2.52) answers
+for the same patterns in a root `.gitignore`: a path under an ignored directory is ignored,
+whatever later `!` patterns say, and a symlink is tested as a file even when it points to a
+directory. (A git older than 2.52 answers otherwise for a `**` right after a pattern's literal
+prefix: it took `foo**/bar` to ignore `foobar` too.) It differs from `git check-ignore` in four
+ways: a relative path is taken from the project root, not the current directory; `pipeline.py`
+and `.pivot/` at the project root are never ignored, whatever the patterns say; the project
+root itself is never ignored, where `git check-ignore .` reports it ignored by `*`; and a line
+with more than 256 runs of `*` tried at more than one place (not one at the end of the line,
+nor a lone `*` right before a `/`; consecutive `**/` count as one) is matched differently, with
+a warning: a negation is taken to match every path, and any other such line is not used.
+Hashing applies the same rules to a
 directory input's files, except for an input directory that `.pivotignore` ignores itself:
 `check-ignore` reports its files ignored, but the input is hashed whole. See
 [Directory inputs and `.pivotignore`](../concepts/dependencies.md#directory-inputs-and-pivotignore).

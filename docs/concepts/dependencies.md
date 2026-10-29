@@ -68,12 +68,14 @@ directories the project's `.pivotignore` names. `pivot init` writes a starter
 files, build directories. So a Python process that imports from an input
 directory and writes `__pycache__/*.pyc` there leaves the stage cached.
 
-- Patterns are read and matched as git reads and matches a root `.gitignore`,
-  with a port of git's own matcher: the same syntax, the same `**` rules
-  (`logs/**` names what is inside `logs`, not `logs` itself, so
-  `!logs/.gitkeep` brings that file back), and the same bytes (a line that is
-  not valid UTF-8 matches the same bytes in a name; a NUL ends a line). Matching
-  is case-sensitive, as git's is with `core.ignorecase` off. Each file is
+- Patterns are read and matched as git 2.52 reads and matches a root
+  `.gitignore`, with a port of git's own matcher: the same syntax, the same
+  `**` rules (`logs/**` names what is inside `logs`, not `logs` itself, so
+  `!logs/.gitkeep` brings that file back; `foo**/bar` names `foo/bar` and
+  `foox/bar` but not `foobar`, which git before 2.52 also named), and the same
+  bytes (a line that is not valid UTF-8 matches the same bytes in a name; a NUL
+  ends a line). Matching is case-sensitive, as git's is with `core.ignorecase`
+  off. Each file is
   matched by its path inside the project (the input's path plus the file's path
   under it), never by where a symlink points, so a directory linked in from
   outside the project is treated as a local one. A file under an ignored

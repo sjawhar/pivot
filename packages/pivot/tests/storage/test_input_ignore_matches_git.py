@@ -1,14 +1,19 @@
 """A directory input's filtered hash against git: for random trees and generated ``.pivotignore``
 bytes, the files the hash keeps are the files ``git ls-files -o --exclude-standard`` keeps.
 
-Each pattern is built from tokens: literals, ``*``, ``**`` and ``?`` in every position, classes
-(ranges, ``]`` first, ``!`` and ``^``, every ``[:name:]``, unknown and unclosed ones), escapes,
+Each pattern is built from tokens: literals, ``*``, ``**`` and ``?`` in every position (a ``**``
+right after a literal, before an escaped ``/``, chained stars such as ``*?*`` and ``*[ab]*``),
+classes (ranges, an escaped range end, ``]`` first, ``!`` and ``^``, all twelve ``[:name:]``,
+unknown names, an unclosed ``[:name``, an unclosed class, ``[\\`` at the end), escapes,
 leading, middle and trailing ``/``, trailing spaces escaped or not, negations of a variant of an
-earlier pattern, comments; the file gets CRLF endings, a byte order mark, a NUL inside a line or
-no final newline now and then. Names hold spaces, tabs, ``\\v``, ``\\f``, wildcards, backslashes,
-bytes that are not UTF-8, and NFC and NFD forms.
+earlier pattern and of what an ``X/**`` holds, comments, and lines of ``*`` and a literal tail
+(git's suffix-test fast path); the file gets CRLF endings, a byte order mark, a NUL inside a
+line or no final newline now and then. Names hold spaces, tabs, ``\\v``, ``\\f``, wildcards,
+backslashes, bytes that are not UTF-8, and NFC and NFD forms.
 
-The seed and the number of cases are fixed, so a failure reproduces. Set
+The oracle is the ``git`` on PATH. Pivot matches as git 2.52 does; on an older git the lines
+git matched otherwise before 2.52 (``helpers.git_differs_before_2_52``) are left out of both
+files. The seed and the number of cases are fixed, so a failure reproduces. Set
 ``PIVOT_IGNORE_GIT_CASES`` to run more cases.
 """
 
@@ -23,6 +28,7 @@ from typing import TYPE_CHECKING
 
 from pivot import ignore
 from pivot.storage import cache
+from tests import helpers
 
 if TYPE_CHECKING:
     import pathlib
@@ -51,9 +57,11 @@ _LITERALS = [
     *(b"keep.txt", b"__pycache__", b"build", b"logs", b"x y", b"a b", _E_NFC, _E_NFD),
     *(b"caf" + _E_NFC, b"\xff", b"\xff*", b".gitkeep"),
 ]
-_STARS = [  # in every position, a "**" right after a literal included
+_STARS = [  # in every position, a "**" right after a literal and before an escaped "/" included
     *(b"*", b"**", b"***", b"*a", b"a*", b"f*o", b"fo*", b"fo**", b"foo**", b"**o", b"**oo"),
-    *(b"a**b", b"*.txt", b"**.txt", b"*.pyc", b"x**", b"**x", b"a*b*", b"*-*-*"),
+    *(b"a**b", b"*.txt", b"**.txt", b"*.pyc", b"x**", b"**x", b"a*b*", b"*-*-*", b"**\\/x"),
+    *(b"**\\/a", b"a*?b", b"*?*", b"**?", b"?**", b"*[!a]*", b"*[ab]*[ab]", b"f*o*o", b"**a**"),
+    b"*/*",
 ]
 _QUESTIONS = [b"?", b"??", b"?.txt", b"a?", b"f?o", b"a?b", b"?b"]
 _CLASSES = [
@@ -61,7 +69,9 @@ _CLASSES = [
     *(b"[z-a]", b"a[!x]b", b"a[^x]b", b"[[:alpha:]]*", b"[[:digit:][:alpha:]]*"),
     *(b"[[:space:]]", b"a[[:space:]]b", b"*[[:space:]]*", b"[![:space:]]*", b"[[:punct:]]"),
     *(b"[[:upper:]]*", b"[[:cntrl:]]", b"[[:blank:]]*", b"[[:xdigit:]]*", b"[[:bogus:]]"),
+    *(b"[[:alnum:]]*", b"[[:graph:]]", b"[[:lower:]]*", b"[[:print:]]*", b"a[[:graph:]]b"),
     *(b"[a", b"[\\]]", b"[\\a-c]", b"[[:alpha:]-z]", b"[[:al]", b"[[]", b"[a-[:]", b"[!/]"),
+    *(b"[a-\\c]", b"[\\a-\\c]*", b"[[:alpha", b"[[:alpha:]", b"a[\\", b"[\\"),
     *(b"*[ab]", b"[ab]*"),
 ]
 _ESCAPES = [
@@ -74,7 +84,10 @@ _PREFIXES = [
     *(b"", b"", b"", b"/", b"data/raw/in/", b"/data/raw/in/", b"**/", b"raw/in/"),
     *(b"data/**/", b"data/raw/in/**/", b"data/raw/i*/", b"d**/raw/in/", b"data**/"),
     *(b"**/**/", b"data/**/**/raw/", b"data/raw/in/**/***/"),  # merged into one "**/"
+    *(b"**\\/", b"data/raw/in/**\\/", b"data/**\\/raw/"),  # a "**" before an escaped "/"
 ]
+# The literal tails of a line that is "*" and a tail, which git tests as a suffix
+_ENDSWITH_TAILS = [b".txt", b"a", b"b", b".pyc", b"~", b"ab", b"txt", b"o", b" a", b"b.txt"]
 _SUFFIXES = [
     *(b"", b"", b"", b"", b"/", b"/**", b"/**/", b"**", b" ", b"  ", b"\\ ", b"\\  "),
     *(b" \\ ", b"\t"),
@@ -114,6 +127,9 @@ def _helper_ignore_bytes(rng: random.Random) -> bytes:
         inside = rng.choice([b"foo", b"fo", b"a", b"b", b"sub", b"deep", b"logs", b"x"])
         kept = rng.choice([b"keep.txt", b"a", b"b", b"*.txt", b"*"])
         lines.extend([prefix + inside + b"/**", b"!" + prefix + inside + b"/" + kept])
+    if rng.random() < 0.4:
+        line = rng.choice([b"", b"!"]) + b"*" + rng.choice(_ENDSWITH_TAILS)
+        lines.insert(rng.randrange(len(lines) + 1), line + rng.choice([b"", b"", b"/"]))
     if rng.random() < 0.05:
         at = rng.randrange(len(lines))
         lines[at] = lines[at] + b"\0" + _helper_component(rng)  # git reads a line up to a NUL
@@ -166,6 +182,19 @@ def _helper_git_kept(repo: pathlib.Path, home: pathlib.Path) -> dict[str, set[st
     return kept
 
 
+_BOM = b"\xef\xbb\xbf"
+
+
+def _helper_for_this_git(data: bytes) -> bytes:
+    """``data`` without the lines the ``git`` on PATH matches otherwise than git 2.52, when it
+    is older than 2.52."""
+    if helpers.git_version() >= (2, 52):
+        return data
+    bom = _BOM if data.startswith(_BOM) else b""
+    lines = data.removeprefix(bom).split(b"\n")
+    return bom + b"\n".join(line for line in lines if not helpers.git_differs_before_2_52(line))
+
+
 def test_an_input_hash_keeps_exactly_the_files_git_keeps(tmp_path: pathlib.Path) -> None:
     """The pruning walk, ``filter_listing`` over the whole listing and ``check_ignore`` all keep
     the files git keeps. An input directory the patterns ignore is hashed whole, on purpose
@@ -177,7 +206,7 @@ def test_an_input_hash_keeps_exactly_the_files_git_keeps(tmp_path: pathlib.Path)
         case = repo / f"c{index}"
         _helper_tree(case / _INPUT, rng, 3)
         (case / _INPUT / "always.dat").write_text("x\n")
-        data = _helper_ignore_bytes(rng)
+        data = _helper_for_this_git(_helper_ignore_bytes(rng))
         (case / ".pivotignore").write_bytes(data)
         ending = b"" if data.endswith(b"\n") else b"\n"
         (case / ".gitignore").write_bytes(data + ending + b"/.pivotignore\n/.gitignore\n")

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from pivot import ignore
+from tests import helpers
 
 if TYPE_CHECKING:
     from pytest import LogCaptureFixture
@@ -733,6 +734,12 @@ def test_member_ignored_checks_every_directory_above(
             ["a/b", "a/x/b", "a/x/y/b"],
             id="consecutive-starstar-components-match-as-one",
         ),
+        pytest.param(
+            "a/**\\/b\n",
+            ["a/b", "x/a/b"],
+            ["a/x/b", "a/x/y/b"],
+            id="starstar-before-an-escaped-slash-is-a-whole-component",
+        ),
         pytest.param("a**b\n", ["a/b", "a/x/b"], ["ab", "axb", "d/axxb"], id="starstar-as-star"),
         pytest.param("***\n", [], ["anything", "deep/er/file"], id="star-run-matches-all"),
         pytest.param("sub/\n!sub/\n", ["sub/a.txt"], [], id="negated-dir-pattern"),
@@ -751,27 +758,30 @@ def test_member_ignored_checks_every_directory_above(
         pytest.param("**/a?b\n", ["a/b", "ab"], ["ayb", "d/a b"], id="question-never-a-slash"),
         pytest.param(
             "*.txt\n!data/raw/src/docs**\n",
+            ["data/raw/src/docsx.txt", "data/raw/src/docs.txt"],
             [
                 "data/raw/src/docs/notes.txt",
                 "data/raw/src/docs/sub/deep.txt",
-                "data/raw/src/docsx.txt",
+                "data/raw/src/other.txt",
+                "data/raw/src/sub/docs.txt",
             ],
-            ["data/raw/src/other.txt", "data/raw/src/sub/docs.txt"],
-            id="starstar-after-a-literal-prefix-spans-directories",
+            id="starstar-after-a-literal-prefix-is-a-star",
         ),
         pytest.param(
             "foo**/bar\n",
-            ["x/foo/bar", "foo/baz"],
-            ["foo/bar", "foo/x/bar", "foox/bar"],
-            id="starstar-slash-after-a-literal-prefix",
+            ["x/foo/bar", "foo/baz", "foo/x/bar", "foobar"],
+            ["foo/bar", "foox/bar"],
+            id="starstar-slash-after-a-literal-prefix-is-a-star",
         ),
     ],
 )
 def test_patterns_decide_as_git_decides(
     tmp_path: pathlib.Path, patterns: str, kept: list[str], ignored: list[str]
 ) -> None:
-    """Each case is git's own answer, checked here with ``git ls-files``: ``X/**`` names what
-    is inside X, never X itself, so a later negation brings a file inside it back."""
+    """Each case is git 2.52's own answer, checked here with ``git ls-files``: ``X/**`` names
+    what is inside X, never X itself, so a later negation brings a file inside it back. On a
+    git older than 2.52 the check against git is left out for a case holding a line that git
+    matched otherwise before 2.52 (``helpers.git_differs_before_2_52``)."""
     project = tmp_path / "project"
     for relpath in [*kept, *ignored]:
         (project / relpath).parent.mkdir(parents=True, exist_ok=True)
@@ -779,9 +789,25 @@ def test_patterns_decide_as_git_decides(
     (project / ".pivotignore").write_text(patterns)
     filter_instance = ignore.IgnoreFilter(project_root=project)
 
-    assert _helper_git_kept(tmp_path, project, patterns) == set(kept), "the case is git's"
+    if helpers.git_version() >= (2, 52) or not any(
+        helpers.git_differs_before_2_52(line) for line in patterns.encode().split(b"\n")
+    ):
+        assert _helper_git_kept(tmp_path, project, patterns) == set(kept), "the case is git's"
     assert [path for path in kept if filter_instance.is_ignored(path, is_dir=False)] == []
     assert [path for path in ignored if not filter_instance.is_ignored(path, is_dir=False)] == []
+
+
+def test_starstar_after_a_literal_prefix_is_not_a_whole_component(tmp_path: pathlib.Path) -> None:
+    """git's own case, t0008 "** not confused by matching leading prefix" (git commit
+    1940a02dc1, git 2.52): `foo**/bar` ignores foo/bar, not foobar. git gives wildmatch the
+    literal prefix's last byte, so the `**` after `o` is a `*`; before 2.52 it gave wildmatch
+    `**/bar` and `bar`, a whole `**/` matching no directory, and ignored foobar too."""
+    (tmp_path / ".pivotignore").write_text("foo**/bar\n")
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+
+    assert [
+        path for path in ("foobar", "foo/bar") if filter_instance.check_ignore(path).ignored
+    ] == ["foo/bar"]
 
 
 def _helper_git_kept(home: pathlib.Path, project: pathlib.Path, patterns: str) -> set[str]:
@@ -1007,13 +1033,16 @@ def test_a_nul_byte_ends_a_line_as_in_git(tmp_path: pathlib.Path) -> None:
 
 
 def test_check_ignore_never_ignores_the_project_root(tmp_path: pathlib.Path) -> None:
-    """git matches no pattern against the root of the work tree, so `.*` does not ignore `.`."""
-    (tmp_path / ".pivotignore").write_text(".*\n")
-    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+    """The project root is never ignored, as git's own walk never tests it. This differs from
+    `git check-ignore .`, which matches the root, as an empty name, against `*` (git 2.43 and
+    2.52 print `.gitignore:1:*	.`), though not against `.*`."""
+    for patterns in ("*\n", ".*\n"):
+        (tmp_path / ".pivotignore").write_text(patterns)
+        filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
 
-    assert not filter_instance.check_ignore(".").ignored
-    assert not filter_instance.check_ignore(tmp_path).ignored
-    assert filter_instance.check_ignore(".hidden").ignored
+        assert not filter_instance.check_ignore(".").ignored, patterns
+        assert not filter_instance.check_ignore(tmp_path).ignored, patterns
+        assert filter_instance.check_ignore(".hidden").ignored, patterns
 
 
 def test_check_ignore_tests_a_symlink_to_a_directory_as_a_file(tmp_path: pathlib.Path) -> None:
