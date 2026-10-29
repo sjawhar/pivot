@@ -34,36 +34,42 @@ _INPUT = "data/raw/in"
 _E_NFC = unicodedata.normalize("NFC", "é").encode()
 _E_NFD = unicodedata.normalize("NFD", "é").encode()
 _FILE_NAMES = [
-    *(b"a", b"b", b"ab", b"abc", b"a.txt", b"b.txt", b"x.pyc", b"keep.txt", b"keep.pyc"),
-    *(b"foo", b"foobar", b"fo", b"a b", b"a ", b" a", b"#c", b"!n", b"*", b"?", b"[a]", b"]"),
-    *(b"-", b"a\\b", b"\\", _E_NFC, _E_NFD, b"caf" + _E_NFC, b"\xff", b"\xffx", b".hidden"),
-    *(b"x~", b"A.TXT", b"a.txt ", b"z9", b"Z", b"_", b"a-b", b"a\tb", b"a\vb", b"\f", b"q?"),
-    *(b".#l", b"x.pyc.txt", b"**", b"[ab]", b".gitkeep"),
+    *(b"a", b"b", b"c", b"ab", b"abc", b"cab", b"a.txt", b"b.txt", b"x.pyc", b"keep.txt"),
+    *(b"keep.pyc", b"foo", b"foobar", b"fo", b"a b", b"a ", b" a", b"#c", b"!n", b"*", b"?"),
+    *(b"[a]", b"]", b"-", b"a\\b", b"\\", _E_NFC, _E_NFD, b"caf" + _E_NFC, b"\xff", b"\xffx"),
+    *(b".hidden", b"x~", b"A.TXT", b"a.txt ", b"z9", b"Z", b"_", b"a-b", b"a\tb", b"q?"),
+    *(b"a\vb", b"a\fb", b"\v", b"\f", b".#l", b"x.pyc.txt", b"**", b"[ab]", b".gitkeep"),
 ]
 _DIR_NAMES = [
     *(b"foo", b"foobar", b"fo", b"fox", b"a", b"b", b"sub", b"deep", b"x y", b"**", b"[ab]"),
     *(_E_NFC, b"__pycache__", b"build", b"logs", b"x", b"y", b"#d", b"!d", b"d "),
 ]
-_COMPONENTS = [
-    # literals
+# Tokens by kind, a kind drawn by weight: classes and "?" as often as literals, so that one
+# seed meets each of their rules (a range's ends, "/" never matched, git's [:space:]).
+_LITERALS = [
     *(b"a", b"b", b"ab", b"foo", b"fo", b"foobar", b"sub", b"deep", b"x", b"y", b"a.txt"),
     *(b"keep.txt", b"__pycache__", b"build", b"logs", b"x y", b"a b", _E_NFC, _E_NFD),
     *(b"caf" + _E_NFC, b"\xff", b"\xff*", b".gitkeep"),
-    # stars in every position, a "**" right after a literal included
+]
+_STARS = [  # in every position, a "**" right after a literal included
     *(b"*", b"**", b"***", b"*a", b"a*", b"f*o", b"fo*", b"fo**", b"foo**", b"**o", b"**oo"),
     *(b"a**b", b"*.txt", b"**.txt", b"*.pyc", b"x**", b"**x", b"a*b*", b"*-*-*"),
-    # ?
-    *(b"?", b"??", b"?.txt", b"a?", b"f?o"),
-    # classes
-    *(b"[ab]", b"[!a]", b"[^a]", b"[a-c]*", b"[]a]", b"[!]a]", b"[a-]", b"[-a]", b"[z-a]"),
-    *(b"[[:alpha:]]*", b"[[:digit:][:alpha:]]*", b"[[:space:]]", b"a[[:space:]]b"),
-    *(b"[[:punct:]]", b"[[:upper:]]*", b"[[:cntrl:]]", b"[[:blank:]]*", b"[[:xdigit:]]*"),
-    *(b"[[:bogus:]]", b"[a", b"[\\]]", b"[\\a-c]", b"[[:alpha:]-z]", b"[[:al]", b"[[]"),
-    *(b"[a-[:]", b"[!/]", b"*[ab]", b"[ab]*"),
-    # escapes
+]
+_QUESTIONS = [b"?", b"??", b"?.txt", b"a?", b"f?o", b"a?b", b"?b"]
+_CLASSES = [
+    *(b"[ab]", b"[!a]", b"[^a]", b"[a-c]", b"[a-c]*", b"[]a]", b"[!]a]", b"[a-]", b"[-a]"),
+    *(b"[z-a]", b"a[!x]b", b"a[^x]b", b"[[:alpha:]]*", b"[[:digit:][:alpha:]]*"),
+    *(b"[[:space:]]", b"a[[:space:]]b", b"*[[:space:]]*", b"[![:space:]]*", b"[[:punct:]]"),
+    *(b"[[:upper:]]*", b"[[:cntrl:]]", b"[[:blank:]]*", b"[[:xdigit:]]*", b"[[:bogus:]]"),
+    *(b"[a", b"[\\]]", b"[\\a-c]", b"[[:alpha:]-z]", b"[[:al]", b"[[]", b"[a-[:]", b"[!/]"),
+    *(b"*[ab]", b"[ab]*"),
+]
+_ESCAPES = [
     *(b"\\*", b"\\?", b"\\[a]", b"\\[ab]", b"a\\ ", b"\\#c", b"\\!n", b"\\\\", b"a\\\\b"),
     *(b"a\\b", b"\\a", b"f\\*o", b"\\**", b"*\\*"),
 ]
+_KINDS = (_LITERALS, _STARS, _QUESTIONS, _CLASSES, _ESCAPES)
+_KIND_WEIGHTS = (3, 3, 2, 3, 1)
 _PREFIXES = [
     *(b"", b"", b"", b"/", b"data/raw/in/", b"/data/raw/in/", b"**/", b"raw/in/"),
     *(b"data/**/", b"data/raw/in/**/", b"data/raw/i*/", b"d**/raw/in/", b"data**/"),
@@ -74,9 +80,14 @@ _SUFFIXES = [
 ]
 
 
+def _helper_component(rng: random.Random) -> bytes:
+    """One token: a kind drawn by weight, then a token of that kind."""
+    return rng.choice(rng.choices(_KINDS, _KIND_WEIGHTS)[0])
+
+
 def _helper_pattern(rng: random.Random) -> bytes:
-    """One random line: a prefix, one to three components joined by "/", and a suffix."""
-    body = b"/".join(rng.choice(_COMPONENTS) for _ in range(rng.choice((1, 1, 1, 2, 2, 3))))
+    """One random line: a prefix, one to three tokens joined by "/", and a suffix."""
+    body = b"/".join(_helper_component(rng) for _ in range(rng.choice((1, 1, 1, 2, 2, 3))))
     line = rng.choice(_PREFIXES) + body + rng.choice(_SUFFIXES)
     roll = rng.random()
     if roll < 0.25:
@@ -96,9 +107,15 @@ def _helper_ignore_bytes(rng: random.Random) -> bytes:
     if rng.random() < 0.5:
         variant = rng.choice(lines).lstrip(b"!")
         lines.append(b"!" + variant + rng.choice([b"", b"/**", b"/keep.txt", b"/a", b"/*"]))
+    if rng.random() < 0.3:
+        # "X/**" and a negation of what is inside X: right only if "X/**" never names X itself
+        prefix = rng.choice([b"", b"**/", b"data/raw/in/", b"/data/raw/in/"])
+        inside = rng.choice([b"foo", b"fo", b"a", b"b", b"sub", b"deep", b"logs", b"x"])
+        kept = rng.choice([b"keep.txt", b"a", b"b", b"*.txt", b"*"])
+        lines.extend([prefix + inside + b"/**", b"!" + prefix + inside + b"/" + kept])
     if rng.random() < 0.05:
         at = rng.randrange(len(lines))
-        lines[at] = lines[at] + b"\0" + rng.choice(_COMPONENTS)  # git reads a line up to a NUL
+        lines[at] = lines[at] + b"\0" + _helper_component(rng)  # git reads a line up to a NUL
     eol = b"\r\n" if rng.random() < 0.15 else b"\n"
     data = eol.join(lines)
     if rng.random() < 0.8:

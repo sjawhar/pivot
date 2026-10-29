@@ -738,6 +738,12 @@ def test_member_ignored_checks_every_directory_above(
         pytest.param("*.txt\\ \n", ["a.txt"], ["a.txt "], id="escaped-trailing-space"),
         pytest.param("\\!x\n", ["x"], ["!x"], id="escaped-bang"),
         pytest.param(
+            "a[[:space:]]b\n", ["a\vb", "a\fb"], ["a b", "a\tb"], id="space-class-is-gits"
+        ),
+        pytest.param("[a-c]\n", ["d", "ab"], ["a", "b", "c"], id="range-holds-both-ends"),
+        pytest.param("**/a[!x]b\n", ["a/b", "axb"], ["ayb", "d/a b"], id="class-never-a-slash"),
+        pytest.param("**/a?b\n", ["a/b", "ab"], ["ayb", "d/a b"], id="question-never-a-slash"),
+        pytest.param(
             "*.txt\n!data/raw/src/docs**\n",
             [
                 "data/raw/src/docs/notes.txt",
