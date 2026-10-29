@@ -2,6 +2,25 @@
 
 <!-- version list -->
 
+## v0.6.0 (2026-10-29)
+
+### Features
+
+- **fingerprint**: Add fingerprint_by_name to record a helper by its name only
+  ([#512](https://github.com/sjawhar/pivot/pull/512),
+  [`187c037`](https://github.com/sjawhar/pivot/commit/187c037e46a6bd2c1011396bd09a1f74179128d3))
+
+- **storage**: Record directories by committed listings
+  ([#523](https://github.com/sjawhar/pivot/pull/523),
+  [`0df6227`](https://github.com/sjawhar/pivot/commit/0df62272a1fff9b3620ac7a2b766895f1ac5c489))
+
+### Testing
+
+- **fingerprint**: Compare upgrade locks by content after the schema 3 listing format
+  ([#541](https://github.com/sjawhar/pivot/pull/541),
+  [`b1004d3`](https://github.com/sjawhar/pivot/commit/b1004d30c3d00535681952f673529c6aba325f25))
+
+
 ## v0.5.21 (2026-10-28)
 
 ### Bug Fixes
