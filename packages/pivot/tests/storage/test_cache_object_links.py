@@ -22,8 +22,8 @@ import xxhash
 
 from pivot import exceptions
 from pivot.show import selection
-from pivot.storage import cache, state
-from pivot.types import DirHash, is_dir_hash
+from pivot.storage import cache, listing, state
+from pivot.types import DirHash, HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -37,6 +37,14 @@ _NOT_HEX = "zz" + "z" * 14
 
 def _helper_key(content: bytes) -> str:
     return xxhash.xxh64(content).hexdigest()
+
+
+def _with_members(cache_dir: pathlib.Path, record: HashInfo) -> tuple[DirHash, listing.DirListing]:
+    """Return a record and its cached listing for tests that inspect members."""
+    assert is_dir_hash(record)
+    members = cache.cached_listing(cache_dir, record)
+    assert members is not None
+    return record, members
 
 
 def _helper_resolved_symlink_hash(path: pathlib.Path, cache_dir: pathlib.Path) -> str | None:
@@ -315,7 +323,7 @@ def test_hash_directory_counts_the_links_it_counted_before(
     with caplog.at_level(logging.WARNING):
         result = cache.hash_directory(root, cache_dir=cache_dir, warn_left_out_symlinks=True)
 
-    members = {entry["relpath"]: entry["hash"] for entry in result["manifest"]}
+    members = {entry["relpath"]: entry["hash"] for entry in result["listing"]["files"]}
     counted = ["direct", "link-to-link", "relative", "through-symlinked-cache-path", "hard-link"]
     assert members == {kind: _helper_key(contents[kind]) for kind in counted}
     left_out = sorted([*(kind for kind in _CASES if kind not in counted), "misnamed-object"])
@@ -370,8 +378,8 @@ def test_a_link_repointed_at_another_filesystem_stops_counting(
             prefix.symlink_to(twin.parent, target_is_directory=True)
         after = cache.hash_directory(root, db, cache_dir=cache_dir)
 
-    assert [entry["relpath"] for entry in before["manifest"]] == ["member.bin"]
-    assert after["manifest"] == [], "the hash through the link before is not reused"
+    assert [entry["relpath"] for entry in before["listing"]["files"]] == ["member.bin"]
+    assert after["listing"]["files"] == [], "the hash through the link before is not reused"
     assert _helper_resolved_key(link, cache_dir) is None, "and resolve() refuses it too"
 
 
@@ -403,19 +411,25 @@ def test_symlink_checkout_names_each_object_without_resolving_it(
     """A file-by-file symlink restore links each member to its object's real path, the text it
     wrote before, resolving the cache directory once instead of each object's path."""
     source, cache_dir = _helper_source(tmp_path, 40)
-    output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK)
+    output_hash, output_members = _with_members(
+        cache_dir, cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK)
+    )
     assert is_dir_hash(output_hash)
     restored = tmp_path / "restored"
     resolved = _helper_recording_realpath(monkeypatch)
 
     assert cache.restore_from_cache(
-        restored, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK
+        restored,
+        output_hash,
+        cache_dir,
+        checkout_mode=cache.CheckoutMode.SYMLINK,
+        members=output_members,
     )
 
     under_cache = [path for path in resolved if path.startswith(os.fspath(cache_dir))]
     assert under_cache == [os.fspath(cache_dir)]
     assert not restored.is_symlink(), "No tree was cached, so each member is its own link"
-    for entry in output_hash["manifest"]:
+    for entry in output_members["files"]:
         expected = cache.get_cache_path(cache_dir, entry["hash"]).resolve()
         assert os.readlink(restored / entry["relpath"]) == os.fspath(expected)
 
@@ -426,17 +440,23 @@ def test_hash_directory_of_a_symlink_checkout_resolves_only_the_cache_directory(
     """Hashing a file-by-file symlink checkout resolves the cache directory once, not each link:
     at 180,000 links the per-link resolve was most of a status after the checkout."""
     source, cache_dir = _helper_source(tmp_path, 40)
-    output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK)
+    output_hash, output_members = _with_members(
+        cache_dir, cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK)
+    )
     restored = tmp_path / "restored"
     assert cache.restore_from_cache(
-        restored, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK
+        restored,
+        output_hash,
+        cache_dir,
+        checkout_mode=cache.CheckoutMode.SYMLINK,
+        members=output_members,
     )
     assert all(member.is_symlink() for member in restored.iterdir())
     resolved = _helper_recording_realpath(monkeypatch)
 
     result = cache.hash_directory(restored, cache_dir=cache_dir)
 
-    assert result["hash"] == output_hash["hash"]
+    assert result["record"]["hash"] == output_hash["hash"]
     assert resolved == [os.fspath(cache_dir)]
 
 
@@ -495,8 +515,8 @@ def test_a_cache_directory_repointed_between_commands_is_resolved_again(
     after = cache.hash_directory(root, cache_dir=cache_dir)
     own = cache.get_cache_path(cache_dir, _helper_key(_CONTENT))
 
-    assert [entry["relpath"] for entry in before["manifest"]] == ["member.bin"]
-    assert after["manifest"] == []
+    assert [entry["relpath"] for entry in before["listing"]["files"]] == ["member.bin"]
+    assert after["listing"]["files"] == []
     assert _helper_resolved_key(link, cache_dir) is None
     assert link.resolve() != own.resolve()
     assert not cache._links_to_object(link, own, cache.resolve_cache_root(cache_dir))
@@ -519,7 +539,7 @@ def test_a_member_link_ending_in_a_loop_inside_the_cache_is_left_out(
     obj.symlink_to(other)
     other.symlink_to(obj)
 
-    assert cache.hash_directory(root, cache_dir=cache_dir)["manifest"] == []
+    assert cache.hash_directory(root, cache_dir=cache_dir)["listing"]["files"] == []
     assert _helper_resolved_key(root / "member.bin", cache_dir) is None, "resolve() refused it"
 
 
@@ -537,7 +557,7 @@ def test_the_cache_root_is_a_path_boundary_not_a_string_prefix(tmp_path: pathlib
     sibling.write_bytes(_CONTENT)
     (root / "member.bin").symlink_to(sibling)
 
-    assert cache.hash_directory(root, cache_dir=cache_dir)["manifest"] == []
+    assert cache.hash_directory(root, cache_dir=cache_dir)["listing"]["files"] == []
     assert _helper_resolved_key(root / "member.bin", cache_dir) is None, "resolve() refused it"
 
 
@@ -558,7 +578,7 @@ def test_link_text_with_dotdot_under_the_cache_root_is_resolved_in_full(
 
     result = cache.hash_directory(root, cache_dir=cache_dir)
 
-    assert [(e["relpath"], e["hash"]) for e in result["manifest"]] == [
+    assert [(e["relpath"], e["hash"]) for e in result["listing"]["files"]] == [
         ("member.bin", _helper_key(_CONTENT))
     ]
     assert _helper_resolved_key(root / "member.bin", cache_dir) == _helper_key(_CONTENT)
@@ -575,20 +595,25 @@ def _helper_cache_through_symlink(tmp_path: pathlib.Path) -> pathlib.Path:
 
 def _helper_symlink_checkout(
     tmp_path: pathlib.Path, cache_dir: pathlib.Path, restored: pathlib.Path, suffix: str = ".txt"
-) -> DirHash:
+) -> tuple[DirHash, listing.DirListing]:
     """Three files saved by hardlink, then restored at ``restored`` file by file as symlinks."""
     source = tmp_path / "source"
     source.mkdir()
     for index in range(3):
         (source / f"f{index}{suffix}").write_text(f'{{"i": {index}}}\n')
-    output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK)
-    assert is_dir_hash(output_hash)
+    output_hash, output_members = _with_members(
+        cache_dir, cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK)
+    )
     restored.parent.mkdir(parents=True, exist_ok=True)
     assert cache.restore_from_cache(
-        restored, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK
+        restored,
+        output_hash,
+        cache_dir,
+        checkout_mode=cache.CheckoutMode.SYMLINK,
+        members=output_members,
     )
     assert all(member.is_symlink() for member in restored.iterdir())
-    return output_hash
+    return output_hash, output_members
 
 
 # Each loop-back maker replaces a part of the cache object's path ``obj`` with a symlink back to
@@ -626,8 +651,8 @@ def test_links_to_object_answers_as_resolve_for_a_member_looping_through_its_obj
     when neither is a symlink, so ``_links_to_object`` gives resolve()'s answer."""
     cache_dir = tmp_path / "cache" / "files"
     restored = tmp_path / "restored"
-    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
-    looped = output_hash["manifest"][0]
+    output_hash, output_members = _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    looped = output_members["files"][0]
     member = restored / looped["relpath"]
     obj = cache.get_cache_path(cache_dir, looped["hash"])
     loop_back(member, obj)
@@ -648,13 +673,16 @@ def test_only_missing_calls_a_member_looping_through_its_object_a_local_change(
     it."""
     cache_dir = tmp_path / "cache" / "files"
     restored = tmp_path / "restored"
-    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
-    looped, deleted = output_hash["manifest"][0], output_hash["manifest"][1]
+    output_hash, output_members = _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    looped, deleted = output_members["files"][0], output_members["files"][1]
     loop_back(restored / looped["relpath"], cache.get_cache_path(cache_dir, looped["hash"]))
     (restored / deleted["relpath"]).unlink()
 
     result = cache.restore_missing_in_directory(
-        restored, output_hash, cache_dir, [cache.CheckoutMode.SYMLINK]
+        restored,
+        output_members,
+        cache_dir,
+        [cache.CheckoutMode.SYMLINK],
     )
 
     assert result == cache.MissingRestore(
@@ -669,12 +697,15 @@ def test_only_missing_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Pat
     object is a change the cache holds, so the directory may be replaced."""
     cache_dir = _helper_cache_through_symlink(tmp_path)
     restored = tmp_path / "restored"
-    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
-    first, second, third = output_hash["manifest"]
+    output_hash, output_members = _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    first, second, third = output_members["files"]
 
     (restored / third["relpath"]).unlink()
     result = cache.restore_missing_in_directory(
-        restored, output_hash, cache_dir, [cache.CheckoutMode.SYMLINK]
+        restored,
+        output_members,
+        cache_dir,
+        [cache.CheckoutMode.SYMLINK],
     )
     assert result == cache.MissingRestore(restored=1, missing=0, local_changes=[], replace=False)
     third_object = cache.get_cache_path(cache_dir, third["hash"])
@@ -684,7 +715,10 @@ def test_only_missing_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Pat
     member.unlink()
     member.symlink_to(cache.get_cache_path(cache_dir, second["hash"]).resolve())
     result = cache.restore_missing_in_directory(
-        restored, output_hash, cache_dir, [cache.CheckoutMode.SYMLINK]
+        restored,
+        output_members,
+        cache_dir,
+        [cache.CheckoutMode.SYMLINK],
     )
     assert result == cache.MissingRestore(restored=0, missing=0, local_changes=[], replace=True)
 
@@ -694,12 +728,13 @@ def test_diff_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Path) -> No
     with the cache reached through a symlink, a symlink checkout's member links are members."""
     cache_dir = _helper_cache_through_symlink(tmp_path)
     proj = tmp_path / "proj"
-    output_hash = _helper_symlink_checkout(
+    output_hash, output_members = _helper_symlink_checkout(
         tmp_path, cache_dir, proj / "data" / "out", suffix=".jsonl"
     )
     output = selection._DiffOutput(
         path="data/out",
         head=output_hash,
+        head_listing=output_members,
         in_workspace=True,
         is_directory=True,
         changed_kind=None,
@@ -708,7 +743,7 @@ def test_diff_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Path) -> No
 
     members = selection._workspace_members(output, None, proj, cache_dir, None, [])
 
-    assert sorted(members) == [f"data/out/{e['relpath']}" for e in output_hash["manifest"]]
+    assert sorted(members) == [f"data/out/{e['relpath']}" for e in output_members["files"]]
 
 
 def test_publish_tree_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Path) -> None:
@@ -717,14 +752,15 @@ def test_publish_tree_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Pat
     commit's `_ensure_tree_complete` verifies the layout and writes the content-checked marker."""
     cache_dir = _helper_cache_through_symlink(tmp_path)
     restored = tmp_path / "restored"
-    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
-    tree = cache.get_cache_path(cache_dir, output_hash["hash"])
+    output_hash, output_members = _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    tree = cache.tree_path(cache_dir, output_hash["hash"])
 
-    cache._publish_tree(restored, tree, output_hash, cache_dir)
+    members = output_members
+    cache._publish_tree(restored, tree, members, cache_dir)
 
-    assert sorted(p.name for p in tree.iterdir()) == [e["relpath"] for e in output_hash["manifest"]]
+    assert sorted(p.name for p in tree.iterdir()) == [e["relpath"] for e in output_members["files"]]
     assert not cache._tree_layout_marker(tree).exists()
-    assert cache._ensure_tree_complete(tree, output_hash, cache_dir, repair=True)
+    assert cache._ensure_tree_complete(tree, members, cache_dir, repair=True)
     assert cache._tree_layout_marker(tree).exists()
 
 
@@ -740,7 +776,7 @@ def _helper_refusal(call: Callable[[], str]) -> exceptions.UnreadableLinkError:
 
 def _helper_hash(restored: pathlib.Path, cache_dir: pathlib.Path) -> str:
     result = cache.hash_directory(restored, cache_dir=cache_dir, warn_left_out_symlinks=True)
-    return f"recorded {[e['relpath'] for e in result['manifest']]}"
+    return f"recorded {[e['relpath'] for e in result['listing']['files']]}"
 
 
 def _helper_assert_unreadable(
@@ -765,14 +801,14 @@ def test_hash_directory_raises_for_a_member_link_into_an_unsearchable_prefix_dir
     out of the manifest as a user symlink."""
     cache_dir = tmp_path / "cache" / "files"
     restored = tmp_path / "restored"
-    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
-    prefix = cache.get_cache_path(cache_dir, output_hash["manifest"][0]["hash"]).parent
+    output_hash, output_members = _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    prefix = cache.get_cache_path(cache_dir, output_members["files"][0]["hash"]).parent
     os.chmod(prefix, 0)
     try:
         error = _helper_refusal(lambda: _helper_hash(restored, cache_dir))
     finally:
         os.chmod(prefix, 0o755)
-    link = restored / output_hash["manifest"][0]["relpath"]
+    link = restored / output_members["files"][0]["relpath"]
     _helper_assert_unreadable(error, link, PermissionError, errno.EACCES)
 
 
@@ -788,11 +824,16 @@ def test_hash_directory_raises_for_member_links_in_a_listable_unsearchable_direc
     (source / "sub").mkdir(parents=True)
     for index in range(2):
         (source / "sub" / f"f{index}.txt").write_text(f"{index}\n")
-    output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK)
-    assert is_dir_hash(output_hash)
+    output_hash, output_members = _with_members(
+        cache_dir, cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.HARDLINK)
+    )
     restored = tmp_path / "restored"
     assert cache.restore_from_cache(
-        restored, output_hash, cache_dir, checkout_mode=cache.CheckoutMode.SYMLINK
+        restored,
+        output_hash,
+        cache_dir,
+        checkout_mode=cache.CheckoutMode.SYMLINK,
+        members=output_members,
     )
     sub = restored / "sub"
     assert all(member.is_symlink() for member in sub.iterdir())
@@ -829,8 +870,8 @@ def test_hash_of_a_checkout_link_that_cannot_be_read(
     left out as a user symlink and the commit recorded the other members only."""
     cache_dir = tmp_path / "cache" / "files"
     restored = tmp_path / "restored"
-    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
-    victim = restored / output_hash["manifest"][0]["relpath"]
+    output_hash, output_members = _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    victim = restored / output_members["files"][0]["relpath"]
     _helper_fail_readlink(monkeypatch, victim)
     error = _helper_refusal(lambda: _helper_hash(restored, cache_dir))
     _helper_assert_unreadable(error, victim, OSError, errno.EIO)
@@ -843,15 +884,18 @@ def test_only_missing_with_a_checkout_link_that_cannot_be_read(
     cannot read raises. #516 called that member a local change the cache cannot restore."""
     cache_dir = tmp_path / "cache" / "files"
     restored = tmp_path / "restored"
-    output_hash = _helper_symlink_checkout(tmp_path, cache_dir, restored)
-    deleted = restored / output_hash["manifest"][1]["relpath"]
+    output_hash, output_members = _helper_symlink_checkout(tmp_path, cache_dir, restored)
+    deleted = restored / output_members["files"][1]["relpath"]
     deleted.unlink()
-    victim = restored / output_hash["manifest"][0]["relpath"]
+    victim = restored / output_members["files"][0]["relpath"]
     _helper_fail_readlink(monkeypatch, victim)
 
     def only_missing() -> str:
         result = cache.restore_missing_in_directory(
-            restored, output_hash, cache_dir, [cache.CheckoutMode.SYMLINK]
+            restored,
+            output_members,
+            cache_dir,
+            [cache.CheckoutMode.SYMLINK],
         )
         return f"returned {result}"
 

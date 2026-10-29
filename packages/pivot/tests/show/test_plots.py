@@ -77,7 +77,13 @@ def _register_plot_stage(test_pipeline: PipelineLike, name: str) -> None:
 def _write_lock(repo_path: Path, stage_name: str, outs: list[dict[str, object]]) -> None:
     stages_dir = repo_path / ".pivot" / "stages"
     stages_dir.mkdir(parents=True, exist_ok=True)
-    lock_content = {"code_manifest": {}, "params": {}, "deps": [], "outs": outs}
+    lock_content = {
+        "schema_version": 3,
+        "code_manifest": {},
+        "params": {},
+        "deps": [],
+        "outs": outs,
+    }
     (stages_dir / f"{stage_name}.lock").write_text(yaml.dump(lock_content))
 
 

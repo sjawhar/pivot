@@ -18,37 +18,44 @@ Dependency generations (`{dep_path: generation}`) live **only in StateDB**, not 
 
 ## File-Hash Write-Back
 
-The rule: commands that read or materialize files may save their hashes best-effort; that cache
-never fails a command, and a read-only command writes no lock, run record or output. A
-`--no-commit` run writes its authoritative `nocommit:` record for `pivot commit`, and returns the
-file hashes it read or wrote for the coordinator's separate best-effort cache write.
-
-`state.open_readonly(..., create=False)` looks entries up without creating a database. A
-`PermissionError` or `lmdb.ReadonlyError` (a database this user cannot write) yields no cache
-first. Another `OSError` or `lmdb.Error` yields no cache only when
-`statvfs(state.lmdb) & ST_RDONLY` says that database itself is on a read-only mount; the same
-error on a writable mount is a damaged database and raises. Checkout catches any failed hash-cache
-open and restores without it; status reports a damaged database.
+Commands that read or write workspace files may save their hashes best-effort. A hash-cache
+failure does not fail the command. Read-only commands do not write locks, run history, or outputs.
+`--no-commit` writes no lock or `run:` history entry. It records the uncommitted run in
+`nocommit:` for a later `pivot commit`. Every command that writes the workspace saves the hash
+of each file it reads, commits or restores, so `pivot status --explain` and `pivot verify` find a
+matching entry and read no file. A new command that reads or writes workspace files must record
+them the same way:
 
 - `hash_file(..., pending=...)` and `hash_directory(..., pending=...)` append `(path, stat,
-  hash)` for each file they read. The caller saves them in one `state.save_file_hashes` call; a
-  command over many targets uses `state.FileHashBatch`, once per state directory.
-- A restore records each file with the stat of what it staged before its rename; a write after
-  that rename does not match this cache entry.
-- Workers return `DeferredWrites.file_hash_entries` (`types.FileHashEntry` tuples) for the
-  dependencies and outputs they read, commit or restore. The coordinator writes normal deferred
-  state atomically; under `--no-commit` it saves file hashes best-effort and persists only the
-  `nocommit:` record. The skip check uses the same best-effort rule.
-- Checkout, pull, get, import, update, track, commit, `--checkout-missing`, status, explanation,
-  diff and plots diff save what they read or write. Stage outputs go in that stage's state
-  directory; other files use the configured state directory.
-- `state.save_best_effort` is the shared rule for materialized-file hashes and fingerprint cache
-  flushes. A failed fingerprint flush retains its entries for the next flush; a skipped hash
-  write merely costs one later read.
-- Every `hash:` write also writes the `inode:` index after the hash entries. Identity lookup is
-  allowlisted by mount type and confirms the recorded path's device, inode and change time, so a
-  hard-linked replica can use its original hash without weakening a path lookup.
-
+  hash)` for each file they read. The caller passes these entries to `state.save_file_hashes` or
+  `state.FileHashBatch`, which writes once per state directory.
+- Every cache save goes through `state.save_best_effort` (`state.save_file_hashes`) or
+  `StateDB.save_many_best_effort` (save-on-read in `hash_file`/`hash_directory`). They wait at
+  most `_WRITE_BACK_TIMEOUT` (2 s) for the write lock, log a failed write at debug level, and keep
+  the command's result. A fingerprint-cache flush that is skipped keeps its entries pending for
+  the next flush; a skipped hash write costs one later read.
+- `state.open_readonly(..., create=False)` looks hashes up without creating a database. A
+  database this user cannot open safely (`PermissionError`, `lmdb.ReadonlyError`) yields no
+  cache first. Another `OSError` or `lmdb.Error` yields no cache only when
+  `os.statvfs(state.lmdb)` reports a read-only filesystem; otherwise it raises. `pivot checkout`
+  catches a failure to open the cache and restores without it; status and verify raise.
+- A restore records each file with the stat of what it staged before the rename puts it in place
+  (`cache.restore_from_cache(..., recorded=...)`, `cache.atomic_write_file`'s return value). A
+  write after the rename changes the stat. The entry then does not vouch for the new bytes.
+- Workers open StateDB read-only. They return `DeferredWrites.file_hash_entries`
+  (`types.FileHashEntry`, from `cache.deferred_file_hash_entries`) for the coordinator to write
+  after the stage. For a normal run these are not a cache save: they share one transaction with
+  the stage's generations, which is the run's own commit. Under `--no-commit` only the
+  `nocommit:` record is authoritative and the coordinator saves the hashes best-effort. The
+  coordinator's skip check writes what it reads and restores, best-effort.
+- `pivot checkout`, `pivot pull`, `pivot get`, `pivot import`, `pivot update`, `pivot track`,
+  repro's `--checkout-missing` path, `pivot status`, its explanations, `pivot diff` and
+  `pivot plots diff` record what they write or read. Stage outputs use the StateDB in the output
+  stage's state directory. Other paths use the configured state directory.
+- Every `hash:` write also writes the `inode:` index after the hash entries. An identity lookup
+  is allowlisted by mount type (`storage/mounts.py`; tmpfs only with `inode64`) and confirms the
+  recorded path's device, inode and change time, so a hard-linked replica reuses its original
+  hash without weakening a path lookup.
 
 ## StateDB Key Prefixes
 
@@ -56,7 +63,7 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 
 | Prefix | Purpose |
 |--------|---------|
-| `hash:` | File content hashes keyed by the absolute path as given, with `(mtime_ns, size, dev, inode)` from `stat()` |
+| `hash:` | File content hashes (keyed by the absolute path as given, `os.fsencode(os.path.abspath(path))`; the value's `(mtime_ns, size, dev, inode)` comes from `stat()`, which follows symlinks. No ctime: a new hard link changes it, so every hardlink checkout or hard-linked replica would invalidate its entries) |
 | `inode:` | `(st_dev, st_ino)` → a `hash:` key hint; served only after the hash stat and recorded-path device, inode and change-time checks |
 | `gen:` | Output generation counters (keyed by artifact identity, `stage` or `stage:key`) |
 | `dep:` | Stage dependency generations (`stage:dep_identity` → generation; one file of a directory output records its directory's identity) |
@@ -131,78 +138,68 @@ When multiple `pivot` processes share the same StateDB:
 - Sharing a cache across hosts needs `flock` that is coherent across them (NFSv4, or NFSv3 with
   NLM). With host-local locks (NFS `nolock` or `local_lock=flock`/`all`, Lustre `localflock`)
   the locks here exclude nothing across hosts: one host's sweep can remove another host's live
-  temporary entry, and two hosts can repair one tree at once. A commit checks the tree it
-  published before marking it, which narrows the window for marking a copy that lost files
-  without closing it: a sweep already deleting through the copy's directory descriptors keeps
-  deleting after the rename. Where `flock()` is refused (Lustre without `flock`: ENOSYS; NFS when
-  its lock manager does not answer: ENOLCK) staging goes on without the shared lock, and this
-  process neither sweeps nor repairs a tree. Only where every host sharing the cache is refused
-  does nothing sweep: an NFSv3 client whose own `rpc.statd` is down gets ENOLCK while other
-  clients' locks work, and their sweeps can remove its live temporary entries, with the effects
-  above.
+  temporary entry. Where `flock()` is refused (Lustre without `flock`: ENOSYS; NFS when its lock
+  manager does not answer: ENOLCK) staging still goes on without the shared lock, and this
+  process neither sweeps nor repairs a tree. It never trusts a tree merely because its XXH64
+  name exists. Only where every host sharing the cache is refused does nothing sweep: an NFSv3
+  client whose own `rpc.statd` is down gets ENOLCK while other clients' locks work, and their
+  sweeps can remove its live temporary entries.
 - A lock file in the cache is created writable by whoever can write its directory, since NFS
   takes an exclusive lock only on a file opened for writing; one this user cannot write is
   opened read-only. Lock files are never deleted.
-- A whole-directory SYMLINK tree is built under a temporary name beside its cache name, renamed
-  into place, checked, then marked (`<tree>.content-checked`), because a restore symlinks to a
-  tree as soon as its name exists. The marker is staged under the prefix directory's shared lock
-  (`_staging_in`), so a sweep never removes it between a check and its rename. A restore or commit
-  checks every unmarked tree member's path, content hash, size and executable bit, plus its
-  directories, under the tree's exclusive `<tree>.lock`, and marks a tree that matches. Only a
-  commit repairs a tree that does not match, in place from the files' own cache objects
-  (`_ensure_tree_complete(..., repair=True)`): its manifest is `hash_directory` of the bytes it
-  commits. A restore never writes into a tree. A tree the restore or commit cannot use (it
-  differs and, for a commit, cannot be repaired: a file's object is absent, or this user cannot
-  read or write the tree) is not used: a restore goes file by file, a commit fails. Only
-  `<tree>.content-checked` is trusted: `<tree>.layout-checked` (pivot 0.3.4, partial trees
-  included) and `<tree>.verified` (pivot 0.3.5 to 0.5.11, sizes only) are older marks that never
-  checked content, so such a tree is checked again, and the old mark is removed when the tree is
-  marked. The mark is only written where this user can write the tree's prefix directory: for a
-  user who cannot, every symlink restore or commit checks an old-marked tree again, and a symlink
-  commit through a stale one fails, until a user who can write the cache commits the output in
-  symlink mode. That cost is the price of not trusting a size-only mark.
-- A tree's name is the XXH64 of its manifest. Content addressing by XXH64 guards against
-  accident, not against a chosen-digest forgery: XXH64's finalization is invertible, so 16 free
-  bytes near the end of a manifest someone commits in a `.pvt` or lock steer it to any tree's
-  name in under a second. No **restore** trust decision may rest on an attacker failing to hit an
-  XXH64 digest: a restore's manifest is a claim and never drives a write into the cache. A commit
-  is different: its manifest is `hash_directory` of the stage-written bytes, and it may repair an
-  unmarked tree those bytes' XXH64 names. This is identical at main: a user's own stage can write
-  colliding bytes into a tree an output is linked to, where they still match the lock; closing it
-  would give up #522's automatic repair of stale legacy trees. The marker and canonical-manifest
-  rules below protect against committed `.pvt` and lock manifests, not stage-written collisions.
-  For those committed manifests, a tree is trusted only for the manifest pivot checked it to hold:
-  the marker records the SHA-256 of that manifest's canonical JSON
-  (`cache._canonical_manifest`: the four fields pivot writes per entry, entries sorted by relpath
-  and empty directories sorted, as `hash_directory` writes them, a relpath or empty directory
-  listed twice refused; `cache._mark_tree`), and a restore trusts the tree only when the caller's
-  canonical manifest has that digest. A tree marked for another manifest is neither trusted nor
-  changed; a tree with an empty marker (an older pivot's) is checked but never repaired; an
-  unmarked tree is checked, and marked only if it holds the caller's manifest exactly, its
-  recorded empty directories included (exactly the tree's, as `hash_directory` finds them). So
-  one tree has one canonical manifest, and no other form of its entries (another order, a
-  duplicate, a full directory listed as empty) can mark it for another digest. A restore's
-  manifest comes from a `.pvt` or a lock, so it is a claim, not a source of truth: it never drives
-  a write into the cache. Repairing toward it and then comparing the result with that same
-  manifest proves nothing (a forged manifest would rewrite the bytes of every output already
-  linked to the tree). A commit repairs toward `hash_directory` of the bytes it commits, and after
-  a repair the tree's manifest is recomputed and must equal that manifest entry for entry before
-  the tree is marked.
-  A manifest whose XXH64 is not the tree's name, or that lacks a field pivot writes or holds one
-  JSON cannot encode, is refused before anything is read; that only spares work. Any refused
-  manifest restores file by file, where each restored file is the cache object its own hash
-  names. `.pvt` manifest relpaths that are absolute or hold `..` are refused
-  (`track.pvt_field_error`, `track.read_pvt_file`).
-  Known limits: pivot does not re-read a marked tree, so a tree whose files someone with write
-  access to the cache edits, or whose marker they rewrite, after it was marked stays trusted; an
-  empty marker an older pivot wrote, which this user cannot replace, costs a content check on
-  every symlink restore through that tree until a user who can write the cache re-marks it; an
-  unmarked tree that does not match is restored file by file until a commit of that output
-  repairs it; and a symlink commit can replace an unmarked tree with stage-written bytes whose
-  `hash_directory` XXH64 collides with the tree's name. That is identical on main: an output
-  already linked to the tree then reads the stage-written bytes and still matches its lock. A
-  marked tree refuses this commit, but closing the unmarked case would remove #522's automatic
-  repair of stale legacy trees.
+- A whole-directory SYMLINK tree lives at `<cache root>/trees/XX/YYYY...` (`cache.tree_path`),
+  named by the directory hash. Its `<tree>.content-checked` marker holds the canonical listing
+  bytes after Pivot verifies the tree. A tree is used without a check only when its non-empty
+  marker equals the supplied listing's bytes. A different non-empty marker means another
+  listing was verified for this tree, so the tree is neither used nor changed. An unmarked tree,
+  or one with an empty, `.layout-checked` (pivot 0.3.4) or `.verified` (pivot 0.3.5–0.5.11)
+  marker, is checked under the tree's exclusive `<tree>.lock`. A restore or
+  `missing_cache_objects` passes `repair=False`. It can mark a tree that already matches, but it
+  never changes that tree. Only the commit path passes `repair=True`, because its listing came
+  from actual output bytes. It can repair from individual objects, hashes the tree again, and
+  marks it only when the result equals its listing bytes. `_publish_tree` never marks. A tree
+  that cannot be checked or repaired is not used. A restore goes file by file. A commit fails.
+  The marker is staged under the prefix directory's shared lock (`_staging_in`). A user who
+  cannot write the prefix directory cannot mark a tree, so each of their symlink restores and
+  commits checks it again.
+- The object at a directory's hash under `files/` is its listing (`listing.store_object`),
+  read-only like every object. Every listing read follows one rule (`listing._resolve`): a
+  committed listing (workspace file, or a file at a git revision) that hashes to the recorded
+  directory hash is taken only when, if the cache also holds the listing, its bytes equal that
+  canonical cache copy. Bytes that differ despite the same XXH64 are refused as a collision; a
+  listing that has the wrong hash or cannot be read falls back to the cache object with one
+  warning, and is refused only when that object is absent too, or at once with `strict`
+  (`pivot verify`).
+
+## Lock and Listing Files
+
+- A lock records a directory as `{listing, size, nfiles}` on disk (`StorageLockData` holds the
+  listing's hash under `hash`, as for a file; `lock._from_document`/`_to_document` convert). The
+  key is not `hash` because every released pivot reads an entry with a `hash` and no inline
+  `manifest` as one file. A lock that records a directory keeps every entry under `records` and
+  leaves `deps` and `outs` empty (`lock._shaped`): released pivots read that as a lock that
+  records nothing, rerun an ordinary stage, and stop at an incremental one instead of restarting
+  it from empty. Run-cache keys hold `run_history._DIRECTORY_RECORD` for the same reason; an
+  older pivot's entry is looked up under `worker.older_pivot_input_hash`.
+- A stage with an incremental output commits a restart proof beside its lock
+  (`lock.restart_proof_path`, a `.incremental` file this pivot owns). No released pivot writes
+  one, so this file — or, for a directory output, this pivot's committed output listing — beside
+  a lock an older pivot wrote is proof this pivot wrote the lock first and the older pivot
+  replaced it, which may have restarted the output from empty. Such a stage is refused
+  (`lock.restart_proofs`): `status`/`verify` through `explain.get_stage_explanation`, `repro`
+  in `engine` before it schedules anything.
+- `StageLock.write` writes each directory output's listing (`listing.output_listing_path`),
+  each directory input's (`listing.input_listing_path`) and, for an incremental stage, the
+  restart proof before the lock, leaving a file that already holds the bytes untouched. It is
+  the one writer of lock, listing and restart-proof files (Task 2.2 of the BET-36 plan moves
+  that call to the coordinator).
+- A lock whose `schema_version` is below `lock.SCHEMA_VERSION` (an older pivot's, listing a
+  directory's files inline) is read as it is, with one warning per process: `StageLock.read`
+  converts each inline listing to its record and stores the listing in the cache it is given,
+  where every listing read finds it. Pass the cache to every `read`. A newer pivot's lock reads
+  as missing.
+- `pivot init` writes `*.listing -merge` into `.gitattributes`, so a merge conflicts on a
+  listing instead of producing bytes that hash to neither side.
 
 ## Output Ownership
 

@@ -1348,11 +1348,9 @@ class StateDB:
                         + f"{stage_name}:{deferred['run_cache_input_hash']}".encode()
                     )
                     txn.put(key, run_history.serialize_to_bytes(deferred["run_cache_entry"]))
-                if "run_cache_delete_input_hash" in deferred:
-                    txn.delete(
-                        _RUNCACHE_PREFIX
-                        + f"{stage_name}:{deferred['run_cache_delete_input_hash']}".encode()
-                    )
+                if "run_cache_delete_input_hashes" in deferred:
+                    for input_hash in deferred["run_cache_delete_input_hashes"]:
+                        txn.delete(_RUNCACHE_PREFIX + f"{stage_name}:{input_hash}".encode())
 
                 # File hash entries; ``_put_file_hashes`` leaves out cache entries that cannot
                 # be represented, then writes every `hash:` before the `inode:` index entries.
@@ -1521,7 +1519,12 @@ def save_file_hashes(
 
 
 class FileHashBatch:
-    """The file-hash entries one command collects across its targets, by state directory."""
+    """The file-hash entries one command collects across its targets, by state directory.
+
+    ``save`` writes each directory's entries once (``save_file_hashes``), so a checkout or get of
+    many targets costs one write transaction and one fdatasync per state directory, not one per
+    target. Restores running in several threads may ``add`` at once.
+    """
 
     def __init__(self) -> None:
         self._lock: threading.Lock = threading.Lock()

@@ -6,7 +6,7 @@ import shutil
 from typing import TYPE_CHECKING
 
 from pivot import cli, compose, exceptions, executor, project
-from pivot.storage import cache, lock, track
+from pivot.storage import cache, listing, lock, track
 
 if TYPE_CHECKING:
     import click.testing
@@ -588,7 +588,7 @@ def test_verify_allow_missing_uses_pvt_hash_for_nested_dep(
     runner: click.testing.CliRunner,
     mocker: MockerFixture,
 ) -> None:
-    """verify --allow-missing uses directory .pvt manifest for nested file dep."""
+    """verify --allow-missing reads a nested dependency hash from its listing."""
     # Raw data directory with one file the stage depends on
     data_dir = mock_discovery.root / "data" / "raw"
     data_dir.mkdir(parents=True)
@@ -599,25 +599,27 @@ def test_verify_allow_missing_uses_pvt_hash_for_nested_dep(
     run_result = runner.invoke(cli.cli, ["repro"])
     assert run_result.exit_code == 0, f"Run failed: {run_result.output}"
 
-    # Track the directory (create .pvt with manifest)
-    dir_hash = cache.hash_directory(data_dir)
+    # Track the directory with a compact record and committed member listing.
+    hashed = cache.hash_directory(data_dir)
+    record = hashed["record"]
+    pvt_path = data_dir.parent / "raw.pvt"
     pvt_data = track.PvtData(
         path="raw",
-        hash=dir_hash["hash"],
-        size=7,
-        num_files=1,
-        manifest=dir_hash["manifest"],
+        hash=record["hash"],
+        size=record["size"],
+        nfiles=record["nfiles"],
     )
-    track.write_pvt_file(data_dir.parent / "raw.pvt", pvt_data)
+    listing.write(listing.tracked_listing_path(pvt_path), hashed["data"])
+    track.write_pvt_file(pvt_path, pvt_data)
 
-    # Delete the actual data directory (simulating CI without data)
+    # Delete the actual data directory (simulating CI without data).
     shutil.rmtree(data_dir)
 
     _setup_mock_remote(mocker, files_exist_on_remote=True)
 
     result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
 
-    # Should use manifest entry hash for data/raw/file.csv
+    # The sidecar listing supplies the hash for data/raw/file.csv.
     assert "Missing deps" not in result.output, f"Got: {result.output}"
     assert result.exit_code == 0, f"Expected pass, got: {result.output}"
 

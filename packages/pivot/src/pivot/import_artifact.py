@@ -18,13 +18,13 @@ from pivot import state_dir as state_dir_mod
 from pivot.config import io as config_io
 from pivot.remote import config as remote_config
 from pivot.remote import git_archive, github, protocol
-from pivot.storage import cache, ownership, state, track
+from pivot.storage import cache, listing, ownership, state, track
 from pivot.storage import lock as storage_lock
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pivot.types import DirManifestEntry, OutEntry, StorageLockData
+    from pivot.types import OutEntry
 
 logger = logging.getLogger(__name__)
 
@@ -165,11 +165,6 @@ async def read_remote_config(
     _ = remote_config.validate_remote_url(url)
     logger.info("Using source remote: %s", url)
 
-    # Two parses on purpose: remotes are read above as 0.5.2 reads them (YAML 1.1, as the source's
-    # `pivot remote` reads them), and the returned config, which supplies core.state_dir, as every
-    # other Pivot command reads its config (YAML 1.2). Each key means what it means to the source.
-    # 0.5.2 never read core.state_dir, so a file only PyYAML accepts (a duplicate key) never
-    # refuses the import: its state directory is 0.5.2's .pivot.
     try:
         source_config = config_io.parse_config_yaml(raw, "remote config")
     except exceptions.ConfigError as e:
@@ -179,7 +174,7 @@ async def read_remote_config(
 
 
 def _warn_source_state_dir_ignored(repo_url: str, problem: str) -> None:
-    """Report a source ``core.state_dir`` that cannot be used; the import reads ``.pivot``."""
+    """Report a source core.state_dir that cannot be used; the import reads .pivot."""
     logger.warning(
         "Ignoring core.state_dir in .pivot/config.yaml of %s: %s; "
         + "reading its locks from the default .pivot",
@@ -189,7 +184,7 @@ def _warn_source_state_dir_ignored(repo_url: str, problem: str) -> None:
 
 
 def _normalized_source_state_dir(state_dir: object) -> str | None:
-    """``state_dir`` as a normalized path inside the source repo, or None when it is not one."""
+    """Return state_dir as a normalized path inside the source repo, or None when invalid."""
     if (
         not isinstance(state_dir, str)
         or not state_dir
@@ -210,11 +205,7 @@ def _normalized_source_state_dir(state_dir: object) -> str | None:
 
 
 def _remote_state_dir(repo_url: str, config_data: dict[str, object]) -> str:
-    """Return the source repo's normalized state path at the imported revision.
-
-    0.5.2 read every source's locks from ``.pivot``, so a value that is not a path inside the
-    repo never refuses an import: it is reported and ``.pivot`` is read.
-    """
+    """Return the source's normalized state path, with invalid values falling back to .pivot."""
     core = config_data.get("core")
     if not isinstance(core, dict):
         return ".pivot"
@@ -229,10 +220,7 @@ def _remote_state_dir(repo_url: str, config_data: dict[str, object]) -> str:
 
 
 async def _source_state_dir(repo_url: str, rev: str, config_data: dict[str, object]) -> str:
-    """``_remote_state_dir``, with a symlinked local git source directory reported as unusable.
-
-    Its locks are not at that path in the revision's tree, so ``.pivot`` is read instead.
-    """
+    """Return the source state dir, rejecting a local source's symlinked directory."""
     source_state_dir = _remote_state_dir(repo_url, config_data)
     if source_state_dir in {".", ".pivot"} or github.is_github_url(repo_url):
         return source_state_dir
@@ -286,7 +274,6 @@ async def _try_list_remote_lock_files(
     *,
     session: aiohttp.ClientSession | None = None,
 ) -> list[str] | None:
-    """List source lock files, returning None only when the lock directory cannot be listed."""
     if github.is_github_url(repo_url):
         owner, repo = github.parse_github_url(repo_url)
         entries = await _list_github_lock_paths(
@@ -334,7 +321,8 @@ async def read_remote_lock_file(
     stages_dir: str,
     *,
     session: aiohttp.ClientSession | None = None,
-) -> StorageLockData | None:
+) -> storage_lock.CommittedLock | None:
+    """Read a remote stage lock, retaining its listing-bearing historical representation."""
     path = f"{stages_dir}/{stage_name}.lock"
     raw = await _read_remote_file(repo_url, path, rev, token, session=session)
     if raw is None:
@@ -344,31 +332,46 @@ async def read_remote_lock_file(
     except yaml.YAMLError:
         logger.warning("Failed to parse lock file for stage '%s'", stage_name)
         return None
-    if not storage_lock.is_lock_data(data):
+    parsed = storage_lock.parse_committed(data)
+    if not isinstance(parsed, storage_lock.CommittedLock):
         logger.warning("Invalid lock file structure for stage '%s'", stage_name)
         return None
-    return data
+    return parsed
 
 
 def _entry_size(entry: OutEntry, identity: str) -> int:
     if "size" in entry:
         return int(entry["size"])
-    if "manifest" in entry:
-        return sum(int(m["size"]) for m in entry["manifest"])
     logger.warning("Lock entry '%s' has no size information", identity)
     return 0
 
 
-def _iter_manifest_paths(
-    identity: types.ArtifactIdentity, entry: OutEntry
-) -> list[tuple[str, DirManifestEntry]]:
-    """Each file of a directory output, named as a stage depending on it names it."""
-    if "manifest" not in entry:
-        return []
-    return [
-        (types.identity_key(types.directory_file_identity(identity, m["relpath"])), m)
-        for m in entry["manifest"]
-    ]
+def _directory_file_relpath(identity: types.ArtifactIdentity, path: str) -> str | None:
+    """The path of the file ``path`` names inside directory output ``identity``, or None."""
+    prefix = (
+        f"{identity.producer}:" if identity.key is None else f"{identity.producer}:{identity.key}/"
+    )
+    return path.removeprefix(prefix) if path.startswith(prefix) and path != prefix else None
+
+
+async def _read_remote_listing(
+    repo_url: str,
+    identity: types.ArtifactIdentity,
+    record: types.DirHash,
+    rev: str,
+    token: str | None,
+    stages_dir: str,
+    *,
+    session: aiohttp.ClientSession | None = None,
+) -> listing.DirListing | None:
+    """A remote directory output's committed listing file, checked against its lock's
+    ``record``; None when the repository has no such file."""
+    rel_path = listing.output_listing_path(pathlib.Path(stages_dir), identity).as_posix()
+    raw = await _read_remote_file(repo_url, rel_path, rev, token, session=session)
+    if raw is None:
+        return None
+    source = f"{rel_path} at {rev}"
+    return listing.parse(listing.check(raw, record, source), record, source)
 
 
 def _renamed_message(old_name: str, directory: str, relpath: str, new_name: str) -> str:
@@ -428,8 +431,7 @@ async def _resolve_remote_path_with_session(
     source_state_dir = await _source_state_dir(repo_url, rev_lock, config_data)
     stages_dir = "stages" if source_state_dir == "." else f"{source_state_dir}/stages"
 
-    # Pivot 0.5.2 always wrote source locks below .pivot. A source still carrying that layout
-    # must remain importable while its configured directory cannot be read from this revision.
+    # Older source revisions keep locks in .pivot even after core.state_dir changed.
     stage_names = await _try_list_remote_lock_files(
         repo_url, rev_lock, token, stages_dir, session=gh_session
     )
@@ -443,7 +445,6 @@ async def _resolve_remote_path_with_session(
         )
     elif stage_names is None:
         raise exceptions.RemoteError(f"Remote repo has no {stages_dir} directory")
-
     lock_datas = await asyncio.gather(
         *[
             read_remote_lock_file(repo_url, stage, rev_lock, token, stages_dir, session=gh_session)
@@ -455,18 +456,17 @@ async def _resolve_remote_path_with_session(
     available = set[str]()
     renamed: str | None = None
 
-    for stage, lock_data in zip(stage_names, lock_datas, strict=True):
-        if lock_data is None:
+    for stage, committed in zip(stage_names, lock_datas, strict=True):
+        if committed is None:
             continue
-        for entry in lock_data["outs"]:
+        for entry in committed.data["outs"]:
             entry_identity = types.ArtifactIdentity(stage, entry["key"])
             identity = types.identity_key(entry_identity)
-            manifest_paths = _iter_manifest_paths(entry_identity, entry)
+            hash_info = storage_lock.entry_hash_info(entry)
             available.add(identity)
-            available.update(full_path for full_path, _ in manifest_paths)
 
             if identity == path:
-                if "manifest" in entry:
+                if types.is_dir_hash(hash_info):
                     file_example = types.identity_key(
                         types.directory_file_identity(entry_identity, "{filename}")
                     )
@@ -478,19 +478,40 @@ async def _resolve_remote_path_with_session(
                     raise exceptions.PivotError(message)
                 matches.append((stage, path, entry["hash"], _entry_size(entry, identity)))
                 continue
+            if not types.is_dir_hash(hash_info):
+                continue
 
-            for full_path, manifest_entry in manifest_paths:
-                if full_path == path:
-                    matches.append(
-                        (
-                            stage,
-                            path,
-                            manifest_entry["hash"],
-                            int(manifest_entry["size"]),
-                        )
-                    )
-                elif f"{identity}/{manifest_entry['relpath']}" == path:
-                    renamed = _renamed_message(path, identity, manifest_entry["relpath"], full_path)
+            # One file of a directory output, read from the directory's committed listing; a
+            # path of the old form `stage/relpath` is named in a rename message.
+            relpath = _directory_file_relpath(entry_identity, path)
+            old_relpath = (
+                path.removeprefix(f"{identity}/") if path.startswith(f"{identity}/") else None
+            )
+            if relpath is None and old_relpath is None:
+                continue
+            members = committed.listings.get(entry["key"]) or await _read_remote_listing(
+                repo_url,
+                entry_identity,
+                hash_info,
+                rev_lock,
+                token,
+                stages_dir,
+                session=gh_session,
+            )
+            if members is None:
+                raise exceptions.ListingMissingError(
+                    f"Cannot import {path!r}: remote directory output {identity!r} has no "
+                    + "committed listing file"
+                )
+            for member in members["files"]:
+                full_path = types.identity_key(
+                    types.directory_file_identity(entry_identity, member["relpath"])
+                )
+                available.add(full_path)
+                if member["relpath"] == relpath:
+                    matches.append((stage, path, member["hash"], int(member["size"])))
+                elif member["relpath"] == old_relpath:
+                    renamed = _renamed_message(path, identity, member["relpath"], full_path)
 
     if not matches and renamed is not None:
         raise exceptions.PivotError(renamed)
@@ -579,9 +600,6 @@ async def import_artifact(
     if force and data_path.exists() and data_path.is_dir():
         raise exceptions.PivotError("Cannot overwrite directory with import")
 
-    # A destination inside a configured state directory that does not exist yet is created
-    # through the common creator, so that directory gets its ignore file before the import
-    # writes the `.pvt` file or the data under it.
     state_dir_mod.make_dirs(pvt_path.parent)
     state_dir_mod.make_dirs(data_path.parent)
 

@@ -216,12 +216,12 @@ def _stage_definition(func: Callable[..., Any]) -> fingerprint.FunctionIdentity:
     closures from one factory (`make_stage(2)`, `make_stage(5)`) share a file and qualname but
     differ in their closure values.
     """
-    return fingerprint.function_identity(inspect.unwrap(func))
+    return fingerprint.function_identity(fingerprint.unwrap(func))
 
 
 def _shown_file(func: Callable[..., Any], root: pathlib.Path) -> str:
     """The file defining a stage function, relative to the pipeline root when inside it."""
-    func = inspect.unwrap(func)
+    func = fingerprint.unwrap(func)
     source = inspect.getsourcefile(func)
     if source is None:
         return func.__module__
@@ -231,7 +231,7 @@ def _shown_file(func: Callable[..., Any], root: pathlib.Path) -> str:
 
 def _cell_values(func: Callable[..., Any]) -> dict[str, object]:
     """The live closure cell values of `func`, by free variable name."""
-    func = inspect.unwrap(func)
+    func = fingerprint.unwrap(func)
     names = func.__code__.co_freevars
     return {
         name: fingerprint._cell_value(cell)  # pyright: ignore[reportPrivateUsage] - the cell reader fingerprinting uses, so sameness matches it
@@ -241,7 +241,7 @@ def _cell_values(func: Callable[..., Any]) -> dict[str, object]:
 
 def _default_values(func: Callable[..., Any]) -> dict[str, object]:
     """The live default values of `func`, by parameter name."""
-    return dict(fingerprint._function_defaults(inspect.unwrap(func)))  # pyright: ignore[reportPrivateUsage] - the defaults reader fingerprinting uses
+    return dict(fingerprint._function_defaults(fingerprint.unwrap(func)))  # pyright: ignore[reportPrivateUsage] - the defaults reader fingerprinting uses
 
 
 def _show_ref(identity: types.ArtifactIdentity, tag: types.ArtifactTag) -> str:
@@ -967,6 +967,18 @@ class Pipeline:
         reason = lock.stage_name_error(qualified_name)
         if reason is not None:
             raise ValueError(f"Invalid stage name {qualified_name!r}: {reason}")
+        # Refuse a stage with @fingerprint_by_name anywhere on its `__wrapped__` chain (this
+        # @stage wrapper, the function @stage received, and each object below that one, read as
+        # every chain is, by `fingerprint.wrapper_chain`), before any read of the stage: the mark
+        # is for helpers, and a stage's own code is fingerprinted.
+        if fingerprint.fingerprinted_by_name(
+            fingerprint.unwrap(stage_wrapper, stop=fingerprint.fingerprinted_by_name)
+        ):
+            self._validation_errors.append(
+                f"{qualified_name}: @fingerprint_by_name marks a helper, not a stage. "
+                + "Use @no_fingerprint() to opt a stage out of AST fingerprinting."
+            )
+            return self._error_handle()
         output_specs = _analyze_return_type(original_func, qualified_name)
 
         sig = inspect.signature(original_func)
@@ -976,13 +988,7 @@ class Pipeline:
             bound.apply_defaults()
         except TypeError as exc:
             self._validation_errors.append(f"{stage_name}: {exc}")
-            dummy_input = _InputNode(
-                name="__error__",
-                python_type=None,
-                path="__error__",
-                format=loaders_mod.PathOnly(),
-            )
-            return ArtifactHandle(self, dummy_input, None, object)
+            return self._error_handle()
 
         for parameter in sig.parameters.values():
             if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
@@ -1120,6 +1126,16 @@ class Pipeline:
             output_key=None,
             python_type=dict,
         )
+
+    def _error_handle(self) -> ArtifactHandle:
+        """A placeholder handle for a stage call refused with a validation error."""
+        dummy_input = _InputNode(
+            name="__error__",
+            python_type=None,
+            path="__error__",
+            format=loaders_mod.PathOnly(),
+        )
+        return ArtifactHandle(self, dummy_input, None, object)
 
     def previous(self, key: str | None = None) -> Any:
         """Mark a parameter as this stage call's prior incremental output."""

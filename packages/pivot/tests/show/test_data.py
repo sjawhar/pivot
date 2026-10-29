@@ -1514,6 +1514,7 @@ def test_select_data_files_reads_head_hash(
     """The HEAD lock's hash is returned under the output's workspace path."""
     _register_csv_stage(mock_discovery)
     lock_content = b"""
+schema_version: 3
 code_manifest:
   func:main: abc123
 params: {}

@@ -264,27 +264,14 @@ def test_code_function_added() -> None:
 def test_group_dep_detects_added_key() -> None:
     lock_data = _helper_make_lock_data(
         dep_hashes={
-            _id("group"): DirHash(
-                hash="group_hash",
-                manifest=[
-                    {"relpath": "x", "hash": "hash_x", "size": 1, "isexec": False},
-                ],
-            ),
+            _id("group"): DirHash(hash="group_hash", size=1, nfiles=1),
         },
     )
     result = skip.check_stage(
         lock_data=lock_data,
         fingerprint={"func:main": "abc123"},
         params={"lr": 0.01},
-        dep_hashes={
-            _id("group"): DirHash(
-                hash="group_hash_with_y",
-                manifest=[
-                    {"relpath": "x", "hash": "hash_x", "size": 1, "isexec": False},
-                    {"relpath": "y", "hash": "hash_y", "size": 1, "isexec": False},
-                ],
-            )
-        },
+        dep_hashes={_id("group"): DirHash(hash="group_hash_with_y", size=2, nfiles=2)},
         out_paths=[_id("stage", "output")],
         explain=True,
     )
@@ -296,26 +283,14 @@ def test_group_dep_detects_added_key() -> None:
 def test_group_dep_detects_accessed_key_change() -> None:
     lock_data = _helper_make_lock_data(
         dep_hashes={
-            _id("group"): DirHash(
-                hash="group_hash",
-                manifest=[
-                    {"relpath": "x", "hash": "hash_x", "size": 1, "isexec": False},
-                ],
-            ),
+            _id("group"): DirHash(hash="group_hash", size=1, nfiles=1),
         },
     )
     result = skip.check_stage(
         lock_data=lock_data,
         fingerprint={"func:main": "abc123"},
         params={"lr": 0.01},
-        dep_hashes={
-            _id("group"): DirHash(
-                hash="group_hash",
-                manifest=[
-                    {"relpath": "x", "hash": "hash_x_changed", "size": 1, "isexec": False},
-                ],
-            )
-        },
+        dep_hashes={_id("group"): DirHash(hash="group_hash_changed", size=1, nfiles=1)},
         out_paths=[_id("stage", "output")],
         explain=True,
     )

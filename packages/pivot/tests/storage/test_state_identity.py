@@ -89,9 +89,9 @@ def test_a_hard_link_is_served_by_identity_without_reading_it(
 
     with state.StateDB(state_dir, readonly=True) as state_db:
         assert cache.hash_file(replica, state_db)[0] == live_hash
-        manifest = cache.hash_directory(replica.parent, state_db)["manifest"]
+        members = cache.hash_directory(replica.parent, state_db)["listing"]
 
-    assert [entry["hash"] for entry in manifest] == [live_hash]
+    assert [entry["hash"] for entry in members["files"]] == [live_hash]
     assert reads.call_count == 0, "A hard link of a recorded file is not read"
 
 

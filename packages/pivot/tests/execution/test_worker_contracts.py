@@ -1892,7 +1892,13 @@ def test_incremental_input_that_cannot_be_restored_names_the_fix(
 
     with pytest.raises(exceptions.CacheRestoreError) as exc_info:
         worker._prepare_incremental_inputs(
-            _STAGE, [ref], {"prev": ref.identity}, lock_data, store, state_dir, state_dir
+            _STAGE,
+            [ref],
+            {"prev": ref.identity},
+            lock_data["output_hashes"],
+            store,
+            state_dir,
+            state_dir,
         )
 
     assert str(exc_info.value) == (
@@ -1930,7 +1936,13 @@ def test_incremental_restore_keeps_a_tracked_file_at_the_output_path(
 
     with pytest.raises(exceptions.PivotError, match=r"skip/consume/a\.txt\.pvt"):
         worker._prepare_incremental_inputs(
-            _STAGE, [ref], {"prev": ref.identity}, lock_data, store, tmp_path, tmp_path
+            _STAGE,
+            [ref],
+            {"prev": ref.identity},
+            lock_data["output_hashes"],
+            store,
+            tmp_path,
+            tmp_path,
         )
 
     assert output_path.read_text() == "user input"

@@ -143,6 +143,23 @@ def venv_pivot(venv: pathlib.Path, *specs: str) -> str:
     return str(venv / "bin" / "pivot")
 
 
+def incremental_stop(output: str, stage: str) -> str | None:
+    """How a released pivot's ``repro`` left ``stage``, an incremental stage, without running it.
+
+    ``"refused"`` when it printed its cache-missing refusal for the stage; ``"blocked"`` when it
+    marked the stage blocked behind another stage's failure; ``None`` otherwise (the stage ran,
+    or the output does not name it). Which of two independent incremental stages refuses and
+    which is blocked depends on which one a worker reaches first, so a test asserts that each
+    stopped and that one refused, never the order.
+    """
+    flat = " ".join(output.split())
+    if f"Cache missing for incremental output '{stage}'" in flat:
+        return "refused"
+    if re.search(rf"(?<!\S){re.escape(stage)} blocked(?!\S)", flat):
+        return "blocked"
+    return None
+
+
 # Default pipeline for register_test_stage(). The conftest fixture
 # bind_test_pipeline_helper sets it to the test_pipeline fixture's Pipeline for
 # every test that uses test_pipeline (directly or via mock_discovery etc.).

@@ -158,7 +158,17 @@ class NoCommitRecord(TypedDict, total=False):
     """What a stage's outputs hold that no lock records yet, kept under the StateDB key
     `nocommit:<stage>`. A written lock supersedes it, and its whole record is removed.
 
-    Each feature replaces only its own keys and keeps every other key in one write transaction.
+    Two features write the record, each its own keys. `code_manifest` is the manifest a
+    `--no-commit` run's lock would have held, rerun marks included, and `output_hashes` the
+    outputs it wrote: the run writes both (`NoCommitRun`, `StateDB.apply_deferred_writes`), and
+    `pivot commit` writes that manifest when both are present and the outputs on disk still have
+    these hashes. `pvt_members` maps each `*.pvt` file Pivot wrote in a directory output (path
+    relative to the project root) to its content hash; the feature that keeps those files owns it.
+
+    Every writer replaces only its own keys and keeps every other key, in one write transaction.
+    The reader (`StateDB.get_no_commit_record`) validates each of these three keys on its own and
+    returns every other key as stored, so a record that holds only one feature's keys reads as
+    present, and a malformed key hides no other.
     """
 
     code_manifest: dict[str, str]
@@ -167,7 +177,7 @@ class NoCommitRecord(TypedDict, total=False):
 
 
 class NoCommitRun(TypedDict):
-    """The keys of ``NoCommitRecord`` a ``--no-commit`` run writes."""
+    """The keys of `NoCommitRecord` a `--no-commit` run writes: always both, never one alone."""
 
     code_manifest: dict[str, str]
     output_hashes: dict[str, str]  # output identity key -> content hash
@@ -183,8 +193,9 @@ class DeferredWrites(TypedDict, total=False):
     dep_generations: dict[str, int]  # {dep_path: generation}
     run_cache_input_hash: str
     run_cache_entry: RunCacheEntry
-    # A run the stage-import check flagged: delete any run-cache entry at this input hash.
-    run_cache_delete_input_hash: str
+    # A run the stage-import check flagged: delete any run-cache entry at these input hashes (its
+    # key, and the unmarked key an older pivot files under, run_history.compute_input_hash).
+    run_cache_delete_input_hashes: list[str]
     increment_outputs: bool  # True → increment output generations; False/absent → skip
     file_hash_entries: list[FileHashEntry]
     no_commit_record: NoCommitRun  # a --no-commit run's keys of its `nocommit:` record
@@ -217,9 +228,9 @@ class StageResult(TypedDict):
 #
 #   FileHash          Simple {hash: str} for individual files.
 #
-#   DirHash           Tree hash with manifest listing all files, plus the directory's
-#                     empty directories. The manifest enables incremental sync (only
-#                     transfer changed files).
+#   DirHash           A directory as a lock records it: the hash of its listing, its total
+#                     size and its file count. The members live in the listing
+#                     (storage/listing.py), committed beside the lock and kept in the cache.
 #
 #   HashInfo          Union type for hashes (files or directories).
 #
@@ -232,34 +243,29 @@ class FileHash(TypedDict):
 
 
 class DirManifestEntry(TypedDict):
-    """Entry in directory manifest."""
+    """One file of a directory listing."""
 
-    relpath: str
+    relpath: str  # os.fsdecode form: a byte that is not UTF-8 is a surrogate escape
     hash: str
     size: int
     isexec: bool
 
 
 class DirHash(TypedDict):
-    """Hash info for a directory with full manifest.
-
-    ``empty_dirs`` lists the directories that hold no stored file and no other directory, as
-    relpaths, sorted. Restoring the files recreates their parents and these recreate every
-    other directory, so a restored directory has exactly the directories the hashed one had.
-    The key is present only when the list is non-empty.
-    """
+    """A directory: the hash of its listing (``storage/listing.py``), the sum of its files'
+    sizes, and its file count."""
 
     hash: str
-    manifest: list[DirManifestEntry]
-    empty_dirs: NotRequired[list[str]]
+    size: int
+    nfiles: int
 
 
 HashInfo = FileHash | DirHash
 
 
 def is_dir_hash(h: HashInfo) -> TypeGuard[DirHash]:
-    """Type guard to narrow HashInfo to DirHash based on manifest presence."""
-    return "manifest" in h
+    """Type guard to narrow HashInfo to DirHash."""
+    return "nfiles" in h
 
 
 MetricValue = str | int | float | bool | None
@@ -283,7 +289,9 @@ class OutputFormat(enum.StrEnum):
 # Two representations exist for different purposes:
 #
 #   StorageLockData   On-disk YAML format. Uses project-relative identity keys
-#                     and list-based deps/outs (stable YAML output).
+#                     and list-based deps/outs (stable YAML output). A lock file holds a
+#                     directory's hash under ``listing`` (lock._DIR_HASH_KEY); this type
+#                     holds it under ``hash``, as it holds a file's.
 #
 #   LockData          In-memory format. Uses ArtifactIdentity keys
 #                     and dict-based deps/outs (O(1) lookups by identity).
@@ -402,32 +410,29 @@ def validate_artifact_identity(identity: ArtifactIdentity) -> None:
 
 
 class DepEntry(TypedDict):
-    """Entry in deps list for lock file storage."""
+    """Entry in deps list for lock file storage. A directory carries ``size`` and ``nfiles``."""
 
     producer: str
     key: str | None
     hash: str
     size: NotRequired[int]
-    manifest: NotRequired[list[DirManifestEntry]]
-    empty_dirs: NotRequired[list[str]]
+    nfiles: NotRequired[int]
 
 
 class OutEntry(TypedDict):
-    """Entry in outs list for lock file storage."""
+    """Entry in outs list for lock file storage. A directory carries ``size`` and ``nfiles``."""
 
     key: str | None
     hash: str
     path: NotRequired[str]
     size: NotRequired[int]
-    manifest: NotRequired[list[DirManifestEntry]]
-    empty_dirs: NotRequired[list[str]]
+    nfiles: NotRequired[int]
 
 
 class StorageLockData(TypedDict):
     """Storage format for lock files (list-based, relative paths)."""
 
-    # Schema version for forward compatibility (missing = v0, current = v1)
-    schema_version: NotRequired[int]
+    schema_version: int
     code_manifest: dict[str, str]
     params: dict[str, Any]
     deps: list[DepEntry]
@@ -442,6 +447,10 @@ class LockData(TypedDict):
     dep_hashes: dict[ArtifactIdentity, HashInfo]
     output_hashes: dict[ArtifactIdentity, HashInfo]
     output_paths: NotRequired[dict[ArtifactIdentity, str]]
+    # Present for a lock an older pivot wrote: its directories' listings were inline and are in
+    # the cache only (``StageLock.read``); a listing file beside it is another lock's
+    # (``lock.committed_listing``).
+    older_format: NotRequired[bool]
 
 
 class OutputMessageKind(enum.StrEnum):

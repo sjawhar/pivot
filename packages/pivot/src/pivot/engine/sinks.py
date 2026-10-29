@@ -193,7 +193,7 @@ def _print_completions(
                         console.print(f"          [dim]{escaped}[/dim]")
                 if detail := _console_reason(event):
                     for line in _format_error_detail(detail, total=total):
-                        console.print(line)
+                        console.print(line, soft_wrap=True)
             elif event["stage"] in warnings_by_stage:
                 buffered = warnings_by_stage[event["stage"]]
                 stage_lines = [

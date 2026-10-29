@@ -411,6 +411,11 @@ Checks that all stages are cached (code, params, deps match lock files) and outp
 For a directory output, `pivot verify` also checks that the workspace path is a directory. A file
 at that path fails verification.
 
+Every committed listing file a stage's lock records, its outputs' and its directory inputs', must
+hash to its record; one that does not fails that stage, naming the file and how to put it right.
+With no stage named, `pivot verify` also checks each tracked directory's `<path>.pvt.listing`
+against its `.pvt`, whether or not a stage reads it, and fails naming that path.
+
 **Arguments:**
 
 - `STAGES` - Stage names to verify (optional, verifies all if not specified)
@@ -464,9 +469,18 @@ pivot track PATHS... [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--force` / `-f` | Overwrite existing .pvt files |
+| `--force` / `-f` | Overwrite existing `.pvt` files and a directory's `.pvt.listing` file |
 
-Creates `.pvt` manifest files for tracking files outside of stage outputs.
+Creates a `.pvt` sidecar for a file. For a directory it also creates
+`<path>.pvt.listing`, the committed listing of its files and empty directories;
+commit both files. `track` refuses a target that is the `.pvt` or listing file
+of another tracked path, or whose own `.pvt` or listing file would be another
+tracked path, naming that path; any other name can be tracked, one ending in
+`.pvt` or `.pvt.listing` included. It warns when git ignores either sidecar.
+`--force` rewrites or removes a `<path>.pvt.listing` only when Pivot wrote it:
+the cache (also the `.pivot` cache from before `core.state_dir` was set) holds
+exactly its bytes, or, with no cached copy, its bytes hash to the directory the
+`.pvt` records. Any other file there is refused, naming it.
 
 `pivot track` loads every pipeline in the project and refuses a new path that overlaps a
 declared output of any of them, including pipelines this directory does not select, and names
@@ -1083,6 +1097,11 @@ pivot init [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--force` / `-f` | Overwrite `.pivot/.gitignore` only for the default state directory. A configured state directory keeps any existing entry and creates a missing one atomically. |
+
+Writes `.pivot/.gitignore`, a `.pivotignore` if there is none, and the line
+`*.listing -merge` into `.gitattributes` (created if absent), so git never
+merges a listing line by line (see
+[Listing files](../concepts/outputs.md#listing-files)).
 
 ---
 
