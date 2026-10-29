@@ -623,7 +623,12 @@ def test_get_metric_info_from_head_with_metric_stage(
     _register_metric_stage(mock_discovery, "my_stage")
 
     lock_content = yaml.dump(
-        make_valid_lock_content(outs=[{"key": None, "hash": "abc1230000000000", "tag": "metric"}])
+        {
+            **make_valid_lock_content(
+                outs=[{"key": None, "hash": "abc1230000000000", "tag": "metric"}]
+            ),
+            "schema_version": 3,
+        }
     )
     mocker.patch.object(
         git,
@@ -681,7 +686,7 @@ def test_get_metric_info_from_head_lock_missing_outs(
 
     _register_metric_stage(mock_discovery, "my_stage")
 
-    lock_content = yaml.dump({"deps": []})
+    lock_content = yaml.dump({"schema_version": 3, "code_manifest": {}, "params": {}, "deps": []})
     mocker.patch.object(
         git,
         "read_files_from_head",
@@ -702,7 +707,15 @@ def test_get_metric_info_from_head_outs_not_list(
 
     _register_metric_stage(mock_discovery, "my_stage")
 
-    lock_content = yaml.dump({"outs": "not a list"})
+    lock_content = yaml.dump(
+        {
+            "schema_version": 3,
+            "code_manifest": {},
+            "params": {},
+            "deps": [],
+            "outs": "not a list",
+        }
+    )
     mocker.patch.object(
         git,
         "read_files_from_head",

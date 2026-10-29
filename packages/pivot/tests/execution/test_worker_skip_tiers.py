@@ -16,7 +16,7 @@ import pytest
 
 from pivot import loaders, run_history, types
 from pivot.executor import worker
-from pivot.storage import cache, ownership, state
+from pivot.storage import cache, listing, lock, ownership, state
 from pivot.storage import store as store_mod
 from pivot.types import DepEntry, DirHash, FileHash, LockData
 
@@ -177,7 +177,7 @@ def test_generation_tier_defers_to_full_check_when_anything_changed(
             assert case.can_skip() is False
         case "dep-locked-as-directory":
             case.lock_data["dep_hashes"] = {
-                case.dep.identity: DirHash(hash="0123456789abcdef", manifest=[])
+                case.dep.identity: DirHash(hash="0123456789abcdef", size=0, nfiles=0)
             }
             assert case.can_skip() is False
         case "dep-deleted":
@@ -220,6 +220,7 @@ class _EvictedCacheStore(store_mod.WorkspaceStore):
         *,
         state_dir: pathlib.Path | None = None,
         checkout_modes: list[cache.CheckoutMode] | None = None,
+        members: listing.DirListing | None = None,
         claims: ownership.StageClaims | None = None,
         recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
     ) -> bool:
@@ -269,7 +270,7 @@ def test_restore_verifies_directory_output(project: pathlib.Path, state_db: stat
     ref = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
     directory = store.prepare_output(ref)
     (directory / "a.txt").write_text("a")
-    output_hash = cache.hash_directory(directory, None)
+    output_hash = cache.hash_directory(directory, None)["record"]
 
     result = _restore(store, [ref], {ref.identity: output_hash}, state_db)
 
@@ -280,6 +281,52 @@ def test_restore_verifies_directory_output(project: pathlib.Path, state_db: stat
         empty_dirs_unrecorded=[],
         to_restore=[],
     )
+
+
+def test_restore_uses_committed_listing_when_its_cache_object_is_missing(
+    project: pathlib.Path, state_db: state.StateDB
+) -> None:
+    store = _workspace(project, {})
+    ref = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
+    directory = store.prepare_output(ref)
+    member = directory / "a.txt"
+    member.write_text("a")
+    hashed = cache.hash_directory(directory)
+    record = hashed["record"]
+    files_dir = project / ".pivot" / "cache" / "files"
+    cache.copy_to_cache(
+        member, cache.get_cache_path(files_dir, hashed["listing"]["files"][0]["hash"])
+    )
+    stage_lock = lock.StageLock(_STAGE, project / ".pivot" / "stages")
+    stage_lock.write(
+        LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={ref.identity: record},
+        ),
+        hashed_dirs={record["hash"]: hashed},
+    )
+    cache.remove_output(directory)
+
+    assert store.cached_listing(record) is None
+    result = worker.restore_outputs_to_hashes(
+        store,
+        [ref],
+        {ref.identity: record},
+        state_db,
+        listing_lock=stage_lock,
+        report_changes=True,
+    )
+
+    assert result == worker.OutputRestoreResult(
+        available=True,
+        outputs_restored=True,
+        unavailable=[],
+        empty_dirs_unrecorded=[],
+        to_restore=[ref],
+    )
+    assert (directory / "a.txt").read_text() == "a"
 
 
 def test_restore_brings_back_deleted_output_from_cache(
@@ -443,9 +490,10 @@ def test_restore_keeps_checking_outputs_after_restoring_one(
 
 def _old_lock_tree(
     project: pathlib.Path, store: store_mod.WorkspaceStore, ref: types.ArtifactRef
-) -> tuple[pathlib.Path, HashInfo]:
-    """A cached directory output holding an empty directory, and the hash pivot before 0.3.4
-    recorded for it: its files alone, as a copy without the directory hashes."""
+) -> tuple[pathlib.Path, DirHash]:
+    """A cached directory output holding an empty directory, and the record of the listing an
+    old lock gives it when it lists the files alone (pivot before 0.3.4), as ``StageLock.read``
+    converts it: the listing of a copy without the empty directory, put in the cache."""
     directory = store.prepare_output(ref)
     (directory / "a.txt").write_text("a")
     (directory / "logs").mkdir()
@@ -453,25 +501,31 @@ def _old_lock_tree(
     files_only = project / "files-only"
     files_only.mkdir()
     (files_only / "a.txt").write_text("a")
-    old_hash = cache.hash_directory(files_only, None)
-    assert "empty_dirs" not in old_hash
-    return directory, old_hash
+    hashed = cache.hash_directory(files_only, None)
+    assert hashed["listing"]["empty_dirs"] == []
+    listing.store_object(
+        project / ".pivot" / "cache" / "files", hashed["record"]["hash"], hashed["data"]
+    )
+    return directory, hashed["record"]
 
 
 @pytest.mark.parametrize("restore", [True, False], ids=["restore", "check"])
 def test_old_lock_without_empty_dirs_makes_the_stage_run_instead_of_stripping_them(
     project: pathlib.Path, state_db: state.StateDB, restore: bool
 ) -> None:
-    """An output holding every file its lock records plus an empty directory that a lock
-    written before pivot 0.3.4 cannot record is not restored to that lock: the restore would
-    delete the directory. The output is reported unusable, so the stage runs and records it."""
+    """An output holding every file its lock lists plus an empty directory that a lock written
+    before pivot 0.3.4 cannot record is not restored to that lock: the restore would delete the
+    directory. The output is reported unusable, so the stage runs and records it."""
     store = _workspace(project, {})
     ref = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
-    directory, old_hash = _old_lock_tree(project, store, ref)
-    assert store.cache_contains(ref, old_hash), "a restore would be possible"
+    directory, old_record = _old_lock_tree(project, store, ref)
+    members = store.cached_listing(old_record)
+    assert members is not None and store.cache_contains(ref, old_record, members), (
+        "a restore would be possible"
+    )
 
     result = worker.restore_outputs_to_hashes(
-        store, [ref], {ref.identity: old_hash}, state_db, restore=restore, report_changes=True
+        store, [ref], {ref.identity: old_record}, state_db, restore=restore, report_changes=True
     )
 
     assert result == worker.OutputRestoreResult(
@@ -490,11 +544,11 @@ def test_old_lock_still_restores_a_directory_whose_files_changed(
     """An output whose files differ from its old lock's is restored from the cache as before."""
     store = _workspace(project, {})
     ref = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
-    directory, old_hash = _old_lock_tree(project, store, ref)
+    directory, old_record = _old_lock_tree(project, store, ref)
     (directory / "a.txt").unlink()
     (directory / "a.txt").write_text("edited")
 
-    result = _restore(store, [ref], {ref.identity: old_hash}, state_db)
+    result = _restore(store, [ref], {ref.identity: old_record}, state_db)
 
     assert result == worker.OutputRestoreResult(
         available=True,
@@ -506,20 +560,19 @@ def test_old_lock_still_restores_a_directory_whose_files_changed(
     assert (directory / "a.txt").read_text() == "a"
 
 
-def test_unrecorded_empty_dirs_only_needs_matching_files_and_an_old_hash() -> None:
-    manifest = [types.DirManifestEntry(relpath="a.txt", hash="1" * 16, size=1, isexec=False)]
-    old = types.DirHash(hash="0" * 16, manifest=manifest)
-    with_dirs = types.DirHash(hash="2" * 16, manifest=manifest, empty_dirs=["logs"])
-    other_files = types.DirHash(
-        hash="3" * 16,
-        manifest=[types.DirManifestEntry(relpath="b.txt", hash="1" * 16, size=1, isexec=False)],
+def test_unrecorded_empty_dirs_only_needs_matching_files_and_no_recorded_empty_dirs() -> None:
+    files = [types.DirManifestEntry(relpath="a.txt", hash="1" * 16, size=1, isexec=False)]
+    old = listing.DirListing(files=files, empty_dirs=[])
+    with_dirs = listing.DirListing(files=files, empty_dirs=["logs"])
+    other_files = listing.DirListing(
+        files=[types.DirManifestEntry(relpath="b.txt", hash="1" * 16, size=1, isexec=False)],
         empty_dirs=["logs"],
     )
 
     assert worker.unrecorded_empty_dirs_only(old, with_dirs)
     assert not worker.unrecorded_empty_dirs_only(with_dirs, old), "a newer lock is authoritative"
     assert not worker.unrecorded_empty_dirs_only(old, other_files), "the files differ"
-    assert not worker.unrecorded_empty_dirs_only(FileHash(hash="0" * 16), with_dirs)
+    assert not worker.unrecorded_empty_dirs_only(old, old)
 
 
 def test_restore_on_cache_store_reports_whether_every_output_is_stored(
@@ -667,6 +720,73 @@ def test_run_cache_key_marks_metric_outputs_uncacheable(
         [DepEntry(producer="raw", key=None, hash="0123456789abcdef")],
         [(f"{_STAGE}:table", True), (f"{_STAGE}:score", False)],
     )
+
+
+def test_run_cache_reads_an_older_pivots_entry_under_its_unmarked_key(
+    project: pathlib.Path, state_db: state.StateDB
+) -> None:
+    """An entry an older pivot filed lists a directory's files inline, under the key without
+    the directory marker; it is read in memory, so an upgrade reruns nothing it restored."""
+    store = _workspace(project, {})
+    ref = _ref(_STAGE, tag=types.ArtifactTag.DIRECTORY)
+    directory = store.prepare_output(ref)
+    (directory / "a.txt").write_text("a")
+    output_hash = store.commit(ref, directory)
+    file_hash, _ = cache.hash_file(directory / "a.txt", None)
+    assert types.is_dir_hash(output_hash)
+    assert store.cache_contains(ref, output_hash)
+    (directory / "a.txt").unlink()
+    directory.rmdir()
+
+    legacy_document: object = {
+        "run_id": "__legacy__",
+        "output_hashes": [
+            {
+                "path": types.identity_key(ref.identity),
+                "hash": output_hash["hash"],
+                "manifest": [
+                    types.DirManifestEntry(
+                        relpath="a.txt",
+                        hash=file_hash,
+                        size=1,
+                        isexec=False,
+                    )
+                ],
+            }
+        ],
+    }
+    legacy_entry = cast("run_history.RunCacheEntry", cast("object", legacy_document))
+    state_db.apply_deferred_writes(
+        _STAGE,
+        [],
+        types.DeferredWrites(run_cache_input_hash="legacy-manifest", run_cache_entry=legacy_entry),
+    )
+
+    result = worker._try_skip_via_run_cache_with_store(
+        _STAGE,
+        "marked-key-miss",
+        [ref],
+        store,
+        state_db,
+        state_dir=project / ".pivot",
+        legacy_input_hash="legacy-manifest",
+    )
+
+    assert result is not None
+    assert result["output_hashes"] == {types.identity_key(ref.identity): output_hash}
+    assert (directory / "a.txt").read_text() == "a"
+
+
+def test_run_cache_keys_differ_from_an_older_pivots_so_it_never_misreads_one() -> None:
+    """Pivot 0.5.10 and earlier read a run-cache directory entry that lists no files inline as
+    one file; every entry this pivot files is under a key they never compute."""
+    deps = [DepEntry(producer="raw", key=None, hash="0123456789abcdef")]
+    out_specs = [(f"{_STAGE}:table", True)]
+
+    marked = run_history.compute_input_hash(dict(_FINGERPRINT), {}, deps, out_specs)
+    unmarked = run_history.compute_input_hash(dict(_FINGERPRINT), {}, deps, out_specs, marked=False)
+
+    assert marked != unmarked
 
 
 def test_completed_run_asks_coordinator_to_bump_output_generations(

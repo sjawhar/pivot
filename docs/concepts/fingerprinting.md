@@ -150,10 +150,15 @@ and a thread native code starts outside `_thread`:
   fingerprint, the "trust me" path. Outputs the run wrote, unchanged since, are
   recorded with the manifest the run recorded, the mark included;
 - a result cached by an earlier Pivot version: if its static fingerprint is
-  unchanged, it may be reused because `_CACHE_SCHEMA_VERSION` keys only the
-  state.lmdb caches, not the lock. A stage whose static walk reaches a user
-  class method or a user module gains entries in its manifest, so it reruns
-  once as Code changed after the upgrade. That accepted one-time rerun writes
+  unchanged, it may be reused, from its lock, which Pivot reads as it is, or
+  from its run-cache entry, which Pivot finds under the key that version filed
+  it under (each directory the stage reads whole hashed from its listing the
+  way that version hashed it), because `_CACHE_SCHEMA_VERSION` keys only the
+  fingerprint caches in state.lmdb, not the lock or the run cache. A stage whose
+  static walk reaches
+  a user class method or a user module gains entries in its manifest, so it
+  reruns once as Code changed after the upgrade. That accepted one-time rerun
+  writes
   the current manifest; later runs reuse it until code or inputs change. Run
   `pivot repro --force <stage>` once to re-check a stage you know imports
   dynamically. Upgrading from 0.5.6 or earlier, every stage with outputs reruns

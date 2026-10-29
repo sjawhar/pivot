@@ -12,11 +12,10 @@ from pivot.remote import keys
 from pivot.remote import storage as remote_mod
 from pivot.remote import sync as transfer
 from pivot.storage import cache as cache_mod
-from pivot.storage import lock
+from pivot.storage import listing, lock
 from pivot.storage import state as state_mod
 from pivot.types import (
     ArtifactIdentity,
-    DirHash,
     DirManifestEntry,
     FileHash,
     HashInfo,
@@ -54,25 +53,64 @@ def _helper_write_lock(
     *,
     outs: dict[str | None, HashInfo] | None = None,
     deps: dict[str, HashInfo] | None = None,
-) -> None:
-    """Write a schema-v2 lock file: outputs keyed by output key, deps by input name."""
-    lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).write(
+    directories: tuple[listing.HashedDirectory, ...] = (),
+) -> lock.StageLock:
+    """Write a lock file, with the committed listing of each directory output it records."""
+    stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
+    stage_lock.write(
         LockData(
             code_manifest={},
             params={},
             dep_hashes={ArtifactIdentity(name, None): h for name, h in (deps or {}).items()},
             output_hashes={ArtifactIdentity(stage_name, key): h for key, h in (outs or {}).items()},
-        )
+        ),
+        hashed_dirs={directory["record"]["hash"]: directory for directory in directories},
     )
+    return stage_lock
 
 
-def _helper_dir_hash(tree_hash: str, *files: tuple[str, str, int]) -> DirHash:
-    return DirHash(
-        hash=tree_hash,
-        manifest=[
+def _helper_hashed_dir(*files: tuple[str, str, int]) -> listing.HashedDirectory:
+    """Build a directory record and the listing bytes its hash names."""
+    members = listing.DirListing(
+        files=[
             DirManifestEntry(relpath=relpath, hash=h, size=size, isexec=False)
             for relpath, h, size in files
         ],
+        empty_dirs=[],
+    )
+    data = listing.encode(members)
+    return listing.HashedDirectory(
+        record=listing.record_of(members, data), listing=members, data=data
+    )
+
+
+def _helper_cache_object(files_dir: Path, content: bytes) -> str:
+    """Put content in a local cache at its xxhash64 key and return the key."""
+    content_hash = xxhash.xxh64(content).hexdigest()
+    cache_path = cache_mod.get_cache_path(files_dir, content_hash)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(content)
+    return content_hash
+
+
+async def _helper_remote_object(
+    s3_remote: remote_mod.S3Remote, client: S3Client, object_hash: str
+) -> bytes:
+    """Read an object pushed to the moto remote by cache key."""
+    response = await client.get_object(
+        Bucket=s3_remote.bucket, Key=keys.hash_to_key(s3_remote.prefix, object_hash)
+    )
+    return await response["Body"].read()
+
+
+async def _helper_put_remote_object(
+    s3_remote: remote_mod.S3Remote, client: S3Client, object_hash: str, content: bytes
+) -> None:
+    """Put an object on the moto remote by cache key."""
+    await client.put_object(
+        Bucket=s3_remote.bucket,
+        Key=keys.hash_to_key(s3_remote.prefix, object_hash),
+        Body=content,
     )
 
 
@@ -144,7 +182,7 @@ def test_get_local_cache_hashes_ignores_invalid_structure(tmp_path: Path) -> Non
 
 
 # -----------------------------------------------------------------------------
-# Stage Output Hash Extraction Tests
+# Target Output Hash Resolution Tests
 # -----------------------------------------------------------------------------
 
 
@@ -157,103 +195,168 @@ def lock_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-def test_get_stage_output_hashes_no_lock(lock_project: Path) -> None:
-    """Missing lock file returns empty set with warning."""
+def test_get_target_hashes_stage_without_lock_returns_empty(lock_project: Path) -> None:
+    """A known stage with no lock has no cache objects to transfer."""
     state_dir = lock_project / ".pivot"
 
-    result = transfer.get_stage_output_hashes(state_dir, ["nonexistent"])
+    result = transfer.get_target_hashes(
+        ["missing_stage"],
+        state_dir,
+        all_stages=_helper_make_all_stages("missing_stage"),
+        cache_dir=state_dir / "cache",
+    )
     assert result == set()
 
 
-def test_get_stage_output_hashes_file_output(lock_project: Path) -> None:
-    """Extracts hash from file output in lock file."""
+def test_get_target_hashes_file_output(lock_project: Path) -> None:
+    """A target stage's file output names its cache object."""
     state_dir = lock_project / ".pivot"
 
     _helper_write_lock(state_dir, "my_stage", outs={None: FileHash(hash="abc123def4567800")})
 
-    result = transfer.get_stage_output_hashes(state_dir, ["my_stage"])
+    result = transfer.get_target_hashes(
+        ["my_stage"],
+        state_dir,
+        all_stages=_helper_make_all_stages("my_stage"),
+        cache_dir=state_dir / "cache",
+    )
     assert result == {"abc123def4567800"}
 
 
-def test_get_stage_output_hashes_directory_output(lock_project: Path) -> None:
-    """Extracts all hashes from directory output including manifest (tree hash excluded)."""
+def test_get_target_hashes_directory_output_stores_listing_object(lock_project: Path) -> None:
+    """A directory output names its listing object and listed files for push."""
     state_dir = lock_project / ".pivot"
+    files_dir = state_dir / "cache" / "files"
+    directory = _helper_hashed_dir(
+        ("file1.txt", "f11e1a5b12345670", 100),
+        ("file2.txt", "f11e2a5b23456780", 200),
+    )
 
     _helper_write_lock(
         state_dir,
         "my_stage",
-        outs={
-            "output_dir": _helper_dir_hash(
-                "7ee1a5b1234567aa",
-                ("file1.txt", "f11e1a5b12345670", 100),
-                ("file2.txt", "f11e2a5b23456780", 200),
-            )
-        },
+        outs={"output_dir": directory["record"]},
+        directories=(directory,),
     )
 
-    result = transfer.get_stage_output_hashes(state_dir, ["my_stage"])
-    assert result == {"f11e1a5b12345670", "f11e2a5b23456780"}
+    result = transfer.get_target_hashes(
+        ["my_stage"],
+        state_dir,
+        all_stages=_helper_make_all_stages("my_stage"),
+        cache_dir=state_dir / "cache",
+    )
+
+    assert result == {directory["record"]["hash"], "f11e1a5b12345670", "f11e2a5b23456780"}
+    assert cache_mod.cached_listing(files_dir, directory["record"]) == directory["listing"], (
+        "Push should be able to send the listing object keyed by the directory hash"
+    )
 
 
-def test_get_stage_output_hashes_multiple_stages(lock_project: Path) -> None:
-    """Collects hashes from multiple stages."""
+def test_get_target_hashes_multiple_stage_outputs(lock_project: Path) -> None:
+    """Collects target hashes from multiple stages."""
     state_dir = lock_project / ".pivot"
 
     for i, stage in enumerate(["stage_a", "stage_b"]):
         _helper_write_lock(state_dir, stage, outs={None: FileHash(hash=f"a{i}{'0' * 14}")})
 
-    result = transfer.get_stage_output_hashes(state_dir, ["stage_a", "stage_b"])
-    assert "a0" + "0" * 14 in result
-    assert "a1" + "0" * 14 in result
+    result = transfer.get_target_hashes(
+        ["stage_a", "stage_b"],
+        state_dir,
+        all_stages=_helper_make_all_stages("stage_a", "stage_b"),
+        cache_dir=state_dir / "cache",
+    )
+    assert result == {"a0" + "0" * 14, "a1" + "0" * 14}
 
 
 # -----------------------------------------------------------------------------
-# Stage Dependency Hash Extraction Tests
+# Target Dependency Hash Resolution Tests
 # -----------------------------------------------------------------------------
 
 
-def test_get_stage_dep_hashes(lock_project: Path) -> None:
-    """Extracts dependency hashes from lock file."""
+def test_get_target_hashes_include_deps_file_outputs(lock_project: Path) -> None:
+    """A target stage's cached upstream file outputs are included."""
     state_dir = lock_project / ".pivot"
 
     _helper_write_lock(
         state_dir,
         "my_stage",
         deps={
-            "input.csv": FileHash(hash="de01a5b123456700"),
-            "config.yaml": FileHash(hash="de02a5b123456700"),
+            "upstream_a": FileHash(hash="de01a5b123456700"),
+            "upstream_b": FileHash(hash="de02a5b123456700"),
         },
     )
 
-    result = transfer.get_stage_dep_hashes(state_dir, ["my_stage"])
+    result = transfer.get_target_hashes(
+        ["my_stage"],
+        state_dir,
+        include_deps=True,
+        all_stages=_helper_make_all_stages("my_stage", "upstream_a", "upstream_b"),
+        cache_dir=state_dir / "cache",
+    )
     assert result == {"de01a5b123456700", "de02a5b123456700"}
 
 
-def test_get_stage_dep_hashes_with_manifest(lock_project: Path) -> None:
-    """Extracts all hashes from directory dependency including manifest (tree hash excluded)."""
+def test_get_target_hashes_include_deps_directory_listing_and_files(lock_project: Path) -> None:
+    """An upstream directory dependency names its listing object and listed files."""
     state_dir = lock_project / ".pivot"
-
+    directory = _helper_hashed_dir(
+        ("a.txt", "af11ea5b12345600", 10),
+        ("b.txt", "bf11ea5b12345600", 20),
+    )
     _helper_write_lock(
         state_dir,
-        "my_stage",
-        deps={
-            "input_dir": _helper_dir_hash(
-                "d17ee1a5b1234560",
-                ("a.txt", "af11ea5b12345600", 10),
-                ("b.txt", "bf11ea5b12345600", 20),
-            )
-        },
+        "upstream",
+        outs={None: directory["record"]},
+        directories=(directory,),
     )
+    _helper_write_lock(state_dir, "my_stage", deps={"upstream": directory["record"]})
 
-    result = transfer.get_stage_dep_hashes(state_dir, ["my_stage"])
-    assert result == {"af11ea5b12345600", "bf11ea5b12345600"}
+    result = transfer.get_target_hashes(
+        ["my_stage"],
+        state_dir,
+        include_deps=True,
+        all_stages=_helper_make_all_stages("my_stage", "upstream"),
+        cache_dir=state_dir / "cache",
+    )
+    assert result == {directory["record"]["hash"], "af11ea5b12345600", "bf11ea5b12345600"}
 
 
-def test_get_stage_dep_hashes_no_lock(lock_project: Path) -> None:
-    """Missing lock file skips silently."""
+def test_get_target_hashes_directory_without_listing_names_listing_object(
+    lock_project: Path,
+) -> None:
+    """A directory whose listing is not local is first transferred as its listing object."""
+    state_dir = lock_project / ".pivot"
+    directory = _helper_hashed_dir(("a.txt", "af11ea5b12345600", 10))
+    stage_lock = _helper_write_lock(
+        state_dir,
+        "upstream",
+        outs={None: directory["record"]},
+        directories=(directory,),
+    )
+    stage_lock.output_listing_path(ArtifactIdentity("upstream", None)).unlink()
+    _helper_write_lock(state_dir, "my_stage", deps={"upstream": directory["record"]})
+
+    result = transfer.get_target_hashes(
+        ["my_stage"],
+        state_dir,
+        include_deps=True,
+        all_stages=_helper_make_all_stages("my_stage", "upstream"),
+        cache_dir=state_dir / "cache",
+    )
+    assert result == {directory["record"]["hash"]}
+
+
+def test_get_target_hashes_include_deps_no_lock(lock_project: Path) -> None:
+    """A target stage with no lock has no dependency objects to transfer."""
     state_dir = lock_project / ".pivot"
 
-    result = transfer.get_stage_dep_hashes(state_dir, ["nonexistent"])
+    result = transfer.get_target_hashes(
+        ["missing_stage"],
+        state_dir,
+        include_deps=True,
+        all_stages=_helper_make_all_stages("missing_stage"),
+        cache_dir=state_dir / "cache",
+    )
     assert result == set()
 
 
@@ -715,6 +818,51 @@ async def test_push_async_integration(
     state_db.close()
 
 
+async def test_push_async_directory_target_sends_listing_and_files_integration(
+    lock_project: Path,
+    s3_remote: remote_mod.S3Remote,
+    aioboto3_s3_client: S3Client,
+) -> None:
+    """A targeted directory push sends its listing object and every listed file object."""
+    state_dir = lock_project / ".pivot"
+    cache_dir = state_dir / "cache"
+    files_dir = cache_dir / "files"
+    first = b"first file"
+    second = b"second file"
+    first_hash = _helper_cache_object(files_dir, first)
+    second_hash = _helper_cache_object(files_dir, second)
+    directory = _helper_hashed_dir(
+        ("a.txt", first_hash, len(first)),
+        ("nested/b.txt", second_hash, len(second)),
+    )
+    _helper_write_lock(
+        state_dir,
+        "my_stage",
+        outs={"output_dir": directory["record"]},
+        directories=(directory,),
+    )
+    assert cache_mod.cached_listing(files_dir, directory["record"]) is None
+
+    with state_mod.StateDB(state_dir) as state_db:
+        result = await transfer._push_async(
+            cache_dir,
+            state_dir,
+            s3_remote,
+            state_db,
+            "origin",
+            targets=["my_stage"],
+            all_stages=_helper_make_all_stages("my_stage"),
+        )
+
+    assert result == {"transferred": 3, "skipped": 0, "failed": 0, "errors": []}
+    assert (
+        await _helper_remote_object(s3_remote, aioboto3_s3_client, directory["record"]["hash"])
+        == directory["data"]
+    )
+    assert await _helper_remote_object(s3_remote, aioboto3_s3_client, first_hash) == first
+    assert await _helper_remote_object(s3_remote, aioboto3_s3_client, second_hash) == second
+
+
 async def test_pull_async_integration(
     tmp_path: Path,
     s3_remote: remote_mod.S3Remote,
@@ -751,17 +899,22 @@ async def test_pull_then_checkout_preserves_executable_bit_integration(
     """A directory output's executable file keeps its executable bit after `pivot pull`.
 
     A pull writes each downloaded cache object by content hash alone, with no
-    executable bit (always 0o444): it has no manifest to read one from. Checking it out as
+    executable bit (always 0o444). The pulled listing records the bit. Checking it out as
     HARDLINK or SYMLINK must still produce a correctly-executable workspace file, by falling
     back to COPY rather than serving the pulled object's own (wrong) permissions.
     """
     content = b"#!/bin/sh\necho hi\n"
     file_hash = xxhash.xxh64(content).hexdigest()
+    members = listing.DirListing(
+        files=[DirManifestEntry(relpath="run.sh", hash=file_hash, size=len(content), isexec=True)],
+        empty_dirs=[],
+    )
+    listing_data = listing.encode(members)
+    output_hash = listing.record_of(members, listing_data)
 
-    await aioboto3_s3_client.put_object(
-        Bucket=s3_remote.bucket,
-        Key=keys.hash_to_key(s3_remote.prefix, file_hash),
-        Body=content,
+    await _helper_put_remote_object(s3_remote, aioboto3_s3_client, file_hash, content)
+    await _helper_put_remote_object(
+        s3_remote, aioboto3_s3_client, output_hash["hash"], listing_data
     )
 
     state_dir = tmp_path / ".pivot"
@@ -774,13 +927,8 @@ async def test_pull_then_checkout_preserves_executable_bit_integration(
 
     pulled_cache_path = cache_mod.get_cache_path(cache_dir / "files", file_hash)
     assert not os.access(pulled_cache_path, os.X_OK), "pull has no isexec to write; sanity check"
+    assert cache_mod.cached_listing(cache_dir / "files", output_hash) == members
 
-    output_hash: DirHash = {
-        "hash": "deadbeefdeadbeef",
-        "manifest": [
-            DirManifestEntry(relpath="run.sh", hash=file_hash, size=len(content), isexec=True)
-        ],
-    }
     output_dir = tmp_path / "restored"
     assert cache_mod.restore_from_cache(
         output_dir,
@@ -912,6 +1060,105 @@ async def test_pull_async_with_deps_integration(
     assert out_path.read_bytes() == b"main_file"
     assert dep_path.read_bytes() == b"dependency_file"
     state_db.close()
+
+
+async def test_pull_async_directory_target_fetches_listing_then_files_integration(
+    lock_project: Path,
+    s3_remote: remote_mod.S3Remote,
+    aioboto3_s3_client: S3Client,
+) -> None:
+    """A targeted directory whose listing is not local fetches its listing, then its files."""
+    first = b"first pulled file"
+    second = b"second pulled file"
+    first_hash = xxhash.xxh64(first).hexdigest()
+    second_hash = xxhash.xxh64(second).hexdigest()
+    directory = _helper_hashed_dir(
+        ("a.txt", first_hash, len(first)),
+        ("nested/b.txt", second_hash, len(second)),
+    )
+    for object_hash, content in (
+        (directory["record"]["hash"], directory["data"]),
+        (first_hash, first),
+        (second_hash, second),
+    ):
+        await _helper_put_remote_object(s3_remote, aioboto3_s3_client, object_hash, content)
+
+    state_dir = lock_project / ".pivot"
+    cache_dir = state_dir / "cache"
+    files_dir = cache_dir / "files"
+    stage_lock = _helper_write_lock(
+        state_dir,
+        "my_stage",
+        outs={"output_dir": directory["record"]},
+        directories=(directory,),
+    )
+    stage_lock.output_listing_path(ArtifactIdentity("my_stage", "output_dir")).unlink()
+
+    with state_mod.StateDB(state_dir) as state_db:
+        result = await transfer._pull_async(
+            cache_dir,
+            state_dir,
+            s3_remote,
+            state_db,
+            "origin",
+            targets=["my_stage"],
+            all_stages=_helper_make_all_stages("my_stage"),
+        )
+
+    assert result == {"transferred": 3, "skipped": 0, "failed": 0, "errors": []}
+    assert cache_mod.cached_listing(files_dir, directory["record"]) == directory["listing"]
+    assert cache_mod.get_cache_path(files_dir, first_hash).read_bytes() == first
+    assert cache_mod.get_cache_path(files_dir, second_hash).read_bytes() == second
+
+
+async def test_pull_async_with_directory_dep_integration(
+    lock_project: Path,
+    s3_remote: remote_mod.S3Remote,
+    aioboto3_s3_client: S3Client,
+) -> None:
+    """A targeted pull includes an upstream directory's listing object and listed files.
+
+    The committed listing is copied into the local cache, so only file objects are fetched.
+    """
+    output = b"main output"
+    dep_file = b"directory dependency file"
+    out_hash = xxhash.xxh64(output).hexdigest()
+    dep_file_hash = xxhash.xxh64(dep_file).hexdigest()
+    directory = _helper_hashed_dir(("input.txt", dep_file_hash, len(dep_file)))
+    for object_hash, content in ((out_hash, output), (dep_file_hash, dep_file)):
+        await _helper_put_remote_object(s3_remote, aioboto3_s3_client, object_hash, content)
+
+    state_dir = lock_project / ".pivot"
+    cache_dir = state_dir / "cache"
+    files_dir = cache_dir / "files"
+    _helper_write_lock(
+        state_dir,
+        "upstream",
+        outs={None: directory["record"]},
+        directories=(directory,),
+    )
+    _helper_write_lock(
+        state_dir,
+        "my_stage",
+        outs={None: FileHash(hash=out_hash)},
+        deps={"upstream": directory["record"]},
+    )
+
+    with state_mod.StateDB(state_dir) as state_db:
+        result = await transfer._pull_async(
+            cache_dir,
+            state_dir,
+            s3_remote,
+            state_db,
+            "origin",
+            targets=["my_stage"],
+            all_stages=_helper_make_all_stages("my_stage", "upstream"),
+        )
+
+    assert result == {"transferred": 2, "skipped": 1, "failed": 0, "errors": []}
+    assert cache_mod.get_cache_path(files_dir, out_hash).read_bytes() == output
+    assert cache_mod.cached_listing(files_dir, directory["record"]) == directory["listing"]
+    assert cache_mod.get_cache_path(files_dir, dep_file_hash).read_bytes() == dep_file
 
 
 # -----------------------------------------------------------------------------
