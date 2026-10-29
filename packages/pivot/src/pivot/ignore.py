@@ -27,8 +27,10 @@ file is read: a ``.pivotignore`` in a subdirectory is data like any other file.
 
 Pivot departs from git in two places: ``pipeline.py`` and ``.pivot/`` at the project root are
 never ignored (``PROTECTED_PATHS``), and a line with more than ``_MAX_STAR_RUNS`` runs of ``*``
-(after that merge) is not matched as git would, with a warning: a negation is taken to match
-every path, so it keeps every file git might keep, and any other line is not used.
+that make ``dowild`` recurse (``_recursing_runs``: not one at the end of the line, nor one that
+is not a whole ``**`` right before a ``/``; after that merge) is not matched as git would, with
+a warning: a negation is taken to match every path, so it keeps every file git might keep, and
+any other line is not used.
 """
 
 from __future__ import annotations
@@ -428,21 +430,24 @@ def _parse(data: bytes, source_name: str) -> tuple[_Pattern, ...]:
             )
             continue
         classes, star_runs = compiled
-        if star_runs <= _MAX_STAR_RUNS:
+        start = 0 if basename else _literal_length(body)
+        recursing = _recursing_runs(body, star_runs, start, not basename)
+        if recursing <= _MAX_STAR_RUNS:
             match = _name_matcher(body, classes) if basename else _path_matcher(body, classes)
         elif negated:
             # Taken to match every path, it can only keep a file git would leave out (a rerun
             # too many), never leave out a file git keeps (a stage that should rerun)
             logger.warning(
-                f"Negation on line {line_number} of {source_name} has {star_runs} runs of "
-                + f"'*'; Pivot matches at most {_MAX_STAR_RUNS}, so it takes it to match every "
-                + "path. Shorten it."
+                f"Negation on line {line_number} of {source_name} ('{text}') has {recursing} "
+                + "runs of '*' that try more than one place; Pivot matches at most "
+                + f"{_MAX_STAR_RUNS}, so it takes it to match every path. Shorten it."
             )
             match = _matches_everything
         else:
             logger.warning(
-                f"Pattern on line {line_number} of {source_name} has {star_runs} runs of '*'; "
-                + f"Pivot matches at most {_MAX_STAR_RUNS} and does not use it. Shorten it."
+                f"Pattern on line {line_number} of {source_name} ('{text}') has {recursing} "
+                + "runs of '*' that try more than one place; Pivot matches at most "
+                + f"{_MAX_STAR_RUNS} and does not use it. Shorten it."
             )
             continue
         patterns.append(
@@ -532,9 +537,9 @@ def _trim_trailing_spaces(line: bytes) -> bytes:
 # The bytes git's ``is_glob_special`` names: a literal prefix ends at the first of them.
 _GLOB_SPECIAL = b"*?[\\"
 
-# A line with more runs of "*" than this is not matched as git would (see the module
-# docstring): each run is one level of recursion in ``_dowild``, and Python's recursion limit
-# is far below what git's C stack allows.
+# A line with more runs of "*" that recurse than this is not matched as git would (see the
+# module docstring): each is one level of recursion in ``_dowild``, and Python's recursion
+# limit is far below what git's C stack allows.
 _MAX_STAR_RUNS = 256
 
 
@@ -585,10 +590,10 @@ class _Class(NamedTuple):
     end: int
 
 
-def _compile(pattern: bytes) -> tuple[dict[int, _Class], int] | None:
-    """The classes of a wildmatch pattern by the index of their ``[``, and its number of runs of
-    ``*``; or None when git never matches it: a lone trailing backslash, or a class that is
-    unclosed or names an unknown ``[:name:]``.
+def _compile(pattern: bytes) -> tuple[dict[int, _Class], list[tuple[int, int]]] | None:
+    """The classes of a wildmatch pattern by the index of their ``[``, and the span of each of
+    its runs of ``*``; or None when git never matches it: a lone trailing backslash, or a class
+    that is unclosed or names an unknown ``[:name:]``.
 
     A match has to pass every element of the pattern, so wildmatch gives up on such a pattern
     (``WM_ABORT_ALL``) wherever it reaches the element, and nothing can match it. A class's
@@ -596,7 +601,7 @@ def _compile(pattern: bytes) -> tuple[dict[int, _Class], int] | None:
     ``dowild`` reads it.
     """
     classes = dict[int, _Class]()
-    star_runs = 0
+    star_runs = list[tuple[int, int]]()
     index = 0
     size = len(pattern)
     while index < size:
@@ -612,12 +617,46 @@ def _compile(pattern: bytes) -> tuple[dict[int, _Class], int] | None:
             classes[index] = compiled
             index = compiled.end + 1
         elif byte == 0x2A:  # "*"
-            star_runs += 1
+            run_start = index
             while index < size and pattern[index] == 0x2A:
                 index += 1
+            star_runs.append((run_start, index))
         else:
             index += 1
     return classes, star_runs
+
+
+def _recursing_runs(
+    pattern: bytes, star_runs: list[tuple[int, int]], start: int, pathname: bool
+) -> int:
+    """How many of ``pattern``'s runs of ``*`` make ``_dowild`` recurse when it starts at
+    ``start``, which bounds the depth of its recursion: each nested call starts after a later
+    run.
+
+    A run at the end of the pattern returns at once. With ``WM_PATHNAME``, a run that is not a
+    whole ``**`` component and is followed by ``/`` jumps to the next ``/`` in the text. Every
+    other run tries the rest of the pattern at each place in the text (a whole ``**/`` also
+    tries matching no directory), one level deeper.
+    """
+    size = len(pattern)
+    count = 0
+    for run_start, run_end in star_runs:
+        if run_end >= size:
+            continue
+        if pathname:
+            after = pattern[run_end]
+            whole = (
+                run_end - run_start >= 2
+                and (run_start == start or pattern[run_start - 1] == 0x2F)
+                and (
+                    after == 0x2F
+                    or (after == 0x5C and run_end + 1 < size and pattern[run_end + 1] == 0x2F)
+                )
+            )
+            if not whole and after == 0x2F:
+                continue
+        count += 1
+    return count
 
 
 # git's ASCII character classes (``sane_ctype``), as wildmatch's ``[:name:]`` tests them.
@@ -716,8 +755,9 @@ def _dowild(
 
     Its abort results are what keep it fast: a ``*`` that cannot match by taking the rest of the
     text tells every ``*`` further out to stop (``WM_ABORT_ALL``), so no pattern backtracks
-    through every way of splitting the text, as a regular expression would. Each run of ``*``
-    recurses once, so the depth is at most the pattern's runs of ``*`` (``_MAX_STAR_RUNS``).
+    through every way of splitting the text, as a regular expression would. Each nested call
+    starts after a later run of ``*``, so the depth is at most the pattern's runs that recurse
+    (``_recursing_runs``, at most ``_MAX_STAR_RUNS``).
     """
     p = start
     size = len(pattern)

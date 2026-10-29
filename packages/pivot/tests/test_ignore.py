@@ -926,9 +926,12 @@ def test_a_negation_too_long_to_match_matches_every_path(
     assert every_ignored == (False, False), "it matches every file and directory"
     assert dirs_ignored == (True, False), "with a trailing '/', every directory and no file"
     warnings = [record.getMessage() for record in caplog.records]
-    assert len(warnings) == 2, warnings
-    assert all("Negation on line 3 of .pivotignore has 257 runs of '*'" in w for w in warnings)
-    assert all("so it takes it to match every path" in w for w in warnings)
+    assert warnings == [
+        f"Negation on line 3 of .pivotignore ('{long_negation}{suffix}') has 257 runs of '*' that "
+        + "try more than one place; Pivot matches at most 256, so it takes it to match every "
+        + "path. Shorten it."
+        for suffix in ("", "/")
+    ]
 
 
 def test_a_pattern_too_long_to_match_is_not_used(
@@ -945,9 +948,53 @@ def test_a_pattern_too_long_to_match_is_not_used(
     assert not long_ignored
     assert filter_instance.is_ignored("notes.txt", is_dir=False)
     assert [record.getMessage() for record in caplog.records] == [
-        "Pattern on line 1 of .pivotignore has 257 runs of '*'; Pivot matches at most 256 and "
-        + "does not use it. Shorten it."
+        f"Pattern on line 1 of .pivotignore ('{'*a' * 257}') has 257 runs of '*' that try more "
+        + "than one place; Pivot matches at most 256 and does not use it. Shorten it."
     ]
+
+
+def test_the_limit_is_256_runs_of_star_that_try_more_than_one_place(
+    tmp_path: pathlib.Path, caplog: LogCaptureFixture
+) -> None:
+    """256 runs of "*" that each try every place are matched as git matches them; 257 are not,
+    and the warning quotes the line."""
+    at_limit, over_limit = "*a" * 256, "*a" * 257
+    for name, line in (("at", at_limit), ("over", over_limit)):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / ".pivotignore").write_text(line + "\n")
+
+    with caplog.at_level("WARNING", logger="pivot.ignore"):
+        at = ignore.IgnoreFilter(project_root=tmp_path / "at")
+        at_ignored = (at.is_ignored("a" * 256, is_dir=False), at.is_ignored("a" * 255))
+        at_warnings = [record.getMessage() for record in caplog.records]
+        over = ignore.IgnoreFilter(project_root=tmp_path / "over")
+        over_ignored = over.is_ignored("a" * 257, is_dir=False)
+
+    assert at_ignored == (True, False), "256 runs: matched as git matches them"
+    assert at_warnings == []
+    assert not over_ignored, "257 runs: not used"
+    assert [record.getMessage() for record in caplog.records] == [
+        f"Pattern on line 1 of .pivotignore ('{over_limit}') has 257 runs of '*' that try more "
+        + "than one place; Pivot matches at most 256 and does not use it. Shorten it."
+    ]
+
+
+def test_runs_of_star_that_never_recurse_do_not_count(
+    tmp_path: pathlib.Path, caplog: LogCaptureFixture
+) -> None:
+    """A lone "*" right before "/" matches the rest of one name, and a run at the end returns
+    at once: neither makes wildmatch recurse, so `*/` 257 times then `x`, and a line ending in
+    one more `*`, are matched as git matches them, with no warning."""
+    (tmp_path / ".pivotignore").write_text("*/" * 257 + "x\nkeep/" + "*/" * 300 + "*\n")
+
+    with caplog.at_level("WARNING", logger="pivot.ignore"):
+        filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+        deep_x = filter_instance.is_ignored("d/" * 257 + "x", is_dir=False)
+        short_x = filter_instance.is_ignored("d/" * 256 + "x", is_dir=False)
+        deep_keep = filter_instance.is_ignored("keep/" + "d/" * 300 + "f", is_dir=False)
+
+    assert (deep_x, short_x, deep_keep) == (True, False, True)
+    assert caplog.records == []
 
 
 def test_a_nul_byte_ends_a_line_as_in_git(tmp_path: pathlib.Path) -> None:
