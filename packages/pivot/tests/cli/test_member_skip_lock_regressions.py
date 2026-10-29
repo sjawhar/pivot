@@ -1,7 +1,6 @@
-"""PR540 reviewer, round 7 (sjawhar/pivot#540 at 31f438d2).
+"""Regression locks for other stages' members and `track`'s refusal.
 
-Regression locks for the round-6 findings the head fixes without a test; each passes at the head
-and fails at the round-6 head ca47c682:
+The tests lock down:
 
 - M1: another stage's committed listing that does not match its lock (a lock reverted without
   its listing) is read without a warning: the stage is not the command's.
@@ -12,14 +11,11 @@ and fails at the round-6 head ca47c682:
   path and prints no "outside base" warning.
 - M4: `track`'s refusal of a file a deleted stage left names the remedy, and the remedy works:
   remove the lock, then `pivot track --force <path>`; the file is then tracked.
-
-Red tests; each passes on main cea092a6 and fails at the head:
-
-- A: a lock of a stage the command does not run holds a YAML scalar the safe loader cannot
+- Y1: a lock of a stage the command does not run holds a YAML scalar the safe loader cannot
   build (`when: 2024-13-01`); commands that never run that stage must not fail.
-- C: the deleted stage's member is a symlink to its cache object, as pivot links each file of an
-  output when the cache lies on another filesystem; `track` must refuse the file it left, or the
-  file must then be tracked.
+- Y2: the deleted stage's member is a symlink to its cache object, as pivot links each file of
+  an output when the cache lies on another filesystem; `track` must refuse the file it left, or
+  the file must then be tracked.
 
 `_pivot` keeps `PYTHONPATH`, so a mutant run that points it at a mutated `src` reaches the CLI.
 """

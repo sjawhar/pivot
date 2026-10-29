@@ -199,15 +199,15 @@ class _LockFile:
         self._read = False
 
     def committed(self) -> CommittedLock | None:
-        """The decoded lock, or None when the file cannot be read or decoded as a lock."""
+        """The decoded lock, or None when any error naming, reading or decoding it occurs."""
         if not self._read:
             self._read = True
             try:
                 with open(self.path) as f:
                     document: object = yaml.load(f, Loader=yaml_config.Loader)
-            except (OSError, UnicodeDecodeError, yaml.YAMLError):
-                document = None
-            parsed = parse_committed(document)
+                parsed = parse_committed(document)
+            except (OSError, UnicodeError, yaml.YAMLError, ValueError, exceptions.PivotError):
+                return None
             if isinstance(parsed, CommittedLock):
                 self._document = document
                 self._committed = parsed
@@ -1309,12 +1309,14 @@ def restarted_reason(stage_lock: StageLock, proofs: list[pathlib.Path]) -> str:
 
 
 def stage_lock_files(stages_dir: pathlib.Path) -> dict[str, pathlib.Path]:
-    """Each lock file under ``stages_dir`` (``<stage name>.lock``, a regular file or a symlink
-    to one), by its stage name; none in a directory that cannot be listed (absent, unreadable,
-    or a configured path no directory can have). Symlinked directories are not entered, and an
-    entry whose type cannot be read (a symlink that loops or dangles into a directory it cannot
-    search) is no lock, as ``Path.is_file`` reads it. Each entry's type comes from the directory
-    listing (``os.scandir``), so only a symlink costs a ``stat``."""
+    """Each lock file under ``stages_dir`` (``<stage name>.lock`, a regular file or a symlink
+    to one) whose name can name a stage, by its stage name; none in a directory that cannot be
+    listed (absent, unreadable, or a configured path no directory can have). Symlinked
+    directories are not entered, and an entry whose type cannot be read (a symlink that loops
+    or dangles into a directory it cannot search) or whose name is invalid is no lock, as
+    ``Path.is_file`` and the stage-name rule read it. Each entry's type comes from the directory
+    listing (``os.scandir``), so only a symlink costs a ``stat``.
+    """
     found = dict[str, pathlib.Path]()
     pending = [(os.fspath(stages_dir), "")]
     while pending:
@@ -1329,7 +1331,8 @@ def stage_lock_files(stages_dir: pathlib.Path) -> dict[str, pathlib.Path]:
                     pending.append((entry.path, f"{prefix}{entry.name}/"))
                 elif entry.name.endswith(_LOCK_SUFFIX) and entry.is_file():
                     name = f"{prefix}{entry.name[: -len(_LOCK_SUFFIX)]}"
-                    found[name] = pathlib.Path(entry.path)
+                    if stage_name_error(name) is None:
+                        found[name] = pathlib.Path(entry.path)
             except OSError:
                 continue
     return found
@@ -1398,9 +1401,13 @@ def recorded_directories(
     kept = state_dir_mod.recorded_locks()
     found = dict[str, RecordedDirectory]()
     for stage_name in {name for files in listed for name in files} - set(exclude):
-        choice = _choose_stage_lock(stages_dir, stage_name, other_dir)
-        lock_files = tuple(files[stage_name] for files in listed if stage_name in files)
-        for record in _directory_records(stage_name, choice, kept):
+        try:
+            choice = _choose_stage_lock(stages_dir, stage_name, other_dir)
+            lock_files = tuple(files[stage_name] for files in listed if stage_name in files)
+            records = _directory_records(stage_name, choice, kept)
+        except (OSError, UnicodeError, ValueError, exceptions.PivotError):
+            continue
+        for record in records:
             found[record.path] = RecordedDirectory(
                 stage_name, record, lock_files, choice.stages_dir
             )
