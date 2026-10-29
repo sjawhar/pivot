@@ -33,6 +33,8 @@ class Store(Protocol):
         ref: types.ArtifactRef,
         claims: ownership.StageClaims | None = None,
         returned: ownership.StageMembers | None = None,
+        *,
+        state_dir: pathlib.Path | None = None,
     ) -> pathlib.Path: ...
 
     def commit(
@@ -112,10 +114,13 @@ class CacheStore:
         ref: types.ArtifactRef,
         claims: ownership.StageClaims | None = None,
         returned: ownership.StageMembers | None = None,
+        *,
+        state_dir: pathlib.Path | None = None,
     ) -> pathlib.Path:
         """A fresh path in the cache for the output. Nothing in the workspace is replaced, so
-        ``claims`` and ``returned`` (the stage's ``*.pvt`` files there) do not apply."""
-        _ = claims, returned
+        ``claims`` and ``returned`` (the stage's ``*.pvt`` files there) and ``state_dir`` (for
+        a workspace path's restore lock) do not apply."""
+        _ = claims, returned, state_dir
         state_dir_mod.make_dirs(self._cache_dir)
         if ref.tag == types.ArtifactTag.DIRECTORY:
             return pathlib.Path(tempfile.mkdtemp(prefix="pivot_cache_out_", dir=self._cache_dir))
@@ -312,6 +317,22 @@ class WorkspaceStore:
             lambda path: ownership.stage_members(path, claims, returned=written.get(path)),
         )
 
+    def _write_target(
+        self,
+        ref: types.ArtifactRef,
+        claims: ownership.StageClaims | None,
+        returned: ownership.StageMembers | None,
+    ) -> ownership.ForcedRestore:
+        """The forced-restore target for a stage write of ``ref``: its own ``*.pvt`` files are
+        ``ownership.stage_members`` of ``claims`` and of what this run writes (``returned``)."""
+        output_path = ownership.normalized(self._resolve_output_path(ref))
+        return ownership.ForcedRestore(
+            replacement=ownership.stage_output(output_path, ref.identity.producer),
+            restored=None,
+            claims=None if claims is None else lambda: claims,
+            written={} if returned is None else returned,
+        )
+
     def refuse_output_replacement_at_write(
         self,
         ref: types.ArtifactRef,
@@ -321,13 +342,7 @@ class WorkspaceStore:
         """Run the forced-restore refusal after an output is prepared and before its writer
         writes, so a user file that landed in that window is named instead of becoming a loader
         error."""
-        output_path = ownership.normalized(self._resolve_output_path(ref))
-        target = ownership.ForcedRestore(
-            replacement=ownership.stage_output(output_path, ref.identity.producer),
-            restored=None,
-            claims=None if claims is None else lambda: claims,
-            written={} if returned is None else returned,
-        )
+        target = self._write_target(ref, claims, returned)
         refusal = ownership.forced_restore_refusal(self._project_root, [target])
         if refusal is not None:
             raise refusal
@@ -337,19 +352,34 @@ class WorkspaceStore:
         ref: types.ArtifactRef,
         claims: ownership.StageClaims | None = None,
         returned: ownership.StageMembers | None = None,
+        *,
+        state_dir: pathlib.Path | None = None,
     ) -> pathlib.Path:
         """Clear the output's path for the stage to write, refusing first if that would remove
-        a user's file (``refuse_output_replacements``)."""
+        a user's file (``refuse_output_replacements``).
+
+        The old output is checked again just before it is removed (``cache.remove_output_checked``,
+        ``ownership.swap_refusal``): a directory renamed aside, so a user's file copied into it
+        after the first check is named and put back with the output, never deleted; a file in
+        place, just before it is unlinked. Only the first check sees a sidecar that names a path
+        holding nothing. With ``state_dir`` the removal holds the path's restore lock and first
+        removes, once checked the same way, the backup a killed stage write of the path left.
+        """
         self.refuse_output_replacements(
             [ref], claims, None if returned is None else {ref: returned}
         )
         path = self._resolve_path(ref)
-        if ref.tag == types.ArtifactTag.DIRECTORY:
-            cache.remove_output(path)
-            path.mkdir(parents=True, exist_ok=True)
-            return path
         path.parent.mkdir(parents=True, exist_ok=True)
-        cache.remove_output(path)
+        target = self._write_target(ref, claims, returned)
+
+        def refuse_moved(entry: pathlib.Path) -> None:
+            refusal = ownership.swap_refusal(self._project_root, target, entry)
+            if refusal is not None:
+                raise refusal
+
+        cache.remove_output_checked(path, refuse_moved, state_dir)
+        if ref.tag is types.ArtifactTag.DIRECTORY:
+            path.mkdir(exist_ok=True)
         return path
 
     def commit(
@@ -370,7 +400,9 @@ class WorkspaceStore:
         its hash, so the lock writer has its listing. The stage's own ``*.pvt`` files in the
         output are ``ownership.stage_members`` of ``claims`` and of the ones this run wrote there
         (``written``); every other ``*.pvt`` there is a user's, and the commit refuses before
-        linking the output to the cache would replace it.
+        linking the output to the cache would replace it. A directory that symlink mode replaces
+        by a link to its cache tree is renamed aside and checked again there, as
+        ``prepare_output`` does, and goes back when that check refuses.
         """
         hashed: types.FileHash | listing.HashedDirectory
         if path.is_dir():
@@ -388,12 +420,20 @@ class WorkspaceStore:
             self.refuse_output_replacements(
                 [ref], claims, None if written is None else {ref: written}
             )
+            target = self._write_target(ref, claims, written)
+
+            def refuse_moved(entry: pathlib.Path) -> None:
+                refusal = ownership.swap_refusal(self._project_root, target, entry)
+                if refusal is not None:
+                    raise refusal
+
             cache.store_hashed_output(
                 path,
                 hashed,
                 self._cache_dir,
                 self._checkout_modes,
                 state_dir=state_dir,
+                before_remove=refuse_moved,
             )
         return _record(hashed, hashed_dirs) if "listing" in hashed else hashed
 

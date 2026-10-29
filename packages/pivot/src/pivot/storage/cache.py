@@ -825,20 +825,31 @@ def _clear_path(path: pathlib.Path) -> None:
     if path.is_dir() and not path.is_symlink():
         shutil.rmtree(path, onexc=_make_writable_and_retry)
     else:
-        try:
-            path.unlink()
-        except PermissionError as perm_err:
-            # Make parent directory writable, not the file itself.
-            # Files may be hardlinks to read-only cache - chmod would corrupt cache.
-            parent = path.parent
-            try:
-                parent_perm = parent.stat().st_mode
-            except FileNotFoundError:
-                # Parent was deleted concurrently - re-raise original error
-                raise perm_err from None
-            if not (parent_perm & stat.S_IWUSR):
-                os.chmod(parent, parent_perm | stat.S_IWUSR)
-            path.unlink()
+        _unlink(path)
+
+
+def _unlink(path: pathlib.Path) -> None:
+    """Unlink the file or symlink at ``path``, making a read-only parent writable first if that
+    is what refuses it. Never chmod the file: it may be a hardlink to the read-only cache. A
+    directory at ``path`` is never removed: unlink fails on it."""
+    try:
+        path.unlink()
+    except PermissionError as perm_err:
+        _make_parent_writable(path, perm_err)
+        path.unlink()
+
+
+def _make_parent_writable(path: pathlib.Path, error: PermissionError) -> None:
+    """Make ``path``'s parent directory writable after ``error`` refused removing or renaming
+    ``path``; raise ``error`` when the parent is gone or was writable already."""
+    try:
+        parent_mode = path.parent.stat().st_mode
+    except FileNotFoundError:
+        # Parent was deleted concurrently - re-raise original error
+        raise error from None
+    if parent_mode & stat.S_IWUSR:
+        raise error
+    os.chmod(path.parent, parent_mode | stat.S_IWUSR)
 
 
 def _is_real_dir(path: pathlib.Path) -> bool:
@@ -850,9 +861,11 @@ def _cleanup_stale_restore_temps(parent_dir: pathlib.Path) -> None:
     """Remove stale restore temporaries (staged replacements) older than max age.
 
     It takes no lock, so it never removes a backup (``_BACKUP_TEMP_PREFIX``): a backup is the
-    entry a restore renamed aside, which keeps its own old mtime and may still be under that
-    restore's check. Only the next directory restore of the same path removes a backup, under
-    that path's restore lock (``_cleanup_fresh_restore_orphans``); a file restore removes none.
+    directory (or, for a restore, any entry) a restore or a stage write renamed aside, which keeps
+    its own old mtime and may still be under that command's check. Only a command holding the
+    same path's restore lock removes a backup a killed one left, once it is checked: the next
+    directory restore of the path considers every one (``_cleanup_fresh_restore_orphans``), and
+    the next stage write of the path the one at ``_locked_backup_path``.
     """
     cutoff = time.time() - _RESTORE_TEMP_MAX_AGE
 
@@ -884,25 +897,34 @@ def _cleanup_fresh_restore_orphans(
     token: str,
     before_swap: Callable[[pathlib.Path], None] | None = None,
 ) -> None:
-    """Remove fresh temporaries from a killed restore under ``path``'s restore lock.
+    """Remove fresh temporaries from a killed restore or stage write under ``path``'s restore lock.
 
-    A backup is the old entry a killed directory restore had renamed aside. Before deleting one,
-    the same swap check the pending restore would run must prove that it holds no user file. A
-    refusal keeps the backup and warns with the refusal, which names the user file.
+    A backup is the old entry a killed directory restore or stage write had renamed aside; each is
+    checked before it is removed (``_remove_backup_left``).
     """
     restore_prefix = f"{_RESTORE_TEMP_PREFIX}{token}."
     backup_prefix = f"{_BACKUP_TEMP_PREFIX}{token}."
     for entry in os.scandir(path.parent):
-        if not entry.name.startswith((restore_prefix, backup_prefix)):
-            continue
-        orphan = pathlib.Path(entry.path)
-        if entry.name.startswith(backup_prefix) and before_swap is not None:
-            try:
-                before_swap(orphan)
-            except exceptions.OutputOwnershipError as error:
-                logger.warning("Keeping interrupted restore backup %s: %s", orphan, error)
-                continue
-        _clear_path(orphan)
+        if entry.name.startswith(backup_prefix):
+            _ = _remove_backup_left(pathlib.Path(entry.path), before_swap)
+        elif entry.name.startswith(restore_prefix):
+            _clear_path(pathlib.Path(entry.path))
+
+
+def _remove_backup_left(backup: pathlib.Path, check: Callable[[pathlib.Path], None] | None) -> bool:
+    """Remove the backup a killed restore or stage write left, once ``check`` (the swap check the
+    pending command would run) proves that it holds no user file; return whether it is gone.
+
+    A refusal keeps the backup and warns with the refusal, which names the user file.
+    """
+    if check is not None:
+        try:
+            check(backup)
+        except exceptions.OutputOwnershipError as error:
+            logger.warning("Keeping interrupted restore backup %s: %s", backup, error)
+            return False
+    _clear_path(backup)
+    return True
 
 
 def _get_symlink_cache_hash(path: pathlib.Path, cache_dir: pathlib.Path) -> str | None:
@@ -1889,8 +1911,14 @@ def _store_directory(
     *,
     keep_existing_copy: bool,
     state_dir: pathlib.Path | None = None,
+    before_remove: Callable[[pathlib.Path], None] | None = None,
 ) -> None:
-    """Put a directory's files and its listing in the cache, then link it per mode."""
+    """Put a directory's files and its listing in the cache, then link it per mode.
+
+    In SYMLINK mode the directory is replaced by a symlink to its cache tree. With
+    ``before_remove`` (a stage output's swap check) the directory is first renamed aside and
+    checked there, and goes back when the check refuses (``_remove_checked``); without it, it is
+    removed unchecked."""
     members = hashed["listing"]
     manifest = members["files"]
     # Cache individual files first, then the listing, at the directory's hash
@@ -1900,7 +1928,7 @@ def _store_directory(
         copy_to_cache(file_path, cache_path, executable=entry["isexec"])
     listing.store_object(cache_dir, hashed["record"]["hash"], hashed["data"])
 
-    with restore_lock(path, state_dir):
+    with restore_lock(path, state_dir) as lock_token:
         if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK:
             # SYMLINK mode: cache entire directory, symlink to it
             cache_dir_path = tree_path(cache_dir, hashed["record"]["hash"])
@@ -1919,7 +1947,10 @@ def _store_directory(
                     + "to let this commit publish it again"
                 )
 
-            _clear_path(path)
+            if before_remove is None:
+                _clear_path(path)
+            else:
+                _remove_checked(path, before_remove, lock_token)
             path.symlink_to(cache_dir_path.resolve())
         else:
             # HARDLINK/COPY modes: replace each file with link/copy from cache
@@ -1945,13 +1976,16 @@ def store_hashed_output(
     checkout_modes: list[CheckoutMode] | None = None,
     *,
     state_dir: pathlib.Path | None = None,
+    before_remove: Callable[[pathlib.Path], None] | None = None,
 ) -> None:
     """Put an output whose hash is already known into the cache, then link it per mode.
 
     ``hashed`` must describe ``path``'s current contents; nothing is hashed again. Each file is
     copied into the cache once, a directory's listing beside them, and the workspace path is
     linked to the cache entry with the first checkout mode that works. Reaching COPY leaves the
-    workspace file as it is, since it already holds the cached bytes.
+    workspace file as it is, since it already holds the cached bytes. ``before_remove`` checks a
+    directory that SYMLINK mode replaces by a link to its cache tree (``_store_directory``); a
+    file, and each file of a directory in the other modes, is replaced without it.
     """
     effective_modes = _resolve_checkout_modes(None, checkout_modes)
     if "listing" in hashed:
@@ -1962,6 +1996,7 @@ def store_hashed_output(
             effective_modes,
             keep_existing_copy=True,
             state_dir=state_dir,
+            before_remove=before_remove,
         )
     else:
         _store_file(
@@ -2251,10 +2286,43 @@ def _restore_directory_from_cache(
 
 
 def _backup_path(path: pathlib.Path, token: str) -> pathlib.Path:
-    """A fresh name beside ``path`` to rename it to while a restore swaps in its replacement,
-    tagged with ``path``'s restore token so the next directory restore of ``path`` removes an
-    orphan. A file restore removes none: a killed one's backup stays beside ``path``."""
+    """A fresh name beside ``path`` to rename it to while a restore swaps in its replacement (or
+    a stage write removes it without ``_locked_backup_path``), tagged with ``path``'s restore
+    token so the next directory restore of ``path`` removes an orphan. No file restore or stage
+    write looks for it: a killed one's backup stays beside ``path`` until a directory restore."""
     return path.parent / f"{_BACKUP_TEMP_PREFIX}{token}.{secrets.token_hex(4)}"
+
+
+def _locked_backup_path(path: pathlib.Path, token: str) -> pathlib.Path:
+    """The one name beside ``path`` that a stage write holding ``path``'s restore lock renames an
+    old directory output to (``_remove_checked``), so the next stage write of ``path`` finds a
+    killed one's backup with one ``lstat``. It carries the restore token too, so a directory
+    restore of ``path`` considers it like any other backup."""
+    return path.parent / f"{_BACKUP_TEMP_PREFIX}{token}.old"
+
+
+# rename() errors from a filesystem that cannot give this entry another name in its directory:
+# overlayfs with redirect_dir off (the default on many kernels) for a directory on a lower layer
+# (EXDEV), and filesystems that do not rename it at all (ENOTSUP, EOPNOTSUPP).
+_NO_RENAME_ERRNO = frozenset({errno.EXDEV, errno.ENOTSUP, errno.EOPNOTSUPP})
+
+
+def _rename_aside(path: pathlib.Path, backup_path: pathlib.Path) -> bool:
+    """Rename the entry at ``path`` to ``backup_path``; return False, renaming nothing, where
+    the filesystem cannot rename it (``_NO_RENAME_ERRNO``).
+
+    The caller then checks the entry in place and removes it, as before renames aside existed:
+    there a file copied into it after the check is removed with it. Every other error propagates
+    (FileNotFoundError when nothing is at ``path``, EBUSY when it is a mount point).
+    """
+    try:
+        path.rename(backup_path)
+    except OSError as error:
+        if error.errno not in _NO_RENAME_ERRNO:
+            raise
+        logger.debug("Cannot rename %s aside (%s); checking and removing it in place", path, error)
+        return False
+    return True
 
 
 def _swap_in(
@@ -2268,12 +2336,20 @@ def _swap_in(
     The entry is first renamed to ``backup_path`` and checked there by ``before_swap``
     (``restore_from_cache``): when the check raises, the entry goes back (``_put_back_checked``).
     When ``staged`` cannot take its place, the entry goes back if ``path`` is still free. Either
-    way the error propagates and ``staged`` is left for the caller to remove.
+    way the error propagates and ``staged`` is left for the caller to remove. Where the
+    filesystem cannot rename the entry (``_rename_aside``), ``before_swap`` checks it in place
+    and it is removed before ``staged`` takes its place, so it cannot go back.
     """
     try:
-        path.rename(backup_path)
+        renamed = _rename_aside(path, backup_path)
     except FileNotFoundError:
         # Nothing at path: nothing to check or remove
+        staged.replace(path)
+        return
+    if not renamed:
+        if before_swap is not None:
+            before_swap(path)
+        _clear_path(path)
         staged.replace(path)
         return
     if before_swap is not None:
@@ -2318,6 +2394,81 @@ def _put_back_checked(moved: pathlib.Path, path: pathlib.Path) -> None:
         logger.warning("Could not put %s back (%s), nor keep it at %s: %s", path, reason, kept, e)
         return
     logger.warning("Could not put %s back (%s); it is at %s", path, reason, kept)
+
+
+def remove_output_checked(
+    path: pathlib.Path,
+    before_remove: Callable[[pathlib.Path], None],
+    state_dir: pathlib.Path | None = None,
+) -> None:
+    """Remove the entry at ``path`` once ``before_remove`` has checked it (``_remove_checked``),
+    holding ``path``'s restore lock when ``state_dir`` is given."""
+    with restore_lock(path, state_dir) as token:
+        _remove_checked(path, before_remove, token)
+
+
+def _remove_checked(
+    path: pathlib.Path, before_remove: Callable[[pathlib.Path], None], token: str | None
+) -> None:
+    """Remove the entry at ``path`` once ``before_remove`` has checked it.
+
+    A file or symlink is checked in place and unlinked, as a restore checks a file it replaces:
+    a file moved over it in the instant between the check and the unlink is removed. Renaming it
+    aside would close only that instant, and on overlayfs renaming a lower-layer file first copies
+    all of it up into the writable layer. The unlink never removes a directory that took the path
+    after the check; it fails instead.
+
+    A directory is first renamed beside ``path``: once renamed, no writer that names its files by
+    path can add one to it, so ``before_remove`` sees every file the removal deletes. When the
+    check raises, the directory goes back (``_put_back_checked``) and the error propagates.
+    Otherwise the backup is removed; if that fails, what is left of it goes back and the error
+    propagates. Where the filesystem cannot rename it (``_rename_aside``), ``before_remove``
+    checks it in place and it is removed there.
+
+    ``token`` is ``path``'s restore token when the caller holds its restore lock, else None. Under
+    the lock the backup is ``_locked_backup_path``. The backup a killed removal left there is
+    checked first and removed (``_remove_backup_left``), even when nothing is at ``path``; if it
+    holds a user's file it is kept, with a warning, and this removal takes a fresh
+    ``_backup_path``, as it does without the lock. A process killed between the rename and the
+    removal leaves the backup beside ``path``, for the next stage write or directory restore of
+    ``path``.
+    """
+    backup_path = None
+    if token is not None:
+        backup_path = _locked_backup_path(path, token)
+        if os.path.lexists(backup_path) and not _remove_backup_left(backup_path, before_remove):
+            backup_path = _backup_path(path, token)
+    try:
+        mode = os.lstat(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        # Nothing at path, the common case of a first run: one lstat answers it
+        return
+    if not stat.S_ISDIR(mode):
+        before_remove(path)
+        with contextlib.suppress(FileNotFoundError):
+            _unlink(path)
+        return
+    if backup_path is None:
+        backup_path = _backup_path(path, _restore_target_token(path))
+    try:
+        try:
+            renamed = _rename_aside(path, backup_path)
+        except PermissionError as perm_err:
+            # As _unlink does: make the parent directory writable, never the entry itself
+            _make_parent_writable(path, perm_err)
+            renamed = _rename_aside(path, backup_path)
+    except FileNotFoundError:
+        return
+    if not renamed:
+        before_remove(path)
+        _clear_path(path)
+        return
+    try:
+        before_remove(backup_path)
+        _clear_path(backup_path)
+    except BaseException:
+        _put_back_checked(backup_path, path)
+        raise
 
 
 def remove_output(path: pathlib.Path) -> None:

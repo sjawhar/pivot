@@ -1977,6 +1977,7 @@ def _write_outputs_with_store(
     project_root: pathlib.Path,
     dependency_paths: collections_abc.Collection[pathlib.Path] = (),
     claims: ownership.StageClaims | None = None,
+    state_dir: pathlib.Path | None = None,
 ) -> WrittenOutputs:
     """Write a stage's outputs once every one of them has passed its checks.
 
@@ -1984,6 +1985,7 @@ def _write_outputs_with_store(
     stage before any output is prepared, so the previous run's outputs stay as they were.
     ``claims`` (the stage's, for a workspace store) decide which ``*.pvt`` files already in an
     output are the stage's, and record each one this run writes before it lands there.
+    ``state_dir`` holds the restore locks under which each old output is removed.
     """
     checked = {
         ref: _check_output_value(ref, value, project_root, dependency_paths)
@@ -2011,7 +2013,9 @@ def _write_outputs_with_store(
     paths = dict[types.ArtifactRef, pathlib.Path]()
     written = dict[types.ArtifactRef, ownership.StageMembers]()
     for ref, value in checked.items():
-        paths[ref], members = _write_output_with_store(ref, value, store, claims, returned.get(ref))
+        paths[ref], members = _write_output_with_store(
+            ref, value, store, claims, returned.get(ref), state_dir
+        )
         if members:
             written[ref] = members
     return WrittenOutputs(paths=paths, pvt_members=written)
@@ -2023,10 +2027,11 @@ def _write_output_with_store(
     store: store_mod.Store,
     claims: ownership.StageClaims | None = None,
     returned: ownership.StageMembers | None = None,
+    state_dir: pathlib.Path | None = None,
 ) -> tuple[pathlib.Path, ownership.StageMembers]:
     """Write one output; return its path and the ``*.pvt`` files written in it, with content."""
     with stage_io.PIVOT_IO:
-        output_path = store.prepare_output(ref, claims, returned)
+        output_path = store.prepare_output(ref, claims, returned, state_dir=state_dir)
     if isinstance(store, store_mod.WorkspaceStore):
         store.refuse_output_replacement_at_write(ref, claims, returned)
     writer = cast("Any", ref.format)
@@ -2215,8 +2220,8 @@ def _prepare_incremental_inputs(
                 + "to reset this incremental output."
             )
         output_path = store.resolve_display_path(ref)
-        store.refuse_output_replacements([ref], claims)
-        cache.remove_output(output_path)
+        # The restore checks the output, then replaces it with a copy (a directory renamed aside
+        # and checked there, a file checked in place just before the rename): nothing goes first
         if not store.restore_from_cache(
             ref,
             output_hash,
@@ -2291,7 +2296,7 @@ def _run_stage_function_with_store(
 
         output_values = _resolve_output_values(result, outs, stage_name)
         return _write_outputs_with_store(
-            output_values, store, project_root, dependency_paths, claims
+            output_values, store, project_root, dependency_paths, claims, project_state_dir
         )
 
 
