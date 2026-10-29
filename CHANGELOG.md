@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.6.1 (2026-10-29)
+
+### Performance Improvements
+
+- **storage**: Find a file hash by file identity, and save what status reads
+  ([#525](https://github.com/sjawhar/pivot/pull/525),
+  [`bba86fd`](https://github.com/sjawhar/pivot/commit/bba86fd242f452d89cfeef3e1b2ec8b99610e96e))
+
+
 ## v0.6.0 (2026-10-29)
 
 ### Features
