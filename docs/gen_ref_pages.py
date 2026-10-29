@@ -11,7 +11,7 @@ PUBLIC_MODULES: list[tuple[str, str, list[str] | None]] = [
     ("pivot.compose", "Pipelines and Stages", ["Pipeline", "stage", "ArtifactHandle"]),
     ("pivot.stage_def", "Stage Parameters", ["StageParams"]),
     ("pivot.loaders", "Loaders", None),
-    ("pivot.decorators", "Decorators", ["no_fingerprint"]),
+    ("pivot.decorators", "Decorators", ["no_fingerprint", "fingerprint_by_name"]),
 ]
 
 for module_path, display_name, members in PUBLIC_MODULES:

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, TypedDict
 import pytest
 
 from pivot import cli, exceptions, project, run_history, types
-from pivot.storage import cache, gc, lock, state, track
+from pivot.storage import cache, gc, listing, lock, state, track
 
 if TYPE_CHECKING:
     import pathlib
@@ -87,18 +87,23 @@ def _helper_publish(space: Workspace, content: str) -> str:
     return key
 
 
-def _helper_publish_tree(space: Workspace, name: str) -> types.DirHash:
-    """Publish one directory object, its member blobs included, naming nothing."""
+def _helper_publish_tree(space: Workspace, name: str) -> listing.HashedDirectory:
+    """Publish one directory object — its listing, its member blobs and its whole-directory
+    tree — naming nothing."""
     source = space["scratch"] / name
     source.mkdir()
     (source / "a.txt").write_text(f"{name}-a")
     (source / "b.txt").write_text(f"{name}-b")
+    hashed_dirs = dict[str, listing.HashedDirectory]()
     output_hash = cache.save_to_cache(
-        source, space["object_root"], checkout_mode=cache.CheckoutMode.SYMLINK
+        source,
+        space["object_root"],
+        checkout_mode=cache.CheckoutMode.SYMLINK,
+        hashed_dirs=hashed_dirs,
     )
-    assert types.is_dir_hash(output_hash), "a directory hashes to a tree"
+    assert types.is_dir_hash(output_hash), "a directory hashes to a listing"
     cache.remove_output(source)
-    return output_hash
+    return hashed_dirs[output_hash["hash"]]
 
 
 def _helper_write_lock(
@@ -106,9 +111,11 @@ def _helper_write_lock(
     stage_name: str = _STAGE,
     outs: dict[str | None, types.HashInfo] | None = None,
     deps: dict[str, types.HashInfo] | None = None,
-) -> None:
-    """Write the lock file a stage writes after it runs."""
-    lock.StageLock(stage_name, space["stages_dir"]).write(
+    hashed_dirs: dict[str, listing.HashedDirectory] | None = None,
+) -> list[pathlib.Path]:
+    """Write the lock file a stage writes after it runs, with the listing of each directory it
+    records (from ``hashed_dirs``, else the cache's object)."""
+    return lock.StageLock(stage_name, space["stages_dir"]).write(
         types.LockData(
             code_manifest={"self:test": "abc123"},
             params={},
@@ -120,7 +127,9 @@ def _helper_write_lock(
                 types.ArtifactIdentity(stage_name, key): hash_info
                 for key, hash_info in (outs or {}).items()
             },
-        )
+        ),
+        hashed_dirs=hashed_dirs,
+        cache_dir=space["object_root"],
     )
 
 
@@ -157,6 +166,23 @@ def _helper_keys(space: Workspace) -> set[str]:
     """Every cache key still in the object store."""
     keys = set[str]()
     for prefix in space["object_root"].iterdir():
+        if len(prefix.name) != 2:
+            continue
+        keys.update(
+            prefix.name + entry.name
+            for entry in prefix.iterdir()
+            if cache.is_valid_hash(prefix.name + entry.name)
+        )
+    return keys
+
+
+def _helper_trees(space: Workspace) -> set[str]:
+    """Every whole-directory tree still in the cache."""
+    keys = set[str]()
+    trees = space["cache_dir"] / gc.TREES_DIR
+    if not trees.is_dir():
+        return keys
+    for prefix in trees.iterdir():
         if len(prefix.name) != 2:
             continue
         keys.update(
@@ -264,19 +290,57 @@ def test_gc_keeps_an_object_only_a_cache_ref_names(
     assert _helper_keys(workspace) == {referenced}, result.output
 
 
+def test_gc_keeps_a_tree_only_a_workspace_symlink_names(
+    workspace: Workspace, runner: click.testing.CliRunner
+) -> None:
+    """A whole-directory symlink checkout links the output to the tree, and `pivot get --rev`
+    leaves one whose record is in git history alone. The link names that tree."""
+    tree = _helper_publish_tree(workspace, "linked-tree")
+    dead = _helper_publish_tree(workspace, "dead-tree")
+    out = workspace["root"] / "data" / "demo" / "out"
+    out.parent.mkdir(parents=True)
+    out.symlink_to(cache.tree_path(workspace["object_root"], tree["record"]["hash"]).resolve())
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code == 0, result.output
+    assert _helper_trees(workspace) == {tree["record"]["hash"]}, result.output
+    assert out.resolve().is_dir(), "the checked-out directory must not dangle"
+    assert dead["record"]["hash"] not in _helper_keys(workspace), "nothing names the dead tree"
+
+
+def test_gc_keeps_the_members_a_run_cache_rows_directory_names(
+    workspace: Workspace, runner: click.testing.CliRunner
+) -> None:
+    """A row records a directory by its listing's hash, size and file count; the members it
+    restores are named only inside that listing."""
+    tree = _helper_publish_tree(workspace, "row-tree")
+    _helper_publish(workspace, "unnamed")
+    _helper_write_run_cache_row(workspace, tree["record"])
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code == 0, result.output
+    members = {entry["hash"] for entry in tree["listing"]["files"]}
+    assert _helper_keys(workspace) == {tree["record"]["hash"], *members}, result.output
+
+
 def test_gc_keeps_a_trees_members_while_the_tree_lives(
     workspace: Workspace, runner: click.testing.CliRunner
 ) -> None:
     """A tree holds copies, so its members must be kept beside it or a repair fails."""
     tree = _helper_publish_tree(workspace, "kept-tree")
     _helper_publish(workspace, "unnamed")
-    _helper_write_lock(workspace, outs={None: tree})
+    _helper_write_lock(
+        workspace, outs={None: tree["record"]}, hashed_dirs={tree["record"]["hash"]: tree}
+    )
 
     result = _helper_run(runner, "--yes", "--grace-hours", "0")
 
     assert result.exit_code == 0, result.output
-    members = {entry["hash"] for entry in tree["manifest"]}
-    assert _helper_keys(workspace) == {tree["hash"], *members}, result.output
+    members = {entry["hash"] for entry in tree["listing"]["files"]}
+    assert _helper_keys(workspace) == {tree["record"]["hash"], *members}, result.output
+    assert _helper_trees(workspace) == {tree["record"]["hash"]}, "the tree a lock names went"
 
 
 def test_gc_removes_a_tree_with_its_marker_and_leaves_its_lock_file(
@@ -284,7 +348,7 @@ def test_gc_removes_a_tree_with_its_marker_and_leaves_its_lock_file(
 ) -> None:
     """A tree no record names goes with its `.verified` marker; lock files never go."""
     tree = _helper_publish_tree(workspace, "dead-tree")
-    tree_path = cache.get_cache_path(workspace["object_root"], tree["hash"])
+    tree_path = cache.tree_path(workspace["object_root"], tree["record"]["hash"])
     marker = tree_path.with_name(tree_path.name + cache.TREE_MARKER_SUFFIXES[0])
     tree_lock = tree_path.with_name(tree_path.name + ".lock")
     tree_lock.touch()

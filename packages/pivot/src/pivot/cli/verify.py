@@ -13,12 +13,10 @@ from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
-from pivot.storage import lock
-from pivot.types import HashInfo, PipelineStatus, PipelineStatusInfo, is_dir_hash
+from pivot.storage import listing, lock, track
+from pivot.types import HashInfo, LockData, PipelineStatus, PipelineStatusInfo, is_dir_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from pivot.remote import protocol
 
 
@@ -26,7 +24,8 @@ VerifyStatus = Literal["passed", "failed"]
 
 
 class StageVerifyInfo(TypedDict):
-    """Verification info for a single stage."""
+    """Verification info for a single stage, or for a tracked directory whose committed listing
+    verify refuses (named by its path)."""
 
     name: str
     status: VerifyStatus
@@ -41,39 +40,83 @@ class VerifyOutput(TypedDict):
     stages: list[StageVerifyInfo]
 
 
-def _extract_file_hashes(hash_infos: Mapping[str, HashInfo]) -> dict[str, str]:
-    """Extract individual file hashes from a hash_info dict.
+def _object_hashes(
+    path: str,
+    hash_info: HashInfo,
+    committed: pathlib.Path | None,
+    files_dir: pathlib.Path,
+) -> dict[str, str]:
+    """The cache objects an output or dependency at ``path`` needs, by workspace path.
 
-    Tree hashes (directory hashes) are computed, not cached - only individual
-    file hashes are stored in the cache. For directories with manifests,
-    extracts each manifest entry's hash.
+    A directory needs its listing object (keyed by the directory's path) and each file's
+    object, named by its listing (``committed``, else the cache's object). A committed listing
+    that does not hash to its record, or cannot be read, is refused (CorruptListingError,
+    naming it): a fresh clone would have no cache to restore from.
     """
-    result = dict[str, str]()
-    for path, hash_info in hash_infos.items():
-        if is_dir_hash(hash_info):
-            for entry in hash_info["manifest"]:
-                entry_path = str(pathlib.Path(path) / entry["relpath"])
-                result[entry_path] = entry["hash"]
-        else:
-            result[path] = hash_info["hash"]
+    result = {path: hash_info["hash"]}
+    if not is_dir_hash(hash_info):
+        return result
+    try:
+        members = listing.read(committed, hash_info, files_dir, strict=True)
+    except exceptions.ListingMissingError:
+        return result
+    for entry in members["files"]:
+        result[str(pathlib.Path(path) / entry["relpath"])] = entry["hash"]
     return result
+
+
+def _check_tracked_listing(
+    data_path: pathlib.Path, pvt_data: track.PvtData | None, files_dir: pathlib.Path
+) -> None:
+    """Refuse a tracked directory's committed ``.pvt.listing`` that does not hash to its
+    ``.pvt``'s record (``pvt_data``) or cannot be read (CorruptListingError, naming it)."""
+    if pvt_data is None or "nfiles" not in pvt_data:
+        return
+    try:
+        track.tracked_members(data_path, pvt_data, files_dir, strict=True)
+    except exceptions.ListingMissingError:
+        return
+
+
+def _tracked_listing_failures(files_dir: pathlib.Path) -> list[StageVerifyInfo]:
+    """A failed result, named by its path, for each tracked directory in the project whose
+    committed ``.pvt.listing`` cannot be used (``_check_tracked_listing``), whether or not a
+    stage reads it: a fresh clone would have no cache to restore it from."""
+    project_root = project.get_project_root()
+    failures = list[StageVerifyInfo]()
+    for path, pvt_data in sorted(track.discover_pvt_files(project_root).items()):
+        try:
+            _check_tracked_listing(pathlib.Path(path), pvt_data, files_dir)
+        except exceptions.CorruptListingError as e:
+            failures.append(
+                StageVerifyInfo(
+                    name=project.to_relative_path(path, project_root),
+                    status="failed",
+                    reason=f"{e}. {e.REMEDY}",
+                    missing_files=[],
+                )
+            )
+    return failures
 
 
 def _get_stage_lock_hashes(
     stage_name: str,
 ) -> tuple[dict[str, str], dict[str, str]]:
-    """Get output and dep file hashes from a stage's lock file.
+    """Get output and dep cache-object hashes from a stage's lock file and listings.
 
     Returns (output_hashes, dep_hashes) where each is {path: hash}.
 
-    For both outputs and deps, includes manifest entry hashes for directories.
-    Non-cached outputs (e.g. Metric with cache=False) are excluded —
-    they are git-tracked, not in cache.
+    For both outputs and deps, a directory contributes its listing object and its files; a
+    tracked directory a dep names has its ``.pvt.listing`` checked too. Non-cached outputs
+    (e.g. Metric with cache=False) are excluded — they are git-tracked, not in cache. Raises
+    CorruptListingError, naming the file, for a listing that cannot be used.
     """
     stage_info = cli_helpers.get_stage(stage_name)
-    state_dir = registry.get_stage_state_dir(stage_info, config.locate_state_dir())
+    default_state_dir = config.locate_state_dir()
+    state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
+    files_dir = config.locate_cache_dir() / "files"
     stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
-    lock_data = stage_lock.read()
+    lock_data = stage_lock.read(cache_dir=files_dir)
     if lock_data is None:
         return {}, {}
 
@@ -85,7 +128,7 @@ def _get_stage_lock_hashes(
         for identity_key, out in output_refs.items()
         if out.tag is not types.ArtifactTag.METRIC
     }
-    cached_output_hashes: dict[str, HashInfo] = {}
+    output_hashes = dict[str, str]()
     for identity, hash_info in lock_data["output_hashes"].items():
         identity_key = types.identity_key(identity)
         if identity_key in cached_identity_keys:
@@ -94,29 +137,59 @@ def _get_stage_lock_hashes(
                 resolved_path = project.to_relative_path(display_path)
             else:
                 resolved_path = identity_key
-            cached_output_hashes[resolved_path] = hash_info
+            output_hashes.update(
+                _object_hashes(
+                    resolved_path,
+                    hash_info,
+                    lock.committed_listing(lock_data, stage_lock.output_listing_path(identity)),
+                    files_dir,
+                )
+            )
 
     # Key deps by workspace path: upstream stage outputs at their output path,
-    # raw inputs at their input binding (data/raw/<name> by default).
-    stage_names = set(cli_helpers.list_stages())
+    # raw inputs at their input binding (data/raw/<name> by default). A producer's listing is
+    # read beside the producer's own lock, which alone says whether that file is its listing.
+    all_stages = cli_helpers.get_all_stages()
     dep_refs = {ref.identity: ref for ref in stage_info["deps"].values()}
-    dep_hashes = dict[str, HashInfo]()
+    producer_locks = dict[str, LockData | None]()
+    dep_hashes = dict[str, str]()
     for identity, hash_info in lock_data["dep_hashes"].items():
         ref = dep_refs.get(identity)
         if workspace_store is None or ref is None:
-            dep_hashes[types.identity_key(identity)] = hash_info
+            dep_hashes[types.identity_key(identity)] = hash_info["hash"]
             continue
-        dep_path = (
-            workspace_store.resolve_display_path(ref)
-            if identity.producer in stage_names
-            else workspace_store.checkout(ref)
+        if identity.producer in all_stages:
+            dep_path = workspace_store.resolve_display_path(ref)
+            producer_dir = lock.get_stages_dir(
+                registry.get_stage_state_dir(all_stages[identity.producer], default_state_dir)
+            )
+            committed = listing.output_listing_path(producer_dir, identity)
+            if is_dir_hash(hash_info):
+                if identity.producer not in producer_locks:
+                    producer_locks[identity.producer] = lock.StageLock(
+                        identity.producer, producer_dir
+                    ).read(cache_dir=files_dir)
+                producer_lock = producer_locks[identity.producer]
+                if producer_lock is not None:
+                    committed = lock.committed_listing(producer_lock, committed)
+        else:
+            dep_path = workspace_store.checkout(ref)
+            committed = lock.committed_listing(
+                lock_data,
+                listing.input_listing_path(
+                    stage_lock.stages_dir, workspace_store.input_relpath(ref)
+                ),
+            )
+            if is_dir_hash(hash_info):
+                data_path = project.normalize_path(dep_path)
+                _check_tracked_listing(
+                    data_path, track.read_pvt_file(track.get_pvt_path(data_path)), files_dir
+                )
+        dep_hashes.update(
+            _object_hashes(project.to_relative_path(dep_path), hash_info, committed, files_dir)
         )
-        dep_hashes[project.to_relative_path(dep_path)] = hash_info
 
-    return (
-        _extract_file_hashes(cached_output_hashes),
-        _extract_file_hashes(dep_hashes),
-    )
+    return output_hashes, dep_hashes
 
 
 def _get_stage_missing_workspace_files(
@@ -245,16 +318,22 @@ def _verify_stages(
     local_hashes = transfer.get_local_cache_hashes(cache_dir)
     project_root = project.get_project_root()
 
-    # Phase 1: Collect missing hashes from all non-stale stages
+    # Phase 1: Collect missing hashes from all non-stale stages. A listing that cannot be used
+    # fails its own stage, naming the file, and no other.
     stage_hash_to_paths = dict[str, dict[str, list[str]]]()
+    listing_problems = dict[str, str]()
     all_missing_hashes = set[str]()
 
     for stage_info in pipeline_status:
         if stage_info["status"] == PipelineStatus.STALE:
             continue
-        hash_to_paths = _get_stage_missing_hashes(
-            stage_info["name"], local_hashes, allow_missing, project_root
-        )
+        try:
+            hash_to_paths = _get_stage_missing_hashes(
+                stage_info["name"], local_hashes, allow_missing, project_root
+            )
+        except exceptions.CorruptListingError as e:
+            listing_problems[stage_info["name"]] = f"{e}. {e.REMEDY}"
+            continue
         stage_hash_to_paths[stage_info["name"]] = hash_to_paths
         all_missing_hashes.update(hash_to_paths.keys())
 
@@ -298,9 +377,19 @@ def _verify_stages(
             )
             continue
 
+        if stage_name in listing_problems:
+            results.append(
+                StageVerifyInfo(
+                    name=stage_name,
+                    status="failed",
+                    reason=listing_problems[stage_name],
+                    missing_files=[],
+                )
+            )
+            continue
+
         hash_to_paths = stage_hash_to_paths[stage_name]
 
-        # Determine missing files based on mode
         # Determine missing files based on mode
         if not hash_to_paths:
             missing_files = list[str]()
@@ -376,7 +465,8 @@ def verify(
     """Verify pipeline was reproduced and outputs are available.
 
     Checks that all stages are cached (code, params, deps match lock files)
-    and output files exist locally or on remote.
+    and output files exist locally or on remote. With no stage named, it also
+    checks that every tracked directory's committed listing hashes to its .pvt.
 
     With --allow-missing, both stage dependencies and outputs are verified
     to exist on the remote cache, enabling CI verification without local data.
@@ -415,6 +505,10 @@ def verify(
 
     # Verify stages
     passed, results = _verify_stages(pipeline_status, cache_dir, allow_missing)
+    if stages_list is None:
+        tracked_failures = _tracked_listing_failures(cache_dir / "files")
+        results.extend(tracked_failures)
+        passed = passed and not tracked_failures
 
     # Output results
     if output_json:

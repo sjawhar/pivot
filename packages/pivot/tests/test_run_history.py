@@ -10,10 +10,12 @@ import pytest
 
 from pivot import run_history
 from pivot.storage import state
-from pivot.types import DeferredWrites, DepEntry, DirHash, StageStatus
+from pivot.types import DeferredWrites, DepEntry, DirHash, FileHash, StageStatus
 
 if TYPE_CHECKING:
     import pathlib
+
+    from pivot.types import HashInfo
 
 
 # =============================================================================
@@ -155,24 +157,77 @@ def test_serialize_deserialize_run_cache_entry() -> None:
 
 
 @pytest.mark.parametrize(
-    "output_hash",
+    ("output_hash", "stored"),
     [
-        DirHash(hash="aaaaaaaaaaaaaaa0", manifest=[], empty_dirs=["bundle/classifier_source"]),
-        DirHash(hash="aaaaaaaaaaaaaaa1", manifest=[]),
+        pytest.param(
+            DirHash(hash="aaaaaaaaaaaaaaa0", size=42, nfiles=3),
+            {"path": "data/out", "hash": "aaaaaaaaaaaaaaa0", "size": 42, "nfiles": 3},
+            id="directory",
+        ),
+        pytest.param(
+            DirHash(hash="aaaaaaaaaaaaaaa1", size=0, nfiles=0),
+            {"path": "data/out", "hash": "aaaaaaaaaaaaaaa1", "size": 0, "nfiles": 0},
+            id="directory-without-files",
+        ),
+        pytest.param(
+            FileHash(hash="aaaaaaaaaaaaaaa2"),
+            {"path": "data/out", "hash": "aaaaaaaaaaaaaaa2"},
+            id="file",
+        ),
     ],
-    ids=["with-empty-dirs", "without-empty-dirs"],
 )
-def test_run_cache_entry_keeps_directory_empty_dirs(output_hash: DirHash) -> None:
-    """A run-cache restore rebuilds a directory output from its entry, so the entry carries
-    the output's empty directories; one without any carries no empty_dirs field."""
+def test_run_cache_entry_records_directory_without_listing(
+    output_hash: HashInfo, stored: dict[str, object]
+) -> None:
+    """A run-cache entry records a directory by its hash, size and file count; its listing is
+    the cache object at that hash. A restore reads the same output hash back."""
     entry = run_history.RunCacheEntry(
         run_id="20250110_143000_abc12345",
         output_hashes=[run_history.output_hash_to_entry("data/out", output_hash)],
     )
+    serialized = run_history.serialize_to_bytes(entry)
 
-    deserialized = run_history.deserialize_run_cache_entry(run_history.serialize_to_bytes(entry))
+    assert json.loads(serialized)["output_hashes"] == [stored], (
+        "Entry should store the output's hash, size and file count, never its listing"
+    )
+    deserialized = run_history.deserialize_run_cache_entry(serialized)
+    assert run_history.entry_to_output_hash(deserialized["output_hashes"][0]) == output_hash, (
+        "Stored entry should restore the output hash it recorded"
+    )
 
-    assert run_history.entry_to_output_hash(deserialized["output_hashes"][0]) == output_hash
+
+@pytest.mark.parametrize(
+    "stored_output",
+    [
+        pytest.param(
+            {
+                "path": "data/out",
+                "hash": "aaaaaaaaaaaaaaa0",
+                "manifest": [
+                    {"relpath": "a.txt", "hash": "bbbbbbbbbbbbbbb0", "size": 3, "isexec": False}
+                ],
+                "empty_dirs": ["bundle/classifier_source"],
+            },
+            id="with-files-and-empty-dirs",
+        ),
+        pytest.param(
+            {"path": "data/out", "hash": "aaaaaaaaaaaaaaa1", "manifest": []},
+            id="without-files",
+        ),
+    ],
+)
+def test_run_cache_entry_with_inline_listing_is_unusable(stored_output: dict[str, object]) -> None:
+    """An older pivot listed a directory's files inline in its run-cache entry. Its hash is not
+    a directory hash this pivot computes, so the entry cannot restore the output."""
+    stored = json.dumps(
+        {"run_id": "20250110_143000_abc12345", "output_hashes": [stored_output]}
+    ).encode()
+
+    entry = run_history.deserialize_run_cache_entry(stored)
+
+    assert run_history.entry_to_output_hash(entry["output_hashes"][0]) is None, (
+        "An entry with an inline listing should be unusable"
+    )
 
 
 def test_deserialize_run_manifest_missing_keys() -> None:

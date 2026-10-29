@@ -63,7 +63,7 @@ from pivot import (
     types,
 )
 from pivot import state_dir as state_dir_mod
-from pivot.storage import artifact_lock, cache, lock, ownership, state
+from pivot.storage import artifact_lock, cache, listing, lock, ownership, state
 from pivot.storage import gc as gc_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -874,8 +874,6 @@ class WorkerStageInfo(TypedDict):
     params_arg_name: str | None
     project_root: pathlib.Path
     state_dir: pathlib.Path
-    # The Pivot process's resolution of the project's core.state_dir, the outcome for a path that
-    # cannot be used included: the stage's state-directory record starts with it.
     state_dir_resolution: state_dir_mod.StateDirResolution
     collection_params: dict[str, str]
     incremental_inputs: dict[str, types.ArtifactIdentity]
@@ -984,7 +982,9 @@ def _execute_stage(
                         StateChange(kind=OutputMessageKind.STATE, stage=stage_name, state="running")
                     )
                 with stage_io.PIVOT_IO:
-                    lock_data = production_lock.read()
+                    lock_data = production_lock.read(
+                        cache_dir=store_cache_dir(store), warn_old_format=False
+                    )
 
                 with _open_state_db(state_dir) as state_db:
                     # The *.pvt files the stage claims in its outputs: its lock's, and its
@@ -999,6 +999,7 @@ def _execute_stage(
                         functools.partial(
                             ownership.record_members, project_root, state_dir, stage_name
                         ),
+                        stage_lock=production_lock,
                     )
                     outputs_unusable: str | None = None
                     if lock_data is not None and not stage_info["force"]:
@@ -1027,6 +1028,9 @@ def _execute_stage(
                                 lock_data["output_hashes"],
                                 state_db,
                                 state_dir=project_state_dir,
+                                listing_lock=None
+                                if "older_format" in lock_data
+                                else production_lock,
                                 report_changes=True,
                                 file_hash_entries=restored_entries,
                                 register=lambda: _register_before_restore(
@@ -1044,8 +1048,9 @@ def _execute_stage(
                                 )
                             outputs_unusable = _outputs_unusable_reason(restoration)
 
+                    hashed_dirs = dict[str, listing.HashedDirectory]()
                     dep_hashes, missing, unreadable, file_hash_entries = hash_dependencies(
-                        stage_info["deps"], store, state_db
+                        stage_info["deps"], store, state_db, hashed_dirs=hashed_dirs
                     )
 
                     if missing:
@@ -1087,6 +1092,7 @@ def _execute_stage(
                             lock_data["output_hashes"],
                             state_db,
                             state_dir=project_state_dir,
+                            listing_lock=None if "older_format" in lock_data else production_lock,
                             report_changes=True,
                             file_hash_entries=restored_entries,
                             register=lambda: _register_before_restore(
@@ -1120,6 +1126,15 @@ def _execute_stage(
                                 store,
                                 state_db,
                                 state_dir=project_state_dir,
+                                legacy_input_hash=older_pivot_input_hash(
+                                    current_fingerprint,
+                                    current_params,
+                                    stage_info["deps"].values(),
+                                    _to_identity_hashes(dep_hashes),
+                                    stage_outs,
+                                    hashed_dirs,
+                                    store_cache_dir(store),
+                                ),
                                 claims=claims,
                             )
                             if run_cache_skip is not None:
@@ -1149,6 +1164,8 @@ def _execute_stage(
                                     run_cache_skip["output_hashes"],
                                     production_lock,
                                     state_db,
+                                    store=store,
+                                    hashed_dirs=hashed_dirs,
                                     file_hash_entries=file_hash_entries
                                     + run_cache_skip["file_hash_entries"],
                                     increment_outputs=run_cache_skip["outputs_restored"],
@@ -1176,7 +1193,7 @@ def _execute_stage(
                         stage_info["params_arg_name"],
                         stage_info["collection_params"],
                         stage_info["incremental_inputs"],
-                        lock_data,
+                        None if lock_data is None else lock_data["output_hashes"],
                         state_dir,
                         project_state_dir,
                         project_root,
@@ -1248,8 +1265,21 @@ def _execute_stage(
                 output_hashes = dict[str, HashInfo]()
                 if no_commit:
                     output_hashes = _hash_output_paths(
-                        output_paths, cache_dir=_store_cache_dir(store)
+                        output_paths, cache_dir=store_cache_dir(store)
                     )
+                else:
+                    # Hash and publish before the naming unit, so a large output's reading and
+                    # copying holds no lock a waiting collection would turn into a stall for
+                    # every other commit on the cache.
+                    with stage_io.PIVOT_IO:
+                        prepared = _prepare_outputs_with_store(
+                            output_paths,
+                            store,
+                            project_state_dir,
+                            hashed_dirs,
+                            claims,
+                            written["pvt_members"],
+                        )
                 # For --no-commit, write no lock and no cache entry. Leave the record of what
                 # ran, which `pivot commit` writes if the outputs are still these. The same record
                 # already lists the `*.pvt` members this run wrote: each was recorded before it was
@@ -1280,6 +1310,7 @@ def _execute_stage(
                             output_paths,
                             store,
                             project_state_dir,
+                            hashed_dirs,
                             claims,
                             written["pvt_members"],
                         )
@@ -1289,13 +1320,18 @@ def _execute_stage(
                     with gc_mod.naming_unit(naming_root, project=(project_root, project_state_dir)):
                         with stage_io.PIVOT_IO:
                             output_hashes = _commit_outputs_with_store(
-                                output_paths, store, project_state_dir, prepared
+                                output_paths, store, project_state_dir, prepared, hashed_dirs
                             )
                         for ref, path in output_paths.items():
+                            output_hash = output_hashes[types.identity_key(ref.identity)]
                             file_hash_entries.extend(
                                 cache.deferred_file_hash_entries(
                                     cache.known_file_hashes(
-                                        path, output_hashes[types.identity_key(ref.identity)]
+                                        path,
+                                        output_hash,
+                                        hashed_dirs[output_hash["hash"]]["listing"]
+                                        if is_dir_hash(output_hash)
+                                        else None,
                                     )
                                 )
                             )
@@ -1320,6 +1356,8 @@ def _execute_stage(
                                 output_hashes,
                                 production_lock,
                                 state_db,
+                                store=store,
+                                hashed_dirs=hashed_dirs,
                                 reusable=not uncovered and not edited and not unreadable,
                                 file_hash_entries=file_hash_entries,
                             )
@@ -1334,6 +1372,8 @@ def _execute_stage(
         except (
             exceptions.OutputMissingError,
             exceptions.CacheError,
+            exceptions.CacheRestoreError,
+            exceptions.CorruptListingError,
             exceptions.StageDefinitionError,
             exceptions.InvalidPathError,
             exceptions.OutputOwnershipError,
@@ -1432,13 +1472,11 @@ def execute_stage(
 
     A stage interrupted by a stop signal (``unwind_when_stopped``) fails without committing
     anything. After SIGTERM or the death of its Pivot process, the worker exits once the stage
-    has unwound instead of returning. Each stage is one state-directory invocation that starts
-    with the resolution the Pivot process decided for the command (``state_dir_resolution``),
-    so the worker never reads ``core.state_dir`` itself and takes every state file, the secret
-    key included, from the same outcome; it reports nothing, which the Pivot process does.
+    has unwound instead of returning.
     """
     invocation = state_dir_mod.begin_invocation(
-        report=False, state_dirs={stage_info["project_root"]: stage_info["state_dir_resolution"]}
+        report=False,
+        state_dirs={stage_info["project_root"]: stage_info["state_dir_resolution"]},
     )
     try:
         _begin_stage()
@@ -1469,7 +1507,7 @@ class OutputRestoreResult(NamedTuple):
 
     ``unavailable`` lists outputs that neither match their locked hash nor can be restored
     from the cache. ``empty_dirs_unrecorded`` lists outputs that hold every file their locked
-    hash records plus empty directories it records none of (``unrecorded_empty_dirs_only``):
+    listing records plus empty directories it records none of (``unrecorded_empty_dirs_only``):
     restoring such an output would delete the directories, so the stage runs instead.
     ``to_restore`` lists outputs that differ from their locked hash and that the cache holds:
     a restore writes them from the cache, a check only names them, so a check whose result is
@@ -1485,24 +1523,22 @@ class OutputRestoreResult(NamedTuple):
     to_restore: list[types.ArtifactRef]
 
 
-def unrecorded_empty_dirs_only(expected: HashInfo, actual: HashInfo) -> bool:
-    """Whether directory output ``actual`` is ``expected``'s files plus empty directories, where
-    ``expected`` records no empty directories.
+def unrecorded_empty_dirs_only(expected: listing.DirListing, actual: listing.DirListing) -> bool:
+    """Whether a directory output holding ``actual`` is ``expected``'s files plus empty
+    directories, where ``expected`` records none.
 
-    Pivot before 0.3.4 hashed a directory by its files alone, and a hash pivot 0.3.4 or later
-    recorded for a directory that had no empty directories looks the same: lock files carry no
-    pivot version to tell them apart. Restoring an output to such a hash deletes the empty
-    directories on disk, and the stages that read the output then hash the stripped tree to the
-    old value and stay cached, though a fresh build of a stage that makes the directories would
-    hold them. Running the stage instead costs one run where the directories were only added by
-    hand; that run rebuilds the output without them.
+    Pivot before 0.3.4 listed a directory's files alone, and a lock pivot 0.3.4 or later wrote
+    for a directory with no empty directories looks the same; pivot reads such a lock as it is
+    (``StageLock.read``), its listing recording no empty directories. Restoring an output to it
+    deletes the empty directories on disk, and the stages that read the output then hash the
+    stripped tree to the old value and stay cached, though a fresh build of a stage that makes
+    the directories would hold them. Running the stage instead costs one run where the
+    directories were only added by hand; that run rebuilds the output without them.
     """
     return (
-        is_dir_hash(expected)
-        and is_dir_hash(actual)
-        and "empty_dirs" not in expected
-        and "empty_dirs" in actual
-        and actual["manifest"] == expected["manifest"]
+        not expected["empty_dirs"]
+        and bool(actual["empty_dirs"])
+        and actual["files"] == expected["files"]
     )
 
 
@@ -1527,23 +1563,26 @@ def stage_claims(
     no_commit_record: types.NoCommitRecord | None,
     project_root: pathlib.Path,
     recorder: ownership.MemberRecorder | None = None,
+    *,
+    stage_lock: lock.StageLock,
 ) -> ownership.StageClaims | None:
     """The stage's claims on the ``*.pvt`` files in its workspace outputs
-    (``ownership.StageClaims``), from its lock and its ``nocommit:`` record; None for a store
-    that writes outside the workspace."""
+    (``ownership.StageClaims``), from its lock (``stage_lock``, which read ``lock_data``; a
+    directory's members from the listing committed beside it) and its ``nocommit:`` record; None
+    for a store that writes outside the workspace."""
     if not isinstance(store, store_mod.WorkspaceStore):
         return None
     locked = lock_data["output_hashes"] if lock_data is not None else {}
+    paths = {out.identity: store.resolve_display_path(out) for out in outs}
     return ownership.stage_claims(
         project_root,
-        {
-            store.resolve_display_path(out): locked[out.identity]
-            for out in outs
-            if out.identity in locked
-        },
+        {path: locked[identity] for identity, path in paths.items() if identity in locked},
         no_commit_record,
         cache_dir=store.cache_dir,
         recorder=recorder,
+        listing_readers=ownership.lock_listing_readers(
+            stage_lock, lock_data, paths, store.cache_dir
+        ),
     )
 
 
@@ -1555,6 +1594,7 @@ def restore_outputs_to_hashes(
     state_db: state.StateDB | None,
     *,
     state_dir: pathlib.Path | None = None,
+    listing_lock: lock.StageLock | None = None,
     restore: bool = True,
     report_changes: Literal[False] = False,
     file_hash_entries: list[FileHashEntry] | None = None,
@@ -1571,6 +1611,7 @@ def restore_outputs_to_hashes(
     state_db: state.StateDB | None,
     *,
     state_dir: pathlib.Path | None = None,
+    listing_lock: lock.StageLock | None = None,
     restore: bool = True,
     report_changes: Literal[True],
     file_hash_entries: list[FileHashEntry] | None = None,
@@ -1586,6 +1627,7 @@ def restore_outputs_to_hashes(
     state_db: state.StateDB | None,
     *,
     state_dir: pathlib.Path | None = None,
+    listing_lock: lock.StageLock | None = None,
     restore: bool = True,
     report_changes: bool = False,
     file_hash_entries: list[FileHashEntry] | None = None,
@@ -1594,6 +1636,8 @@ def restore_outputs_to_hashes(
 ) -> bool | OutputRestoreResult:
     """Verify outputs match recorded hashes and restore cacheable mismatches.
 
+    ``listing_lock`` supplies a directory output's committed listing before the cache object,
+    so an evicted listing object does not make a still-restorable output unavailable.
     ``file_hash_entries``, when given, receives a StateDB file-hash entry for every file the
     check had to read and every file restored from the cache, so the next check finds each
     without reading it. ``register``, when given, runs once before the first restore: a restore
@@ -1614,8 +1658,10 @@ def restore_outputs_to_hashes(
             if expected_hash is not None:
                 output_path = store.resolve_display_path(ref)
                 read = list[tuple[pathlib.Path, os.stat_result, str]]()
+                actual_hash: HashInfo | None
+                actual_listing: listing.DirListing | None
                 try:
-                    actual_hash = hash_output(
+                    actual_hash, actual_listing = hash_output(
                         output_path,
                         state_db,
                         cache_dir=store.cache_dir,
@@ -1623,21 +1669,43 @@ def restore_outputs_to_hashes(
                     )
                 except OSError:
                     # An output the check cannot read differs from its lock. A symlink it cannot
-                    # classify raises UnreadableLinkError instead (not an OSError), which fails
-                    # the stage: restoring over the link would remove a link that may be a user's.
-                    actual_hash = None
+                    # classify raises UnreadableLinkError instead, so a caller refuses rather
+                    # than restoring over a link that may be a user's.
+                    actual_hash, actual_listing = None, None
                 if file_hash_entries is not None:
                     file_hash_entries.extend(cache.deferred_file_hash_entries(read))
                 if actual_hash == expected_hash:
                     continue
-                if actual_hash is not None and unrecorded_empty_dirs_only(
-                    expected_hash, actual_hash
+                members = None
+                if is_dir_hash(expected_hash):
+                    try:
+                        members = (
+                            listing.read(
+                                listing_lock.output_listing_path(ref.identity),
+                                expected_hash,
+                                store.cache_dir,
+                            )
+                            if listing_lock is not None
+                            else store.cached_listing(expected_hash)
+                        )
+                    except exceptions.ListingMissingError:
+                        pass
+                    except exceptions.CorruptListingError as e:
+                        # The output cannot be restored from this listing: the stage runs,
+                        # which rewrites it.
+                        logger.warning("%s. %s", e, e.REMEDY)
+                if (
+                    members is not None
+                    and actual_listing is not None
+                    and unrecorded_empty_dirs_only(members, actual_listing)
                 ):
                     empty_dirs_unrecorded.append(ref)
                     if restore:
                         break
                     continue
-                if store.cache_contains(ref, expected_hash):
+                if (members is not None or not is_dir_hash(expected_hash)) and (
+                    store.cache_contains(ref, expected_hash, members)
+                ):
                     to_restore.append(ref)
                     if not restore:
                         continue
@@ -1649,6 +1717,7 @@ def restore_outputs_to_hashes(
                         ref,
                         expected_hash,
                         state_dir=state_dir,
+                        members=members,
                         recorded=restored,
                         claims=claims,
                     ):
@@ -1702,7 +1771,7 @@ def _check_skip_or_run(
     return "unchanged", "", input_hash, decision["run_cache_allowed"]
 
 
-def _store_cache_dir(store: store_mod.Store) -> pathlib.Path | None:
+def store_cache_dir(store: store_mod.Store) -> pathlib.Path | None:
     """The cache object root whose symlinks count as directory content for ``store``."""
     return store.cache_dir if isinstance(store, store_mod.WorkspaceStore) else None
 
@@ -1713,16 +1782,18 @@ def hash_output(
     *,
     cache_dir: pathlib.Path | None = None,
     pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
-) -> HashInfo:
-    """Compute output hash without saving to cache.
+) -> tuple[HashInfo, listing.DirListing | None]:
+    """Compute output hash without saving to cache, with a directory's listing (None for a
+    file).
 
     ``cache_dir`` is the cache object root whose symlinks count as directory content.
     ``pending`` receives the file-hash entry of each file read, as ``cache.hash_file`` says.
     """
     if path.is_dir():
-        return cache.hash_directory(path, state_db, cache_dir=cache_dir, pending=pending)
+        hashed = cache.hash_directory(path, state_db, cache_dir=cache_dir, pending=pending)
+        return hashed["record"], hashed["listing"]
     file_hash, _ = cache.hash_file(path, state_db, pending=pending)
-    return FileHash(hash=file_hash)
+    return FileHash(hash=file_hash), None
 
 
 def lock_output_paths(
@@ -2166,13 +2237,17 @@ def _prepare_incremental_inputs(
     stage_name: str,
     outs: list[types.ArtifactRef],
     incremental_inputs: dict[str, types.ArtifactIdentity],
-    lock_data: LockData | None,
+    prior_outputs: Mapping[types.ArtifactIdentity, HashInfo] | None,
     store: store_mod.Store,
     stage_state_dir: pathlib.Path,
     project_state_dir: pathlib.Path,
     claims: ownership.StageClaims | None = None,
 ) -> dict[str, Any]:
-    """Restore previous incremental outputs and load them for the stage call."""
+    """Restore previous incremental outputs and load them for the stage call.
+
+    ``prior_outputs`` are the output hashes the stage's last run recorded, or None when it has
+    none.
+    """
     if not incremental_inputs:
         return {}
     if not isinstance(store, store_mod.WorkspaceStore):
@@ -2183,11 +2258,11 @@ def _prepare_incremental_inputs(
     for param_name, identity in incremental_inputs.items():
         ref = outs_by_identity[identity]
         loader = cast("loaders.Loader[Any, Any]", ref.format)
-        if lock_data is None:
+        if prior_outputs is None:
             values[param_name] = loader.empty()
             continue
 
-        output_hash = lock_data["output_hashes"].get(identity)
+        output_hash = prior_outputs.get(identity)
         stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
         if output_hash is None:
             raise exceptions.CacheRestoreError(
@@ -2226,7 +2301,7 @@ def _run_stage_function_with_store(
     params_arg_name: str | None,
     collection_params: dict[str, str],
     incremental_inputs: dict[str, types.ArtifactIdentity],
-    lock_data: LockData | None,
+    prior_outputs: Mapping[types.ArtifactIdentity, HashInfo] | None,
     state_dir: pathlib.Path,
     project_state_dir: pathlib.Path,
     project_root: pathlib.Path,
@@ -2255,7 +2330,7 @@ def _run_stage_function_with_store(
                 stage_name,
                 outs,
                 incremental_inputs,
-                lock_data,
+                prior_outputs,
                 store,
                 state_dir,
                 project_state_dir,
@@ -2289,7 +2364,7 @@ def _hash_output_paths(
         if path.is_dir():
             output_hashes[types.identity_key(ref.identity)] = cache.hash_directory(
                 path, state_db, cache_dir=cache_dir, warn_left_out_symlinks=True
-            )
+            )["record"]
         else:
             file_hash, _ = cache.hash_file(path, state_db)
             output_hashes[types.identity_key(ref.identity)] = FileHash(hash=file_hash)
@@ -2300,12 +2375,14 @@ def _prepare_outputs_with_store(
     outputs_by_ref: dict[types.ArtifactRef, pathlib.Path],
     store: store_mod.Store,
     project_state_dir: pathlib.Path,
+    hashed_dirs: dict[str, listing.HashedDirectory],
     claims: ownership.StageClaims | None = None,
     written: dict[types.ArtifactRef, ownership.StageMembers] | None = None,
-) -> dict[types.ArtifactRef, HashInfo]:
+) -> dict[types.ArtifactRef, types.FileHash | listing.HashedDirectory]:
     """Hash and publish each output before the naming-lock unit (a workspace store only),
-    refusing first an output whose link would replace a user's ``*.pvt`` file."""
-    prepared = dict[types.ArtifactRef, HashInfo]()
+    refusing first an output whose link would replace a user's ``*.pvt`` file.
+    ``hashed_dirs`` receives each hashed directory output, by hash."""
+    prepared = dict[types.ArtifactRef, types.FileHash | listing.HashedDirectory]()
     for ref, path in outputs_by_ref.items():
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
@@ -2314,6 +2391,7 @@ def _prepare_outputs_with_store(
                 ref,
                 path,
                 state_dir=project_state_dir,
+                hashed_dirs=hashed_dirs,
                 claims=claims,
                 written=written.get(ref) if written is not None else None,
             )
@@ -2324,7 +2402,8 @@ def _commit_outputs_with_store(
     outputs_by_ref: dict[types.ArtifactRef, pathlib.Path],
     store: store_mod.Store,
     project_state_dir: pathlib.Path,
-    prepared: dict[types.ArtifactRef, HashInfo],
+    prepared: dict[types.ArtifactRef, types.FileHash | listing.HashedDirectory],
+    hashed_dirs: dict[str, listing.HashedDirectory],
 ) -> dict[str, HashInfo]:
     """Inside the naming-lock unit: finish each prepared output, or commit it whole."""
     output_hashes = dict[str, HashInfo]()
@@ -2332,10 +2411,9 @@ def _commit_outputs_with_store(
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
         if isinstance(store, store_mod.WorkspaceStore):
-            output_hash = prepared[ref]
-            store.finish_commit(ref, path, output_hash, state_dir=project_state_dir)
+            output_hash = store.finish_commit(ref, path, prepared[ref], state_dir=project_state_dir)
         else:
-            output_hash = store.commit(ref, path)
+            output_hash = store.commit(ref, path, hashed_dirs=hashed_dirs)
         output_hashes[types.identity_key(ref.identity)] = output_hash
     return output_hashes
 
@@ -2501,12 +2579,15 @@ def hash_dependencies(
     deps: dict[str, types.ArtifactRef] | list[str],
     store: store_mod.Store | None = None,
     state_db: state.StateDB | None = None,
+    *,
+    hashed_dirs: dict[str, listing.HashedDirectory] | None = None,
 ) -> tuple[dict[str, HashInfo], list[str], list[str], list[FileHashEntry]]:
     """Hash all dependencies and collect file-hash cache write-backs.
 
     With a read-only (or no) ``state_db``, the write-backs are the StateDB file-hash entries of
     every file read, a file of a directory dependency included, for the coordinator to save; a
-    writable ``state_db`` saves them itself.
+    writable ``state_db`` saves them itself. ``hashed_dirs`` receives each directory
+    dependency, by hash, so the lock writer has its listing.
     """
     _t = metrics.start()
     hashes = dict[str, HashInfo]()
@@ -2520,7 +2601,9 @@ def hash_dependencies(
         for ref in deps.values():
             key = types.identity_key(ref.identity)
             try:
-                hashes[key] = store.hash_artifact(ref, state_db, pending=pending)
+                hashes[key] = store.hash_artifact(
+                    ref, state_db, pending=pending, hashed_dirs=hashed_dirs
+                )
             except FileNotFoundError:
                 missing.append(key)
             except IsADirectoryError:
@@ -2535,7 +2618,10 @@ def hash_dependencies(
             path = pathlib.Path(project.normalize_path(dep))
             try:
                 if path.is_dir():
-                    hashes[dep] = cache.hash_directory(path, state_db, pending=pending)
+                    hashed = cache.hash_directory(path, state_db, pending=pending)
+                    hashes[dep] = hashed["record"]
+                    if hashed_dirs is not None:
+                        hashed_dirs[hashed["record"]["hash"]] = hashed
                 else:
                     file_hash, _ = cache.hash_file(path, state_db, pending=pending)
                     hashes[dep] = FileHash(hash=file_hash)
@@ -2628,6 +2714,56 @@ def compute_dep_generation_map(
     return gen_record
 
 
+def input_listing_paths(
+    deps: dict[str, types.ArtifactRef],
+    store: store_mod.Store,
+    dep_hashes: Mapping[types.ArtifactIdentity, HashInfo],
+) -> dict[types.ArtifactIdentity, str]:
+    """Each pipeline input dependency's project-relative path, which names the listing file of
+    one that is a directory. Empty when ``dep_hashes``, the lock's, records no directory: the
+    lock writer reads a path only for a directory."""
+    if not isinstance(store, store_mod.WorkspaceStore) or not any(
+        is_dir_hash(hash_info) for hash_info in dep_hashes.values()
+    ):
+        return {}
+    return {
+        ref.identity: store.input_relpath(ref)
+        for ref in deps.values()
+        if ref.tag is types.ArtifactTag.INPUT
+    }
+
+
+def older_pivot_input_hash(
+    code_manifest: dict[str, str],
+    params: dict[str, object],
+    deps: collections_abc.Iterable[types.ArtifactRef],
+    dep_hashes: Mapping[types.ArtifactIdentity, HashInfo],
+    outs: collections_abc.Iterable[types.ArtifactRef],
+    hashed_dirs: Mapping[str, listing.HashedDirectory],
+    cache_dir: pathlib.Path | None,
+) -> str | None:
+    """The run-cache key an older pivot files the same run under: unmarked
+    (``run_history.compute_input_hash``), with each directory dependency hashed as that pivot
+    hashes it (``listing.legacy_digest`` of its members: this run's listing in ``hashed_dirs``,
+    else the cache's object). None when a directory's members cannot be read here; that run's
+    entry is then not found, and the stage reruns once."""
+    legacy = dict[types.ArtifactIdentity, HashInfo]()
+    for identity, hash_info in dep_hashes.items():
+        if not is_dir_hash(hash_info):
+            legacy[identity] = hash_info
+            continue
+        hashed = hashed_dirs.get(hash_info["hash"])
+        if hashed is not None:
+            members = hashed["listing"]
+        else:
+            try:
+                members = listing.read(None, hash_info, cache_dir)
+            except (exceptions.ListingMissingError, exceptions.CorruptListingError):
+                return None
+        legacy[identity] = FileHash(hash=listing.legacy_digest(members))
+    return run_history.stage_input_hash(code_manifest, params, deps, legacy, outs, marked=False)
+
+
 def _commit_lock_and_build_deferred(
     stage_info: WorkerStageInfo,
     lock_data: LockData,
@@ -2636,23 +2772,43 @@ def _commit_lock_and_build_deferred(
     production_lock: lock.StageLock,
     state_db: state.StateDB,
     *,
+    store: store_mod.Store,
+    hashed_dirs: Mapping[str, listing.HashedDirectory],
     reusable: bool = True,
     file_hash_entries: list[FileHashEntry] | None = None,
     increment_outputs: bool = True,
 ) -> DeferredWrites:
     """Commit lock file and build deferred writes for StateDB.
 
-    Only called in the commit (non --no-commit) path. Writes the production
-    lock file and returns DeferredWrites for the coordinator to apply.
+    Only called in the commit (non --no-commit) path. Writes the production lock file with the
+    listing of each directory it records (``hashed_dirs`` holds the ones this run hashed; the
+    rest come from the cache) and returns DeferredWrites for the coordinator to apply.
     """
     with stage_io.PIVOT_IO:
-        production_lock.write(lock_data)
+        production_lock.write(
+            lock_data,
+            hashed_dirs=hashed_dirs,
+            input_paths=input_listing_paths(stage_info["deps"], store, lock_data["dep_hashes"]),
+            cache_dir=store_cache_dir(store),
+            outs=stage_info["outs"],
+        )
     return _build_deferred_writes(
         stage_info,
         input_hash,
         output_hashes,
         state_db,
         reusable=reusable,
+        legacy_input_hash=None
+        if reusable
+        else older_pivot_input_hash(
+            stage_info["fingerprint"],
+            lock_data["params"],
+            stage_info["deps"].values(),
+            lock_data["dep_hashes"],
+            stage_info["outs"],
+            hashed_dirs,
+            store_cache_dir(store),
+        ),
         file_hash_entries=file_hash_entries,
         increment_outputs=increment_outputs,
     )
@@ -2665,15 +2821,17 @@ def _build_deferred_writes(
     state_db: state.StateDB,
     *,
     reusable: bool = True,
+    legacy_input_hash: str | None = None,
     file_hash_entries: list[FileHashEntry] | None = None,
     increment_outputs: bool = True,
 ) -> DeferredWrites:
     """Build deferred writes for coordinator to apply.
 
     A result that is not ``reusable`` (its run imported user modules its fingerprint does not
-    cover, or modules that changed after the coordinator loaded them) files no run-cache entry
-    and deletes any entry at its input hash; its lock carries a key no fingerprint has and
-    `skip.check_stage` never consults the run cache for it, so no tier skips it.
+    cover, or modules changed after the coordinator loaded them) files no run-cache entry and
+    deletes any entry at its input hash and at ``legacy_input_hash``, the unmarked key an older
+    pivot files under; its lock carries a key no fingerprint has and `skip.check_stage` never
+    consults the run cache for it, so no tier skips it.
     """
     # A lock written now supersedes the stage's whole nocommit: record: what a --no-commit run
     # left for `pivot commit`, and the `*.pvt` members it lists.
@@ -2714,7 +2872,10 @@ def _build_deferred_writes(
                 output_hashes=output_entries,
             )
     if not reusable:
-        result["run_cache_delete_input_hash"] = input_hash
+        result["run_cache_delete_input_hashes"] = [
+            input_hash,
+            *([] if legacy_input_hash is None else [legacy_input_hash]),
+        ]
 
     if file_hash_entries:
         result["file_hash_entries"] = file_hash_entries
@@ -2735,6 +2896,25 @@ class RunCacheSkipResult(TypedDict):
     file_hash_entries: list[FileHashEntry]
 
 
+def _run_cache_output_hash(
+    output: run_history.OutputHashEntry, cache_dir: pathlib.Path | None
+) -> HashInfo | None:
+    """A run-cache output entry's hash. An entry an older pivot filed for a directory lists its
+    files inline: it becomes the record of its listing, which is put in ``cache_dir`` for the
+    restore to read, as ``StageLock.read`` does for an older pivot's lock. None when such an
+    entry is malformed or there is no cache."""
+    raw = cast("Mapping[str, object]", output)
+    if "manifest" not in raw:
+        return run_history.entry_to_output_hash(output)
+    members = listing.from_inline(raw["manifest"], raw.get("empty_dirs", []))
+    if members is None or cache_dir is None:
+        return None
+    data = listing.encode(members)
+    record = listing.record_of(members, data)
+    listing.store_object(cache_dir, record["hash"], data)
+    return record
+
+
 def _try_skip_via_run_cache_with_store(
     stage_name: str,
     input_hash: str,
@@ -2743,9 +2923,12 @@ def _try_skip_via_run_cache_with_store(
     state_db: state.StateDB,
     *,
     state_dir: pathlib.Path,
+    legacy_input_hash: str | None = None,
     claims: ownership.StageClaims | None = None,
 ) -> RunCacheSkipResult | None:
-    """Restore all cached outputs from a matching run-cache entry.
+    """Restore all cached outputs from a matching run-cache entry: the one at ``input_hash``,
+    else the one an older pivot filed at ``legacy_input_hash`` (its unmarked key,
+    ``run_history.compute_input_hash``), read in memory (``_run_cache_output_hash``).
 
     No lock records the entry's outputs until one is written (never, under ``--no-commit``), so
     each restore records the ``*.pvt`` members it writes as the stage's (``claims``) first.
@@ -2753,12 +2936,16 @@ def _try_skip_via_run_cache_with_store(
     if any(out.tag is types.ArtifactTag.METRIC for out in stage_outs):
         return None
     entry = state_db.lookup_run_cache(stage_name, input_hash)
+    if entry is None and legacy_input_hash is not None:
+        entry = state_db.lookup_run_cache(stage_name, legacy_input_hash)
     if entry is None:
         return None
-    output_hashes = {
-        output["path"]: run_history.entry_to_output_hash(output)
-        for output in entry["output_hashes"]
-    }
+    output_hashes = dict[str, HashInfo]()
+    for output in entry["output_hashes"]:
+        output_hash = _run_cache_output_hash(output, store_cache_dir(store))
+        if output_hash is None:
+            return None
+        output_hashes[output["path"]] = output_hash
     expected_keys = {types.identity_key(ref.identity) for ref in stage_outs}
     if output_hashes.keys() != expected_keys:
         return None

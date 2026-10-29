@@ -284,7 +284,7 @@ def gc_cmd(
                                 + "(core.run_history_retention).",
                                 to_stderr=notes_to_stderr,
                             )
-                            gc.reread_run_cache(roots, scopes)
+                            gc.reread_run_cache(roots, scopes, cache_dir)
                         if plan["doomed"]:
                             removed = gc.execute_plan(
                                 plan,

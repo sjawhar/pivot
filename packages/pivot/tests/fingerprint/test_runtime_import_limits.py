@@ -109,11 +109,12 @@ outs:
 def test_result_cached_by_0_5_2_reruns_once_and_its_run_marks_the_stage(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Each output's tag joined the manifest after 0.5.6 (`out:<key>:tag`), so a 0.5.2 lock no
-    longer matches: the first `pivot repro` after the upgrade reruns the stage once as Code
-    changed, and the stage-import check sees that run and marks the lock. A marked result is
-    never reused, so the next `pivot repro` reruns it with the uncovered-import reason, and an
-    edit to the module it imports is picked up. Both docs state the upgrade rerun."""
+    """A 0.5.2 lock is read as it is, with one warning naming it. Each output's tag joined the
+    manifest after 0.5.6 (`out:<key>:tag`), so it no longer matches: the first `pivot repro`
+    after the upgrade reruns the stage once as Code changed, and the stage-import check sees that
+    run and marks the lock. A marked result is never reused, so the next `pivot repro` reruns it
+    with the uncovered-import reason, and an edit to the module it imports is picked up. Both
+    docs state the upgrade rerun."""
     project = _project(tmp_path, {**_LIB, "pipeline.py": _RUNTIME_IMPORT}, lines=_LINES_0_5_2)
     flagged = _run(project, "repro")
     assert flagged.returncode == 0, flagged.stdout + flagged.stderr
@@ -128,6 +129,9 @@ def test_result_cached_by_0_5_2_reruns_once_and_its_run_marks_the_stage(
     upgraded = _run(project, "repro", "--json")
 
     assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+    assert "count.lock was written by an older pivot; pivot reads it as it is" in upgraded.stderr, (
+        upgraded.stderr
+    )
     assert '"stage": "t/count", "status": "ran", "reason": "Code changed"' in upgraded.stdout, (
         upgraded.stdout
     )

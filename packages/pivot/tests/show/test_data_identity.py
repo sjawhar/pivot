@@ -1,19 +1,28 @@
-# pyright: reportMissingImports=false
+# pyright: reportMissingImports=false, reportImplicitRelativeImport=false
 from __future__ import annotations
 
 import inspect
 import pathlib
+from typing import TYPE_CHECKING
 
 import pytest
+import yaml
 
-from pivot import exceptions, git, loaders, project, types
+from pivot import exceptions, loaders, project, types
 from pivot.cli import helpers as cli_helpers
 from pivot.registry import RegistryStageInfo
 from pivot.show import common as show_common
 from pivot.show import data as data_module
 from pivot.show import selection as selection_module
+from pivot.storage import listing, lock
 from pivot.storage import store as store_mod
 from pivot.types import DataFileFormat, StorageLockData
+
+if TYPE_CHECKING:
+    from conftest import GitRepo
+
+_LOCK_PATH = ".pivot/stages/train.lock"
+_LISTING_PATH = ".pivot/stages/train=.listing"  # train's unkeyed output, beside its lock
 
 
 def _make_artifact_ref(
@@ -70,11 +79,40 @@ def _register(monkeypatch: pytest.MonkeyPatch, ref: types.ArtifactRef) -> None:
     monkeypatch.setattr(cli_helpers, "get_all_stages", lambda: stage_info)
 
 
-def _mock_head_files(monkeypatch: pytest.MonkeyPatch, files: dict[str, bytes]) -> None:
-    def _read_files_from_head(paths: list[str]) -> dict[str, bytes]:
-        return files
+def _commit_head(git_repo: GitRepo, files: dict[str, bytes]) -> None:
+    """Commit ``files``, keyed by project-relative path, as git HEAD."""
+    root, commit = git_repo
+    for rel_path, content in files.items():
+        path = root / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    commit("head")
 
-    monkeypatch.setattr(git, "read_files_from_head", _read_files_from_head)
+
+def _directory_head(listing_bytes: bytes, *, size: int, nfiles: int) -> dict[str, bytes]:
+    """The HEAD files of train's directory output: its lock, which records the directory by the
+    hash of ``listing_bytes``, its size and its file count, and that listing beside the lock."""
+    lock_content = yaml.safe_dump(
+        {
+            "schema_version": lock.SCHEMA_VERSION,
+            "code_manifest": {},
+            "params": {},
+            "deps": [],
+            "outs": [],
+            "records": {
+                "deps": [],
+                "outs": [
+                    {
+                        "key": None,
+                        "listing": listing.digest(listing_bytes),
+                        "size": size,
+                        "nfiles": nfiles,
+                    }
+                ],
+            },
+        }
+    )
+    return {_LOCK_PATH: lock_content.encode(), _LISTING_PATH: listing_bytes}
 
 
 def _head_hashes() -> dict[str, str | None]:
@@ -83,6 +121,7 @@ def _head_hashes() -> dict[str, str | None]:
     return selection["head_hashes"]
 
 
+@pytest.mark.usefixtures("git_repo")
 def test_select_data_files_detects_format_from_ref_loader(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -91,7 +130,6 @@ def test_select_data_files_detects_format_from_ref_loader(
     _register(
         monkeypatch, _make_artifact_ref("train", None, types.ArtifactTag.DATA, loaders.JSON())
     )
-    _mock_head_files(monkeypatch, {})
 
     assert data_module.detect_format(pathlib.Path("train")) == DataFileFormat.UNKNOWN
 
@@ -102,6 +140,7 @@ def test_select_data_files_detects_format_from_ref_loader(
 
 def test_extract_output_hashes_from_lock_uses_identity_keys() -> None:
     lock_data: StorageLockData = {
+        "schema_version": lock.SCHEMA_VERSION,
         "code_manifest": {},
         "params": {},
         "deps": [],
@@ -116,71 +155,70 @@ def test_extract_output_hashes_from_lock_uses_identity_keys() -> None:
     assert result == {"train": "deadbeef", "train:model": "beadfeed"}
 
 
-def test_select_data_files_expands_directory_manifest(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+def test_select_data_files_expands_a_directory_from_its_committed_listing(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, git_repo: GitRepo
 ) -> None:
-    """A directory output records one head hash per comparable file in its manifest."""
+    """A directory output records one head hash per comparable file its committed listing
+    names."""
     _use_store(tmp_path, monkeypatch)
     _register(
         monkeypatch,
         _make_artifact_ref("train", None, types.ArtifactTag.DIRECTORY, loaders.CSV()),
     )
-    lock_content = b"""
-code_manifest: {}
-params: {}
-deps: []
-outs:
-  - key: null
-    hash: deadbeef00000000
-    manifest:
-      - relpath: first.csv
-        hash: abcd123400000000
-        size: 4
-        isexec: false
-      - relpath: notes.yaml
-        hash: beadfeed00000000
-        size: 5
-        isexec: false
-"""
-    _mock_head_files(monkeypatch, {".pivot/stages/train.lock": lock_content})
+    _commit_head(
+        git_repo,
+        _directory_head(
+            b"abcd123400000000 4 - first.csv\nbeadfeed00000000 5 - notes.yaml\n",
+            size=9,
+            nfiles=2,
+        ),
+    )
 
     result = _head_hashes()
 
     assert result == {"data/train/first.csv": "abcd123400000000"}
 
 
-def test_select_data_files_refuses_a_manifest_path_outside_its_directory(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("listing_bytes", "refusal"),
+    [
+        pytest.param(
+            b"abcd123400000000 4 - ../../secret.csv\n",
+            "an empty, '.' or '..' segment",
+            id="traversal",
+        ),
+        pytest.param(
+            b'abcd123400000000 4 - "secret\\000.csv"\n',
+            "a NUL byte",
+            id="nul",
+        ),
+    ],
+)
+def test_select_data_files_refuses_an_unsafe_path_in_a_committed_listing(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    git_repo: GitRepo,
+    listing_bytes: bytes,
+    refusal: str,
 ) -> None:
-    """A committed lock whose directory manifest leaves the directory is refused, naming the lock
-    and the path, before any file is read through it."""
+    """A committed listing whose member path leaves its directory or holds a NUL byte is refused,
+    naming the listing and the path's fault, before any file is read through it. The listing
+    hashes to the directory hash its lock records, so the path check, not the hash check,
+    refuses it."""
     _use_store(tmp_path, monkeypatch)
     _register(
         monkeypatch,
         _make_artifact_ref("train", None, types.ArtifactTag.DIRECTORY, loaders.CSV()),
     )
-    lock_content = b"""
-code_manifest: {}
-params: {}
-deps: []
-outs:
-  - key: null
-    hash: deadbeef00000000
-    manifest:
-      - relpath: ../../secret.csv
-        hash: abcd123400000000
-        size: 4
-        isexec: false
-"""
-    _mock_head_files(monkeypatch, {".pivot/stages/train.lock": lock_content})
+    _commit_head(git_repo, _directory_head(listing_bytes, size=4, nfiles=1))
 
-    with pytest.raises(exceptions.SecurityValidationError) as excinfo:
+    with pytest.raises(exceptions.CorruptListingError) as excinfo:
         _head_hashes()
 
-    assert ".pivot/stages/train.lock" in str(excinfo.value)
-    assert "outs[0].manifest[0].relpath: '../../secret.csv'" in str(excinfo.value)
+    assert f"{_LISTING_PATH} at HEAD: line 1: {refusal}" in str(excinfo.value)
 
 
+@pytest.mark.usefixtures("git_repo")
 def test_select_data_files_expands_an_unlocked_path_directory_from_the_workspace(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -192,7 +230,6 @@ def test_select_data_files_expands_an_unlocked_path_directory_from_the_workspace
     directory = tmp_path / "data" / "train.dat"
     directory.mkdir(parents=True)
     (directory / "rows.csv").write_text("id\n1\n")
-    _mock_head_files(monkeypatch, {})
 
     selection = selection_module.select_data_files(["data/train.dat/rows.csv"])
     assert selection is not None
@@ -201,28 +238,16 @@ def test_select_data_files_expands_an_unlocked_path_directory_from_the_workspace
 
 
 def test_select_data_files_reads_a_path_directory_output_as_a_directory_from_its_lock(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, git_repo: GitRepo
 ) -> None:
-    """A DATA-tagged output whose HEAD lock records a manifest is a directory output, even
-    when the workspace no longer holds it."""
+    """A DATA-tagged output whose HEAD lock records a directory is a directory output, its
+    members read from the listing committed beside the lock, even when the workspace no longer
+    holds it."""
     _use_store(tmp_path, monkeypatch)
     _register(
         monkeypatch, _make_artifact_ref("train", None, types.ArtifactTag.DATA, loaders.PathOnly())
     )
-    lock_content = b"""
-code_manifest: {}
-params: {}
-deps: []
-outs:
-  - key: null
-    hash: deadbeef00000000
-    manifest:
-      - relpath: rows.csv
-        hash: abcd123400000000
-        size: 4
-        isexec: false
-"""
-    _mock_head_files(monkeypatch, {".pivot/stages/train.lock": lock_content})
+    _commit_head(git_repo, _directory_head(b"abcd123400000000 4 - rows.csv\n", size=4, nfiles=1))
 
     selection = selection_module.select_data_files(["data/train.dat/rows.csv"])
     assert selection is not None

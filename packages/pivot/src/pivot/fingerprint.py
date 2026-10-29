@@ -248,8 +248,9 @@ _walk_path: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
 # under it, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep apart.
 _owner_ref: contextvars.ContextVar[str | None] = contextvars.ContextVar("_owner_ref", default=None)
 
-# Per-pass memo for `function_identity` and `_hint_classes`, keyed by kind and object id, and
-# for source file digests (`_source_digest`), keyed by file name.
+# Per-pass memo, keyed by kind and object id, for function identities (`function_identity`),
+# type-hint classes (`_hint_classes`), user-class members (`_user_methods`) and mark decisions
+# (`_mark_decision`), and by file name for source file digests (`_source_digest`).
 # Set only inside `fingerprint_pass()`; a reload, a mutated cell or an edit is seen by the next
 # pass.
 _pass_memo: contextvars.ContextVar[dict[tuple[str, int | str], Any] | None] = (
@@ -257,10 +258,50 @@ _pass_memo: contextvars.ContextVar[dict[tuple[str, int | str], Any] | None] = (
 )
 
 
+type _TypeAttributeProbe = tuple[bool, bool, Any, bool, bool]
+# Per real type: the type (held so its id is not reused) and its facts per attribute name.
+type _TypeAttributeMemo = dict[int, tuple[type[Any], dict[str, _TypeAttributeProbe]]]
+# Per real type whose route its MRO alone decides: the type and the route (see `_type_memo`).
+type _TypeDumpRoutes = dict[int, tuple[type[Any], _DumpRoute | None]]
+
+# The real-MRO facts of the types met while the memo lives, and the canonical form's
+# `model_dump` route for those whose MRO alone decides it: `ASK_KEPT` for a type whose MRO both
+# defines `__getattr__` and keeps `model_dump` (as a pydantic model), None for one with no
+# class-side hook for it (no `__getattr__`, no class-level `model_dump`, no `__getattribute__`
+# or `__class__` but `object`'s), whose instances main's C `hasattr` then asks, reading only the
+# real instance dict. They are separate from `_pass_memo` so the hot probe does not allocate a
+# `(kind, id)` tuple or call its generic wrapper for each value. Keyed by id with the type held,
+# never hashed: a metaclass `__hash__` or `__eq__` never runs, and an id is not reused while the
+# memo lives. It lives for one `fingerprint_pass()`, or else for one stage's fingerprint
+# (`_type_facts_scope`).
+_type_memo: contextvars.ContextVar[tuple[_TypeAttributeMemo, _TypeDumpRoutes] | None] = (
+    contextvars.ContextVar("_type_memo", default=None)
+)
+
+
+@contextlib.contextmanager
+def _type_facts_scope() -> Iterator[None]:
+    """Hold the real-MRO facts of the types met inside, unless an enclosing scope already does.
+
+    `fingerprint_pass()` holds them for a pass over many stages; a stage's fingerprint, a cache
+    hit's re-read included, holds them for itself, so a value repeated across a stage's bound
+    arguments pays the walk once. The facts are not kept past the scope, so a class changed
+    later is read again.
+    """
+    if _type_memo.get() is not None:
+        yield
+        return
+    token = _type_memo.set(({}, {}))
+    try:
+        yield
+    finally:
+        _type_memo.reset(token)
+
+
 @contextlib.contextmanager
 def fingerprint_pass() -> Iterator[None]:
-    """Share function identities, type-hint classes and source digests across one pass over
-    many stages.
+    """Share function identities, type-hint classes, user-class members, mark decisions, type
+    MRO facts and source digests across one pass over many stages.
 
     A cache hit re-reads every recorded value, and stages of one pipeline read the same
     helpers, model classes and source files: inside the pass each is named or read once. The
@@ -271,9 +312,13 @@ def fingerprint_pass() -> Iterator[None]:
         yield
         return
     token = _pass_memo.set({})
+    # The pass holds the type facts itself (as `_type_facts_scope` would), without a second
+    # context manager per pass.
+    type_token = _type_memo.set(({}, {}))
     try:
         yield
     finally:
+        _type_memo.reset(type_token)
         _pass_memo.reset(token)
 
 
@@ -434,8 +479,9 @@ def _function_identity(func: Callable[..., Any], active: tuple[int, ...]) -> Fun
         defaults=[],
     )
     if not is_user_code(func):
-        # An install path outside the project differs from machine to machine.
-        if file is not None and pathlib.PurePath(file).is_absolute():
+        # An install path outside the project differs from machine to machine, and a function
+        # the walk records by name is named by its module and qualified name only.
+        if file is not None and (pathlib.PurePath(file).is_absolute() or _recorded_by_name(func)):
             identity["file"] = None
         return identity
     if id(func) in active:
@@ -712,6 +758,7 @@ class _ValueKind(enum.Enum):
 
     PARTIAL = "partial"
     REFUSED = "refused"
+    CLASS_ABOVE_MARK = "class_above_mark"
     USER = "user"
     EXTERNAL = "external"
     MODULE = "module"
@@ -738,10 +785,21 @@ def _immutable_value_text(value: Any) -> str | None:
 
 
 def _value_kind(value: Any) -> _ValueKind:
-    """Classify a value a walked function reads; the walk and a cache hit share this."""
+    """Classify a value a walked function reads; the walk and a cache hit share this.
+
+    A value on a `__wrapped__` chain that holds a `@fingerprint_by_name` mark takes the mark
+    decision (`_mark_decision`) first: a user class instance above the mark is
+    CLASS_ABOVE_MARK, and an object the walk records by name is EXTERNAL, also when it is a
+    marked instance of a class-based decorator.
+    """
+    mark = _mark_decision(value)
+    if mark is _MarkDecision.REFUSED:
+        return _ValueKind.CLASS_ABOVE_MARK
     # functools.partial and partialmethod fail is_user_code() (module is functools/stdlib).
     if isinstance(value, (functools.partial, functools.partialmethod)):
         return _ValueKind.PARTIAL
+    if mark is _MarkDecision.BY_NAME and not _carries_instance(value):
+        return _ValueKind.EXTERNAL
     if _is_callable_instance(value) or _is_user_class_instance(value) or _carries_instance(value):
         return _ValueKind.REFUSED
     if callable(value):
@@ -826,7 +884,7 @@ def _read_step(owner: Any, step: str) -> Any:
                 module = _body_import_module(arg)
                 return _UNREAD if module is None else module
             case "u":
-                return inspect.unwrap(owner)
+                return unwrap(owner, stop=_stop_at_mark)
             case "pf":
                 return owner.func
             case "pa":
@@ -1086,7 +1144,7 @@ def get_stage_fingerprint(
 
     _t = metrics.start()
     try:
-        with _collected_capture_errors():
+        with _collected_capture_errors(), _type_facts_scope():
             return _get_stage_fingerprint_impl(func, visited)
     finally:
         metrics.end("fingerprint.get_stage_fingerprint", _t)
@@ -1131,7 +1189,7 @@ def stage_fingerprint_scope(stage_name: str) -> Iterator[StageFingerprintScope]:
     token = _current_stage_name.set(stage_name)
     scope_token = _stage_scope.set(scope)
     try:
-        with _collected_capture_errors():
+        with _collected_capture_errors(), _type_facts_scope():
             yield scope
     finally:
         _stage_scope.reset(scope_token)
@@ -1149,7 +1207,7 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
     from pivot import state_dir as state_dir_mod
 
     _t = metrics.start()
-    with state_dir_mod.entry_invocation():
+    with state_dir_mod.entry_invocation(), _type_facts_scope():
         # Try cache hit
         cached = _try_manifest_cache_hit(stage_name, func)
         if cached is not None:
@@ -1226,11 +1284,17 @@ def _collect_nested_code_globals(code: types.CodeType) -> set[str]:
 
 
 def _source_tree(func: Callable[..., Any]) -> ast.Module | None:
-    """Parse `func`'s own source, without following a functools.wraps chain."""
+    """Parse `func`'s own source, without following a functools.wraps chain.
+
+    None for a wrapper without code of its own (functools.cache): it has no source of its own.
+    """
     code = getattr(func, "__code__", None)
-    target: object = (
-        code if hasattr(func, "__wrapped__") and isinstance(code, types.CodeType) else func
-    )
+    if hasattr(func, "__wrapped__"):
+        if not isinstance(code, types.CodeType):
+            return None
+        target: object = code
+    else:
+        target = func
     try:
         return ast.parse(textwrap.dedent(loaded_source.getsource(target)))
     except (OSError, TypeError, SyntaxError):
@@ -1238,17 +1302,26 @@ def _source_tree(func: Callable[..., Any]) -> ast.Module | None:
 
 
 def _wrapped_source_tree(func: Callable[..., Any]) -> ast.Module | None:
-    """Parse the source `inspect.getsource(func)` returns: for a functools.wraps wrapper, the
-    function at the end of its `__wrapped__` chain."""
+    """Parse the source `inspect.getsource(func)` returns, stopped above a mark
+    (`_source_object`): for a functools.wraps wrapper, the function at the end of its
+    `__wrapped__` chain, or the user decorator above a marked function on that chain."""
+    target = _source_object(func)
+    if target is None:
+        return None
     try:
-        return ast.parse(textwrap.dedent(loaded_source.getsource(func)))
+        return ast.parse(textwrap.dedent(loaded_source.getsource(target)))
     except (OSError, TypeError, SyntaxError):
         return None
 
 
-def _check_dynamic_name_access(func: Callable[..., Any], tree: ast.Module) -> None:
+def _check_dynamic_name_access(
+    func: Callable[..., Any], tree: ast.Module, *, dunder_import: bool = False
+) -> None:
     """Refuse `getattr` with a computed name, `globals()`/`locals()`, and `x.import_module(...)`.
 
+    With `dunder_import`, also refuse `__import__(...)` and `x.__import__(...)`. The
+    `@fingerprint_by_name` decorator asks for this: the walk does not read a marked body, so
+    the worker's stage-import check would count such an import of a user module on every run.
     Other dynamic imports are left to the worker's stage-import check, which makes a stage that
     loads uncovered user code at run time not reusable.
     """
@@ -1269,7 +1342,14 @@ def _check_dynamic_name_access(func: Callable[..., Any], tree: ast.Module) -> No
                     + "which bypasses fingerprint tracking."
                 )
                 raise exceptions.StageDefinitionError(message)
-        elif isinstance(node.func, ast.Attribute) and node.func.attr == "import_module":
+            dynamic = dunder_import and node.func.id == "__import__"
+        elif isinstance(node.func, ast.Attribute):
+            dynamic = node.func.attr == "import_module" or (
+                dunder_import and node.func.attr == "__import__"
+            )
+        else:
+            dynamic = False
+        if dynamic:
             message = (
                 f"'{getattr(func, '__qualname__', '?')}' uses dynamic imports. "
                 + "Use static imports instead."
@@ -1293,8 +1373,8 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
     if is_user_code(func):
         tree = _source_tree(func)
         # The refusals read the source `inspect.getsource` returns, which follows a
-        # functools.wraps chain to the wrapped function, as on main; the body-import walk below
-        # reads the wrapper's own source.
+        # functools.wraps chain to the wrapped function, as on main, and stops at the user
+        # decorator above a mark; the body-import walk below reads the wrapper's own source.
         check_tree = _wrapped_source_tree(func) if hasattr(func, "__wrapped__") else tree
         if check_tree is not None:
             _check_dynamic_name_access(func, check_tree)
@@ -1313,14 +1393,16 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
             return manifest
         # A C-level wrapper such as functools.cache or lru_cache is not a Python function, so
         # getclosurevars rejects it. The function it wraps reads the module values, so walk
-        # that function's globals, nonlocals and defaults instead.
-        unwrapped = inspect.unwrap(func)
+        # that function's globals, nonlocals and defaults instead. The unwrap stops at a user
+        # decorator above a mark, which the walk enters, or at the mark, which it does not.
+        unwrapped = unwrap(func, stop=_stop_at_mark)
         if unwrapped is not func and inspect.isfunction(unwrapped):
             _record_read(func, "u")
-            with _walking("u"):
-                for key, value in _get_stage_fingerprint_impl(unwrapped, visited).items():
-                    if not key.startswith("self:"):
-                        manifest[key] = value
+            if not fingerprinted_by_name(unwrapped):
+                with _walking("u"):
+                    for key, value in _get_stage_fingerprint_impl(unwrapped, visited).items():
+                        if not key.startswith("self:"):
+                            manifest[key] = value
         return manifest
     metrics.end("fingerprint.getclosurevars", _t_closure)
 
@@ -1489,13 +1571,26 @@ def _written_in_user_source(function: types.FunctionType) -> bool:
 
 
 def _user_member_value(value: Any) -> Any:
-    """Return a class member that needs tracking, or `_UNREAD` when library machinery owns it."""
+    """Return a class member that needs tracking, or `_UNREAD` when library machinery owns it.
+
+    A member on a chain that holds a mark takes the mark decision (`_mark_decision`) before
+    any unwrap. A member recorded by name, such as a marked `@contextmanager` or
+    `@functools.cache` helper held as a class attribute, is returned, so its name is in the
+    manifest. A member with a user class instance above the mark is returned too, so the walk
+    refuses it rather than dropping it. Each unwrap below stops at a user decorator above a
+    mark, or at the mark (`_stop_at_mark`), and a marked object it reaches is returned.
+    """
+    decision = _mark_decision(value)
+    if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
+        return value
     if isinstance(value, functools.partial):
         return cast("Any", value)
     if inspect.isfunction(value):
         if _written_in_user_source(value):
             return value
-        unwrapped = inspect.unwrap(value)
+        unwrapped = unwrap(value, stop=_stop_at_mark)
+        if fingerprinted_by_name(unwrapped):
+            return unwrapped
         if unwrapped is not value and inspect.isfunction(unwrapped):
             return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
         return _UNREAD
@@ -1504,10 +1599,12 @@ def _user_member_value(value: Any) -> Any:
     if _is_callable_instance(value) or _carries_instance(value):
         return value
     if callable(value):
-        unwrapped = inspect.unwrap(value)
+        unwrapped = unwrap(value, stop=_stop_at_mark)
+        if fingerprinted_by_name(unwrapped):
+            return unwrapped
         if unwrapped is not value and inspect.isfunction(unwrapped):
             return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
-    if hasattr(value, "__get__") and _is_user_class_instance(value):
+    if _has_attribute(value, "__get__") and _is_user_class_instance(value):
         return value
     return _UNREAD
 
@@ -1992,6 +2089,231 @@ def _check_non_scalar_capture(
     errors.append(message)
 
 
+def _has_attribute(value: Any, name: str) -> bool:
+    """`hasattr(value, name)` for a value the walk reads, where an error other than
+    AttributeError from the lookup also means no attribute.
+
+    Python calls an object's `__getattr__` only for a name its class and `__dict__` lack. One
+    that raises KeyError or RuntimeError for that name (a dict-backed config, an `AttrDict`, a
+    lazy object) says the attribute is absent, but `hasattr` lets the error through, and the
+    walk would stop on it.
+    """
+    try:
+        return hasattr(value, name)
+    except Exception:  # the error of the value's own `__getattr__` or property
+        return False
+
+
+def _attribute_or_none(value: Any, name: str) -> Any:
+    """`getattr(value, name, None)`, with the errors `_has_attribute` takes as no attribute."""
+    try:
+        return getattr(value, name, None)
+    except Exception:  # the error of the value's own `__getattr__` or property
+        return None
+
+
+# `type`'s own descriptors for a class's MRO and namespace. Read through them, a class's real
+# `tp_mro` and `tp_dict` are reached without asking its metaclass: no metaclass
+# `__getattribute__`, `__mro__` property or `__dict__` property runs, and a walk over the MRO
+# ends at its real length.
+_class_mro = cast("Callable[[Any], tuple[type, ...]]", type.__dict__["__mro__"].__get__)
+_class_namespace = cast("Callable[[type], Mapping[str, Any]]", type.__dict__["__dict__"].__get__)
+# The C descriptors a class keeps for its instances' `__dict__` (a class's getset, a module's
+# member); reading the instance dict through one runs no code of the object or its class. An
+# entry's type is compared with them by identity: `==` would ask a metaclass `__eq__`.
+_GETSET_DESCRIPTOR = types.GetSetDescriptorType
+_MEMBER_DESCRIPTOR = types.MemberDescriptorType
+# `type`'s own C member for a class's instance-dict offset: 0 when its instances have no
+# `__dict__` (a `__slots__` class without one, a namedtuple), -1 for a managed dict. Read
+# through it, no metaclass code runs.
+_class_dictoffset = cast("Callable[[Any], int]", type.__dict__["__dictoffset__"].__get__)
+# The generic C attribute lookup (`object.__getattribute__`): the type's MRO, then the
+# instance dict, and no `__getattr__` fallback.
+_generic_getattribute = object.__getattribute__
+
+
+class _DumpRoute(enum.Enum):
+    """How the canonical form decides whether a value is dumped by its `model_dump`."""
+
+    # It may answer names it does not keep, and no class keeps `model_dump`: asked by attribute
+    # lookup, where an error other than AttributeError is the object's own "absent" signal (a
+    # `__getattr__` that raises KeyError or TypeError for a name it lacks) and means no.
+    ASK = "ask"
+    # It may answer names it does not keep, and a class keeps `model_dump`: the attribute exists,
+    # so an error from the lookup (a `model_dump` property that raises) is real and propagates,
+    # as it does from main's `hasattr`.
+    ASK_KEPT = "ask_kept"
+    # It keeps `model_dump` of its own, found with none of its code run.
+    STATIC = "static"
+
+
+# The routes the canonical form compares once per value, read as globals rather than as enum
+# members through their class.
+_ASK_KEPT = _DumpRoute.ASK_KEPT
+_STATIC = _DumpRoute.STATIC
+
+
+def _keeps_own_attribute(obj: Any, name: str) -> bool:
+    """Whether `obj` keeps `name` of its own: in its instance `__dict__`, or in the namespace of
+    a class on its real MRO (a slot, a property, a method, a class attribute). Nothing of `obj`,
+    its class or its metaclass runs; see `_probe_own_attribute`."""
+    return _probe_own_attribute(obj, name, False) is not None
+
+
+def _read_type_attribute_probe(cls: type[Any], name: str) -> _TypeAttributeProbe:
+    """Read `_probe_own_attribute`'s real-MRO facts without executing class-side code."""
+    forwards = False
+    keeps = False
+    instance_dict: Any = None
+    reports_class = False
+    for klass in _class_mro(cls):
+        namespace = _class_namespace(klass)
+        if klass is not object:
+            reports_class = reports_class or (
+                "__class__" in namespace or "__getattribute__" in namespace
+            )
+        forwards = forwards or "__getattr__" in namespace
+        if name in namespace:
+            keeps = True
+        elif instance_dict is None and "__dict__" in namespace:
+            entry = namespace["__dict__"]
+            if (
+                type(entry) is _GETSET_DESCRIPTOR or type(entry) is _MEMBER_DESCRIPTOR
+            ) and entry.__objclass__ is klass:
+                instance_dict = entry.__get__
+    has_instance_dict = instance_dict is not None or (not keeps and bool(_class_dictoffset(cls)))
+    return forwards, keeps, instance_dict, has_instance_dict, reports_class
+
+
+def _type_attribute_probe(cls: type[Any], name: str) -> _TypeAttributeProbe:
+    """Read the static part of `_probe_own_attribute` once per real type and fingerprint pass.
+
+    The cache is keyed by the type's id and holds the type strongly, so it cannot be reused. It
+    never hashes the type: a metaclass may define `__hash__` or `__eq__` as user code. The
+    instance-dict read and a reported `__class__` remain per value.
+    """
+    memo = _type_memo.get()
+    if memo is None:
+        return _read_type_attribute_probe(cls, name)
+    facts = memo[0]
+    key = id(cls)
+    entry = facts.get(key)
+    if entry is None:
+        probes: dict[str, _TypeAttributeProbe] = {}
+        facts[key] = (cls, probes)
+    else:
+        probes = entry[1]
+    result = probes.get(name)
+    if result is None:
+        result = _read_type_attribute_probe(cls, name)
+        probes[name] = result
+    return result
+
+
+def _probe_own_attribute(
+    obj: Any, name: str, forwarding: bool, facts: _TypeAttributeProbe | None = None
+) -> _DumpRoute | None:
+    """`STATIC` when `obj` keeps `name` of its own; with `forwarding`, `ASK` or `ASK_KEPT` first
+    when `obj` may answer names it does not keep; otherwise None.
+
+    The real MRO and each class namespace are read through `type`'s own descriptors
+    (`_class_mro`, `_class_namespace`), and types are compared by identity, so no metaclass
+    `__getattribute__`, `__mro__` property, `__eq__` or `__hash__` is asked. That static part is
+    memoized by real type within one `fingerprint_pass()`; the memo holds the type strongly and
+    ends with the pass. The instance `__dict__` is still read from each value through the C
+    descriptor a class on that MRO keeps for it. Without one, an instance of a class with no
+    dict offset (a `__slots__` class without `__dict__`, a namedtuple) has no dict, and the
+    answer is no; any other (a class whose `__dict__` is a property) is asked through
+    `_generic_getattribute`, the generic C lookup main's `hasattr` makes minus the `__getattr__`
+    fallback. It is reached only after the static walk has shown that no class on the MRO holds
+    `name`, so it finds no descriptor to run and reads the instance dict the C way, past any
+    `__dict__` property. An object that answers every name it lacks (a `unittest.mock.MagicMock`,
+    an attribute tree) does not read as keeping it. Only AttributeError means no; any other
+    error (a dict key's own `__eq__`) propagates, as it does from main's `hasattr`.
+
+    With `forwarding`, a value whose real class defines `__getattr__` on its MRO (a pydantic
+    model, whose `BaseModel` defines it; a hand-written forwarder that delegates to a target held
+    in an attribute, a slot or a closure; celery's `local.Proxy`, `lazy_object_proxy`, wrapt), or
+    that reports a class other than `type(obj)` as `__class__` (a proxy that forwards through
+    `__getattribute__`), keeps its data where no static read reaches it, and the canonical form
+    asks it by attribute lookup: `ASK_KEPT` when a class on the real MRO or on the reported
+    class's MRO keeps `name`, `ASK` when none does (see `_DumpRoute`). The reported class is read
+    as `isinstance` reads it, by `getattr(obj, "__class__", None)`, where only AttributeError
+    means none, and `issubclass(type(reported), type)` asks the real type, not a `__class__`.
+    """
+    cls: type[Any] = type(obj)  # pyright: ignore[reportUnknownVariableType] - any class
+    forwards, keeps, instance_dict, has_instance_dict, reports_class = (
+        _type_attribute_probe(cls, name) if facts is None else facts
+    )
+    if forwarding:
+        if forwards and keeps:
+            return _DumpRoute.ASK_KEPT
+        # Only a class other than `object` that defines `__class__` or `__getattribute__` can
+        # report another class; without one, `obj.__class__` is `type(obj)` and is not read.
+        if reports_class:
+            reported = getattr(obj, "__class__", None)
+            if reported is not cls and issubclass(type(reported), type):
+                forwards = True
+                if not keeps:
+                    reported_class = cast("type[Any]", reported)
+                    keeps = _type_attribute_probe(reported_class, name)[1]
+        if forwards:
+            return _DumpRoute.ASK_KEPT if keeps else _DumpRoute.ASK
+    if keeps:
+        return _DumpRoute.STATIC
+    if instance_dict is not None:
+        found = instance_dict(obj)
+        if type(found) is dict:
+            holds = name in found
+        # An instance `__dict__` that is a dict subclass: its own `__contains__` is class-side
+        # code, so the dict is asked the C way, as main's attribute lookup asks it. (A class asked
+        # here, as `_mark_chain` asks one through `_source_object`, has a `mappingproxy` for its
+        # namespace, which the last branch asks with `in`, a C lookup on the class's own dict.)
+        elif issubclass(type(found), dict):
+            holds = dict.__contains__(found, name)  # pyright: ignore[reportUnknownMemberType] - a dict subclass with unknown item types
+        else:
+            holds = name in found
+        return _DumpRoute.STATIC if holds else None
+    if not has_instance_dict:
+        return None
+    try:
+        _generic_getattribute(obj, name)
+    except AttributeError:
+        return None
+    return _DumpRoute.STATIC
+
+
+def _model_dump_route(
+    value: Any, value_type: type[Any], routes: _TypeDumpRoutes | None
+) -> _DumpRoute | None:
+    """The canonical form's `model_dump` route for a value that is not an exact built-in.
+
+    A class is never dumped, whatever its metaclass reports: `isinstance(value, type)` is asked
+    before any probe. It reads the real type, then the reported `__class__`, so a type is
+    recorded in `routes` only when no class on its MRO but `object` defines `__class__` or
+    `__getattribute__`: then every instance reports its real type, which is no metaclass, and
+    the guard answers no for each without being asked again. Such a type is recorded when the
+    type alone decides the route (see `_type_memo`): `ASK_KEPT` when its MRO defines
+    `__getattr__` and keeps `model_dump`, as `_probe_own_attribute` answers first for it, or
+    main's C `hasattr` when it has no class-side hook for `model_dump` either, which reads only
+    the real instance dict, as `_probe_own_attribute` does. Later instances skip the probe.
+    """
+    if isinstance(value, type):
+        return None
+    facts = _type_attribute_probe(value_type, "model_dump")
+    forwards, keeps, _, _, reports_class = facts
+    if not reports_class:
+        if forwards and keeps:
+            if routes is not None:
+                routes[id(value_type)] = (value_type, _ASK_KEPT)
+            return _ASK_KEPT
+        if not (forwards or keeps):
+            if routes is not None:
+                routes[id(value_type)] = (value_type, None)
+            return _STATIC if hasattr(value, "model_dump") else None
+    return _probe_own_attribute(value, "model_dump", True, facts)
+
+
 def _is_user_class_instance(value: Any) -> bool:
     """Return whether `value` is an instance of a user-defined class."""
     return not isinstance(value, type) and is_user_code(type(value))
@@ -2024,7 +2346,7 @@ def _library_module(value: Any) -> types.ModuleType | None:
     such as `expit`) is looked up in every loaded module; `np.frompyfunc` products stay
     refused because no module binds their generated names.
     """
-    name = getattr(value, "__name__", None)
+    name = _attribute_or_none(value, "__name__")
     if not isinstance(name, str):
         return None
     module_name = getattr(value, "__module__", None)
@@ -2049,14 +2371,16 @@ def _library_name(value: Any) -> str:
     `np.mean` is `numpy.mean` and `from numpy import median` is `numpy.median`, so a binding
     that now holds another library function reads as changed. A method bound to a class or a
     scalar carries it in brackets (`builtins.str.join[',']`): the bound object is part of what
-    the callable does.
+    the callable does. A marked class-based decorator without names of its own (one with
+    `__slots__` that `functools.update_wrapper` did not make), or a library wrapper over one, is
+    named by the helper at the end of its chain: the module-level function that
+    `@fingerprint_by_name` checked.
     """
     bound = getattr(value, "__self__", None)
-    qualname = (
-        getattr(value, "__qualname__", None)
-        or getattr(value, "__name__", None)
-        or type(value).__qualname__
-    )
+    named = getattr(value, "__qualname__", None) or getattr(value, "__name__", None)
+    if not named and _recorded_by_name(value):
+        return _library_name(unwrap(value))
+    qualname = named or type(value).__qualname__
     module = getattr(value, "__module__", None)
     if not isinstance(module, str):
         owner_class = getattr(value, "__objclass__", None)
@@ -2085,7 +2409,7 @@ def _carries_instance(value: Any) -> bool:
     neither does a library module's own export (`np.random.normal`, `random.random`), whose
     state belongs to the library.
     """
-    bound = getattr(value, "__self__", None)
+    bound = _attribute_or_none(value, "__self__")
     if bound is None or isinstance(
         bound, (types.ModuleType, type, bool, int, float, str, bytes, logging.Logger)
     ):
@@ -2175,6 +2499,8 @@ def _process_captured_value(
             manifest[f"const:{binding_ref}"] = text
         case _ValueKind.REFUSED:
             _check_non_scalar_capture(name, value, stage_name, parameter=parameter)
+        case _ValueKind.CLASS_ABOVE_MARK:
+            _refuse_class_above_mark(value)
         case _ValueKind.EXTERNAL:
             # A library function or class is named by where it is defined; its code is not
             # hashed, but rebinding the name to another one must change the manifest.
@@ -2187,11 +2513,16 @@ def _attributes_read(func: Callable[..., Any], chain: str) -> list[str]:
     """Each attribute `func` reads directly on the value it reaches as `chain`, in source order.
 
     For `chain` "settings", `settings.AGG(...)` and `settings.Config.SCALE` give `AGG` and
-    `Config`; what is read on `Config` is found from the chain "settings.Config".
+    `Config`; what is read on `Config` is found from the chain "settings.Config". The source
+    read stops above a mark (`_source_object`), so a user decorator above a marked function
+    gives the attributes its own lines read.
     """
+    target = _source_object(func)
+    if target is None:
+        return []
     prefix = f"{chain}."
     found = dict[str, None]()
-    for owner, path in ast_utils.extract_module_attr_usage(func):
+    for owner, path in ast_utils.extract_module_attr_usage(target):
         expression = f"{owner}.{path}"
         if expression.startswith(prefix):
             found[expression.removeprefix(prefix).split(".", 1)[0]] = None
@@ -2261,7 +2592,7 @@ def _is_user_class_attribute(cls: type, attribute: str) -> bool:
         return False
     raw = vars(owner)[attribute]
     if isinstance(raw, (classmethod, staticmethod)) or (
-        hasattr(raw, "__get__") and not callable(raw)
+        _has_attribute(raw, "__get__") and not callable(raw)
     ):
         return False
     sunder = len(attribute) > 2 and attribute[0] == attribute[-1] == "_"
@@ -2424,11 +2755,15 @@ def _process_partial_dependency(
 
     underlying = partial_obj.func
     _record_read(partial_obj, "pf")
-    if _value_kind(underlying) is _ValueKind.REFUSED:
+    kind = _value_kind(underlying)
+    if kind is _ValueKind.REFUSED:
         with _walking("pf"):
             _check_non_scalar_capture(
                 f"{binding_ref}.func", underlying, _current_stage_name.get() or "<unknown>"
             )
+    elif kind is _ValueKind.CLASS_ABOVE_MARK:
+        with _walking("pf"):
+            _refuse_class_above_mark(underlying)
     elif callable(underlying) and is_user_code(underlying):
         callable_ref = _callable_ref(underlying, f"{binding_ref}.func")
         with _walking("pf"):
@@ -2486,7 +2821,11 @@ def _process_bound_values(
     globals, closure values, defaults, and the non-scalar refusal. An instance of a user
     class with `__call__`, or a method bound to an instance (`Scaler(3).apply`,
     `default_rng(SEED).normal`), is refused, as it is when a stage reads one: what it reads
-    from its instance is not walked, and its repr does not record that state.
+    from its instance is not walked, and its repr does not record that state. A callable on a
+    chain that holds a mark takes the mark decision (`_mark_decision`) before any unwrap: one
+    recorded by name, or one with a user class instance above the mark, is left to the
+    canonical form of the same binding, which every caller computes (`loader_config_text`, the
+    partial's `args` and `keywords`): it names the first and refuses the second.
     """
     if isinstance(value, functools.partial):
         partial_obj = cast("functools.partial[Any]", value)
@@ -2519,9 +2858,16 @@ def _process_bound_values(
                 _hash_pydantic_schema(
                     cast("type[_PydanticModelProtocol]", value), manifest, visited
                 )
-    elif callable(value) and (_is_user_class_instance(value) or _carries_instance(value)):
+    elif not callable(value):
+        return
+    elif (decision := _mark_decision(value)) is _MarkDecision.REFUSED or (
+        decision is _MarkDecision.BY_NAME and not _carries_instance(value)
+    ):
+        # The binding's canonical form decides (`_canonicalize_value_for_hash`).
+        return
+    elif _is_user_class_instance(value) or _carries_instance(value):
         _check_non_scalar_capture(binding_ref, value, _current_stage_name.get() or "<unknown>")
-    elif callable(value) and inspect.isfunction(inspect.unwrap(value)) and is_user_code(value):
+    elif inspect.isfunction(unwrap(value, stop=_stop_at_mark)) and is_user_code(value):
         _process_callable_dependency(binding_ref, value, manifest, visited)
 
 
@@ -2560,10 +2906,23 @@ def _resolved_type_hints(func: Callable[..., Any]) -> dict[str, Any]:
         hints = None  # Not in cache and can't be cached
 
     if hints is None:
-        try:
-            hints = typing.get_type_hints(func)
-        except Exception:
-            hints = _resolve_annotations_individually(func)
+        # The walk enters no marked function, so a mark on `func`'s chain is below it.
+        marked = _mark_on_chain(func)
+        if marked is not None and getattr(func, "__annotations__", None) is getattr(
+            marked, "__annotations__", None
+        ):
+            # `functools.wraps` copied these annotations from the marked function below `func`:
+            # they are that function's type hints, which the walk does not read.
+            hints = dict[str, Any]()
+        else:
+            try:
+                # With a mark below, resolve in `func`'s own globals: by default
+                # `get_type_hints` follows `__wrapped__` to the globals at the end of the chain.
+                hints = typing.get_type_hints(
+                    func, globalns=None if marked is None else getattr(func, "__globals__", {})
+                )
+            except Exception:
+                hints = _resolve_annotations_individually(func)
         # Cache result if function is weakly referenceable
         with contextlib.suppress(TypeError):
             _get_type_hints_cache[func] = hints
@@ -2739,6 +3098,10 @@ def _annotation_classes(annotation: Any) -> list[type]:
     return []
 
 
+# The exact built-in containers the canonical form takes without a probe (see its shortcut).
+_BUILTIN_TYPES = frozenset({dict, list, tuple, set, frozenset, bytes})
+
+
 def _serialize_value_for_hash(value: Any) -> str:
     """Serialize a value to a stable string for hashing."""
     return json.dumps(_canonicalize_value_for_hash(value))
@@ -2757,18 +3120,34 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     itself) becomes `["cycle", N]`, N steps back up the path, the same in every process. A
     library function, or a library module's own callable export,
     becomes `["external", _library_name]`: its repr can hold an address (`np.mean`). A
-    `functools.partial` is canonicalised through its function and arguments. A pydantic
-    instance is dumped in python mode, which keeps each secret (`SecretStr`, `SecretBytes`,
-    `Secret[T]`) as its own object; a secret becomes `["secret", digest]`, the keyed digest the
-    lock file records for it (`parameters.secret_digest`), so changing it changes the hash and
-    no fingerprint holds its value. A dataclass instance becomes `[module.qualname,
-    canonical({field: value})]`, field by field, so a secret inside one reaches that leaf
-    rather than the generated repr's mask. An object whose class keeps `object.__repr__`
-    (which holds the address) and that has a `__dict__` becomes
-    `[module.qualname, canonical(vars(obj))]`. A compiled regex becomes
-    `["re.Pattern", canonical(pattern), flags]`, so its full pattern is recorded. Other leaves
-    keep their `repr`, tagged with their type. A class is a leaf, even a pydantic model class:
-    only an instance is dumped.
+    `functools.partial` is canonicalised through its function and arguments. An instance is
+    dumped by its `model_dump` as main dumps it, by one of two routes. A value that may answer
+    names it does not keep, because its class defines `__getattr__` on its MRO (a pydantic model,
+    a forwarder) or it reports a class other than its own type as `__class__` (a transparent
+    proxy), is asked by attribute lookup, as main asks. On ASK, where no class keeps
+    `model_dump`, it is dumped only when the answer is callable and returns an exact dict, so an
+    object that answers every name with junk (a `MagicMock`, an attribute tree) gets the plain
+    form. On ASK_KEPT, where a class keeps `model_dump`, the callable result is dumped as main
+    dumps it; RootModel returns its root, which can be a list, a secret or a scalar. An error
+    other than AttributeError from that lookup propagates, as from main's `hasattr`, when a class
+    on the value's MRO or on its reported class's MRO keeps `model_dump`; when none does, it is
+    the object's "absent" signal and means no. Beyond the `__class__` read each `isinstance`
+    check makes, as main's do, that lookup is the one place the probe runs the value's own code.
+    Any other value is dumped when it keeps `model_dump` of its own (`_keeps_own_attribute`,
+    which runs none of its code). The dump is in python mode, which keeps each secret
+    (`SecretStr`, `SecretBytes`, `Secret[T]`) as its own object; a secret becomes
+    `["secret", digest]`, the keyed digest the lock file records for it
+    (`parameters.secret_digest`), so changing it
+    changes the hash and no fingerprint holds its value. A dataclass instance becomes
+    `[module.qualname, canonical({field: value})]`, field by field, so a secret inside one
+    reaches that leaf rather than the generated repr's mask. An object whose class keeps
+    `object.__repr__` (which holds the address) and that has a `__dict__` becomes
+    `[module.qualname, canonical(vars(obj))]`, without the `@fingerprint_by_name` mark that
+    `functools.update_wrapper` copies into a wrapper when `vars(obj)` is an exact dict (a mark
+    copied into a dict subclass stays, and is canonicalised by the marked object's name, so the
+    form is stable). A compiled regex becomes `["re.Pattern", canonical(pattern), flags]`, so
+    its full pattern is recorded. Other leaves keep their `repr`, tagged with their type. A class
+    is a leaf, even a pydantic model class, whatever its metaclass reports as `__class__`.
     """
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -2777,21 +3156,91 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         return ["re.Pattern", _canonicalize_value_for_hash(pattern.pattern), pattern.flags]
     if id(value) in active:
         return ["cycle", len(active) - active.index(id(value))]
-    if hasattr(value, "model_dump") and not isinstance(value, type):
-        return _canonicalize_value_for_hash(value.model_dump(), (*active, id(value)))
-    if inspect.isfunction(value):
-        return ["function", _function_identity(value, active)]
-    if _is_library_callable(value):
-        return ["external", _library_name(value)]
-    if isinstance(value, (functools.partial, functools.partialmethod)):
-        partial_value = cast("Any", value)
-        inner = (*active, id(partial_value))
-        return [
-            "partial",
-            _canonicalize_value_for_hash(partial_value.func, inner),
-            _canonicalize_value_for_hash(partial_value.args, inner),
-            _canonicalize_value_for_hash(partial_value.keywords, inner),
-        ]
+    # An exact dict, list, tuple, set, frozenset or bytes skips every branch up to the container
+    # branches: an exact instance has no `__dict__`, is not callable, and neither its type nor
+    # `object` holds a mark, a `__wrapped__` or a `model_dump`, which a built-in type cannot gain.
+    # Scalars, `str` and None returned above. The set lookup hashes the type, so it is reached
+    # only for a type whose metaclass is `type` itself, whose `__hash__` and `__eq__` are identity
+    # in C (a class cannot override them for itself); a type with another metaclass, whose
+    # `__hash__` or `__eq__` may run code or raise, is no built-in and skips the lookup.
+    value_type: type[Any] = type(value)  # pyright: ignore[reportUnknownVariableType] - any class
+    if type(value_type) is not type or value_type not in _BUILTIN_TYPES:
+        # The mark decision. The canonical form is where a value bound in a loader field or a
+        # partial argument meets it (`_process_bound_values` leaves both answers here), so it
+        # comes before every branch that could name the value without it: `model_dump`, the
+        # function identity, and the library-callable test, which would name a `functools.cache`
+        # wrapper over a class-based decorator over the mark and drop the class. A chain with a
+        # user class instance above the mark is refused. A marked instance of a class-based
+        # decorator is named like a marked function: its own `__dict__` is not dumped.
+        # `_mark_decision` answers None before any read while no mark exists (`_marks_made`);
+        # asking the flag here keeps that common case free of a call per value.
+        if _marks_made:
+            decision = _mark_decision(value)
+            if decision is _REFUSED:
+                _refuse_class_above_mark(value)
+        else:
+            decision = None
+        # Main dumped every value with a `model_dump` (`hasattr`) that is not a class; so does
+        # this walk, by one of the routes `_probe_own_attribute` picks (`_model_dump_route`). A
+        # class is never dumped, whatever its metaclass reports. A real type whose route its MRO
+        # alone decides takes it from `_type_memo`: `ASK_KEPT`, or main's C `hasattr`, which for
+        # a type with no class-side hook reads only the real instance dict. No class's type is
+        # recorded there.
+        memo = _type_memo.get()
+        routes = None if memo is None else memo[1]
+        known = None if routes is None else routes.get(id(value_type))
+        if known is None:
+            route = _model_dump_route(value, value_type, routes)
+        elif (route := known[1]) is None:
+            route = _STATIC if hasattr(value, "model_dump") else None
+        if route is _STATIC:
+            # The static probe runs none of the value's code and agrees with `hasattr` for a
+            # class that defines no `__getattr__`; the value is dumped as main dumps it.
+            try:
+                dump = value.model_dump
+            except AttributeError:
+                # A `model_dump` the class keeps but the object does not hold: an unset slot, or
+                # a property that raises AttributeError. Main's `hasattr` is False there too, so
+                # the value takes the branches below and is canonicalized as the plain object it
+                # is.
+                pass
+            else:
+                return _canonicalize_value_for_hash(dump(), (*active, id(value)))
+        elif route is not None:
+            # `ASK` or `ASK_KEPT`: a value that may answer names it does not keep (its class
+            # defines `__getattr__`, or it reports another class) is asked by attribute lookup,
+            # as main asks: beyond the `__class__` read each `isinstance` makes, the one place
+            # the probe runs the value's code, as main does. When a class keeps `model_dump`, the
+            # attribute exists and an error from the lookup propagates, as from main's `hasattr`;
+            # when none does, an error is the object's "absent" signal and means no
+            # (`_attribute_or_none`). On ASK, only an exact dict returned by a callable is
+            # dumped, so a MagicMock or attribute tree that answers every name with junk gets the
+            # plain form. On ASK_KEPT, a class really keeps the name, so its callable result is
+            # dumped as main dumps it; a RootModel can therefore return a list, a secret or a
+            # scalar root.
+            if route is _ASK_KEPT:
+                dump = getattr(value, "model_dump", None)
+            else:
+                dump = _attribute_or_none(value, "model_dump")
+            if callable(dump):
+                dumped = dump()
+                if route is _ASK_KEPT or type(dumped) is dict:
+                    return _canonicalize_value_for_hash(dumped, (*active, id(value)))
+        if inspect.isfunction(value):
+            return ["function", _function_identity(value, active)]
+        if decision is _BY_NAME and not _carries_instance(value):
+            return ["external", _library_name(value)]
+        if _is_library_callable(value):
+            return ["external", _library_name(value)]
+        if isinstance(value, (functools.partial, functools.partialmethod)):
+            partial_value = cast("Any", value)
+            inner = (*active, id(partial_value))
+            return [
+                "partial",
+                _canonicalize_value_for_hash(partial_value.func, inner),
+                _canonicalize_value_for_hash(partial_value.args, inner),
+                _canonicalize_value_for_hash(partial_value.keywords, inner),
+            ]
     if isinstance(value, dict):
         mapping = cast("dict[Any, Any]", value)
         inner = (*active, id(mapping))
@@ -2818,9 +3267,16 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         inner = (*active, id(value))
         fields = {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
         return [_definition_ref(type(value)), _canonicalize_value_for_hash(fields, inner)]
-    if type(value).__repr__ is object.__repr__ and hasattr(value, "__dict__"):
+    if type(value).__repr__ is object.__repr__ and _has_attribute(value, "__dict__"):
         inner = (*active, id(value))
-        return [_definition_ref(type(value)), _canonicalize_value_for_hash(vars(value), inner)]
+        attributes: Any = vars(value)
+        # A `__dict__` property may return anything (None, an int), so only an exact dict is
+        # filtered. A mark copied into a dict subclass stays in the form; it is canonicalised by
+        # the marked object's name, so the form is stable.
+        if type(attributes) is dict and _BY_NAME_MARK in attributes:
+            own = cast("dict[str, Any]", attributes)
+            attributes = {name: item for name, item in own.items() if name != _BY_NAME_MARK}
+        return [_definition_ref(type(value)), _canonicalize_value_for_hash(attributes, inner)]
     return [type(value).__name__, repr(value)]
 
 
@@ -2981,6 +3437,18 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
             _active_source_map.setdefault(rel_path, digest)
     _t = metrics.start()
     try:
+        # 0. The mark decision (`_mark_decision`): an object the walk records by name gets a
+        # hash of that name, and its body is not read. A chain with a user class instance
+        # above the mark is refused (a default factory, a loader method or a function identity
+        # reaches the hash without the walk's value classification). While no mark exists
+        # (`_marks_made`) the decision is None, so it is not asked.
+        if _marks_made:
+            decision = _mark_decision(func)
+            if decision is _MarkDecision.REFUSED:
+                _refuse_class_above_mark(func)
+            if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
+                return _by_name_hash(func)
+
         # 1. Check in-memory WeakKeyDictionary cache first (fastest)
         # WeakKeyDictionary raises TypeError for non-weakly-referenceable functions (builtins)
         try:
@@ -3108,11 +3576,19 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         if hasattr(func, "__wrapped__") and hasattr(func, "__code__"):
             return _hash_code_object(func.__code__)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
 
+        # `inspect.getsource` follows `__wrapped__` with no stop, so the read takes the object
+        # `_source_object` gives: the end of the chain, as on main, or the code of the user
+        # decorator above a mark. Where the read would reach the mark, the hash is of the name.
+        target = _source_object(func)
+        if target is None:
+            return _by_name_hash(func)
         _t_source = metrics.start()
         try:
-            source = loaded_source.getsource(func)
+            source = loaded_source.getsource(target)
         except (OSError, TypeError):
             metrics.end("fingerprint.inspect_getsource", _t_source)
+            if isinstance(target, types.CodeType):
+                return _hash_code_object(target)
             if hasattr(func, "__code__"):
                 # Marshal captures constants as well as bytecode, so `x + 1` and `x + 999`
                 # differ. Remove embedded source paths before hashing to keep it portable.
@@ -3179,6 +3655,320 @@ def _has_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) 
     )
 
 
+_BY_NAME_MARK = "__pivot_fingerprint_by_name__"
+# The marked objects the mark cannot be stored on (see `mark_by_name`): a class-based decorator
+# with `__slots__` and no `__dict__`, which may lack a `__weakref__` slot too, so no weak
+# reference can hold it. The
+# table is keyed by `id(obj)` because such a class may define `__eq__` without `__hash__`, which
+# makes the object unusable as a key. The value is the object itself, a strong reference: the
+# table keeps every marked object alive for the life of the process, so its address is never
+# freed and no other object can get its id. `fingerprinted_by_name` also checks the stored value
+# is `obj` itself, so a lookup by id alone never marks another object.
+_marked_without_dict = dict[int, Any]()
+# Whether `@pivot.fingerprint_by_name` has marked anything in this process. In a process that
+# fingerprints, the decorator, run when discovery imports the pipeline's modules, is the only
+# writer of a mark (`mark_by_name`), so until it runs no `__wrapped__` chain can hold one: every
+# mark decision is None and the walk reads no chain. A project that marks nothing, the common
+# one, pays one module-global read per classified value for the mark. Two states pivot never
+# enters break that premise (an object unpickled by value with its `__dict__`, and
+# `importlib.reload` of this module); in both the walk records the body: more, never less.
+#
+# `AGENTS.md` warns against module-level mutable state, and a flush of project-scoped state into
+# the wrong project caused a real bug (#536). This flag is not that kind of state, so do not
+# "fix" it into a `ContextVar` or a parameter: it records which objects the decorator marked in
+# *this interpreter*, a property of the loaded code and never of a project, it is set once and
+# never reset, it is never read as "which project am I in", and it gates only the probe's speed —
+# the decision's result is the same whether it is True or False, because an unmarked value's
+# chain holds no mark either way. Removing it puts a chain read and an MRO walk back on every
+# classified value of every project, marked or not: the cost the benchmark gate caught.
+_marks_made = False
+
+
+def mark_by_name(obj: Any) -> None:
+    """Mark `obj` itself for `@pivot.fingerprint_by_name` (see `fingerprinted_by_name`).
+
+    The mark is written with `object.__setattr__`, the generic C store: no class `__setattr__`
+    and no class-level `__dict__` property runs, and the mark lands in the real instance dict.
+    An object with no instance dict (`__slots__` without `__dict__`), or whose type refuses the
+    generic store, is held in `_marked_without_dict` instead.
+    """
+    global _marks_made
+    _marks_made = True
+    try:
+        object.__setattr__(obj, _BY_NAME_MARK, obj)
+    except (AttributeError, TypeError):
+        _marked_without_dict[id(obj)] = obj
+
+
+def fingerprinted_by_name(obj: Any) -> bool:
+    """Whether `@pivot.fingerprint_by_name` marked `obj` itself.
+
+    The fallback table is checked first by object identity, for a marked object whose type
+    refused the generic store. Otherwise the mark is read with `object.__getattribute__`, the
+    generic C lookup: no class `__getattr__`, no class-level `__dict__` property and no metaclass
+    code runs. A class property with the mark's name can still run, so any error from that read
+    means unmarked. `functools.update_wrapper` copies the instance dict into a wrapper, so the
+    copy in a wrapper holds a different object and the wrapper is not marked.
+    """
+    if _marked_without_dict.get(id(obj)) is obj:
+        return True
+    try:
+        mark = object.__getattribute__(obj, _BY_NAME_MARK)
+    except Exception:
+        return False
+    return mark is obj
+
+
+def wrapper_chain(obj: Any, stop: Callable[[Any], bool] | None = None) -> Iterator[Any]:
+    """Yield `obj`, then each object its `__wrapped__` chain reaches, in order.
+
+    Every step along a `__wrapped__` chain in pivot goes through this, so each path sees the
+    chain `inspect.unwrap` sees; the mark decision first asks whether a value keeps a
+    `__wrapped__` of its own (`_mark_chain`). It follows the chain as `inspect.unwrap` does: by
+    attribute access, so a `__wrapped__` kept in a slot or a property counts as one in an
+    instance `__dict__`; a class ends the chain; `stop` ends it at the first object it accepts;
+    and its loop guard, by object identity and the recursion limit, ends the chain before an
+    object it has already yielded. `inspect.unwrap` raises ValueError at a loop, and so does
+    `unwrap`; a decision about the chain (`_mark_decision`, through `_mark_chain`) takes a loop
+    as the chain's end, so a looped chain without a mark on it is decided as main decides it.
+    """
+    memo = {id(obj): obj}
+    limit = sys.getrecursionlimit()
+    current = obj
+    yield current
+    while not isinstance(current, type) and hasattr(current, "__wrapped__"):
+        if stop is not None and stop(current):
+            return
+        current = current.__wrapped__
+        if id(current) in memo or len(memo) >= limit:
+            return
+        memo[id(current)] = current
+        yield current
+
+
+def unwrap(obj: Any, stop: Callable[[Any], bool] | None = None) -> Any:
+    """`inspect.unwrap(obj, stop=stop)`, through `wrapper_chain`: the last object on `obj`'s
+    `__wrapped__` chain, or the first one `stop` accepts. A loop raises ValueError, as it does
+    in `inspect.unwrap`.
+
+    It differs from `inspect.unwrap` in two pathological chains, and each fails loudly and
+    drops nothing: with a `__wrapped__` property that returns another object on each access,
+    the second test of the end (`looped`, and `stop` asked again) can raise ValueError where
+    `inspect.unwrap` returns; and on a chain longer than the recursion limit, `_stop_at_mark`
+    asked of a lower link can see a mark that `_mark_decision` asked of the top does not, and
+    the walk then raises.
+    """
+    *_, end = wrapper_chain(obj, stop)
+    looped = not isinstance(end, type) and hasattr(end, "__wrapped__")
+    if looped and (stop is None or not stop(end)):
+        raise ValueError(f"wrapper loop when unwrapping {obj!r}")
+    return end
+
+
+def _mark_chain(obj: Any) -> Iterator[Any]:
+    """`wrapper_chain(obj)` as the mark decision reads it, for a value main may not walk as code.
+
+    `obj` is a wrapper only if it keeps a `__wrapped__` of its own (`_keeps_own_attribute`), so
+    its `__getattr__` is not asked. Then the chain is read as `wrapper_chain` reads it, with the
+    same reads, and a lookup that raises an exception other than AttributeError ends the chain.
+    Main reads no `__wrapped__` of a value it does not unwrap, such as a callable user class
+    instance, which it refuses as it is; so an object whose `__getattr__` answers every name, or
+    raises KeyError for a missing one (a dict-backed config, an `AttrDict`), and a `__wrapped__`
+    property that raises, give no chain, and the value is decided as main decides it. Where main
+    does unwrap the value, `unwrap` reads the chain as `inspect.unwrap` does on main, errors
+    included.
+    """
+    if not _keeps_own_attribute(obj, "__wrapped__"):
+        yield obj
+        return
+    chain = wrapper_chain(obj)
+    while True:
+        try:
+            current = next(chain)
+        except Exception:  # StopIteration at the end, or the error of user code in a lookup
+            return
+        yield current
+
+
+def _recorded_by_name(obj: Any) -> bool:
+    """Whether the walk records `obj` by its module and qualified name for a mark.
+
+    That is a marked object (a function, or an instance of a class-based decorator that
+    `@fingerprint_by_name` marked), a method bound to one, and a library wrapper object without
+    Python code of its own (functools.cache, lru_cache) whose `__wrapped__` chain reaches a
+    marked object through such wrappers only. A Python function on the chain (a functools.wraps
+    decorator) or an instance of a user class above the mark is user code: `_mark_decision`
+    fingerprints the function by its own code and refuses the instance.
+    """
+    if not _marks_made:  # nothing in this process is marked (`_marks_made`)
+        return False
+    if fingerprinted_by_name(obj):
+        return True
+    if inspect.ismethod(obj):
+        return _recorded_by_name(obj.__func__)
+    if inspect.isfunction(obj) or isinstance(obj, (type, types.ModuleType)):
+        return False
+    if is_user_code(type(obj)):
+        return False
+    below = _mark_chain(obj)
+    next(below)  # `obj` itself
+    for current in below:
+        if fingerprinted_by_name(current):
+            return True
+        if _is_user_class_instance(current):
+            return False
+        if inspect.isfunction(current) or isinstance(current, (type, types.ModuleType)):
+            return False
+    return False
+
+
+class _MarkDecision(enum.Enum):
+    """What the walk does with an object on a `__wrapped__` chain that holds a mark."""
+
+    BY_NAME = "by_name"  # the marked object, or library wrappers over it: recorded by name
+    OWN_CODE = "own_code"  # a user function above the mark: fingerprinted by its own code
+    REFUSED = "refused"  # a user class instance above the mark: refused
+
+
+# The decisions the canonical form compares once per value, read as globals.
+_BY_NAME = _MarkDecision.BY_NAME
+_REFUSED = _MarkDecision.REFUSED
+
+
+def _mark_decision(obj: Any) -> _MarkDecision | None:
+    """The one decision for an object whose `__wrapped__` chain holds a `@fingerprint_by_name`
+    mark, or None when the chain holds no mark.
+
+    Every path that reads a value (a global, closure cell, default, class member, module
+    attribute, partial function or argument, loader field, default factory) asks it before it
+    unwraps, so no path drops an object on such a chain without a decision. The decision and
+    every unwrap read the chain through `wrapper_chain`, so they see the same objects of a chain
+    whose objects keep their own `__wrapped__`. The decision reads it through `_mark_chain`, and
+    only for a callable: main walks no other value as code, and reads no `__wrapped__` of a
+    value it does not unwrap, so the decision does not ask the value's own `__getattr__`, and
+    takes an error from a lookup as the end of the chain. Without a mark the answer is None and
+    the walk is main's.
+
+    Two short-circuits keep the decision off the hot path: without a mark in the process
+    (`_marks_made`) it is None for every value, with no chain read; and within one
+    `fingerprint_pass()` an object is decided once, so a value classified twice reads its chain
+    once.
+    """
+    if not _marks_made or not callable(obj) or isinstance(obj, (type, types.ModuleType)):
+        return None
+    return _memoized("mark", obj, lambda: _chain_mark_decision(obj))
+
+
+def _chain_mark_decision(obj: Any) -> _MarkDecision | None:
+    """`_mark_decision` for a callable in a process that holds a mark: the chain reads."""
+    target = obj.__func__ if inspect.ismethod(obj) else obj
+    if _mark_on_chain(target) is None:
+        return None
+    if _recorded_by_name(obj):
+        return _MarkDecision.BY_NAME
+    if _class_above_mark(target) is not None:
+        return _MarkDecision.REFUSED
+    return _MarkDecision.OWN_CODE
+
+
+def _class_above_mark(obj: Any) -> Any:
+    """The first user class instance on `obj`'s `__wrapped__` chain (`_mark_chain`), `obj`
+    included, that is above a marked object, or None."""
+    found: Any = None
+    for current in _mark_chain(obj):
+        if fingerprinted_by_name(current):
+            return found
+        if found is None and _is_user_class_instance(current):
+            found = current
+    return None
+
+
+def _refuse_class_above_mark(value: Any) -> None:
+    """Refuse `value`, on whose chain a user class instance is above a mark, naming both.
+
+    The mark records only the object below the instance, and no fingerprint records a class
+    instance's code and state, so an edit to the class would go unseen. Unsafe fingerprinting
+    does not suppress this refusal: the fixes are local to the helper.
+    """
+    instance = _class_above_mark(value.__func__ if inspect.ismethod(value) else value)
+    marked = _mark_on_chain(instance)  # below the instance: `_class_above_mark` stops at a mark
+    decorator = _definition_ref(type(instance))
+    helper = _library_name(marked) if marked is not None else _definition_ref(instance)
+    stage = _current_stage_name.get()
+    prefix = f"Stage '{stage}': " if stage else ""
+    message = (
+        f"{prefix}the class-based decorator '{decorator}' is above '{helper}', which is marked "
+        + "@fingerprint_by_name.\n"
+        + f"The mark records '{helper}' by name only, and Pivot cannot fingerprint the code and "
+        + f"state of a class-based decorator, so an edit to '{decorator}' would leave the stage "
+        + "cached with an old output.\n"
+        + "Fix one of:\n"
+        + "  - put @fingerprint_by_name above the class-based decorator, so Pivot records the "
+        + "whole helper by name;\n"
+        + "  - replace the class with a function decorator built with functools.wraps, which "
+        + "Pivot fingerprints by its own code."
+    )
+    errors = _capture_errors.get()
+    if errors is None:
+        raise exceptions.StageDefinitionError(message)
+    errors.append(message)
+
+
+def _mark_on_chain(obj: Any) -> Any:
+    """The first marked object on `obj`'s `__wrapped__` chain (`_mark_chain`), `obj` included,
+    or None. Without a mark in the process (`_marks_made`) no chain holds one, and none is read.
+    """
+    if not _marks_made:
+        return None
+    return next((current for current in _mark_chain(obj) if fingerprinted_by_name(current)), None)
+
+
+def _stop_at_mark(obj: Any) -> bool:
+    """Where an unwrap that leads to code stops: a marked object, or user code above one.
+
+    The mark covers only the marked object. The walk reads the own code of a user function
+    above it, and `_mark_decision` refuses a user class instance above it, so no unwrap passes
+    either. A library wrapper (a `contextlib.contextmanager` helper, `functools.cache`) is not a
+    stop. Without a mark on the chain nothing stops, and the unwrap goes to the end, as on main.
+    Each unwrap with this stop is `unwrap`, which reads the chain as `_mark_decision` does, and
+    raises where a `__wrapped__` lookup raises, as `inspect.unwrap` does on main.
+    """
+    if _mark_on_chain(obj) is None:
+        return False
+    return (
+        fingerprinted_by_name(obj)
+        or (inspect.isfunction(obj) and _written_in_user_source(obj))
+        or _is_user_class_instance(obj)
+    )
+
+
+def _source_object(func: Any) -> Any:
+    """What a read of `func`'s source parses, or None where that read would reach a mark.
+
+    `inspect.getsource` follows `__wrapped__` to the end of the chain with no stop. Without a
+    mark on the chain this returns that end, so the read is the one main makes. With a mark,
+    `_mark_decision` decides: an object recorded by name, or a chain with a user class instance
+    above the mark (which the walk refuses), gives None. Otherwise the unwrap stops at
+    `_stop_at_mark`: for a user function decorator above the mark this returns the decorator's
+    code object, whose own lines `inspect.getsource` reads (a code object has no
+    `__wrapped__`); for the mark itself it returns None. No source read reaches a marked body.
+    """
+    decision = _mark_decision(func)
+    if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
+        return None
+    target = unwrap(func, stop=_stop_at_mark)
+    if fingerprinted_by_name(target):
+        return None
+    if _stop_at_mark(target):
+        return target.__code__
+    return target
+
+
+def _by_name_hash(func: Any) -> str:
+    """The code hash of a function the walk records by name: a hash of that name."""
+    return xxhash.xxh64(f"by-name:{_library_name(func)}".encode()).hexdigest()
+
+
 def is_user_code(obj: Any) -> bool:
     """Check if object is user code (not stdlib/site-packages/builtins, nor pivot's own
     packages: ``is_library_path``)."""
@@ -3204,6 +3994,11 @@ def is_user_code(obj: Any) -> bool:
 
 def _is_user_code_impl(obj: Any) -> bool:
     """Internal implementation of is_user_code."""
+    # A function the walk records by name (`_recorded_by_name`) is library code: the walk
+    # records it by name and never descends into its body.
+    if _recorded_by_name(obj):
+        return False
+
     module = _get_module(obj)
     if module is None:
         return False

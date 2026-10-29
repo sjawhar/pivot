@@ -7,7 +7,7 @@ import pytest
 from pivot import exceptions, executor, explain, status
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
-from pivot.storage import cache, track
+from pivot.storage import cache, listing, track
 from pivot.storage import state as state_mod
 from pivot.types import RemoteStatus, StageExplanation
 from tests import helpers
@@ -41,6 +41,19 @@ def _helper_register_two_stages() -> None:
         _helper_stage_a, name="stage_a", deps={"input_file": "input.txt"}
     )
     helpers.register_test_stage(_helper_stage_b, name="stage_b", deps={"a_file": stage_a})
+
+
+def _helper_write_tracked_directory(project_root: pathlib.Path, name: str) -> None:
+    """Record a directory as `pivot track` does: its `.pvt` holds the directory's record, and
+    the `.pvt.listing` beside it holds the directory's members."""
+    hashed = cache.hash_directory(project_root / name)
+    record = hashed["record"]
+    pvt_path = project_root / f"{name}.pvt"
+    listing.write(listing.tracked_listing_path(pvt_path), hashed["data"])
+    track.write_pvt_file(
+        pvt_path,
+        track.PvtData(path=name, hash=record["hash"], size=record["size"], nfiles=record["nfiles"]),
+    )
 
 
 # =============================================================================
@@ -275,17 +288,14 @@ def test_tracked_directory_clean(set_project_root: pathlib.Path) -> None:
     (data_dir / "file1.txt").write_text("content1")
     (data_dir / "file2.txt").write_text("content2")
 
-    dir_hash = cache.hash_directory(data_dir)
-    total_size = sum(entry["size"] for entry in dir_hash["manifest"])
-
-    pvt_data = track.PvtData(path="data", hash=dir_hash["hash"], size=total_size)
-    track.write_pvt_file(set_project_root / "data.pvt", pvt_data)
+    _helper_write_tracked_directory(set_project_root, "data")
 
     results = status.get_tracked_files_status(set_project_root)
 
-    assert len(results) == 1
+    assert len(results) == 1, "The .pvt.listing beside data.pvt is not a tracked file"
     assert results[0]["path"] == "data"
     assert results[0]["status"] == "clean"
+    assert results[0]["size"] == 16, "Size is the two 8-byte files' total, from the .pvt"
 
 
 def test_tracked_directory_modified(set_project_root: pathlib.Path) -> None:
@@ -296,11 +306,7 @@ def test_tracked_directory_modified(set_project_root: pathlib.Path) -> None:
     data_dir.mkdir()
     (data_dir / "file1.txt").write_text("content1")
 
-    dir_hash = cache.hash_directory(data_dir)
-    total_size = sum(entry["size"] for entry in dir_hash["manifest"])
-
-    pvt_data = track.PvtData(path="data", hash=dir_hash["hash"], size=total_size)
-    track.write_pvt_file(set_project_root / "data.pvt", pvt_data)
+    _helper_write_tracked_directory(set_project_root, "data")
 
     (data_dir / "file1.txt").write_text("modified content")
 

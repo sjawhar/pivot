@@ -8,18 +8,26 @@ fast as possible.
 ## Content-Addressable Cache
 
 Every output file is hashed with `xxhash64` and stored under
-`<state dir>/cache/files/<hash[:2]>/<hash[2:]>` (a two-level directory structure using the first
-two hex characters as a prefix). The per-stage lock file records each output's content hash.
-`<state dir>` is `core.state_dir`, which defaults to `.pivot`.
+`<state dir>/cache/files/<hash[:2]>/<hash[2:]>` (a two-level directory structure
+using the first two hex characters as a prefix). A directory has one cache
+object at its directory hash too: its text listing. The directory's whole-tree
+symlink checkout, when configured, is separate under
+`<state dir>/cache/trees/<hash[:2]>/<hash[2:]>`; it cannot collide with a file or
+listing object. The per-stage lock records a file's hash, or a directory's
+listing hash, total size and file count. `<state dir>` is `core.state_dir`,
+which defaults to `.pivot`.
 
 ```
 <state dir>/
   cache/
     files/
       a1/
-        b2c3d4e5f6g7h8     # cached file (content-addressed)
+        b2c3d4e5f6g7h8     # cached file or a directory listing
         .pivot_cache.lock  # lock file pivot keeps in each prefix directory
       ...
+    trees/
+      a1/
+        b2c3d4e5f6g7h8     # a complete directory for symlink checkout
     projects/
       3f2a1c0d9e8b7a65.json  # one view of a project that uses this cache (see below)
     mounts/
@@ -28,22 +36,24 @@ two hex characters as a prefix). The per-stage lock file records each output's c
   stages/
     demo/
       clean.lock           # lock file for stage "demo/clean"
+      clean=.listing       # listing for clean's directory output, if any
       train.lock           # lock file for stage "demo/train"
   state.lmdb/              # LMDB database and this project's pivot-project-id
 ```
 
-Each prefix directory also holds a `.pivot_cache.lock` file, and while a file
-or directory is being cached a `.pivot_tmp_*` entry; in `symlink` checkout
-mode, each cached directory tree has a `<hash>.content-checked` marker and may
-have a `<hash>.lock` file beside it. Pivot keeps the lock files and removes the
-`.pivot_tmp_*` entries a killed process leaves (at most once an hour per
-prefix directory). Do not delete these files while pivot runs. A tree that
-pivot 0.5.11 or older marked `<hash>.verified` is checked by content again,
-then marked anew. A user who cannot write the cache cannot mark it, so pivot
-checks the tree on each of their symlink restores and commits, and their
-symlink commit through a stale one fails. One
-`pivot checkout --checkout-mode symlink` through the tree by a user who can
-write the cache ends this.
+Each prefix directory also holds a `.pivot_cache.lock` file. A file or directory cache operation
+uses a `.pivot_tmp_*` entry. In `symlink` mode, each cached directory tree has a
+`<hash>.content-checked` marker and can have a `<hash>.lock` file beside it. The marker contains
+the canonical listing bytes after Pivot verifies the tree. Pivot uses a tree without a check only
+when the listing bytes match that marker. It checks an unmarked tree by content first, and it does
+not use a tree marked for other listing bytes. A restore can mark a matching tree, but it never
+repairs a tree. Only a commit can repair a tree from its file objects. Pivot keeps lock files and
+removes stale `.pivot_tmp_*` entries at most once each hour per prefix directory. Do not delete
+these files while Pivot runs. A tree that Pivot 0.5.11 or older marked `<hash>.verified` is
+checked by content again. A user who cannot write the cache cannot mark or repair a tree. Pivot
+then checks the tree on each of their symlink restores and commits, and their symlink commit
+through a stale tree fails. A `pivot checkout --checkout-mode symlink` by a user who can write the
+cache marks a tree that matches. Only a symlink commit by such a user repairs a stale tree.
 
 A cache several machines share (a `cache.dir` on a network filesystem) needs
 file locks that work across those machines: NFSv4, or NFSv3 with its lock

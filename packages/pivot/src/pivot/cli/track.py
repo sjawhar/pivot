@@ -6,10 +6,10 @@ from typing import TypedDict
 
 import click
 
-from pivot import config, discovery, project
+from pivot import config, discovery, git, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
-from pivot.storage import cache, ownership, state
+from pivot.storage import cache, listing, ownership, state
 from pivot.storage import gc as gc_mod
 from pivot.storage import track as track_mod
 
@@ -19,6 +19,69 @@ class TrackResult(TypedDict):
 
     warning: str | None
     tracked_path: str
+
+
+def _tracking_files(data_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """The files tracking ``data_path`` writes, or for a file removes: its .pvt and listing."""
+    pvt_path = track_mod.get_pvt_path(data_path)
+    return pvt_path, listing.tracked_listing_path(pvt_path)
+
+
+def _tracking_file_collision(
+    path: pathlib.Path, existing_tracked: dict[str, track_mod.PvtData], project_root: pathlib.Path
+) -> str | None:
+    """Why tracking ``path`` would collide with another tracked path, or None.
+
+    A collision is ``path`` being the .pvt or listing file pivot keeps for another tracked
+    path, or one of ``path``'s own being another tracked path: tracking would overwrite or
+    remove it. Any other name, ``.pvt`` or ``.pvt.listing`` endings included, can be tracked.
+    """
+    for tracked in existing_tracked:
+        other = pathlib.Path(tracked)
+        if other == path:
+            continue
+        shown = project.to_relative_path(other, project_root)
+        if path in _tracking_files(other):
+            return f"it is the file pivot keeps to record the tracked path '{shown}'"
+        if other in _tracking_files(path):
+            return f"tracking it writes the file '{shown}', which is itself a tracked path"
+    return None
+
+
+def _foreign_listing(
+    listing_path: pathlib.Path,
+    recorded: track_mod.PvtData | None,
+    new_data: bytes | None,
+    cache_dir: pathlib.Path,
+) -> bool:
+    """Whether something stands at ``listing_path`` that pivot did not write for this target:
+    anything but a file holding the listing of the directory its .pvt records (``recorded``) or
+    the bytes about to be written there (``new_data``).
+
+    A listing file is pivot's when the cache (configured or legacy,
+    ``cache.resolve_cache_object_path``) holds exactly its bytes at their own digest: a listing
+    pivot stored, current or stale. With no cache copy at that digest it is pivot's when its
+    bytes hash to the recorded directory, the rule ``listing._resolve`` reads it by. XXH64 alone
+    never overrides a cache copy whose bytes differ.
+    """
+    if not os.path.lexists(listing_path):
+        return False
+    if listing_path.is_symlink() or not listing_path.is_file():
+        return True
+    try:
+        data = listing_path.read_bytes()
+    except OSError:
+        return True
+    if data == new_data:
+        return False
+    data_digest = listing.digest(data)
+    cached_path = cache.resolve_cache_object_path(cache_dir, data_digest)
+    if cached_path is not None:
+        try:
+            return cached_path.read_bytes() != data
+        except OSError:
+            return True
+    return recorded is None or "nfiles" not in recorded or data_digest != recorded["hash"]
 
 
 def _track_single_path(
@@ -61,6 +124,10 @@ def _track_single_path(
     if not path.exists():
         raise click.ClickException(f"Path not found: {path_str}")
 
+    collision = _tracking_file_collision(path, existing_tracked, project_root)
+    if collision is not None:
+        raise click.ClickException(f"Cannot track '{path_str}': {collision}; rename one of them")
+
     # Check if tracking file inside symlinked directory. The .pvt is written beside the data
     # (get_pvt_path), so a directory that really lies outside the project takes the .pvt with
     # it, where no command finds it again: refuse before anything is cached or written.
@@ -83,6 +150,7 @@ def _track_single_path(
     already_tracked = abs_path_str in existing_tracked
     if already_tracked and not force:
         raise click.ClickException(f"'{path_str}' is already tracked. Use --force to update.")
+    track_mod.validate_pvt_path_name(path.name)
 
     # Check every pipeline output. OSError reaches the command error handler, which names path.
     overlap = ownership.find_declared_overlap(path, stage_outputs, project_root)
@@ -104,32 +172,46 @@ def _track_single_path(
     # Hash and publish before the naming unit, so reading and copying a large file or directory
     # holds no lock that a waiting collection would turn into a stall for every other commit on
     # the cache. A newly published object is protected by the grace period in the meantime.
+    listing_path = listing.tracked_listing_path(pvt_path)
+    listing_data: bytes | None = None
     if path.is_dir():
-        dir_hash = cache.hash_directory(
+        hashed = cache.hash_directory(
             path, cache_dir=cache_dir, warn_left_out_symlinks=warn_left_out_symlinks, pending=read
         )
-        manifest = dir_hash["manifest"]
-        objects = [(path / entry["relpath"], entry["hash"], entry["isexec"]) for entry in manifest]
-        pvt_data: track_mod.PvtData = {
-            "path": path.name,
-            "hash": dir_hash["hash"],
-            "size": sum(e["size"] for e in manifest),
-            "num_files": len(manifest),
-            "manifest": manifest,
-        }
-        if "empty_dirs" in dir_hash:
-            pvt_data["empty_dirs"] = dir_hash["empty_dirs"]
+        objects = [
+            (path / entry["relpath"], entry["hash"], entry["isexec"])
+            for entry in hashed["listing"]["files"]
+        ]
+        record = hashed["record"]
+        listing_data = hashed["data"]
+        pvt_data = track_mod.PvtData(
+            path=path.name,
+            hash=record["hash"],
+            size=record["size"],
+            nfiles=record["nfiles"],
+        )
     else:
         file_hash, file_stat = cache.hash_file(path, pending=read)
         objects = [(path, file_hash, False)]
-        pvt_data = {"path": path.name, "hash": file_hash, "size": file_stat.st_size}
+        pvt_data = track_mod.PvtData(path=path.name, hash=file_hash, size=file_stat.st_size)
     for source, key, executable in objects:
         cache.copy_to_cache(source, cache.get_cache_path(cache_dir, key), executable=executable)
+    if listing_data is not None:
+        listing.store_object(cache_dir, pvt_data["hash"], listing_data)
 
+    # Pivot writes or removes only a listing it wrote for this target.
+    if _foreign_listing(listing_path, existing_tracked.get(abs_path_str), listing_data, cache_dir):
+        shown = project.to_relative_path(listing_path, project_root)
+        raise click.ClickException(
+            f"Cannot track '{path_str}': '{shown}' is in the way, and it is not a listing pivot "
+            + "wrote for it; move it aside (pivot never overwrites or removes a file it did not "
+            + "write)"
+        )
     # Naming-lock unit (shared), the naming step only: re-check under the lock that every object
     # is still in the cache — one that already existed was not published above (a cache hit
     # publishes nothing), so a collection may have removed it since — publish any that is gone,
-    # then write the .pvt that names them. gc cannot delete while this unit is open.
+    # the directory's listing object included, then write the listing and the .pvt that name
+    # them. gc cannot delete while this unit is open.
     with gc_mod.naming_unit(
         config.get_cache_dir(), project=(project.get_project_root(), config.get_state_dir())
     ):
@@ -138,7 +220,23 @@ def _track_single_path(
             cache.copy_to_cache(
                 source, cache.get_cache_path(cache_dir, key), executable=executable, verify=True
             )
+        # Write the .pvt after its listing, so no .pvt names a listing not yet written.
+        if listing_data is not None:
+            listing.store_object(cache_dir, pvt_data["hash"], listing_data)
+            listing.write(listing_path, listing_data)
+        else:
+            listing_path.unlink(missing_ok=True)  # the listing of a directory tracked here before
         track_mod.write_pvt_file(pvt_path, pvt_data)
+    written = [pvt_path] if listing_data is None else [pvt_path, listing_path]
+
+    ignored = git.ignored_paths(project_root, written)
+    if ignored:
+        names = ", ".join(str(ignored_path.relative_to(project_root)) for ignored_path in ignored)
+        ignored_warning = (
+            f"Warning: git ignores {names}; commit {'it' if len(ignored) == 1 else 'them'} "
+            + "with the data path's other tracking files (un-ignore them, or `git add -f`)"
+        )
+        warning = ignored_warning if warning is None else f"{warning}\n{ignored_warning}"
 
     # Update existing_tracked for subsequent paths
     existing_tracked[abs_path_str] = pvt_data

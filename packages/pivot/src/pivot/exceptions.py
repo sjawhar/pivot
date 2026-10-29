@@ -1,7 +1,7 @@
 import os
 import pathlib
 from difflib import get_close_matches
-from typing import override
+from typing import ClassVar, override
 
 # Fuzzy matching constants
 _FUZZY_CUTOFF = 0.6
@@ -274,6 +274,12 @@ class CacheCollectionRefusedError(CacheError):
     """
 
 
+class RestartedIncrementalOutputError(CacheError):
+    """Raised when an older pivot rewrote the lock this pivot wrote for a stage with an
+    incremental output (``lock.restart_proofs``): that pivot may have restarted the output
+    from empty."""
+
+
 class CacheModeCollisionError(CacheError):
     """A HARDLINK/SYMLINK checkout shares the cache object's own permissions and found it
     already recorded with the wrong executable bit, with no COPY fallback available.
@@ -295,6 +301,31 @@ class CacheModeCollisionError(CacheError):
             "<stage>`, `pivot track --force <path>`) to publish it with the right bit; until it "
             "is published again, any workspace file symlinked to it is broken"
         )
+
+
+class CorruptListingError(CacheError):
+    """A directory listing is malformed or cannot be read, or its bytes do not hash to the
+    directory hash its lock or ``.pvt`` records. The message names the file."""
+
+    REMEDY: ClassVar[str] = (
+        "`pivot repro --force <stage>` rewrites a stage's listing and `pivot track --force "
+        + "<path>` a tracked directory's; `git checkout <the revision its lock or .pvt came "
+        + "from> -- <file>` restores the one committed with it"
+    )
+    """What puts the file right. The listing may be stale in git's index as well (a lock put
+    back without it, a merge), so ``git checkout -- <file>`` alone can change nothing."""
+
+    @override
+    def get_suggestion(self) -> str:
+        return f"`pivot pull` fetches the cache's copy of a listing a remote holds. {self.REMEDY}"
+
+
+class ListingMissingError(CacheError):
+    """Neither the committed listing file nor the cache holds a directory's listing."""
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Commit the listing file beside its lock or .pvt, or run 'pivot pull'"
 
 
 class ParamsError(PivotError):

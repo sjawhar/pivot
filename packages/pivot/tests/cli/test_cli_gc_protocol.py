@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pivot import run_history, types
-from pivot.storage import cache, gc, lock, state, track
+from pivot.storage import cache, gc, listing, lock, state, track
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -1764,3 +1764,185 @@ def test_pivot_gc_refuses_a_stale_clone_after_the_original_writes_again(
     out = collected.stdout + collected.stderr
     assert collected.returncode != 0, out
     assert obj.exists(), "node2's gc read its stale clone as node1's project"
+
+
+# =============================================================================
+# Round 10: a directory's members live in its listing, and the mount table is watched
+# =============================================================================
+
+_DIRECTORY_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def split(text: str) -> Annotated[dict[str, str], directory]:
+    return {"a.txt": text, "b.txt": text.upper(), "sub/c.txt": "c"}
+
+
+with Pipeline("shadow") as pipeline:
+    split(pipeline.input("input.txt", t=str))
+"""
+
+
+def _directory_record(root: pathlib.Path) -> types.DirHash:
+    """The directory output's record in the stage lock `pivot repro` wrote."""
+    data = lock.StageLock("shadow/split", lock.get_stages_dir(root / ".pivot")).read(
+        cache_dir=root / ".pivot" / "cache" / "files"
+    )
+    assert data is not None, "the stage wrote no lock"
+    record = next(iter(data["output_hashes"].values()))
+    assert types.is_dir_hash(record), "the stage's output is a directory"
+    return record
+
+
+def _directory_project(path: pathlib.Path) -> pathlib.Path:
+    root = _project(path)
+    (root / "pipeline.py").write_text(_DIRECTORY_PIPELINE)
+    _ok(_run(root, "repro"))
+    return root
+
+
+def test_pivot_gc_keeps_the_members_a_directorys_listing_names(tmp_path: pathlib.Path) -> None:
+    """#523 records a directory by its listing: the lock holds the listing's hash, its size and
+    its file count, and the members are named only inside the listing. A collection must read
+    it and keep every member, the listing object itself and the whole-directory tree."""
+    root = _directory_project(tmp_path / "project")
+    objects = root / ".pivot" / "cache" / "files"
+    record = _directory_record(root)
+    members = listing.read(None, record, objects)
+    assert len(members["files"]) == 3, members
+    member_objects = [cache.get_cache_path(objects, entry["hash"]) for entry in members["files"]]
+    assert all(path.exists() for path in member_objects), member_objects
+    dead = _publish(objects, tmp_path, "named by nothing\n")
+
+    collected = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode == 0, out
+    for path in member_objects:
+        assert path.exists(), f"gc removed {path}, a member of the directory the lock records"
+    assert cache.get_cache_path(objects, record["hash"]).exists(), "gc removed the listing object"
+    assert not cache.get_cache_path(objects, dead).exists(), out
+
+
+def test_pivot_gc_refuses_a_directory_whose_listing_is_gone(tmp_path: pathlib.Path) -> None:
+    """With neither the committed listing nor the cache's copy, the files of a recorded
+    directory are unknown. A collection must refuse and remove nothing, never take the members
+    for dead."""
+    root = _directory_project(tmp_path / "project")
+    objects = root / ".pivot" / "cache" / "files"
+    record = _directory_record(root)
+    members = listing.read(None, record, objects)
+    member_objects = [cache.get_cache_path(objects, entry["hash"]) for entry in members["files"]]
+    committed = listing.output_listing_path(
+        lock.get_stages_dir(root / ".pivot"), types.ArtifactIdentity("shadow/split", None)
+    )
+    assert committed.is_file(), committed
+    committed.unlink()
+    cache.clear_path(cache.get_cache_path(objects, record["hash"]))
+    dead = _publish(objects, tmp_path, "named by nothing\n")
+
+    refused = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert record["hash"] in out and "no listing of it" in out, out
+    for path in member_objects:
+        assert path.exists(), f"gc removed {path} with no listing to prove it dead"
+    assert cache.get_cache_path(objects, dead).exists(), "a refused collection removed an object"
+
+
+_MOUNT_DRIVER = """\
+import pathlib
+import subprocess
+import sys
+
+from pivot.storage import gc
+
+root, state_dir, cache_dir, source, target = (pathlib.Path(a) for a in sys.argv[1:6])
+gc.register_project(cache_dir, root, state_dir)
+subprocess.run(
+    ["sudo", "-n", "mount", "--bind", str(source), str(target)], check=True, capture_output=True
+)
+gc.register_project(cache_dir, root, state_dir)
+print(gc.project_register_path(cache_dir, root, state_dir))
+"""
+
+
+def test_a_naming_unit_records_a_mount_that_appeared_since_the_last_one(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The registration memo lets a unit skip the mount-table read, so it watches the table
+    instead (`_watch_mount_table`): the kernel reports every mount in this namespace. A unit
+    after a mount under the project must register in full and record that mount, or a
+    collection would read a register that no longer describes where this project's records
+    are."""
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True, check=False).returncode:
+        pytest.skip("a mount namespace needs passwordless sudo")
+    root = _project(tmp_path / "project")
+    _ok(_run(root, "repro"))
+    source = tmp_path / "late-disk"
+    source.mkdir()
+    target = root / "data" / "late"
+    target.mkdir()
+    driver = tmp_path / "driver.py"
+    driver.write_text(_MOUNT_DRIVER)
+    user_command = shlex.join(
+        [
+            "sudo",
+            "-n",
+            "-u",
+            getpass.getuser(),
+            "env",
+            f"HOME={os.environ['HOME']}",
+            f"PATH={os.environ['PATH']}",
+            sys.executable,
+            str(driver),
+            str(root),
+            str(root / ".pivot"),
+            str(root / ".pivot" / "cache"),
+            str(source),
+            str(target),
+        ]
+    )
+    done = subprocess.run(
+        ["sudo", "-n", "unshare", "-m", "--", "bash", "-c", f"set -e\n{user_command}"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+    out = done.stdout + done.stderr
+    assert done.returncode == 0, out
+    entry = json.loads(pathlib.Path(done.stdout.strip().splitlines()[-1]).read_text())
+    assert str(target.resolve()) in entry["mounts"], entry
+
+
+def test_pivot_gc_reads_a_committed_listing_the_cache_no_longer_holds(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A clone has the listing files git carries and an empty cache; a cache someone emptied
+    is the same. The committed listing beside the lock names the directory's files, so a
+    collection reads it instead of refusing."""
+    root = _directory_project(tmp_path / "project")
+    objects = root / ".pivot" / "cache" / "files"
+    record = _directory_record(root)
+    members = listing.read(None, record, objects)
+    member_objects = [cache.get_cache_path(objects, entry["hash"]) for entry in members["files"]]
+    committed = listing.output_listing_path(
+        lock.get_stages_dir(root / ".pivot"), types.ArtifactIdentity("shadow/split", None)
+    )
+    assert committed.is_file(), committed
+    cache.clear_path(cache.get_cache_path(objects, record["hash"]))
+    dead = _publish(objects, tmp_path, "named by nothing\n")
+
+    collected = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode == 0, out
+    for path in member_objects:
+        assert path.exists(), f"gc removed {path}, a member the committed listing names"
+    assert not cache.get_cache_path(objects, dead).exists(), out

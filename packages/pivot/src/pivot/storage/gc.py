@@ -2,8 +2,12 @@
 
 Liveness is read from disk, never inferred. Five classes of record name an object: a stage
 lock (``outs`` and ``deps``), a ``.pvt`` file, a run-cache row, a workspace link into the
-cache, and a ref under ``<cache>/files/refs``. Each contributes a file's hash, or a
-directory's tree hash and every hash in its manifest.
+cache, and a ref under ``<cache>/files/refs``. Each contributes a file's hash, or, for a
+directory, the hash of its listing — which is itself the cache object at that hash, and the
+name of its whole-directory tree under ``<cache>/trees`` — and every file hash that listing
+names (``storage/listing.py``). A directory whose listing this collection cannot read refuses
+it: the members are unknown, and a collection that cannot read a record never licences a
+delete.
 
 A cache outside the project root can hold another project's outputs, whose locks this project
 cannot read. Pivot therefore keeps a register of the projects that use a cache, at
@@ -22,6 +26,7 @@ import contextlib
 import datetime
 import errno
 import fcntl
+import functools
 import hashlib
 import importlib.metadata
 import json
@@ -30,6 +35,7 @@ import os
 import pathlib
 import re
 import secrets
+import select
 import socket
 import subprocess
 import time
@@ -40,19 +46,23 @@ import yaml
 
 from pivot import exceptions, project, run_history, yaml_config
 from pivot import state_dir as state_dir_mod
-from pivot.storage import cache, lock, state, track
+from pivot.storage import cache, listing, lock, state, track
 from pivot.types import is_dir_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable, Iterator
+    from collections.abc import Generator, Iterable
 
-    from pivot.types import HashInfo
+    from pivot.types import DirHash
 
 logger = logging.getLogger(__name__)
 
 # Cache objects live under this directory of the cache; the register is its sibling, so no
 # cache scan sees it (``remote/sync.py`` descends two-character prefix directories only).
 OBJECTS_DIR = "files"
+# Whole-directory trees a symlink checkout links to, one per directory hash
+# (``cache.tree_path``). A tree's bytes are copies of its members, so it is collected on its
+# own; the record that names the directory keeps both it and the listing object.
+TREES_DIR = "trees"
 REGISTER_DIR = "projects"
 # Held exclusively for a whole collection, so two collections never run on one cache.
 GC_LOCK = "gc.lock"
@@ -86,8 +96,14 @@ VIEW_NONCE_DIR = "gc-views"
 # directory on a mount that is not mounted holds no entries.
 CACHE_MOUNTS_DIR = "mounts"
 _MOUNTS_TABLE = pathlib.Path("/proc/self/mounts")
+# Anything in /proc is on this, the one procfs mount a watch of the mount table must be on.
+_PROC_SELF = pathlib.Path("/proc/self")
 _MOUNT_ESCAPE = re.compile(rb"\\([0-7]{3})")
 _MOUNT_COMMAND_LINE = re.compile(r"^.* on (.*) \([^()]*\)$")
+# How long a register entry's ``last_write`` may lag before a registration rewrites the entry
+# that otherwise says exactly what this one would. Every process of a view would write the
+# same document, so without this each one rewrites it for its timestamp alone.
+_ENTRY_REFRESH_SECONDS = 3600.0
 
 
 class ProjectEntry(TypedDict):
@@ -329,7 +345,7 @@ def _entry_nonce_path(entry: pathlib.Path) -> pathlib.Path:
     return entry.with_suffix(".nonce")
 
 
-def _rotate_nonces(state_fd: int, register_fd: int) -> None:
+def _rotate_nonces(state_fd: int, register_fd: int, *, truncate: bool = False) -> None:
     """Write one fresh nonce to this view's nonce file in the state directory, then to the
     entry's nonce file in the register.
 
@@ -341,6 +357,11 @@ def _rotate_nonces(state_fd: int, register_fd: int) -> None:
     writes, so the register holds the nonce written last. Where the filesystem refuses the lock
     they write unlocked: an interleaving then leaves a mismatch, which only makes a collection
     refuse. Raises OSError.
+
+    Every nonce is the same length, so only a registration, which may find a longer file at
+    either path, truncates (``truncate``); the rotations after it overwrite the whole file.
+    A nonce file holding anything else is refused by its reader, so a collection never takes a
+    rotation for a stale nonce.
     """
     data = f"{secrets.token_hex(16)}\n".encode()
     locked = True
@@ -352,7 +373,8 @@ def _rotate_nonces(state_fd: int, register_fd: int) -> None:
         for fd in (state_fd, register_fd):
             if os.pwrite(fd, data, 0) != len(data):
                 raise OSError(errno.EIO, "short write of a view nonce")
-            os.ftruncate(fd, len(data))
+            if truncate:
+                os.ftruncate(fd, len(data))
     finally:
         if locked:
             fcntl.flock(state_fd, fcntl.LOCK_UN)
@@ -437,6 +459,53 @@ def _read_mount_table() -> bytes | None:
     return b"".join(chunks)
 
 
+class _MountWatch(NamedTuple):
+    """An open mount table and the poll that reports every change to it since it was opened."""
+
+    fd: int
+    poller: select.poll
+
+
+def _watch_mount_table() -> _MountWatch | None:
+    """Open `/proc/self/mounts` and arm a watch on this mount namespace's mount table, or None
+    where there is none to watch.
+
+    The kernel records the namespace's mount event counter in the open file and reports
+    ``POLLPRI`` (with ``POLLERR``) on the next poll after it changes, for every mount, unmount
+    and propagated mount in this namespace (``proc(5)``, "this file is pollable"); the poll
+    then re-arms. So one poll of this descriptor answers "has the mount table changed since I
+    read it", for the price of one syscall, where reading the table costs the kernel a pass
+    over every mount.
+
+    The watch is only that file's: a descriptor on anything but the procfs that holds
+    ``/proc/self`` reports no such event, so one that is not on it is refused and the caller
+    reads the table's bytes instead.
+    """
+    try:
+        fd = os.open(_MOUNTS_TABLE, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if os.fstat(fd).st_dev != os.stat(_PROC_SELF).st_dev:
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
+        return None
+    poller = select.poll()
+    poller.register(fd, select.POLLPRI)
+    return _MountWatch(fd, poller)
+
+
+def _mount_table_changed(watch: _MountWatch) -> bool:
+    """Whether this namespace's mount table changed since ``watch`` was armed or last polled."""
+    try:
+        events = watch.poller.poll(0)
+    except OSError:
+        return True
+    return any(event & (select.POLLPRI | select.POLLERR) for _fd, event in events)
+
+
 def _mount_points(table: bytes | None) -> frozenset[str] | None:
     """Every mount point in ``table`` (from `mount` where it is None), or None when unknown."""
     if table is None:
@@ -461,16 +530,17 @@ def _mount_points(table: bytes | None) -> frozenset[str] | None:
 
 # A writer-side shortcut only. Each naming unit registers its project. A full registration reads
 # the id and the mount table and writes the entry. This records, per process, what it checked:
-# the mount table bytes and the identity of the project id file and of the entry, with both nonce
-# files kept open. While those are unchanged and each open nonce file is still the one at its
-# path, a unit skips the reads but never the nonce rotation (`_rotate_view_nonce`). A collection
-# never reads this: `read_register` and `collect_roots` always read the files.
+# a watch on the mount table (``_watch_mount_table``: one poll reports every mount change since
+# the registration read it) and the identity of the project id file and of the entry, with both
+# nonce files kept open. While those are unchanged and each open nonce file is still the one at
+# its path, a unit skips the reads but never the nonce rotation (`_rotate_view_nonce`). A
+# collection never reads this: `read_register` and `collect_roots` always read the files.
 _RegistrationKey = tuple[pathlib.Path, pathlib.Path, pathlib.Path]
 _FileIdentity = tuple[int, int, int]
 
 
 class _VerifiedRegistration(NamedTuple):
-    table: bytes
+    watch: _MountWatch
     id_path: str
     id_identity: _FileIdentity
     entry_path: str
@@ -503,10 +573,10 @@ def _still_open_at(path: str, fd: int) -> bool:
     return (at_path.st_dev, at_path.st_ino) == (opened.st_dev, opened.st_ino)
 
 
-def _registration_unchanged(key: _RegistrationKey, table: bytes | None) -> bool:
+def _registration_unchanged(key: _RegistrationKey) -> bool:
     """Whether this process already registered ``key`` against the evidence it sees now."""
     verified = _VERIFIED_REGISTRATIONS.get(key)
-    if verified is None or table is None or verified.table != table:
+    if verified is None or _mount_table_changed(verified.watch):
         return False
     if _file_identity(verified.id_path) != verified.id_identity:
         return False
@@ -522,6 +592,7 @@ def _forget_registration(key: _RegistrationKey) -> None:
     if verified is not None:
         os.close(verified.state_nonce_fd)
         os.close(verified.register_nonce_fd)
+        os.close(verified.watch.fd)
 
 
 def _rotate_view_nonce(key: _RegistrationKey) -> None:
@@ -584,6 +655,42 @@ def _record_cache_mounts(cache_dir: pathlib.Path, points: frozenset[str] | None)
         _write_json(path, desired)
 
 
+@functools.cache
+def _pivot_version() -> str:
+    """This pivot's version, read once: the lookup walks the installation's metadata, which a
+    registration in every naming unit must not pay for."""
+    try:
+        return importlib.metadata.version("pivot")
+    except importlib.metadata.PackageNotFoundError:  # pragma: no cover - always installed
+        return "unknown"
+
+
+def _entry_timestamp(when: float) -> str:
+    """A register entry's ``last_write``, which compares as text in the order of its time."""
+    return datetime.datetime.fromtimestamp(when, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _entry_is_current(path: pathlib.Path, fields: dict[str, object], *, now: float) -> bool:
+    """Whether the entry at ``path`` already records ``fields`` — everything a registration
+    writes but its timestamp and this pivot's version — and recently enough that its
+    ``last_write`` still shows the project in use.
+
+    Every process of one view writes the same document but its timestamp (a worker pool is a
+    dozen of them), and the write costs a staged file and a rename over the live entry. So one
+    that says the same thing is kept until ``_ENTRY_REFRESH_SECONDS`` have passed, and the
+    entry is rewritten then, whoever is running; an upgraded pivot records its version at that
+    refresh. The version is not compared, because reading it walks this installation's metadata
+    (``_pivot_version``), which costs more than every other part of a registration together.
+    """
+    existing = _entry_from_file(path)
+    if existing is None or set(existing) != {*fields, "last_write", "pivot"}:
+        return False
+    recorded = existing["last_write"]
+    if not isinstance(recorded, str) or recorded < _entry_timestamp(now - _ENTRY_REFRESH_SECONDS):
+        return False
+    return all(existing[key] == value for key, value in fields.items())
+
+
 def register_project(
     cache_dir: pathlib.Path, project_root: pathlib.Path, state_dir: pathlib.Path
 ) -> None:
@@ -601,9 +708,8 @@ def register_project(
     """
     if not cache_dir.is_dir():
         return
-    table = _read_mount_table()
     key = (cache_dir, project_root, state_dir)
-    if _registration_unchanged(key, table):
+    if _registration_unchanged(key):
         try:
             _rotate_view_nonce(key)
             return
@@ -611,6 +717,10 @@ def register_project(
             logger.debug("Cannot rotate the view nonce in %s: %s", state_dir, e)
     _forget_registration(key)
     path = cache_dir / REGISTER_DIR
+    # The watch before the bytes: it reports every mount change after it is armed, so a change
+    # between the two only costs this process one more registration.
+    watch = _watch_mount_table()
+    table = _read_mount_table()
     host, machine, mount_ns = _this_view()
     view_key = _view_key(host, machine, mount_ns)
     state_fd: int | None = None
@@ -629,27 +739,36 @@ def register_project(
         except (OSError, ValueError) as e:
             logger.debug("Cannot record mounts for %s: %s", project_root, e)
             mounts = None
-        try:
-            version = importlib.metadata.version("pivot")
-        except importlib.metadata.PackageNotFoundError:  # pragma: no cover - always installed
-            version = "unknown"
-        entry = ProjectEntry(
-            root=str(project_root),
-            state_dir=str(state_dir),
-            host=host,
-            pivot=version,
-            last_write=datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            project_id=project_id,
-            machine=machine,
-            mount_ns=mount_ns,
-            mounts=mounts,
-        )
+        now = time.time()
+        fields: dict[str, object] = {
+            "root": str(project_root),
+            "state_dir": str(state_dir),
+            "host": host,
+            "project_id": project_id,
+            "machine": machine,
+            "mount_ns": mount_ns,
+            "mounts": mounts,
+        }
         path.parent.mkdir(exist_ok=True)
         if project_id is not None and state_fd is not None:
             # The nonce file first: an entry without one is refused, never read with a stale one.
             register_fd = _open_nonce_file(_entry_nonce_path(path))
-            _rotate_nonces(state_fd, register_fd)
-        _write_entry(str(path), entry)
+            _rotate_nonces(state_fd, register_fd, truncate=True)
+        if not _entry_is_current(path, fields, now=now):
+            _write_entry(
+                str(path),
+                ProjectEntry(
+                    root=str(project_root),
+                    state_dir=str(state_dir),
+                    host=host,
+                    pivot=_pivot_version(),
+                    last_write=_entry_timestamp(now),
+                    project_id=project_id,
+                    machine=machine,
+                    mount_ns=mount_ns,
+                    mounts=mounts,
+                ),
+            )
         _record_cache_mounts(cache_dir, points)
         if project_id is not None and state_fd is not None and register_fd is not None:
             # This view's entry without an id, written while the state directory could not
@@ -658,9 +777,9 @@ def register_project(
             id_path = str(_project_id_path(state_dir))
             id_identity = _file_identity(id_path)
             entry_identity = _file_identity(path)
-            if table is not None and id_identity is not None and entry_identity is not None:
+            if watch is not None and id_identity is not None and entry_identity is not None:
                 _VERIFIED_REGISTRATIONS[key] = _VerifiedRegistration(
-                    table=table,
+                    watch=watch,
                     id_path=id_path,
                     id_identity=id_identity,
                     entry_path=str(path),
@@ -671,13 +790,14 @@ def register_project(
                     register_nonce_fd=register_fd,
                 )
                 state_fd = register_fd = None  # the memo owns them now
+                watch = None
     except (OSError, ValueError) as e:
         if isinstance(e, OSError) and e.errno == errno.EROFS:
             logger.debug("%s is on a read-only filesystem; nothing can delete there", path)
             return
         raise _unrecorded_project(cache_dir, path, e) from e
     finally:
-        for fd in (state_fd, register_fd):
+        for fd in (state_fd, register_fd, None if watch is None else watch.fd):
             if fd is not None:
                 os.close(fd)
 
@@ -1160,12 +1280,64 @@ def _dedupe_scopes(scopes: list[ProjectScope]) -> list[ProjectScope]:
 # -----------------------------------------------------------------------------
 
 
-def _hash_info_keys(hash_info: HashInfo) -> Iterator[str]:
-    """A record's own key, and every member key when it records a directory."""
-    yield hash_info["hash"]
-    if is_dir_hash(hash_info):
-        for entry in hash_info["manifest"]:
-            yield entry["hash"]
+class _Listings:
+    """Reads the members of each directory a record names.
+
+    A directory's listing is the cache object at the directory's hash, and is committed beside
+    the record that names it (``storage/listing.py``). This takes the cache's object first,
+    because it is the one every reader falls back to and the one pivot itself wrote; a
+    committed file is used only when the cache has none, and only when its bytes hash to the
+    directory the record names. A directory whose listing neither holds raises
+    ``ListingMissingError``, which refuses the collection: its members are unknown.
+
+    ``add`` takes each committed listing file a walk found; they are hashed only when a record
+    is not in the cache (a fresh clone, whose listings are in git and whose cache is empty),
+    so an ordinary collection reads none of them.
+    """
+
+    _object_root: pathlib.Path
+    _files: list[pathlib.Path]
+    _committed: dict[str, pathlib.Path] | None
+
+    def __init__(self, object_root: pathlib.Path) -> None:
+        self._object_root = object_root
+        self._files = list[pathlib.Path]()
+        self._committed = None
+
+    def add(self, path: pathlib.Path) -> None:
+        """Index a committed listing file for a record the cache has no object for."""
+        self._files.append(path)
+
+    def _by_digest(self) -> dict[str, pathlib.Path]:
+        if self._committed is None:
+            committed = dict[str, pathlib.Path]()
+            for path in self._files:
+                try:
+                    committed.setdefault(listing.digest(path.read_bytes()), path)
+                except OSError as e:
+                    logger.debug("Cannot read the committed listing %s: %s", path, e)
+            self._committed = committed
+        return self._committed
+
+    def members(self, record: DirHash, source: pathlib.Path) -> listing.DirListing:
+        """The files of the directory ``record`` names, as ``source`` records it.
+
+        Raises:
+            exceptions.ListingMissingError: no listing for it is in the cache or committed.
+            exceptions.CorruptListingError: the listing found does not hold what ``record`` says.
+        """
+        cached = cache.resolve_cache_object_path(self._object_root, record["hash"])
+        if cached is not None:
+            with contextlib.suppress(FileNotFoundError):
+                return listing.read_found(cached.read_bytes(), str(cached), record, None)
+        committed = self._by_digest().get(record["hash"])
+        if committed is not None:
+            return listing.read_found(committed.read_bytes(), str(committed), record, None)
+        raise exceptions.ListingMissingError(
+            f"{source} records the directory {record['hash']}, and no listing of it is in the "
+            + f"cache ({cache.get_cache_path(self._object_root, record['hash'])}) or committed "
+            + "in this project; its files are unknown"
+        )
 
 
 def _text_keys(path: pathlib.Path) -> set[str]:
@@ -1178,8 +1350,9 @@ def _text_keys(path: pathlib.Path) -> set[str]:
     return set(_KEY_RE.findall(path.read_text(errors="replace")))
 
 
-def _lock_keys(path: pathlib.Path) -> set[str]:
-    """Every key a stage lock names: each ``outs`` and ``deps`` hash and manifest member.
+def _lock_keys(path: pathlib.Path, listings: _Listings) -> set[str]:
+    """Every key a stage lock names: each ``outs`` and ``deps`` hash, and every file of each
+    directory it records, read from that directory's listing (``lock.recorded_hashes``).
 
     ``open`` raising ``OSError`` refuses the run (the lock cannot be read, so what it names is
     unknown); ``yaml.load`` raising ``yaml.YAMLError`` (a committed lock left with git conflict
@@ -1187,28 +1360,47 @@ def _lock_keys(path: pathlib.Path) -> set[str]:
     rather than let a lock it cannot parse licence a delete."""
     with open(path) as f:
         data: object = yaml.load(f, Loader=yaml_config.Loader)
-    if not lock.is_lock_data(data):
+    recorded = lock.recorded_hashes(data)
+    if recorded is None:
         return _text_keys(path)
-    entries = [*data["deps"], *data["outs"]]
-    return {key for entry in entries for key in _hash_info_keys(lock.entry_hash_info(entry))}
+    keys = set(recorded.keys)
+    for record in recorded.directories:
+        keys.update(entry["hash"] for entry in listings.members(record, path)["files"])
+    return keys
 
 
-def _pvt_keys(path: pathlib.Path) -> set[str]:
-    """Every key a ``.pvt`` names: its hash and, for a directory, every manifest member."""
+def _pvt_keys(path: pathlib.Path, object_root: pathlib.Path) -> set[str]:
+    """Every key a ``.pvt`` names: its hash and, for a directory, every file of its listing
+    (``track.tracked_members``: the listing committed beside it, the cache's object, or the one
+    an older pivot's ``.pvt`` holds inline)."""
     data = track.read_pvt_file(path)
     if data is None:
         return _text_keys(path)
-    return set(_hash_info_keys(track.pvt_to_hash_info(data)))
+    record = track.pvt_to_hash_info(data)
+    keys = {record["hash"]}
+    if is_dir_hash(record):
+        members = track.tracked_members(track.get_data_path(path), data, object_root)
+        keys.update(entry["hash"] for entry in members["files"])
+    return keys
 
 
-def _lock_paths(stages_dir: pathlib.Path) -> list[pathlib.Path]:
-    """Every lock below ``stages_dir``, following symlinked directories once each.
+class _StateRecords(NamedTuple):
+    """What one state directory's ``stages`` directory holds for a collection."""
+
+    locks: list[pathlib.Path]
+    listings: list[pathlib.Path]
+
+
+def _state_records(stages_dir: pathlib.Path) -> _StateRecords:
+    """Every lock and every committed listing below ``stages_dir``, following symlinked
+    directories once each.
 
     A dangling link refuses the collection: it may hide stage locks on a disk that is not
     mounted. A directory named ``*.lock`` is returned so its open refuses, as an unreadable
     lock does.
     """
-    paths = list[pathlib.Path]()
+    locks = list[pathlib.Path]()
+    listings = list[pathlib.Path]()
     seen = set[tuple[int, int]]()
     stack = [stages_dir]
     while stack:
@@ -1222,23 +1414,49 @@ def _lock_paths(stages_dir: pathlib.Path) -> list[pathlib.Path]:
             for entry in entries:
                 path = pathlib.Path(entry.path)
                 if entry.name.endswith(".lock"):
-                    paths.append(path)
+                    locks.append(path)
+                elif entry.name.endswith(listing.SUFFIX) and entry.is_file():
+                    listings.append(path)
                 elif entry.is_dir():
                     stack.append(path)
                 elif entry.is_symlink() and not os.path.exists(path):
                     raise FileNotFoundError(errno.ENOENT, "symlink target is missing", str(path))
-    return sorted(paths)
+    return _StateRecords(sorted(locks), listings)
+
+
+def _row_keys(
+    output: run_history.OutputHashEntry, source: pathlib.Path, listings: _Listings
+) -> set[str]:
+    """Every key one run-cache output entry names: its own, and each file of a directory's
+    listing — the one an older pivot's row holds inline, else the one ``listings`` reads."""
+    record = run_history.entry_to_output_hash(output)
+    if record is None:
+        # An older pivot's row lists a directory's files inline; one that records neither is a
+        # row no pivot writes, so nothing proves what it names and the collection refuses.
+        raw = cast("dict[str, object]", cast("object", output))
+        inline = listing.from_inline(raw.get("manifest"), raw.get("empty_dirs", []))
+        if inline is None:
+            raise exceptions.ListingMissingError(
+                f"{source} holds a run-cache row recording the directory {output['hash']} "
+                + "without its size, file count or files; what it names is unknown"
+            )
+        return {output["hash"], *(entry["hash"] for entry in inline["files"])}
+    keys = {record["hash"]}
+    if is_dir_hash(record):
+        keys.update(entry["hash"] for entry in listings.members(record, source)["files"])
+    return keys
 
 
 def _run_cache_keys(
-    state_dir: pathlib.Path, valid_run_ids: set[str] | None = None
+    state_dir: pathlib.Path, listings: _Listings, valid_run_ids: set[str] | None = None
 ) -> tuple[set[str], int]:
     """Every key the run-cache rows of one project's database name, and the number of rows.
 
     ``valid_run_ids`` restricts the rows to those a run-history prune would keep — its sentinel
     rows (``__``-prefixed) and the rows of runs within the retention — so the plan counts an
     object whose only record is a row the confirmed run will drop (``StateDB.prune_runs``)."""
-    if not (state_dir / "state.lmdb").exists():
+    database = state_dir / "state.lmdb"
+    if not database.exists():
         return set(), 0
     with state.StateDB(state_dir, readonly=True) as db:
         entries = db.list_run_cache_entries()
@@ -1248,12 +1466,10 @@ def _run_cache_keys(
             for entry in entries
             if entry["run_id"].startswith("__") or entry["run_id"] in valid_run_ids
         ]
-    keys = {
-        key
-        for entry in entries
-        for output in entry["output_hashes"]
-        for key in _hash_info_keys(run_history.entry_to_output_hash(output))
-    }
+    keys = set[str]()
+    for entry in entries:
+        for output in entry["output_hashes"]:
+            keys |= _row_keys(output, database, listings)
     return keys, len(entries)
 
 
@@ -1269,15 +1485,27 @@ def _scope_state_dirs(scope: ProjectScope) -> tuple[pathlib.Path, ...]:
     return (current,) if current == legacy else (current, legacy)
 
 
+class _WalkResult(NamedTuple):
+    """What a walk of one project found for a collection."""
+
+    pvt_paths: list[pathlib.Path]
+    keys: set[str]
+    outward: list[pathlib.Path]
+    listings: list[pathlib.Path]
+
+
 def _walk_project(
-    root: pathlib.Path, object_root: pathlib.Path, skip: pathlib.Path | None
-) -> tuple[list[pathlib.Path], set[str], list[pathlib.Path]]:
-    """Every ``.pvt`` file under ``root``, every key a symlink there resolves to, and every
-    symlinked directory that leaves the project.
+    root: pathlib.Path,
+    object_root: pathlib.Path,
+    tree_root: pathlib.Path,
+    skip: pathlib.Path | None,
+) -> _WalkResult:
+    """Every ``.pvt`` file under ``root``, every key a symlink there resolves to, every
+    committed listing file, and every symlinked directory that leaves the project.
 
     A file-by-file symlink checkout links each member to its object; a whole-directory
-    checkout links the directory itself to its tree object. Both are read here. ``skip`` is
-    the cache itself, listed object by object rather than walked.
+    checkout links the directory itself to its tree under ``tree_root``. Both are read here.
+    ``skip`` is the cache itself, listed object by object rather than walked.
 
     A symlinked directory is walked when the place it really is lies inside ``root``
     (``project.real_location_outside``, BET-301's containment rule, against ``root`` resolved
@@ -1292,9 +1520,11 @@ def _walk_project(
     pvt_paths = list[pathlib.Path]()
     keys = set[str]()
     outward = list[pathlib.Path]()
+    listings = list[pathlib.Path]()
     seen = set[tuple[int, int]]()
     resolved_root = root.resolve()
     resolved_objects = object_root.resolve()
+    resolved_trees = tree_root.resolve()
     stack = [root]
     while stack:
         directory = stack.pop()
@@ -1314,16 +1544,19 @@ def _walk_project(
                         outward.append(path)
                         continue
                     if key is not None and cache.is_valid_hash(key):
-                        # A checkout of a cache object, file or whole tree: not a subtree.
+                        # A file-by-file checkout of a cache object: not a subtree.
                         keys.add(key)
                     elif entry.name.endswith(".pvt") and entry.is_file():
                         pvt_paths.append(path)
                     elif entry.is_dir():
-                        where = _link_target(path, resolved_root, resolved_objects)
-                        if where == "inside":
+                        where = _link_target(path, resolved_root, resolved_objects, resolved_trees)
+                        if where.place == "inside":
                             stack.append(path)
-                        elif where == "outside":
+                        elif where.place == "outside":
                             outward.append(path)
+                        elif where.key is not None:
+                            # A whole-directory symlink checkout: the tree is this link's record.
+                            keys.add(where.key)
                     elif not os.path.exists(path):
                         # Its target may be a record directory on a disk that is not mounted.
                         outward.append(path)
@@ -1332,26 +1565,43 @@ def _walk_project(
                         stack.append(path)
                 elif entry.name.endswith(".pvt"):
                     pvt_paths.append(path)
-    return pvt_paths, keys, outward
+                elif entry.name.endswith(listing.SUFFIX):
+                    listings.append(path)
+    return _WalkResult(pvt_paths, keys, outward, listings)
+
+
+class _LinkTarget(NamedTuple):
+    """Where a symlinked directory really is, and the tree object it is when it is one."""
+
+    place: Literal["inside", "outside", "cache"]
+    key: str | None
 
 
 def _link_target(
-    path: pathlib.Path, resolved_root: pathlib.Path, resolved_objects: pathlib.Path
-) -> Literal["inside", "outside", "cache"]:
+    path: pathlib.Path,
+    resolved_root: pathlib.Path,
+    resolved_objects: pathlib.Path,
+    resolved_trees: pathlib.Path,
+) -> _LinkTarget:
     """Where the symlinked directory ``path`` really is: inside the project, outside it, or in
-    the cache's object store (listed object by object, never walked).
+    the cache (listed object by object, never walked), with the key of the whole-directory tree
+    it links to when it is one.
 
     ``project.real_location_outside`` is BET-301's containment rule (#533); a link it cannot
     resolve counts as outside, because where it leads is unknown. Only a link into
-    ``<cache>/files`` is the cache's own: the cache root can be a broad scratch directory that
-    also holds a user's data (``PIVOT_CACHE_DIR=/scratch``), and records under it are records
-    like any others, so a link there that leaves the project counts as leaving it.
+    ``<cache>/files`` or ``<cache>/trees`` is the cache's own: the cache root can be a broad
+    scratch directory that also holds a user's data (``PIVOT_CACHE_DIR=/scratch``), and records
+    under it are records like any others, so a link there that leaves the project counts as
+    leaving it.
     """
     outside = project.real_location_outside(path, resolved_root)
     real = path.resolve() if outside is None else outside
     if real.is_relative_to(resolved_objects):
-        return "cache"
-    return "inside" if outside is None else "outside"
+        return _LinkTarget("cache", None)
+    if real.is_relative_to(resolved_trees):
+        key = real.parent.name + real.name
+        return _LinkTarget("cache", key if cache.is_valid_hash(key) else None)
+    return _LinkTarget("inside" if outside is None else "outside", None)
 
 
 def collect_roots(
@@ -1368,9 +1618,11 @@ def collect_roots(
 
     Raises:
         ProjectUnreadableError: a project in scope cannot be read, so what it names is
-            unknown and nothing may be removed.
+            unknown and nothing may be removed. A directory record whose listing is neither in
+            the cache nor committed is one such project: its files are unknown.
     """
     object_root = cache_dir / OBJECTS_DIR
+    tree_root = cache_dir / TREES_DIR
     roots = Roots(
         named=set[str](),
         run_cache=set[str](),
@@ -1381,64 +1633,93 @@ def collect_roots(
     )
     for scope in scopes:
         try:
+            # Every listing this project committed is indexed before its records are read, so a
+            # record whose listing the cache has lost is still read from the file beside it.
+            walked = _walk_project(scope["root"], object_root, tree_root, cache_dir)
+            listings = _Listings(object_root)
+            records = dict[pathlib.Path, _StateRecords]()
             for state_dir in _scope_state_dirs(scope):
                 stages_dir = lock.get_stages_dir(state_dir)
-                if stages_dir.is_dir():
-                    for lock_path in _lock_paths(stages_dir):
-                        roots["counts"]["locks"] += 1
-                        try:
-                            roots["named"] |= _lock_keys(lock_path)
-                        except (yaml.YAMLError, UnicodeDecodeError):
-                            logger.warning(
-                                "Cannot read %s as a stage lock; keeping every cache object, because a lock pivot cannot read may name any of them",
-                                lock_path,
-                            )
-                            roots["unreadable"].append(str(lock_path))
+                if not stages_dir.is_dir():
+                    continue
+                records[state_dir] = _state_records(stages_dir)
+                for listing_path in records[state_dir].listings:
+                    listings.add(listing_path)
+            for listing_path in walked.listings:
+                listings.add(listing_path)
+            for state_dir in _scope_state_dirs(scope):
+                for lock_path in records[state_dir].locks if state_dir in records else ():
+                    roots["counts"]["locks"] += 1
+                    try:
+                        roots["named"] |= _lock_keys(lock_path, listings)
+                    except (yaml.YAMLError, UnicodeDecodeError):
+                        logger.warning(
+                            "Cannot read %s as a stage lock; keeping every cache object, because a lock pivot cannot read may name any of them",
+                            lock_path,
+                        )
+                        roots["unreadable"].append(str(lock_path))
                 scope_valid = valid_run_ids if state_dir == prune_state_dir else None
-                rows_keys, rows = _run_cache_keys(state_dir, scope_valid)
+                rows_keys, rows = _run_cache_keys(state_dir, listings, scope_valid)
                 roots["counts"]["rows"] += rows
                 roots["run_cache"] |= rows_keys
-            pvt_paths, links, outward = _walk_project(scope["root"], object_root, cache_dir)
-            for pvt_path in pvt_paths:
+            for pvt_path in walked.pvt_paths:
                 roots["counts"]["pvt_files"] += 1
-                roots["named"] |= _pvt_keys(pvt_path)
-            roots["counts"]["links"] += len(links)
-            roots["linked"] |= links
-            roots["outward_dirs"].extend(str(path) for path in outward)
+                roots["named"] |= _pvt_keys(pvt_path, object_root)
+            roots["counts"]["links"] += len(walked.keys)
+            roots["linked"] |= walked.keys
+            roots["outward_dirs"].extend(str(path) for path in walked.outward)
         except (OSError, lmdb.Error, state.StateDBError) as e:
             raise ProjectUnreadableError(
                 scope, e.strerror if isinstance(e, OSError) and e.strerror else str(e)
             ) from e
+        except (exceptions.ListingMissingError, exceptions.CorruptListingError) as e:
+            raise ProjectUnreadableError(scope, str(e)) from e
 
     refs = object_root / "refs"
     if refs.is_dir():
-        _, ref_keys, _ = _walk_project(refs, object_root, None)
-        roots["counts"]["links"] += len(ref_keys)
+        roots["counts"]["links"] += len(
+            ref_keys := _walk_project(refs, object_root, tree_root, None).keys
+        )
         roots["linked"] |= ref_keys
     return roots
 
 
-def reread_run_cache(roots: Roots, scopes: Iterable[ProjectScope]) -> None:
+def reread_run_cache(roots: Roots, scopes: Iterable[ProjectScope], cache_dir: pathlib.Path) -> None:
     """Replace ``roots``' run-cache keys with every row the scopes' databases hold now.
 
     Called under the exclusive naming lock after a run-history prune, so the rows the prune
     dropped stop protecting their objects and every row that remains, however recent, does.
+    A row that records a directory is read with its listing, as ``collect_roots`` reads one.
 
     Raises:
-        ProjectUnreadableError: a scope's database cannot be read.
+        ProjectUnreadableError: a scope's database, or the listing of a directory one of its
+            rows records, cannot be read.
     """
+    object_root = cache_dir / OBJECTS_DIR
+    tree_root = cache_dir / TREES_DIR
     keys = set[str]()
     rows = 0
     for scope in scopes:
         try:
+            listings = _Listings(object_root)
+            for listing_path in _walk_project(
+                scope["root"], object_root, tree_root, cache_dir
+            ).listings:
+                listings.add(listing_path)
             for state_dir in _scope_state_dirs(scope):
-                scope_keys, scope_rows = _run_cache_keys(state_dir)
+                stages_dir = lock.get_stages_dir(state_dir)
+                if stages_dir.is_dir():
+                    for listing_path in _state_records(stages_dir).listings:
+                        listings.add(listing_path)
+                scope_keys, scope_rows = _run_cache_keys(state_dir, listings)
                 keys |= scope_keys
                 rows += scope_rows
         except (OSError, lmdb.Error, state.StateDBError) as e:
             raise ProjectUnreadableError(
                 scope, e.strerror if isinstance(e, OSError) and e.strerror else str(e)
             ) from e
+        except (exceptions.ListingMissingError, exceptions.CorruptListingError) as e:
+            raise ProjectUnreadableError(scope, str(e)) from e
     roots["run_cache"] = keys
     roots["counts"]["rows"] = rows
 
@@ -1676,7 +1957,13 @@ def build_plan(
     remove_linked: bool,
     now: float | None = None,
 ) -> Plan:
-    """List every object in the cache and decide, under each prefix's lock, what may go."""
+    """List every object in the cache and decide, under each prefix's lock, what may go.
+
+    Both stores are listed: the objects under ``files`` (a file's content, and a directory's
+    listing) and the whole-directory trees under ``trees``, which a symlink checkout links to.
+    One directory hash names its listing object and its tree, so the record that names the
+    directory keeps both.
+    """
     object_root = cache_dir / OBJECTS_DIR
     cutoff = (time.time() if now is None else now) - grace_hours * 3600
     plan = Plan(
@@ -1690,7 +1977,7 @@ def build_plan(
         doomed_bytes=0,
         linked=ObjectCount(objects=0, bytes=0),
     )
-    for prefix_dir in _prefix_dirs(object_root):
+    for prefix_dir in [*_prefix_dirs(object_root), *_prefix_dirs(cache_dir / TREES_DIR)]:
         with _prefix_locked(prefix_dir), os.scandir(prefix_dir) as entries:
             for entry in sorted(entries, key=lambda e: e.name):
                 key = prefix_dir.name + entry.name

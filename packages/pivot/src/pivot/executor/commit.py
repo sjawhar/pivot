@@ -13,7 +13,7 @@ import pathlib
 from pivot import config, exceptions, parameters, project, registry, run_history, skip, types
 from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
-from pivot.storage import cache, lock
+from pivot.storage import cache, listing, lock
 from pivot.storage import gc as gc_mod
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
@@ -113,8 +113,9 @@ def _commit_stages(
             )
 
             # 3. Hash deps (pass state_db for hash caching)
+            hashed_dirs = dict[str, listing.HashedDirectory]()
             dep_hashes, missing, unreadable, _ = worker.hash_dependencies(
-                stage_info["deps"], store, stage_db
+                stage_info["deps"], store, stage_db, hashed_dirs=hashed_dirs
             )
             if missing:
                 logger.error(
@@ -139,7 +140,7 @@ def _commit_stages(
             # Compute normalized output paths once (used for skip check, lock data, and StateDB)
             out_paths = [types.identity_key(out.identity) for out in stage_outs]
             production_lock = lock.StageLock(stage_name, stages_dir)
-            previous_lock = production_lock.read()
+            previous_lock = production_lock.read(cache_dir=worker.store_cache_dir(store))
             # A --no-commit run left a record of the code it ran; it decides once the outputs are
             # hashed, so a stage with one is never skipped here. The run writes its two keys
             # together and the reader drops a malformed key on its own, so a record without both
@@ -157,7 +158,14 @@ def _commit_stages(
             # The stage's own *.pvt files are the ones its lock or its nocommit: record lists.
             # Every other *.pvt in an output is a user's: the commit refuses before it would
             # claim one, so a later run cannot delete it as the stage's.
-            claims = worker.stage_claims(store, stage_outs, previous_lock, run_record, project_root)
+            claims = worker.stage_claims(
+                store,
+                stage_outs,
+                previous_lock,
+                run_record,
+                project_root,
+                stage_lock=production_lock,
+            )
 
             # 5. If not force and no explicit stages, check lock — skip if unchanged
             if (
@@ -179,7 +187,10 @@ def _commit_stages(
             # 6. Hash and publish every output before the naming unit, so a large output's
             # reading and copying holds no lock a waiting collection would turn into a stall for
             # every other commit on the cache.
-            prepared = dict[types.ArtifactIdentity, tuple[pathlib.Path, HashInfo]]()
+            prepared = dict[
+                types.ArtifactIdentity,
+                tuple[pathlib.Path, types.FileHash | listing.HashedDirectory],
+            ]()
             outputs_missing = False
             for out in stage_outs:
                 identity_key = types.identity_key(out.identity)
@@ -192,6 +203,7 @@ def _commit_stages(
                             out_path,
                             state_dir=default_state_dir,
                             warn_left_out_symlinks=warn_left_out_symlinks,
+                            hashed_dirs=hashed_dirs,
                             claims=claims,
                         ),
                     )
@@ -224,7 +236,7 @@ def _commit_stages(
 
             # 7. Under the naming lock (shared), the naming step only: re-check and link each
             # output (an object a collection removed since is published again), record its
-            # materialized file hash (#516), then write the lock that names the objects.
+            # materialized file hash (#516), then write the lock and the listings that name them.
             with gc_mod.naming_unit(
                 config.get_cache_dir(), project=(project_root, config.get_state_dir())
             ):
@@ -234,9 +246,11 @@ def _commit_stages(
                 file_hash_entries = list[types.FileHashEntry]()
                 for out in stage_outs:
                     identity_key = types.identity_key(out.identity)
-                    out_path, hash_info = prepared[out.identity]
+                    out_path, hashed = prepared[out.identity]
                     try:
-                        store.finish_commit(out, out_path, hash_info, state_dir=default_state_dir)
+                        hash_info = store.finish_commit(
+                            out, out_path, hashed, state_dir=default_state_dir
+                        )
                     except FileNotFoundError:
                         logger.error(
                             "Stage '%s': output missing: %s — skipping", stage_name, identity_key
@@ -258,7 +272,13 @@ def _commit_stages(
                     try:
                         file_hash_entries.extend(
                             cache.deferred_file_hash_entries(
-                                cache.known_file_hashes(out_path, hash_info)
+                                cache.known_file_hashes(
+                                    out_path,
+                                    hash_info,
+                                    hashed_dirs[hash_info["hash"]]["listing"]
+                                    if types.is_dir_hash(hash_info)
+                                    else None,
+                                )
                             )
                         )
                     except exceptions.UnreadableLinkError as exc:
@@ -316,7 +336,15 @@ def _commit_stages(
                     output_paths=output_paths_by_identity,
                 )
                 try:
-                    production_lock.write(new_lock_data)
+                    production_lock.write(
+                        new_lock_data,
+                        hashed_dirs=hashed_dirs,
+                        input_paths=worker.input_listing_paths(
+                            stage_info["deps"], store, new_lock_data["dep_hashes"]
+                        ),
+                        cache_dir=store.cache_dir,
+                        outs=stage_outs,
+                    )
                 except exceptions.InvalidPathError as exc:
                     logger.error("%s — skipping", exc)
                     failed.append(stage_name)
@@ -351,7 +379,19 @@ def _commit_stages(
                         output_hashes=output_entries,
                     )
             if not reusable:
-                deferred["run_cache_delete_input_hash"] = input_hash
+                older_key = worker.older_pivot_input_hash(
+                    fingerprint,
+                    current_params,
+                    stage_info["deps"].values(),
+                    dep_hashes_by_identity,
+                    stage_outs,
+                    hashed_dirs,
+                    store.cache_dir,
+                )
+                deferred["run_cache_delete_input_hashes"] = [
+                    input_hash,
+                    *([] if older_key is None else [older_key]),
+                ]
             if file_hash_entries:
                 deferred["file_hash_entries"] = file_hash_entries
 

@@ -115,6 +115,63 @@ def test_a_naming_unit_reregisters_after_its_entry_is_deleted(tmp_path: pathlib.
     assert entry.exists(), "a naming unit ran without its project in the register"
 
 
+def test_a_second_process_keeps_the_entry_another_just_wrote(tmp_path: pathlib.Path) -> None:
+    """Every process of one view writes the same entry but its timestamp, and a worker pool is
+    a dozen of them. A process whose first unit finds that entry keeps it, so the register
+    takes one write per view instead of one per process."""
+    root, state_dir, cache_dir = _project(tmp_path)
+    _unit(cache_dir, root, state_dir)
+    entry = gc.project_register_path(cache_dir, root, state_dir)
+    assert entry is not None
+    before = entry.stat()
+
+    gc._VERIFIED_REGISTRATIONS.clear()  # pyright: ignore[reportPrivateUsage] - another process
+    _unit(cache_dir, root, state_dir)
+
+    after = entry.stat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino), (
+        "a second process replaced an entry that already said what it would write"
+    )
+
+
+def test_a_registration_refreshes_an_entry_whose_last_write_is_old(tmp_path: pathlib.Path) -> None:
+    """``last_write`` tells a reader whether a registered project is still in use, so an entry
+    that says what this registration would say is still rewritten once it is stale."""
+    root, state_dir, cache_dir = _project(tmp_path)
+    _unit(cache_dir, root, state_dir)
+    entry = gc.project_register_path(cache_dir, root, state_dir)
+    assert entry is not None
+    document = json.loads(entry.read_text())
+    document["last_write"] = "2020-01-01T00:00:00Z"
+    entry.write_text(json.dumps(document, sort_keys=True) + "\n")
+
+    gc._VERIFIED_REGISTRATIONS.clear()  # pyright: ignore[reportPrivateUsage] - another process
+    _unit(cache_dir, root, state_dir)
+
+    assert json.loads(entry.read_text())["last_write"] != "2020-01-01T00:00:00Z", (
+        "a stale entry was kept, so the register no longer shows the project in use"
+    )
+
+
+def test_a_registration_truncates_a_nonce_file_that_held_more(tmp_path: pathlib.Path) -> None:
+    """A nonce file is rewritten in place. One that held longer bytes (another tool wrote
+    there) must be cut to the nonce, or every reader refuses it and a collection refuses the
+    project for ever."""
+    root, state_dir, cache_dir = _project(tmp_path)
+    _unit(cache_dir, root, state_dir)
+    entry = gc.project_register_path(cache_dir, root, state_dir)
+    assert entry is not None
+    nonces = state_dir / "state.lmdb" / gc.VIEW_NONCE_DIR
+    (nonce_file,) = nonces.iterdir()
+    nonce_file.write_text("0" * 64 + "\n")
+
+    gc._VERIFIED_REGISTRATIONS.clear()  # pyright: ignore[reportPrivateUsage] - another process
+    _unit(cache_dir, root, state_dir)
+
+    nonce = nonce_file.read_text()
+    assert len(nonce) == 33 and nonce == entry.with_suffix(".nonce").read_text(), nonce
+
+
 def _swap(a: pathlib.Path, b: pathlib.Path) -> None:
     """Exchange two directories' contents by renaming, so ``a``'s path shows ``b``'s copy."""
     spare = a.with_name(a.name + ".swap")

@@ -6,23 +6,23 @@ import functools
 import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, NotRequired, TypedDict, TypeGuard
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import xxhash
 import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
 from pivot import state_dir as state_dir_mod
-from pivot.storage import cache, lock, ownership, state, track
+from pivot.storage import cache, listing, lock, ownership, state, track
 from pivot.storage import gc as gc_mod
-from pivot.types import HashInfo
+from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from pivot.remote.protocol import RemoteStorage
     from pivot.storage.track import PvtData
-    from pivot.types import StorageLockData, TransferResult
+    from pivot.types import DirHash, TransferResult
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,7 @@ class TargetInfo(TypedDict):
     original_target: str
     paths: list[str]
     hashes: dict[str, HashInfo | None]
+    members: dict[str, listing.DirListing]  # each directory's listing at the revision, by path
     error: NotRequired[str]
     """Why the target cannot be restored (its .pvt is not valid), reported for each path."""
 
@@ -72,80 +73,72 @@ class StageTarget(TypedDict):
     """Fallback lock output key -> workspace path for older locks with no recorded path."""
 
 
-def _parse_yaml_bytes[T](
-    content: bytes,
-    validator: Callable[[object], TypeGuard[T]],
-) -> T | None:
-    """Parse YAML bytes and validate. Returns None on any failure."""
+def _parse_lock_data_from_bytes(content: bytes) -> lock.CommittedLock | None:
+    """Parse committed lock file content from bytes, an older pivot's format included."""
     try:
         data: object = yaml.load(content, Loader=yaml_config.Loader)
-        if validator(data):
-            return data
-        return None
     except yaml.YAMLError:
         return None
+    parsed = lock.parse_committed(data)
+    return parsed if isinstance(parsed, lock.CommittedLock) else None
 
 
-def _parse_lock_data_from_bytes(content: bytes) -> StorageLockData | None:
-    """Parse lock file content from bytes."""
-    return _parse_yaml_bytes(content, lock.is_lock_data)
-
-
-def _parse_pvt_data_from_bytes(content: bytes) -> PvtData | str | None:
-    """Parse .pvt file content from bytes: None if it is not a valid .pvt file, else its data, or
-    why a restore cannot use it (``track.pvt_field_error``)."""
-    data = _parse_yaml_bytes(content, track.is_pvt_data)
-    if data is None:
+def _parse_pvt_data_from_bytes(
+    content: bytes,
+) -> tuple[PvtData, listing.DirListing | None] | str | None:
+    """Parse .pvt file content from bytes: None if it is not a valid .pvt file, else its data
+    with an older pivot's inline directory listing, or why a restore cannot use it
+    (``track.pvt_field_error``)."""
+    try:
+        data: object = yaml.load(content, Loader=yaml_config.Loader)
+    except yaml.YAMLError:
         return None
-    if (error := track.pvt_field_error(data)) is not None:
-        return error
-    # Security check: no path traversal in stored path
-    if track.has_path_traversal(data["path"]):
-        return None
-    return data
+    return track.parse_pvt(data)
 
 
 def get_lock_data_from_revision(
     stage_name: str, rev: str, state_dir: pathlib.Path
-) -> StorageLockData | None:
-    """Read a stage lock from a revision, including a matching 0.5.2 lock location."""
+) -> lock.CommittedLock | None:
+    """Read a lock at a revision, falling back to the legacy state directory when needed."""
     root = project.get_project_root()
-    try:
-        stages_dir = lock.stages_rel_path(state_dir, root)
-    except ValueError:
-        stages_dir = None
-    if stages_dir is not None:
-        content = git.read_file_from_revision(f"{stages_dir}/{stage_name}.lock", rev)
-        if content is not None:
-            return _parse_lock_data_from_bytes(content)
-
-    other_state_dir = state_dir_mod.other_state_dir_for(state_dir)
-    other_stages_dir = None
-    if other_state_dir is not None:
+    state_dirs = [state_dir]
+    if (other_state_dir := state_dir_mod.other_state_dir_for(state_dir)) is not None:
+        state_dirs.append(other_state_dir)
+    for candidate in state_dirs:
         try:
-            other_stages_dir = lock.stages_rel_path(other_state_dir, root)
+            rel_path = str(lock.get_stages_dir(candidate).relative_to(root) / f"{stage_name}.lock")
         except ValueError:
-            other_stages_dir = None
-    content = None
-    if other_stages_dir is not None and other_stages_dir != stages_dir:
-        content = git.read_file_from_revision(f"{other_stages_dir}/{stage_name}.lock", rev)
-    if content is None:
-        if stages_dir is None:
-            raise exceptions.ConfigError(
-                "core.state_dir is outside the project, so lock files are not in git"
-            ) from None
-        return None
-    state_dir_mod.report_legacy_state_dir(state_dir)
-    return _parse_lock_data_from_bytes(content)
+            continue
+        content = git.read_file_from_revision(rel_path, rev)
+        if content is not None:
+            if candidate != state_dir:
+                state_dir_mod.report_legacy_state_dir(state_dir)
+            return _parse_lock_data_from_bytes(content)
+    return None
 
 
-def get_pvt_data_from_revision(pvt_rel_path: str, rev: str) -> PvtData | str | None:
+def get_pvt_data_from_revision(
+    pvt_rel_path: str, rev: str
+) -> tuple[PvtData, listing.DirListing | None] | str | None:
     """Read and parse .pvt file from a git revision: None when the revision has no valid .pvt
-    file there, else its data, or why a restore cannot use it."""
+    file there, else its data with an older pivot's inline listing, or why a restore cannot use
+    it."""
     content = git.read_file_from_revision(pvt_rel_path, rev)
     if content is None:
         return None
     return _parse_pvt_data_from_bytes(content)
+
+
+def _listing_from_revision(
+    rel_path: str, rev: str, record: DirHash, cache_dir: pathlib.Path | None
+) -> listing.DirListing | None:
+    """A directory's listing by its committed file at a git revision, else the cache's object
+    in ``cache_dir`` (``listing.read_found``); None when neither holds it."""
+    content = git.read_file_from_revision(rel_path, rev)
+    try:
+        return listing.read_found(content, f"{rel_path} at revision {rev}", record, cache_dir)
+    except exceptions.ListingMissingError:
+        return None
 
 
 def _normalize_target_path(target: str, proj_root: pathlib.Path) -> str:
@@ -170,8 +163,12 @@ def resolve_targets(
     targets: Sequence[str],
     rev: str,
     stage_targets: Mapping[str, StageTarget],
+    cache_dir: pathlib.Path | None = None,
 ) -> list[TargetInfo]:
-    """Resolve targets to TargetInfo: a target in ``stage_targets`` is a stage, others are files."""
+    """Resolve targets to TargetInfo: a target in ``stage_targets`` is a stage, others are files.
+
+    A directory's listing is read from the revision, else from the cache object in
+    ``cache_dir`` (``<cache.dir>/files``)."""
     proj_root = project.get_project_root()
     results = list[TargetInfo]()
 
@@ -179,15 +176,16 @@ def resolve_targets(
         if target in stage_targets:
             stage_target = stage_targets[target]
             stage_name = stage_target["stage_name"]
-            lock_data = get_lock_data_from_revision(stage_name, rev, stage_target["state_dir"])
-            if lock_data is None:
+            committed = get_lock_data_from_revision(stage_name, rev, stage_target["state_dir"])
+            if committed is None:
                 raise exceptions.TargetNotFoundError(
                     f"Stage '{stage_name}' has no lock file at revision '{rev}'"
                 )
             paths_by_key = stage_target["paths_by_key"]
             selected_key = types.identity_from_key(target).key
             hashes = dict[str, HashInfo | None]()
-            for entry in lock_data["outs"]:
+            members = dict[str, listing.DirListing]()
+            for entry in committed.data["outs"]:
                 key = entry["key"]
                 if selected_key is not None and key != selected_key:
                     continue
@@ -200,7 +198,27 @@ def resolve_targets(
                         f"Target '{target}' output key {key!r} at revision '{rev}' has no "
                         + "recorded path and is not defined by the current pipeline"
                     )
-                hashes[path] = lock.entry_hash_info(entry)
+                hashes[path] = hash_info = lock.entry_hash_info(entry)
+                if is_dir_hash(hash_info):
+                    if key in committed.listings:
+                        members[path] = committed.listings[key]
+                        continue
+                    listing_state_dir = stage_target["state_dir"]
+                    try:
+                        stages_rel = lock.get_stages_dir(listing_state_dir).relative_to(proj_root)
+                    except ValueError:
+                        legacy_state_dir = state_dir_mod.other_state_dir_for(listing_state_dir)
+                        if legacy_state_dir is None:
+                            raise exceptions.TargetNotFoundError(
+                                f"Stage '{stage_name}' has no git-tracked state directory"
+                            ) from None
+                        stages_rel = lock.get_stages_dir(legacy_state_dir).relative_to(proj_root)
+                    listing_rel = listing.output_listing_path(
+                        stages_rel, types.ArtifactIdentity(stage_name, key)
+                    ).as_posix()
+                    found = _listing_from_revision(listing_rel, rev, hash_info, cache_dir)
+                    if found is not None:
+                        members[path] = found
             if not hashes:
                 raise exceptions.TargetNotFoundError(
                     f"Target '{target}' recorded no outputs at revision '{rev}'"
@@ -211,6 +229,7 @@ def resolve_targets(
                     original_target=target,
                     paths=list(hashes),
                     hashes=hashes,
+                    members=members,
                 )
             )
             continue
@@ -221,25 +240,39 @@ def resolve_targets(
 
         # Try as a .pvt tracked file. One that is not valid is this target's error, so the other
         # targets are still restored and reported.
-        pvt_data = get_pvt_data_from_revision(pvt_rel_path, rev)
-        if isinstance(pvt_data, str):
+        parsed_pvt = get_pvt_data_from_revision(pvt_rel_path, rev)
+        if isinstance(parsed_pvt, str):
             results.append(
                 TargetInfo(
                     target_type=TargetType.FILE,
                     original_target=target,
                     paths=[rel_target],
                     hashes={rel_target: None},
-                    error=f"{pvt_rel_path} at {rev} is not a valid .pvt file: {pvt_data}",
+                    members={},
+                    error=f"{pvt_rel_path} at {rev} is not a valid .pvt file: {parsed_pvt}",
                 )
             )
             continue
-        if pvt_data is not None:
+        if parsed_pvt is not None:
+            pvt_data, inline_members = parsed_pvt
+            pvt_hash = track.pvt_to_hash_info(pvt_data)
+            pvt_members = dict[str, listing.DirListing]()
+            if is_dir_hash(pvt_hash):
+                found = inline_members or _listing_from_revision(
+                    listing.tracked_listing_path(pathlib.Path(pvt_rel_path)).as_posix(),
+                    rev,
+                    pvt_hash,
+                    cache_dir,
+                )
+                if found is not None:
+                    pvt_members[rel_target] = found
             results.append(
                 TargetInfo(
                     target_type=TargetType.FILE,
                     original_target=target,
                     paths=[rel_target],
-                    hashes={rel_target: track.pvt_to_hash_info(pvt_data)},
+                    hashes={rel_target: pvt_hash},
+                    members=pvt_members,
                 )
             )
             continue
@@ -253,6 +286,7 @@ def resolve_targets(
                     original_target=target,
                     paths=[rel_target],
                     hashes={rel_target: None},  # None means must use git
+                    members={},
                 )
             )
             continue
@@ -324,6 +358,19 @@ def _download_error(failed: list[TransferResult]) -> exceptions.RemoteError:
     return exceptions.RemoteError(message)
 
 
+def _download(remote: RemoteStorage, files_dir: pathlib.Path, hashes: list[str]) -> None:
+    """Download the cache objects ``hashes`` names into ``files_dir``, raising the error of a
+    download whose files did not arrive (``_download_error``)."""
+    results = asyncio.run(
+        remote.download_batch(
+            [(file_hash, cache.get_cache_path(files_dir, file_hash)) for file_hash in hashes],
+            readonly=True,
+        )
+    )
+    if failed := [result for result in results if not result["success"]]:
+        raise _download_error(failed)
+
+
 def _skipped(dest_path: pathlib.Path, force: bool) -> RestoreResult | None:
     """The result for a target already in the workspace that ``get`` keeps, or None."""
     if dest_path.exists() and not force:
@@ -343,6 +390,7 @@ def _restore_named(
     target: ownership.ForcedRestore,
     *,
     state_dir: pathlib.Path,
+    members: listing.DirListing | None = None,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
 ) -> bool:
     """Restore ``dest_path`` from the cache inside a naming-lock unit (shared), under the
@@ -368,6 +416,7 @@ def _restore_named(
                 checkout_modes=checkout_modes,
                 state_dir=state_dir,
                 lock_token=token,
+                members=members,
                 before_swap=before_swap,
                 recorded=recorded,
             ),
@@ -387,6 +436,7 @@ def restore_file(
     remote_factory: Callable[[], RemoteStorage],
     state_dir: pathlib.Path | None = None,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
+    members: listing.DirListing | None = None,
 ) -> RestoreResult:
     """Restore a single file from revision and return its result.
 
@@ -402,16 +452,31 @@ def restore_file(
     refusal is this target's error. For a stage output restored to its own path, the ``*.pvt``
     members ``output_hash`` writes are recorded as the stage's before anything is written.
 
-    A restore appends ``(path, stat, hash)`` for each file it materializes to ``recorded``, for
-    the caller to save in a StateDB (#516). Each stat is of what was staged, taken before the
-    rename put it in place. ``state_dir`` is the stage's own directory for a stage target,
-    otherwise the configured directory from ``config.locate_state_dir()``.
+    ``members`` is a directory's listing at the revision; None reads the cache's object, once,
+    here, for the ``*.pvt`` record and the restore. A directory with neither is not restored: no
+    listing names the files to restore or download.
+
+    A restore appends ``(path, stat, hash)`` for each file it writes to ``recorded``, for the
+    caller to batch by state directory, so the next status, explanation or run looks the file up
+    instead of reading it. Each stat is of what was staged, taken before the rename put it in
+    place. ``state_dir`` is the stage's own state directory for a stage target, otherwise the
+    configured directory from ``config.locate_state_dir()``.
     """
     if (skipped := _skipped(dest_path, force)) is not None:
         return skipped
 
+    if members is None and output_hash is not None and is_dir_hash(output_hash):
+        try:
+            members = cache.cached_listing(cache_dir / "files", output_hash)
+        except (exceptions.PivotError, OSError) as error:
+            # With no usable listing the cache strategy is skipped; the result names the cause
+            logger.debug("Cannot read the cached listing for %s: %s", rel_path, error)
+    if members is not None and "restored_members" not in target:
+        # The ownership checks read the restored directory's files from the same listing
+        target = target.copy()
+        target["restored_members"] = members
     if target["claims"] is not None and output_hash is not None:
-        ownership.record_restored(target["claims"], dest_path, output_hash)
+        ownership.record_restored(target["claims"], dest_path, output_hash, members)
 
     state_dir = state_dir or config.locate_state_dir()
     try:
@@ -426,6 +491,7 @@ def restore_file(
             remote_factory,
             state_dir,
             recorded,
+            members,
         )
     except exceptions.OutputOwnershipError as error:
         return RestoreResult(
@@ -444,14 +510,13 @@ def _restore_from_sources(
     remote_factory: Callable[[], RemoteStorage],
     state_dir: pathlib.Path,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None,
+    members: listing.DirListing | None,
 ) -> RestoreResult:
     """``restore_file``'s strategies, each write under ``_replace_checked``."""
     path_str = str(dest_path)
     files_dir = cache_dir / "files"
 
-    # Ensure parent directory exists before any restore strategy. A parent inside the
-    # configured state directory is made as Pivot makes that directory, with its ignore file,
-    # before the restore lock or the copy writes anything there.
+    # Ensure parent directory exists before any restore strategy
     try:
         state_dir_mod.make_dirs(dest_path.parent)
     except OSError as e:
@@ -461,16 +526,16 @@ def _restore_from_sources(
             message=f"Error: {dest_path} - cannot create its directory: {e}",
         )
 
-    # Strategy 1: Try local cache (if hash available)
+    # Strategy 1: Try local cache (if hash available). A directory needs its listing: the one
+    # committed at the revision, else the cache's object (``restore_file`` read it).
     if output_hash is not None:
         cached_hash = output_hash
         restored = list[tuple[pathlib.Path, os.stat_result, str]]()
         success = False
         try:
-            # For directories with manifest, restore_from_cache checks each file in manifest.
-            # For files, we check if the single cached file exists first.
-            should_try_cache = True
-            if "manifest" not in output_hash:
+            if is_dir_hash(output_hash):
+                should_try_cache = members is not None
+            else:
                 should_try_cache = (
                     cache.resolve_cache_object_path(files_dir, output_hash["hash"]) is not None
                 )
@@ -482,6 +547,7 @@ def _restore_from_sources(
                     checkout_modes,
                     target,
                     state_dir=state_dir,
+                    members=members,
                     recorded=restored,
                 )
         except exceptions.OutputOwnershipError:
@@ -529,12 +595,23 @@ def _restore_from_sources(
     # restore from the cache. Any failure is this target's error, so the targets already
     # restored are still reported.
     if output_hash is not None:
+        if is_dir_hash(output_hash) and members is None:
+            # A directory is restored from its listing, which names its files; with none
+            # committed or cached, its members are unknown and nothing can be downloaded.
+            return RestoreResult(
+                status=RestoreStatus.ERROR,
+                path=path_str,
+                message=f"Error: {dest_path} - not in local cache or git, and no committed or "
+                + "cached listing names its files to download from the remote",
+            )
         cached_hash = output_hash
         source = "cache"
         remote: RemoteStorage | None = None
         downloaded = list[tuple[pathlib.Path, os.stat_result, str]]()
         try:
-            missing_hashes = cache.missing_cache_objects(output_hash, files_dir, checkout_modes)
+            missing_hashes = cache.missing_cache_objects(
+                output_hash, members, files_dir, checkout_modes
+            )
             # Two attempts: an object downloaded before the naming unit can be removed by a
             # collection run with no grace before the unit is taken; download it again then.
             success = False
@@ -546,17 +623,7 @@ def _restore_from_sources(
                     # with its ignore file, before any object is downloaded into it.
                     config.get_cache_dir()
                     remote = remote or remote_factory()
-                    download_results = asyncio.run(
-                        remote.download_batch(
-                            [
-                                (file_hash, cache.get_cache_path(files_dir, file_hash))
-                                for file_hash in missing_hashes
-                            ],
-                            readonly=True,
-                        )
-                    )
-                    if failed := [result for result in download_results if not result["success"]]:
-                        raise _download_error(failed)
+                    _download(remote, files_dir, missing_hashes)
                 success = _restore_named(
                     dest_path,
                     cached_hash,
@@ -564,12 +631,15 @@ def _restore_from_sources(
                     checkout_modes,
                     target,
                     state_dir=state_dir,
+                    members=members,
                     recorded=downloaded,
                 )
                 missing_hashes = (
                     []
                     if success
-                    else cache.missing_cache_objects(cached_hash, files_dir, checkout_modes)
+                    else cache.missing_cache_objects(
+                        cached_hash, members, files_dir, checkout_modes
+                    )
                 )
                 if not missing_hashes:
                     break
@@ -611,40 +681,37 @@ def _restore_from_sources(
     )
 
 
-def _current_output_hashes(stage_target: StageTarget) -> dict[str, HashInfo]:
-    """The hashes the stage's current lock records, by workspace path relative to the root."""
-    lock_data = lock.StageLock(
-        stage_target["stage_name"], lock.get_stages_dir(stage_target["state_dir"])
-    ).read()
-    if lock_data is None:
-        return {}
-    recorded_paths = (
-        lock_data["output_paths"]
-        if "output_paths" in lock_data
-        else dict[types.ArtifactIdentity, str]()
-    )
-    hashes = dict[str, HashInfo]()
-    for identity, output_hash in lock_data["output_hashes"].items():
-        path = recorded_paths.get(identity) or stage_target["paths_by_key"].get(identity.key)
-        if path is not None:
-            hashes[path] = output_hash
-    return hashes
-
-
 def _read_claims(
     proj_root: pathlib.Path, stage_target: StageTarget, files_dir: pathlib.Path
 ) -> ownership.StageClaims:
-    """The stage's claims (``ownership.StageClaims``): the hashes its current lock records, its
-    ``nocommit:`` record and the cache object root ``files_dir``, with a recorder for the
-    ``*.pvt`` members ``get`` writes."""
+    """The stage's claims (``ownership.StageClaims``): the hashes its current lock records, each
+    directory's listing committed beside that lock, its ``nocommit:`` record and the cache object
+    root ``files_dir``, with a recorder for the ``*.pvt`` members ``get`` writes."""
+    stage_lock = lock.StageLock(
+        stage_target["stage_name"], lock.get_stages_dir(stage_target["state_dir"])
+    )
+    lock_data = stage_lock.read(cache_dir=files_dir)
+    paths = dict[types.ArtifactIdentity, pathlib.Path]()
+    if lock_data is not None:
+        recorded_paths = (
+            lock_data["output_paths"]
+            if "output_paths" in lock_data
+            else dict[types.ArtifactIdentity, str]()
+        )
+        for identity in lock_data["output_hashes"]:
+            path = recorded_paths.get(identity) or stage_target["paths_by_key"].get(identity.key)
+            if path is not None:
+                paths[identity] = proj_root / path
+    locked = (
+        {path: lock_data["output_hashes"][identity] for identity, path in paths.items()}
+        if lock_data is not None
+        else {}
+    )
     return ownership.read_stage_claims(
         proj_root,
         stage_target["stage_name"],
         stage_target["state_dir"],
-        {
-            proj_root / path: output_hash
-            for path, output_hash in _current_output_hashes(stage_target).items()
-        },
+        locked,
         cache_dir=files_dir,
         recorder=functools.partial(
             ownership.record_members,
@@ -652,6 +719,7 @@ def _read_claims(
             stage_target["state_dir"],
             stage_target["stage_name"],
         ),
+        listing_readers=ownership.lock_listing_readers(stage_lock, lock_data, paths, files_dir),
     )
 
 
@@ -690,19 +758,24 @@ def _restore_targets(
             dest_path = output if output is not None else own_path
             restored = target_info["hashes"].get(rel_path)
             if dest_path != own_path:
-                restores[(index, rel_path)] = ownership.ForcedRestore(
+                restore = ownership.ForcedRestore(
                     replacement=ownership.destination(dest_path), restored=restored, claims=None
                 )
             elif stage_target is not None:
-                restores[(index, rel_path)] = ownership.ForcedRestore(
+                restore = ownership.ForcedRestore(
                     replacement=ownership.stage_output(dest_path, stage_target["stage_name"]),
                     restored=restored,
                     claims=claims,
                 )
             else:
-                restores[(index, rel_path)] = ownership.ForcedRestore(
+                restore = ownership.ForcedRestore(
                     replacement=ownership.tracked_restore(dest_path), restored=restored, claims=None
                 )
+            # The listing at the revision names a restored directory's files
+            members = target_info["members"].get(rel_path)
+            if members is not None:
+                restore["restored_members"] = members
+            restores[(index, rel_path)] = restore
     return restores
 
 
@@ -733,7 +806,7 @@ def restore_targets_from_revision(
         raise exceptions.RevisionNotFoundError(f"Cannot resolve revision: '{rev}'")
 
     # Resolve targets
-    target_infos = resolve_targets(targets, rev, stage_targets)
+    target_infos = resolve_targets(targets, rev, stage_targets, cache_dir / "files")
 
     # Validate -o usage
     if output is not None:
@@ -754,7 +827,7 @@ def restore_targets_from_revision(
 
     results = list[RestoreResult]()
     # Resolves the remote and builds its backend once per call, not once per target that misses
-    # the cache
+    # the cache.
     open_remote = functools.cache(remote_factory)
     # A remote this call could not reach is not tried again, so an unreachable remote costs one
     # connection timeout per call, not one per target. Only RemoteUnreachableError sets it: a
@@ -769,10 +842,9 @@ def restore_targets_from_revision(
             )
         return open_remote()
 
-    # Every target's file hashes, saved once per state directory when the loop ends, best-effort:
-    # a stage output's in its stage's state directory, any other file's in the configured one.
-    # Located, not created: `get` creates nothing for a target it skips, and the save makes the
-    # directory #503's resolver chose only when it has a hash to save.
+    # Every target's file hashes are saved once per state directory when the loop ends,
+    # best-effort. A stage output uses its stage state directory; other files use the configured
+    # project state directory.
     batch = state.FileHashBatch()
     try:
         for index, target_info in enumerate(target_infos):
@@ -810,6 +882,7 @@ def restore_targets_from_revision(
                     remote_factory=reachable_remote,
                     state_dir=hash_state_dir,
                     recorded=recorded,
+                    members=target_info["members"].get(rel_path),
                 )
                 batch.add(hash_state_dir, recorded)
                 if "unreachable_remote" in result:
