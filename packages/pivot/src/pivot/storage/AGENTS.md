@@ -324,16 +324,20 @@ When multiple `pivot` processes share the same StateDB:
   moved over a file output in the instant between the last check and its unlink (a stage write)
   or the rename that replaces it (a restore); and a file moved over a file output while the
   stage's own writer writes it (after `refuse_output_replacement_at_write`, before the loader's
-  or `worker._save_recorded`'s rename over the path), which the stage's output replaces; the
-  commit's check then refuses, naming the sidecar. A directory output loses nothing in that last
-  window: the writer adds its files beside the user's, and the commit refuses.
+  or `worker._save_recorded`'s rename over the path), which the stage's output replaces. For an
+  output Pivot caches, the commit's check then refuses, naming the sidecar; a metric output (whose
+  commit runs no check) and a `--no-commit` run (which commits nothing) finish with exit 0, and
+  the next `pivot status` or `pivot repro` warns, naming it. A directory output loses in that
+  window only a user file that has the name of a file the stage writes; the writer adds its other
+  files beside the user's, and the commit refuses.
 - Where the filesystem cannot rename a directory aside (`cache._rename_aside`: EXDEV from
   overlayfs with `redirect_dir` off, the default on many kernels, for a directory on a lower
   layer; ENOTSUP or EOPNOTSUPP), a swap, a stage write and a symlink-mode commit check it in place
   and remove it there, as before the rename aside existed: on such a filesystem a file copied into
-  it after that check is removed with it. A rename refused for want of write permission on the
-  parent is retried once the parent is made writable; any other rename error (EBUSY for an output
-  that is a mount point) fails before anything is removed.
+  it after that check is removed with it. A stage write or symlink-mode commit whose rename is
+  refused for want of write permission on the parent retries once the parent is made writable
+  (`cache._remove_checked`); a restore's swap (`cache._swap_in`) does not. Any other rename error
+  (EBUSY for an output that is a mount point) fails before anything is removed.
 - A directory restore killed between renaming the old entry aside and checking it leaves a backup.
   The next directory restore of that path holds the same restore lock and checks that backup
   before removing it. If the check finds a user file, Pivot keeps the backup and warns, naming the
