@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from pivot import loaders, types
 from pivot.remote import sync
-from pivot.storage import lock, track
+from pivot.storage import cache, listing, lock, track
 
 if TYPE_CHECKING:
     from pivot.registry import RegistryStageInfo
@@ -135,13 +135,14 @@ def test_get_file_hash_from_stages_matches_identity_key(tmp_path: pathlib.Path) 
         },
     )
 
-    out_hash = sync._get_file_hash_from_stages(
+    out_blobs = sync._get_file_hash_from_stages(
         "train:model",
         tmp_path,
+        tmp_path / "cache" / "files",
         all_stages={stage_name: stage_info},
     )
 
-    assert out_hash == types.FileHash(hash="abc1230000000000")
+    assert out_blobs == {"abc1230000000000"}
 
 
 def test_get_target_hashes_empty_targets(tmp_path: pathlib.Path) -> None:
@@ -341,6 +342,67 @@ def test_get_target_hashes_include_deps_keeps_pvt_tracked_inputs(
     )
 
     assert hashes == {"7074a10000000000", "7cacced000000000"}
+
+
+def test_get_target_hashes_include_deps_keeps_tracked_directory_listing_and_files(
+    set_project_root: pathlib.Path,
+) -> None:
+    """A `pivot track` directory input transfers its listing object and listed files."""
+    total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
+    all_stages = {
+        "smoke/total": _make_stage_info("smoke/total", [total_ref], state_dir=set_project_root),
+    }
+    members = listing.DirListing(
+        files=[
+            types.DirManifestEntry(relpath="a.csv", hash="a1a1a10000000000", size=4, isexec=False),
+            types.DirManifestEntry(
+                relpath="nested/b.csv", hash="b2b2b20000000000", size=5, isexec=False
+            ),
+        ],
+        empty_dirs=[],
+    )
+    data = listing.encode(members)
+    directory = listing.record_of(members, data)
+    raw_dir = set_project_root / "data" / "raw"
+    raw_dir.mkdir(parents=True)
+    pvt_path = raw_dir / "numbers.pvt"
+    track.write_pvt_file(
+        pvt_path,
+        track.PvtData(
+            path="numbers",
+            hash=directory["hash"],
+            size=directory["size"],
+            nfiles=directory["nfiles"],
+        ),
+    )
+    listing.write(listing.tracked_listing_path(pvt_path), data)
+    _helper_write_lock_with_deps(
+        "smoke/total",
+        set_project_root,
+        dep_hashes={types.ArtifactIdentity("numbers", None): directory},
+        output_hashes={
+            types.ArtifactIdentity("smoke/total", None): types.FileHash(hash="7074a10000000000"),
+        },
+    )
+    cache_dir = set_project_root / ".pivot" / "cache"
+
+    hashes = sync.get_target_hashes(
+        ["smoke/total"],
+        set_project_root,
+        include_deps=True,
+        all_stages=all_stages,
+        cache_dir=cache_dir,
+    )
+
+    assert hashes == {
+        "7074a10000000000",
+        directory["hash"],
+        "a1a1a10000000000",
+        "b2b2b20000000000",
+    }
+    assert cache.cached_listing(cache_dir / "files", directory) == members, (
+        "Push should be able to send the tracked directory listing object"
+    )
 
 
 def test_get_target_hashes_include_deps_skips_imported_inputs(

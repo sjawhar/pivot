@@ -84,7 +84,9 @@ def stage_changed(params: _ChangedParams) -> None:
 
 def _head_lock(stage_name: str, params: dict[str, object]) -> dict[str, bytes]:
     """HEAD lock-file content for ``git.read_files_from_head`` (path keyed by qualified name)."""
-    content = yaml.dump({"code_manifest": {}, "params": params, "deps": [], "outs": []})
+    content = yaml.dump(
+        {"schema_version": 3, "code_manifest": {}, "params": params, "deps": [], "outs": []}
+    )
     return {f".pivot/stages/{stage_name}.lock": content.encode()}
 
 

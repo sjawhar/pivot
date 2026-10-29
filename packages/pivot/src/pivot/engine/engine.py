@@ -171,6 +171,15 @@ class _MissingDependencyRun:
         )
 
 
+def _file_identity(path: pathlib.Path) -> tuple[int, int, int] | None:
+    """``path``'s (inode, mtime, size), or None when it does not exist."""
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    return (info.st_ino, info.st_mtime_ns, info.st_size)
+
+
 def _merge_run_requests(earlier: RunRequested, later: RunRequested) -> RunRequested:
     """One request that runs everything ``earlier`` and ``later`` would run.
 
@@ -1227,6 +1236,18 @@ class Engine:
                     + "files first."
                 )
 
+        # Refuse an incremental stage whose lock an older pivot rewrote over this pivot's: that
+        # pivot may have restarted the output from empty. `--force` accepts its lock on purpose.
+        if not force:
+            restarted = executor_core.check_restarted_incremental_outputs(
+                execution_order, self._get_all_stages()
+            )
+            if restarted:
+                raise pivot_exceptions.RestartedIncrementalOutputError(
+                    "Pivot will not run these stages:\n"
+                    + "\n".join(f"  - {reason}" for reason in restarted)
+                )
+
         # The pool never needs more workers than stages that can run at once, but the cpu
         # resource capacity is the configured worker count, whatever this run schedules.
         cpu_capacity = executor_core.configured_worker_count(max_workers) if parallel else 1
@@ -1293,6 +1314,10 @@ class Engine:
             if stage_state_dir not in state_dbs:
                 state_dbs[stage_state_dir] = state_mod.StateDB(stage_state_dir)
             return state_dbs[stage_state_dir]
+
+        # The lock and listing files as they stand before this run, so the run names each one
+        # it writes that git ignores, whatever path wrote it (a run, a run-cache restore).
+        committed_before = self._committed_files(execution_order, all_stages, project_root)
 
         try:
             # Ensure default StateDB exists before skip checks
@@ -1553,6 +1578,7 @@ class Engine:
             retention=retention,
             state_dir=default_state_dir,
         )
+        self._warn_ignored_committed_files(committed_before, project_root)
 
         # Materialize presentation symlinks for successful stages
         from pivot.storage import presentation
@@ -1920,7 +1946,7 @@ class Engine:
         def _read_lock() -> LockData | None:
             stages_dir = lock.get_stages_dir(stage_state_dir)
             stage_lock = lock.StageLock(stage_name, stages_dir)
-            return stage_lock.read()
+            return stage_lock.read(cache_dir=worker.store_cache_dir(store))
 
         lock_data = await anyio.to_thread.run_sync(_read_lock)
         if lock_data is None:
@@ -2014,12 +2040,13 @@ class Engine:
         """
         from pivot import run_history
         from pivot import skip as skip_mod
+        from pivot.storage import lock
 
         deps = stage_info["deps"]
+        listing_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
 
         def _save_file_hashes(entries: list[types.FileHashEntry]) -> None:
-            """Record the file hashes this check read or restored, so the next one reads none;
-            best-effort, so a write that cannot happen never fails the run."""
+            """Record the file hashes this check read or restored, so the next one reads none."""
             if entries:
                 _ = state_mod.save_best_effort(
                     stage_state_dir,
@@ -2038,6 +2065,7 @@ class Engine:
                     lock_data["output_hashes"],
                     state_db,
                     state_dir=state_dir,
+                    listing_lock=None if "older_format" in lock_data else listing_lock,
                     restore=False,
                     report_changes=True,
                     file_hash_entries=file_hash_entries,
@@ -2052,6 +2080,7 @@ class Engine:
                 lock_data["output_hashes"],
                 state_db,
                 state_dir=state_dir,
+                listing_lock=None if "older_format" in lock_data else listing_lock,
                 file_hash_entries=file_hash_entries,
                 claims=worker.stage_claims(
                     store,
@@ -2059,6 +2088,7 @@ class Engine:
                     lock_data,
                     state_db.get_no_commit_record(stage_name),
                     project.get_project_root(),
+                    stage_lock=listing_lock,
                 ),
             )
             _save_file_hashes(file_hash_entries)
@@ -2234,7 +2264,7 @@ class Engine:
             )
             lock_data = lock.StageLock(
                 stage_name, lock.get_stages_dir(worker_info["state_dir"])
-            ).read()
+            ).read(cache_dir=store.cache_dir)
             return explain_mod.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=worker_info["fingerprint"],
@@ -2481,6 +2511,78 @@ class Engine:
         with state_mod.StateDB(state_dir) as state_db:
             state_db.write_run(manifest)
             state_db.prune_runs(retention)
+
+    def _committed_files(
+        self,
+        stage_names: list[str],
+        all_stages: dict[str, RegistryStageInfo],
+        project_root: pathlib.Path,
+    ) -> dict[pathlib.Path, tuple[int, int, int] | None]:
+        """The lock, listing and restart-proof files ``stage_names`` record, each with its
+        (inode, mtime, size), or None when absent. Each is written by an atomic replace, so a
+        file whose stat changes was written. Empty outside a git repository, where git ignores
+        nothing."""
+        from pivot import git
+        from pivot.storage import listing, lock
+
+        if not git.in_repository(project_root):
+            return {}
+        default_state_dir = config.get_state_dir()
+        pipeline = self._require_pipeline()
+        store = store_mod.WorkspaceStore(
+            project_root=project_root,
+            pipeline_name=pipeline.name,
+            input_bindings=pipeline.input_bindings,
+        )
+        files = dict[pathlib.Path, tuple[int, int, int] | None]()
+        for name in stage_names:
+            stage_info = all_stages.get(name)
+            if stage_info is None:
+                continue
+            stages_dir = lock.get_stages_dir(
+                registry.get_stage_state_dir(stage_info, default_state_dir)
+            )
+            candidates = [lock.StageLock(name, stages_dir).path]
+            candidates.extend(
+                listing.output_listing_path(stages_dir, out.identity) for out in stage_info["outs"]
+            )
+            if any(out.tag is types.ArtifactTag.INCREMENTAL for out in stage_info["outs"]):
+                candidates.append(lock.restart_proof_path(stages_dir, name))
+            candidates.extend(
+                listing.input_listing_path(stages_dir, store.input_relpath(ref))
+                for ref in stage_info["deps"].values()
+                if ref.tag is types.ArtifactTag.INPUT
+            )
+            for path in candidates:
+                files[path] = _file_identity(path)
+        return files
+
+    def _warn_ignored_committed_files(
+        self,
+        before: dict[pathlib.Path, tuple[int, int, int] | None],
+        project_root: pathlib.Path,
+    ) -> None:
+        """Warn once per run when git ignores a lock or listing file this run wrote: one of
+        ``before`` whose stat changed (``_committed_files``).
+
+        A project made before ``pivot init`` wrote ``!/**`` into the stages directory's
+        ``.gitignore`` can hide them under a root pattern such as ``lib/`` or ``build/``.
+        """
+        from pivot import git
+
+        written = [
+            path
+            for path, identity in before.items()
+            if (now := _file_identity(path)) is not None and now != identity
+        ]
+        ignored = git.ignored_paths(project_root, sorted(written))
+        if ignored:
+            _logger.warning(
+                "git ignores %s, which pivot just wrote and which must be committed: add "
+                + "`!/**` to the .gitignore in Pivot's stages directory and make sure no "
+                + "other pattern ignores .pivot itself, or `git add -f` them",
+                ", ".join(project.to_relative_path(path, project_root) for path in ignored),
+            )
 
     # =========================================================================
     # Event Handlers

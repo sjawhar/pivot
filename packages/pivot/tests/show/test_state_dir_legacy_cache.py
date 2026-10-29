@@ -9,7 +9,8 @@ import pytest
 from pivot import state_dir as state_dir_mod
 from pivot.remote import sync
 from pivot.show import data, metrics
-from pivot.storage import cache
+from pivot.storage import cache, listing
+from pivot.types import DirManifestEntry
 
 if TYPE_CHECKING:
     import pathlib
@@ -87,6 +88,29 @@ def test_current_cache_scan_stays_silent(
 
     assert hashes == {_HASH}
     assert "holds stage locks or cache objects of this project" not in caplog.text
+
+
+def test_push_names_a_legacy_cached_listing_without_copying_it_into_the_configured_cache(
+    set_project_root: pathlib.Path,
+) -> None:
+    """A directory's listing object only in the legacy cache is named for push as it is: push
+    reads it there, so it writes no copy into (and creates no) configured cache."""
+    _configure_state_dir(set_project_root)
+    members = listing.DirListing(
+        files=[DirManifestEntry(relpath="a.txt", hash="0123456789abcdef", size=5, isexec=False)],
+        empty_dirs=[],
+    )
+    data_bytes = listing.encode(members)
+    record = listing.record_of(members, data_bytes)
+    legacy = cache.get_cache_path(set_project_root / ".pivot" / "cache" / "files", record["hash"])
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(data_bytes)
+    configured_files = set_project_root / "altstate" / "cache" / "files"
+
+    hashes = sync._blob_hashes(record, lambda _record: members, configured_files)
+
+    assert hashes == {record["hash"], "0123456789abcdef"}
+    assert not (set_project_root / "altstate").exists()
 
 
 def test_cache_object_resolver_rejects_a_primary_symlink(

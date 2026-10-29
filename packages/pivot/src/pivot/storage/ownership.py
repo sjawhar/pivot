@@ -30,8 +30,8 @@ from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import lmdb
 
-from pivot import exceptions, project, types
-from pivot.storage import cache, lock, state, track
+from pivot import config, exceptions, project, types
+from pivot.storage import cache, listing, lock, state, track
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -66,6 +66,11 @@ class StageClaims(TypedDict):
     the caller writes none."""
     cache_dir: pathlib.Path | None
     """The cache object root (``<cache.dir>/files``) the stage's outputs are cached in."""
+    locked_members: NotRequired[Callable[[pathlib.Path], listing.DirListing | None]]
+    """An output's ``normalized`` path -> the listing of the directory the lock records for it,
+    read from the listing file committed beside the lock (byte-checked, else the cache's copy;
+    ``stage_claims``), or None when neither can be read. Without it, or with None, the listing is
+    read from the cache alone."""
 
 
 class ReplacementKind(enum.StrEnum):
@@ -118,6 +123,13 @@ class ForcedRestore(TypedDict):
     replacement: Replacement
     restored: types.HashInfo | None
     """The hash the restore writes; None for a file restored from git or a stage output."""
+    restored_members: NotRequired[listing.DirListing]
+    """The listing of a restored directory, when the caller has read it (a committed listing
+    file); without it the listing is read by ``read_restored_members``, else from the cache at
+    the restored hash."""
+    read_restored_members: NotRequired[Callable[[], listing.DirListing]]
+    """Reads the listing of a restored directory (``restored_members``), called only when the
+    path holds a ``*.pvt``; an error reading it leaves the listing to the cache."""
     claims: Callable[[], StageClaims] | None
     """For a stage output restored to its own path: reads the stage's claims, called only when
     the path holds a ``*.pvt``."""
@@ -154,27 +166,55 @@ def normalized(path: pathlib.Path) -> pathlib.Path:
     return pathlib.Path(os.path.normpath(path.absolute()))
 
 
+def _cached_listing(
+    output_hash: types.DirHash, cache_dir: pathlib.Path | None
+) -> listing.DirListing | None:
+    """The listing the cache holds for a directory hash (``cache_dir``, else the configured
+    cache), or None when it holds no usable copy: the directory's members are then unknown, so
+    no ``*.pvt`` in it counts as the stage's and each is refused as the user's."""
+    try:
+        files_dir = cache_dir if cache_dir is not None else config.locate_cache_dir() / "files"
+        return cache.cached_listing(files_dir, output_hash)
+    except (exceptions.CorruptListingError, exceptions.ProjectNotInitializedError):
+        return None
+
+
 def member_hashes(
-    output_path: pathlib.Path, output_hash: types.HashInfo | None
+    output_path: pathlib.Path,
+    output_hash: types.HashInfo | None,
+    *,
+    members: listing.DirListing | None = None,
+    cache_dir: pathlib.Path | None = None,
 ) -> dict[pathlib.Path, str]:
     """The ``*.pvt`` files ``output_hash`` puts in ``output_path``, each with its content hash.
 
-    Only a directory hash lists files, whatever the output's tag is."""
+    Only a directory hash lists files, whatever the output's tag is. Its files are in its
+    listing: ``members`` when the caller has read it, else the cache's copy (``cache_dir``)."""
     if output_hash is None or not types.is_dir_hash(output_hash):
         return {}
+    if members is None:
+        members = _cached_listing(output_hash, cache_dir)
+        if members is None:
+            return {}
     root = normalized(output_path)
     return {
         root / entry["relpath"]: entry["hash"]
-        for entry in output_hash["manifest"]
+        for entry in members["files"]
         if entry["relpath"].endswith(".pvt")
     }
 
 
-def _hash_members(output_path: pathlib.Path, *hashes: types.HashInfo | None) -> StageMembers:
-    """The ``*.pvt`` files ``hashes`` put in ``output_path``, each with every hash recorded."""
+def _hash_members(
+    output_path: pathlib.Path,
+    hashes: Iterable[tuple[types.HashInfo | None, listing.DirListing | None]],
+    cache_dir: pathlib.Path | None,
+) -> StageMembers:
+    """The ``*.pvt`` files ``hashes`` put in ``output_path``, each with every hash recorded; each
+    hash comes with its listing when the caller has read it (``member_hashes``)."""
     found = dict[pathlib.Path, set[str]]()
-    for output_hash in hashes:
-        for path, content_hash in member_hashes(output_path, output_hash).items():
+    for output_hash, members in hashes:
+        listed = member_hashes(output_path, output_hash, members=members, cache_dir=cache_dir)
+        for path, content_hash in listed.items():
             found.setdefault(path, set[str]()).add(content_hash)
     return {path: frozenset(recorded) for path, recorded in found.items()}
 
@@ -184,6 +224,7 @@ def stage_members(
     claims: StageClaims | None,
     *,
     restored: types.HashInfo | None = None,
+    restored_members: listing.DirListing | None = None,
     returned: StageMembers | None = None,
     moved_to: pathlib.Path | None = None,
 ) -> StageMembers:
@@ -205,7 +246,13 @@ def stage_members(
     root = normalized(output_path)
     locked = claims["locked"].get(root) if claims is not None else None
     cache_dir = claims["cache_dir"] if claims is not None else None
-    for path, recorded in _hash_members(output_path, restored, locked).items():
+    locked_members = (
+        claims["locked_members"](root)
+        if claims is not None and locked is not None and "locked_members" in claims
+        else None
+    )
+    hashes = ((restored, restored_members), (locked, locked_members))
+    for path, recorded in _hash_members(output_path, hashes, cache_dir).items():
         found[path] = set(recorded)
         located = path if moved_to is None else moved_to / path.relative_to(root)
         if cache_dir is not None and located.is_file():
@@ -265,18 +312,22 @@ def record_members(
 
 
 def record_restored(
-    read_claims: Callable[[], StageClaims], output_path: pathlib.Path, restored: types.HashInfo
+    read_claims: Callable[[], StageClaims],
+    output_path: pathlib.Path,
+    restored: types.HashInfo,
+    members: listing.DirListing | None = None,
 ) -> None:
     """Record the ``*.pvt`` files restoring ``restored`` writes in ``output_path`` as the stage's,
     before the restore writes them, unless the stage's lock records that hash for the output
-    (the lock already lists them). Reads the claims only when there is a file to record."""
-    members = member_hashes(output_path, restored)
-    if not members:
+    (the lock already lists them). ``members`` is a restored directory's listing when the caller
+    has read it. Reads the claims only when there is a file to record."""
+    members_written = member_hashes(output_path, restored, members=members)
+    if not members_written:
         return
     claims = read_claims()
     if claims["recorder"] is None or claims["locked"].get(normalized(output_path)) == restored:
         return
-    claims["recorder"](members)
+    claims["recorder"](members_written)
 
 
 def _no_commit_members(
@@ -306,14 +357,32 @@ def stage_claims(
     *,
     cache_dir: pathlib.Path | None,
     recorder: MemberRecorder | None = None,
+    listing_readers: Mapping[pathlib.Path, Callable[[], listing.DirListing]] | None = None,
 ) -> StageClaims:
     """A stage's claims: ``locked`` maps each output path to the hash the stage's lock records
-    for it, and ``no_commit_record`` is the stage's ``nocommit:`` record."""
+    for it, and ``no_commit_record`` is the stage's ``nocommit:`` record. ``listing_readers``
+    maps a directory output's path to a reader of the listing committed beside the lock
+    (``listing.read``); each is called at most once, when an output holds a ``*.pvt``."""
+    readers = {normalized(path): reader for path, reader in (listing_readers or {}).items()}
+
+    @functools.cache
+    def locked_members(output_path: pathlib.Path) -> listing.DirListing | None:
+        reader = readers.get(output_path)
+        if reader is None:
+            return None
+        try:
+            return reader()
+        except (exceptions.PivotError, OSError):
+            # Neither the committed file nor the cache gives the listing: its members are
+            # unknown, so every *.pvt there is refused as the user's
+            return None
+
     return StageClaims(
         locked={normalized(path): output_hash for path, output_hash in locked.items()},
         no_commit=_no_commit_members(project_root, no_commit_record),
         recorder=recorder,
         cache_dir=cache_dir,
+        locked_members=locked_members,
     )
 
 
@@ -325,6 +394,7 @@ def read_stage_claims(
     *,
     cache_dir: pathlib.Path | None,
     recorder: MemberRecorder | None = None,
+    listing_readers: Mapping[pathlib.Path, Callable[[], listing.DirListing]] | None = None,
 ) -> StageClaims:
     """``stage_claims``, reading the stage's ``nocommit:`` record from the StateDB in
     ``state_dir`` (opened read-only, never created)."""
@@ -332,7 +402,37 @@ def read_stage_claims(
     if (state_dir / "state.lmdb").exists():
         with state.StateDB(state_dir, readonly=True) as state_db:
             record = state_db.get_no_commit_record(stage_name)
-    return stage_claims(project_root, locked, record, cache_dir=cache_dir, recorder=recorder)
+    return stage_claims(
+        project_root,
+        locked,
+        record,
+        cache_dir=cache_dir,
+        recorder=recorder,
+        listing_readers=listing_readers,
+    )
+
+
+def lock_listing_readers(
+    stage_lock: lock.StageLock,
+    lock_data: types.LockData | None,
+    paths: Mapping[types.ArtifactIdentity, pathlib.Path],
+    cache_dir: pathlib.Path | None,
+) -> dict[pathlib.Path, Callable[[], listing.DirListing]]:
+    """For each directory output ``lock_data`` records at one of ``paths``, a reader of its
+    listing: the file committed beside the lock (``StageLock.output_listing_path``), byte-checked,
+    else the cache's copy (``listing.read``). A lock an older pivot wrote listed each directory
+    inline, and ``StageLock.read`` put that listing in the cache, so only the cache is read
+    (``lock.committed_listing``)."""
+    readers: dict[pathlib.Path, Callable[[], listing.DirListing]] = {}
+    if lock_data is None:
+        return readers
+    for identity, output_hash in lock_data["output_hashes"].items():
+        path = paths.get(identity)
+        if path is None or not types.is_dir_hash(output_hash):
+            continue
+        committed = lock.committed_listing(lock_data, stage_lock.output_listing_path(identity))
+        readers[path] = functools.partial(listing.read, committed, output_hash, cache_dir)
+    return readers
 
 
 def _same_location(path_a: pathlib.Path, path_b: pathlib.Path) -> bool:
@@ -584,6 +684,18 @@ def ownership_error(
     return exceptions.OutputOwnershipError(f"{header}\n{details}\n{remedy}")
 
 
+def _restored_listing(target: ForcedRestore) -> listing.DirListing | None:
+    """The listing of the directory ``target`` restores, when its caller read it or gave a reader;
+    None leaves the listing to the cache (``member_hashes``)."""
+    members = target.get("restored_members")
+    if members is not None or "read_restored_members" not in target:
+        return members
+    try:
+        return target["read_restored_members"]()
+    except (exceptions.PivotError, OSError):
+        return None
+
+
 def _restore_members(
     target: ForcedRestore, output_path: pathlib.Path, *, moved_to: pathlib.Path | None = None
 ) -> StageMembers:
@@ -596,6 +708,7 @@ def _restore_members(
                 output_path,
                 claims,
                 restored=target["restored"],
+                restored_members=_restored_listing(target),
                 returned=target.get("written"),
                 moved_to=moved_to,
             )
@@ -604,8 +717,11 @@ def _restore_members(
             current = track.read_pvt_file(track.get_pvt_path(output_path))
             return _hash_members(
                 output_path,
-                target["restored"],
-                track.pvt_to_hash_info(current) if current is not None else None,
+                (
+                    (target["restored"], _restored_listing(target)),
+                    (track.pvt_to_hash_info(current) if current is not None else None, None),
+                ),
+                None,
             )
         case ReplacementKind.DESTINATION:
             return {}
@@ -741,13 +857,23 @@ def _output_members(
     @functools.cache
     def members_of(output_path: pathlib.Path) -> StageMembers:
         stage_name, identity, state_dir = owners[output_path]
-        lock_data = lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).read()
+        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(state_dir))
+        lock_data = stage_lock.read(cache_dir=cache_dir)
         locked = (
             {output_path: lock_data["output_hashes"][identity]}
             if lock_data is not None and identity in lock_data["output_hashes"]
             else {}
         )
-        claims = read_stage_claims(project_root, stage_name, state_dir, locked, cache_dir=cache_dir)
+        claims = read_stage_claims(
+            project_root,
+            stage_name,
+            state_dir,
+            locked,
+            cache_dir=cache_dir,
+            listing_readers=lock_listing_readers(
+                stage_lock, lock_data, {identity: output_path}, cache_dir
+            ),
+        )
         return stage_members(output_path, claims)
 
     return {path: owner[0] for path, owner in owners.items()}, members_of

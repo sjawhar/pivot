@@ -206,7 +206,7 @@ def test_a_write_just_after_a_copy_restore_is_not_recorded_as_the_cached_content
     batch = state_mod.FileHashBatch()
     outcome = checkout_mod._restore_path_sync(
         target,
-        FileHash(hash=file_hash),
+        checkout_mod.Expected(FileHash(hash=file_hash)),
         cache_dir,
         [cache.CheckoutMode.COPY],
         checkout_mod.CheckoutBehavior.ERROR,

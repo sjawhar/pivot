@@ -16,11 +16,13 @@ if TYPE_CHECKING:
     from pivot.compose import metric as metric
     from pivot.compose import plot as plot
     from pivot.compose import stage as stage
+    from pivot.decorators import fingerprint_by_name as fingerprint_by_name
     from pivot.decorators import no_fingerprint as no_fingerprint
     from pivot.stage_def import StageParams as StageParams
 
 # Lazy import mapping for runtime: (module_path, attr_name or None for module import)
 _LAZY_IMPORTS: dict[str, tuple[str, str | None]] = {
+    "fingerprint_by_name": ("pivot.decorators", "fingerprint_by_name"),
     "no_fingerprint": ("pivot.decorators", "no_fingerprint"),
     "loaders": ("pivot.loaders", None),
     "stage_def": ("pivot.stage_def", None),

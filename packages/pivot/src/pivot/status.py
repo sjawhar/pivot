@@ -68,10 +68,12 @@ from pivot import state_dir as state_dir_mod
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
-from pivot.storage import cache, lock, ownership, track
+from pivot.storage import cache, listing, lock, ownership, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
+    ArtifactIdentity,
+    ArtifactTag,
     CodeChange,
     DepChange,
     ImportCheckStatus,
@@ -144,8 +146,15 @@ def _get_explanations_in_parallel(
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
     default_state_dir = config.locate_state_dir()
     max_workers = min(8, len(execution_order))
-    locks = explain.read_locks(execution_order, all_stages, default_state_dir)
-    producer_hashes = explain.producer_output_hashes(locks.values())
+    locks = explain.read_locks(execution_order, all_stages, default_state_dir, store.cache_dir)
+    unreadable = dict[ArtifactIdentity, str]()
+    producer_hashes = explain.producer_output_hashes(
+        locks,
+        (ref for name in execution_order for ref in all_stages[name]["deps"].values()),
+        {name: explain.stages_dir(all_stages[name], default_state_dir) for name in locks},
+        store.cache_dir,
+        unreadable,
+    )
     explanations_by_name = dict[str, StageExplanation]()
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -154,7 +163,6 @@ def _get_explanations_in_parallel(
             stage_info = all_stages[stage_name]
             fingerprint = cast("dict[str, str]", stage_info["fingerprint"])
             stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
-            # Workers run in this context, so a warning they report counts as this command's.
             future = pool.submit(
                 contextvars.copy_context().run,
                 explain.get_stage_explanation,
@@ -172,6 +180,7 @@ def _get_explanations_in_parallel(
                 tracked_files=tracked_files,
                 tracked_trie=tracked_trie,
                 producer_hashes=producer_hashes,
+                unreadable_listings=unreadable,
             )
             futures[future] = stage_name
 
@@ -216,7 +225,6 @@ def get_pipeline_explanations(
 ) -> list[StageExplanation]:
     _t = metrics.start()
     try:
-        # One state-directory record for the query, started with the pipeline's directories.
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
             tracked_files, tracked_trie = _discover_tracked_files(
                 allow_missing, all_stages, pipeline
@@ -248,9 +256,7 @@ def get_pipeline_explanations(
                 store=store,
             )
 
-            # Preserve original order for staleness propagation
             explanations = [explanations_by_name[name] for name in execution_order]
-
             return _compute_explanations_with_upstream(explanations, stage_graph)
     finally:
         metrics.end("status.get_pipeline_explanations", _t)
@@ -312,7 +318,6 @@ def get_pipeline_status(
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
     _t = metrics.start()
     try:
-        # One state-directory record for the query, started with the pipeline's directories.
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
             tracked_files, tracked_trie = _discover_tracked_files(
                 allow_missing, all_stages, pipeline
@@ -343,10 +348,7 @@ def get_pipeline_status(
                 store=store,
             )
 
-            # Preserve original order for staleness propagation
             explanations = [explanations_by_name[name] for name in execution_order]
-
-            # Reuse the shared upstream computation logic
             enriched = _compute_explanations_with_upstream(explanations, stage_graph)
             return _explanations_to_status(enriched), stage_graph
     finally:
@@ -385,8 +387,7 @@ def get_tracked_files_status(
     results = list[TrackedFileInfo]()
 
     # Look hashes up read-only and save what was read once, best-effort, so a hash cache that
-    # cannot be opened or written never fails status. Both directories are located, not created:
-    # the save makes the state directory #503's resolver chose only when it has a hash to save.
+    # cannot be written never fails status (open_readonly raises for a damaged database).
     cache_dir = config.locate_cache_dir() / "files"
     state_dir = config.locate_state_dir()
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
@@ -399,7 +400,7 @@ def get_tracked_files_status(
                 if path.is_dir():
                     current_hash = cache.hash_directory(
                         path, state_db, cache_dir=cache_dir, pending=pending
-                    )["hash"]
+                    )["record"]["hash"]
                 else:
                     current_hash, _ = cache.hash_file(path, state_db, pending=pending)
             except FileNotFoundError:
@@ -425,6 +426,7 @@ def get_tracked_files_status(
             )
             if on_progress is not None:
                 on_progress(i, total)
+
     state_mod.save_file_hashes(state_dir, pending)
 
     return results
@@ -471,17 +473,38 @@ def _pluralize(count: int, singular: str) -> str:
     return singular if count == 1 else f"{singular}s"
 
 
-def find_orphaned_lock_files(all_stages: dict[str, RegistryStageInfo]) -> list[str]:
-    """Find lock files in the registered stages' state dirs that belong to no registered stage."""
+def find_orphaned_lock_files(
+    all_stages: dict[str, RegistryStageInfo], pipeline: registry.PipelineLike
+) -> list[str]:
+    """Find lock and listing files in the registered stages' state dirs that belong to no
+    registered stage, output or input."""
     default_state_dir = config.locate_state_dir()
     state_dirs = {default_state_dir} | {
         registry.get_stage_state_dir(stage_info, default_state_dir)
         for stage_info in all_stages.values()
     }
-    registered = set(all_stages)
+    store = _make_workspace_store(pipeline)
+    registered_stages = dict[pathlib.Path, set[str]]()
+    registered_listings = set[pathlib.Path]()
+    for stage_name, stage_info in all_stages.items():
+        stages_dir = explain.stages_dir(stage_info, default_state_dir)
+        registered_stages.setdefault(stages_dir, set[str]()).add(stage_name)
+        registered_listings.update(
+            listing.output_listing_path(stages_dir, out.identity) for out in stage_info["outs"]
+        )
+        for ref in stage_info["deps"].values():
+            if ref.tag is ArtifactTag.INPUT:
+                registered_listings.add(
+                    listing.input_listing_path(stages_dir, store.input_relpath(ref))
+                )
     orphaned = set[str]()
     for state_dir in state_dirs:
-        orphaned.update(lock.find_orphaned_locks(lock.get_stages_dir(state_dir), registered))
+        stages_dir = lock.get_stages_dir(state_dir)
+        orphaned.update(
+            lock.find_orphaned_locks(
+                stages_dir, registered_stages.get(stages_dir, set[str]()), registered_listings
+            )
+        )
     return sorted(orphaned)
 
 
@@ -526,7 +549,7 @@ def get_suggestions(
 
     if orphan_count > 0:
         suggestions.append(
-            f"{orphan_count} orphaned lock {_pluralize(orphan_count, 'file')} from "
+            f"{orphan_count} orphaned lock or listing {_pluralize(orphan_count, 'file')} from "
             + "renamed/removed stages. Old outputs may still exist on disk."
         )
 
