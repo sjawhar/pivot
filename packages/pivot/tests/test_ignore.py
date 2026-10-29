@@ -727,6 +727,12 @@ def test_member_ignored_checks_every_directory_above(
         pytest.param(
             "a/**/b\n", ["x/a/b", "a/c"], ["a/b", "a/x/b", "a/x/y/b"], id="middle-starstar"
         ),
+        pytest.param(
+            "a/**/**/**/b\n",
+            ["x/a/b", "a/c"],
+            ["a/b", "a/x/b", "a/x/y/b"],
+            id="consecutive-starstar-components-match-as-one",
+        ),
         pytest.param("a**b\n", ["a/b", "a/x/b"], ["ab", "axb", "d/axxb"], id="starstar-as-star"),
         pytest.param("***\n", [], ["anything", "deep/er/file"], id="star-run-matches-all"),
         pytest.param("sub/\n!sub/\n", ["sub/a.txt"], [], id="negated-dir-pattern"),
@@ -847,6 +853,101 @@ def test_patterns_a_regex_would_backtrack_on_match_quickly(tmp_path: pathlib.Pat
     assert member_filter("/".join(["a", *["d"] * 28, "z"]), False), "the pattern still matches"
     assert member_filter("p0-p1-p2-p3-p4-p5.bak", False)
     assert elapsed < 1.0, f"{elapsed:.2f} s for 1 deep path and 200 long names"
+
+
+def test_a_long_run_of_starstar_components_matches_quickly(tmp_path: pathlib.Path) -> None:
+    """256 consecutive "**/" match what one "**/" matches, and are merged into one first: kept
+    as they are, each one more is another level of trying every split of the path, and one
+    `repro` took 587 s on such a negation."""
+    (tmp_path / ".pivotignore").write_text("a/" + "**/" * 256 + "z\n")
+    member_filter = ignore.IgnoreFilter(project_root=tmp_path).member_filter(".")
+    assert member_filter is not None
+    deep = "/".join(["a", *["d"] * 28, "y"])
+
+    started = time.perf_counter()
+    deep_ignored = ignore.member_ignored(member_filter, deep, is_dir=False)
+    elapsed = time.perf_counter() - started
+
+    assert not deep_ignored
+    assert member_filter("/".join(["a", *["d"] * 28, "z"]), False)
+    assert member_filter("a/z", False)
+    assert elapsed < 1.0, f"{elapsed:.2f} s for 1 deep path"
+
+
+def test_a_negation_of_257_starstar_components_keeps_what_git_keeps(
+    tmp_path: pathlib.Path, caplog: LogCaptureFixture
+) -> None:
+    """`!` and 257 "**/" before `keep.txt` is `!**/keep.txt` once they are merged: git keeps
+    `sub/keep.txt`, and so does Pivot, with no warning."""
+    patterns = "*.txt\n!" + "**/" * 257 + "keep.txt\n"
+    project = tmp_path / "project"
+    for relpath in ("keep.txt", "sub/keep.txt", "sub/other.txt"):
+        (project / relpath).parent.mkdir(parents=True, exist_ok=True)
+        (project / relpath).write_text("x\n")
+    (project / ".pivotignore").write_text(patterns)
+    filter_instance = ignore.IgnoreFilter(project_root=project)
+
+    with caplog.at_level("WARNING", logger="pivot.ignore"):
+        kept = {
+            relpath
+            for relpath in ("keep.txt", "sub/keep.txt", "sub/other.txt")
+            if not filter_instance.is_ignored(relpath, is_dir=False)
+        }
+
+    assert kept == {"keep.txt", "sub/keep.txt"}
+    assert _helper_git_kept(tmp_path / "home", project, patterns) == kept, "the case is git's"
+    assert caplog.records == []
+
+
+def test_a_negation_too_long_to_match_matches_every_path(
+    tmp_path: pathlib.Path, caplog: LogCaptureFixture
+) -> None:
+    """A negation with more than 256 runs of "*" is taken to match every path, with a warning:
+    it can then keep a file git leaves out (a rerun too many) but never leave out one git keeps
+    (a stale stage). A trailing "/" still limits it to directories."""
+    long_negation = "!" + "*a" * 257
+    (tmp_path / "every").mkdir()
+    (tmp_path / "every" / ".pivotignore").write_text(f"*.txt\nbuild/\n{long_negation}\n")
+    (tmp_path / "dirs").mkdir()
+    (tmp_path / "dirs" / ".pivotignore").write_text(f"*.txt\nbuild/\n{long_negation}/\n")
+
+    with caplog.at_level("WARNING", logger="pivot.ignore"):
+        every = ignore.IgnoreFilter(project_root=tmp_path / "every")
+        every_ignored = (
+            every.is_ignored("a.txt", is_dir=False),
+            every.is_ignored("build", is_dir=True),
+        )
+        dirs = ignore.IgnoreFilter(project_root=tmp_path / "dirs")
+        dirs_ignored = (
+            dirs.is_ignored("a.txt", is_dir=False),
+            dirs.is_ignored("build", is_dir=True),
+        )
+
+    assert every_ignored == (False, False), "it matches every file and directory"
+    assert dirs_ignored == (True, False), "with a trailing '/', every directory and no file"
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 2, warnings
+    assert all("Negation on line 3 of .pivotignore has 257 runs of '*'" in w for w in warnings)
+    assert all("so it takes it to match every path" in w for w in warnings)
+
+
+def test_a_pattern_too_long_to_match_is_not_used(
+    tmp_path: pathlib.Path, caplog: LogCaptureFixture
+) -> None:
+    """Any other line with more than 256 runs of "*" is not used, with a warning: leaving it
+    out can only keep files git leaves out."""
+    (tmp_path / ".pivotignore").write_text("*a" * 257 + "\n*.txt\n")
+
+    with caplog.at_level("WARNING", logger="pivot.ignore"):
+        filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+        long_ignored = filter_instance.is_ignored("xa", is_dir=False)
+
+    assert not long_ignored
+    assert filter_instance.is_ignored("notes.txt", is_dir=False)
+    assert [record.getMessage() for record in caplog.records] == [
+        "Pattern on line 1 of .pivotignore has 257 runs of '*'; Pivot matches at most 256 and "
+        + "does not use it. Shorten it."
+    ]
 
 
 def test_a_nul_byte_ends_a_line_as_in_git(tmp_path: pathlib.Path) -> None:

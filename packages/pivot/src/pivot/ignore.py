@@ -21,12 +21,14 @@
 Matching is on bytes and case-sensitive, as git's is with ``core.ignorecase`` false. On macOS,
 where git precomposes the names it reads (``core.precomposeunicode``, true by default there), a
 path is first put in Unicode NFC; a pattern never is. Wildmatch is ``dowild`` itself, not a
-regular expression, so a pattern costs what it costs in git. Only the project's own file is
-read: a ``.pivotignore`` in a subdirectory is data like any other file.
+regular expression, so a pattern costs what it costs in git; consecutive whole ``**/``
+components are first merged into one, which matches the same paths. Only the project's own
+file is read: a ``.pivotignore`` in a subdirectory is data like any other file.
 
 Pivot departs from git in two places: ``pipeline.py`` and ``.pivot/`` at the project root are
 never ignored (``PROTECTED_PATHS``), and a line with more than ``_MAX_STAR_RUNS`` runs of ``*``
-is not used, with a warning.
+(after that merge) is not matched as git would, with a warning: a negation is taken to match
+every path, so it keeps every file git might keep, and any other line is not used.
 """
 
 from __future__ import annotations
@@ -177,8 +179,8 @@ class IgnoreFilter:
     directory that the file itself ignores, or that lies inside a directory it ignores:
     ``check-ignore`` reports its files ignored, as git does, but ``member_filter`` returns None
     and the input is hashed whole, since leaving out every file would hide every change to it.
-    ``check-ignore`` itself differs from git's in two ways: a relative path is taken from the
-    project root, not the working directory, and ``PROTECTED_PATHS`` are never ignored. No
+    ``check-ignore`` also takes a relative path from the project root, not the working
+    directory; the module docstring names where matching itself departs from git. No
     user-level file is read: an ignore rule changes dependency hashes, and lock files carry
     those to every machine.
     """
@@ -417,7 +419,7 @@ def _parse(data: bytes, source_name: str) -> tuple[_Pattern, ...]:
             body = body[:-1]
         basename = b"/" not in body
         if not basename:
-            body = body.removeprefix(b"/")
+            body = _merge_starstar_components(body.removeprefix(b"/"))
         compiled = _compile(body)
         if compiled is None:
             logger.warning(
@@ -426,7 +428,18 @@ def _parse(data: bytes, source_name: str) -> tuple[_Pattern, ...]:
             )
             continue
         classes, star_runs = compiled
-        if star_runs > _MAX_STAR_RUNS:
+        if star_runs <= _MAX_STAR_RUNS:
+            match = _name_matcher(body, classes) if basename else _path_matcher(body, classes)
+        elif negated:
+            # Taken to match every path, it can only keep a file git would leave out (a rerun
+            # too many), never leave out a file git keeps (a stage that should rerun)
+            logger.warning(
+                f"Negation on line {line_number} of {source_name} has {star_runs} runs of "
+                + f"'*'; Pivot matches at most {_MAX_STAR_RUNS}, so it takes it to match every "
+                + "path. Shorten it."
+            )
+            match = _matches_everything
+        else:
             logger.warning(
                 f"Pattern on line {line_number} of {source_name} has {star_runs} runs of '*'; "
                 + f"Pivot matches at most {_MAX_STAR_RUNS} and does not use it. Shorten it."
@@ -439,10 +452,61 @@ def _parse(data: bytes, source_name: str) -> tuple[_Pattern, ...]:
                 negated=negated,
                 dir_only=dir_only,
                 basename=basename,
-                match=(_name_matcher(body, classes) if basename else _path_matcher(body, classes)),
+                match=match,
             )
         )
     return tuple(patterns)
+
+
+def _matches_everything(_path: bytes) -> bool:
+    """The match of a negation too long to match as git does (``_MAX_STAR_RUNS``)."""
+    return True
+
+
+def _merge_starstar_components(body: bytes) -> bytes:
+    """``body``, a pattern holding a ``/``, with each run of consecutive whole ``**/``
+    components cut to one.
+
+    A whole ``**/`` (one starting the pattern or a component, and followed by ``/``) matches
+    any number of directories, none included, so ``**/**/`` matches what ``**/`` matches. Each
+    one more costs ``dowild`` another level of trying every split of the path: 256 of them took
+    minutes on one deep path. A run of ``*`` inside a class, after a backslash, or not filling
+    its component is left as it is.
+    """
+    out = bytearray()
+    size = len(body)
+    index = 0
+    component_start = True  # the next byte starts the pattern or a component
+    after_starstar = False  # ``out`` ends with a whole "**" component and its "/"
+    while index < size:
+        byte = body[index]
+        if byte == 0x2A:  # "*"
+            end = index
+            while end < size and body[end] == 0x2A:
+                end += 1
+            if end - index >= 2 and component_start and end < size and body[end] == 0x2F:
+                if not after_starstar:
+                    out += body[index : end + 1]
+                after_starstar = True
+                index = end + 1
+                continue
+            out += body[index:end]
+            index = end
+        elif byte == 0x5C:  # "\": it and the byte it escapes
+            out += body[index : index + 2]
+            index += 2
+        elif byte == 0x5B and (compiled := _compile_class(body, index)) is not None:  # "["
+            out += body[index : compiled.end + 1]
+            index = compiled.end + 1
+        else:
+            out.append(byte)
+            index += 1
+            component_start = byte == 0x2F
+            after_starstar = False
+            continue
+        component_start = False
+        after_starstar = False
+    return bytes(out)
 
 
 def _trim_trailing_spaces(line: bytes) -> bytes:
@@ -468,8 +532,9 @@ def _trim_trailing_spaces(line: bytes) -> bytes:
 # The bytes git's ``is_glob_special`` names: a literal prefix ends at the first of them.
 _GLOB_SPECIAL = b"*?[\\"
 
-# A pattern with more runs of "*" than this is not used: each run is one level of recursion in
-# ``_dowild``, and Python's recursion limit is far below what git's C stack allows.
+# A line with more runs of "*" than this is not matched as git would (see the module
+# docstring): each run is one level of recursion in ``_dowild``, and Python's recursion limit
+# is far below what git's C stack allows.
 _MAX_STAR_RUNS = 256
 
 

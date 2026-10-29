@@ -348,6 +348,30 @@ def test_a_file_a_negation_brings_back_past_a_literal_prefix_reruns_its_stage(
     assert _statuses(root, home) == {"p/lane": "stale"}
 
 
+def test_a_file_a_negation_of_257_starstar_components_keeps_reruns_its_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`!` and 257 "**/" before `keep.txt` match what `!**/keep.txt` matches, so git keeps
+    sub/keep.txt, and an edit to it makes the stage stale. At 9c8acdce the line was over the
+    limit of 256 runs of "*" and not used, so the edit left the stage cached."""
+    home, root = _project(tmp_path, _INPUT_PIPELINE.replace("tasks/server", "data/raw/src"))
+    (root / ".pivotignore").write_text(
+        "\n".join(ignore.get_default_patterns()) + "\n*.txt\n!" + "**/" * 257 + "keep.txt\n"
+    )
+    source = root / "data" / "raw" / "src"
+    (source / "sub").mkdir(parents=True)
+    (source / "grade.py").write_text("print('grade')\n")
+    (source / "sub" / "keep.txt").write_text("keep\n")
+    (source / "scratch.txt").write_text("ignored\n")
+    assert _ran(root, home) == {"p/lane": "ran"}
+
+    (source / "scratch.txt").write_text("still ignored\n")
+    assert _statuses(root, home) == {"p/lane": "cached"}
+    (source / "sub" / "keep.txt").write_text("edited\n")
+    assert _statuses(root, home) == {"p/lane": "stale"}
+    assert _ran(root, home) == {"p/lane": "ran"}
+
+
 def test_a_pivotignore_that_is_not_utf8_fails_no_command(tmp_path: pathlib.Path) -> None:
     """git reads .gitignore as bytes, and so Pivot reads .pivotignore: an undecodable line
     matches the same bytes in a name, and status and repro run."""

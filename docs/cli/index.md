@@ -1215,11 +1215,13 @@ Exit code 0 if any target is ignored, 1 if none are ignored.
 It reads only the project's `.pivotignore` and answers as `git check-ignore` answers for the same
 patterns in a root `.gitignore`: a path under an ignored directory is ignored, whatever later `!`
 patterns say, a symlink is tested as a file even when it points to a directory, and the project
-root is never ignored. It differs from `git check-ignore` in two ways: a relative path is taken
-from the project root, not the current directory, and `pipeline.py` and `.pivot/` at the project
-root are never ignored, whatever the patterns say. Hashing applies the same rules to a directory
-input's files, except for an input directory that `.pivotignore` ignores itself: `check-ignore`
-reports its files ignored, but the input is hashed whole. See
+root is never ignored. It differs from `git check-ignore` in three ways: a relative path is taken
+from the project root, not the current directory; `pipeline.py` and `.pivot/` at the project
+root are never ignored, whatever the patterns say; and a line with more than 256 runs of `*`
+(consecutive `**/` count as one) is matched differently, with a warning: a negation is taken to
+match every path, and any other such line is not used. Hashing applies the same rules to a
+directory input's files, except for an input directory that `.pivotignore` ignores itself:
+`check-ignore` reports its files ignored, but the input is hashed whole. See
 [Directory inputs and `.pivotignore`](../concepts/dependencies.md#directory-inputs-and-pivotignore).
 
 **Examples:**

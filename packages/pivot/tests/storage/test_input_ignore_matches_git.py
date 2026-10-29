@@ -73,6 +73,7 @@ _KIND_WEIGHTS = (3, 3, 2, 3, 1)
 _PREFIXES = [
     *(b"", b"", b"", b"/", b"data/raw/in/", b"/data/raw/in/", b"**/", b"raw/in/"),
     *(b"data/**/", b"data/raw/in/**/", b"data/raw/i*/", b"d**/raw/in/", b"data**/"),
+    *(b"**/**/", b"data/**/**/raw/", b"data/raw/in/**/***/"),  # merged into one "**/"
 ]
 _SUFFIXES = [
     *(b"", b"", b"", b"", b"/", b"/**", b"/**/", b"**", b" ", b"  ", b"\\ ", b"\\  "),

@@ -86,6 +86,11 @@ directory and writes `__pycache__/*.pyc` there leaves the stage cached.
   hashed whole. `pipeline.py` and `.pivot/` at the project root are never
   ignored, whatever the patterns say, and `check-ignore` takes a relative path
   from the project root, not the current directory.
+- A line may hold at most 256 runs of `*` (consecutive `**/` count as one).
+  Pivot matches a longer line differently from git, with a warning: a negation
+  (`!...`) is taken to match every path, so it keeps every file git might keep
+  (at worst a stage reruns when git's rule would not count the file), and any
+  other such line is not used.
 - It does not apply to stage outputs, to data you `pivot track`, or to the
   cache: every file in a directory output or a tracked directory is hashed,
   cached and restored, a `.pyc` included. A stage that reads another stage's
