@@ -1,20 +1,20 @@
-"""PR540 reviewer, round 5 (sjawhar/pivot#540 at 04baeda3): tests for the index of other
-stages' locks.
+"""Other stages' locks are read without failing a command or saying a word.
 
-- Red (passes on main 435707af, fails at the head): a command now reads the lock of every stage
-  it does not run, once the project holds a `.pvt` outside its own outputs (any tracked file). A
-  lock it cannot read (another account's 0600 lock in a shared state directory, a permission
-  mistake) must not fail a command that never runs that stage: main never opened it.
-- Red (passes on main, fails at the head): `track`'s refusal of a file a deleted stage left must
-  hold when the path reaches it through a symlinked directory.
-- Red (passes on main, fails at the head): the lock of a stage the command does not run, in the
-  format pivot 0.5.21 wrote (schema 2, every lock before 0.6.0), is read quietly: no warning about
-  a stage the command does not run, and no listing written into the cache by `status`.
-- Regression lock (passes at the head, fails on main and under mutant m15, an index that reads
-  only the configured state directory): after `core.state_dir` moves, a pipeline not run since
-  keeps its locks in `.pivot`, the 0.5.2 layout's other directory; its member is still skipped.
+A command that meets a `.pvt` outside its own outputs (any tracked file) reads the locks of the
+stages it does not run, for the directory outputs they record.
 
-`_pivot` keeps `PYTHONPATH`, so a mutant run that points it at a mutated `src` reaches the CLI.
+- A lock it cannot read (another account's 0600 lock in a shared state directory, a permission
+  mistake) does not fail a command that never runs that stage.
+- `track`'s refusal of a file a deleted stage left holds when the path reaches it through a
+  symlinked directory.
+- The lock of a stage the command does not run, in the format pivot 0.5.21 wrote (schema 2,
+  every lock before 0.6.0), is read quietly: no warning about that stage, and no listing written
+  into the cache by `status`.
+- After `core.state_dir` moves, a pipeline not run since keeps its locks in `.pivot`, the 0.5.2
+  layout's other directory; its member is still skipped.
+
+The tests are the review's of sjawhar/pivot#540 at 04baeda3, unchanged. `_pivot` keeps
+`PYTHONPATH`, so a mutant run that points it at a mutated `src` reaches the CLI.
 """
 
 from __future__ import annotations

@@ -14,7 +14,7 @@ import py_compile
 import sys
 import types as _stdlib_types
 import zipimport
-from typing import TYPE_CHECKING, Final, cast, override
+from typing import TYPE_CHECKING, Final, NamedTuple, cast, override
 
 import cloudpickle
 
@@ -1008,31 +1008,39 @@ def _log_skipped_module(strict: bool, message: str) -> None:
         logger.warning(message)
 
 
-def _discover_every_pipeline(
-    project_root: pathlib.Path,
-) -> tuple[PipelineLike, store_mod.WorkspaceStore] | None:
-    """Every pipeline in the project, discovered as ``--all`` discovers them, and its workspace.
+class DeclaredOutputs(NamedTuple):
+    """Every pipeline's outputs (``declared_outputs``) and the stages that declare them."""
+
+    outputs: dict[str, ownership.DeclaredOutput]
+    stages: dict[str, RegistryStageInfo]
+
+
+def declared_outputs(project_root: pathlib.Path) -> DeclaredOutputs:
+    """Map every output declared by every pipeline in the project to where it resolves and the
+    stage that writes it, beside every pipeline's stages.
+
+    Pipelines are discovered as ``--all`` discovers them, so an output of a pipeline the command
+    did not load still counts: ``track`` and ``import`` refuse a path overlapping any of them. A
+    ``pipeline.py`` that fails to load fails this call; one that loads but defines no Pivot
+    pipeline declares nothing. Keys are the normalized workspace paths; resolved paths catch a
+    path that reaches an output through a symlink.
 
     Raises:
-        exceptions.ValidationError: The reason discovery failed.
+        exceptions.ValidationError: Naming every output path that cannot be resolved, or the
+            reason discovery failed.
     """
     try:
         pipeline = discover_pipeline(project_root=project_root, all_pipelines=True, strict_all=True)
     except DiscoveryError as exc:
         raise exceptions.ValidationError(str(exc)) from exc
     if pipeline is None:
-        return None
+        return DeclaredOutputs({}, {})
+
     workspace = store_mod.WorkspaceStore(
         project_root=project_root,
         pipeline_name=pipeline.name,
         input_bindings=pipeline.input_bindings,
     )
-    return pipeline, workspace
-
-
-def _resolved_outputs(
-    pipeline: PipelineLike, workspace: store_mod.WorkspaceStore
-) -> dict[str, ownership.DeclaredOutput]:
     stage_by_path = {
         str(workspace.resolve_display_path(out)): stage_name
         for stage_name in pipeline.list_stages()
@@ -1052,42 +1060,8 @@ def _resolved_outputs(
         raise exceptions.ValidationError(
             "Cannot resolve stage outputs (fix these first):\n" + "\n".join(errors)
         )
-    return resolved
-
-
-def declared_outputs(project_root: pathlib.Path) -> dict[str, ownership.DeclaredOutput]:
-    """Map every output declared by every pipeline in the project to where it resolves and the
-    stage that writes it.
-
-    Pipelines are discovered as ``--all`` discovers them, so an output of a pipeline the command
-    did not load still counts: ``track`` and ``import`` refuse a path overlapping any of them. A
-    ``pipeline.py`` that fails to load fails this call; one that loads but defines no Pivot
-    pipeline declares nothing. Keys are the normalized workspace paths; resolved paths catch a
-    path that reaches an output through a symlink.
-
-    Raises:
-        exceptions.ValidationError: Naming every output path that cannot be resolved, or the
-            reason discovery failed.
-    """
-    discovered = _discover_every_pipeline(project_root)
-    return {} if discovered is None else _resolved_outputs(*discovered)
-
-
-def declared_outputs_and_stages(
-    project_root: pathlib.Path,
-) -> tuple[dict[str, ownership.DeclaredOutput], dict[str, RegistryStageInfo]]:
-    """``declared_outputs``, and every pipeline's stages, from one discovery: what ``pivot
-    track`` checks a path against. A project with no pipeline declares no stage.
-
-    Raises:
-        exceptions.ValidationError: As ``declared_outputs``.
-    """
-    discovered = _discover_every_pipeline(project_root)
-    if discovered is None:
-        return {}, {}
-    pipeline, workspace = discovered
-    stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
-    return _resolved_outputs(pipeline, workspace), stages
+    stages = {stage_name: pipeline.get_stage(stage_name) for stage_name in pipeline.list_stages()}
+    return DeclaredOutputs(resolved, stages)
 
 
 def load_pipeline_from_path(path: pathlib.Path) -> PipelineLike | None:

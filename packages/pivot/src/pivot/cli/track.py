@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
-from typing import TYPE_CHECKING, NamedTuple, TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 import click
 
@@ -23,20 +23,15 @@ class TrackResult(TypedDict):
     tracked_path: str
 
 
-class _Checks(NamedTuple):
-    """What a path to track is checked against, from one every-pipeline discovery."""
-
-    outputs: dict[str, ownership.DeclaredOutput]
-    """Every declared output (``discovery.declared_outputs``)."""
-    orphaned_member: Callable[[pathlib.Path], member_skip.OrphanedMember | None]
-    """A sidecar a stage no pipeline declares records as its own (``member_skip``)."""
-
-
 def _orphan_refusal(path_str: str, orphan: member_skip.OrphanedMember) -> str:
     """Why ``track`` refuses a path whose sidecar a deleted stage's lock records."""
     project_root = project.get_project_root()
-    locks = [f"'{project.to_relative_path(found, project_root)}'" for found in orphan.lock_files]
-    sidecar = project.to_relative_path(orphan.sidecar, project_root)
+
+    def shown(path: pathlib.Path) -> str:
+        relative = project.relative_within(path, project_root)
+        return str(path if relative is None else relative)
+
+    locks = [f"'{shown(found)}'" for found in orphan.lock_files]
     if len(locks) == 1:
         recorded = f"the lock {locks[0]} records"
         remedy = "remove that lock"
@@ -44,10 +39,11 @@ def _orphan_refusal(path_str: str, orphan: member_skip.OrphanedMember) -> str:
         recorded = f"the locks {' and '.join(locks)} record"
         remedy = "remove those locks"
     return (
-        f"Cannot track '{path_str}': {recorded} '{sidecar}' as a file of stage "
+        f"Cannot track '{path_str}': {recorded} '{shown(orphan.sidecar)}' as a file of stage "
         + f"'{orphan.stage_name}', a stage that no longer exists in any pipeline. Pivot reads "
         + "that stage's files there as its own, not as tracked files. If the stage is gone for "
-        + f"good, {remedy}, then track the path again."
+        + f"good, {remedy}, then run `pivot track --force {path_str}`, which tracks the file "
+        + "whatever its .pvt then says."
     )
 
 
@@ -117,7 +113,8 @@ def _foreign_listing(
 def _track_single_path(
     path_str: str,
     cache_dir: pathlib.Path,
-    checks: _Checks,
+    outputs: dict[str, ownership.DeclaredOutput],
+    orphaned_member: Callable[[pathlib.Path], member_skip.OrphanedMember | None],
     existing_tracked: dict[str, track_mod.PvtData],
     force: bool,
     *,
@@ -183,7 +180,7 @@ def _track_single_path(
     track_mod.validate_pvt_path_name(path.name)
 
     # Check every pipeline output. OSError reaches the command error handler, which names path.
-    overlap = ownership.find_declared_overlap(path, checks.outputs, project_root)
+    overlap = ownership.find_declared_overlap(path, outputs, project_root)
     if overlap is not None:
         if not already_tracked:
             raise click.ClickException(
@@ -199,7 +196,7 @@ def _track_single_path(
         )
     # A sidecar a stage that no longer exists recorded at this path: every command reads it as
     # that stage's own file, by its lock, so a sidecar written there could be one none reads
-    orphan = checks.orphaned_member(path)
+    orphan = orphaned_member(path)
     if orphan is not None:
         raise click.ClickException(_orphan_refusal(path_str, orphan))
     warning = "\n".join(warnings) if warnings else None
@@ -285,17 +282,16 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
 
     # Every pipeline's outputs and stages, not only the pipeline this directory selects: a file
     # tracked in another pipeline's output would be removed when that pipeline runs.
-    outputs, stages = discovery.declared_outputs_and_stages(project_root)
+    declared = discovery.declared_outputs(project_root)
     state_dir = config.locate_state_dir()
-    checks = _Checks(
-        outputs=outputs,
-        orphaned_member=member_skip.orphaned_member(project_root, state_dir, cache_dir, stages),
+    orphaned_member = member_skip.orphaned_member(
+        project_root, state_dir, cache_dir, declared.stages
     )
 
     # Discover existing .pvt files: a stage's own .pvt member of its output tracks nothing
     existing_tracked = track_mod.discover_pvt_files(
         project_root,
-        skip=member_skip.own_member_skip(project_root, stages, state_dir, cache_dir),
+        skip=member_skip.own_member_skip(project_root, declared.stages, state_dir, cache_dir),
     )
 
     read = list[tuple[pathlib.Path, os.stat_result, str]]()
@@ -303,7 +299,8 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
         result = _track_single_path(
             path_str,
             cache_dir,
-            checks,
+            declared.outputs,
+            orphaned_member,
             existing_tracked,
             force,
             warn_left_out_symlinks=not quiet,

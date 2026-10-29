@@ -417,6 +417,7 @@ def _resolve(
     *,
     strict: bool,
     problem: exceptions.CorruptListingError | None = None,
+    quiet: bool = False,
 ) -> tuple[CheckedBytes, pathlib.Path | str]:
     """The checked bytes of ``record``'s listing and the name ``parse`` gives where they came
     from, by the one rule every reader follows.
@@ -429,7 +430,8 @@ def _resolve(
     run of another stage moved on, a lock reverted without its listing, a merge, or a run
     interrupted between writing the listing and the lock. Only when the cache lacks that object
     too is the committed file refused. ``strict`` refuses it at once, for ``pivot verify``: a
-    fresh clone has no cache to fall back on.
+    fresh clone has no cache to fall back on. ``quiet`` passes over it without the warning, for a
+    reader of a stage the command does not run.
     """
     if found is not None:
         assert source is not None, "committed bytes come from a named file"
@@ -471,7 +473,10 @@ def _resolve(
             raise exceptions.CorruptListingError(f"{cached}: cannot be read ({e})") from e
         else:
             if problem is not None:
-                _warn_stale(str(problem))
+                if quiet:
+                    logger.debug("%s; using the cache's copy of that listing", problem)
+                else:
+                    _warn_stale(str(problem))
             return data, f"cache object {record['hash']}"
     if problem is not None:
         raise problem
@@ -497,6 +502,7 @@ def _read_located(
     cache_dir: pathlib.Path | None,
     *,
     strict: bool = False,
+    quiet: bool = False,
 ) -> tuple[CheckedBytes, pathlib.Path | str]:
     """``_resolve`` for the listing file at ``committed`` in the workspace. A path that cannot
     be read (a directory, no permission) is treated as a file that does not hash to its record,
@@ -514,7 +520,9 @@ def _read_located(
             problem = exceptions.CorruptListingError(
                 f"{committed}: cannot be read ({e.strerror or e})"
             )
-    return _resolve(found, committed, record, cache_dir, strict=strict, problem=problem)
+    return _resolve(
+        found, committed, record, cache_dir, strict=strict, problem=problem, quiet=quiet
+    )
 
 
 def read_bytes(
@@ -549,10 +557,11 @@ def read(
     cache_dir: pathlib.Path | None,
     *,
     strict: bool = False,
+    quiet: bool = False,
 ) -> DirListing:
     """The listing ``record`` names, by the workspace file at ``committed`` or the cache
     (``_resolve``), parsed."""
-    data, source = _read_located(committed, record, cache_dir, strict=strict)
+    data, source = _read_located(committed, record, cache_dir, strict=strict, quiet=quiet)
     return parse(data, record, source)
 
 

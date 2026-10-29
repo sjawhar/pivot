@@ -8,7 +8,7 @@ lock records (``lock.recorded_directories``), wherever that output was placed.
 - A lock outlives its stage, and its members stay skipped, so ``pivot track`` refuses a path
   whose sidecar the lock of a stage that no longer exists records.
 - ``status --check-imports`` and ``pivot update`` read no import from a stage's own member.
-- A lock file is parsed once per state-directory record, and again when it changes.
+- A lock file is decoded once per state-directory record, and again when it changes.
 
 The first three tests are the review's of sjawhar/pivot#540 at 4f145295; the track test requires
 the refusal where the review's accepted either outcome. ``_pivot`` keeps ``PYTHONPATH``, so a
@@ -301,29 +301,30 @@ def test_update_and_check_imports_read_no_import_from_a_stages_own_member(
     assert "No imports found to update." in update.stdout, update.stdout + update.stderr
 
 
-def test_a_lock_is_parsed_once_per_record_and_again_when_it_changes(
+def test_a_lock_is_decoded_once_per_record_and_again_when_it_changes(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """From the root, b's `fake.pvt` lies outside every output of the loaded pipeline `a`, so a
-    command that discovers the `.pvt` files reads the directory outputs b's lock records.
+    command that discovers the `.pvt` files reads the directory outputs b's lock records. Each
+    decode is counted through `lock.parse_committed`, the one decoder of a lock file.
 
     - In one state-directory record, every skip and `track`'s orphan check share what a lock
-      file records: b/tree's lock is parsed once for three callers.
-    - A lock file written since is parsed again in the same record, as a `--watch` run needs.
-    - `verify` and `repro` (its pre-flight) each parse it once.
+      file records: b/tree's lock is decoded once for three callers.
+    - A lock file written since is decoded again in the same record, as a `--watch` run needs.
+    - `verify` and `repro` (its pre-flight) each decode it once.
     """
     root = _project(tmp_path, _NESTED_MEMBER_PIPELINE.replace("HASH_OF_2", "abcdef0000000002"))
     monkeypatch.chdir(root)
     monkeypatch.setattr(project, "_project_root_cache", None)
     b_lock = root / ".pivot" / "stages" / "b" / "tree.lock"
-    parsed = list[pathlib.Path]()
-    read_recorded = lock._read_recorded
+    decoded = list[bool]()  # one entry per decode: whether it was b/tree's lock
+    parse_committed = lock.parse_committed
 
-    def counted(stage_name: str, path: pathlib.Path, *args: object) -> object:
-        parsed.append(path)
-        return read_recorded(stage_name, path, *args)  # pyright: ignore[reportArgumentType]
+    def counted(document: object) -> lock.CommittedLock | lock.UnsafeLockPath | None:
+        decoded.append("data/b/tree" in json.dumps(document, default=str))
+        return parse_committed(document)
 
-    monkeypatch.setattr(lock, "_read_recorded", counted)
+    monkeypatch.setattr(lock, "parse_committed", counted)
     member = root / "data" / "b" / "tree" / "sub" / "deep" / "fake.pvt"
     member_data = track.read_pvt_file(member)
     assert member_data is not None
@@ -336,7 +337,7 @@ def test_a_lock_is_parsed_once_per_record_and_again_when_it_changes(
         claim = member_skip.orphaned_member(root, state_dir, files_dir, ())
         skipped = [first(member, member_data), second(member, member_data)]
         claimed = claim(member.with_suffix(""))
-        once = parsed.count(b_lock)
+        once = decoded.count(True)
         b_lock.write_text(b_lock.read_text() + "\n")  # a run rewrote the lock
         third = member_skip.own_member_skip(root, {}, state_dir, files_dir)
         skipped.append(third(member, member_data))
@@ -345,16 +346,16 @@ def test_a_lock_is_parsed_once_per_record_and_again_when_it_changes(
 
     assert skipped == [True, True, True]
     assert claimed is not None and claimed.stage_name == "b/tree", claimed
-    assert once == 1, parsed
-    assert parsed.count(b_lock) == 2, parsed
+    assert once == 1, decoded
+    assert decoded.count(True) == 2, decoded
 
-    parsed.clear()
+    decoded.clear()
     runner = click.testing.CliRunner()
     verified = runner.invoke(cli.cli, ["verify"])
-    verify_parses = parsed.count(b_lock)
+    verify_decodes = decoded.count(True)
     rerun = runner.invoke(cli.cli, ["repro"])
 
     assert verified.exit_code == 0, verified.output
-    assert verify_parses == 1, parsed
+    assert verify_decodes == 1, decoded
     assert rerun.exit_code == 0, rerun.output
-    assert parsed.count(b_lock) == 2, parsed
+    assert decoded.count(True) == 2, decoded

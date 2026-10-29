@@ -133,28 +133,28 @@ def orphaned_member(
 
     ``own_member_skip`` skips such a stage's members by its lock, so a sidecar ``track`` wrote at
     a listed path could carry the bytes the lock records and then be one no command reads: the
-    listed path decides, whatever is there now. Paths are compared resolved, so a path spelled
-    through a symlink is caught as well. Any other path in that output tracks as before. The
-    locks are read at the first path asked about.
+    listed path decides, whatever is there now. The sidecar is spelled as the ``.pvt`` walk
+    reaches it: where it really lies, below the project root, so a path typed through a symlink
+    is caught, and an output reached only through a symlinked parent is not one the walk (or the
+    skip) would read it in. Any other path in that output tracks as before. The locks are read
+    at the first path asked about.
     """
-
-    @functools.cache
-    def recorded() -> tuple[_Recorded, dict[pathlib.Path, pathlib.Path]]:
-        found = _recorded(project_root, default_state_dir, cache_dir, declared)
-        return found, {output.resolve(): output for output in found.outputs}
+    recorded = functools.cache(
+        functools.partial(_recorded, project_root, default_state_dir, cache_dir, declared)
+    )
 
     def claim(path: pathlib.Path) -> OrphanedMember | None:
-        found, resolved = recorded()
-        sidecar = track.get_pvt_path(path).resolve()
-        for parent in sidecar.parents:
-            output = resolved.get(parent)
-            if output is None:
-                continue
-            listed = output / sidecar.relative_to(parent)
-            if listed not in found.members_of(output):
+        real = track.get_pvt_path(path).resolve()
+        real_root = project_root.resolve()
+        if not real.is_relative_to(real_root):
+            return None
+        sidecar = ownership.normalized(project_root) / real.relative_to(real_root)
+        found = recorded()
+        for output in sidecar.parents:
+            if output not in found.outputs or sidecar not in found.members_of(output):
                 continue
             output_record = found.outputs[output]
-            return OrphanedMember(listed, output_record.stage_name, output_record.lock_files)
+            return OrphanedMember(sidecar, output_record.stage_name, output_record.lock_files)
         return None
 
     return claim

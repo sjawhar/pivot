@@ -19,6 +19,7 @@ from collections.abc import Callable, Iterator, Mapping
 from pivot import config_files, exceptions, project
 
 if typing.TYPE_CHECKING:
+    from pivot.storage.lock import DirectoryRecord
     from pivot.storage.state import StateDB
 
 logger = logging.getLogger(__name__)
@@ -121,10 +122,10 @@ class StateDirInvocation(typing.TypedDict):
     # What ordering a stage's two locks needs, kept for the whole record
     # (``lock.resolve_stage_lock_path``).
     lock_ordering: LockOrdering
-    # Per lock file read for the directory outputs it records (``lock.recorded_directories``):
-    # the file's identity when it was read (device, inode, size, change time) and what it
-    # recorded. A file whose identity changed is read again, as during a ``--watch`` session.
-    recorded_locks: dict[str, tuple[tuple[int, int, int, int], object]]
+    # Per lock file decoded for the directory outputs it records (``lock.recorded_directories``):
+    # the file's identity when it was decoded (device, inode, size, change time) and what it
+    # records. A file whose identity changed is decoded again, as during a ``--watch`` session.
+    recorded_locks: "dict[str, tuple[tuple[int, int, int, int], tuple[DirectoryRecord, ...]]]"
 
 
 # Set by the CLI callback for one CLI invocation, by a worker for one stage, and by a library
@@ -150,7 +151,9 @@ def lock_ordering() -> LockOrdering | None:
     return None if invocation is None else invocation["lock_ordering"]
 
 
-def recorded_locks() -> dict[str, tuple[tuple[int, int, int, int], object]] | None:
+def recorded_locks() -> (
+    "dict[str, tuple[tuple[int, int, int, int], tuple[DirectoryRecord, ...]]] | None"
+):
     """The current record's lock files read for their recorded directory outputs; None outside
     a record."""
     invocation = _invocation.get()
@@ -626,7 +629,9 @@ def begin_invocation(
                 decisions=dict[str, tuple[object, bool]](),
                 stale=set[pathlib.Path](),
             ),
-            recorded_locks=dict[str, tuple[tuple[int, int, int, int], object]](),
+            recorded_locks=dict[
+                str, tuple[tuple[int, int, int, int], tuple["DirectoryRecord", ...]]
+            ](),
         )
     )
 
