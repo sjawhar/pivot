@@ -244,6 +244,11 @@ function's code and is tracked with it. A default that is a pipeline input
 handle (`raw=RAW` with `RAW = pipeline.input("t.csv")`) is wired as an input
 and tracked by its content.
 
+An object whose `__getattr__` raises an error other than `AttributeError` for
+a name it does not have (a dict-backed config, an `AttrDict`, a lazy object)
+gets the same decision as any other object of its kind: Pivot takes that error
+as a missing attribute rather than stopping the fingerprint on it.
+
 Fix: move a mutable or nested value into the stage's [StageParams](parameters.md).
 Configuration in module-level mutable collections is not supported.
 
@@ -392,6 +397,70 @@ that are part of the stage's code; editing one marks the stage "Code changed".
 
 **Use sparingly.** File-level hashing is less precise: any change anywhere
 in the file triggers a re-run.
+
+
+## @pivot.fingerprint_by_name
+
+A helper function that cannot change a stage's output — process bookkeeping,
+file locks, log rotation — can carry this mark so Pivot records it by its
+module and qualified name only, never its body:
+
+```python
+from pivot import fingerprint_by_name
+
+
+@fingerprint_by_name
+def process_start():
+    """Read /proc for a running process."""
+    ...
+```
+
+A stage that calls a marked helper does not rerun when the helper's body
+changes. It reruns once when the helper moves to another module, when the
+helper gets a new name, or when someone removes the mark.
+
+The decorator accepts a module-level function, and a `functools.wraps`,
+`contextlib.contextmanager` or class-based wrapper of one (an instance whose
+`__wrapped__` leads to the function, also one with `__slots__` and no
+`__dict__`). It refuses a class, a method, a lambda, a
+nested function, a `functools.partial`, a helper that imports a user module in
+its body, and a helper that uses `importlib.import_module` or `__import__`.
+Import the module at the top of the helper's file instead.
+
+The fingerprint walk never reads the body of a marked function. A decorator
+above the mark is user code: Pivot adds a function decorator's own code to the
+fingerprint and records the marked function inside it by name. This is also
+true when `functools.cache` wraps that decorator. A library wrapper directly
+above the mark (`functools.cache`, `functools.lru_cache`,
+`contextlib.contextmanager`) keeps the record by name.
+
+Pivot refuses a class-based decorator above the mark, however the stage
+reaches the helper (a call, a class member, a partial argument, a default, a
+pydantic `default_factory`) and however the decorator keeps `__wrapped__` (in
+its `__dict__`, a slot or a property). Pivot cannot fingerprint the code and
+state of a class instance, and the mark records only the function below it.
+`core.unsafe_fingerprinting` does not turn this refusal into a warning. To
+clear it, put `@fingerprint_by_name` above the class-based decorator, so Pivot
+records the whole helper by name, or replace the class with a function
+decorator built with `functools.wraps`.
+
+Without a mark below it, Pivot fingerprints a `functools.wraps` decorator as
+in earlier versions. It follows `__wrapped__` to the wrapped function, so it
+does not see what the decorator's own lines read through a module (for
+example `settings.FACTOR`), or the decorator's body when `functools.cache`
+wraps the decorator.
+
+A stage cannot carry `@fingerprint_by_name`: Pipeline refuses a stage with
+the mark above `@stage`, below it, or below another decorator. Use
+`@no_fingerprint()` to opt a stage out of AST fingerprinting.
+
+Pivot does not walk code that only a marked helper calls. If that code
+imports a user module in its body, the run-time check counts the import, and
+the stage warns and reruns each run. Move that import to the top of its
+module to clear it.
+
+Soundness is the user's choice: if a marked helper can change a stage's
+output, Pivot does not see the change.
 
 ## Performance
 

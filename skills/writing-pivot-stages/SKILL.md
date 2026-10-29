@@ -198,6 +198,53 @@ scores/scale@x10:
 
 A stage is a pure function of its inputs and its `StageParams`: every setting it uses is a `StageParams` field, never a module-level value. Pivot fingerprints a module-level scalar, tuple or frozenset of scalars, or compiled regex that a stage reads, so editing one re-runs the stage. It refuses any other module-level value (list, dict, set, a tuple holding a tuple, list or object, enum member, class instance, or a method bound to an instance such as `np.random.default_rng(SEED).normal`), read directly, as `module.NAME`, or as a default argument (`cols=COLUMNS`), with an error that names the variable. Neither is how a pipeline carries settings.
 
+
+## Helpers that do not affect output
+
+A helper that cannot change a stage's output — process bookkeeping, file
+locks, log rotation — can carry `@pivot.fingerprint_by_name` so Pivot
+records it by its module and qualified name only:
+
+```python
+from pivot import fingerprint_by_name
+
+
+@fingerprint_by_name
+def process_start():
+    """Read /proc for a running process."""
+    ...
+```
+
+A body change to a marked helper does not rerun calling stages. A move to
+another module, a rename, or removing the mark reruns them once. The
+decorator accepts module-level functions and `functools.wraps` /
+`contextlib.contextmanager` / class-based wrappers of one. It refuses a
+method, a lambda, a helper that imports a user module in its body, and a
+helper that uses `importlib.import_module` or `__import__`.
+
+The fingerprint walk never reads the body of a marked function. A decorator
+above the mark is user code: Pivot adds a function decorator's own code to the
+fingerprint and records the marked function inside it by name, also when
+`functools.cache` wraps that decorator. A library wrapper directly above the
+mark (`functools.cache`, `functools.lru_cache`, `contextlib.contextmanager`)
+keeps the record by name. Pivot refuses a class-based decorator above the
+mark, however the stage reaches the helper and however the decorator keeps
+`__wrapped__`, and unsafe fingerprinting does not suppress that refusal. To
+clear it, put `@fingerprint_by_name` above the class-based decorator, or use a
+`functools.wraps` function decorator. Without a mark below it, a
+`functools.wraps` decorator is fingerprinted as in earlier versions: Pivot
+does not see what its own lines read through a module (`settings.FACTOR`), or
+its body when `functools.cache` wraps it. A stage cannot carry the mark, also
+below another decorator.
+
+Pivot does not walk code that only a marked helper calls. If that code
+imports a user module in its body, the run-time check counts the import,
+and the stage warns and reruns each run. Move that import to the top of its
+module to clear it.
+
+Soundness is the user's choice: if a marked helper can change a stage's
+output, Pivot does not see the change.
+
 ## Variants and fan-out
 
 Variants are Python loops. Calling the same stage again in one pipeline creates `name@1`, `name@2`, and so on. For readable names, wrap the call in `with pipeline.variant("x2"):` to get `scale@x2`; nested variant blocks give `name@outer@inner`. Variant names use letters, digits, `_`, `.` and `-` only. Fan in by passing a list of handles to one stage.
