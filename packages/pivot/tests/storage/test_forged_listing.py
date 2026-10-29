@@ -94,7 +94,7 @@ def test_committed_listing_collision_is_refused(tmp_path: pathlib.Path) -> None:
 
     # The read refuses the collision
     with pytest.raises(exceptions.CorruptListingError, match="XXH64 collision"):
-        listing.read(pvt_listing, record, cache_dir, strict=True)
+        listing.read(pvt_listing, record, cache_dir, on_stale=listing.OnStale.REFUSE)
 
 
 def test_cached_listing_collision_is_refused(tmp_path: pathlib.Path) -> None:

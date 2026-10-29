@@ -578,7 +578,7 @@ async def import_artifact(
 
     # Any pipeline's output, loaded or not: running it would remove the import and its sidecar
     overlap = ownership.find_declared_overlap(
-        data_path, discovery.declared_outputs(project_root), project_root
+        data_path, discovery.declared_outputs(project_root).outputs, project_root
     )
     shown = project.relative_within(data_path, project_root) or data_path
     if overlap is not None:

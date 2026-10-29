@@ -617,17 +617,24 @@ def _restore_tracked_file(
     )
 
 
-def verify_tracked_files(project_root: pathlib.Path, checkout_missing: bool = False) -> None:
+def verify_tracked_files(
+    project_root: pathlib.Path,
+    checkout_missing: bool = False,
+    *,
+    skip: track.PvtSkip | None = None,
+) -> None:
     """Verify all .pvt tracked files exist and warn on hash mismatches.
 
     Args:
         project_root: Project root directory.
         checkout_missing: If True, restore missing tracked files from cache before validating.
             Only restores files that don't exist - never overwrites existing files.
+        skip: Leaves a .pvt out of the tracked files (``track.discover_pvt_files``): a stage's
+            own member of its output (``member_skip.own_member_skip``).
     """
     from pivot import metrics
 
-    tracked_files = track.discover_pvt_files_and_update_memo(project_root)
+    tracked_files = track.discover_pvt_files_and_update_memo(project_root, skip=skip)
     if not tracked_files:
         return
 

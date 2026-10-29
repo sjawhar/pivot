@@ -28,9 +28,12 @@ if TYPE_CHECKING:
     TrackedFiles = Callable[[], dict[str, track.PvtData]]
 
 
-def _project_tracked_files() -> TrackedFiles:
-    """The project's tracked files, scanned for ``.pvt`` files once, when first asked for."""
-    return functools.cache(functools.partial(track.discover_pvt_files, project.get_project_root()))
+def _project_tracked_files(skip: track.PvtSkip | None = None) -> TrackedFiles:
+    """The project's tracked files, scanned for ``.pvt`` files once, when first asked for.
+    ``skip`` leaves out a stage's own ``*.pvt`` member of its output, which tracks nothing."""
+    return functools.cache(
+        functools.partial(track.discover_pvt_files, project.get_project_root(), skip=skip)
+    )
 
 
 VerifyStatus = Literal["passed", "failed"]
@@ -70,7 +73,7 @@ def _object_hashes(
     if not is_dir_hash(hash_info):
         return result
     try:
-        members = listing.read(committed, hash_info, files_dir, strict=True)
+        members = listing.read(committed, hash_info, files_dir, on_stale=listing.OnStale.REFUSE)
     except exceptions.ListingMissingError:
         return result
     for entry in members["files"]:
@@ -86,7 +89,7 @@ def _check_tracked_listing(
     if pvt_data is None or "nfiles" not in pvt_data:
         return
     try:
-        track.tracked_members(data_path, pvt_data, files_dir, strict=True)
+        track.tracked_members(data_path, pvt_data, files_dir, on_stale=listing.OnStale.REFUSE)
     except exceptions.ListingMissingError:
         return
 
@@ -96,7 +99,9 @@ def _tracked_listing_failures(
 ) -> list[StageVerifyInfo]:
     """A failed result, named by its path, for each tracked directory in the project whose
     committed ``.pvt.listing`` cannot be used (``_check_tracked_listing``), whether or not a
-    stage reads it: a fresh clone would have no cache to restore it from."""
+    stage reads it: a fresh clone would have no cache to restore it from. ``tracked_files``
+    leaves out a stage's own ``*.pvt`` member of its output, which tracks nothing and whose
+    directory a restore of that output reads from the lock's listing."""
     project_root = project.get_project_root()
     failures = list[StageVerifyInfo]()
     for path, pvt_data in sorted(tracked_files().items()):
@@ -143,7 +148,7 @@ def _tracked_input_objects(
             continue
         try:
             members = track.tracked_members(
-                pathlib.Path(data_path), pvt_data, files_dir, strict=True
+                pathlib.Path(data_path), pvt_data, files_dir, on_stale=listing.OnStale.REFUSE
             )
         except exceptions.ListingMissingError:
             continue
@@ -570,8 +575,9 @@ def verify(
     if not pipeline_status:
         raise click.ClickException("No stages to verify.")
 
-    # Verify stages; verify's own checks share one scan of the project's .pvt files
-    tracked_files = _project_tracked_files()
+    # Verify stages; verify's own checks share one scan of the project's .pvt files. A stage's
+    # own .pvt member of its output, in any pipeline, is no tracked file or directory.
+    tracked_files = _project_tracked_files(cli_helpers.own_member_skip(cache_dir / "files"))
     passed, results = _verify_stages(pipeline_status, cache_dir, allow_missing, tracked_files)
     if stages_list is None:
         tracked_failures = _tracked_listing_failures(cache_dir / "files", tracked_files)

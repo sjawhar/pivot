@@ -10,7 +10,7 @@ from pivot import config, exceptions, metrics, names, project, registry, types
 from pivot import state_dir as state_dir_mod
 from pivot.remote import config as remote_config
 from pivot.remote import protocol
-from pivot.storage import cache, listing, lock, track
+from pivot.storage import cache, listing, lock, member_skip, track
 from pivot.storage import store as store_mod
 from pivot.types import HashInfo, LockData, RemoteStatus, TransferSummary, is_dir_hash
 
@@ -218,15 +218,19 @@ def _get_file_hash_from_pvt(
     proj_root: pathlib.Path,
     files_dir: pathlib.Path,
     *,
+    skip: track.PvtSkip | None = None,
     require_members: bool = False,
 ) -> set[str] | None:
-    """The cache objects of a path tracked by a .pvt file."""
+    """The cache objects of a path tracked by a .pvt file; None when ``skip`` leaves that .pvt
+    out (a stage's own member of its output, which tracks nothing)."""
     pvt_path = proj_root / (rel_path + ".pvt")
     if not pvt_path.exists():
         return None
 
     track_data = track.read_pvt_file(pvt_path)
     if track_data is None:
+        return None
+    if skip is not None and skip(pvt_path, track_data):
         return None
 
     return _tracked_blobs(
@@ -236,18 +240,22 @@ def _get_file_hash_from_pvt(
 
 def _get_tracked_artifacts(
     proj_root: pathlib.Path,
+    *,
+    skip: track.PvtSkip | None = None,
 ) -> dict[pathlib.PurePosixPath, tuple[pathlib.Path, track.PvtData]]:
     """Every `pivot track`-ed file or directory in the project, by its project-relative path.
 
     Imports are left out: `pivot import` writes the file straight to the workspace, so its
-    blob never enters the local cache and push never sends it to this project's remote.
+    blob never enters the local cache and push never sends it to this project's remote. So is
+    a stage's own ``*.pvt`` member of its output (``skip``): it records no tracked file, so no
+    dependency may resolve through it.
     """
     return {
         pathlib.PurePosixPath(project.to_relative_path(data_path, proj_root)): (
             pathlib.Path(data_path),
             pvt_data,
         )
-        for data_path, pvt_data in track.discover_pvt_files(proj_root).items()
+        for data_path, pvt_data in track.discover_pvt_files(proj_root, skip=skip).items()
         if not track.is_import(pvt_data)
     }
 
@@ -298,7 +306,9 @@ def get_target_hashes(
     A directory resolves to its listing object and its files' objects. ``cache_dir`` is the
     cache root (``config.locate_cache_dir()`` when None). With ``require_members`` (push), a
     directory whose committed listing cannot be read and whose listing object the cache lacks
-    raises rather than naming an object that is not there (``_blob_hashes``).
+    raises rather than naming an object that is not there (``_blob_hashes``). A ``*.pvt`` file a
+    stage wrote as its own member resolves nothing (``member_skip.own_member_skip``: the stages
+    of ``all_stages`` by the registry, any other by its lock in ``state_dir``).
     """
     _t = metrics.start()
     proj_root = project.get_project_root()
@@ -307,6 +317,7 @@ def get_target_hashes(
     output_identities: dict[str, types.ArtifactIdentity] | None = None
     unresolved = list[str]()
     tracked: dict[pathlib.PurePosixPath, tuple[pathlib.Path, track.PvtData]] | None = None
+    skip = member_skip.own_member_skip(proj_root, all_stages or {}, state_dir, files_dir)
 
     for target in targets:
         original_target = target
@@ -381,7 +392,7 @@ def get_target_hashes(
                                 if input_path is None:
                                     continue
                                 if tracked is None:
-                                    tracked = _get_tracked_artifacts(proj_root)
+                                    tracked = _get_tracked_artifacts(proj_root, skip=skip)
                                 hashes |= _tracked_blobs_for_input(
                                     tracked,
                                     input_path,
@@ -436,7 +447,7 @@ def get_target_hashes(
             continue
 
         pvt_blobs = _get_file_hash_from_pvt(
-            rel_path, proj_root, files_dir, require_members=require_members
+            rel_path, proj_root, files_dir, skip=skip, require_members=require_members
         )
         if pvt_blobs is not None:
             hashes |= pvt_blobs

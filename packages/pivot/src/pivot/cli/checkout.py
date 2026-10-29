@@ -755,15 +755,17 @@ def checkout(
         [cache.CheckoutMode(checkout_mode)] if checkout_mode else config.get_checkout_mode_order()
     )
 
-    # Discover tracked files
-    tracked_files = track.discover_pvt_files(project_root)
-
     # Get stage output info from lock files (cached outputs only)
     pipeline = cli_decorators.get_pipeline_from_context()
     stage_outputs = dict[str, Expected]()
     output_state_dirs = dict[str, pathlib.Path]()
     if pipeline is not None:
         stage_outputs, output_state_dirs = _get_stage_output_info(cache_dir)
+
+    # Discover tracked files: a stage's own .pvt member of its output, in any pipeline, is none
+    tracked_files = track.discover_pvt_files(
+        project_root, skip=cli_helpers.own_member_skip(cache_dir)
+    )
 
     state_dir = config.locate_state_dir()
 

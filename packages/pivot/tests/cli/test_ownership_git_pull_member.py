@@ -1,8 +1,9 @@
 """Two teammates share a git repository, each with their own cache. B has run the stage; A runs
 it with new params and commits the lock and the listing beside it; B runs ``git pull`` but not
 ``pivot pull``. The stage writes a sidecar-shaped ``fake.pvt`` in its directory output. B's
-``status`` does not call that file a user's, and B's ``repro`` reruns the stage over it: the
-stage's own members are read from the listing committed beside the lock, which B's cache lacks.
+``status`` does not call that file a user's, B's ``repro`` reruns the stage over it, and B's
+target-less ``checkout --force`` restores no path it names: the stage's own members are read
+from the listing committed beside the lock, which B's cache lacks.
 
 Runs the installed ``pivot`` console script.
 """
@@ -76,7 +77,10 @@ def _no_ownership_text(out: str) -> None:
         assert text not in flat, out
 
 
-def test_after_git_pull_the_stages_own_pvt_stays_the_stages(tmp_path: pathlib.Path) -> None:
+def _b_after_as_rerun_arrived_through_git(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Two clones of one repository. A and B each run the stage at n=1 with their own cache; A
+    then reruns it at n=2 and commits the lock and the listing beside it; B runs ``git pull``
+    and not ``pivot pull``, so B's cache holds n=1 alone. Returns B's root."""
     a = tmp_path / "a"
     a.mkdir()
     _git(a, "init", "-q", "-b", "main")
@@ -90,8 +94,7 @@ def test_after_git_pull_the_stages_own_pvt_stays_the_stages(tmp_path: pathlib.Pa
     b = tmp_path / "b"
     _git(tmp_path, "clone", "-q", str(a), str(b))
     _ok(_pivot(b, "repro"))  # B runs the stage itself: its own cache, n=1
-    fake = b / "data" / "b" / "tree" / "fake.pvt"
-    assert "abcdef0000000001" in fake.read_text()
+    assert "abcdef0000000001" in (b / "data" / "b" / "tree" / "fake.pvt").read_text()
 
     (a / "params.yaml").write_text("b/tree:\n  n: 2\n")
     _ok(_pivot(a, "repro"))
@@ -100,6 +103,13 @@ def test_after_git_pull_the_stages_own_pvt_stays_the_stages(tmp_path: pathlib.Pa
 
     _git(b, "checkout", "--", ".")  # B's own rerun may have rewritten its lock: discard
     _git(b, "pull", "-q", "--no-rebase", "origin", "main")  # no `pivot pull`
+    return b
+
+
+def test_after_git_pull_the_stages_own_pvt_stays_the_stages(tmp_path: pathlib.Path) -> None:
+    b = _b_after_as_rerun_arrived_through_git(tmp_path)
+    fake = b / "data" / "b" / "tree" / "fake.pvt"
+
     status = _pivot(b, "status")
     rerun = _pivot(b, "repro")
 
@@ -109,3 +119,27 @@ def test_after_git_pull_the_stages_own_pvt_stays_the_stages(tmp_path: pathlib.Pa
     _no_ownership_text(rerun.stdout + rerun.stderr)
     assert (b / "data" / "b" / "tree" / "value.txt").read_text() == "2"
     assert "abcdef0000000002" in fake.read_text()
+
+
+def test_after_git_pull_a_targetless_forced_checkout_restores_no_path_the_member_names(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot checkout --force` with no target restores every tracked file as well, so it
+    discovers the project's ``*.pvt`` files. ``fake.pvt`` is the stage's own member by the
+    listing A committed beside the lock, which B's cache has no copy of, so it drives no
+    restore. B is still missing A's objects, so the stage's own output cannot be restored: the
+    checkout fails over that output's objects, names none of the member's, and leaves the
+    workspace as it was (BET-412)."""
+    b = _b_after_as_rerun_arrived_through_git(tmp_path)
+    tree = b / "data" / "b" / "tree"
+    written = (tree / "fake.pvt").read_text()
+
+    forced = _pivot(b, "checkout", "--force")
+
+    out = forced.stdout + forced.stderr
+    assert forced.returncode == 1, out
+    assert "cache object missing" in out, out
+    _no_ownership_text(out)
+    assert "abcdef" not in out, out  # no restore of the path the stage's own member names
+    assert (tree / "value.txt").read_text() == "1", out
+    assert (tree / "fake.pvt").read_text() == written

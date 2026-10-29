@@ -68,7 +68,7 @@ from pivot import state_dir as state_dir_mod
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
-from pivot.storage import cache, listing, lock, track
+from pivot.storage import cache, listing, lock, member_skip, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -104,13 +104,23 @@ UPSTREAM_STALE_REASON_PREFIX = "Upstream stale"
 
 
 def _discover_tracked_files(
-    allow_missing: bool,
+    allow_missing: bool, all_stages: dict[str, RegistryStageInfo]
 ) -> tuple[dict[str, PvtData] | None, pygtrie.Trie[str] | None]:
-    """Discover tracked files for .pvt hash lookup when allow_missing is set."""
+    """Discover tracked files for .pvt hash lookup when allow_missing is set. A stage's own
+    ``*.pvt`` member of its output is none (``member_skip.own_member_skip``)."""
     if not allow_missing:
         return None, None
 
-    tracked_files = track.discover_pvt_files(project.get_project_root())
+    project_root = project.get_project_root()
+    tracked_files = track.discover_pvt_files(
+        project_root,
+        skip=member_skip.own_member_skip(
+            project_root,
+            all_stages,
+            config.locate_state_dir(),
+            config.locate_cache_dir() / "files",
+        ),
+    )
     tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
     for path in tracked_files:
         tracked_trie[pathlib.Path(path).parts] = path
@@ -219,7 +229,7 @@ def get_pipeline_explanations(
     _t = metrics.start()
     try:
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
-            tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
+            tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
             if graph is None:
                 graph = engine_graph.build_graph(all_stages)
             stage_graph = engine_graph.get_stage_dag(graph)
@@ -310,7 +320,7 @@ def get_pipeline_status(
     _t = metrics.start()
     try:
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
-            tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
+            tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
             if graph is None:
                 graph = engine_graph.build_graph(all_stages)
             stage_graph = engine_graph.get_stage_dag(graph)
@@ -360,14 +370,18 @@ def _explanations_to_status(explanations: list[StageExplanation]) -> list[Pipeli
 def get_tracked_files_status(
     project_root: pathlib.Path,
     on_progress: Callable[[int, int], None] | None = None,
+    *,
+    skip: track.PvtSkip | None = None,
 ) -> list[TrackedFileInfo]:
     """Get status for all tracked files.
 
     Args:
         project_root: Project root directory.
         on_progress: Optional callback called with (completed, total) after each file.
+        skip: Leaves a .pvt out of the tracked files (``track.discover_pvt_files``): a stage's
+            own member of its output (``member_skip.own_member_skip``).
     """
-    tracked = track.discover_pvt_files(project_root)
+    tracked = track.discover_pvt_files(project_root, skip=skip)
     total = len(tracked)
     results = list[TrackedFileInfo]()
 
@@ -603,9 +617,12 @@ async def _check_imports_batch(
     return results
 
 
-def get_import_status(project_root: pathlib.Path) -> list[ImportStatusInfo]:
-    """Check update status for all imported artifacts concurrently."""
-    import_pvts = track.discover_import_pvt_files(project_root)
+def get_import_status(
+    project_root: pathlib.Path, *, skip: track.PvtSkip | None = None
+) -> list[ImportStatusInfo]:
+    """Check update status for all imported artifacts concurrently (``skip``: as
+    ``get_tracked_files_status``)."""
+    import_pvts = track.discover_import_pvt_files(project_root, skip=skip)
     if not import_pvts:
         return []
     return asyncio.run(_check_imports_batch(import_pvts, project_root))
