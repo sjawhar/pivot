@@ -151,7 +151,9 @@ def test_get_params_from_head_with_lock_file(
 
     helpers.register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
 
-    lock_content = yaml.dump(make_valid_lock_content(params={"lr": 0.05, "epochs": 10}))
+    lock_content = yaml.dump(
+        {**make_valid_lock_content(params={"lr": 0.05, "epochs": 10}), "schema_version": 3}
+    )
     mocker.patch.object(
         git,
         "read_files_from_head",
@@ -227,7 +229,7 @@ def test_get_params_from_head_missing_params_key(
     from pivot import git
 
     helpers.register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
-    lock_content = yaml.dump({"deps": []})
+    lock_content = yaml.dump({"schema_version": 3, "code_manifest": {}, "deps": [], "outs": []})
     mocker.patch.object(
         git,
         "read_files_from_head",
@@ -247,7 +249,9 @@ def test_get_params_from_head_empty_params(
     from pivot import git
 
     helpers.register_test_stage(_helper_lock_stage, name="train", params=_LockParams())
-    lock_content = yaml.dump({"params": {}})
+    lock_content = yaml.dump(
+        {"schema_version": 3, "code_manifest": {}, "params": {}, "deps": [], "outs": []}
+    )
     mocker.patch.object(
         git,
         "read_files_from_head",
@@ -270,8 +274,8 @@ def test_get_params_from_head_filters_by_stage_names(
     helpers.register_test_stage(_helper_filter_a, name="stage_a", params=_FilterParams())
     helpers.register_test_stage(_helper_filter_b, name="stage_b", params=_FilterParams())
 
-    lock_a = yaml.dump(make_valid_lock_content(params={"value": 1}))
-    lock_b = yaml.dump(make_valid_lock_content(params={"value": 2}))
+    lock_a = yaml.dump({**make_valid_lock_content(params={"value": 1}), "schema_version": 3})
+    lock_b = yaml.dump({**make_valid_lock_content(params={"value": 2}), "schema_version": 3})
     mocker.patch.object(
         git,
         "read_files_from_head",

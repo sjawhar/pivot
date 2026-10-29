@@ -348,17 +348,28 @@ class AgentRpcHandler:
                         if ref.identity.producer in all_stages
                     }
                     default_state_dir = config_io.locate_state_dir()
+                    cache_dir = config_io.locate_cache_dir() / "files"
                     locks = explain_mod.read_locks(
-                        [stage, *producers], all_stages, default_state_dir
-                    )
-                    producer_hashes = explain_mod.producer_output_hashes(
-                        locks[producer] for producer in producers
+                        [stage, *producers], all_stages, default_state_dir, cache_dir
                     )
                     store = store_mod.WorkspaceStore(
                         project_root=project.get_project_root(),
                         pipeline_name=pipeline.name,
                         input_bindings=pipeline.input_bindings,
-                        cache_dir=config_io.locate_cache_dir() / "files",
+                        cache_dir=cache_dir,
+                    )
+                    unreadable = dict[types.ArtifactIdentity, str]()
+                    producer_hashes = explain_mod.producer_output_hashes(
+                        {producer: locks[producer] for producer in producers},
+                        reg_info["deps"].values(),
+                        {
+                            producer: explain_mod.stages_dir(
+                                all_stages[producer], default_state_dir
+                            )
+                            for producer in producers
+                        },
+                        store.cache_dir,
+                        unreadable,
                     )
                     return explain_mod.get_stage_explanation(
                         stage_name=stage,
@@ -372,6 +383,7 @@ class AgentRpcHandler:
                         lock_data=locks[stage],
                         allow_missing=True,
                         producer_hashes=producer_hashes,
+                        unreadable_listings=unreadable,
                     )
 
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue

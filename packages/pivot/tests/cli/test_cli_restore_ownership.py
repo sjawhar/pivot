@@ -551,6 +551,58 @@ def test_forced_restore_keeps_a_tracked_file_that_lands_in_an_output_during_its_
     assert not [p.name for p in output.parent.iterdir() if p.name.startswith(".pivot_")]
 
 
+def test_forced_symlink_restore_keeps_a_tracked_file_that_lands_before_the_tree_swap(
+    runner: CliRunner, git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A SYMLINK checkout of a directory whose cache tree is checked replaces the output with one
+    link to the tree, in one swap. A tracked file and its sidecar copied into the output while
+    that link is built are found by the swap's check of the old output, moved aside: the
+    restore refuses, names the sidecar, exits 1 and puts the output back with both files."""
+    repo_path, _commit = git_repo
+    (repo_path / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    monkeypatch.chdir(repo_path)
+    (repo_path / ".pivot" / "config.yaml").write_text("cache:\n  checkout_mode: [symlink, copy]\n")
+    (repo_path / "pipeline.py").write_text(_TWO_TREES_PIPELINE)
+    assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+    output = repo_path / "data" / "b" / "one"
+    tree = output.resolve()
+    assert output.is_symlink() and tree.is_dir(), "precondition: repro linked the output to a tree"
+    copied = runner.invoke(cli.cli, ["checkout", "--checkout-mode", "copy", "--force", "b/one"])
+    assert copied.exit_code == 0, copied.output
+    assert output.is_dir() and not output.is_symlink()
+    user = repo_path / "data" / "raw" / "u.txt"
+    user.parent.mkdir(parents=True)
+    user.write_text("user bytes")
+    assert runner.invoke(cli.cli, ["track", "data/raw/u.txt"]).exit_code == 0
+    user_sidecar = track.get_pvt_path(user).read_bytes()
+    landed = list[pathlib.Path]()
+    swap_in = cache._swap_in
+
+    def land_then_swap(
+        staged: pathlib.Path, path: pathlib.Path, backup: pathlib.Path, before_swap: Any
+    ) -> None:
+        # The tree's link is built: a user's file lands in the output it replaces
+        if not landed and staged.is_symlink():
+            shutil.copyfile(user, path / "u.txt")
+            (path / "u.txt.pvt").write_bytes(user_sidecar)
+            landed.append(path)
+        swap_in(staged, path, backup, before_swap)
+
+    monkeypatch.setattr(cache, "_swap_in", land_then_swap)
+
+    result = runner.invoke(cli.cli, ["checkout", "--checkout-mode", "symlink", "--force", "b/one"])
+
+    assert landed == [output], result.output
+    assert result.exit_code != 0, result.output
+    assert "data/b/one/u.txt.pvt" in " ".join(result.output.split())
+    assert not output.is_symlink(), "the output went back, not replaced by the tree's link"
+    assert (output / "u.txt").read_text() == "user bytes"
+    assert (output / "u.txt.pvt").read_bytes() == user_sidecar
+    assert (output / "g.txt").read_text() == "one"
+    assert not (tree / "u.txt").exists(), "nothing landed in the cache tree"
+
+
 _PATH_ONLY_DIRECTORY_PIPELINE = """\
 import pathlib
 import tempfile

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import os
+import subprocess
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 import dulwich.errors
@@ -306,3 +308,37 @@ def list_files_at_revision(directory: str, rev: str, pattern: str = "*") -> list
 
     files = _list_tree_files(ctx.repo, dir_sha, "", pattern)
     return [f"{directory}/{f}" for f in files]
+
+
+def in_repository(root: Path) -> bool:
+    """Whether git can find a repository from ``root``: through a ``.git`` at or above it, or
+    through ``GIT_DIR``. Elsewhere ``ignored_paths`` names nothing."""
+    return "GIT_DIR" in os.environ or _find_git_root(root) is not None
+
+
+def ignored_paths(root: Path, paths: Sequence[Path]) -> list[Path]:
+    """The ``paths`` git would ignore, as ``git check-ignore`` decides from ``root``.
+
+    A path git already tracks is not ignored. Empty when git is not installed or ``root`` is
+    not in a repository: then nothing can be ignored.
+    """
+    if not paths:
+        return []
+    names = [os.fsencode(os.path.relpath(path, root)) for path in paths]
+    request = b"".join(name + b"\0" for name in names)
+    try:
+        proc = subprocess.run(
+            ["git", "check-ignore", "--stdin", "-z"],
+            cwd=root,
+            input=request,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.debug("git check-ignore did not run: %s", e)
+        return []
+    if proc.returncode not in (0, 1):  # 128: not a repository
+        return []
+    ignored = {name for name in proc.stdout.split(b"\0") if name}
+    return [path for path, name in zip(paths, names, strict=True) if name in ignored]

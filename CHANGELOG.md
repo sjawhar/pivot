@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v0.5.21 (2026-10-28)
+
+### Bug Fixes
+
+- **storage**: Preserve tracked files inside stage outputs
+  ([#521](https://github.com/sjawhar/pivot/pull/521),
+  [`303d135`](https://github.com/sjawhar/pivot/commit/303d135bb094069fc27cfa3660c738346bf6e8df))
+
+### Testing
+
+- **fingerprint**: Make the wall-clock step test independent of clock-read timing
+  ([#537](https://github.com/sjawhar/pivot/pull/537),
+  [`ce4cb2b`](https://github.com/sjawhar/pivot/commit/ce4cb2b3ed9f2a8e55d340c0e01cf0faf42f024b))
+
+
 ## v0.5.20 (2026-10-28)
 
 ### Performance Improvements

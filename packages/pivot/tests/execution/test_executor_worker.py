@@ -16,7 +16,9 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from pivot import types
 from pivot.executor import worker
+from pivot.storage import listing
 from pivot.types import OutputMessage
 
 if TYPE_CHECKING:
@@ -148,20 +150,24 @@ def test_hash_dependencies_files_and_missing(tmp_path: pathlib.Path) -> None:
     assert entries[0][0] == str(existing)
 
 
-def test_hash_dependencies_directory_has_manifest(tmp_path: pathlib.Path) -> None:
-    """Directory hashing returns a tree hash with every file in its manifest."""
+def test_hash_dependencies_directory_preserves_its_listing(tmp_path: pathlib.Path) -> None:
+    """Directory hashing returns its record and keeps every file in the separate listing."""
     directory = tmp_path / "data"
     directory.mkdir()
     (directory / "a.txt").write_text("a")
     (directory / "b.txt").write_text("b")
 
-    hashes, missing, unreadable, _ = worker.hash_dependencies([str(directory)])
+    hashed_dirs = dict[str, listing.HashedDirectory]()
+    hashes, missing, unreadable, _ = worker.hash_dependencies(
+        [str(directory)], hashed_dirs=hashed_dirs
+    )
 
     assert missing == []
     assert unreadable == []
-    hash_info = hashes[str(directory)]
-    assert "manifest" in hash_info
-    assert {entry["relpath"] for entry in hash_info["manifest"]} == {"a.txt", "b.txt"}
+    directory_hash = hashes[str(directory)]
+    assert types.is_dir_hash(directory_hash)
+    members = hashed_dirs[directory_hash["hash"]]["listing"]
+    assert {entry["relpath"] for entry in members["files"]} == {"a.txt", "b.txt"}
 
 
 def _double(value: int) -> int:

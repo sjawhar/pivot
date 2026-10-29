@@ -20,13 +20,17 @@ if TYPE_CHECKING:
 
 
 def _lock_bytes(*, outs: list[dict[str, object]]) -> bytes:
-    """Build a schema-v2 remote lock with identity-addressed outputs."""
-    data = {
+    """Build a schema-v3 remote lock with identity-addressed outputs, its entries under
+    ``records`` when one records a directory, as pivot writes it."""
+    data: dict[str, object] = {
+        "schema_version": 3,
         "code_manifest": {"stage": "hash"},
         "params": {},
         "deps": [],
         "outs": outs,
     }
+    if any("listing" in out for out in outs):
+        data.update({"outs": [], "records": {"deps": [], "outs": outs}})
     return yaml.safe_dump(data).encode()
 
 
@@ -546,3 +550,129 @@ async def test_import_artifact_force_overwrites(
     assert pvt_data is not None
     assert pvt_data["hash"] == file_hash
     assert pvt_data["size"] == len(content), "Size should come from downloaded file"
+
+
+@pytest.mark.parametrize(
+    ("stage", "key", "directory", "listing_path", "artifact", "hint", "data_rel"),
+    [
+        pytest.param(
+            "images",
+            None,
+            "images",
+            ".pivot/stages/images=.listing",
+            "images:part/a.csv",
+            "images:{filename}",
+            "images/part/a.csv",
+            id="return-value",
+        ),
+        pytest.param(
+            "build",
+            "images",
+            "build:images",
+            ".pivot/stages/build=images.listing",
+            "build:images/part/a.csv",
+            "build:images/{filename}",
+            "build/images/part/a.csv",
+            id="typed-dict-field",
+        ),
+    ],
+)
+async def test_import_artifact_imports_one_file_from_remote_directory_listing(
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    moto_s3_bucket: str,
+    aioboto3_s3_client: S3Client,
+    stage: str,
+    key: str | None,
+    directory: str,
+    listing_path: str,
+    artifact: str,
+    hint: str,
+    data_rel: str,
+) -> None:
+    repo_url = "https://github.com/org/repo"
+    remote_url = f"s3://{moto_s3_bucket}/test-prefix/"
+    selected = b"a,b\n1,2\n"
+    other = b"b\n"
+    selected_hash = xxhash.xxh64(selected).hexdigest()
+    other_hash = xxhash.xxh64(other).hexdigest()
+    listing_bytes = (
+        f"{selected_hash} {len(selected)} - part/a.csv\n"
+        + f"{other_hash} {len(other)} - part/b.csv\n"
+    ).encode()
+    lock_bytes = _lock_bytes(
+        outs=[
+            {
+                "key": key,
+                "tag": "directory",
+                "listing": xxhash.xxh64(listing_bytes).hexdigest(),
+                "size": len(selected) + len(other),
+                "nfiles": 2,
+            }
+        ]
+    )
+
+    list_directory = mocker.patch(
+        "pivot.import_artifact.github.list_directory",
+        autospec=True,
+    )
+    list_directory.return_value = _github_files(f"{stage}.lock")
+    resolve_ref = mocker.patch(
+        "pivot.import_artifact.github.resolve_ref",
+        autospec=True,
+    )
+    resolve_ref.return_value = "deadbeef"
+
+    async def _read_file(
+        _owner: str, _repo: str, path: str, _ref: str, _token: str | None = None, **_kw: object
+    ) -> bytes:
+        if path == ".pivot/config.yaml":
+            return _config_bytes(remote_url)
+        if path == f".pivot/stages/{stage}.lock":
+            return lock_bytes
+        if path == listing_path:
+            return listing_bytes
+        raise AssertionError(f"Unexpected path: {path}")
+
+    read_file = mocker.patch(
+        "pivot.import_artifact.github.read_file",
+        autospec=True,
+    )
+    read_file.side_effect = _read_file
+
+    with pytest.raises(exceptions.PivotError) as refused:
+        await import_artifact.import_artifact(
+            repo_url,
+            directory,
+            rev="main",
+            project_root=tmp_path,
+            no_download=True,
+        )
+    assert f"Cannot import directory output '{directory}'" in str(refused.value)
+    assert hint in str(refused.value), "Directory refusal should name the per-file artifact form"
+
+    key_path = keys.hash_to_key("test-prefix/", selected_hash)
+    await aioboto3_s3_client.put_object(Bucket=moto_s3_bucket, Key=key_path, Body=selected)
+    mocker.patch(
+        "pivot.remote.storage.S3Remote",
+        autospec=True,
+        return_value=remote_mod.S3Remote(remote_url),
+    )
+
+    result = await import_artifact.import_artifact(
+        repo_url,
+        artifact,
+        rev="main",
+        project_root=tmp_path,
+    )
+
+    data_path = tmp_path / data_rel
+    assert pathlib.Path(result["data_path"]) == data_path
+    assert data_path.read_bytes() == selected
+    pvt_data = track.read_pvt_file(track.get_pvt_path(data_path))
+    assert pvt_data is not None
+    assert pvt_data["hash"] == selected_hash, "Import should use the listing member hash"
+    assert pvt_data["size"] == len(selected), "Import should use the selected member size"
+    assert "source" in pvt_data
+    assert pvt_data["source"]["stage"] == stage
+    assert pvt_data["source"]["path"] == artifact

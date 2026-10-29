@@ -10,6 +10,40 @@ from pivot import state_dir as state_dir_mod
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 
+# A listing's bytes must hash to the record in its lock or .pvt, so git must never merge two
+# listings line by line (the result would hash to neither side's record): a merge that changes
+# one on both sides conflicts instead, beside its lock, and both are taken from one side.
+_GITATTRIBUTES_LINE = "*.listing -merge"
+_GITATTRIBUTES_CONTENT = f"""\
+# Pivot listing files: never merge one line by line; take it and its lock from one side
+{_GITATTRIBUTES_LINE}
+"""
+_STAGES_GITIGNORE_CONTENT = "!/**\n"
+
+
+def _create_stages_gitignore(path: pathlib.Path) -> None:
+    """Create the stages-level negation that keeps locks and listings visible to Git."""
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    except FileExistsError:
+        return
+    with os.fdopen(descriptor, "w") as gitignore:
+        gitignore.write(_STAGES_GITIGNORE_CONTENT)
+
+
+def _ensure_gitattributes(path: pathlib.Path) -> bool:
+    """Add the listing merge rule to the project's .gitattributes; whether the file was created
+    (an existing one keeps its lines and gains the rule if it lacks it)."""
+    try:
+        existing = path.read_text()
+    except FileNotFoundError:
+        path.write_text(_GITATTRIBUTES_CONTENT)
+        return True
+    if _GITATTRIBUTES_LINE not in (line.strip() for line in existing.splitlines()):
+        separator = "" if not existing or existing.endswith("\n") else "\n"
+        path.write_text(existing + separator + _GITATTRIBUTES_CONTENT)
+    return False
+
 
 @cli_decorators.pivot_command(auto_discover=False)
 @click.option(
@@ -66,7 +100,8 @@ def init(ctx: click.Context, force: bool) -> None:
         created_gitignores.append(marker_gitignore)
 
     stages_dir = state_dir / "stages"
-    stages_dir.mkdir(exist_ok=True)
+    state_dir_mod.make_dirs(stages_dir)
+    _create_stages_gitignore(stages_dir / ".gitignore")
 
     # Create .pivotignore with default patterns if it doesn't exist
     pivotignore_path = pathlib.Path.cwd() / ".pivotignore"
@@ -75,6 +110,8 @@ def init(ctx: click.Context, force: bool) -> None:
         pivotignore_content = "\n".join(ignore.get_default_patterns()) + "\n"
         pivotignore_path.write_text(pivotignore_content)
         created_pivotignore = True
+
+    created_gitattributes = _ensure_gitattributes(cwd / ".gitattributes")
 
     if not quiet:
         click.echo("Initialized Pivot project.")
@@ -86,6 +123,8 @@ def init(ctx: click.Context, force: bool) -> None:
             click.echo(f"  {_display_path(gitignore_path, cwd)}")
         if created_pivotignore:
             click.echo("  .pivotignore")
+        if created_gitattributes:
+            click.echo("  .gitattributes")
         click.echo()
         click.echo("Next steps:")
         click.echo("  1. Create pipeline.py to define your pipeline stages")
