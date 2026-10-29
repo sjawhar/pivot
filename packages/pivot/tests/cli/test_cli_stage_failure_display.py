@@ -205,7 +205,11 @@ def test_the_remote_existence_check_keeps_the_text_of_its_cause(
     monkeypatch.setattr(project, "get_project_root", lambda: tmp_path)
 
     def one_missing_hash(
-        stage_name: str, local_hashes: set[str], allow_missing: bool, project_root: pathlib.Path
+        stage_name: str,
+        local_hashes: set[str],
+        allow_missing: bool,
+        project_root: pathlib.Path,
+        tracked_files: object,
     ) -> dict[str, list[str]]:
         return {"a000000000000001": ["data/p/big"]}
 
@@ -215,7 +219,7 @@ def test_the_remote_existence_check_keeps_the_text_of_its_cause(
     )
 
     with pytest.raises(exceptions.RemoteError) as raised:
-        verify_mod._verify_stages([cached], tmp_path, True)
+        verify_mod._verify_stages([cached], tmp_path, True, verify_mod._project_tracked_files())
 
     assert str(raised.value) == "Failed to check remote existence: connection reset by peer"
 

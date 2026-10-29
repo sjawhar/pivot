@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 import boto3
 import pytest
 
+from pivot import ignore
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -318,6 +319,33 @@ def test_a_changed_tracked_input_whose_listing_cannot_be_read_would_run(
     plan = json.loads(result.stdout[result.stdout.index("{") :])
     assert plan["stages"]["p/lane"]["would_run"] is True, plan
     assert "Input dependencies changed" in plan["stages"]["p/lane"]["reason"], plan
+
+
+def test_a_file_a_negation_brings_back_past_a_literal_prefix_reruns_its_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """git compares a pattern's literal prefix as is and gives wildmatch the rest, so in
+    `!data/raw/src/docs**` the `**` spans directories: git keeps docs/notes.txt and
+    docs/sub/deep.txt, so an edit to either makes the stage stale."""
+    home, root = _project(tmp_path, _INPUT_PIPELINE.replace("tasks/server", "data/raw/src"))
+    (root / ".pivotignore").write_text(
+        "\n".join(ignore.get_default_patterns()) + "\n*.txt\n!data/raw/src/docs**\n"
+    )
+    source = root / "data" / "raw" / "src"
+    (source / "docs" / "sub").mkdir(parents=True)
+    (source / "grade.py").write_text("print('grade')\n")
+    (source / "docs" / "notes.txt").write_text("notes\n")
+    (source / "docs" / "sub" / "deep.txt").write_text("deep\n")
+    (source / "scratch.txt").write_text("ignored\n")
+    assert _ran(root, home) == {"p/lane": "ran"}
+
+    (source / "scratch.txt").write_text("still ignored\n")
+    assert _statuses(root, home) == {"p/lane": "cached"}
+    (source / "docs" / "notes.txt").write_text("edited\n")
+    assert _statuses(root, home) == {"p/lane": "stale"}
+    assert _ran(root, home) == {"p/lane": "ran"}
+    (source / "docs" / "sub" / "deep.txt").write_text("edited\n")
+    assert _statuses(root, home) == {"p/lane": "stale"}
 
 
 def test_a_pivotignore_that_is_not_utf8_fails_no_command(tmp_path: pathlib.Path) -> None:

@@ -1,23 +1,32 @@
-"""The project's ``.pivotignore``, read and matched exactly as git reads and matches a root
-``.gitignore``.
+"""The project's ``.pivotignore``, read and matched as git reads and matches a root
+``.gitignore``: a port of git's own code (``dir.c`` and ``wildmatch.c``, git 2.43).
 
-git's rules (``dir.c`` and ``wildmatch.c``):
-
-- The file is bytes. Lines split on ``\\n`` (a ``\\r`` before it is dropped); an empty line or one
-  starting with ``#`` is skipped, and trailing spaces are dropped unless a backslash escapes
-  them. A leading ``!`` negates the pattern; a trailing ``/`` makes it match directories only.
+- The file is bytes, a UTF-8 byte order mark at its start dropped. Lines split on ``\\n``; a
+  ``\\r`` before it is dropped, and a line ends at a NUL, as a C string does. An empty line or
+  one starting with ``#`` is skipped, and trailing spaces are dropped unless a backslash
+  escapes them. A leading ``!`` negates the pattern; a trailing ``/`` makes it match
+  directories only.
 - A pattern with no other ``/`` matches an entry's own name at any depth. Any other pattern
-  matches the whole path from the project root, a leading ``/`` dropped, by wildmatch with
-  ``WM_PATHNAME``: ``*``, ``?`` and ``[...]`` never match ``/``; ``**`` matches any number of
-  directories only as a whole path component (``**/``, ``/**/``, a trailing ``/**``), and is a
-  ``*`` anywhere else. A backslash makes the next byte literal.
+  matches the whole path from the project root, a leading ``/`` dropped: its literal prefix (up
+  to the first of ``*?[\\``) byte for byte, and the rest by wildmatch with ``WM_PATHNAME``.
+  ``*``, ``?`` and ``[...]`` never match ``/``; ``**`` matches any number of directories only as
+  a whole path component (``**/``, ``/**/``, a trailing ``/**``) or at the start of what
+  wildmatch sees (so in ``data/docs**`` the ``**`` spans directories), and is a ``*``
+  anywhere else. A backslash makes the next byte literal.
 - The last pattern that matches a path decides it. A path is ignored when that pattern is not
   a negation, or when a directory above it is ignored: git never looks inside an ignored
-  directory, so no later negation can bring a file back from one.
+  directory, so no later negation can bring a file back from one. The project root itself is
+  never ignored.
 
-Matching is on bytes, as git matches. On macOS, where git precomposes the names it reads
-(``core.precomposeunicode``, true by default there), a path is first put in Unicode NFC; a
-pattern never is.
+Matching is on bytes and case-sensitive, as git's is with ``core.ignorecase`` false. On macOS,
+where git precomposes the names it reads (``core.precomposeunicode``, true by default there), a
+path is first put in Unicode NFC; a pattern never is. Wildmatch is ``dowild`` itself, not a
+regular expression, so a pattern costs what it costs in git. Only the project's own file is
+read: a ``.pivotignore`` in a subdirectory is data like any other file.
+
+Pivot departs from git in two places: ``pipeline.py`` and ``.pivot/`` at the project root are
+never ignored (``PROTECTED_PATHS``), and a line with more than ``_MAX_STAR_RUNS`` runs of ``*``
+is not used, with a warning.
 """
 
 from __future__ import annotations
@@ -26,7 +35,7 @@ import contextlib
 import logging
 import os
 import pathlib
-import re
+import stat
 import sys
 import threading
 import unicodedata
@@ -111,14 +120,14 @@ class CheckIgnoreResult(NamedTuple):
 
 
 class _Pattern(NamedTuple):
-    """One ``.pivotignore`` line, parsed as git parses a gitignore line."""
+    """One ``.pivotignore`` line, parsed as git's ``parse_path_pattern`` parses it."""
 
     text: str  # the line as written, a byte that is not UTF-8 shown as a \x escape
     source: str  # e.g. ".pivotignore:5"
     negated: bool
     dir_only: bool  # a trailing "/": it matches a directory only
     basename: bool  # no "/" in it: it matches an entry's own name, at any depth
-    regex: re.Pattern[bytes]
+    match: Callable[[bytes], bool]  # tests the entry's name (basename) or its whole path
 
 
 def _encode(path: str) -> bytes:
@@ -127,12 +136,13 @@ def _encode(path: str) -> bytes:
 
 
 def _deciding(patterns: tuple[_Pattern, ...], path: bytes, is_dir: bool) -> _Pattern | None:
-    """The last pattern that matches ``path`` alone (git's ``last_matching_pattern``), if any."""
+    """The last pattern that matches ``path`` alone (git's ``last_matching_pattern_from_list``),
+    if any."""
     name = path[path.rfind(b"/") + 1 :]
     for pattern in reversed(patterns):
         if pattern.dir_only and not is_dir:
             continue
-        if pattern.regex.fullmatch(name if pattern.basename else path) is not None:
+        if pattern.match(name if pattern.basename else path):
             return pattern
     return None
 
@@ -145,7 +155,10 @@ def _excluding(patterns: tuple[_Pattern, ...], path: bytes, is_dir: bool) -> _Pa
 
 def _ignored_at(patterns: tuple[_Pattern, ...], path_str: str, is_dir: bool) -> _Pattern | None:
     """The pattern that ignores ``path_str``: the one that ignores the first directory above it
-    that is ignored, else the one that ignores it, else None (git's parent rule)."""
+    that is ignored, else the one that ignores it, else None (git's parent rule). The project
+    root, ``.``, is never ignored: git matches no pattern against it."""
+    if path_str == ".":
+        return None
     path = _encode(path_str)
     end = path.find(b"/", 1)
     while end != -1:
@@ -160,11 +173,14 @@ class IgnoreFilter:
 
     Matching is git's, as the module docstring says. This one rule decides ``pivot
     check-ignore``, the files a directory input's hash leaves out (``member_filter``) and the
-    input changes watch mode skips. The one difference is an input directory that the file
-    itself ignores, or that lies inside a directory it ignores: ``check-ignore`` reports its
-    files ignored, as git does, but ``member_filter`` returns None and the input is hashed
-    whole, since leaving out every file would hide every change to it. No user-level file is
-    read: an ignore rule changes dependency hashes, and lock files carry those to every machine.
+    input changes watch mode skips. Hashing differs from ``check-ignore`` for an input
+    directory that the file itself ignores, or that lies inside a directory it ignores:
+    ``check-ignore`` reports its files ignored, as git does, but ``member_filter`` returns None
+    and the input is hashed whole, since leaving out every file would hide every change to it.
+    ``check-ignore`` itself differs from git's in two ways: a relative path is taken from the
+    project root, not the working directory, and ``PROTECTED_PATHS`` are never ignored. No
+    user-level file is read: an ignore rule changes dependency hashes, and lock files carry
+    those to every machine.
     """
 
     _lock: threading.Lock
@@ -344,11 +360,15 @@ class IgnoreFilter:
         return False
 
     def _detect_is_dir(self, path: str | pathlib.Path) -> bool:
-        """Auto-detect if path is a directory."""
+        """Whether ``path`` is a directory, as git and the hash walk see it: by ``lstat``, so a
+        symlink to a directory is not one. A relative path is taken from the project root, as
+        matching takes it. A path that does not exist is a directory when written with a
+        trailing ``/``."""
+        path_obj = path if isinstance(path, pathlib.Path) else pathlib.Path(path)
+        if self._project_root is not None and not path_obj.is_absolute():
+            path_obj = self._project_root / path_obj
         try:
-            path_obj = path if isinstance(path, pathlib.Path) else pathlib.Path(path)
-            if path_obj.exists():
-                return path_obj.is_dir()
+            return stat.S_ISDIR(path_obj.lstat().st_mode)
         except OSError:
             pass
         # Check original path for trailing slash (pathlib strips it during normalization)
@@ -377,14 +397,16 @@ def _load_ignore_file(
 
 
 def _parse(data: bytes, source_name: str) -> tuple[_Pattern, ...]:
-    """Parse an ignore file's bytes as git's ``add_patterns_from_buffer`` does."""
+    """Parse an ignore file's bytes as git's ``add_patterns_from_buffer`` and
+    ``parse_path_pattern`` do."""
     data = data.removeprefix(b"\xef\xbb\xbf")
     lines = data.split(b"\n")
     if lines[-1] == b"":
         lines.pop()
     patterns = list[_Pattern]()
     for line_number, raw in enumerate(lines, start=1):
-        line = _trim_trailing_spaces(raw.removesuffix(b"\r"))
+        # git ends a line at the CR before its LF, then reads it as a C string: up to a NUL
+        line = _trim_trailing_spaces(raw.removesuffix(b"\r").partition(b"\0")[0])
         if not line or line.startswith(b"#"):
             continue
         text = line.decode("utf-8", "backslashreplace")
@@ -394,13 +416,20 @@ def _parse(data: bytes, source_name: str) -> tuple[_Pattern, ...]:
         if dir_only:
             body = body[:-1]
         basename = b"/" not in body
-        if not basename and body.startswith(b"/"):
-            body = body[1:]
-        regex = _wildmatch_regex(body)
-        if regex is None:
+        if not basename:
+            body = body.removeprefix(b"/")
+        compiled = _compile(body)
+        if compiled is None:
             logger.warning(
                 f"Invalid pattern on line {line_number} of {source_name}: '{text}' - git never "
                 + "matches it (a lone trailing backslash, or an unclosed or unknown [...] class)"
+            )
+            continue
+        classes, star_runs = compiled
+        if star_runs > _MAX_STAR_RUNS:
+            logger.warning(
+                f"Pattern on line {line_number} of {source_name} has {star_runs} runs of '*'; "
+                + f"Pivot matches at most {_MAX_STAR_RUNS} and does not use it. Shorten it."
             )
             continue
         patterns.append(
@@ -410,7 +439,7 @@ def _parse(data: bytes, source_name: str) -> tuple[_Pattern, ...]:
                 negated=negated,
                 dir_only=dir_only,
                 basename=basename,
-                regex=re.compile(regex, re.DOTALL),
+                match=(_name_matcher(body, classes) if basename else _path_matcher(body, classes)),
             )
         )
     return tuple(patterns)
@@ -436,51 +465,94 @@ def _trim_trailing_spaces(line: bytes) -> bytes:
     return line if last_space is None else line[:last_space]
 
 
-def _wildmatch_regex(pattern: bytes) -> bytes | None:
-    """git's ``wildmatch(pattern, subject, WM_PATHNAME)`` as a regular expression the whole
-    subject must match, or None when no subject can match it.
+# The bytes git's ``is_glob_special`` names: a literal prefix ends at the first of them.
+_GLOB_SPECIAL = b"*?[\\"
 
-    For a pattern matched against a name alone, which holds no ``/``, git uses wildmatch
-    without ``WM_PATHNAME``; on such a subject the two agree.
+# A pattern with more runs of "*" than this is not used: each run is one level of recursion in
+# ``_dowild``, and Python's recursion limit is far below what git's C stack allows.
+_MAX_STAR_RUNS = 256
+
+
+def _literal_length(pattern: bytes, start: int = 0) -> int:
+    """git's ``simple_length``: the index of the first of ``*?[\\`` at or after ``start``."""
+    for index in range(start, len(pattern)):
+        if pattern[index] in _GLOB_SPECIAL:
+            return index
+    return len(pattern)
+
+
+def _name_matcher(body: bytes, classes: dict[int, _Class]) -> Callable[[bytes], bool]:
+    """git's ``match_basename``, for a pattern with no ``/``: a pattern with no wildcard is
+    compared whole, ``*`` and a literal tail is a suffix test (``PATTERN_FLAG_ENDSWITH``), and
+    any other pattern is wildmatch without ``WM_PATHNAME``."""
+    if _literal_length(body) == len(body):
+        return lambda name: name == body
+    if body[0] == 0x2A and _literal_length(body, 1) == len(body):
+        tail = body[1:]
+        return lambda name: name.endswith(tail)
+    return lambda name: _dowild(body, classes, 0, name, 0, False) == _WM_MATCH
+
+
+def _path_matcher(body: bytes, classes: dict[int, _Class]) -> Callable[[bytes], bool]:
+    """git's ``match_pathname``, for a pattern holding a ``/`` (its leading ``/`` already
+    dropped), against a path from the project root.
+
+    The literal prefix (up to the first of ``*?[\\``) is compared as is, and wildmatch with
+    ``WM_PATHNAME`` sees only the rest. So a ``**`` right after the prefix starts the pattern
+    wildmatch sees and spans directories: ``data/docs**`` names ``data/docs/sub/a.txt``.
     """
-    out = list[bytes]()
+    literal = _literal_length(body)
+    if literal == len(body):
+        return lambda path: path == body
+    prefix = body[:literal]
+    return lambda path: (
+        path.startswith(prefix)
+        and _dowild(body, classes, literal, path, literal, True) == _WM_MATCH
+    )
+
+
+class _Class(NamedTuple):
+    """A ``[...]`` class of a wildmatch pattern: the bytes it names, whether it is negated, and
+    the index of its closing ``]``."""
+
+    members: frozenset[int]
+    negated: bool
+    end: int
+
+
+def _compile(pattern: bytes) -> tuple[dict[int, _Class], int] | None:
+    """The classes of a wildmatch pattern by the index of their ``[``, and its number of runs of
+    ``*``; or None when git never matches it: a lone trailing backslash, or a class that is
+    unclosed or names an unknown ``[:name:]``.
+
+    A match has to pass every element of the pattern, so wildmatch gives up on such a pattern
+    (``WM_ABORT_ALL``) wherever it reaches the element, and nothing can match it. A class's
+    members do not depend on the byte it is tested against, so each is read once here, as
+    ``dowild`` reads it.
+    """
+    classes = dict[int, _Class]()
+    star_runs = 0
     index = 0
     size = len(pattern)
     while index < size:
         byte = pattern[index]
-        if byte == 0x5C:  # "\": the next byte is literal; a trailing one never matches
+        if byte == 0x5C:  # "\"
             if index + 1 >= size:
                 return None
-            out.append(re.escape(pattern[index + 1 : index + 2]))
             index += 2
-        elif byte == 0x3F:  # "?"
-            out.append(b"[^/]")
-            index += 1
+        elif byte == 0x5B:  # "["
+            compiled = _compile_class(pattern, index)
+            if compiled is None:
+                return None
+            classes[index] = compiled
+            index = compiled.end + 1
         elif byte == 0x2A:  # "*"
-            start = index
+            star_runs += 1
             while index < size and pattern[index] == 0x2A:
                 index += 1
-            rest = pattern[index:]
-            whole_component = (start == 0 or pattern[start - 1] == 0x2F) and (
-                not rest or rest.startswith((b"/", b"\\/"))
-            )
-            if index - start == 1 or not whole_component:
-                out.append(b"[^/]*")
-            elif rest.startswith(b"/"):
-                out.append(b"(?:.*/)?")  # "**/": no directory, or any number of them
-                index += 1
-            else:
-                out.append(b".*")  # a trailing "**" (or "**" before an escaped "/")
-        elif byte == 0x5B:  # "["
-            bracket = _bracket_regex(pattern, index)
-            if bracket is None:
-                return None
-            regex, index = bracket
-            out.append(regex)
         else:
-            out.append(re.escape(pattern[index : index + 1]))
             index += 1
-    return b"".join(out)
+    return classes, star_runs
 
 
 # git's ASCII character classes (``sane_ctype``), as wildmatch's ``[:name:]`` tests them.
@@ -496,72 +568,174 @@ _CTYPE_CLASSES = {
     b"lower": frozenset(b"abcdefghijklmnopqrstuvwxyz"),
     b"print": frozenset(range(0x20, 0x7F)),
     b"punct": _GRAPH - _ALNUM,
-    b"space": frozenset(b" \t\n\r"),
+    b"space": frozenset(b" \t\n\r"),  # not \v or \f: git's isspace is not C's
     b"upper": frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
     b"xdigit": frozenset(b"0123456789ABCDEFabcdef"),
 }
 
 
-def _bracket_regex(pattern: bytes, start: int) -> tuple[bytes, int] | None:
-    """The ``[...]`` class at ``pattern[start]`` as a regular expression, and the index after
-    it, or None when git never matches it (unclosed, or an unknown ``[:name:]``).
+def _compile_class(pattern: bytes, start: int) -> _Class | None:
+    """The ``[...]`` class at ``pattern[start]``, read as ``dowild``'s ``case '['`` reads it, or
+    None where it gives up (an unclosed class, an unknown ``[:name:]``).
 
-    As wildmatch reads it: a leading ``!`` or ``^`` negates it, its first byte is a member even
-    when it is ``]``, ``a-z`` is a range of bytes, a backslash makes the next byte literal, and
-    it never matches ``/``.
+    A leading ``!`` or ``^`` negates it, its first byte is a member even when it is ``]``,
+    ``a-z`` is a range of bytes, a backslash makes the next byte a member, and ``[`` not
+    followed by ``:name:]`` is a member like any other byte.
     """
     size = len(pattern)
-    index = start + 1
-    negated = index < size and pattern[index] in b"!^"
+    p = start + 1
+    p_ch = pattern[p] if p < size else 0
+    if p_ch == 0x5E:  # "^" is "!"
+        p_ch = 0x21
+    negated = p_ch == 0x21
     if negated:
-        index += 1
+        p += 1
+        p_ch = pattern[p] if p < size else 0
     members = set[int]()
-    previous = 0
-    first = True
+    prev_ch = 0
     while True:
-        if index >= size:
+        if p_ch == 0:
             return None
-        byte = pattern[index]
-        if byte == 0x5D and not first:  # "]"
-            break
-        first = False
-        if byte == 0x5C:
-            index += 1
-            if index >= size:
+        if p_ch == 0x5C:  # "\"
+            p += 1
+            p_ch = pattern[p] if p < size else 0
+            if p_ch == 0:
                 return None
-            byte = pattern[index]
-            members.add(byte)
-        elif byte == 0x2D and previous and index + 1 < size and pattern[index + 1] != 0x5D:
-            index += 1
-            high = pattern[index]
-            if high == 0x5C:
-                index += 1
-                if index >= size:
+            members.add(p_ch)
+        elif p_ch == 0x2D and prev_ch and p + 1 < size and pattern[p + 1] != 0x5D:  # "a-z"
+            p += 1
+            p_ch = pattern[p]
+            if p_ch == 0x5C:
+                p += 1
+                p_ch = pattern[p] if p < size else 0
+                if p_ch == 0:
                     return None
-                high = pattern[index]
-            members.update(range(previous, high + 1))
-            byte = 0
-        elif byte == 0x5B and index + 1 < size and pattern[index + 1] == 0x3A:  # "[:"
-            close = pattern.find(b"]", index + 2)
+            members.update(range(prev_ch, p_ch + 1))
+            p_ch = 0  # the next byte starts no range
+        elif p_ch == 0x5B and p + 1 < size and pattern[p + 1] == 0x3A:  # "[:"
+            name_start = p + 2
+            close = pattern.find(b"]", name_start)
             if close == -1:
                 return None
-            if close - (index + 2) - 1 < 0 or pattern[close - 1] != 0x3A:
+            if close - name_start - 1 < 0 or pattern[close - 1] != 0x3A:
                 members.add(0x5B)  # no ":]": the "[" is a member, and ":" is read next
             else:
-                named = _CTYPE_CLASSES.get(pattern[index + 2 : close - 1])
+                named = _CTYPE_CLASSES.get(pattern[name_start : close - 1])
                 if named is None:
                     return None
                 members.update(named)
-                index = close
-                byte = 0
+                p = close
+                p_ch = 0
         else:
-            members.add(byte)
-        previous = byte
-        index += 1
-    matched = (set(range(1, 256)) - members) if negated else members
-    matched.discard(0x2F)
-    if not matched:
-        return b"(?!)", index + 1
-    return b"[" + b"".join(
-        re.escape(bytes([member])) for member in sorted(matched)
-    ) + b"]", index + 1
+            members.add(p_ch)
+        prev_ch = p_ch
+        p += 1
+        p_ch = pattern[p] if p < size else 0
+        if p_ch == 0x5D:  # "]"
+            return _Class(frozenset(members), negated, p)
+
+
+# wildmatch's results: a match, no match here, or no match anywhere a "*" (or, only past a
+# "/", a "**") further out could try.
+_WM_MATCH = 0
+_WM_NOMATCH = 1
+_WM_ABORT_ALL = -1
+_WM_ABORT_TO_STARSTAR = -2
+
+
+def _dowild(
+    pattern: bytes, classes: dict[int, _Class], start: int, text: bytes, t: int, pathname: bool
+) -> int:
+    """git's ``dowild`` (wildmatch.c, git 2.43), line for line: ``pattern[start:]`` against
+    ``text[t:]``, with ``WM_PATHNAME`` when ``pathname``.
+
+    Its abort results are what keep it fast: a ``*`` that cannot match by taking the rest of the
+    text tells every ``*`` further out to stop (``WM_ABORT_ALL``), so no pattern backtracks
+    through every way of splitting the text, as a regular expression would. Each run of ``*``
+    recurses once, so the depth is at most the pattern's runs of ``*`` (``_MAX_STAR_RUNS``).
+    """
+    p = start
+    size = len(pattern)
+    end = len(text)
+    while p < size:
+        p_ch = pattern[p]
+        t_ch = text[t] if t < end else 0
+        if t_ch == 0 and p_ch != 0x2A:
+            return _WM_ABORT_ALL
+        if p_ch == 0x5C:  # "\": the next byte is literal
+            p += 1
+            if p >= size or t_ch != pattern[p]:
+                return _WM_NOMATCH
+        elif p_ch == 0x3F:  # "?": any byte but "/"
+            if pathname and t_ch == 0x2F:
+                return _WM_NOMATCH
+        elif p_ch == 0x5B:  # "["
+            members, negated, close = classes[p]
+            if (t_ch in members) == negated or (pathname and t_ch == 0x2F):
+                return _WM_NOMATCH
+            p = close
+        elif p_ch == 0x2A:  # "*"
+            p += 1
+            if p < size and pattern[p] == 0x2A:
+                prev_p = p
+                p += 1
+                while p < size and pattern[p] == 0x2A:
+                    p += 1
+                if not pathname:
+                    match_slash = True  # without WM_PATHNAME, "*" is "**"
+                elif (prev_p - start < 2 or pattern[prev_p - 2] == 0x2F) and (
+                    p >= size
+                    or pattern[p] == 0x2F
+                    or (pattern[p] == 0x5C and p + 1 < size and pattern[p + 1] == 0x2F)
+                ):
+                    # A whole "**" component: "**/" first tries matching no directory at all
+                    if (
+                        p < size
+                        and pattern[p] == 0x2F
+                        and _dowild(pattern, classes, p + 1, text, t, pathname) == _WM_MATCH
+                    ):
+                        return _WM_MATCH
+                    match_slash = True
+                else:
+                    match_slash = False
+            else:
+                match_slash = not pathname
+            if p >= size:
+                # A trailing "**" matches everything; a trailing "*" only what holds no "/"
+                if not match_slash and text.find(b"/", t) != -1:
+                    return _WM_ABORT_TO_STARSTAR
+                return _WM_MATCH
+            if not match_slash and pattern[p] == 0x2F:
+                # One "*" and then "/" matches the rest of this directory's name
+                slash = text.find(b"/", t)
+                if slash == -1:
+                    return _WM_ABORT_ALL
+                t = slash
+            else:
+                while True:
+                    if t_ch == 0:
+                        break
+                    if pattern[p] not in _GLOB_SPECIAL:
+                        # The text up to the next byte the literal after "*" names is the "*"'s
+                        p_ch = pattern[p]
+                        while True:
+                            t_ch = text[t] if t < end else 0
+                            if t_ch in (0, p_ch) or (not match_slash and t_ch == 0x2F):
+                                break
+                            t += 1
+                        if t_ch != p_ch:
+                            return _WM_ABORT_ALL if match_slash else _WM_ABORT_TO_STARSTAR
+                    matched = _dowild(pattern, classes, p, text, t, pathname)
+                    if matched != _WM_NOMATCH:
+                        if not match_slash or matched != _WM_ABORT_TO_STARSTAR:
+                            return matched
+                    elif not match_slash and t_ch == 0x2F:
+                        return _WM_ABORT_TO_STARSTAR
+                    t += 1
+                    t_ch = text[t] if t < end else 0
+                return _WM_ABORT_ALL
+        elif t_ch != p_ch:
+            return _WM_NOMATCH
+        p += 1
+        t += 1
+    return _WM_NOMATCH if t < end else _WM_MATCH

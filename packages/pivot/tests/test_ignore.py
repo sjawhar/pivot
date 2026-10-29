@@ -737,6 +737,22 @@ def test_member_ignored_checks_every_directory_above(
         pytest.param("*.txt  \n", ["a.txt  "], ["a.txt"], id="trailing-spaces-trimmed"),
         pytest.param("*.txt\\ \n", ["a.txt"], ["a.txt "], id="escaped-trailing-space"),
         pytest.param("\\!x\n", ["x"], ["!x"], id="escaped-bang"),
+        pytest.param(
+            "*.txt\n!data/raw/src/docs**\n",
+            [
+                "data/raw/src/docs/notes.txt",
+                "data/raw/src/docs/sub/deep.txt",
+                "data/raw/src/docsx.txt",
+            ],
+            ["data/raw/src/other.txt", "data/raw/src/sub/docs.txt"],
+            id="starstar-after-a-literal-prefix-spans-directories",
+        ),
+        pytest.param(
+            "foo**/bar\n",
+            ["x/foo/bar", "foo/baz"],
+            ["foo/bar", "foo/x/bar", "foox/bar"],
+            id="starstar-slash-after-a-literal-prefix",
+        ),
     ],
 )
 def test_patterns_decide_as_git_decides(
@@ -801,3 +817,75 @@ def test_a_pivotignore_that_is_not_utf8_is_read_as_bytes(
         ".pivotignore:2",
     ), "check-ignore shows the line with its odd bytes escaped"
     assert caplog.records == []
+
+
+def test_patterns_a_regex_would_backtrack_on_match_quickly(tmp_path: pathlib.Path) -> None:
+    """git's wildmatch gives up as soon as a "*" cannot match by taking the rest of the text
+    (WM_ABORT_ALL), so no pattern tries every way of splitting a path. A regular expression for
+    the same patterns does: eight "**/" on a path 30 levels deep took 12.8 s that way, and
+    `*-*-*-*-*-*.bak` on 200 names of 60 hyphen-separated parts 38 s (git: 44 and 5 ms)."""
+    (tmp_path / ".pivotignore").write_text("a/**/**/**/**/**/**/**/**/z\n*-*-*-*-*-*.bak\n")
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+    member_filter = filter_instance.member_filter(".")
+    assert member_filter is not None
+    deep = "/".join(["a", *["d"] * 28, "y"])
+    names = ["-".join(f"p{part}" for part in range(60)) + suffix for suffix in (".txt", "")]
+
+    started = time.perf_counter()
+    deep_ignored = ignore.member_ignored(member_filter, deep, is_dir=False)
+    names_ignored = [member_filter(name, False) for name in names * 100]
+    elapsed = time.perf_counter() - started
+
+    assert not deep_ignored
+    assert not any(names_ignored)
+    assert member_filter("/".join(["a", *["d"] * 28, "z"]), False), "the pattern still matches"
+    assert member_filter("p0-p1-p2-p3-p4-p5.bak", False)
+    assert elapsed < 1.0, f"{elapsed:.2f} s for 1 deep path and 200 long names"
+
+
+def test_a_nul_byte_ends_a_line_as_in_git(tmp_path: pathlib.Path) -> None:
+    """git reads each line as a C string, so a NUL ends it: `!a.log<NUL>junk` is `!a.log`."""
+    (tmp_path / ".pivotignore").write_bytes(b"*.log\n!a.log\0junk\n")
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+
+    assert not filter_instance.is_ignored("a.log", is_dir=False)
+    assert filter_instance.is_ignored("b.log", is_dir=False)
+
+
+def test_check_ignore_never_ignores_the_project_root(tmp_path: pathlib.Path) -> None:
+    """git matches no pattern against the root of the work tree, so `.*` does not ignore `.`."""
+    (tmp_path / ".pivotignore").write_text(".*\n")
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+
+    assert not filter_instance.check_ignore(".").ignored
+    assert not filter_instance.check_ignore(tmp_path).ignored
+    assert filter_instance.check_ignore(".hidden").ignored
+
+
+def test_check_ignore_tests_a_symlink_to_a_directory_as_a_file(tmp_path: pathlib.Path) -> None:
+    """git, and the hash walk, take a symlink as what it is, not as what it points to: `cache/`
+    names a directory, so a link named `cache` is not ignored, whatever it links to."""
+    (tmp_path / ".pivotignore").write_text("cache/\n")
+    (tmp_path / "real").mkdir()
+    (tmp_path / "cache").symlink_to(tmp_path / "real", target_is_directory=True)
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "cache").mkdir()
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+
+    assert not filter_instance.check_ignore("cache").ignored
+    assert filter_instance.check_ignore("sub/cache").ignored
+    assert "cache" in _helper_git_kept(tmp_path / "home", tmp_path, "cache/\n"), "git keeps it"
+
+
+def test_check_ignore_takes_a_relative_path_from_the_project_root(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unlike `git check-ignore`, a relative path is taken from the project root, not from the
+    working directory, for matching and for whether it is a directory."""
+    (tmp_path / ".pivotignore").write_text("/data/raw/src/\n")
+    (tmp_path / "data" / "raw" / "src").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path / "data")
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+
+    assert filter_instance.check_ignore("data/raw/src").ignored
+    assert not filter_instance.check_ignore("raw/src").ignored
