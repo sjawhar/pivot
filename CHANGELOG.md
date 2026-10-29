@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.6.2 (2026-10-29)
+
+### Bug Fixes
+
+- **storage**: Keep a user file that lands in an output while pivot replaces it
+  ([#538](https://github.com/sjawhar/pivot/pull/538),
+  [`435707a`](https://github.com/sjawhar/pivot/commit/435707af3f52d498752142c17c15c3ae0b511def))
+
+
 ## v0.6.1 (2026-10-29)
 
 ### Performance Improvements
