@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import os
 import pathlib
+import statistics
 import time
 from typing import TYPE_CHECKING
 
@@ -219,39 +220,75 @@ def test_hash_directory_skips_hash_caching_for_a_path_too_long_for_the_state_db(
     assert result == expected
 
 
-def _helper_floor_seconds(files: list[pathlib.Path]) -> float:
-    """Reading and hashing every file, with no walk, manifest or path work: the floor."""
-    start = time.perf_counter()
-    for path in files:
-        with open(path, "rb", buffering=0) as f:
-            xxhash.xxh64(f.read()).hexdigest()
-    return time.perf_counter() - start
-
-
-def test_hash_directory_costs_little_more_than_reading_its_files(tmp_path: pathlib.Path) -> None:
-    """Warm, a directory of 2,000 small files hashes within 4 times the cost of reading and
-    hashing each file. The direct loop cannot build the canonical listing, scandir or StateDB
-    keys; the threshold holds under an 8-worker suite on a loaded shared VM without flaking."""
-    root = tmp_path / "many"
+def _helper_write_files(root: pathlib.Path, size: int) -> list[pathlib.Path]:
+    """2,000 files of ``size`` bytes in 20 directories, under the same names in every root."""
     files = list[pathlib.Path]()
     for index in range(2_000):
         path = root / f"d{index // 100:02d}" / f"f{index:05d}.bin"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(index.to_bytes(4, "big") * 256)
+        path.write_bytes(index.to_bytes(4, "big") * (size // 4))
         files.append(path)
+    return files
+
+
+def _helper_floor_cpu_ns(files: list[pathlib.Path]) -> int:
+    """CPU time to read and hash every file, with no walk, manifest or path work: the floor."""
+    start = time.process_time_ns()
+    for path in files:
+        with open(path, "rb", buffering=0) as f:
+            xxhash.xxh64(f.read()).hexdigest()
+    return time.process_time_ns() - start
+
+
+def _helper_hash_directory_cpu_ns(root: pathlib.Path) -> int:
+    start = time.process_time_ns()
     cache.hash_directory(root)
-    _helper_floor_seconds(files)
+    return time.process_time_ns() - start
 
-    floor = min(_helper_floor_seconds(files) for _ in range(3))
-    elapsed = list[float]()
-    for _ in range(3):
-        start = time.perf_counter()
+
+def test_hash_directory_costs_little_more_than_reading_its_files(tmp_path: pathlib.Path) -> None:
+    """Warm, a directory of 2,000 small files hashes within 4 times the CPU cost of reading and
+    hashing each file, and reads the bytes of each file once.
+
+    The direct loop does no walk, stat or canonical listing. How much more hash_directory costs
+    varies with the CPU and with coverage tracing (1.3 to 2.6 times), so reading every file twice
+    (2.2 to 3.7 times) needs its own check: two trees with the same names, of 1 KiB and 64 KiB
+    files, cancel the per-file work. 63 KiB more in each file costs hash_directory 1.0 to 1.25
+    times what it costs the loop, and 1.55 to 1.85 times when it reads every file twice.
+
+    The test counts this process's CPU time, so time that other processes take from it on a busy
+    runner is left out. It compares the four measurements within each of 10 interleaved rounds
+    and takes the median round: in CPU time a round runs up to 1.8 times faster while the other
+    hyperthread of its core is idle, and the minimum of each measurement would mix fast and slow
+    rounds."""
+    small_root = tmp_path / "small"
+    large_root = tmp_path / "large"
+    small = _helper_write_files(small_root, 1024)
+    large = _helper_write_files(large_root, 64 * 1024)
+    for root, files in ((small_root, small), (large_root, large)):
         cache.hash_directory(root)
-        elapsed.append(time.perf_counter() - start)
+        _helper_floor_cpu_ns(files)
 
-    assert min(elapsed) < 4 * floor, (
-        f"hash_directory took {min(elapsed):.4f}s for 2,000 files against {floor:.4f}s to read "
-        + "and hash them"
+    ratios = list[float]()
+    slopes = list[float]()
+    for _ in range(10):
+        floor_small = _helper_floor_cpu_ns(small)
+        cost_small = _helper_hash_directory_cpu_ns(small_root)
+        floor_large = _helper_floor_cpu_ns(large)
+        cost_large = _helper_hash_directory_cpu_ns(large_root)
+        ratios.append(cost_small / floor_small)
+        slopes.append((cost_large - cost_small) / (floor_large - floor_small))
+
+    ratio, slope = statistics.median(ratios), statistics.median(slopes)
+    assert ratio < 4, (
+        f"hash_directory of 2,000 files took {ratio:.2f} times the CPU of reading and hashing "
+        + f"them (median; by round: {', '.join(f'{value:.2f}' for value in ratios)})"
+    )
+    assert slope < 1.4, (
+        f"63 KiB more in each of 2,000 files took hash_directory {slope:.2f} times the extra CPU "
+        + "of reading and hashing them (median; by round: "
+        + f"{', '.join(f'{value:.2f}' for value in slopes)}): it does more work per byte than one "
+        + "read and hash (reading every file twice gives about 1.6 times)"
     )
 
 
