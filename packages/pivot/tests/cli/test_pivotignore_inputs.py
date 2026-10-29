@@ -6,6 +6,7 @@ directory input) and what it never touches (outputs, tracked data, the cache).""
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import uuid
 from typing import TYPE_CHECKING, Protocol, cast
@@ -215,11 +216,26 @@ def test_bytecode_in_an_input_directory_changes_neither_its_listing_nor_its_lock
     assert "__pycache__" not in input_listing.read_text()
 
 
-def test_pull_fetches_every_file_of_a_tracked_directory_input(
-    tmp_path: pathlib.Path, moto_services: dict[str, str]
-) -> None:
-    """A stage's lock leaves out what .pivotignore names, but a tracked directory restores
-    whole, so `pivot pull <stage>` fetches every file of its .pvt, the ignored ones too."""
+def _helper_tracked_input_project(
+    tmp_path: pathlib.Path,
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    """A project whose stage reads the tracked directory ``data/raw/server``, which holds a .pyc
+    that .pivotignore names, run once. Returns its home, root and tracked directory."""
+    home, root = _project(tmp_path, _INPUT_PIPELINE.replace("tasks/server", "data/raw/server"))
+    tracked = root / "data" / "raw" / "server"
+    (tracked / "__pycache__").mkdir(parents=True)
+    (tracked / "grade.py").write_text("print('grade')\n")
+    (tracked / "__pycache__" / "grade.cpython-312.pyc").write_bytes(b"\x00bytecode")
+    _ok(helpers.run_pivot(root, home, "track", "data/raw/server"))
+    assert _ran(root, home) == {"p/lane": "ran"}
+    return home, root, tracked
+
+
+def _helper_s3_remote(
+    root: pathlib.Path, home: pathlib.Path, moto_services: dict[str, str]
+) -> dict[str, str]:
+    """Make an empty bucket on the moto server, configure it as the project's remote, and
+    return the environment that points pivot at the server."""
     bucket = f"pivotignore-{uuid.uuid4().hex[:8]}"
     s3 = cast(
         "_S3Client",
@@ -232,20 +248,22 @@ def test_pull_fetches_every_file_of_a_tracked_directory_input(
         ),
     )
     s3.create_bucket(Bucket=bucket)
-    env = {
+    _ok(helpers.run_pivot(root, home, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
+    return {
         "AWS_ENDPOINT_URL": moto_services["s3"],
         "AWS_ACCESS_KEY_ID": "x",
         "AWS_SECRET_ACCESS_KEY": "x",
         "AWS_DEFAULT_REGION": "us-east-1",
     }
-    home, root = _project(tmp_path, _INPUT_PIPELINE.replace("tasks/server", "data/raw/server"))
-    tracked = root / "data" / "raw" / "server"
-    (tracked / "__pycache__").mkdir(parents=True)
-    (tracked / "grade.py").write_text("print('grade')\n")
-    (tracked / "__pycache__" / "grade.cpython-312.pyc").write_bytes(b"\x00bytecode")
-    _ok(helpers.run_pivot(root, home, "track", "data/raw/server"))
-    _ok(helpers.run_pivot(root, home, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
-    assert _ran(root, home) == {"p/lane": "ran"}
+
+
+def test_pull_fetches_every_file_of_a_tracked_directory_input(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """A stage's lock leaves out what .pivotignore names, but a tracked directory restores
+    whole, so `pivot pull <stage>` fetches every file of its .pvt, the ignored ones too."""
+    home, root, tracked = _helper_tracked_input_project(tmp_path)
+    env = _helper_s3_remote(root, home, moto_services)
     _ok(helpers.run_pivot(root, home, "push", extra_env=env))
 
     shutil.rmtree(root / ".pivot" / "cache")
@@ -255,6 +273,68 @@ def test_pull_fetches_every_file_of_a_tracked_directory_input(
 
     assert (tracked / "__pycache__" / "grade.cpython-312.pyc").read_bytes() == b"\x00bytecode"
     assert (tracked / "grade.py").read_text() == "print('grade')\n"
+
+
+def test_verify_allow_missing_passes_after_targeted_pushes_of_a_tracked_input(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """`verify --allow-missing` asks the remote for what restores a tracked input, its .pvt's
+    listing and files, which `push <path>` sends. It never asks for the listing of the lock's
+    filtered hash: only the machine that ran the stage holds that, and it is derived from the
+    whole listing wherever it is needed."""
+    home, root, tracked = _helper_tracked_input_project(tmp_path)
+    env = _helper_s3_remote(root, home, moto_services)
+    _ok(helpers.run_pivot(root, home, "push", "data/raw/server", extra_env=env))
+    _ok(helpers.run_pivot(root, home, "push", "p/lane", extra_env=env))
+
+    shutil.rmtree(root / ".pivot" / "cache")
+    shutil.rmtree(tracked)
+    result = helpers.run_pivot(root, home, "verify", "--allow-missing", extra_env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_a_changed_tracked_input_whose_listing_cannot_be_read_would_run(
+    tmp_path: pathlib.Path, damage: str
+) -> None:
+    """`--allow-missing` takes a missing tracked input's hash from its .pvt. When the
+    `.pvt.listing` is missing or corrupt the filtered hash cannot be derived, so the .pvt's
+    whole hash stands, as 0.6.0 compares it: a changed input would run, never read unchanged."""
+    home, root, tracked = _helper_tracked_input_project(tmp_path)
+    (tracked / "grade.py").write_text("print('graded')\n")
+    _ok(helpers.run_pivot(root, home, "track", "--force", "data/raw/server"))
+    listing_file = root / "data" / "raw" / "server.pvt.listing"
+    if damage == "missing":
+        listing_file.unlink()
+    else:
+        listing_file.write_text("not a listing\n")
+    shutil.rmtree(root / ".pivot" / "cache")
+    shutil.rmtree(tracked)
+
+    result = helpers.run_pivot(root, home, "repro", "--dry-run", "--allow-missing", "--json")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    plan = json.loads(result.stdout[result.stdout.index("{") :])
+    assert plan["stages"]["p/lane"]["would_run"] is True, plan
+    assert "Input dependencies changed" in plan["stages"]["p/lane"]["reason"], plan
+
+
+def test_a_pivotignore_that_is_not_utf8_fails_no_command(tmp_path: pathlib.Path) -> None:
+    """git reads .gitignore as bytes, and so Pivot reads .pivotignore: an undecodable line
+    matches the same bytes in a name, and status and repro run."""
+    home, root = _project(tmp_path, _INPUT_PIPELINE)
+    source = _source_dir(tmp_path, root, linked=False)
+    with (root / ".pivotignore").open("ab") as pivotignore:
+        pivotignore.write(b"\xff\xfe*.tmp\n")
+    assert _ran(root, home) == {"p/lane": "ran"}
+
+    (source / os.fsdecode(b"\xff\xfeX.tmp")).write_bytes(b"odd")
+
+    assert _statuses(root, home) == {"p/lane": "cached"}
+    assert _ran(root, home) == {"p/lane": "cached"}
+    (source / "X.tmp").write_bytes(b"counted")
+    assert _statuses(root, home) == {"p/lane": "stale"}
 
 
 def test_a_downstream_stage_depends_on_a_directory_output_whole(tmp_path: pathlib.Path) -> None:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import pathlib  # noqa: TCH003 - used at runtime by pytest fixtures (tmp_path)
+import subprocess
 import threading
 import time
 import unicodedata
@@ -226,7 +228,7 @@ def test_detects_file_creation(tmp_path: pathlib.Path) -> None:
 def test_unusual_patterns_do_not_crash(tmp_path: pathlib.Path) -> None:
     """Unusual patterns should not crash the filter."""
     pivotignore = tmp_path / ".pivotignore"
-    # pathspec is lenient and handles these patterns
+    # git never matches "[unclosed"; "***" is a "**" that matches every name
     pivotignore.write_text("*.log\n[unclosed\n***\n*.txt\n")
 
     # Should not raise
@@ -381,22 +383,23 @@ def test_gitignore_backslash_escapes_are_kept_in_patterns(
     assert filter_instance.is_ignored("sub/#user.txt")
 
 
-def test_normalizes_unicode_nfc(tmp_path: pathlib.Path) -> None:
-    """Should normalize Unicode to NFC form for consistent matching."""
+def test_unicode_paths_match_as_git_matches_them(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """git compares a path's bytes with the pattern's, so a decomposed path is another name
+    than a precomposed pattern; on macOS git precomposes the path first, so Pivot does too."""
     pivotignore = tmp_path / ".pivotignore"
-    # Pattern with precomposed e-acute (NFC form)
     pivotignore.write_text("café/*.log\n")
-
-    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
-
-    # Test with NFC (precomposed) - should match
     nfc_path = "café/app.log"
-    assert filter_instance.is_ignored(nfc_path)
-
-    # Test with NFD (decomposed e + combining acute) - should also match after normalization
-    nfd_path = unicodedata.normalize("NFD", "café/app.log")
+    nfd_path = unicodedata.normalize("NFD", nfc_path)
     assert nfc_path != nfd_path, "Test setup: paths should be different encodings"
-    assert filter_instance.is_ignored(nfd_path)
+
+    monkeypatch.setattr(ignore, "_PRECOMPOSE", False)
+    assert ignore.IgnoreFilter(project_root=tmp_path).is_ignored(nfc_path)
+    assert not ignore.IgnoreFilter(project_root=tmp_path).is_ignored(nfd_path)
+
+    monkeypatch.setattr(ignore, "_PRECOMPOSE", True)
+    assert ignore.IgnoreFilter(project_root=tmp_path).is_ignored(nfd_path)
 
 
 def test_handles_absolute_paths(tmp_path: pathlib.Path) -> None:
@@ -654,13 +657,24 @@ def test_member_filter_never_ignores_a_protected_path(tmp_path: pathlib.Path) ->
     assert member_filter("stages.py", False)
 
 
-def test_member_filter_normalizes_a_member_name_to_nfc(tmp_path: pathlib.Path) -> None:
+def test_member_filter_compares_names_as_bytes_as_git_does(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """git compares bytes: a decomposed name is not the precomposed pattern, except on macOS,
+    where git precomposes the names it reads (core.precomposeunicode)."""
     (tmp_path / ".pivotignore").write_text("café.log\n")
+    decomposed = unicodedata.normalize("NFD", "café.log")
 
-    member_filter = ignore.IgnoreFilter(project_root=tmp_path).member_filter("inputs")
+    monkeypatch.setattr(ignore, "_PRECOMPOSE", False)
+    bytewise = ignore.IgnoreFilter(project_root=tmp_path).member_filter("inputs")
+    assert bytewise is not None
+    assert bytewise("café.log", False)
+    assert not bytewise(decomposed, False), "another byte sequence is another name"
 
-    assert member_filter is not None
-    assert member_filter(unicodedata.normalize("NFD", "café.log"), False)
+    monkeypatch.setattr(ignore, "_PRECOMPOSE", True)
+    precomposing = ignore.IgnoreFilter(project_root=tmp_path).member_filter("inputs")
+    assert precomposing is not None
+    assert precomposing(decomposed, False), "macOS git precomposes the name it reads"
 
 
 @pytest.mark.parametrize(
@@ -682,3 +696,108 @@ def test_member_ignored_checks_every_directory_above(
     assert member_filter is not None
 
     assert ignore.member_ignored(member_filter, relpath, is_dir=is_dir) is expected
+
+
+# =============================================================================
+# git's per-pattern rules (wildmatch), where a looser matcher drops a file git keeps
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("patterns", "kept", "ignored"),
+    [
+        pytest.param(
+            "logs/**\n!logs/.gitkeep\n",
+            ["logs/.gitkeep"],
+            ["logs/today.log", "logs/old/day.log"],
+            id="dir-starstar-with-negation",
+        ),
+        pytest.param(
+            "**/foo/**\n!**/foo/keep.txt\n",
+            ["inputs/foo/keep.txt", "inputs/a/foo/keep.txt"],
+            ["inputs/foo/other.txt"],
+            id="leading-and-trailing-starstar",
+        ),
+        pytest.param(
+            "/inputs/foo/**\n!/inputs/foo/keep.txt\n",
+            ["inputs/foo/keep.txt"],
+            ["inputs/foo/x/keep.txt", "inputs/foo/other.txt"],
+            id="anchored-starstar",
+        ),
+        pytest.param(
+            "a/**/b\n", ["x/a/b", "a/c"], ["a/b", "a/x/b", "a/x/y/b"], id="middle-starstar"
+        ),
+        pytest.param("a**b\n", ["a/b", "a/x/b"], ["ab", "axb", "d/axxb"], id="starstar-as-star"),
+        pytest.param("***\n", [], ["anything", "deep/er/file"], id="star-run-matches-all"),
+        pytest.param("sub/\n!sub/\n", ["sub/a.txt"], [], id="negated-dir-pattern"),
+        pytest.param("[!a]*.bin\n", ["a.bin"], ["c.bin", "d/b.bin"], id="negated-class"),
+        pytest.param("[]x].txt\n", ["y.txt"], ["].txt", "x.txt"], id="bracket-first-member"),
+        pytest.param("[[:digit:]]*\n", ["a1"], ["1a", "d/9"], id="named-class"),
+        pytest.param("[z-a]\n", ["a"], ["z"], id="reversed-range-keeps-its-first-byte"),
+        pytest.param("*.txt  \n", ["a.txt  "], ["a.txt"], id="trailing-spaces-trimmed"),
+        pytest.param("*.txt\\ \n", ["a.txt"], ["a.txt "], id="escaped-trailing-space"),
+        pytest.param("\\!x\n", ["x"], ["!x"], id="escaped-bang"),
+    ],
+)
+def test_patterns_decide_as_git_decides(
+    tmp_path: pathlib.Path, patterns: str, kept: list[str], ignored: list[str]
+) -> None:
+    """Each case is git's own answer, checked here with ``git ls-files``: ``X/**`` names what
+    is inside X, never X itself, so a later negation brings a file inside it back."""
+    project = tmp_path / "project"
+    for relpath in [*kept, *ignored]:
+        (project / relpath).parent.mkdir(parents=True, exist_ok=True)
+        (project / relpath).write_text("x\n")
+    (project / ".pivotignore").write_text(patterns)
+    filter_instance = ignore.IgnoreFilter(project_root=project)
+
+    assert _helper_git_kept(tmp_path, project, patterns) == set(kept), "the case is git's"
+    assert [path for path in kept if filter_instance.is_ignored(path, is_dir=False)] == []
+    assert [path for path in ignored if not filter_instance.is_ignored(path, is_dir=False)] == []
+
+
+def _helper_git_kept(home: pathlib.Path, project: pathlib.Path, patterns: str) -> set[str]:
+    """The files under ``project`` that git keeps with ``patterns`` as its root .gitignore: no
+    global or system git configuration is read."""
+    (project / ".gitignore").write_text(patterns + "/.gitignore\n/.pivotignore\n")
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home),
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=project, env=env, check=True)
+    listed = subprocess.run(
+        ["git", "ls-files", "-o", "--exclude-standard", "-z"],
+        cwd=project,
+        env=env,
+        check=True,
+        capture_output=True,
+    ).stdout
+    return {os.fsdecode(path) for path in listed.split(b"\0") if path}
+
+
+def test_a_pivotignore_that_is_not_utf8_is_read_as_bytes(
+    tmp_path: pathlib.Path, caplog: LogCaptureFixture
+) -> None:
+    """git reads the file as bytes, so does Pivot: no byte makes it fail, and a byte that is not
+    UTF-8 matches the same byte in a name."""
+    (tmp_path / ".pivotignore").write_bytes(b"*.pyc\n\xff\xfe*.tmp\n")
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+    odd_name = os.fsdecode(b"\xff\xfeX.tmp")
+
+    with caplog.at_level("WARNING", logger="pivot.ignore"):
+        member_filter = filter_instance.member_filter("inputs")
+        result = filter_instance.check_ignore(f"inputs/{odd_name}")
+
+    assert member_filter is not None
+    assert member_filter("x.pyc", False)
+    assert member_filter(odd_name, False), "the undecodable bytes match themselves"
+    assert not member_filter("X.tmp", False)
+    assert (result.ignored, result.pattern, result.source) == (
+        True,
+        "\\xff\\xfe*.tmp",
+        ".pivotignore:2",
+    ), "check-ignore shows the line with its odd bytes escaped"
+    assert caplog.records == []

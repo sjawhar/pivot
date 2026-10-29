@@ -99,6 +99,44 @@ def _tracked_listing_failures(files_dir: pathlib.Path) -> list[StageVerifyInfo]:
     return failures
 
 
+def _tracked_input_objects(
+    input_path: str, tracked: dict[str, track.PvtData], files_dir: pathlib.Path
+) -> dict[str, str]:
+    """The cache objects that restore the tracked data holding the pipeline input at
+    ``input_path`` (project-relative), by workspace path: every tracked file or directory at,
+    under or above it, a directory's listing object and each file it lists.
+
+    These are what pull fetches for the input (``sync.get_target_hashes``) and what checkout
+    restores it from. The lock's dependency hash of a directory input leaves out what
+    ``.pivotignore`` names, and its listing object is written only to the cache of the machine
+    that ran the stage; it is derived from the whole listing wherever it is needed
+    (``WorkspaceStore.recorded_input_hash``), so it is never required from a remote. Imports
+    are left out, as pull leaves them out. Raises CorruptListingError for a ``.pvt.listing``
+    that cannot be used.
+    """
+    target = pathlib.PurePosixPath(input_path)
+    objects = dict[str, str]()
+    for data_path, pvt_data in tracked.items():
+        if track.is_import(pvt_data):
+            continue
+        relpath = pathlib.PurePosixPath(project.to_relative_path(data_path))
+        if not (relpath.is_relative_to(target) or target.is_relative_to(relpath)):
+            continue
+        record = track.pvt_to_hash_info(pvt_data)
+        objects[str(relpath)] = record["hash"]
+        if not is_dir_hash(record):
+            continue
+        try:
+            members = track.tracked_members(
+                pathlib.Path(data_path), pvt_data, files_dir, strict=True
+            )
+        except exceptions.ListingMissingError:
+            continue
+        for entry in members["files"]:
+            objects[str(relpath / entry["relpath"])] = entry["hash"]
+    return objects
+
+
 def _get_stage_lock_hashes(
     stage_name: str,
 ) -> tuple[dict[str, str], dict[str, str]]:
@@ -106,10 +144,12 @@ def _get_stage_lock_hashes(
 
     Returns (output_hashes, dep_hashes) where each is {path: hash}.
 
-    For both outputs and deps, a directory contributes its listing object and its files; a
-    tracked directory a dep names has its ``.pvt.listing`` checked too. Non-cached outputs
-    (e.g. Metric with cache=False) are excluded — they are git-tracked, not in cache. Raises
-    CorruptListingError, naming the file, for a listing that cannot be used.
+    For both outputs and deps, a directory contributes its listing object and its files. A
+    directory input held by tracked data contributes what restores that data instead
+    (``_tracked_input_objects``); another directory input has its tracked ``.pvt.listing``
+    checked too. Non-cached outputs (e.g. Metric with cache=False) are excluded — they are
+    git-tracked, not in cache. Raises CorruptListingError, naming the file, for a listing that
+    cannot be used.
     """
     stage_info = cli_helpers.get_stage(stage_name)
     default_state_dir = config.locate_state_dir()
@@ -153,6 +193,7 @@ def _get_stage_lock_hashes(
     dep_refs = {ref.identity: ref for ref in stage_info["deps"].values()}
     producer_locks = dict[str, LockData | None]()
     dep_hashes = dict[str, str]()
+    tracked: dict[str, track.PvtData] | None = None
     for identity, hash_info in lock_data["dep_hashes"].items():
         ref = dep_refs.get(identity)
         if workspace_store is None or ref is None:
@@ -174,6 +215,15 @@ def _get_stage_lock_hashes(
                     committed = lock.committed_listing(producer_lock, committed)
         else:
             dep_path = workspace_store.checkout(ref)
+            if is_dir_hash(hash_info):
+                if tracked is None:
+                    tracked = track.discover_pvt_files(project.get_project_root())
+                restore_objects = _tracked_input_objects(
+                    project.to_relative_path(dep_path), tracked, files_dir
+                )
+                if restore_objects:
+                    dep_hashes.update(restore_objects)
+                    continue
             committed = lock.committed_listing(
                 lock_data,
                 listing.input_listing_path(

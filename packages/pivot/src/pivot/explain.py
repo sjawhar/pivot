@@ -6,6 +6,7 @@ showing specific code, param, and dependency changes.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import pathlib
 from typing import TYPE_CHECKING
@@ -293,7 +294,12 @@ def get_stage_explanation(
                         # leaves out what .pivotignore names, as hashing the restored input
                         # would, and the filtered hash comes from the whole listing.
                         pvt_data = tracked_files[str(dep_path)]
-                        try:
+                        with contextlib.suppress(
+                            exceptions.ListingMissingError, exceptions.CorruptListingError
+                        ):
+                            # Without a readable listing the .pvt's whole hash stands, as
+                            # 0.6.0 compares it: at worst the stage reads stale. The lock's own
+                            # hash would compare with itself and call a changed input unchanged.
                             tracked_hash = store.recorded_input_hash(
                                 ref,
                                 tracked_hash,
@@ -301,8 +307,6 @@ def get_stage_explanation(
                                     track.tracked_members, dep_path, pvt_data, store.cache_dir
                                 ),
                             )
-                        except (exceptions.ListingMissingError, exceptions.CorruptListingError):
-                            tracked_hash = None  # the lock's hash below, or a missing dep
                 fallback_hash = tracked_hash or lock_data["dep_hashes"].get(ref.identity)
                 if fallback_hash is None:
                     unresolved.append(dep_key)
