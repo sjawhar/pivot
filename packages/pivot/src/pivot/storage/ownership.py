@@ -606,13 +606,14 @@ def find_output_overlaps(
     return sorted(found.values(), key=overlap_path)
 
 
-def _display(path: pathlib.Path, project_root: pathlib.Path) -> str:
+def display_path(path: pathlib.Path, project_root: pathlib.Path) -> str:
+    """``path`` relative to ``project_root`` when it lies inside it, else as given."""
     relative = project.relative_within(path, project_root)
     return str(path if relative is None else relative)
 
 
 def _label(replacement: Replacement, project_root: pathlib.Path) -> str:
-    path = _display(replacement["path"], project_root)
+    path = display_path(replacement["path"], project_root)
     match replacement["kind"]:
         case ReplacementKind.DESTINATION:
             return f"destination '{path}'"
@@ -636,16 +637,16 @@ def _describe(overlap: OutputOverlap, project_root: pathlib.Path) -> str:
     label = _label(overlap["replacement"], project_root)
     replaced = normalized(overlap["replacement"]["path"])
     if "unreadable_dir" in overlap:
-        directory = _display(overlap["unreadable_dir"], project_root)
+        directory = display_path(overlap["unreadable_dir"], project_root)
         relation = _relation(normalized(overlap["unreadable_dir"]), replaced)
         return (
             f"directory '{directory}', which Pivot cannot read, {relation} {label}; "
             + "Pivot cannot tell whether a tracked file is inside it"
         )
-    pvt = _display(overlap["pvt_path"], project_root)
+    pvt = display_path(overlap["pvt_path"], project_root)
     tracked_path = overlap["tracked_path"]
     if tracked_path is not None:
-        tracked = _display(tracked_path, project_root)
+        tracked = display_path(tracked_path, project_root)
         relation = _relation(normalized(tracked_path), replaced)
         return f"tracked path '{tracked}' (sidecar '{pvt}') {relation} {label}"
     unreadable = f"sidecar '{pvt}', which this version of Pivot cannot read,"
@@ -654,7 +655,8 @@ def _describe(overlap: OutputOverlap, project_root: pathlib.Path) -> str:
     data_path = track.get_data_path(overlap["pvt_path"])
     if data_path == replaced:
         return f"{unreadable} may track {label} itself"
-    return f"{unreadable} may track '{_display(data_path, project_root)}', which contains {label}"
+    shown = display_path(data_path, project_root)
+    return f"{unreadable} may track '{shown}', which contains {label}"
 
 
 def refuse_output_replacements(
@@ -825,7 +827,7 @@ def find_declared_overlap(
         else:
             relation = "contains"
         text = (
-            f"it {relation} output '{_display(pathlib.Path(output), project_root)}' "
+            f"it {relation} output '{display_path(pathlib.Path(output), project_root)}' "
             + f"of stage '{declared['stage']}'"
         )
         if resolved != normalized(path) or out_resolved != pathlib.Path(output):

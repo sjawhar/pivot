@@ -306,7 +306,8 @@ def test_a_lock_is_decoded_once_per_record_and_again_when_it_changes(
 ) -> None:
     """From the root, b's `fake.pvt` lies outside every output of the loaded pipeline `a`, so a
     command that discovers the `.pvt` files reads the directory outputs b's lock records. Each
-    decode is counted through `lock.parse_committed`, the one decoder of a lock file.
+    decode is counted through `lock.parse_committed`, which decodes every lock read for other
+    stages (`StageLock.read` decodes a lock of the command's own stages on its own path).
 
     - In one state-directory record, every skip and `track`'s orphan check share what a lock
       file records: b/tree's lock is decoded once for three callers.

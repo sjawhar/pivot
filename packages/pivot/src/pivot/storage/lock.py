@@ -187,6 +187,7 @@ class _LockFile:
     identity: _LockIdentity
     _document: object | None
     _committed: CommittedLock | None
+    _output_hashes: list[str] | None
     _read: bool
 
     def __init__(self, path: pathlib.Path, identity: _LockIdentity) -> None:
@@ -194,6 +195,7 @@ class _LockFile:
         self.identity = identity
         self._document = None
         self._committed = None
+        self._output_hashes = None
         self._read = False
 
     def committed(self) -> CommittedLock | None:
@@ -209,12 +211,13 @@ class _LockFile:
             if isinstance(parsed, CommittedLock):
                 self._document = document
                 self._committed = parsed
+                self._output_hashes = sorted(out["hash"] for out in parsed.data["outs"])
         return self._committed
 
     def output_hashes(self) -> list[str] | None:
         """Return the lock's output hashes, or None when it cannot be read as a lock."""
-        committed = self.committed()
-        return None if committed is None else sorted(out["hash"] for out in committed.data["outs"])
+        _ = self.committed()
+        return self._output_hashes
 
     def valid_document(self) -> object | None:
         """Return the parsed YAML if it was a valid lock, otherwise None."""
@@ -1348,22 +1351,29 @@ class RecordedDirectory(NamedTuple):
     """A directory output a stage lock records at a path (``recorded_directories``)."""
 
     stage_name: str
-    output_hash: DirHash
+    record: DirectoryRecord
     lock_files: tuple[pathlib.Path, ...]
     """Every lock file of the stage: one per state directory of the 0.5.2 layout holding one."""
-    state_dir: pathlib.Path
-    """The state directory of the lock this was read from (its ``nocommit:`` record is there)."""
-    committed: pathlib.Path | None
-    """The listing committed beside that lock; None for an older pivot's lock (``inline``)."""
-    inline: listing.DirListing | None
+    stages_dir: pathlib.Path
+    """The stages directory of the lock the record was read from."""
+
+    @property
+    def state_dir(self) -> pathlib.Path:
+        """The state directory of that lock (its stage's ``nocommit:`` record is there)."""
+        return self.stages_dir.parent
 
     def read_listing(self, cache_dir: pathlib.Path | None) -> listing.DirListing:
-        """The directory's listing: the older lock's inline one, else ``listing.read``, which
-        passes over a committed listing that does not match without a warning (the stage is not
-        the command's)."""
-        if self.inline is not None:
-            return self.inline
-        return listing.read(self.committed, self.output_hash, cache_dir, quiet=True)
+        """The directory's listing: the older lock's inline one, else the one committed beside
+        the lock or the cache's copy, read without a word (``listing.OnStale.QUIET``): the stage
+        is not the command's."""
+        if self.record.inline is not None:
+            return self.record.inline
+        return listing.read(
+            listing.output_listing_path(self.stages_dir, self.record.identity),
+            self.record.output_hash,
+            cache_dir,
+            on_stale=listing.OnStale.QUIET,
+        )
 
 
 def recorded_directories(
@@ -1376,10 +1386,10 @@ def recorded_directories(
     This reads what runs left behind, for stages the command does not run, so it says nothing
     and never fails: the stage's current lock is chosen as ``StageLock`` chooses it, without its
     notices (``_choose_stage_lock``), and decoded as ``parse_committed`` decodes a lock, writing
-    nothing; a lock that cannot be read or decoded (unreadable, damaged, a newer pivot's)
-    records nothing here. Within one state-directory record (``state_dir.recorded_locks``) a
-    lock file is decoded again only when it changed, so a ``--watch`` run sees every lock written
-    since the last.
+    nothing; a lock that cannot be read or decoded (unreadable, damaged, a newer pivot's, a
+    scalar the safe loader cannot build) records nothing here. Within one state-directory record
+    (``state_dir.recorded_locks``) a lock file is decoded again only when it changed, so a
+    ``--watch`` run sees every lock written since the last.
     """
     other_dir = state_dir_mod.other_stages_dir_for(stages_dir)
     listed = [stage_lock_files(stages_dir)]
@@ -1392,16 +1402,7 @@ def recorded_directories(
         lock_files = tuple(files[stage_name] for files in listed if stage_name in files)
         for record in _directory_records(stage_name, choice, kept):
             found[record.path] = RecordedDirectory(
-                stage_name=stage_name,
-                output_hash=record.output_hash,
-                lock_files=lock_files,
-                state_dir=choice.stages_dir.parent,
-                committed=(
-                    None
-                    if record.inline is not None
-                    else listing.output_listing_path(choice.stages_dir, record.identity)
-                ),
-                inline=record.inline,
+                stage_name, record, lock_files, choice.stages_dir
             )
     return found
 
@@ -1420,8 +1421,8 @@ def _directory_records(
     key = os.fspath(choice.path)
     if kept is not None and key in kept and kept[key][0] == identity:
         return kept[key][1]
-    committed = (lock_file or _LockFile(choice.path, identity)).committed()
     try:
+        committed = (lock_file or _LockFile(choice.path, identity)).committed()
         records = _decoded_directories(stage_name, committed)
     except (ValueError, exceptions.PivotError) as e:
         logger.debug("Reading no recorded directory from %s: %s", choice.path, e)

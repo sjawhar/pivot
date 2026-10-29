@@ -866,12 +866,12 @@ def tracked_members(
     pvt_data: PvtData,
     cache_dir: pathlib.Path | None,
     *,
-    strict: bool = False,
+    on_stale: listing.OnStale = listing.OnStale.WARN,
 ) -> listing.DirListing:
     """A tracked directory's listing: for a .pvt an older pivot wrote, the listing it holds
     inline (a ``<path>.pvt.listing`` beside it is a stale one of this pivot's, and is named in
     a warning, not read); else its committed ``<path>.pvt.listing``, or the cache's object at
-    its hash (``listing.read``, which ``strict`` passes on). Raises ``CorruptListingError`` or
+    its hash (``listing.read``, which ``on_stale`` passes on). Raises ``CorruptListingError`` or
     ``ListingMissingError``."""
     from pivot.types import is_dir_hash
 
@@ -881,4 +881,6 @@ def tracked_members(
     parsed = _load_pvt(pvt_path)
     if isinstance(parsed, tuple) and parsed[1] is not None and parsed[0]["hash"] == record["hash"]:
         return parsed[1]
-    return listing.read(listing.tracked_listing_path(pvt_path), record, cache_dir, strict=strict)
+    return listing.read(
+        listing.tracked_listing_path(pvt_path), record, cache_dir, on_stale=on_stale
+    )

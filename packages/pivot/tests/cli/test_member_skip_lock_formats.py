@@ -1,16 +1,17 @@
-"""PR540 reviewer, round 6 (sjawhar/pivot#540 at ca47c682).
+"""Other stages' locks in any format, and lock entries no `stat` can follow.
 
-- Regression lock (passes at the head, fails on main 33baed12, kills mutant m20, an older pivot's
-  lock recording no directory output): pivot 0.5.21 (lock schema 2, every lock before 0.6.0, with
-  each directory listed inline) runs pipeline `b`, whose directory output holds a member. From
-  the root, where only `a` is loaded, this pivot skips that member by the inline listing.
-- Red (passes on main, fails at the head): a `*.lock` entry under the stages directory that is a
-  symlink no `stat` can follow (here one that loops) is no lock. Main's walker (`Path.is_file`)
-  reads it as none; the head's (`DirEntry.is_file`) raises, failing every command that lists
-  other stages' locks, and plain `pivot status` (its orphaned-lock count) even with no `.pvt`.
+- Pivot 0.5.21 (lock schema 2, every lock before 0.6.0, with each directory listed inline) runs
+  pipeline `b`, whose directory output holds a member. From the root, where only `a` is loaded,
+  this pivot skips that member by the inline listing (kills m20, an older pivot's lock recording
+  no directory output).
+- A `*.lock` entry under the stages directory that is a symlink no `stat` can follow (here one
+  that loops) is no lock, as `Path.is_file` reads it: every command that lists other stages'
+  locks, and plain `pivot status` (its orphaned-lock count) with no `.pvt`, still exits 0.
 
-The released pivot runs with `uv tool run` (``PIVOT_TEST_UV``, as tests/cli/test_mixed_version_teams.py
-does), without ``PYTHONPATH``; this pivot keeps ``PYTHONPATH``, so a mutant run reaches it.
+The tests are the review's of sjawhar/pivot#540 at ca47c682, unchanged but for line wrapping.
+The released pivot runs with `uv tool run` (``PIVOT_TEST_UV``, as
+tests/cli/test_mixed_version_teams.py does), without ``PYTHONPATH``; this pivot keeps
+``PYTHONPATH``, so a mutant run reaches it.
 """
 
 from __future__ import annotations

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shlex
 from typing import TYPE_CHECKING, TypedDict
 
 import click
@@ -26,24 +27,20 @@ class TrackResult(TypedDict):
 def _orphan_refusal(path_str: str, orphan: member_skip.OrphanedMember) -> str:
     """Why ``track`` refuses a path whose sidecar a deleted stage's lock records."""
     project_root = project.get_project_root()
-
-    def shown(path: pathlib.Path) -> str:
-        relative = project.relative_within(path, project_root)
-        return str(path if relative is None else relative)
-
-    locks = [f"'{shown(found)}'" for found in orphan.lock_files]
+    locks = [f"'{ownership.display_path(found, project_root)}'" for found in orphan.lock_files]
     if len(locks) == 1:
         recorded = f"the lock {locks[0]} records"
         remedy = "remove that lock"
     else:
         recorded = f"the locks {' and '.join(locks)} record"
         remedy = "remove those locks"
+    sidecar = ownership.display_path(orphan.sidecar, project_root)
     return (
-        f"Cannot track '{path_str}': {recorded} '{shown(orphan.sidecar)}' as a file of stage "
+        f"Cannot track '{path_str}': {recorded} '{sidecar}' as a file of stage "
         + f"'{orphan.stage_name}', a stage that no longer exists in any pipeline. Pivot reads "
         + "that stage's files there as its own, not as tracked files. If the stage is gone for "
-        + f"good, {remedy}, then run `pivot track --force {path_str}`, which tracks the file "
-        + "whatever its .pvt then says."
+        + f"good, {remedy}, then run `pivot track --force {shlex.quote(path_str)}`, which tracks "
+        + "the file whatever its .pvt then says."
     )
 
 

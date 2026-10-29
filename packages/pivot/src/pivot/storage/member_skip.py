@@ -57,7 +57,7 @@ def _recorded(
         return ownership.LockedOutput(
             recorded.stage_name,
             recorded.state_dir,
-            recorded.output_hash,
+            recorded.record.output_hash,
             functools.partial(recorded.read_listing, cache_dir),
         )
 
@@ -134,17 +134,20 @@ def orphaned_member(
     ``own_member_skip`` skips such a stage's members by its lock, so a sidecar ``track`` wrote at
     a listed path could carry the bytes the lock records and then be one no command reads: the
     listed path decides, whatever is there now. The sidecar is spelled as the ``.pvt`` walk
-    reaches it: where it really lies, below the project root, so a path typed through a symlink
-    is caught, and an output reached only through a symlinked parent is not one the walk (or the
-    skip) would read it in. Any other path in that output tracks as before. The locks are read
-    at the first path asked about.
+    reaches it: its directory where it really lies, below the project root, so a path typed
+    through a symlinked directory is caught, and an output reached only through a symlinked
+    parent is not one the walk (or the skip) would read it in. The sidecar itself is not
+    resolved, as the walk does not resolve it: a member that is a symlink to its cache object (a
+    checkout across filesystems) is still that member. Any other path in that output tracks as
+    before. The locks are read at the first path asked about.
     """
     recorded = functools.cache(
         functools.partial(_recorded, project_root, default_state_dir, cache_dir, declared)
     )
 
     def claim(path: pathlib.Path) -> OrphanedMember | None:
-        real = track.get_pvt_path(path).resolve()
+        pvt = track.get_pvt_path(path)
+        real = pvt.parent.resolve() / pvt.name
         real_root = project_root.resolve()
         if not real.is_relative_to(real_root):
             return None

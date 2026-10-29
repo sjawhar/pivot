@@ -57,7 +57,7 @@ def _object_hashes(
     if not is_dir_hash(hash_info):
         return result
     try:
-        members = listing.read(committed, hash_info, files_dir, strict=True)
+        members = listing.read(committed, hash_info, files_dir, on_stale=listing.OnStale.REFUSE)
     except exceptions.ListingMissingError:
         return result
     for entry in members["files"]:
@@ -73,7 +73,7 @@ def _check_tracked_listing(
     if pvt_data is None or "nfiles" not in pvt_data:
         return
     try:
-        track.tracked_members(data_path, pvt_data, files_dir, strict=True)
+        track.tracked_members(data_path, pvt_data, files_dir, on_stale=listing.OnStale.REFUSE)
     except exceptions.ListingMissingError:
         return
 
