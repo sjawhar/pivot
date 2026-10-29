@@ -171,6 +171,26 @@ mtime, such as a tool that restores the original mtime. Pivot detects the
 file after its metadata changes. Run `pivot repro --force <stage>` to rewrite
 the stage's output.
 
+The StateDB entry is keyed by the file's path. A copy of a project made outside
+Pivot holds the original's `<state dir>/state.lmdb`, whose entries name the original's
+paths: a copy that hard-links Pivot's read-only outputs and copies the database,
+or `cp -al`, which hard-links the database too, so the two share it. Pivot also
+finds an entry by the file's device and inode: a hard-linked output reuses the
+original's entry, after Pivot checks that the original path still names the same
+file, so `pivot status` in such a copy reads no output. It does so only on a filesystem that gives
+each live file its own inode number on its device: ext2, ext3, ext4, XFS, Btrfs, F2FS and ZFS,
+or tmpfs only when mountinfo says `inode64`. On any other filesystem (FUSE mounts such as mergerfs
+or sshfs, NFS, overlayfs, tmpfs without `inode64`), and on systems without
+`/proc/self/mountinfo` such as macOS, a copy's outputs are read once instead. A copied output is a
+new file and is read once: `pivot status` saves the hashes it computed, so the next `pivot status`
+reads none of them. Every command that hashes a dependency or an output saves its hash the same
+way, also those that write no lock file: `pivot repro --no-commit`, `--dry-run` and `--explain`,
+`pivot verify`, `pivot diff` and `pivot plots diff`. The tracked-file pass of `pivot status`, and
+commands that materialize or track files (`pivot checkout`, `get`, `import`, `update`, `track` and
+restore), may create `state.lmdb` when they have hashes to save. The read-only comparison passes
+of explanations, diff and plots diff never create it. A save is skipped, never an error, when the
+database cannot be written or another Pivot command holds its write lock for more than 2 seconds.
+
 ## Checkout Modes
 
 When restoring outputs from cache, Pivot supports three strategies,

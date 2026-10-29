@@ -36,6 +36,7 @@ Use a single LMDB database with key prefixes to namespace different data types:
 ```python
 # Key prefixes for different entry types
 _HASH_PREFIX = b"hash:"      # File hash entries
+_INODE_PREFIX = b"inode:"    # (st_dev, st_ino) -> hash key hint
 _GEN_PREFIX = b"gen:"        # Output generation counters
 _DEP_PREFIX = b"dep:"        # Stage dependency generations
 _REMOTE_PREFIX = b"remote:"  # Remote index entries
@@ -50,12 +51,24 @@ Each data type gets methods that use the appropriate prefix:
 def _make_key_file_hash(path: pathlib.Path) -> bytes:
     return _HASH_PREFIX + os.fsencode(os.path.abspath(path))
 
+
+def _make_key_file_identity(dev: int, inode: int) -> bytes:
+    return _INODE_PREFIX + struct.pack(">QQ", dev, inode)
+
 def _make_key_output_generation(identity: str) -> bytes:
     return _GEN_PREFIX + identity.encode()
+
 
 def _make_key_dep_generation(stage_name: str, dep_path: str) -> bytes:
     return _DEP_PREFIX + f"{stage_name}:{dep_path}".encode()
 ```
+
+Every `hash:` write updates its `inode:` hint in the same transaction. A path lookup that misses
+may follow the hint only when shared `storage.mounts` says the device keeps live identities
+unique (tmpfs needs `inode64`); it serves the other path's entry only after the entry matches the
+file's stat and that path still names the same device and inode with the same change time. The
+hint therefore saves a hard-linked replica from reading its outputs without making a stale path
+entry authoritative.
 
 Atomic multi-type updates happen in a single transaction:
 

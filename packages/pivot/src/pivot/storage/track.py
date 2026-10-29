@@ -5,7 +5,6 @@ import functools
 import logging
 import os
 import pathlib
-import re
 import shlex
 import stat
 import struct
@@ -15,7 +14,7 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, TypeGuard,
 import yaml
 
 from pivot import config, exceptions, project
-from pivot.storage import cache, listing
+from pivot.storage import cache, listing, mounts
 
 logger = logging.getLogger(__name__)
 
@@ -413,13 +412,10 @@ def restore_target(
 # is not descended, as in os.walk, and a walk that can read its type must not reuse that.
 _MEMO_SETTLE_NS = 2_000_000_000
 _NS_PER_S = 1_000_000_000
-_MEMO_FS_TYPES = frozenset({b"ext2", b"ext3", b"ext4", b"xfs", b"btrfs", b"tmpfs", b"f2fs", b"zfs"})
 _MEMO_ERRORS = (exceptions.PivotError, OSError, ValueError)  # ValueError: a NUL in core.state_dir
 _MEMO_RECORD = struct.Struct(">II")  # a memo file record's key and value sizes
 _MEMO_COUNT = struct.Struct(">I")  # the root record's value: how many listings follow it
 _MEMO_OPEN = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC  # no symlink followed, no FIFO waited on
-_MOUNTINFO = pathlib.Path("/proc/self/mountinfo")
-_MOUNTINFO_ESCAPE = re.compile(rb"\\([0-7]{3})")
 _LISTING_VERSION = b"\x03"  # an earlier version is never reused; version 1 may omit a subdirectory
 _STAMP = struct.Struct(">QQqq")  # st_dev, st_ino, st_mtime_ns, st_ctime_ns
 _STAMP_TIMES = range(-(2**63), 2**63)  # the times _STAMP's signed 64-bit fields hold
@@ -441,57 +437,6 @@ def _times_trusted(dir_stat: os.stat_result, settled_before: int) -> bool:
         and mtime_ns in _STAMP_TIMES
         and ctime_ns in _STAMP_TIMES
     )
-
-
-class _Mounts(TypedDict):
-    """What ``/proc/self/mountinfo`` says about the memo's allowlist."""
-
-    allowed: frozenset[int]  # devices mounted only with an allowlisted type
-    refused: frozenset[int]  # devices mounted with any type off the allowlist
-    points: list[tuple[bytes, bytes]]  # (mount point, type), deepest first
-
-
-def _read_mounts() -> _Mounts:
-    """Read the mounts; without the file (not Linux) no device is allowed."""
-    try:
-        lines = _MOUNTINFO.read_bytes().splitlines()
-    except OSError:
-        return _Mounts(allowed=frozenset(), refused=frozenset(), points=[])
-    allowed = set[int]()
-    refused = set[int]()
-    points = list[tuple[bytes, bytes]]()
-    for line in lines:
-        # id parent major:minor root mount-point options [optional fields...] - type source ...
-        fields = line.split()
-        try:
-            fstype = fields[fields.index(b"-", 6) + 1]
-            major, minor = fields[2].split(b":")
-            device = os.makedev(int(major), int(minor))
-        except (ValueError, IndexError):
-            continue
-        (allowed if fstype in _MEMO_FS_TYPES else refused).add(device)
-        point = _MOUNTINFO_ESCAPE.sub(lambda match: bytes([int(match[1], 8)]), fields[4])
-        points.append((point, fstype))
-    points.sort(key=lambda mount: len(mount[0]), reverse=True)
-    return _Mounts(allowed=frozenset(allowed - refused), refused=frozenset(refused), points=points)
-
-
-def _device_allowed(mounts: _Mounts, device: int, real_path: str) -> bool:
-    """Whether directories on ``device`` keep their times the way the memo needs.
-
-    NFS, overlayfs, FUSE and any other type are refused. A device the file does not list is a
-    btrfs subvolume, which reports a device of its own: it is allowed when the deepest mount
-    holding ``real_path`` is btrfs, and refused otherwise.
-    """
-    if device in mounts["allowed"]:
-        return True
-    if device in mounts["refused"]:
-        return False
-    path = os.fsencode(real_path)
-    for point, fstype in mounts["points"]:
-        if path == point or path.startswith(point.rstrip(b"/") + b"/"):
-            return fstype == b"btrfs"
-    return False
 
 
 def _list_directory(path: str) -> tuple[list[str], list[str], bool] | None:
@@ -542,7 +487,7 @@ def _unpack_listing(listing: bytes) -> tuple[list[str], list[str]] | None:
 
 
 def _walk(
-    root: pathlib.Path, memo: dict[str, bytes], mounts: _Mounts, *, record: bool
+    root: pathlib.Path, memo: dict[str, bytes], mount_table: mounts.Mounts, *, record: bool
 ) -> tuple[list[pathlib.Path], dict[str, bytes]]:
     """Return every .pvt candidate under root, in ``os.walk`` order, and the listings to record.
 
@@ -570,7 +515,7 @@ def _walk(
         device = dir_stat.st_dev
         if device not in allowed_devices:
             real_path = os.path.join(real_root, rel) if rel else real_root
-            allowed_devices[device] = _device_allowed(mounts, device, real_path)
+            allowed_devices[device] = mounts.device_allowed(mount_table, device, real_path)
         memoizable = allowed_devices[device] and _times_trusted(dir_stat, settled_before)
         stamp = (
             _STAMP.pack(device, dir_stat.st_ino, dir_stat.st_mtime_ns, dir_stat.st_ctime_ns)
@@ -653,16 +598,8 @@ def _memo_path() -> pathlib.Path:
     return config.locate_state_dir() / "state.lmdb" / f"pvt-memo-{os.geteuid()}"
 
 
-def _memo_device_allowed(mounts: _Mounts, device: int, directory: pathlib.Path) -> bool:
-    """``_device_allowed`` for the memo's directory, resolving its real path only when mountinfo
-    does not list the device (a btrfs subvolume)."""
-    return device in mounts["allowed"] or _device_allowed(
-        mounts, device, os.path.realpath(directory)
-    )
-
-
 def _memo_refusal(
-    memo_stat: os.stat_result, mounts: _Mounts, directory: pathlib.Path
+    memo_stat: os.stat_result, mount_table: mounts.Mounts, directory: pathlib.Path
 ) -> tuple[str, bool] | None:
     """Why an open memo file must not be used, and whether the pre-flight may replace it; None
     when no other account can reach it.
@@ -675,7 +612,7 @@ def _memo_refusal(
     """
     if not stat.S_ISREG(memo_stat.st_mode):
         return f"is not a regular file ({stat.filemode(memo_stat.st_mode)})", False
-    if not _memo_device_allowed(mounts, memo_stat.st_dev, directory):
+    if not mounts.device_allowed(mount_table, memo_stat.st_dev, directory):
         return "is on a filesystem off the allowlist", False
     if memo_stat.st_uid != os.geteuid():
         return f"belongs to uid {memo_stat.st_uid}", False
@@ -727,7 +664,7 @@ def _unpack_memo(content: bytes) -> _Memo | None:
     return _Memo(root=os.fsdecode(root), dirs={os.fsdecode(rel): item for rel, item in listings})
 
 
-def _create_memo(path: pathlib.Path, mounts: _Mounts) -> int | None:
+def _create_memo(path: pathlib.Path, mount_table: mounts.Mounts) -> int | None:
     """Create the account's memo file with mode 0600 and return its descriptor.
 
     None when the state database's directory does not exist yet (the memo never creates it) or is
@@ -736,7 +673,7 @@ def _create_memo(path: pathlib.Path, mounts: _Mounts) -> int | None:
     """
     try:
         parent_stat = os.stat(path.parent)
-        if not _memo_device_allowed(mounts, parent_stat.st_dev, path.parent):
+        if not mounts.device_allowed(mount_table, parent_stat.st_dev, path.parent):
             logger.debug(f"No .pvt walk memo: {path.parent} is on a filesystem off the allowlist")
             return None
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | _MEMO_OPEN, 0o600)
@@ -747,7 +684,7 @@ def _create_memo(path: pathlib.Path, mounts: _Mounts) -> int | None:
         return None
     try:
         memo_stat = os.fstat(fd)
-        refusal = _memo_refusal(memo_stat, mounts, path.parent)
+        refusal = _memo_refusal(memo_stat, mount_table, path.parent)
         if refusal is None:
             return fd
         logger.debug(f"No .pvt walk memo: the new file {path} {refusal[0]}")
@@ -759,7 +696,7 @@ def _create_memo(path: pathlib.Path, mounts: _Mounts) -> int | None:
 
 
 def _replace_memo(
-    fd: int, path: pathlib.Path, memo_stat: os.stat_result, mounts: _Mounts
+    fd: int, path: pathlib.Path, memo_stat: os.stat_result, mount_table: mounts.Mounts
 ) -> int | None:
     """Replace a loosened memo of the account's own, open as ``fd``, with a new private file.
 
@@ -774,10 +711,10 @@ def _replace_memo(
     except OSError as e:
         logger.debug(f"No .pvt walk memo: cannot replace {path}: {e}")
         return None
-    return _create_memo(path, mounts)
+    return _create_memo(path, mount_table)
 
 
-def _open_memo(mounts: _Mounts, *, write: bool) -> tuple[int | None, _Memo | None]:
+def _open_memo(mount_table: mounts.Mounts, *, write: bool) -> tuple[int | None, _Memo | None]:
     """Open the account's memo file and read it: its descriptor and its memo.
 
     The descriptor is None, and the caller lists every directory, when the file cannot be opened
@@ -795,14 +732,14 @@ def _open_memo(mounts: _Mounts, *, write: bool) -> tuple[int | None, _Memo | Non
     try:
         fd = os.open(path, (os.O_RDWR if write else os.O_RDONLY) | _MEMO_OPEN)
     except FileNotFoundError:
-        return (_create_memo(path, mounts) if write else None), None
+        return (_create_memo(path, mount_table) if write else None), None
     except _MEMO_ERRORS as e:
         logger.debug(f"Listing every directory: cannot open the .pvt walk memo: {e}")
         return None, None
     replacement = None
     try:
         memo_stat = os.fstat(fd)
-        refusal = _memo_refusal(memo_stat, mounts, path.parent)
+        refusal = _memo_refusal(memo_stat, mount_table, path.parent)
         if refusal is None:
             content = os.pread(fd, memo_stat.st_size, 0)
             memo = _unpack_memo(content)
@@ -812,7 +749,7 @@ def _open_memo(mounts: _Mounts, *, write: bool) -> tuple[int | None, _Memo | Non
         reason, replaceable = refusal
         if write and replaceable:
             logger.debug(f"Replacing the .pvt walk memo {path}: it {reason}")
-            replacement = _replace_memo(fd, path, memo_stat, mounts)
+            replacement = _replace_memo(fd, path, memo_stat, mount_table)
             reason = "could not be replaced"
     except OSError as e:
         reason = f"cannot be read: {e}"
@@ -862,11 +799,11 @@ def discover_pvt_files(root: pathlib.Path, *, skip: PvtSkip | None = None) -> di
     feeds writes there (see ``restore_target``). A .pvt ``skip`` returns True for is left out
     too: a stage's own member of its output (``ownership.own_member_skip``) is no tracked file.
     """
-    mounts = _read_mounts()
-    fd, memo = _open_memo(mounts, write=False)
+    mount_table = mounts.read_mounts()
+    fd, memo = _open_memo(mount_table, write=False)
     if fd is not None:
         os.close(fd)
-    candidates, _ = _walk(root, _trusted_listings(memo, root), mounts, record=False)
+    candidates, _ = _walk(root, _trusted_listings(memo, root), mount_table, record=False)
     return _read_pvt_files(candidates, root, skip)
 
 
@@ -883,11 +820,11 @@ def discover_pvt_files_and_update_memo(
     for this walk.
     """
     real_root = _memo_root(root)
-    mounts = _read_mounts()
-    fd, previous = _open_memo(mounts, write=True)
+    mount_table = mounts.read_mounts()
+    fd, previous = _open_memo(mount_table, write=True)
     try:
         candidates, listings = _walk(
-            root, _trusted_listings(previous, root), mounts, record=fd is not None
+            root, _trusted_listings(previous, root), mount_table, record=fd is not None
         )
         if fd is not None and previous != _Memo(root=real_root, dirs=listings):
             _write_memo(fd, _pack_memo(real_root, listings))

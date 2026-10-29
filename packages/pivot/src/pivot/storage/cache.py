@@ -17,6 +17,7 @@ import tempfile
 import time
 from typing import TYPE_CHECKING, NewType, TypedDict
 
+import lmdb
 import xxhash
 
 from pivot import exceptions, metrics
@@ -183,6 +184,7 @@ def hash_file(
     write is logged, never raised), unless ``pending`` is given: then ``(path, stat, hash)`` is
     appended to it instead, for the caller to save in one transaction, or, when ``state_db`` is
     read-only, to hand to a process that can write.
+
     Returns:
         Tuple of (file_hash, file_stat) where file_hash is the xxhash64 hex digest
         and file_stat is the os.stat_result for the file.
@@ -229,8 +231,8 @@ def known_file_hashes(
     for file_path, file_hash in files:
         try:
             file_stat = file_path.stat()
-        except OSError as e:
-            logger.debug("No known-hash entry for %s; its stat failed: %s", file_path, e)
+        except OSError as error:
+            logger.debug("No known-hash entry for %s; its stat failed: %s", file_path, error)
             continue
         entries.append((file_path, file_stat, file_hash))
     return entries
@@ -256,6 +258,30 @@ def deferred_file_hash_entries(
         )
         for path, file_stat, file_hash in entries
     ]
+
+
+def hash_read_only[T](
+    state_dir: pathlib.Path,
+    hash_files: Callable[
+        [state_mod.StateDB | None, list[tuple[pathlib.Path, os.stat_result, str]]], T
+    ],
+) -> T:
+    """Hash files against ``state_dir`` read-only, then save what was read best-effort.
+
+    Both production callers locate their state directory without creating it. A damaged cache
+    is treated as absent for these workspace comparisons, and no option changes that policy.
+    """
+    from pivot.storage import state as state_mod
+
+    pending = list[tuple[pathlib.Path, os.stat_result, str]]()
+    try:
+        with state_mod.open_readonly(state_dir, create=False) as state_db:
+            result = hash_files(state_db, pending)
+    except lmdb.Error as error:
+        logger.debug("Reading files without the state database in %s: %s", state_dir, error)
+        return hash_files(None, [])
+    state_mod.save_file_hashes(state_dir, pending, create=False)
+    return result
 
 
 # ``os.path.realpath`` of a cache's object root (``<cache.dir>/files``), from

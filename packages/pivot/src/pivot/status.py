@@ -76,6 +76,7 @@ from pivot.types import (
     ArtifactTag,
     CodeChange,
     DepChange,
+    FileHashEntry,
     ImportCheckStatus,
     ImportStatusInfo,
     ParamChange,
@@ -151,6 +152,7 @@ def _get_explanations_in_parallel(
         unreadable,
     )
     explanations_by_name = dict[str, StageExplanation]()
+    entries_per_stage = list[tuple[pathlib.Path, list[FileHashEntry]]]()
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = dict[Future[StageExplanation], str]()
@@ -158,6 +160,8 @@ def _get_explanations_in_parallel(
             stage_info = all_stages[stage_name]
             fingerprint = cast("dict[str, str]", stage_info["fingerprint"])
             stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
+            entries = list[FileHashEntry]()
+            entries_per_stage.append((stage_state_dir, entries))
             future = pool.submit(
                 contextvars.copy_context().run,
                 explain.get_stage_explanation,
@@ -175,6 +179,7 @@ def _get_explanations_in_parallel(
                 tracked_files=tracked_files,
                 tracked_trie=tracked_trie,
                 producer_hashes=producer_hashes,
+                file_hash_entries=entries,
                 unreadable_listings=unreadable,
             )
             futures[future] = stage_name
@@ -197,6 +202,11 @@ def _get_explanations_in_parallel(
                     upstream_stale=[],
                 )
 
+    entries_by_state_dir = dict[pathlib.Path, list[FileHashEntry]]()
+    for state_dir, entries in entries_per_stage:
+        entries_by_state_dir.setdefault(state_dir, []).extend(entries)
+    for state_dir, entries in entries_by_state_dir.items():
+        state_mod.save_file_hashes(state_dir, entries, create=False)
     return explanations_by_name
 
 
@@ -378,7 +388,9 @@ def get_tracked_files_status(
     results = list[TrackedFileInfo]()
 
     # Look hashes up read-only and save what was read once, best-effort, so a hash cache that
-    # cannot be written never fails status (open_readonly raises for a damaged database).
+    # cannot be opened or written never fails status; a damaged one still does. Both
+    # directories are located, not created: the save makes the state directory #503's resolver
+    # chose only when it has a hash to save.
     cache_dir = config.locate_cache_dir() / "files"
     state_dir = config.locate_state_dir()
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
@@ -418,7 +430,7 @@ def get_tracked_files_status(
             if on_progress is not None:
                 on_progress(i, total)
 
-    state_mod.save_file_hashes(state_dir, pending)
+    state_mod.save_file_hashes(state_dir, pending, create=True)
 
     return results
 

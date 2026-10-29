@@ -55,6 +55,43 @@ and hashing a small file cold (8.8 µs), measured on main for BET-36 plan Task 1
 every path that passes through a symlink, so after an upgrade each such file is read once
 more, until a command that writes the workspace records it.
 
+## Replicas: finding an entry by the file's identity
+
+A replica of a project made outside pivot holds the original's state database: BET's replica
+hard-links pivot's read-only outputs and copies the rest, `<state dir>/state.lmdb` included, and
+`cp -al` hard-links even the database, so the two share it. Its `hash:` keys name the
+original's paths. The replica's hard-linked outputs are the very inodes those entries
+describe, yet a lookup by the replica's path misses, so on BET's 180,000-file replicas every
+`pivot status` read every output again (Dispatch BET-263).
+
+Every write of a `hash:` entry also writes `inode:<st_dev><st_ino>` → that entry's key, and a
+lookup that misses by path follows it. The other path's entry is served only when it matches
+the file's stat (mtime_ns, size, device, inode) and that path, stat'ed now, still names the
+same device and inode with the same change time: then a lookup at that path would serve the
+same hash, and both paths name one inode, so the identity lookup is never weaker than a path
+lookup at the recorded path. The second check is what keeps a reused inode number from being
+served: a copy that keeps mtimes (`cp -a`, `rsync -a`, `shutil.copy2`) can give a new file the
+number, size and mtime of a deleted one, but the deleted file's path names nothing any more.
+The entry itself has no ctime because a new hard link changes it, which would invalidate every
+hard-linked replica; check (2) reads both change times at lookup time instead.
+
+The argument needs one device and inode number to name one live file. Some filesystems break
+that: mergerfs with `inodecalc=passthrough` reports each branch's inode number under one
+device, and other FUSE, network and union filesystems make inode numbers up. The change time
+cannot tell two such files apart: one command that changes both (`touch -d @T a b`,
+`chmod -R`) gives them one change time to the nanosecond, and with it one size and mtime: on
+mergerfs that let `pivot repro` keep a stale output. So the identity lookup runs only where
+`storage.mounts` says a device keeps live identities unique: ext2, ext3, ext4, xfs, btrfs, f2fs
+and zfs, or tmpfs only with the `inode64` super option. A btrfs subvolume's own device counts as
+btrfs. Any other filesystem, and macOS, which has no mountinfo, gets the path lookup only: it
+loses the replica speedup, never correctness. The `.pvt` walk memo uses the same helper.
+
+`pivot status`, every explanation, `pivot diff` and `pivot plots diff` read their selected
+database, then save what they had to hash with `state.save_file_hashes`, best-effort. The tracked
+file pass of status may create its selected database; explanation, diff and plots diff do not.
+A `--no-commit` run saves the hashes its workers read the same way: a hash entry is a cache its
+stat check validates, not part of the commit.
+
 ## Key Insight
 
 A cache key only has to name the place a reader will look again; the value proves whether the

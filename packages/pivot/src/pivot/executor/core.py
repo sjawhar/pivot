@@ -679,7 +679,7 @@ def verify_tracked_files(
                     + f"Run 'pivot track --force {track_data['path']}' to update."
                 )
 
-    state_mod.save_file_hashes(state_dir, pending)
+    state_mod.save_file_hashes(state_dir, pending, create=True)
 
     metrics.end("core.verify_tracked_files", _t)
     if missing:

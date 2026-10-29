@@ -32,9 +32,11 @@ them the same way:
 - Every cache save goes through `state.save_best_effort` (`state.save_file_hashes`) or
   `StateDB.save_many_best_effort` (save-on-read in `hash_file`/`hash_directory`). They wait at
   most `_WRITE_BACK_TIMEOUT` (2 s) for the write lock, log a failed write at debug level, and keep
-  the command's result.
-- `state.open_readonly(..., create=False)` looks hashes up without creating a database. On an
-  existing database, an `OSError` or `lmdb.Error` yields no cache only when
+  the command's result. A fingerprint-cache flush that is skipped keeps its entries pending for
+  the next flush; a skipped hash write costs one later read.
+- `state.open_readonly(..., create=False)` looks hashes up without creating a database. A
+  database this user cannot open safely (`PermissionError`, `lmdb.ReadonlyError`) yields no
+  cache first. Another `OSError` or `lmdb.Error` yields no cache only when
   `os.statvfs(state.lmdb)` reports a read-only filesystem; otherwise it raises. `pivot checkout`
   catches a failure to open the cache and restores without it; status and verify raise.
 - A restore records each file with the stat of what it staged before the rename puts it in place
@@ -42,12 +44,18 @@ them the same way:
   write after the rename changes the stat. The entry then does not vouch for the new bytes.
 - Workers open StateDB read-only. They return `DeferredWrites.file_hash_entries`
   (`types.FileHashEntry`, from `cache.deferred_file_hash_entries`) for the coordinator to write
-  after the stage. These are not a cache save: they share one transaction with the stage's
-  generations, which is the run's own commit. The coordinator's skip check writes what it reads
-  and restores.
+  after the stage. For a normal run these are not a cache save: they share one transaction with
+  the stage's generations, which is the run's own commit. Under `--no-commit` only the
+  `nocommit:` record is authoritative and the coordinator saves the hashes best-effort. The
+  coordinator's skip check writes what it reads and restores, best-effort.
 - `pivot checkout`, `pivot pull`, `pivot get`, `pivot import`, `pivot update`, `pivot track`,
-  and repro's `--checkout-missing` path record what they write or read. Stage outputs use the
-  StateDB in the output stage's state directory. Other paths use the configured state directory.
+  repro's `--checkout-missing` path, `pivot status`, its explanations, `pivot diff` and
+  `pivot plots diff` record what they write or read. Stage outputs use the StateDB in the output
+  stage's state directory. Other paths use the configured state directory.
+- Every `hash:` write also writes the `inode:` index after the hash entries. An identity lookup
+  is allowlisted by mount type (`storage/mounts.py`; tmpfs only with `inode64`) and confirms the
+  recorded path's device, inode and change time, so a hard-linked replica reuses its original
+  hash without weakening a path lookup.
 
 ## StateDB Key Prefixes
 
@@ -56,6 +64,7 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 | Prefix | Purpose |
 |--------|---------|
 | `hash:` | File content hashes (keyed by the absolute path as given, `os.fsencode(os.path.abspath(path))`; the value's `(mtime_ns, size, dev, inode)` comes from `stat()`, which follows symlinks. No ctime: a new hard link changes it, so every hardlink checkout or hard-linked replica would invalidate its entries) |
+| `inode:` | `(st_dev, st_ino)` → a `hash:` key hint; served only after the hash stat and recorded-path device, inode and change-time checks |
 | `gen:` | Output generation counters (keyed by artifact identity, `stage` or `stage:key`) |
 | `dep:` | Stage dependency generations (`stage:dep_identity` → generation; one file of a directory output records its directory's identity) |
 | `runcache:` | Run cache entries (`stage:input_hash` → output hashes) |
@@ -72,10 +81,10 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 
 `track.discover_pvt_files` must find every `.pvt` that `os.walk` over the project finds. Never prune it by directory name or by stage output: `track` and `import` accept paths under `.git`, `.pivot` and other pipelines' outputs. The memo makes an unchanged directory cost one `lstat` instead of a listing:
 
-- A listing is reused only when the directory's stamp (`st_dev`, `st_ino`, `st_mtime_ns`, `st_ctime_ns`) matches, its mtime and ctime are at least 2 s before the walk start (a later change in the same timestamp tick would leave the stamp unchanged), its mtime and ctime are not both whole seconds (on a one-second-timestamp filesystem a clock stepped back into a recorded second would keep the stamp; such filesystems are always listed), both fit the stamp's signed 64-bit nanoseconds (1677 to 2262; any other time is listed every walk), and its mount type is on the allowlist read from `/proc/self/mountinfo`. A device mountinfo does not list (a btrfs subvolume reports its own) counts as btrfs only when the deepest mount holding the directory is btrfs.
+- A listing is reused only when the directory's stamp (`st_dev`, `st_ino`, `st_mtime_ns`, `st_ctime_ns`) matches, its mtime and ctime are at least 2 s before the walk start (a later change in the same timestamp tick would leave the stamp unchanged), its mtime and ctime are not both whole seconds (on a one-second-timestamp filesystem a clock stepped back into a recorded second would keep the stamp; such filesystems are always listed), both fit the stamp's signed 64-bit nanoseconds (1677 to 2262; any other time is listed every walk), and `storage.mounts` says its device keeps live identities unique. A device mountinfo does not list (a btrfs subvolume reports its own) counts as btrfs only when the deepest mount holding the directory is btrfs; tmpfs is allowed only with `inode64`.
 - It holds names only. Every `.pvt` found is read on every walk, since rewriting a file does not change its directory.
 - Only the repro/run pre-flight (`executor/core.py` `verify_tracked_files`) writes it, and only when the walk's listings differ from it. It writes through the descriptor (`os.write`) under an `flock` (when another pre-flight holds it, this one skips its write) and empties the file first, so a walk reading it meanwhile, or after a pre-flight killed mid-write, sees a prefix of the new memo. A prefix never parses (it ends inside a record, or holds fewer listings than the root record counts), so that walk lists every directory. A write that fails partway (a full disk) empties the file again, so no cut memo keeps the space. Every other caller only reads it, and reading never creates anything. A memo that cannot be read means every directory is listed.
-- It is not in the state database, which other accounts can read. It is a file of the running account's own, `state.lmdb/pvt-memo-<uid>` in the state directory (`.pivot/.gitignore` keeps `state.lmdb/` out of git), created with mode 0600. The pre-flight creates it only in a `state.lmdb` directory that already exists and is on an allowlisted filesystem, and rewrites it in place, so that directory's stamp does not change at each write. A walk opens it without following a symlink (`O_NOFOLLOW`, and `O_NONBLOCK` so a FIFO there cannot block it) and uses it, for reading or writing, only when an `fstat` of the open file shows a regular file, on a filesystem of the walk's allowlist (`_MEMO_FS_TYPES` through `_device_allowed`, with mountinfo read once per walk; there owner and mode are the file's own and the kernel enforces them, while bindfs, CIFS and NFS can report the mount's), owned by the running account, with no group or other permission bits (a POSIX ACL's mask shows in the group bits) and one link. Otherwise the walk lists every directory, writes nothing, and logs the reason at debug level. A file of another account, of another kind or on another filesystem is never written, replaced or removed. When the account's own memo fails only the mode or link check (its owner loosened it, `chmod -R go+rX .pivot` say), the read-only walk only refuses it, and the pre-flight empties it, unlinks it and creates a new 0600 file, so its names leave that path, every descriptor opened on it and any other link to it. So no other account reads the memo's names, whatever the modes of the project's directories and wherever the state directory or `state.lmdb` points, except while the owner leaves the file loose, until the next pre-flight replaces it. The cost is that `open` and one `fstat` per walk (one more when a loosened memo is replaced). Each account keeps its own memo in a shared state directory.
+- It is not in the state database, which other accounts can read. It is a file of the running account's own, `state.lmdb/pvt-memo-<uid>` in the state directory (the state directory's `.gitignore` keeps `state.lmdb/` out of git), created with mode 0600. The pre-flight creates it only in a `state.lmdb` directory that already exists and is on an allowlisted filesystem, and rewrites it in place, so that directory's stamp does not change at each write. A walk opens it without following a symlink (`O_NOFOLLOW`, and `O_NONBLOCK` so a FIFO there cannot block it) and uses it, for reading or writing, only when an `fstat` of the open file shows a regular file, on a filesystem of the walk's allowlist (`storage.mounts` `device_allowed`, with mountinfo read once per walk; there owner and mode are the file's own and the kernel enforces them, while bindfs, CIFS and NFS can report the mount's), owned by the running account, with no group or other permission bits (a POSIX ACL's mask shows in the group bits) and one link. Otherwise the walk lists every directory, writes nothing, and logs the reason at debug level. A file of another account, of another kind or on another filesystem is never written, replaced or removed. When the account's own memo fails only the mode or link check (its owner loosened it, `chmod -R go+rX .pivot` say), the read-only walk only refuses it, and the pre-flight empties it, unlinks it and creates a new 0600 file, so its names leave that path, every descriptor opened on it and any other link to it. So no other account reads the memo's names, whatever the modes of the project's directories and wherever the state directory or `state.lmdb` points, except while the owner leaves the file loose, until the next pre-flight replaces it. The cost is one `open` and one `fstat` per walk (one more when a loosened memo is replaced). Each account keeps its own memo in a shared state directory.
 - A listing in which an entry's type could not be read (the `lstat` a filesystem without `d_type` needs failed) is never recorded, so a walk that can read that type never reuses it.
 
 The walk never skips a `.pvt` file. Its `skip` argument leaves a `.pvt` out of the result only after the file is read. Every command that discovers the project's `.pvt` files passes `ownership.own_member_skip`, which leaves out a stage's own member of its output (the `ownership.stage_members` rule) and keeps every user's `.pvt` there, which a restore of that output then refuses. The loaded pipeline's stages decide their own outputs from the registry. Any other `.pvt` is decided from recorded state alone, never by importing another `pipeline.py`: it is a member when a stage lock in the state directory (both directories of the 0.5.2 layout) records a directory output holding it and that lock's committed listing (byte-checked, else the cache's copy) or the stage's `nocommit:` record lists it with its current content. Whether a stage run wrote a file is execution state, not a stage definition. The locks are found by the path (`<data|metrics|plots>/<stage name>[/<key>]`), so a `.pvt` outside those prefixes reads no lock. A pipeline that fails to load, and a stage that no longer exists, are decided the same way: their members are skipped, not restored. A `nocommit:` record that cannot be read is taken as absent (`ownership.read_stage_claims`), which can only refuse. `remote/sync.py` applies the same rule to the one `.pvt` it reads by path (`_get_file_hash_from_pvt`), so no target or dependency resolves to what a member records.
@@ -333,6 +342,6 @@ When multiple `pivot` processes share the same StateDB:
 
 ## Path Storage
 
-All paths stored in the database must be **relative** to ensure portability across machines and correct cache behavior.
+Generation, dependency and run-cache keys hold artifact identities and project-relative paths, so they mean the same thing on every machine. File-hash keys and the identity index hold absolute paths on purpose: an entry describes one file on this machine, checked by its `stat`.
 
 See `docs/solutions/2026-02-01-statedb-path-strategies.md` for path handling patterns.
