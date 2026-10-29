@@ -136,6 +136,32 @@ def test_a_reused_inode_number_never_gets_the_deleted_files_hash(
         assert state_db.get_many([(new, reused)]) == {new: None}
 
 
+def test_a_batched_lookup_refuses_a_reused_inode_and_serves_a_hard_link(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A directory's members are looked up in one ``get_many`` (``cache.hash_directory``). In
+    that batch a member that got a deleted recorded file's inode number, size and mtime is
+    refused, as in a one-file lookup, because no recorded path names its inode any more; a hard
+    link of a live recorded file in the same batch is still served by identity."""
+    state_dir = tmp_path / ".pivot"
+    gone = _helper_file(tmp_path / "live" / "f.txt", b"content")
+    kept = _helper_file(tmp_path / "live" / "h.txt", b"sibling")
+    _helper_record(state_dir, gone)
+    kept_hash = _helper_record(state_dir, kept)
+    link = tmp_path / "replica" / "h.txt"
+    link.parent.mkdir()
+    os.link(kept, link)
+    old = gone.stat()
+    gone.unlink()
+    new = _helper_file(tmp_path / "replica" / "g.txt", b"CONTENT")
+    reused = _helper_stat(new.stat(), ino=old.st_ino, dev=old.st_dev, mtime_ns=old.st_mtime_ns)
+
+    with state.StateDB(state_dir, readonly=True) as state_db:
+        found = state_db.get_many([(new, reused), (link, link.stat())])
+
+    assert found == {new: None, link: kept_hash}
+
+
 def test_an_inode_number_on_another_device_is_not_the_recorded_file(
     tmp_path: pathlib.Path,
 ) -> None:

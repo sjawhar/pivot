@@ -146,6 +146,7 @@ def test_no_commit_produces_outputs_without_production_lock(
     }
     assert "no_commit_record" in deferred
     record = deferred["no_commit_record"]
+    assert "code_manifest" in record and "output_hashes" in record, record
     assert record["code_manifest"] == stage_info["fingerprint"]
     assert set(record["output_hashes"]) == {"test_stage"}
 

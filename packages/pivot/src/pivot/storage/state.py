@@ -57,7 +57,8 @@ def _db_full_message(path: pathlib.Path) -> str:
     return f"State cache is full ({_MAP_SIZE // (1024**3)}GB limit). Delete {path}/ to reset."
 
 
-# How long a best-effort write-back waits for another process's write lock
+# How long a best-effort write-back waits for another process's write lock: a fraction of a
+# pivot write's own 30 s, so a busy database costs a command a missed cache entry, not a stall.
 _WRITE_BACK_TIMEOUT = 2.0
 
 
@@ -1417,8 +1418,9 @@ def save_best_effort(
     the fingerprint caches (``fingerprint.flush_ast_hash_cache`` and ``flush_manifest_cache``).
     Each reader validates its entries and no decision depends on one being present, so a write
     that cannot happen at once is skipped with a debug log naming ``what`` instead of failing or
-    holding up the command. Without ``create``, a state directory that has no database is left
-    without one.
+    holding up the command: another process holding the write lock for longer than ``timeout``
+    (0 makes one attempt), a database this user cannot write, a read-only filesystem, a full
+    map. Without ``create``, a state directory that has no database is left without one.
     """
     if not create and not (state_dir / "state.lmdb").exists():
         return False
@@ -1439,7 +1441,9 @@ def open_readonly(
 
     A database this user cannot open safely (``PermissionError`` or ``lmdb.ReadonlyError``)
     yields None first. Otherwise an open error yields None only when ``state.lmdb`` is on a
-    read-only mount; the same error on a writable mount is a damaged database and propagates.
+    read-only mount: the database directory's own mount flag is inspected, not its parent's,
+    which may be a different, writable mount. The same error on a writable mount is a damaged
+    database and propagates.
     Opening creates a database where there is none unless ``create`` is False; no ``state_dir``
     yields None. The caller's own errors propagate with no context from the open.
     """

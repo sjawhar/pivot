@@ -1279,10 +1279,11 @@ def _execute_stage(
                         )
 
                 # Under --no-commit, write no lock, cache object, generation or run-cache
-                # entry. Keep the record for `pivot commit`, and hand file-hash cache entries
-                # to the coordinator for its best-effort save. The same record already lists the
-                # `*.pvt` members this run wrote: each was recorded before it was written, and
-                # the record stays until a lock is written.
+                # entry. Leave the record of what ran, which `pivot commit` writes if the outputs
+                # are still these, and hand file-hash cache entries to the coordinator for its
+                # best-effort save. The same record already lists the `*.pvt` members this run
+                # wrote: each was recorded before it was written, and the record stays until a
+                # lock is written.
                 if no_commit:
                     return StageResult(
                         status=StageStatus.RAN,
