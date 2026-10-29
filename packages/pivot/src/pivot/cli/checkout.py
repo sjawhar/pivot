@@ -242,11 +242,14 @@ def _refuse(targets: Iterable[ownership.ForcedRestore]) -> None:
 
 
 def _refuse_swap(target: ownership.ForcedRestore, entry: pathlib.Path) -> None:
-    """Fail, naming the target, if the entry its swap removes, now at ``entry``, holds a user's
-    file (``ownership.swap_refusal``)."""
+    """Raise the refusal, naming the target, if the entry its swap removes, now at ``entry``,
+    holds a user's file (``ownership.swap_refusal``). It stays the ``OutputOwnershipError`` it is,
+    so a restore's cleanup of a backup a killed command left keeps that backup with a warning
+    (``cache._remove_backup_left``); ``_checkout_files_async`` reports a swap's refusal like the
+    others."""
     refusal = ownership.swap_refusal(project.get_project_root(), target, entry)
     if refusal is not None:
-        raise click.ClickException(str(refusal))
+        raise refusal
 
 
 def _restore_path_sync(
@@ -280,6 +283,7 @@ def _restore_path_sync(
             Cache misses return ("missing", name) instead of raising, as does a directory whose
             committed listing cannot be used while the cache lacks its copy (logged, naming the
             file); nothing is written.
+        exceptions.OutputOwnershipError: The entry the swap removes holds a user's file.
     """
     with cache.restore_lock(path, state_dir) as lock_token:
         return _restore_path_locked(
@@ -464,6 +468,9 @@ async def _checkout_files_async(
                 callback(len(outcomes), len(files), outcome.name)
         except click.ClickException as e:
             immediate_errors.append(e)
+        except exceptions.OutputOwnershipError as e:
+            # A swap's refusal (_refuse_swap), reported with the other immediate failures
+            immediate_errors.append(click.ClickException(str(e)))
 
     # Anything else a restore raises leaves as an exception group, which the command's error
     # handler words (cli/decorators.py).

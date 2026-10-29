@@ -87,7 +87,7 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 - It is not in the state database, which other accounts can read. It is a file of the running account's own, `state.lmdb/pvt-memo-<uid>` in the state directory (the state directory's `.gitignore` keeps `state.lmdb/` out of git), created with mode 0600. The pre-flight creates it only in a `state.lmdb` directory that already exists and is on an allowlisted filesystem, and rewrites it in place, so that directory's stamp does not change at each write. A walk opens it without following a symlink (`O_NOFOLLOW`, and `O_NONBLOCK` so a FIFO there cannot block it) and uses it, for reading or writing, only when an `fstat` of the open file shows a regular file, on a filesystem of the walk's allowlist (`storage.mounts` `device_allowed`, with mountinfo read once per walk; there owner and mode are the file's own and the kernel enforces them, while bindfs, CIFS and NFS can report the mount's), owned by the running account, with no group or other permission bits (a POSIX ACL's mask shows in the group bits) and one link. Otherwise the walk lists every directory, writes nothing, and logs the reason at debug level. A file of another account, of another kind or on another filesystem is never written, replaced or removed. When the account's own memo fails only the mode or link check (its owner loosened it, `chmod -R go+rX .pivot` say), the read-only walk only refuses it, and the pre-flight empties it, unlinks it and creates a new 0600 file, so its names leave that path, every descriptor opened on it and any other link to it. So no other account reads the memo's names, whatever the modes of the project's directories and wherever the state directory or `state.lmdb` points, except while the owner leaves the file loose, until the next pre-flight replaces it. The cost is one `open` and one `fstat` per walk (one more when a loosened memo is replaced). Each account keeps its own memo in a shared state directory.
 - A listing in which an entry's type could not be read (the `lstat` a filesystem without `d_type` needs failed) is never recorded, so a walk that can read that type never reuses it.
 
-The walk never skips a `.pvt` file. Its `skip` argument leaves a `.pvt` out of the result only after the file is read. Every command that discovers the project's `.pvt` files passes `ownership.own_member_skip`, which leaves out a stage's own member of its output (the `ownership.stage_members` rule) and keeps every other `.pvt` there, which a restore of that output then refuses. The command's own stages decide their outputs from the registry. Any other `.pvt` is decided from recorded state alone, never by importing another `pipeline.py`: it is a member when a directory output another stage's lock records at a path (`ownership.recorded_directory_outputs`: every lock's `output_paths`, both directories of the 0.5.2 layout, built at the first `.pvt` outside the command's outputs and shared by the command's skips through `ownership.index_per_command`) holds it, and that lock's committed listing (byte-checked, else the cache's copy) or the stage's `nocommit:` record lists it with its current content. Whether a stage run wrote a file is execution state, not a stage definition; no output placement is re-derived. A pipeline that fails to load, and a stage that no longer exists, are decided the same way: their members are skipped, not restored. Because a file with a member's exact bytes is then skipped too, `track` refuses a path inside the recorded output of a stage no pipeline declares (`discovery.track_checks`), naming the lock to remove. A `nocommit:` record that cannot be read is taken as absent (`ownership.read_stage_claims`), which can only refuse. `remote/sync.py` applies the same rule to the one `.pvt` it reads by path (`_get_file_hash_from_pvt`), so no target or dependency resolves to what a member records.
+The walk never skips a `.pvt` file. Its `skip` argument leaves a `.pvt` out of the result only after the file is read. Every command that discovers the project's `.pvt` files passes `ownership.own_member_skip`, which leaves out a stage's own member of its output (the `ownership.stage_members` rule) and keeps every other `.pvt` there, which a restore of that output then refuses. The command's own stages decide their outputs from the registry. Any other `.pvt` is decided from recorded state alone, never by importing another `pipeline.py`: it is a member when a directory output another stage's lock records at a path (`ownership.recorded_directory_outputs`: every lock's `output_paths` in both directories of the 0.5.2 layout, the command's own stages left out, built at the first `.pvt` outside the command's outputs and shared by the command's skips through `ownership.index_per_command`) holds it, and that lock's committed listing (byte-checked, else the cache's copy) or the stage's `nocommit:` record lists it with its current content. When every pipeline is loaded (`--all`, `track`) only the locks of stages no pipeline declares are read. Whether a stage run wrote a file is execution state, not a stage definition; no output placement is re-derived. A pipeline that fails to load, and a stage that no longer exists, are decided the same way: their members are skipped, not restored. A sidecar `track` wrote at such a member's path could carry the bytes the lock records and then be skipped, so `track` refuses a path whose sidecar a lock of a stage no pipeline declares lists as a member (`ownership.orphaned_member_claim`), naming the lock to remove. A `nocommit:` record that cannot be read is taken as absent (`ownership.read_stage_claims`), which can only refuse. `remote/sync.py` applies the same rule to the one `.pvt` it reads by path (`_get_file_hash_from_pvt`), so no target or dependency resolves to what a member records.
 
 ## LMDB Specifics
 
@@ -116,6 +116,10 @@ When multiple `pivot` processes share the same StateDB:
   target's token, and atomically replace it. Directory restores build in a private
   temporary directory and swap it. Both run under the target's restore lock, and each
   first removes the token-tagged entries a killed restore of the same target left.
+- A stage write with a `state_dir` (the worker passes the project's to
+  `WorkspaceStore.prepare_output`) and a symlink-mode commit hold the same lock while they
+  replace an old output (a directory renamed aside, checked and removed; a file checked in place
+  and unlinked), so no restore's cleanup removes a backup while they check it.
 
 ## Publishing Cache Objects
 
@@ -305,20 +309,54 @@ When multiple `pivot` processes share the same StateDB:
 - A forced restore checks each target three times: with every target before any is changed, under
   its restore lock before its replacement is built, and at its swap over the entry it removes,
   renamed aside where a directory is involved. A run-cache, generation or incremental output
-  restore and repro's restore of a missing tracked file make the same swap check. A stage writer
-  calls `WorkspaceStore.refuse_output_replacement_at_write` after `prepare_output` and before
-  its loader writes, so a user file that lands in that window is refused with the same target and
-  sidecar message rather than leaking a loader's "Directory not empty" error. Once renamed, no
-  writer that names its files by path can add one to that entry, so a file copied into a target
-  while the command runs refuses that target. What the swap can still miss: a writer holding an
-  open handle on a directory inside the target (its working directory, or a directory descriptor),
-  which can add a file to the renamed entry after the walk; or a sidecar created beside the target,
-  or beside a directory above it, in the instant between the swap's check and its rename.
+  restore and repro's restore of a missing tracked file make the same swap check; an incremental
+  output's restore removes nothing before it. A stage write clears its old output the same way:
+  `WorkspaceStore.prepare_output` calls `cache.remove_output_checked`, which renames an old
+  directory at the output's path aside, beside it (to `cache._locked_backup_path` under the
+  path's restore lock, else to a fresh `cache._backup_path`), checks it there
+  (`ownership.swap_refusal`), and removes it only when the check finds no user file; when the
+  check refuses, the directory goes back to its path (`cache._put_back_checked`) and the refusal
+  names the file. When removing the backup fails, what is left of it goes back and the removal's
+  own error propagates. An old file or symlink is checked in place and unlinked, as a restore
+  checks a file it replaces: renaming it aside would close only the instant between the check and
+  the unlink, and on overlayfs renaming a file on the lower layer copies all of it up into the
+  writable layer first. The unlink fails, removing nothing, on a directory that took the path
+  after the check. A symlink-mode commit replaces a directory output with its link to the cache
+  tree the same way (`WorkspaceStore.commit` passes the check to `cache.store_hashed_output`). A
+  stage writer then calls `WorkspaceStore.refuse_output_replacement_at_write` after
+  `prepare_output` and before its loader writes, so a user file that lands in the new, empty
+  output is refused with the same target and sidecar message rather than leaking a loader's
+  "Directory not empty" error. Once a swap or a stage write renames a directory aside, no writer
+  that names its files by path can add one to it, so a file copied into a target while the
+  command runs refuses that target. What the checks can still miss: a writer holding an open
+  handle on a directory inside the target (its working directory, or a directory descriptor),
+  which can add a file to the renamed entry after the walk; a sidecar created beside the target,
+  or beside a directory above it, in the instant between the swap's check and its rename; a file
+  moved over a file output in the instant between the last check and its unlink (a stage write)
+  or the rename that replaces it (a restore); and a file moved over a file output while the
+  stage's own writer writes it (after `refuse_output_replacement_at_write`, before the loader's
+  or `worker._save_recorded`'s rename over the path), which the stage's output replaces. For an
+  output Pivot caches, the commit's check then refuses, naming the sidecar; a metric output (whose
+  commit runs no check) and a `--no-commit` run (which commits nothing) finish with exit 0, and
+  the next `pivot status` or `pivot repro` warns, naming it. A directory output loses in that
+  window only a user file that has the name of a file the stage writes; the writer adds its other
+  files beside the user's, and the commit refuses.
+- Where the filesystem cannot rename a directory aside (`cache._rename_aside`: EXDEV from
+  overlayfs with `redirect_dir` off, the default on many kernels, for a directory on a lower
+  layer; ENOTSUP or EOPNOTSUPP), a swap, a stage write and a symlink-mode commit check it in place
+  and remove it there, as before the rename aside existed: on such a filesystem a file copied into
+  it after that check is removed with it. A stage write or symlink-mode commit whose rename is
+  refused for want of write permission on the parent retries once the parent is made writable
+  (`cache._remove_checked`); a restore's swap (`cache._swap_in`) does not. Any other rename error
+  (EBUSY for an output that is a mount point) fails before anything is removed.
 - A directory restore killed between renaming the old entry aside and checking it leaves a backup.
   The next directory restore of that path holds the same restore lock and checks that backup
   before removing it. If the check finds a user file, Pivot keeps the backup and warns, naming the
-  file; it restores the new output without deleting the backup. Every backup is named with its
-  path's restore token. The unlocked sweep a directory restore runs in its parent
+  file; it restores the new output without deleting the backup. The cleanup catches only
+  `OutputOwnershipError` (`cache._remove_backup_left`), so every swap check raises the refusal
+  itself, `pivot checkout`'s and `pivot pull`'s included (`checkout._refuse_swap`; the command
+  reports a refusal from the swap itself as a failure). Every backup is named with its path's
+  restore token. The unlocked sweep a directory restore runs in its parent
   (`cache._cleanup_stale_restore_temps`) removes only staged replacements, since a backup keeps
   the old entry's mtime and may be under another restore's check. A file restore never runs that
   cleanup (`cache._restore_file_from_cache`), so when one is killed after renaming a directory at
@@ -328,9 +366,19 @@ When multiple `pivot` processes share the same StateDB:
   at its path is renamed aside and checked, including one made after a file target's check. An
   entry the check refuses goes back to its path; when something took the path meanwhile, it is
   renamed to `<name>.pivot-kept-<hex>` beside it and a warning names it, never left under the
-  backup name a later restore considers. Stage writes, symlink-mode commits and presentation still
-  check when they start replacing an output; `track` and `import` refuse to create a sidecar inside
-  an output, so only a file copied or made by hand can appear there.
+  backup name a later restore considers. A stage write killed between renaming its old directory
+  output aside and removing it leaves the backup at `.pivot_backup_<token>.old`
+  (`cache._locked_backup_path`); only a stage write or a symlink-mode commit of a directory makes
+  one, since a file output is never renamed aside. The next stage write of that path, under the
+  same restore lock, checks that backup first and removes it, or keeps it and warns, naming the
+  file, as a directory restore does with every backup; a stage write that keeps it renames its own
+  old output to a fresh `cache._backup_path`, which only a directory restore considers. A
+  directory restore of the path considers it like any other backup. Commits other than a
+  symlink-mode commit of a directory output, and presentation, still check only when they start
+  replacing an output: a commit in hardlink mode (or symlink mode, for a file output) replaces
+  each file the stage wrote with its link to the cache after that one check. `track` and `import`
+  refuse to create a sidecar inside an output, so only a file copied or made by hand can appear
+  there.
 - `track` and `import` load every pipeline (`discovery.track_checks` and
   `discovery.declared_outputs`, as `--all` discovers them) and refuse a new path overlapping any
   declared output, naming the stage. A `pipeline.py`
