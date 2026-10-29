@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pathlib
 import shutil
 from typing import TYPE_CHECKING, Any
 
@@ -13,7 +14,6 @@ from pivot.types import StageStatus
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    import pathlib
     from collections.abc import Callable
 
     from pivot.types import OutputMessage
@@ -130,11 +130,20 @@ def test_no_commit_produces_outputs_without_production_lock(
     production_lock = lock.StageLock("test_stage", lock.get_stages_dir(tmp_path / ".pivot"))
     assert not production_lock.path.exists(), "Production lock should NOT be written"
 
-    # The only deferred write is the record of what ran, for `pivot commit`: no lock, no cache
-    # entry, no generation.
+    # The deferred writes hold the record for `pivot commit` and the file hashes the stage read
+    # and wrote, which the coordinator saves best-effort.
     assert "deferred_writes" in result
     deferred = result["deferred_writes"]
-    assert set(deferred) == {"no_commit_record"}
+    assert set(deferred) == {"file_hash_entries", "no_commit_record"}
+    assert "file_hash_entries" in deferred
+    hashed = {
+        pathlib.Path(path).name: file_hash
+        for path, _, _, _, _, file_hash in deferred["file_hash_entries"]
+    }
+    assert hashed == {
+        "input.txt": cache.hash_file(tmp_path / "input.txt")[0],
+        "test_stage.txt": cache.hash_file(output_path)[0],
+    }
     assert "no_commit_record" in deferred
     record = deferred["no_commit_record"]
     assert "code_manifest" in record and "output_hashes" in record, record

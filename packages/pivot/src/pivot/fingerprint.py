@@ -985,7 +985,13 @@ def _walk_to(path: tuple[str, ...], owners: dict[tuple[str, ...], Any]) -> Any:
 
 
 def flush_ast_hash_cache() -> None:
-    """Write each pending AST hash to the state directory it is filed under."""
+    """Write each pending AST hash to the state directory it is filed under, best-effort.
+
+    A write that cannot happen at once (``state.save_best_effort``: another process holds the
+    write lock past its short wait, or the database cannot be opened or written) keeps its
+    entries pending under the same directory, so a later flush retries them instead of holding
+    a read command behind a pivot write.
+    """
     global _pending_ast_writes
     if not _pending_ast_writes:
         return
@@ -994,24 +1000,31 @@ def flush_ast_hash_cache() -> None:
     _pending_ast_writes = dict[pathlib.Path, list[AstHashEntry]]()
 
     for state_dir, entries in pending.items():
+        saved = False
         try:
             from pivot.storage import state
 
-            with state.StateDB(state_dir, readonly=False) as db:
-                db.save_ast_hash_many(entries)
-            metrics.count("fingerprint.ast_hash_cache.flush")
+            saved = state.save_best_effort(
+                state_dir,
+                lambda db, entries=entries: db.save_ast_hash_many(entries),
+                what=f"{len(entries)} AST hashes",
+            )
         except Exception:
-            # OSError (filesystem), ImportError (module), lmdb.Error, etc.
-            # Restore pending writes on failure so they can be retried on next flush.
-            # This prevents permanent loss of cache entries on transient failures.
-            _pending_ast_writes.setdefault(state_dir, list[AstHashEntry]()).extend(entries)
             _logger.debug(
                 "Failed to flush AST hash cache (%d entries)", len(entries), exc_info=True
             )
+        if saved:
+            metrics.count("fingerprint.ast_hash_cache.flush")
+        else:
+            _pending_ast_writes.setdefault(state_dir, list[AstHashEntry]()).extend(entries)
 
 
 def flush_manifest_cache() -> None:
-    """Write each pending manifest to the state directory it is filed under."""
+    """Write each pending manifest to the state directory it is filed under, best-effort.
+
+    A skipped write keeps its entries pending under the same directory, as
+    ``flush_ast_hash_cache`` does.
+    """
     global _pending_manifest_writes
     if not _pending_manifest_writes:
         return
@@ -1020,18 +1033,24 @@ def flush_manifest_cache() -> None:
     _pending_manifest_writes = dict[pathlib.Path, list[tuple[bytes, bytes]]]()
 
     for state_dir, entries in pending.items():
+        saved = False
         try:
             from pivot.storage import state
 
-            with state.StateDB(state_dir, readonly=False) as db:
-                db.put_raw_many(entries)
-            metrics.count("fingerprint.manifest_cache.flush")
-        except Exception:
-            _pending_manifest_writes.setdefault(state_dir, list[tuple[bytes, bytes]]()).extend(
-                entries
+            saved = state.save_best_effort(
+                state_dir,
+                lambda db, entries=entries: db.put_raw_many(entries),
+                what=f"{len(entries)} manifest entries",
             )
+        except Exception:
             _logger.debug(
                 "Failed to flush manifest cache (%d entries)", len(entries), exc_info=True
+            )
+        if saved:
+            metrics.count("fingerprint.manifest_cache.flush")
+        else:
+            _pending_manifest_writes.setdefault(state_dir, list[tuple[bytes, bytes]]()).extend(
+                entries
             )
 
 

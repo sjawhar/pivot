@@ -342,7 +342,8 @@ def _validate_stages_required(stages_list: list[str] | None) -> list[str]:
 @click.option(
     "--no-commit",
     is_flag=True,
-    help="Skip writing lock files. Run 'pivot commit' to finalize.",
+    help="Skip writing lock files and committing outputs; file hashes are still saved. "
+    + "Run 'pivot commit' to finalize.",
 )
 @click.option(
     "--fail-fast",
