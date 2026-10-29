@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from pivot.storage import track
     from pivot.storage.store import WorkspaceStore
 
-from pivot import discovery, display, exceptions, names, project
+from pivot import display, exceptions, names, project
 from pivot.cli import decorators as cli_decorators
 
 
@@ -87,16 +87,24 @@ def require_workspace_store() -> WorkspaceStore:
 
 
 def own_member_skip(cache_dir: pathlib.Path) -> track.PvtSkip:
-    """The skip that leaves every pipeline's stage-owned ``*.pvt`` members out of what this
-    command discovers (``discovery.every_pipeline_member_skip``): the loaded pipeline's stages
-    first (none without a pipeline), and the others only when the command did not load them
-    all (``--all``). ``cache_dir`` is the cache object root."""
+    """The skip that leaves a stage's own ``*.pvt`` member out of what this command discovers
+    (``ownership.own_member_skip``): the loaded pipeline's stages (none without a pipeline)
+    decide their outputs, and the locks in the state directory decide every other.
+    ``cache_dir`` is the cache object root. Output paths depend on each stage's name alone, so a
+    workspace with no pipeline name places them."""
+    from pivot import config
+    from pivot.storage import ownership
+
+    store_mod = importlib.import_module("pivot.storage.store")
+
     pipeline = cli_decorators.get_pipeline_from_context()
-    return discovery.every_pipeline_member_skip(
-        project.get_project_root(),
+    project_root = project.get_project_root()
+    return ownership.own_member_skip(
+        project_root,
         get_all_stages() if pipeline is not None else {},
+        store_mod.WorkspaceStore(project_root, "", {}),
+        config.locate_state_dir(),
         cache_dir,
-        every_pipeline_loaded=cli_decorators.get_all_pipelines_from_context(),
     )
 
 

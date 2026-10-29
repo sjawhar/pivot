@@ -3,7 +3,6 @@ from __future__ import annotations
 import _imp
 import contextlib
 import dataclasses
-import functools
 import importlib
 import importlib.abc
 import importlib.machinery
@@ -19,14 +18,14 @@ from typing import TYPE_CHECKING, Final, cast, override
 
 import cloudpickle
 
-from pivot import config, exceptions, fingerprint, loaded_source, metrics, project, types
+from pivot import exceptions, fingerprint, loaded_source, metrics, project, types
 from pivot import state_dir as state_dir_mod
-from pivot.registry import PipelineLike, RegistryStageInfo
+from pivot.registry import PipelineLike
 from pivot.storage import ownership
 from pivot.storage import store as store_mod
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Sequence
     from importlib.abc import PathEntryFinder
 
     from pivot.storage import track
@@ -1093,48 +1092,6 @@ def declared_outputs_and_member_skip(
     stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
     skip = ownership.own_member_skip(project_root, stages, workspace, default_state_dir, cache_dir)
     return _resolved_outputs(pipeline, workspace), skip
-
-
-def every_pipeline_stages(project_root: pathlib.Path) -> dict[str, RegistryStageInfo]:
-    """The stages of every pipeline in the project, discovered as ``--all`` discovers them: a
-    ``pipeline.py`` that fails to load is skipped with a warning (``_discover_all_pipelines``).
-    Pipelines that cannot be combined (two files declare one name) give no stages, with that
-    reason in a warning. Either way the missing stages' ``*.pvt`` members are read as tracked
-    files, which every restore of their outputs refuses."""
-    try:
-        pipeline = discover_pipeline(project_root=project_root, all_pipelines=True)
-    except DiscoveryError as exc:
-        logger.warning("Reading no other pipeline's stage outputs: %s", exc)
-        return {}
-    if pipeline is None:
-        return {}
-    return {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
-
-
-def every_pipeline_member_skip(
-    project_root: pathlib.Path,
-    loaded: Mapping[str, RegistryStageInfo],
-    cache_dir: pathlib.Path,
-    *,
-    every_pipeline_loaded: bool = False,
-) -> track.PvtSkip:
-    """``ownership.own_member_skip`` for a command that discovers the project's ``*.pvt`` files,
-    over every pipeline's stages: a stage's own member is no tracked file whichever pipeline the
-    command loaded. The ``loaded`` stages answer first; the first ``*.pvt`` none of their outputs
-    holds discovers the other pipelines (``every_pipeline_stages``), unless the command loaded
-    them all (``every_pipeline_loaded``, ``--all``). ``cache_dir`` is the cache object root; the
-    state directory is located, not created. Output paths depend on each stage's name alone, so
-    one workspace places every pipeline's outputs."""
-    return ownership.own_member_skip(
-        project_root,
-        loaded,
-        store_mod.WorkspaceStore(project_root, "", {}),
-        config.locate_state_dir(),
-        cache_dir,
-        other_stages=None
-        if every_pipeline_loaded
-        else functools.partial(every_pipeline_stages, project_root),
-    )
 
 
 def load_pipeline_from_path(path: pathlib.Path) -> PipelineLike | None:

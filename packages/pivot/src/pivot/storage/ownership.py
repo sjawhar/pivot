@@ -26,6 +26,7 @@ import functools
 import logging
 import os
 import pathlib
+import posixpath
 import stat
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
@@ -890,6 +891,81 @@ def _output_members(
     return {path: owner[0] for path, owner in owners.items()}, members_of
 
 
+# Where ``store.relative_output_path`` puts every stage output: ``<prefix>/<stage name>[/<key>]``
+_OUTPUT_PREFIXES = frozenset({"data", "metrics", "plots"})
+
+
+def _recorded_members(
+    project_root: pathlib.Path, default_state_dir: pathlib.Path, cache_dir: pathlib.Path
+) -> Callable[[pathlib.Path], list[StageMembers]]:
+    """A reader, for a ``normalized`` path, of the ``*.pvt`` members of each directory output
+    that a stage lock in ``default_state_dir`` records around it (``stage_members`` of the claims
+    that lock, the listing committed beside it and the stage's ``nocommit:`` record make).
+
+    The locks are found by the path: an output lies at ``<prefix>/<stage name>[/<key>]``, so only
+    the locks of the stage names the path spells are read (``StageLock`` resolves both
+    directories of the 0.5.2 layout), each at most once. A path outside those prefixes, such as a
+    tracked file in ``data/raw``, reads none. Where a lock records no output path, the output is
+    placed as ``store.relative_output_path`` places it, under the path's own prefix.
+    """
+    root = normalized(project_root)
+    stages_dir = lock.get_stages_dir(default_state_dir)
+
+    @functools.cache
+    def outputs_of(stage_name: str, prefix: str) -> tuple[tuple[pathlib.Path, StageMembers], ...]:
+        try:
+            stage_lock = lock.StageLock(stage_name, stages_dir)
+        except ValueError:  # the path spells no stage name a lock can have
+            return ()
+        lock_data = stage_lock.read(cache_dir=cache_dir)
+        if lock_data is None:
+            return ()
+        recorded = (
+            lock_data["output_paths"]
+            if "output_paths" in lock_data
+            else dict[types.ArtifactIdentity, str]()
+        )
+
+        def placed(identity: types.ArtifactIdentity) -> pathlib.Path:
+            if identity in recorded:
+                return normalized(root / recorded[identity])
+            key = [] if identity.key is None else [identity.key]
+            return normalized(root / posixpath.join(prefix, stage_name, *key))
+
+        paths = {
+            identity: placed(identity)
+            for identity, output_hash in lock_data["output_hashes"].items()
+            if types.is_dir_hash(output_hash)
+        }
+        if not paths:
+            return ()
+        claims = read_stage_claims(
+            project_root,
+            stage_name,
+            default_state_dir,
+            {path: lock_data["output_hashes"][identity] for identity, path in paths.items()},
+            cache_dir=cache_dir,
+            listing_readers=lock_listing_readers(stage_lock, lock_data, paths, cache_dir),
+        )
+        return tuple((path, stage_members(path, claims)) for path in paths.values())
+
+    def members_around(path: pathlib.Path) -> list[StageMembers]:
+        if not path.is_relative_to(root):
+            return []
+        parts = path.relative_to(root).parts
+        if len(parts) < 4 or parts[0] not in _OUTPUT_PREFIXES:
+            return []
+        # A stage name has at least two parts (``<pipeline>/<stage>``), and the file lies below it
+        return [
+            members
+            for end in range(3, len(parts))
+            for output, members in outputs_of("/".join(parts[1:end]), parts[0])
+            if output in path.parents
+        ]
+
+    return members_around
+
+
 def saved_input_warnings(
     project_root: pathlib.Path,
     stages: Mapping[str, RegistryStageInfo],
@@ -919,40 +995,32 @@ def own_member_skip(
     workspace: WorkspaceStore,
     default_state_dir: pathlib.Path,
     cache_dir: pathlib.Path,
-    *,
-    other_stages: Callable[[], Mapping[str, RegistryStageInfo]] | None = None,
 ) -> track.PvtSkip:
-    """Whether a ``*.pvt`` file that parses is a member of an output these stages write
+    """Whether a ``*.pvt`` file that parses is a stage's own member of its output
     (``stage_members``, the rule every write, restore and commit uses): ``skip`` for
     ``track.discover_pvt_files``, so no command reads a stage's own member as a tracked file.
 
+    A ``*.pvt`` in an output of these stages (the loaded pipeline's) is decided by the registry.
+    Any other is decided by recorded state alone (``_recorded_members``): it is a member when a
+    stage lock in ``default_state_dir`` records a directory output holding it and the listing
+    committed beside that lock (byte-checked, else the cache's copy), or that stage's
+    ``nocommit:`` record, lists it with its current content. Whether a stage run wrote this file
+    is execution state, not a stage definition, so no other pipeline is imported; a pipeline that
+    fails to load, or a stage that no longer exists, is decided the same way.
+
     Any other ``*.pvt`` in an output is the user's: discovery keeps it, and every restore of that
     output refuses it. A stage's claims are read only for an output that holds a ``*.pvt``.
-
-    ``other_stages`` reads the stages of the pipelines the command did not load. It is called
-    once, for the first ``*.pvt`` that lies in none of ``stages``' outputs, and from then on every
-    stage's outputs are read: a command whose ``*.pvt`` files all lie in its own outputs, or that
-    finds none, loads no other pipeline.
     """
     owners, members_of = _output_members(
         project_root, stages, workspace, default_state_dir, cache_dir
     )
-    pending = other_stages
-
-    def outputs_holding(path: pathlib.Path) -> list[pathlib.Path]:
-        return [output for output in path.parents if output in owners]
+    recorded_around = _recorded_members(project_root, default_state_dir, cache_dir)
 
     def skip(pvt_path: pathlib.Path, data: track.PvtData) -> bool:
-        nonlocal owners, members_of, pending
         path = normalized(pvt_path)
-        outputs = outputs_holding(path)
-        if not outputs and pending is not None:
-            every = {**pending(), **stages}
-            pending = None
-            owners, members_of = _output_members(
-                project_root, every, workspace, default_state_dir, cache_dir
-            )
-            outputs = outputs_holding(path)
-        return any(_is_stage_member(path, data, members_of(output), path) for output in outputs)
+        outputs = [output for output in path.parents if output in owners]
+        if outputs:
+            return any(_is_stage_member(path, data, members_of(output), path) for output in outputs)
+        return any(_is_stage_member(path, data, members, path) for members in recorded_around(path))
 
     return skip

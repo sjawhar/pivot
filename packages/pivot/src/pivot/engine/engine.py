@@ -1119,8 +1119,8 @@ class Engine:
         """Orchestrate parallel stage execution with the async event loop."""
         import datetime
 
-        from pivot import discovery, run_history
         from pivot import exceptions as pivot_exceptions
+        from pivot import run_history
 
         # Record start time for run history
         started_at = datetime.datetime.now(datetime.UTC).isoformat()
@@ -1128,18 +1128,20 @@ class Engine:
         if cache_dir is None:
             cache_dir = config.get_cache_dir()
 
-        # Verify tracked files before building DAG: a stage's own .pvt member of its output, in
-        # any pipeline, is none
+        # Verify tracked files before building DAG: a stage's own .pvt member of its output is
+        # none, this pipeline's by its stages and any other's by its lock. Output paths depend on
+        # each stage's name alone, so a workspace with no pipeline name places them.
         project_root = project.get_project_root()
         all_stages = self._get_all_stages()
         executor_core.verify_tracked_files(
             project_root,
             checkout_missing=checkout_missing,
-            skip=discovery.every_pipeline_member_skip(
+            skip=ownership.own_member_skip(
                 project_root,
                 all_stages,
+                store_mod.WorkspaceStore(project_root, "", {}),
+                config.get_state_dir(),
                 cache_dir / "files",
-                every_pipeline_loaded=self._all_pipelines,
             ),
         )
 

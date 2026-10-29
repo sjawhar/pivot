@@ -6,11 +6,11 @@ import os
 import pathlib
 from typing import TYPE_CHECKING
 
-from pivot import config, discovery, exceptions, metrics, names, project, registry, types
+from pivot import config, exceptions, metrics, names, project, registry, types
 from pivot import state_dir as state_dir_mod
 from pivot.remote import config as remote_config
 from pivot.remote import protocol
-from pivot.storage import cache, listing, lock, track
+from pivot.storage import cache, listing, lock, ownership, track
 from pivot.storage import store as store_mod
 from pivot.types import HashInfo, LockData, RemoteStatus, TransferSummary, is_dir_hash
 
@@ -286,9 +286,9 @@ def get_target_hashes(
     A directory resolves to its listing object and its files' objects. ``cache_dir`` is the
     cache root (``config.locate_cache_dir()`` when None). With ``require_members`` (push), a
     directory whose committed listing cannot be read and whose listing object the cache lacks
-    raises rather than naming an object that is not there (``_blob_hashes``). A ``*.pvt`` file
-    that a stage of any pipeline wrote as its own member resolves nothing
-    (``discovery.every_pipeline_member_skip``, ``all_stages`` answering first).
+    raises rather than naming an object that is not there (``_blob_hashes``). A ``*.pvt`` file a
+    stage wrote as its own member resolves nothing (``ownership.own_member_skip``: the stages of
+    ``all_stages`` by the registry, any other by its lock in ``state_dir``).
     """
     _t = metrics.start()
     proj_root = project.get_project_root()
@@ -297,7 +297,9 @@ def get_target_hashes(
     output_identities: dict[str, types.ArtifactIdentity] | None = None
     unresolved = list[str]()
     tracked_blobs: dict[str, set[str]] | None = None
-    skip = discovery.every_pipeline_member_skip(proj_root, all_stages or {}, files_dir)
+    # Display paths depend only on qualified stage names, not the pipeline name.
+    workspace = store_mod.WorkspaceStore(proj_root, "", {})
+    skip = ownership.own_member_skip(proj_root, all_stages or {}, workspace, state_dir, files_dir)
 
     for target in targets:
         original_target = target
@@ -403,8 +405,6 @@ def get_target_hashes(
         # A workspace path of a stage output stands for that output's identity.
         if all_stages is not None:
             if output_identities is None:
-                # Display paths depend only on qualified stage names, not the pipeline name.
-                workspace = store_mod.WorkspaceStore(proj_root, "", {})
                 output_identities = workspace.output_identities_by_path(
                     out for stage_info in all_stages.values() for out in stage_info["outs"]
                 )
