@@ -738,9 +738,10 @@ def test_diff_resolves_a_symlinked_cache_directory(tmp_path: pathlib.Path) -> No
         in_workspace=True,
         is_directory=True,
         changed_kind=None,
+        state_dir=proj / ".pivot",
     )
 
-    members = selection._workspace_members(output, None, proj, cache_dir)
+    members = selection._workspace_members(output, None, proj, cache_dir, None, [])
 
     assert sorted(members) == [f"data/out/{e['relpath']}" for e in output_members["files"]]
 

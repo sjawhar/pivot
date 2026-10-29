@@ -1,0 +1,595 @@
+"""`pivot status` on a replica of a project reads no output it can vouch for (Dispatch BET-263).
+
+A replica made outside pivot (hard links, copies) carries a byte copy of the state database,
+whose file-hash entries name the original project's paths. A hard-linked output is the same
+inode as the original, so its entry is found by the file's identity and nothing is read. A
+copied output is a new file: the first status reads it and saves its hash, so the second
+status reads nothing. `pivot diff` and `pivot plots diff` look files up and save what they read
+the same way. The tests drive the installed `pivot` binary and record every file of the
+replica's outputs that the process opens, so the hard-link tests need the temporary directory
+on a filesystem type the identity lookup trusts (``storage.mounts``; ext4 in CI).
+"""
+
+from __future__ import annotations
+
+import json
+import multiprocessing
+import os
+import pathlib
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from typing import TYPE_CHECKING
+
+import lmdb
+import pytest
+
+from pivot.storage import mounts
+from tests import helpers
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+_PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
+_FILES = 12
+_OUTPUT_FILES = _FILES + 1  # the tree's files and count's output
+_PIPELINE = f"""\
+import pathlib
+import tempfile
+
+from pivot import Pipeline, stage
+
+
+@stage
+def make_tree() -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "tree"
+    for i in range({_FILES}):
+        (out / f"d{{i % 3}}").mkdir(parents=True, exist_ok=True)
+        (out / f"d{{i % 3}}" / f"f{{i:02d}}.txt").write_text(f"file {{i}}\\n")
+    return out
+
+
+@stage
+def count(tree: pathlib.Path) -> str:
+    return str(sum(1 for _ in tree.rglob("*.txt")))
+
+
+with Pipeline("syn") as pipeline:
+    count(make_tree())
+"""
+
+# Runs the installed `pivot` script in this interpreter and writes, as JSON, every file under
+# argv[1] that the process opened. Reading a file's content needs an open; a stat does not.
+_RECORD_OPENS = """\
+import json, os, runpy, sys
+
+watched = os.path.realpath(sys.argv[1]) + os.sep
+record = sys.argv[2]
+opened = []
+
+
+def hook(event, args):
+    if event == "open" and isinstance(args[0], (str, bytes, os.PathLike)):
+        path = os.path.realpath(os.fsdecode(args[0]))
+        if path.startswith(watched):
+            opened.append(path)
+
+
+sys.addaudithook(hook)
+sys.argv = sys.argv[3:]
+try:
+    runpy.run_path(sys.argv[0], run_name="__main__")
+finally:
+    with open(record, "w") as f:
+        json.dump(sorted(set(opened)), f)
+"""
+
+
+def _env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+
+
+def _ok(proc: subprocess.CompletedProcess[str]) -> str:
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    return out
+
+
+def _pivot(cwd: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [_PIVOT, *args], cwd=cwd, env=_env(), capture_output=True, text=True, timeout=180
+    )
+
+
+def _helper_project(root: pathlib.Path) -> pathlib.Path:
+    """A project whose two stages ran once."""
+    root.mkdir(parents=True)
+    root = root.resolve()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    _ok(_pivot(root, "init"))
+    (root / "pipeline.py").write_text(_PIPELINE)
+    (root / ".gitignore").write_text("/data/\n__pycache__/\n")
+    _ok(_pivot(root, "repro"))
+    return root
+
+
+def _helper_status(root: pathlib.Path, tmp_path: pathlib.Path) -> list[str]:
+    """Run `pivot status --json -v` in ``root``; return the output files the process opened.
+
+    Every stage must be reported cached: a replica is a copy of a current project.
+    """
+    record = tmp_path / f"opened-{time.monotonic_ns()}.json"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _RECORD_OPENS,
+            str(root / "data"),
+            str(record),
+            _PIVOT,
+            "status",
+            "--json",
+            "-v",
+        ],
+        cwd=root,
+        env=_env(),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    _ok(proc)
+    stages = json.loads(proc.stdout)["stages"]
+    assert [(entry["name"], entry["status"]) for entry in stages] == [
+        ("syn/make_tree", "cached"),
+        ("syn/count", "cached"),
+    ], proc.stdout
+    return json.loads(record.read_text())
+
+
+def _cp_al(src: pathlib.Path, dst: pathlib.Path) -> None:
+    """`cp -al`: every file a hard link, the state database's files included."""
+    shutil.copytree(src, dst, symlinks=True, copy_function=os.link)
+
+
+def _bet_replica(src: pathlib.Path, dst: pathlib.Path) -> None:
+    """The BET lanes' replica (their make_replica.py): a symlink is recreated, a file with no
+    write bit (pivot's outputs and cache objects) is hard-linked, and every other file, the
+    state database's included, is copied with `shutil.copy2`."""
+    for root, dirs, files in os.walk(src):
+        out = dst / pathlib.Path(root).relative_to(src)
+        out.mkdir(parents=True, exist_ok=True)
+        for name in list(dirs):
+            path = pathlib.Path(root) / name
+            if path.is_symlink():
+                (out / name).symlink_to(os.readlink(path))
+                dirs.remove(name)
+        for name in files:
+            path = pathlib.Path(root) / name
+            if path.is_symlink():
+                (out / name).symlink_to(os.readlink(path))
+            elif path.lstat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH):
+                shutil.copy2(path, out / name)
+            else:
+                os.link(path, out / name)
+
+
+def _rsync_a(src: pathlib.Path, dst: pathlib.Path) -> None:
+    """`rsync -a`: every file copied, mtimes kept."""
+    shutil.copytree(src, dst, symlinks=True)
+
+
+def _cp_r(src: pathlib.Path, dst: pathlib.Path) -> None:
+    """`cp -r`: every file copied with its mode, mtimes not kept."""
+    shutil.copytree(src, dst, symlinks=True, copy_function=shutil.copy)
+
+
+def _skip_if_identity_refused(tmp_path: pathlib.Path) -> None:
+    """Skip when ``tmp_path``'s filesystem is off the shared identity allowlist, so a hard link
+    there is not served by identity and a test that pins an identity-served read cannot hold.
+    pytest's temporary directory can land on such a filesystem — a container's own overlayfs
+    root among them — and the documented test command must not go red there on correct code.
+    CI keeps this coverage on ext4; the skip reason names the filesystem."""
+    mount_table = mounts.read_mounts()
+    if mounts.device_allowed(mount_table, os.stat(tmp_path).st_dev, tmp_path):
+        return
+    real = os.fsencode(os.path.realpath(tmp_path))
+    fstype = next(
+        (
+            os.fsdecode(mount_type)
+            for point, mount_type in mount_table["points"]
+            if real == point or real.startswith(point.rstrip(b"/") + b"/")
+        ),
+        "an unlisted filesystem",
+    )
+    pytest.skip(
+        f"the temporary directory is on {fstype}, off the shared identity allowlist; "
+        + "a hard-linked replica is not served by identity there"
+    )
+
+
+@pytest.mark.parametrize(
+    "make_replica",
+    [pytest.param(_cp_al, id="cp-al"), pytest.param(_bet_replica, id="bet-replica")],
+)
+def test_a_hard_linked_replicas_first_status_reads_no_output(
+    tmp_path: pathlib.Path, make_replica: Callable[[pathlib.Path, pathlib.Path], None]
+) -> None:
+    """Each output file of the replica is the original's inode, so the entry its copied state
+    database holds for the original's path vouches for it, and status reads none of them."""
+    _skip_if_identity_refused(tmp_path)
+    root = _helper_project(tmp_path / "live")
+    replica = tmp_path / "replica"
+    make_replica(root, replica)
+
+    assert _helper_status(replica, tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "make_replica", [pytest.param(_rsync_a, id="rsync-a"), pytest.param(_cp_r, id="cp-r")]
+)
+def test_a_copied_replicas_second_status_reads_no_output(
+    tmp_path: pathlib.Path, make_replica: Callable[[pathlib.Path, pathlib.Path], None]
+) -> None:
+    """A copied output is a new file, so the first status reads it; it saves what it read, so
+    the second status reads nothing."""
+    root = _helper_project(tmp_path / "live")
+    replica = tmp_path / "replica"
+    make_replica(root, replica)
+
+    assert len(_helper_status(replica, tmp_path)) == _OUTPUT_FILES, "A copy is a new file"
+    assert _helper_status(replica, tmp_path) == []
+
+
+def _helper_json(proc: subprocess.CompletedProcess[str]) -> object:
+    """The JSON document a `--json` command wrote to standard output, which must be alone there
+    (`pivot status --json` sends its notes to standard error)."""
+    _ = _ok(proc)
+    return json.loads(proc.stdout)
+
+
+def _helper_dump(state_dir: pathlib.Path) -> dict[bytes, bytes]:
+    env = lmdb.open(str(state_dir / "state.lmdb"), readonly=True, lock=False)
+    try:
+        with env.begin() as txn:
+            return dict(txn.cursor())
+    finally:
+        env.close()
+
+
+def test_status_against_a_locked_state_db_exits_0_and_saves_once_it_is_free(
+    tmp_path: pathlib.Path,
+) -> None:
+    """While another process holds the state database's write lock, status reports, exits 0,
+    and leaves the database as it was, waiting no longer than a pivot write does. Once the
+    lock is free, status saves the hashes it read."""
+    root = _helper_project(tmp_path / "live")
+    replica = tmp_path / "replica"
+    _rsync_a(root, replica)
+    state_dir = replica / ".pivot"
+    before = _helper_dump(state_dir)
+
+    ctx = multiprocessing.get_context("spawn")
+    held, release = ctx.Event(), ctx.Event()
+    holder = ctx.Process(target=helpers.hold_write_lock, args=(str(state_dir), held, release))
+    holder.start()
+    try:
+        assert held.wait(30), "The holder took the write lock"
+        started = time.monotonic()
+        assert len(_helper_status(replica, tmp_path)) == _OUTPUT_FILES
+        assert time.monotonic() - started < 2.0 + 15, (
+            "Status gives up the write after its 2 s budget; a pivot write would wait 30 s"
+        )
+    finally:
+        release.set()
+        holder.join(30)
+    assert holder.exitcode == 0
+    assert _helper_dump(state_dir) == before, "A locked database is left as it was"
+
+    assert len(_helper_status(replica, tmp_path)) == _OUTPUT_FILES, (
+        "Nothing was saved under the lock"
+    )
+    assert _helper_dump(state_dir) != before, "With the lock free, status saves what it read"
+    assert _helper_status(replica, tmp_path) == []
+
+
+def test_status_with_the_fingerprint_caches_to_fill_does_not_wait_for_a_held_lock(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A `pivot status` that has fingerprint entries to save (here `pivot fingerprint reset`
+    emptied them) gives the same report while another process holds the state database's write
+    lock, and gives up each save after its 2 s budget instead of a pivot write's 30 s."""
+    root = _helper_project(tmp_path / "live")
+    state_dir = root / ".pivot"
+    _ok(_pivot(root, "fingerprint", "reset"))
+    started = time.monotonic()
+    free = _helper_json(_pivot(root, "status", "--json"))
+    free_seconds = time.monotonic() - started
+    _ok(_pivot(root, "fingerprint", "reset"))
+
+    ctx = multiprocessing.get_context("spawn")
+    held, release = ctx.Event(), ctx.Event()
+    holder = ctx.Process(target=helpers.hold_write_lock, args=(str(state_dir), held, release))
+    holder.start()
+    try:
+        assert held.wait(30), "The holder took the write lock"
+        started = time.monotonic()
+        locked = _helper_json(_pivot(root, "status", "--json"))
+        locked_seconds = time.monotonic() - started
+    finally:
+        release.set()
+        holder.join(30)
+    assert holder.exitcode == 0
+
+    assert locked == free, "The report is the same under a held lock"
+    assert locked_seconds < free_seconds + 15, (
+        "Each save gives up after 2 s; a pivot write would wait 30 s"
+    )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes through any file mode")
+@pytest.mark.parametrize(
+    ("make_replica", "lock_writable", "opened"),
+    [
+        pytest.param(_bet_replica, True, 0, id="bet-replica-served"),
+        pytest.param(_rsync_a, True, _OUTPUT_FILES, id="rsync-a-read"),
+        pytest.param(_bet_replica, False, _OUTPUT_FILES, id="lock-read-only-not-used"),
+    ],
+)
+def test_status_against_a_read_only_state_db_exits_0_and_leaves_it_unchanged(
+    tmp_path: pathlib.Path,
+    make_replica: Callable[[pathlib.Path, pathlib.Path], None],
+    lock_writable: bool,
+    opened: int,
+) -> None:
+    """A state database this user cannot write still serves its entries while its lock file
+    lets this reader register against writers; with a lock file it cannot write either (another
+    user's project), the database is not used and status reads the files. Either way status
+    reports, exits 0, and leaves the database as it was."""
+    if opened == 0:  # the bet-replica-served case relies on the hard links being served
+        _skip_if_identity_refused(tmp_path)
+    root = _helper_project(tmp_path / "live")
+    replica = tmp_path / "replica"
+    make_replica(root, replica)
+    state_dir = replica / ".pivot"
+    before = _helper_dump(state_dir)
+    lmdb_dir = state_dir / "state.lmdb"
+    modes = {
+        path: path.stat().st_mode
+        for path in [lmdb_dir, *lmdb_dir.iterdir()]
+        if path.name != "lock.mdb" or not lock_writable
+    }
+    for path, mode in modes.items():
+        path.chmod(mode & ~0o222)
+    try:
+        assert len(_helper_status(replica, tmp_path)) == opened
+    finally:
+        for path, mode in modes.items():
+            path.chmod(mode)
+
+    assert _helper_dump(state_dir) == before
+
+
+# Outputs `pivot diff` compares (JSON files in a directory output) and one plot.
+_SHOW_PIPELINE = f"""\
+import json
+import pathlib
+import tempfile
+from typing import Annotated
+
+import matplotlib.figure
+
+from pivot import Pipeline, plot, stage
+
+
+@stage
+def make_tables() -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "tables"
+    for i in range({_FILES}):
+        (out / f"d{{i % 3}}").mkdir(parents=True, exist_ok=True)
+        (out / f"d{{i % 3}}" / f"t{{i:02d}}.json").write_text(json.dumps({{"row": i}}))
+    return out
+
+
+@stage
+def chart() -> Annotated[matplotlib.figure.Figure, plot]:
+    figure = matplotlib.figure.Figure()
+    figure.subplots().plot([1, 2])
+    return figure
+
+
+with Pipeline("show") as pipeline:
+    make_tables()
+    chart()
+"""
+
+
+def _helper_show_project(root: pathlib.Path) -> pathlib.Path:
+    """A project whose stages ran once, with their locks committed for `pivot diff` to read."""
+    root.mkdir(parents=True)
+    root = root.resolve()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    _ok(_pivot(root, "init"))
+    (root / "pipeline.py").write_text(_SHOW_PIPELINE)
+    (root / ".gitignore").write_text("/data/\n/plots/\n__pycache__/\n")
+    _ok(_pivot(root, "repro"))
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "run"],
+        cwd=root,
+        check=True,
+    )
+    return root
+
+
+def _helper_opens(
+    root: pathlib.Path, watched: str, tmp_path: pathlib.Path, *args: str
+) -> tuple[list[str], str]:
+    """Run `pivot <args>` in ``root``; return the files under ``root / watched`` it opened, and
+    its stdout."""
+    record = tmp_path / f"opened-{time.monotonic_ns()}.json"
+    proc = subprocess.run(
+        [sys.executable, "-c", _RECORD_OPENS, str(root / watched), str(record), _PIVOT, *args],
+        cwd=root,
+        env=_env(),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    _ok(proc)
+    return json.loads(record.read_text()), proc.stdout
+
+
+def test_a_copied_replicas_second_diff_reads_no_output(tmp_path: pathlib.Path) -> None:
+    """`pivot diff` hashes each workspace file it compares as status does: a copied output is
+    a new file, so the first diff reads it; it saves what it read, so the second reads none."""
+    root = _helper_show_project(tmp_path / "live")
+    replica = tmp_path / "replica"
+    _cp_r(root, replica)
+
+    first, out = _helper_opens(replica, "data", tmp_path, "diff", "--no-tui", ".")
+    assert "No data file changes detected." in out, out
+    assert len(first) == _FILES, "A copy is a new file"
+    second, out = _helper_opens(replica, "data", tmp_path, "diff", "--no-tui", ".")
+    assert "No data file changes detected." in out, out
+    assert second == []
+
+
+def test_a_copied_replicas_second_plots_diff_reads_no_plot(tmp_path: pathlib.Path) -> None:
+    """`pivot plots diff` hashes each plot as status does: the first call on a copy reads the
+    plot and saves its hash, so the second reads nothing."""
+    root = _helper_show_project(tmp_path / "live")
+    replica = tmp_path / "replica"
+    _cp_r(root, replica)
+
+    first, out = _helper_opens(replica, "plots", tmp_path, "plots", "diff")
+    assert "No plot changes." in out, out
+    assert [pathlib.Path(path).name for path in first] == ["chart.png"], "A copy is a new file"
+    second, out = _helper_opens(replica, "plots", tmp_path, "plots", "diff")
+    assert "No plot changes." in out, out
+    assert second == []
+
+
+def test_diff_and_plots_diff_leave_a_project_without_a_state_database(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot diff` and `pivot plots diff` look files up read-only and save best-effort, so a
+    project with no state database is left without one."""
+    root = _helper_show_project(tmp_path / "live")
+    shutil.rmtree(root / ".pivot" / "state.lmdb")
+
+    for args in (("diff", "--no-tui", "."), ("plots", "diff")):
+        _ok(_pivot(root, *args))
+        assert not (root / ".pivot" / "state.lmdb").exists(), args
+
+
+def test_diff_and_plots_diff_read_the_files_past_a_damaged_state_database(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A damaged state database (its first 8 KiB zeroed, as a torn copy of a live one can leave
+    it) does not fail the two read-only reports, which read no database before they saved
+    hashes: `pivot diff` and `pivot plots diff` read the files, exit 0 and leave it as it was."""
+    root = _helper_show_project(tmp_path / "live")
+    data_file = root / ".pivot" / "state.lmdb" / "data.mdb"
+    with data_file.open("r+b") as f:
+        f.write(b"\0" * 8192)
+    before = data_file.read_bytes()
+
+    opened, out = _helper_opens(root, "data", tmp_path, "diff", "--no-tui", ".")
+    assert "No data file changes detected." in out, out
+    assert len(opened) == _FILES, "Every compared file is read"
+    opened, out = _helper_opens(root, "plots", tmp_path, "plots", "diff")
+    assert "No plot changes." in out, out
+    assert [pathlib.Path(path).name for path in opened] == ["chart.png"]
+    assert data_file.read_bytes() == before
+
+
+_STATE_DIR_PIPELINE = f"""\
+import json
+import pathlib
+import tempfile
+from typing import Annotated
+
+import matplotlib.figure
+import pandas as pd
+
+from pivot import Pipeline, loaders, plot, stage
+
+
+@stage
+def make_tables() -> pathlib.Path:
+    out = pathlib.Path(tempfile.mkdtemp()) / "tables"
+    for i in range({_FILES}):
+        (out / f"d{{i % 3}}").mkdir(parents=True, exist_ok=True)
+        (out / f"d{{i % 3}}" / f"t{{i:02d}}.json").write_text(json.dumps({{"row": i}}))
+    return out
+
+
+@stage
+def make_csv() -> Annotated[pd.DataFrame, loaders.CSV()]:
+    return pd.DataFrame({{"id": [1, 2], "value": [10, 20]}})
+
+
+@stage
+def chart() -> Annotated[matplotlib.figure.Figure, plot]:
+    figure = matplotlib.figure.Figure()
+    figure.subplots().plot([1, 2])
+    return figure
+
+
+with Pipeline("show") as pipeline:
+    make_tables()
+    make_csv()
+    chart()
+"""
+
+
+def test_with_the_state_dir_elsewhere_each_command_saves_where_status_reads(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With ``core.state_dir`` set to ``.state``, every state file is there: the stage locks and
+    the state database (#503). `pivot diff` (a directory output and a single-file output),
+    `pivot plots diff` and a `--no-commit` run save the hashes they read in that database, so
+    the next diff and `pivot status` read none of them, and none creates a ``.pivot`` one."""
+    root = (tmp_path / "live").resolve()
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    _ok(_pivot(root, "init"))
+    (root / "pipeline.py").write_text(_STATE_DIR_PIPELINE)
+    # ``.state/.gitignore`` (written when the directory is made) keeps its database out of git
+    # and its stage locks in, as ``.pivot``'s does, so `pivot diff` reads the committed locks.
+    (root / ".gitignore").write_text("/data/\n/plots/\n__pycache__/\n")
+    _ok(_pivot(root, "config", "set", "core.state_dir", ".state"))
+    _ok(_pivot(root, "repro"))
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "run"],
+        cwd=root,
+        check=True,
+    )
+    replica = tmp_path / "replica"
+    _cp_r(root, replica)
+    assert (replica / ".state" / "stages").is_dir(), "The stage locks are in .state"
+
+    first, _ = _helper_opens(replica, "data", tmp_path, "diff", "--no-tui", ".")
+    assert len(first) == _FILES + 1, "A copy is a new file"
+    assert _helper_opens(replica, "data", tmp_path, "diff", "--no-tui", ".")[0] == []
+    assert len(_helper_opens(replica, "plots", tmp_path, "plots", "diff")[0]) == 1
+    assert _helper_outputs_status_opens(replica, tmp_path) == [], "Status reads none of them"
+
+    _ok(_pivot(replica, "repro", "--no-commit", "--force"))
+    assert _helper_outputs_status_opens(replica, tmp_path) == [], "Status reads no output"
+    assert (replica / ".state" / "state.lmdb").is_dir()
+    assert not (replica / ".pivot" / "state.lmdb").exists(), "No command made a .pivot database"
+
+
+def _helper_outputs_status_opens(root: pathlib.Path, tmp_path: pathlib.Path) -> list[str]:
+    """The stage outputs (under data/ and plots/) that `pivot status --json` opens in ``root``."""
+    opened, _ = _helper_opens(root, ".", tmp_path, "status", "--json")
+    resolved = root.resolve()
+    return [
+        path
+        for path in opened
+        if pathlib.Path(path).relative_to(resolved).parts[0] in ("data", "plots")
+    ]

@@ -26,7 +26,7 @@ import pytest
 from pivot import config, exceptions, project
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
-from pivot.storage import cache, state, track
+from pivot.storage import cache, mounts, state, track
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -66,12 +66,18 @@ def memo_project(new_project: pathlib.Path) -> pathlib.Path:
     return new_project
 
 
-def _helper_mount_line(mount_id: int, device: int, point: str, fstype: str) -> str:
+def _helper_mount_line(
+    mount_id: int,
+    device: int,
+    point: str,
+    fstype: str,
+    super_options: str = "rw,errors=continue",
+) -> str:
     """One /proc/self/mountinfo line, with optional fields and the escaping the kernel uses."""
     escaped = point.replace("\\", "\\134").replace(" ", "\\040")
     return (
         f"{mount_id} 1 {os.major(device)}:{os.minor(device)} / {escaped} "
-        + f"rw,relatime shared:{mount_id} master:3 - {fstype} /dev/sdz1 rw,errors=continue"
+        + f"rw,relatime shared:{mount_id} master:3 - {fstype} /dev/sdz1 {super_options}"
     )
 
 
@@ -80,17 +86,21 @@ def _helper_write_mountinfo(
 ) -> None:
     decoy = _helper_mount_line(90, os.makedev(0, 4242), "/mnt/other", "nfs4")
     path.write_text("\n".join([decoy, *lines]) + "\n")
-    monkeypatch.setattr(track, "_MOUNTINFO", path)
+    monkeypatch.setattr(mounts, "_MOUNTINFO", path)
 
 
 def _helper_mountinfo(
-    monkeypatch: pytest.MonkeyPatch, path: pathlib.Path, root: pathlib.Path, fstype: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    path: pathlib.Path,
+    root: pathlib.Path,
+    fstype: str | None,
+    super_options: str = "rw,errors=continue",
 ) -> None:
     """Point the walk at a mountinfo that mounts root's device as ``fstype`` (None: not at all)."""
     device = os.stat(root).st_dev
     lines = list[str]()
     if fstype is not None:
-        lines.append(_helper_mount_line(91, device, "/mnt/with space", fstype))
+        lines.append(_helper_mount_line(91, device, "/mnt/with space", fstype, super_options))
     _helper_write_mountinfo(monkeypatch, path, lines)
 
 
@@ -945,6 +955,7 @@ def test_clock_stepped_back_into_a_recorded_second_hides_nothing(
 @pytest.mark.parametrize(
     "fstype",
     [
+        pytest.param("tmpfs", id="tmpfs,inode32"),
         pytest.param("nfs4", id="nfs"),
         pytest.param("nfs", id="nfs-version-3"),
         pytest.param("overlay", id="overlayfs"),
@@ -981,7 +992,7 @@ def test_without_mountinfo_no_directory_is_trusted(
     memo_project: pathlib.Path, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """No /proc/self/mountinfo (not Linux, or /proc not mounted): every directory is listed."""
-    monkeypatch.setattr(track, "_MOUNTINFO", tmp_path / "no-such-mountinfo")
+    monkeypatch.setattr(mounts, "_MOUNTINFO", tmp_path / "no-such-mountinfo")
     _helper_build_tree(memo_project)
     _helper_settle(monkeypatch)
     _helper_record(memo_project)
@@ -1011,7 +1022,7 @@ def test_whole_second_mtime_alone_still_uses_the_memo(
     _helper_assert_matches_main(found, memo_project)
 
 
-@pytest.mark.parametrize("fstype", ["ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs", "f2fs", "zfs"])
+@pytest.mark.parametrize("fstype", ["ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "zfs"])
 def test_allowlisted_filesystem_uses_the_memo(
     memo_project: pathlib.Path,
     tmp_path: pathlib.Path,
@@ -1029,6 +1040,24 @@ def test_allowlisted_filesystem_uses_the_memo(
     listings = listed.call_count
 
     assert listings == 0, f"a settled directory on {fstype} is not listed again"
+    _helper_assert_matches_main(found, memo_project)
+
+
+def test_tmpfs_inode64_uses_the_memo(
+    memo_project: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+) -> None:
+    """tmpfs is memoizable only when mountinfo confirms inode64."""
+    _helper_mountinfo(monkeypatch, tmp_path / "mountinfo", memo_project, "tmpfs", "rw,inode64")
+    _helper_build_tree(memo_project)
+    _helper_settle(monkeypatch)
+    _helper_record(memo_project)
+
+    listed = mocker.spy(os, "scandir")
+    found = track.discover_pvt_files(memo_project)
+    assert listed.call_count == 0
     _helper_assert_matches_main(found, memo_project)
 
 

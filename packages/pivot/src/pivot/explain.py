@@ -18,6 +18,7 @@ from pivot.storage import listing, lock, state, track
 from pivot.storage import store as store_mod
 from pivot.types import (
     ArtifactIdentity,
+    FileHashEntry,
     HashInfo,
     LockData,
     StageExplanation,
@@ -201,6 +202,7 @@ def get_stage_explanation(
     tracked_files: dict[str, track.PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
     producer_hashes: dict[ArtifactIdentity, HashInfo] | None = None,
+    file_hash_entries: list[FileHashEntry] | None = None,
     unreadable_listings: Mapping[ArtifactIdentity, str] | None = None,
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run.
@@ -211,6 +213,10 @@ def get_stage_explanation(
     restores outputs. ``unreadable_listings`` says, by file dependency, why the listing that
     would give its hash cannot be used (``producer_output_hashes``); a missing dependency's
     reason names it.
+
+    The explanation reads the state database and writes nothing. ``file_hash_entries``, when
+    given, receives the file-hash entry of every file whose content it read, for the caller to
+    save with ``state.save_file_hashes``.
     """
     if lock_data is None:
         return StageExplanation(
@@ -257,11 +263,13 @@ def get_stage_explanation(
     with state.open_readonly(state_dir, create=False) as state_db:
         known_hashes = producer_hashes or {}
         pending_deps = {name: ref for name, ref in deps.items() if ref.identity not in known_hashes}
-        str_hashes, missing_deps, unreadable_deps, _ = worker.hash_dependencies(
+        str_hashes, missing_deps, unreadable_deps, dep_entries = worker.hash_dependencies(
             pending_deps,
             store,
             state_db,
         )
+        if file_hash_entries is not None:
+            file_hash_entries.extend(dep_entries)
         dep_hashes = _to_identity_keyed(str_hashes)
         for ref in deps.values():
             if ref.identity in known_hashes:
@@ -359,6 +367,7 @@ def get_stage_explanation(
                     else lock.StageLock(stage_name, lock.get_stages_dir(state_dir)),
                     restore=False,
                     report_changes=True,
+                    file_hash_entries=file_hash_entries,
                 )
             except exceptions.UnreadableLinkError as error:
                 # An output holds a link the check cannot read: its message, which names the

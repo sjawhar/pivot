@@ -774,6 +774,26 @@ def test_open_readonly_uses_the_database_mount_to_classify_an_lmdb_error(
         pass
 
 
+def test_open_readonly_treats_a_permission_error_before_the_mount_check(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A database this user cannot open is no cache even if its mount is writable."""
+    with state.StateDB(tmp_path):
+        pass
+
+    def denied(*_: object, **__: object) -> object:
+        raise PermissionError("Permission denied")
+
+    def unexpected_statvfs(_: object) -> object:
+        raise AssertionError("the permission case must not inspect the mount")
+
+    monkeypatch.setattr(state, "_acquire_shared_env", denied)
+    monkeypatch.setattr(os, "statvfs", unexpected_statvfs)
+
+    with state.open_readonly(tmp_path, create=False) as state_db:
+        assert state_db is None
+
+
 def test_readonly_blocks_save(tmp_path: pathlib.Path) -> None:
     """Readonly mode blocks save operation."""
     db_path = tmp_path
@@ -1931,6 +1951,6 @@ def test_a_best_effort_save_skips_a_state_directory_holding_a_nul_byte(
     saved = state.save_best_effort(
         state_dir, lambda db: db.save(data, data.stat(), "0123456789abcdef"), what="a hash"
     )
-    state.save_file_hashes(state_dir, [(data, data.stat(), "0123456789abcdef")])
+    state.save_file_hashes(state_dir, [(data, data.stat(), "0123456789abcdef")], create=True)
 
     assert saved is False

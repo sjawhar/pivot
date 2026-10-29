@@ -109,7 +109,7 @@ def plots_diff(targets: tuple[str, ...], json_output: bool, md: bool, no_path: b
             return
         paths = set(old_hashes.keys())
 
-    new_hashes = plots_mod.get_plot_hashes_from_workspace(list(paths))
+    new_hashes = plots_mod.get_plot_hashes_from_workspace(list(paths), plots_mod.plot_state_dirs())
     diffs = plots_mod.diff_plots(old_hashes, new_hashes)
 
     output_format: OutputFormat | None = (
