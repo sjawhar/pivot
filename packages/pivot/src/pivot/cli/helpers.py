@@ -9,13 +9,16 @@ import click
 from tqdm.asyncio import tqdm as async_tqdm
 
 if TYPE_CHECKING:
+    import pathlib
+
     from networkx import DiGraph
 
     from pivot.cli import CliContext
     from pivot.registry import PipelineLike, RegistryStageInfo
+    from pivot.storage import track
     from pivot.storage.store import WorkspaceStore
 
-from pivot import display, exceptions, names, project
+from pivot import discovery, display, exceptions, names, project
 from pivot.cli import decorators as cli_decorators
 
 
@@ -81,6 +84,20 @@ def require_workspace_store() -> WorkspaceStore:
     if store is None:
         raise NoPipelineError()
     return store
+
+
+def own_member_skip(cache_dir: pathlib.Path) -> track.PvtSkip:
+    """The skip that leaves every pipeline's stage-owned ``*.pvt`` members out of what this
+    command discovers (``discovery.every_pipeline_member_skip``): the loaded pipeline's stages
+    first (none without a pipeline), and the others only when the command did not load them
+    all (``--all``). ``cache_dir`` is the cache object root."""
+    pipeline = cli_decorators.get_pipeline_from_context()
+    return discovery.every_pipeline_member_skip(
+        project.get_project_root(),
+        get_all_stages() if pipeline is not None else {},
+        cache_dir,
+        every_pipeline_loaded=cli_decorators.get_all_pipelines_from_context(),
+    )
 
 
 def _json_default(obj: Any) -> Any:  # noqa: ANN401 - json.dumps default requires Any

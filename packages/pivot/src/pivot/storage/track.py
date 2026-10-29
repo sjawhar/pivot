@@ -905,10 +905,14 @@ def is_import(data: PvtData) -> bool:
 def discover_import_pvt_files(
     root: pathlib.Path, *, skip: PvtSkip | None = None
 ) -> dict[str, PvtData]:
-    """Find all import .pvt files under root (``discover_pvt_files``, with ``skip``)."""
-    return {
-        path: data for path, data in discover_pvt_files(root, skip=skip).items() if is_import(data)
-    }
+    """Find all import .pvt files under root (``discover_pvt_files``). ``skip`` is asked about
+    import .pvt files alone, so one that reads more than the file (a stage's own member,
+    ``ownership.own_member_skip``) does so only once an import is found."""
+
+    def other_or_skipped(path: pathlib.Path, data: PvtData) -> bool:
+        return not is_import(data) or (skip is not None and skip(path, data))
+
+    return discover_pvt_files(root, skip=other_or_skipped)
 
 
 def pvt_to_hash_info(pvt_data: PvtData) -> HashInfo:

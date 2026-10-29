@@ -510,10 +510,9 @@ def verify(
     # Verify stages
     passed, results = _verify_stages(pipeline_status, cache_dir, allow_missing)
     if stages_list is None:
-        # A stage's own .pvt member of its output is no tracked directory
+        # A stage's own .pvt member of its output, in any pipeline, is no tracked directory
         tracked_failures = _tracked_listing_failures(
-            cache_dir / "files",
-            status_mod.own_member_skip(all_stages, cli_helpers.require_workspace_store()),
+            cache_dir / "files", cli_helpers.own_member_skip(cache_dir / "files")
         )
         results.extend(tracked_failures)
         passed = passed and not tracked_failures

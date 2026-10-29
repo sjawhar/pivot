@@ -752,17 +752,13 @@ def checkout(
     pipeline = cli_decorators.get_pipeline_from_context()
     stage_outputs = dict[str, Expected]()
     output_state_dirs = dict[str, pathlib.Path]()
-    skip: track.PvtSkip | None = None
     if pipeline is not None:
         stage_outputs, output_state_dirs = _get_stage_output_info(cache_dir)
-        store = cli_helpers.get_workspace_store()
-        if store is not None:
-            skip = ownership.own_member_skip(
-                project_root, cli_helpers.get_all_stages(), store, config.get_state_dir(), cache_dir
-            )
 
-    # Discover tracked files: a stage's own .pvt member of its output is none
-    tracked_files = track.discover_pvt_files(project_root, skip=skip)
+    # Discover tracked files: a stage's own .pvt member of its output, in any pipeline, is none
+    tracked_files = track.discover_pvt_files(
+        project_root, skip=cli_helpers.own_member_skip(cache_dir)
+    )
 
     state_dir = config.locate_state_dir()
 

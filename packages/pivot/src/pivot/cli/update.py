@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import pathlib
 from typing import TYPE_CHECKING
@@ -49,7 +50,7 @@ def update(targets: tuple[str, ...], rev: str | None, dry_run: bool) -> None:
 
     If no TARGETS specified, updates all imports found in the project.
     """
-    from pivot import project
+    from pivot import config, discovery, project
     from pivot.storage import track
 
     root = project.get_project_root()
@@ -71,7 +72,19 @@ def update(targets: tuple[str, ...], rev: str | None, dry_run: bool) -> None:
                 continue
             pairs.append((pvt_path, pvt_data))
     else:
-        imports = track.discover_import_pvt_files(root)
+        # A stage's own .pvt member of its output, in any pipeline, is no import. The command
+        # loads no pipeline and reads no config until an import .pvt is found; the first one
+        # discovers every pipeline.
+        @functools.cache
+        def member_skip() -> track.PvtSkip:
+            return discovery.every_pipeline_member_skip(
+                root, {}, config.locate_cache_dir() / "files"
+            )
+
+        def skip(path: pathlib.Path, data: track.PvtData) -> bool:
+            return member_skip()(path, data)
+
+        imports = track.discover_import_pvt_files(root, skip=skip)
         pairs = list[tuple[pathlib.Path, track.PvtData]]()
         for data_path_str, pvt_data in imports.items():
             pvt_path = track.get_pvt_path(pathlib.Path(data_path_str))

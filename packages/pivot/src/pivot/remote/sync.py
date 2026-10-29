@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
 import os
 import pathlib
 from typing import TYPE_CHECKING
 
-from pivot import config, exceptions, metrics, names, project, registry, types
+from pivot import config, discovery, exceptions, metrics, names, project, registry, types
 from pivot import state_dir as state_dir_mod
 from pivot.remote import config as remote_config
 from pivot.remote import protocol
-from pivot.storage import cache, listing, lock, ownership, track
+from pivot.storage import cache, listing, lock, track
 from pivot.storage import store as store_mod
 from pivot.types import HashInfo, LockData, RemoteStatus, TransferSummary, is_dir_hash
 
@@ -287,9 +286,9 @@ def get_target_hashes(
     A directory resolves to its listing object and its files' objects. ``cache_dir`` is the
     cache root (``config.locate_cache_dir()`` when None). With ``require_members`` (push), a
     directory whose committed listing cannot be read and whose listing object the cache lacks
-    raises rather than naming an object that is not there (``_blob_hashes``). With
-    ``all_stages``, a ``*.pvt`` file one of those stages wrote as its own member resolves
-    nothing (``member_skip``).
+    raises rather than naming an object that is not there (``_blob_hashes``). A ``*.pvt`` file
+    that a stage of any pipeline wrote as its own member resolves nothing
+    (``discovery.every_pipeline_member_skip``, ``all_stages`` answering first).
     """
     _t = metrics.start()
     proj_root = project.get_project_root()
@@ -298,22 +297,7 @@ def get_target_hashes(
     output_identities: dict[str, types.ArtifactIdentity] | None = None
     unresolved = list[str]()
     tracked_blobs: dict[str, set[str]] | None = None
-
-    @functools.cache
-    def member_skip() -> track.PvtSkip | None:
-        """Leaves a stage's own ``*.pvt`` member of its output out of what a ``.pvt`` tracks
-        (``ownership.own_member_skip``); None without the stages, which decide it. Read once,
-        and only by a target that reaches a ``.pvt``: display paths depend on the qualified
-        stage names alone, so the pipeline's own name is not needed here either."""
-        if all_stages is None:
-            return None
-        return ownership.own_member_skip(
-            proj_root,
-            all_stages,
-            store_mod.WorkspaceStore(proj_root, "", {}),
-            state_dir,
-            files_dir,
-        )
+    skip = discovery.every_pipeline_member_skip(proj_root, all_stages or {}, files_dir)
 
     for target in targets:
         original_target = target
@@ -386,7 +370,7 @@ def get_target_hashes(
                                     tracked_blobs = _get_tracked_blobs(
                                         proj_root,
                                         files_dir,
-                                        skip=member_skip(),
+                                        skip=skip,
                                         require_members=require_members,
                                     )
                                 hashes |= tracked_blobs.get(dep_hash["hash"], set[str]())
@@ -438,7 +422,7 @@ def get_target_hashes(
             continue
 
         pvt_blobs = _get_file_hash_from_pvt(
-            rel_path, proj_root, files_dir, skip=member_skip(), require_members=require_members
+            rel_path, proj_root, files_dir, skip=skip, require_members=require_members
         )
         if pvt_blobs is not None:
             hashes |= pvt_blobs

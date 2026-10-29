@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import enum
 import functools
+import logging
 import os
 import pathlib
 import stat
@@ -32,6 +33,8 @@ import lmdb
 
 from pivot import config, exceptions, project, types
 from pivot.storage import cache, listing, lock, state, track
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -397,11 +400,19 @@ def read_stage_claims(
     listing_readers: Mapping[pathlib.Path, Callable[[], listing.DirListing]] | None = None,
 ) -> StageClaims:
     """``stage_claims``, reading the stage's ``nocommit:`` record from the StateDB in
-    ``state_dir`` (opened read-only, never created)."""
+    ``state_dir`` (opened read-only, never created; ``state.open_readonly``).
+
+    A record that cannot be read (a damaged or unwritable database) is taken as absent: a
+    ``*.pvt`` only it lists is then the user's, which every restore refuses, and the members the
+    lock lists are still the stage's. A command never fails for want of the record.
+    """
     record: types.NoCommitRecord | None = None
-    if (state_dir / "state.lmdb").exists():
-        with state.StateDB(state_dir, readonly=True) as state_db:
-            record = state_db.get_no_commit_record(stage_name)
+    try:
+        with state.open_readonly(state_dir, create=False) as state_db:
+            if state_db is not None:
+                record = state_db.get_no_commit_record(stage_name)
+    except (OSError, lmdb.Error) as error:
+        logger.debug("No nocommit: record for %s in %s: %s", stage_name, state_dir, error)
     return stage_claims(
         project_root,
         locked,
@@ -908,23 +919,40 @@ def own_member_skip(
     workspace: WorkspaceStore,
     default_state_dir: pathlib.Path,
     cache_dir: pathlib.Path,
-) -> Callable[[pathlib.Path, track.PvtData], bool]:
+    *,
+    other_stages: Callable[[], Mapping[str, RegistryStageInfo]] | None = None,
+) -> track.PvtSkip:
     """Whether a ``*.pvt`` file that parses is a member of an output these stages write
     (``stage_members``, the rule every write, restore and commit uses): ``skip`` for
     ``track.discover_pvt_files``, so no command reads a stage's own member as a tracked file.
 
     Any other ``*.pvt`` in an output is the user's: discovery keeps it, and every restore of that
     output refuses it. A stage's claims are read only for an output that holds a ``*.pvt``.
+
+    ``other_stages`` reads the stages of the pipelines the command did not load. It is called
+    once, for the first ``*.pvt`` that lies in none of ``stages``' outputs, and from then on every
+    stage's outputs are read: a command whose ``*.pvt`` files all lie in its own outputs, or that
+    finds none, loads no other pipeline.
     """
     owners, members_of = _output_members(
         project_root, stages, workspace, default_state_dir, cache_dir
     )
+    pending = other_stages
+
+    def outputs_holding(path: pathlib.Path) -> list[pathlib.Path]:
+        return [output for output in path.parents if output in owners]
 
     def skip(pvt_path: pathlib.Path, data: track.PvtData) -> bool:
+        nonlocal owners, members_of, pending
         path = normalized(pvt_path)
-        return any(
-            output in owners and _is_stage_member(path, data, members_of(output), path)
-            for output in path.parents
-        )
+        outputs = outputs_holding(path)
+        if not outputs and pending is not None:
+            every = {**pending(), **stages}
+            pending = None
+            owners, members_of = _output_members(
+                project_root, every, workspace, default_state_dir, cache_dir
+            )
+            outputs = outputs_holding(path)
+        return any(_is_stage_member(path, data, members_of(output), path) for output in outputs)
 
     return skip

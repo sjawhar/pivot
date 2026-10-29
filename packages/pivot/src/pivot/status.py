@@ -54,6 +54,7 @@ import pygtrie
 
 from pivot import (
     config,
+    discovery,
     display,
     exceptions,
     explain,
@@ -68,7 +69,7 @@ from pivot import state_dir as state_dir_mod
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
-from pivot.storage import cache, listing, lock, ownership, track
+from pivot.storage import cache, listing, lock, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -102,30 +103,21 @@ UPSTREAM_STALE_REASON_PREFIX = "Upstream stale"
 """Reason prefix for a stage that is current on its own but has a stale upstream."""
 
 
-def own_member_skip(
-    all_stages: dict[str, RegistryStageInfo], workspace: store_mod.WorkspaceStore
-) -> track.PvtSkip:
-    """``ownership.own_member_skip`` for these stages, with the state and cache directories
-    located, not created."""
-    return ownership.own_member_skip(
-        project.get_project_root(),
-        all_stages,
-        workspace,
-        config.locate_state_dir(),
-        config.locate_cache_dir() / "files",
-    )
-
-
 def _discover_tracked_files(
-    allow_missing: bool, all_stages: dict[str, RegistryStageInfo], pipeline: registry.PipelineLike
+    allow_missing: bool, all_stages: dict[str, RegistryStageInfo]
 ) -> tuple[dict[str, PvtData] | None, pygtrie.Trie[str] | None]:
-    """Discover tracked files for .pvt hash lookup when allow_missing is set."""
+    """Discover tracked files for .pvt hash lookup when allow_missing is set. A stage's own
+    ``*.pvt`` member of its output, in any pipeline, is none
+    (``discovery.every_pipeline_member_skip``)."""
     if not allow_missing:
         return None, None
 
+    project_root = project.get_project_root()
     tracked_files = track.discover_pvt_files(
-        project.get_project_root(),
-        skip=own_member_skip(all_stages, _make_workspace_store(pipeline)),
+        project_root,
+        skip=discovery.every_pipeline_member_skip(
+            project_root, all_stages, config.locate_cache_dir() / "files"
+        ),
     )
     tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
     for path in tracked_files:
@@ -226,9 +218,7 @@ def get_pipeline_explanations(
     _t = metrics.start()
     try:
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
-            tracked_files, tracked_trie = _discover_tracked_files(
-                allow_missing, all_stages, pipeline
-            )
+            tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
             if graph is None:
                 graph = engine_graph.build_graph(all_stages)
             stage_graph = engine_graph.get_stage_dag(graph)
@@ -319,9 +309,7 @@ def get_pipeline_status(
     _t = metrics.start()
     try:
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
-            tracked_files, tracked_trie = _discover_tracked_files(
-                allow_missing, all_stages, pipeline
-            )
+            tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
             if graph is None:
                 graph = engine_graph.build_graph(all_stages)
             stage_graph = engine_graph.get_stage_dag(graph)
@@ -380,7 +368,7 @@ def get_tracked_files_status(
         project_root: Project root directory.
         on_progress: Optional callback called with (completed, total) after each file.
         skip: Leaves a .pvt out of the tracked files (``track.discover_pvt_files``): a stage's
-            own member of its output (``own_member_skip``).
+            own member of its output (``discovery.every_pipeline_member_skip``).
     """
     tracked = track.discover_pvt_files(project_root, skip=skip)
     total = len(tracked)
