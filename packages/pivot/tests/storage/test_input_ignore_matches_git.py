@@ -79,6 +79,22 @@ _PATTERNS = [
     "data/raw/in/**/keep.txt",
     "a**b",
 ]
+# A pattern and a later negation that undoes part of it, the case a matcher most often gets
+# wrong (``X/**`` must not name X itself, or the parent rule keeps the negation from working).
+_PAIRS = [
+    ("**/foo/**", "!**/foo/keep.txt"),
+    ("logs/**", "!logs/.gitkeep"),
+    ("**/logs/**", "!**/logs/.gitkeep"),
+    ("/data/raw/in/foo/**", "!/data/raw/in/foo/keep.txt"),
+    ("sub/**", "!sub/a.txt"),
+    ("x/**", "!x/keep.txt"),
+    ("build/", "!build/keep.txt"),
+    ("*.txt", "!a.txt"),
+    ("sub/", "!sub/"),
+    ("*/", "!*/"),
+    ("deep/*", "!deep/b"),
+    ("*.pyc", "!keep.pyc"),
+]
 _NAMES = [
     "a.txt",
     "x.pyc",
@@ -148,6 +164,9 @@ def test_an_input_hash_keeps_exactly_the_files_git_keeps(tmp_path: pathlib.Path)
         _helper_tree(case / _INPUT, rng, 3)
         (case / _INPUT / "always.dat").write_text("x\n")
         patterns = rng.sample(_PATTERNS, rng.randint(1, 6))
+        if rng.random() < 0.5:
+            # A negation only matters after a pattern it undoes, so put one such pair in order.
+            patterns.extend(rng.choice(_PAIRS))
         text = "\n".join(patterns) + "\n"
         (case / ".pivotignore").write_text(text)
         (case / ".gitignore").write_text(text + "/.pivotignore\n/.gitignore\n")
