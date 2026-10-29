@@ -251,16 +251,16 @@ def test_hash_directory_costs_little_more_than_reading_its_files(tmp_path: pathl
     hashing each file, and reads the bytes of each file once.
 
     The direct loop does no walk, stat or canonical listing. How much more hash_directory costs
-    varies with the CPU and with coverage tracing (1.3 to 2.6 times), so reading every file twice
-    (2.2 to 3.7 times) needs its own check: two trees with the same names, of 1 KiB and 64 KiB
-    files, cancel the per-file work. 63 KiB more in each file costs hash_directory 1.0 to 1.25
-    times what it costs the loop, and 1.55 to 1.85 times when it reads every file twice.
+    varies with the CPU and with coverage tracing (1.3 to 2.8 times), so reading every file twice
+    (2.2 to 3.8 times) needs its own check: two trees with the same names, of 1 KiB and 64 KiB
+    files, cancel the per-file work. 63 KiB more in each file costs hash_directory 0.9 to 1.2
+    times what it costs the loop, and 1.6 to 2.2 times when it reads every file twice.
 
     The test counts this process's CPU time, so time that other processes take from it on a busy
-    runner is left out. It compares the four measurements within each of 10 interleaved rounds
-    and takes the median round: in CPU time a round runs up to 1.8 times faster while the other
-    hyperthread of its core is idle, and the minimum of each measurement would mix fast and slow
-    rounds."""
+    runner is left out. It runs 10 interleaved rounds of the four measurements and takes the
+    median of the 10 per-round ratios and of the 10 per-round slopes: in CPU time a round runs up
+    to 1.8 times faster while the other hyperthread of its core is idle, and the minimum of each
+    measurement would mix fast and slow rounds."""
     small_root = tmp_path / "small"
     large_root = tmp_path / "large"
     small = _helper_write_files(small_root, 1024)
@@ -288,7 +288,7 @@ def test_hash_directory_costs_little_more_than_reading_its_files(tmp_path: pathl
         f"63 KiB more in each of 2,000 files took hash_directory {slope:.2f} times the extra CPU "
         + "of reading and hashing them (median; by round: "
         + f"{', '.join(f'{value:.2f}' for value in slopes)}): it does more work per byte than one "
-        + "read and hash (reading every file twice gives about 1.6 times)"
+        + "read and hash (reading every file twice gives 1.6 to 2.2 times)"
     )
 
 
