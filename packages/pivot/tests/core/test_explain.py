@@ -1008,29 +1008,32 @@ class _TrackedCorpus(TypedDict):
     cache_dir: pathlib.Path
 
 
-def _discover_corpus(root: pathlib.Path) -> _TrackedCorpus:
-    """Discover the tracked paths under ``root`` as ``pivot status --allow-missing`` does."""
-    tracked_files, tracked_trie = status._discover_tracked_files(allow_missing=True)
+def _discover_corpus(pipeline: compose.Pipeline) -> _TrackedCorpus:
+    """Discover the tracked paths under the pipeline's root as `pivot status --allow-missing`
+    does. These tests register no stage, so no `*.pvt` there is a stage's own member."""
+    tracked_files, tracked_trie = status._discover_tracked_files(
+        allow_missing=True, all_stages={}, pipeline=pipeline
+    )
     assert tracked_files is not None and tracked_trie is not None
     return _TrackedCorpus(
         tracked_files=tracked_files,
         tracked_trie=tracked_trie,
-        corpus=project.normalize_path(root / "corpus"),
+        corpus=project.normalize_path(pipeline.root / "corpus"),
         cache_dir=config.get_cache_dir() / "files",
     )
 
 
-def _track_corpus(root: pathlib.Path, runner: click.testing.CliRunner) -> _TrackedCorpus:
+def _track_corpus(pipeline: compose.Pipeline, runner: click.testing.CliRunner) -> _TrackedCorpus:
     """``pivot track corpus`` over a.csv and sub/b.csv, then delete the directory, as a fresh
     clone has it before ``pivot pull``: only a listing can give a member's hash."""
-    corpus = root / "corpus"
+    corpus = pipeline.root / "corpus"
     (corpus / "sub").mkdir(parents=True)
     (corpus / "a.csv").write_bytes(b"a\n1\n")
     (corpus / "sub" / "b.csv").write_bytes(b"b\n2\n")
     result = runner.invoke(cli.cli, ["track", "corpus"])
     assert result.exit_code == 0, result.output
     shutil.rmtree(corpus)
-    return _discover_corpus(root)
+    return _discover_corpus(pipeline)
 
 
 def test_find_tracked_hash_exact_match() -> None:
@@ -1053,7 +1056,7 @@ def test_find_tracked_hash_reads_a_member_from_the_committed_listing(
     mock_discovery: compose.Pipeline, runner: click.testing.CliRunner
 ) -> None:
     """With the directory gone and no cache, ``corpus.pvt.listing`` gives a member's hash."""
-    tracked = _track_corpus(mock_discovery.root, runner)
+    tracked = _track_corpus(mock_discovery, runner)
 
     result = explain._find_tracked_hash(
         tracked["corpus"] / "sub" / "b.csv", tracked["tracked_files"], tracked["tracked_trie"], None
@@ -1066,7 +1069,7 @@ def test_find_tracked_hash_reads_a_member_from_the_cache_without_a_committed_lis
     mock_discovery: compose.Pipeline, runner: click.testing.CliRunner
 ) -> None:
     """A listing missing from the commit is read from the cache object at the directory hash."""
-    tracked = _track_corpus(mock_discovery.root, runner)
+    tracked = _track_corpus(mock_discovery, runner)
     (mock_discovery.root / "corpus.pvt.listing").unlink()
 
     result = explain._find_tracked_hash(
@@ -1084,7 +1087,7 @@ def test_find_tracked_hash_has_no_hash_for_a_member_when_no_listing_exists(
 ) -> None:
     """With neither the committed listing nor a cache, a member has no tracked hash, so explain
     falls back to the stage lock's hash."""
-    tracked = _track_corpus(mock_discovery.root, runner)
+    tracked = _track_corpus(mock_discovery, runner)
     (mock_discovery.root / "corpus.pvt.listing").unlink()
     shutil.rmtree(tracked["cache_dir"])
 
@@ -1116,7 +1119,7 @@ def test_find_tracked_hash_not_in_listing(
     mock_discovery: compose.Pipeline, runner: click.testing.CliRunner
 ) -> None:
     """Returns None for a file inside a tracked directory that its listing does not hold."""
-    tracked = _track_corpus(mock_discovery.root, runner)
+    tracked = _track_corpus(mock_discovery, runner)
 
     assert (
         explain._find_tracked_hash(
@@ -1134,7 +1137,7 @@ def test_find_tracked_hash_refuses_an_edited_committed_listing_the_cache_cannot_
 ) -> None:
     """A committed listing whose bytes no longer hash to the .pvt's record is refused, naming
     it, when the cache holds no object at that record's hash to read instead."""
-    tracked = _track_corpus(mock_discovery.root, runner)
+    tracked = _track_corpus(mock_discovery, runner)
     committed = mock_discovery.root / "corpus.pvt.listing"
     original = committed.read_bytes()
     committed.write_bytes(original.replace(_B_CSV_HASH.encode(), _A_CSV_HASH.encode()))
@@ -1158,7 +1161,7 @@ def test_find_tracked_hash_reads_a_member_from_an_old_directory_pvt_with_one_war
     pvt_path.write_text(_OLD_CORPUS_PVT)
 
     with caplog.at_level(logging.WARNING, logger="pivot.storage.track"):
-        tracked = _discover_corpus(mock_discovery.root)
+        tracked = _discover_corpus(mock_discovery)
         result = explain._find_tracked_hash(
             tracked["corpus"] / "sub" / "b.csv",
             tracked["tracked_files"],

@@ -960,3 +960,41 @@ def test_forced_get_restores_the_other_targets_beside_one_whose_pvt_is_not_valid
     assert other.read_text() == "v1", result.output
     assert tracked.read_text() == "user bytes"
     assert track.get_pvt_path(tracked).is_file()
+
+
+_DIRECTORY_SHAPED_MEMBER_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def tree() -> Annotated[dict[str, str], directory]:
+    return {
+        "value.txt": "1",
+        "d.pvt": "path: d\\nhash: abcdef0000000001\\nsize: 1\\nnfiles: 1\\n",
+        "d.pvt.listing": "stage output, not a listing\\n",
+    }
+
+
+with Pipeline("b") as pipeline:
+    tree()
+"""
+
+
+def test_verify_checks_no_listing_of_a_stages_own_directory_shaped_member(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """`pivot verify` with no stage named refuses every tracked directory whose committed
+    `.pvt.listing` does not hash to its `.pvt`. `d.pvt` and the file beside it are the stage's
+    own output, not a tracked directory: a restore of `b/tree` reads the lock's listing, so
+    verify must not read them and must pass."""
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_DIRECTORY_SHAPED_MEMBER_PIPELINE)
+        assert runner.invoke(cli.cli, ["repro"]).exit_code == 0
+
+        result = runner.invoke(cli.cli, ["verify"])
+
+        assert result.exit_code == 0, result.output
+        assert "Verification passed" in result.output, result.output
+        assert (root / "data" / "b" / "tree" / "d.pvt").is_file()
