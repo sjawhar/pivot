@@ -159,14 +159,16 @@ class NoCommitRecord(TypedDict, total=False):
     `nocommit:<stage>`. A written lock supersedes it, and its whole record is removed.
 
     Two features write the record, each its own keys. `code_manifest` is the manifest a
-    `--no-commit` run's lock would have held, rerun marks included, and `output_hashes` the
-    outputs it wrote: the run writes both (`NoCommitRun`, `StateDB.apply_deferred_writes`), and
-    `pivot commit` writes that manifest when both are present and the outputs on disk still have
-    these hashes. `pvt_members` maps each `*.pvt` file Pivot wrote in a directory output (path
-    relative to the project root) to its content hash; the feature that keeps those files owns it.
+    `--no-commit` run's lock would have held, rerun marks included, `output_hashes` the outputs it
+    wrote, and `reads` the objects it read by hash (`pivot.read_by_hash`), when it read any: the
+    run writes these (`NoCommitRun`, `StateDB.apply_deferred_writes`), and `pivot commit` writes
+    that manifest and those reads when the manifest and outputs are present and the outputs on
+    disk still have these hashes. `pvt_members` maps each `*.pvt` file Pivot wrote in a directory
+    output (path relative to the project root) to its content hash; the feature that keeps those
+    files owns it.
 
     Every writer replaces only its own keys and keeps every other key, in one write transaction.
-    The reader (`StateDB.get_no_commit_record`) validates each of these three keys on its own and
+    The reader (`StateDB.get_no_commit_record`) validates each of these four keys on its own and
     returns every other key as stored, so a record that holds only one feature's keys reads as
     present, and a malformed key hides no other.
     """
@@ -174,13 +176,25 @@ class NoCommitRecord(TypedDict, total=False):
     code_manifest: dict[str, str]
     output_hashes: dict[str, str]  # output identity key -> content hash
     pvt_members: dict[str, str]  # `*.pvt` path relative to the project root -> content hash
+    reads: list[str]  # content hashes the run read, sorted, each once
 
 
 class NoCommitRun(TypedDict):
-    """The keys of `NoCommitRecord` a `--no-commit` run writes: always both, never one alone."""
+    """The keys of `NoCommitRecord` a `--no-commit` run writes: the manifest and outputs always,
+    never one alone, and `reads` when it read any. Applying it replaces all three."""
 
     code_manifest: dict[str, str]
     output_hashes: dict[str, str]  # output identity key -> content hash
+    reads: NotRequired[list[str]]  # content hashes the run read, sorted, each once
+
+
+class RemoteHashes(TypedDict):
+    """The objects a run's reads fetched from one remote (`reads.Recording.fetched`): its name,
+    its URL as `RemoteStorage.url` gives it, and the hashes, sorted, each once."""
+
+    name: str
+    url: str
+    hashes: list[str]
 
 
 class DeferredWrites(TypedDict, total=False):
@@ -200,6 +214,8 @@ class DeferredWrites(TypedDict, total=False):
     file_hash_entries: list[FileHashEntry]
     no_commit_record: NoCommitRun  # a --no-commit run's keys of its `nocommit:` record
     clear_no_commit_record: bool  # a lock was written: drop the stage's --no-commit record
+    # The objects the run's reads fetched, which the remote index records as `pivot pull` does
+    remote_hashes: list[RemoteHashes]
 
 
 class StageResult(TypedDict):
@@ -437,6 +453,9 @@ class StorageLockData(TypedDict):
     params: dict[str, Any]
     deps: list[DepEntry]
     outs: list[OutEntry]
+    # The objects the run read by hash (``pivot.read_by_hash``), sorted, each once; absent when it
+    # read none, so the lock of a stage that reads nothing by hash is what it was before.
+    reads: NotRequired[list[str]]
 
 
 class LockData(TypedDict):
@@ -447,6 +466,7 @@ class LockData(TypedDict):
     dep_hashes: dict[ArtifactIdentity, HashInfo]
     output_hashes: dict[ArtifactIdentity, HashInfo]
     output_paths: NotRequired[dict[ArtifactIdentity, str]]
+    reads: NotRequired[list[str]]  # content hashes the run read by hash, sorted, each once
     # Present for a lock an older pivot wrote: its directories' listings were inline and are in
     # the cache only (``StageLock.read``); a listing file beside it is another lock's
     # (``lock.committed_listing``).
@@ -534,11 +554,32 @@ class OutputChange(TypedDict):
     output_type: Literal["out", "metric", "plot"]
 
 
+class Recovery(enum.StrEnum):
+    """What brings a stale stage up to date without running it. Carried beside the reason
+    (`ChangeDecision`, `StageExplanation`, `PipelineStatusInfo`) so `pivot status` chooses its
+    `pivot pull` suggestion from it, never from the reason's text. Present only when it recovers
+    every reason the stage is stale, its stale upstream stages included; absent when only a run
+    does."""
+
+    PULL_OUTPUTS = "pull_outputs"  # its lock is current; `pivot pull` restores missing outputs
+    PULL_READS = "pull_reads"  # `pivot pull` fetches objects it read by hash that the cache lacks
+    UPSTREAM = "upstream"  # current on its own: up to date once its stale upstream stages are
+
+
+class UnavailableReads(TypedDict):
+    """Why objects a lock or run-cache entry records its run read by hash are neither in the
+    cache nor known to be on the default remote (`reads.unavailable`)."""
+
+    reason: str
+    pullable: bool  # a usable remote may hold them, so `pivot pull` fetches them
+
+
 class ChangeDecision(TypedDict, total=False):
     """Result of skip detection check_stage().
 
     In fast mode (explain=False), detail fields are omitted (not present).
     In explain mode (explain=True), they contain the full diff information.
+    `recovery` is present when the stage is changed only for a reason `pivot pull` repairs.
     """
 
     changed: Required[bool]
@@ -547,6 +588,7 @@ class ChangeDecision(TypedDict, total=False):
     run_cache_allowed: Required[bool]
     param_changes: list[ParamChange]
     dep_changes: list[DepChange]
+    recovery: Recovery
 
 
 class StageExplanation(TypedDict, total=False):
@@ -560,6 +602,7 @@ class StageExplanation(TypedDict, total=False):
     param_changes: Required[list[ParamChange]]
     dep_changes: Required[list[DepChange]]
     upstream_stale: Required[list[str]]
+    recovery: Recovery  # what brings it up to date without running it, when something does
 
 
 # =============================================================================
@@ -640,6 +683,7 @@ class PipelineStatusInfo(TypedDict):
     status: PipelineStatus
     reason: str
     upstream_stale: list[str]
+    recovery: NotRequired[Recovery]  # what brings it up to date without running it, if anything
 
 
 class TrackedFileInfo(TypedDict):
@@ -714,6 +758,7 @@ class ExplainStageJson(TypedDict):
     param_changes: list[ParamChange]
     dep_changes: list[DepChangeJson]
     upstream_stale: list[str]
+    recovery: NotRequired[Recovery]  # what brings it up to date without running it, if anything
 
 
 class ExplainOutput(TypedDict, total=False):

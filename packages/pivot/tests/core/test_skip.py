@@ -7,7 +7,15 @@ from typing import Any
 import pytest
 
 from pivot import skip
-from pivot.types import ArtifactIdentity, DirHash, FileHash, HashInfo, LockData
+from pivot.types import (
+    ArtifactIdentity,
+    DirHash,
+    FileHash,
+    HashInfo,
+    LockData,
+    Recovery,
+    UnavailableReads,
+)
 
 
 def _id(producer: str, key: str | None = None) -> ArtifactIdentity:
@@ -476,3 +484,80 @@ def test_marked_lock_reruns_with_its_reason_and_never_from_the_run_cache(
         assert decision["changed"] is True
         assert decision["reason"] == reason
         assert decision["run_cache_allowed"] is False
+
+
+# =============================================================================
+# Objects the previous run read by hash, now in neither the cache nor the remote
+# =============================================================================
+
+_UNAVAILABLE = UnavailableReads(
+    reason="Read objects missing from the cache: 0123456789abcdef (no remote is configured)",
+    pullable=False,
+)
+_UNSEEN = UnavailableReads(
+    reason="Read objects missing from the cache: 0123456789abcdef (pivot has not seen them on "
+    + "remote 'origin'; `pivot pull` fetches them)",
+    pullable=True,
+)
+
+
+@pytest.mark.parametrize("explain", [False, True])
+def test_a_current_lock_whose_read_objects_are_unavailable_is_changed(explain: bool) -> None:
+    lock_data = _helper_make_lock_data()
+
+    decision = skip.check_stage(
+        lock_data=lock_data,
+        fingerprint={"func:main": "abc123"},
+        params={"lr": 0.01},
+        dep_hashes={_id("input"): FileHash(hash="hash_a")},
+        out_paths=[_id("stage", "output")],
+        explain=explain,
+        unavailable_reads=_UNAVAILABLE,
+    )
+
+    assert decision["changed"] is True
+    assert decision["reason"] == _UNAVAILABLE["reason"]
+    assert "recovery" not in decision, "with no remote to pull from, only a run recovers it"
+
+
+@pytest.mark.parametrize("explain", [False, True])
+def test_read_objects_a_remote_may_hold_are_recovered_by_pull(explain: bool) -> None:
+    """The decision says, in a field and not in its reason's text, that `pivot pull` brings the
+    stage up to date: `pivot status` suggests it from that field."""
+    lock_data = _helper_make_lock_data()
+
+    decision = skip.check_stage(
+        lock_data=lock_data,
+        fingerprint={"func:main": "abc123"},
+        params={"lr": 0.01},
+        dep_hashes={_id("input"): FileHash(hash="hash_a")},
+        out_paths=[_id("stage", "output")],
+        explain=explain,
+        unavailable_reads=_UNSEEN,
+    )
+
+    assert decision["changed"] is True
+    assert decision["reason"] == _UNSEEN["reason"]
+    assert "recovery" in decision and decision["recovery"] is Recovery.PULL_READS, decision
+
+
+@pytest.mark.parametrize("explain", [False, True])
+@pytest.mark.parametrize("unavailable", [_UNAVAILABLE, _UNSEEN], ids=["no-remote", "unseen"])
+def test_a_code_change_is_named_before_unavailable_read_objects(
+    explain: bool, unavailable: UnavailableReads
+) -> None:
+    lock_data = _helper_make_lock_data()
+
+    decision = skip.check_stage(
+        lock_data=lock_data,
+        fingerprint={"func:main": "DIFFERENT"},
+        params={"lr": 0.01},
+        dep_hashes={_id("input"): FileHash(hash="hash_a")},
+        out_paths=[_id("stage", "output")],
+        explain=explain,
+        unavailable_reads=unavailable,
+    )
+
+    assert decision["changed"] is True
+    assert decision["reason"] == "Code changed"
+    assert "recovery" not in decision, "pulling cannot undo a code change"

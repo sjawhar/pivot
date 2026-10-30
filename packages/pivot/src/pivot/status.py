@@ -83,6 +83,7 @@ from pivot.types import (
     ParamChange,
     PipelineStatus,
     PipelineStatusInfo,
+    Recovery,
     RemoteSyncInfo,
     StageExplanation,
     TrackedFileInfo,
@@ -303,24 +304,19 @@ def get_pipeline_explanations(
         metrics.end("status.get_pipeline_explanations", _t)
 
 
-def pullable_stages(stages: Iterable[tuple[str, str, list[str]]]) -> set[str]:
-    """The stages, of (name, reason, stale upstream stages) in execution order with their
+def pullable_stages(stages: Iterable[tuple[str, Recovery | None, list[str]]]) -> set[str]:
+    """The stages, of (name, recovery, stale upstream stages) in execution order with their
     upstream counted, that ``pivot pull`` brings up to date without recomputing anything.
 
-    A stage is pullable when its outputs are missing from the cache
-    (``explain.OUTPUTS_MISSING_REASON``) and every stale upstream is itself pullable: in a plain
-    clone the downstream stages are stale only because their upstream's outputs are missing too,
-    and pull restores all of them. A stage current on its own (e.g. a committed metric) passes
-    through when its stale upstreams are pullable, but has nothing to pull itself. A stage
-    downstream of a stage that must recompute is recomputed by repro.
+    A stage is pullable when it has a recovery (``Recovery``: pull restores its outputs, fetches
+    an object it reads by hash, or brings its stale upstream stages up to date) and every stale
+    upstream stage is itself pullable. In a plain clone the downstream stages are stale only
+    because their upstream's outputs are missing too, and pull restores all of them; a stage
+    downstream of one that must recompute is recomputed by repro.
     """
     pullable = set[str]()
-    for name, reason, upstream_stale in stages:
-        if not pullable.issuperset(upstream_stale):
-            continue
-        if reason == explain.OUTPUTS_MISSING_REASON or reason.startswith(
-            UPSTREAM_STALE_REASON_PREFIX
-        ):
+    for name, recovery, upstream_stale in stages:
+        if recovery is not None and pullable.issuperset(upstream_stale):
             pullable.add(name)
     return pullable
 
@@ -337,8 +333,8 @@ def expand_current(
     Whether a producer is current is the explain path's decision (``get_pipeline_explanations``
     over the producers and their upstream stages): its explanation, its upstream counted, says it
     would not run; or, with a remote configured, only that it and its stale upstream stages are
-    pullable (``pullable_stages``): its lock matches, and its output, missing from the cache, is
-    restored from the remote. Every other template stays unexpanded, naming what it waits for.
+    pullable (``pullable_stages``, by each explanation's ``recovery``): its lock matches, and pull
+    restores what it lacks. Every other template stays unexpanded, naming what it waits for.
 
     Returns the expansion and the explanations it computed, before their upstream is counted,
     for the caller to pass on as ``known`` (computed with ``force`` and ``allow_missing``).
@@ -374,7 +370,12 @@ def expand_current(
             current = {exp["stage_name"] for exp in enriched if not exp["will_run"]}
             if remote_config.list_remotes():
                 current |= pullable_stages(
-                    (exp["stage_name"], exp["reason"], exp["upstream_stale"]) for exp in enriched
+                    (
+                        exp["stage_name"],
+                        exp["recovery"] if "recovery" in exp else None,
+                        exp["upstream_stale"],
+                    )
+                    for exp in enriched
                 )
             waiting = {
                 exp["stage_name"]: exp["reason"] or "stale"
@@ -420,8 +421,14 @@ def _compute_explanations_with_upstream(
     explanations: list[StageExplanation],
     graph: DiGraph[str],
 ) -> list[StageExplanation]:
-    """Process explanations and add upstream_stale field for stages stale due to upstream."""
+    """Process explanations and add upstream_stale field for stages stale due to upstream.
+
+    ``recovery`` stays only when it brings the stage up to date without running it: a stage that
+    will run keeps its own, and one current on its own gets ``Recovery.UPSTREAM``, but only when
+    every stale upstream stage has a recovery too. A stage downstream of one that must run gets
+    none, since that run's outputs reach it. ``explanations`` arrive in execution order."""
     stale_stages = set[str]()
+    recovered = set[str]()
     results = list[StageExplanation]()
 
     for exp in explanations:
@@ -457,6 +464,14 @@ def _compute_explanations_with_upstream(
             dep_changes=exp["dep_changes"],
             upstream_stale=upstream_stale,
         )
+        if recovered.issuperset(upstream_stale):
+            if exp["will_run"]:
+                if "recovery" in exp:
+                    new_exp["recovery"] = exp["recovery"]
+            elif upstream_stale:
+                new_exp["recovery"] = Recovery.UPSTREAM
+        if "recovery" in new_exp:
+            recovered.add(exp["stage_name"])
         results.append(new_exp)
 
     return results
@@ -504,15 +519,18 @@ def get_pipeline_status(
 
 def _explanations_to_status(explanations: list[StageExplanation]) -> list[PipelineStatusInfo]:
     """Convert enriched explanations to PipelineStatusInfo list."""
-    return [
-        PipelineStatusInfo(
+    rows = list[PipelineStatusInfo]()
+    for exp in explanations:
+        row = PipelineStatusInfo(
             name=exp["stage_name"],
             status=PipelineStatus.STALE if exp["will_run"] else PipelineStatus.CACHED,
             reason=exp["reason"],
             upstream_stale=exp["upstream_stale"],
         )
-        for exp in explanations
-    ]
+        if "recovery" in exp:
+            row["recovery"] = exp["recovery"]
+        rows.append(row)
+    return rows
 
 
 def get_tracked_files_status(
@@ -675,6 +693,7 @@ def get_suggestions(
     pull_count: int,
     orphan_count: int = 0,
     missing_outputs_count: int = 0,
+    missing_reads_count: int = 0,
     remote_configured: bool = False,
 ) -> list[str]:
     suggestions = list[str]()
@@ -685,6 +704,14 @@ def get_suggestions(
         suggestions.append(
             f"Run `pivot pull` to restore outputs of {missing_outputs_count} "
             + f"{_pluralize(missing_outputs_count, 'stage')} from the remote"
+        )
+
+    # Objects stages read by hash, missing from the cache: pulling fetches them, and the
+    # stages are then current without running.
+    if missing_reads_count > 0 and remote_configured:
+        suggestions.append(
+            f"Run `pivot pull` to fetch the objects {missing_reads_count} "
+            + f"{_pluralize(missing_reads_count, 'stage')} read by hash from the remote"
         )
 
     if stale_count > 0:

@@ -357,6 +357,10 @@ def get_target_hashes(
                                     require_members=require_members,
                                 )
                         if include_deps:
+                            # The objects the stage read by hash (`pivot.read_by_hash`) are
+                            # inputs of a rerun as its deps are, and always cache objects.
+                            if "reads" in lock_data:
+                                hashes.update(lock_data["reads"])
                             # Only deps whose blobs pivot caches (and so pushes) can be fetched:
                             # upstream stage outputs and `pivot track` inputs. Raw inputs
                             # committed to git and `pivot import` inputs are never in the remote.

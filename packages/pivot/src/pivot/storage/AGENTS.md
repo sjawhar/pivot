@@ -85,7 +85,7 @@ StateDB uses key prefixes for namespacing. Current prefixes in `pivot/storage/st
 | `remote:` | Remote index entries |
 | `remote_url:` | Remote URL tracking for change detection |
 | `fp:` | AST fingerprint/hash cache entries |
-| `nocommit:` | What a stage's outputs hold that no lock records yet (`stage` → a JSON object, `types.NoCommitRecord`): a `--no-commit` run's code manifest, marks included, and output hashes, for `pivot commit`, and the `*.pvt` directory members Pivot wrote (`pvt_members`, path → content hash, each added before the file is written); a written lock removes the whole record. Each writer replaces only its own keys and keeps every other key, in one write transaction. The reader validates each of the three keys on its own, dropping only a malformed one, and returns every other key as stored, so a record holding only another feature's key reads as present; `pivot commit` uses the run's manifest only when both of the run's keys are present |
+| `nocommit:` | What a stage's outputs hold that no lock records yet (`stage` → a JSON object, `types.NoCommitRecord`): a `--no-commit` run's code manifest, marks included, output hashes and, when it read any, the objects it read by hash (`reads`), for `pivot commit`, and the `*.pvt` directory members Pivot wrote (`pvt_members`, path → content hash, each added before the file is written); a written lock removes the whole record. Each writer replaces only its own keys and keeps every other key, in one write transaction; a run's record replaces all three of its keys, so an earlier run's `reads` never stays beside a later run's outputs. The reader validates each of the four keys on its own, dropping only a malformed one, and returns every other key as stored, so a record holding only another feature's key reads as present; `pivot commit` uses the run's manifest and reads only when the run's manifest and outputs are both present |
 
 **When adding new state types**, define a new prefix constant and document it here.
 
@@ -219,6 +219,31 @@ When multiple `pivot` processes share the same StateDB:
   as missing.
 - `pivot init` writes `*.listing -merge` into `.gitattributes`, so a merge conflicts on a
   listing instead of producing bytes that hash to neither side.
+- A lock lists the objects its run read by hash (`pivot.read_by_hash`, `pivot/reads.py`) under a
+  top-level `reads` key: content hashes, sorted, each once, written only when the run read one,
+  so a stage that reads nothing by hash writes the lock it wrote before. Released pivots allow an
+  unknown top-level key and read such a lock as any other. The run-cache entry the run files
+  (`RunCacheEntry.reads`) and its `nocommit:` record carry the same list, so a run-cache restore
+  and `pivot commit` write it too. The input that names a hash reruns the stage; `reads` is what
+  that run read. Every skip decision passes `reads.lock_unavailable` to `skip.check_stage`
+  (status, `explain`, the engine's pre-check and the worker's tier 2; the worker's tier 1
+  declines on it, and a run-cache entry whose objects are gone is not used), so a lock that
+  records an object neither in the cache nor known to be on the remote is stale everywhere at
+  once. The check is local, as for outputs: an object the cache lacks counts as on the remote
+  only when the remote index (`remote:`) records it for the remote's URL; it never contacts the
+  remote, so plain `status` and `repro` never wait on the network. `pivot push`, `pull` and
+  `fetch` fill that index, and so does a completed run whose read fetched an object: the worker
+  returns what its reads fetched in `DeferredWrites.remote_hashes` (`reads.Recording.fetched`),
+  under `--no-commit` too, and `apply_deferred_writes` adds it in the run's transaction, storing
+  the fetch's URL when none is stored for the remote and adding nothing when another one is. A
+  failed run applies no deferred writes, so its fetches stay unrecorded.
+  `reads.unavailable` returns the reason and whether a usable remote may hold the objects
+  (`types.UnavailableReads.pullable`); when those objects alone change the stage, `check_stage`
+  sets `recovery` to `Recovery.PULL_READS`. Explain keeps it only when pull also restores every
+  output the stage lacks, and status only when every stale upstream stage has a recovery too;
+  `pivot status` suggests `pivot pull` from that field, never from the reason's text. A trust-me
+  `pivot commit <stage>` keeps the previous lock's `reads` only when that lock records the same
+  code, params, dependency hashes and outputs.
 
 ## Output Ownership
 

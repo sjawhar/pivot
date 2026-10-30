@@ -208,6 +208,86 @@ count(parts)                   # every file: reruns when any of them changes
 fit(parts["train.csv"])        # one file: reruns only when train.csv changes
 ```
 
+## Objects named by hash
+
+A declared input can name another object by its content hash instead of holding
+it: a pin file holding the hash of a snapshot another project pushed, an index
+naming the hashes of records. The stage reads each such object with
+`pivot.read_by_hash`:
+
+```python
+import pivot
+from pivot import Pipeline, stage
+
+
+@stage
+def plan(pin: str) -> dict:
+    snapshot = pivot.read_by_hash(pin.strip())  # a pathlib.Path to the object
+    return {"taken": snapshot.read_text().splitlines()}
+
+
+with Pipeline("plan") as pipeline:
+    plan(pipeline.input("counted.pin", t=str))
+```
+
+- **Where the object comes from.** Pivot looks the object up in the cache, else
+  downloads it from the project's default remote into the cache, and checks that
+  its bytes hash to the hash asked for. The path is the read-only cache object:
+  read it, never change it. Any file object in the cache can be read this way: a
+  stage's file output, one file of a directory output, or a tracked file, once
+  `pivot push` has put it on the remote.
+- **Finding a hash to pin.** `pivot.output_hash("pipeline/stage", key)` returns the
+  content hash a stage's committed lock records for its output `key` (`None` for
+  a stage's one unnamed output, a `TypedDict` field's name otherwise), read from
+  the lock file alone, so a command that writes a pin can name the output it
+  pins. It raises `pivot.exceptions.OutputMissingError` when no lock records it.
+  Call it outside the stage: inside a stage run it raises
+  `pivot.exceptions.ObjectReadError`, since the lock it reads is not one of the
+  stage's inputs, and a new output there would never rerun the stage. Write the
+  hash into a pin file and declare that file instead.
+- **What reruns the stage.** The input that names the hash, as any input does:
+  a new hash in `counted.pin` reruns `plan`.
+- **What the lock records.** Each hash the run read, once, sorted, under
+  `reads`, beside the stage's declared dependencies. A run-cache restore records
+  what the restored run read, and `pivot commit` after `pivot repro --no-commit`
+  records what that run read. `pivot commit <stage>` with no such run records
+  the outputs on disk: when the lock already records those outputs from the same
+  code, params and dependencies, it keeps the lock's `reads`, since those outputs
+  came from those objects. Otherwise (edited outputs, or a changed input such as a
+  new pin, even when the outputs' bytes are the same) it records no `reads`: a
+  fresh run, or a matching `--no-commit` record, records what the stage reads now.
+  A stage that reads nothing by hash has no `reads`.
+  A pivot older than this one drops `reads` when it writes the lock: from a
+  run-cache restore, or from `pivot commit` after this pivot's `--no-commit` run.
+  And when a `--no-commit` run of an older pivot follows this pivot's own, the
+  older pivot keeps this pivot's `reads` in the record, so `pivot commit` then
+  records objects the later run may not have read: that can only make the stage
+  stale or `pivot pull` fetch an extra object, never skip a run that is needed.
+- **A recorded object that is not at hand.** `pivot status` and `pivot repro`
+  decide from local state, as they do for outputs, and contact no remote: an
+  object the lock records counts as available when it is in the cache, or when
+  the remote index (filled by `pivot push`, `pull` and `fetch`, and by a run that
+  completed after its read fetched the object) records it on the default remote.
+  Otherwise `pivot status` reports the stage stale, naming the objects and why,
+  and suggests `pivot pull`, which fetches them, when a remote is configured and
+  pulling brings the stage up to date (not beside an edited metric, or below a
+  stage that must run);
+  `pivot repro` runs the stage: its read fetches the object from the remote, or
+  fails naming it when the remote lacks it too. An object the index records is
+  not checked again, so its later loss from the remote is found by the next
+  read, not by `pivot status`.
+- **Pulling.** `pivot pull <stage>` fetches the objects its lock records under
+  `reads`, as it fetches the stage's dependencies, so the stage can run again in
+  the clone.
+- **A read that fails** raises `pivot.exceptions.ObjectReadError` naming the hash:
+  a value that is not a content hash (16 lowercase hex characters), an object
+  neither the cache nor the remote holds, or bytes that hash to something else.
+
+`pivot.read_by_hash` works only inside a stage Pivot runs, from any thread of the
+stage's own process, a coroutine's included. A process the stage starts (a forked
+child, joblib's processes backend) is refused: only the stage's own process
+records what it reads, so read there and pass the path or bytes on.
+
 ## Testing is natural
 
 Outside a `with Pipeline` block a `@stage` function is an ordinary function, so

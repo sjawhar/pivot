@@ -16,6 +16,7 @@ import yaml
 from pivot import compose, config, executor, expansion, loaders, stage_def, status
 from pivot.remote import config as remote_config
 from pivot.storage import cache
+from pivot.types import Recovery
 
 if TYPE_CHECKING:
     import pathlib
@@ -276,3 +277,19 @@ def test_a_pipeline_without_templates_reads_nothing(
         expansion.Expansion(expanded={}, not_expanded={}, listings={}),
         {},
     )
+
+
+def test_a_producer_counts_as_current_through_pull_only_by_its_recovery() -> None:
+    """With a remote configured, a producer is current when pull brings it up to date: its
+    explanation carries a recovery, and so does each stale stage above it. A stage whose
+    cacheable output is missing beside an edited metric reads the cache reason but has no
+    recovery, so neither it nor a stage below it counts."""
+    rows = [
+        ("p/plan", Recovery.PULL_OUTPUTS, list[str]()),
+        ("p/edited", None, list[str]()),
+        ("p/below_plan", Recovery.UPSTREAM, ["p/plan"]),
+        ("p/below_edited", Recovery.UPSTREAM, ["p/edited"]),
+        ("p/reads", Recovery.PULL_READS, list[str]()),
+    ]
+
+    assert status.pullable_stages(rows) == {"p/plan", "p/below_plan", "p/reads"}

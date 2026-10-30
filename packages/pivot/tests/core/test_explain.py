@@ -33,6 +33,7 @@ from pivot.types import (
     DirHash,
     HashInfo,
     LockData,
+    Recovery,
     StageExplanation,
 )
 
@@ -454,9 +455,14 @@ def _output_ref(producer: str, key: str, tag: ArtifactTag) -> ArtifactRef:
 
 
 def _explain_with_outputs(
-    tmp_path: pathlib.Path, outs: list[ArtifactRef], edit: dict[ArtifactRef, str | None]
+    tmp_path: pathlib.Path,
+    outs: list[ArtifactRef],
+    edit: dict[ArtifactRef, str | None],
+    *,
+    reads: list[str] | None = None,
 ) -> StageExplanation:
-    """Lock `outs` at their current bytes, apply `edit` (None deletes), and explain the stage."""
+    """Lock `outs` at their current bytes, with `reads` when given, apply `edit` (None deletes),
+    and explain the stage."""
     state_dir = tmp_path / ".pivot"
     store = _store(tmp_path)
     output_hashes = dict[ArtifactIdentity, HashInfo]()
@@ -466,9 +472,12 @@ def _explain_with_outputs(
         path.write_text("value: 1\n")
         output_hashes[ref.identity] = executor.worker.hash_output(path)[0]
     manifest = {"self:summarize": "abc123"}
-    lock.StageLock("s", lock.get_stages_dir(state_dir)).write(
-        LockData(code_manifest=manifest, params={}, dep_hashes={}, output_hashes=output_hashes)
+    lock_data = LockData(
+        code_manifest=manifest, params={}, dep_hashes={}, output_hashes=output_hashes
     )
+    if reads is not None:
+        lock_data["reads"] = reads
+    lock.StageLock("s", lock.get_stages_dir(state_dir)).write(lock_data)
     for ref, text in edit.items():
         path = store.resolve_display_path(ref)
         if text is None:
@@ -501,6 +510,7 @@ def test_get_stage_explanation_edited_metric_is_not_missing_from_cache(
     assert result["will_run"] is True
     assert result["reason"] != explain.OUTPUTS_MISSING_REASON
     assert result["reason"] == "Metric output changed: s:stats"
+    assert "recovery" not in result, "pull restores no metric"
 
 
 def test_get_stage_explanation_deleted_metric_is_reported_missing(tmp_path: pathlib.Path) -> None:
@@ -513,10 +523,23 @@ def test_get_stage_explanation_deleted_metric_is_reported_missing(tmp_path: path
     assert result["reason"] == "Metric output missing: s:stats"
 
 
+def test_get_stage_explanation_missing_cacheable_output_is_recovered_by_pull(
+    tmp_path: pathlib.Path,
+) -> None:
+    table = _output_ref("s", "table", ArtifactTag.DATA)
+
+    result = _explain_with_outputs(tmp_path, [table], {table: None})
+
+    assert result["will_run"] is True
+    assert result["reason"] == explain.OUTPUTS_MISSING_REASON
+    assert "recovery" in result and result["recovery"] is Recovery.PULL_OUTPUTS, result
+
+
 def test_get_stage_explanation_missing_cacheable_output_keeps_cache_reason(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A cacheable output pull could restore keeps the cache reason, even beside a metric edit."""
+    """A cacheable output pull could restore keeps the cache reason, even beside a metric edit.
+    But pull cannot restore the edited metric, so the stage must still run: it has no recovery."""
     table = _output_ref("s", "table", ArtifactTag.DATA)
     stats = _output_ref("s", "stats", ArtifactTag.METRIC)
 
@@ -524,6 +547,50 @@ def test_get_stage_explanation_missing_cacheable_output_keeps_cache_reason(
 
     assert result["will_run"] is True
     assert result["reason"] == explain.OUTPUTS_MISSING_REASON
+    assert "recovery" not in result, result
+
+
+@pytest.mark.parametrize(
+    ("edit", "recovered"),
+    [
+        pytest.param({}, True, id="reads-only"),
+        pytest.param({"table": None}, True, id="with-a-missing-cacheable-output"),
+        pytest.param({"stats": "value: 999\n"}, False, id="with-an-edited-metric"),
+    ],
+)
+def test_read_objects_a_remote_may_hold_are_recovered_by_pull_only_beside_pullable_outputs(
+    set_project_root: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    edit: dict[str, str | None],
+    recovered: bool,
+) -> None:
+    """The stage's read object is in neither the cache nor the remote index, and a remote is
+    configured, so `pivot pull` may fetch it. That recovers the stage only when pull restores
+    every other output it lacks too: an edited metric still makes it run."""
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "x")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "x")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    (set_project_root / ".pivot" / "config.yaml").write_text(
+        "remotes:\n  origin: s3://unreachable/cache\n"
+    )
+    table = _output_ref("s", "table", ArtifactTag.DATA)
+    stats = _output_ref("s", "stats", ArtifactTag.METRIC)
+    refs = {"table": table, "stats": stats}
+
+    result = _explain_with_outputs(
+        set_project_root,
+        [stats, table],
+        {refs[key]: text for key, text in edit.items()},
+        reads=["0123456789abcdef"],
+    )
+
+    assert result["will_run"] is True
+    assert "0123456789abcdef" in result["reason"], result
+    if recovered:
+        assert "recovery" in result and result["recovery"] is Recovery.PULL_READS, result
+    else:
+        assert "recovery" not in result, result
 
 
 def test_get_stage_explanation_code_changed(tmp_path: pathlib.Path) -> None:

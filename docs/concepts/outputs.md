@@ -426,8 +426,9 @@ key's chain only, and a new file runs the producer and the new chain only.
   `push`, `pull`, `commit`, `params show`, `params diff`, `repro --dry-run` and
   `--explain`) expand each mapped stage by the same rule, from the producer's lock
   and listing, when the producer is current: its lock matches, and its output is
-  in the cache or, with a remote configured, missing from it and restorable by
-  `pivot pull`. A fresh clone therefore lists every instance before any pull.
+  in the cache or, with a remote configured, `pivot pull` brings it up to date (its
+  `pivot status` row carries a `recovery`, and so does each stale stage above it).
+  A fresh clone therefore lists every instance before any pull.
   Until then a mapped stage is *not yet expanded*: `pivot status` shows it
   (`not_expanded` in `--json`) with what it waits for, `pivot list` lists it under
   "Mapped stages, not yet expanded" (`templates` in `--json`), and `pivot dag`
