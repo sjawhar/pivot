@@ -2084,3 +2084,51 @@ def test_pivot_gc_refuses_a_tracked_directory_left_in_a_merge_conflict(
     _git(root, "add", "data/images.pvt", "data/images.pvt.listing")
     _ok(_run(root, "checkout", "--force", "data/images"))
     assert sorted(path.name for path in images.iterdir()) == ["a-feat.bin", "b-feat.bin"]
+
+
+_TRACKED_INPUT_PIPELINE = """\
+import pathlib
+
+from pivot import Pipeline, stage
+
+
+@stage
+def lane(server: pathlib.Path) -> str:
+    return (server / "grade.py").read_text()
+
+
+with Pipeline("p") as pipeline:
+    lane(pipeline.input("server", path="data/raw/server", t=pathlib.Path))
+"""
+
+
+def test_pivot_gc_keeps_a_tracked_inputs_files_that_pivotignore_names(
+    tmp_path: pathlib.Path,
+) -> None:
+    """#539: a stage's lock records a directory input by a listing that leaves out what
+    `.pivotignore` names (`=inputs/<path>.listing`). A tracked directory's members come from
+    its whole `.pvt.listing`, never from that filtered one, so a collection keeps the tracked
+    input's `.pyc`, and a checkout restores it."""
+    root = _project(tmp_path / "project")
+    (root / ".pivotignore").write_text("*.pyc\n__pycache__/\n")
+    (root / "pipeline.py").write_text(_TRACKED_INPUT_PIPELINE)
+    tracked = root / "data" / "raw" / "server"
+    (tracked / "__pycache__").mkdir(parents=True)
+    (tracked / "grade.py").write_text("print('grade')\n")
+    pyc = tracked / "__pycache__" / "grade.cpython-312.pyc"
+    pyc.write_bytes(b"\x00bytecode")
+    _ok(_run(root, "track", "data/raw/server"))
+    _ok(_run(root, "repro"))
+    pyc_object = cache.get_cache_path(root / ".pivot" / "cache" / "files", cache.hash_file(pyc)[0])
+    filtered = list((root / ".pivot" / "stages" / listing.INPUTS_DIR).glob(f"*{listing.SUFFIX}"))
+    assert filtered, "the stage's lock records its directory input by a listing"
+    assert all("grade.cpython-312.pyc" not in path.read_text() for path in filtered), filtered
+    assert pyc_object.exists(), "track cached the .pyc"
+    cache.clear_path(tracked)  # nothing but the records names the object now: no workspace link
+
+    collected = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert pyc_object.exists(), "gc read the tracked input's members from the filtered listing"
+    _ok(_run(root, "checkout", "data/raw/server"))
+    assert pyc.read_bytes() == b"\x00bytecode"

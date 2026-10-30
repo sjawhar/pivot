@@ -6,6 +6,8 @@ showing specific code, param, and dependency changes.
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import pathlib
 from typing import TYPE_CHECKING
 
@@ -282,12 +284,29 @@ def get_stage_explanation(
                 )
                 tracked_hash = None
                 if tracked_files is not None and tracked_trie is not None:
+                    dep_path = project.normalize_path(store.checkout(ref))
                     tracked_hash = _find_tracked_hash(
-                        project.normalize_path(store.checkout(ref)),
-                        tracked_files,
-                        tracked_trie,
-                        store.cache_dir,
+                        dep_path, tracked_files, tracked_trie, store.cache_dir
                     )
+                    if tracked_hash is not None and types.is_dir_hash(tracked_hash):
+                        # Only the tracked directory itself gives a directory hash, so its .pvt
+                        # is the one at this path. A .pvt keeps every file; the dependency hash
+                        # leaves out what .pivotignore names, as hashing the restored input
+                        # would, and the filtered hash comes from the whole listing.
+                        pvt_data = tracked_files[str(dep_path)]
+                        with contextlib.suppress(
+                            exceptions.ListingMissingError, exceptions.CorruptListingError
+                        ):
+                            # Without a readable listing the .pvt's whole hash stands, as
+                            # 0.6.0 compares it: at worst the stage reads stale. The lock's own
+                            # hash would compare with itself and call a changed input unchanged.
+                            tracked_hash = store.recorded_input_hash(
+                                ref,
+                                tracked_hash,
+                                functools.partial(
+                                    track.tracked_members, dep_path, pvt_data, store.cache_dir
+                                ),
+                            )
                 fallback_hash = tracked_hash or lock_data["dep_hashes"].get(ref.identity)
                 if fallback_hash is None:
                     unresolved.append(dep_key)

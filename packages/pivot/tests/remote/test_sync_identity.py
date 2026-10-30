@@ -31,6 +31,7 @@ def _make_stage_info(
     outs: list[types.ArtifactRef],
     *,
     state_dir: pathlib.Path | None = None,
+    input_paths: dict[str, str] | None = None,
 ) -> RegistryStageInfo:
     info: RegistryStageInfo = {  # type: ignore[assignment] - test helper
         "func": lambda: None,
@@ -48,7 +49,7 @@ def _make_stage_info(
         "collection_params": {},
         "no_fingerprint": False,
         "code_deps": [],
-        "input_paths": {},
+        "input_paths": input_paths or {},
         "unsafe_fingerprint": False,
     }
     return info
@@ -318,7 +319,12 @@ def test_get_target_hashes_include_deps_keeps_pvt_tracked_inputs(
     """A `pivot track` input is in the local cache, so push sends it and pull fetches it."""
     total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
     all_stages = {
-        "smoke/total": _make_stage_info("smoke/total", [total_ref], state_dir=set_project_root),
+        "smoke/total": _make_stage_info(
+            "smoke/total",
+            [total_ref],
+            state_dir=set_project_root,
+            input_paths={"numbers.csv": "data/raw/numbers.csv"},
+        ),
     }
     raw_dir = set_project_root / "data" / "raw"
     raw_dir.mkdir(parents=True)
@@ -344,13 +350,32 @@ def test_get_target_hashes_include_deps_keeps_pvt_tracked_inputs(
     assert hashes == {"7074a10000000000", "7cacced000000000"}
 
 
+def _helper_track_directory(
+    pvt_path: pathlib.Path, name: str, members: listing.DirListing
+) -> types.DirHash:
+    """Track a directory by its whole listing, as `pivot track` records it."""
+    data = listing.encode(members)
+    record = listing.record_of(members, data)
+    track.write_pvt_file(
+        pvt_path,
+        track.PvtData(path=name, hash=record["hash"], size=record["size"], nfiles=record["nfiles"]),
+    )
+    listing.write(listing.tracked_listing_path(pvt_path), data)
+    return record
+
+
 def test_get_target_hashes_include_deps_keeps_tracked_directory_listing_and_files(
     set_project_root: pathlib.Path,
 ) -> None:
     """A `pivot track` directory input transfers its listing object and listed files."""
     total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
     all_stages = {
-        "smoke/total": _make_stage_info("smoke/total", [total_ref], state_dir=set_project_root),
+        "smoke/total": _make_stage_info(
+            "smoke/total",
+            [total_ref],
+            state_dir=set_project_root,
+            input_paths={"numbers": "data/raw/numbers"},
+        ),
     }
     members = listing.DirListing(
         files=[
@@ -361,21 +386,9 @@ def test_get_target_hashes_include_deps_keeps_tracked_directory_listing_and_file
         ],
         empty_dirs=[],
     )
-    data = listing.encode(members)
-    directory = listing.record_of(members, data)
     raw_dir = set_project_root / "data" / "raw"
     raw_dir.mkdir(parents=True)
-    pvt_path = raw_dir / "numbers.pvt"
-    track.write_pvt_file(
-        pvt_path,
-        track.PvtData(
-            path="numbers",
-            hash=directory["hash"],
-            size=directory["size"],
-            nfiles=directory["nfiles"],
-        ),
-    )
-    listing.write(listing.tracked_listing_path(pvt_path), data)
+    directory = _helper_track_directory(raw_dir / "numbers.pvt", "numbers", members)
     _helper_write_lock_with_deps(
         "smoke/total",
         set_project_root,
@@ -405,6 +418,76 @@ def test_get_target_hashes_include_deps_keeps_tracked_directory_listing_and_file
     )
 
 
+def test_get_target_hashes_include_deps_fetches_every_file_of_a_tracked_directory_input(
+    set_project_root: pathlib.Path,
+) -> None:
+    """A lock's hash of a directory input leaves out what .pivotignore names, and an input can
+    be a directory inside a tracked one, but restoring the tracked data needs every file. So the
+    blobs come from the .pvt and its listing, found by the input's path, not from the lock."""
+    total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
+    all_stages = {
+        "smoke/total": _make_stage_info(
+            "smoke/total",
+            [total_ref],
+            state_dir=set_project_root,
+            input_paths={"src": "data/raw/src", "cats": "data/raw/images/cats"},
+        ),
+    }
+    raw_dir = set_project_root / "data" / "raw"
+    raw_dir.mkdir(parents=True)
+    kept = types.DirManifestEntry(relpath="m.py", hash="0000000000000a01", size=1, isexec=False)
+    pyc = types.DirManifestEntry(
+        relpath="__pycache__/m.cpython-312.pyc", hash="0000000000000a02", size=1, isexec=False
+    )
+    src = _helper_track_directory(
+        raw_dir / "src.pvt", "src", listing.DirListing(files=[pyc, kept], empty_dirs=[])
+    )
+    cat = types.DirManifestEntry(
+        relpath="cats/a.png", hash="0000000000000b01", size=1, isexec=False
+    )
+    dog = types.DirManifestEntry(
+        relpath="dogs/b.png", hash="0000000000000b02", size=1, isexec=False
+    )
+    images = _helper_track_directory(
+        raw_dir / "images.pvt", "images", listing.DirListing(files=[cat, dog], empty_dirs=[])
+    )
+    # The lock holds the filtered hashes, which name no .pvt: src without its .pyc, and the
+    # cats directory inside the tracked images.
+    _helper_write_lock_with_deps(
+        "smoke/total",
+        set_project_root,
+        dep_hashes={
+            types.ArtifactIdentity("src", None): types.DirHash(
+                hash="00000000000000c0", size=1, nfiles=1
+            ),
+            types.ArtifactIdentity("cats", None): types.DirHash(
+                hash="00000000000000d0", size=1, nfiles=1
+            ),
+        },
+        output_hashes={
+            types.ArtifactIdentity("smoke/total", None): types.FileHash(hash="7074a10000000000"),
+        },
+    )
+
+    hashes = sync.get_target_hashes(
+        ["smoke/total"],
+        set_project_root,
+        include_deps=True,
+        all_stages=all_stages,
+        cache_dir=set_project_root / ".pivot" / "cache",
+    )
+
+    assert hashes == {
+        "7074a10000000000",
+        src["hash"],
+        "0000000000000a01",
+        "0000000000000a02",
+        images["hash"],
+        "0000000000000b01",
+        "0000000000000b02",
+    }, "Every file of the src .pvt, and the whole images .pvt the cats input lies inside"
+
+
 def test_get_target_hashes_include_deps_skips_imported_inputs(
     set_project_root: pathlib.Path,
 ) -> None:
@@ -412,7 +495,12 @@ def test_get_target_hashes_include_deps_skips_imported_inputs(
     pushed to this project's remote, so pull must not fetch it."""
     total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
     all_stages = {
-        "smoke/total": _make_stage_info("smoke/total", [total_ref], state_dir=set_project_root),
+        "smoke/total": _make_stage_info(
+            "smoke/total",
+            [total_ref],
+            state_dir=set_project_root,
+            input_paths={"numbers.csv": "data/raw/numbers.csv"},
+        ),
     }
     raw_dir = set_project_root / "data" / "raw"
     raw_dir.mkdir(parents=True)
@@ -535,8 +623,14 @@ def test_get_target_hashes_include_deps_resolves_no_dep_through_a_stages_own_pvt
 ) -> None:
     """A stage's own `*.pvt` member records no tracked file, so a dependency no stage produces
     must not resolve through it: `pivot pull smoke/total` would otherwise fetch whatever hash
-    the stage happened to write in its output. A real `pivot track` input still resolves."""
+    the stage happened to write in its output. A real `pivot track` input still resolves. A
+    tracked input is found by its path, so `numbers.csv` is bound to the path the member names:
+    without the skip, that member would be the tracked artifact at it."""
     all_stages, cache_dir = _helper_project_with_a_stage_member(set_project_root)
+    all_stages["smoke/total"]["input_paths"] = {
+        "numbers.csv": "data/b/tree/value.txt",
+        "other.csv": "data/raw/other.csv",
+    }
     raw_dir = set_project_root / "data" / "raw"
     raw_dir.mkdir(parents=True)
     track.write_pvt_file(

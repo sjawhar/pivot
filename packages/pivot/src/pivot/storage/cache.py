@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, NewType, TypedDict
 import lmdb
 import xxhash
 
-from pivot import exceptions, metrics
+from pivot import exceptions, ignore, metrics
 from pivot import state_dir as state_dir_mod
 from pivot.config import CheckoutMode as CheckoutMode
 from pivot.storage import listing
@@ -440,12 +440,16 @@ def walk_artifact_members(
     files: list[tuple[str, os.DirEntry[str]]],
     dirs: list[str],
     left_out: list[pathlib.Path],
+    ignored: ignore.MemberFilter | None = None,
 ) -> None:
     """Collect every stored file under ``directory`` with its relpath, ``prefix`` + its name.
 
-    A declared directory artifact is hashed and cached whole: no name is ignored, so a change
-    to any file in a directory input reruns its consumers, and every file in a directory output
-    survives cache and restore. Ignore rules belong to code fingerprinting and watch mode.
+    A declared directory artifact is cached and restored whole: every file in a directory output
+    or a tracked directory survives cache and restore. ``ignored`` is for one use only, the
+    dependency hash of a directory input (``store.WorkspaceStore.hash_artifact``): an entry it
+    names is left out and a directory it names is not entered, so a file ``.pivotignore`` names
+    never makes the input's consumers stale. Never pass it where the walk feeds the cache or a
+    restore: a file left out there is lost on restore.
     A symlink to an object in the cache (left by a symlink checkout; see ``_cache_object_key``)
     counts as the file it points to; any other symlink, a symlinked directory included, is not
     stored and is appended to ``left_out``. The walk never follows a symlink, so every regular
@@ -462,20 +466,30 @@ def walk_artifact_members(
         files: Collects (relpath, entry) for every stored file
         dirs: Collects the relpath of every directory under the root
         left_out: Collects the symlinks that are not part of the artifact
+        ignored: Names the entries to leave out, by relpath and whether each is a directory (a
+            symlink is not); None leaves out nothing
     """
     with os.scandir(directory) as entries:
         for entry in entries:
             relpath = prefix + entry.name
             if entry.is_symlink():
+                if ignored is not None and ignored(relpath, False):
+                    continue
                 if _cache_object_key(entry.path, cache_root) is not None:
                     files.append((relpath, entry))
                 else:
                     left_out.append(pathlib.Path(entry.path))
             elif entry.is_file():
+                if ignored is not None and ignored(relpath, False):
+                    continue
                 files.append((relpath, entry))
             elif entry.is_dir():
+                if ignored is not None and ignored(relpath, True):
+                    continue
                 dirs.append(relpath)
-                walk_artifact_members(entry.path, relpath + "/", cache_root, files, dirs, left_out)
+                walk_artifact_members(
+                    entry.path, relpath + "/", cache_root, files, dirs, left_out, ignored
+                )
 
 
 def _parent_dirs(relpaths: Iterable[str]) -> set[str]:
@@ -528,6 +542,7 @@ def hash_directory(
     cache_dir: pathlib.Path | None = None,
     warn_left_out_symlinks: bool = False,
     pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
+    ignored: ignore.MemberFilter | None = None,
 ) -> listing.HashedDirectory:
     """Compute a directory's listing and the hash it gives the directory.
 
@@ -554,13 +569,15 @@ def hash_directory(
             listing is recorded (a stage output, a tracked directory), not on every re-hash.
         pending: Receives ``(path, stat, hash)`` for each file whose hash was read, instead of
             ``state_db``.
+        ignored: For a directory input's dependency hash only: the members to leave out (see
+            ``walk_artifact_members``). Never pass it for a hash that is cached or restored.
     """
     _t = metrics.start()
     files = list[tuple[str, os.DirEntry[str]]]()
     dirs = list[str]()
     left_out = list[pathlib.Path]()
     cache_root = None if cache_dir is None else resolve_cache_root(cache_dir)
-    walk_artifact_members(os.fspath(path), "", cache_root, files, dirs, left_out)
+    walk_artifact_members(os.fspath(path), "", cache_root, files, dirs, left_out, ignored)
     try:  # UTF-8 keeps code point order, so a str sort is the listing's byte order
         "\0".join(relpath for relpath, _ in files).encode("utf-8")
         files.sort(key=operator.itemgetter(0))
@@ -613,20 +630,49 @@ def hash_directory(
     if left_out and warn_left_out_symlinks:
         log_left_out_symlinks(path, left_out)
 
+    hashed = _hashed_tree(manifest, set(dirs))
+    metrics.end("cache.hash_directory", _t)
+    return hashed
+
+
+def _hashed_tree(manifest: list[DirManifestEntry], found_dirs: set[str]) -> listing.HashedDirectory:
+    """The listing of a tree, hashed: ``manifest`` in listing order, and every directory in it."""
     # A deepest empty directory holds no stored file and no other directory.
-    found_dirs = set(dirs)
     file_dirs = {posixpath.dirname(entry["relpath"]) for entry in manifest}
     has_child = {posixpath.dirname(directory) for directory in found_dirs}
     empty_dirs = sorted(
         found_dirs - file_dirs - has_child, key=lambda relpath: os.fsencode(relpath) + b"/"
     )
-
     members = listing.DirListing(files=manifest, empty_dirs=empty_dirs)
     data = listing.encode(members)
-    metrics.end("cache.hash_directory", _t)
     return listing.HashedDirectory(
         record=listing.record_of(members, data), listing=members, data=data
     )
+
+
+def filter_listing(
+    members: listing.DirListing, ignored: ignore.MemberFilter
+) -> listing.HashedDirectory:
+    """The directory ``hash_directory(path, ignored=ignored)`` gives the tree ``members`` lists.
+
+    For a directory input whose hash comes from a record instead of a walk: a tracked
+    directory's whole listing, when the input is not in the workspace. An entry is left out
+    when ``ignored`` names it or a directory above it (``ignore.member_ignored``), which is what
+    the walk decides by never entering an ignored directory, and the directories come from the
+    listing's files and empty directories, which name every directory the hashed tree held. So
+    for the tree ``hash_directory`` listed as ``members``, both give one listing and one hash.
+    """
+    manifest = [
+        entry
+        for entry in members["files"]
+        if not ignore.member_ignored(ignored, entry["relpath"], is_dir=False)
+    ]
+    found_dirs = {
+        directory
+        for directory in _restored_dirs(members)
+        if not ignore.member_ignored(ignored, directory, is_dir=True)
+    }
+    return _hashed_tree(manifest, found_dirs)
 
 
 _VALID_HASH_CHARS = frozenset("0123456789abcdef")

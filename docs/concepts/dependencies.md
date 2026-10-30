@@ -58,6 +58,71 @@ An input whose file does not exist fails before anything runs:
 `Stage 'demo/keep' depends on 'missing.csv' which is not produced by any stage
 and does not exist on disk`.
 
+### Directory inputs and `.pivotignore`
+
+A directory input (`t=pathlib.Path` on a directory) is hashed file by file, and
+any change to it makes its consumers stale, except for the files and
+directories the project's `.pivotignore` names. `pivot init` writes a starter
+`.pivotignore` (`pivot check-ignore --show-defaults` lists it): compiled Python
+(`*.pyc`, `__pycache__/`), virtual environments, version-control and editor
+files, build directories. So a Python process that imports from an input
+directory and writes `__pycache__/*.pyc` there leaves the stage cached.
+
+- Patterns are read and matched as git 2.52 reads and matches a root
+  `.gitignore`, with a port of git's own matcher: the same syntax, the same
+  `**` rules (`logs/**` names what is inside `logs`, not `logs` itself, so
+  `!logs/.gitkeep` brings that file back; `foo**/bar` names `foo/bar` and
+  `foox/bar` but not `foobar`, which git before 2.52 also named), and the same
+  bytes (a line that is not valid UTF-8 matches the same bytes in a name; a NUL
+  ends a line). Matching is case-sensitive, as git's is with `core.ignorecase`
+  off. Each file is
+  matched by its path inside the project (the input's path plus the file's path
+  under it), never by where a symlink points, so a directory linked in from
+  outside the project is treated as a local one. A file under an ignored
+  directory stays ignored, as in git: a later `!` pattern cannot bring it back.
+- `.pivotignore` decides two things: which files of a directory input count
+  for its hash (so whether its consumers rerun), and which changes inside a
+  directory input `pivot repro --watch` skips. `pivot check-ignore` answers by
+  the same rules. For an input directory that `.pivotignore` ignores (below),
+  `check-ignore` reports its files ignored, as git would, but the input is
+  hashed whole. `pipeline.py` and `.pivot/` at the project root are never
+  ignored, whatever the patterns say, and `check-ignore` takes a relative path
+  from the project root, not the current directory.
+- A line may hold at most 256 runs of `*` that are tried at more than one
+  place. A run at the end of the line does not count, nor a lone `*` right
+  before a `/` (it matches the rest of one name), and consecutive `**/` count
+  as one. Pivot matches a longer line differently from git, with a warning
+  that quotes it, and always toward hashing more. For a *member* (a file or
+  directory inside an input) a negation (`!...`) is taken to match it and any
+  other such line not to, so every file git might keep is kept. For an *input
+  directory* (the input's own directory, or one above it) it is the other way
+  round: a negation matches none, so an earlier `build/` rule still makes an
+  input at `build` hash whole, and any other such line matches every input
+  directory, so an input is hashed whole unless a later line unignores it and
+  every directory above it. At worst a stage reruns when git's rule would not
+  count the file.
+- It does not apply to stage outputs, to data you `pivot track`, or to the
+  cache: every file in a directory output or a tracked directory is hashed,
+  cached and restored, a `.pyc` included. A stage that reads another stage's
+  directory output depends on that output's whole hash.
+- The listing committed for a directory input
+  ([Listing files](outputs.md#listing-files)) holds the files its hash counts,
+  so it leaves out what `.pivotignore` names too. A tracked directory's
+  `.pvt.listing` keeps every file, and `pivot pull <stage>` fetches every one
+  of them, so `pivot checkout` restores the directory as it was.
+- An input file you declare by name is always hashed, whatever `.pivotignore`
+  says. An input directory that `.pivotignore` ignores itself (or that lies in
+  a directory it ignores, such as an input under `build/`) is hashed whole,
+  with a warning: leaving out every file in it would hide every change to it.
+- Only the project's `.pivotignore` counts: not one in your home directory,
+  since lock files carry input hashes to every machine, and not one in a
+  subdirectory, which is data like any other file.
+- Changing `.pivotignore` changes the hash of every directory input holding a
+  file whose status it changes, so those stages run once. `pivot status
+  --explain` shows the input's hash change; `git diff` on the input's committed
+  listing (`.pivot/stages/=inputs/`) after the run shows which files entered or
+  left its hash.
+
 ## Example
 
 ```python

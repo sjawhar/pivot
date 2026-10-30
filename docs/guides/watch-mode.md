@@ -69,6 +69,9 @@ Changes that trigger re-runs:
 Changes that do **not** trigger re-runs:
 
 - Files written by stages (output filtering)
+- Files inside a directory declared with `pipeline.input()` that `.pivotignore` names, since
+  the directory's hash leaves them out (see
+  [Directory inputs and `.pivotignore`](../concepts/dependencies.md#directory-inputs-and-pivotignore))
 - Files outside the watch scope
 - Changes to `.pivot/` internal state
 
