@@ -74,6 +74,7 @@ successful run:
 | `params` | Serialised [parameters](parameters.md) dict |
 | `deps` | One entry per input: producer, key, content hash |
 | `outs` | One entry per output: key, project-relative POSIX path, content hash |
+| `reads` | The content hashes of the objects the run read by hash ([`pivot.read_by_hash`](dependencies.md#objects-named-by-hash)), sorted, each once; absent when it read none |
 
 This is the ground truth for "what did the stage look like last time it
 ran?" The skip algorithm compares current state against these fields.

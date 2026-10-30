@@ -476,3 +476,46 @@ def test_marked_lock_reruns_with_its_reason_and_never_from_the_run_cache(
         assert decision["changed"] is True
         assert decision["reason"] == reason
         assert decision["run_cache_allowed"] is False
+
+
+# =============================================================================
+# Objects the previous run read by hash, now in neither the cache nor the remote
+# =============================================================================
+
+_UNAVAILABLE = "Read objects missing from the cache: 0123456789abcdef (no remote is configured)"
+
+
+@pytest.mark.parametrize("explain", [False, True])
+def test_a_current_lock_whose_read_objects_are_unavailable_is_changed(explain: bool) -> None:
+    lock_data = _helper_make_lock_data()
+
+    decision = skip.check_stage(
+        lock_data=lock_data,
+        fingerprint={"func:main": "abc123"},
+        params={"lr": 0.01},
+        dep_hashes={_id("input"): FileHash(hash="hash_a")},
+        out_paths=[_id("stage", "output")],
+        explain=explain,
+        unavailable_reads=_UNAVAILABLE,
+    )
+
+    assert decision["changed"] is True
+    assert decision["reason"] == _UNAVAILABLE
+
+
+@pytest.mark.parametrize("explain", [False, True])
+def test_a_code_change_is_named_before_unavailable_read_objects(explain: bool) -> None:
+    lock_data = _helper_make_lock_data()
+
+    decision = skip.check_stage(
+        lock_data=lock_data,
+        fingerprint={"func:main": "DIFFERENT"},
+        params={"lr": 0.01},
+        dep_hashes={_id("input"): FileHash(hash="hash_a")},
+        out_paths=[_id("stage", "output")],
+        explain=explain,
+        unavailable_reads=_UNAVAILABLE,
+    )
+
+    assert decision["changed"] is True
+    assert decision["reason"] == "Code changed"

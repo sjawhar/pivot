@@ -320,6 +320,12 @@ class ListingMissingError(CacheError):
         return "Commit the listing file beside its lock or .pvt, or run 'pivot pull'"
 
 
+class ObjectReadError(CacheError):
+    """``pivot.read_by_hash`` cannot hand its stage the object a content hash names: the value is
+    not a content hash, neither the cache nor the remote holds the object, or the bytes found do
+    not hash to it. The message names the hash and why."""
+
+
 class ParamsError(PivotError):
     """Raised when parameter validation or loading fails."""
 

@@ -1856,6 +1856,13 @@ _PVT = {"pvt_members": {"data/out/a.pvt": "77aa"}}
         pytest.param(
             {**_RAN, "later_field": [1]}, {**_RAN, "later_field": [1]}, id="unknown-key-as-stored"
         ),
+        pytest.param(
+            {**_RAN, "reads": ["0123456789abcdef"]},
+            {**_RAN, "reads": ["0123456789abcdef"]},
+            id="reads",
+        ),
+        pytest.param({**_RAN, "reads": ["../etc/passwd"]}, _RAN, id="malformed-reads"),
+        pytest.param({**_RAN, "reads": "0123456789abcdef"}, _RAN, id="reads-not-a-list"),
     ],
 )
 def test_a_no_commit_record_reads_each_valid_field_it_knows(
@@ -1886,6 +1893,11 @@ _OLDER_RUN = {
             json.dumps({**_OLDER_RUN, **_PVT}).encode(),
             {**_RAN, **_PVT},
             id="an-older-run-and-another-field",
+        ),
+        pytest.param(
+            json.dumps({**_OLDER_RUN, "reads": ["0123456789abcdef"], **_PVT}).encode(),
+            {**_RAN, **_PVT},
+            id="an-older-run-that-read-by-hash",
         ),
         pytest.param(b"not json", _RAN, id="unreadable-record"),
     ],

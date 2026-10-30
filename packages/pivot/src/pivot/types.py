@@ -159,14 +159,16 @@ class NoCommitRecord(TypedDict, total=False):
     `nocommit:<stage>`. A written lock supersedes it, and its whole record is removed.
 
     Two features write the record, each its own keys. `code_manifest` is the manifest a
-    `--no-commit` run's lock would have held, rerun marks included, and `output_hashes` the
-    outputs it wrote: the run writes both (`NoCommitRun`, `StateDB.apply_deferred_writes`), and
-    `pivot commit` writes that manifest when both are present and the outputs on disk still have
-    these hashes. `pvt_members` maps each `*.pvt` file Pivot wrote in a directory output (path
-    relative to the project root) to its content hash; the feature that keeps those files owns it.
+    `--no-commit` run's lock would have held, rerun marks included, `output_hashes` the outputs it
+    wrote, and `reads` the objects it read by hash (`pivot.read_by_hash`), when it read any: the
+    run writes these (`NoCommitRun`, `StateDB.apply_deferred_writes`), and `pivot commit` writes
+    that manifest and those reads when the manifest and outputs are present and the outputs on
+    disk still have these hashes. `pvt_members` maps each `*.pvt` file Pivot wrote in a directory
+    output (path relative to the project root) to its content hash; the feature that keeps those
+    files owns it.
 
     Every writer replaces only its own keys and keeps every other key, in one write transaction.
-    The reader (`StateDB.get_no_commit_record`) validates each of these three keys on its own and
+    The reader (`StateDB.get_no_commit_record`) validates each of these four keys on its own and
     returns every other key as stored, so a record that holds only one feature's keys reads as
     present, and a malformed key hides no other.
     """
@@ -174,13 +176,16 @@ class NoCommitRecord(TypedDict, total=False):
     code_manifest: dict[str, str]
     output_hashes: dict[str, str]  # output identity key -> content hash
     pvt_members: dict[str, str]  # `*.pvt` path relative to the project root -> content hash
+    reads: list[str]  # content hashes the run read, sorted, each once
 
 
 class NoCommitRun(TypedDict):
-    """The keys of `NoCommitRecord` a `--no-commit` run writes: always both, never one alone."""
+    """The keys of `NoCommitRecord` a `--no-commit` run writes: the manifest and outputs always,
+    never one alone, and `reads` when it read any. Applying it replaces all three."""
 
     code_manifest: dict[str, str]
     output_hashes: dict[str, str]  # output identity key -> content hash
+    reads: NotRequired[list[str]]  # content hashes the run read, sorted, each once
 
 
 class DeferredWrites(TypedDict, total=False):
@@ -437,6 +442,9 @@ class StorageLockData(TypedDict):
     params: dict[str, Any]
     deps: list[DepEntry]
     outs: list[OutEntry]
+    # The objects the run read by hash (``pivot.read_by_hash``), sorted, each once; absent when it
+    # read none, so the lock of a stage that reads nothing by hash is what it was before.
+    reads: NotRequired[list[str]]
 
 
 class LockData(TypedDict):
@@ -447,6 +455,7 @@ class LockData(TypedDict):
     dep_hashes: dict[ArtifactIdentity, HashInfo]
     output_hashes: dict[ArtifactIdentity, HashInfo]
     output_paths: NotRequired[dict[ArtifactIdentity, str]]
+    reads: NotRequired[list[str]]  # content hashes the run read by hash, sorted, each once
     # Present for a lock an older pivot wrote: its directories' listings were inline and are in
     # the cache only (``StageLock.read``); a listing file beside it is another lock's
     # (``lock.committed_listing``).

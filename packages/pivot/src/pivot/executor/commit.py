@@ -248,14 +248,18 @@ def _commit_stages(
 
             # The outputs a --no-commit run wrote came from the code that run fingerprinted, which
             # may differ from the code on disk now: record that run's manifest, its marks
-            # included. Otherwise (no record, or outputs edited since) record the outputs on disk
-            # against the current code, the "trust me" commit. A run that executed code the
-            # fingerprint does not describe marked its lock; committing the same outputs keeps
-            # that mark, so the stage is still not reusable.
+            # included, and the objects it read by hash. Otherwise (no record, or outputs edited
+            # since) record the outputs on disk against the current code, the "trust me" commit,
+            # which no read produced. A run that executed code the fingerprint does not describe
+            # marked its lock; committing the same outputs keeps that mark, so the stage is still
+            # not reusable.
+            read_hashes = list[str]()
             if run_manifest is not None and run_outputs == {
                 key: hash_info["hash"] for key, hash_info in output_hashes_by_key.items()
             }:
                 code_manifest = run_manifest
+                if run_record is not None and "reads" in run_record:
+                    read_hashes = run_record["reads"]
             else:
                 code_manifest = skip.carry_rerun_marks(
                     previous_lock["code_manifest"] if previous_lock is not None else None,
@@ -278,6 +282,8 @@ def _commit_stages(
                 output_hashes=dict(sorted(output_hashes_by_identity.items())),
                 output_paths=output_paths_by_identity,
             )
+            if read_hashes:
+                new_lock_data["reads"] = read_hashes
             try:
                 production_lock.write(
                     new_lock_data,
@@ -321,6 +327,8 @@ def _commit_stages(
                         run_id=run_id,
                         output_hashes=output_entries,
                     )
+                    if read_hashes:
+                        deferred["run_cache_entry"]["reads"] = read_hashes
             if not reusable:
                 older_key = worker.older_pivot_input_hash(
                     fingerprint,

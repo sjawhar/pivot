@@ -2048,7 +2048,7 @@ class Engine:
         needs WRITE on them. Without it, nothing is written: a cached stage whose outputs
         need restoring returns ``NEEDS_RESTORE``, for the caller to decide again under WRITE.
         """
-        from pivot import run_history
+        from pivot import reads, run_history
         from pivot import skip as skip_mod
         from pivot.storage import lock
 
@@ -2149,7 +2149,7 @@ class Engine:
             )
             return generation_outcome
 
-        def _hash_deps() -> tuple[dict[str, HashInfo], list[str], list[str]]:
+        def _hash_deps() -> tuple[dict[str, HashInfo], list[str], list[str], str | None]:
             state_db = _get_skip_state_db()
             try:
                 dep_hashes, missing, unreadable, file_hash_entries = worker.hash_dependencies(
@@ -2159,9 +2159,16 @@ class Engine:
                 if skip_state_dbs is None:
                     state_db.close()
             _save_file_hashes(file_hash_entries)
-            return dep_hashes, missing, unreadable
+            unavailable_reads = (
+                None
+                if missing or unreadable
+                else reads.lock_unavailable(lock_data, worker.store_cache_dir(store), remember=True)
+            )
+            return dep_hashes, missing, unreadable, unavailable_reads
 
-        dep_hashes, missing, unreadable = await anyio.to_thread.run_sync(_hash_deps)
+        dep_hashes, missing, unreadable, unavailable_reads = await anyio.to_thread.run_sync(
+            _hash_deps
+        )
         dep_hashes_by_identity = {
             types.identity_from_key(key): info for key, info in dep_hashes.items()
         }
@@ -2177,6 +2184,7 @@ class Engine:
             out_identities,
             explain=False,
             force=False,
+            unavailable_reads=unavailable_reads,
         )
         if decision["changed"]:
             return _SkipOutcome.RUN

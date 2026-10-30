@@ -76,6 +76,11 @@ empty lists as a lock that records nothing: it reruns an ordinary stage from its
 a stage with an incremental output it stops with "Cache missing for incremental output" instead
 of restarting that output from empty, which it would do for a lock it read as missing. A lock
 that records only files keeps them at the top level, where those pivots read them as before."""
+_READS_KEY = "reads"
+"""Where a lock lists the objects its run read by hash (``pivot.read_by_hash``): a top-level list
+of content hashes, sorted, each once, written only when the run read one. Every released pivot
+allows an unknown top-level key (``lock_data_error``), so it reads such a lock as it reads any
+other, and its own records stay where it looks for them."""
 _RESTART_PROOF_SUFFIX = ".incremental"
 """The suffix of the file this pivot writes beside the lock of a stage that keeps an incremental
 output and commits with it (``restart_proof_path``). No released pivot writes one, so this file
@@ -622,6 +627,12 @@ def _is_str_mapping(value: object, *, str_values: bool) -> bool:
     return not str_values or all(isinstance(item, str) for item in mapping.values())
 
 
+def _is_hash_list(value: object) -> bool:
+    return isinstance(value, list) and all(
+        cache.is_valid_hash(item) for item in cast("list[object]", value)
+    )
+
+
 def _entry_error(
     raw: object, field: str, list_key: str, *, listed: bool
 ) -> str | UnsafeLockPath | None:
@@ -686,6 +697,8 @@ def lock_data_error(data: object) -> str | UnsafeLockPath | None:
         return "code_manifest"
     if not _is_str_mapping(document["params"], str_values=False):
         return "params"
+    if _READS_KEY in document and not _is_hash_list(document[_READS_KEY]):
+        return _READS_KEY
     records: dict[object, object] = document
     prefix = ""
     if _RECORDS_KEY in document:
@@ -917,13 +930,16 @@ def _convert_to_storage_format(data: LockData) -> StorageLockData:
 
     sorted_code_manifest = dict(sorted(data["code_manifest"].items()))
 
-    return StorageLockData(
+    storage = StorageLockData(
         schema_version=SCHEMA_VERSION,
         code_manifest=sorted_code_manifest,
         params=data["params"],
         deps=deps_list,
         outs=outs_list,
     )
+    if "reads" in data and data["reads"]:
+        storage["reads"] = sorted(set(data["reads"]))
+    return storage
 
 
 def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> LockData:
@@ -948,6 +964,8 @@ def _convert_from_storage_format(data: StorageLockData, *, stage_name: str) -> L
     )
     if output_paths:
         lock_data["output_paths"] = output_paths
+    if "reads" in data and data["reads"]:
+        lock_data["reads"] = data["reads"]
     return lock_data
 
 
