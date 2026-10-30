@@ -1297,7 +1297,11 @@ def test_the_programs_main_module_is_never_compared(
     monkeypatch.syspath_prepend(str(root))
     _held_module("__main__", tmp_path / "program" / "run.py", monkeypatch)
 
-    loaded_source.check_worker_imports({"module:__main__": ""})
+    loaded_source.note_held_modules(list(sys.modules.items()))
+    try:
+        loaded_source.check_worker_imports({"module:__main__": ""})
+    finally:
+        loaded_source.note_held_modules(())
 
 
 def test_discovery_survives_another_thread_changing_sys_modules(

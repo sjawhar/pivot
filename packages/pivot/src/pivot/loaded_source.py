@@ -101,6 +101,9 @@ _warned = set[str]()
 # What a worker imports for each module name, by name and the `sys.path` it inherits
 # (`_worker_origin`); `prune` forgets them when the session ends.
 _worker_origins = dict[tuple[str, tuple[str, ...]], tuple[str | None] | None]()
+# The modules `sys.modules` held when the current import session started, by name: the ones the
+# program that runs Pivot loaded (`note_held_modules`; `prune` forgets them).
+_held = dict[str, types.ModuleType]()
 # Whether this process was forked without exec from one that imported this module: it holds
 # modules its parent loaded before this process started (`_note_fork`).
 _forked = False
@@ -299,6 +302,13 @@ def prune() -> None:
         _token = None
     _unseen.clear()
     _worker_origins.clear()
+    _held.clear()
+
+
+def note_held_modules(modules: Iterable[tuple[str, object]]) -> None:
+    """Keep the modules `sys.modules` holds as an import session starts (`check_worker_imports`)."""
+    _held.clear()
+    _held.update((name, module) for name, module in modules if isinstance(module, types.ModuleType))
 
 
 def digest(file: str) -> str | None:
@@ -463,7 +473,8 @@ def check_stage(
 
 
 def check_worker_imports(manifest: Mapping[str, str]) -> None:
-    """Raise when a module a stage's manifest names is not the one its worker would import.
+    """Raise when a module a stage's manifest names, which the program that runs Pivot held
+    before the import session started, is not the one its worker would import.
 
     A worker receives a module discovery did not register by value as a reference by name, and
     imports it with the `sys.path` it inherits from this process (loky copies it when the worker
@@ -473,7 +484,9 @@ def check_worker_imports(manifest: Mapping[str, str]) -> None:
     fingerprinted from that module while its worker runs the other file. That is a soundness
     risk, so it is an error, for the user modules the manifest covers (`module:` entries) and
     the top-level module of each library callable it records by name (`ext:` entries). A name
-    `sys.path` does not resolve is left to the finders that loaded it, in both processes.
+    `sys.path` does not resolve is left to the finders that loaded it, in both processes. A
+    module the session imported resolved on the same `sys.path`; a file that appears or changes
+    after that is the worker's to report (`check_stage`).
     """
     names = fingerprint.covered_user_modules(dict(manifest))
     for key, value in manifest.items():
@@ -484,7 +497,7 @@ def check_worker_imports(manifest: Mapping[str, str]) -> None:
         module = sys.modules.get(name)
         # A worker never imports the program's main module by name: cloudpickle sends its
         # functions by value.
-        if not isinstance(module, types.ModuleType) or name == "__main__":
+        if module is None or _held.get(name) is not module or name == "__main__":
             continue
         resolved = _worker_origin(name)
         if resolved is None:

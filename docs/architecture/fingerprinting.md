@@ -367,12 +367,15 @@ loaded from another file, which `import` in `pipeline.py` returns from `sys.modu
 would then be fingerprinted from one file while its worker runs another, and an edit to the
 project's file would leave a stale `cached`. So when a stage's fingerprint is computed,
 `loaded_source.check_worker_imports` resolves each module the manifest names (the user modules
-of its `module:` entries and the top-level module of each `ext:` library callable) with
-`importlib.machinery.PathFinder` on `sys.path`, without importing it, and raises when the file
-differs from the one `sys.modules` holds, naming both. The remedy is a new process (the `pivot`
-command) or renaming one module. A name nothing on `sys.path` holds is left to the finder that
-loaded it, and the program's `__main__` is never compared: a worker gets its functions by value.
-Pivot changes nothing in the program's `sys.modules`.
+of its `module:` entries and the top-level module of each `ext:` library callable) that
+`sys.modules` already held when the import session started (`loaded_source.note_held_modules`),
+with `importlib.machinery.PathFinder` on the `sys.path` a worker starts with, without importing
+it, and raises when the file differs from the held module's, naming both. The remedy is a new
+process (the `pivot` command) or renaming one module. A module the session imported resolved on
+that same `sys.path`; a file that appears or changes after that, during a run, is the worker's to
+report (below). A name nothing on `sys.path` holds is left to the finder that loaded it, and the
+program's `__main__` is never compared: a worker gets its functions by value. Pivot changes
+nothing in the program's `sys.modules`.
 
 A worker imports some user modules itself, from their files: a stage's module discovery does not
 send by value (outside the root, or under it in a `src` layout), a module outside the root that
