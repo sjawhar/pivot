@@ -458,7 +458,9 @@ in the register, whichever command it runs and whether or not the cache existed 
 Only a test standing in for a writer passes `project=None`. A full registration (a process's
 first unit, or after its evidence changed) tries to write the project id to
 `<state dir>/state.lmdb/pivot-project-id`, then one fresh nonce to this view's
-`<state dir>/state.lmdb/gc-views/<view>` and the entry's sibling `<digest>.nonce`, then the entry
+`<state dir>/state.lmdb/gc-views/<view>-<cache id>` (the cache id is a random value in
+`<cache>/projects/cache-id`, so each cache a project uses has its own nonce and registering in
+one never makes another cache's entry stale) and the entry's sibling `<digest>.nonce`, then the entry
 with the mount points at or below the project root and state directory, and cache-root submounts
 in `<cache>/mounts/`. An entry that already records exactly that (its timestamp aside) and was
 written in the last hour is kept rather than rewritten (`_entry_is_current`), so a worker pool
@@ -478,8 +480,19 @@ namespace). An id or nonce write failure leaves an entry without them, so a coll
 it but the writer preserves #503's unusable-state behavior. A register write failure refuses the
 writer. The only exception is `EROFS` on the cache: a read-only cache cannot be collected
 either. A restore that links a cache object into a workspace outside a naming unit runs after a
-registering unit: `checkout` and `pull` call `config.register_cache_use` first, and a skipped
-stage's restore and `--checkout-missing` run inside a `repro` or `run`, after the engine's.
+registering unit **in the cache it restores from** (`naming.register_use(cache_root, …)`, with
+the same `cache_root` the restore reads): `checkout` and `pull` through
+`config.register_cache_use`; a skipped stage's restore in `execute_stage` (exported, so it may
+run without the engine) through `restore_outputs_to_hashes(register=…)`, once and only when a
+restore happens, in the cache its store spec names; the engine's own skipped-stage restore after
+its pre-run registration in the `cache_dir` its store is built from; `--checkout-missing` in
+`verify_tracked_files`, which restores from the configured cache and registers there itself,
+since a library caller can give the engine another `cache_dir` (L1). A restore inside a naming
+unit (the run-cache restore) passes no `register`: that unit registered, and a nested unit could
+wait on a collection that waits on the outer one. `executor.core.run(pipeline=...)` refuses a
+supplied pipeline, or one it includes, with a `root=` other than the project root, as discovery
+does (`discovery.require_project_roots`, which checks the roots the pipeline recorded at its
+load, not the configuration now): its stages' locks would sit where no collection reads (L2).
 
 **A registered project is live only after a real read.** `read_register` resolves the state
 directory from that project's own `core.state_dir`, requires the entry's project id there, and

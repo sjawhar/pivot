@@ -354,7 +354,9 @@ def _view_nonce_reason(
         detail = "the entry has no readable view nonce"
     else:
         try:
-            nonce = naming.read_view_nonce(scope["state_dir"], view_key)
+            # The entry's cache is the one whose register holds it (`<cache>/projects/`)
+            cache_id = naming.read_cache_id(entry.parent.parent)
+            nonce = naming.read_view_nonce(scope["state_dir"], view_key, cache_id)
         except (OSError, ValueError) as e:
             detail = f"no nonce for that view readable here: {_error_text(e)}"
         else:

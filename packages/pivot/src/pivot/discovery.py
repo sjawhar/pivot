@@ -657,6 +657,25 @@ def _require_project_state(pipeline: PipelineLike, project_root: pathlib.Path) -
             )
 
 
+def require_project_roots(pipeline: PipelineLike, project_root: pathlib.Path) -> None:
+    """Refuse a pipeline given to the library, or one it includes, whose ``root=`` is not the
+    project root: its stages' locks would sit in that root's state directory, where no
+    collection of this project reads them. Discovery refuses the same pipeline as it loads
+    (``_require_project_state``).
+
+    It checks the roots the pipeline recorded when it loaded (``resolved_state_dirs``), not the
+    configuration now, so a pipeline loaded before a ``core.state_dir`` edit still runs in the
+    directory it loaded with, as the library documents.
+    """
+    for root in (pipeline.root, *pipeline.resolved_state_dirs):
+        if root.resolve() != project_root:
+            raise exceptions.PipelineConfigError(
+                f"Pipeline '{pipeline.name}' or a pipeline it includes sets root={root}, but a "
+                + f"pipeline always uses the project's .pivot and data/ ({project_root}); "
+                + "remove root="
+            )
+
+
 def find_config_in_dir(directory: pathlib.Path) -> pathlib.Path | None:
     """Find the pipeline config file in a directory.
 

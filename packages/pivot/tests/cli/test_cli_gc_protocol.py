@@ -873,11 +873,14 @@ def test_a_writer_refuses_when_it_cannot_open_the_naming_lock(tmp_path: pathlib.
 # =============================================================================
 
 
-def _shared_project(path: pathlib.Path, shared_cache: pathlib.Path) -> pathlib.Path:
-    """A project that caches into ``shared_cache`` with symlink checkout (the reporter's mode)."""
+def _shared_project(
+    path: pathlib.Path, shared_cache: pathlib.Path, checkout: str = "symlink"
+) -> pathlib.Path:
+    """A project that caches into ``shared_cache`` with ``checkout`` mode (by default symlink,
+    the reporter's mode)."""
     root = _project(path)
     (root / ".pivot" / "config.yaml").write_text(
-        f"cache:\n  dir: {shared_cache}\n  checkout_mode:\n  - symlink\n"
+        f"cache:\n  dir: {shared_cache}\n  checkout_mode:\n  - {checkout}\n"
     )
     return root
 
@@ -2273,13 +2276,18 @@ def _unregister(cache_dir: pathlib.Path, root: pathlib.Path) -> None:
     assert not _registered(cache_dir, root)
 
 
-def _unregistered_gated_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
-    """A registered peer and a project out of the register, both on one external cache with
-    symlink checkout; the project's two-stage pipeline has run once. Returns (peer, project)."""
+def _unregistered_gated_project(
+    tmp_path: pathlib.Path, checkout: str = "symlink"
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """A registered peer and a project out of the register, both on one external cache, the
+    project with ``checkout`` mode; its two-stage pipeline has run once. Returns (peer, project)."""
     shared = tmp_path / "shared-cache"
     peer = _shared_project(tmp_path / "peer", shared)
     _ok(_run(peer, "repro"))
-    root = _shared_project(tmp_path / "project", shared)
+    root = _shared_project(tmp_path / "project", shared, checkout)
+    # Content no record of the peer names: the peer's own stage shouts "hello", which would make
+    # its lock keep the same object and hide a lost registration.
+    (root / "data" / "raw" / "input.txt").write_text("only this project reads this\n")
     (root / "pipeline.py").write_text(_GATED_PIPELINE.replace("VERSION", "v1"))
     _ok(_run(root, "repro"))
     _unregister(shared, root)
@@ -2295,18 +2303,22 @@ def _start_held(
     return proc
 
 
+@pytest.mark.parametrize("checkout", ["symlink", "copy"])
 def test_a_project_out_of_the_register_registers_before_its_changed_stage_runs(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, checkout: str
 ) -> None:
     """U1: a project out of the register (last run by a pivot release) runs `pivot repro` with
     `down` changed and `up` skipped in place. While `down` runs, a peer's `pivot gc` reads the
     register. The project must already be in it, or gc removes `up`'s object, which only the
-    project's lock names, and leaves its link dangling."""
-    peer, root = _unregistered_gated_project(tmp_path)
+    project's lock names. With copy checkout no workspace link names the object either, so the
+    registration alone keeps it."""
+    peer, root = _unregistered_gated_project(tmp_path, checkout)
     shared = tmp_path / "shared-cache"
-    up_link = root / "data" / "ug" / "up.txt"
-    up_object = up_link.resolve()
-    assert up_object.is_relative_to(shared.resolve()) and up_object.exists(), up_object
+    up_out = root / "data" / "ug" / "up.txt"
+    up_object = cache.get_cache_path(shared / "files", cache.hash_file(up_out)[0])
+    assert up_object.exists(), up_object
+    assert up_out.is_symlink() == (checkout == "symlink"), "the checkout mode was not applied"
+    up_content = up_out.read_text()
     (root / "pipeline.py").write_text(_GATED_PIPELINE.replace("VERSION", "v2"))
 
     proc = _start_held(root, tmp_path / "gate", "down")
@@ -2318,10 +2330,11 @@ def test_a_project_out_of_the_register_registers_before_its_changed_stage_runs(
     _finish(proc)
 
     out = collected.stdout + collected.stderr
-    assert registered, "the project was not in the register while its changed stage ran"
     assert collected.returncode == 0, out
+    # The object first: in copy mode nothing but the registration can keep it.
     assert up_object.exists(), f"gc removed {up_object}, which the project's up.lock names"
-    assert up_link.resolve().exists(), "up's link dangles"
+    assert up_out.exists() and up_out.read_text() == up_content, "up's output is gone or dangles"
+    assert registered, "the project was not in the register while its changed stage ran"
 
 
 def test_a_forced_run_registers_before_its_first_stage_runs(tmp_path: pathlib.Path) -> None:
@@ -2349,3 +2362,126 @@ def test_a_run_where_every_stage_skips_registers_its_project(tmp_path: pathlib.P
 
     assert "0 ran" in out, out
     assert _registered(shared, root), "a run that skipped every stage left its project unregistered"
+
+
+# =============================================================================
+# Round 14: the library path registers where it restores (L1) and refuses root= (L2)
+# =============================================================================
+
+_LIBRARY_RUN = """\
+import pathlib
+import sys
+
+from pivot.executor import core
+
+if __name__ == "__main__":  # pivot starts processes with spawn, which re-imports this module
+    core.run(cache_dir=pathlib.Path(sys.argv[1]), checkout_missing=True)
+"""
+
+
+def test_a_library_run_with_another_cache_registers_where_it_restores_tracked_files(
+    tmp_path: pathlib.Path,
+) -> None:
+    """L1: `executor.core.run(cache_dir=C2, checkout_missing=True)` registers in C2, the engine's
+    cache, but restores a missing tracked file from the configured cache C1. The project must be
+    registered in C1 before that restore links C1's object, or a peer's `pivot gc` on C1
+    removes it and the restored link dangles."""
+    shared = tmp_path / "shared-cache"
+    peer = _shared_project(tmp_path / "peer", shared)
+    _ok(_run(peer, "repro"))
+    root = _shared_project(tmp_path / "project", shared)
+    tracked = root / "notes.txt"
+    content = "tracked notes, in the configured cache only\n"
+    tracked.write_text(content)
+    _ok(_run(root, "track", "notes.txt"))
+    tracked_object = cache.get_cache_path(shared / "files", cache.hash_file(tracked)[0])
+    assert tracked_object.exists(), tracked_object
+    _unregister(shared, root)
+    tracked.unlink()
+    other_cache = tmp_path / "other-cache"
+    other_cache.mkdir()
+    driver = tmp_path / "library_run.py"
+    driver.write_text(_LIBRARY_RUN)
+
+    done = subprocess.run(
+        [sys.executable, str(driver), str(other_cache)],
+        cwd=root,
+        env=_env(),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert tracked.read_text() == content, "the tracked file was not restored from C1"
+    registered = _registered(shared, root)
+    collected = _run(peer, "gc", "--yes", "--grace-hours", "0")
+    assert registered, "the project was not registered in the cache its restore linked from"
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert tracked_object.exists(), "gc removed the object the project's .pvt names"
+
+
+_ROOTED_MODULE = """\
+import os
+import pathlib
+
+from pivot import Pipeline, stage
+
+
+@stage
+def made() -> str:
+    return "made elsewhere"
+
+
+ext = Pipeline("ext", root=pathlib.Path(os.environ["GC_TEST_ELSEWHERE"]))
+with ext:
+    made()
+top = Pipeline("top", root=pathlib.Path(os.environ["GC_TEST_ROOT"]))
+top.include(ext)
+"""
+
+_ROOTED_DRIVER = """\
+import sys
+
+from pivot import exceptions
+from pivot.executor import core
+
+import rooted_pipeline
+
+if __name__ == "__main__":  # pivot starts processes with spawn, which re-imports this module
+    try:
+        core.run(pipeline=rooted_pipeline.top)
+    except exceptions.PipelineConfigError as error:
+        print(f"REFUSED: {error}")
+        sys.exit(3)
+"""
+
+
+def test_a_library_run_refuses_an_included_pipeline_rooted_elsewhere(
+    tmp_path: pathlib.Path,
+) -> None:
+    """L2: the CLI's discovery refuses a pipeline whose `root=` is not the project root. Given
+    one through `executor.core.run(pipeline=...)`, the library ran it and wrote the included
+    stage's lock under that other root, where no `pivot gc` reads it. It must refuse the same."""
+    root = _project(tmp_path / "project")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (root / "rooted_pipeline.py").write_text(_ROOTED_MODULE)
+    driver = root / "rooted_driver.py"
+    driver.write_text(_ROOTED_DRIVER)
+
+    done = subprocess.run(
+        [sys.executable, str(driver)],
+        cwd=root,
+        # PYTHONPATH: the driver and every worker import the stage module by name
+        env=_env(PYTHONPATH=str(root), GC_TEST_ELSEWHERE=str(elsewhere), GC_TEST_ROOT=str(root)),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+    out = done.stdout + done.stderr
+    assert done.returncode == 3 and "REFUSED" in out and "root=" in out, out
+    assert not list(elsewhere.rglob("*.lock")), "a stage lock was written outside the project"

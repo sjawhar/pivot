@@ -389,11 +389,7 @@ def register_cache_use() -> None:
         root = project.get_project_root()
     except exceptions.ProjectNotInitializedError:
         return
-    cache_dir = locate_cache_dir()
-    if not cache_dir.is_dir():
-        return
-    with naming.naming_unit(cache_dir, project=(root, locate_state_dir())):
-        pass  # the unit registers the project under the shared lock
+    naming.register_use(locate_cache_dir(), root, locate_state_dir())
 
 
 def locate_state_dir() -> pathlib.Path:

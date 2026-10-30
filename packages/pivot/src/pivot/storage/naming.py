@@ -56,8 +56,14 @@ ENTRY_ID_RE = re.compile(r"[0-9a-f]{32}")
 _MOUNT_NAMESPACE = pathlib.Path("/proc/self/ns/mnt")
 # The machine id, so two machines that share a hostname (cloned VMs) are different views.
 _MACHINE_ID = pathlib.Path("/etc/machine-id")
-# One nonce file per view in a project's state directory: proof of what that view last wrote.
+# One nonce file per view and cache in a project's state directory: proof of what that view last
+# wrote for that cache's entry. Keyed by the cache too, so registering in one cache never
+# replaces the nonce another cache's entry holds (a run with another `cache_dir`).
 VIEW_NONCE_DIR = "gc-views"
+# A random id for each cache, in its register, that names the cache in those nonce files. It is
+# read from the cache itself, so every view of the cache finds the same id whatever path it
+# mounts the cache at.
+CACHE_ID_FILE = "cache-id"
 # Mount points under the cache root that each view of the cache (host and mount namespace) saw,
 # one file per view, read by a collection before it trusts the register: a register or ref
 # directory on a mount that is not mounted holds no entries.
@@ -142,16 +148,16 @@ def project_register_path(
     return register_path(cache_dir, project_root, project_id, view_key_of(*this_view()))
 
 
-def _view_nonce_path(state_dir: pathlib.Path, view_key: str) -> pathlib.Path:
-    """Where one view's latest registration nonce lives in a project's state directory (inside
-    ``state.lmdb``, which the state directory's ignore file keeps out of git)."""
-    return state_dir / "state.lmdb" / VIEW_NONCE_DIR / view_key
+def _view_nonce_path(state_dir: pathlib.Path, view_key: str, cache_id: str) -> pathlib.Path:
+    """Where one view's latest registration nonce for one cache lives in a project's state
+    directory (inside ``state.lmdb``, which the state directory's ignore file keeps out of git)."""
+    return state_dir / "state.lmdb" / VIEW_NONCE_DIR / f"{view_key}-{cache_id}"
 
 
-def _open_view_nonce(state_dir: pathlib.Path, view_key: str) -> int:
-    """Open (creating) this view's nonce file in the state directory. Raises OSError or
-    ValueError (a NUL byte in an unusable configured path)."""
-    path = _view_nonce_path(state_dir, view_key)
+def _open_view_nonce(state_dir: pathlib.Path, view_key: str, cache_id: str) -> int:
+    """Open (creating) this view's nonce file for one cache in the state directory. Raises
+    OSError or ValueError (a NUL byte in an unusable configured path)."""
+    path = _view_nonce_path(state_dir, view_key, cache_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
     os.fchmod(fd, 0o644)  # other users' collections must read it, whatever the umask
@@ -235,9 +241,45 @@ def read_nonce_file(path: pathlib.Path) -> str:
     return nonce
 
 
-def read_view_nonce(state_dir: pathlib.Path, view_key: str) -> str:
-    """Read one view's nonce in the state directory. Raises OSError or ValueError."""
-    return read_nonce_file(_view_nonce_path(state_dir, view_key))
+def read_view_nonce(state_dir: pathlib.Path, view_key: str, cache_id: str) -> str:
+    """Read one view's nonce for one cache in the state directory. Raises OSError or
+    ValueError."""
+    return read_nonce_file(_view_nonce_path(state_dir, view_key, cache_id))
+
+
+def _cache_id_path(cache_dir: pathlib.Path) -> pathlib.Path:
+    return cache_dir / REGISTER_DIR / CACHE_ID_FILE
+
+
+def read_cache_id(cache_dir: pathlib.Path) -> str:
+    """Read the cache's id without following a symlink. Raises OSError or ValueError."""
+    path = _cache_id_path(cache_dir)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(fd) as file:
+        cache_id = file.read().strip()
+    if not ENTRY_ID_RE.fullmatch(cache_id):
+        raise ValueError(f"{path} does not hold a pivot cache id")
+    return cache_id
+
+
+def _ensure_cache_id(cache_dir: pathlib.Path) -> str:
+    """Return the cache's id, creating it once (the first writer's link wins). Raises OSError or
+    ValueError."""
+    with contextlib.suppress(FileNotFoundError):
+        return read_cache_id(cache_dir)
+    register = cache_dir / REGISTER_DIR
+    register.mkdir(exist_ok=True)
+    staged = register / f".{CACHE_ID_FILE}.{os.urandom(8).hex()}"
+    try:
+        fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o644)
+        with os.fdopen(fd, "w") as file:
+            os.fchmod(file.fileno(), 0o644)  # every user of the cache reads it
+            file.write(os.urandom(16).hex() + "\n")
+        with contextlib.suppress(FileExistsError):
+            os.link(staged, _cache_id_path(cache_dir))
+    finally:
+        staged.unlink(missing_ok=True)
+    return read_cache_id(cache_dir)
 
 
 def _project_id_path(state_dir: pathlib.Path) -> pathlib.Path:
@@ -558,11 +600,13 @@ def register_project(
     view_key = view_key_of(host, machine, mount_ns)
     state_fd: int | None = None
     register_fd: int | None = None
+    cache_id = ""
     try:
         project_id: str | None = _ensure_project_id(state_dir, project_root)
-        state_fd = _open_view_nonce(state_dir, view_key)
+        cache_id = _ensure_cache_id(cache_dir)
+        state_fd = _open_view_nonce(state_dir, view_key, cache_id)
     except (OSError, ValueError) as e:
-        logger.debug("Cannot write the project id or view nonce in %s: %s", state_dir, e)
+        logger.debug("Cannot write the project id, cache id or view nonce for %s: %s", state_dir, e)
         project_id = None
     try:
         path = register_path(cache_dir, project_root, project_id or "", view_key)
@@ -616,7 +660,7 @@ def register_project(
                     id_identity=id_identity,
                     entry_path=str(path),
                     entry_identity=entry_identity,
-                    state_nonce_path=str(_view_nonce_path(state_dir, view_key)),
+                    state_nonce_path=str(_view_nonce_path(state_dir, view_key, cache_id)),
                     state_nonce_fd=state_fd,
                     register_nonce_path=str(entry_nonce_path(path)),
                     register_nonce_fd=register_fd,
@@ -733,6 +777,22 @@ def naming_unit(
                 fcntl.flock(nm_fd, fcntl.LOCK_UN)
         os.close(nm_fd)
         os.close(ts_fd)
+
+
+def register_use(
+    cache_root: pathlib.Path, project_root: pathlib.Path, state_dir: pathlib.Path
+) -> None:
+    """Register ``project_root`` in ``cache_root`` in one naming unit, before a command links
+    or names that cache's objects outside a publishing unit.
+
+    Pass the cache the command reads from: a restore links objects of the cache it restores
+    from, and that cache's collection reads only its own register, so registering in another
+    cache protects nothing. A cache that does not exist holds nothing to collect, so nothing is
+    created or registered for it.
+    """
+    if cache_root.is_dir():
+        with naming_unit(cache_root, project=(project_root, state_dir)):
+            pass
 
 
 def _unopenable_naming_lock(

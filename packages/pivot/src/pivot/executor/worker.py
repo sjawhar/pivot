@@ -930,6 +930,17 @@ def _execute_stage(
     project_state_dir = state_dir_mod.locate_state_dir(project_root)
     store = store_mod.store_from_spec(stage_info["store_spec"])
 
+    def register_before_restore() -> None:
+        """Register the project in the cache the store restores from, before a skipped stage
+        links that cache's objects outside a publishing unit. `execute_stage` is exported, so a
+        caller without the engine's registration restores here; the store spec names the
+        cache's object root as spelled in config (the store itself resolves it)."""
+        naming.register_use(
+            pathlib.Path(stage_info["store_spec"]["cache_dir"]).parent,
+            project_root,
+            project_state_dir,
+        )
+
     # Set project root cache explicitly - workers in reusable pool may have
     # stale cache from previous execution in different project/test.
     project._project_root_cache = project_root  # pyright: ignore[reportPrivateUsage]
@@ -1033,6 +1044,7 @@ def _execute_stage(
                                 report_changes=True,
                                 file_hash_entries=restored_entries,
                                 claims=claims,
+                                register=register_before_restore,
                             )
                             if restoration.available:
                                 return _make_result(
@@ -1092,6 +1104,7 @@ def _execute_stage(
                             report_changes=True,
                             file_hash_entries=restored_entries,
                             claims=claims,
+                            register=register_before_restore,
                         )
                         if restoration.available:
                             # The dependencies read to decide, and the outputs read or restored
@@ -1609,6 +1622,7 @@ def restore_outputs_to_hashes(
     report_changes: Literal[False] = False,
     file_hash_entries: list[FileHashEntry] | None = None,
     claims: ownership.StageClaims | None = None,
+    register: Callable[[], None] | None = None,
 ) -> bool: ...
 
 
@@ -1625,6 +1639,7 @@ def restore_outputs_to_hashes(
     report_changes: Literal[True],
     file_hash_entries: list[FileHashEntry] | None = None,
     claims: ownership.StageClaims | None = None,
+    register: Callable[[], None] | None = None,
 ) -> OutputRestoreResult: ...
 
 
@@ -1640,6 +1655,7 @@ def restore_outputs_to_hashes(
     report_changes: bool = False,
     file_hash_entries: list[FileHashEntry] | None = None,
     claims: ownership.StageClaims | None = None,
+    register: Callable[[], None] | None = None,
 ) -> bool | OutputRestoreResult:
     """Verify outputs match recorded hashes and restore cacheable mismatches.
 
@@ -1647,10 +1663,11 @@ def restore_outputs_to_hashes(
     so an evicted listing object does not make a still-restorable output unavailable.
     ``file_hash_entries``, when given, receives a StateDB file-hash entry for every file the
     check had to read and every file restored from the cache, so the next check finds each
-    without reading it. A restore links cache objects into the workspace; within `repro` and
-    `run` the engine registered the project before any stage (`Engine._orchestrate_execution`).
-    ``claims`` (the stage's) decide which ``*.pvt`` files in an output are the stage's own, and
-    record the ones a restore writes that the lock does not list
+    without reading it. ``register``, when given, runs once before the first restore: a restore
+    links cache objects into the workspace outside a publishing unit, so the project must be in
+    the register of the cache it restores from first. A caller inside a naming unit passes none
+    (that unit registered). ``claims`` (the stage's) decide which ``*.pvt`` files in an output
+    are the stage's own, and record the ones a restore writes that the lock does not list
     (``store.WorkspaceStore.restore_from_cache``).
     """
     unavailable = list[types.ArtifactRef]()
@@ -1717,6 +1734,9 @@ def restore_outputs_to_hashes(
                     if not restore:
                         continue
                     restored = list[tuple[pathlib.Path, os.stat_result, str]]()
+                    if register is not None:
+                        register()
+                        register = None
                     if store.restore_from_cache(
                         ref,
                         expected_hash,

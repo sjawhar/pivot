@@ -1147,15 +1147,12 @@ class Engine:
         # collection deletes waits for it here, once, before its first stage. A cache that does
         # not exist yet holds nothing to collect, and the first commit's unit creates the cache
         # and registers.
-        if cache_dir.is_dir():
-            with naming.naming_unit(
-                cache_dir, project=(project_root, state_dir_mod.locate_state_dir(project_root))
-            ):
-                pass
+        naming.register_use(cache_dir, project_root, state_dir_mod.locate_state_dir(project_root))
 
         # Verify tracked files before building DAG: a stage's own .pvt member of its output is
-        # none, the loaded pipeline's by the registry and any other's by its lock. This may
-        # restore a tracked file, which the registration above covers.
+        # none, the loaded pipeline's by the registry and any other's by its lock. A tracked
+        # file it restores comes from the configured cache, and it registers there first: a
+        # library caller can run the engine with another `cache_dir`.
         all_stages = self._get_all_stages()
         executor_core.verify_tracked_files(
             project_root,

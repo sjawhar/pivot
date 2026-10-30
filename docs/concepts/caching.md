@@ -172,9 +172,12 @@ The project id is a random value in `<state dir>/state.lmdb/pivot-project-id`, s
 copies it to another checkout. A copy of the project (`cp -a`, a container built from an image
 that holds it, a VM cloned from its disk) keeps the id and can keep its directories' inode
 numbers, so neither proves which project a view reads. Every naming step therefore writes one
-fresh nonce to `<state dir>/state.lmdb/gc-views/<view>` and to the entry's sibling
+fresh nonce to `<state dir>/state.lmdb/gc-views/<view>-<cache id>` and to the entry's sibling
 `projects/<digest>.nonce`, so a clone taken while a writer runs holds a nonce the writer's next
-step replaces. A project that sets a new `core.state_dir` copies the id from its `.pivot` state.
+step replaces. The cache id is a random value in the cache's `projects/cache-id`, so a project
+that uses two caches keeps one nonce for each, and registering in one never invalidates the
+other's entry.
+A project that sets a new `core.state_dir` copies the id from its `.pivot` state.
 `mounts` lists the mount points at or below the project root and state directory that this view
 saw.
 

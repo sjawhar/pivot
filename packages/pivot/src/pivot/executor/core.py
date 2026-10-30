@@ -21,7 +21,7 @@ import loky.reusable_executor
 from pivot import config, discovery, exceptions, loaded_source, parameters, project, registry, types
 from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
-from pivot.storage import cache, lock, ownership, track
+from pivot.storage import cache, lock, naming, ownership, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import OnError, StageStatus
@@ -435,6 +435,11 @@ def _run_inner(
             raise exceptions.PipelineNotFoundError(
                 "No pipeline found. Create pipeline.py to define stages."
             )
+    else:
+        # Refuse what discovery refuses: a pipeline (or an included one) with a `root=` other
+        # than the project root keeps its stages' locks outside the project's state directory,
+        # where no `pivot gc` reads them.
+        discovery.require_project_roots(pipeline, project.get_project_root())
 
     # Run async execution
     async def execute() -> dict[str, ExecutionSummary]:
@@ -640,12 +645,15 @@ def verify_tracked_files(
 
     _t = metrics.start()
     missing = list[str]()
-    cache_dir = config.locate_cache_dir() / "files"
+    cache_root = config.locate_cache_dir()
+    cache_dir = cache_root / "files"
     state_dir = config.locate_state_dir()
 
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
-    # A restore links a cache object into the workspace; the engine registered the project
-    # before calling this (`Engine._orchestrate_execution`), as `pivot checkout` registers first.
+    # A restore links an object of the configured cache into the workspace, so the project
+    # registers in that cache first, once, before the first restore. The engine registered in
+    # its own `cache_dir`, which a library caller can point at another cache.
+    registered = False
     with state_mod.open_readonly(state_dir, create=False) as state_db:
         for data_path, track_data in tracked_files.items():
             path = pathlib.Path(data_path)
@@ -663,6 +671,9 @@ def verify_tracked_files(
                     raise FileNotFoundError(data_path)
             except FileNotFoundError:
                 if checkout_missing:
+                    if not registered:
+                        naming.register_use(cache_root, project_root, state_dir)
+                        registered = True
                     if _restore_tracked_file(
                         path, track_data, cache_dir, project_root, state_dir, pending
                     ):
