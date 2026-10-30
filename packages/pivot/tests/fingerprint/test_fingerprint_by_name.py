@@ -1786,7 +1786,8 @@ def test_cache_wrapper_above_the_mark_records_the_marked_function_by_name(
     third = fingerprint.get_stage_fingerprint(_fresh(*names).my_stage)
     assert second == third, "an edit to a callee of the marked function changed the fingerprint"
     assert {key: value for key, value in third.items() if not key.startswith("self:")} == {
-        "ext:rk_cache_s.start": "rk_cache_h.start"
+        "ext:rk_cache_s.start": "rk_cache_h.start",
+        "byname:rk_cache_h": "",
     }, third
 
 

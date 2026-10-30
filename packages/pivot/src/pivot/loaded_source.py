@@ -36,6 +36,7 @@ when the coordinator's record changed after the workers started (`digests_for_st
 from __future__ import annotations
 
 import _imp
+import ast
 import importlib.machinery
 import importlib.util
 import inspect
@@ -44,19 +45,23 @@ import json
 import linecache
 import logging
 import marshal
+import multiprocessing.process
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import tokenize
 import types
 import warnings
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
+import cloudpickle
 import xxhash
 
 # `fingerprint` imports this module; the cycle resolves through `sys.modules`. A local import
 # would run inside the worker's import hook, which calls `record_modules`, and recurse.
-from pivot import fingerprint
+from pivot import fingerprint, import_origin
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
@@ -97,6 +102,22 @@ _sent_token: str | None = None
 _unseen = set[str]()
 # The unreadable modules whose reason this process has logged (`check_stage`).
 _warned = set[str]()
+# What a worker imports for each module name (`worker_origin`), by name, `sys.path` and the
+# working directory (a relative entry names a directory under it); `prune` forgets them when the
+# session ends.
+_worker_origins = dict[tuple[str, tuple[object, ...], str], import_origin.Origin | None]()
+# What a new interpreter started as a worker starts reported for each module name (`_confirm`),
+# by name, the worker's `sys.path` and the working directory; `prune` forgets them.
+_confirmed = dict[tuple[str, tuple[str, ...], str], import_origin.Origin | None]()
+# The `sys.path` and working directory for which this session already confirmed every suspected
+# module the program held (`_held_suspects`); `prune` forgets them.
+_confirmed_held = set[tuple[tuple[object, ...], str]]()
+# The modules `sys.modules` held when the latest import session started, by name: the ones the
+# program that runs Pivot loaded (`note_held_modules`). `prune` keeps them, so a pipeline
+# fingerprinted after its session ended (a later discovery found nothing) still compares against
+# what the program held; the next session's start replaces them. Replaced whole, never changed
+# in place, so a fingerprint on another thread never reads it half made.
+_held: Mapping[str, types.ModuleType] = {}
 # Whether this process was forked without exec from one that imported this module: it holds
 # modules its parent loaded before this process started (`_note_fork`).
 _forked = False
@@ -294,6 +315,15 @@ def prune() -> None:
             del linecache.cache[loaded.filename]
         _token = None
     _unseen.clear()
+    _worker_origins.clear()
+    _confirmed.clear()
+    _confirmed_held.clear()
+
+
+def note_held_modules(modules: Iterable[tuple[str, object]]) -> None:
+    """Keep the modules `sys.modules` holds as an import session starts (`check_worker_imports`)."""
+    global _held
+    _held = {name: module for name, module in modules if isinstance(module, types.ModuleType)}
 
 
 def digest(file: str) -> str | None:
@@ -455,6 +485,220 @@ def check_stage(
         elif own is not None and _record_text(own) != wanted:
             edited.append(name)
     return edited, unreadable
+
+
+def check_worker_imports(manifest: Mapping[str, str]) -> None:
+    """Refuse the stage when a module its manifest names (`fingerprint.by_name_modules`), which
+    the program that runs Pivot held before the import session started, is not the module its
+    worker would import (`fingerprint.refuse`: inside `fingerprint.stage_fingerprint_scope`, the
+    refusal is reported with the stage's other refusals).
+
+    A worker imports by name each module that discovery did not register by value, with the
+    `sys.path` loky gives it (`worker_path`), where an import session puts the project root first.
+    A program that runs Pivot in its own process (a notebook, a script, a test) may hold a module
+    of that name loaded from another file, which `import` in `pipeline.py` returns from
+    `sys.modules`: the stage would be fingerprinted from that module while its worker runs the
+    other one. That is a soundness risk, so it is an error.
+
+    The check is a cheap prediction (`worker_origin`), then, only for a module the prediction
+    places elsewhere, a confirmation in a new interpreter started as a worker starts (`_confirm`),
+    which sees what `site`, a `sitecustomize` or a `.pth` file imports at startup. It refuses only
+    when that interpreter also places the module elsewhere. The first confirmation of a session
+    (for one `sys.path` and working directory) also confirms every other held module the
+    prediction places elsewhere (`_held_suspects`), so the stages of a session start one
+    interpreter, not one each. A module nothing would find, or whose finder raised, is left
+    alone: the worker's import fails loudly. A module the session imported itself resolved on the
+    worker's `sys.path`; one replaced in `sys.modules` during the session is not the program's any
+    more. The program's `__main__` is never compared: a worker gets its functions by value.
+    """
+    held_modules = _held
+    by_value = cloudpickle.list_registry_pickle_by_value()
+    suspects = dict[str, import_origin.Origin]()
+    for name in sorted(fingerprint.by_name_modules(manifest)):
+        if (held := _suspect_origin(name, held_modules, by_value)) is not None:
+            suspects[name] = held
+    if not suspects:
+        return
+    to_confirm = suspects
+    session_key = (tuple(sys.path), os.getcwd())
+    if session_key not in _confirmed_held:
+        _confirmed_held.add(session_key)
+        to_confirm = {**_held_suspects(held_modules, by_value), **suspects}
+    confirmed, failure = _confirm(sorted(to_confirm))
+    problems = list[str]()
+    for name, held in suspects.items():
+        if failure is None:
+            worker = confirmed[name]
+            if worker is None or worker[0] == "unknown" or worker == held:
+                continue
+        else:
+            worker = worker_origin(name)
+            assert worker is not None
+        problems.append(
+            f"module '{name}' is {import_origin.describe(held)} in this process, but a worker "
+            + f"would import {import_origin.describe(worker)}"
+        )
+    if not problems:
+        return
+    checked = (
+        "Pivot started an interpreter as it starts a worker to confirm this"
+        if failure is None
+        else f"Pivot could not start an interpreter to confirm this ({failure})"
+    )
+    fingerprint.refuse(
+        "; ".join(problems)
+        + f". The stage would run code its fingerprint does not describe ({checked}). Fix: "
+        + "rename one of the two modules; or, when this program imported its own module of that "
+        + "name before it ran Pivot, run Pivot in a new process (the `pivot` command)."
+    )
+
+
+def _suspect_origin(
+    name: str, held_modules: Mapping[str, types.ModuleType], by_value: set[str]
+) -> import_origin.Origin | None:
+    """The origin of held module `name` when the prediction places the module a worker imports
+    elsewhere; None when the module is not compared, or a worker would import the same one."""
+    module = sys.modules.get(name)
+    if (
+        name == "__main__"
+        or module is None
+        or held_modules.get(name) is not module
+        or _pickled_by_value(name, by_value)
+    ):
+        return None
+    held = import_origin.of_module(module)
+    return None if worker_origin(name) in (None, held) else held
+
+
+def _held_suspects(
+    held_modules: Mapping[str, types.ModuleType], by_value: set[str]
+) -> dict[str, import_origin.Origin]:
+    """Every held module the prediction places elsewhere (`_suspect_origin`), by name: what one
+    confirmation checks for every stage of a session. A submodule of a top-level module the
+    prediction places where it is resolves in the same directories, so only the submodules of a
+    suspect top-level module, or of one the program does not hold, are predicted. This only
+    prepares the confirmations the stages' own checks read, so a module whose origin cannot be
+    read is left to them."""
+    by_top = dict[str, list[str]]()
+    for name in held_modules:
+        by_top.setdefault(name.partition(".")[0], []).append(name)
+    suspects = dict[str, import_origin.Origin]()
+    for top, names in by_top.items():
+        try:
+            if top in held_modules and _suspect_origin(top, held_modules, by_value) is None:
+                continue
+            for name in names:
+                if (held := _suspect_origin(name, held_modules, by_value)) is not None:
+                    suspects[name] = held
+        except Exception:  # noqa: BLE001 - a module's own attributes can raise; see above
+            logger.debug("Cannot predict held module %s", top, exc_info=True)
+    return suspects
+
+
+def _pickled_by_value(name: str, registry: set[str]) -> bool:
+    """Whether cloudpickle sends module `name` by value: it or one of its packages is
+    registered (as `cloudpickle.cloudpickle._is_registered_pickle_by_value` decides)."""
+    parts = name.split(".")
+    return any(".".join(parts[:index]) in registry for index in range(1, len(parts) + 1))
+
+
+def worker_path() -> list[str]:
+    """The `sys.path` a new worker searches: this process's, `""` replaced by the directory this
+    process started in (`loky.backend.spawn.get_preparation_data`), a relative entry joined to
+    the working directory, which loky gives the worker (a `FileFinder` makes its entry absolute
+    when it is created), and without the entries that are not `str`, which `PathFinder` skips."""
+    # Typeshed does not declare `ORIGINAL_DIR`; loky reads the same attribute.
+    start_dir = cast("str", vars(multiprocessing.process)["ORIGINAL_DIR"])
+    cwd = os.getcwd()
+    # Typed `list[str]`, but a program can put any object in `sys.path` (a `pathlib.Path`).
+    entries = cast("Iterable[object]", sys.path)
+    return [os.path.join(cwd, entry or start_dir) for entry in entries if isinstance(entry, str)]
+
+
+def worker_origin(name: str) -> import_origin.Origin | None:
+    """Where a worker would import module `name` from, predicted in this process without
+    importing it (`import_origin.find_spec` on `worker_path()`): None when nothing would find it,
+    `("unknown", why)` when a finder raised. A worker started earlier from a warm pool keeps the
+    `sys.path` and working directory it started with."""
+    key = (name, tuple(sys.path), os.getcwd())
+    if key in _worker_origins:
+        return _worker_origins[key]
+    try:
+        spec = import_origin.find_spec(name, worker_path())
+    except Exception as exc:  # noqa: BLE001 - a finder's error leaves the origin unknown
+        origin: import_origin.Origin | None = ("unknown", f"{type(exc).__name__}: {exc}")
+    else:
+        origin = None if spec is None else import_origin.of_spec(spec)
+    _worker_origins[key] = origin
+    return origin
+
+
+# A new interpreter started as a loky worker starts (`python -m loky.backend.popen_loky_posix`,
+# with this process's environment and working directory): it imports what that module imports
+# before `prepare()` gives it the worker's `sys.path`, then reports from `import_origin`, loaded
+# by its file so that nothing of pivot's is imported. The report goes to the file descriptor in
+# `sys.argv[2]`, since `site`, a `sitecustomize` or a `.pth` file may write to stdout.
+_CONFIRM_PROGRAM = """\
+import sys
+import argparse, loky.backend.popen_loky_posix
+import importlib.util
+spec = importlib.util.spec_from_file_location("_pivot_import_origin", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.report_worker_origins(int(sys.argv[2]))
+"""
+_CONFIRM_TIMEOUT_S = 120
+
+
+def _confirm(
+    names: list[str],
+) -> tuple[dict[str, import_origin.Origin | None], str | None]:
+    """What an interpreter started as a worker starts reports for each of `names`
+    (`import_origin.report_worker_origins`), and None; or no results and why it could not run."""
+    path = worker_path()
+    cwd = os.getcwd()
+    results = dict[str, import_origin.Origin | None]()
+    missing = list[str]()
+    for name in names:
+        key = (name, tuple(path), cwd)
+        if key in _confirmed:
+            results[name] = _confirmed[key]
+        else:
+            missing.append(name)
+    if not missing:
+        return results, None
+    payload = "\0".join([str(len(missing)), *missing, *path])
+    with tempfile.TemporaryFile() as report:
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    _CONFIRM_PROGRAM,
+                    import_origin.__file__,
+                    str(report.fileno()),
+                ],
+                input=os.fsencode(payload),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                pass_fds=(report.fileno(),),
+                timeout=_CONFIRM_TIMEOUT_S,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {}, f"{type(exc).__name__}: {exc}"
+        if proc.returncode != 0:
+            lines = proc.stderr.decode(errors="replace").strip().splitlines()
+            return {}, f"exit {proc.returncode}: {lines[-1] if lines else 'no output'}"
+        report.seek(0)
+        text = report.read()
+    try:
+        reported = cast("dict[str, import_origin.Origin | None]", ast.literal_eval(text.decode()))
+    except (ValueError, SyntaxError, UnicodeDecodeError) as exc:
+        return {}, f"unreadable report: {exc}"
+    for name in missing:
+        results[name] = _confirmed[(name, tuple(path), cwd)] = reported.get(name)
+    return results, None
 
 
 def _warn_unreadable(name: str, reason: str | None) -> None:

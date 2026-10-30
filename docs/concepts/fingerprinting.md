@@ -19,6 +19,7 @@ logical keys to hashes:
 | `const:<module>.<qualname>.<name>` | Immutable values in a closure cell, keyed under the function that holds the cell, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep their own values |
 | `default:<module>.<qualname>.<parameter>` | Default argument values the AST does not record |
 | `ext:<module>.<name>` | Library functions and classes a stage reads (`agg = np.mean`), recorded by name (`numpy.mean`); library code is not hashed |
+| `byname:<module>` | A module the stage's worker imports by name and whose code is not hashed: a library module the stage reads as a global (`np.mean(x)` with `import numpy as np`) or imports in its body, and the module that defines each `ext:` callable. Pivot checks it is the module the worker will import ([Same module in the worker](#same-module-in-the-worker)); the lock file does not record it |
 | `schema:<module>.<qualname>` | Pydantic model JSON schemas |
 | `wire:<parameter>` | Call-site artifact wiring: a direct identity, or a collection's kind and ordered identities; input path bindings use `wire:<parameter>:path` or `:paths` |
 | `dep:…:loader:<module>.<class>:…`, `out:…:loader:<module>.<class>:…`, `out:…:tag` | Reader/Writer method ASTs and config for each input and output, plus each output's placement and write semantics |
@@ -370,6 +371,36 @@ outputs on disk are still those, so a stage that ran loaded or edited code
 reruns on the next run, as it would without `--no-commit`. Outputs edited by
 hand since that run are recorded against the code on disk now, the "trust me"
 path.
+
+### Same Module in the Worker
+
+A worker imports a module your stage refers to by name (a helper module outside
+the project, a library, the module a library function comes from) with the
+project root first on its `sys.path`. A program that runs Pivot in its own
+process, such as a notebook or a script calling `pivot.executor.run()`, may
+already hold a module of that name from another file: a notebook's own
+`helpers.py`, or an installed library named like a project file. `import` in
+`pipeline.py` then returns the program's module, so the fingerprint would
+describe it while the worker runs the project's file, and an edit to that file
+would read as cached. Pivot fails the stage's fingerprint instead, naming both
+files. Rename one of the two modules, or, when the program imported its own
+module of that name, run Pivot in a new process (the `pivot` command).
+
+Every module a stage refers to by name is predicted once per run, without
+importing anything. On a 1,000-stage project with three such modules per stage,
+`pivot status` took about 3% longer than before the check. Only when a module
+Pivot holds is not the one the prediction finds does Pivot start one
+interpreter, as it starts a worker (about a tenth of a second, once per run), to
+confirm what a worker would import. That interpreter runs your `sitecustomize`
+and `.pth` files once more, as every worker does, and imports no project module.
+A module that `site`, a `sitecustomize` or a `.pth` file imports in every
+interpreter is what the worker imports too, so it is no error. Cases not
+checked: a module the program loads by file location while Pivot is loading the
+pipeline (from another thread); a finder the program inserted into
+`sys.meta_path` after it started, which Pivot assumes the worker has too; a
+package whose `__init__` changes its own `__path__`; and a pipeline object run
+again after the program changed `sys.path`, whose fingerprints Pivot keeps (load
+the pipeline again).
 
 ## @pivot.no_fingerprint()
 

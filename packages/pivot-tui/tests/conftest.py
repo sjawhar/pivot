@@ -23,7 +23,8 @@ from pivot.config import io as config_io
 from pivot.executor import core as executor_core
 from pivot.registry import PipelineLike, StageRegistry
 
-# Add tests directory to sys.path so helpers.py can be imported
+# Add tests directory to sys.path so pivot_tui_test_helpers.py can be imported. Its name is unique:
+# a full-suite run imports pivot's tests in the same process, and their projects have `helpers.py`.
 _tests_dir = pathlib.Path(__file__).parent
 if str(_tests_dir) not in sys.path:
     sys.path.insert(0, str(_tests_dir))

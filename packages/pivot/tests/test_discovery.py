@@ -1152,3 +1152,29 @@ def test_second_discovery_keeps_libraries_from_venv_inside_root(
     assert first is not None
     assert second is not None, "the second discovery should load pipeline.py again"
     assert second.list_stages() == ["venv/train"]
+
+
+def test_a_session_starts_while_another_thread_imports(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A watch reload discovers on a worker thread while the event loop, the TUI and the RPC
+    server import. Starting a session reads a snapshot of `sys.modules`: each module it classifies
+    here adds one to `sys.modules`, as an import on another thread would at that moment, and a
+    read of the live dict raises `RuntimeError: dictionary changed size during iteration`."""
+    root = _write_sibling_stage_project(tmp_path / "project", "project").parent
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    real = discovery._module_is_under_root
+    added = list[str]()
+
+    def import_elsewhere(
+        module: _stdlib_types.ModuleType, at: pathlib.Path, file_under_root: dict[str, bool]
+    ) -> bool:
+        name = f"_pivot_imported_elsewhere_{len(added)}"
+        added.append(name)
+        monkeypatch.setitem(sys.modules, name, _stdlib_types.ModuleType(name))
+        return real(module, at, file_under_root)
+
+    monkeypatch.setattr(discovery, "_module_is_under_root", import_elsewhere)
+
+    assert discovery.discover_pipeline(project_root=root) is not None
+    assert added, "the session classified the modules it found"
