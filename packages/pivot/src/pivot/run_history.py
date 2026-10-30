@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import datetime
+import functools
 import hashlib
 import json
 import uuid
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NotRequired,
+    TypedDict,
+    cast,
+    get_origin,
+    get_type_hints,
+)
 
 from pivot.types import (
     ArtifactTag,
@@ -97,6 +107,69 @@ def entry_to_output_hash(entry: OutputHashEntry) -> FileHash | DirHash | None:
             return None
         return DirHash(hash=entry["hash"], size=entry["size"], nfiles=entry["nfiles"])
     return FileHash(hash=entry["hash"])
+
+
+# The keys of an output entry an older pivot filed for a directory, listing its files inline
+# (``entry_to_output_hash`` returns None for one; ``listing.from_inline`` reads it).
+OLDER_DIRECTORY_KEYS = frozenset({"manifest", "empty_dirs"})
+
+
+def _is_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+@functools.cache
+def _output_entry_keys() -> tuple[frozenset[str], frozenset[str]]:
+    """``OutputHashEntry``'s required and optional keys, from its resolved annotations: under
+    this module's postponed annotations, ``__required_keys__`` counts a ``NotRequired`` key as
+    required."""
+    hints = get_type_hints(OutputHashEntry, include_extras=True)
+    optional = frozenset(key for key, hint in hints.items() if get_origin(hint) is NotRequired)
+    return frozenset(hints) - optional, optional
+
+
+def run_cache_entry_error(row: object) -> str | None:
+    """Why a parsed run-cache row does not hold exactly ``RunCacheEntry``, each output exactly an
+    ``OutputHashEntry`` (or an older pivot's inline directory, ``OLDER_DIRECTORY_KEYS``), or None.
+
+    For a reader that must not skip what it cannot read (`pivot gc`): a key outside the schema
+    may be a newer pivot's record of objects. ``deserialize_run_cache_entry`` checks only what a
+    lookup needs.
+    """
+    if not isinstance(row, dict):
+        return f"its JSON is {type(row).__name__}, not an object"
+    fields = cast("dict[object, object]", row)
+    held = {str(key) for key in fields}
+    if held ^ RunCacheEntry.__required_keys__:
+        expected = " and ".join(sorted(RunCacheEntry.__required_keys__))
+        return f"its keys are {', '.join(sorted(held)) or 'none'}, not {expected}"
+    if not isinstance(fields["run_id"], str):
+        return "its run_id is not a string"
+    outputs = fields["output_hashes"]
+    if not isinstance(outputs, list):
+        return "its output_hashes is not a list"
+    required, optional = _output_entry_keys()
+    allowed = required | optional
+    for index, raw in enumerate(cast("list[object]", outputs)):
+        if not isinstance(raw, dict):
+            return f"output_hashes[{index}] is not an object"
+        output = cast("dict[object, object]", raw)
+        keys = {str(key) for key in output}
+        extra = sorted(keys - allowed - OLDER_DIRECTORY_KEYS)
+        if extra:
+            return (
+                f"output_hashes[{index}] holds the key {', '.join(extra)}, which this pivot does "
+                + "not know"
+            )
+        missing = sorted(required - keys)
+        if missing:
+            return f"output_hashes[{index}] has no {', '.join(missing)}"
+        if not isinstance(output["path"], str) or not isinstance(output["hash"], str):
+            return f"output_hashes[{index}] has a path or hash that is not a string"
+        for count in ("size", "nfiles"):
+            if count in output and not _is_count(output[count]):
+                return f"output_hashes[{index}].{count} is not a count"
+    return None
 
 
 def generate_run_id() -> str:

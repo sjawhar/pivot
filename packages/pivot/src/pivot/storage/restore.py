@@ -13,8 +13,7 @@ import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
 from pivot import state_dir as state_dir_mod
-from pivot.storage import cache, listing, lock, ownership, state, track
-from pivot.storage import gc as gc_mod
+from pivot.storage import cache, listing, lock, naming, ownership, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
@@ -404,7 +403,7 @@ def _restore_named(
     state directory is the stage's own directory for a stage target, otherwise the configured
     directory from ``config.locate_state_dir()``.
     """
-    with gc_mod.naming_unit(cache_dir, project=(project.get_project_root(), state_dir)):
+    with naming.naming_unit(cache_dir, project=(project.get_project_root(), state_dir)):
         return _replace_checked(
             dest_path,
             target,

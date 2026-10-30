@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, TypedDict
 import pytest
 
 from pivot import cli, project, run_history, types
-from pivot.storage import cache, gc, lock, state
+from pivot.storage import cache, gc, lock, naming, state
 
 if TYPE_CHECKING:
     import pathlib
@@ -255,10 +255,10 @@ def test_gc_refuses_and_names_the_register_entry_whose_root_is_absent(
     collection never drops it on its own. It refuses, names the entry for the user to delete
     if the project is gone for good, and keeps it; a second run says the same."""
     gone = tmp_path / "a-worktree-that-was-deleted"
-    gc.register_project(shared["cache_dir"], shared["root"], shared["state_dir"])
+    naming.register_project(shared["cache_dir"], shared["root"], shared["state_dir"])
     (gone / ".pivot").mkdir(parents=True)
-    gc.register_project(shared["cache_dir"], gone, gone / ".pivot")
-    entry = gc.project_register_path(shared["cache_dir"], gone, gone / ".pivot")
+    naming.register_project(shared["cache_dir"], gone, gone / ".pivot")
+    entry = naming.project_register_path(shared["cache_dir"], gone, gone / ".pivot")
     assert entry is not None
     shutil.rmtree(gone)
 

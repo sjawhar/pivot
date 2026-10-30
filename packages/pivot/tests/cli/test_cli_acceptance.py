@@ -32,7 +32,7 @@ import yaml
 
 from pivot import loaders, types
 from pivot.remote import keys
-from pivot.storage import cache, gc, listing, state
+from pivot.storage import cache, listing, naming, state
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -3380,7 +3380,7 @@ def _helper_snapshot(root: pathlib.Path) -> dict[str, bytes]:
     uses the cache, written by any command that resolves it, so it is not output state.
     """
     tops = [root / "data", root / ".pivot" / "cache", root / ".pivot" / "stages"]
-    register = root / ".pivot" / "cache" / gc.REGISTER_DIR
+    register = root / ".pivot" / "cache" / naming.REGISTER_DIR
     return {
         str(path.relative_to(root)): path.read_bytes()
         for top in tops

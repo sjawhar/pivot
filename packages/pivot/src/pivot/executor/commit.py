@@ -13,8 +13,7 @@ import pathlib
 from pivot import config, exceptions, parameters, project, registry, run_history, skip, types
 from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
-from pivot.storage import cache, listing, lock
-from pivot.storage import gc as gc_mod
+from pivot.storage import cache, listing, lock, naming
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import ArtifactTag, DeferredWrites, HashInfo, LockData
@@ -237,7 +236,7 @@ def _commit_stages(
             # 7. Under the naming lock (shared), the naming step only: re-check and link each
             # output (an object a collection removed since is published again), record its
             # materialized file hash (#516), then write the lock and the listings that name them.
-            with gc_mod.naming_unit(
+            with naming.naming_unit(
                 config.get_cache_dir(), project=(project_root, config.get_state_dir())
             ):
                 output_hashes_by_key = dict[str, HashInfo]()

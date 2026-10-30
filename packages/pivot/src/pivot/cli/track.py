@@ -10,8 +10,7 @@ import click
 from pivot import config, discovery, git, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
-from pivot.storage import cache, listing, member_skip, ownership, state
-from pivot.storage import gc as gc_mod
+from pivot.storage import cache, listing, member_skip, naming, ownership, state
 from pivot.storage import track as track_mod
 
 if TYPE_CHECKING:
@@ -242,7 +241,7 @@ def _track_single_path(
     # publishes nothing), so a collection may have removed it since — publish any that is gone,
     # the directory's listing object included, then write the listing and the .pvt that name
     # them. gc cannot delete while this unit is open.
-    with gc_mod.naming_unit(
+    with naming.naming_unit(
         config.get_cache_dir(), project=(project.get_project_root(), config.get_state_dir())
     ):
         for source, key, executable in objects:

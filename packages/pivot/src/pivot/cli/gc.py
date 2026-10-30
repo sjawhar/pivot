@@ -10,7 +10,7 @@ import click
 from pivot import config, display, exceptions, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
-from pivot.storage import gc, state
+from pivot.storage import gc, naming, state
 
 if TYPE_CHECKING:
     from pivot.storage.gc import GcResult, Plan, ProjectScope, Roots
@@ -187,7 +187,7 @@ def gc_cmd(
 
     scopes = gc.resolve_scopes(cache_dir, project_root, state_dir, project_paths, dry_run=dry_run)
     if not dry_run:
-        gc.register_project(cache_dir, project_root, state_dir)
+        naming.register_project(cache_dir, project_root, state_dir)
 
     if not cache_dir.is_dir():
         # N4: a cache that has never stored anything has nothing to collect. Pivot does not
@@ -285,7 +285,9 @@ def gc_cmd(
                             )
         except gc.ProjectUnreadableError as e:
             raise exceptions.CacheCollectionRefusedError(
-                gc.refusal_unreadable(cache_dir, len(scopes), [(gc.scope_label(e.scope), e.reason)])
+                gc.refusal_unreadable(
+                    cache_dir, len(scopes), [(gc.scope_label(e.scope), e.reason)], e.remedy
+                )
             ) from e
 
     result = gc.result_document(cache_dir, plan, removed, scopes, dry_run=dry_run)

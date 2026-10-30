@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from pivot import cli, exceptions, project, run_history, types
-from pivot.storage import cache, gc, listing, lock, state, track
+from pivot.storage import cache, gc, listing, lock, naming, state, track
 
 if TYPE_CHECKING:
     import pathlib
@@ -498,6 +498,8 @@ def test_gc_refuses_a_lock_it_cannot_fully_interpret(
     assert result.exit_code != 0, result.output
     flat = " ".join(result.output.split())
     assert str(lock_path) in flat and reason in flat, result.output
+    assert "Fix or resolve that record" in flat, "a lock refusal names the wrong remedy"
+    assert "register entry" not in flat, "a lock refusal tells the user to delete an entry"
     assert _helper_keys(workspace) == before, "a refused collection removed an object"
 
 
@@ -534,6 +536,8 @@ def test_gc_refuses_a_pvt_it_cannot_fully_interpret(
     assert result.exit_code != 0, result.output
     flat = " ".join(result.output.split())
     assert str(pvt) in flat and reason in flat, result.output
+    assert "Fix or resolve that record" in flat, "a .pvt refusal names the wrong remedy"
+    assert "register entry" not in flat, "a .pvt refusal tells the user to delete an entry"
     assert "keeping every cache object" not in result.output, result.output
     assert dead in _helper_keys(workspace), "a refused collection removed an object"
 
@@ -555,6 +559,11 @@ def test_gc_refuses_a_pvt_it_cannot_fully_interpret(
         pytest.param(
             b'{"run_id": 7, "output_hashes": []}', "its run_id is not a string", id="wrong type"
         ),
+        pytest.param(
+            b'{"run_id": "__committed__", "output_hashes": [{"path": "o", "hash": "not-a-key"}]}',
+            "its output hash 'not-a-key' is not a cache key",
+            id="bad hash",
+        ),
     ],
 )
 def test_gc_refuses_a_run_cache_row_it_cannot_fully_interpret(
@@ -574,6 +583,8 @@ def test_gc_refuses_a_run_cache_row_it_cannot_fully_interpret(
     assert result.exit_code != 0, result.output
     flat = " ".join(result.output.split())
     assert name in flat and reason in flat, result.output
+    assert "Fix or resolve that record" in flat, "a row refusal names the wrong remedy"
+    assert "register entry" not in flat, "a row refusal tells the user to delete an entry"
     assert dead in _helper_keys(workspace), "a refused collection removed an object"
 
 
@@ -753,8 +764,8 @@ def test_gc_refuses_while_a_registered_projects_root_is_absent(
     dead = _helper_publish(shared, "dead")
     retired = tmp_path / "retired"
     (retired / ".pivot").mkdir(parents=True)
-    gc.register_project(shared["cache_dir"], retired, retired / ".pivot")
-    entry = gc.project_register_path(shared["cache_dir"], retired, retired / ".pivot")
+    naming.register_project(shared["cache_dir"], retired, retired / ".pivot")
+    entry = naming.project_register_path(shared["cache_dir"], retired, retired / ".pivot")
     assert entry is not None
     shutil.rmtree(retired)
 
@@ -776,13 +787,14 @@ def test_gc_refuses_while_a_registered_projects_root_is_absent(
 def test_gc_refuses_when_a_registered_project_cannot_be_read(
     shared: Workspace, runner: click.testing.CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """A project whose records cannot be read may hold outputs this run would remove."""
+    """A project whose records cannot be read may hold outputs this run would remove. The project
+    is there, so the remedy is to restore access, never to delete its register entry."""
     dead = _helper_publish(shared, "dead")
     other_root = tmp_path / "second"
     other_root.mkdir()
     other = _helper_workspace(other_root, shared["cache_dir"])
-    gc.register_project(shared["cache_dir"], other_root, other["state_dir"])
-    gc.register_project(shared["cache_dir"], shared["root"], shared["state_dir"])
+    naming.register_project(shared["cache_dir"], other_root, other["state_dir"])
+    naming.register_project(shared["cache_dir"], shared["root"], shared["state_dir"])
     # A lock file no reader can open: the collection learns nothing about what it names.
     (other["stages_dir"] / "other" / "build.lock").mkdir(parents=True)
 
@@ -795,7 +807,8 @@ def test_gc_refuses_when_a_registered_project_cannot_be_read(
     assert f"  {other_root} (host " in result.output, result.output
     assert "Is a directory" in result.output, result.output
     assert "That project may hold outputs this run would remove." in result.output
-    assert "delete the register entry named above" in result.output
+    assert "Restore access to it, then collect again." in result.output, result.output
+    assert "register entry" not in result.output, "an unreadable record is not a gone project"
     assert _helper_keys(shared) == {dead}, "a refusal removes nothing"
 
 
@@ -804,7 +817,7 @@ def test_gc_refuses_when_a_register_entry_cannot_be_read(
 ) -> None:
     """A register entry pivot cannot parse hides a project that may own these objects."""
     dead = _helper_publish(shared, "dead")
-    entry = shared["cache_dir"] / gc.REGISTER_DIR / "unreadable.json"
+    entry = shared["cache_dir"] / naming.REGISTER_DIR / "unreadable.json"
     entry.parent.mkdir(parents=True, exist_ok=True)
     entry.write_text("{not json")
 
@@ -1081,8 +1094,8 @@ def test_gc_creates_naming_lock_files(
     result = _helper_run(runner, "--yes", "--grace-hours", "0")
 
     assert result.exit_code == 0, result.output
-    assert (workspace["cache_dir"] / gc.NAMING_LOCK).exists(), "naming.lock not created"
-    assert (workspace["cache_dir"] / gc.NAMING_TURNSTILE).exists(), "naming.turnstile not created"
+    assert (workspace["cache_dir"] / naming.NAMING_LOCK).exists(), "naming.lock not created"
+    assert (workspace["cache_dir"] / naming.NAMING_TURNSTILE).exists(), "turnstile not created"
 
 
 def test_gc_keeps_a_republished_object_hardlinked_after_the_plan(
@@ -1208,7 +1221,7 @@ def test_gc_keeps_an_object_a_registered_peer_of_an_internal_cache_names(
             output_hashes={types.ArtifactIdentity("peer/stage", None): types.FileHash(hash=theirs)},
         )
     )
-    gc.register_project(workspace["cache_dir"], peer, peer / ".pivot")
+    naming.register_project(workspace["cache_dir"], peer, peer / ".pivot")
 
     result = _helper_run(runner, "--yes", "--grace-hours", "0")
 
@@ -1251,7 +1264,7 @@ def test_gc_reads_a_named_project_from_its_configured_state_dir(
 
     assert result.exit_code == 0, result.output
     assert named in _helper_keys(workspace), "an object the named project's lock names was removed"
-    entry_path = gc.project_register_path(workspace["cache_dir"], other.resolve(), state_dir)
+    entry_path = naming.project_register_path(workspace["cache_dir"], other.resolve(), state_dir)
     assert entry_path is not None
     entry = json.loads(entry_path.read_text())
     recorded = type(state_dir)(entry["state_dir"]).resolve()

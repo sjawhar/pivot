@@ -63,8 +63,7 @@ from pivot import (
     types,
 )
 from pivot import state_dir as state_dir_mod
-from pivot.storage import artifact_lock, cache, listing, lock, ownership, state
-from pivot.storage import gc as gc_mod
+from pivot.storage import artifact_lock, cache, listing, lock, naming, ownership, state
 from pivot.storage import store as store_mod
 from pivot.types import (
     DeferredWrites,
@@ -1112,11 +1111,30 @@ def _execute_stage(
                         run_reason = _outputs_unusable_reason(restoration)
 
                     # Check run cache for previously executed configuration (skip if forcing)
-                    if run_reason and not stage_info["force"] and run_cache_allowed:
+                    run_cache_wanted = (
+                        bool(run_reason) and not stage_info["force"] and run_cache_allowed
+                    )
+                    legacy_input_hash = (
+                        older_pivot_input_hash(
+                            current_fingerprint,
+                            current_params,
+                            stage_info["deps"].values(),
+                            _to_identity_hashes(dep_hashes),
+                            stage_outs,
+                            hashed_dirs,
+                            store_cache_dir(store),
+                        )
+                        if run_cache_wanted
+                        else None
+                    )
+                    if run_cache_wanted and _run_cache_candidate(
+                        state_db, stage_name, input_hash, legacy_input_hash, stage_outs
+                    ):
                         # Naming-lock unit (shared): the run-cache restore checks whether
                         # objects exist and creates workspace links, then the lock file names
-                        # them. gc cannot delete while this unit is open.
-                        with gc_mod.naming_unit(
+                        # them. gc cannot delete while this unit is open. With no row to
+                        # restore, nothing is named and no unit is taken.
+                        with naming.naming_unit(
                             naming_root, project=(project_root, project_state_dir)
                         ):
                             run_cache_skip = _try_skip_via_run_cache_with_store(
@@ -1126,15 +1144,7 @@ def _execute_stage(
                                 store,
                                 state_db,
                                 state_dir=project_state_dir,
-                                legacy_input_hash=older_pivot_input_hash(
-                                    current_fingerprint,
-                                    current_params,
-                                    stage_info["deps"].values(),
-                                    _to_identity_hashes(dep_hashes),
-                                    stage_outs,
-                                    hashed_dirs,
-                                    store_cache_dir(store),
-                                ),
+                                legacy_input_hash=legacy_input_hash,
                                 claims=claims,
                             )
                             if run_cache_skip is not None:
@@ -1326,7 +1336,7 @@ def _execute_stage(
                     # Naming-lock unit (shared), the naming step only: re-check each object (one
                     # a collection removed since is published again), link the outputs, write the
                     # lock that names them. gc cannot delete while this unit is open.
-                    with gc_mod.naming_unit(naming_root, project=(project_root, project_state_dir)):
+                    with naming.naming_unit(naming_root, project=(project_root, project_state_dir)):
                         with stage_io.PIVOT_IO:
                             output_hashes = _commit_outputs_with_store(
                                 output_paths,
@@ -1438,7 +1448,7 @@ def _register_before_restore(
     read the lock that names them (a fresh clone whose run only restores). The unit holds the
     naming lock only for the registration; the restore's I/O runs after it.
     """
-    with gc_mod.naming_unit(naming_root, project=(project_root, project_state_dir)):
+    with naming.naming_unit(naming_root, project=(project_root, project_state_dir)):
         pass
 
 
@@ -2927,6 +2937,26 @@ def _run_cache_output_hash(
     record = listing.record_of(members, data)
     listing.store_object(cache_dir, record["hash"], data)
     return record
+
+
+def _run_cache_candidate(
+    state_db: state.StateDB,
+    stage_name: str,
+    input_hash: str,
+    legacy_input_hash: str | None,
+    stage_outs: list[types.ArtifactRef],
+) -> bool:
+    """Whether a run-cache row could restore this stage's outputs: one at ``input_hash``, or at
+    an older pivot's ``legacy_input_hash``, for a stage with no metric output.
+
+    Read before the naming unit, so a lookup that finds no row (every stage of a cold run) takes
+    none; ``_try_skip_via_run_cache_with_store`` reads the row again inside the unit, so a row
+    a prune removed in between restores nothing.
+    """
+    if any(out.tag is types.ArtifactTag.METRIC for out in stage_outs):
+        return False
+    keys = [input_hash] if legacy_input_hash is None else [input_hash, legacy_input_hash]
+    return any(state_db.lookup_run_cache(stage_name, key) is not None for key in keys)
 
 
 def _try_skip_via_run_cache_with_store(

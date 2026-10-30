@@ -383,7 +383,7 @@ def register_cache_use() -> None:
     directory: a cache that does not exist holds nothing to collect, and a state directory that
     cannot be written gives an entry without a project id, which a collection refuses.
     """
-    from pivot.storage import gc
+    from pivot.storage import naming
 
     try:
         root = project.get_project_root()
@@ -392,7 +392,7 @@ def register_cache_use() -> None:
     cache_dir = locate_cache_dir()
     if not cache_dir.is_dir():
         return
-    with gc.naming_unit(cache_dir, project=(root, locate_state_dir())):
+    with naming.naming_unit(cache_dir, project=(root, locate_state_dir())):
         pass  # the unit registers the project under the shared lock
 
 

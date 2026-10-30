@@ -163,7 +163,7 @@ namespace, so the key holds the root, the project id and the view:
 
 ```json
 {"root": "/home/me/experiment", "state_dir": "/home/me/experiment/.pivot",
- "host": "workstation", "machine": "4f1c...", "mount_ns": 4026531841, "pivot": "0.5.12",
+ "host": "workstation", "machine": "4f1c...", "mount_ns": 4026531841,
  "last_write": "2026-10-27T06:43:11Z", "project_id": "0f8c...",
  "mounts": ["/home/me/experiment/data"]}
 ```

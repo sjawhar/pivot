@@ -4,7 +4,7 @@ import shutil
 
 import pytest
 
-from pivot.storage import gc
+from pivot.storage import gc, naming
 
 
 def _project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
@@ -18,7 +18,7 @@ def _project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, pathli
 
 
 def _unit(cache_dir: pathlib.Path, root: pathlib.Path, state_dir: pathlib.Path) -> None:
-    with gc.naming_unit(cache_dir, project=(root, state_dir)):
+    with naming.naming_unit(cache_dir, project=(root, state_dir)):
         pass
 
 
@@ -33,9 +33,9 @@ def test_a_naming_unit_reregisters_after_the_mount_table_changes(
     root, state_dir, cache_dir = _project(tmp_path)
     table = tmp_path / "mounts"
     table.write_bytes(b"/dev/root / ext4 rw 0 0\n")
-    monkeypatch.setattr(gc, "_MOUNTS_TABLE", table)
+    monkeypatch.setattr(naming, "_MOUNTS_TABLE", table)
     _unit(cache_dir, root, state_dir)
-    entry = gc.project_register_path(cache_dir, root, state_dir)
+    entry = naming.project_register_path(cache_dir, root, state_dir)
     assert entry is not None
     assert json.loads(entry.read_text())["mounts"] == []
 
@@ -54,13 +54,13 @@ def test_a_naming_unit_reregisters_after_the_project_id_is_replaced(
     unit writes the entry for the new id, so a collection does not refuse the live project."""
     root, state_dir, cache_dir = _project(tmp_path)
     _unit(cache_dir, root, state_dir)
-    first = gc.project_register_path(cache_dir, root, state_dir)
+    first = naming.project_register_path(cache_dir, root, state_dir)
     assert first is not None and first.exists()
 
-    (state_dir / "state.lmdb" / gc.PROJECT_ID_FILE).unlink()
+    (state_dir / "state.lmdb" / naming.PROJECT_ID_FILE).unlink()
     _unit(cache_dir, root, state_dir)
 
-    second = gc.project_register_path(cache_dir, root, state_dir)
+    second = naming.project_register_path(cache_dir, root, state_dir)
     assert second is not None and second != first
     assert second.exists(), "the unit after the reset did not register the new project id"
 
@@ -72,7 +72,7 @@ def test_a_naming_unit_reregisters_after_another_writer_replaces_the_entry(
     this host's evidence back instead of trusting what it verified before."""
     root, state_dir, cache_dir = _project(tmp_path)
     _unit(cache_dir, root, state_dir)
-    entry = gc.project_register_path(cache_dir, root, state_dir)
+    entry = naming.project_register_path(cache_dir, root, state_dir)
     assert entry is not None
     replaced = json.loads(entry.read_text())
     replaced["host"] = "pivot-other-node"
@@ -89,9 +89,9 @@ def test_a_naming_unit_reopens_a_view_nonce_file_that_was_replaced(tmp_path: pat
     not to the one it opened before, so the entry and the file a collection reads agree."""
     root, state_dir, cache_dir = _project(tmp_path)
     _unit(cache_dir, root, state_dir)
-    entry = gc.project_register_path(cache_dir, root, state_dir)
+    entry = naming.project_register_path(cache_dir, root, state_dir)
     assert entry is not None
-    nonces = state_dir / "state.lmdb" / gc.VIEW_NONCE_DIR
+    nonces = state_dir / "state.lmdb" / naming.VIEW_NONCE_DIR
     (nonce_file,) = nonces.iterdir()
     nonce_file.unlink()
     nonce_file.write_text("0" * 32 + "\n")
@@ -108,7 +108,7 @@ def test_a_naming_unit_reregisters_after_its_entry_is_deleted(tmp_path: pathlib.
     the project's records would be invisible to every collection."""
     root, state_dir, cache_dir = _project(tmp_path)
     _unit(cache_dir, root, state_dir)
-    entry = gc.project_register_path(cache_dir, root, state_dir)
+    entry = naming.project_register_path(cache_dir, root, state_dir)
     assert entry is not None
     entry.unlink()
 
@@ -123,11 +123,11 @@ def test_a_second_process_keeps_the_entry_another_just_wrote(tmp_path: pathlib.P
     takes one write per view instead of one per process."""
     root, state_dir, cache_dir = _project(tmp_path)
     _unit(cache_dir, root, state_dir)
-    entry = gc.project_register_path(cache_dir, root, state_dir)
+    entry = naming.project_register_path(cache_dir, root, state_dir)
     assert entry is not None
     before = entry.stat()
 
-    gc._VERIFIED_REGISTRATIONS.clear()  # as a second process of this view would start
+    naming._VERIFIED_REGISTRATIONS.clear()  # as a second process of this view would start
     _unit(cache_dir, root, state_dir)
 
     after = entry.stat()
@@ -141,13 +141,13 @@ def test_a_registration_refreshes_an_entry_whose_last_write_is_old(tmp_path: pat
     that says what this registration would say is still rewritten once it is stale."""
     root, state_dir, cache_dir = _project(tmp_path)
     _unit(cache_dir, root, state_dir)
-    entry = gc.project_register_path(cache_dir, root, state_dir)
+    entry = naming.project_register_path(cache_dir, root, state_dir)
     assert entry is not None
     document = json.loads(entry.read_text())
     document["last_write"] = "2020-01-01T00:00:00Z"
     entry.write_text(json.dumps(document, sort_keys=True) + "\n")
 
-    gc._VERIFIED_REGISTRATIONS.clear()  # as a second process of this view would start
+    naming._VERIFIED_REGISTRATIONS.clear()  # as a second process of this view would start
     _unit(cache_dir, root, state_dir)
 
     assert json.loads(entry.read_text())["last_write"] != "2020-01-01T00:00:00Z", (
@@ -161,13 +161,13 @@ def test_a_registration_truncates_a_nonce_file_that_held_more(tmp_path: pathlib.
     project for ever."""
     root, state_dir, cache_dir = _project(tmp_path)
     _unit(cache_dir, root, state_dir)
-    entry = gc.project_register_path(cache_dir, root, state_dir)
+    entry = naming.project_register_path(cache_dir, root, state_dir)
     assert entry is not None
-    nonces = state_dir / "state.lmdb" / gc.VIEW_NONCE_DIR
+    nonces = state_dir / "state.lmdb" / naming.VIEW_NONCE_DIR
     (nonce_file,) = nonces.iterdir()
     nonce_file.write_text("0" * 64 + "\n")
 
-    gc._VERIFIED_REGISTRATIONS.clear()  # as a second process of this view would start
+    naming._VERIFIED_REGISTRATIONS.clear()  # as a second process of this view would start
     _unit(cache_dir, root, state_dir)
 
     nonce = nonce_file.read_text()
@@ -211,7 +211,7 @@ def test_two_views_that_share_a_view_key_refuse_each_others_entry(
     key, so the last writer's entry replaces the other's. The view that did not write last holds
     another nonce, so its collection refuses. (The view that wrote last accepts the entry and
     reads its own records; the other view's objects named since the clone are not in them.)"""
-    monkeypatch.setattr(gc, "_this_view", lambda: ("cloned-host", "same-machine-id", 1))
+    monkeypatch.setattr(naming, "this_view", lambda: ("cloned-host", "same-machine-id", 1))
     root, state_dir, cache_dir = _project(tmp_path)
     _unit(cache_dir, root, state_dir)
     clone = tmp_path / "clone-state"

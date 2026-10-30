@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pivot import run_history, types
-from pivot.storage import cache, gc, listing, lock, state, track
+from pivot.storage import cache, gc, listing, lock, naming, state, track
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -119,7 +119,7 @@ def _locks(root: pathlib.Path) -> dict[str, str]:
 
 def _entry(cache_dir: pathlib.Path, root: pathlib.Path) -> pathlib.Path:
     """The register entry of a project whose state is in `.pivot`."""
-    path = gc.project_register_path(cache_dir, root, root / ".pivot")
+    path = naming.project_register_path(cache_dir, root, root / ".pivot")
     assert path is not None, f"{root} has no project id"
     return path
 
@@ -128,7 +128,7 @@ def _register_fresh(root: pathlib.Path) -> pathlib.Path:
     """Write this project's register entry now, so the command entry takes no lock, and return
     the cache. The tests then hold the exclusive lock against the writer sites alone."""
     cache_dir = root / ".pivot" / "cache"
-    gc.register_project(cache_dir, root, root / ".pivot")
+    naming.register_project(cache_dir, root, root / ".pivot")
     assert _entry(cache_dir, root).exists()
     return cache_dir
 
@@ -391,7 +391,7 @@ def test_a_collection_runs_while_a_stage_executes(tmp_path: pathlib.Path) -> Non
 
 def _naming_paths(cache_dir: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
     """The turnstile and naming lock in the cache root, where `pivot gc` takes them."""
-    return cache_dir / gc.NAMING_TURNSTILE, cache_dir / gc.NAMING_LOCK
+    return cache_dir / naming.NAMING_TURNSTILE, cache_dir / naming.NAMING_LOCK
 
 
 def _probe_blocked(path: pathlib.Path) -> bool:
@@ -439,7 +439,7 @@ def _fifo_pin(project: pathlib.Path, cache_dir: pathlib.Path) -> Iterator[thread
     (project / ".pivot").mkdir(parents=True)
     fifo = project / "pin.pvt"
     os.mkfifo(fifo)
-    gc.register_project(cache_dir, project, project / ".pivot")
+    naming.register_project(cache_dir, project, project / ".pivot")
     allowed = threading.Semaphore(0)
     stop = threading.Event()
 
@@ -558,7 +558,7 @@ def test_pivot_gc_rereads_the_records_under_its_lock(tmp_path: pathlib.Path) -> 
 
     with _fifo_pin(tmp_path / "peer", cache_dir) as pin:
         pin.release()  # the plan's read of the peer
-        with gc.naming_unit(cache_dir, project=None):  # a writer mid-commit
+        with naming.naming_unit(cache_dir, project=None):  # a writer mid-commit
             collector = _start_gc(root)
             _wait_until(
                 "the turnstile", lambda: _gc_waits_for_the_naming_lock(cache_dir), collector
@@ -585,7 +585,7 @@ def test_pivot_gc_waits_for_no_publisher_while_it_holds_the_naming_lock(
     prefix_lock = object_root / doomed[:2] / cache.PREFIX_LOCK
 
     with contextlib.ExitStack() as held:
-        with gc.naming_unit(cache_dir, project=None):  # let gc plan, then hold it at the turnstile
+        with naming.naming_unit(cache_dir, project=None):  # let gc plan, then hold the turnstile
             collector = _start_gc(root)
             _wait_until(
                 "the turnstile", lambda: _gc_waits_for_the_naming_lock(cache_dir), collector
@@ -611,11 +611,11 @@ def test_pivot_gc_rereads_the_register_under_its_lock(tmp_path: pathlib.Path) ->
     late = tmp_path / "late-project"
     (late / ".pivot" / "stages").mkdir(parents=True)
 
-    with gc.naming_unit(cache_dir, project=None):  # a command registering its project
+    with naming.naming_unit(cache_dir, project=None):  # a command registering its project
         collector = _start_gc(root)
         _wait_until("the turnstile", lambda: _gc_waits_for_the_naming_lock(cache_dir), collector)
         _name_in_lock(late / ".pivot" / "stages", "other/stage", victim)
-        gc.register_project(cache_dir, late, late / ".pivot")
+        naming.register_project(cache_dir, late, late / ".pivot")
 
     _finish(collector)
     assert cache.get_cache_path(cache_dir / "files", victim).exists(), "gc used a stale register"
@@ -632,7 +632,7 @@ def test_pivot_gc_keeps_an_object_a_run_cache_row_written_before_its_lock_names(
     cache_dir = _register_fresh(root)
     victim = _publish(cache_dir / "files", tmp_path, "named only by a new run-cache row\n")
 
-    with gc.naming_unit(cache_dir, project=None):
+    with naming.naming_unit(cache_dir, project=None):
         collector = _start_gc(root)
         _wait_until("the turnstile", lambda: _gc_waits_for_the_naming_lock(cache_dir), collector)
         with state.StateDB(root / ".pivot") as db:
@@ -677,7 +677,7 @@ def test_pivot_gc_refuses_when_another_hosts_project_is_not_visible(tmp_path: pa
     elsewhere = tmp_path / "node-local"  # the parent exists here; the root does not
     elsewhere.mkdir()
     other_root = elsewhere / "project-on-another-node"
-    entry = cache_dir / gc.REGISTER_DIR / "project-on-another-node.json"
+    entry = cache_dir / naming.REGISTER_DIR / "project-on-another-node.json"
     entry.write_text(
         json.dumps(
             {
@@ -712,7 +712,7 @@ def test_pivot_gc_is_not_starved_by_a_stream_of_writers(tmp_path: pathlib.Path) 
     def writer(offset: float) -> None:
         time.sleep(offset)
         while not stop.is_set():
-            with gc.naming_unit(cache_dir, project=None):
+            with naming.naming_unit(cache_dir, project=None):
                 time.sleep(0.3)
 
     writers = [threading.Thread(target=writer, args=(i * 0.05,), daemon=True) for i in range(6)]
@@ -749,7 +749,7 @@ def test_a_command_refuses_when_it_cannot_register(tmp_path: pathlib.Path) -> No
     root = _project(tmp_path / "project")
     _ok(_run(root, "repro"))
     cache_dir = root / ".pivot" / "cache"
-    register = cache_dir / gc.REGISTER_DIR
+    register = cache_dir / naming.REGISTER_DIR
     if register.exists():
         for entry in register.iterdir():
             entry.unlink()
@@ -845,7 +845,9 @@ def test_pivot_get_rev_registers_its_project(tmp_path: pathlib.Path) -> None:
     subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True, env=git_env)
     # The producer is not a user of this cache (it ran elsewhere). Before round 4b it was never
     # registered at all (P13), so the entry may be absent.
-    if (origin_entry := gc.project_register_path(shared, origin, origin / ".pivot")) is not None:
+    if (
+        origin_entry := naming.project_register_path(shared, origin, origin / ".pivot")
+    ) is not None:
         origin_entry.unlink(missing_ok=True)
     other = _shared_project(tmp_path / "other", shared)
     (other / "data" / "raw" / "input.txt").write_text("an unrelated project\n")
@@ -944,7 +946,7 @@ def test_a_writer_that_cannot_register_refuses_before_naming_objects(
     writer = _shared_project(tmp_path / "writer", shared)
     (writer / "data" / "raw" / "input.txt").write_text("writer cannot register\n")
     _ok(_run(collector, "repro"))
-    register = shared / gc.REGISTER_DIR
+    register = shared / naming.REGISTER_DIR
     mode = register.stat().st_mode
     register.chmod(0o555)
     try:
@@ -1195,7 +1197,7 @@ def test_pivot_gc_refuses_when_the_register_cannot_be_listed(tmp_path: pathlib.P
     internal = here / ".pivot" / "cache"
     peer = _shared_project(tmp_path / "peer", internal)
     _, obj = _cached_link(peer, internal, "data.txt", "named by a peer of an internal cache\n")
-    register = internal / gc.REGISTER_DIR
+    register = internal / naming.REGISTER_DIR
     mode = register.stat().st_mode
     register.chmod(0o300)
     try:
@@ -1849,6 +1851,8 @@ def test_pivot_gc_refuses_a_directory_whose_listing_is_gone(tmp_path: pathlib.Pa
     out = refused.stdout + refused.stderr
     assert refused.returncode != 0, out
     assert record["hash"] in out and "no listing of it" in out, out
+    flat = " ".join(out.split())
+    assert "until its listing is back" in flat and "register entry" not in flat, out
     for path in member_objects:
         assert path.exists(), f"gc removed {path} with no listing to prove it dead"
     assert cache.get_cache_path(objects, dead).exists(), "a refused collection removed an object"
@@ -1859,15 +1863,15 @@ import pathlib
 import subprocess
 import sys
 
-from pivot.storage import gc
+from pivot.storage import naming
 
 root, state_dir, cache_dir, source, target = (pathlib.Path(a) for a in sys.argv[1:6])
-gc.register_project(cache_dir, root, state_dir)
+naming.register_project(cache_dir, root, state_dir)
 subprocess.run(
     ["sudo", "-n", "mount", "--bind", str(source), str(target)], check=True, capture_output=True
 )
-gc.register_project(cache_dir, root, state_dir)
-print(gc.project_register_path(cache_dir, root, state_dir))
+naming.register_project(cache_dir, root, state_dir)
+print(naming.project_register_path(cache_dir, root, state_dir))
 """
 
 
@@ -2077,6 +2081,7 @@ def test_pivot_gc_refuses_a_tracked_directory_left_in_a_merge_conflict(
     flat = " ".join(out.split())
     assert refused.returncode != 0, out
     assert str(root / "data" / "images.pvt") in flat and "does not parse" in flat, out
+    assert "Fix or resolve that record" in flat and "register entry" not in flat, out
     assert "keeping every cache object" not in out, out
     for path in feature_objects:
         assert path.exists(), f"gc removed {path}, a file only feature's listing names"

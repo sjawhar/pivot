@@ -11,9 +11,9 @@ delete.
 
 A cache outside the project root can hold another project's outputs, whose locks this project
 cannot read. Pivot therefore keeps a register of the projects that use a cache, at
-``<cache>/projects/``, written by every naming unit (``naming_unit``, and through it by
-``config.register_cache_use()`` before a restore links objects), and
-refuses to collect an external cache that records nothing.
+``<cache>/projects/``, written by every naming unit (``storage/naming.py``, and through it by
+``config.register_cache_use()`` before a restore links objects), and refuses to collect an
+external cache that records nothing.
 
 Two rules cover the window between publishing an object and writing the record that names it
 (``storage/AGENTS.md``): every object whose ``st_ctime`` is inside the grace period is kept,
@@ -23,21 +23,13 @@ and so is every object some directory entry outside the cache still hardlinks.
 from __future__ import annotations
 
 import contextlib
-import datetime
 import errno
 import fcntl
-import functools
-import hashlib
-import importlib.metadata
 import json
 import logging
 import os
 import pathlib
-import re
-import secrets
-import select
 import socket
-import subprocess
 import time
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, cast
 
@@ -46,7 +38,7 @@ import yaml
 
 from pivot import exceptions, project, run_history, yaml_config
 from pivot import state_dir as state_dir_mod
-from pivot.storage import cache, listing, lock, member_skip, state, track
+from pivot.storage import cache, listing, lock, member_skip, naming, state, track
 from pivot.types import is_dir_hash
 
 if TYPE_CHECKING:
@@ -63,65 +55,11 @@ OBJECTS_DIR = "files"
 # (``cache.tree_path``). A tree's bytes are copies of its members, so it is collected on its
 # own; the record that names the directory keeps both it and the listing object.
 TREES_DIR = "trees"
-REGISTER_DIR = "projects"
 # Held exclusively for a whole collection, so two collections never run on one cache.
 GC_LOCK = "gc.lock"
-# The naming lock excludes gc-from-writers. Writers hold it shared for each commit unit (from
-# the object existence check to the durable record that names it); gc holds it exclusive while
-# it deletes (re-read register → prune → collect_roots → unlink). The turnstile prevents
-# starvation: gc takes it exclusive first, so new writers queue, then gc takes naming exclusive
-# to wait for in-flight writers to finish. Lock order: gc.lock → prefix (listing, before any
-# naming lock) → turnstile → naming; gc takes no prefix lock while it holds naming exclusive.
-NAMING_LOCK = "naming.lock"
-NAMING_TURNSTILE = "naming.turnstile"
 # Every marker file beside a whole-directory tree object, removed with the tree.
 _TREE_MARKER_SUFFIXES = cache.TREE_MARKER_SUFFIXES
 DEFAULT_GRACE_HOURS = 24.0
-# A project's identity lives in its state database directory, which the state directory's
-# ignore file keeps out of git, so two checkouts of one repository never share it. A copy (`cp
-# -a`, a container image, a cloned disk) keeps the id; the view nonce tells it apart.
-PROJECT_ID_FILE = "pivot-project-id"
-_ENTRY_ID_RE = re.compile(r"[0-9a-f]{32}")
-# This process's mount namespace. Entries are keyed by it and the hostname, so each view of a
-# project (another host, a container that keeps the hostname) keeps its own mount evidence.
-_MOUNT_NAMESPACE = pathlib.Path("/proc/self/ns/mnt")
-# The machine id, so two machines that share a hostname (cloned VMs) are different views.
-_MACHINE_ID = pathlib.Path("/etc/machine-id")
-# One nonce file per view in a project's state directory: proof of what that view last wrote.
-VIEW_NONCE_DIR = "gc-views"
-# Mount points under the cache root that each view of the cache (host and mount namespace) saw,
-# one file per view, read by a collection before it trusts the register: a register or ref
-# directory on a mount that is not mounted holds no entries.
-CACHE_MOUNTS_DIR = "mounts"
-_MOUNTS_TABLE = pathlib.Path("/proc/self/mounts")
-# Anything in /proc is on this, the one procfs mount a watch of the mount table must be on.
-_PROC_SELF = pathlib.Path("/proc/self")
-_MOUNT_ESCAPE = re.compile(rb"\\([0-7]{3})")
-_MOUNT_COMMAND_LINE = re.compile(r"^.* on (.*) \([^()]*\)$")
-# How long a register entry's ``last_write`` may lag before a registration rewrites the entry
-# that otherwise says exactly what this one would. Every process of a view would write the
-# same document, so without this each one rewrites it for its timestamp alone.
-_ENTRY_REFRESH_SECONDS = 3600.0
-
-
-class ProjectEntry(TypedDict):
-    """One project's entry in a cache's register."""
-
-    root: str
-    state_dir: str
-    host: str
-    pivot: str
-    last_write: str
-    # None when the state directory cannot be written; a collection refuses such an entry.
-    project_id: str | None
-    # The writer's machine id ("" where there is none) and mount namespace inode (None where the
-    # platform has none): with the hostname, the view this entry speaks for.
-    machine: str
-    mount_ns: int | None
-    # The entry's view nonce is not here: it rotates in every naming unit, so it lives in the
-    # fixed-size sibling file `<digest>.nonce`, rewritten in place (`_rotate_nonces`).
-    # Mount points under the root and state directory; None where the mount table is unknown.
-    mounts: list[str] | None
 
 
 class ProjectScope(TypedDict):
@@ -223,589 +161,46 @@ class GcResult(TypedDict):
     dry_run: bool
 
 
+# What the user can do about each kind of refusal over a project gc cannot read. Each refusal
+# names its own remedy: deleting a register entry is right only for a project that is gone.
+REMEDY_REGISTER = (
+    "That project may hold outputs this run would remove. Restore access to it, or, for a "
+    + "project that is gone\nfor good, delete the register entry named above."
+)
+REMEDY_ACCESS = (
+    "That project may hold outputs this run would remove. Restore access to it, then collect "
+    + "again."
+)
+REMEDY_CONFIG = "Fix that project's configuration, then collect again."
+REMEDY_RECORD = (
+    "A record pivot cannot fully read may name any object in this cache. Fix or resolve that "
+    + "record\n(finish the merge that left it, or restore it from git), then collect again; or "
+    + "collect with the\npivot that wrote it."
+)
+REMEDY_LISTING = (
+    "That directory's files are unknown until its listing is back. Restore the listing from "
+    + "git, or\ncheck the directory out or track it again, then collect again."
+)
+
+
 class ProjectUnreadableError(exceptions.CacheError):
-    """A project registered with this cache cannot be read, so its records are unknown."""
+    """A project in scope cannot be read, so its records are unknown. ``remedy`` is what the
+    user can do about this kind of refusal."""
 
     scope: ProjectScope
     reason: str
+    remedy: str
 
-    def __init__(self, scope: ProjectScope, reason: str) -> None:
+    def __init__(self, scope: ProjectScope, reason: str, remedy: str = REMEDY_ACCESS) -> None:
         super().__init__(f"{scope['root']}: {reason}")
         self.scope = scope
         self.reason = reason
+        self.remedy = remedy
 
 
 # -----------------------------------------------------------------------------
 # The register of the projects that use a cache
 # -----------------------------------------------------------------------------
-
-
-def _mount_namespace() -> int | None:
-    """This process's mount namespace inode, or None where there is none to read."""
-    try:
-        return os.stat(_MOUNT_NAMESPACE).st_ino
-    except OSError:
-        return None
-
-
-def _machine_id() -> str:
-    """This machine's systemd machine id, or "" where there is none to read."""
-    try:
-        return _MACHINE_ID.read_text().strip()
-    except OSError:
-        return ""
-
-
-def _view_key(host: str, machine: str, mount_ns: int | None) -> str:
-    """The key of one view of a project: a hostname, a machine id and a mount namespace."""
-    return hashlib.sha256(f"{host}\0{machine}\0{mount_ns}".encode()).hexdigest()[:16]
-
-
-def _this_view() -> tuple[str, str, int | None]:
-    return socket.gethostname(), _machine_id(), _mount_namespace()
-
-
-def register_path(
-    cache_dir: pathlib.Path, project_root: pathlib.Path, project_id: str, view_key: str
-) -> pathlib.Path:
-    """Return the register entry one view of a project owns in a cache.
-
-    The key holds the root, the project id and the view (hostname, machine id and mount
-    namespace). Each host and each mount view of a project writes its own entry, so no writer
-    replaces another's mount evidence, and host-local projects at one path keep separate entries.
-    """
-    key = f"{project_root}\0{project_id}\0{view_key}"
-    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
-    return cache_dir / REGISTER_DIR / f"{digest}.json"
-
-
-def project_register_path(
-    cache_dir: pathlib.Path, project_root: pathlib.Path, state_dir: pathlib.Path
-) -> pathlib.Path | None:
-    """Return this view's entry for the project id in ``state_dir``, or None without an id."""
-    try:
-        project_id = _read_project_id(state_dir)
-    except (OSError, ValueError):
-        return None
-    return register_path(cache_dir, project_root, project_id, _view_key(*_this_view()))
-
-
-def _view_nonce_path(state_dir: pathlib.Path, view_key: str) -> pathlib.Path:
-    """Where one view's latest registration nonce lives in a project's state directory (inside
-    ``state.lmdb``, which the state directory's ignore file keeps out of git)."""
-    return state_dir / "state.lmdb" / VIEW_NONCE_DIR / view_key
-
-
-def _open_view_nonce(state_dir: pathlib.Path, view_key: str) -> int:
-    """Open (creating) this view's nonce file in the state directory. Raises OSError or
-    ValueError (a NUL byte in an unusable configured path)."""
-    path = _view_nonce_path(state_dir, view_key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
-    os.fchmod(fd, 0o644)  # other users' collections must read it, whatever the umask
-    return fd
-
-
-def _write_entry(path: str, document: ProjectEntry) -> None:
-    """Replace ``path`` with ``document`` atomically, readable by every user of the cache."""
-    data = (json.dumps(document, sort_keys=True) + "\n").encode()
-    head, tail = os.path.split(path)
-    staged = os.path.join(head, f".{tail}.{os.getpid()}.tmp")
-    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o644)
-    try:
-        try:
-            os.fchmod(fd, 0o644)
-            if os.write(fd, data) != len(data):
-                raise OSError(errno.EIO, "short write", str(staged))
-        finally:
-            os.close(fd)
-        os.replace(staged, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(staged)
-        raise
-
-
-def _open_nonce_file(path: pathlib.Path) -> int:
-    """Open (creating) a nonce file other users can read. Raises OSError or ValueError."""
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
-    os.fchmod(fd, 0o644)  # other users' collections must read it, whatever the umask
-    return fd
-
-
-def _entry_nonce_path(entry: pathlib.Path) -> pathlib.Path:
-    """The sibling file that holds a register entry's current view nonce."""
-    return entry.with_suffix(".nonce")
-
-
-def _rotate_nonces(state_fd: int, register_fd: int, *, truncate: bool = False) -> None:
-    """Write one fresh nonce to this view's nonce file in the state directory, then to the
-    entry's nonce file in the register.
-
-    A collection in any view accepts the entry only if it reads that nonce in its own view of the
-    state directory, which proves it reads the bytes this view last wrote, not a clone or an
-    overlay copy that shares the directory's inode number. Both are fixed-size files rewritten in
-    place: a collection reads them only under the exclusive naming lock, and a writer writes them
-    only under the shared one. Processes of one view hold the state nonce file's lock across both
-    writes, so the register holds the nonce written last. Where the filesystem refuses the lock
-    they write unlocked: an interleaving then leaves a mismatch, which only makes a collection
-    refuse. Raises OSError.
-
-    Every nonce is the same length, so only a registration, which may find a longer file at
-    either path, truncates (``truncate``); the rotations after it overwrite the whole file.
-    A nonce file holding anything else is refused by its reader, so a collection never takes a
-    rotation for a stale nonce.
-    """
-    data = f"{secrets.token_hex(16)}\n".encode()
-    locked = True
-    try:
-        fcntl.flock(state_fd, fcntl.LOCK_EX)
-    except OSError:
-        locked = False
-    try:
-        for fd in (state_fd, register_fd):
-            if os.pwrite(fd, data, 0) != len(data):
-                raise OSError(errno.EIO, "short write of a view nonce")
-            if truncate:
-                os.ftruncate(fd, len(data))
-    finally:
-        if locked:
-            fcntl.flock(state_fd, fcntl.LOCK_UN)
-
-
-def _read_nonce_file(path: pathlib.Path) -> str:
-    """Read a nonce file without following a symlink. Raises OSError or ValueError."""
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    with os.fdopen(fd) as file:
-        nonce = file.read().strip()
-    if not _ENTRY_ID_RE.fullmatch(nonce):
-        raise ValueError(f"{path} does not hold a pivot view nonce")
-    return nonce
-
-
-def _read_view_nonce(state_dir: pathlib.Path, view_key: str) -> str:
-    """Read one view's nonce in the state directory. Raises OSError or ValueError."""
-    return _read_nonce_file(_view_nonce_path(state_dir, view_key))
-
-
-def _project_id_path(state_dir: pathlib.Path) -> pathlib.Path:
-    return state_dir / "state.lmdb" / PROJECT_ID_FILE
-
-
-def _read_project_id(state_dir: pathlib.Path) -> str:
-    """Read the project id without following a symlink. Raises OSError or ValueError."""
-    path = _project_id_path(state_dir)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    with os.fdopen(fd) as file:
-        project_id = file.read().strip()
-    if not _ENTRY_ID_RE.fullmatch(project_id):
-        raise ValueError(f"{path} does not hold a pivot project id")
-    return project_id
-
-
-def _ensure_project_id(state_dir: pathlib.Path, project_root: pathlib.Path) -> str:
-    """Return this state directory's project id, creating it once. Raises OSError or ValueError.
-
-    A new configured state directory takes the id from the project's `.pivot` state, so changing
-    ``core.state_dir`` does not leave the project's current entry under a different identity. A
-    copy of a project keeps the id; what tells a copy from the project is the view nonce.
-    """
-    with contextlib.suppress(FileNotFoundError):
-        return _read_project_id(state_dir)
-    if not state_dir.is_dir():
-        raise FileNotFoundError(errno.ENOENT, "state directory does not exist", str(state_dir))
-    legacy = project_root / ".pivot"
-    try:
-        project_id = _read_project_id(legacy) if legacy != state_dir else None
-    except FileNotFoundError:
-        project_id = None
-    database_dir = state_dir / "state.lmdb"
-    database_dir.mkdir(exist_ok=True)
-    staged = database_dir / f".{PROJECT_ID_FILE}.{secrets.token_hex(8)}"
-    try:
-        staged.write_text((project_id or secrets.token_hex(16)) + "\n")
-        with contextlib.suppress(FileExistsError):
-            os.link(staged, _project_id_path(state_dir))
-    finally:
-        staged.unlink(missing_ok=True)
-    return _read_project_id(state_dir)
-
-
-def _decode_mount_point(raw: bytes) -> str:
-    return os.fsdecode(_MOUNT_ESCAPE.sub(lambda match: bytes([int(match[1], 8)]), raw))
-
-
-def _read_mount_table() -> bytes | None:
-    """This mount namespace's mount table, or None where `/proc/self/mounts` cannot be read."""
-    try:
-        fd = os.open(_MOUNTS_TABLE, os.O_RDONLY | os.O_CLOEXEC)
-    except OSError:
-        return None
-    chunks = list[bytes]()
-    try:
-        while chunk := os.read(fd, 65536):
-            chunks.append(chunk)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
-    return b"".join(chunks)
-
-
-class _MountWatch(NamedTuple):
-    """An open mount table and the poll that reports every change to it since it was opened."""
-
-    fd: int
-    poller: select.poll
-
-
-def _watch_mount_table() -> _MountWatch | None:
-    """Open `/proc/self/mounts` and arm a watch on this mount namespace's mount table, or None
-    where there is none to watch.
-
-    The kernel records the namespace's mount event counter in the open file and reports
-    ``POLLPRI`` (with ``POLLERR``) on the next poll after it changes, for every mount, unmount
-    and propagated mount in this namespace (``proc(5)``, "this file is pollable"); the poll
-    then re-arms. So one poll of this descriptor answers "has the mount table changed since I
-    read it", for the price of one syscall, where reading the table costs the kernel a pass
-    over every mount.
-
-    The watch is only that file's: a descriptor on anything but the procfs that holds
-    ``/proc/self`` reports no such event, so one that is not on it is refused and the caller
-    reads the table's bytes instead.
-    """
-    try:
-        fd = os.open(_MOUNTS_TABLE, os.O_RDONLY | os.O_CLOEXEC)
-    except OSError:
-        return None
-    try:
-        if os.fstat(fd).st_dev != os.stat(_PROC_SELF).st_dev:
-            os.close(fd)
-            return None
-    except OSError:
-        os.close(fd)
-        return None
-    poller = select.poll()
-    poller.register(fd, select.POLLPRI)
-    return _MountWatch(fd, poller)
-
-
-def _mount_table_changed(watch: _MountWatch) -> bool:
-    """Whether this namespace's mount table changed since ``watch`` was armed or last polled."""
-    try:
-        events = watch.poller.poll(0)
-    except OSError:
-        return True
-    return any(event & (select.POLLPRI | select.POLLERR) for _fd, event in events)
-
-
-def _mount_points(table: bytes | None) -> frozenset[str] | None:
-    """Every mount point in ``table`` (from `mount` where it is None), or None when unknown."""
-    if table is None:
-        try:
-            result = subprocess.run(
-                ["mount"], capture_output=True, check=True, text=True, timeout=10
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        points = set[str]()
-        for line in result.stdout.splitlines():
-            match = _MOUNT_COMMAND_LINE.fullmatch(line)
-            if match is not None:
-                points.add(match[1])
-        return frozenset(points)
-    return frozenset(
-        _decode_mount_point(fields[1])
-        for line in table.splitlines()
-        if len(fields := line.split()) >= 2
-    )
-
-
-# A writer-side shortcut only. Each naming unit registers its project. A full registration reads
-# the id and the mount table and writes the entry. This records, per process, what it checked:
-# a watch on the mount table (``_watch_mount_table``: one poll reports every mount change since
-# the registration read it) and the identity of the project id file and of the entry, with both
-# nonce files kept open. While those are unchanged and each open nonce file is still the one at
-# its path, a unit skips the reads but never the nonce rotation (`_rotate_view_nonce`). A
-# collection never reads this: `read_register` and `collect_roots` always read the files.
-_RegistrationKey = tuple[pathlib.Path, pathlib.Path, pathlib.Path]
-_FileIdentity = tuple[int, int, int]
-
-
-class _VerifiedRegistration(NamedTuple):
-    watch: _MountWatch
-    id_path: str
-    id_identity: _FileIdentity
-    entry_path: str
-    entry_identity: _FileIdentity
-    state_nonce_path: str
-    state_nonce_fd: int
-    register_nonce_path: str
-    register_nonce_fd: int
-
-
-_VERIFIED_REGISTRATIONS = dict[_RegistrationKey, _VerifiedRegistration]()
-
-
-def _file_identity(path: pathlib.Path | str) -> _FileIdentity | None:
-    """A file's (dev, ino, mtime), or None when it cannot be read."""
-    try:
-        stats = os.stat(path, follow_symlinks=False)
-    except (OSError, ValueError):
-        return None
-    return (stats.st_dev, stats.st_ino, stats.st_mtime_ns)
-
-
-def _still_open_at(path: str, fd: int) -> bool:
-    """Whether ``fd`` is still the file at ``path``, so a write through it lands there."""
-    try:
-        at_path = os.stat(path, follow_symlinks=False)
-        opened = os.fstat(fd)
-    except OSError:
-        return False
-    return (at_path.st_dev, at_path.st_ino) == (opened.st_dev, opened.st_ino)
-
-
-def _registration_unchanged(key: _RegistrationKey) -> bool:
-    """Whether this process already registered ``key`` against the evidence it sees now."""
-    verified = _VERIFIED_REGISTRATIONS.get(key)
-    if verified is None or _mount_table_changed(verified.watch):
-        return False
-    if _file_identity(verified.id_path) != verified.id_identity:
-        return False
-    if _file_identity(verified.entry_path) != verified.entry_identity:
-        return False
-    return _still_open_at(verified.state_nonce_path, verified.state_nonce_fd) and _still_open_at(
-        verified.register_nonce_path, verified.register_nonce_fd
-    )
-
-
-def _forget_registration(key: _RegistrationKey) -> None:
-    verified = _VERIFIED_REGISTRATIONS.pop(key, None)
-    if verified is not None:
-        os.close(verified.state_nonce_fd)
-        os.close(verified.register_nonce_fd)
-        os.close(verified.watch.fd)
-
-
-def _rotate_view_nonce(key: _RegistrationKey) -> None:
-    """Rotate the view nonce, for a unit the memo lets skip the rest of the registration.
-
-    The memo never skips this: a clone of the state directory taken while this process runs (a
-    VM snapshot, `docker commit`) holds the nonce of the last unit, which this unit replaces
-    before it names anything new, so the clone's collection no longer accepts this entry.
-    Raises OSError; the caller then registers in full.
-    """
-    verified = _VERIFIED_REGISTRATIONS[key]
-    _rotate_nonces(verified.state_nonce_fd, verified.register_nonce_fd)
-
-
-def _mounts_under(points: frozenset[str] | None, bases: Iterable[pathlib.Path]) -> list[str] | None:
-    """The mount points at or below each base, by real path; None when ``points`` is unknown."""
-    if points is None:
-        return None
-    real_bases = [os.path.realpath(base) for base in bases]
-    return sorted(
-        point
-        for point in points
-        if any(point == base or point.startswith(base.rstrip("/") + "/") for base in real_bases)
-    )
-
-
-def _entry_from_file(path: pathlib.Path) -> dict[str, object] | None:
-    """A readable JSON object at ``path``, or None when absent or unusable."""
-    try:
-        data: object = json.loads(path.read_text())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    return cast("dict[str, object]", data) if isinstance(data, dict) else None
-
-
-def _write_json(path: pathlib.Path, value: object) -> None:
-    def write(fd: int) -> None:
-        with os.fdopen(fd, "w") as file:
-            json.dump(value, file, sort_keys=True)
-            file.write("\n")
-
-    cache.atomic_write_file(path, write)
-
-
-def _cache_mounts_path(cache_dir: pathlib.Path, view_key: str) -> pathlib.Path:
-    return cache_dir / CACHE_MOUNTS_DIR / f"{view_key}.json"
-
-
-def _record_cache_mounts(cache_dir: pathlib.Path, points: frozenset[str] | None) -> None:
-    """Record, for this view, the mount points below the cache root a register read depends on."""
-    host, machine, mount_ns = _this_view()
-    path = _cache_mounts_path(cache_dir, _view_key(host, machine, mount_ns))
-    real_cache = os.path.realpath(cache_dir)
-    mounts = _mounts_under(points, [cache_dir])
-    if mounts is not None:
-        mounts = [mount for mount in mounts if mount != real_cache]
-    desired = {"host": host, "machine": machine, "mount_ns": mount_ns, "mounts": mounts}
-    if _entry_from_file(path) != desired:
-        path.parent.mkdir(exist_ok=True)
-        _write_json(path, desired)
-
-
-@functools.cache
-def _pivot_version() -> str:
-    """This pivot's version, read once: the lookup walks the installation's metadata, which a
-    registration in every naming unit must not pay for."""
-    try:
-        return importlib.metadata.version("pivot")
-    except importlib.metadata.PackageNotFoundError:  # pragma: no cover - always installed
-        return "unknown"
-
-
-def _entry_timestamp(when: float) -> str:
-    """A register entry's ``last_write``, which compares as text in the order of its time."""
-    return datetime.datetime.fromtimestamp(when, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _entry_is_current(path: pathlib.Path, fields: dict[str, object], *, now: float) -> bool:
-    """Whether the entry at ``path`` already records ``fields`` — everything a registration
-    writes but its timestamp and this pivot's version — and recently enough that its
-    ``last_write`` still shows the project in use.
-
-    Every process of one view writes the same document but its timestamp (a worker pool is a
-    dozen of them), and the write costs a staged file and a rename over the live entry. So one
-    that says the same thing is kept until ``_ENTRY_REFRESH_SECONDS`` have passed, and the
-    entry is rewritten then, whoever is running; an upgraded pivot records its version at that
-    refresh. The version is not compared, because reading it walks this installation's metadata
-    (``_pivot_version``), which costs more than every other part of a registration together.
-    """
-    existing = _entry_from_file(path)
-    if existing is None or set(existing) != {*fields, "last_write", "pivot"}:
-        return False
-    recorded = existing["last_write"]
-    if not isinstance(recorded, str) or recorded < _entry_timestamp(now - _ENTRY_REFRESH_SECONDS):
-        return False
-    return all(existing[key] == value for key, value in fields.items())
-
-
-def register_project(
-    cache_dir: pathlib.Path, project_root: pathlib.Path, state_dir: pathlib.Path
-) -> None:
-    """Record this project as a user of ``cache_dir`` with evidence a collection can verify.
-
-    The entry records the project id in its state directory, the mount points below its root
-    and state directory, and a fresh nonce this view writes into the state directory first. The
-    id and the nonce are best-effort: a state directory that cannot be written (#503's unusable
-    layouts) gives an entry without them, which a collection refuses, while the writer keeps
-    0.5.2's behaviour. Each process registers in full at its first naming unit, and again when
-    its mount table or project id changes; every other unit only rotates the nonce. The register
-    write itself must succeed before a writer names an object, so its failure refuses that
-    writer. ``EROFS`` on the cache is the one exception: no collection can delete from a
-    read-only cache.
-    """
-    if not cache_dir.is_dir():
-        return
-    key = (cache_dir, project_root, state_dir)
-    if _registration_unchanged(key):
-        try:
-            _rotate_view_nonce(key)
-            return
-        except OSError as e:
-            logger.debug("Cannot rotate the view nonce in %s: %s", state_dir, e)
-    _forget_registration(key)
-    path = cache_dir / REGISTER_DIR
-    # The watch before the bytes: it reports every mount change after it is armed, so a change
-    # between the two only costs this process one more registration.
-    watch = _watch_mount_table()
-    table = _read_mount_table()
-    host, machine, mount_ns = _this_view()
-    view_key = _view_key(host, machine, mount_ns)
-    state_fd: int | None = None
-    register_fd: int | None = None
-    try:
-        project_id: str | None = _ensure_project_id(state_dir, project_root)
-        state_fd = _open_view_nonce(state_dir, view_key)
-    except (OSError, ValueError) as e:
-        logger.debug("Cannot write the project id or view nonce in %s: %s", state_dir, e)
-        project_id = None
-    try:
-        path = register_path(cache_dir, project_root, project_id or "", view_key)
-        points = _mount_points(table)
-        try:
-            mounts = _mounts_under(points, [project_root, state_dir])
-        except (OSError, ValueError) as e:
-            logger.debug("Cannot record mounts for %s: %s", project_root, e)
-            mounts = None
-        now = time.time()
-        fields: dict[str, object] = {
-            "root": str(project_root),
-            "state_dir": str(state_dir),
-            "host": host,
-            "project_id": project_id,
-            "machine": machine,
-            "mount_ns": mount_ns,
-            "mounts": mounts,
-        }
-        path.parent.mkdir(exist_ok=True)
-        if project_id is not None and state_fd is not None:
-            # The nonce file first: an entry without one is refused, never read with a stale one.
-            register_fd = _open_nonce_file(_entry_nonce_path(path))
-            _rotate_nonces(state_fd, register_fd, truncate=True)
-        if not _entry_is_current(path, fields, now=now):
-            _write_entry(
-                str(path),
-                ProjectEntry(
-                    root=str(project_root),
-                    state_dir=str(state_dir),
-                    host=host,
-                    pivot=_pivot_version(),
-                    last_write=_entry_timestamp(now),
-                    project_id=project_id,
-                    machine=machine,
-                    mount_ns=mount_ns,
-                    mounts=mounts,
-                ),
-            )
-        _record_cache_mounts(cache_dir, points)
-        if project_id is not None and state_fd is not None and register_fd is not None:
-            # This view's entry without an id, written while the state directory could not
-            # hold one, is superseded: the entry just written covers the same root and view.
-            register_path(cache_dir, project_root, "", view_key).unlink(missing_ok=True)
-            id_path = str(_project_id_path(state_dir))
-            id_identity = _file_identity(id_path)
-            entry_identity = _file_identity(path)
-            if watch is not None and id_identity is not None and entry_identity is not None:
-                _VERIFIED_REGISTRATIONS[key] = _VerifiedRegistration(
-                    watch=watch,
-                    id_path=id_path,
-                    id_identity=id_identity,
-                    entry_path=str(path),
-                    entry_identity=entry_identity,
-                    state_nonce_path=str(_view_nonce_path(state_dir, view_key)),
-                    state_nonce_fd=state_fd,
-                    register_nonce_path=str(_entry_nonce_path(path)),
-                    register_nonce_fd=register_fd,
-                )
-                state_fd = register_fd = None  # the memo owns them now
-                watch = None
-    except (OSError, ValueError) as e:
-        if isinstance(e, OSError) and e.errno == errno.EROFS:
-            logger.debug("%s is on a read-only filesystem; nothing can delete there", path)
-            return
-        raise _unrecorded_project(cache_dir, path, e) from e
-    finally:
-        for fd in (state_fd, register_fd, None if watch is None else watch.fd):
-            if fd is not None:
-                os.close(fd)
-
-
-def _unrecorded_project(
-    cache_dir: pathlib.Path, path: pathlib.Path, error: OSError | ValueError
-) -> exceptions.CacheError:
-    """The refusal when a writer cannot add its project to a shared cache's register."""
-    reason = error.strerror if isinstance(error, OSError) and error.strerror else str(error)
-    return exceptions.CacheError(
-        f"Cannot record this project in the cache register at {path}: {reason}. "
-        + f"This command names objects in the cache {cache_dir}, and a `pivot gc` run in another "
-        + "project would not see this project's records and could remove them. Make "
-        + f"{path.parent} and this project's state directory writable for this user."
-    )
 
 
 def _project_from_entry(path: pathlib.Path) -> _RegisteredProject:
@@ -825,7 +220,7 @@ def _project_from_entry(path: pathlib.Path) -> _RegisteredProject:
     machine = entry.get("machine")
     mount_ns = entry.get("mount_ns")
     try:
-        nonce: str | None = _read_nonce_file(_entry_nonce_path(path))
+        nonce: str | None = naming.read_nonce_file(naming.entry_nonce_path(path))
     except (OSError, ValueError):
         nonce = None
     scope = ProjectScope(
@@ -845,7 +240,7 @@ def _project_from_entry(path: pathlib.Path) -> _RegisteredProject:
     return _RegisteredProject(
         scope=scope,
         project_id=project_id
-        if isinstance(project_id, str) and _ENTRY_ID_RE.fullmatch(project_id)
+        if isinstance(project_id, str) and naming.ENTRY_ID_RE.fullmatch(project_id)
         else None,
         machine=machine if isinstance(machine, str) else "",
         mount_ns=mount_ns if isinstance(mount_ns, int) and not isinstance(mount_ns, bool) else None,
@@ -906,7 +301,7 @@ def _identity_reason(
             + f"{entry} and re-run",
         )
     try:
-        project_id = _read_project_id(scope["state_dir"])
+        project_id = naming.read_project_id(scope["state_dir"])
     except (OSError, ValueError) as e:
         return _registered_scope_reason(
             entry, scope, f"no project id readable in {scope['state_dir']}: {_error_text(e)}"
@@ -922,7 +317,7 @@ def _identity_reason(
         )
     if (nonce_reason := _view_nonce_reason(entry, registered)) is not None:
         return nonce_reason
-    host, machine, mount_ns = _this_view()
+    host, machine, mount_ns = naming.this_view()
     if (scope["host"], registered["machine"], registered["mount_ns"]) != (host, machine, mount_ns):
         return _other_view_reason(entry, registered)
     mounts = registered["mounts"]
@@ -954,12 +349,12 @@ def _view_nonce_reason(
     view reads those bytes (one directory, as over NFS), not a clone or an overlay copy.
     """
     scope = registered["scope"]
-    view_key = _view_key(scope["host"], registered["machine"], registered["mount_ns"])
+    view_key = naming.view_key_of(scope["host"], registered["machine"], registered["mount_ns"])
     if registered["nonce"] is None:
         detail = "the entry has no readable view nonce"
     else:
         try:
-            nonce = _read_view_nonce(scope["state_dir"], view_key)
+            nonce = naming.read_view_nonce(scope["state_dir"], view_key)
         except (OSError, ValueError) as e:
             detail = f"no nonce for that view readable here: {_error_text(e)}"
         else:
@@ -1013,7 +408,7 @@ def _cache_mount_reasons(
     Each view's record is checked: this view's recorded mounts must be mounted now, and another
     view's record may name no mount under the cache root, since this view cannot check it.
     """
-    directory = cache_dir / CACHE_MOUNTS_DIR
+    directory = cache_dir / naming.CACHE_MOUNTS_DIR
     try:
         with os.scandir(directory) as entries:
             paths = sorted(pathlib.Path(e.path) for e in entries if e.name.endswith(".json"))
@@ -1023,7 +418,7 @@ def _cache_mount_reasons(
         return [(str(directory), _error_text(e))]
     reasons = list[tuple[str, str]]()
     for path in paths:
-        recorded = _entry_from_file(path)
+        recorded = naming.entry_from_file(path)
         mounts = None if recorded is None else recorded.get("mounts")
         if recorded is None or (
             mounts is not None
@@ -1039,7 +434,7 @@ def _cache_mount_reasons(
             recorded.get("host"),
             recorded.get("machine"),
             recorded.get("mount_ns"),
-        ) == _this_view()
+        ) == naming.this_view()
         if not same_view:
             if recorded_mounts != []:
                 what = "unknown" if recorded_mounts is None else ", ".join(recorded_mounts)
@@ -1080,9 +475,9 @@ def read_register(
     must still be mounted. ``resolve_scopes`` then opens every scope's root, `.pivot` and state
     directory before any record is read.
     """
-    register = cache_dir / REGISTER_DIR
+    register = cache_dir / naming.REGISTER_DIR
     live = list[ProjectScope]()
-    points = _mount_points(_read_mount_table())  # always read now; never the writer memo
+    points = naming.mount_points(naming.read_mount_table())  # always read now; never the memo
     unreadable = _cache_mount_reasons(cache_dir, points)
     try:
         with os.scandir(register) as entries:
@@ -1146,20 +541,16 @@ def refusal_not_a_project(cache_dir: pathlib.Path, path: pathlib.Path) -> str:
 
 
 def refusal_unreadable(
-    cache_dir: pathlib.Path, recorded: int, unreadable: list[tuple[str, str]]
+    cache_dir: pathlib.Path, recorded: int, unreadable: list[tuple[str, str]], remedy: str
 ) -> str:
-    """What a collection says when a project the cache records cannot be read."""
+    """What a collection says when a project the cache records cannot be read, ending with
+    ``remedy`` (one of the ``REMEDY_*`` texts, for the kind of refusal)."""
     lines = [
         f"Refusing to collect {cache_dir}: it records {recorded} projects and "
         + f"{len(unreadable)} cannot be read:"
     ]
     lines.extend(f"  {label}: {reason}" for label, reason in unreadable)
-    lines.append(
-        "That project may hold outputs this run would remove. Restore access to "
-        + ("it" if len(unreadable) == 1 else "them")
-        + ", or, for a project that is gone\nfor good, delete the register entry named above. "
-        + "Nothing was removed."
-    )
+    lines.append(f"{remedy} Nothing was removed.")
     return "\n".join(lines)
 
 
@@ -1193,7 +584,7 @@ def resolve_scopes(
     live, unreadable = read_register(cache_dir)
     if unreadable:
         raise exceptions.CacheCollectionRefusedError(
-            refusal_unreadable(cache_dir, len(live) + len(unreadable), unreadable)
+            refusal_unreadable(cache_dir, len(live) + len(unreadable), unreadable, REMEDY_REGISTER)
         )
     named = list[ProjectScope]()
     for path in extra:
@@ -1207,7 +598,9 @@ def resolve_scopes(
             scope_state_dir = state_dir_mod.locate_state_dir(root)
         except (exceptions.ConfigError, UnicodeDecodeError) as e:
             raise exceptions.CacheCollectionRefusedError(
-                refusal_unreadable(cache_dir, 1, [(str(root), f"cannot read its config: {e}")])
+                refusal_unreadable(
+                    cache_dir, 1, [(str(root), f"cannot read its config: {e}")], REMEDY_CONFIG
+                )
             ) from e
         scope = ProjectScope(
             root=root,
@@ -1228,11 +621,12 @@ def resolve_scopes(
                             f"its state directory cannot be read: {_error_text(e)}",
                         )
                     ],
+                    REMEDY_ACCESS,
                 )
             ) from e
         named.append(scope)
         if not dry_run:
-            register_project(cache_dir, root, scope_state_dir)
+            naming.register_project(cache_dir, root, scope_state_dir)
 
     # The external-only refusal: a cache outside the project root with no registered or named
     # project, and none on the command line, is someone else's cache.
@@ -1245,7 +639,12 @@ def resolve_scopes(
             _read_scope_directories(scope)
         except (OSError, ValueError) as e:
             raise exceptions.CacheCollectionRefusedError(
-                refusal_unreadable(cache_dir, len(scopes), [(scope_label(scope), _error_text(e))])
+                refusal_unreadable(
+                    cache_dir,
+                    len(scopes),
+                    [(scope_label(scope), _error_text(e))],
+                    REMEDY_ACCESS,
+                )
             ) from e
     return scopes
 
@@ -1339,12 +738,9 @@ class _UninterpretableRecordError(Exception):
 
 
 def _uninterpretable_record(kind: str, path: pathlib.Path | str, reason: str) -> str:
-    """The refusal for one record this pivot cannot fully read, naming it and what to do."""
-    return (
-        f"cannot fully read the {kind} {path}: {reason}. A record pivot cannot fully read may "
-        + "name any cache object, so none may be removed. Resolve it (a merge left unfinished: "
-        + "finish it), or collect with the pivot that wrote it"
-    )
+    """The refusal reason for one record this pivot cannot fully read, naming it; the remedy is
+    ``REMEDY_RECORD``."""
+    return f"cannot fully read the {kind} {path}: {reason}"
 
 
 def _yaml_problem(error: yaml.YAMLError | UnicodeDecodeError) -> str:
@@ -1494,49 +890,16 @@ def _state_records(stages_dir: pathlib.Path) -> _StateRecords:
     return _StateRecords(sorted(locks), listings)
 
 
-# Every key a run-cache row this pivot or an older one writes, and every key of one of its
-# output entries (``run_history.OutputHashEntry``; ``manifest`` and ``empty_dirs`` are an older
-# pivot's inline directory). A key outside these may be a newer pivot's record of objects.
-_ROW_KEYS = frozenset({"run_id", "output_hashes"})
-_ROW_OUTPUT_KEYS = frozenset({"path", "hash", "size", "nfiles", "manifest", "empty_dirs"})
-
-
-def _is_count(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
-
-
-def _row_error(row: object) -> str | None:
-    """Why a parsed run-cache row is not one this pivot can fully interpret, or None."""
-    if not isinstance(row, dict):
-        return f"its JSON is {type(row).__name__}, not an object"
-    fields = cast("dict[object, object]", row)
-    held = {str(key) for key in fields}
-    if held ^ _ROW_KEYS:
-        return f"its keys are {', '.join(sorted(held)) or 'none'}, not run_id and output_hashes"
-    if not isinstance(fields["run_id"], str):
-        return "its run_id is not a string"
-    outputs = fields["output_hashes"]
-    if not isinstance(outputs, list):
-        return "its output_hashes is not a list"
-    for index, raw in enumerate(cast("list[object]", outputs)):
-        if not isinstance(raw, dict):
-            return f"output_hashes[{index}] is not an object"
-        output = cast("dict[object, object]", raw)
-        extra = sorted(str(key) for key in set(output) - _ROW_OUTPUT_KEYS)
-        if extra:
-            return f"output_hashes[{index}] holds the key {', '.join(extra)}, which this pivot does not know"
-        if not cache.is_valid_hash(output.get("hash")):
-            return f"output_hashes[{index}].hash is not a cache key"
-        for count in ("size", "nfiles"):
-            if count in output and not _is_count(output[count]):
-                return f"output_hashes[{index}].{count} is not a count"
-    return None
-
-
 def _row_keys(output: run_history.OutputHashEntry, source: str, listings: _Listings) -> set[str]:
-    """Every key one run-cache output entry ``_row_error`` passed names: its own, and each file
-    of a directory's listing — the one an older pivot's row holds inline, else the one
-    ``listings`` reads."""
+    """Every key one run-cache output entry ``run_history.run_cache_entry_error`` passed names:
+    its own, and each file of a directory's listing — the one an older pivot's row holds inline,
+    else the one ``listings`` reads. A hash that is not a cache key refuses."""
+    if not cache.is_valid_hash(output["hash"]):
+        raise _UninterpretableRecordError(
+            _uninterpretable_record(
+                "run-cache row", source, f"its output hash {output['hash']!r} is not a cache key"
+            )
+        )
     record = run_history.entry_to_output_hash(output)
     if record is None:
         # An older pivot's row lists a directory's files inline; one that records neither is a
@@ -1587,7 +950,7 @@ def _run_cache_keys(
             raise _UninterpretableRecordError(
                 _uninterpretable_record("run-cache row", source, f"it does not parse as JSON ({e})")
             ) from e
-        if (error := _row_error(row)) is not None:
+        if (error := run_history.run_cache_entry_error(row)) is not None:
             raise _UninterpretableRecordError(
                 _uninterpretable_record("run-cache row", source, error)
             )
@@ -1802,12 +1165,10 @@ def collect_roots(
             raise ProjectUnreadableError(
                 scope, e.strerror if isinstance(e, OSError) and e.strerror else str(e)
             ) from e
-        except (
-            exceptions.ListingMissingError,
-            exceptions.CorruptListingError,
-            _UninterpretableRecordError,
-        ) as e:
-            raise ProjectUnreadableError(scope, str(e)) from e
+        except (exceptions.ListingMissingError, exceptions.CorruptListingError) as e:
+            raise ProjectUnreadableError(scope, str(e), REMEDY_LISTING) from e
+        except _UninterpretableRecordError as e:
+            raise ProjectUnreadableError(scope, str(e), REMEDY_RECORD) from e
 
     refs = object_root / "refs"
     if refs.is_dir():
@@ -1852,12 +1213,10 @@ def reread_run_cache(roots: Roots, scopes: Iterable[ProjectScope], cache_dir: pa
             raise ProjectUnreadableError(
                 scope, e.strerror if isinstance(e, OSError) and e.strerror else str(e)
             ) from e
-        except (
-            exceptions.ListingMissingError,
-            exceptions.CorruptListingError,
-            _UninterpretableRecordError,
-        ) as e:
-            raise ProjectUnreadableError(scope, str(e)) from e
+        except (exceptions.ListingMissingError, exceptions.CorruptListingError) as e:
+            raise ProjectUnreadableError(scope, str(e), REMEDY_LISTING) from e
+        except _UninterpretableRecordError as e:
+            raise ProjectUnreadableError(scope, str(e), REMEDY_RECORD) from e
     roots["run_cache"] = keys
     roots["counts"]["rows"] = rows
 
@@ -1908,18 +1267,6 @@ def collection_lock(cache_dir: pathlib.Path) -> Generator[None]:
         os.close(fd)
 
 
-def naming_lock_paths(cache_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
-    """The cache's naming turnstile and naming lock, the one pair every writer and `pivot gc` use.
-
-    ``cache_root`` is the cache root as configured: the directory that holds ``files/``
-    (``config.get_cache_dir()``, or the engine's ``cache_dir``), however its path is spelled. The
-    lock files live in that directory, so any spelling of it reaches the same files. Never pass a
-    path derived from the object root: ``files`` may be a symlink to another disk, and the parent
-    of where it really is would be a different directory, and so a different, unshared lock.
-    """
-    return cache_root / NAMING_TURNSTILE, cache_root / NAMING_LOCK
-
-
 @contextlib.contextmanager
 def naming_exclusive(cache_dir: pathlib.Path) -> Generator[None]:
     """Hold the naming lock exclusive: no writer can name a cache object while this is held.
@@ -1928,7 +1275,7 @@ def naming_exclusive(cache_dir: pathlib.Path) -> Generator[None]:
     The turnstile prevents writer starvation: gc takes it exclusive first so new commit
     units queue, then gc takes naming exclusive to wait for in-flight units to finish.
     """
-    ts_path, nm_path = naming_lock_paths(cache_dir)
+    ts_path, nm_path = naming.naming_lock_paths(cache_dir)
     ts_fd = cache.open_cache_lock(ts_path)
     nm_fd = cache.open_cache_lock(nm_path)
     try:
@@ -1942,94 +1289,6 @@ def naming_exclusive(cache_dir: pathlib.Path) -> Generator[None]:
             fcntl.flock(ts_fd, fcntl.LOCK_UN)
         os.close(nm_fd)
         os.close(ts_fd)
-
-
-@contextlib.contextmanager
-def naming_unit(
-    cache_dir: pathlib.Path, *, project: tuple[pathlib.Path, pathlib.Path] | None
-) -> Generator[None]:
-    """Hold the naming lock shared for one commit unit: from the first existence check on a
-    cache object to the durable record (lock, ``.pvt``, workspace link) being on disk.
-
-    ``project`` is the ``(root, state_dir)`` of the project whose records this unit writes. It
-    is registered in the cache under the shared lock, before anything is named (one ``stat``
-    while its entry is fresh), so every process that names an object is registered first,
-    whatever command it runs and whether or not the cache existed when it started. Only a
-    test that holds the lock as a stand-in writer passes ``None``.
-
-    Lock order: naming.turnstile (SH) → naming.lock (SH) → turnstile UN → … → naming UN.
-    The turnstile SH is released immediately after acquiring naming SH. This unit must NOT
-    span stage execution — only the commit step.
-
-    The cache directory is created when missing: the commit this unit guards is about to
-    publish into it, and a first commit into a fresh cache must hold the lock like any other
-    (otherwise ``gc --grace-hours 0`` started mid-commit could collect its objects). Where
-    ``flock`` is refused (``cache.NO_FLOCK_ERRNO``), the unit runs unlocked, because
-    ``pivot gc`` refuses to collect there. Where the lock files cannot be opened (they do not
-    exist yet and this user cannot create them), the unit refuses: another user's collection
-    could create them and delete while this writer named objects unlocked. The one exception
-    is a read-only filesystem, where nothing — a collection included — can delete.
-
-    Raises:
-        exceptions.CacheError: the lock files cannot be opened on a writable filesystem.
-    """
-    ts_path, nm_path = naming_lock_paths(cache_dir)
-    try:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        ts_fd = cache.open_cache_lock(ts_path)
-    except OSError as e:
-        if e.errno != errno.EROFS:
-            raise _unopenable_naming_lock(cache_dir, ts_path, e) from e
-        logger.debug("%s is on a read-only filesystem; nothing can delete there", ts_path)
-        yield
-        return
-    try:
-        nm_fd = cache.open_cache_lock(nm_path)
-    except OSError as e:
-        os.close(ts_fd)
-        if e.errno != errno.EROFS:
-            raise _unopenable_naming_lock(cache_dir, nm_path, e) from e
-        logger.debug("%s is on a read-only filesystem; nothing can delete there", nm_path)
-        yield
-        return
-    locked = True
-    try:
-        try:
-            fcntl.flock(ts_fd, fcntl.LOCK_SH)
-            fcntl.flock(nm_fd, fcntl.LOCK_SH)
-            fcntl.flock(ts_fd, fcntl.LOCK_UN)
-        except OSError as e:
-            if e.errno not in cache.NO_FLOCK_ERRNO:
-                raise
-            # gc refuses outright on a filesystem that refuses flock (collection_lock), so a
-            # writer here is never racing a collector. This is a reasoned exemption, not a
-            # silent fallback: if gc ever collects on a flockless mount, the writers must also
-            # take the lock. See storage/AGENTS.md "gc refuses, writers proceed."
-            logger.debug(
-                "flock refused on %s; proceeding unlocked (gc refuses on this mount)", nm_path
-            )
-            locked = False
-        if project is not None:
-            register_project(cache_dir, *project)
-        yield
-    finally:
-        if locked:
-            with contextlib.suppress(OSError):
-                fcntl.flock(nm_fd, fcntl.LOCK_UN)
-        os.close(nm_fd)
-        os.close(ts_fd)
-
-
-def _unopenable_naming_lock(
-    cache_dir: pathlib.Path, path: pathlib.Path, error: OSError
-) -> exceptions.CacheError:
-    """The refusal a writer gives when it cannot take the cache's naming lock."""
-    return exceptions.CacheError(
-        f"Cannot open {path} ({error.strerror or error}): this command names objects in the "
-        + f"cache {cache_dir} and must hold its naming lock, or a `pivot gc` run by another user "
-        + "could remove them meanwhile. Make the cache root writable for this user, or have "
-        + "someone who can write it run any pivot command there once to create the lock files."
-    )
 
 
 @contextlib.contextmanager

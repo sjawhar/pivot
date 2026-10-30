@@ -438,14 +438,19 @@ A naming unit covers only the **naming step**: from the **last existence check o
 object** to the **durable record that names it** (lock file, `.pvt`, run-cache row or workspace
 link). It must NEVER span stage execution, hashing, copying or a download. Hash and publish
 before the unit; download outside it; inside it, re-check every object (publishing again any a
-collection removed since) and then link and write the record. See `gc.naming_unit`,
+collection removed since) and then link and write the record. See `naming.naming_unit`,
 `WorkspaceStore.prepare_commit` / `finish_commit`, and `cache.publish_hashed_output`.
 
 Sites: `executor/worker.py` (normal commit and run-cache skip), `executor/commit.py` (`pivot
 commit`), `cli/track.py` (`pivot track`), `storage/restore.py` (restore from revision), and
 `config.register_cache_use` (a register write). Every site and `pivot gc` take the lock files
-from `gc.naming_lock_paths(<cache root as configured>)`, never from a path derived from the
+from `naming.naming_lock_paths(<cache root as configured>)`, never from a path derived from the
 resolved object root (a `files/` symlink would split the lock).
+
+The writer side (the naming lock, the register and the registration memo) lives in
+`storage/naming.py`; the collector in `storage/gc.py` imports it to read the register. Writers
+import only `naming`, so a worker process never pays to import the collector (its module body,
+with a dozen `TypedDict`s and `member_skip`, cost about 2.7 ms of CPU per process).
 
 **Every unit registers its project** (`naming_unit(cache_root, project=(root, state_dir))`),
 under the shared lock and before anything is named, so every process that names an object is
@@ -455,11 +460,13 @@ first unit, or after its evidence changed) tries to write the project id to
 `<state dir>/state.lmdb/pivot-project-id`, then one fresh nonce to this view's
 `<state dir>/state.lmdb/gc-views/<view>` and the entry's sibling `<digest>.nonce`, then the entry
 with the mount points at or below the project root and state directory, and cache-root submounts
-in `<cache>/mounts/`. An entry that already records exactly that (its timestamp and pivot
-version aside) and was written in the last hour is kept rather than rewritten
-(`_entry_is_current`), so a worker pool writes one entry, not one per process; the pivot version
-is read only for an entry that is written (`_pivot_version`, which walks the installation's
-metadata).
+in `<cache>/mounts/`. An entry that already records exactly that (its timestamp aside) and was
+written in the last hour is kept rather than rewritten (`_entry_is_current`), so a worker pool
+writes one entry, not one per process. The entry records no pivot version: nothing reads one,
+and looking it up walks the installation's metadata (about 30 ms of CPU in a cold run).
+A worker takes a naming unit for a run-cache lookup only when a row exists for the stage
+(`worker._run_cache_candidate`): with none, nothing is named, so a cold run takes one unit per
+stage, for its commit.
 Entries, nonces and cache mount records are keyed per view (hostname, machine id and mount
 namespace). An id or nonce write failure leaves an entry without them, so a collection refuses
 it but the writer preserves #503's unusable-state behavior. A register write failure refuses the
