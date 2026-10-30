@@ -1372,6 +1372,22 @@ class StateDB:
                 if "file_hash_entries" in deferred:
                     _put_file_hashes(txn, deferred["file_hash_entries"])
 
+                # The objects the run's reads fetched (`reads.Recording.fetched`) count as on that
+                # remote, as `pivot pull` counts what it downloads. As in `sync.check_remote_url`,
+                # a remote with no URL stored takes the fetch's; unlike it, an index kept for
+                # another URL is left alone rather than cleared: the fetch adds nothing to it.
+                if "remote_hashes" in deferred:
+                    for fetched in deferred["remote_hashes"]:
+                        url_key = _REMOTE_URL_PREFIX + fetched["name"].encode()
+                        stored_url = txn.get(url_key)
+                        if stored_url is None:
+                            txn.put(url_key, fetched["url"].encode("utf-8"))
+                        elif stored_url.decode("utf-8") != fetched["url"]:
+                            continue
+                        prefix = _REMOTE_PREFIX + fetched["name"].encode() + b":"
+                        for hash_ in fetched["hashes"]:
+                            txn.put(prefix + hash_.encode(), b"1")
+
                 nocommit_key = _NOCOMMIT_PREFIX + stage_name.encode()
                 if "no_commit_record" in deferred:
                     # Replace the run's keys (`types.NoCommitRun`) and keep every other key:

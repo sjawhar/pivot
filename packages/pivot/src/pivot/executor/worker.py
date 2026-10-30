@@ -1196,6 +1196,7 @@ def _execute_stage(
                     )
                 output_paths = written["paths"]
                 read_hashes = recorded.hashes()
+                fetched = recorded.fetched()
                 # A @no_fingerprint stage declares its code as files (`code_deps`); that
                 # declaration is its contract, so its imports are not checked.
                 uncovered = (
@@ -1304,16 +1305,18 @@ def _execute_stage(
                     )
                     if read_hashes:
                         no_commit_record["reads"] = read_hashes
+                    no_commit_writes = DeferredWrites(
+                        file_hash_entries=file_hash_entries, no_commit_record=no_commit_record
+                    )
+                    if fetched:
+                        no_commit_writes["remote_hashes"] = fetched
                     return StageResult(
                         status=StageStatus.RAN,
                         reason=run_reason,
                         input_hash=input_hash,
                         output_lines=ring_buffer.snapshot(),
                         metrics=metrics.get_entries(),
-                        deferred_writes=DeferredWrites(
-                            file_hash_entries=file_hash_entries,
-                            no_commit_record=no_commit_record,
-                        ),
+                        deferred_writes=no_commit_writes,
                     )
 
                 # Build lock data
@@ -1342,6 +1345,8 @@ def _execute_stage(
                         reusable=not uncovered and not edited and not unreadable,
                         file_hash_entries=file_hash_entries,
                     )
+                    if fetched:
+                        deferred["remote_hashes"] = fetched
                     return StageResult(
                         status=StageStatus.RAN,
                         reason=run_reason,

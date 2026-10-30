@@ -219,7 +219,13 @@ When multiple `pivot` processes share the same StateDB:
   records an object neither in the cache nor known to be on the remote is stale everywhere at
   once. The check is local, as for outputs: an object the cache lacks counts as on the remote
   only when the remote index (`remote:`) records it for the remote's URL; it never contacts the
-  remote, so plain `status` and `repro` never wait on the network.
+  remote, so plain `status` and `repro` never wait on the network. `pivot push`, `pull` and
+  `fetch` fill that index, and so does a run whose read fetched an object: the worker returns
+  what its reads fetched in `DeferredWrites.remote_hashes` (`reads.Recording.fetched`), under
+  `--no-commit` too, and `apply_deferred_writes` adds it in the run's transaction, storing the
+  fetch's URL when none is stored for the remote and adding nothing when another one is.
+  A stage whose only reason to run is objects the index lacks on a usable remote
+  (`reads.pull_fetches`) is one `pivot status` says `pivot pull` brings up to date.
 
 ## Output Ownership
 

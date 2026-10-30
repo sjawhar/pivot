@@ -5,7 +5,7 @@ import sys
 import click
 import tqdm
 
-from pivot import config, display, exceptions, project
+from pivot import config, display, exceptions, project, reads
 from pivot import explain as explain_mod
 from pivot import status as status_mod
 from pivot.cli import completion, console
@@ -184,6 +184,7 @@ def status(
     # Pull restores missing outputs without recomputing; skip the count when there is no
     # remote to pull from. The count reads only explain's reasons, so it is cheap.
     missing_outputs_count = 0
+    missing_reads_count = 0
     if remote_config.list_remotes():
         # Stages arrive in execution order. A stage is pullable when its outputs are missing
         # and every stale upstream is itself pullable: in a plain clone the downstream stages
@@ -198,6 +199,9 @@ def status(
             if reason == explain_mod.OUTPUTS_MISSING_REASON:
                 pullable.add(name)
                 missing_outputs_count += 1
+            elif reads.pull_fetches(reason):  # objects it read by hash: pull fetches them
+                pullable.add(name)
+                missing_reads_count += 1
             elif reason.startswith(status_mod.UPSTREAM_STALE_REASON_PREFIX):
                 pullable.add(name)
     modified_count = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.MODIFIED)
@@ -210,7 +214,8 @@ def status(
         pull_count,
         len(orphaned_locks),
         missing_outputs_count=missing_outputs_count,
-        remote_configured=missing_outputs_count > 0,
+        missing_reads_count=missing_reads_count,
+        remote_configured=missing_outputs_count + missing_reads_count > 0,
     )
 
     # Quiet mode: no output, exit 1 if there are issues needing attention

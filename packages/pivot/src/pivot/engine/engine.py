@@ -246,8 +246,9 @@ def _deferred_writes_to_apply(
 
     Only RAN/CACHED stages persist. A normal run persists its whole deferred dict, file hashes
     included, in the one ``apply_deferred_writes`` transaction. Under ``--no-commit`` only the
-    ``nocommit:`` record is authoritative, and the file hashes are returned for the best-effort
-    ``state.save_file_hashes``.
+    ``nocommit:`` record and the remote index entries for what the run's reads fetched (the
+    remote holds those whether or not the run is committed) are authoritative, and the file
+    hashes are returned for the best-effort ``state.save_file_hashes``.
     """
     if result["status"] not in (StageStatus.RAN, StageStatus.CACHED):
         return None, []
@@ -256,12 +257,12 @@ def _deferred_writes_to_apply(
     deferred = result["deferred_writes"]
     if not no_commit:
         return deferred, []
-    writes = (
-        types.DeferredWrites(no_commit_record=deferred["no_commit_record"])
-        if "no_commit_record" in deferred
-        else None
-    )
-    return writes, deferred["file_hash_entries"] if "file_hash_entries" in deferred else []
+    writes = types.DeferredWrites()
+    if "no_commit_record" in deferred:
+        writes["no_commit_record"] = deferred["no_commit_record"]
+    if "remote_hashes" in deferred:
+        writes["remote_hashes"] = deferred["remote_hashes"]
+    return writes or None, deferred["file_hash_entries"] if "file_hash_entries" in deferred else []
 
 
 class Engine:

@@ -261,6 +261,8 @@ class _MotoS3Client(Protocol):
 
     def delete_object(self, **kwargs: object) -> object: ...
 
+    def put_object(self, **kwargs: object) -> object: ...
+
 
 def _helper_remote(root: pathlib.Path, endpoint: str) -> tuple[dict[str, str], _MotoS3Client, str]:
     """Point the project at a fresh bucket on the moto server at ``endpoint`` as its one remote.
@@ -381,6 +383,27 @@ def test_commit_after_a_no_commit_run_records_what_that_run_read(tmp_path: pathl
 
     assert _helper_lock_reads(root) == [snapshot]
     assert _helper_status(root) == ("cached", "")
+
+
+def test_an_object_a_no_commit_run_fetched_counts_as_on_the_remote(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """A `--no-commit` run's read records what it fetched in the remote index, as a committed
+    run's does: the remote holds the object whether or not the outputs are committed. So once
+    `pivot commit` records the run and the cache loses the object, the stage is still cached."""
+    root = _project(tmp_path / "p")
+    env, s3, bucket = _helper_remote(root, moto_services["s3"])
+    snapshot = xxhash.xxh64(b"taken: lemma_a\n").hexdigest()
+    s3.put_object(
+        Bucket=bucket, Key=f"cache/files/{snapshot[:2]}/{snapshot[2:]}", Body=b"taken: lemma_a\n"
+    )
+    _helper_pin(root, snapshot)
+    _ok(_pivot(root, "repro", "--no-commit", env=env))
+    _ok(_pivot(root, "commit", env=env))
+    _helper_remove_object(root, snapshot)
+
+    assert _helper_lock_reads(root) == [snapshot]
+    assert _helper_status(root, env) == ("cached", "")
 
 
 # =============================================================================

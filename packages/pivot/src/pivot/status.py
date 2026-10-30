@@ -516,6 +516,7 @@ def get_suggestions(
     pull_count: int,
     orphan_count: int = 0,
     missing_outputs_count: int = 0,
+    missing_reads_count: int = 0,
     remote_configured: bool = False,
 ) -> list[str]:
     suggestions = list[str]()
@@ -526,6 +527,14 @@ def get_suggestions(
         suggestions.append(
             f"Run `pivot pull` to restore outputs of {missing_outputs_count} "
             + f"{_pluralize(missing_outputs_count, 'stage')} from the remote"
+        )
+
+    # Objects stages read by hash, missing from the cache: pulling fetches them, and the
+    # stages are then current without running.
+    if missing_reads_count > 0 and remote_configured:
+        suggestions.append(
+            f"Run `pivot pull` to fetch the objects {missing_reads_count} "
+            + f"{_pluralize(missing_reads_count, 'stage')} read by hash from the remote"
         )
 
     if stale_count > 0:

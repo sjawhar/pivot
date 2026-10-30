@@ -647,6 +647,45 @@ def test_suggestions_missing_outputs_without_remote_omits_pull() -> None:
     assert "pivot repro" in suggestions[0]
 
 
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [
+        (1, "Run `pivot pull` to fetch the objects 1 stage read by hash from the remote"),
+        (3, "Run `pivot pull` to fetch the objects 3 stages read by hash from the remote"),
+    ],
+)
+def test_suggestions_missing_read_objects_with_remote_suggests_pull_first(
+    count: int, expected: str
+) -> None:
+    """Objects stages read by hash are missing from the cache, and the remote may hold them:
+    pull fetches them, so it comes before re-running the stages."""
+    suggestions = status.get_suggestions(
+        stale_count=count,
+        modified_count=0,
+        push_count=0,
+        pull_count=0,
+        missing_reads_count=count,
+        remote_configured=True,
+    )
+
+    assert suggestions[0] == expected
+    assert "pivot repro" in suggestions[1]
+
+
+def test_suggestions_missing_read_objects_without_remote_omits_pull() -> None:
+    suggestions = status.get_suggestions(
+        stale_count=1,
+        modified_count=0,
+        push_count=0,
+        pull_count=0,
+        missing_reads_count=1,
+        remote_configured=False,
+    )
+
+    assert len(suggestions) == 1
+    assert "pivot repro" in suggestions[0]
+
+
 def test_suggestions_multiple() -> None:
     """Should generate multiple suggestions when needed."""
     suggestions = status.get_suggestions(

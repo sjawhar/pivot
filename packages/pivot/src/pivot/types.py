@@ -188,6 +188,15 @@ class NoCommitRun(TypedDict):
     reads: NotRequired[list[str]]  # content hashes the run read, sorted, each once
 
 
+class RemoteHashes(TypedDict):
+    """The objects a run's reads fetched from one remote (`reads.Recording.fetched`): its name,
+    its URL as `RemoteStorage.url` gives it, and the hashes, sorted, each once."""
+
+    name: str
+    url: str
+    hashes: list[str]
+
+
 class DeferredWrites(TypedDict, total=False):
     """Deferred StateDB writes from worker for coordinator to apply.
 
@@ -205,6 +214,8 @@ class DeferredWrites(TypedDict, total=False):
     file_hash_entries: list[FileHashEntry]
     no_commit_record: NoCommitRun  # a --no-commit run's keys of its `nocommit:` record
     clear_no_commit_record: bool  # a lock was written: drop the stage's --no-commit record
+    # The objects the run's reads fetched, which the remote index records as `pivot pull` does
+    remote_hashes: list[RemoteHashes]
 
 
 class StageResult(TypedDict):

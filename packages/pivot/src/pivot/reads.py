@@ -14,7 +14,9 @@ read, so the lock says exactly which objects the outputs came from. A stage whos
 object that is not in the cache and not known to be on the remote (``unavailable``, decided from
 local state as for outputs) counts as changed in every skip decision (``skip.check_stage``):
 ``status`` reports it stale and ``repro`` reruns it, where the read fetches the object or fails
-naming it.
+naming it. The objects a run's reads fetch go back to the coordinator with the run's other
+StateDB writes (``DeferredWrites.remote_hashes``), which records them in the remote index, as
+``pivot pull`` records what it downloads, so the cache losing one later does not make it unknown.
 
 The run's recording is process state, not a ``ContextVar``: a stage may read from threads it
 starts (a thread pool, joblib's threading backend), and on Python 3.13 a new thread does not
@@ -47,27 +49,45 @@ if TYPE_CHECKING:
 @final
 class Recording:
     """The objects one stage run reads by hash from the cache at ``cache_dir``, in the process
-    ``pid``: a forked child holds a copy of the recording that no lock ever reads."""
+    ``pid``: a forked child holds a copy of the recording that no lock ever reads. It also keeps
+    the objects its reads fetched, by remote, for the coordinator to record in the remote index
+    as ``pivot pull`` records what it downloads (``StateDB.apply_deferred_writes``)."""
 
     cache_dir: pathlib.Path | None
     pid: int
     _hashes: set[str]
+    _fetched: dict[tuple[str, str], set[str]]
     _lock: threading.Lock
 
     def __init__(self, cache_dir: pathlib.Path | None) -> None:
         self.cache_dir = cache_dir
         self.pid = os.getpid()
         self._hashes = set[str]()
+        self._fetched = dict[tuple[str, str], set[str]]()
         self._lock = threading.Lock()
 
     def add(self, content_hash: str) -> None:
         with self._lock:
             self._hashes.add(content_hash)
 
+    def add_fetched(self, remote_name: str, url: str, content_hash: str) -> None:
+        """Record that a read downloaded ``content_hash`` from remote ``remote_name`` at ``url``."""
+        with self._lock:
+            self._fetched.setdefault((remote_name, url), set[str]()).add(content_hash)
+
     def hashes(self) -> list[str]:
         """Each hash the run read, once, in hash order: what its lock lists under ``reads``."""
         with self._lock:
             return sorted(self._hashes)
+
+    def fetched(self) -> list[types.RemoteHashes]:
+        """The objects the run's reads fetched, per remote: what its ``DeferredWrites`` hand the
+        coordinator under ``remote_hashes``."""
+        with self._lock:
+            return [
+                types.RemoteHashes(name=name, url=url, hashes=sorted(hashes))
+                for (name, url), hashes in sorted(self._fetched.items())
+            ]
 
 
 def _run_async[T](make: Callable[[], Coroutine[object, object, T]]) -> T:
@@ -176,23 +196,24 @@ def read_by_hash(content_hash: str) -> pathlib.Path:
             + "`pivot run`), which records what the stage reads"
         )
     with stage_io.PIVOT_IO:
-        path = _read(current.cache_dir, content_hash)
+        path = _read(current, content_hash)
     current.add(content_hash)
     return path
 
 
-def _read(cache_dir: pathlib.Path | None, content_hash: str) -> pathlib.Path:
+def _read(current: Recording, content_hash: str) -> pathlib.Path:
     if not cache.is_valid_hash(content_hash):
         raise exceptions.ObjectReadError(
             f"{content_hash!r} is not a content hash: expected 16 lowercase hex characters"
         )
+    cache_dir = current.cache_dir
     if cache_dir is None:
         raise exceptions.ObjectReadError(
             f"Object {content_hash} cannot be read: this run has no cache"
         )
     path = cache.resolve_cache_object_path(cache_dir, content_hash)
     if path is None:
-        path = _fetch(cache_dir, content_hash)
+        path = _fetch(current, cache_dir, content_hash)
     actual, _ = cache.hash_file(path)
     if actual != content_hash:
         raise exceptions.ObjectReadError(
@@ -202,9 +223,10 @@ def _read(cache_dir: pathlib.Path | None, content_hash: str) -> pathlib.Path:
     return path
 
 
-def _fetch(cache_dir: pathlib.Path, content_hash: str) -> pathlib.Path:
-    """Download the object at ``content_hash`` from the default remote into the cache; the
-    remote layer checks the bytes before it publishes them (``remote.keys.atomic_download``)."""
+def _fetch(current: Recording, cache_dir: pathlib.Path, content_hash: str) -> pathlib.Path:
+    """Download the object at ``content_hash`` from the default remote into the cache, and
+    record in ``current`` where it came from; the remote layer checks the bytes before it
+    publishes them (``remote.keys.atomic_download``)."""
     remote = _default_remote()
     if isinstance(remote, str):
         raise exceptions.ObjectReadError(f"Object {content_hash} is not in the cache, and {remote}")
@@ -224,6 +246,7 @@ def _fetch(cache_dir: pathlib.Path, content_hash: str) -> pathlib.Path:
             f"Object {content_hash} is not in the cache, and remote '{name}' ({storage.url}) "
             + f"did not give it: {reason}"
         )
+    current.add_fetched(name, storage.url, content_hash)
     return destination
 
 
@@ -257,9 +280,10 @@ def unavailable(hashes: Collection[str], cache_dir: pathlib.Path | None) -> str 
     The check is local, as for a stage's outputs, so plain ``status`` and ``repro`` never wait on
     the network: the cache is looked up first, one ``lstat`` per object, and an object it lacks
     counts as on the remote only when the project's remote index (StateDB ``remote:``, which
-    ``pivot push``, ``pull``, ``fetch`` and ``status --remote`` fill) records it for that
-    remote's URL, as ``pivot push`` counts it. No remote is contacted. ``pivot pull <stage>``
-    fetches the objects a stage's lock records, and a run's read fetches what it needs itself.
+    ``pivot push``, ``pull`` and ``fetch`` fill, and a run with what its reads fetched) records it
+    for that remote's URL, as ``pivot push`` counts it. No remote is contacted.
+    ``pivot pull <stage>`` fetches the objects a stage's lock records, and a run's read fetches
+    what it needs itself. When such objects are the reason, ``pull_fetches`` says so.
     """
     missing = sorted(
         content_hash
@@ -283,10 +307,19 @@ def unavailable(hashes: Collection[str], cache_dir: pathlib.Path | None) -> str 
     absent = [content_hash for content_hash in missing if content_hash not in known]
     if not absent:
         return None
-    return _missing_reason(
-        absent, f"pivot has not seen them on remote '{name}'; `pivot pull` fetches them"
-    )
+    return _missing_reason(absent, f"pivot has not seen them on remote '{name}'; {_PULL_FETCHES}")
+
+
+_MISSING_PREFIX = "Read objects missing from the cache: "
+_PULL_FETCHES = "`pivot pull` fetches them"
 
 
 def _missing_reason(hashes: list[str], why: str) -> str:
-    return f"Read objects missing from the cache: {', '.join(hashes)} ({why})"
+    return f"{_MISSING_PREFIX}{', '.join(hashes)} ({why})"
+
+
+def pull_fetches(reason: str) -> bool:
+    """Whether ``reason``, why a stage must run, is ``unavailable``'s for objects a usable remote
+    may hold but the remote index does not record, which ``pivot pull`` fetches; not its reason
+    when no remote can be used. ``pivot status`` then suggests ``pivot pull``."""
+    return reason.startswith(_MISSING_PREFIX) and reason.endswith(f"; {_PULL_FETCHES})")

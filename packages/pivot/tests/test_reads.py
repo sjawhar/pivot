@@ -17,10 +17,10 @@ import xxhash
 import yaml
 
 import pivot
-from pivot import exceptions, reads
+from pivot import exceptions, explain, reads
 from pivot.remote import keys, protocol
 from pivot.storage import cache, listing, lock, state
-from pivot.types import ArtifactIdentity, FileHash, LockData
+from pivot.types import ArtifactIdentity, FileHash, LockData, RemoteHashes
 
 
 class _MotoS3Client(Protocol):
@@ -92,6 +92,7 @@ def test_a_read_returns_the_cache_object_and_records_its_hash(files_dir: pathlib
 
     assert path.read_bytes() == b"two\n"
     assert recorded.hashes() == sorted([first, second])
+    assert recorded.fetched() == [], "nothing came from a remote"
 
 
 def test_a_read_from_a_thread_the_stage_started_is_recorded(files_dir: pathlib.Path) -> None:
@@ -207,6 +208,40 @@ def test_a_read_fetches_a_missing_object_from_the_remote_into_the_cache(
     assert path == cache.get_cache_path(files_dir, content_hash)
     assert path.read_bytes() == b"snapshot\n"
     assert recorded.hashes() == [content_hash]
+    assert recorded.fetched() == [
+        RemoteHashes(
+            name="origin",
+            url=protocol.open_remote(f"s3://{bucket}/cache").url,
+            hashes=[content_hash],
+        )
+    ], "the coordinator records what a read fetched in the remote index, as `pivot pull` does"
+
+
+def test_a_read_records_each_object_it_fetched_once(
+    files_dir: pathlib.Path,
+    set_project_root: pathlib.Path,
+    moto_services: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An object read twice is fetched once, and one read from the cache is fetched never."""
+    s3, bucket = _helper_remote(set_project_root, moto_services["s3"], monkeypatch)
+    cached = _helper_put(files_dir, b"cached\n")
+    first, second = _helper_hash(b"first\n"), _helper_hash(b"second\n")
+    for content_hash, body in ((first, b"first\n"), (second, b"second\n")):
+        s3.put_object(Bucket=bucket, Key=keys.hash_to_key("cache/", content_hash), Body=body)
+
+    with reads.recording(files_dir) as recorded:
+        for content_hash in (second, cached, first, second):
+            _ = pivot.read_by_hash(content_hash)
+
+    assert recorded.fetched() == [
+        RemoteHashes(
+            name="origin",
+            url=protocol.open_remote(f"s3://{bucket}/cache").url,
+            hashes=sorted([first, second]),
+        )
+    ]
+    assert recorded.hashes() == sorted([cached, first, second])
 
 
 def test_a_remote_object_whose_bytes_do_not_match_its_hash_fails_the_read(
@@ -225,6 +260,7 @@ def test_a_remote_object_whose_bytes_do_not_match_its_hash_fails_the_read(
     ):
         pivot.read_by_hash(content_hash)
     assert recorded.hashes() == []
+    assert recorded.fetched() == [], "a download that failed puts nothing in the remote index"
     assert not cache.get_cache_path(files_dir, content_hash).exists()
 
 
@@ -326,6 +362,22 @@ def test_an_index_entry_for_another_url_of_the_remote_does_not_count(
     _helper_index(set_project_root, "s3://elsewhere/cache/", content_hash)
 
     assert reads.unavailable([content_hash], files_dir) is not None
+
+
+def test_pull_fetches_objects_the_remote_index_lacks_but_not_with_no_remote(
+    files_dir: pathlib.Path, set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`pivot status` suggests `pivot pull` for a stage whose only reason to run is objects a
+    remote may hold: not when no remote can be used, and not for another reason."""
+    content_hash = _helper_hash(b"snapshot\n")
+    no_remote = reads.unavailable([content_hash], files_dir)
+    _ = _helper_unreachable_remote(set_project_root, monkeypatch)
+    unseen = reads.unavailable([content_hash], files_dir)
+
+    assert unseen is not None and reads.pull_fetches(unseen), unseen
+    assert no_remote is not None and not reads.pull_fetches(no_remote), no_remote
+    assert not reads.pull_fetches(explain.OUTPUTS_MISSING_REASON)
+    assert not reads.pull_fetches("Input dependencies changed")
 
 
 # =============================================================================

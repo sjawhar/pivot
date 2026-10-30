@@ -187,12 +187,14 @@ with Pipeline("plan") as pipeline:
 - **A recorded object that is not at hand.** `pivot status` and `pivot repro`
   decide from local state, as they do for outputs, and contact no remote: an
   object the lock records counts as available when it is in the cache, or when
-  the remote index (filled by `pivot push`, `pull`, `fetch` and `status --remote`)
-  records it on the default remote. Otherwise `pivot status` reports the stage
-  stale, naming the objects and why, and `pivot repro` runs it: its read fetches
-  the object from the remote, or fails naming it when the remote lacks it too.
-  An object the index records is not checked again, so its later loss from the
-  remote is found by the next read, not by `pivot status`.
+  the remote index (filled by `pivot push`, `pull` and `fetch`, and by a run
+  whose read fetched the object) records it on the default remote. Otherwise
+  `pivot status` reports the stage stale, naming the objects and why, and
+  suggests `pivot pull`, which fetches them, when a remote is configured;
+  `pivot repro` runs the stage: its read fetches the object from the remote, or
+  fails naming it when the remote lacks it too. An object the index records is
+  not checked again, so its later loss from the remote is found by the next
+  read, not by `pivot status`.
 - **Pulling.** `pivot pull <stage>` fetches the objects its lock records under
   `reads`, as it fetches the stage's dependencies, so the stage can run again in
   the clone.
