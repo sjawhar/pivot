@@ -919,6 +919,69 @@ async def test_sink_prints_one_line_when_a_template_expands(
     assert "[2–4/4] ○ 3 cached" in report, report
 
 
+@pytest.mark.parametrize("sink_type", [sinks.StaticConsoleSink, sinks.LiveConsoleSink])
+async def test_sink_prints_a_failed_template_where_it_failed(
+    sink_type: type[sinks.StaticConsoleSink] | type[sinks.LiveConsoleSink],
+) -> None:
+    """A template (``Pipeline.map``) counts in no total, so its completion carries index 0. A
+    template that fails once its producer has run prints after the producer's line, and before
+    the line of a stage that finished after it."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=200)
+    sink = sink_type(console=console)
+    failed = StageCompleted(
+        type="stage_completed",
+        seq=2,
+        stage="demo/cut",
+        status=StageStatus.FAILED,
+        reason="Unknown stage(s): demo/cut@zzz",
+        duration_ms=0.0,
+        index=0,
+        total=2,
+        run_id="run-1",
+        input_hash=None,
+    )
+
+    await sink.handle(_helper_engine_state(EngineState.ACTIVE))
+    await sink.handle(_helper_completed("demo/plan", index=1, total=2, run_id="run-1"))
+    await sink.handle(failed)
+    await sink.handle(_helper_completed("demo/static", index=2, total=2, run_id="run-1"))
+    await sink.handle(_helper_engine_state(EngineState.IDLE))
+    report = output.getvalue()
+
+    assert report.index("demo/plan") < report.index("demo/cut") < report.index("demo/static"), (
+        report
+    )
+
+
+async def test_static_sink_counts_a_blocked_template_in_a_group_of_blocked_stages() -> None:
+    """A template blocked after a blocked stage collapses into one line with it, its index 0
+    starting the range as a template's always has."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=200)
+    sink = sinks.StaticConsoleSink(console=console)
+
+    await sink.handle(_helper_engine_state(EngineState.ACTIVE))
+    for stage, index in (("demo/static", 3), ("demo/cut", 0)):
+        await sink.handle(
+            StageCompleted(
+                type="stage_completed",
+                seq=index,
+                stage=stage,
+                status=StageStatus.BLOCKED,
+                reason="upstream 'demo/config' failed",
+                duration_ms=0.0,
+                index=index,
+                total=3,
+                run_id="run-1",
+                input_hash=None,
+            )
+        )
+    await sink.handle(_helper_engine_state(EngineState.IDLE))
+
+    assert "[0–3/3] ○ 2 blocked" in output.getvalue(), output.getvalue()
+
+
 # =============================================================================
 # LiveConsoleSink Tests
 # =============================================================================

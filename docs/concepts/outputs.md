@@ -425,7 +425,9 @@ key's chain only, and a new file runs the producer and the new chain only.
   Until then a mapped stage is *not yet expanded*: `pivot status` shows it
   (`not_expanded` in `--json`) with what it waits for, `pivot list` lists it under
   "Mapped stages, not yet expanded" (`templates` in `--json`), and `pivot dag`
-  labels its node. `checkout`, `push`, `pull` and `params` refuse a target naming
+  labels its node. `params show` and `params diff` without targets list each such
+  mapped stage that takes parameters under the same heading (on stderr beside
+  `--json`). `checkout`, `push`, `pull` and `params` refuse a target naming
   it, and `verify` fails it. `pull` first fetches the listing of a current
   producer that the clone lacks, then expands. `pivot commit` commits the
   producer first, then expands and commits each stale instance, or the instances

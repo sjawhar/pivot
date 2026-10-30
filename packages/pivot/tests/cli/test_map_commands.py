@@ -254,6 +254,82 @@ def test_params_show_takes_a_mapped_stage_once_it_expands(tmp_path: pathlib.Path
     assert json.loads(_stdout(shown)) == {}, "p/cut declares no params"
 
 
+_PARAMS_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, StageParams, directory, loaders, stage
+
+
+class CutParams(StageParams):
+    factor: int = 2
+
+
+@stage
+def plan(
+    entries: dict[str, int],
+) -> Annotated[dict[str, dict[str, int]], directory, loaders.YAML[dict[str, int]]()]:
+    return {f"{name}.yaml": {"value": value} for name, value in entries.items()}
+
+
+@stage
+def cut(entry: dict[str, int], params: CutParams) -> dict[str, int]:
+    return {"cut": entry["value"] * params.factor}
+
+
+@stage
+def build(cut: dict[str, int]) -> dict[str, int]:
+    return {"built": cut["cut"] + 1000}
+
+
+with Pipeline("p") as pipeline:
+    planned = plan(pipeline.input("plan.yaml", t=dict[str, int]))
+    build(cut(pipeline.map(planned), params=CutParams()))
+"""
+
+
+def test_params_without_targets_name_the_mapped_stages_not_yet_expanded(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Before the producer has run, the parameters of `p/cut`'s instances cannot be read: `params
+    show` and `params diff` say so in place of finding no parameters, beside `--json` on stderr.
+    `p/build` takes no parameters, so it hides none."""
+    root, home = _project(tmp_path, {"a": 1, "b": 2})
+    (root / "pipeline.py").write_text(_PARAMS_PIPELINE)
+    note = "Mapped stages, not yet expanded (1):\n  p/cut\n    waits for 'p/plan'"
+
+    shown = _ok(helpers.run_pivot(root, home, "params", "show"))
+    as_json = helpers.run_pivot(root, home, "params", "show", "--json")
+    diffed = _ok(helpers.run_pivot(root, home, "params", "diff"))
+    _ok(helpers.run_pivot(root, home, "repro"))
+    expanded = _ok(helpers.run_pivot(root, home, "params", "show"))
+
+    for output in (shown, diffed):
+        assert note in output, output
+        assert "No parameter" not in output, output
+        assert "p/build" not in output, output
+    assert json.loads(_stdout(as_json)) == {}, as_json.stdout
+    assert note in as_json.stderr, as_json.stderr
+    assert "p/cut@a" in expanded and "p/cut@b" in expanded, expanded
+    assert "not yet expanded" not in expanded, expanded
+
+
+def test_a_key_found_missing_after_the_producer_ran_prints_after_the_producer(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The run fails `p/cut` only once `p/plan` has run and written no file for the key, so the
+    report prints `p/plan`'s line first."""
+    root, home = _project(tmp_path, {"a": 1})
+
+    failed = helpers.run_pivot(root, home, "repro", "p/cut@zzz")
+
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    lines = failed.stdout.splitlines()
+    plan = [number for number, line in enumerate(lines) if "p/plan" in line and "done" in line]
+    cut = [number for number, line in enumerate(lines) if "p/cut" in line and "FAILED" in line]
+    assert len(plan) == 1 and len(cut) == 1, failed.stdout
+    assert plan[0] < cut[0], failed.stdout
+
+
 # =============================================================================
 # Outputs: checkout, verify, push and pull
 # =============================================================================

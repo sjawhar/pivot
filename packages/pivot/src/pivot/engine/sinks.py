@@ -128,6 +128,19 @@ class _StageWarnings:
     dropped: int = 0
 
 
+def _report_order(events: list[StageCompleted]) -> list[StageCompleted]:
+    """``events``, given in arrival order, sorted by index. A template (``Pipeline.map``) counts
+    in no total, so its index is 0; its line goes where it finished, after every stage that
+    finished before it, so a mapped stage that fails once its producer has run prints after the
+    producer."""
+    positions = list[int]()
+    latest = 0
+    for event in events:
+        latest = max(latest, event["index"])
+        positions.append(event["index"] or latest)
+    return [events[i] for i in sorted(range(len(events)), key=positions.__getitem__)]
+
+
 def _print_completions(
     console: rich.console.Console,
     events: list[StageCompleted],
@@ -137,7 +150,7 @@ def _print_completions(
     stage_logs: dict[str, list[str]] | None = None,
     stage_warnings: dict[str, _StageWarnings] | None = None,
 ) -> None:
-    """Print buffered completions sorted by index with skip collapsing.
+    """Print buffered completions in index order (``_report_order``) with skip collapsing.
 
     A failed stage shows its captured output; any other stage shows the ``WARNING:``
     lines in ``stage_warnings`` (pass None when those already streamed).
@@ -145,7 +158,7 @@ def _print_completions(
     if not events:
         return
 
-    sorted_events = sorted(events, key=lambda e: e["index"])
+    sorted_events = _report_order(events)
     logs = stage_logs or {}
     warnings_by_stage = stage_warnings or {}
 
@@ -162,9 +175,11 @@ def _print_completions(
                 j += 1
 
             if len(same_cat_group) >= 2:
+                # A template's index 0 can follow a stage's, so the range spans both ends
+                indices = [skipped["index"] for skipped in same_cat_group]
                 line = _format_skip_group_line(
-                    start_index=same_cat_group[0]["index"],
-                    end_index=same_cat_group[-1]["index"],
+                    start_index=min(indices),
+                    end_index=max(indices),
                     total=total,
                     count=len(same_cat_group),
                     category=category,

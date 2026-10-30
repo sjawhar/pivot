@@ -186,7 +186,8 @@ class _MapRun:
 
     templates: set[str]
     # Each source directory's (key, file key) pairs, read once per run so chained templates
-    # expand over the same keys
+    # expand over the same keys; the engine's own record, kept after the run
+    # (``Engine.expansion_keys``)
     keys: dict[types.ArtifactIdentity, list[tuple[str, str]]]
     # The keys a template expands when the run's targets name instances (``_mapped_targets``),
     # each with the targets that need it; a template it does not hold expands every key
@@ -554,6 +555,9 @@ class Engine:
     _reload_done: anyio.Event
     # The running run's templates, or None when it has none
     _map_run: _MapRun | None
+    # Each source directory's (key, file key) pairs that the running or latest run read to
+    # expand its templates (Pipeline.map); emptied when a run starts
+    _expansion_keys: dict[types.ArtifactIdentity, list[tuple[str, str]]]
 
     def __init__(
         self, *, pipeline: registry.PipelineLike | None = None, all_pipelines: bool = False
@@ -620,6 +624,7 @@ class Engine:
         self._reload_done = anyio.Event()
         self._reload_done.set()
         self._map_run = None
+        self._expansion_keys = dict[types.ArtifactIdentity, list[tuple[str, str]]]()
 
     @property
     def state(self) -> EngineState:
@@ -640,6 +645,14 @@ class Engine:
     def is_reloading(self) -> bool:
         """Whether a code reload is in flight: import, fingerprints, then the re-run's start."""
         return not self._reload_done.is_set()
+
+    def expansion_keys(self, template: str) -> frozenset[str] | None:
+        """The keys of the files of template ``template``'s source directory (``Pipeline.map``)
+        that the running or latest run read to expand it, which name each instance it can have;
+        None when no run has read them since that run started."""
+        source = self._require_pipeline().get_template(template)["source"]
+        keys = self._expansion_keys.get(source)
+        return None if keys is None else frozenset(key for key, _ in keys)
 
     @property
     def sources(self) -> list[EventSource]:
@@ -1376,9 +1389,11 @@ class Engine:
         pipeline = self._pipeline
         if pipeline is None:
             raise pivot_exceptions.PipelineNotFoundError("No active pipeline registered.")
-        # Each run expands its templates afresh (Pipeline.map): no expansion is kept from a run
-        # to the next, so the stages are the pipeline's own until a producer is current.
+        # Each run expands its templates afresh (Pipeline.map): no expansion, and no key a run
+        # read, is kept from a run to the next, so the stages are the pipeline's own until a
+        # producer is current.
         pipeline.reset_expansions()
+        self._expansion_keys.clear()
         all_stages = self._get_all_stages()
         templates = {name: pipeline.get_template(name) for name in pipeline.list_templates()}
         # A target naming an instance (a watch run's affected stage, or a name the user gave) is
@@ -1572,7 +1587,7 @@ class Engine:
         self._map_run = (
             _MapRun(
                 templates=set(run_templates),
-                keys={},
+                keys=self._expansion_keys,
                 wanted=wanted,
                 stage_order=stage_order,
                 all_stages=all_stages,

@@ -244,17 +244,6 @@ def _validate_stages_param(raw: object) -> list[str] | None | str:
     return cast("list[str]", raw)
 
 
-def _not_expanded_reason(pipeline: registry_mod.PipelineLike, stage: str) -> str | None:
-    """What ``stage`` waits for when it names a template (``Pipeline.map``) or an instance of
-    one that this pipeline has not expanded into; None when it names neither."""
-    templates = pipeline.list_templates()
-    template = stage if stage in templates else registry_mod.template_of(stage, templates)
-    if template is None:
-        return None
-    producer = pipeline.get_template(template)["source"].producer
-    return f"'{template}' adds its instances when a run finds '{producer}' current"
-
-
 def _not_expanded_explanation(stage: str, why: str) -> StageExplanation:
     """The explanation of a template or instance not yet expanded, as ``pivot status`` gives it:
     a run would expand it, then run its instances."""
@@ -409,22 +398,45 @@ class AgentRpcHandler:
             raise ValueError("No pipeline loaded")
         return stage, pipeline
 
+    def _not_expanded_reason(self, pipeline: registry_mod.PipelineLike, stage: str) -> str:
+        """What ``stage`` waits for, naming no registered stage: a template (``Pipeline.map``)
+        not expanded, or an instance its template has not added.
+
+        Raises:
+            ValueError: ``stage`` names no stage, template or instance. An instance whose key
+                no file has, of those the run read to expand its template
+                (``Engine.expansion_keys``), is refused as ``pivot status`` refuses its name.
+        """
+        templates = pipeline.list_templates()
+        template = stage if stage in templates else registry_mod.template_of(stage, templates)
+        if template is None:
+            raise ValueError(f"Unknown stage: {stage}")
+        if template != stage:
+            keys = self._engine.expansion_keys(template)
+            if keys is not None and stage[len(template) + 1 :] not in keys:
+                unknown = exceptions.StageNotFoundError(
+                    [stage], available_stages=[*pipeline.list_stages(), *templates]
+                )
+                raise ValueError(unknown.format_user_message())
+            if pipeline.instances_of(template):
+                return f"'{template}' added only the instances its run's targets name"
+        producer = pipeline.get_template(template)["source"].producer
+        return f"'{template}' adds its instances when a run finds '{producer}' current"
+
     def _get_stage_info(self, params: dict[str, object]) -> tuple[str, RegistryStageInfo]:
         """Extract and validate stage param, return (stage_name, reg_info). A template
         (``Pipeline.map``) gives the stage as declared, reading its producer's whole directory.
 
         Raises:
             ValueError: The param names no stage or template, or an instance its template has
-                not expanded into (``_not_expanded_reason``).
+                not added (``_not_expanded_reason``).
         """
         stage, pipeline = self._stage_param(params)
         with contextlib.suppress(KeyError):
             return stage, pipeline.get_stage(stage)
         if stage in pipeline.list_templates():
             return stage, pipeline.get_template(stage)["info"]
-        why = _not_expanded_reason(pipeline, stage)
-        if why is None:
-            raise ValueError(f"Unknown stage: {stage}")
+        why = self._not_expanded_reason(pipeline, stage)
         raise ValueError(f"'{stage}' is not yet expanded: {why}")
 
     async def handle_query(
@@ -467,7 +479,7 @@ class AgentRpcHandler:
                 await self._engine.wait_for_fingerprints()
                 stage, pipeline = self._stage_param(params)
                 # A template (Pipeline.map) is explained by the instances it expanded into; one
-                # not expanded, or an instance of one, by what its expansion waits for
+                # not expanded, or an instance its template has not added, by what it waits for
                 stages = list[str]()
                 with contextlib.suppress(KeyError):
                     _ = pipeline.get_stage(stage)
@@ -475,10 +487,9 @@ class AgentRpcHandler:
                 if not stages and stage in pipeline.list_templates():
                     stages = pipeline.instances_of(stage)
                 if not stages:
-                    why = _not_expanded_reason(pipeline, stage)
-                    if why is None:
-                        raise ValueError(f"Unknown stage: {stage}")
-                    return _not_expanded_explanation(stage, why)
+                    return _not_expanded_explanation(
+                        stage, self._not_expanded_reason(pipeline, stage)
+                    )
                 fingerprints = {name: pipeline.ensure_fingerprint(name) for name in stages}
 
                 def _get_explanation() -> StageExplanation:
