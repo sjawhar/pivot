@@ -744,6 +744,39 @@ def test_the_first_commit_into_a_new_cache_takes_the_naming_lock(tmp_path: pathl
     assert naming.exists() and turnstile.exists(), "the first commit took no naming lock"
 
 
+_METRIC_ONLY_PIPELINE = """\
+from typing import Annotated
+
+from pivot.compose import Pipeline, metric, stage
+
+
+@stage
+def score(text: str) -> Annotated[dict[str, float], metric]:
+    return {"length": float(len(text))}
+
+
+with Pipeline("shadow") as pipeline:
+    score(pipeline.input("input.txt", t=str))
+"""
+
+
+def test_a_first_commit_that_publishes_nothing_still_takes_the_naming_lock(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A metric is not cached, so a project whose only output is one publishes nothing before
+    its first commit, and no run-cache lookup takes a unit in a cold run. The commit's unit must
+    still create the cache root and take the lock there, not refuse or run unlocked."""
+    root = _project(tmp_path / "project")
+    (root / "pipeline.py").write_text(_METRIC_ONLY_PIPELINE)
+    cache_dir = root / ".pivot" / "cache"
+    assert not cache_dir.exists()
+
+    _ok(_run(root, "repro"))
+
+    turnstile, naming_lock = _naming_paths(cache_dir)
+    assert naming_lock.exists() and turnstile.exists(), "the first commit took no naming lock"
+
+
 def test_a_command_refuses_when_it_cannot_register(tmp_path: pathlib.Path) -> None:
     """A writer cannot name objects when its register entry cannot be written."""
     root = _project(tmp_path / "project")
