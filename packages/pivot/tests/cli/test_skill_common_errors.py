@@ -198,6 +198,23 @@ _CASES = {
         files={"pipeline.py": _MAP_PIPELINE},
         args=("run", "demo/cut"),
     ),
+    "map-instance-name-taken": _Case(
+        doc="`has the name of an instance of mapped stage '<stage>'`",
+        observed="'demo/cut@a' has the name of an instance of mapped stage 'demo/cut'",
+        files={
+            "pipeline.py": "from typing import Annotated\n\n"
+            + "from pivot import Pipeline, directory, loaders, stage\n\n\n"
+            + "@stage\ndef plan(raw: str) -> "
+            + "Annotated[dict[str, dict], directory, loaders.YAML[dict]()]:\n"
+            + '    return {"a.yaml": {"v": 1}}\n\n\n'
+            + "@stage\ndef cut(entry: dict) -> dict:\n    return entry\n\n\n"
+            + 'with Pipeline("demo") as pipeline:\n'
+            + '    planned = plan(pipeline.input("t.csv", t=str))\n'
+            + "    cut(pipeline.map(planned))\n"
+            + '    with pipeline.variant("a"):\n'
+            + '        cut(planned["a.yaml"])\n'
+        },
+    ),
     "directory-file-without-extension": _Case(
         doc="`depends on file 'x' of stage '<stage>': key must include file extension`",
         observed="depends on file 'train' of stage 'demo/split': key must include file extension",

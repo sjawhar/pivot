@@ -8,7 +8,7 @@ run a real pipeline in a temporary project, then expand as a command would.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Annotated, NoReturn
+from typing import TYPE_CHECKING, Annotated, NoReturn, TypedDict
 
 import pytest
 import yaml
@@ -37,6 +37,18 @@ def _stage_cut(entry: dict[str, int], params: _CutParams) -> dict[str, int]:
 
 def _stage_build(cut: dict[str, int]) -> dict[str, int]:
     return {"built": cut["cut"] + 1000}
+
+
+class _Fields(TypedDict):
+    _stage_y: dict[str, int]
+
+
+def _stage_fields(entry: dict[str, int]) -> _Fields:
+    return {"_stage_y": entry}
+
+
+def _stage_y() -> dict[str, int]:
+    return {"value": 0}
 
 
 def _write_plan(root: pathlib.Path, plan: dict[str, int]) -> None:
@@ -225,22 +237,27 @@ def test_a_refused_key_reads_the_same_in_a_command_and_in_a_run(
 def test_a_refused_expansion_leaves_its_template_and_its_chain_not_expanded(
     set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Instance `p/_stage_fields@b`'s field `_stage_y` and pipeline `p/_stage_fields@b`'s stage
+    `_stage_y` would both write `data/p/_stage_fields@b/_stage_y.yaml`."""
     root = set_project_root
     monkeypatch.chdir(root)
     _write_plan(root, {"a": 1, "b": 2})
-    with compose.Pipeline("p", root=root) as pipeline:
-        plan = compose.stage(_stage_plan)(pipeline.input("plan.yaml", t=dict[str, int]))
-        cut = compose.stage(_stage_cut)(pipeline.map(plan), params=_CutParams())
-        compose.stage(_stage_build)(cut)
-        with pipeline.variant("b"):
-            compose.stage(_stage_cut)(plan["b.yaml"], params=_CutParams())
+    with compose.Pipeline("p", root=root) as mapped:
+        plan = compose.stage(_stage_plan)(mapped.input("plan.yaml", t=dict[str, int]))
+        fields = compose.stage(_stage_fields)(mapped.map(plan))
+        compose.stage(_stage_build)(fields["_stage_y"])
+    with compose.Pipeline("p/_stage_fields@b", root=root) as static:
+        compose.stage(_stage_y)()
+    pipeline = compose.Pipeline("all", root=root)
+    pipeline.include(mapped)
+    pipeline.include(static)
     executor.run(pipeline=pipeline, stages=["p/_stage_plan"])
 
     result, _ = status.expand_current(pipeline)
 
-    assert "'p/_stage_cut@b' already registered" in result["not_expanded"]["p/_stage_cut"]
+    assert "both write" in result["not_expanded"]["p/_stage_fields"]
     assert "p/_stage_build" in result["not_expanded"]
-    assert sorted(pipeline.list_stages()) == ["p/_stage_cut@b", "p/_stage_plan"]
+    assert sorted(pipeline.list_stages()) == ["p/_stage_fields@b/_stage_y", "p/_stage_plan"]
 
 
 def test_a_pipeline_without_templates_reads_nothing(

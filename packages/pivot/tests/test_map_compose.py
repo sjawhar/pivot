@@ -240,6 +240,88 @@ def test_a_stage_mapped_over_two_directories_is_refused(tmp_path: pathlib.Path) 
         _helper_cut_with(pipeline.map(first), pipeline.map(second))
 
 
+def _helper_variant_after(pipeline: compose.Pipeline) -> None:
+    plan = _helper_plan(_plan_input(pipeline))
+    _helper_cut(pipeline.map(plan))
+    with pipeline.variant("a"):
+        _helper_cut(plan["a.yaml"])
+
+
+def _helper_variant_before(pipeline: compose.Pipeline) -> None:
+    plan = _helper_plan(_plan_input(pipeline))
+    with pipeline.variant("a"):
+        _helper_cut(plan["a.yaml"])
+    _helper_cut(pipeline.map(plan))
+
+
+def _helper_second_call(pipeline: compose.Pipeline) -> None:
+    plan = _helper_plan(_plan_input(pipeline))
+    _helper_cut(pipeline.map(plan))
+    _helper_cut(plan["a.yaml"])
+
+
+def _helper_mapped_in_a_variant(pipeline: compose.Pipeline) -> None:
+    plan = _helper_plan(_plan_input(pipeline))
+    _helper_cut(pipeline.map(plan))
+    with pipeline.variant("a"):
+        _helper_cut(pipeline.map(plan))
+
+
+@pytest.mark.parametrize(
+    ("build", "name"),
+    [
+        pytest.param(_helper_variant_after, "p/_helper_cut@a", id="a-variant-after"),
+        pytest.param(_helper_variant_before, "p/_helper_cut@a", id="a-variant-before"),
+        pytest.param(_helper_second_call, "p/_helper_cut@1", id="a-second-call"),
+        pytest.param(_helper_mapped_in_a_variant, "p/_helper_cut@a", id="a-mapped-variant"),
+    ],
+)
+def test_a_stage_named_as_an_instance_of_a_mapped_stage_is_refused(
+    tmp_path: pathlib.Path, build: Callable[[compose.Pipeline], None], name: str
+) -> None:
+    """Beside the mapped `p/_helper_cut`, a stage `p/_helper_cut@<key>` (a variant, a second
+    call, or a mapped stage in a variant) would share its name with an instance: a target, a
+    lock and a params.yaml key could each mean either. The load refuses it, naming both."""
+    with (
+        pytest.raises(exceptions.ValidationError) as refused,
+        compose.Pipeline("p", root=tmp_path) as pipeline,
+    ):
+        build(pipeline)
+
+    assert str(refused.value) == (
+        f"'{name}' has the name of an instance of mapped stage 'p/_helper_cut' "
+        + "('p/_helper_cut@<key>'): call one of them inside a pipeline.variant(...) block"
+    )
+
+
+def test_an_included_stage_named_as_an_instance_of_a_mapped_stage_is_refused(
+    tmp_path: pathlib.Path,
+) -> None:
+    with compose.Pipeline("p", root=tmp_path) as mapped:
+        plan = _helper_plan(_plan_input(mapped))
+        _helper_cut(mapped.map(plan))
+    with compose.Pipeline("p", root=tmp_path) as static, static.variant("a"):
+        _helper_cut(_helper_value())
+    combined = compose.Pipeline("all", root=tmp_path)
+    combined.include(mapped)
+
+    with pytest.raises(exceptions.ValidationError, match="'p/_helper_cut@a' has the name of an"):
+        combined.include(static)
+
+    assert "p/_helper_cut@a" not in combined.list_stages()
+
+
+def test_variants_of_a_mapped_stage_beside_each_other_load(tmp_path: pathlib.Path) -> None:
+    """Neither `p/_helper_cut@a` nor `p/_helper_cut@b` is the other's instance."""
+    with compose.Pipeline("p", root=tmp_path) as pipeline:
+        plan = _helper_plan(_plan_input(pipeline))
+        for variant in ("a", "b"):
+            with pipeline.variant(variant):
+                _helper_cut(pipeline.map(plan))
+
+    assert pipeline.list_templates() == ["p/_helper_cut@a", "p/_helper_cut@b"]
+
+
 def _helper_select_item(entry: compose.ArtifactHandle) -> object:
     return entry["x.yaml"]
 

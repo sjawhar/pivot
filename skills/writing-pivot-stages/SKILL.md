@@ -263,6 +263,7 @@ with Pipeline("p") as pipeline:
 - `pivot repro p/plan` expands nothing; `pivot repro p/cut` runs `p/plan` and every `p/cut@<key>`; `pivot repro p/build@a` runs `p/plan`, `p/cut@a` and `p/build@a` only (with `--force`, no other instance is forced), and a key `p/plan` has no file for is refused; `pivot run p/cut` is refused. `pivot status`, `list`, `dag`, `checkout`, `verify`, `push`, `pull`, `commit` and `params show` show the instances when the producer is current, and the mapped stage as "not yet expanded" otherwise.
 - `params.yaml`: `p/cut` applies to every instance, `p/cut@a` to one, even before a run added it.
 - No stage can take every instance's output (no fan-in over a map), and one stage cannot be mapped over two directories.
+- An instance's name belongs to its mapped stage: beside a mapped `p/cut`, a variant `p/cut@a`, a second call (`p/cut@1`) or a mapped call in a variant is refused when the pipeline loads. Call one of them inside a `pipeline.variant(...)` block (`p/cut@small` and `p/cut@big` can both be mapped).
 
 ## Several modules and pipelines
 
@@ -360,6 +361,7 @@ Commit `pipeline.py`, `data/raw/` inputs you own, and `.pivot/stages/` (lock and
 | `pipeline.map() needs a directory output` | Map a stage's `directory` output, or a directory field (`out.parts`) |
 | `cannot expand over the files of '<stage>'` (a run, or "not yet expanded" in `pivot status`) | Rename the producer's files so each key (path without extension) is a valid variant name and unique |
 | `'<stage>' is mapped over the files of '<producer>'` | Use `pivot repro <stage>`; `pivot run` cannot expand a mapped stage |
+| `has the name of an instance of mapped stage '<stage>'` | Call the mapped stage, or the stage beside it, inside a `pipeline.variant(...)` block |
 | `is tagged directory but its type is <type>` | A `directory` output's type is `dict[str, T]`, from file path to value |
 | `whose loader <loader> cannot read it back` | Give that output a full `Loader`, or stop passing its handle to a stage |
 | `depends on file 'x' of stage '<stage>': key must include file extension` | Index a directory handle by the file's path as the producer writes it, extension included: `parts["train.jsonl"]` |

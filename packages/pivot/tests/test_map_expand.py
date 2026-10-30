@@ -164,14 +164,14 @@ def test_reset_expansions_removes_every_instance_and_frees_its_paths(
     assert pipeline.expand_template("p/_helper_cut", [("a", "a.yaml")]) == ["p/_helper_cut@a"]
 
 
-def test_an_instance_named_like_a_static_stage_is_refused_and_nothing_is_added(
+def test_an_instance_named_like_a_registered_stage_is_refused_and_nothing_is_added(
     tmp_path: pathlib.Path,
 ) -> None:
-    with compose.Pipeline("p", root=tmp_path) as pipeline:
-        plan = _helper_plan(_plan_input(pipeline))
-        _helper_cut(pipeline.map(plan))
-        with pipeline.variant("b"):
-            _helper_cut(plan["b.yaml"])
+    """The load refuses a stage named as an instance would be (``test_map_compose``), so the
+    name an expansion finds taken is an instance's: expanding keys a template already added is
+    refused whole."""
+    pipeline = _chain(tmp_path)
+    pipeline.expand_template("p/_helper_cut", [("b", "b.yaml")])
 
     with pytest.raises(exceptions.ValidationError, match="'p/_helper_cut@b' already registered"):
         pipeline.expand_template("p/_helper_cut", _PAIRS)

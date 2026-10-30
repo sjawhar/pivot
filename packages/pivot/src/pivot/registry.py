@@ -112,11 +112,20 @@ class StageRegistry:
             stage_info: Complete stage info to add.
 
         Raises:
-            ValidationError: If stage name already exists.
+            ValidationError: If stage name already exists, or is the name an instance of a
+                template would have (``<template>@<key>``).
             OutputPathConflictError: If an output's workspace path equals, contains, or lies
                 inside the path of an output already registered. Each worker resolves paths
                 in its own store, so this is the only place that sees every output at once.
         """
+        name = stage_info["name"]
+        template = template_of(name, self._templates)
+        if template is not None:
+            raise exceptions.ValidationError(_instance_name_error(name, template))
+        self._add(stage_info)
+
+    def _add(self, stage_info: RegistryStageInfo) -> None:
+        """``add_existing`` for a stage that may be a template's instance (``expand``)."""
         name = stage_info["name"]
         if name in self._stages or name in self._templates:
             raise exceptions.ValidationError(f"Stage '{name}' already registered")
@@ -183,11 +192,22 @@ class StageRegistry:
         each instance's paths are checked when it is added (``expand``).
 
         Raises:
-            ValidationError: If a stage or template already has its name.
+            ValidationError: If a stage or template already has its name, a stage or template
+                has the name of one of its instances, or it has the name of an instance of
+                another template.
         """
         name = template["info"]["name"]
         if name in self._stages or name in self._templates:
             raise exceptions.ValidationError(f"Stage '{name}' already registered")
+        owner = template_of(name, self._templates)
+        if owner is not None:
+            raise exceptions.ValidationError(_instance_name_error(name, owner))
+        taken = next(
+            (other for other in (*self._stages, *self._templates) if template_of(other, [name])),
+            None,
+        )
+        if taken is not None:
+            raise exceptions.ValidationError(_instance_name_error(taken, name))
         self._templates[name] = template
         self._cached_dag = None
 
@@ -228,7 +248,7 @@ class StageRegistry:
                         f"Mapped stage '{name}' cannot name its instance for file {file_key!r} "
                         + f"of '{types.identity_key(template['source'])}': {reason}"
                     )
-                self.add_existing(info)
+                self._add(info)
                 added.append(info["name"])
         except exceptions.PivotError:
             for stage_name in added:
@@ -393,6 +413,15 @@ def template_of(stage_name: str, templates: Iterable[str]) -> str | None:
         ):
             return template
     return None
+
+
+def _instance_name_error(name: str, template: str) -> str:
+    """Why stage or template ``name`` cannot load beside template ``template``: it has the name
+    of one of its instances, so a target, a lock and a ``params.yaml`` key could mean either."""
+    return (
+        f"'{name}' has the name of an instance of mapped stage '{template}' "
+        + f"('{template}@<key>'): call one of them inside a pipeline.variant(...) block"
+    )
 
 
 def instantiate(template: MapTemplate, key: str, file_key: str) -> RegistryStageInfo:

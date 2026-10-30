@@ -82,7 +82,7 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    from collections.abc import Callable, Iterator
+    from collections.abc import AsyncIterator, Callable, Collection, Iterator
 
     import networkx as nx
     from anyio.abc import TaskGroup
@@ -203,6 +203,9 @@ class _MapRun:
     force: bool
     no_commit: bool
     allow_uncached_incremental: bool
+    # Whether the run starts no stage after its first failure, a template's included
+    # (``OnError.FAIL``)
+    fail_fast: bool
 
 
 def _file_identity(path: pathlib.Path) -> tuple[int, int, int] | None:
@@ -331,6 +334,14 @@ def _refuse_single_stage_templates(
     for name in stages:
         if name in templates:
             raise expansion.single_stage_refusal(name, templates[name])
+
+
+def _run_target(stage: str, templates: Collection[str]) -> str:
+    """The name a run schedules for target ``stage``: an instance (``<template>@<key>``) is
+    reached through its template (``_mapped_targets``); any other target is itself."""
+    if stage in templates:
+        return stage
+    return registry.template_of(stage, templates) or stage
 
 
 def _mapped_targets(
@@ -469,11 +480,31 @@ def _incremental_refusal(
 
 
 def _first_failed(results: dict[str, executor_core.ExecutionSummary]) -> str:
-    """The first stage of ``results`` that failed, the upstream a blocked stage reports."""
+    """The first stage of ``results`` that failed."""
     return next(
         (name for name, result in results.items() if result["status"] == StageStatus.FAILED),
         "unknown",
     )
+
+
+def _failed_upstream(
+    graph: nx.DiGraph[str] | None, stage: str, results: dict[str, executor_core.ExecutionSummary]
+) -> str | None:
+    """The failure a blocked ``stage`` reports: the nearest stage above it in bipartite graph
+    ``graph`` that failed in ``results``; None when none did (a stage fail-fast blocked)."""
+    if graph is None:
+        return None
+    seen = {stage}
+    pending = collections.deque([stage])
+    while pending:
+        for name in engine_graph.get_upstream_stages(graph, pending.popleft()):
+            if name in seen:
+                continue
+            if name in results and results[name]["status"] == StageStatus.FAILED:
+                return name
+            seen.add(name)
+            pending.append(name)
+    return None
 
 
 class Engine:
@@ -558,6 +589,13 @@ class Engine:
     # Each source directory's (key, file key) pairs that the running or latest run read to
     # expand its templates (Pipeline.map); emptied when a run starts
     _expansion_keys: dict[types.ArtifactIdentity, list[tuple[str, str]]]
+    # Why the running or latest run failed each template it could not expand; emptied when a
+    # run starts
+    _expansion_failures: dict[str, str]
+    # RPC calls reading the registry in a worker thread (``reading_registry``), and an event set
+    # while none does: no run start or expansion changes the registry under them
+    _registry_readers: int
+    _registry_unread: anyio.Event
 
     def __init__(
         self, *, pipeline: registry.PipelineLike | None = None, all_pipelines: bool = False
@@ -625,6 +663,10 @@ class Engine:
         self._reload_done.set()
         self._map_run = None
         self._expansion_keys = dict[types.ArtifactIdentity, list[tuple[str, str]]]()
+        self._expansion_failures = dict[str, str]()
+        self._registry_readers = 0
+        self._registry_unread = anyio.Event()
+        self._registry_unread.set()
 
     @property
     def state(self) -> EngineState:
@@ -653,6 +695,31 @@ class Engine:
         source = self._require_pipeline().get_template(template)["source"]
         keys = self._expansion_keys.get(source)
         return None if keys is None else frozenset(key for key, _ in keys)
+
+    def expansion_failure(self, template: str) -> str | None:
+        """Why the running or latest run failed template ``template`` (``Pipeline.map``) when it
+        could not add its instances; None when no run has failed it since that run started."""
+        return self._expansion_failures.get(template)
+
+    @contextlib.asynccontextmanager
+    async def reading_registry(self) -> AsyncIterator[None]:
+        """Hold off every change to the registry while the caller reads it in a worker thread:
+        a run start removing the instances (``reset_expansions``) and an expansion adding them
+        wait until the block ends."""
+        if self._registry_readers == 0:
+            self._registry_unread = anyio.Event()
+        self._registry_readers += 1
+        try:
+            yield
+        finally:
+            self._registry_readers -= 1
+            if self._registry_readers == 0:
+                self._registry_unread.set()
+
+    async def _wait_for_registry_readers(self) -> None:
+        """Wait until no caller reads the registry in a worker thread (``reading_registry``)."""
+        while self._registry_readers:
+            await self._registry_unread.wait()
 
     @property
     def sources(self) -> list[EventSource]:
@@ -1389,13 +1456,18 @@ class Engine:
         pipeline = self._pipeline
         if pipeline is None:
             raise pivot_exceptions.PipelineNotFoundError("No active pipeline registered.")
-        # Each run expands its templates afresh (Pipeline.map): no expansion, and no key a run
-        # read, is kept from a run to the next, so the stages are the pipeline's own until a
-        # producer is current.
+        # Each run expands its templates afresh (Pipeline.map): no expansion, no key a run read
+        # and no failed expansion is kept from a run to the next, so the stages are the
+        # pipeline's own until a producer is current.
+        # A run start removes every instance, so it waits for a thread reading the registry
+        await self._wait_for_registry_readers()
         pipeline.reset_expansions()
         self._expansion_keys.clear()
+        self._expansion_failures.clear()
         all_stages = self._get_all_stages()
         templates = {name: pipeline.get_template(name) for name in pipeline.list_templates()}
+        # The run history records the targets as given, an instance's name among them
+        targets = list(stages) if stages else list[str]()
         # A target naming an instance (a watch run's affected stage, or a name the user gave) is
         # reached through its template, which then adds that instance alone, with its chain
         wanted = dict[str, dict[str, set[str]]]()
@@ -1463,6 +1535,7 @@ class Engine:
             if stages and dep_errors:
                 # Across all pipelines with keep-going, a stage still missing an input stays out
                 stages = [stage for stage in stages if stage in runnable]
+                targets = [t for t in targets if _run_target(t, templates) in runnable]
                 if not stages:
                     return {}
         if dep_errors:
@@ -1600,6 +1673,7 @@ class Engine:
                 force=force,
                 no_commit=no_commit,
                 allow_uncached_incremental=allow_uncached_incremental,
+                fail_fast=on_error == OnError.FAIL,
             )
             if run_templates
             else None
@@ -1738,43 +1812,7 @@ class Engine:
 
                             # Check error mode
                             if on_error == OnError.FAIL:
-                                has_failed = any(
-                                    s == StageExecutionState.COMPLETED
-                                    and n in results
-                                    and results[n]["status"] == StageStatus.FAILED
-                                    for n, s in self._scheduler.stage_states.items()
-                                )
-                                if has_failed:
-                                    first_failed = next(
-                                        n
-                                        for n, s in self._scheduler.stage_states.items()
-                                        if s == StageExecutionState.COMPLETED
-                                        and n in results
-                                        and results[n]["status"] == StageStatus.FAILED
-                                    )
-                                    blocked = self._scheduler.apply_fail_fast()
-                                    for name, old_state in blocked:
-                                        await self.emit(
-                                            StageStateChanged(
-                                                type="stage_state_changed",
-                                                stage=name,
-                                                state=StageExecutionState.BLOCKED,
-                                                previous_state=old_state,
-                                            )
-                                        )
-                                    # Emit terminal events for blocked stages not yet in results
-                                    for name, state in self._scheduler.stage_states.items():
-                                        if (
-                                            state == StageExecutionState.BLOCKED
-                                            and name not in results
-                                        ):
-                                            await self._emit_terminal_stage(
-                                                name,
-                                                StageStatus.BLOCKED,
-                                                f"upstream '{first_failed}' failed",
-                                                results,
-                                                run_id=run_id,
-                                            )
+                                await self._apply_fail_fast(results, run_id)
 
                             # Start more stages if slots available
                             if not self._scheduler.stop_starting_new:
@@ -1797,24 +1835,19 @@ class Engine:
                             if name not in results:
                                 missing_by_state.setdefault(state.name, []).append(name)
                         if missing_by_state:
-                            for state_name, stages in missing_by_state.items():
+                            for state_name, names in missing_by_state.items():
                                 _logger.debug(
                                     "Stages not in results (state=%s): %s",
                                     state_name,
-                                    stages[:10] if len(stages) > 10 else stages,
+                                    names[:10] if len(names) > 10 else names,
                                 )
 
                         # Handle any blocked stages not yet processed
                         for name, state in self._scheduler.stage_states.items():
                             if state == StageExecutionState.BLOCKED and name not in results:
-                                failed_upstream = next(
-                                    (
-                                        n
-                                        for n, r in results.items()
-                                        if r["status"] == StageStatus.FAILED
-                                    ),
-                                    "unknown",
-                                )
+                                failed_upstream = _failed_upstream(
+                                    self._graph, name, results
+                                ) or _first_failed(results)
                                 await self._emit_terminal_stage(
                                     name,
                                     StageStatus.BLOCKED,
@@ -1854,9 +1887,10 @@ class Engine:
             self._map_run = None
 
         # Write run history after execution completes. The record's order holds each instance
-        # the run added (stage_order grows with every expansion), and no template.
+        # the run added (stage_order grows with every expansion), and no template; its targets
+        # are the run's as given.
         ended_at = datetime.datetime.now(datetime.UTC).isoformat()
-        targeted_stages = stages if stages else stage_order
+        targeted_stages = targets if targets else stage_order
         retention = config.get_run_history_retention()
 
         self._write_run_history(
@@ -1905,6 +1939,45 @@ class Engine:
             return_when=concurrent.futures.FIRST_COMPLETED,
         )
         return done
+
+    async def _apply_fail_fast(
+        self, results: dict[str, executor_core.ExecutionSummary], run_id: str
+    ) -> None:
+        """Once a stage of the run has failed, start no stage (``OnError.FAIL``): block each
+        one not started, reporting the failure above it, or the first failure of the run."""
+        first_failed = next(
+            (
+                name
+                for name, state in self._scheduler.stage_states.items()
+                if state == StageExecutionState.COMPLETED
+                and name in results
+                and results[name]["status"] == StageStatus.FAILED
+            ),
+            None,
+        )
+        if first_failed is None:
+            return
+        blocked = self._scheduler.apply_fail_fast()
+        for name, old_state in blocked:
+            await self.emit(
+                StageStateChanged(
+                    type="stage_state_changed",
+                    stage=name,
+                    state=StageExecutionState.BLOCKED,
+                    previous_state=old_state,
+                )
+            )
+        # Emit terminal events for blocked stages not yet in results
+        for name, state in self._scheduler.stage_states.items():
+            if state == StageExecutionState.BLOCKED and name not in results:
+                failed_upstream = _failed_upstream(self._graph, name, results) or first_failed
+                await self._emit_terminal_stage(
+                    name,
+                    StageStatus.BLOCKED,
+                    f"upstream '{failed_upstream}' failed",
+                    results,
+                    run_id=run_id,
+                )
 
     async def _drain_output_queue(
         self,
@@ -2104,9 +2177,14 @@ class Engine:
                 if not self._can_start_stage(stage_name):
                     continue
 
-                # A template starts no worker: it adds its instances, which this loop reaches
+                # A template starts no worker: it adds its instances, which this loop reaches.
+                # One that fails under fail-fast stops this pass, as a failed stage stops the next.
                 if self._map_run is not None and stage_name in self._map_run.templates:
                     await self._expand_template(stage_name, self._map_run, results, run_id)
+                    # An expanded template has no result; a failed one has its failure
+                    if self._map_run.fail_fast and stage_name in results:
+                        await self._apply_fail_fast(results, run_id)
+                        break
                     continue
 
                 # Reserve every resource before checking the next ready stage.
@@ -2281,11 +2359,14 @@ class Engine:
                 )
                 if problem is not None:
                     raise problem
+                # Adding instances waits for a thread reading the registry, as a run start does
+                await self._wait_for_registry_readers()
                 added = pipeline.expand_template(name, keys)
         except exceptions.PivotError as exc:
             reason = expansion.refusal_reason(source, exc)
         if reason is not None:
             _logger.error("Stage %s failed: %s", name, reason)
+            self._expansion_failures[name] = reason
             await self._emit_terminal_stage(
                 name, StageStatus.FAILED, reason, results, run_id=run_id
             )
@@ -2320,10 +2401,13 @@ class Engine:
         await self._complete_template(name, failed=False, results=results, run_id=run_id)
         for stage, state in states:
             if state == StageExecutionState.BLOCKED:
+                failed_upstream = _failed_upstream(self._graph, stage, results) or _first_failed(
+                    results
+                )
                 await self._emit_terminal_stage(
                     stage,
                     StageStatus.BLOCKED,
-                    f"upstream '{_first_failed(results)}' failed",
+                    f"upstream '{failed_upstream}' failed",
                     results,
                     run_id=run_id,
                 )

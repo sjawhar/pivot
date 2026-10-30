@@ -9,18 +9,20 @@ returns are its record of which stage ran and which was cached.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated
+import pathlib
+import time
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
 import pytest
 import yaml
 
-from pivot import compose, exceptions, executor, loaders, stage_def
+from pivot import compose, config, exceptions, executor, loaders, stage_def
 from pivot.engine import engine as engine_mod
 from pivot.engine.types import RunRequested
+from pivot.storage import state as state_mod
 from pivot.types import OnError, StageStatus
 
 if TYPE_CHECKING:
-    import pathlib
     from collections.abc import Callable
 
     from pivot.executor.core import ExecutionSummary
@@ -63,6 +65,55 @@ def _stage_spaced_plan(
 
 def _stage_static() -> dict[str, int]:
     return {"static": 1}
+
+
+class _FragileParams(stage_def.StageParams):
+    # A file to create before failing, so a stage that waits for the failure can go on
+    marker: str = ""
+
+
+def _stage_fragile_cut(entry: dict[str, int], params: _FragileParams) -> dict[str, int]:
+    if entry["value"] < 0:
+        if params.marker:
+            pathlib.Path(params.marker).touch()
+        raise RuntimeError("negative value")
+    return {"cut": entry["value"]}
+
+
+class _LateParams(stage_def.StageParams):
+    marker: str = ""
+
+
+def _stage_late(params: _LateParams) -> dict[str, int]:
+    """Finish only once `_stage_fragile_cut` has failed, leaving the engine time to record it."""
+    marker = pathlib.Path(params.marker)
+    deadline = time.monotonic() + 60
+    while not marker.exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"{marker} never appeared")
+        time.sleep(0.05)
+    time.sleep(2)
+    return {"late": 1}
+
+
+def _stage_join(cut: dict[str, int], late: dict[str, int]) -> dict[str, int]:
+    return {"joined": cut["cut"] + late["late"]}
+
+
+def _stage_broken() -> dict[str, int]:
+    raise RuntimeError("broken on purpose")
+
+
+class _Fields(TypedDict):
+    _stage_y: dict[str, int]
+
+
+def _stage_fields(entry: dict[str, int]) -> _Fields:
+    return {"_stage_y": entry}
+
+
+def _stage_y() -> dict[str, int]:
+    return {"value": 0}
 
 
 # =============================================================================
@@ -402,6 +453,31 @@ def test_each_run_expands_afresh(
     assert pipeline.instances_of("p/_stage_cut") == ["p/_stage_cut@a"]
 
 
+@pytest.mark.parametrize(
+    "targets",
+    [
+        pytest.param(None, id="every-stage"),
+        pytest.param(["p/_stage_build@a"], id="an-instance"),
+        pytest.param(["p/_stage_cut", "p/_stage_build@b"], id="a-template-and-an-instance"),
+    ],
+)
+def test_the_run_history_records_the_targets_as_given(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch, targets: list[str] | None
+) -> None:
+    """A target naming an instance or a template is recorded as given, never as the template
+    the run reached it through; a run of every stage records every stage it ran, the producer
+    and each instance, and no template."""
+    root = set_project_root
+    _project(root, monkeypatch, {"a": 1, "b": 2})
+
+    results = executor.run(pipeline=_chain_pipeline(root), stages=targets)
+
+    with state_mod.StateDB(config.get_state_dir()) as state_db:
+        (run,) = state_db.list_runs(limit=1)
+    assert run["targeted_stages"] == (run["execution_order"] if targets is None else targets)
+    assert sorted(run["execution_order"]) == sorted(results), run
+
+
 # =============================================================================
 # Failures
 # =============================================================================
@@ -410,22 +486,119 @@ def test_each_run_expands_afresh(
 def test_an_instance_output_conflicting_with_a_static_stage_fails_the_template(
     set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Instance `p/_stage_fields@b`'s field `_stage_y` and pipeline `p/_stage_fields@b`'s stage
+    `_stage_y` would both write `data/p/_stage_fields@b/_stage_y.yaml`."""
     root = set_project_root
     _project(root, monkeypatch, {"a": 1, "b": 2})
-    with compose.Pipeline("p", root=root) as pipeline:
-        plan = compose.stage(_stage_plan)(_plan_input(pipeline))
-        compose.stage(_stage_cut)(pipeline.map(plan), params=_CutParams())
-        with pipeline.variant("b"):
-            compose.stage(_stage_cut)(plan["b.yaml"], params=_CutParams())
+    with compose.Pipeline("p", root=root) as mapped:
+        plan = compose.stage(_stage_plan)(_plan_input(mapped))
+        compose.stage(_stage_fields)(mapped.map(plan))
+    with compose.Pipeline("p/_stage_fields@b", root=root) as static:
+        compose.stage(_stage_y)()
+    pipeline = compose.Pipeline("all", root=root)
+    pipeline.include(mapped)
+    pipeline.include(static)
 
     results = executor.run(pipeline=pipeline, on_error="keep_going")
 
     statuses = _statuses(results)
     assert statuses["p/_stage_plan"] == _RAN, results
-    assert statuses["p/_stage_cut@b"] == _RAN, "the static stage ran"
-    assert statuses["p/_stage_cut"] == StageStatus.FAILED, results
-    assert "'p/_stage_cut@b' already registered" in results["p/_stage_cut"]["reason"]
-    assert "p/_stage_cut@a" not in results, "the failed expansion added no instance"
+    assert statuses["p/_stage_fields@b/_stage_y"] == _RAN, "the static stage ran"
+    assert statuses["p/_stage_fields"] == StageStatus.FAILED, results
+    assert "both write" in results["p/_stage_fields"]["reason"], results
+    assert "p/_stage_fields@a" not in results, "the failed expansion added no instance"
+
+
+def test_a_blocked_instance_names_its_own_failed_upstream(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`p/_stage_broken` fails first; `p/_stage_build@a` is blocked by `p/_stage_fragile_cut@a`,
+    the stage above it that failed, and says so."""
+    root = set_project_root
+    _project(root, monkeypatch, {"a": -1, "b": 2})
+    with compose.Pipeline("p", root=root) as pipeline:
+        compose.stage(_stage_broken)()
+        plan = compose.stage(_stage_plan)(_plan_input(pipeline))
+        cut = compose.stage(_stage_fragile_cut)(pipeline.map(plan), params=_FragileParams())
+        compose.stage(_stage_build)(cut)
+
+    results = executor.run(pipeline=pipeline, on_error="keep_going")
+
+    assert _statuses(results) == {
+        "p/_stage_broken": StageStatus.FAILED,
+        "p/_stage_plan": _RAN,
+        "p/_stage_fragile_cut@a": StageStatus.FAILED,
+        "p/_stage_fragile_cut@b": _RAN,
+        "p/_stage_build@a": StageStatus.BLOCKED,
+        "p/_stage_build@b": _RAN,
+    }, results
+    assert results["p/_stage_build@a"]["reason"] == "upstream 'p/_stage_fragile_cut@a' failed"
+
+
+def test_an_instance_added_under_a_failed_upstream_names_it(
+    set_project_root: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """`p/_stage_join` also waits for `p/_stage_late`, which finishes only once
+    `p/_stage_fragile_cut@a` has failed, so the run adds `p/_stage_join@a` already blocked. It
+    names `p/_stage_fragile_cut@a`, not `p/_stage_broken`, the run's first failure."""
+    root = set_project_root
+    _project(root, monkeypatch, {"a": -1, "b": 2})
+    marker = str(tmp_path_factory.mktemp("marker") / "failed")
+    with compose.Pipeline("p", root=root) as pipeline:
+        compose.stage(_stage_broken)()
+        plan = compose.stage(_stage_plan)(_plan_input(pipeline))
+        cut = compose.stage(_stage_fragile_cut)(
+            pipeline.map(plan), params=_FragileParams(marker=marker)
+        )
+        late = compose.stage(_stage_late)(params=_LateParams(marker=marker))
+        compose.stage(_stage_join)(cut, late)
+
+    results = executor.run(pipeline=pipeline, on_error="keep_going", max_workers=4)
+
+    assert _statuses(results) == {
+        "p/_stage_broken": StageStatus.FAILED,
+        "p/_stage_plan": _RAN,
+        "p/_stage_late": _RAN,
+        "p/_stage_fragile_cut@a": StageStatus.FAILED,
+        "p/_stage_fragile_cut@b": _RAN,
+        "p/_stage_join@a": StageStatus.BLOCKED,
+        "p/_stage_join@b": _RAN,
+    }, results
+    assert results["p/_stage_join@a"]["reason"] == "upstream 'p/_stage_fragile_cut@a' failed"
+
+
+def test_a_failed_expansion_starts_no_other_stage_under_fail_fast(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both mapped stages become ready when the producer finishes, and the engine expands them
+    in one pass: `p/_stage_cut` adds its instances, then `p/_stage_fields` fails (its instance
+    `p/_stage_fields@b` would write the output of pipeline `p/_stage_fields@b`'s stage).
+    Fail-fast then starts nothing more, so `p/_stage_cut`'s instances are blocked, not run."""
+    root = set_project_root
+    _project(root, monkeypatch, {"a": 1, "b": 2})
+    with compose.Pipeline("p", root=root) as mapped:
+        plan = compose.stage(_stage_plan)(_plan_input(mapped))
+        compose.stage(_stage_cut)(mapped.map(plan), params=_CutParams())
+        compose.stage(_stage_fields)(mapped.map(plan))
+    with compose.Pipeline("p/_stage_fields@b", root=root) as static:
+        compose.stage(_stage_y)()
+    pipeline = compose.Pipeline("all", root=root)
+    pipeline.include(mapped)
+    pipeline.include(static)
+
+    results = executor.run(pipeline=pipeline, on_error="fail")
+
+    assert _statuses(results) == {
+        "p/_stage_plan": _RAN,
+        "p/_stage_fields@b/_stage_y": _RAN,
+        "p/_stage_fields": StageStatus.FAILED,
+        "p/_stage_cut@a": StageStatus.BLOCKED,
+        "p/_stage_cut@b": StageStatus.BLOCKED,
+    }, results
+    assert results["p/_stage_cut@a"]["reason"] == "upstream 'p/_stage_fields' failed"
+    assert not (root / "data" / "p" / "_stage_cut@a.yaml").exists()
 
 
 def test_a_key_that_cannot_name_a_stage_fails_the_template_naming_the_file(

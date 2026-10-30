@@ -12,13 +12,9 @@ import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from pydantic import BaseModel, ValidationError, field_validator
 
-from pivot import display, exceptions, parameters, project, types, unix_socket
-from pivot import explain as explain_mod
-from pivot import registry as registry_mod
-from pivot.config import io as config_io
+from pivot import display, exceptions, types, unix_socket
+from pivot.engine import stage_queries
 from pivot.engine.types import CancelRequested, EngineState, OutputEvent, RunRequested
-from pivot.storage import state as state_mod
-from pivot.storage import store as store_mod
 from pivot.types import DataDiffResult, OnError, StageExplanation
 
 if TYPE_CHECKING:
@@ -28,7 +24,7 @@ if TYPE_CHECKING:
 
     from pivot.engine.engine import Engine
     from pivot.engine.types import InputEvent
-    from pivot.registry import RegistryStageInfo
+    from pivot.registry import PipelineLike
 
 __all__ = [
     "AgentRpcHandler",
@@ -244,96 +240,6 @@ def _validate_stages_param(raw: object) -> list[str] | None | str:
     return cast("list[str]", raw)
 
 
-def _not_expanded_explanation(stage: str, why: str) -> StageExplanation:
-    """The explanation of a template or instance not yet expanded, as ``pivot status`` gives it:
-    a run would expand it, then run its instances."""
-    from pivot import status as status_mod
-
-    return StageExplanation(
-        stage_name=stage,
-        will_run=True,
-        is_forced=False,
-        reason=f"{status_mod.NOT_EXPANDED_REASON_PREFIX}: {why}",
-        code_changes=[],
-        param_changes=[],
-        dep_changes=[],
-        upstream_stale=[],
-    )
-
-
-def _template_explanation(template: str, explanations: list[StageExplanation]) -> StageExplanation:
-    """A template's explanation from its instances': it would run when one would, and its reason
-    names each of those with its own reason."""
-    running = [exp for exp in explanations if exp["will_run"]]
-    noun = "stage" if len(explanations) == 1 else "stages"
-    reason = f"Expanded into {len(explanations)} {noun}; " + (
-        "would run: " + ", ".join(f"{exp['stage_name']} ({exp['reason']})" for exp in running)
-        if running
-        else "none would run"
-    )
-    return StageExplanation(
-        stage_name=template,
-        will_run=bool(running),
-        is_forced=any(exp["is_forced"] for exp in running),
-        reason=reason,
-        code_changes=[],
-        param_changes=[],
-        dep_changes=[],
-        upstream_stale=[],
-    )
-
-
-def _explain_stage(
-    stage: str,
-    fingerprint: dict[str, str],
-    overrides: parameters.ParamsOverrides,
-    all_stages: dict[str, RegistryStageInfo],
-    store: store_mod.WorkspaceStore,
-    *,
-    default_state_dir: Path,
-    cache_dir: Path,
-) -> StageExplanation:
-    """Explain why ``stage`` would run, reading its lock and its producers' as ``pivot status``
-    does, and save the hash of each file it had to read."""
-    reg_info = all_stages[stage]
-    producers = {
-        ref.identity.producer
-        for ref in reg_info["deps"].values()
-        if ref.identity.producer in all_stages
-    }
-    locks = explain_mod.read_locks([stage, *producers], all_stages, default_state_dir, cache_dir)
-    unreadable = dict[types.ArtifactIdentity, str]()
-    producer_hashes = explain_mod.producer_output_hashes(
-        {producer: locks[producer] for producer in producers},
-        reg_info["deps"].values(),
-        {
-            producer: explain_mod.stages_dir(all_stages[producer], default_state_dir)
-            for producer in producers
-        },
-        store.cache_dir,
-        unreadable,
-    )
-    state_dir = registry_mod.get_stage_state_dir(reg_info, default_state_dir)
-    file_hash_entries = list[types.FileHashEntry]()
-    explanation = explain_mod.get_stage_explanation(
-        stage_name=stage,
-        fingerprint=fingerprint,
-        deps=reg_info["deps"],
-        outs=list(reg_info["outs"]),
-        params_instance=reg_info["params"],
-        overrides=overrides,
-        state_dir=state_dir,
-        store=store,
-        lock_data=locks[stage],
-        allow_missing=True,
-        producer_hashes=producer_hashes,
-        file_hash_entries=file_hash_entries,
-        unreadable_listings=unreadable,
-    )
-    state_mod.save_file_hashes(state_dir, file_hash_entries, create=False)
-    return explanation
-
-
 class AgentRpcHandler:
     """Handles JSON-RPC queries that need engine/inspector access."""
 
@@ -369,26 +275,20 @@ class AgentRpcHandler:
     def validate_stages(self, stages: list[str] | None) -> str | None:
         """Validate stage names exist. Returns error message or None if valid.
 
-        A template (``Pipeline.map``) and an instance of one are names a run takes: the run
-        reaches the instance through its template, which adds it when the run expands it.
+        A template (``Pipeline.map``) and an instance of one are names a run takes
+        (``stage_queries.unknown_run_stages``).
         """
         if stages is None:
             return None
         pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
         if pipeline is None:
             return "No pipeline loaded"
-        templates = pipeline.list_templates()
-        available = {*pipeline.list_stages(), *templates}
-        unknown = [
-            s
-            for s in stages
-            if s not in available and registry_mod.template_of(s, templates) is None
-        ]
+        unknown = stage_queries.unknown_run_stages(pipeline, stages)
         if unknown:
             return f"Unknown stages: {', '.join(unknown)}"
         return None
 
-    def _stage_param(self, params: dict[str, object]) -> tuple[str, registry_mod.PipelineLike]:
+    def _stage_param(self, params: dict[str, object]) -> tuple[str, PipelineLike]:
         """The stage param and the engine's pipeline, both validated."""
         stage = params.get("stage")
         if not isinstance(stage, str):
@@ -397,47 +297,6 @@ class AgentRpcHandler:
         if pipeline is None:
             raise ValueError("No pipeline loaded")
         return stage, pipeline
-
-    def _not_expanded_reason(self, pipeline: registry_mod.PipelineLike, stage: str) -> str:
-        """What ``stage`` waits for, naming no registered stage: a template (``Pipeline.map``)
-        not expanded, or an instance its template has not added.
-
-        Raises:
-            ValueError: ``stage`` names no stage, template or instance. An instance whose key
-                no file has, of those the run read to expand its template
-                (``Engine.expansion_keys``), is refused as ``pivot status`` refuses its name.
-        """
-        templates = pipeline.list_templates()
-        template = stage if stage in templates else registry_mod.template_of(stage, templates)
-        if template is None:
-            raise ValueError(f"Unknown stage: {stage}")
-        if template != stage:
-            keys = self._engine.expansion_keys(template)
-            if keys is not None and stage[len(template) + 1 :] not in keys:
-                unknown = exceptions.StageNotFoundError(
-                    [stage], available_stages=[*pipeline.list_stages(), *templates]
-                )
-                raise ValueError(unknown.format_user_message())
-            if pipeline.instances_of(template):
-                return f"'{template}' added only the instances its run's targets name"
-        producer = pipeline.get_template(template)["source"].producer
-        return f"'{template}' adds its instances when a run finds '{producer}' current"
-
-    def _get_stage_info(self, params: dict[str, object]) -> tuple[str, RegistryStageInfo]:
-        """Extract and validate stage param, return (stage_name, reg_info). A template
-        (``Pipeline.map``) gives the stage as declared, reading its producer's whole directory.
-
-        Raises:
-            ValueError: The param names no stage or template, or an instance its template has
-                not added (``_not_expanded_reason``).
-        """
-        stage, pipeline = self._stage_param(params)
-        with contextlib.suppress(KeyError):
-            return stage, pipeline.get_stage(stage)
-        if stage in pipeline.list_templates():
-            return stage, pipeline.get_template(stage)["info"]
-        why = self._not_expanded_reason(pipeline, stage)
-        raise ValueError(f"'{stage}' is not yet expanded: {why}")
 
     async def handle_query(
         self, method: str, params: dict[str, object] | None = None
@@ -478,51 +337,7 @@ class AgentRpcHandler:
                 # first, and it explains the pipeline loaded once they have.
                 await self._engine.wait_for_fingerprints()
                 stage, pipeline = self._stage_param(params)
-                # A template (Pipeline.map) is explained by the instances it expanded into; one
-                # not expanded, or an instance its template has not added, by what it waits for
-                stages = list[str]()
-                with contextlib.suppress(KeyError):
-                    _ = pipeline.get_stage(stage)
-                    stages = [stage]
-                if not stages and stage in pipeline.list_templates():
-                    stages = pipeline.instances_of(stage)
-                if not stages:
-                    return _not_expanded_explanation(
-                        stage, self._not_expanded_reason(pipeline, stage)
-                    )
-                fingerprints = {name: pipeline.ensure_fingerprint(name) for name in stages}
-
-                def _get_explanation() -> StageExplanation:
-                    try:
-                        overrides = parameters.load_params_yaml(pipeline)
-                    except Exception as e:
-                        raise ValueError(f"Failed to load params.yaml: {e}") from e
-                    all_stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
-                    default_state_dir = config_io.locate_state_dir()
-                    cache_dir = config_io.locate_cache_dir() / "files"
-                    store = store_mod.WorkspaceStore(
-                        project_root=project.get_project_root(),
-                        pipeline_name=pipeline.name,
-                        input_bindings=pipeline.input_bindings,
-                        cache_dir=cache_dir,
-                    )
-                    explanations = [
-                        _explain_stage(
-                            name,
-                            fingerprints[name],
-                            overrides,
-                            all_stages,
-                            store,
-                            default_state_dir=default_state_dir,
-                            cache_dir=cache_dir,
-                        )
-                        for name in stages
-                    ]
-                    if stages == [stage]:
-                        return explanations[0]
-                    return _template_explanation(stage, explanations)
-
-                return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
+                return await stage_queries.explain(self._engine, pipeline, stage)
             case "commit":
                 # Commit fingerprints every stage, so it never runs alongside the startup
                 # snapshot or a reload. Over the socket it is refused while either runs instead.
@@ -537,9 +352,12 @@ class AgentRpcHandler:
                     committed, failed = commit_mod.commit_stages(pipeline)
                     return CommitResult(committed=committed, failed=failed)
 
-                return await anyio.to_thread.run_sync(_do_commit)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
+                # Its thread reads the registry, so no run start or expansion changes it meanwhile
+                async with self._engine.reading_registry():
+                    return await anyio.to_thread.run_sync(_do_commit)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
             case "stage_info":
-                stage, reg_info = self._get_stage_info(params)
+                stage, pipeline = self._stage_param(params)
+                reg_info = stage_queries.stage_info(self._engine, pipeline, stage)
                 return QueryStageInfoResult(
                     name=stage,
                     deps=[_identity_json(dep) for dep in reg_info["deps"].values()],

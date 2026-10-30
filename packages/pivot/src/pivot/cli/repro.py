@@ -980,15 +980,21 @@ def repro(
 
         resolved = set(mapped)
         unresolved = list[str]()
+        not_expanded = list[str]()
 
         if not all(s in registered for s in others):
-            # Build graph and resolve file paths to producer stages (same as pivot dag)
-            graph_stages = cli_helpers.get_graph_stages()
+            # Resolve file paths to producer stages through the expansion, as `pivot dag` does:
+            # an instance's output path names the instance, whose chain the run reaches alone
+            result, _ = cli_helpers.expand_mapped_stages()
+            graph_stages = cli_helpers.get_graph_stages(result["expanded"])
             bipartite_graph = engine_graph.build_graph(graph_stages)
             found, unresolved = cli_targets.resolve_targets_to_stages(
                 others, bipartite_graph, stages=graph_stages
             )
+            # The run expands its templates afresh
+            cli_helpers.get_pipeline().reset_expansions()
             resolved |= found
+            not_expanded = list(result["not_expanded"])
         else:
             # All remaining targets are registered stages - no resolution needed
             resolved |= set(others)
@@ -1017,6 +1023,11 @@ def repro(
             msg += f"  Available stages: {available}"
             if len(registered) > 5:
                 msg += f" (and {len(registered) - 5} more)"
+            if not_expanded:
+                msg += (
+                    f"\n  Mapped stages not yet expanded: {', '.join(not_expanded)} (an instance's"
+                    + " output path names it once its producer is current)"
+                )
             msg += "\n  Run 'pivot list' to see all stages."
             raise click.ClickException(msg)
         stages_list = sorted(resolved)

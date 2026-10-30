@@ -202,6 +202,27 @@ def test_repro_and_status_take_a_mapped_stage_or_an_instance_as_target(
     assert unknown.returncode != 0 and "p/cut@zzz" in unknown.stderr, unknown.stderr
 
 
+def test_repro_takes_an_instance_output_path_as_pivot_dag_does(tmp_path: pathlib.Path) -> None:
+    """A path target resolves through the expansion: the instance writing it runs with its chain
+    alone. Before the producer is current no instance writes it, and the refusal names the
+    mapped stages not yet expanded."""
+    root, home = _project(tmp_path, {"a": 1, "b": 2})
+
+    waiting = helpers.run_pivot(root, home, "repro", "--dry-run", "data/p/cut@a.yaml")
+    _ok(helpers.run_pivot(root, home, "repro", "p/plan"))
+    dag = _ok(helpers.run_pivot(root, home, "dag", "--stages", "data/p/cut@a.yaml"))
+    dry_run = _ok(helpers.run_pivot(root, home, "repro", "--dry-run", "data/p/cut@a.yaml"))
+    _ok(helpers.run_pivot(root, home, "repro", "data/p/build@b.yaml"))
+
+    assert waiting.returncode != 0, waiting.stdout
+    assert "Unknown target(s): 'data/p/cut@a.yaml'" in waiting.stderr, waiting.stderr
+    assert "not yet expanded: p/cut, p/build" in waiting.stderr, waiting.stderr
+    assert "p/cut@a" in dag, dag
+    assert "p/cut@a" in dry_run and "p/cut@b" not in dry_run, dry_run
+    assert (root / "data" / "p" / "build@b.yaml").is_file()
+    assert not (root / "data" / "p" / "cut@a.yaml").exists(), "the path's chain runs alone"
+
+
 def test_a_run_targeted_at_the_producer_expands_nothing(tmp_path: pathlib.Path) -> None:
     root, home = _project(tmp_path, {"a": 1, "b": 2})
 

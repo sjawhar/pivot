@@ -393,8 +393,9 @@ key's chain only, and a new file runs the producer and the new chain only.
   read; a `--no-commit` run, which records no listing, reads the directory it wrote. A
   key follows the variant-name rule (letters, digits, `_`, `.`, `-`), so a file
   in a subdirectory, or two files with one key (`a.yaml`, `a.json`), fail the
-  mapped stage in the run, naming the files; so does an instance whose name or
-  output path another stage holds. A failed expansion adds no instance. A run and
+  mapped stage in the run, naming the files; so does an instance whose output path
+  another stage holds. A failed expansion adds no instance, and under fail-fast
+  (the default) the run starts no other stage after it. A run and
   every command give such a refusal in one wording, `cannot expand over the files
   of 'p/plan': ...`. A producer whose listing neither its lock's directory nor the
   cache holds leaves its mapped stages unexpanded with `the listing of 'p/plan' is
@@ -410,7 +411,10 @@ key's chain only, and a new file runs the producer and the new chain only.
   no file for is refused as `pivot status` refuses it (`Unknown stage(s):
   p/cut@zzz`); when it is not, the run refuses the key once `p/plan` has run and
   has no file for it, failing `p/cut` with `Unknown stage(s): p/cut@zzz, needed by
-  the target p/build@zzz` for a target further down the chain. `pivot run p/cut`
+  the target p/build@zzz` for a target further down the chain. A path target is
+  resolved through the expansion, as `pivot dag` resolves it: `pivot repro
+  data/p/build@a.yaml` runs `p/build@a`'s chain once `p/plan` is current, and
+  before that the refusal names the mapped stages not yet expanded. `pivot run p/cut`
   is refused: a mapped stage expands only in a run that finds its producer current.
   Nothing about an expansion is saved: each
   run expands afresh. A watch run (`pivot repro --watch`) expands as any run does,
@@ -438,6 +442,11 @@ key's chain only, and a new file runs the producer and the new chain only.
   stage called with a mapped stage's output is mapped over the same files; one
   stage cannot be mapped over two directories, and no stage can take every
   instance's output at once (a stage that receives a mapped handle is mapped).
+  An instance's name is its mapped stage's: beside a mapped `p/cut`, a stage
+  named `p/cut@<key>` (a variant `p/cut@a`, a second call `p/cut@1`, or a mapped
+  call in a variant) is refused when the pipeline loads, `'p/cut@a' has the name
+  of an instance of mapped stage 'p/cut'`; call one of them inside a
+  `pipeline.variant(...)` block.
 - **Parameters.** `params.yaml` key `p/cut` applies to every instance, and
   `p/cut@a` to one, whether or not a run has added it; each is checked against
   the mapped stage's `StageParams`. A mapped variant's own name
