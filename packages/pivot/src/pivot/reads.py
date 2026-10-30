@@ -24,7 +24,9 @@ process is that stage's.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
+import os
 import threading
 from typing import TYPE_CHECKING, final
 
@@ -36,21 +38,24 @@ from pivot.storage import cache, lock, state
 
 if TYPE_CHECKING:
     import pathlib
-    from collections.abc import Collection, Generator
+    from collections.abc import Callable, Collection, Coroutine, Generator
 
     from pivot.remote import protocol
 
 
 @final
 class Recording:
-    """The objects one stage run reads by hash from the cache at ``cache_dir``."""
+    """The objects one stage run reads by hash from the cache at ``cache_dir``, in the process
+    ``pid``: a forked child holds a copy of the recording that no lock ever reads."""
 
     cache_dir: pathlib.Path | None
+    pid: int
     _hashes: set[str]
     _lock: threading.Lock
 
     def __init__(self, cache_dir: pathlib.Path | None) -> None:
         self.cache_dir = cache_dir
+        self.pid = os.getpid()
         self._hashes = set[str]()
         self._lock = threading.Lock()
 
@@ -62,6 +67,19 @@ class Recording:
         """Each hash the run read, once, in hash order: what its lock lists under ``reads``."""
         with self._lock:
             return sorted(self._hashes)
+
+
+def _run_async[T](make: Callable[[], Coroutine[object, object, T]]) -> T:
+    """Run the coroutine ``make`` returns to completion from synchronous code. A read may come
+    from a coroutine (a stage's helper under ``asyncio.run``), where this thread already runs an
+    event loop that a second loop may not join, so the coroutine then runs on a thread of its
+    own while this one waits."""
+    try:
+        _ = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(make())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(make())).result()
 
 
 def output_hash(
@@ -98,6 +116,12 @@ class _Active:
     guard: threading.Lock = threading.Lock()
 
 
+_STAGE_PROCESS_ENV = "PIVOT_READ_BY_HASH_STAGE_PID"
+"""Set to the stage's process id while it runs, so a process the stage starts (a spawned or
+forked child, joblib's processes backend) is told why it cannot read rather than that it is
+outside a stage."""
+
+
 @contextlib.contextmanager
 def recording(cache_dir: pathlib.Path | None) -> Generator[Recording]:
     """Record the objects the stage this process runs reads by hash, from any of its threads.
@@ -108,9 +132,15 @@ def recording(cache_dir: pathlib.Path | None) -> Generator[Recording]:
         if _Active.recording is not None:
             raise RuntimeError("pivot is already recording a stage run's reads in this process")
         _Active.recording = current
+    previous = os.environ.get(_STAGE_PROCESS_ENV)
+    os.environ[_STAGE_PROCESS_ENV] = str(current.pid)
     try:
         yield current
     finally:
+        if previous is None:
+            _ = os.environ.pop(_STAGE_PROCESS_ENV, None)
+        else:
+            os.environ[_STAGE_PROCESS_ENV] = previous
         with _Active.guard:
             _Active.recording = None
 
@@ -123,15 +153,23 @@ def read_by_hash(content_hash: str) -> pathlib.Path:
     under ``reads``. Pivot looks the object up in the cache, else fetches it from the project's
     default remote into the cache, and checks that its bytes hash to ``content_hash`` before
     returning. The path is Pivot's read-only cache object: read it, never change it. Any thread
-    of the stage's own process may call this.
+    of the stage's own process may call this, a coroutine's included; a process the stage starts
+    may not, since only the stage's own process records what it reads.
 
     Raises:
-        ObjectReadError: Called outside a stage run; ``content_hash`` is not a content hash; the
-            object is in neither the cache nor the remote, or the remote cannot be used; or its
-            bytes hash to another hash.
+        ObjectReadError: Called outside a stage run or in a process the stage started;
+            ``content_hash`` is not a content hash; the object is in neither the cache nor the
+            remote, or the remote cannot be used; or its bytes hash to another hash.
     """
     current = _Active.recording
-    if current is None:
+    if current is None or current.pid != os.getpid():
+        if current is not None or _STAGE_PROCESS_ENV in os.environ:
+            raise exceptions.ObjectReadError(
+                "pivot.read_by_hash was called in a process a stage started: reads are recorded "
+                + "only in the stage's own process and its threads, so read the object there "
+                + "(a thread, or joblib's default threading backend) and pass its path or bytes "
+                + "to the process"
+            )
         raise exceptions.ObjectReadError(
             "pivot.read_by_hash works only inside a stage that Pivot runs (`pivot repro`, "
             + "`pivot run`), which records what the stage reads"
@@ -172,8 +210,8 @@ def _fetch(cache_dir: pathlib.Path, content_hash: str) -> pathlib.Path:
     name, storage = remote
     destination = cache.get_cache_path(cache_dir, content_hash)
     try:
-        (result,) = asyncio.run(
-            storage.download_batch([(content_hash, destination)], readonly=True)
+        (result,) = _run_async(
+            lambda: storage.download_batch([(content_hash, destination)], readonly=True)
         )
     except exceptions.RemoteError as error:
         result = None
@@ -248,7 +286,7 @@ def unavailable(
     if not unknown:
         return None
     try:
-        existence = asyncio.run(storage.bulk_exists(unknown))
+        existence = _run_async(lambda: storage.bulk_exists(unknown))
     except exceptions.RemoteError as error:
         return _missing_reason(unknown, f"remote '{name}' could not be reached: {error}")
     found = {content_hash for content_hash, exists in existence.items() if exists}

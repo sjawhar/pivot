@@ -182,17 +182,27 @@ with Pipeline("plan") as pipeline:
   `reads`, beside the stage's declared dependencies. A run-cache restore records
   what the restored run read, and `pivot commit` after `pivot repro --no-commit`
   records what that run read. A stage that reads nothing by hash has no `reads`.
+  A pivot older than this one drops `reads` when it writes the lock: from a
+  run-cache restore, or from `pivot commit` after this pivot's `--no-commit` run.
 - **A recorded object that is gone.** When an object the lock records is in
   neither the cache nor the remote, the stage cannot be run again as it ran:
   `pivot status` reports it stale, naming the objects and why, and `pivot repro`
   runs it, where the read fails. An object the cache lacks costs one check of the
-  remote, which Pivot then remembers, as `pivot push` does.
+  remote, which Pivot then remembers in its remote index, as `pivot push`,
+  `pivot pull` and `pivot status --remote` do: once the index records an object
+  on the remote, its later loss from the remote is found by the read, not by
+  `pivot status`.
+- **Pulling.** `pivot pull <stage>` fetches the objects its lock records under
+  `reads`, as it fetches the stage's dependencies, so the stage can run again in
+  the clone.
 - **A read that fails** raises `pivot.exceptions.ObjectReadError` naming the hash:
   a value that is not a content hash (16 lowercase hex characters), an object
   neither the cache nor the remote holds, or bytes that hash to something else.
 
 `pivot.read_by_hash` works only inside a stage Pivot runs, from any thread of the
-stage's own process.
+stage's own process, a coroutine's included. A process the stage starts (a forked
+child, joblib's processes backend) is refused: only the stage's own process
+records what it reads, so read there and pass the path or bytes on.
 
 ## Testing is natural
 

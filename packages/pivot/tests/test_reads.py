@@ -5,6 +5,8 @@ of whether the objects a lock records are still in the cache or the remote, and
 from __future__ import annotations
 
 import pathlib
+import subprocess
+import sys
 import threading
 import uuid
 from typing import Protocol, cast
@@ -112,6 +114,22 @@ def test_one_recording_at_a_time(files_dir: pathlib.Path) -> None:
         reads.recording(files_dir),
     ):
         pass
+
+
+def test_a_read_in_a_process_the_stage_started_names_the_rule(files_dir: pathlib.Path) -> None:
+    """A process the stage starts (joblib's processes backend, a `subprocess` running Python)
+    cannot record its reads in the stage's lock, so its read is refused with that reason, not
+    with "outside a stage"."""
+    with reads.recording(files_dir):
+        child = subprocess.run(
+            [sys.executable, "-c", "import pivot; pivot.read_by_hash('0123456789abcdef')"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert child.returncode != 0
+    assert "only in the stage's own process and its threads" in child.stderr, child.stderr
 
 
 @pytest.mark.parametrize(
