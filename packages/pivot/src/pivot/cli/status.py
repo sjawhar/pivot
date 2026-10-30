@@ -175,37 +175,19 @@ def status(
     # Compute counts once for suggestions and output
     if explain and pipeline_explanations:
         stale_count = sum(1 for e in pipeline_explanations if e["will_run"])
-        stage_recoveries = [
-            (e["stage_name"], e["recovery"] if "recovery" in e else None, e["upstream_stale"])
-            for e in pipeline_explanations
-        ]
+        recoveries = [e["recovery"] for e in pipeline_explanations if "recovery" in e]
     else:
         stale_count = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.STALE)
-        stage_recoveries = [
-            (s["name"], s["recovery"] if "recovery" in s else None, s["upstream_stale"])
-            for s in pipeline_status
-        ]
+        recoveries = [s["recovery"] for s in pipeline_status if "recovery" in s]
     # Pull restores missing outputs, and fetches missing objects stages read by hash, without
-    # recomputing; skip the count when there is no remote to pull from. The count reads only each
-    # stage's recovery, so it is cheap.
+    # recomputing; skip the count when there is no remote to pull from. A stage's recovery is set
+    # only when it brings the stage up to date with everything upstream of it
+    # (`status._compute_explanations_with_upstream`), so the count reads nothing else.
     missing_outputs_count = 0
     missing_reads_count = 0
     if remote_config.list_remotes():
-        # Stages arrive in execution order. A stage is pullable when pull recovers it and every
-        # stale upstream is itself pullable: in a plain clone the downstream stages are stale only
-        # because their upstream's outputs are missing too, and pull restores all of them. A stage
-        # current on its own (e.g. a committed metric) passes through when its stale upstreams are
-        # pullable, but has nothing to pull itself. A stage downstream of a stage that must
-        # recompute is recomputed by repro.
-        pullable = set[str]()
-        for name, recovery, upstream_stale in stage_recoveries:
-            if recovery is None or not pullable.issuperset(upstream_stale):
-                continue
-            pullable.add(name)
-            if recovery is Recovery.PULL_OUTPUTS:
-                missing_outputs_count += 1
-            elif recovery is Recovery.PULL_READS:
-                missing_reads_count += 1
+        missing_outputs_count = recoveries.count(Recovery.PULL_OUTPUTS)
+        missing_reads_count = recoveries.count(Recovery.PULL_READS)
     modified_count = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.MODIFIED)
     push_count = remote_status["push_count"] if remote_status else 0
     pull_count = remote_status["pull_count"] if remote_status else 0

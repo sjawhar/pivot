@@ -591,9 +591,9 @@ def test_committing_a_stage_whose_outputs_are_unchanged_keeps_what_its_run_read(
     tmp_path: pathlib.Path,
 ) -> None:
     """`pivot commit <stage>` with no `--no-commit` run to record records the outputs on disk.
-    When they are the outputs the lock already records, they came from the objects that lock
-    lists, so its `reads` stay, in the lock and in the run-cache entry the commit files: a later
-    restore from that entry still records them."""
+    When the lock already records those outputs from the same code, params and inputs, they came
+    from the objects that lock lists, so its `reads` stay, in the lock and in the run-cache entry
+    the commit files: a later restore from that entry still records them."""
     root = _project(tmp_path / "p")
     first = _helper_object(root, "taken: lemma_a\n")
     second = _helper_object(root, "taken: lemma_b\n")
@@ -622,6 +622,45 @@ def test_committing_edited_outputs_records_no_reads(tmp_path: pathlib.Path) -> N
 
     _ok(_pivot(root, "commit", "p/plan"))
 
+    assert _helper_lock_reads(root) is None
+
+
+_COUNTING_PIPELINE = """\
+import pivot
+from pivot import Pipeline, stage
+
+
+@stage
+def plan(pin: str) -> dict:
+    return {"count": len([pivot.read_by_hash(h).read_bytes() for h in pin.split()])}
+
+
+with Pipeline("p") as pipeline:
+    plan(pipeline.input("counted.pin", t=str))
+"""
+
+
+def test_committing_unchanged_outputs_after_the_pin_changed_records_no_reads(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The pin moved from A to B, and the stage's output does not depend on which object it reads,
+    so its bytes are the same. The lock's `reads` name what a run with pin A read; nothing read B.
+    Carrying `[A]` into a lock that records pin B would make status check A, and call the stage
+    cached while B is gone. So the commit records no `reads`, and only a fresh run (or a matching
+    `--no-commit` record) records what this pin's run reads."""
+    root = _project(tmp_path / "p")
+    (root / "pipeline.py").write_text(_COUNTING_PIPELINE)
+    first = _helper_object(root, "taken: lemma_a\n")
+    second = _helper_object(root, "taken: lemma_b\n")
+    _helper_pin(root, first)
+    _ok(_pivot(root, "repro"))
+    assert _helper_lock_reads(root) == [first]
+    output = (root / _OUTPUT).read_bytes()
+    _helper_pin(root, second)
+
+    _ok(_pivot(root, "commit", "p/plan"))
+
+    assert (root / _OUTPUT).read_bytes() == output, "the output should not depend on the object"
     assert _helper_lock_reads(root) is None
 
 

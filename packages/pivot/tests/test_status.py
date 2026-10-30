@@ -184,6 +184,28 @@ def test_status_carries_each_stages_recovery_and_marks_one_stale_only_for_its_up
         assert entries == expected
 
 
+def test_a_stage_downstream_of_one_that_must_run_has_no_recovery() -> None:
+    """`p/run` must run, so whatever it writes reaches the stages downstream of it: pulling cannot
+    bring them up to date, whatever their own state, so neither has a recovery."""
+    graph: nx.DiGraph[str] = nx.DiGraph()
+    graph.add_edge("p/fetch", "p/run")  # consumer -> producer
+    graph.add_edge("p/below", "p/run")
+    explanations = [
+        _helper_explanation("p/run", will_run=True),
+        _helper_explanation("p/fetch", will_run=True, recovery=Recovery.PULL_READS),
+        _helper_explanation("p/below", will_run=False),
+    ]
+
+    enriched = status._compute_explanations_with_upstream(explanations, graph)
+
+    assert {e["stage_name"]: e["upstream_stale"] for e in enriched} == {
+        "p/run": [],
+        "p/fetch": ["p/run"],
+        "p/below": ["p/run"],
+    }
+    assert [e["stage_name"] for e in enriched if "recovery" in e] == []
+
+
 def test_pipeline_status_specific_stages(
     set_project_root: pathlib.Path, test_pipeline: Pipeline
 ) -> None:

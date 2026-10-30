@@ -557,7 +557,9 @@ class OutputChange(TypedDict):
 class Recovery(enum.StrEnum):
     """What brings a stale stage up to date without running it. Carried beside the reason
     (`ChangeDecision`, `StageExplanation`, `PipelineStatusInfo`) so `pivot status` chooses its
-    `pivot pull` suggestion from it, never from the reason's text; absent when only a run does."""
+    `pivot pull` suggestion from it, never from the reason's text. Present only when it recovers
+    every reason the stage is stale, its stale upstream stages included; absent when only a run
+    does."""
 
     PULL_OUTPUTS = "pull_outputs"  # its lock is current; `pivot pull` restores missing outputs
     PULL_READS = "pull_reads"  # `pivot pull` fetches objects it read by hash that the cache lacks

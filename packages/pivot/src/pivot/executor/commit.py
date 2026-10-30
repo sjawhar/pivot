@@ -252,8 +252,11 @@ def _commit_stages(
             # since) record the outputs on disk against the current code, the "trust me" commit.
             # A run that executed code the fingerprint does not describe marked its lock;
             # committing the same outputs keeps that mark, so the stage is still not reusable.
-            # The same outputs also came from the objects that lock lists under `reads`, so those
-            # stay too; other outputs no read produced.
+            # The previous lock's `reads` stay only when it records this whole provenance: the
+            # same code, params, dependencies and outputs. A changed input (a new pin) can leave
+            # the outputs' bytes alone while naming other objects, and the old list would have
+            # status check what the old pin named and never what the new one does; then no reads
+            # are recorded, and only a fresh run or a matching --no-commit record records them.
             read_hashes = list[str]()
             output_content_hashes = {
                 key: hash_info["hash"] for key, hash_info in output_hashes_by_key.items()
@@ -270,6 +273,9 @@ def _commit_stages(
                 if (
                     previous_lock is not None
                     and "reads" in previous_lock
+                    and previous_lock["code_manifest"] == code_manifest
+                    and skip.params_equal(previous_lock["params"], current_params)
+                    and previous_lock["dep_hashes"] == dep_hashes_by_identity
                     and {
                         types.identity_key(identity): hash_info["hash"]
                         for identity, hash_info in previous_lock["output_hashes"].items()

@@ -220,14 +220,18 @@ When multiple `pivot` processes share the same StateDB:
   once. The check is local, as for outputs: an object the cache lacks counts as on the remote
   only when the remote index (`remote:`) records it for the remote's URL; it never contacts the
   remote, so plain `status` and `repro` never wait on the network. `pivot push`, `pull` and
-  `fetch` fill that index, and so does a run whose read fetched an object: the worker returns
-  what its reads fetched in `DeferredWrites.remote_hashes` (`reads.Recording.fetched`), under
-  `--no-commit` too, and `apply_deferred_writes` adds it in the run's transaction, storing the
-  fetch's URL when none is stored for the remote and adding nothing when another one is.
+  `fetch` fill that index, and so does a completed run whose read fetched an object: the worker
+  returns what its reads fetched in `DeferredWrites.remote_hashes` (`reads.Recording.fetched`),
+  under `--no-commit` too, and `apply_deferred_writes` adds it in the run's transaction, storing
+  the fetch's URL when none is stored for the remote and adding nothing when another one is. A
+  failed run applies no deferred writes, so its fetches stay unrecorded.
   `reads.unavailable` returns the reason and whether a usable remote may hold the objects
   (`types.UnavailableReads.pullable`); when those objects alone change the stage, `check_stage`
-  sets `recovery` to `Recovery.PULL_READS`, and `pivot status` suggests `pivot pull` from that
-  field, never from the reason's text.
+  sets `recovery` to `Recovery.PULL_READS`. Explain keeps it only when pull also restores every
+  output the stage lacks, and status only when every stale upstream stage has a recovery too;
+  `pivot status` suggests `pivot pull` from that field, never from the reason's text. A trust-me
+  `pivot commit <stage>` keeps the previous lock's `reads` only when that lock records the same
+  code, params, dependency hashes and outputs.
 
 ## Output Ownership
 

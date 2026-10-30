@@ -15,8 +15,9 @@ object that is not in the cache and not known to be on the remote (``unavailable
 local state as for outputs) counts as changed in every skip decision (``skip.check_stage``):
 ``status`` reports it stale and ``repro`` reruns it, where the read fetches the object or fails
 naming it. The objects a run's reads fetch go back to the coordinator with the run's other
-StateDB writes (``DeferredWrites.remote_hashes``), which records them in the remote index, as
-``pivot pull`` records what it downloads, so the cache losing one later does not make it unknown.
+StateDB writes (``DeferredWrites.remote_hashes``), which records them in the remote index when the
+stage completes, as ``pivot pull`` records what it downloads, so the cache losing one later does
+not make it unknown. A run that fails records nothing.
 
 The run's recording is process state, not a ``ContextVar``: a stage may read from threads it
 starts (a thread pool, joblib's threading backend), and on Python 3.13 a new thread does not
@@ -296,8 +297,8 @@ def unavailable(
     The check is local, as for a stage's outputs, so plain ``status`` and ``repro`` never wait on
     the network: the cache is looked up first, one ``lstat`` per object, and an object it lacks
     counts as on the remote only when the project's remote index (StateDB ``remote:``, which
-    ``pivot push``, ``pull`` and ``fetch`` fill, and a run with what its reads fetched) records it
-    for that remote's URL, as ``pivot push`` counts it. No remote is contacted.
+    ``pivot push``, ``pull`` and ``fetch`` fill, and a completed run with what its reads fetched)
+    records it for that remote's URL, as ``pivot push`` counts it. No remote is contacted.
     ``pivot pull <stage>`` fetches the objects a stage's lock records, and a run's read fetches
     what it needs itself; the result is ``pullable`` when a usable remote may hold them.
     """

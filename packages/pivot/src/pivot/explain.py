@@ -33,22 +33,28 @@ if TYPE_CHECKING:
 OUTPUTS_MISSING_REASON = "Outputs missing from cache"
 """Reason for a stage whose lock is current but whose cacheable outputs are absent locally.
 
-Its explanation's ``recovery`` is ``Recovery.PULL_OUTPUTS``, by which ``pivot status`` counts it
-as restorable by ``pivot pull``, so it is never used when the only unavailable outputs are
-metrics, which are not cached.
+It is never used when the only unavailable outputs are metrics, which are not cached. The
+explanation's ``recovery`` is ``Recovery.PULL_OUTPUTS`` only when ``pivot pull`` restores every
+output the stage lacks (``_pull_restores_all``): beside an edited metric, the stage still runs.
 """
 
 
-def _pull_restores(unavailable: list[types.ArtifactRef]) -> bool:
-    """Whether ``pivot pull`` can restore any of ``unavailable``: any output but a metric."""
-    return any(ref.tag is not types.ArtifactTag.METRIC for ref in unavailable)
+def _pull_restores_all(
+    unavailable: list[types.ArtifactRef], empty_dirs_unrecorded: list[types.ArtifactRef]
+) -> bool:
+    """Whether ``pivot pull`` restores every output of ``unavailable``: none is a metric, which is
+    not cached, and no output holds empty directories its listing does not record, which a
+    restore would delete."""
+    return not empty_dirs_unrecorded and all(
+        ref.tag is not types.ArtifactTag.METRIC for ref in unavailable
+    )
 
 
 def _unavailable_outputs_reason(
     store: store_mod.WorkspaceStore, unavailable: list[types.ArtifactRef]
 ) -> str:
     """Say why a stage whose lock is current must still run to regenerate ``unavailable``."""
-    if _pull_restores(unavailable):
+    if any(ref.tag is not types.ArtifactTag.METRIC for ref in unavailable):
         return OUTPUTS_MISSING_REASON
     changed = list[str]()
     missing = list[str]()
@@ -397,7 +403,7 @@ def get_stage_explanation(
                 dep_changes=[],
                 upstream_stale=[],
             )
-            if _pull_restores(unavailable):
+            if unavailable and _pull_restores_all(unavailable, empty_dirs_unrecorded):
                 explanation["recovery"] = types.Recovery.PULL_OUTPUTS
             return explanation
         explanation = StageExplanation(
@@ -410,6 +416,8 @@ def get_stage_explanation(
             dep_changes=decision.get("dep_changes", []),
             upstream_stale=[],
         )
-        if "recovery" in decision:
+        # Pull fetches the read objects the decision names; it recovers the stage only when it
+        # also restores every output the stage lacks.
+        if "recovery" in decision and _pull_restores_all(unavailable, empty_dirs_unrecorded):
             explanation["recovery"] = decision["recovery"]
         return explanation

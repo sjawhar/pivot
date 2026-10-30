@@ -96,11 +96,11 @@ def check_digest(expected_hash: str, actual_hash: str, location: str) -> None:
             + f"for {location}. Delete {location} from the remote, then run "
             + "`pivot push` on a machine whose cache has a good copy and has not run "
             + "`pivot push`, `pivot pull`, `pivot fetch`, or `pivot status --remote` "
-            + "against this remote for this object, nor a stage whose `pivot.read_by_hash` "
-            + "downloaded it from this remote. Pivot records hashes those commands upload, "
-            + "download, or find, and those a read by hash downloads, then skips recorded "
-            + "hashes. If every machine "
-            + f"with a good copy has recorded it, delete `{state_db_path}/` before "
+            + "against this remote for this object, nor completed a stage whose "
+            + "`pivot.read_by_hash` downloaded it from this remote. Pivot records hashes those "
+            + "commands upload, download, or find, and those a stage's reads downloaded when "
+            + "the stage completes (not when it fails), then skips recorded hashes. If every "
+            + f"machine with a good copy has recorded it, delete `{state_db_path}/` before "
             + "pushing; this also clears run history and local caches."
         )
 

@@ -186,9 +186,12 @@ with Pipeline("plan") as pipeline:
   `reads`, beside the stage's declared dependencies. A run-cache restore records
   what the restored run read, and `pivot commit` after `pivot repro --no-commit`
   records what that run read. `pivot commit <stage>` with no such run records
-  the outputs on disk: when they are the outputs the lock already records, it
-  keeps the lock's `reads`, since those outputs came from those objects; other
-  outputs get none. A stage that reads nothing by hash has no `reads`.
+  the outputs on disk: when the lock already records those outputs from the same
+  code, params and dependencies, it keeps the lock's `reads`, since those outputs
+  came from those objects. Otherwise (edited outputs, or a changed input such as a
+  new pin, even when the outputs' bytes are the same) it records no `reads`: a
+  fresh run, or a matching `--no-commit` record, records what the stage reads now.
+  A stage that reads nothing by hash has no `reads`.
   A pivot older than this one drops `reads` when it writes the lock: from a
   run-cache restore, or from `pivot commit` after this pivot's `--no-commit` run.
   And when a `--no-commit` run of an older pivot follows this pivot's own, the
@@ -198,10 +201,12 @@ with Pipeline("plan") as pipeline:
 - **A recorded object that is not at hand.** `pivot status` and `pivot repro`
   decide from local state, as they do for outputs, and contact no remote: an
   object the lock records counts as available when it is in the cache, or when
-  the remote index (filled by `pivot push`, `pull` and `fetch`, and by a run
-  whose read fetched the object) records it on the default remote. Otherwise
-  `pivot status` reports the stage stale, naming the objects and why, and
-  suggests `pivot pull`, which fetches them, when a remote is configured;
+  the remote index (filled by `pivot push`, `pull` and `fetch`, and by a run that
+  completed after its read fetched the object) records it on the default remote.
+  Otherwise `pivot status` reports the stage stale, naming the objects and why,
+  and suggests `pivot pull`, which fetches them, when a remote is configured and
+  pulling brings the stage up to date (not beside an edited metric, or below a
+  stage that must run);
   `pivot repro` runs the stage: its read fetches the object from the remote, or
   fails naming it when the remote lacks it too. An object the index records is
   not checked again, so its later loss from the remote is found by the next

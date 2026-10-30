@@ -465,33 +465,6 @@ def test_what_a_stage_of_another_root_fetched_counts_as_on_the_project_remote(
 
 
 # =============================================================================
-# The repair a corrupt remote object's hash mismatch prints
-# =============================================================================
-
-
-@pytest.mark.usefixtures("set_project_root")
-def test_the_hash_mismatch_repair_names_a_read_by_hash_among_what_records_a_hash() -> None:
-    """A run whose `pivot.read_by_hash` downloaded an object records it in the remote index, as
-    `pivot pull` does, and `pivot push` then skips it. So the repair a hash mismatch prints
-    (`keys.check_digest`) names such a stage among what records a hash: a user who pushed from a
-    machine whose stage read the object would leave the remote corrupt."""
-    with pytest.raises(exceptions.RemoteError) as caught:
-        keys.check_digest("0123456789abcdef", "fedcba9876543210", "bucket/cache/files/01/23")
-
-    message = str(caught.value)
-    assert "read_by_hash" in message or "read by hash" in message, message
-
-
-def test_remote_storage_guide_names_a_read_by_hash_among_what_records_a_hash() -> None:
-    """The remote-storage guide's copy of the same repair names it too."""
-    guide = pathlib.Path(__file__).resolve().parents[3] / "docs/guides/remote-storage.md"
-    text = guide.read_text()
-    (paragraph,) = [p for p in text.split("\n\n") if "Pivot records hashes those commands" in p]
-
-    assert "read_by_hash" in paragraph or "read by hash" in paragraph, paragraph
-
-
-# =============================================================================
 # The content hash a stage's committed lock records for an output
 # =============================================================================
 
