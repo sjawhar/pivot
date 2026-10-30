@@ -11,7 +11,7 @@ from typing import Annotated, TypedDict
 
 import pytest
 
-from pivot import compose, exceptions, loaders, registry, types
+from pivot import compose, exceptions, loaders, registry, stage_def, types
 
 
 @compose.stage
@@ -45,9 +45,22 @@ def _helper_y() -> dict[str, int]:
     return {"value": 0}
 
 
+class _HelperCutParams(stage_def.StageParams):
+    factor: int = 1
+
+
+@compose.stage
+def _helper_cut_params(entry: dict[str, int], params: _HelperCutParams) -> dict[str, int]:
+    return {"value": entry["value"] * params.factor}
+
+
+def _plan_input(pipeline: compose.Pipeline) -> dict[str, int]:
+    return pipeline.input("plan.yaml", t=dict[str, int])
+
+
 def _chain(tmp_path: pathlib.Path) -> compose.Pipeline:
     with compose.Pipeline("p", root=tmp_path) as pipeline:
-        plan = _helper_plan(pipeline.input("plan.yaml"))
+        plan = _helper_plan(_plan_input(pipeline))
         cut = _helper_cut(pipeline.map(plan))
         _helper_build(cut)
     return pipeline
@@ -155,7 +168,7 @@ def test_an_instance_named_like_a_static_stage_is_refused_and_nothing_is_added(
     tmp_path: pathlib.Path,
 ) -> None:
     with compose.Pipeline("p", root=tmp_path) as pipeline:
-        plan = _helper_plan(pipeline.input("plan.yaml"))
+        plan = _helper_plan(_plan_input(pipeline))
         _helper_cut(pipeline.map(plan))
         with pipeline.variant("b"):
             _helper_cut(plan["b.yaml"])
@@ -173,7 +186,7 @@ def test_an_instance_output_path_taken_by_a_static_stage_is_refused_and_nothing_
     ``p/_helper_fields@b``'s stage ``_helper_y`` both write
     ``data/p/_helper_fields@b/_helper_y.yaml``."""
     with compose.Pipeline("p", root=tmp_path) as mapped:
-        plan = _helper_plan(mapped.input("plan.yaml"))
+        plan = _helper_plan(_plan_input(mapped))
         _helper_fields(mapped.map(plan))
     with compose.Pipeline("p/_helper_fields@b", root=tmp_path) as static:
         _helper_y()
@@ -185,9 +198,7 @@ def test_an_instance_output_path_taken_by_a_static_stage_is_refused_and_nothing_
         combined.expand_template("p/_helper_fields", _PAIRS)
 
     assert "p/_helper_fields@a" not in combined.list_stages(), "the expansion was undone whole"
-    assert combined.expand_template("p/_helper_fields", [("a", "a.yaml")]) == [
-        "p/_helper_fields@a"
-    ]
+    assert combined.expand_template("p/_helper_fields", [("a", "a.yaml")]) == ["p/_helper_fields@a"]
 
 
 def test_an_instance_name_too_long_for_a_lock_is_refused(tmp_path: pathlib.Path) -> None:
@@ -198,3 +209,18 @@ def test_an_instance_name_too_long_for_a_lock_is_refused(tmp_path: pathlib.Path)
         pipeline.expand_template("p/_helper_cut", [(key, f"{key}.yaml")])
 
     assert pipeline.list_stages() == ["p/_helper_plan"]
+
+
+def test_each_instance_owns_a_copy_of_the_templates_params(tmp_path: pathlib.Path) -> None:
+    with compose.Pipeline("p", root=tmp_path) as pipeline:
+        plan = _helper_plan(_plan_input(pipeline))
+        _helper_cut_params(pipeline.map(plan), params=_HelperCutParams(factor=2))
+
+    pipeline.expand_template("p/_helper_cut_params", _PAIRS)
+
+    declared = pipeline.get_template("p/_helper_cut_params")["info"]["params"]
+    first = pipeline.get_stage("p/_helper_cut_params@a")["params"]
+    second = pipeline.get_stage("p/_helper_cut_params@b")["params"]
+    assert first == declared, "an instance's params equal the template's"
+    assert first is not declared, "no instance shares the template's params object"
+    assert first is not second, "no two instances share one params object"

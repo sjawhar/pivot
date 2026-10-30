@@ -66,8 +66,8 @@ def _helper_cut_params(entry: dict[str, int], params: _HelperCutParams) -> dict[
     return {"value": entry["value"] * params.factor}
 
 
-def _plan_input(pipeline: compose.Pipeline) -> compose.ArtifactHandle:
-    return pipeline.input("plan.yaml")
+def _plan_input(pipeline: compose.Pipeline) -> dict[str, int]:
+    return pipeline.input("plan.yaml", t=dict[str, int])
 
 
 # =============================================================================
@@ -132,7 +132,7 @@ def test_a_template_keeps_its_unmapped_dependencies(tmp_path: pathlib.Path) -> N
 def test_map_over_a_typed_dict_directory_field(tmp_path: pathlib.Path) -> None:
     with compose.Pipeline("p", root=tmp_path) as pipeline:
         produced = _helper_plan_parts()
-        _helper_cut(pipeline.map(produced.parts))
+        _helper_cut(pipeline.map(produced["parts"]))
 
     template = pipeline.get_template("p/_helper_cut")
     assert template["source"] == types.ArtifactIdentity("p/_helper_plan_parts", "parts")
@@ -240,11 +240,19 @@ def test_a_stage_mapped_over_two_directories_is_refused(tmp_path: pathlib.Path) 
         _helper_cut_with(pipeline.map(first), pipeline.map(second))
 
 
+def _helper_select_item(entry: compose.ArtifactHandle) -> object:
+    return entry["x.yaml"]
+
+
+def _helper_select_attribute(entry: compose.ArtifactHandle) -> object:
+    return entry.field
+
+
 @pytest.mark.parametrize(
     "select",
     [
-        pytest.param(lambda entry: entry["x.yaml"], id="item"),
-        pytest.param(lambda entry: entry.field, id="attribute"),
+        pytest.param(_helper_select_item, id="item"),
+        pytest.param(_helper_select_attribute, id="attribute"),
     ],
 )
 def test_a_mapped_entry_has_no_parts(

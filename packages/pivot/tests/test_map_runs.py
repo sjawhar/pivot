@@ -9,7 +9,6 @@ returns are its record of which stage ran and which was cached.
 
 from __future__ import annotations
 
-import pathlib
 from typing import TYPE_CHECKING, Annotated
 
 import pytest
@@ -19,6 +18,9 @@ from pivot import compose, exceptions, executor, loaders, stage_def
 from pivot.types import StageStatus
 
 if TYPE_CHECKING:
+    import pathlib
+    from collections.abc import Callable
+
     from pivot.executor.core import ExecutionSummary
 
 
@@ -76,9 +78,16 @@ def _write_plan(root: pathlib.Path, plan: dict[str, int]) -> None:
     (root / "data" / "raw" / "plan.yaml").write_text(yaml.safe_dump(plan))
 
 
-def _chain_pipeline(root: pathlib.Path, plan_stage: object = _stage_plan) -> compose.Pipeline:
+def _plan_input(pipeline: compose.Pipeline) -> dict[str, int]:
+    return pipeline.input("plan.yaml", t=dict[str, int])
+
+
+def _chain_pipeline(
+    root: pathlib.Path,
+    plan_stage: Callable[[dict[str, int]], dict[str, dict[str, int]]] = _stage_plan,
+) -> compose.Pipeline:
     with compose.Pipeline("p", root=root) as pipeline:
-        plan = compose.stage(plan_stage)(pipeline.input("plan.yaml"))  # pyright: ignore[reportArgumentType, reportUnknownVariableType] - a stage function from the test's table
+        plan = compose.stage(plan_stage)(_plan_input(pipeline))
         cut = compose.stage(_stage_cut)(pipeline.map(plan), params=_CutParams())
         compose.stage(_stage_build)(cut)
     return pipeline
@@ -290,7 +299,7 @@ def test_an_instance_output_conflicting_with_a_static_stage_fails_the_template(
     root = set_project_root
     _project(root, monkeypatch, {"a": 1, "b": 2})
     with compose.Pipeline("p", root=root) as pipeline:
-        plan = compose.stage(_stage_plan)(pipeline.input("plan.yaml"))
+        plan = compose.stage(_stage_plan)(_plan_input(pipeline))
         compose.stage(_stage_cut)(pipeline.map(plan), params=_CutParams())
         with pipeline.variant("b"):
             compose.stage(_stage_cut)(plan["b.yaml"], params=_CutParams())
@@ -343,7 +352,7 @@ def test_a_template_mapped_alongside_a_static_stage_runs_beside_it(
     root = set_project_root
     _project(root, monkeypatch, {"a": 1})
     with compose.Pipeline("p", root=root) as pipeline:
-        plan = compose.stage(_stage_plan)(pipeline.input("plan.yaml"))
+        plan = compose.stage(_stage_plan)(_plan_input(pipeline))
         compose.stage(_stage_cut)(pipeline.map(plan), params=_CutParams())
         compose.stage(_stage_static)()
 

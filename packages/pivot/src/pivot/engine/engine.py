@@ -55,13 +55,13 @@ from pivot.engine.types import (
     SinkStateChanged,
     StageCompleted,
     StageExecutionState,
+    StagesExpanded,
     StageStarted,
     StageStateChanged,
-    StagesExpanded,
 )
 from pivot.executor import core as executor_core
 from pivot.executor import worker
-from pivot.storage import cache, member_skip, ownership
+from pivot.storage import artifact_lock, cache, member_skip, ownership
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -335,7 +335,9 @@ def _read_map_keys(source: types.ArtifactIdentity, map_run: _MapRun) -> list[tup
 
     The walk is the one a directory artifact's listing is made from
     (``cache.walk_artifact_members``): a link into the cache that a symlink checkout leaves is a
-    file, and any other link is not part of the directory.
+    file, and any other link is not part of the directory. It holds READ on the directory, the
+    lock every stage reading it as a dependency takes, so another pivot run cannot rewrite it
+    mid-walk.
 
     Raises:
         PipelineConfigError: The directory is missing, or a file's key cannot name a stage.
@@ -344,15 +346,18 @@ def _read_map_keys(source: types.ArtifactIdentity, map_run: _MapRun) -> list[tup
     output = next(out for out in producer["outs"] if out.identity == source)
     directory = map_run.store.resolve_display_path(output)
     files = list[tuple[str, os.DirEntry[str]]]()
+    lock_dir = registry.get_stage_state_dir(producer, config.get_state_dir()) / "locks"
+    requests = artifact_lock.expand_lock_requests({"source": output}, [], map_run.project_root)
     try:
-        cache.walk_artifact_members(
-            os.fspath(directory),
-            "",
-            cache.resolve_cache_root(map_run.cache_dir / "files"),
-            files,
-            list[str](),
-            list[pathlib.Path](),
-        )
+        with artifact_lock.LocalFlockLockService(lock_dir).acquire_many(requests):
+            cache.walk_artifact_members(
+                os.fspath(directory),
+                "",
+                cache.resolve_cache_root(map_run.cache_dir / "files"),
+                files,
+                list[str](),
+                list[pathlib.Path](),
+            )
     except FileNotFoundError:
         shown = project.to_relative_path(directory, map_run.project_root)
         raise exceptions.PipelineConfigError(f"the directory {shown} is missing") from None
@@ -2162,16 +2167,16 @@ class Engine:
         except exceptions.PivotError as exc:
             reason = f"cannot expand over the files of '{types.identity_key(source)}': {exc}"
             _logger.error("Stage %s failed: %s", name, reason)
-            await self._emit_terminal_stage(name, StageStatus.FAILED, reason, results, run_id=run_id)
+            await self._emit_terminal_stage(
+                name, StageStatus.FAILED, reason, results, run_id=run_id
+            )
             await self._complete_template(name, failed=True, results=results, run_id=run_id)
             return
 
         infos = {stage: pipeline.get_stage(stage) for stage in added}
         map_run.all_stages.update(infos)
         map_run.stage_order.extend(added)
-        map_run.committed_before.update(
-            self._committed_files(added, infos, map_run.project_root)
-        )
+        map_run.committed_before.update(self._committed_files(added, infos, map_run.project_root))
         if self._graph is None:
             raise RuntimeError(f"Template {name} expanded outside a run")
         engine_graph.add_stages(self._graph, infos)
@@ -2237,7 +2242,7 @@ class Engine:
         run_id: str,
         skip_state_dbs: dict[pathlib.Path, state_mod.StateDB] | None = None,
     ) -> bool:
-        from pivot.storage import artifact_lock, lock
+        from pivot.storage import lock
 
         if force:
             return False

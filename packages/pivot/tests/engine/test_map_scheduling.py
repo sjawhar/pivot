@@ -14,7 +14,6 @@ from pivot.engine import graph as engine_graph
 from pivot.engine.scheduler import Scheduler
 from pivot.engine.types import NodeType, StageExecutionState
 from pivot.registry import RegistryStageInfo
-from tests.config.test_registry import _helper_info  # pyright: ignore[reportPrivateUsage]
 
 _COMPLETED = StageExecutionState.COMPLETED
 
@@ -167,10 +166,30 @@ def _helper_ref(identity: types.ArtifactIdentity) -> types.ArtifactRef:
     )
 
 
+def _helper_noop() -> None:
+    pass
+
+
 def _helper_stage(name: str, deps: dict[str, types.ArtifactIdentity]) -> RegistryStageInfo:
-    info = _helper_info(name, outs=[_helper_ref(types.ArtifactIdentity(name, None))])
-    info["deps"] = {dep: _helper_ref(identity) for dep, identity in deps.items()}
-    return info
+    return RegistryStageInfo(
+        func=_helper_noop,
+        name=name,
+        deps={dep: _helper_ref(identity) for dep, identity in deps.items()},
+        outs=[_helper_ref(types.ArtifactIdentity(name, None))],
+        params=None,
+        resources={},
+        variant=None,
+        signature=None,
+        fingerprint=None,
+        params_arg_name=None,
+        state_dir=None,
+        collection_params={},
+        no_fingerprint=False,
+        code_deps=[],
+        input_paths={},
+        incremental_inputs={},
+        unsafe_fingerprint=False,
+    )
 
 
 def test_add_stages_grows_a_graph_to_the_one_build_graph_makes() -> None:

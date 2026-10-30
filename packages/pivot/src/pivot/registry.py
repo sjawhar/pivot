@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
 import inspect
 import json
@@ -386,7 +387,10 @@ def template_of(stage_name: str, templates: Iterable[str]) -> str | None:
     template matches."""
     for template in templates:
         prefix = f"{template}@"
-        if stage_name.startswith(prefix) and lock.variant_name_error(stage_name[len(prefix) :]) is None:
+        if (
+            stage_name.startswith(prefix)
+            and lock.variant_name_error(stage_name[len(prefix) :]) is None
+        ):
             return template
     return None
 
@@ -429,7 +433,8 @@ def instantiate(template: MapTemplate, key: str, file_key: str) -> RegistryStage
             param: types.ArtifactIdentity(name, identity.key)
             for param, identity in declared["incremental_inputs"].items()
         },
-        params=declared["params"],
+        # Each instance owns its params, as an included stage owns a deep copy of its info
+        params=copy.deepcopy(declared["params"]),
         resources=dict(declared["resources"]),
         variant=key if variant is None else f"{variant}@{key}",
         signature=declared["signature"],

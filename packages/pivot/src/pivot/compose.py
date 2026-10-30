@@ -574,9 +574,7 @@ def _register_node(
         for i, handle in enumerate(handles):
             note(f"{param_name}[{i}]", handle)
     reg.add_template(
-        registry.MapTemplate(
-            info=info, source=node.map_source.identity(), mapped_deps=mapped_deps
-        )
+        registry.MapTemplate(info=info, source=node.map_source.identity(), mapped_deps=mapped_deps)
     )
 
 
@@ -767,13 +765,17 @@ class Pipeline:
         known_templates = (
             self._included_templates
             if self._constructing
-            else {name: self._registry.get_template(name) for name in self._registry.list_templates()}
+            else {
+                name: self._registry.get_template(name) for name in self._registry.list_templates()
+            }
         )
         for template_name in other.list_templates():
             incoming_template = other.get_template(template_name)
             existing_template = known_templates.get(template_name)
             if existing_template is not None:
-                _require_same_template(template_name, existing_template, incoming_template, self._root)
+                _require_same_template(
+                    template_name, existing_template, incoming_template, self._root
+                )
                 continue
             template = copy.deepcopy(incoming_template)
             self._included_templates[template_name] = template
@@ -1257,7 +1259,7 @@ class Pipeline:
         self._previous_markers.append(marker)
         return marker
 
-    def map(self, handle: ArtifactHandle) -> Any:
+    def map(self, handle: object) -> Any:
         """Stand for each file of a directory output, one at a time.
 
         A stage called with the returned handle is mapped: a run that finds the directory's
@@ -1266,6 +1268,11 @@ class Pipeline:
         depends on its own file only. A stage called with a mapped stage's handle is mapped
         over the same files, its instance of each key depending on that key's instance.
         """
+        if not isinstance(handle, ArtifactHandle):
+            raise exceptions.PipelineConfigError(
+                "pipeline.map() takes what a stage call returned (or one of its fields), "
+                + f"not a {type(handle).__name__}."
+            )
         if not isinstance(handle._source, _StageNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
             raise exceptions.PipelineConfigError(
                 "pipeline.map() takes a directory output of a stage; "

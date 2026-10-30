@@ -22,15 +22,13 @@ import pydantic.fields
 import pydantic.json_schema
 import yaml
 
-from pivot import exceptions, project, yaml_config
+from pivot import exceptions, project, registry, yaml_config
 from pivot import state_dir as state_dir_mod
 
 if TYPE_CHECKING:
     import pathlib
 
     import pydantic_core
-
-    from pivot.registry import PipelineLike
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +47,9 @@ _params_merger = deepmerge.Merger(  # pyright: ignore[reportPrivateImportUsage]
 ParamsOverrides = dict[str, dict[str, Any]]
 
 
-def load_params_yaml(pipeline: PipelineLike, path: pathlib.Path | None = None) -> ParamsOverrides:
+def load_params_yaml(
+    pipeline: registry.PipelineLike, path: pathlib.Path | None = None
+) -> ParamsOverrides:
     """Load params.yaml from the project root (or ``path``) and check it against ``pipeline``.
 
     Keys are qualified stage names (``<pipeline>/<stage>``); a key without ``@...`` applies to
@@ -86,8 +86,6 @@ def load_params_yaml(pipeline: PipelineLike, path: pathlib.Path | None = None) -
 
     if not isinstance(data, dict):
         raise exceptions.ParamsError(f"params.yaml root must be a dict, got {type(data).__name__}")
-
-    from pivot import registry
 
     stage_names = pipeline.list_stages()
     templates = pipeline.list_templates()
