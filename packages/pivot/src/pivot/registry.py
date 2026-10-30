@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import json
 import logging
 import pathlib
+import posixpath
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
 import pygtrie
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
 from pivot import exceptions, fingerprint, loaded_source, project, stage_def, types
-from pivot.storage import cache
+from pivot.storage import cache, lock
 from pivot.storage import store as store_mod
 
 if TYPE_CHECKING:
@@ -66,14 +68,39 @@ class RegistryStageInfo(TypedDict):
     unsafe_fingerprint: bool
 
 
+class MapTemplate(TypedDict):
+    """A stage mapped over a directory output (``Pipeline.map``): not a stage itself, but the
+    pattern of one instance per file of the directory, ``<name>@<key>``, made when a run finds
+    its producer current.
+
+    Attributes:
+        info: The stage as declared, named by the template. A mapped dependency reads the
+            whole directory (``source``), or an upstream template's output; the rest are
+            ordinary dependencies every instance shares.
+        source: The directory output whose files expand the template.
+        mapped_deps: Each mapped dependency's name, mapped to None for the file of the
+            instance's key, or to the name of the upstream template whose instance of that key
+            the dependency reads.
+    """
+
+    info: RegistryStageInfo
+    source: types.ArtifactIdentity
+    mapped_deps: dict[str, str | None]
+
+
 class StageRegistry:
     """Registry for pipeline stages and DAG construction."""
 
     _stages: dict[str, RegistryStageInfo]
+    _templates: dict[str, MapTemplate]
+    # Each expanded template's instances, in the order they were added
+    _instances: dict[str, list[str]]
     _output_paths: pygtrie.Trie[types.ArtifactIdentity]
 
     def __init__(self) -> None:
         self._stages = dict[str, RegistryStageInfo]()
+        self._templates = dict[str, MapTemplate]()
+        self._instances = dict[str, list[str]]()
         self._output_paths = pygtrie.Trie()
         self._cached_dag: DiGraph[str] | None = None
 
@@ -90,7 +117,7 @@ class StageRegistry:
                 in its own store, so this is the only place that sees every output at once.
         """
         name = stage_info["name"]
-        if name in self._stages:
+        if name in self._stages or name in self._templates:
             raise exceptions.ValidationError(f"Stage '{name}' already registered")
         for out in stage_info["outs"]:
             if out.identity.producer != name:
@@ -147,8 +174,84 @@ class StageRegistry:
         return self._stages[name]
 
     def list_stages(self) -> list[str]:
-        """Get list of all stage names."""
+        """Get list of all stage names: no template, and each expanded instance."""
         return list(self._stages.keys())
+
+    def add_template(self, template: MapTemplate) -> None:
+        """Add a template (``Pipeline.map``). It writes nothing, so it claims no output path;
+        each instance's paths are checked when it is added (``expand``).
+
+        Raises:
+            ValidationError: If a stage or template already has its name.
+        """
+        name = template["info"]["name"]
+        if name in self._stages or name in self._templates:
+            raise exceptions.ValidationError(f"Stage '{name}' already registered")
+        self._templates[name] = template
+        self._cached_dag = None
+
+    def list_templates(self) -> list[str]:
+        """The names of the templates, in the order they were added."""
+        return list(self._templates)
+
+    def get_template(self, name: str) -> MapTemplate:
+        """Get a template by name (raises KeyError if not found)."""
+        return self._templates[name]
+
+    def graph_stages(self) -> dict[str, RegistryStageInfo]:
+        """Every stage and every template, as the stage graph holds them: a template stands
+        for its instances until a run expands it, and reads its whole source directory."""
+        return {**self._stages, **{name: t["info"] for name, t in self._templates.items()}}
+
+    def expand(self, name: str, keys: Sequence[tuple[str, str]]) -> list[str]:
+        """Add template ``name``'s instance for each (key, file key) of ``keys``
+        (``map_instance_keys``), and return their names.
+
+        Each instance is added as any stage is (``add_existing``), so a name or an output path
+        another stage holds is refused. The expansion is all or nothing: on a refusal no
+        instance of it stays.
+
+        Raises:
+            PipelineConfigError: An instance name is not a legal stage name.
+            ValidationError: A stage already has an instance's name.
+            OutputPathConflictError: An instance's output path overlaps another's.
+        """
+        template = self._templates[name]
+        added = list[str]()
+        try:
+            for key, file_key in keys:
+                info = instantiate(template, key, file_key)
+                reason = lock.stage_name_error(info["name"])
+                if reason is not None:
+                    raise exceptions.PipelineConfigError(
+                        f"Mapped stage '{name}' cannot name its instance for file {file_key!r} "
+                        + f"of '{types.identity_key(template['source'])}': {reason}"
+                    )
+                self.add_existing(info)
+                added.append(info["name"])
+        except exceptions.PivotError:
+            for stage_name in added:
+                self._remove(stage_name)
+            raise
+        self._instances.setdefault(name, []).extend(added)
+        return added
+
+    def instances_of(self, name: str) -> list[str]:
+        """The instances template ``name`` was expanded into since the last reset."""
+        return list(self._instances.get(name, []))
+
+    def reset_expansions(self) -> None:
+        """Remove every instance, leaving each template unexpanded, as a load leaves it."""
+        for instances in self._instances.values():
+            for stage_name in instances:
+                self._remove(stage_name)
+        self._instances.clear()
+
+    def _remove(self, name: str) -> None:
+        info = self._stages.pop(name)
+        for out in info["outs"]:
+            del self._output_paths[store_mod.relative_output_path(out).parts]
+        self._cached_dag = None
 
     def ensure_fingerprint(self, stage_name: str) -> dict[str, str]:
         """Ensure a stage fingerprint is computed and cached."""
@@ -158,7 +261,7 @@ class StageRegistry:
         return info["fingerprint"]
 
     def build_dag(self) -> DiGraph[str]:
-        """Build DAG from registered stages.
+        """Build DAG from registered stages and templates (``graph_stages``).
 
         Returns:
             NetworkX DiGraph with stages as nodes and dependencies as edges
@@ -169,7 +272,7 @@ class StageRegistry:
         from pivot.engine import graph as engine_graph
 
         # Build bipartite graph, extract stage DAG
-        bipartite = engine_graph.build_graph(self._stages)
+        bipartite = engine_graph.build_graph(self.graph_stages())
         graph = engine_graph.get_stage_dag(bipartite)
 
         self._cached_dag = graph
@@ -177,8 +280,10 @@ class StageRegistry:
         return graph
 
     def clear(self) -> None:
-        """Clear all registered stages (for testing)."""
+        """Clear all registered stages and templates (for testing)."""
         self._stages.clear()
+        self._templates.clear()
+        self._instances.clear()
         self._output_paths = pygtrie.Trie()
         self._cached_dag = None
 
@@ -223,6 +328,16 @@ class PipelineLike(Protocol):
 
     def get_stage(self, name: str) -> RegistryStageInfo: ...
 
+    def list_templates(self) -> list[str]: ...
+
+    def get_template(self, name: str) -> MapTemplate: ...
+
+    def expand_template(self, name: str, keys: Sequence[tuple[str, str]]) -> list[str]: ...
+
+    def instances_of(self, name: str) -> list[str]: ...
+
+    def reset_expansions(self) -> None: ...
+
     def ensure_fingerprint(self, name: str) -> dict[str, str]: ...
 
     def build_dag(self) -> DiGraph[str]: ...
@@ -232,6 +347,101 @@ class PipelineLike(Protocol):
     def snapshot(self) -> dict[str, RegistryStageInfo]: ...
 
     def include(self, other: PipelineLike) -> None: ...
+
+
+def map_instance_keys(file_keys: Iterable[str]) -> list[tuple[str, str]]:
+    """Each file of a mapped directory as (instance key, file key), sorted by instance key.
+
+    A file's instance key is its path inside the directory without its extension: a template
+    ``p/cut`` over ``plan/a.yaml`` has the instance ``p/cut@a``. The key follows the
+    variant-name rule (``lock.variant_name_error``), so a key never holds ``/`` or ``@`` and
+    no two files map to one instance.
+
+    Raises:
+        PipelineConfigError: Naming every file whose key breaks the rule and every two files
+            that share a key.
+    """
+    file_by_key = dict[str, str]()
+    errors = list[str]()
+    for file_key in sorted(file_keys):
+        key = posixpath.splitext(file_key)[0]
+        reason = lock.variant_name_error(key)
+        if reason is not None:
+            errors.append(
+                f"file {file_key!r}: its key {key!r} (its path without the extension) cannot "
+                + f"name a stage: {reason}"
+            )
+        elif key in file_by_key:
+            errors.append(f"files {file_by_key[key]!r} and {file_key!r} have one key {key!r}")
+        else:
+            file_by_key[key] = file_key
+    if errors:
+        raise exceptions.PipelineConfigError("; ".join(errors))
+    return sorted(file_by_key.items())
+
+
+def template_of(stage_name: str, templates: Iterable[str]) -> str | None:
+    """The template of ``templates`` whose instance ``stage_name`` names (``<template>@<key>``,
+    with a key ``map_instance_keys`` allows), or None. A key holds no ``@``, so at most one
+    template matches."""
+    for template in templates:
+        prefix = f"{template}@"
+        if stage_name.startswith(prefix) and lock.variant_name_error(stage_name[len(prefix) :]) is None:
+            return template
+    return None
+
+
+def instantiate(template: MapTemplate, key: str, file_key: str) -> RegistryStageInfo:
+    """Template ``template``'s stage for one key: named ``<template>@<key>``, its entry reading
+    file ``file_key`` of the source directory, each mapped dependency on an upstream template
+    reading that template's instance of the key, and its outputs its own."""
+    declared = template["info"]
+    name = f"{declared['name']}@{key}"
+
+    def instance_of(identity: types.ArtifactIdentity) -> types.ArtifactIdentity:
+        return types.ArtifactIdentity(f"{identity.producer}@{key}", identity.key)
+
+    deps = dict[str, types.ArtifactRef]()
+    for dep_name, ref in declared["deps"].items():
+        if dep_name not in template["mapped_deps"]:
+            deps[dep_name] = ref
+        elif template["mapped_deps"][dep_name] is None:
+            source = template["source"]
+            deps[dep_name] = dataclasses.replace(
+                ref, identity=types.directory_file_identity(source, file_key), directory=source
+            )
+        else:
+            deps[dep_name] = dataclasses.replace(
+                ref,
+                identity=instance_of(ref.identity),
+                directory=None if ref.directory is None else instance_of(ref.directory),
+            )
+    variant = declared["variant"]
+    return RegistryStageInfo(
+        func=declared["func"],
+        name=name,
+        deps=deps,
+        outs=[
+            dataclasses.replace(out, identity=types.ArtifactIdentity(name, out.identity.key))
+            for out in declared["outs"]
+        ],
+        incremental_inputs={
+            param: types.ArtifactIdentity(name, identity.key)
+            for param, identity in declared["incremental_inputs"].items()
+        },
+        params=declared["params"],
+        resources=dict(declared["resources"]),
+        variant=key if variant is None else f"{variant}@{key}",
+        signature=declared["signature"],
+        fingerprint=None,
+        params_arg_name=declared["params_arg_name"],
+        state_dir=declared["state_dir"],
+        collection_params=dict(declared["collection_params"]),
+        no_fingerprint=declared["no_fingerprint"],
+        code_deps=list(declared["code_deps"]),
+        input_paths=dict(declared["input_paths"]),
+        unsafe_fingerprint=False,
+    )
 
 
 def _check_output_path_free(

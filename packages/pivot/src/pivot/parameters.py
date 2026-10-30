@@ -56,6 +56,12 @@ def load_params_yaml(pipeline: PipelineLike, path: pathlib.Path | None = None) -
     every variant of that stage. Returns stage_name -> param_dict, or an empty dict when the
     file is missing.
 
+    A stage mapped over a directory (``Pipeline.map``) has instances only once a run expands
+    it, so its keys are checked against the template: its base name applies to every instance,
+    and ``<template>@<key>`` to the instance of one key, whether or not a run has added it. A
+    template's own name is no key when it holds ``@`` (a variant): its instances read only the
+    base name and their own.
+
     Raises:
         ParamsError: The file cannot be read or parsed, or its root is not a mapping.
         PipelineConfigError: A key has no pipeline part, names no stage of a pipeline loaded
@@ -81,14 +87,23 @@ def load_params_yaml(pipeline: PipelineLike, path: pathlib.Path | None = None) -
     if not isinstance(data, dict):
         raise exceptions.ParamsError(f"params.yaml root must be a dict, got {type(data).__name__}")
 
+    from pivot import registry
+
     stage_names = pipeline.list_stages()
-    valid_keys = set(stage_names) | {name.split("@")[0] for name in stage_names}
+    templates = pipeline.list_templates()
+    valid_keys = (
+        set(stage_names)
+        | {name.split("@")[0] for name in stage_names}
+        | {name.split("@")[0] for name in templates}
+    )
     loaded = pipeline.loaded_pipelines
 
     # YAML dict has unknown key/value types from parsing arbitrary user input
     typed_data = cast("dict[Any, Any]", data)
     result = ParamsOverrides()
     errors_by_key = dict[str, list[str]]()
+    # Each instance key that names no added stage, with the params of its template
+    instance_keys = dict[str, pydantic.BaseModel | None]()
     for k, v in typed_data.items():
         key = str(k)
         key_errors = errors_by_key.setdefault(key, list[str]())
@@ -99,10 +114,27 @@ def load_params_yaml(pipeline: PipelineLike, path: pathlib.Path | None = None) -
             )
             continue
         result[key] = v
-        if key not in valid_keys and (error := _unmatched_key_error(key, valid_keys, loaded)):
+        if key in valid_keys:
+            continue
+        if key in templates:
+            base = key.split("@")[0]
+            key_errors.append(
+                f"params.yaml key '{key}' names mapped stage '{key}', whose instances read only "
+                + f"'{base}' and their own '{key}@<key>'"
+            )
+            continue
+        template = registry.template_of(key, templates)
+        if template is not None:
+            instance_keys[key] = pipeline.get_template(template)["info"]["params"]
+            continue
+        if error := _unmatched_key_error(key, valid_keys, loaded):
             key_errors.append(error)
-    for stage_name in stage_names:
-        params = pipeline.get_stage(stage_name)["params"]
+    checked = [
+        *((name, pipeline.get_stage(name)["params"]) for name in stage_names),
+        *((name, pipeline.get_template(name)["info"]["params"]) for name in templates),
+        *instance_keys.items(),
+    ]
+    for stage_name, params in checked:
         if params is None:
             continue
         for key, message in _override_errors(params, stage_name, result):

@@ -38,6 +38,7 @@ class Scheduler:
     _stage_resources: dict[str, dict[str, int]]
     _resource_capacity: dict[str, int]
     _resource_counts: collections.defaultdict[str, int]
+    _failed: set[str]
     _stop_starting_new: bool
 
     def __init__(self) -> None:
@@ -47,6 +48,7 @@ class Scheduler:
         self._stage_resources = dict[str, dict[str, int]]()
         self._resource_capacity = dict[str, int]()
         self._resource_counts = collections.defaultdict(int)
+        self._failed = set[str]()
         self._stop_starting_new = False
 
     @property
@@ -90,36 +92,11 @@ class Scheduler:
         self._stage_resources.clear()
         self._resource_capacity = dict(resource_capacity)
         self._stage_states.clear()
+        self._failed.clear()
         self._stop_starting_new = False
 
         stages_set = set(execution_order)
-        resource_keys = set(stage_resources)
-        missing = stages_set - resource_keys
-        extra = resource_keys - stages_set
-        if missing or extra:
-            parts = list[str]()
-            if missing:
-                parts.append(f"missing: {sorted(missing)}")
-            if extra:
-                parts.append(f"unknown: {sorted(extra)}")
-            msg = f"stage resource inconsistency — {', '.join(parts)}"
-            raise ValueError(msg)
-
-        for resource, capacity in self._resource_capacity.items():
-            if capacity <= 0:
-                raise ValueError(f"Resource {resource!r} has non-positive capacity {capacity}")
-
-        for stage_name, request in stage_resources.items():
-            for resource, amount in request.items():
-                if amount <= 0:
-                    msg = (
-                        f"Stage {stage_name!r} requests non-positive amount {amount} "
-                        + f"of resource {resource!r}"
-                    )
-                    raise ValueError(msg)
-                if resource not in self._resource_capacity:
-                    msg = f"Stage {stage_name!r} requests resource {resource!r} with no capacity"
-                    raise ValueError(msg)
+        self._check_requests(stages_set, stage_resources)
 
         for stage_name in execution_order:
             if graph is not None:
@@ -144,6 +121,96 @@ class Scheduler:
                 StageExecutionState.READY if not upstream else StageExecutionState.PENDING
             )
             _ = self.set_state(stage_name, initial_state)
+
+    def _check_requests(self, stages: set[str], stage_resources: dict[str, dict[str, int]]) -> None:
+        """Raise ValueError unless ``stage_resources`` names exactly ``stages``, every capacity
+        is at least 1, each request is at least 1, and each requested resource has a capacity."""
+        resource_keys = set(stage_resources)
+        missing = stages - resource_keys
+        extra = resource_keys - stages
+        if missing or extra:
+            parts = list[str]()
+            if missing:
+                parts.append(f"missing: {sorted(missing)}")
+            if extra:
+                parts.append(f"unknown: {sorted(extra)}")
+            msg = f"stage resource inconsistency — {', '.join(parts)}"
+            raise ValueError(msg)
+
+        for resource, capacity in self._resource_capacity.items():
+            if capacity <= 0:
+                raise ValueError(f"Resource {resource!r} has non-positive capacity {capacity}")
+        for stage_name, request in stage_resources.items():
+            for resource, amount in request.items():
+                if amount <= 0:
+                    msg = (
+                        f"Stage {stage_name!r} requests non-positive amount {amount} "
+                        + f"of resource {resource!r}"
+                    )
+                    raise ValueError(msg)
+                if resource not in self._resource_capacity:
+                    msg = f"Stage {stage_name!r} requests resource {resource!r} with no capacity"
+                    raise ValueError(msg)
+
+    def extend(
+        self,
+        stages: list[str],
+        graph: nx.DiGraph[str],
+        *,
+        stage_resources: dict[str, dict[str, int]],
+    ) -> list[tuple[str, StageExecutionState]]:
+        """Add ``stages`` to the schedule under way, after every stage it holds, and return each
+        with its first state.
+
+        A run adds a template's instances this way (``Pipeline.map``); ``graph`` already holds
+        them (``engine_graph.add_stages``). Every stage already scheduled keeps its state. A new
+        stage waits for each upstream stage of the run not yet finished, earlier new stages
+        included, and is BLOCKED when an upstream stage failed or is blocked. Each upstream
+        stage, however far up, counts the new stage downstream, so a later failure blocks it.
+
+        Raises:
+            ValueError: As ``initialize`` does for ``stage_resources``.
+        """
+        self._check_requests(set(stages), stage_resources)
+        members = set(self._stage_states) | set(stages)
+        added = list[tuple[str, StageExecutionState]]()
+        for stage_name in stages:
+            upstream = [
+                name
+                for name in engine_graph.get_upstream_stages(graph, stage_name)
+                if name in members
+            ]
+            for ancestor in self._ancestors(graph, upstream, members):
+                self._downstream[ancestor].append(stage_name)
+            self._downstream[stage_name] = []
+            self._stage_resources[stage_name] = dict(stage_resources[stage_name])
+            self._upstream_unfinished[stage_name] = {
+                name for name in upstream if self.get_state(name) != StageExecutionState.COMPLETED
+            }
+            if any(
+                name in self._failed or self.get_state(name) == StageExecutionState.BLOCKED
+                for name in upstream
+            ):
+                state = StageExecutionState.BLOCKED
+            elif self._upstream_unfinished[stage_name]:
+                state = StageExecutionState.PENDING
+            else:
+                state = StageExecutionState.READY
+            _ = self.set_state(stage_name, state)
+            added.append((stage_name, state))
+        return added
+
+    @staticmethod
+    def _ancestors(graph: nx.DiGraph[str], upstream: list[str], members: set[str]) -> set[str]:
+        """``upstream`` and every stage of ``members`` above it in ``graph``."""
+        found = set(upstream)
+        pending = list(upstream)
+        while pending:
+            for name in engine_graph.get_upstream_stages(graph, pending.pop()):
+                if name in members and name not in found:
+                    found.add(name)
+                    pending.append(name)
+        return found
 
     def get_state(self, stage: str) -> StageExecutionState:
         return self._stage_states.get(stage, StageExecutionState.PENDING)
@@ -426,6 +493,7 @@ class Scheduler:
                 newly_ready.append(downstream_name)
 
         if failed:
+            self._failed.add(stage)
             newly_blocked = self._cascade_failure(stage)
         else:
             newly_blocked = list[tuple[str, StageExecutionState]]()
