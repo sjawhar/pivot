@@ -1,26 +1,23 @@
 """Red test from round 2 of the acceptance of sjawhar/pivot#545 (BET-473) at caf288134cc2.
 
-Run from a checkout of the PR head (on a pivot-slices VM, never on sami-rocqperf):
-
-    cp /mnt/nvme/sami/tmp/BET408/accept/test_map_accept545_round2_red.py packages/pivot/tests/cli/
-    uv run pytest packages/pivot/tests/cli/test_map_accept545_round2_red.py -p no:randomly --basetemp=/tmp/a545 --no-cov
-
 It drives the installed ``pivot repro --watch --serve`` in a real git project and calls the agent
 server over its Unix socket, as ``docs/architecture/agent-server.md``'s client example does. It
-failed at caf288134cc2.
+connects through ``pivot.unix_socket``, as the server binds, so a socket path longer than the
+kernel's address limit works. It failed at caf288134cc2.
 """
 
 from __future__ import annotations
 
 import json
 import signal
-import socket
 import subprocess
 import time
 from typing import TYPE_CHECKING
 
+import anyio
 import yaml
 
+from pivot import unix_socket
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -74,32 +71,45 @@ def _project(tmp_path: pathlib.Path, plan: Mapping[str, int]) -> tuple[pathlib.P
     return root, home
 
 
-def _rpc(path: pathlib.Path, method: str, params: dict[str, object]) -> dict[str, object]:
-    """One JSON-RPC call to the agent server; the whole reply."""
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(30)
-        sock.connect(str(path))
-        request = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
-        sock.sendall(json.dumps(request).encode() + b"\n")
-        buffer = b""
-        while not buffer.endswith(b"\n"):
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            buffer += chunk
+async def _call(path: pathlib.Path, method: str, params: dict[str, object]) -> dict[str, object]:
+    request = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
+    with anyio.fail_after(30):
+        async with await unix_socket.connect_unix(path) as stream:
+            await stream.send(json.dumps(request).encode() + b"\n")
+            buffer = b""
+            while not buffer.endswith(b"\n"):
+                try:
+                    buffer += await stream.receive(65536)
+                except anyio.EndOfStream:
+                    break
     return json.loads(buffer)
 
 
-def _expanded(path: pathlib.Path) -> bool:
-    try:
-        reply = _rpc(path, "stages", {})
-    except OSError:
-        return False
-    result = reply.get("result")
-    return isinstance(result, dict) and result.get("templates", {}).get("p/cut") == [
-        "p/cut@a",
-        "p/cut@b",
-    ]
+def _rpc(path: pathlib.Path, method: str, params: dict[str, object]) -> dict[str, object]:
+    """One JSON-RPC call to the agent server; the whole reply."""
+    return anyio.run(_call, path, method, params)
+
+
+def _wait_for_expansion(path: pathlib.Path, deadline: float) -> None:
+    """Wait until the server's socket exists and its ``stages`` answer holds p/cut's instances.
+
+    The server binds the socket, then listens (``anyio.create_unix_listener``), so a connection
+    in between is refused; no other connection error is retried."""
+    while not path.is_socket():
+        assert time.monotonic() < deadline, "the watch server never created its socket"
+        time.sleep(0.2)
+    while True:
+        try:
+            result = _rpc(path, "stages", {}).get("result")
+        except ConnectionRefusedError:
+            result = None
+        if isinstance(result, dict) and result.get("templates", {}).get("p/cut") == [
+            "p/cut@a",
+            "p/cut@b",
+        ]:
+            return
+        assert time.monotonic() < deadline, "the watch run never expanded p/cut"
+        time.sleep(0.5)
 
 
 def test_rpc_explain_and_stage_info_of_a_key_no_instance_has_say_it_is_unknown(
@@ -121,10 +131,7 @@ def test_rpc_explain_and_stage_info_of_a_key_no_instance_has_say_it_is_unknown(
         start_new_session=True,
     )
     try:
-        deadline = time.monotonic() + 90
-        while not _expanded(sock):
-            assert time.monotonic() < deadline, "the watch run never expanded p/cut"
-            time.sleep(0.5)
+        _wait_for_expansion(sock, time.monotonic() + 90)
         no_stage = _rpc(sock, "explain", {"stage": "p/nosuch"})
         explain = _rpc(sock, "explain", {"stage": "p/cut@zzz"})
         info = _rpc(sock, "stage_info", {"stage": "p/cut@zzz"})

@@ -223,15 +223,24 @@ def test_repro_takes_an_instance_output_path_as_pivot_dag_does(tmp_path: pathlib
     assert not (root / "data" / "p" / "cut@a.yaml").exists(), "the path's chain runs alone"
 
 
-def test_repro_refuses_the_output_path_a_mapped_stage_declares(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(("repro", "--dry-run"), id="repro"),
+        pytest.param(("dag", "--stages"), id="dag"),
+    ],
+)
+def test_the_output_path_a_mapped_stage_declares_is_refused(
+    tmp_path: pathlib.Path, command: tuple[str, ...]
+) -> None:
     """No stage writes `data/p/cut.yaml`: each instance of `p/cut` writes its own. Before the
-    producer runs and after, the target is refused, naming the mapped stage and its instances'
-    path."""
+    producer runs and after, `repro` and `dag` refuse the target alike, naming the mapped stage
+    and its instances' path."""
     root, home = _project(tmp_path, {"a": 1})
 
-    before = helpers.run_pivot(root, home, "repro", "--dry-run", "data/p/cut.yaml")
+    before = helpers.run_pivot(root, home, *command, "data/p/cut.yaml")
     _ok(helpers.run_pivot(root, home, "repro", "p/plan"))
-    after = helpers.run_pivot(root, home, "repro", "--dry-run", "data/p/cut.yaml")
+    after = helpers.run_pivot(root, home, *command, "data/p/cut.yaml")
 
     for refused in (before, after):
         assert refused.returncode != 0, refused.stdout

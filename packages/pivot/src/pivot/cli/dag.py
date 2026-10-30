@@ -107,6 +107,8 @@ def dag_cmd(
     # Filter to subgraph if targets provided
     if targets:
         valid_targets = cli_targets.validate_targets(targets)
+        # A mapped stage's declared output path names no stage, as `pivot repro` refuses it
+        cli_helpers.refuse_template_output_targets(valid_targets)
         stage_names, unresolved = cli_targets.resolve_targets_to_stages(
             cli_helpers.mapped_target_names(valid_targets, result),
             bipartite_graph,
