@@ -458,12 +458,12 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
     root = root.resolve()
     file_under_root = dict[str, bool]()
     preexisting_root_modules = dict[str, _stdlib_types.ModuleType]()
-    outside_root = list[str]()
+    outside_root = set[str]()
     for module_name, module in sys.modules.items():
         if _module_is_under_root(module, root, file_under_root):
             preexisting_root_modules[module_name] = module
         elif fingerprint.is_user_code(module):
-            outside_root.append(module_name)
+            outside_root.add(module_name)
     root_str = str(root)
     caller_path_entries = [
         (index, entry) for index, entry in enumerate(sys.path) if entry == root_str
@@ -489,16 +489,17 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
 _MAIN_MODULES: Final = frozenset({"__main__", "__mp_main__"})
 
 
-def _displace_modules_the_root_provides(session: _ImportSession, outside_root: list[str]) -> None:
-    """Displace, until the session ends, each user module loaded from outside the root
-    (``outside_root``) whose top-level module or package the root provides, with its submodules.
+def _displace_modules_the_root_provides(session: _ImportSession, outside_root: set[str]) -> None:
+    """Displace, until the session ends, each top-level user module loaded from outside the root
+    (``outside_root``) that the root also provides, with its submodules.
 
     With the root first on ``sys.path``, project code's ``import helpers`` loads the root's
     ``helpers.py``, as it does in a ``pivot`` process and in a worker, which imports by name a
     module the stage's code refers to but discovery did not send by value. A ``helpers`` that
     the program running Pivot imported from elsewhere would be returned from ``sys.modules``
     instead: the stage's fingerprint would describe that module while its worker ran the root's
-    file. Libraries stay, as Pivot and its workers hold them too. A directory without
+    file. Libraries stay, as Pivot and its workers hold them too, with their submodules, even one
+    that counts as user code because it has no file (``six.moves``). A directory without
     ``__init__.py`` provides nothing: a module or package found anywhere on ``sys.path`` wins over
     a namespace portion.
     """
@@ -511,7 +512,7 @@ def _displace_modules_the_root_provides(session: _ImportSession, outside_root: l
     provides = dict[str, bool]()
     for module_name in outside_root:
         top = module_name.partition(".")[0]
-        if top in _MAIN_MODULES:
+        if top in _MAIN_MODULES or top not in outside_root:
             continue
         if (verdict := provides.get(top)) is None:
             spec = finder.find_spec(top)

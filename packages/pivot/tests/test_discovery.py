@@ -1183,7 +1183,10 @@ def test_discovery_takes_over_a_programs_package_and_its_submodule_for_the_sessi
 def test_discovery_keeps_a_library_the_root_has_a_module_for(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pivot and its workers hold their libraries: a root `json.py` displaces none of them."""
+    """Pivot and its workers hold their libraries: a root `json.py` displaces none of them, nor
+    a submodule of one that counts as user code because it has no file (as `six.moves`)."""
+    fileless = _stdlib_types.ModuleType("json.fileless")
+    monkeypatch.setitem(sys.modules, "json.fileless", fileless)
     root = _write_sibling_stage_project(tmp_path / "project", "project").parent
     (root / "json.py").write_text("VALUE = 'project'\n")
     monkeypatch.setattr(project, "_project_root_cache", root)
@@ -1191,6 +1194,7 @@ def test_discovery_keeps_a_library_the_root_has_a_module_for(
     assert discovery.discover_pipeline(project_root=root) is not None
 
     assert sys.modules["json"] is json
+    assert sys.modules["json.fileless"] is fileless
 
 
 @pytest.mark.parametrize(
