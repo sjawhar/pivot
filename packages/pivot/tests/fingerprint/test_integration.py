@@ -175,10 +175,10 @@ def run_stage():
     stage_mod = _import_module("test_mod_stage_v4")
     fp = fingerprint.get_stage_fingerprint(stage_mod.run_stage)
 
-    # json is stdlib - should NOT be in fingerprint
-    assert not any("json" in key for key in fp if not key.startswith("self:")), (
-        f"Stdlib module attrs should not be tracked, got: {list(fp.keys())}"
-    )
+    # json is stdlib - its attributes and code are not in the fingerprint, only its name
+    assert {key: value for key, value in fp.items() if not key.startswith("self:")} == {
+        "byname:json": ""
+    }, f"Stdlib module attrs should not be tracked, got: {list(fp.keys())}"
 
 
 def test_direct_import_change_detected(module_dir: pathlib.Path) -> None:

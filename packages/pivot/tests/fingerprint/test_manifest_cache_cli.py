@@ -2454,3 +2454,50 @@ def test_unchanged_wiring_stays_cached(tmp_path: pathlib.Path) -> None:
 
     assert "1 cached, 0 stale" in status, status
     assert "0 ran, 1 cached" in output, output
+
+
+_LIBRARY_THEN_PROJECT_PIPELINE = """\
+import helpers
+
+from pivot import Pipeline, stage
+
+
+@stage
+def use() -> str:
+    return helpers.plain()
+
+
+with Pipeline("lib") as pipeline:
+    use()
+"""
+
+
+def test_a_project_module_that_takes_over_a_librarys_name_is_not_hidden_by_the_cache(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`helpers` is first a library (a `site-packages` directory on `PYTHONPATH`); then the
+    project vendors its own `helpers.py`, which the root puts first, and edits it. No file the
+    first walk read changed, and a library module records no read of its own, so the cached
+    manifest is reused only while `helpers` still resolves where it did."""
+    home = tmp_path / "home"
+    site = tmp_path / "lib" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "helpers.py").write_text('def plain():\n    return "lib-v1"\n')
+    env = {"PYTHONPATH": os.pathsep.join([str(site), os.environ.get("PYTHONPATH", "")])}
+    (tmp_path / "project").mkdir()
+    root = _helper_project(
+        tmp_path / "project", home, {"pipeline.py": _LIBRARY_THEN_PROJECT_PIPELINE}
+    )
+    output = root / "data" / "lib" / "use.txt"
+    _helper_ok(helpers.run_pivot(root, home, "repro", extra_env=env))
+    assert output.read_text() == "lib-v1"
+
+    (root / "helpers.py").write_text('def plain():\n    return "proj-v1"\n')
+    vendored = _helper_ok(helpers.run_pivot(root, home, "repro", extra_env=env))
+    assert "1 ran" in vendored, vendored
+    assert output.read_text() == "proj-v1"
+
+    (root / "helpers.py").write_text('def plain():\n    return "proj-v2"\n')
+    edited = _helper_ok(helpers.run_pivot(root, home, "repro"))
+    assert "1 ran" in edited, edited
+    assert output.read_text() == "proj-v2"
