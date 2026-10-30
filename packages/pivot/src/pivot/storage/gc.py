@@ -11,9 +11,9 @@ delete.
 
 A cache outside the project root can hold another project's outputs, whose locks this project
 cannot read. Pivot therefore keeps a register of the projects that use a cache, at
-``<cache>/projects/``, written by every naming unit (``storage/naming.py``, and through it by
-``config.register_cache_use()`` before a restore links objects), and refuses to collect an
-external cache that records nothing.
+``<cache>/projects/``, written by every naming unit (``storage/naming.py``: once per ``repro``
+or ``run`` before any stage, and through ``config.register_cache_use()`` before ``checkout``
+and ``pull`` link objects), and refuses to collect an external cache that records nothing.
 
 Two rules cover the window between publishing an object and writing the record that names it
 (``storage/AGENTS.md``): every object whose ``st_ctime`` is inside the grace period is kept,
@@ -499,7 +499,14 @@ def read_register(
         try:
             scope["state_dir"] = state_dir_mod.locate_state_dir(scope["root"])
         except (exceptions.ConfigError, UnicodeDecodeError) as e:
-            unreadable.append(_registered_scope_reason(path, scope, f"cannot read its config: {e}"))
+            # The project is there: its configuration is what needs fixing, not its entry.
+            unreadable.append(
+                (
+                    scope_label(scope),
+                    f"{_recorded_where(scope)}, and its configuration cannot be read ({e}). "
+                    + "Fix that project's configuration and re-run",
+                )
+            )
             continue
         except OSError as e:
             unreadable.append(_registered_scope_reason(path, scope, e.strerror or str(e)))

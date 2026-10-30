@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NotRequired, get_origin, get_type_hints
 
 import pytest
 
@@ -21,6 +21,28 @@ if TYPE_CHECKING:
 # =============================================================================
 # run_history module tests
 # =============================================================================
+
+
+def test_gc_accepts_exactly_the_run_cache_keys_the_typed_dicts_declare() -> None:
+    """`pivot gc` roots only an output's ``hash`` and a directory's listing, and accepts only the
+    keys ``run_history`` lists. A field added to ``RunCacheEntry`` or ``OutputHashEntry`` must be
+    added to that list, and rooted in gc if it can name a cache object, in the same change: this
+    fails until the list and the TypedDicts agree."""
+    hints = get_type_hints(run_history.OutputHashEntry, include_extras=True)
+    optional = {key for key, hint in hints.items() if get_origin(hint) is NotRequired}
+
+    assert set(hints) - optional == run_history.OUTPUT_ENTRY_REQUIRED_KEYS
+    assert optional == run_history.OUTPUT_ENTRY_OPTIONAL_KEYS
+    assert set(get_type_hints(run_history.RunCacheEntry)) == run_history.RUN_CACHE_ROW_KEYS
+
+
+def test_a_run_cache_row_with_an_unlisted_output_key_is_not_one_gc_reads() -> None:
+    """A key outside the list may be a newer pivot's record of an object: gc refuses the row."""
+    row = {"run_id": "r", "output_hashes": [{"path": "o", "hash": "0123456789abcdef", "x": 1}]}
+
+    error = run_history.run_cache_entry_error(row)
+
+    assert error is not None and "x" in error, error
 
 
 def test_generate_run_id_format() -> None:

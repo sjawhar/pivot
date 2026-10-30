@@ -181,9 +181,11 @@ saw.
 Every pivot process that names a cache object registers its project first, inside the naming
 lock described above: a stage commit, a run-cache restore, `pivot commit`, `pivot track` and
 `pivot get --rev`, whatever the command and whether or not the cache existed when it started
-(the project whose first run creates a shared cache is registered by that run). Every restore
-that links a cache object into a workspace registers first too: `checkout`, `pull`, a skipped
-stage's restore in `repro` and `run`, and `--checkout-missing`. Read-only commands such as
+(the project whose first run creates a shared cache is registered by that run). `repro` and
+`run` also register once before any stage runs, so a project that is not in the register yet
+(last run by an older pivot) is in it while its stages run, skip or restore; a run started
+while a collection deletes waits for it there. `checkout` and `pull` register before they link
+anything. Read-only commands such as
 `status`, `diff`, `list` and `dag` do not register. If the register cannot be written, the
 command refuses before it names an object. A project id is best-effort through #503's state
 resolver. If the state directory cannot store it, the entry has no id, the writer still

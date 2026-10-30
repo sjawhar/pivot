@@ -812,6 +812,29 @@ def test_gc_refuses_when_a_registered_project_cannot_be_read(
     assert _helper_keys(shared) == {dead}, "a refusal removes nothing"
 
 
+def test_gc_names_a_registered_peers_unreadable_config_as_what_to_fix(
+    shared: Workspace, runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A registered peer whose configuration does not parse is there; the refusal says to fix
+    its configuration, not that its root may be gone."""
+    dead = _helper_publish(shared, "dead")
+    other_root = tmp_path / "second"
+    other_root.mkdir()
+    other = _helper_workspace(other_root, shared["cache_dir"])
+    naming.register_project(shared["cache_dir"], other_root, other["state_dir"])
+    naming.register_project(shared["cache_dir"], shared["root"], shared["state_dir"])
+    (other_root / ".pivot" / "config.yaml").write_text("cache: [unclosed\n")
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code != 0, result.output
+    flat = " ".join(result.output.split())
+    assert "its configuration cannot be read" in flat, result.output
+    assert "Fix that project's configuration" in flat, result.output
+    assert "not visible here" not in flat, "a peer that is there was called not visible"
+    assert _helper_keys(shared) == {dead}, "a refusal removes nothing"
+
+
 def test_gc_refuses_when_a_register_entry_cannot_be_read(
     shared: Workspace, runner: click.testing.CliRunner
 ) -> None:

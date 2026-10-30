@@ -464,15 +464,22 @@ in `<cache>/mounts/`. An entry that already records exactly that (its timestamp 
 written in the last hour is kept rather than rewritten (`_entry_is_current`), so a worker pool
 writes one entry, not one per process. The entry records no pivot version: nothing reads one,
 and looking it up walks the installation's metadata (about 30 ms of CPU in a cold run).
-A worker takes a naming unit for a run-cache lookup only when a row exists for the stage
-(`worker._run_cache_candidate`): with none, nothing is named, so a cold run takes one unit per
-stage, for its commit.
+**Every `repro` and `run` registers its project before any stage runs or restores**
+(`Engine._orchestrate_execution`, one unit per run when the cache exists). A worker takes a
+naming unit for a run-cache lookup only when a row exists for the stage (`worker._run_cache_row`),
+so a stage that executes takes its first unit at its commit, possibly hours later, and a stage
+skipped with its outputs in place takes none: without the engine's unit, a project out of the
+register (last run by a pivot release, or whose entry was deleted) would stay out of it while
+its changed stages run, and a peer's `pivot gc` would remove what only its locks name (U1). The
+engine registers the identity every worker registers: the project root and its configured
+state directory (`state_dir.locate_state_dir`).
 Entries, nonces and cache mount records are keyed per view (hostname, machine id and mount
 namespace). An id or nonce write failure leaves an entry without them, so a collection refuses
 it but the writer preserves #503's unusable-state behavior. A register write failure refuses the
 writer. The only exception is `EROFS` on the cache: a read-only cache cannot be collected
-either. A restore that links a cache object into a workspace outside a naming unit
-(`checkout`, a skipped stage's restore, `--checkout-missing`) runs a registering unit first.
+either. A restore that links a cache object into a workspace outside a naming unit runs after a
+registering unit: `checkout` and `pull` call `config.register_cache_use` first, and a skipped
+stage's restore and `--checkout-missing` run inside a `repro` or `run`, after the engine's.
 
 **A registered project is live only after a real read.** `read_register` resolves the state
 directory from that project's own `core.state_dir`, requires the entry's project id there, and

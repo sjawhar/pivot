@@ -1032,9 +1032,6 @@ def _execute_stage(
                                 else production_lock,
                                 report_changes=True,
                                 file_hash_entries=restored_entries,
-                                register=lambda: _register_before_restore(
-                                    naming_root, project_root, project_state_dir
-                                ),
                                 claims=claims,
                             )
                             if restoration.available:
@@ -1094,9 +1091,6 @@ def _execute_stage(
                             listing_lock=None if "older_format" in lock_data else production_lock,
                             report_changes=True,
                             file_hash_entries=restored_entries,
-                            register=lambda: _register_before_restore(
-                                naming_root, project_root, project_state_dir
-                            ),
                             claims=claims,
                         )
                         if restoration.available:
@@ -1127,13 +1121,18 @@ def _execute_stage(
                         if run_cache_wanted
                         else None
                     )
-                    if run_cache_wanted and _run_cache_candidate(
-                        state_db, stage_name, input_hash, legacy_input_hash, stage_outs
+                    if (
+                        run_cache_wanted
+                        and _run_cache_row(
+                            state_db, stage_name, input_hash, legacy_input_hash, stage_outs
+                        )
+                        is not None
                     ):
                         # Naming-lock unit (shared): the run-cache restore checks whether
                         # objects exist and creates workspace links, then the lock file names
                         # them. gc cannot delete while this unit is open. With no row to
-                        # restore, nothing is named and no unit is taken.
+                        # restore, nothing is named and no unit is taken; the engine registered
+                        # the project before any stage ran (`Engine._orchestrate_execution`).
                         with naming.naming_unit(
                             naming_root, project=(project_root, project_state_dir)
                         ):
@@ -1438,20 +1437,6 @@ def _execute_stage(
             return result
 
 
-def _register_before_restore(
-    naming_root: pathlib.Path, project_root: pathlib.Path, project_state_dir: pathlib.Path
-) -> None:
-    """Register the project before a skipped stage restores outputs its lock already names.
-
-    The restore links cache objects outside a publishing naming unit, as `pivot checkout` does,
-    so the project must be in the register first, or another project's collection would not
-    read the lock that names them (a fresh clone whose run only restores). The unit holds the
-    naming lock only for the registration; the restore's I/O runs after it.
-    """
-    with naming.naming_unit(naming_root, project=(project_root, project_state_dir)):
-        pass
-
-
 def _open_state_db(state_dir: pathlib.Path) -> state.StateDB:
     """Open the stage's state database read-only; a failure to open it is pivot's own I/O."""
     with stage_io.PIVOT_IO:
@@ -1623,7 +1608,6 @@ def restore_outputs_to_hashes(
     restore: bool = True,
     report_changes: Literal[False] = False,
     file_hash_entries: list[FileHashEntry] | None = None,
-    register: Callable[[], None] | None = None,
     claims: ownership.StageClaims | None = None,
 ) -> bool: ...
 
@@ -1640,7 +1624,6 @@ def restore_outputs_to_hashes(
     restore: bool = True,
     report_changes: Literal[True],
     file_hash_entries: list[FileHashEntry] | None = None,
-    register: Callable[[], None] | None = None,
     claims: ownership.StageClaims | None = None,
 ) -> OutputRestoreResult: ...
 
@@ -1656,7 +1639,6 @@ def restore_outputs_to_hashes(
     restore: bool = True,
     report_changes: bool = False,
     file_hash_entries: list[FileHashEntry] | None = None,
-    register: Callable[[], None] | None = None,
     claims: ownership.StageClaims | None = None,
 ) -> bool | OutputRestoreResult:
     """Verify outputs match recorded hashes and restore cacheable mismatches.
@@ -1665,8 +1647,8 @@ def restore_outputs_to_hashes(
     so an evicted listing object does not make a still-restorable output unavailable.
     ``file_hash_entries``, when given, receives a StateDB file-hash entry for every file the
     check had to read and every file restored from the cache, so the next check finds each
-    without reading it. ``register``, when given, runs once before the first restore: a restore
-    links cache objects into the workspace, so the project must be in the cache register first.
+    without reading it. A restore links cache objects into the workspace; within `repro` and
+    `run` the engine registered the project before any stage (`Engine._orchestrate_execution`).
     ``claims`` (the stage's) decide which ``*.pvt`` files in an output are the stage's own, and
     record the ones a restore writes that the lock does not list
     (``store.WorkspaceStore.restore_from_cache``).
@@ -1735,9 +1717,6 @@ def restore_outputs_to_hashes(
                     if not restore:
                         continue
                     restored = list[tuple[pathlib.Path, os.stat_result, str]]()
-                    if register is not None:
-                        register()
-                        register = None
                     if store.restore_from_cache(
                         ref,
                         expected_hash,
@@ -2939,24 +2918,27 @@ def _run_cache_output_hash(
     return record
 
 
-def _run_cache_candidate(
+def _run_cache_row(
     state_db: state.StateDB,
     stage_name: str,
     input_hash: str,
     legacy_input_hash: str | None,
     stage_outs: list[types.ArtifactRef],
-) -> bool:
-    """Whether a run-cache row could restore this stage's outputs: one at ``input_hash``, or at
-    an older pivot's ``legacy_input_hash``, for a stage with no metric output.
+) -> run_history.RunCacheEntry | None:
+    """The run-cache row that could restore this stage's outputs, or None: the one at
+    ``input_hash``, else the one an older pivot filed at ``legacy_input_hash``. A stage with a
+    metric output is never restored from the run cache.
 
-    Read before the naming unit, so a lookup that finds no row (every stage of a cold run) takes
-    none; ``_try_skip_via_run_cache_with_store`` reads the row again inside the unit, so a row
-    a prune removed in between restores nothing.
+    Read twice per lookup: before the naming unit (so a stage with no row, as in every stage of
+    a cold run, takes no unit for it) and again inside it by ``_try_skip_via_run_cache_with_store``
+    (so a row a prune removed in between restores nothing).
     """
     if any(out.tag is types.ArtifactTag.METRIC for out in stage_outs):
-        return False
-    keys = [input_hash] if legacy_input_hash is None else [input_hash, legacy_input_hash]
-    return any(state_db.lookup_run_cache(stage_name, key) is not None for key in keys)
+        return None
+    entry = state_db.lookup_run_cache(stage_name, input_hash)
+    if entry is None and legacy_input_hash is not None:
+        entry = state_db.lookup_run_cache(stage_name, legacy_input_hash)
+    return entry
 
 
 def _try_skip_via_run_cache_with_store(
@@ -2977,11 +2959,7 @@ def _try_skip_via_run_cache_with_store(
     No lock records the entry's outputs until one is written (never, under ``--no-commit``), so
     each restore records the ``*.pvt`` members it writes as the stage's (``claims``) first.
     """
-    if any(out.tag is types.ArtifactTag.METRIC for out in stage_outs):
-        return None
-    entry = state_db.lookup_run_cache(stage_name, input_hash)
-    if entry is None and legacy_input_hash is not None:
-        entry = state_db.lookup_run_cache(stage_name, legacy_input_hash)
+    entry = _run_cache_row(state_db, stage_name, input_hash, legacy_input_hash, stage_outs)
     if entry is None:
         return None
     output_hashes = dict[str, HashInfo]()

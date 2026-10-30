@@ -644,9 +644,8 @@ def verify_tracked_files(
     state_dir = config.locate_state_dir()
 
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
-    # A restore links a cache object into the workspace, so the project registers in the cache
-    # first, once, before the first restore (as `pivot checkout` does).
-    registered = False
+    # A restore links a cache object into the workspace; the engine registered the project
+    # before calling this (`Engine._orchestrate_execution`), as `pivot checkout` registers first.
     with state_mod.open_readonly(state_dir, create=False) as state_db:
         for data_path, track_data in tracked_files.items():
             path = pathlib.Path(data_path)
@@ -664,9 +663,6 @@ def verify_tracked_files(
                     raise FileNotFoundError(data_path)
             except FileNotFoundError:
                 if checkout_missing:
-                    if not registered:
-                        config.register_cache_use()
-                        registered = True
                     if _restore_tracked_file(
                         path, track_data, cache_dir, project_root, state_dir, pending
                     ):

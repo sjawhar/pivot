@@ -215,7 +215,8 @@ def test_a_stage_commit_waits_while_a_collection_holds_the_naming_lock(
 ) -> None:
     """The normal commit site: a stage that ran publishes its outputs and writes its lock only
     once the collection releases the naming lock. ``--force`` skips the run-cache lookup, so this
-    test reaches the commit site alone."""
+    test reaches the commit site alone. The run registers its project before the stage runs, so
+    the collection takes the lock while the stage body runs, and the commit is what meets it."""
     root = _project(tmp_path / "project")
     _ok(_run(root, "repro"))
     cache_dir = _register_fresh(root)
@@ -226,23 +227,53 @@ def test_a_stage_commit_waits_while_a_collection_holds_the_naming_lock(
     gate = tmp_path / "gate"
     gate.mkdir()
 
-    with gc.naming_exclusive(cache_dir):
-        proc = _start(root, "repro", "--force", env=_env(GC_PROTOCOL_GATE=str(gate)))
-        try:
-            _wait_for(gate / "started", proc, timeout=120)
+    proc = _start(
+        root, "repro", "--force", env=_env(GC_PROTOCOL_GATE=str(gate), GC_PROTOCOL_WAIT="1")
+    )
+    try:
+        _wait_for(gate / "started", proc, timeout=120)
+        with gc.naming_exclusive(cache_dir):
+            (gate / "go").write_text("")
             _publishes_outside_then_rechecks(
                 proc, "a stage commit", output_object, lambda: _locks(root) != before
             )
             time.sleep(2.0)  # the commit follows the stage body within milliseconds
             assert proc.poll() is None, "a stage commit did not wait for the collection"
             assert _locks(root) == before, "a stage lock was written during the collection"
-        except BaseException:
-            proc.kill()
-            raise
+    except BaseException:
+        proc.kill()
+        raise
 
     _finish(proc)
     assert _locks(root) != before, "the commit never landed after the collection"
     assert output_object.exists(), "a stage commit named an object it did not re-check"
+
+
+# Loaded into every process of a run through PYTHONPATH: pauses a worker right after its
+# pre-unit run-cache lookup found a row, before the naming unit, until the test writes `go`.
+_ROW_HOOK = """\
+import os
+import pathlib
+import time
+
+_gate = os.environ.get("GC_TEST_ROW_GATE")
+if _gate:
+    from pivot.executor import worker as _worker
+
+    _original = _worker._run_cache_row
+
+    def _held(*args, **kwargs):
+        row = _original(*args, **kwargs)
+        started = pathlib.Path(_gate, "started")
+        if row is not None and not started.exists():
+            started.write_text("")
+            deadline = time.monotonic() + 120
+            while not pathlib.Path(_gate, "go").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+        return row
+
+    _worker._run_cache_row = _held
+"""
 
 
 def test_a_run_cache_skip_waits_while_a_collection_holds_the_naming_lock(
@@ -250,29 +281,33 @@ def test_a_run_cache_skip_waits_while_a_collection_holds_the_naming_lock(
 ) -> None:
     """The run-cache skip site: a stage restored from the run cache re-links objects that are
     already cached and names them in its lock. It does so only once the collection releases the
-    naming lock, since the objects it re-uses may be the ones being removed."""
+    naming lock, since the objects it re-uses may be the ones being removed. The run registers
+    before its stages, so a hook holds the worker after its lookup found a row and before the
+    unit; the collection takes the lock there, and the restore is what meets it."""
     root = _project(tmp_path / "project")
     _ok(_run(root, "repro"))
     (root / "data" / "raw" / "input.txt").write_text("other\n")
-    started = time.monotonic()
     _ok(_run(root, "repro"))
-    unblocked = time.monotonic() - started
     (root / "data" / "raw" / "input.txt").write_text("hello\n")  # back to a cached run
-    cache_dir = _register_fresh(root)
+    cache_dir = root / ".pivot" / "cache"
     before = _locks(root)
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_ROW_HOOK)
+    gate = tmp_path / "gate"
+    gate.mkdir()
 
-    with gc.naming_exclusive(cache_dir):
-        proc = _start(root, "repro", env=_env())
-        try:
-            # An unblocked run of this size took `unblocked` seconds; give it three times that.
-            deadline = time.monotonic() + max(3 * unblocked, 5.0)
-            while proc.poll() is None and time.monotonic() < deadline:
-                time.sleep(0.1)
+    proc = _start(root, "repro", env=_env(PYTHONPATH=str(hook), GC_TEST_ROW_GATE=str(gate)))
+    try:
+        _wait_for(gate / "started", proc, timeout=120)
+        with gc.naming_exclusive(cache_dir):
+            (gate / "go").write_text("")
+            time.sleep(3.0)  # the restore follows the lookup within milliseconds
             assert proc.poll() is None, "a run-cache skip did not wait for the collection"
             assert _locks(root) == before, "a run-cache skip wrote its lock during the collection"
-        except BaseException:
-            proc.kill()
-            raise
+    except BaseException:
+        proc.kill()
+        raise
 
     out = _finish(proc)
     # Reported cached while its lock changed: only a run-cache restore does both (an unchanged
@@ -520,14 +555,25 @@ def test_a_stage_commit_racing_pivot_gc_loses_nothing(tmp_path: pathlib.Path, la
     gate = tmp_path / "gate"
     gate.mkdir()
 
+    # The run registers its project, then its stage body waits: the commit, not the run's
+    # registration, is what meets the collection's lock.
+    writer = _start(
+        root, "repro", "--force", env=_env(GC_PROTOCOL_GATE=str(gate), GC_PROTOCOL_WAIT="1")
+    )
+    try:
+        _wait_for(gate / "started", writer, timeout=120)
+    except BaseException:
+        writer.kill()
+        raise
     with _fifo_pin(tmp_path / "peer", cache_dir) as pin:
         pin.release()  # the plan's read of the peer
         collector = _start_gc(root)
-        _wait_until("its exclusive lock", lambda: _gc_holds_the_naming_lock(cache_dir), collector)
-        # gc holds the lock and waits on the peer's record, before it deletes anything.
-        writer = _start(root, "repro", "--force", env=_env(GC_PROTOCOL_GATE=str(gate)))
         try:
-            _wait_for(gate / "started", writer, timeout=120)
+            _wait_until(
+                "its exclusive lock", lambda: _gc_holds_the_naming_lock(cache_dir), collector
+            )
+            # gc holds the lock and waits on the peer's record, before it deletes anything.
+            (gate / "go").write_text("")  # the stage returns; its commit meets gc's lock
             time.sleep(2.0)  # the commit follows the stage body within milliseconds
             landed = writer.poll() is not None or _locks(root) != before
         except BaseException:
@@ -2170,3 +2216,136 @@ def test_pivot_gc_keeps_a_tracked_inputs_files_that_pivotignore_names(
     assert pyc_object.exists(), "gc read the tracked input's members from the filtered listing"
     _ok(_run(root, "checkout", "data/raw/server"))
     assert pyc.read_bytes() == b"\x00bytecode"
+
+
+# =============================================================================
+# Round 13: every run registers its project before any stage runs (U1)
+# =============================================================================
+
+_GATED_PIPELINE = """\
+import os
+import pathlib
+import time
+
+from pivot import Pipeline, stage
+
+
+def _hold(name: str) -> None:
+    gate = os.environ.get("GC_TEST_GATE")
+    if gate and os.environ.get("GC_TEST_GATE_STAGE") == name:
+        pathlib.Path(gate, "started").write_text("")
+        deadline = time.monotonic() + 120
+        while not pathlib.Path(gate, "go").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+
+@stage
+def up(text: str) -> str:
+    _hold("up")
+    return text.upper()
+
+
+@stage
+def down(text: str) -> str:
+    _hold("down")
+    return text + " down VERSION"
+
+
+with Pipeline("ug") as pipeline:
+    down(up(pipeline.input("input.txt", t=str)))
+"""
+
+
+def _registered(cache_dir: pathlib.Path, root: pathlib.Path) -> bool:
+    register = cache_dir / naming.REGISTER_DIR
+    return register.is_dir() and any(
+        json.loads(entry.read_text()).get("root") == str(root) for entry in register.glob("*.json")
+    )
+
+
+def _unregister(cache_dir: pathlib.Path, root: pathlib.Path) -> None:
+    """Leave ``root`` out of the register, as a project last run by a pivot release (which
+    writes no entry) or one whose entry a user deleted is."""
+    for entry in (cache_dir / naming.REGISTER_DIR).glob("*.json"):
+        if json.loads(entry.read_text()).get("root") == str(root):
+            entry.unlink()
+            entry.with_suffix(".nonce").unlink(missing_ok=True)
+    assert not _registered(cache_dir, root)
+
+
+def _unregistered_gated_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """A registered peer and a project out of the register, both on one external cache with
+    symlink checkout; the project's two-stage pipeline has run once. Returns (peer, project)."""
+    shared = tmp_path / "shared-cache"
+    peer = _shared_project(tmp_path / "peer", shared)
+    _ok(_run(peer, "repro"))
+    root = _shared_project(tmp_path / "project", shared)
+    (root / "pipeline.py").write_text(_GATED_PIPELINE.replace("VERSION", "v1"))
+    _ok(_run(root, "repro"))
+    _unregister(shared, root)
+    return peer, root
+
+
+def _start_held(
+    root: pathlib.Path, gate: pathlib.Path, stage: str, *args: str
+) -> subprocess.Popen[str]:
+    gate.mkdir()
+    proc = _start(root, "repro", *args, env=_env(GC_TEST_GATE=str(gate), GC_TEST_GATE_STAGE=stage))
+    _wait_for(gate / "started", proc, 120)
+    return proc
+
+
+def test_a_project_out_of_the_register_registers_before_its_changed_stage_runs(
+    tmp_path: pathlib.Path,
+) -> None:
+    """U1: a project out of the register (last run by a pivot release) runs `pivot repro` with
+    `down` changed and `up` skipped in place. While `down` runs, a peer's `pivot gc` reads the
+    register. The project must already be in it, or gc removes `up`'s object, which only the
+    project's lock names, and leaves its link dangling."""
+    peer, root = _unregistered_gated_project(tmp_path)
+    shared = tmp_path / "shared-cache"
+    up_link = root / "data" / "ug" / "up.txt"
+    up_object = up_link.resolve()
+    assert up_object.is_relative_to(shared.resolve()) and up_object.exists(), up_object
+    (root / "pipeline.py").write_text(_GATED_PIPELINE.replace("VERSION", "v2"))
+
+    proc = _start_held(root, tmp_path / "gate", "down")
+    try:
+        registered = _registered(shared, root)
+        collected = _run(peer, "gc", "--yes", "--grace-hours", "0")
+    finally:
+        (tmp_path / "gate" / "go").write_text("")
+    _finish(proc)
+
+    out = collected.stdout + collected.stderr
+    assert registered, "the project was not in the register while its changed stage ran"
+    assert collected.returncode == 0, out
+    assert up_object.exists(), f"gc removed {up_object}, which the project's up.lock names"
+    assert up_link.resolve().exists(), "up's link dangles"
+
+
+def test_a_forced_run_registers_before_its_first_stage_runs(tmp_path: pathlib.Path) -> None:
+    """`--force` takes no run-cache lookup, so no stage takes a naming unit before it runs."""
+    _peer, root = _unregistered_gated_project(tmp_path)
+    shared = tmp_path / "shared-cache"
+
+    proc = _start_held(root, tmp_path / "gate", "up", "--force")
+    try:
+        registered = _registered(shared, root)
+    finally:
+        (tmp_path / "gate" / "go").write_text("")
+    _finish(proc)
+
+    assert registered, "a forced run's project was not in the register while its stages ran"
+
+
+def test_a_run_where_every_stage_skips_registers_its_project(tmp_path: pathlib.Path) -> None:
+    """A stage skipped with its outputs in place takes no naming unit, so a run that skips every
+    stage must still leave its project in the register: its locks name those outputs."""
+    _peer, root = _unregistered_gated_project(tmp_path)
+    shared = tmp_path / "shared-cache"
+
+    out = _ok(_run(root, "repro"))
+
+    assert "0 ran" in out, out
+    assert _registered(shared, root), "a run that skipped every stage left its project unregistered"

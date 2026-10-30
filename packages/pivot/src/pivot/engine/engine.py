@@ -61,7 +61,7 @@ from pivot.engine.types import (
 )
 from pivot.executor import core as executor_core
 from pivot.executor import worker
-from pivot.storage import member_skip, ownership
+from pivot.storage import member_skip, naming, ownership
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -1137,12 +1137,25 @@ class Engine:
         if cache_dir is None:
             cache_dir = config.get_cache_dir()
 
-        # Verify tracked files before building DAG: a stage's own .pvt member of its output is
-        # none, the loaded pipeline's by the registry and any other's by its lock. This may
-        # restore a tracked file, but stage commits register in their own narrow naming units so
-        # stage execution never waits for gc.
         project_root = project.get_project_root()
         default_state_dir = config.get_state_dir()
+        # Register the project before any stage runs or restores. A stage that executes takes
+        # its first naming unit at its commit, possibly hours later; a stage skipped with its
+        # outputs in place takes none; and a peer's `pivot gc` reads only registered projects.
+        # One registration per run (about 1.4 ms of CPU); every worker registers the same
+        # identity, the project root and its configured state directory. A run started while a
+        # collection deletes waits for it here, once, before its first stage. A cache that does
+        # not exist yet holds nothing to collect, and the first commit's unit creates the cache
+        # and registers.
+        if cache_dir.is_dir():
+            with naming.naming_unit(
+                cache_dir, project=(project_root, state_dir_mod.locate_state_dir(project_root))
+            ):
+                pass
+
+        # Verify tracked files before building DAG: a stage's own .pvt member of its output is
+        # none, the loaded pipeline's by the registry and any other's by its lock. This may
+        # restore a tracked file, which the registration above covers.
         all_stages = self._get_all_stages()
         executor_core.verify_tracked_files(
             project_root,
@@ -2090,7 +2103,6 @@ class Engine:
                 state_dir=state_dir,
                 listing_lock=None if "older_format" in lock_data else listing_lock,
                 file_hash_entries=file_hash_entries,
-                register=config.register_cache_use,
                 claims=worker.stage_claims(
                     store,
                     stage_info["outs"],
