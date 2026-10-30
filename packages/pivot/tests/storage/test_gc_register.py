@@ -92,7 +92,7 @@ def test_a_naming_unit_reopens_a_view_nonce_file_that_was_replaced(tmp_path: pat
     entry = naming.project_register_path(cache_dir, root, state_dir)
     assert entry is not None
     nonces = state_dir / "state.lmdb" / naming.VIEW_NONCE_DIR
-    (nonce_file,) = nonces.iterdir()
+    (nonce_file,) = (p for p in nonces.iterdir() if p.suffix != naming.CACHE_RECORD_SUFFIX)
     nonce_file.unlink()
     nonce_file.write_text("0" * 32 + "\n")
 
@@ -164,7 +164,7 @@ def test_a_registration_truncates_a_nonce_file_that_held_more(tmp_path: pathlib.
     entry = naming.project_register_path(cache_dir, root, state_dir)
     assert entry is not None
     nonces = state_dir / "state.lmdb" / naming.VIEW_NONCE_DIR
-    (nonce_file,) = nonces.iterdir()
+    (nonce_file,) = (p for p in nonces.iterdir() if p.suffix != naming.CACHE_RECORD_SUFFIX)
     nonce_file.write_text("0" * 64 + "\n")
 
     naming._VERIFIED_REGISTRATIONS.clear()  # as a second process of this view would start

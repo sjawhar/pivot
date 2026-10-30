@@ -19,11 +19,12 @@ import json
 import os
 import pathlib
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
 
@@ -2372,9 +2373,29 @@ _LIBRARY_RUN = """\
 import pathlib
 import sys
 
+from pivot import config, project
 from pivot.executor import core
+from pivot.storage import naming
+
+
+def _watch_first_restore(configured_cache: pathlib.Path, report: pathlib.Path) -> None:
+    # At the first tracked-file restore, record whether the project is already in the register
+    # of the cache that restore links from: the order, not only the end state.
+    restore = core._restore_tracked_file
+
+    def watched(*args, **kwargs):
+        if not report.exists():
+            entry = naming.project_register_path(
+                configured_cache, project.get_project_root(), config.locate_state_dir()
+            )
+            report.write_text("registered" if entry is not None and entry.exists() else "absent")
+        return restore(*args, **kwargs)
+
+    core._restore_tracked_file = watched
+
 
 if __name__ == "__main__":  # pivot starts processes with spawn, which re-imports this module
+    _watch_first_restore(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]))
     core.run(cache_dir=pathlib.Path(sys.argv[1]), checkout_missing=True)
 """
 
@@ -2385,7 +2406,7 @@ def test_a_library_run_with_another_cache_registers_where_it_restores_tracked_fi
     """L1: `executor.core.run(cache_dir=C2, checkout_missing=True)` registers in C2, the engine's
     cache, but restores a missing tracked file from the configured cache C1. The project must be
     registered in C1 before that restore links C1's object, or a peer's `pivot gc` on C1
-    removes it and the restored link dangles."""
+    removes it and the restored link dangles. A hook at the restore checks the order."""
     shared = tmp_path / "shared-cache"
     peer = _shared_project(tmp_path / "peer", shared)
     _ok(_run(peer, "repro"))
@@ -2402,9 +2423,10 @@ def test_a_library_run_with_another_cache_registers_where_it_restores_tracked_fi
     other_cache.mkdir()
     driver = tmp_path / "library_run.py"
     driver.write_text(_LIBRARY_RUN)
+    report = tmp_path / "registered-at-restore"
 
     done = subprocess.run(
-        [sys.executable, str(driver), str(other_cache)],
+        [sys.executable, str(driver), str(other_cache), str(shared), str(report)],
         cwd=root,
         env=_env(),
         capture_output=True,
@@ -2415,6 +2437,7 @@ def test_a_library_run_with_another_cache_registers_where_it_restores_tracked_fi
 
     assert done.returncode == 0, done.stdout + done.stderr
     assert tracked.read_text() == content, "the tracked file was not restored from C1"
+    assert report.read_text() == "registered", "the restore linked C1's object before registering"
     registered = _registered(shared, root)
     collected = _run(peer, "gc", "--yes", "--grace-hours", "0")
     assert registered, "the project was not registered in the cache its restore linked from"
@@ -2485,3 +2508,173 @@ def test_a_library_run_refuses_an_included_pipeline_rooted_elsewhere(
     out = done.stdout + done.stderr
     assert done.returncode == 3 and "REFUSED" in out and "root=" in out, out
     assert not list(elsewhere.rglob("*.lock")), "a stage lock was written outside the project"
+
+
+# =============================================================================
+# Round 15: a project that uses two caches is checked in both (N1)
+# =============================================================================
+
+
+def _use_cache(root: pathlib.Path, cache_dir: pathlib.Path) -> None:
+    """Point the project at ``cache_dir`` with copy checkout, so no workspace link keeps an
+    object: only the project's records and its registration can."""
+    (root / ".pivot" / "config.yaml").write_text(
+        f"cache:\n  dir: {cache_dir}\n  checkout_mode:\n  - copy\n"
+    )
+
+
+class _TwoCaches(NamedTuple):
+    peer: pathlib.Path
+    root: pathlib.Path
+    c1: pathlib.Path
+    c2: pathlib.Path
+    output_in_c2: pathlib.Path
+
+
+def _two_cache_project(tmp_path: pathlib.Path, order: str) -> _TwoCaches:
+    """A peer registered in C2 only, and a project that ran on C2 and on C1, in ``order``
+    (`c2-then-c1`: its last registration is in C1; `c1-then-c2`: in C2). The project's lock
+    names the object of its output in C2."""
+    c1, c2 = tmp_path / "cache-one", tmp_path / "cache-two"
+    c1.mkdir()
+    peer = _shared_project(tmp_path / "peer", c2)
+    _ok(_run(peer, "repro"))
+    root = _project(tmp_path / "project")
+    (root / "data" / "raw" / "input.txt").write_text("only this project reads this\n")
+    _use_cache(root, c2)
+    _ok(_run(root, "repro"))  # its output's object goes to C2
+    output = root / "data" / "shadow" / "shout.txt"
+    output_in_c2 = cache.get_cache_path(c2 / "files", cache.hash_file(output)[0])
+    assert output_in_c2.exists(), output_in_c2
+    _use_cache(root, c1)
+    _ok(_run(root, "repro"))  # registers in C1 before its stage skips
+    if order == "c1-then-c2":
+        _use_cache(root, c2)
+        _ok(_run(root, "repro"))
+    assert _registered(c1, root) and _registered(c2, root), "the project is not in both registers"
+    return _TwoCaches(peer, root, c1, c2, output_in_c2)
+
+
+@pytest.mark.parametrize("order", ["c2-then-c1", "c1-then-c2"])
+def test_a_copy_of_a_project_that_moved_on_through_another_cache_refuses(
+    tmp_path: pathlib.Path, order: str
+) -> None:
+    """N1: a project uses C2 and C1; its disk is cloned; the original then names objects
+    through C1 only, which rotates C1's nonce and not C2's. The clone's entry in C2 still holds
+    the nonce its state directory holds, so a collection of C2 run where the clone is visible
+    must read the project's entry in C1 too, find a nonce the clone does not hold, and refuse,
+    naming the project and C1."""
+    setup = _two_cache_project(tmp_path, order)
+    clone = tmp_path / "clone-of-the-disk"
+    shutil.copytree(setup.root, clone, symlinks=True)
+    # The original goes on, through C1.
+    _use_cache(setup.root, setup.c1)
+    (setup.root / "data" / "raw" / "input.txt").write_text("the original moved on\n")
+    _ok(_run(setup.root, "repro"))
+    # The clone, at the original's path, is what this host now sees.
+    setup.root.rename(tmp_path / "original-elsewhere")
+    clone.rename(setup.root)
+    dead = _publish(setup.c2 / "files", tmp_path, "named by nothing\n")
+
+    refused = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
+
+    out = refused.stdout + refused.stderr
+    flat = " ".join(out.split())
+    assert refused.returncode != 0, out
+    c1_id = naming.read_cache_id(setup.c1)
+    assert str(setup.root) in flat and "cache-one" in flat and f"id {c1_id}" in flat, out
+    assert "different nonce" in flat and "pivot forget-cache" in flat, out
+    assert cache.get_cache_path(setup.c2 / "files", dead).exists(), "a refusal removed an object"
+    assert setup.output_in_c2.exists(), out
+
+
+@pytest.mark.parametrize("order", ["c2-then-c1", "c1-then-c2"])
+def test_a_project_that_uses_two_caches_is_collected_when_both_entries_are_current(
+    tmp_path: pathlib.Path, order: str
+) -> None:
+    """The control: no copy, the project's last step in C1 rotated C1's nonce in its own state
+    directory too. A collection of C2 reads both entries, accepts the project, keeps its output
+    and removes what no record names."""
+    setup = _two_cache_project(tmp_path, order)
+    _use_cache(setup.root, setup.c1)
+    (setup.root / "data" / "raw" / "input.txt").write_text("the original moved on\n")
+    _ok(_run(setup.root, "repro"))
+    dead = _publish(setup.c2 / "files", tmp_path, "named by nothing\n")
+
+    collected = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
+
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert not cache.get_cache_path(setup.c2 / "files", dead).exists(), collected.stdout
+    assert setup.output_in_c2.exists(), "gc removed an object the project's run-cache row names"
+
+
+def test_an_unreadable_listed_cache_refuses_until_the_project_forgets_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A listed cache that cannot be read (deleted, or on a disk that is gone) leaves the
+    project's freshness unproven, so a collection of the other cache refuses, naming it.
+    `pivot forget-cache` removes it from the project's list, and changes nothing else: the
+    removed cache keeps its objects and the project's entry, the other cache stays listed, and
+    the next collection proceeds."""
+    setup = _two_cache_project(tmp_path, "c2-then-c1")
+    c1_id = naming.read_cache_id(setup.c1)
+    c1_files_before = sorted(p.relative_to(setup.c1) for p in setup.c1.rglob("*"))
+    away = tmp_path / "unmounted-disk"
+    setup.c1.rename(away)
+    dead = _publish(setup.c2 / "files", tmp_path, "named by nothing\n")
+
+    refused = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
+
+    out = refused.stdout + refused.stderr
+    flat = " ".join(out.split())
+    assert refused.returncode != 0, out
+    assert "cache-one" in flat and "cannot be read" in flat, out
+    assert f"pivot forget-cache {c1_id}" in flat, out
+    assert cache.get_cache_path(setup.c2 / "files", dead).exists(), "a refusal removed an object"
+
+    unknown = _run(setup.root, "forget-cache", str(tmp_path / "never-a-cache"))
+    assert unknown.returncode != 0, unknown.stdout + unknown.stderr
+    assert "cache-two" in unknown.stdout + unknown.stderr, "the refusal lists no cache"
+    forgotten = _ok(_run(setup.root, "forget-cache", str(setup.c1)))
+    assert c1_id in forgotten and "Nothing in that cache changed" in forgotten, forgotten
+    listed = {record.cache_id for record in naming.cache_records(setup.root / ".pivot")}
+    assert listed == {naming.read_cache_id(setup.c2)}, listed
+
+    collected = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
+
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert not cache.get_cache_path(setup.c2 / "files", dead).exists(), collected.stdout
+    assert setup.output_in_c2.exists(), collected.stdout
+    away.rename(setup.c1)
+    assert sorted(p.relative_to(setup.c1) for p in setup.c1.rglob("*")) == c1_files_before, (
+        "forget-cache changed the cache it removed from the list"
+    )
+
+
+def test_a_listed_path_that_now_holds_another_cache_refuses(tmp_path: pathlib.Path) -> None:
+    """A listed cache's path that now holds a different cache (its id differs) is not the cache
+    the project registered in, so its entry there proves nothing."""
+    setup = _two_cache_project(tmp_path, "c2-then-c1")
+    setup.c1.rename(tmp_path / "old-cache-one")
+    setup.c1.mkdir()
+    (setup.c1 / naming.REGISTER_DIR).mkdir()
+    (setup.c1 / naming.REGISTER_DIR / naming.CACHE_ID_FILE).write_text("f" * 32 + "\n")
+
+    refused = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
+
+    flat = " ".join((refused.stdout + refused.stderr).split())
+    assert refused.returncode != 0, flat
+    assert f"another cache is at that path now (id {'f' * 32})" in flat, flat
+
+
+def test_a_listed_cache_without_the_projects_entry_refuses(tmp_path: pathlib.Path) -> None:
+    """A listed cache that holds no entry for the project (its entry was deleted there) gives
+    no nonce to compare, so the project's freshness is unproven and the collection refuses."""
+    setup = _two_cache_project(tmp_path, "c2-then-c1")
+    _unregister(setup.c1, setup.root)
+
+    refused = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
+
+    flat = " ".join((refused.stdout + refused.stderr).split())
+    assert refused.returncode != 0, flat
+    assert "cache-one" in flat and "is missing" in flat, flat

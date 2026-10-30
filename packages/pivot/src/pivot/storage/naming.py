@@ -58,8 +58,11 @@ _MOUNT_NAMESPACE = pathlib.Path("/proc/self/ns/mnt")
 _MACHINE_ID = pathlib.Path("/etc/machine-id")
 # One nonce file per view and cache in a project's state directory: proof of what that view last
 # wrote for that cache's entry. Keyed by the cache too, so registering in one cache never
-# replaces the nonce another cache's entry holds (a run with another `cache_dir`).
+# replaces the nonce another cache's entry holds (a run with another `cache_dir`). Beside each
+# is a record of where that view found the cache (``CACHE_RECORD_SUFFIX``): the list of caches
+# the project uses, which a collection reads to check the project's entry in every one of them.
 VIEW_NONCE_DIR = "gc-views"
+CACHE_RECORD_SUFFIX = ".cache"
 # A random id for each cache, in its register, that names the cache in those nonce files. It is
 # read from the cache itself, so every view of the cache finds the same id whatever path it
 # mounts the cache at.
@@ -154,6 +157,92 @@ def _view_nonce_path(state_dir: pathlib.Path, view_key: str, cache_id: str) -> p
     return state_dir / "state.lmdb" / VIEW_NONCE_DIR / f"{view_key}-{cache_id}"
 
 
+def _cache_record_path(state_dir: pathlib.Path, view_key: str, cache_id: str) -> pathlib.Path:
+    """Where a project's state directory records where one view found one cache it uses."""
+    nonce = _view_nonce_path(state_dir, view_key, cache_id)
+    return nonce.with_name(nonce.name + CACHE_RECORD_SUFFIX)
+
+
+class CacheRecord(NamedTuple):
+    """One cache a project's state directory lists: the view that uses it, the cache's id, and
+    where that view found it (None when the record cannot be read)."""
+
+    record: pathlib.Path
+    view_key: str
+    cache_id: str
+    cache_dir: pathlib.Path | None
+
+
+def cache_records(state_dir: pathlib.Path, view_key: str | None = None) -> list[CacheRecord]:
+    """Every cache the project in ``state_dir`` lists, for one view or (None) for every view.
+
+    Raises OSError when the list cannot be read; a missing list is empty.
+    """
+    directory = state_dir / "state.lmdb" / VIEW_NONCE_DIR
+    try:
+        with os.scandir(directory) as entries:
+            names = sorted(entry.name for entry in entries)
+    except FileNotFoundError:
+        return []
+    records = list[CacheRecord]()
+    for name in names:
+        stem = name.removesuffix(CACHE_RECORD_SUFFIX)
+        if stem == name:
+            continue
+        record_view, _, cache_id = stem.rpartition("-")
+        if not ENTRY_ID_RE.fullmatch(cache_id) or (
+            view_key is not None and record_view != view_key
+        ):
+            continue
+        path = directory / name
+        document = entry_from_file(path)
+        cache_dir = None if document is None else document.get("cache")
+        records.append(
+            CacheRecord(
+                path,
+                record_view,
+                cache_id,
+                pathlib.Path(cache_dir) if isinstance(cache_dir, str) and cache_dir else None,
+            )
+        )
+    return records
+
+
+def _record_cache(
+    state_dir: pathlib.Path, view_key: str, cache_id: str, cache_dir: pathlib.Path
+) -> None:
+    """List ``cache_dir`` among the caches this view of the project uses, unless it is listed
+    there already. Raises OSError."""
+    path = _cache_record_path(state_dir, view_key, cache_id)
+    desired: dict[str, object] = {"cache": os.path.abspath(cache_dir)}
+    if entry_from_file(path) != desired:
+        _replace_readable(str(path), (json.dumps(desired, sort_keys=True) + "\n").encode())
+
+
+def read_nonce_pair(
+    state_dir: pathlib.Path, view_key: str, cache_id: str, entry_nonce: pathlib.Path
+) -> tuple[str, str]:
+    """Read one view's nonce for one cache in the state directory and the nonce its entry in
+    that cache holds, under the shared lock writers take across both writes
+    (``_rotate_nonces``), so a rotation in progress is never read half done. Where the
+    filesystem refuses the lock both are read unlocked. Raises OSError or ValueError."""
+    state_nonce = _view_nonce_path(state_dir, view_key, cache_id)
+    fd = os.open(state_nonce, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        locked = True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+        except OSError:
+            locked = False
+        try:
+            return read_nonce_file(state_nonce), read_nonce_file(entry_nonce)
+        finally:
+            if locked:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def _open_view_nonce(state_dir: pathlib.Path, view_key: str, cache_id: str) -> int:
     """Open (creating) this view's nonce file for one cache in the state directory. Raises
     OSError or ValueError (a NUL byte in an unusable configured path)."""
@@ -166,7 +255,12 @@ def _open_view_nonce(state_dir: pathlib.Path, view_key: str, cache_id: str) -> i
 
 def _write_entry(path: str, document: ProjectEntry) -> None:
     """Replace ``path`` with ``document`` atomically, readable by every user of the cache."""
-    data = (json.dumps(document, sort_keys=True) + "\n").encode()
+    _replace_readable(path, (json.dumps(document, sort_keys=True) + "\n").encode())
+
+
+def _replace_readable(path: str, data: bytes) -> None:
+    """Replace ``path`` with ``data`` atomically, readable by every user (another user's
+    collection reads register entries and a project's list of caches)."""
     head, tail = os.path.split(path)
     staged = os.path.join(head, f".{tail}.{os.getpid()}.tmp")
     fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o644)
@@ -605,6 +699,9 @@ def register_project(
         project_id: str | None = _ensure_project_id(state_dir, project_root)
         cache_id = _ensure_cache_id(cache_dir)
         state_fd = _open_view_nonce(state_dir, view_key, cache_id)
+        # Listed before its first nonce, so no nonce for a cache exists that a collection of
+        # another cache the project uses would not check (``gc._other_caches_reason``).
+        _record_cache(state_dir, view_key, cache_id, cache_dir)
     except (OSError, ValueError) as e:
         logger.debug("Cannot write the project id, cache id or view nonce for %s: %s", state_dir, e)
         project_id = None

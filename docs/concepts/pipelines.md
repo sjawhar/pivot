@@ -147,18 +147,21 @@ and output formats, params, resources, variant and fingerprint settings; the
 error names the first difference and the source files. A pipeline cannot include
 itself.
 
-A pipeline resolves `core.state_dir` when it loads, and its stages, runs and
-caches all use that directory. That includes the fallback to `.pivot` when the
-value, or the path it names, cannot be used: a pipeline loaded while the path
-could not be used (a regular file, a dangling link, a directory it cannot write)
-keeps `.pivot` for everything it writes, whether or not the path can be used
-when it runs. A program that loads it gets the warning a `pivot` command prints,
+A pipeline resolves `core.state_dir` when it loads, and its stages and caches
+use that directory. That includes the fallback to `.pivot` when the value, or
+the path it names, cannot be used: a pipeline loaded while the path could not
+be used (a regular file, a dangling link, a directory it cannot write) keeps
+`.pivot`. A program that loads it gets the warning a `pivot` command prints,
 once per load, so `discover_pipeline(all_pipelines=True)` prints one line per
-pipeline file it loads. So `include()` refuses a pipeline loaded before an edit of
-`core.state_dir` (or of a symbolic link it names, or of whether the path it
-names can be used) into one loaded after it: the error names both directories.
-Load both pipelines after the change. The pipelines of one `pivot` command, or
-of one discovery, always share one directory.
+pipeline file it loads. A run of a loaded pipeline (`executor.run(pipeline=...)`)
+refuses when `core.state_dir` names another directory than the one the pipeline
+loaded with: after an edit of the value, of a symbolic link it names, or of
+whether the path it names can be used. The error names both directories, since
+the run would record its stages where `pivot gc` does not read them; load the
+pipeline again and run that. So `include()` likewise refuses a pipeline loaded
+before such a change into one loaded after it. Load both pipelines after the
+change. The pipelines of one `pivot` command, or of one discovery, always share
+one directory.
 
 ## State and Cache Layout
 

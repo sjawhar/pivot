@@ -23,6 +23,7 @@ COMMAND_CATEGORIES = {
         "doctor",
         "fingerprint",
         "gc",
+        "forget-cache",
     ],
 }
 
@@ -71,6 +72,11 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     ),
     "doctor": ("pivot.cli.doctor", "doctor", "Check environment and configuration for issues."),
     "gc": ("pivot.cli.gc", "gc_cmd", "Remove cache objects no record names."),
+    "forget-cache": (
+        "pivot.cli.forget_cache",
+        "forget_cache",
+        "Remove a cache from the list of caches this project uses.",
+    ),
     "fingerprint": (
         "pivot.cli.fingerprint",
         "fingerprint",

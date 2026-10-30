@@ -497,9 +497,18 @@ load, not the configuration now): its stages' locks would sit where no collectio
 **A registered project is live only after a real read.** `read_register` resolves the state
 directory from that project's own `core.state_dir`, requires the entry's project id there, and
 requires the entry's nonce in that view's nonce file, read in the collector's own view: an
-inode number is not proof (an overlay copy or a cloned disk shares it). For this view's entries
-every recorded mount must be mounted; another view's entry may record only its root and state
-directory. Any missing evidence refuses collection and names the entry. `resolve_scopes` then
+inode number is not proof (an overlay copy or a cloned disk shares it). The project must also be
+current in **every other cache its state directory lists** for that view
+(`gc._other_caches_reason`): a registration lists its cache in
+`gc-views/<view>-<cache id>.cache` before that cache's first nonce (`naming._record_cache`), and
+a collection reads the project's entry nonce in each other listed cache and the state
+directory's nonce for it, under the writers' shared lock (`naming.read_nonce_pair`). A copy of
+the project keeps every nonce while the original names through another cache, which rotates
+only that cache's nonce; that write to shared storage is the only thing the copy can see, so
+an unreadable, replaced or mismatched listed cache refuses (N1). `pivot forget-cache` removes a
+cache from the list and deletes nothing. For this view's entries every recorded mount must be
+mounted; another view's entry may record only its root and state directory. Any missing
+evidence refuses collection and names the entry. `resolve_scopes` then
 opens every scope's root, `.pivot` and state directory. When `core.state_dir` differs from
 `.pivot`, collection reads both state layouts so a 0.5.2 lock in `.pivot` still protects its
 object. The writer-side registration memo (`_VERIFIED_REGISTRATIONS`) only lets a naming unit

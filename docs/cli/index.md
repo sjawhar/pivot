@@ -1223,6 +1223,36 @@ Would remove 22,294 objects (4.4 GB). Nothing was removed (--dry-run).
 After a collection, `pivot diff` and `pivot get --rev` may need `pivot fetch` for a revision
 whose objects were removed.
 
+A project that has used more than one cache (`cache.dir` changed, or a library run with another
+`cache_dir`) lists each in its state directory. `pivot gc` of any of them reads the project's
+entry in every other one, and refuses when one cannot be read or holds an older entry; see
+[Caching](../concepts/caching.md#a-project-that-uses-more-than-one-cache).
+
+---
+
+### `pivot forget-cache`
+
+Remove a cache from the list of caches this project uses.
+
+```bash
+pivot forget-cache CACHE
+```
+
+**Arguments:**
+
+- `CACHE` - The cache's path, or its id, as a `pivot gc` refusal names it
+
+Use it when the project no longer uses that cache, for example one that was deleted or is on a
+disk that is gone. It changes only the project's list: it deletes nothing from any cache, and a
+collection of the removed cache still reads this project's entry there. Any pivot command that
+uses the removed cache lists it again. An unknown CACHE fails and prints the caches the project
+lists.
+
+```bash
+pivot forget-cache /mnt/old-disk/pivot-cache
+pivot forget-cache 3f2a1c0d9e8b7a653f2a1c0d9e8b7a65
+```
+
 ---
 
 ### `pivot completion`

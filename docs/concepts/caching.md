@@ -217,6 +217,27 @@ need no flag. A `--projects` path must be a real pivot project — a directory w
 worktree that was deleted and re-created, a typo) names no records, so pivot refuses the whole
 run rather than collect this cache on one project's records alone.
 
+### A Project That Uses More Than One Cache
+
+A project registers in every cache it names objects in: a changed `cache.dir`, or a library run
+given another `cache_dir`. Its state directory lists each one, with where this view found it,
+in `<state dir>/state.lmdb/gc-views/<view>-<cache id>.cache`, beside that cache's nonce. A copy
+of the project (a cloned disk) keeps the nonce of every cache, and only the original goes on
+naming objects; a step in one cache replaces only that cache's nonce. So a collection of any
+cache the project lists also reads the project's entry in **every other cache it lists**, and
+accepts the project only when each of those entries holds the nonce its state directory holds
+for that cache. A listed cache that cannot be read where it is recorded, now holds another
+cache, holds no entry for the project, or holds a different nonce refuses the collection,
+naming the project and that cache. A project that uses one cache lists only it, and nothing
+more is read.
+
+If the project is the original, run any pivot command in it against that cache (one naming
+step brings its entry up to date). If it no longer uses that cache (deleted, or on a disk that
+is gone), remove the cache from its list with
+[`pivot forget-cache`](../cli/index.md#pivot-forget-cache) CACHE, the path or id the refusal
+names. That changes only the project's list and deletes nothing from any cache; any pivot
+command that uses the removed cache lists it again.
+
 ## Per-Stage Lock Files
 
 Each stage has a `.lock` file that records everything about its last

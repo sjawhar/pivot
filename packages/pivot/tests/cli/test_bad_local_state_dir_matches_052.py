@@ -74,6 +74,7 @@ _COMMANDS: dict[str, tuple[str, ...]] = {
     "doctor": ("doctor",),
     "fetch": ("fetch",),
     "fingerprint": ("fingerprint", "reset"),
+    "forget-cache": ("forget-cache", "0123456789abcdef0123456789abcdef"),
     "gc": ("gc", "--dry-run"),
     "get": ("get", "--rev", "HEAD", "data/raw/input.txt"),
     "history": ("history",),
@@ -95,8 +96,9 @@ _COMMANDS: dict[str, tuple[str, ...]] = {
     "verify": ("verify",),
 }
 
-# `gc` is new after 0.5.2. The table still lists it, but has no historical exit code to compare.
-_LEGACY_COMMANDS = tuple(command for command in _COMMANDS if command != "gc")
+# `gc` and `forget-cache` are new after 0.5.2. The table still lists them, but has no historical
+# exit code to compare.
+_LEGACY_COMMANDS = tuple(command for command in _COMMANDS if command not in {"gc", "forget-cache"})
 
 # The tail of the one warning a command that runs prints about the unusable configuration.
 _DEFAULT_WARNING = "; Pivot uses the default .pivot."

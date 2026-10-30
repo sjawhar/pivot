@@ -438,8 +438,9 @@ def _run_inner(
     else:
         # Refuse what discovery refuses: a pipeline (or an included one) with a `root=` other
         # than the project root keeps its stages' locks outside the project's state directory,
-        # where no `pivot gc` reads them.
+        # where no `pivot gc` reads them; so does one loaded before `core.state_dir` moved.
         discovery.require_project_roots(pipeline, project.get_project_root())
+        discovery.require_current_state_dirs(pipeline)
 
     # Run async execution
     async def execute() -> dict[str, ExecutionSummary]:

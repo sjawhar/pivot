@@ -249,6 +249,12 @@ def resolution_for(root: pathlib.Path) -> StateDirResolution:
     return resolution
 
 
+def current_resolution(root: pathlib.Path) -> StateDirResolution:
+    """``root``'s resolution read from its config now, whatever the current record holds: for a
+    check that a resolution kept from earlier (a loaded pipeline's) still holds."""
+    return _resolve_state_dir(root)
+
+
 def _resolve_state_dir(root: pathlib.Path) -> StateDirResolution:
     """Read and resolve ``root``'s ``core.state_dir``: the directory, or why it cannot be used."""
     config_path = root / ".pivot" / "config.yaml"
@@ -363,9 +369,10 @@ def _unusable_message(
 def report_unusable_path_to_library(root: pathlib.Path, resolution: StateDirResolution) -> None:
     """Warn a library caller, at each pipeline load, that the configured path cannot be used.
 
-    The pipeline then keeps its state in ``.pivot`` for its whole life (``kept_by_pipeline``),
-    so the caller gets the warning a command prints, once per load. Silent under a CLI
-    invocation, which reports it once per command, and in a worker.
+    The pipeline then keeps ``.pivot`` for its fingerprints (``kept_by_pipeline``), and a run of
+    it refuses once the path can be used (``discovery.require_current_state_dirs``), so the
+    caller gets the warning a command prints, once per load. Silent under a CLI invocation,
+    which reports it once per command, and in a worker.
     """
     invocation = _invocation.get()
     if (

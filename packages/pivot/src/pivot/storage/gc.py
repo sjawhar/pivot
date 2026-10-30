@@ -317,6 +317,8 @@ def _identity_reason(
         )
     if (nonce_reason := _view_nonce_reason(entry, registered)) is not None:
         return nonce_reason
+    if (caches_reason := _other_caches_reason(entry, registered, project_id)) is not None:
+        return caches_reason
     host, machine, mount_ns = naming.this_view()
     if (scope["host"], registered["machine"], registered["mount_ns"]) != (host, machine, mount_ns):
         return _other_view_reason(entry, registered)
@@ -371,6 +373,83 @@ def _view_nonce_reason(
         + "where that view's state directory is visible; if that view is gone for good, delete "
         + f"{entry} and re-run",
     )
+
+
+def _other_caches_reason(
+    entry: pathlib.Path, registered: _RegisteredProject, project_id: str
+) -> tuple[str, str] | None:
+    """Why this view cannot prove the entry's project has named nothing through another cache
+    since this state directory was written, or None.
+
+    The entry's own nonce proves this state directory is the one its view last wrote for this
+    cache. A copy of the project (a cloned disk) keeps that nonce while the original goes on
+    naming objects through another cache it uses, and its records then are not the original's.
+    Only something the original writes to shared storage after the copy can tell the copy
+    apart: the nonce of its entry in each other cache. So every other cache the state directory
+    lists for the entry's view (``naming.cache_records``) must be readable where it is recorded,
+    hold the same cache, and hold an entry for the project whose nonce is the one this state
+    directory holds for it. A project that uses one cache lists only it, and nothing more is
+    read.
+    """
+    scope = registered["scope"]
+    view_key = naming.view_key_of(scope["host"], registered["machine"], registered["mount_ns"])
+    try:
+        this_cache = naming.read_cache_id(entry.parent.parent)
+        records = naming.cache_records(scope["state_dir"], view_key)
+    except (OSError, ValueError) as e:
+        return (
+            scope_label(scope),
+            f"{_recorded_where(scope)}, and the list of caches it uses in {scope['state_dir']} "
+            + f"cannot be read ({_error_text(e)}). Make it readable and re-run",
+        )
+    for record in records:
+        if record.cache_id == this_cache:
+            continue
+        problem = _listed_cache_problem(record, scope, project_id)
+        if problem is None:
+            continue
+        where = record.cache_dir if record.cache_dir is not None else record.record
+        return (
+            scope_label(scope),
+            f"{_recorded_where(scope)}, and it also uses the cache {where} (id "
+            + f"{record.cache_id}), where {problem}. This host cannot tell whether the project "
+            + "named objects through that cache that this path does not show: this path may "
+            + "hold a copy of the project (a cloned disk) that the project has moved on from. If "
+            + "it is the project, run any pivot command in it against that cache, which brings "
+            + "that record up to date; if the project no longer uses that cache, run `pivot "
+            + f"forget-cache {record.cache_id}` in it. Then re-run",
+        )
+    return None
+
+
+def _listed_cache_problem(
+    record: naming.CacheRecord, scope: ProjectScope, project_id: str
+) -> str | None:
+    """What stops this view from proving one listed cache holds the project's latest entry."""
+    if record.cache_dir is None:
+        return f"the record {record.record} of where that cache is cannot be read"
+    try:
+        cache_id = naming.read_cache_id(record.cache_dir)
+    except (OSError, ValueError) as e:
+        return f"that cache cannot be read ({_error_text(e)})"
+    if cache_id != record.cache_id:
+        return f"another cache is at that path now (id {cache_id})"
+    entry = naming.register_path(record.cache_dir, scope["root"], project_id, record.view_key)
+    try:
+        state_nonce, entry_nonce = naming.read_nonce_pair(
+            scope["state_dir"], record.view_key, record.cache_id, naming.entry_nonce_path(entry)
+        )
+    except FileNotFoundError as e:
+        missing = "its nonce in this state directory" if e.filename is None else e.filename
+        return f"the project's entry there cannot be checked ({missing} is missing)"
+    except (OSError, ValueError) as e:
+        return f"the project's entry there cannot be checked ({_error_text(e)})"
+    if state_nonce != entry_nonce:
+        return (
+            "the project's entry holds a different nonce from the one this state directory "
+            + "holds for it"
+        )
+    return None
 
 
 def _other_view_reason(

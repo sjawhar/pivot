@@ -173,12 +173,15 @@ import sys
 def main() -> None:
     os.chdir(sys.argv[1])
 
-    from pivot import discovery, executor
+    from pivot import discovery, exceptions, executor
 
     pipeline = discovery.discover_pipeline()
     executor.run(pipeline=pipeline)
     pathlib.Path(".pivot/config.yaml").write_text("core:\\n  state_dir: otherstate\\n")
-    executor.run(pipeline=pipeline, force=True)
+    try:
+        executor.run(pipeline=pipeline, force=True)
+    except exceptions.PipelineConfigError as error:
+        print(f"REFUSED: {error}")
 
 
 if __name__ == "__main__":
@@ -451,18 +454,22 @@ def test_a_pipeline_loaded_again_after_an_edit_runs_in_the_new_state_dir(
     assert (root / "otherstate" / "stages" / "test" / "process.lock").is_file(), ran.stderr
 
 
-def test_a_reused_pipeline_keeps_its_state_dir_after_an_edit(tmp_path: pathlib.Path) -> None:
-    """A loaded pipeline's runs keep the directory its stages' locks are recorded in, so its
-    second run writes its locks, its run manifest and its caches where its first run did."""
+def test_a_reused_pipeline_refuses_to_run_after_its_state_dir_moves(tmp_path: pathlib.Path) -> None:
+    """A loaded pipeline's stages record the directory it loaded with. Once `core.state_dir`
+    names another, a run of it refuses, naming both directories, rather than write locks where
+    no `pivot gc` reads them; it writes nothing in either directory."""
     home, root = _project(tmp_path, "libstate")
 
     ran = _run_library_caller(tmp_path, home, root, _REUSED_PIPELINE_CALLER)
 
-    assert ran.returncode == 0, ran.stdout + ran.stderr
+    out = " ".join((ran.stdout + ran.stderr).split())
+    assert ran.returncode == 0, out
+    assert "REFUSED:" in out and "libstate" in out and "otherstate" in out, out
+    assert "Load the pipeline again" in out, out
     assert not (root / "otherstate").exists(), sorted(
         p.relative_to(root).as_posix() for p in (root / "otherstate").rglob("*")
     )
-    assert _cached_keys(root / "libstate", b"run:") == 2, ran.stdout + ran.stderr
+    assert _cached_keys(root / "libstate", b"run:") == 1, out
 
 
 def test_direct_fingerprints_of_one_pipeline_use_the_state_dir_it_loaded_with(
