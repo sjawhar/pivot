@@ -352,6 +352,16 @@ interrupted. The session itself (its modules, its `sys.path` entry and its recor
 the next discovery ends it. A worker installs its own loader and recorder for its life
 (`discovery.install_user_code_loader`).
 
+A session puts the project root first on `sys.path`, so project code's `import helpers` loads the
+root's `helpers.py`, as it does in a `pivot` process and in a worker. A program that runs Pivot
+in its own process (`executor.run`, a notebook) may already hold a user module of that name from
+elsewhere, which `sys.modules` would return instead: the stage would be fingerprinted from that
+module while its worker, which imports a module discovery did not send by value from its file,
+ran the root's. So a session displaces each user module loaded from outside the root whose
+top-level module or package the root provides, with its submodules, and puts them back when it
+ends (`discovery._displace_modules_the_root_provides`). Libraries stay, as Pivot and its workers
+hold them too, and so does the program's main module.
+
 Fingerprinting reads the recorded bytes, not the file: `loaded_source.getsource` puts their lines
 into `linecache` as an entry without an mtime, which `linecache.checkcache` leaves alone, before
 it calls `inspect.getsource`; `fingerprint._source_digest`, which keys the `fp:` and `sm:` caches,
