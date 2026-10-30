@@ -1228,11 +1228,13 @@ and `.pivot/` at the project root are never ignored, whatever the patterns say; 
 root itself is never ignored, where `git check-ignore .` reports it ignored by `*`; and a line
 with more than 256 runs of `*` tried at more than one place (not one at the end of the line,
 nor a lone `*` right before a `/`; consecutive `**/` count as one) is matched differently, with
-a warning: a negation is taken to match every path, and any other such line is not used.
-Hashing applies the same rules to a directory input's members, except for an input directory
-that an earlier rule ignores: an over-limit negation does not decide that directory is unignored,
-so it is hashed whole. It is also whole when `.pivotignore` itself ignores it; `check-ignore`
-reports its files ignored, but they count for its hash. See
+a warning: `check-ignore` tests each path as a *member*, which such a negation is taken to match
+and any other such line not to. Hashing applies the same rules to a directory input's members.
+To decide whether the input directory itself, or one above it, is ignored, such a line is taken
+the other way round: a negation matches none, so an input an earlier rule ignores stays
+ignored, and any other such line matches every one. An ignored input is hashed whole, so
+either way the input counts every file git might count. It is also whole when `.pivotignore`
+itself ignores it; `check-ignore` reports its files ignored, but they count for its hash. See
 [Directory inputs and `.pivotignore`](../concepts/dependencies.md#directory-inputs-and-pivotignore).
 
 **Examples:**

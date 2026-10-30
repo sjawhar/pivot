@@ -83,7 +83,7 @@ _PREFIXES = [
     *(b"data/**/", b"data/raw/in/**/", b"data/raw/i*/", b"d**/raw/in/", b"data**/"),
     *(b"**/**/", b"data/**/**/raw/", b"data/raw/in/**/***/"),  # merged into one "**/"
     *(b"**\\/", b"data/raw/in/**\\/", b"data/**\\/raw/"),  # a "**" before an escaped "/"
-    b"a**/**/",  # a non-whole star component followed by a whole "**/"
+    b"d**/**/",  # a non-whole star component (matching "data") followed by a whole "**/"
 ]
 _KINDS = (_LITERALS, _STARS, _QUESTIONS, _CLASSES, _ESCAPES)
 _KIND_WEIGHTS = (3, 3, 2, 3, 1)

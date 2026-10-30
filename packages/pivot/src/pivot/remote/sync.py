@@ -218,7 +218,7 @@ def _get_file_hash_from_pvt(
     proj_root: pathlib.Path,
     files_dir: pathlib.Path,
     *,
-    skip: track.PvtSkip | None = None,
+    skip: track.PvtSkip | None,
     require_members: bool = False,
 ) -> set[str] | None:
     """The cache objects of a path tracked by a .pvt file; None when ``skip`` leaves that .pvt
@@ -241,7 +241,7 @@ def _get_file_hash_from_pvt(
 def _get_tracked_artifacts(
     proj_root: pathlib.Path,
     *,
-    skip: track.PvtSkip | None = None,
+    skip: track.PvtSkip | None,
 ) -> dict[pathlib.PurePosixPath, tuple[pathlib.Path, track.PvtData]]:
     """Every `pivot track`-ed file or directory in the project, by its project-relative path.
 

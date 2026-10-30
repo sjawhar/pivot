@@ -96,7 +96,7 @@ def test_get_stage_lock_hashes_uses_identity_paths(
     )
 
     output_hashes, dep_hashes = cli_verify._get_stage_lock_hashes(
-        "train", cli_verify._project_tracked_files()
+        "train", cli_verify._project_tracked_files(None)
     )
 
     workspace_store = cli_helpers.get_workspace_store()
@@ -127,7 +127,7 @@ def test_get_stage_lock_hashes_merged_pipeline_paths(
     )
 
     output_hashes, dep_hashes = cli_verify._get_stage_lock_hashes(
-        stage_name, cli_verify._project_tracked_files()
+        stage_name, cli_verify._project_tracked_files(None)
     )
 
     workspace_store = cli_helpers.get_workspace_store()
@@ -173,7 +173,7 @@ def test_get_stage_lock_hashes_without_workspace_store(
     try:
         cli_helpers_mod.get_workspace_store = lambda: None  # type: ignore[assignment]
         output_hashes, dep_hashes = cli_verify._get_stage_lock_hashes(
-            "train", cli_verify._project_tracked_files()
+            "train", cli_verify._project_tracked_files(None)
         )
 
         # Should fall back to identity_key
@@ -205,7 +205,7 @@ def test_get_stage_lock_hashes_filters_metric_outputs(
     )
 
     output_hashes, dep_hashes = cli_verify._get_stage_lock_hashes(
-        "train", cli_verify._project_tracked_files()
+        "train", cli_verify._project_tracked_files(None)
     )
 
     # Only data output, not metric

@@ -219,7 +219,7 @@ def test_the_remote_existence_check_keeps_the_text_of_its_cause(
     )
 
     with pytest.raises(exceptions.RemoteError) as raised:
-        verify_mod._verify_stages([cached], tmp_path, True, verify_mod._project_tracked_files())
+        verify_mod._verify_stages([cached], tmp_path, True, verify_mod._project_tracked_files(None))
 
     assert str(raised.value) == "Failed to check remote existence: connection reset by peer"
 

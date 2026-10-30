@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     TrackedFiles = Callable[[], dict[str, track.PvtData]]
 
 
-def _project_tracked_files(skip: track.PvtSkip | None = None) -> TrackedFiles:
+def _project_tracked_files(skip: track.PvtSkip | None) -> TrackedFiles:
     """The project's tracked files, scanned for ``.pvt`` files once, when first asked for.
     ``skip`` leaves out a stage's own ``*.pvt`` member of its output, which tracks nothing."""
     return functools.cache(

@@ -735,9 +735,9 @@ def test_member_ignored_checks_every_directory_above(
             id="consecutive-starstar-components-match-as-one",
         ),
         pytest.param(
-            "a**/**/b\n!a**/**/keep.txt\n",
+            "*.txt\na**/**/b\n!a**/**/keep.txt\n",
             ["x/a/b", "a/keep.txt", "a/x/keep.txt", "ax/y/keep.txt", "a/c"],
-            ["a/b", "a/x/b", "a/x/y/b", "ax/b", "ax/y/b"],
+            ["a/b", "a/x/b", "a/x/y/b", "ax/b", "ax/y/b", "x/keep.txt", "a/x/other.txt"],
             id="non-whole-star-before-a-whole-starstar",
         ),
         pytest.param(
@@ -931,12 +931,24 @@ def test_a_negation_of_257_starstar_components_keeps_what_git_keeps(
     assert caplog.records == []
 
 
-def test_a_negation_too_long_to_match_matches_every_path(
+_NEGATION_WARNING = (
+    "Negation on line {line} of .pivotignore ('{text}') has 257 runs of '*' that try more than "
+    + "one place; Pivot matches at most 256, so it takes it to match every member and no input "
+    + "directory. Shorten it."
+)
+_PATTERN_WARNING = (
+    "Pattern on line {line} of .pivotignore ('{text}') has 257 runs of '*' that try more than "
+    + "one place; Pivot matches at most 256, so it takes it to match no member and every input "
+    + "directory, which is hashed whole. Shorten it."
+)
+
+
+def test_a_negation_too_long_to_match_matches_every_member(
     tmp_path: pathlib.Path, caplog: LogCaptureFixture
 ) -> None:
-    """A negation with more than 256 runs of "*" is taken to match every path, with a warning:
-    it can then keep a file git leaves out (a rerun too many) but never leave out one git keeps
-    (a stale stage). A trailing "/" still limits it to directories."""
+    """A negation with more than 256 runs of "*" is taken to match every member, with a
+    warning: it can then keep a file git leaves out (a rerun too many) but never leave out one
+    git keeps (a stale stage). A trailing "/" still limits it to directories."""
     long_negation = "!" + "*a" * 257
     (tmp_path / "every").mkdir()
     (tmp_path / "every" / ".pivotignore").write_text(f"*.txt\nbuild/\n{long_negation}\n")
@@ -957,20 +969,29 @@ def test_a_negation_too_long_to_match_matches_every_path(
 
     assert every_ignored == (False, False), "it matches every file and directory"
     assert dirs_ignored == (True, False), "with a trailing '/', every directory and no file"
-    warnings = [record.getMessage() for record in caplog.records]
-    assert warnings == [
-        f"Negation on line 3 of .pivotignore ('{long_negation}{suffix}') has 257 runs of '*' that "
-        + "try more than one place; Pivot matches at most 256, so it takes it to match every "
-        + "path. Shorten it."
-        for suffix in ("", "/")
+    assert [record.getMessage() for record in caplog.records] == [
+        _NEGATION_WARNING.format(line=3, text=long_negation + suffix) for suffix in ("", "/")
     ]
 
 
-def test_a_pattern_too_long_to_match_is_not_used(
+def test_an_over_limit_negation_unignores_no_input_directory(tmp_path: pathlib.Path) -> None:
+    """`build/` ignores build and every path below it. A directory-only negation over the limit
+    matches every *member*, but decides neither that an input directory nor that a directory
+    above one is not ignored, so an input at build or at build/sub gets no filter and is hashed
+    whole; one elsewhere still gets a filter."""
+    (tmp_path / ".pivotignore").write_text("build/\n*.txt\n!" + "*a" * 257 + "/\n")
+    filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
+
+    assert filter_instance.member_filter("build") is None
+    assert filter_instance.member_filter("build/sub") is None, "the parent build is ignored"
+    assert filter_instance.member_filter("src") is not None
+
+
+def test_a_pattern_too_long_to_match_matches_no_member(
     tmp_path: pathlib.Path, caplog: LogCaptureFixture
 ) -> None:
-    """Any other line with more than 256 runs of "*" is not used, with a warning: leaving it
-    out can only keep files git leaves out."""
+    """Any other line with more than 256 runs of "*" matches no member, with a warning: leaving
+    it out there can only keep files git leaves out."""
     (tmp_path / ".pivotignore").write_text("*a" * 257 + "\n*.txt\n")
 
     with caplog.at_level("WARNING", logger="pivot.ignore"):
@@ -980,9 +1001,31 @@ def test_a_pattern_too_long_to_match_is_not_used(
     assert not long_ignored
     assert filter_instance.is_ignored("notes.txt", is_dir=False)
     assert [record.getMessage() for record in caplog.records] == [
-        f"Pattern on line 1 of .pivotignore ('{'*a' * 257}') has 257 runs of '*' that try more "
-        + "than one place; Pivot matches at most 256 and does not use it. Shorten it."
+        _PATTERN_WARNING.format(line=1, text="*a" * 257)
     ]
+
+
+def test_an_over_limit_pattern_ignores_every_input_directory(tmp_path: pathlib.Path) -> None:
+    """A positive line over the limit matches no member but every input directory, so every
+    input is hashed whole. Dropping it there would filter an input git ignores by it: here git
+    ignores the 258-byte input directory a×128/a×129 (so grade.py in it too), and `*.txt` would
+    then leave out its counted.txt."""
+    deep = "a" * 128 + "/" + "a" * 129
+    patterns = "*a" * 128 + "/" + "*a" * 129 + "\n*.txt\n"
+    project = tmp_path / "project"
+    (project / deep).mkdir(parents=True)
+    (project / deep / "counted.txt").write_text("x\n")
+    (project / deep / "grade.py").write_text("x\n")
+    (project / "kept.py").write_text("x\n")
+    (project / ".pivotignore").write_text(patterns)
+    filter_instance = ignore.IgnoreFilter(project_root=project)
+
+    git_kept = _helper_git_kept(tmp_path / "home", project, patterns)
+    assert "kept.py" in git_kept
+    assert f"{deep}/grade.py" not in git_kept, "git ignores the input directory by the line"
+    assert not filter_instance.is_ignored(deep, is_dir=True), "no member: as before"
+    assert filter_instance.member_filter(deep) is None, "an input directory: hashed whole"
+    assert filter_instance.member_filter("src") is None, "every input directory"
 
 
 def test_the_limit_is_256_runs_of_star_that_try_more_than_one_place(
@@ -1004,10 +1047,9 @@ def test_the_limit_is_256_runs_of_star_that_try_more_than_one_place(
 
     assert at_ignored == (True, False), "256 runs: matched as git matches them"
     assert at_warnings == []
-    assert not over_ignored, "257 runs: not used"
+    assert not over_ignored, "257 runs: it matches no member"
     assert [record.getMessage() for record in caplog.records] == [
-        f"Pattern on line 1 of .pivotignore ('{over_limit}') has 257 runs of '*' that try more "
-        + "than one place; Pivot matches at most 256 and does not use it. Shorten it."
+        _PATTERN_WARNING.format(line=1, text=over_limit)
     ]
 
 
