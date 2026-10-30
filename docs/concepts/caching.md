@@ -76,12 +76,22 @@ git records, and keeps every object that any of these names:
 
 | Record | Where it lives | What it names |
 |--------|----------------|---------------|
-| Stage lock `outs` | `.pivot/stages/**/<stage>.lock` | each output's hash; a directory's tree hash **and** every hash in its manifest |
+| Stage lock `outs` | `.pivot/stages/**/<stage>.lock` | each output's hash; for a directory, its listing's hash (the listing object and the whole-directory tree) **and** every file its listing names |
 | Stage lock `deps` | the same file | each input's hash, which may outlive the stage that produced it |
-| `.pvt` file | anywhere under the project root | a tracked file's hash, or a tracked directory's hash and members |
-| Run-cache row | `.pivot/state.lmdb/` | the output hashes a previous run can restore without executing |
-| Workspace link | `data/**` and any tracked path | the object a `symlink` checkout points at, file or whole directory |
+| `.pvt` file | anywhere under the project root | a tracked file's hash, or a tracked directory's listing hash and every file its listing names |
+| Run-cache row | `.pivot/state.lmdb/` | the output hashes a previous run can restore without executing, a directory's members included |
+| Workspace link | `data/**` and any tracked path | the object a `symlink` checkout points at: a file, or a whole directory's tree under `trees/` |
 | Cache ref | `.pivot/cache/files/refs/**` | the object a `kind: cache` store published |
+
+A directory's members are read from its listing: the cache's object at the directory's hash,
+or, when the cache has lost it (a fresh clone), the listing file committed beside the lock or
+`.pvt`. A recorded directory whose listing is in neither place refuses the collection, naming
+the record: its files are unknown, so none of them may be removed. A `.pvt` that a stage
+wrote into its own directory output is the stage's data, not a record; its objects are kept,
+but a listing it lacks does not refuse. A lock an older pivot wrote lists each directory's
+files inline, and those, with the directory hash it recorded, are kept as they are. An entry a
+killed run left beside an output (`.pivot_backup_<token>.*`) is walked like any other, so the
+links it still holds keep their objects until a later restore of that path removes it.
 
 Two more rules cover objects no record names yet:
 
@@ -111,18 +121,18 @@ collection. The plan and the prompt run before the lock is taken, so a dry run o
 prompt blocks nobody; nothing read before the lock decides what is deleted.
 A collection also takes `<cache>/gc.lock`, so two collections never run on one cache, and lists
 each prefix directory under its `.pivot_cache.lock`, waiting there for a publish in progress
-before it takes the naming lock; under the naming lock it waits for nothing. It removes a
-directory tree with its `.content-checked` marker (and the
-`.layout-checked` and `.verified` markers older pivot versions wrote), markers first, and
-never removes a lock file or a `.pivot_tmp_*` entry another process owns.
+before it takes the naming lock; under the naming lock it waits for nothing. It lists both
+stores, `files/` and `trees/`, and removes a directory tree with its `.content-checked` marker
+(and the `.layout-checked` and `.verified` markers older pivot versions wrote), markers first,
+and never removes a lock file or a `.pivot_tmp_*` entry another process owns.
 
 A symlinked directory inside the project whose target lies outside it — `data -> /mnt/big/data`,
 or a plain `.venv -> /opt/venvs/x` — hides whatever records are beneath it, since pivot does not
 follow a link out of the project. A collection that finds one keeps every object and removes
 nothing, and names the link: point it at a directory inside the project (or remove it) to
 collect. A symlinked directory that stays inside the project is walked. A link into the cache's
-own `files/` is a checkout, read as one; a link anywhere else under the cache root (which may be a
-broad scratch directory holding your data too) leaves the project like any other.
+own `files/` or `trees/` is a checkout, read as one; a link anywhere else under the cache root
+(which may be a broad scratch directory holding your data too) leaves the project like any other.
 
 What this does and does not cover: there is no timing window between pivot processes that take
 the lock. It holds when every pivot that uses the cache is this version or newer, the
@@ -300,6 +310,26 @@ The fast path cannot detect an edit that preserves the size, inode, device and
 mtime, such as a tool that restores the original mtime. Pivot detects the
 file after its metadata changes. Run `pivot repro --force <stage>` to rewrite
 the stage's output.
+
+The StateDB entry is keyed by the file's path. A copy of a project made outside
+Pivot holds the original's `<state dir>/state.lmdb`, whose entries name the original's
+paths: a copy that hard-links Pivot's read-only outputs and copies the database,
+or `cp -al`, which hard-links the database too, so the two share it. Pivot also
+finds an entry by the file's device and inode: a hard-linked output reuses the
+original's entry, after Pivot checks that the original path still names the same
+file, so `pivot status` in such a copy reads no output. It does so only on a filesystem that gives
+each live file its own inode number on its device: ext2, ext3, ext4, XFS, Btrfs, F2FS and ZFS,
+or tmpfs only when mountinfo says `inode64`. On any other filesystem (FUSE mounts such as mergerfs
+or sshfs, NFS, overlayfs, tmpfs without `inode64`), and on systems without
+`/proc/self/mountinfo` such as macOS, a copy's outputs are read once instead. A copied output is a
+new file and is read once: `pivot status` saves the hashes it computed, so the next `pivot status`
+reads none of them. Every command that hashes a dependency or an output saves its hash the same
+way, also those that write no lock file: `pivot repro --no-commit`, `--dry-run` and `--explain`,
+`pivot verify`, `pivot diff` and `pivot plots diff`. The tracked-file pass of `pivot status`, and
+commands that materialize or track files (`pivot checkout`, `get`, `import`, `update`, `track` and
+restore), may create `state.lmdb` when they have hashes to save. The read-only comparison passes
+of explanations, diff and plots diff never create it. A save is skipped, never an error, when the
+database cannot be written or another Pivot command holds its write lock for more than 2 seconds.
 
 ## Checkout Modes
 

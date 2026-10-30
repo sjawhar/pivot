@@ -68,7 +68,7 @@ from pivot import state_dir as state_dir_mod
 from pivot.engine import graph as engine_graph
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
-from pivot.storage import cache, listing, lock, track
+from pivot.storage import cache, listing, lock, member_skip, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -76,6 +76,7 @@ from pivot.types import (
     ArtifactTag,
     CodeChange,
     DepChange,
+    FileHashEntry,
     ImportCheckStatus,
     ImportStatusInfo,
     ParamChange,
@@ -103,13 +104,23 @@ UPSTREAM_STALE_REASON_PREFIX = "Upstream stale"
 
 
 def _discover_tracked_files(
-    allow_missing: bool,
+    allow_missing: bool, all_stages: dict[str, RegistryStageInfo]
 ) -> tuple[dict[str, PvtData] | None, pygtrie.Trie[str] | None]:
-    """Discover tracked files for .pvt hash lookup when allow_missing is set."""
+    """Discover tracked files for .pvt hash lookup when allow_missing is set. A stage's own
+    ``*.pvt`` member of its output is none (``member_skip.own_member_skip``)."""
     if not allow_missing:
         return None, None
 
-    tracked_files = track.discover_pvt_files(project.get_project_root())
+    project_root = project.get_project_root()
+    tracked_files = track.discover_pvt_files(
+        project_root,
+        skip=member_skip.own_member_skip(
+            project_root,
+            all_stages,
+            config.locate_state_dir(),
+            config.locate_cache_dir() / "files",
+        ),
+    )
     tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
     for path in tracked_files:
         tracked_trie[pathlib.Path(path).parts] = path
@@ -139,6 +150,7 @@ def _get_explanations_in_parallel(
         unreadable,
     )
     explanations_by_name = dict[str, StageExplanation]()
+    entries_per_stage = list[tuple[pathlib.Path, list[FileHashEntry]]]()
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = dict[Future[StageExplanation], str]()
@@ -146,6 +158,8 @@ def _get_explanations_in_parallel(
             stage_info = all_stages[stage_name]
             fingerprint = cast("dict[str, str]", stage_info["fingerprint"])
             stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
+            entries = list[FileHashEntry]()
+            entries_per_stage.append((stage_state_dir, entries))
             future = pool.submit(
                 contextvars.copy_context().run,
                 explain.get_stage_explanation,
@@ -163,6 +177,7 @@ def _get_explanations_in_parallel(
                 tracked_files=tracked_files,
                 tracked_trie=tracked_trie,
                 producer_hashes=producer_hashes,
+                file_hash_entries=entries,
                 unreadable_listings=unreadable,
             )
             futures[future] = stage_name
@@ -185,6 +200,11 @@ def _get_explanations_in_parallel(
                     upstream_stale=[],
                 )
 
+    entries_by_state_dir = dict[pathlib.Path, list[FileHashEntry]]()
+    for state_dir, entries in entries_per_stage:
+        entries_by_state_dir.setdefault(state_dir, []).extend(entries)
+    for state_dir, entries in entries_by_state_dir.items():
+        state_mod.save_file_hashes(state_dir, entries, create=False)
     return explanations_by_name
 
 
@@ -209,7 +229,7 @@ def get_pipeline_explanations(
     _t = metrics.start()
     try:
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
-            tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
+            tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
             if graph is None:
                 graph = engine_graph.build_graph(all_stages)
             stage_graph = engine_graph.get_stage_dag(graph)
@@ -300,7 +320,7 @@ def get_pipeline_status(
     _t = metrics.start()
     try:
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
-            tracked_files, tracked_trie = _discover_tracked_files(allow_missing)
+            tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
             if graph is None:
                 graph = engine_graph.build_graph(all_stages)
             stage_graph = engine_graph.get_stage_dag(graph)
@@ -350,19 +370,25 @@ def _explanations_to_status(explanations: list[StageExplanation]) -> list[Pipeli
 def get_tracked_files_status(
     project_root: pathlib.Path,
     on_progress: Callable[[int, int], None] | None = None,
+    *,
+    skip: track.PvtSkip | None = None,
 ) -> list[TrackedFileInfo]:
     """Get status for all tracked files.
 
     Args:
         project_root: Project root directory.
         on_progress: Optional callback called with (completed, total) after each file.
+        skip: Leaves a .pvt out of the tracked files (``track.discover_pvt_files``): a stage's
+            own member of its output (``member_skip.own_member_skip``).
     """
-    tracked = track.discover_pvt_files(project_root)
+    tracked = track.discover_pvt_files(project_root, skip=skip)
     total = len(tracked)
     results = list[TrackedFileInfo]()
 
     # Look hashes up read-only and save what was read once, best-effort, so a hash cache that
-    # cannot be written never fails status (open_readonly raises for a damaged database).
+    # cannot be opened or written never fails status; a damaged one still does. Both
+    # directories are located, not created: the save makes the state directory #503's resolver
+    # chose only when it has a hash to save.
     cache_dir = config.locate_cache_dir() / "files"
     state_dir = config.locate_state_dir()
     pending = list[tuple[pathlib.Path, os.stat_result, str]]()
@@ -402,7 +428,7 @@ def get_tracked_files_status(
             if on_progress is not None:
                 on_progress(i, total)
 
-    state_mod.save_file_hashes(state_dir, pending)
+    state_mod.save_file_hashes(state_dir, pending, create=True)
 
     return results
 
@@ -591,9 +617,12 @@ async def _check_imports_batch(
     return results
 
 
-def get_import_status(project_root: pathlib.Path) -> list[ImportStatusInfo]:
-    """Check update status for all imported artifacts concurrently."""
-    import_pvts = track.discover_import_pvt_files(project_root)
+def get_import_status(
+    project_root: pathlib.Path, *, skip: track.PvtSkip | None = None
+) -> list[ImportStatusInfo]:
+    """Check update status for all imported artifacts concurrently (``skip``: as
+    ``get_tracked_files_status``)."""
+    import_pvts = track.discover_import_pvt_files(project_root, skip=skip)
     if not import_pvts:
         return []
     return asyncio.run(_check_imports_batch(import_pvts, project_root))

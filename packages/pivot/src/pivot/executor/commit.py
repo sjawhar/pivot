@@ -249,7 +249,7 @@ def _commit_stages(
                     out_path, hashed = prepared[out.identity]
                     try:
                         hash_info = store.finish_commit(
-                            out, out_path, hashed, state_dir=default_state_dir
+                            out, out_path, hashed, state_dir=default_state_dir, claims=claims
                         )
                     except FileNotFoundError:
                         logger.error(
@@ -267,6 +267,12 @@ def _commit_stages(
                             stage_name,
                             identity_key,
                         )
+                        outputs_missing = True
+                        break
+                    except exceptions.OutputOwnershipError as exc:
+                        # #538's swap check, at the link inside the unit: this stage's failure
+                        # alone, as at the check before the unit
+                        logger.error("Stage '%s': %s", stage_name, exc)
                         outputs_missing = True
                         break
                     try:

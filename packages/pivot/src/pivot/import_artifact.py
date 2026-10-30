@@ -66,7 +66,9 @@ async def _download_verified(remote_url: str, file_hash: str, data_path: pathlib
     finally:
         with contextlib.suppress(FileNotFoundError):
             tmp_path.unlink()
-    state.save_file_hashes(config.locate_state_dir(), [(data_path, tmp_stat, file_hash)])
+    state.save_file_hashes(
+        config.locate_state_dir(), [(data_path, tmp_stat, file_hash)], create=True
+    )
     return tmp_stat.st_size
 
 
@@ -576,7 +578,7 @@ async def import_artifact(
 
     # Any pipeline's output, loaded or not: running it would remove the import and its sidecar
     overlap = ownership.find_declared_overlap(
-        data_path, discovery.declared_outputs(project_root), project_root
+        data_path, discovery.declared_outputs(project_root).outputs, project_root
     )
     shown = project.relative_within(data_path, project_root) or data_path
     if overlap is not None:

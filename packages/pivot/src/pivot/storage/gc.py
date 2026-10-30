@@ -46,7 +46,7 @@ import yaml
 
 from pivot import exceptions, project, run_history, yaml_config
 from pivot import state_dir as state_dir_mod
-from pivot.storage import cache, listing, lock, state, track
+from pivot.storage import cache, listing, lock, member_skip, state, track
 from pivot.types import is_dir_hash
 
 if TYPE_CHECKING:
@@ -1350,6 +1350,10 @@ def _text_keys(path: pathlib.Path) -> set[str]:
     return set(_KEY_RE.findall(path.read_text(errors="replace")))
 
 
+class _UninterpretableLockError(Exception):
+    """A stage lock holds a schema or key this pivot does not know; ``collect_roots`` refuses."""
+
+
 def _lock_keys(path: pathlib.Path, listings: _Listings) -> set[str]:
     """Every key a stage lock names: each ``outs`` and ``deps`` hash, and every file of each
     directory it records, read from that directory's listing (``lock.recorded_hashes``).
@@ -1357,10 +1361,18 @@ def _lock_keys(path: pathlib.Path, listings: _Listings) -> set[str]:
     ``open`` raising ``OSError`` refuses the run (the lock cannot be read, so what it names is
     unknown); ``yaml.load`` raising ``yaml.YAMLError`` (a committed lock left with git conflict
     markers, a truncated one) is caught by ``collect_roots``, which then keeps every object
-    rather than let a lock it cannot parse licence a delete."""
+    rather than let a lock it cannot parse licence a delete. A lock with a newer schema, or a
+    key this pivot does not know, may name objects there (a newer pivot's list of objects a run
+    read by hash): ``_UninterpretableLockError``, which refuses the run and names the lock."""
     with open(path) as f:
         data: object = yaml.load(f, Loader=yaml_config.Loader)
     recorded = lock.recorded_hashes(data)
+    if isinstance(recorded, lock.UninterpretableLock):
+        raise _UninterpretableLockError(
+            f"the stage lock {path} holds {recorded.reason}; a newer pivot may record cache "
+            + "objects there, so this pivot cannot tell which objects it names. Collect with "
+            + "the pivot that wrote it, or a newer one"
+        )
     if recorded is None:
         return _text_keys(path)
     keys = set(recorded.keys)
@@ -1369,17 +1381,30 @@ def _lock_keys(path: pathlib.Path, listings: _Listings) -> set[str]:
     return keys
 
 
-def _pvt_keys(path: pathlib.Path, object_root: pathlib.Path) -> set[str]:
+def _pvt_keys(
+    path: pathlib.Path, object_root: pathlib.Path, stage_member: track.PvtSkip
+) -> set[str]:
     """Every key a ``.pvt`` names: its hash and, for a directory, every file of its listing
     (``track.tracked_members``: the listing committed beside it, the cache's object, or the one
-    an older pivot's ``.pvt`` holds inline)."""
+    an older pivot's ``.pvt`` holds inline).
+
+    A ``.pvt`` a stage wrote into its own directory output (#540, ``stage_member``) is that
+    stage's data, not a record: nothing restores from it, so a directory it names may have no
+    listing anywhere. Its keys are still kept, but a listing it lacks does not refuse the
+    collection. Every other ``.pvt`` is a tracked file, and its missing listing does.
+    """
     data = track.read_pvt_file(path)
     if data is None:
         return _text_keys(path)
     record = track.pvt_to_hash_info(data)
     keys = {record["hash"]}
     if is_dir_hash(record):
-        members = track.tracked_members(track.get_data_path(path), data, object_root)
+        try:
+            members = track.tracked_members(track.get_data_path(path), data, object_root)
+        except (exceptions.ListingMissingError, exceptions.CorruptListingError):
+            if stage_member(path, data):
+                return keys
+            raise
         keys.update(entry["hash"] for entry in members["files"])
     return keys
 
@@ -1662,9 +1687,14 @@ def collect_roots(
                 rows_keys, rows = _run_cache_keys(state_dir, listings, scope_valid)
                 roots["counts"]["rows"] += rows
                 roots["run_cache"] |= rows_keys
+            # Read only when a directory .pvt's listing is missing: the locks it needs are the
+            # ones `member_skip` reads for every other command's discovery.
+            stage_member = member_skip.own_member_skip(
+                scope["root"], {}, scope["state_dir"], object_root
+            )
             for pvt_path in walked.pvt_paths:
                 roots["counts"]["pvt_files"] += 1
-                roots["named"] |= _pvt_keys(pvt_path, object_root)
+                roots["named"] |= _pvt_keys(pvt_path, object_root, stage_member)
             roots["counts"]["links"] += len(walked.keys)
             roots["linked"] |= walked.keys
             roots["outward_dirs"].extend(str(path) for path in walked.outward)
@@ -1672,7 +1702,11 @@ def collect_roots(
             raise ProjectUnreadableError(
                 scope, e.strerror if isinstance(e, OSError) and e.strerror else str(e)
             ) from e
-        except (exceptions.ListingMissingError, exceptions.CorruptListingError) as e:
+        except (
+            exceptions.ListingMissingError,
+            exceptions.CorruptListingError,
+            _UninterpretableLockError,
+        ) as e:
             raise ProjectUnreadableError(scope, str(e)) from e
 
     refs = object_root / "refs"

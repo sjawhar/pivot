@@ -27,7 +27,9 @@ def test_a_naming_unit_reregisters_after_the_mount_table_changes(
 ) -> None:
     """A long-lived writer (the engine, `--watch`) runs many naming units in one process. When
     a disk is mounted under the project between two of them, the second records the mount, so
-    a collection can refuse once it is unmounted."""
+    a collection can refuse once it is unmounted. Here the table is a regular file, which no
+    kernel watch covers (`_watch_mount_table` refuses it), so every unit registers in full;
+    `test_a_naming_unit_records_a_mount_that_appeared_since_the_last_one` covers the watch."""
     root, state_dir, cache_dir = _project(tmp_path)
     table = tmp_path / "mounts"
     table.write_bytes(b"/dev/root / ext4 rw 0 0\n")
@@ -125,7 +127,7 @@ def test_a_second_process_keeps_the_entry_another_just_wrote(tmp_path: pathlib.P
     assert entry is not None
     before = entry.stat()
 
-    gc._VERIFIED_REGISTRATIONS.clear()  # pyright: ignore[reportPrivateUsage] - another process
+    gc._VERIFIED_REGISTRATIONS.clear()  # as a second process of this view would start
     _unit(cache_dir, root, state_dir)
 
     after = entry.stat()
@@ -145,7 +147,7 @@ def test_a_registration_refreshes_an_entry_whose_last_write_is_old(tmp_path: pat
     document["last_write"] = "2020-01-01T00:00:00Z"
     entry.write_text(json.dumps(document, sort_keys=True) + "\n")
 
-    gc._VERIFIED_REGISTRATIONS.clear()  # pyright: ignore[reportPrivateUsage] - another process
+    gc._VERIFIED_REGISTRATIONS.clear()  # as a second process of this view would start
     _unit(cache_dir, root, state_dir)
 
     assert json.loads(entry.read_text())["last_write"] != "2020-01-01T00:00:00Z", (
@@ -165,7 +167,7 @@ def test_a_registration_truncates_a_nonce_file_that_held_more(tmp_path: pathlib.
     (nonce_file,) = nonces.iterdir()
     nonce_file.write_text("0" * 64 + "\n")
 
-    gc._VERIFIED_REGISTRATIONS.clear()  # pyright: ignore[reportPrivateUsage] - another process
+    gc._VERIFIED_REGISTRATIONS.clear()  # as a second process of this view would start
     _unit(cache_dir, root, state_dir)
 
     nonce = nonce_file.read_text()

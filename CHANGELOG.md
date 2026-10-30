@@ -2,6 +2,58 @@
 
 <!-- version list -->
 
+## v0.6.3 (2026-10-30)
+
+### Bug Fixes
+
+- **checkout**: Skip a stage's own .pvt members when finding tracked files
+  ([#540](https://github.com/sjawhar/pivot/pull/540),
+  [`5ca4bc2`](https://github.com/sjawhar/pivot/commit/5ca4bc2277a795a3dea91c517f44c7c7216b2050))
+
+### Testing
+
+- **storage**: Measure the hash_directory cost test in CPU time, median of N
+  ([#542](https://github.com/sjawhar/pivot/pull/542),
+  [`cea092a`](https://github.com/sjawhar/pivot/commit/cea092a63375367a539338cdc71ab1c75e1a54b8))
+
+
+## v0.6.2 (2026-10-29)
+
+### Bug Fixes
+
+- **storage**: Keep a user file that lands in an output while pivot replaces it
+  ([#538](https://github.com/sjawhar/pivot/pull/538),
+  [`435707a`](https://github.com/sjawhar/pivot/commit/435707af3f52d498752142c17c15c3ae0b511def))
+
+
+## v0.6.1 (2026-10-29)
+
+### Performance Improvements
+
+- **storage**: Find a file hash by file identity, and save what status reads
+  ([#525](https://github.com/sjawhar/pivot/pull/525),
+  [`bba86fd`](https://github.com/sjawhar/pivot/commit/bba86fd242f452d89cfeef3e1b2ec8b99610e96e))
+
+
+## v0.6.0 (2026-10-29)
+
+### Features
+
+- **fingerprint**: Add fingerprint_by_name to record a helper by its name only
+  ([#512](https://github.com/sjawhar/pivot/pull/512),
+  [`187c037`](https://github.com/sjawhar/pivot/commit/187c037e46a6bd2c1011396bd09a1f74179128d3))
+
+- **storage**: Record directories by committed listings
+  ([#523](https://github.com/sjawhar/pivot/pull/523),
+  [`0df6227`](https://github.com/sjawhar/pivot/commit/0df62272a1fff9b3620ac7a2b766895f1ac5c489))
+
+### Testing
+
+- **fingerprint**: Compare upgrade locks by content after the schema 3 listing format
+  ([#541](https://github.com/sjawhar/pivot/pull/541),
+  [`b1004d3`](https://github.com/sjawhar/pivot/commit/b1004d30c3d00535681952f673529c6aba325f25))
+
+
 ## v0.5.21 (2026-10-28)
 
 ### Bug Fixes

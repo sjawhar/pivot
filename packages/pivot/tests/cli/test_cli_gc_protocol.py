@@ -1946,3 +1946,67 @@ def test_pivot_gc_reads_a_committed_listing_the_cache_no_longer_holds(
     for path in member_objects:
         assert path.exists(), f"gc removed {path}, a member the committed listing names"
     assert not cache.get_cache_path(objects, dead).exists(), out
+
+
+def test_pivot_gc_keeps_the_members_of_a_tracked_directory(tmp_path: pathlib.Path) -> None:
+    """`pivot track` of a directory writes a `.pvt` holding the listing's record and the
+    listing beside it (`<dir>.pvt.listing`). A collection keeps every member it names."""
+    root = _project(tmp_path / "project")
+    tracked = root / "data" / "images"
+    (tracked / "sub").mkdir(parents=True)
+    (tracked / "a.txt").write_text("tracked member a\n")
+    (tracked / "sub" / "b.txt").write_text("tracked member b\n")
+    _ok(_run(root, "track", "data/images"))
+    objects = root / ".pivot" / "cache" / "files"
+    members = [_object_for(root, "tracked member a\n"), _object_for(root, "tracked member b\n")]
+    assert all(path.exists() for path in members), members
+    dead = _publish(objects, tmp_path, "named by nothing\n")
+
+    collected = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode == 0, out
+    for path in members:
+        assert path.exists(), f"gc removed {path}, a member of a tracked directory"
+    assert not cache.get_cache_path(objects, dead).exists(), out
+
+
+_MEMBER_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def split(text: str) -> Annotated[dict[str, str], directory]:
+    return {
+        "a.txt": text,
+        "inner.pvt": "path: inner\\nhash: 0123456789abcdef\\nsize: 3\\nnfiles: 1\\n",
+    }
+
+
+with Pipeline("shadow") as pipeline:
+    split(pipeline.input("input.txt", t=str))
+"""
+
+
+def test_pivot_gc_reads_a_stages_own_pvt_member_as_its_data(tmp_path: pathlib.Path) -> None:
+    """#540: a stage may write a `*.pvt` into its own directory output; it is the stage's data,
+    not a tracked file. One that names a directory no listing describes must not make the
+    collection refuse, and the output's own objects stay."""
+    root = _project(tmp_path / "project")
+    (root / "pipeline.py").write_text(_MEMBER_PIPELINE)
+    _ok(_run(root, "repro"))
+    objects = root / ".pivot" / "cache" / "files"
+    record = _directory_record(root)
+    members = listing.read(None, record, objects)
+    member_objects = [cache.get_cache_path(objects, entry["hash"]) for entry in members["files"]]
+    dead = _publish(objects, tmp_path, "named by nothing\n")
+
+    collected = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode == 0, out
+    for path in member_objects:
+        assert path.exists(), f"gc removed {path}, a member of the stage's output"
+    assert not cache.get_cache_path(objects, dead).exists(), out

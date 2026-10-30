@@ -476,3 +476,109 @@ def test_get_target_hashes_include_deps_skips_metric_outputs_of_upstream(
     )
 
     assert hashes == {"4e9047000000000a"}
+
+
+_MEMBER_RECORDED_HASH = "7cacced000000000"
+"""The hash the stage's own ``value.txt.pvt`` member records; no cache or remote holds it."""
+
+
+def _helper_project_with_a_stage_member(
+    root: pathlib.Path,
+) -> tuple[dict[str, RegistryStageInfo], pathlib.Path]:
+    """A stage `b/tree` whose directory output holds `value.txt` and a `value.txt.pvt` the stage
+    wrote (BET-412's shape: a `.pvt`-shaped file inside the stage's own output), recorded as the
+    stage's member by the listing committed beside its lock. Returns the stages (with the
+    consumer `smoke/total`) and the cache root."""
+    cache_dir = root / ".pivot" / "cache"
+    tree = root / "data" / "b" / "tree"
+    tree.mkdir(parents=True)
+    value = tree / "value.txt"
+    value.write_text("1")
+    member = tree / "value.txt.pvt"
+    member.write_text(f"path: value.txt\nhash: {_MEMBER_RECORDED_HASH}\nsize: 1\n")
+    members = listing.DirListing(
+        files=[
+            types.DirManifestEntry(
+                relpath=entry.name,
+                hash=cache.hash_file(entry)[0],
+                size=entry.stat().st_size,
+                isexec=False,
+            )
+            for entry in sorted(tree.iterdir())
+        ],
+        empty_dirs=[],
+    )
+    data = listing.encode(members)
+    record = listing.record_of(members, data)
+    tree_ref = _helper_ref("b/tree", None, types.ArtifactTag.DIRECTORY, loaders.YAML())
+    # Only the listing committed beside the lock records the members; the cache holds no copy
+    lock.StageLock("b/tree", lock.get_stages_dir(root)).write(
+        types.LockData(
+            code_manifest={},
+            params={},
+            dep_hashes={},
+            output_hashes={tree_ref.identity: record},
+        ),
+        hashed_dirs={
+            record["hash"]: listing.HashedDirectory(record=record, listing=members, data=data)
+        },
+    )
+    total_ref = _helper_ref("smoke/total", None, types.ArtifactTag.DATA, loaders.YAML())
+    return {
+        "b/tree": _make_stage_info("b/tree", [tree_ref], state_dir=root),
+        "smoke/total": _make_stage_info("smoke/total", [total_ref], state_dir=root),
+    }, cache_dir
+
+
+def test_get_target_hashes_include_deps_resolves_no_dep_through_a_stages_own_pvt_member(
+    set_project_root: pathlib.Path,
+) -> None:
+    """A stage's own `*.pvt` member records no tracked file, so a dependency no stage produces
+    must not resolve through it: `pivot pull smoke/total` would otherwise fetch whatever hash
+    the stage happened to write in its output. A real `pivot track` input still resolves."""
+    all_stages, cache_dir = _helper_project_with_a_stage_member(set_project_root)
+    raw_dir = set_project_root / "data" / "raw"
+    raw_dir.mkdir(parents=True)
+    track.write_pvt_file(
+        raw_dir / "other.csv.pvt",
+        track.PvtData(path="other.csv", hash="0bbbccc000000011", size=4),
+    )
+    _helper_write_lock_with_deps(
+        "smoke/total",
+        set_project_root,
+        dep_hashes={
+            types.ArtifactIdentity("numbers.csv", None): types.FileHash(hash=_MEMBER_RECORDED_HASH),
+            types.ArtifactIdentity("other.csv", None): types.FileHash(hash="0bbbccc000000011"),
+        },
+        output_hashes={
+            types.ArtifactIdentity("smoke/total", None): types.FileHash(hash="7074a10000000000"),
+        },
+    )
+
+    hashes = sync.get_target_hashes(
+        ["smoke/total"],
+        set_project_root,
+        include_deps=True,
+        all_stages=all_stages,
+        cache_dir=cache_dir,
+    )
+
+    assert hashes == {"7074a10000000000", "0bbbccc000000011"}
+
+
+def test_get_target_hashes_resolves_no_path_target_through_a_stages_own_pvt_member(
+    set_project_root: pathlib.Path,
+) -> None:
+    """The same rule for a path a target names: `data/b/tree/value.txt` is a file inside a stage
+    output that the stage's own `value.txt.pvt` names, not a tracked path, so it resolves to
+    nothing rather than to the hash that member records."""
+    all_stages, cache_dir = _helper_project_with_a_stage_member(set_project_root)
+
+    hashes = sync.get_target_hashes(
+        ["data/b/tree/value.txt"],
+        set_project_root,
+        all_stages=all_stages,
+        cache_dir=cache_dir,
+    )
+
+    assert hashes == set()

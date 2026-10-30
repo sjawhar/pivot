@@ -60,13 +60,12 @@ from pivot.engine.types import (
 )
 from pivot.executor import core as executor_core
 from pivot.executor import worker
-from pivot.storage import ownership
+from pivot.storage import member_skip, ownership
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
     ArtifactTag,
     CompletionType,
-    DeferredWrites,
     HashInfo,
     LockData,
     OnError,
@@ -240,22 +239,29 @@ async def _run_in_daemon_thread[T](func: Callable[[], T]) -> T:
     return results[0]
 
 
-def _deferred_writes_to_apply(result: StageResult, *, no_commit: bool) -> DeferredWrites | None:
-    """The StateDB writes a finished stage persists, or None when it persists nothing.
+def _deferred_writes_to_apply(
+    result: StageResult, *, no_commit: bool
+) -> tuple[types.DeferredWrites | None, list[types.FileHashEntry]]:
+    """Return a finished stage's StateDB writes and the file hashes to save best-effort.
 
-    Only a RAN or CACHED stage writes. Under ``--no-commit`` only the record of what ran is
-    kept, for ``pivot commit``; nothing else is persisted.
+    Only RAN/CACHED stages persist. A normal run persists its whole deferred dict, file hashes
+    included, in the one ``apply_deferred_writes`` transaction. Under ``--no-commit`` only the
+    ``nocommit:`` record is authoritative, and the file hashes are returned for the best-effort
+    ``state.save_file_hashes``.
     """
     if result["status"] not in (StageStatus.RAN, StageStatus.CACHED):
-        return None
+        return None, []
     if "deferred_writes" not in result:
-        return None
+        return None, []
     deferred = result["deferred_writes"]
     if not no_commit:
-        return deferred
-    if "no_commit_record" not in deferred:
-        return None
-    return DeferredWrites(no_commit_record=deferred["no_commit_record"])
+        return deferred, []
+    writes = (
+        types.DeferredWrites(no_commit_record=deferred["no_commit_record"])
+        if "no_commit_record" in deferred
+        else None
+    )
+    return writes, deferred["file_hash_entries"] if "file_hash_entries" in deferred else []
 
 
 class Engine:
@@ -1128,14 +1134,22 @@ class Engine:
         if cache_dir is None:
             cache_dir = config.get_cache_dir()
 
-        # Verify tracked files before building DAG. This may restore a tracked file, but stage
-        # commits register in their own narrow naming units so stage execution never waits for gc.
+        # Verify tracked files before building DAG: a stage's own .pvt member of its output is
+        # none, the loaded pipeline's by the registry and any other's by its lock. This may
+        # restore a tracked file, but stage commits register in their own narrow naming units so
+        # stage execution never waits for gc.
         project_root = project.get_project_root()
         default_state_dir = config.get_state_dir()
-        executor_core.verify_tracked_files(project_root, checkout_missing=checkout_missing)
+        all_stages = self._get_all_stages()
+        executor_core.verify_tracked_files(
+            project_root,
+            checkout_missing=checkout_missing,
+            skip=member_skip.own_member_skip(
+                project_root, all_stages, config.get_state_dir(), cache_dir / "files"
+            ),
+        )
 
         # Build bipartite graph (single source of truth)
-        all_stages = self._get_all_stages()
         graph = engine_graph.build_graph(all_stages)
         pipeline = self._pipeline
         if pipeline is None:
@@ -1377,22 +1391,26 @@ class Engine:
                                     )
                                     stage_durations[stage_name] = duration_ms
 
-                                    deferred = _deferred_writes_to_apply(
+                                    writes, file_hash_entries = _deferred_writes_to_apply(
                                         result, no_commit=no_commit
                                     )
-                                    if deferred is not None:
+                                    if writes is not None or file_hash_entries:
                                         stage_info = self._get_stage(stage_name)
-                                        output_paths = [
-                                            types.identity_key(out.identity)
-                                            for out in stage_info["outs"]
-                                        ]
                                         stage_state_dir = registry.get_stage_state_dir(
                                             stage_info, default_state_dir
                                         )
-                                        stage_db = _get_state_db(stage_state_dir)
-                                        stage_db.apply_deferred_writes(
-                                            stage_name, output_paths, deferred
-                                        )
+                                        if writes is not None:
+                                            output_paths = [
+                                                types.identity_key(out.identity)
+                                                for out in stage_info["outs"]
+                                            ]
+                                            _get_state_db(stage_state_dir).apply_deferred_writes(
+                                                stage_name, output_paths, writes
+                                            )
+                                        if file_hash_entries:
+                                            state_mod.save_file_hashes(
+                                                stage_state_dir, file_hash_entries, create=False
+                                            )
 
                                     # Record result
                                     results[stage_name] = executor_core.ExecutionSummary(
@@ -2040,15 +2058,8 @@ class Engine:
         listing_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
 
         def _save_file_hashes(entries: list[types.FileHashEntry]) -> None:
-            """Record the file hashes this check read or restored, so the next one reads none."""
-            if entries:
-                _ = state_mod.save_best_effort(
-                    stage_state_dir,
-                    lambda writable_db: writable_db.apply_deferred_writes(
-                        stage_name, [], DeferredWrites(file_hash_entries=entries)
-                    ),
-                    what=f"{len(entries)} file hashes",
-                )
+            """Record file hashes this check read or restored, without creating a database."""
+            state_mod.save_file_hashes(stage_state_dir, entries, create=False)
 
         def _use_outputs(state_db: state_mod.StateDB) -> _SkipOutcome:
             file_hash_entries = list[types.FileHashEntry]()
@@ -2260,7 +2271,8 @@ class Engine:
             lock_data = lock.StageLock(
                 stage_name, lock.get_stages_dir(worker_info["state_dir"])
             ).read(cache_dir=store.cache_dir)
-            return explain_mod.get_stage_explanation(
+            file_hash_entries = list[types.FileHashEntry]()
+            explanation = explain_mod.get_stage_explanation(
                 stage_name=stage_name,
                 fingerprint=worker_info["fingerprint"],
                 deps=stage_info["deps"],
@@ -2272,7 +2284,14 @@ class Engine:
                 lock_data=lock_data,
                 force=force,
                 allow_missing=True,
+                file_hash_entries=file_hash_entries,
             )
+            # One attempt, no wait: the run is starting its stages, and the worker hands the
+            # dependency hashes it reads back to the coordinator anyway.
+            state_mod.save_file_hashes(
+                worker_info["state_dir"], file_hash_entries, create=False, timeout=0
+            )
+            return explanation
 
         try:
             return await anyio.to_thread.run_sync(_compute)

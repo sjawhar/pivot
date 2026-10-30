@@ -12,6 +12,7 @@ import time
 from typing import TYPE_CHECKING, TypedDict
 
 import pytest
+import yaml
 
 from pivot import cli, exceptions, project, run_history, types
 from pivot.storage import cache, gc, listing, lock, state, track
@@ -323,6 +324,117 @@ def test_gc_keeps_the_members_a_run_cache_rows_directory_names(
     assert result.exit_code == 0, result.output
     members = {entry["hash"] for entry in tree["listing"]["files"]}
     assert _helper_keys(workspace) == {tree["record"]["hash"], *members}, result.output
+
+
+def test_gc_keeps_what_a_killed_runs_backup_still_links(
+    workspace: Workspace, runner: click.testing.CliRunner
+) -> None:
+    """#538 renames an output aside (`.pivot_backup_<token>.old`) and checks it before removing
+    it. A run killed there leaves the backup beside the output, holding the old output's links,
+    until a later restore of that path checks and removes it. Those links name their objects."""
+    linked = _helper_publish(workspace, "backed-up member")
+    tree = _helper_publish_tree(workspace, "backed-up-tree")
+    _helper_publish(workspace, "unnamed")
+    outputs = workspace["root"] / "data" / "demo"
+    outputs.mkdir(parents=True)
+    backup = outputs / ".pivot_backup_0123abcd.old"
+    backup.mkdir()
+    (backup / "member.txt").symlink_to(cache.get_cache_path(workspace["object_root"], linked))
+    tree_backup = outputs / ".pivot_backup_4567cdef.old"
+    tree_backup.symlink_to(
+        cache.tree_path(workspace["object_root"], tree["record"]["hash"]).resolve()
+    )
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code == 0, result.output
+    assert _helper_keys(workspace) == {linked, tree["record"]["hash"]}, result.output
+    assert _helper_trees(workspace) == {tree["record"]["hash"]}, result.output
+    assert (backup / "member.txt").resolve().exists(), "the backup's link dangles"
+
+
+def test_gc_keeps_what_an_older_pivots_lock_lists_inline(
+    workspace: Workspace, runner: click.testing.CliRunner
+) -> None:
+    """A lock an older pivot wrote (schema 2) lists a directory's files inline and records the
+    directory by that pivot's own hash, the name of its whole-directory tree object. Every
+    member, that hash and the listing this pivot derives from it are live."""
+    first = _helper_publish(workspace, "older member one")
+    second = _helper_publish(workspace, "older member two")
+    legacy_tree = "fedcba9876543210"
+    _helper_publish(workspace, "unnamed")
+    lock_path = workspace["stages_dir"] / f"{_STAGE}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = [
+        {"relpath": "a.txt", "hash": first, "size": 16, "isexec": False},
+        {"relpath": "b.txt", "hash": second, "size": 16, "isexec": False},
+    ]
+    lock_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "code_manifest": {"self:test": "abc123"},
+                "params": {},
+                "deps": [],
+                "outs": [{"key": None, "hash": legacy_tree, "manifest": manifest}],
+            }
+        )
+    )
+    legacy = workspace["object_root"] / legacy_tree[:2] / legacy_tree[2:]
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.mkdir()
+    os.utime(legacy, (0, 0))
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code == 0, result.output
+    assert {first, second, legacy_tree} <= _helper_keys(workspace), result.output
+
+
+@pytest.mark.parametrize("where", ["top level", "entry"])
+def test_gc_refuses_a_lock_with_a_key_it_does_not_know(
+    workspace: Workspace, runner: click.testing.CliRunner, where: str
+) -> None:
+    """A newer pivot may add a key to a stage lock that lists objects (a run's reads by hash),
+    at the top level or in an entry. A collection that skipped it would remove what it names,
+    so it refuses, naming the lock, and removes nothing."""
+    named = _helper_publish(workspace, "named by outs")
+    read = _helper_publish(workspace, "named only by an unknown key")
+    _helper_write_lock(workspace, outs={None: types.FileHash(hash=named)})
+    lock_path = workspace["stages_dir"] / f"{_STAGE}.lock"
+    document = yaml.safe_load(lock_path.read_text())
+    if where == "top level":
+        document["reads"] = [read]
+    else:
+        document["outs"][0]["reads"] = [read]
+    lock_path.write_text(yaml.safe_dump(document))
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code != 0, result.output
+    assert str(lock_path) in result.output and "reads" in result.output, result.output
+    assert _helper_keys(workspace) == {named, read}, "a refused collection removed an object"
+
+
+def test_gc_refuses_a_lock_from_a_newer_schema(
+    workspace: Workspace, runner: click.testing.CliRunner
+) -> None:
+    """A lock whose schema is newer than this pivot's may record objects in a form this pivot
+    cannot read, so a collection refuses it rather than read the parts it knows."""
+    named = _helper_publish(workspace, "named by a newer lock")
+    _helper_publish(workspace, "unnamed")
+    _helper_write_lock(workspace, outs={None: types.FileHash(hash=named)})
+    lock_path = workspace["stages_dir"] / f"{_STAGE}.lock"
+    document = yaml.safe_load(lock_path.read_text())
+    document["schema_version"] = lock.SCHEMA_VERSION + 1
+    lock_path.write_text(yaml.safe_dump(document))
+    before = _helper_keys(workspace)
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code != 0, result.output
+    assert str(lock_path) in result.output and "newer" in result.output, result.output
+    assert _helper_keys(workspace) == before, "a refused collection removed an object"
 
 
 def test_gc_keeps_a_trees_members_while_the_tree_lives(

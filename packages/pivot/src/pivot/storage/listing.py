@@ -23,6 +23,7 @@ UTF-8; an empty directory's ``/`` goes inside the quotes. The listing is always 
 
 from __future__ import annotations
 
+import enum
 import functools
 import json
 import logging
@@ -398,6 +399,18 @@ def check(data: bytes, record: DirHash, source: pathlib.Path | str) -> CheckedBy
     return CheckedBytes(data)
 
 
+class OnStale(enum.Enum):
+    """What a listing read does with a committed listing that does not hash to its record."""
+
+    WARN = "warn"
+    """Use the cache's copy, with one warning naming the file (``_warn_stale``)."""
+    QUIET = "quiet"
+    """Use the cache's copy without a word, for a reader of a stage the command does not run;
+    the cache object found only in the legacy state directory draws no notice either."""
+    REFUSE = "refuse"
+    """Refuse it at once, for ``pivot verify``: a fresh clone has no cache to fall back on."""
+
+
 @functools.cache
 def _warn_stale(problem: str) -> None:
     """Warn once per process for each committed listing a read had to pass over, naming what
@@ -415,7 +428,7 @@ def _resolve(
     record: DirHash,
     cache_dir: pathlib.Path | None,
     *,
-    strict: bool,
+    on_stale: OnStale,
     problem: exceptions.CorruptListingError | None = None,
 ) -> tuple[CheckedBytes, pathlib.Path | str]:
     """The checked bytes of ``record``'s listing and the name ``parse`` gives where they came
@@ -425,12 +438,12 @@ def _resolve(
     a git revision), None when there is none; ``problem`` says why a file there could not be
     read. Committed bytes that hash to ``record`` are taken. Bytes that do not, or a file that
     cannot be read, are passed over for the cache object at ``record``'s hash, which is checked
-    and never changes, with one warning naming the file: a shared input listing that a later
-    run of another stage moved on, a lock reverted without its listing, a merge, or a run
-    interrupted between writing the listing and the lock. Only when the cache lacks that object
-    too is the committed file refused. ``strict`` refuses it at once, for ``pivot verify``: a
-    fresh clone has no cache to fall back on.
+    and never changes (``on_stale`` says whether with a warning, or refuses them at once): a
+    shared input listing that a later run of another stage moved on, a lock reverted without its
+    listing, a merge, or a run interrupted between writing the listing and the lock. Only when
+    the cache lacks that object too is the committed file refused.
     """
+    notice = on_stale is not OnStale.QUIET
     if found is not None:
         assert source is not None, "committed bytes come from a named file"
         try:
@@ -441,7 +454,7 @@ def _resolve(
             cached = (
                 None
                 if cache_dir is None
-                else cache.resolve_cache_object_path(cache_dir, record["hash"])
+                else cache.resolve_cache_object_path(cache_dir, record["hash"], notice=notice)
             )
             if cached is None:
                 return checked, source
@@ -457,10 +470,12 @@ def _resolve(
                     + f"both hash to directory {record['hash']}; refuse an XXH64 collision"
                 )
             return checked, source
-    if problem is not None and strict:
+    if problem is not None and on_stale is OnStale.REFUSE:
         raise problem
     cached = (
-        None if cache_dir is None else cache.resolve_cache_object_path(cache_dir, record["hash"])
+        None
+        if cache_dir is None
+        else cache.resolve_cache_object_path(cache_dir, record["hash"], notice=notice)
     )
     if cached is not None:
         try:
@@ -471,7 +486,10 @@ def _resolve(
             raise exceptions.CorruptListingError(f"{cached}: cannot be read ({e})") from e
         else:
             if problem is not None:
-                _warn_stale(str(problem))
+                if notice:
+                    _warn_stale(str(problem))
+                else:
+                    logger.debug("%s; using the cache's copy of that listing", problem)
             return data, f"cache object {record['hash']}"
     if problem is not None:
         raise problem
@@ -496,7 +514,7 @@ def _read_located(
     record: DirHash,
     cache_dir: pathlib.Path | None,
     *,
-    strict: bool = False,
+    on_stale: OnStale = OnStale.WARN,
 ) -> tuple[CheckedBytes, pathlib.Path | str]:
     """``_resolve`` for the listing file at ``committed`` in the workspace. A path that cannot
     be read (a directory, no permission) is treated as a file that does not hash to its record,
@@ -514,7 +532,7 @@ def _read_located(
             problem = exceptions.CorruptListingError(
                 f"{committed}: cannot be read ({e.strerror or e})"
             )
-    return _resolve(found, committed, record, cache_dir, strict=strict, problem=problem)
+    return _resolve(found, committed, record, cache_dir, on_stale=on_stale, problem=problem)
 
 
 def read_bytes(
@@ -522,10 +540,10 @@ def read_bytes(
     record: DirHash,
     cache_dir: pathlib.Path | None,
     *,
-    strict: bool = False,
+    on_stale: OnStale = OnStale.WARN,
 ) -> CheckedBytes:
     """The bytes of the listing ``record`` names, checked against its hash (``_resolve``)."""
-    return _read_located(committed, record, cache_dir, strict=strict)[0]
+    return _read_located(committed, record, cache_dir, on_stale=on_stale)[0]
 
 
 def parse(data: CheckedBytes, record: DirHash, source: pathlib.Path | str) -> DirListing:
@@ -548,11 +566,11 @@ def read(
     record: DirHash,
     cache_dir: pathlib.Path | None,
     *,
-    strict: bool = False,
+    on_stale: OnStale = OnStale.WARN,
 ) -> DirListing:
     """The listing ``record`` names, by the workspace file at ``committed`` or the cache
     (``_resolve``), parsed."""
-    data, source = _read_located(committed, record, cache_dir, strict=strict)
+    data, source = _read_located(committed, record, cache_dir, on_stale=on_stale)
     return parse(data, record, source)
 
 
@@ -565,7 +583,7 @@ def read_found(
     """The listing ``record`` names, by committed bytes read from elsewhere (``found``, a file
     at a git revision or in another repository, named ``source``; None when there is none) or
     the cache (``_resolve``), parsed."""
-    data, where = _resolve(found, source, record, cache_dir, strict=False)
+    data, where = _resolve(found, source, record, cache_dir, on_stale=OnStale.WARN)
     return parse(data, record, where)
 
 
