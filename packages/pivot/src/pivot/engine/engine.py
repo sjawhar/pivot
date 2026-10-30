@@ -2150,7 +2150,9 @@ class Engine:
             )
             return generation_outcome
 
-        def _hash_deps() -> tuple[dict[str, HashInfo], list[str], list[str], str | None]:
+        def _hash_deps() -> tuple[
+            dict[str, HashInfo], list[str], list[str], types.UnavailableReads | None
+        ]:
             state_db = _get_skip_state_db()
             try:
                 dep_hashes, missing, unreadable, file_hash_entries = worker.hash_dependencies(

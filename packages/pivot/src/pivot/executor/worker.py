@@ -1711,7 +1711,7 @@ def _check_skip_or_run(
     current_params: dict[str, Any],
     dep_hashes: dict[str, HashInfo],
     *,
-    unavailable_reads: str | None = None,
+    unavailable_reads: types.UnavailableReads | None = None,
 ) -> tuple[str | None, str, str, bool]:
     """Determine if stage can skip or must run. ``unavailable_reads`` is
     ``reads.lock_unavailable`` of ``lock_data``."""

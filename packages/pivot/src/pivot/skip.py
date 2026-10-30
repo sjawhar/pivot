@@ -19,6 +19,8 @@ from pivot.types import (
     HashInfo,
     LockData,
     ParamChange,
+    Recovery,
+    UnavailableReads,
 )
 
 # A lock's code manifest carries one of these prefixes, followed by module names, when its run
@@ -87,7 +89,7 @@ def check_stage(
     explain: bool = False,
     force: bool = False,
     run_cache_allowed: bool = True,
-    unavailable_reads: str | None = None,
+    unavailable_reads: UnavailableReads | None = None,
 ) -> ChangeDecision:
     """Single source of truth for Tier 2 skip detection.
 
@@ -98,9 +100,10 @@ def check_stage(
     satisfied from the run cache: an entry at the stage's input hash was filed by a run the check
     did not see, so the stage must run.
 
-    ``unavailable_reads`` is why objects the lock records its run read by hash are in neither
-    the cache nor the remote (``reads.unavailable``), or None. Such a stage cannot be run again
-    as it ran, so it is changed, with that reason when nothing else changed.
+    ``unavailable_reads`` says why objects the lock records its run read by hash are in neither
+    the cache nor the remote (``reads.unavailable``), or is None. Such a stage cannot be run again
+    as it ran, so it is changed, with that reason when nothing else changed; then, when a usable
+    remote may hold the objects, ``recovery`` says ``pivot pull`` fetches them.
 
     Callers are responsible for:
     - Tier 1 (generation check via can_skip_via_generation) before calling this
@@ -141,9 +144,7 @@ def check_stage(
                 run_cache_allowed=run_cache_allowed,
             )
         if unavailable_reads is not None:
-            return ChangeDecision(
-                changed=True, reason=unavailable_reads, run_cache_allowed=run_cache_allowed
-            )
+            return _unavailable_reads_decision(unavailable_reads, run_cache_allowed)
         return ChangeDecision(changed=False, reason="", run_cache_allowed=run_cache_allowed)
 
     # Explain path: full diffs for all categories.
@@ -154,23 +155,33 @@ def check_stage(
     locked_out_paths = sorted(lock_data["output_hashes"].keys())
     out_changed = sorted(out_paths) != locked_out_paths
 
-    changed = (
-        force
-        or bool(code_changes or param_changes or dep_changes or out_changed)
-        or unavailable_reads is not None
-    )
-    reason = marked_reason or _first_reason(
-        code_changes, param_changes, dep_changes, out_changed, unavailable_reads, force
-    )
+    if not (code_changes or param_changes or dep_changes or out_changed) and (
+        unavailable_reads is not None
+    ):
+        decision = _unavailable_reads_decision(unavailable_reads, run_cache_allowed)
+    else:
+        decision = ChangeDecision(
+            changed=force or bool(code_changes or param_changes or dep_changes or out_changed),
+            reason=marked_reason
+            or _first_reason(code_changes, param_changes, dep_changes, out_changed, force),
+            run_cache_allowed=run_cache_allowed,
+        )
+    decision["code_changes"] = code_changes
+    decision["param_changes"] = param_changes
+    decision["dep_changes"] = dep_changes
+    return decision
 
-    return ChangeDecision(
-        changed=changed,
-        reason=reason,
-        code_changes=code_changes,
-        param_changes=param_changes,
-        dep_changes=dep_changes,
-        run_cache_allowed=run_cache_allowed,
+
+def _unavailable_reads_decision(
+    unavailable_reads: UnavailableReads, run_cache_allowed: bool
+) -> ChangeDecision:
+    """The decision for a lock nothing changed but whose read objects are unavailable."""
+    decision = ChangeDecision(
+        changed=True, reason=unavailable_reads["reason"], run_cache_allowed=run_cache_allowed
     )
+    if unavailable_reads["pullable"]:
+        decision["recovery"] = Recovery.PULL_READS
+    return decision
 
 
 def _first_reason(
@@ -178,7 +189,6 @@ def _first_reason(
     param_changes: list[ParamChange],
     dep_changes: list[DepChange],
     out_changed: bool,
-    unavailable_reads: str | None,
     force: bool,
 ) -> str:
     # Actual changes take precedence over "forced" — force is the fallback
@@ -200,8 +210,6 @@ def _first_reason(
         return "Input dependencies changed"
     if out_changed:
         return "Output paths changed"
-    if unavailable_reads is not None:
-        return unavailable_reads
     if force:
         return "forced"
     return ""

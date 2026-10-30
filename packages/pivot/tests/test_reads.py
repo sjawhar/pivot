@@ -1,9 +1,12 @@
 """`pivot.read_by_hash`: the object a content hash names, read inside a stage run, the check
 of whether the objects a lock records are still in the cache or the remote, and
-`pivot.output_hash`, the content hash a stage's committed lock records for an output."""
+`pivot.output_hash`, the content hash a stage's committed lock records for an output. A test
+whose docstring names an acceptance round of sjawhar/pivot#544 pins a defect that round found."""
 
 from __future__ import annotations
 
+import asyncio
+import multiprocessing
 import pathlib
 import subprocess
 import sys
@@ -17,10 +20,10 @@ import xxhash
 import yaml
 
 import pivot
-from pivot import exceptions, explain, reads
+from pivot import exceptions, reads
 from pivot.remote import keys, protocol
 from pivot.storage import cache, listing, lock, state
-from pivot.types import ArtifactIdentity, FileHash, LockData, RemoteHashes
+from pivot.types import ArtifactIdentity, FileHash, LockData, RemoteHashes, UnavailableReads
 
 
 class _MotoS3Client(Protocol):
@@ -131,6 +134,36 @@ def test_a_read_in_a_process_the_stage_started_names_the_rule(files_dir: pathlib
 
     assert child.returncode != 0
     assert "only in the stage's own process and its threads" in child.stderr, child.stderr
+
+
+def _forked_read(content_hash: str, queue: multiprocessing.Queue[str]) -> None:
+    try:
+        _ = pivot.read_by_hash(content_hash)
+        queue.put("read")
+    except exceptions.ObjectReadError as error:
+        queue.put(f"refused: {error}")
+
+
+def test_a_read_in_a_forked_child_is_refused(files_dir: pathlib.Path) -> None:
+    """Acceptance round 1, defect 2. A stage that forks a child process which calls
+    `read_by_hash` got the object, but the child's copy of the recording is lost, so the stage's
+    lock recorded no `reads` (observed: edge/forked's lock had no `reads`, and `pivot status` said
+    cached after the object left the cache and the remote). Reads are recorded only in the
+    stage's own process and its threads, so the child's read is refused, naming that rule
+    (decision D2 of the acceptance)."""
+    content_hash = _helper_put(files_dir, b"one\n")
+    ctx = multiprocessing.get_context("fork")
+    queue: multiprocessing.Queue[str] = ctx.Queue()
+
+    with reads.recording(files_dir) as recorded:
+        child = ctx.Process(target=_forked_read, args=(content_hash, queue))
+        child.start()
+        outcome = queue.get(timeout=60)
+        child.join(timeout=60)
+
+    assert outcome.startswith("refused: "), outcome
+    assert "only in the stage's own process and its threads" in outcome, outcome
+    assert recorded.hashes() == []
 
 
 @pytest.mark.parametrize(
@@ -244,6 +277,31 @@ def test_a_read_records_each_object_it_fetched_once(
     assert recorded.hashes() == sorted([cached, first, second])
 
 
+def test_a_read_from_a_coroutine_fetches_the_object_from_the_remote(
+    files_dir: pathlib.Path,
+    set_project_root: pathlib.Path,
+    moto_services: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Acceptance round 1, defect 1. A stage whose helper code runs an event loop calls
+    `read_by_hash` (a plain function) from a coroutine. With the object only on the remote, the
+    read raised `RuntimeError: asyncio.run() cannot be called from a running event loop`
+    (observed: `pivot repro` of edge/asyncer), not the object. The docstring promises any thread
+    of the stage's process may call it, and the event loop's thread is one."""
+    s3, bucket = _helper_remote(set_project_root, moto_services["s3"], monkeypatch)
+    content_hash = _helper_hash(b"snapshot\n")
+    s3.put_object(Bucket=bucket, Key=keys.hash_to_key("cache/", content_hash), Body=b"snapshot\n")
+
+    async def stage_helper() -> bytes:
+        return pivot.read_by_hash(content_hash).read_bytes()
+
+    with reads.recording(files_dir) as recorded:
+        data = asyncio.run(stage_helper())
+
+    assert data == b"snapshot\n"
+    assert recorded.hashes() == [content_hash]
+
+
 def test_a_remote_object_whose_bytes_do_not_match_its_hash_fails_the_read(
     files_dir: pathlib.Path,
     set_project_root: pathlib.Path,
@@ -315,11 +373,12 @@ def test_objects_missing_with_no_remote_are_unavailable(files_dir: pathlib.Path)
     present = _helper_put(files_dir, b"one\n")
     first, second = sorted([_helper_hash(b"absent 1\n"), _helper_hash(b"absent 2\n")])
 
-    reason = reads.unavailable([second, present, first], files_dir)
+    unavailable = reads.unavailable([second, present, first], files_dir)
 
-    assert reason == (
-        f"Read objects missing from the cache: {first}, {second} (no remote is configured)"
-    )
+    assert unavailable == UnavailableReads(
+        reason=f"Read objects missing from the cache: {first}, {second} (no remote is configured)",
+        pullable=False,
+    ), "with no remote, `pivot pull` cannot fetch them"
 
 
 def test_objects_the_remote_index_records_are_available_without_asking_the_remote(
@@ -346,11 +405,12 @@ def test_objects_the_remote_index_does_not_record_are_unavailable_unasked(
     content_hash = _helper_hash(b"snapshot\n")
     s3.put_object(Bucket=bucket, Key=keys.hash_to_key("cache/", content_hash), Body=b"snapshot\n")
 
-    reason = reads.unavailable([content_hash], files_dir)
+    unavailable = reads.unavailable([content_hash], files_dir)
 
-    assert reason == (
-        f"Read objects missing from the cache: {content_hash} (pivot has not seen them on "
-        + "remote 'origin'; `pivot pull` fetches them)"
+    assert unavailable == UnavailableReads(
+        reason=f"Read objects missing from the cache: {content_hash} (pivot has not seen them on "
+        + "remote 'origin'; `pivot pull` fetches them)",
+        pullable=True,
     )
 
 
@@ -364,20 +424,33 @@ def test_an_index_entry_for_another_url_of_the_remote_does_not_count(
     assert reads.unavailable([content_hash], files_dir) is not None
 
 
-def test_pull_fetches_objects_the_remote_index_lacks_but_not_with_no_remote(
-    files_dir: pathlib.Path, set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`pivot status` suggests `pivot pull` for a stage whose only reason to run is objects a
-    remote may hold: not when no remote can be used, and not for another reason."""
-    content_hash = _helper_hash(b"snapshot\n")
-    no_remote = reads.unavailable([content_hash], files_dir)
-    _ = _helper_unreachable_remote(set_project_root, monkeypatch)
-    unseen = reads.unavailable([content_hash], files_dir)
+# =============================================================================
+# The repair a corrupt remote object's hash mismatch prints
+# =============================================================================
 
-    assert unseen is not None and reads.pull_fetches(unseen), unseen
-    assert no_remote is not None and not reads.pull_fetches(no_remote), no_remote
-    assert not reads.pull_fetches(explain.OUTPUTS_MISSING_REASON)
-    assert not reads.pull_fetches("Input dependencies changed")
+
+@pytest.mark.usefixtures("set_project_root")
+def test_the_hash_mismatch_repair_names_a_read_by_hash_among_what_records_a_hash() -> None:
+    """Acceptance round 4, D10. A run whose `pivot.read_by_hash` fetched an object records it in
+    the remote index, as `pivot pull` does (`DeferredWrites.remote_hashes`). The repair that a
+    hash mismatch prints (`keys.check_digest`, and docs/guides/remote-storage.md) listed only
+    `pivot push`, `pull`, `fetch` and `status --remote` as what records a hash. A user who
+    followed it could push from a machine whose stage read the object: that machine has recorded
+    the hash, so its `pivot push` skips it and the remote stays corrupt."""
+    with pytest.raises(exceptions.RemoteError) as caught:
+        keys.check_digest("0123456789abcdef", "fedcba9876543210", "bucket/cache/files/01/23")
+
+    message = str(caught.value)
+    assert "read_by_hash" in message or "read by hash" in message, message
+
+
+def test_remote_storage_guide_names_a_read_by_hash_among_what_records_a_hash() -> None:
+    """Acceptance round 4, D10, the guide's copy of the same repair."""
+    guide = pathlib.Path(__file__).resolve().parents[3] / "docs/guides/remote-storage.md"
+    text = guide.read_text()
+    (paragraph,) = [p for p in text.split("\n\n") if "Pivot records hashes those commands" in p]
+
+    assert "read_by_hash" in paragraph or "read by hash" in paragraph, paragraph
 
 
 # =============================================================================

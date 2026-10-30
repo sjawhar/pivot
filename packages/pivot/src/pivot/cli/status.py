@@ -5,8 +5,7 @@ import sys
 import click
 import tqdm
 
-from pivot import config, display, exceptions, project, reads
-from pivot import explain as explain_mod
+from pivot import config, display, exceptions, project
 from pivot import status as status_mod
 from pivot.cli import completion, console
 from pivot.cli import decorators as cli_decorators
@@ -21,6 +20,7 @@ from pivot.types import (
     ImportStatusInfo,
     PipelineStatus,
     PipelineStatusInfo,
+    Recovery,
     RemoteSyncInfo,
     StageExplanation,
     StatusOutput,
@@ -175,35 +175,37 @@ def status(
     # Compute counts once for suggestions and output
     if explain and pipeline_explanations:
         stale_count = sum(1 for e in pipeline_explanations if e["will_run"])
-        stage_reasons = [
-            (e["stage_name"], e["reason"], e["upstream_stale"]) for e in pipeline_explanations
+        stage_recoveries = [
+            (e["stage_name"], e["recovery"] if "recovery" in e else None, e["upstream_stale"])
+            for e in pipeline_explanations
         ]
     else:
         stale_count = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.STALE)
-        stage_reasons = [(s["name"], s["reason"], s["upstream_stale"]) for s in pipeline_status]
-    # Pull restores missing outputs without recomputing; skip the count when there is no
-    # remote to pull from. The count reads only explain's reasons, so it is cheap.
+        stage_recoveries = [
+            (s["name"], s["recovery"] if "recovery" in s else None, s["upstream_stale"])
+            for s in pipeline_status
+        ]
+    # Pull restores missing outputs, and fetches missing objects stages read by hash, without
+    # recomputing; skip the count when there is no remote to pull from. The count reads only each
+    # stage's recovery, so it is cheap.
     missing_outputs_count = 0
     missing_reads_count = 0
     if remote_config.list_remotes():
-        # Stages arrive in execution order. A stage is pullable when its outputs are missing
-        # and every stale upstream is itself pullable: in a plain clone the downstream stages
-        # are stale only because their upstream's outputs are missing too, and pull restores
-        # all of them. A stage current on its own (e.g. a committed metric) passes through
-        # when its stale upstreams are pullable, but has nothing to pull itself. A stage
-        # downstream of a stage that must recompute is recomputed by repro.
+        # Stages arrive in execution order. A stage is pullable when pull recovers it and every
+        # stale upstream is itself pullable: in a plain clone the downstream stages are stale only
+        # because their upstream's outputs are missing too, and pull restores all of them. A stage
+        # current on its own (e.g. a committed metric) passes through when its stale upstreams are
+        # pullable, but has nothing to pull itself. A stage downstream of a stage that must
+        # recompute is recomputed by repro.
         pullable = set[str]()
-        for name, reason, upstream_stale in stage_reasons:
-            if not pullable.issuperset(upstream_stale):
+        for name, recovery, upstream_stale in stage_recoveries:
+            if recovery is None or not pullable.issuperset(upstream_stale):
                 continue
-            if reason == explain_mod.OUTPUTS_MISSING_REASON:
-                pullable.add(name)
+            pullable.add(name)
+            if recovery is Recovery.PULL_OUTPUTS:
                 missing_outputs_count += 1
-            elif reads.pull_fetches(reason):  # objects it read by hash: pull fetches them
-                pullable.add(name)
+            elif recovery is Recovery.PULL_READS:
                 missing_reads_count += 1
-            elif reason.startswith(status_mod.UPSTREAM_STALE_REASON_PREFIX):
-                pullable.add(name)
     modified_count = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.MODIFIED)
     push_count = remote_status["push_count"] if remote_status else 0
     pull_count = remote_status["pull_count"] if remote_status else 0
@@ -331,6 +333,8 @@ def _output_explain_json(
                 dep_changes=[dep_change_to_json(change) for change in exp["dep_changes"]],
                 upstream_stale=exp["upstream_stale"],
             )
+            if "recovery" in exp:
+                stage_data["recovery"] = exp["recovery"]
             stages.append(stage_data)
         data["stages"] = stages
 

@@ -264,7 +264,7 @@ def _default_remote() -> tuple[str, protocol.RemoteStorage] | str:
 
 def lock_unavailable(
     lock_data: types.LockData | None, cache_dir: pathlib.Path | None
-) -> str | None:
+) -> types.UnavailableReads | None:
     """``unavailable`` for the objects ``lock_data`` records its run read; None for no lock, or
     one that records none. Every skip decision passes this to ``skip.check_stage``."""
     if lock_data is None or "reads" not in lock_data:
@@ -272,7 +272,9 @@ def lock_unavailable(
     return unavailable(lock_data["reads"], cache_dir)
 
 
-def unavailable(hashes: Collection[str], cache_dir: pathlib.Path | None) -> str | None:
+def unavailable(
+    hashes: Collection[str], cache_dir: pathlib.Path | None
+) -> types.UnavailableReads | None:
     """Why some of ``hashes``, objects a lock or run-cache entry records its run read, are
     neither in the cache at ``cache_dir`` nor known to be on the project's default remote; None
     when each is in one of them.
@@ -283,7 +285,7 @@ def unavailable(hashes: Collection[str], cache_dir: pathlib.Path | None) -> str 
     ``pivot push``, ``pull`` and ``fetch`` fill, and a run with what its reads fetched) records it
     for that remote's URL, as ``pivot push`` counts it. No remote is contacted.
     ``pivot pull <stage>`` fetches the objects a stage's lock records, and a run's read fetches
-    what it needs itself. When such objects are the reason, ``pull_fetches`` says so.
+    what it needs itself; the result is ``pullable`` when a usable remote may hold them.
     """
     missing = sorted(
         content_hash
@@ -295,7 +297,7 @@ def unavailable(hashes: Collection[str], cache_dir: pathlib.Path | None) -> str 
         return None
     remote = _default_remote()
     if isinstance(remote, str):
-        return _missing_reason(missing, remote)
+        return types.UnavailableReads(reason=_missing_reason(missing, remote), pullable=False)
     name, storage = remote
     state_dir = state_dir_mod.locate_state_dir(project.get_project_root())
     with state.open_readonly(state_dir, create=False) as state_db:
@@ -307,19 +309,13 @@ def unavailable(hashes: Collection[str], cache_dir: pathlib.Path | None) -> str 
     absent = [content_hash for content_hash in missing if content_hash not in known]
     if not absent:
         return None
-    return _missing_reason(absent, f"pivot has not seen them on remote '{name}'; {_PULL_FETCHES}")
-
-
-_MISSING_PREFIX = "Read objects missing from the cache: "
-_PULL_FETCHES = "`pivot pull` fetches them"
+    return types.UnavailableReads(
+        reason=_missing_reason(
+            absent, f"pivot has not seen them on remote '{name}'; `pivot pull` fetches them"
+        ),
+        pullable=True,
+    )
 
 
 def _missing_reason(hashes: list[str], why: str) -> str:
-    return f"{_MISSING_PREFIX}{', '.join(hashes)} ({why})"
-
-
-def pull_fetches(reason: str) -> bool:
-    """Whether ``reason``, why a stage must run, is ``unavailable``'s for objects a usable remote
-    may hold but the remote index does not record, which ``pivot pull`` fetches; not its reason
-    when no remote can be used. ``pivot status`` then suggests ``pivot pull``."""
-    return reason.startswith(_MISSING_PREFIX) and reason.endswith(f"; {_PULL_FETCHES})")
+    return f"Read objects missing from the cache: {', '.join(hashes)} ({why})"

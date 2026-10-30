@@ -82,6 +82,7 @@ from pivot.types import (
     ParamChange,
     PipelineStatus,
     PipelineStatusInfo,
+    Recovery,
     RemoteSyncInfo,
     StageExplanation,
     TrackedFileInfo,
@@ -267,7 +268,9 @@ def _compute_explanations_with_upstream(
     explanations: list[StageExplanation],
     graph: DiGraph[str],
 ) -> list[StageExplanation]:
-    """Process explanations and add upstream_stale field for stages stale due to upstream."""
+    """Process explanations and add upstream_stale field for stages stale due to upstream. A stage
+    that will run keeps its ``recovery``; one current on its own with stale upstream stages gets
+    ``Recovery.UPSTREAM``."""
     stale_stages = set[str]()
     results = list[StageExplanation]()
 
@@ -304,6 +307,11 @@ def _compute_explanations_with_upstream(
             dep_changes=exp["dep_changes"],
             upstream_stale=upstream_stale,
         )
+        if exp["will_run"]:
+            if "recovery" in exp:
+                new_exp["recovery"] = exp["recovery"]
+        elif upstream_stale:
+            new_exp["recovery"] = Recovery.UPSTREAM
         results.append(new_exp)
 
     return results
@@ -356,15 +364,18 @@ def get_pipeline_status(
 
 def _explanations_to_status(explanations: list[StageExplanation]) -> list[PipelineStatusInfo]:
     """Convert enriched explanations to PipelineStatusInfo list."""
-    return [
-        PipelineStatusInfo(
+    rows = list[PipelineStatusInfo]()
+    for exp in explanations:
+        row = PipelineStatusInfo(
             name=exp["stage_name"],
             status=PipelineStatus.STALE if exp["will_run"] else PipelineStatus.CACHED,
             reason=exp["reason"],
             upstream_stale=exp["upstream_stale"],
         )
-        for exp in explanations
-    ]
+        if "recovery" in exp:
+            row["recovery"] = exp["recovery"]
+        rows.append(row)
+    return rows
 
 
 def get_tracked_files_status(

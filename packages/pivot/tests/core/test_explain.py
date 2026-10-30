@@ -33,6 +33,7 @@ from pivot.types import (
     DirHash,
     HashInfo,
     LockData,
+    Recovery,
     StageExplanation,
 )
 
@@ -501,6 +502,7 @@ def test_get_stage_explanation_edited_metric_is_not_missing_from_cache(
     assert result["will_run"] is True
     assert result["reason"] != explain.OUTPUTS_MISSING_REASON
     assert result["reason"] == "Metric output changed: s:stats"
+    assert "recovery" not in result, "pull restores no metric"
 
 
 def test_get_stage_explanation_deleted_metric_is_reported_missing(tmp_path: pathlib.Path) -> None:
@@ -524,6 +526,7 @@ def test_get_stage_explanation_missing_cacheable_output_keeps_cache_reason(
 
     assert result["will_run"] is True
     assert result["reason"] == explain.OUTPUTS_MISSING_REASON
+    assert "recovery" in result and result["recovery"] is Recovery.PULL_OUTPUTS, result
 
 
 def test_get_stage_explanation_code_changed(tmp_path: pathlib.Path) -> None:

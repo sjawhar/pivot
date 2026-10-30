@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import lmdb
+import networkx as nx
 import pytest
 
 from pivot import config, exceptions, executor, explain, registry, status
@@ -10,7 +11,7 @@ from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import cache, listing, track
 from pivot.storage import state as state_mod
-from pivot.types import RemoteStatus, StageExplanation
+from pivot.types import Recovery, RemoteStatus, StageExplanation
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -139,6 +140,48 @@ def test_pipeline_status_upstream_stale(
 
     assert stage_b["status"] == "stale"
     assert "test/stage_a" in stage_b["upstream_stale"]
+
+
+def _helper_explanation(
+    name: str, *, will_run: bool, recovery: Recovery | None = None
+) -> StageExplanation:
+    explanation = StageExplanation(
+        stage_name=name,
+        will_run=will_run,
+        is_forced=False,
+        reason=explain.OUTPUTS_MISSING_REASON if will_run else "",
+        code_changes=[],
+        param_changes=[],
+        dep_changes=[],
+        upstream_stale=[],
+    )
+    if recovery is not None:
+        explanation["recovery"] = recovery
+    return explanation
+
+
+def test_status_carries_each_stages_recovery_and_marks_one_stale_only_for_its_upstream() -> None:
+    """`pivot status` chooses its `pivot pull` suggestion from these fields, never from reasons:
+    a stale stage keeps its own, one current on its own but downstream of a stale stage is
+    `upstream`, and one with nothing stale has none."""
+    graph: nx.DiGraph[str] = nx.DiGraph()
+    graph.add_edge("p/use", "p/make")  # consumer -> producer
+    graph.add_node("p/alone")
+    explanations = [
+        _helper_explanation("p/make", will_run=True, recovery=Recovery.PULL_OUTPUTS),
+        _helper_explanation("p/use", will_run=False),
+        _helper_explanation("p/alone", will_run=False),
+    ]
+
+    enriched = status._compute_explanations_with_upstream(explanations, graph)
+    rows = status._explanations_to_status(enriched)
+
+    expected = {"p/make": Recovery.PULL_OUTPUTS, "p/use": Recovery.UPSTREAM}
+    for entries in (
+        {e["stage_name"]: e["recovery"] for e in enriched if "recovery" in e},
+        {row["name"]: row["recovery"] for row in rows if "recovery" in row},
+    ):
+        assert entries == expected
 
 
 def test_pipeline_status_specific_stages(

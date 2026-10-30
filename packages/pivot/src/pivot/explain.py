@@ -33,16 +33,22 @@ if TYPE_CHECKING:
 OUTPUTS_MISSING_REASON = "Outputs missing from cache"
 """Reason for a stage whose lock is current but whose cacheable outputs are absent locally.
 
-``pivot status`` counts stages with this reason as restorable by ``pivot pull``, so it is
-never used when the only unavailable outputs are metrics, which are not cached.
+Its explanation's ``recovery`` is ``Recovery.PULL_OUTPUTS``, by which ``pivot status`` counts it
+as restorable by ``pivot pull``, so it is never used when the only unavailable outputs are
+metrics, which are not cached.
 """
+
+
+def _pull_restores(unavailable: list[types.ArtifactRef]) -> bool:
+    """Whether ``pivot pull`` can restore any of ``unavailable``: any output but a metric."""
+    return any(ref.tag is not types.ArtifactTag.METRIC for ref in unavailable)
 
 
 def _unavailable_outputs_reason(
     store: store_mod.WorkspaceStore, unavailable: list[types.ArtifactRef]
 ) -> str:
     """Say why a stage whose lock is current must still run to regenerate ``unavailable``."""
-    if any(ref.tag is not types.ArtifactTag.METRIC for ref in unavailable):
+    if _pull_restores(unavailable):
         return OUTPUTS_MISSING_REASON
     changed = list[str]()
     missing = list[str]()
@@ -377,7 +383,7 @@ def get_stage_explanation(
             unavailable = restoration.unavailable
             empty_dirs_unrecorded = restoration.empty_dirs_unrecorded
         if not decision["changed"] and (unavailable or empty_dirs_unrecorded):
-            return StageExplanation(
+            explanation = StageExplanation(
                 stage_name=stage_name,
                 will_run=True,
                 is_forced=force,
@@ -391,7 +397,10 @@ def get_stage_explanation(
                 dep_changes=[],
                 upstream_stale=[],
             )
-        return StageExplanation(
+            if _pull_restores(unavailable):
+                explanation["recovery"] = types.Recovery.PULL_OUTPUTS
+            return explanation
+        explanation = StageExplanation(
             stage_name=stage_name,
             will_run=decision["changed"],
             is_forced=force,
@@ -401,3 +410,6 @@ def get_stage_explanation(
             dep_changes=decision.get("dep_changes", []),
             upstream_stale=[],
         )
+        if "recovery" in decision:
+            explanation["recovery"] = decision["recovery"]
+        return explanation

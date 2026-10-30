@@ -554,11 +554,30 @@ class OutputChange(TypedDict):
     output_type: Literal["out", "metric", "plot"]
 
 
+class Recovery(enum.StrEnum):
+    """What brings a stale stage up to date without running it. Carried beside the reason
+    (`ChangeDecision`, `StageExplanation`, `PipelineStatusInfo`) so `pivot status` chooses its
+    `pivot pull` suggestion from it, never from the reason's text; absent when only a run does."""
+
+    PULL_OUTPUTS = "pull_outputs"  # its lock is current; `pivot pull` restores missing outputs
+    PULL_READS = "pull_reads"  # `pivot pull` fetches objects it read by hash that the cache lacks
+    UPSTREAM = "upstream"  # current on its own: up to date once its stale upstream stages are
+
+
+class UnavailableReads(TypedDict):
+    """Why objects a lock or run-cache entry records its run read by hash are neither in the
+    cache nor known to be on the default remote (`reads.unavailable`)."""
+
+    reason: str
+    pullable: bool  # a usable remote may hold them, so `pivot pull` fetches them
+
+
 class ChangeDecision(TypedDict, total=False):
     """Result of skip detection check_stage().
 
     In fast mode (explain=False), detail fields are omitted (not present).
     In explain mode (explain=True), they contain the full diff information.
+    `recovery` is present when the stage is changed only for a reason `pivot pull` repairs.
     """
 
     changed: Required[bool]
@@ -567,6 +586,7 @@ class ChangeDecision(TypedDict, total=False):
     run_cache_allowed: Required[bool]
     param_changes: list[ParamChange]
     dep_changes: list[DepChange]
+    recovery: Recovery
 
 
 class StageExplanation(TypedDict, total=False):
@@ -580,6 +600,7 @@ class StageExplanation(TypedDict, total=False):
     param_changes: Required[list[ParamChange]]
     dep_changes: Required[list[DepChange]]
     upstream_stale: Required[list[str]]
+    recovery: Recovery  # what brings it up to date without running it, when something does
 
 
 # =============================================================================
@@ -657,6 +678,7 @@ class PipelineStatusInfo(TypedDict):
     status: PipelineStatus
     reason: str
     upstream_stale: list[str]
+    recovery: NotRequired[Recovery]  # what brings it up to date without running it, if anything
 
 
 class TrackedFileInfo(TypedDict):
@@ -731,6 +753,7 @@ class ExplainStageJson(TypedDict):
     param_changes: list[ParamChange]
     dep_changes: list[DepChangeJson]
     upstream_stale: list[str]
+    recovery: NotRequired[Recovery]  # what brings it up to date without running it, if anything
 
 
 class ExplainOutput(TypedDict, total=False):

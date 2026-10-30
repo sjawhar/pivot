@@ -224,8 +224,10 @@ When multiple `pivot` processes share the same StateDB:
   what its reads fetched in `DeferredWrites.remote_hashes` (`reads.Recording.fetched`), under
   `--no-commit` too, and `apply_deferred_writes` adds it in the run's transaction, storing the
   fetch's URL when none is stored for the remote and adding nothing when another one is.
-  A stage whose only reason to run is objects the index lacks on a usable remote
-  (`reads.pull_fetches`) is one `pivot status` says `pivot pull` brings up to date.
+  `reads.unavailable` returns the reason and whether a usable remote may hold the objects
+  (`types.UnavailableReads.pullable`); when those objects alone change the stage, `check_stage`
+  sets `recovery` to `Recovery.PULL_READS`, and `pivot status` suggests `pivot pull` from that
+  field, never from the reason's text.
 
 ## Output Ownership
 
