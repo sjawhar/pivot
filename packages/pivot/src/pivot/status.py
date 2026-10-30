@@ -478,7 +478,14 @@ def find_orphaned_lock_files(
     all_stages: dict[str, RegistryStageInfo], pipeline: registry.PipelineLike
 ) -> list[str]:
     """Find lock and listing files in the registered stages' state dirs that belong to no
-    registered stage, output or input."""
+    registered stage, output or input.
+
+    A file of an instance of a template (``Pipeline.map``) is none: an instance is registered
+    only while a run has expanded its template, and a run decides which of them stay. Its lock is
+    named by the instance, its listing ``<instance>=<key>.listing`` and its restart proof
+    ``<instance>.incremental``, so each names the template (``registry.template_of``).
+    """
+    templates = pipeline.list_templates()
     default_state_dir = config.locate_state_dir()
     state_dirs = {default_state_dir} | {
         registry.get_stage_state_dir(stage_info, default_state_dir)
@@ -506,7 +513,11 @@ def find_orphaned_lock_files(
                 stages_dir, registered_stages.get(stages_dir, set[str]()), registered_listings
             )
         )
-    return sorted(orphaned)
+    return sorted(
+        entry
+        for entry in orphaned
+        if registry.template_of(entry.split("=", 1)[0], templates) is None
+    )
 
 
 def get_suggestions(
