@@ -402,8 +402,10 @@ changes nothing in the program's `sys.modules`.
 Cost: every by-name module of every stage is predicted once per import session (memoized by
 name, `sys.path` and working directory). On a 1,000-stage project with three by-name modules per
 stage, `pivot status` took 3.0% longer (95% interval 2.5% to 3.6%) and an all-cached `pivot repro`
-1.7% longer than on main; 1,000 stages with none, 0.9%. An interpreter start costs about 80 ms,
-once per session and only when a held module is suspect.
+1.7% longer than on main; on `fan-1000` (1,000 stages, each reading one library module, `zlib`),
+`pivot status` took 2.3% longer (95% interval 1.6% to 2.7%; 10 paired runs against main
+64c5db6c). An interpreter start costs about 80 ms, once per session and only when a held module is
+suspect.
 
 The manifest cache records where each of those modules resolved when the walk ran (`o`, the
 prediction above), and a hit re-predicts them: a project file that takes over a name a library
