@@ -5,6 +5,7 @@ venvs that CI-only tests install with uv."""
 
 from __future__ import annotations
 
+import functools
 import inspect
 import os
 import pathlib
@@ -42,8 +43,8 @@ def cli_env(home: pathlib.Path, **extra: str) -> dict[str, str]:
 
     This process's environment without any ``PIVOT*`` variable (a developer's
     ``PIVOT_CACHE_DIR`` or ``PIVOT_UNSAFE_FINGERPRINTING`` never reaches the command) and
-    without ``VIRTUAL_ENV``, with ``HOME`` set to ``home`` so neither the developer's global
-    config nor ``~/.pivotignore`` applies, then ``extra``.
+    without ``VIRTUAL_ENV``, with ``HOME`` set to ``home`` so the developer's global config
+    does not apply, then ``extra``.
     """
     env = {
         key: value
@@ -141,6 +142,32 @@ def venv_pivot(venv: pathlib.Path, *specs: str) -> str:
         )
         assert ran.returncode == 0, ran.stdout + ran.stderr
     return str(venv / "bin" / "pivot")
+
+
+@functools.cache
+def git_version() -> tuple[int, int]:
+    """The major and minor version of the ``git`` on PATH, which the git-oracle tests run."""
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, check=True).stdout
+    found = re.search(r"(\d+)\.(\d+)", out)
+    assert found is not None, out
+    return int(found[1]), int(found[2])
+
+
+def git_differs_before_2_52(line: bytes) -> bool:
+    """Whether a git older than 2.52 matches the ignore-file line ``line`` otherwise than 2.52
+    and Pivot do: a pattern holding a ``/`` whose first wildcard is a ``**`` right after a byte
+    that is not ``/``. git 2.52 gives wildmatch the literal prefix's last byte, so that ``**``
+    is a ``*``; before it, git dropped the whole prefix and the ``**`` spanned directories (git
+    commit 1940a02dc1, "match_pathname(): give fnmatch one char of prefix context")."""
+    pattern = line.removesuffix(b"\r").partition(b"\0")[0].rstrip(b" ")
+    if not pattern or pattern.startswith(b"#"):
+        return False
+    pattern = pattern.removeprefix(b"!").removesuffix(b"/")
+    if b"/" not in pattern:
+        return False
+    pattern = pattern.removeprefix(b"/")
+    first = next((i for i, byte in enumerate(pattern) if byte in b"*?[\\"), len(pattern))
+    return first > 0 and pattern[first : first + 2] == b"**" and pattern[first - 1] != ord("/")
 
 
 def incremental_stop(output: str, stage: str) -> str | None:

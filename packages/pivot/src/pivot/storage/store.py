@@ -6,13 +6,13 @@ import pathlib
 import tempfile
 from typing import TYPE_CHECKING, Protocol, TypedDict, runtime_checkable
 
-from pivot import config, stage_def, types
+from pivot import config, ignore, stage_def, types
 from pivot import state_dir as state_dir_mod
 from pivot.storage import cache, listing, ownership
 from pivot.storage import state as state_mod
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable, Mapping
+    from collections.abc import Callable, Generator, Iterable, Mapping
 
 
 def _record(
@@ -196,6 +196,7 @@ class WorkspaceStore:
     _output_paths: dict[types.ArtifactRef, pathlib.Path]
     _cache_dir: pathlib.Path | None
     _checkout_modes: list[config.CheckoutMode] | None
+    _ignore_filter: ignore.IgnoreFilter
 
     def __init__(
         self,
@@ -204,8 +205,14 @@ class WorkspaceStore:
         input_bindings: dict[str, str],
         cache_dir: pathlib.Path | None = None,
         checkout_modes: list[config.CheckoutMode] | None = None,
+        ignore_filter: ignore.IgnoreFilter | None = None,
     ) -> None:
-        """``checkout_modes`` orders how outputs are linked to the cache; None means the default."""
+        """``checkout_modes`` orders how outputs are linked to the cache; None means the default.
+
+        ``ignore_filter`` names the files of a directory input that its hash leaves out; pass
+        the command's one filter where it has one. None makes one for this project's
+        ``.pivotignore``, read when a directory input is first hashed.
+        """
         self._project_root = project_root.resolve()
         self._pipeline_name = pipeline_name
         self._input_bindings = input_bindings.copy()
@@ -213,17 +220,43 @@ class WorkspaceStore:
         self._output_paths = {}
         self._cache_dir = cache_dir.resolve() if cache_dir is not None else None
         self._checkout_modes = checkout_modes
+        self._ignore_filter = (
+            ignore_filter if ignore_filter is not None else ignore.IgnoreFilter(self._project_root)
+        )
 
     @property
     def cache_dir(self) -> pathlib.Path | None:
         """The cache object root (``<cache.dir>/files``), or None when this store has no cache."""
         return self._cache_dir
 
-    def _resolve_input_path(self, ref: types.ArtifactRef) -> pathlib.Path:
-        name = ref.identity.producer
+    def _input_binding(self, identity: types.ArtifactIdentity) -> str:
+        """An input's path relative to the project root."""
+        name = identity.producer
         if name in self._input_bindings:
-            return self._project_root / self._input_bindings[name]
-        return self._project_root / "data" / "raw" / name
+            return self._input_bindings[name]
+        return f"data/raw/{name}"
+
+    def _resolve_input_path(self, ref: types.ArtifactRef) -> pathlib.Path:
+        return self._project_root / self._input_binding(ref.identity)
+
+    def input_member_filter(self, identity: types.ArtifactIdentity) -> ignore.MemberFilter | None:
+        """The ``.pivotignore`` rule for the files of input directory ``identity``.
+
+        Each file is matched on its path inside the project (the input's binding plus its
+        relpath), never on a symlink target. None when no file of it can be left out
+        (``ignore.IgnoreFilter.member_filter``).
+        """
+        return self._ignore_filter.member_filter(os.path.normpath(self._input_binding(identity)))
+
+    def _input_member_filter(self, ref: types.ArtifactRef) -> ignore.MemberFilter | None:
+        """The ``.pivotignore`` rule for the files of directory dependency ``ref``.
+
+        Only a pipeline input has one. A stage output has none: its dependency hash is the
+        hash its producer records, which is cached and restored whole.
+        """
+        if ref.tag is not types.ArtifactTag.INPUT:
+            return None
+        return self.input_member_filter(ref.identity)
 
     def _resolve_output_path(self, ref: types.ArtifactRef) -> pathlib.Path:
         # A stage asks for each output's path several times (its write, each ownership check,
@@ -482,14 +515,40 @@ class WorkspaceStore:
         pending: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
         hashed_dirs: dict[str, listing.HashedDirectory] | None = None,
     ) -> types.HashInfo:
+        """Hash dependency ``ref`` as it is in the workspace.
+
+        A directory input leaves out the files ``.pivotignore`` names (``_input_member_filter``).
+        """
         path = self._resolve_path(ref)
         if ref.directory is None and (ref.tag == types.ArtifactTag.DIRECTORY or path.is_dir()):
             hashed = cache.hash_directory(
-                path, state_db, cache_dir=self._cache_dir, pending=pending
+                path,
+                state_db,
+                cache_dir=self._cache_dir,
+                pending=pending,
+                ignored=self._input_member_filter(ref),
             )
             return _record(hashed, hashed_dirs)
         file_hash, _ = cache.hash_file(path, state_db, pending=pending)
         return types.FileHash(hash=file_hash)
+
+    def recorded_input_hash(
+        self,
+        ref: types.ArtifactRef,
+        recorded: types.DirHash,
+        read_members: Callable[[], listing.DirListing],
+    ) -> types.DirHash:
+        """The dependency hash ``hash_artifact`` gives directory input ``ref`` when it holds the
+        directory ``recorded``.
+
+        ``recorded`` keeps every file, as a ``.pvt`` records a tracked directory; when
+        ``.pivotignore`` names files of the input, the files of its listing (``read_members``,
+        read only then) are taken out of it (``cache.filter_listing``).
+        """
+        ignored = self._input_member_filter(ref)
+        if ignored is None:
+            return recorded
+        return cache.filter_listing(read_members(), ignored)["record"]
 
     def input_relpath(self, ref: types.ArtifactRef) -> str:
         """A pipeline input's path relative to the project root, POSIX form: the name of its
@@ -577,7 +636,9 @@ def relative_output_path(ref: types.ArtifactRef) -> pathlib.Path:
     return pathlib.Path(prefix) / stage_name / f"{key}.{ext}"
 
 
-def store_from_spec(spec: StoreSpec) -> Store:
+def store_from_spec(spec: StoreSpec, *, ignore_filter: ignore.IgnoreFilter | None = None) -> Store:
+    """Build the store ``spec`` describes; ``ignore_filter`` is the command's ``.pivotignore``
+    filter for a workspace store, as ``WorkspaceStore`` takes it."""
     kind = spec["kind"]
     if kind == "cache":
         project_root = pathlib.Path(spec["project_root"])
@@ -593,5 +654,6 @@ def store_from_spec(spec: StoreSpec) -> Store:
             input_bindings=spec["input_bindings"],
             cache_dir=pathlib.Path(cache_dir_str) if cache_dir_str else None,
             checkout_modes=spec["checkout_modes"],
+            ignore_filter=ignore_filter,
         )
     raise ValueError(f"Unknown store kind: {kind}")
