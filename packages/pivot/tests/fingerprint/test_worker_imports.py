@@ -14,6 +14,7 @@ Each test names its modules uniquely: the test process puts `packages/pivot/test
 
 from __future__ import annotations
 
+import email.mime.text
 import importlib.machinery
 import importlib.util
 import multiprocessing.process
@@ -22,6 +23,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import uuid
 from typing import TYPE_CHECKING
 
 import pytest
@@ -238,6 +240,48 @@ def test_a_library_the_program_holds_and_a_stage_imports_in_its_body_fails_the_f
         pipeline.ensure_fingerprint("p/use")
 
 
+def test_a_partial_over_a_library_callable_the_program_holds_fails_the_fingerprint(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stage calls a `functools.partial` over `wi_lib.plain`: cloudpickle sends the partial
+    with `plain` by name, so the worker imports `wi_lib`, the project's file in its place."""
+    held = tmp_path / "lib" / "site-packages" / "wi_lib.py"
+    _held("wi_lib", held, monkeypatch)
+    pipeline = _discover(
+        tmp_path,
+        monkeypatch,
+        {"wi_lib.py": _PLAIN},
+        _pipeline(
+            "import functools\n\nfrom wi_lib import plain\n\nPLAIN = functools.partial(plain)",
+            "PLAIN()",
+        ),
+    )
+
+    with pytest.raises(exceptions.PivotError, match=f"module 'wi_lib' is {_resolved(held)}"):
+        pipeline.ensure_fingerprint("p/use")
+
+
+def test_a_library_submodule_a_stage_imports_from_a_project_package_is_recorded_by_name(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The project's `wi_up/__init__.py` adds a `site-packages` directory to its `__path__`, and
+    the stage runs `from wi_up import sub`, a library module there that nothing loaded. The
+    worker imports `wi_up.sub` by name, so the walk names it (`byname:`)."""
+    site = tmp_path / "lib" / "site-packages" / "wi_up"
+    site.mkdir(parents=True)
+    (site / "sub.py").write_text(_PLAIN)
+    pipeline = _discover(
+        tmp_path,
+        monkeypatch,
+        {"wi_up/__init__.py": f"__path__.append({str(site)!r})\n"},
+        "import wi_up\nfrom pivot import Pipeline, stage\n\n\n@stage\ndef use() -> str:\n"
+        + "    from wi_up import sub\n\n    return sub.plain()\n\n\n"
+        + 'with Pipeline("p") as pipeline:\n    use()\n',
+    )
+
+    assert _walk(pipeline).get("byname:wi_up.sub") == "", _walk(pipeline)
+
+
 def test_a_library_module_read_as_a_global_is_recorded_by_name_outside_the_lock(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -279,6 +323,26 @@ def test_a_namespace_child_the_program_holds_from_a_library_fails_the_stages_fin
         pipeline.ensure_fingerprint("p/use")
 
 
+def test_a_pipeline_fingerprinted_after_a_later_discovery_found_nothing_is_still_compared(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The program loaded its own `wi_late` from `program/` by file, and `other/` on its
+    `sys.path` has another `wi_late.py`. It discovers the project, then a directory with no
+    pipeline, which ends the project's import session, and then fingerprints the project's stage:
+    a worker would import `other/wi_late.py`, so the fingerprint still fails."""
+    _held("wi_late", tmp_path / "program" / "wi_late.py", monkeypatch)
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "wi_late.py").write_text(_PLAIN)
+    monkeypatch.syspath_prepend(str(tmp_path / "other"))
+    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_late", "wi_late.plain()"))
+    (tmp_path / "empty").mkdir()
+    assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
+
+    other = _resolved(tmp_path / "other" / "wi_late.py")
+    with pytest.raises(exceptions.PivotError, match=f"would import {other}"):
+        pipeline.ensure_fingerprint("p/use")
+
+
 # Modules a worker imports from the same place --------------------------------------------------
 
 
@@ -309,6 +373,27 @@ def test_a_built_in_module_a_root_file_names_needs_no_new_interpreter(
 
     pipeline.ensure_fingerprint("p/use")
     assert "byname:time" in _walk(pipeline)
+    assert confirm.call_count == 0
+
+
+def test_a_library_submodule_a_worker_imports_from_the_same_file_needs_no_new_interpreter(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """The stage reads `email.mime.text`, which this process holds from the standard library. A
+    worker imports it from the same file, found in its package's directories, so the prediction
+    agrees without starting an interpreter."""
+    assert pathlib.Path(email.mime.text.__file__).name == "text.py"
+    confirm = mocker.spy(loaded_source, "_confirm")
+    pipeline = _discover(
+        tmp_path,
+        monkeypatch,
+        {},
+        _pipeline("from email.mime import text as mime_text", "mime_text.__name__"),
+    )
+
+    pipeline.ensure_fingerprint("p/use")
+
+    assert "byname:email.mime.text" in _walk(pipeline)
     assert confirm.call_count == 0
 
 
@@ -503,10 +588,110 @@ def test_a_changed_sys_path_is_resolved_again(
         loaded_source.check_worker_imports({"byname:wi_moved": ""})
 
 
+def test_a_relative_path_entry_is_predicted_in_the_working_directory_of_the_check(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, hold_modules: Callable[[], None]
+) -> None:
+    """`sys.path` has the relative entry `rel`, and the program holds `first/rel/wi_rl.py`. A check
+    in `first` finds nothing wrong; after a `chdir` to `second`, a new worker would start there
+    and import `second/rel/wi_rl.py`, though this process's finder for `rel` still searches
+    `first/rel`."""
+    for directory in ("first", "second"):
+        (tmp_path / directory / "rel").mkdir(parents=True)
+        (tmp_path / directory / "rel" / "wi_rl.py").write_text(_PLAIN)
+    _held("wi_rl", tmp_path / "first" / "rel" / "wi_rl.py", monkeypatch)
+    monkeypatch.setattr(sys, "path_importer_cache", dict(sys.path_importer_cache))
+    monkeypatch.setattr(sys, "path", ["rel", *sys.path])
+    monkeypatch.chdir(tmp_path / "first")
+    hold_modules()
+    # The program's own imports made the finder for `rel` here, in `first`.
+    assert importlib.machinery.PathFinder.find_spec("wi_rl", ["rel"]) is not None
+    loaded_source.check_worker_imports({"byname:wi_rl": ""})
+    monkeypatch.chdir(tmp_path / "second")
+
+    second = _resolved(tmp_path / "second" / "rel" / "wi_rl.py")
+    with pytest.raises(exceptions.StageDefinitionError, match=f"would import {second}"):
+        loaded_source.check_worker_imports({"byname:wi_rl": ""})
+
+
+def test_a_path_object_in_sys_path_is_skipped_as_the_import_system_skips_it(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`PathFinder` skips an entry of `sys.path` that is not a `str`, in a worker as here: with
+    `pathlib.Path(program)` before `other`, a worker imports `other/wi_pobj.py`, not the
+    program's `wi_pobj`."""
+    program = tmp_path / "program"
+    _held("wi_pobj", program / "wi_pobj.py", monkeypatch)
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "wi_pobj.py").write_text(_PLAIN)
+    monkeypatch.setattr(sys, "path", [program, str(tmp_path / "other"), *sys.path])
+    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_pobj", "wi_pobj.plain()"))
+
+    other = _resolved(tmp_path / "other" / "wi_pobj.py")
+    with pytest.raises(exceptions.PivotError, match=f"would import {other}"):
+        pipeline.ensure_fingerprint("p/use")
+
+
+def test_a_confirmation_is_kept_per_sys_path(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The confirming interpreter's answer for `wi_ck` is kept for the `sys.path` it searched; a
+    new `sys.path` asks again."""
+    monkeypatch.setattr(loaded_source, "_confirmed", {})
+    base = list(sys.path)
+    reports = list[object]()
+    for directory in ("first", "second"):
+        (tmp_path / directory).mkdir()
+        (tmp_path / directory / "wi_ck.py").write_text(_PLAIN)
+        monkeypatch.setattr(sys, "path", [str(tmp_path / directory), *base])
+        results, failure = loaded_source._confirm(["wi_ck"])
+        assert failure is None
+        reports.append(results["wi_ck"])
+
+    assert reports == [
+        ("file", str((tmp_path / directory / "wi_ck.py").resolve()))
+        for directory in ("first", "second")
+    ]
+
+
+def test_a_confirmation_that_cannot_run_fails_on_the_prediction(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the confirming interpreter fails, the prediction decides, and the error says the
+    confirmation did not run."""
+    monkeypatch.setattr(loaded_source, "_CONFIRM_PROGRAM", "raise SystemExit(3)\n")
+    _held("wi_fail", tmp_path / "program" / "wi_fail.py", monkeypatch)
+    pipeline = _discover(
+        tmp_path,
+        monkeypatch,
+        {"wi_fail.py": _PLAIN},
+        _pipeline("import wi_fail", "wi_fail.plain()"),
+    )
+
+    with pytest.raises(exceptions.PivotError, match=r"could not start an interpreter.+\(exit 3"):
+        pipeline.ensure_fingerprint("p/use")
+
+
+def test_a_lock_leaves_out_every_by_name_entry() -> None:
+    """A stage's own `byname:` entries and its loaders' (`dep:`, `out:`) are left out of what a
+    lock records."""
+    manifest = {
+        "self:use": "1",
+        "byname:json": "",
+        "dep:raw:byname:json": "",
+        "out:p/use:byname:csv": "",
+        "dep:raw:loader": "2",
+    }
+
+    assert fingerprint.without_by_name(manifest) == {"self:use": "1", "dep:raw:loader": "2"}
+
+
 # Through a worker -----------------------------------------------------------------------------
 
 
-_SITECUSTOMIZE = "import wi_startup  # noqa: F401 - in every interpreter of this environment\n"
+_SITECUSTOMIZE = (
+    "import wi_startup  # noqa: F401 - in every interpreter of this environment\n"
+    + 'print("sitecustomize: wi_startup imported")  # startup output on stdout\n'
+)
 
 
 def test_a_module_every_interpreter_imports_at_startup_is_the_one_its_worker_runs(
@@ -554,6 +739,103 @@ def test_a_module_from_another_file_fails_the_run_before_a_worker_runs_it(
         executor.run()
 
     assert not (tmp_path / "project" / "data" / "p" / "use.txt").exists()
+
+
+def test_the_suspects_of_a_session_are_confirmed_in_one_interpreter(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+) -> None:
+    """Three stages each read a module a `sitecustomize` imports, each shadowed by a root file.
+    The first stage's check confirms every held suspect at once, so the session starts one
+    interpreter, not one per stage."""
+    names = ("wi_s0", "wi_s1", "wi_s2")
+    startup = tmp_path / "startup"
+    startup.mkdir()
+    (startup / "sitecustomize.py").write_text(
+        "".join(f"import {name}  # noqa: F401\n" for name in names)
+    )
+    for name in names:
+        _held(name, startup / f"{name}.py", monkeypatch)
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join([str(startup), os.environ.get("PYTHONPATH", "")])
+    )
+    stages = "".join(
+        f"@stage\ndef use_{name}() -> str:\n    return {name}.plain()\n\n\n" for name in names
+    )
+    calls = "".join(f"    use_{name}()\n" for name in names)
+    pipeline = _discover(
+        tmp_path,
+        monkeypatch,
+        {f"{name}.py": _PLAIN for name in names},
+        f"import {', '.join(names)}\nfrom pivot import Pipeline, stage\n\n\n{stages}"
+        + f'with Pipeline("p") as pipeline:\n{calls}',
+    )
+    run = mocker.spy(subprocess, "run")
+
+    for name in names:
+        pipeline.ensure_fingerprint(f"p/use_{name}")
+
+    started = [
+        call for call in run.call_args_list if loaded_source._CONFIRM_PROGRAM in call.args[0]
+    ]
+    assert len(started) == 1, started
+
+
+def test_the_check_is_reported_with_the_stages_other_refusals(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stage reads a module-level list and the program's `wi_ag`: one error names both, as
+    every fingerprinting refusal of a stage is reported together."""
+    _held("wi_ag", tmp_path / "program" / "wi_ag.py", monkeypatch)
+    pipeline = _discover(
+        tmp_path,
+        monkeypatch,
+        {"wi_ag.py": _PLAIN},
+        _pipeline("import wi_ag\n\nITEMS = [1, 2]", "wi_ag.plain() + str(ITEMS)"),
+    )
+
+    with pytest.raises(exceptions.PivotError) as raised:
+        pipeline.ensure_fingerprint("p/use")
+
+    assert "captures non-scalar variable 'ITEMS'" in str(raised.value)
+    assert _ANOTHER_FILE in str(raised.value)
+
+
+def test_a_relative_startup_path_names_a_directory_under_the_working_directory(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`PYTHONPATH=startup` is relative: a worker starts in this process's working directory and
+    finds `startup/sitecustomize.py` there, which imports `wi_rel`. The confirming interpreter
+    starts there too, so nothing fails."""
+    startup = tmp_path / "startup"
+    startup.mkdir()
+    (startup / "sitecustomize.py").write_text("import wi_rel  # noqa: F401\n")
+    _held("wi_rel", startup / "wi_rel.py", monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["startup", os.environ.get("PYTHONPATH", "")]))
+    pipeline = _discover(
+        tmp_path, monkeypatch, {"wi_rel.py": _PLAIN}, _pipeline("import wi_rel", "wi_rel.plain()")
+    )
+
+    assert "module:wi_rel" in pipeline.ensure_fingerprint("p/use")
+
+
+def test_a_module_a_worker_imports_before_it_gets_its_path_is_the_one_it_uses(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker imports `uuid` from the standard library while loky starts it, before it gets the
+    `sys.path` with the root first, so the root's `uuid.py` is not what the stage uses there.
+    The confirming interpreter starts the same way, so nothing fails."""
+    assert pathlib.Path(uuid.__file__).name == "uuid.py"
+    pipeline = _discover(
+        tmp_path,
+        monkeypatch,
+        {"uuid.py": _PLAIN},
+        _pipeline("import uuid", "str(uuid.NAMESPACE_DNS)"),
+    )
+
+    pipeline.ensure_fingerprint("p/use")
+
+    assert "byname:uuid" in _walk(pipeline)
 
 
 # The `pivot` command ----------------------------------------------------------------------------

@@ -1210,6 +1210,16 @@ def _collected_capture_errors() -> Iterator[None]:
         raise exceptions.StageDefinitionError("\n\n".join(dict.fromkeys(errors)))
 
 
+def refuse(message: str) -> None:
+    """Refuse the stage being fingerprinted: inside `stage_fingerprint_scope` the refusal is
+    reported with the stage's other refusals when the scope ends, else it is raised now. Unsafe
+    fingerprinting does not downgrade it (`loaded_source.check_worker_imports`)."""
+    errors = _capture_errors.get()
+    if errors is None:
+        raise exceptions.StageDefinitionError(message)
+    errors.append(message)
+
+
 class StageFingerprintScope(TypedDict):
     """What `stage_fingerprint_scope` learned about one stage's fingerprint."""
 

@@ -386,14 +386,21 @@ would read as cached. Pivot fails the stage's fingerprint instead, naming both
 files. Rename one of the two modules, or, when the program imported its own
 module of that name, run Pivot in a new process (the `pivot` command).
 
-The check costs nothing in a new `pivot` process unless a module is suspect,
-and then one interpreter start (about a tenth of a second) to confirm what a
-worker would import. A module that `site`, a `sitecustomize` or a `.pth` file
-imports in every interpreter is what the worker imports too, so it is no error.
-Two cases are not checked: a module the program loads by file location while
-Pivot is loading the pipeline (from another thread), and a finder the program
-inserted into `sys.meta_path` after it started, which Pivot assumes the worker
-has too.
+Every module a stage refers to by name is predicted once per run, without
+importing anything. On a 1,000-stage project with three such modules per stage,
+`pivot status` took about 3% longer than before the check. Only when a module
+Pivot holds is not the one the prediction finds does Pivot start one
+interpreter, as it starts a worker (about a tenth of a second, once per run), to
+confirm what a worker would import. That interpreter runs your `sitecustomize`
+and `.pth` files once more, as every worker does, and imports no project module.
+A module that `site`, a `sitecustomize` or a `.pth` file imports in every
+interpreter is what the worker imports too, so it is no error. Cases not
+checked: a module the program loads by file location while Pivot is loading the
+pipeline (from another thread); a finder the program inserted into
+`sys.meta_path` after it started, which Pivot assumes the worker has too; a
+package whose `__init__` changes its own `__path__`; and a pipeline object run
+again after the program changed `sys.path`, whose fingerprints Pivot keeps (load
+the pipeline again).
 
 ## @pivot.no_fingerprint()
 

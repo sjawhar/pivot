@@ -125,12 +125,14 @@ def _namespace(directories: Iterable[str]) -> Origin:
     return ("namespace", *sorted(os.path.realpath(directory) for directory in directories))
 
 
-def report_worker_origins() -> None:
-    """Write to stdout the origin of each module named on stdin, in an interpreter started as a
-    Pivot worker starts, once given the worker's `sys.path` (also on stdin) as loky's `prepare()`
-    gives it: the loaded module's origin when startup already imported it (by `site`, a
-    `sitecustomize` or a `.pth` import line, or loky's own imports), else the origin of the spec
-    an import would find (`find_spec`), or None when nothing would. Nothing is imported.
+def report_worker_origins(report_fd: int) -> None:
+    """Write to file descriptor `report_fd` the origin of each module named on stdin, in an
+    interpreter started as a Pivot worker starts, once given the worker's `sys.path` (also on
+    stdin) as loky's `prepare()` gives it: the loaded module's origin when startup already
+    imported it (by `site`, a `sitecustomize` or a `.pth` import line, or loky's own imports), else
+    the origin of the spec an import would find (`find_spec`), or None when nothing would.
+    Nothing is imported. The report has its own descriptor because startup code may write to
+    stdout.
 
     Input: NUL-separated fields, encoded with `os.fsencode`: the number of names, the names, then
     the entries of the worker's `sys.path`. Output: `repr` of a dict from name to origin.
@@ -151,4 +153,5 @@ def report_worker_origins() -> None:
             results[name] = ("unknown", f"{type(exc).__name__}: {exc}")
         else:
             results[name] = None if spec is None else of_spec(spec)
-    sys.stdout.write(repr(results))
+    with os.fdopen(report_fd, "w", encoding="utf-8") as report:
+        report.write(repr(results))

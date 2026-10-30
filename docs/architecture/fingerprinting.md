@@ -362,31 +362,48 @@ The lines are split as `linecache` splits a file (`tokenize.open`, universal new
 newline added), so an unedited project keeps its recorded fingerprints.
 
 A worker imports by name each module discovery did not register by value, with the `sys.path`
-loky gives it (the coordinator's, `""` replaced by the directory the coordinator started in),
-where an import session puts the project root first. A program that runs Pivot in its own process
-(a notebook, a script, a test suite) may hold a module of that name loaded from another file,
-which `import` in `pipeline.py` returns from `sys.modules`; the stage would then be fingerprinted
+loky gives it (the coordinator's, `""` replaced by the directory the coordinator started in; it
+starts in the coordinator's working directory, and its `PathFinder` skips an entry that is not a
+`str`), where an import session puts the project root first. A program that runs Pivot in its own
+process (a notebook, a script, a test suite) may hold a module of that name loaded from another
+file, which `import` in `pipeline.py` returns from `sys.modules`; the stage would then be
+fingerprinted
 from one module while its worker runs another, and an edit to the project's file would leave a
 stale `cached`. So when a stage's fingerprint is computed, `loaded_source.check_worker_imports`
 takes each module the manifest names (`fingerprint.by_name_modules`: the `module:` entries and
-the `byname:` entries, a loader's included) that `sys.modules` held when the import session
-started (`loaded_source.note_held_modules`) and still holds, leaving out a module cloudpickle
+the `byname:` entries, a loader's included) that `sys.modules` held when the latest import session
+started (`loaded_source.note_held_modules`; kept after the session ends, so a pipeline fingerprinted
+after a later discovery found nothing is still compared) and still holds, leaving out a module
+cloudpickle
 sends by value and the program's `__main__` (a worker gets its functions by value). For each it
 predicts, without importing anything, where a worker would import it (`loaded_source.worker_origin`,
 `import_origin.find_spec`): a built-in or frozen module first, which no file shadows, then each
-finder of `sys.meta_path` in order, `PathFinder` searching the worker's `sys.path`, a submodule in
-its package's directories. Origins compare by resolved file, by kind for a built-in or frozen
-module, and for a namespace package by its sorted resolved directories. Only where the prediction
-differs from the held module does it start one interpreter as loky starts a worker (the same
-executable, environment and working directory; `loky.backend.popen_loky_posix` imported before
-it is given the worker's `sys.path`), which reports the module its startup already imported
-(by `site`, a `sitecustomize`, a `.pth` import line or loky itself) or else the spec an import
-would find, importing nothing (`import_origin.report_worker_origins`). It raises only when that
-interpreter also places the module elsewhere, naming both origins; the remedy is renaming one of
-the modules, or a new process when the program imported its own module of that name. Predictions
-and confirmations are kept per `sys.path` (and working directory) until the session ends. A module
+finder of `sys.meta_path` in order, `PathFinder` searching the worker's `sys.path` (its `str`
+entries, a relative one joined to the working directory), a submodule in its package's spec's
+directories. Origins compare by resolved file, by kind for a built-in or frozen module, and for a
+namespace package by its sorted resolved directories. Only where the prediction differs from the
+held module does it start an interpreter as loky starts a worker (the same executable,
+environment and working directory; `loky.backend.popen_loky_posix` imported before it is given
+the worker's `sys.path`). That interpreter runs what a worker's start runs, `site` with
+`sitecustomize` and the `.pth` files and loky's own imports, so their code runs once more; it
+imports no project module. It reports the module its start already imported or else the spec an
+import would find, on a file descriptor of its own, since startup code may write to stdout
+(`import_origin.report_worker_origins`). The first such interpreter of a session, for one
+`sys.path` and working directory, also confirms every other held module the prediction places
+elsewhere (`loaded_source._held_suspects`), so one interpreter serves every stage of the session.
+The check refuses the stage only when that interpreter also places the module elsewhere, naming
+both origins, with the stage's other refusals (`fingerprint.refuse`); the remedy is renaming one
+of the modules, or a new process when the program imported its own module of that name. When the
+interpreter cannot run, the prediction decides and the error says so. Predictions and
+confirmations are kept per `sys.path` and working directory until the session ends. A module
 nothing would find, or whose finder raised, is left alone: the worker's import fails loudly. Pivot
 changes nothing in the program's `sys.modules`.
+
+Cost: every by-name module of every stage is predicted once per import session (memoized by
+name, `sys.path` and working directory). On a 1,000-stage project with three by-name modules per
+stage, `pivot status` took 3.0% longer (95% interval 2.5% to 3.6%) and an all-cached `pivot repro`
+1.7% longer than on main; 1,000 stages with none, 0.9%. An interpreter start costs about 80 ms,
+once per session and only when a held module is suspect.
 
 The manifest cache records where each of those modules resolved when the walk ran (`o`, the
 prediction above), and a hit re-predicts them: a project file that takes over a name a library
@@ -404,9 +421,19 @@ Limits of the comparison:
   imports it when it unpickles the stage, before the stage's window opens.
 - A finder the program inserted in `sys.meta_path` after its interpreter started is assumed to be
   in the worker too; one a `.pth` file or a `sitecustomize` installs is.
+- The prediction reads a package's spec, so a package whose `__init__` changes its `__path__`
+  (`pkgutil.extend_path`, or an append) has its submodules predicted in the directories of the
+  spec, not of the loaded package. A submodule found elsewhere is then confirmed in a new
+  interpreter, which reads specs too.
 - A worker of a warm pool keeps the `sys.path` it started with, while the check reads the current
   one; the two differ only when the program changes `sys.path` between runs and loky reuses the
-  pool.
+  pool. In the same way, a pipeline object's fingerprints are kept (`ensure_fingerprint`), so
+  running the same pipeline object again after the program changes `sys.path` checks nothing
+  again; a new discovery does.
+- The parent's `PathFinder` keeps a finder per `sys.path` entry (`sys.path_importer_cache`), made
+  for a relative entry in the working directory of its first use. A relative entry with a `chdir`
+  between two stages of one session is predicted for the new working directory, while the
+  program's own imports still search the old one.
 
 A worker imports some user modules itself, from their files: a stage's module discovery does not
 send by value (outside the root, or under it in a `src` layout), a module outside the root that
