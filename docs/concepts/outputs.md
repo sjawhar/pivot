@@ -127,10 +127,12 @@ Pivot caches it as an artifact. A stage that returns a `dict[str, T]` tagged
 `directory` also makes a directory artifact; see
 [Directory outputs](#directory-outputs).
 
-A directory artifact, input or output, is hashed and cached whole. Every file
-under it counts, including names that code fingerprinting or watch mode may
-ignore, such as `__pycache__/`, `build/`, `.git/` or `*.pyc`. Editing any of
-them changes the directory hash, and all of them return on restore.
+A directory output is hashed and cached whole. Every file under it counts,
+including names `.pivotignore` lists, such as `__pycache__/`, `build/`, `.git/`
+or `*.pyc`: editing any of them changes the directory hash, and all of them
+return on restore. A directory input leaves out the files `.pivotignore` names
+from its hash; see
+[Directory inputs and `.pivotignore`](dependencies.md#directory-inputs-and-pivotignore).
 
 Empty directories are part of a directory artifact too: adding or removing one
 changes the directory hash, and every one the artifact held comes back on
@@ -165,6 +167,13 @@ are kept apart from theirs for the same reason.
 | A stage output | `.pivot/stages/<stage>=<key>.listing`, beside the stage's lock (`<stage>=.listing` for a stage's single output) |
 | A directory the pipeline declares as an input | `.pivot/stages/=inputs/<path>.listing`, one per project |
 | A tracked directory | `<path>.pvt.listing`, beside its `.pvt` |
+
+An input directory's listing holds the members its dependency hash counts, so
+it leaves out the files `.pivotignore` names, exactly as the hash in the lock
+beside it does; writing a `.pyc` into an input changes neither file. A tracked
+directory's `.pvt.listing` holds every file, because `pivot checkout` restores
+the whole directory from it (see
+[Directory inputs and `.pivotignore`](dependencies.md#directory-inputs-and-pivotignore)).
 
 In a file name, every byte of the key or path other than a letter, digit, `_`,
 `.`, `@` or `-` is written `%XX`; a name that would then be longer than 255

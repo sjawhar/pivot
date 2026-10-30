@@ -643,6 +643,77 @@ async def test_child_input_edit_reruns_directory_and_file_consumers(
             tg.cancel_scope.cancel()
 
 
+def _helper_ignored_input_source() -> str:
+    """pipeline.py with one stage reading the directory input ``inputs``."""
+    return """\
+import pathlib
+
+from pivot import Pipeline, stage
+
+
+@stage
+def directory(folder: pathlib.Path) -> str:
+    return (folder / "a.txt").read_text()
+
+
+with Pipeline("ignored") as pipeline:
+    directory(pipeline.input("folder", path="inputs", t=pathlib.Path))
+"""
+
+
+@pytest.mark.anyio
+async def test_change_pivotignore_names_inside_an_input_directory_runs_nothing(
+    watch_project: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A change .pivotignore names inside a stage's input directory starts no run (the
+    input's hash leaves it out); a change to any other file there still runs the stage."""
+    watch = _ScriptedWatch()
+    monkeypatch.setattr(watchfiles, "awatch", watch.awatch)
+    (watch_project / ".pivotignore").write_text("*.log\nscratch/\n")
+    inputs = watch_project / "inputs"
+    inputs.mkdir()
+    (inputs / "a.txt").write_text("one")
+    (watch_project / "pipeline.py").write_text(_helper_ignored_input_source())
+    pipeline = _helper_discover(watch_project)
+    output = _helper_output_path(watch_project, pipeline, "ignored/directory")
+    recorder = _Recorder()
+
+    async with engine_mod.Engine(pipeline=pipeline) as eng:
+        eng.add_sink(recorder)
+        eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+        eng.add_source(
+            sources.OneShotSource(stages=None, force=False, reason="test", max_workers=1)
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+            await recorder.wait_for(_helper_is_idle)
+            await _helper_wait_until_watching(eng)
+            assert output.read_text() == "one"
+
+            start = len(recorder.events)
+            (inputs / "debug.log").write_text("noise")
+            (inputs / "scratch").mkdir()
+            (inputs / "scratch" / "notes.txt").write_text("notes")
+            await watch.report(inputs / "debug.log", inputs / "scratch" / "notes.txt")
+            await anyio.sleep(1.0)
+            started = [
+                event
+                for event in recorder.events[start:]
+                if event["type"] in ("stage_started", "stage_completed", "engine_state_changed")
+            ]
+            assert started == [], "the ignored changes started no run"
+
+            (inputs / "a.txt").write_text("two")
+            await watch.report(inputs / "a.txt")
+            done = await recorder.wait_for(
+                _helper_completes("ignored/directory"), start=start, timeout=30
+            )
+            assert recorder.completed("ignored/directory", start=done) == StageStatus.RAN
+            assert output.read_text() == "two"
+            tg.cancel_scope.cancel()
+
+
 def _helper_symlinked_input_source() -> str:
     """pipeline.py with direct, directory, and symlink aliases for one input file."""
     return """\

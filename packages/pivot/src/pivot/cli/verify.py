@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import pathlib
 from typing import TYPE_CHECKING, Literal, TypedDict
 
@@ -17,7 +18,22 @@ from pivot.storage import listing, lock, track
 from pivot.types import HashInfo, LockData, PipelineStatus, PipelineStatusInfo, is_dir_hash
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pivot.remote import protocol
+
+    # The project's tracked files by data path (``track.discover_pvt_files``), read when first
+    # asked for, and once for all of verify's own checks (the status explanations verify reads
+    # scan once more, in ``status``)
+    TrackedFiles = Callable[[], dict[str, track.PvtData]]
+
+
+def _project_tracked_files(skip: track.PvtSkip | None) -> TrackedFiles:
+    """The project's tracked files, scanned for ``.pvt`` files once, when first asked for.
+    ``skip`` leaves out a stage's own ``*.pvt`` member of its output, which tracks nothing."""
+    return functools.cache(
+        functools.partial(track.discover_pvt_files, project.get_project_root(), skip=skip)
+    )
 
 
 VerifyStatus = Literal["passed", "failed"]
@@ -79,16 +95,16 @@ def _check_tracked_listing(
 
 
 def _tracked_listing_failures(
-    files_dir: pathlib.Path, skip: track.PvtSkip | None
+    files_dir: pathlib.Path, tracked_files: TrackedFiles
 ) -> list[StageVerifyInfo]:
     """A failed result, named by its path, for each tracked directory in the project whose
     committed ``.pvt.listing`` cannot be used (``_check_tracked_listing``), whether or not a
-    stage reads it: a fresh clone would have no cache to restore it from. ``skip`` leaves out a
-    stage's own ``*.pvt`` member of its output, which tracks nothing and whose directory a
-    restore of that output reads from the lock's listing."""
+    stage reads it: a fresh clone would have no cache to restore it from. ``tracked_files``
+    leaves out a stage's own ``*.pvt`` member of its output, which tracks nothing and whose
+    directory a restore of that output reads from the lock's listing."""
     project_root = project.get_project_root()
     failures = list[StageVerifyInfo]()
-    for path, pvt_data in sorted(track.discover_pvt_files(project_root, skip=skip).items()):
+    for path, pvt_data in sorted(tracked_files().items()):
         try:
             _check_tracked_listing(pathlib.Path(path), pvt_data, files_dir)
         except exceptions.CorruptListingError as e:
@@ -103,17 +119,57 @@ def _tracked_listing_failures(
     return failures
 
 
+def _tracked_input_objects(
+    input_path: str, tracked: dict[str, track.PvtData], files_dir: pathlib.Path
+) -> dict[str, str]:
+    """The cache objects that restore the tracked data holding the pipeline input at
+    ``input_path`` (project-relative), by workspace path: every tracked file or directory at,
+    under or above it, a directory's listing object and each file it lists.
+
+    These are what pull fetches for the input (``sync.get_target_hashes``) and what checkout
+    restores it from. The lock's dependency hash of a directory input leaves out what
+    ``.pivotignore`` names, and its listing object is written only to the cache of the machine
+    that ran the stage; it is derived from the whole listing wherever it is needed
+    (``WorkspaceStore.recorded_input_hash``), so it is never required from a remote. Imports
+    are left out, as pull leaves them out. Raises CorruptListingError for a ``.pvt.listing``
+    that cannot be used.
+    """
+    target = pathlib.PurePosixPath(input_path)
+    objects = dict[str, str]()
+    for data_path, pvt_data in tracked.items():
+        if track.is_import(pvt_data):
+            continue
+        relpath = pathlib.PurePosixPath(project.to_relative_path(data_path))
+        if not (relpath.is_relative_to(target) or target.is_relative_to(relpath)):
+            continue
+        record = track.pvt_to_hash_info(pvt_data)
+        objects[str(relpath)] = record["hash"]
+        if not is_dir_hash(record):
+            continue
+        try:
+            members = track.tracked_members(
+                pathlib.Path(data_path), pvt_data, files_dir, on_stale=listing.OnStale.REFUSE
+            )
+        except exceptions.ListingMissingError:
+            continue
+        for entry in members["files"]:
+            objects[str(relpath / entry["relpath"])] = entry["hash"]
+    return objects
+
+
 def _get_stage_lock_hashes(
-    stage_name: str,
+    stage_name: str, tracked_files: TrackedFiles
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Get output and dep cache-object hashes from a stage's lock file and listings.
 
     Returns (output_hashes, dep_hashes) where each is {path: hash}.
 
-    For both outputs and deps, a directory contributes its listing object and its files; a
-    tracked directory a dep names has its ``.pvt.listing`` checked too. Non-cached outputs
-    (e.g. Metric with cache=False) are excluded — they are git-tracked, not in cache. Raises
-    CorruptListingError, naming the file, for a listing that cannot be used.
+    For both outputs and deps, a directory contributes its listing object and its files. A
+    directory input held by tracked data contributes what restores that data instead
+    (``_tracked_input_objects``, over ``tracked_files``); a directory input `pivot import`
+    wrote has its ``.pvt.listing`` checked. Non-cached outputs (e.g. Metric with cache=False)
+    are excluded — they are git-tracked, not in cache. Raises CorruptListingError, naming the
+    file, for a listing that cannot be used.
     """
     stage_info = cli_helpers.get_stage(stage_name)
     default_state_dir = config.locate_state_dir()
@@ -178,6 +234,13 @@ def _get_stage_lock_hashes(
                     committed = lock.committed_listing(producer_lock, committed)
         else:
             dep_path = workspace_store.checkout(ref)
+            if is_dir_hash(hash_info):
+                restore_objects = _tracked_input_objects(
+                    project.to_relative_path(dep_path), tracked_files(), files_dir
+                )
+                if restore_objects:
+                    dep_hashes.update(restore_objects)
+                    continue
             committed = lock.committed_listing(
                 lock_data,
                 listing.input_listing_path(
@@ -199,13 +262,14 @@ def _get_stage_lock_hashes(
 def _get_stage_missing_workspace_files(
     stage_name: str,
     project_root: pathlib.Path,
+    tracked_files: TrackedFiles,
 ) -> list[str]:
     """Get output workspace files that are missing from disk for a non-stale stage.
 
     Returns list of relative paths for output files that don't exist on disk.
     Excludes metric outputs (git-tracked, not workspace files).
     """
-    output_hashes, _ = _get_stage_lock_hashes(stage_name)
+    output_hashes, _ = _get_stage_lock_hashes(stage_name, tracked_files)
     missing = list[str]()
     for rel_path in output_hashes:
         if not (project_root / rel_path).exists():
@@ -236,13 +300,14 @@ def _get_stage_missing_hashes(
     local_hashes: set[str],
     allow_missing: bool,
     project_root: pathlib.Path,
+    tracked_files: TrackedFiles,
 ) -> dict[str, list[str]]:
     """Get hashes missing from local cache for a stage.
 
     Returns {hash: [paths]} for hashes not in local cache.
     When allow_missing=True, also includes deps missing locally.
     """
-    output_hashes, dep_hashes = _get_stage_lock_hashes(stage_name)
+    output_hashes, dep_hashes = _get_stage_lock_hashes(stage_name, tracked_files)
     hash_to_paths = dict[str, list[str]]()
 
     # Check outputs: must be in local cache or (with allow_missing) on remote
@@ -313,6 +378,7 @@ def _verify_stages(
     pipeline_status: list[PipelineStatusInfo],
     cache_dir: pathlib.Path,
     allow_missing: bool,
+    tracked_files: TrackedFiles,
 ) -> tuple[bool, list[StageVerifyInfo]]:
     """Verify all stages and return pass/fail status with details.
 
@@ -333,7 +399,7 @@ def _verify_stages(
             continue
         try:
             hash_to_paths = _get_stage_missing_hashes(
-                stage_info["name"], local_hashes, allow_missing, project_root
+                stage_info["name"], local_hashes, allow_missing, project_root, tracked_files
             )
         except exceptions.CorruptListingError as e:
             listing_problems[stage_info["name"]] = f"{e}. {e.REMEDY}"
@@ -412,7 +478,9 @@ def _verify_stages(
         # This catches the case where outputs were deleted from the workspace
         # but the hash is still in the local cache.
         if not missing_files and not allow_missing:
-            missing_workspace = _get_stage_missing_workspace_files(stage_name, project_root)
+            missing_workspace = _get_stage_missing_workspace_files(
+                stage_name, project_root, tracked_files
+            )
             if missing_workspace:
                 missing_files = missing_workspace
 
@@ -513,8 +581,10 @@ def verify(
     if not pipeline_status:
         raise click.ClickException("No stages to verify.")
 
-    # Verify stages
-    passed, results = _verify_stages(pipeline_status, cache_dir, allow_missing)
+    # Verify stages; verify's own checks share one scan of the project's .pvt files. A stage's
+    # own .pvt member of its output, in any pipeline, is no tracked file or directory.
+    tracked_files = _project_tracked_files(cli_helpers.own_member_skip(cache_dir / "files"))
+    passed, results = _verify_stages(pipeline_status, cache_dir, allow_missing, tracked_files)
     not_expanded = status_mod.not_expanded_status(result, shown_templates)
     results.extend(
         StageVerifyInfo(name=row["name"], status="failed", reason=row["reason"], missing_files=[])
@@ -522,10 +592,7 @@ def verify(
     )
     passed = passed and not not_expanded
     if stages_list is None:
-        # A stage's own .pvt member of its output, in any pipeline, is no tracked directory
-        tracked_failures = _tracked_listing_failures(
-            cache_dir / "files", cli_helpers.own_member_skip(cache_dir / "files")
-        )
+        tracked_failures = _tracked_listing_failures(cache_dir / "files", tracked_files)
         results.extend(tracked_failures)
         passed = passed and not tracked_failures
 

@@ -26,7 +26,9 @@ pivot init
 - `.pivot/`: the project marker and its `config.yaml`
 - `<state dir>/.gitignore`: keeps the cache, state database, artifact locks and agent socket out
   of git; `<state dir>` is `core.state_dir` and defaults to `.pivot`
-- `.pivotignore`: patterns for files watch mode ignores
+- `.pivotignore`: files a directory input's hash leaves out, such as `__pycache__/` and
+  `*.pyc`, so a change to them reruns nothing; watch mode skips them too (see
+  [Directory inputs and `.pivotignore`](../concepts/dependencies.md#directory-inputs-and-pivotignore))
 
 `core.state_dir` selects where Pivot writes state. Commit the lock files under
 `<state dir>/stages/`; they record what ran and what it produced.

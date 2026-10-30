@@ -218,7 +218,7 @@ def _get_file_hash_from_pvt(
     proj_root: pathlib.Path,
     files_dir: pathlib.Path,
     *,
-    skip: track.PvtSkip | None = None,
+    skip: track.PvtSkip | None,
     require_members: bool = False,
 ) -> set[str] | None:
     """The cache objects of a path tracked by a .pvt file; None when ``skip`` leaves that .pvt
@@ -238,27 +238,47 @@ def _get_file_hash_from_pvt(
     )
 
 
-def _get_tracked_blobs(
+def _get_tracked_artifacts(
     proj_root: pathlib.Path,
-    files_dir: pathlib.Path,
     *,
-    skip: track.PvtSkip | None = None,
-    require_members: bool = False,
-) -> dict[str, set[str]]:
-    """The cache objects of every `pivot track`-ed file or directory, by its recorded hash.
+    skip: track.PvtSkip | None,
+) -> dict[pathlib.PurePosixPath, tuple[pathlib.Path, track.PvtData]]:
+    """Every `pivot track`-ed file or directory in the project, by its project-relative path.
 
     Imports are left out: `pivot import` writes the file straight to the workspace, so its
     blob never enters the local cache and push never sends it to this project's remote. So is
     a stage's own ``*.pvt`` member of its output (``skip``): it records no tracked file, so no
     dependency may resolve through it.
     """
-    blobs = dict[str, set[str]]()
-    for data_path, pvt_data in track.discover_pvt_files(proj_root, skip=skip).items():
-        if track.is_import(pvt_data):
-            continue
-        blobs[pvt_data["hash"]] = _tracked_blobs(
-            pathlib.Path(data_path), pvt_data, files_dir, require_members=require_members
+    return {
+        pathlib.PurePosixPath(project.to_relative_path(data_path, proj_root)): (
+            pathlib.Path(data_path),
+            pvt_data,
         )
+        for data_path, pvt_data in track.discover_pvt_files(proj_root, skip=skip).items()
+        if not track.is_import(pvt_data)
+    }
+
+
+def _tracked_blobs_for_input(
+    tracked: dict[pathlib.PurePosixPath, tuple[pathlib.Path, track.PvtData]],
+    input_path: str,
+    files_dir: pathlib.Path,
+    *,
+    require_members: bool = False,
+) -> set[str]:
+    """The cache objects of every tracked artifact that holds the input at ``input_path``: the
+    ones at or under it, and the one it lies inside.
+
+    They come from the ``.pvt`` files, which keep every file, not from the lock's dependency
+    hash, which leaves out what ``.pivotignore`` names: a ``.pvt`` restores its directory whole,
+    so every member must be in the cache, the ignored ones included.
+    """
+    target = pathlib.PurePosixPath(input_path)
+    blobs = set[str]()
+    for path, (data_path, pvt_data) in tracked.items():
+        if path.is_relative_to(target) or target.is_relative_to(path):
+            blobs |= _tracked_blobs(data_path, pvt_data, files_dir, require_members=require_members)
     return blobs
 
 
@@ -296,7 +316,7 @@ def get_target_hashes(
     hashes = set[str]()
     output_identities: dict[str, types.ArtifactIdentity] | None = None
     unresolved = list[str]()
-    tracked_blobs: dict[str, set[str]] | None = None
+    tracked: dict[pathlib.PurePosixPath, tuple[pathlib.Path, track.PvtData]] | None = None
     skip = member_skip.own_member_skip(proj_root, all_stages or {}, state_dir, files_dir)
 
     for target in targets:
@@ -340,7 +360,9 @@ def get_target_hashes(
                             # Only deps whose blobs pivot caches (and so pushes) can be fetched:
                             # upstream stage outputs and `pivot track` inputs. Raw inputs
                             # committed to git and `pivot import` inputs are never in the remote.
-                            # A producer's listing is read beside its own lock (_output_blobs).
+                            # A producer's listing is read beside its own lock (_output_blobs);
+                            # a tracked input's comes from its .pvt, by the input's path.
+                            input_paths = stage_info["input_paths"]
                             producer_locks = dict[str, LockData | None]()
                             for dep_identity, dep_hash in lock_data["dep_hashes"].items():
                                 producer_info = all_stages.get(dep_identity.producer)
@@ -366,14 +388,17 @@ def get_target_hashes(
                                             require_members=require_members,
                                         )
                                     continue
-                                if tracked_blobs is None:
-                                    tracked_blobs = _get_tracked_blobs(
-                                        proj_root,
-                                        files_dir,
-                                        skip=skip,
-                                        require_members=require_members,
-                                    )
-                                hashes |= tracked_blobs.get(dep_hash["hash"], set[str]())
+                                input_path = input_paths.get(types.identity_key(dep_identity))
+                                if input_path is None:
+                                    continue
+                                if tracked is None:
+                                    tracked = _get_tracked_artifacts(proj_root, skip=skip)
+                                hashes |= _tracked_blobs_for_input(
+                                    tracked,
+                                    input_path,
+                                    files_dir,
+                                    require_members=require_members,
+                                )
                         continue
             else:
                 resolved_identity = types.ArtifactIdentity(stage_name, target_identity.key)

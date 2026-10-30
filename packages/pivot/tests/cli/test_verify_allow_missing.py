@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import pathlib
 from typing import TYPE_CHECKING
 
 from pivot import cli, compose, config, types
-from pivot.storage import cache, lock
+from pivot.storage import cache, lock, track
 
 if TYPE_CHECKING:
     import click.testing
@@ -25,6 +26,21 @@ def produce(input_file: str) -> str:
 @compose.stage
 def consume(produced: str) -> str:
     return f"consumed: {produced}"
+
+
+@compose.stage
+def walk_a(source: pathlib.Path) -> str:
+    return str(len(list(source.iterdir())))
+
+
+@compose.stage
+def walk_b(source: pathlib.Path) -> str:
+    return str(len(list(source.iterdir())))
+
+
+@compose.stage
+def walk_c(source: pathlib.Path) -> str:
+    return str(len(list(source.iterdir())))
 
 
 def _helper_mock_remote(mocker: MockerFixture, *, exists: bool) -> None:
@@ -122,3 +138,47 @@ def test_verify_allow_missing_names_stale_producer_dependency(
     assert result.exit_code == 1, result.output
     assert f"✗ {consumer_stage}: failed" in result.output
     assert f"Input dependencies changed: {producer_stage}" in result.output
+
+
+def test_verify_allow_missing_scans_the_project_for_pvt_files_once(
+    mock_discovery: compose.Pipeline,
+    runner: click.testing.CliRunner,
+    mocker: MockerFixture,
+) -> None:
+    """Every stage with a directory input asks which tracked data holds it, from one scan of the
+    project for .pvt files per command, not one per stage: status's explanations scan once, and
+    verify once."""
+    root = mock_discovery.root
+    state_dir = config.get_state_dir()
+    with mock_discovery:
+        for name, walk in (("a", walk_a), ("b", walk_b), ("c", walk_c)):
+            source = root / "data" / "raw" / name
+            source.mkdir(parents=True)
+            (source / "f.txt").write_text(name)
+            walk(mock_discovery.input(name, t=pathlib.Path))
+    for stage_name, name in zip(mock_discovery.list_stages(), ("a", "b", "c"), strict=True):
+        output = root / "data" / "test" / f"{stage_name.rpartition('/')[2]}.txt"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("1")
+        out_hash = cache.save_to_cache(
+            output, config.get_cache_dir() / "files", checkout_mode=config.CheckoutMode.COPY
+        )
+        lock.StageLock(stage_name, lock.get_stages_dir(state_dir)).write(
+            types.LockData(
+                code_manifest=mock_discovery.ensure_fingerprint(stage_name),
+                params={},
+                dep_hashes={
+                    types.ArtifactIdentity(name, None): cache.hash_directory(
+                        root / "data" / "raw" / name
+                    )["record"]
+                },
+                output_hashes={types.ArtifactIdentity(stage_name, None): out_hash},
+            )
+        )
+    _helper_mock_remote(mocker, exists=True)
+    scans = mocker.spy(track, "discover_pvt_files")
+
+    result = runner.invoke(cli.cli, ["verify", "--allow-missing"])
+
+    assert result.exit_code == 0, result.output
+    assert scans.call_count == 2, "one scan for status's explanations and one for verify"
