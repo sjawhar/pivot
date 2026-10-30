@@ -737,11 +737,53 @@ class Pipeline:
         return self._registry.snapshot()
 
     def include(self, other: registry.PipelineLike) -> None:
+        """Add ``other``'s stages, templates and input bindings to this pipeline.
+
+        All or nothing: the include works on copies of this pipeline's records, and outside a
+        construction block on a copy of its registry, which it keeps only once every check has
+        passed. A refused include (a conflicting stage, template, input binding, output path or
+        state directory) leaves the pipeline as it was.
+        """
         if other is self:
             from pivot.exceptions import PipelineConfigError
 
             raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
+        kept = (
+            self._included_stages,
+            self._included_templates,
+            self._inputs,
+            self._input_names_by_path,
+            self._loaded_pipelines,
+            self._included_state_dirs,
+            self._resolved_state_dirs,
+            self._registry,
+        )
+        self._included_stages = dict(self._included_stages)
+        self._included_templates = dict(self._included_templates)
+        self._inputs = dict(self._inputs)
+        self._input_names_by_path = dict(self._input_names_by_path)
+        self._loaded_pipelines = set(self._loaded_pipelines)
+        self._included_state_dirs = dict(self._included_state_dirs)
+        self._resolved_state_dirs = dict(self._resolved_state_dirs)
+        if not self._constructing:
+            self._registry = self._registry.copy()
+        try:
+            self._include(other)
+        except BaseException:
+            (
+                self._included_stages,
+                self._included_templates,
+                self._inputs,
+                self._input_names_by_path,
+                self._loaded_pipelines,
+                self._included_state_dirs,
+                self._resolved_state_dirs,
+                self._registry,
+            ) = kept
+            raise
 
+    def _include(self, other: registry.PipelineLike) -> None:
+        """``include``'s checks and changes, on the copies it made."""
         # One project's state stays in one directory; checked before anything changes.
         for root, resolution in other.resolved_state_dirs.items():
             held = self._held_state_dir(root)

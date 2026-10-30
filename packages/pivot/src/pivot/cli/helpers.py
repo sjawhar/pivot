@@ -166,6 +166,43 @@ def resolve_run_targets(targets: list[str]) -> list[str]:
     return named
 
 
+def refuse_template_output_targets(targets: list[str]) -> None:
+    """Refuse a target that is an output path a mapped stage (``Pipeline.map``) declares. No
+    stage writes it, since each instance writes its own, so it names no stage, whether or not
+    the mapped stage has expanded.
+
+    Raises:
+        click.ClickException: Naming each such target, its mapped stage and the path each of
+            its instances writes instead.
+    """
+    from pivot import registry
+    from pivot.storage import store as store_mod
+
+    pipeline = get_pipeline()
+    templates = pipeline.list_templates()
+    if not templates:
+        return
+    store = require_workspace_store()
+    declared = store.output_identities_by_path(
+        out for name in templates for out in pipeline.get_template(name)["info"]["outs"]
+    )
+    proj_root = project.get_project_root()
+    refusals = list[str]()
+    for target in targets:
+        path = project.to_relative_path(project.normalize_path(target), proj_root)
+        if path not in declared:
+            continue
+        name = declared[path].producer
+        instance = registry.instantiate(pipeline.get_template(name), "<key>", "<key>")
+        written = ", ".join(str(store_mod.relative_output_path(out)) for out in instance["outs"])
+        refusals.append(
+            f"'{target}' is the output path of mapped stage '{name}', which no stage writes: "
+            + f"each instance writes its own ({written})"
+        )
+    if refusals:
+        raise click.ClickException("\n".join(refusals))
+
+
 def mapped_target_names(targets: list[str], result: Expansion) -> list[str]:
     """``targets`` with each name of a template (``Pipeline.map``) replaced after an expansion
     (``expand_mapped_stages``): an expanded template by its instances, a template not expanded,

@@ -414,7 +414,9 @@ key's chain only, and a new file runs the producer and the new chain only.
   the target p/build@zzz` for a target further down the chain. A path target is
   resolved through the expansion, as `pivot dag` resolves it: `pivot repro
   data/p/build@a.yaml` runs `p/build@a`'s chain once `p/plan` is current, and
-  before that the refusal names the mapped stages not yet expanded. `pivot run p/cut`
+  before that the refusal names the mapped stages not yet expanded. The output
+  path the mapped stage declares (`data/p/cut.yaml`) is refused either way, naming
+  its instances' path (`data/p/cut@<key>.yaml`): no stage writes it. `pivot run p/cut`
   is refused: a mapped stage expands only in a run that finds its producer current.
   Nothing about an expansion is saved: each
   run expands afresh. A watch run (`pivot repro --watch`) expands as any run does,

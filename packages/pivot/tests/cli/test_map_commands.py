@@ -223,6 +223,25 @@ def test_repro_takes_an_instance_output_path_as_pivot_dag_does(tmp_path: pathlib
     assert not (root / "data" / "p" / "cut@a.yaml").exists(), "the path's chain runs alone"
 
 
+def test_repro_refuses_the_output_path_a_mapped_stage_declares(tmp_path: pathlib.Path) -> None:
+    """No stage writes `data/p/cut.yaml`: each instance of `p/cut` writes its own. Before the
+    producer runs and after, the target is refused, naming the mapped stage and its instances'
+    path."""
+    root, home = _project(tmp_path, {"a": 1})
+
+    before = helpers.run_pivot(root, home, "repro", "--dry-run", "data/p/cut.yaml")
+    _ok(helpers.run_pivot(root, home, "repro", "p/plan"))
+    after = helpers.run_pivot(root, home, "repro", "--dry-run", "data/p/cut.yaml")
+
+    for refused in (before, after):
+        assert refused.returncode != 0, refused.stdout
+        message = " ".join(refused.stderr.split())
+        assert (
+            "'data/p/cut.yaml' is the output path of mapped stage 'p/cut', which no stage "
+            + "writes: each instance writes its own (data/p/cut@<key>.yaml)"
+        ) in message, refused.stderr
+
+
 def test_a_run_targeted_at_the_producer_expands_nothing(tmp_path: pathlib.Path) -> None:
     root, home = _project(tmp_path, {"a": 1, "b": 2})
 

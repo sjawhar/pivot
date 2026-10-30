@@ -311,6 +311,35 @@ def test_an_included_stage_named_as_an_instance_of_a_mapped_stage_is_refused(
     assert "p/_helper_cut@a" not in combined.list_stages()
 
 
+def test_a_refused_include_leaves_the_pipeline_as_it_was(tmp_path: pathlib.Path) -> None:
+    """The mapped `p/_helper_cut` is refused beside the included `p/_helper_cut@a`, so the
+    include adds nothing: not its producer `p/_helper_plan`, not its input."""
+    with compose.Pipeline("p", root=tmp_path) as static, static.variant("a"):
+        _helper_cut(_helper_value())
+    with compose.Pipeline("p", root=tmp_path) as mapped:
+        plan = _helper_plan(_plan_input(mapped))
+        _helper_cut(mapped.map(plan))
+    combined = compose.Pipeline("all", root=tmp_path)
+    combined.include(static)
+
+    def _state() -> tuple[object, ...]:
+        return (
+            combined.list_stages(),
+            combined.list_templates(),
+            dict(combined.input_bindings),
+            combined.loaded_pipelines,
+        )
+
+    before = _state()
+
+    with pytest.raises(exceptions.ValidationError, match="has the name of an instance"):
+        combined.include(mapped)
+
+    assert _state() == before
+    assert "p/_helper_plan" not in combined.list_stages()
+    assert combined.input_bindings == {}, "the refused include bound no input"
+
+
 def test_variants_of_a_mapped_stage_beside_each_other_load(tmp_path: pathlib.Path) -> None:
     """Neither `p/_helper_cut@a` nor `p/_helper_cut@b` is the other's instance."""
     with compose.Pipeline("p", root=tmp_path) as pipeline:

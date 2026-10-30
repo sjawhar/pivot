@@ -324,6 +324,17 @@ class StageRegistry:
         """
         return dict(self._stages)
 
+    def copy(self) -> StageRegistry:
+        """A registry holding these stages, templates, instances and output paths, which can
+        change without changing this one (``Pipeline.include`` tries an include on one). The
+        stage and template entries are shared, as ``snapshot`` shares them."""
+        copied = StageRegistry()
+        copied._stages = dict(self._stages)
+        copied._templates = dict(self._templates)
+        copied._instances = {name: list(stages) for name, stages in self._instances.items()}
+        copied._output_paths = self._output_paths.copy()
+        return copied
+
 
 @runtime_checkable
 class PipelineLike(Protocol):

@@ -983,6 +983,8 @@ def repro(
         not_expanded = list[str]()
 
         if not all(s in registered for s in others):
+            # A mapped stage's declared output path names no stage: each instance writes its own
+            cli_helpers.refuse_template_output_targets(others)
             # Resolve file paths to producer stages through the expansion, as `pivot dag` does:
             # an instance's output path names the instance, whose chain the run reaches alone
             result, _ = cli_helpers.expand_mapped_stages()
