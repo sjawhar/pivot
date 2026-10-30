@@ -255,9 +255,16 @@ def _run_pipeline(
             SchemaVersionEvent(type=RunEventType.SCHEMA_VERSION, version=_JSONL_SCHEMA_VERSION)
         )
 
-    # Build DAG and get execution order for TUI display
+    # Build DAG and get execution order for TUI display. The DAG holds a mapped stage
+    # (Pipeline.map), not its instances: an instance is reached through its mapped stage.
     graph = cli_helpers.build_dag()
-    execution_order = engine_graph.get_execution_order(graph, stages_list, single_stage=False)
+    templates = cli_helpers.get_pipeline().list_templates()
+    graph_targets = (
+        None
+        if stages_list is None
+        else list(dict.fromkeys(registry.template_of(s, templates) or s for s in stages_list))
+    )
+    execution_order = engine_graph.get_execution_order(graph, graph_targets, single_stage=False)
 
     if not execution_order and not watch:
         # Emit execution result for JSONL mode
@@ -958,31 +965,33 @@ def repro(
                 cli_decorators.store_pipeline_in_context(combined)
 
         # Fast-path: if all targets are registered stage names, skip graph construction. A
-        # mapped stage (Pipeline.map) is a target too, and an instance of one stands for it: the
-        # run expands the mapped stage as it finds its producer current.
+        # mapped stage (Pipeline.map) is a target too, and so is one of its instances, checked as
+        # `pivot status` checks it: the run reaches the instance through its mapped stage and
+        # runs that instance's chain alone.
         registered = set(cli_helpers.list_stages())
         templates = cli_helpers.get_pipeline().list_templates()
-        stages_list = [
+        stages_list = cli_helpers.resolve_run_targets(stages_list)
+        mapped = {
             stage
-            if stage in registered
-            else (cli_helpers.template_target(stage, templates) or stage)
             for stage in stages_list
-        ]
-        registered.update(templates)
+            if stage in templates or registry.template_of(stage, templates) is not None
+        }
+        others = [stage for stage in stages_list if stage not in mapped]
 
-        resolved = set[str]()
+        resolved = set(mapped)
         unresolved = list[str]()
 
-        if stages_list and not all(s in registered for s in stages_list):
+        if not all(s in registered for s in others):
             # Build graph and resolve file paths to producer stages (same as pivot dag)
             graph_stages = cli_helpers.get_graph_stages()
             bipartite_graph = engine_graph.build_graph(graph_stages)
-            resolved, unresolved = cli_targets.resolve_targets_to_stages(
-                stages_list, bipartite_graph, stages=graph_stages
+            found, unresolved = cli_targets.resolve_targets_to_stages(
+                others, bipartite_graph, stages=graph_stages
             )
-        elif stages_list:
+            resolved |= found
+        else:
             # All remaining targets are registered stages - no resolution needed
-            resolved = set(stages_list)
+            resolved |= set(others)
 
         # Merge pipeline-file resolved stages
         resolved |= pipeline_resolved

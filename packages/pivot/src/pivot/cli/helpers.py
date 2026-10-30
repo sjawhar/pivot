@@ -108,6 +108,64 @@ def template_target(name: str, templates: list[str]) -> str | None:
     return bare[0] if len(bare) == 1 else None
 
 
+def mapped_name(name: str, templates: list[str]) -> str | None:
+    """The qualified name of the template (``Pipeline.map``) or instance a target names, bare or
+    qualified (``template_target``): the template's own name, or ``<template>@<key>``; None when
+    it names neither."""
+    from pivot import registry
+
+    template = template_target(name, templates)
+    if template is None:
+        return None
+    if names.resolve_stage_name(name, dict.fromkeys(templates)) == template:
+        return template
+    if registry.template_of(name, [template]) == template:
+        return name
+    return f"{template}{name[len(template.rsplit('/', 1)[-1]) :]}"
+
+
+def resolve_run_targets(targets: list[str]) -> list[str]:
+    """``targets`` for a run that expands mapped stages (``Pipeline.map``) as it goes,
+    ``pivot repro``.
+
+    A name of a template or of one of its instances, bare or qualified, becomes its qualified
+    name (``mapped_name``); the run reaches an instance through its template and adds that
+    instance alone of the template's, with its chain. An instance is checked as ``pivot status``
+    checks it (``resolve_mapped_targets``): when its template expands now, the expansion must
+    add it. Any other target is left for the caller to resolve as a stage or a path.
+
+    Raises:
+        StageNotFoundError: Naming every instance whose template expands now without it, as
+            ``pivot status`` names it.
+    """
+    from pivot import registry
+
+    pipeline = get_pipeline()
+    registered = dict.fromkeys(pipeline.list_stages())
+    templates = pipeline.list_templates()
+    named = list[str]()
+    # Each instance named, by the target naming it
+    instances = dict[str, str]()
+    for target in targets:
+        name = None if target in registered else mapped_name(target, templates)
+        named.append(target if name is None else name)
+        if name is not None and name not in templates:
+            instances[target] = name
+    if not instances:
+        return named
+    result, _ = expand_mapped_stages()
+    available = [*pipeline.list_stages(), *templates]
+    pipeline.reset_expansions()
+    unknown = list[str]()
+    for target, name in instances.items():
+        template = registry.template_of(name, templates)
+        if template in result["expanded"] and name not in result["expanded"][template]:
+            unknown.append(target)
+    if unknown:
+        raise exceptions.StageNotFoundError(unknown, available_stages=available)
+    return named
+
+
 def mapped_target_names(targets: list[str], result: Expansion) -> list[str]:
     """``targets`` with each name of a template (``Pipeline.map``) replaced after an expansion
     (``expand_mapped_stages``): an expanded template by its instances, a template not expanded,

@@ -530,6 +530,8 @@ class PivotApp(textual.app.App[None]):
             info.live_output_snapshot = msg["output_summary"]
         if info.is_template and status == StageStatus.FAILED:
             self._show_template_failure(info)
+        if info.is_template and status in (StageStatus.FAILED, StageStatus.BLOCKED):
+            self._drop_template_rows(info)
 
         # Watch mode: history capture
         if self._watch_mode:
@@ -618,6 +620,20 @@ class PivotApp(textual.app.App[None]):
         for name in instances:
             if name not in self._stages:
                 self._stages[name] = StageInfo(name, 0, 0)
+
+    def _drop_template_rows(self, info: StageInfo) -> None:
+        """A template that failed or was blocked in this run added no instance: drop the rows
+        its last expansion added, so the list shows no instance this run does not have, and the
+        template row reads why it has none."""
+        dropped = set(info.instances or ())
+        info.instances = None
+        if not dropped:
+            return
+        for name in dropped:
+            _ = self._stages.pop(name, None)
+            _ = self._pending_history.pop(name, None)
+        self._stage_order = [name for name in self._stage_order if name not in dropped]
+        self._show_stage_list_changes(self._selected_stage_name)
 
     def _show_template_failure(self, info: StageInfo) -> None:  # pragma: no cover
         """Show a refused expansion's reason in the template's log, where a failed stage shows

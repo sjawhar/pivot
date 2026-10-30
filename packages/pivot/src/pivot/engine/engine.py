@@ -179,14 +179,18 @@ class _MapRun:
 
     A template is a node of the run's schedule with no resources. When its upstream stages
     have finished, its producer among them, the engine reads the producer's recorded listing of
-    the directory and adds one instance per file. ``stage_order``, ``all_stages`` and
-    ``committed_before`` are the run's own records, which each expansion extends.
+    the directory and adds one instance per file, or, for a template in ``wanted``, the instance
+    of each key it names. ``stage_order``, ``all_stages`` and ``committed_before`` are the run's
+    own records, which each expansion extends.
     """
 
     templates: set[str]
     # Each source directory's (key, file key) pairs, read once per run so chained templates
     # expand over the same keys
     keys: dict[types.ArtifactIdentity, list[tuple[str, str]]]
+    # The keys a template expands when the run's targets name instances (``_mapped_targets``);
+    # a template it does not hold expands every key
+    wanted: dict[str, set[str]]
     stage_order: list[str]
     all_stages: dict[str, RegistryStageInfo]
     committed_before: dict[pathlib.Path, tuple[int, int, int] | None]
@@ -326,6 +330,49 @@ def _refuse_single_stage_templates(
     for name in stages:
         if name in templates:
             raise expansion.single_stage_refusal(name, templates[name])
+
+
+def _mapped_targets(
+    stages: list[str], templates: dict[str, registry.MapTemplate]
+) -> tuple[list[str], dict[str, set[str]]]:
+    """Run targets ``stages`` with each instance name (``<template>@<key>``) replaced by its
+    template, and the keys each template expands so the run adds the named instances alone,
+    each with its chain: an instance's key for its template and for every template that one is
+    mapped over. A template named itself, or upstream of one named itself, expands every key
+    and has no entry; so does every template when no target names an instance.
+
+    The instances of a run's expansions are gone when this is called (``reset_expansions``), so
+    a watch run's affected instance and a name the user gave are both reached this way.
+    """
+    # Each template's keys; None for every key
+    wanted = dict[str, set[str] | None]()
+    targets = list[str]()
+    for stage in stages:
+        template = None if stage in templates else registry.template_of(stage, templates)
+        if template is None:
+            if stage in templates:
+                wanted[stage] = None
+            targets.append(stage)
+            continue
+        targets.append(template)
+        keys = wanted.setdefault(template, set[str]())
+        if keys is not None:
+            keys.add(stage[len(template) + 1 :])
+    pending = list(wanted)
+    while pending:
+        name = pending.pop()
+        keys = wanted[name]
+        for upstream in {dep for dep in templates[name]["mapped_deps"].values() if dep is not None}:
+            if upstream in wanted:
+                before = wanted[upstream]
+                if before is None or (keys is not None and keys <= before):
+                    continue
+                wanted[upstream] = None if keys is None else before | keys
+            else:
+                wanted[upstream] = None if keys is None else set(keys)
+            pending.append(upstream)
+    filtered = {name: keys for name, keys in wanted.items() if keys is not None}
+    return list(dict.fromkeys(targets)), filtered
 
 
 def _read_map_keys(source: types.ArtifactIdentity, map_run: _MapRun) -> list[tuple[str, str]]:
@@ -1138,12 +1185,20 @@ class Engine:
     def _drop_removed_stages(self, request: RunRequested) -> RunRequested | None:
         """``request`` without stages a reload removed since it was made; None if none remain.
 
-        An empty stage list would mean every stage, so a request left with none is dropped.
+        A template (``Pipeline.map``) the reloaded pipeline holds stays, and so does an instance
+        of one, which the run reaches through its template. An empty stage list would mean every
+        stage, so a request left with none is dropped.
         """
         if request["stages"] is None:
             return request
-        current = set(self._list_stages())
-        stages = [stage for stage in request["stages"] if stage in current]
+        pipeline = self._require_pipeline()
+        templates = pipeline.list_templates()
+        current = {*pipeline.list_stages(), *templates}
+        stages = [
+            stage
+            for stage in request["stages"]
+            if stage in current or registry.template_of(stage, templates) is not None
+        ]
         if not stages:
             return None
         kept = request.copy()
@@ -1306,6 +1361,11 @@ class Engine:
         pipeline.reset_expansions()
         all_stages = self._get_all_stages()
         templates = {name: pipeline.get_template(name) for name in pipeline.list_templates()}
+        # A target naming an instance (a watch run's affected stage, or a name the user gave) is
+        # reached through its template, which then adds that instance alone, with its chain
+        wanted = dict[str, set[str]]()
+        if stages:
+            stages, wanted = _mapped_targets(stages, templates)
         executor_core.verify_tracked_files(
             project_root,
             checkout_missing=checkout_missing,
@@ -1380,16 +1440,6 @@ class Engine:
 
         if stages:
             registered = set(stage_dag.nodes())
-            # An instance an earlier run added (a watch run's affected stage, or a name the user
-            # gave) is reached through its template, which expands it again
-            stages = list(
-                dict.fromkeys(
-                    stage
-                    if stage in registered
-                    else (registry.template_of(stage, templates) or stage)
-                    for stage in stages
-                )
-            )
             unknown = [s for s in stages if s not in registered]
             if unknown:
                 raise pivot_exceptions.StageNotFoundError(
@@ -1503,6 +1553,7 @@ class Engine:
             _MapRun(
                 templates=set(run_templates),
                 keys={},
+                wanted=wanted,
                 stage_order=stage_order,
                 all_stages=all_stages,
                 committed_before=committed_before,
@@ -2154,11 +2205,13 @@ class Engine:
 
         Its upstream stages have finished, its producer among them, so the producer's directory
         holds what the producer wrote or restored. Each file becomes one instance
-        (``registry.map_instance_keys``), added to the registry, the run's graph and its
-        schedule; the template then completes, so a template mapped over its instances can
-        expand next. A refusal (a file whose key cannot name a stage, an instance whose name or
-        output path another stage holds, an instance's incremental output the run would lose)
-        fails the template with the reason and adds none of its instances.
+        (``registry.map_instance_keys``), or, when the run's targets name instances, each file of
+        a key they name (``_MapRun.wanted``); each is added to the registry, the run's graph and
+        its schedule. The template then completes, so a template mapped over its instances can
+        expand next. A refusal (a file whose key cannot name a stage, a named key no file has,
+        an instance whose name or output path another stage holds, an instance's incremental
+        output the run would lose) fails the template with the reason and adds none of its
+        instances.
         """
         pipeline = self._require_pipeline()
         template = pipeline.get_template(name)
@@ -2169,6 +2222,15 @@ class Engine:
             if keys is None:
                 keys = await anyio.to_thread.run_sync(_read_map_keys, source, map_run)
                 map_run.keys[source] = keys
+            if name in map_run.wanted:
+                wanted = map_run.wanted[name]
+                missing = sorted(wanted.difference(key for key, _ in keys))
+                if missing:
+                    raise exceptions.StageNotFoundError(
+                        [f"{name}@{key}" for key in missing],
+                        available_stages=[f"{name}@{key}" for key, _ in keys],
+                    )
+                keys = [(key, file_key) for key, file_key in keys if key in wanted]
             planned = {
                 info["name"]: info
                 for info in (registry.instantiate(template, key, file) for key, file in keys)
@@ -2185,7 +2247,12 @@ class Engine:
                 raise problem
             added = pipeline.expand_template(name, keys)
         except exceptions.PivotError as exc:
-            reason = f"cannot expand over the files of '{types.identity_key(source)}': {exc}"
+            # A named key no file has reads as `pivot status` reads its target
+            reason = (
+                str(exc)
+                if isinstance(exc, exceptions.StageNotFoundError)
+                else expansion.refusal_reason(source, exc)
+            )
             _logger.error("Stage %s failed: %s", name, reason)
             await self._emit_terminal_stage(
                 name, StageStatus.FAILED, reason, results, run_id=run_id
@@ -3191,7 +3258,9 @@ class Engine:
         # Flush manifest cache so cached manifests survive the reload
         fingerprint.flush_manifest_cache()
 
-        all_stages = self._get_all_stages()
+        # The reloaded pipeline holds no expansion: each template (Pipeline.map) is a stage of
+        # the graph and of the re-run, which expands it, as the first run did
+        all_stages = self._get_graph_stages()
         # Hot-reload: build the graph without checking dependencies, which may be missing while
         # the user edits
         self._graph = engine_graph.build_graph(all_stages)

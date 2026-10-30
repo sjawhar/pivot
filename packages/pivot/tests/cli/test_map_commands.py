@@ -197,6 +197,7 @@ def test_repro_and_status_take_a_mapped_stage_or_an_instance_as_target(
     }
     bare_instance = _ok(helpers.run_pivot(root, home, "repro", "build@a"))
     assert (root / "data" / "p" / "build@a.yaml").is_file(), bare_instance
+    assert not (root / "data" / "p" / "build@b.yaml").exists(), "an instance runs its chain only"
     unknown = helpers.run_pivot(root, home, "status", "p/cut@zzz")
     assert unknown.returncode != 0 and "p/cut@zzz" in unknown.stderr, unknown.stderr
 
@@ -210,6 +211,47 @@ def test_a_run_targeted_at_the_producer_expands_nothing(tmp_path: pathlib.Path) 
     assert not (root / "data" / "p" / "cut@a.yaml").exists()
     # The producer is current now, so the commands expand the mapped stages from its listing
     assert _status_rows(root, home)["p/cut@a"] == "stale"
+
+
+def test_commit_reports_what_it_committed_before_a_refused_instance(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot commit` commits the producer before it can know the keys, so an instance whose
+    key the producer has no file for is refused after it: the output names both."""
+    root, home = _project(tmp_path, {"a": 1})
+    _ok(helpers.run_pivot(root, home, "repro", "--no-commit"))
+
+    refused = helpers.run_pivot(root, home, "commit", "p/plan", "p/cut@zzz")
+
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert "Committed 1 stage(s):\n  p/plan" in out
+    assert "Unknown stage(s): p/cut@zzz" in out
+    assert _status_rows(root, home)["p/plan"] == "cached"
+
+
+def test_commit_of_a_mapped_stage_commits_its_instances(tmp_path: pathlib.Path) -> None:
+    root, home = _project(tmp_path, {"a": 1, "b": 2})
+    _ok(helpers.run_pivot(root, home, "repro", "--no-commit"))
+
+    committed = _ok(helpers.run_pivot(root, home, "commit", "plan", "cut"))
+
+    assert "Committed 3 stage(s)" in committed, committed
+    rows = _status_rows(root, home)
+    assert rows["p/cut@a"] == rows["p/cut@b"] == "cached", rows
+    assert rows["p/build@a"] == "stale", rows
+
+
+def test_params_show_takes_a_mapped_stage_once_it_expands(tmp_path: pathlib.Path) -> None:
+    root, home = _project(tmp_path, {"a": 1, "b": 2})
+
+    waiting = helpers.run_pivot(root, home, "params", "show", "p/cut")
+    _ok(helpers.run_pivot(root, home, "repro"))
+    shown = helpers.run_pivot(root, home, "params", "show", "--json", "cut")
+
+    assert waiting.returncode != 0
+    assert "'p/cut' is not yet expanded: waits for 'p/plan'" in waiting.stderr, waiting.stderr
+    assert json.loads(_stdout(shown)) == {}, "p/cut declares no params"
 
 
 # =============================================================================

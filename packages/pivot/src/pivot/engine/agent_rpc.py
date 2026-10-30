@@ -244,6 +244,107 @@ def _validate_stages_param(raw: object) -> list[str] | None | str:
     return cast("list[str]", raw)
 
 
+def _not_expanded_reason(pipeline: registry_mod.PipelineLike, stage: str) -> str | None:
+    """What ``stage`` waits for when it names a template (``Pipeline.map``) or an instance of
+    one that this pipeline has not expanded into; None when it names neither."""
+    templates = pipeline.list_templates()
+    template = stage if stage in templates else registry_mod.template_of(stage, templates)
+    if template is None:
+        return None
+    producer = pipeline.get_template(template)["source"].producer
+    return f"'{template}' adds its instances when a run finds '{producer}' current"
+
+
+def _not_expanded_explanation(stage: str, why: str) -> StageExplanation:
+    """The explanation of a template or instance not yet expanded, as ``pivot status`` gives it:
+    a run would expand it, then run its instances."""
+    from pivot import status as status_mod
+
+    return StageExplanation(
+        stage_name=stage,
+        will_run=True,
+        is_forced=False,
+        reason=f"{status_mod.NOT_EXPANDED_REASON_PREFIX}: {why}",
+        code_changes=[],
+        param_changes=[],
+        dep_changes=[],
+        upstream_stale=[],
+    )
+
+
+def _template_explanation(template: str, explanations: list[StageExplanation]) -> StageExplanation:
+    """A template's explanation from its instances': it would run when one would, and its reason
+    names each of those with its own reason."""
+    running = [exp for exp in explanations if exp["will_run"]]
+    noun = "stage" if len(explanations) == 1 else "stages"
+    reason = f"Expanded into {len(explanations)} {noun}; " + (
+        "would run: " + ", ".join(f"{exp['stage_name']} ({exp['reason']})" for exp in running)
+        if running
+        else "none would run"
+    )
+    return StageExplanation(
+        stage_name=template,
+        will_run=bool(running),
+        is_forced=any(exp["is_forced"] for exp in running),
+        reason=reason,
+        code_changes=[],
+        param_changes=[],
+        dep_changes=[],
+        upstream_stale=[],
+    )
+
+
+def _explain_stage(
+    stage: str,
+    fingerprint: dict[str, str],
+    overrides: parameters.ParamsOverrides,
+    all_stages: dict[str, RegistryStageInfo],
+    store: store_mod.WorkspaceStore,
+    *,
+    default_state_dir: Path,
+    cache_dir: Path,
+) -> StageExplanation:
+    """Explain why ``stage`` would run, reading its lock and its producers' as ``pivot status``
+    does, and save the hash of each file it had to read."""
+    reg_info = all_stages[stage]
+    producers = {
+        ref.identity.producer
+        for ref in reg_info["deps"].values()
+        if ref.identity.producer in all_stages
+    }
+    locks = explain_mod.read_locks([stage, *producers], all_stages, default_state_dir, cache_dir)
+    unreadable = dict[types.ArtifactIdentity, str]()
+    producer_hashes = explain_mod.producer_output_hashes(
+        {producer: locks[producer] for producer in producers},
+        reg_info["deps"].values(),
+        {
+            producer: explain_mod.stages_dir(all_stages[producer], default_state_dir)
+            for producer in producers
+        },
+        store.cache_dir,
+        unreadable,
+    )
+    state_dir = registry_mod.get_stage_state_dir(reg_info, default_state_dir)
+    file_hash_entries = list[types.FileHashEntry]()
+    explanation = explain_mod.get_stage_explanation(
+        stage_name=stage,
+        fingerprint=fingerprint,
+        deps=reg_info["deps"],
+        outs=list(reg_info["outs"]),
+        params_instance=reg_info["params"],
+        overrides=overrides,
+        state_dir=state_dir,
+        store=store,
+        lock_data=locks[stage],
+        allow_missing=True,
+        producer_hashes=producer_hashes,
+        file_hash_entries=file_hash_entries,
+        unreadable_listings=unreadable,
+    )
+    state_mod.save_file_hashes(state_dir, file_hash_entries, create=False)
+    return explanation
+
+
 class AgentRpcHandler:
     """Handles JSON-RPC queries that need engine/inspector access."""
 
@@ -277,31 +378,54 @@ class AgentRpcHandler:
         return self._engine.pipeline_error
 
     def validate_stages(self, stages: list[str] | None) -> str | None:
-        """Validate stage names exist. Returns error message or None if valid."""
+        """Validate stage names exist. Returns error message or None if valid.
+
+        A template (``Pipeline.map``) and an instance of one are names a run takes: the run
+        reaches the instance through its template, which adds it when the run expands it.
+        """
         if stages is None:
             return None
         pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
         if pipeline is None:
             return "No pipeline loaded"
-        available = set(pipeline.list_stages())
-        unknown = [s for s in stages if s not in available]
+        templates = pipeline.list_templates()
+        available = {*pipeline.list_stages(), *templates}
+        unknown = [
+            s
+            for s in stages
+            if s not in available and registry_mod.template_of(s, templates) is None
+        ]
         if unknown:
             return f"Unknown stages: {', '.join(unknown)}"
         return None
 
-    def _get_stage_info(self, params: dict[str, object]) -> tuple[str, RegistryStageInfo]:
-        """Extract and validate stage param, return (stage_name, reg_info)."""
+    def _stage_param(self, params: dict[str, object]) -> tuple[str, registry_mod.PipelineLike]:
+        """The stage param and the engine's pipeline, both validated."""
         stage = params.get("stage")
         if not isinstance(stage, str):
             raise ValueError("stage must be string")
         pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
         if pipeline is None:
             raise ValueError("No pipeline loaded")
-        try:
-            reg_info = pipeline.get_stage(stage)
-        except KeyError:
-            raise ValueError(f"Unknown stage: {stage}") from None
-        return stage, reg_info
+        return stage, pipeline
+
+    def _get_stage_info(self, params: dict[str, object]) -> tuple[str, RegistryStageInfo]:
+        """Extract and validate stage param, return (stage_name, reg_info). A template
+        (``Pipeline.map``) gives the stage as declared, reading its producer's whole directory.
+
+        Raises:
+            ValueError: The param names no stage or template, or an instance its template has
+                not expanded into (``_not_expanded_reason``).
+        """
+        stage, pipeline = self._stage_param(params)
+        with contextlib.suppress(KeyError):
+            return stage, pipeline.get_stage(stage)
+        if stage in pipeline.list_templates():
+            return stage, pipeline.get_template(stage)["info"]
+        why = _not_expanded_reason(pipeline, stage)
+        if why is None:
+            raise ValueError(f"Unknown stage: {stage}")
+        raise ValueError(f"'{stage}' is not yet expanded: {why}")
 
     async def handle_query(
         self, method: str, params: dict[str, object] | None = None
@@ -341,11 +465,21 @@ class AgentRpcHandler:
                 # Explain fingerprints the stage; the startup snapshot or a reload must finish
                 # first, and it explains the pipeline loaded once they have.
                 await self._engine.wait_for_fingerprints()
-                stage, reg_info = self._get_stage_info(params)
-                pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
-                if pipeline is None:
-                    raise ValueError("No pipeline loaded")
-                fingerprint = pipeline.ensure_fingerprint(stage)
+                stage, pipeline = self._stage_param(params)
+                # A template (Pipeline.map) is explained by the instances it expanded into; one
+                # not expanded, or an instance of one, by what its expansion waits for
+                stages = list[str]()
+                with contextlib.suppress(KeyError):
+                    _ = pipeline.get_stage(stage)
+                    stages = [stage]
+                if not stages and stage in pipeline.list_templates():
+                    stages = pipeline.instances_of(stage)
+                if not stages:
+                    why = _not_expanded_reason(pipeline, stage)
+                    if why is None:
+                        raise ValueError(f"Unknown stage: {stage}")
+                    return _not_expanded_explanation(stage, why)
+                fingerprints = {name: pipeline.ensure_fingerprint(name) for name in stages}
 
                 def _get_explanation() -> StageExplanation:
                     try:
@@ -353,54 +487,29 @@ class AgentRpcHandler:
                     except Exception as e:
                         raise ValueError(f"Failed to load params.yaml: {e}") from e
                     all_stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
-                    producers = {
-                        ref.identity.producer
-                        for ref in reg_info["deps"].values()
-                        if ref.identity.producer in all_stages
-                    }
                     default_state_dir = config_io.locate_state_dir()
                     cache_dir = config_io.locate_cache_dir() / "files"
-                    locks = explain_mod.read_locks(
-                        [stage, *producers], all_stages, default_state_dir, cache_dir
-                    )
                     store = store_mod.WorkspaceStore(
                         project_root=project.get_project_root(),
                         pipeline_name=pipeline.name,
                         input_bindings=pipeline.input_bindings,
                         cache_dir=cache_dir,
                     )
-                    unreadable = dict[types.ArtifactIdentity, str]()
-                    producer_hashes = explain_mod.producer_output_hashes(
-                        {producer: locks[producer] for producer in producers},
-                        reg_info["deps"].values(),
-                        {
-                            producer: explain_mod.stages_dir(
-                                all_stages[producer], default_state_dir
-                            )
-                            for producer in producers
-                        },
-                        store.cache_dir,
-                        unreadable,
-                    )
-                    state_dir = registry_mod.get_stage_state_dir(reg_info, default_state_dir)
-                    file_hash_entries = list[types.FileHashEntry]()
-                    explanation = explain_mod.get_stage_explanation(
-                        stage_name=stage,
-                        fingerprint=fingerprint,
-                        deps=reg_info["deps"],
-                        outs=list(reg_info["outs"]),
-                        params_instance=reg_info["params"],
-                        overrides=overrides,
-                        state_dir=state_dir,
-                        store=store,
-                        lock_data=locks[stage],
-                        allow_missing=True,
-                        producer_hashes=producer_hashes,
-                        file_hash_entries=file_hash_entries,
-                        unreadable_listings=unreadable,
-                    )
-                    state_mod.save_file_hashes(state_dir, file_hash_entries, create=False)
-                    return explanation
+                    explanations = [
+                        _explain_stage(
+                            name,
+                            fingerprints[name],
+                            overrides,
+                            all_stages,
+                            store,
+                            default_state_dir=default_state_dir,
+                            cache_dir=cache_dir,
+                        )
+                        for name in stages
+                    ]
+                    if stages == [stage]:
+                        return explanations[0]
+                    return _template_explanation(stage, explanations)
 
                 return await anyio.to_thread.run_sync(_get_explanation)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType] - anyio stub issue
             case "commit":

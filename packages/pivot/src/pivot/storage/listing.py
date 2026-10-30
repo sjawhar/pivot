@@ -493,14 +493,17 @@ def _resolve(
             return data, f"cache object {record['hash']}"
     if problem is not None:
         raise problem
+    # Each place the listing could have come from, all of them missing
     where = list[str]() if source is None else [str(source)]
-    if cached is not None:
-        where.append(f"the cache object {cached}")
-    raise exceptions.ListingMissingError(
-        f"No listing for directory {record['hash']}: neither {' nor '.join(where)} exists"
-        if where
-        else f"No listing for directory {record['hash']}: no listing file and no cache"
-    )
+    if cache_dir is not None:
+        where.append(f"the cache object {record['hash'] if cached is None else cached}")
+    if not where:
+        reason = "no listing file and no cache"
+    elif len(where) == 1:
+        reason = f"{where[0]} does not exist"
+    else:
+        reason = f"neither {' nor '.join(where)} exists"
+    raise exceptions.ListingMissingError(f"No listing for directory {record['hash']}: {reason}")
 
 
 _DIRECTORY_IN_THE_WAY = (

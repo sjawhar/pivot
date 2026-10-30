@@ -15,7 +15,9 @@ import pytest
 import yaml
 
 from pivot import compose, exceptions, executor, loaders, stage_def
-from pivot.types import StageStatus
+from pivot.engine import engine as engine_mod
+from pivot.engine.types import RunRequested
+from pivot.types import OnError, StageStatus
 
 if TYPE_CHECKING:
     import pathlib
@@ -261,6 +263,74 @@ def test_a_run_targeted_at_a_template_runs_its_upstream_and_expands_it(
     assert _statuses(results) == {"p/_stage_plan": _RAN, **_chains(["a", "b"], _RAN)}, results
 
 
+def test_a_run_targeted_at_an_instance_runs_that_instances_chain_only(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run reaches the instance through its template, and its chained templates expand over
+    that key alone."""
+    root = set_project_root
+    _project(root, monkeypatch, {"a": 1, "b": 2, "c": 3})
+    pipeline = _chain_pipeline(root)
+
+    results = executor.run(pipeline=pipeline, stages=["p/_stage_build@b"])
+
+    assert _statuses(results) == {"p/_stage_plan": _RAN, **_chains(["b"], _RAN)}, results
+    assert pipeline.instances_of("p/_stage_cut") == ["p/_stage_cut@b"]
+    assert not (root / "data" / "p" / "_stage_cut@a.yaml").exists()
+
+
+def test_a_forced_run_of_an_instance_forces_no_other_instance(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = set_project_root
+    _project(root, monkeypatch, {"a": 1, "b": 2, "c": 3})
+    pipeline = _chain_pipeline(root)
+    executor.run(pipeline=pipeline)
+
+    results = executor.run(
+        pipeline=pipeline, stages=["p/_stage_cut@a", "p/_stage_build@c"], force=True
+    )
+
+    assert _statuses(results) == {
+        "p/_stage_plan": _RAN,
+        "p/_stage_cut@a": _RAN,
+        "p/_stage_cut@c": _RAN,
+        "p/_stage_build@c": _RAN,
+    }, results
+
+
+def test_a_template_target_beside_its_instance_expands_every_key(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`p/_stage_build` needs every instance of `p/_stage_cut`, whatever else is named."""
+    root = set_project_root
+    _project(root, monkeypatch, {"a": 1, "b": 2})
+    pipeline = _chain_pipeline(root)
+
+    results = executor.run(pipeline=pipeline, stages=["p/_stage_cut@a", "p/_stage_build"])
+
+    assert _statuses(results) == {"p/_stage_plan": _RAN, **_chains(["a", "b"], _RAN)}, results
+
+
+def test_a_named_key_the_producer_writes_no_file_for_fails_the_template(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The producer ran in this run, so only the run can tell the key is not in the plan: it
+    fails the template as `pivot status` refuses the name, and blocks its chain."""
+    root = set_project_root
+    _project(root, monkeypatch, {"a": 1})
+    pipeline = _chain_pipeline(root)
+
+    results = executor.run(pipeline=pipeline, stages=["p/_stage_build@zzz"], on_error="keep_going")
+
+    statuses = _statuses(results)
+    assert statuses["p/_stage_plan"] == _RAN
+    assert statuses["p/_stage_cut"] == StageStatus.FAILED, results
+    assert results["p/_stage_cut"]["reason"] == "Unknown stage(s): p/_stage_cut@zzz"
+    assert statuses["p/_stage_build"] == StageStatus.BLOCKED
+    assert pipeline.instances_of("p/_stage_cut") == []
+
+
 def test_a_single_stage_run_of_a_template_is_refused(
     set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -270,6 +340,36 @@ def test_a_single_stage_run_of_a_template_is_refused(
 
     with pytest.raises(exceptions.PipelineConfigError, match="pivot repro p/_stage_cut"):
         executor.run(pipeline=pipeline, stages=["p/_stage_cut"], single_stage=True)
+
+
+def test_a_restart_after_a_reload_keeps_its_mapped_targets(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reloaded pipeline lists no template or instance among its stages; a run request
+    replayed after the reload keeps them, and drops only the names the reload removed."""
+    root = set_project_root
+    _project(root, monkeypatch, {"a": 1})
+    request = RunRequested(
+        type="run_requested",
+        stages=["p/_stage_cut", "p/_stage_build@a", "p/_stage_gone"],
+        force=False,
+        reason="test",
+        single_stage=False,
+        parallel=True,
+        max_workers=None,
+        resource_capacity={},
+        no_commit=False,
+        on_error=OnError.FAIL,
+        cache_dir=None,
+        allow_uncached_incremental=False,
+        checkout_missing=False,
+    )
+    engine = engine_mod.Engine(pipeline=_chain_pipeline(root))
+
+    kept = engine._drop_removed_stages(request)
+
+    assert kept is not None
+    assert kept["stages"] == ["p/_stage_cut", "p/_stage_build@a"]
 
 
 def test_each_run_expands_afresh(

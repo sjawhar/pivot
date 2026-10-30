@@ -15,6 +15,7 @@ import yaml
 
 from pivot import compose, config, executor, expansion, loaders, stage_def, status
 from pivot.remote import config as remote_config
+from pivot.storage import cache
 
 if TYPE_CHECKING:
     import pathlib
@@ -174,6 +175,51 @@ def test_a_listing_neither_committed_nor_cached_is_named_for_pull_to_fetch(
     assert result["not_expanded"]["p/_stage_build"] == (
         "mapped over the instances of 'p/_stage_cut', which is not expanded"
     )
+
+
+def test_a_missing_listing_names_the_run_that_writes_it_again(
+    ran: tuple[pathlib.Path, compose.Pipeline],
+) -> None:
+    """A producer whose listing neither its stage directory nor the cache holds leaves its
+    templates unexpanded, in a command and in a run, saying `pivot repro --force` fixes it."""
+    root, pipeline = ran
+    producer = pipeline.get_stage("p/_stage_plan")
+    record = expansion.recorded_directory(
+        producer["outs"][0].identity,
+        expansion.stage_lock(producer, config.locate_state_dir()).read(),
+    )
+    assert record is not None
+    cached = cache.resolve_cache_object_path(
+        config.locate_cache_dir() / "files", record["hash"], notice=False
+    )
+    assert cached is not None
+    cached.unlink()
+    for listing in (root / ".pivot" / "stages" / "p").glob("_stage_plan=*.listing"):
+        listing.unlink()
+
+    result, _ = status.expand_current(pipeline)
+    run = executor.run(pipeline=_pipeline(root))
+
+    remedy = "`pivot repro --force p/_stage_plan` writes it again"
+    assert remedy in result["not_expanded"]["p/_stage_cut"], result["not_expanded"]
+    assert remedy in run["p/_stage_cut"]["reason"], run["p/_stage_cut"]
+    assert run["p/_stage_cut"]["reason"] == result["not_expanded"]["p/_stage_cut"]
+
+
+def test_a_refused_key_reads_the_same_in_a_command_and_in_a_run(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = set_project_root
+    monkeypatch.chdir(root)
+    _write_plan(root, {"a b": 1})
+    run = executor.run(pipeline=_pipeline(root))
+    pipeline = _pipeline(root)
+
+    result, _ = status.expand_current(pipeline)
+
+    reason = run["p/_stage_cut"]["reason"]
+    assert reason.startswith("cannot expand over the files of 'p/_stage_plan': file 'a b.yaml'")
+    assert result["not_expanded"]["p/_stage_cut"] == reason
 
 
 def test_a_refused_expansion_leaves_its_template_and_its_chain_not_expanded(

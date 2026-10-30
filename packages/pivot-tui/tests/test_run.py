@@ -1554,6 +1554,36 @@ async def test_a_new_expansion_replaces_the_template_rows_of_the_last() -> None:
         assert "expanded (2)" in _row_text(app, "demo/cut")
 
 
+@pytest.mark.parametrize(
+    ("status", "label"),
+    [
+        pytest.param(StageStatus.BLOCKED, "not yet expanded", id="producer-failed"),
+        pytest.param(StageStatus.FAILED, "expansion failed", id="expansion-refused"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_template_that_does_not_expand_drops_the_last_runs_instance_rows(
+    status: StageStatus, label: str
+) -> None:
+    """A watch run whose template is blocked (its producer failed) or fails adds no instance,
+    so the rows the last run's expansion added go, and the template row says why."""
+    app = run_tui.PivotApp(stage_names=["demo/plan", "demo/cut"], watch_mode=True)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.post_message(_expanded("demo/cut", ["demo/cut@a", "demo/cut@b"]))
+        await pilot.pause()
+        app.post_message(_status("demo/plan", StageStatus.FAILED))
+        app.post_message(_status("demo/cut", status, "upstream 'demo/plan' failed"))
+        await pilot.pause()
+
+        assert app._stage_order == ["demo/plan", "demo/cut"]
+        assert "demo/cut@a" not in app._stages and "demo/cut@b" not in app._stages
+        assert list(app.query_one("#stage-list", StageListPanel)._rows) == app._stage_order
+        assert label in _row_text(app, "demo/cut")
+        assert app._stages["demo/cut"].instances is None
+
+
 @pytest.mark.asyncio
 async def test_template_row_reads_not_yet_expanded_from_the_stages_answer(
     tmp_path: pathlib.Path,

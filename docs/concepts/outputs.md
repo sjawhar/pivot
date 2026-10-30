@@ -394,25 +394,40 @@ key's chain only, and a new file runs the producer and the new chain only.
   key follows the variant-name rule (letters, digits, `_`, `.`, `-`), so a file
   in a subdirectory, or two files with one key (`a.yaml`, `a.json`), fail the
   mapped stage in the run, naming the files; so does an instance whose name or
-  output path another stage holds. A failed expansion adds no instance.
+  output path another stage holds. A failed expansion adds no instance. A run and
+  every command give such a refusal in one wording, `cannot expand over the files
+  of 'p/plan': ...`. A producer whose listing neither its lock's directory nor the
+  cache holds leaves its mapped stages unexpanded with `the listing of 'p/plan' is
+  missing`: `pivot pull` fetches it from a remote that holds it, and
+  `pivot repro --force p/plan` writes it again.
 - **What expands.** `pivot repro <producer>` runs the producer and its
   upstream only, and expands nothing. `pivot repro p/cut` runs `p/plan`, then
-  every instance of `p/cut`. An instance name (`pivot repro p/cut@a`) stands for
-  its mapped stage. `pivot run p/cut` is refused: a mapped stage expands only in
+  every instance of `p/cut`. An instance name (`pivot repro p/build@a`, or
+  `build@a`) names that instance and its chain only, as `pivot status p/build@a`
+  reads it: the run expands `p/cut` and `p/build` over key `a` alone, so it runs
+  `p/plan`, `p/cut@a` and `p/build@a`, and `pivot repro --force p/cut@a` forces
+  `p/plan` and `p/cut@a`, no other instance. When `p/plan` is current, a key it has
+  no file for is refused as `pivot status` refuses it (`Unknown stage(s):
+  p/cut@zzz`); when it is not, the run refuses the key once `p/plan` has run and
+  has no file for it. `pivot run p/cut` is refused: a mapped stage expands only in
   a run that finds its producer current. Nothing about an expansion is saved: each
-  run expands afresh.
+  run expands afresh. A watch run (`pivot repro --watch`) expands as any run does,
+  including the run that follows a reload after an edit to the code or to
+  `params.yaml`.
 - **The other commands** (`status`, `list`, `dag`, `checkout`, `verify`,
-  `push`, `pull`, `repro --dry-run` and `--explain`) expand each mapped stage
-  by the same rule, from the producer's lock and listing, when the producer is
-  current: its lock matches, and its output is in the cache or, with a remote
-  configured, missing from it and restorable by `pivot pull`. A fresh clone
-  therefore lists every instance before any pull. Until then a mapped stage is
-  *not yet expanded*: `pivot status` shows it (`not_expanded` in `--json`) with
-  what it waits for, `pivot list` lists it under "Mapped stages, not yet
-  expanded" (`templates` in `--json`), and `pivot dag` labels its node.
-  `checkout`, `push` and `pull` refuse a target naming it, and `verify` fails
-  it. `pull` first fetches the listing of a current producer that the clone
-  lacks, then expands.
+  `push`, `pull`, `commit`, `params show`, `params diff`, `repro --dry-run` and
+  `--explain`) expand each mapped stage by the same rule, from the producer's lock
+  and listing, when the producer is current: its lock matches, and its output is
+  in the cache or, with a remote configured, missing from it and restorable by
+  `pivot pull`. A fresh clone therefore lists every instance before any pull.
+  Until then a mapped stage is *not yet expanded*: `pivot status` shows it
+  (`not_expanded` in `--json`) with what it waits for, `pivot list` lists it under
+  "Mapped stages, not yet expanded" (`templates` in `--json`), and `pivot dag`
+  labels its node. `checkout`, `push`, `pull` and `params` refuse a target naming
+  it, and `verify` fails it. `pull` first fetches the listing of a current
+  producer that the clone lacks, then expands. `pivot commit` commits the
+  producer first, then expands and commits each stale instance, or the instances
+  its targets name (`pivot commit p/plan p/cut@a`).
 - **Mapping rules.** `pipeline.map` takes a stage's directory output, or a
   directory field of a multi-output stage (`out.parts`). It refuses an input, one
   file of a directory, any other output, and a handle that is already mapped. A

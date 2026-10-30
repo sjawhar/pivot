@@ -138,9 +138,9 @@ A mapped stage (`pipeline.map`) is a template until a run expands it into one in
     @c                    0:02 ●
 ```
 
-- **`not yet expanded`**: the template has not expanded in this session. The app learns which stages are templates from the `stages` RPC answer's `templates` (see [Agent Server](agent-server.md)), asked once its client connects and again after each reload.
+- **`not yet expanded`**: the template has not expanded in this session, or the latest run blocked it (its producer failed): that run added no instance, so the rows of the last expansion go. The app learns which stages are templates from the `stages` RPC answer's `templates` (see [Agent Server](agent-server.md)), asked once its client connects and again after each reload.
 - **`expanded (N)`**: on a `TuiExpandedMessage` the app marks the template completed, puts the instance rows right after it, numbers every row by its place in the list, and rebuilds the list. The instance names are `<template>@<key>`, so they group under the template as variants do; the group header counts the instances, not the template. A later expansion (the next watch run) replaces the last one: an instance it keeps keeps its state and history, an instance it lacks loses its row. An answer to the `stages` query that shows a template expanded before its event arrives adds the instance rows too.
-- **`expansion failed`**: a refused expansion (an instance name that cannot name a stage, an output path another stage holds) reaches the app as a failed `TuiStatusMessage` for the template. The row shows the failed symbol, and the reason goes to the template's Logs tab as a stderr line, since a template runs nothing of its own.
+- **`expansion failed`**: a refused expansion (an instance name that cannot name a stage, an output path another stage holds) reaches the app as a failed `TuiStatusMessage` for the template. The row shows the failed symbol, the rows of the last expansion go, and the reason goes to the template's Logs tab as a stderr line, since a template runs nothing of its own.
 
 A reload's stage list holds no template, so the app keeps each template row, before the first of its instances the list holds, and the next `stages` answer sets how far the new pipeline expanded it, adds a row for a template the edit added and drops the row of one it removed.
 

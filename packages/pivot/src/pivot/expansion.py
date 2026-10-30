@@ -54,6 +54,20 @@ def single_stage_refusal(
     )
 
 
+def refusal_reason(source: types.ArtifactIdentity, error: exceptions.PivotError) -> str:
+    """Why a template cannot expand over the files of directory output ``source``, in the one
+    wording a run and every command use: a listing that is missing names the commands that
+    bring it back, and any other refusal (a file whose key cannot name a stage, an unusable
+    listing, an instance another stage's name or output path holds) is given as it is."""
+    shown = types.identity_key(source)
+    if isinstance(error, exceptions.ListingMissingError):
+        return (
+            f"the listing of '{shown}' is missing ({error}): `pivot pull` fetches it from a "
+            + f"remote that holds it, and `pivot repro --force {source.producer}` writes it again"
+        )
+    return f"cannot expand over the files of '{shown}': {error}"
+
+
 def stage_lock(
     producer: registry.RegistryStageInfo, default_state_dir: pathlib.Path
 ) -> lock.StageLock:
@@ -160,9 +174,9 @@ def expand_current(
                 record = recorded_directory(source, locks[producer])
                 if record is not None:
                     result["listings"][name] = record["hash"]
-                keys = f"the listing of '{types.identity_key(source)}' is missing ({e})"
+                keys = refusal_reason(source, e)
             except (exceptions.CorruptListingError, exceptions.PipelineConfigError) as e:
-                keys = f"cannot read the files of '{types.identity_key(source)}': {e}"
+                keys = refusal_reason(source, e)
             keys_by_source[source] = keys
         if isinstance(keys, str):
             result["not_expanded"][name] = keys
@@ -170,7 +184,5 @@ def expand_current(
         try:
             result["expanded"][name] = pipeline.expand_template(name, keys)
         except exceptions.PivotError as e:
-            result["not_expanded"][name] = (
-                f"cannot expand over the files of '{types.identity_key(source)}': {e}"
-            )
+            result["not_expanded"][name] = refusal_reason(source, e)
     return result

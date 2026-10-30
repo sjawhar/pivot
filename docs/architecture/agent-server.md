@@ -145,6 +145,14 @@ List the registered stages, and each template of a mapped stage (`pipeline.map`)
 
 The TUI asks once it connects, and again after each reload, so that a template's row reads "not yet expanded" before the `stages_expanded` event arrives.
 
+### Mapped stage names in `run`, `stage_info` and `explain`
+
+A template (`demo/cut`) and an instance (`demo/cut@a`) are names these methods take, as the CLI does:
+
+- `run` takes both: a run reaches an instance through its template and adds that instance alone, with its chain.
+- `stage_info` of a template gives the stage as declared, its mapped dependency reading the producer's whole directory. An instance the template has expanded into gives its own info; any other instance of it is refused: `'demo/cut@a' is not yet expanded: 'demo/cut' adds its instances when a run finds 'demo/plan' current`.
+- `explain` of a template explains each instance it expanded into: `will_run` is true when one would run, and `reason` reads `Expanded into 3 stages; would run: demo/cut@b (Input dependencies changed)` or `Expanded into 3 stages; none would run`. A template that has not expanded, or an instance not expanded, gets `will_run: true` and a reason starting `Not yet expanded:`, as `pivot status` shows it.
+
 ### cancel
 
 Request cancellation of current execution.
