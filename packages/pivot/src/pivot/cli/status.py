@@ -5,7 +5,7 @@ import sys
 import click
 import tqdm
 
-from pivot import config, display, exceptions, project
+from pivot import config, display, exceptions, expansion, project
 from pivot import explain as explain_mod
 from pivot import status as status_mod
 from pivot.cli import completion, console
@@ -70,8 +70,23 @@ def status(
 
     stages_list = cli_helpers.stages_to_list(stages)
     pipeline = cli_decorators.get_pipeline_from_context()
+
+    show_all = not (stages_only or tracked_only or remote_only)
+    show_stages = show_all or stages_only
+    show_tracked = show_all or tracked_only
+    show_remote = remote_only or remote
+
+    # Mapped stages expand first, as a run would expand them, so the stages shown hold their
+    # instances and a target may name a mapped stage or one of its instances.
+    expansion_result = expansion.Expansion(expanded={}, not_expanded={}, listings={})
+    known = dict[str, StageExplanation]()
+    shown_templates: list[str] | None = None
     if pipeline is not None:
-        stages_list = cli_helpers.resolve_stage_names(stages_list)
+        if show_stages:
+            expansion_result, known = cli_helpers.expand_mapped_stages()
+        stages_list, shown_templates = cli_helpers.resolve_mapped_targets(
+            stages_list, expansion_result
+        )
 
     project_root = project.get_project_root()
     resolved_cache_dir = config.locate_cache_dir()
@@ -86,11 +101,6 @@ def status(
         ):
             click.echo(warning, err=True)
 
-    show_all = not (stages_only or tracked_only or remote_only)
-    show_stages = show_all or stages_only
-    show_tracked = show_all or tracked_only
-    show_remote = remote_only or remote
-
     # A stage's own .pvt member of its output, in any pipeline, is no tracked file or import
     skip = (
         cli_helpers.own_member_skip(resolved_cache_dir / "files")
@@ -101,6 +111,7 @@ def status(
     # When --explain is used, fetch detailed explanations instead of basic status
     pipeline_status = list[PipelineStatusInfo]()
     pipeline_explanations = list[StageExplanation]()
+    not_expanded = list[PipelineStatusInfo]()
     tracked_status = list[TrackedFileInfo]()
     remote_status: RemoteSyncInfo | None = None
 
@@ -110,6 +121,7 @@ def status(
         all_stages = cli_helpers.get_all_stages()
         graph = engine_graph.build_graph(all_stages)
         orphaned_locks = status_mod.find_orphaned_lock_files(all_stages, pipeline)
+        not_expanded = status_mod.not_expanded_status(expansion_result, shown_templates)
 
         if explain:
             pipeline_explanations = status_mod.get_pipeline_explanations(
@@ -118,6 +130,7 @@ def status(
                 all_stages=all_stages,
                 pipeline=cli_helpers.get_pipeline(),
                 graph=graph,
+                known=known,
             )
         else:
             pipeline_status, _ = status_mod.get_pipeline_status(
@@ -126,6 +139,7 @@ def status(
                 all_stages=all_stages,
                 pipeline=cli_helpers.get_pipeline(),
                 graph=graph,
+                known=known,
             )
 
     if show_tracked:
@@ -185,21 +199,12 @@ def status(
     # remote to pull from. The count reads only explain's reasons, so it is cheap.
     missing_outputs_count = 0
     if remote_config.list_remotes():
-        # Stages arrive in execution order. A stage is pullable when its outputs are missing
-        # and every stale upstream is itself pullable: in a plain clone the downstream stages
-        # are stale only because their upstream's outputs are missing too, and pull restores
-        # all of them. A stage current on its own (e.g. a committed metric) passes through
-        # when its stale upstreams are pullable, but has nothing to pull itself. A stage
-        # downstream of a stage that must recompute is recomputed by repro.
-        pullable = set[str]()
-        for name, reason, upstream_stale in stage_reasons:
-            if not pullable.issuperset(upstream_stale):
-                continue
-            if reason == explain_mod.OUTPUTS_MISSING_REASON:
-                pullable.add(name)
-                missing_outputs_count += 1
-            elif reason.startswith(status_mod.UPSTREAM_STALE_REASON_PREFIX):
-                pullable.add(name)
+        pullable = status_mod.pullable_stages(stage_reasons)
+        missing_outputs_count = sum(
+            1
+            for name, reason, _ in stage_reasons
+            if name in pullable and reason == explain_mod.OUTPUTS_MISSING_REASON
+        )
     modified_count = sum(1 for f in tracked_status if f["status"] == TrackedFileStatus.MODIFIED)
     push_count = remote_status["push_count"] if remote_status else 0
     pull_count = remote_status["pull_count"] if remote_status else 0
@@ -215,7 +220,7 @@ def status(
 
     # Quiet mode: no output, exit 1 if there are issues needing attention
     if quiet and not output_json:
-        if stale_count > 0 or modified_count > 0:
+        if stale_count > 0 or modified_count > 0 or not_expanded:
             raise SystemExit(1)
         return
 
@@ -224,6 +229,7 @@ def status(
         if explain:
             _output_explain_json(
                 pipeline_explanations,
+                not_expanded,
                 tracked_status,
                 remote_status,
                 imports,
@@ -234,7 +240,7 @@ def status(
             )
         else:
             _output_json(
-                pipeline_status,
+                [*pipeline_status, *not_expanded],
                 tracked_status,
                 remote_status,
                 imports,
@@ -251,10 +257,11 @@ def status(
                 remote_status,
                 suggestions,
                 show_tracked,
+                not_expanded=not_expanded,
             )
         else:
             _output_text(
-                pipeline_status,
+                [*pipeline_status, *not_expanded],
                 tracked_status,
                 remote_status,
                 suggestions,
@@ -300,6 +307,7 @@ def _output_json(
 
 def _output_explain_json(
     explanations: list[StageExplanation],
+    not_expanded: list[PipelineStatusInfo],
     tracked_status: list[TrackedFileInfo],
     remote_status: RemoteSyncInfo | None,
     imports: list[ImportStatusInfo] | None,
@@ -327,6 +335,21 @@ def _output_explain_json(
                 upstream_stale=exp["upstream_stale"],
             )
             stages.append(stage_data)
+        # A mapped stage not yet expanded: a run would expand it and run its instances
+        stages.extend(
+            ExplainStageJson(
+                name=row["name"],
+                status="not_expanded",
+                reason=row["reason"],
+                will_run=True,
+                is_forced=False,
+                code_changes=[],
+                param_changes=[],
+                dep_changes=[],
+                upstream_stale=row["upstream_stale"],
+            )
+            for row in not_expanded
+        )
         data["stages"] = stages
 
     if show_tracked:
@@ -384,20 +407,25 @@ def output_explain_text(
     remote_status: RemoteSyncInfo | None = None,
     suggestions: list[str] | None = None,
     show_tracked: bool = False,
+    *,
+    not_expanded: list[PipelineStatusInfo] | None = None,
 ) -> None:
-    """Output detailed stage explanations as formatted text."""
+    """Output detailed stage explanations as formatted text, then each mapped stage not yet
+    expanded (``not_expanded``) with what it waits for."""
     sections_printed = 0
 
     # Always show stage explanations section
-    if not explanations:
+    if not explanations and not not_expanded:
         click.echo("No stages to run")
     else:
         con = console.Console()
         for exp in explanations:
             con.explain_stage(exp)
+        for row in not_expanded or []:
+            con.explain_not_expanded(row["name"], row["reason"])
 
         will_run = sum(1 for e in explanations if e["will_run"])
-        con.explain_summary(will_run, len(explanations) - will_run)
+        con.explain_summary(will_run, len(explanations) - will_run, len(not_expanded or []))
     sections_printed += 1
 
     if show_tracked and tracked_status is not None:
@@ -419,28 +447,36 @@ def output_explain_text(
 
 
 def _print_pipeline_section(pipeline_status: list[PipelineStatusInfo], verbose: bool) -> None:
-    """Print pipeline status section."""
+    """Print pipeline status section. A mapped stage not yet expanded is always shown."""
     click.echo("Pipeline Status")
 
     if not pipeline_status:
         click.echo("  No stages registered")
         return
 
-    total = len(pipeline_status)
+    not_expanded = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.NOT_EXPANDED)
+    total = len(pipeline_status) - not_expanded
     stale = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.STALE)
     click.echo(f"  {total} stages: {total - stale} cached, {stale} stale")
+    if not_expanded:
+        noun = "stage" if not_expanded == 1 else "stages"
+        click.echo(f"  {not_expanded} mapped {noun} not yet expanded")
     click.echo()
 
     stages_to_show = (
         pipeline_status
         if verbose
-        else [s for s in pipeline_status if s["status"] == PipelineStatus.STALE]
+        else [s for s in pipeline_status if s["status"] != PipelineStatus.CACHED]
     )
 
+    icons = {
+        PipelineStatus.CACHED: "\u2713",
+        PipelineStatus.STALE: "\u26a0",
+        PipelineStatus.NOT_EXPANDED: "\u2026",
+    }
     for stage in stages_to_show:
-        icon = "\u2713" if stage["status"] == PipelineStatus.CACHED else "\u26a0"
         reason = display.escape_control(stage["reason"], keep_newlines=True) or "-"
-        click.echo(f"  {icon} {stage['name']:<20} {reason}")
+        click.echo(f"  {icons[stage['status']]} {stage['name']:<20} {reason}")
 
 
 def _print_tracked_section(tracked_status: list[TrackedFileInfo], verbose: bool) -> None:

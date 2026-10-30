@@ -12,7 +12,7 @@ import rich.live
 import rich.text
 
 from pivot import display
-from pivot.engine.types import LogLine, StageCompleted
+from pivot.engine.types import LogLine, StageCompleted, StagesExpanded
 from pivot.types import LOSSY_OUTPUT_PHRASE, DisplayCategory, categorize_stage_result
 
 if TYPE_CHECKING:
@@ -100,6 +100,14 @@ def _format_error_detail(reason: str, *, total: int) -> list[str]:
     return [
         f"{indent}[dim red]{display.escape_markup(line)}[/dim red]" for line in safe.split("\n")
     ]
+
+
+def _format_expansion_line(event: StagesExpanded) -> str:
+    """The one line a template's expansion (``Pipeline.map``) prints; its instances print as
+    any stage does."""
+    count = len(event["stages"])
+    noun = "stage" if count == 1 else "stages"
+    return f"{display.escape_markup(event['template'])}: expanded into {count} {noun}"
 
 
 def _categorize(event: StageCompleted) -> DisplayCategory:
@@ -292,6 +300,8 @@ class StaticConsoleSink:
                 self._console.print(f"[yellow bold]⚠ Engine diagnostic:[/yellow bold] {msg}")
                 if detail:
                     self._console.print(f"  [dim]{detail}[/dim]")
+            case "stages_expanded":
+                self._console.print(_format_expansion_line(event))
             case "engine_state_changed":
                 # ACTIVE starts a run and IDLE ends one; each run gets its own report.
                 self._finish_run()
@@ -482,6 +492,8 @@ class LiveConsoleSink:
                 self._console.print(f"[yellow bold]⚠ Engine diagnostic:[/yellow bold] {msg}")
                 if detail:
                     self._console.print(f"  [dim]{detail}[/dim]")
+            case "stages_expanded":
+                self._console.print(_format_expansion_line(event))
             case "engine_state_changed":
                 # ACTIVE starts a run and IDLE ends one; each run gets its own display.
                 self._finish_run()

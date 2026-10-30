@@ -116,7 +116,7 @@ def complete_targets(
         discovered = stages is None
         pipeline = _discover_pipeline() if discovered else None
         if stages is None:
-            stages = [] if pipeline is None else pipeline.list_stages()
+            stages = [] if pipeline is None else _stage_names(pipeline)
 
         completions = [stage for stage in stages if stage.startswith(incomplete)]
         _add_bare_completions(stages, completions, incomplete)
@@ -250,7 +250,13 @@ def _get_stages_fast() -> list[str] | None:
 def _get_stages_full() -> list[str]:
     """Fallback: get stage names via full discovery (~500ms), refreshing the cache."""
     pipeline = _discover_pipeline()
-    return [] if pipeline is None else pipeline.list_stages()
+    return [] if pipeline is None else _stage_names(pipeline)
+
+
+def _stage_names(pipeline: PipelineLike) -> list[str]:
+    """The names a stage target completes to: each stage, and each stage mapped over a
+    directory output (``Pipeline.map``), whose instances a run adds."""
+    return [*pipeline.list_stages(), *pipeline.list_templates()]
 
 
 def _discover_pipeline() -> PipelineLike | None:
@@ -275,7 +281,7 @@ def _discover_pipeline() -> PipelineLike | None:
         try:
             post_mtime = (root / config_file).stat().st_mtime
             if pre_mtime == post_mtime:
-                _write_stages_cache(root, config_file, pre_mtime, pipeline.list_stages())
+                _write_stages_cache(root, config_file, pre_mtime, _stage_names(pipeline))
         except OSError:
             pass  # Cache write failure is non-fatal
 

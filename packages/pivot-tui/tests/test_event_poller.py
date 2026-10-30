@@ -34,6 +34,7 @@ from pivot.types import (
 from pivot_tui.event_poller import EventPoller
 from pivot_tui.rpc_client_impl import RpcPivotClient
 from pivot_tui.testing import FakeRpcServer
+from pivot_tui.types import TuiExpandedMessage, TuiMessage
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -56,7 +57,7 @@ async def test_poller_converts_stage_started(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -103,7 +104,7 @@ async def test_poller_converts_stage_completed(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -145,7 +146,7 @@ async def test_poller_converts_log_line(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
     before = time.time()
 
     await server.start(socket_path)
@@ -186,7 +187,7 @@ async def test_poller_converts_engine_state_idle_to_watch(tmp_path: Path) -> Non
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -223,7 +224,7 @@ async def test_poller_ignores_engine_state_active(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -280,6 +281,56 @@ def test_malformed_engine_state_event_raises(event: dict[str, object]) -> None:
         event_poller._convert_event(event)
 
 
+def test_stages_expanded_from_the_wire_becomes_expanded_message() -> None:
+    """A real StagesExpanded, encoded as the RPC server sends it, names the template's instances."""
+    import json
+
+    from pivot.engine import agent_rpc
+    from pivot.engine.types import StagesExpanded
+    from pivot_tui import event_poller
+
+    event = StagesExpanded(
+        type="stages_expanded",
+        seq=9,
+        run_id="run-1",
+        template="demo/cut",
+        stages=["demo/cut@a", "demo/cut@b"],
+    )
+    wire = json.loads(agent_rpc._encode_wire(event))
+
+    msg = event_poller._convert_event(wire)
+
+    assert msg == TuiExpandedMessage(
+        type=TuiMessageType.EXPANDED, template="demo/cut", stages=["demo/cut@a", "demo/cut@b"]
+    )
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        pytest.param({"type": "stages_expanded", "stages": []}, id="missing-template"),
+        pytest.param(
+            {"type": "stages_expanded", "template": 3, "stages": []}, id="template-not-a-name"
+        ),
+        pytest.param(
+            {"type": "stages_expanded", "template": "demo/cut", "stages": "demo/cut@a"},
+            id="stages-not-a-list",
+        ),
+        pytest.param(
+            {"type": "stages_expanded", "template": "demo/cut", "stages": ["demo/cut@a", 4]},
+            id="stage-not-a-name",
+        ),
+    ],
+)
+def test_malformed_stages_expanded_event_raises(event: dict[str, object]) -> None:
+    """A malformed stages_expanded is an error the poller logs and skips, never a silent no-op."""
+    from pivot_tui import event_poller
+    from pivot_tui.rpc_client_impl import RpcProtocolError
+
+    with pytest.raises((KeyError, RpcProtocolError)):
+        event_poller._convert_event(event)
+
+
 @pytest.mark.anyio
 async def test_poller_ignores_unknown_event_types(tmp_path: Path) -> None:
     """Poller ignores events with unknown type."""
@@ -287,7 +338,7 @@ async def test_poller_ignores_unknown_event_types(tmp_path: Path) -> None:
     server = FakeRpcServer()
     server.inject_event({"type": "unknown_event", "data": "foo"})
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -344,7 +395,7 @@ async def test_poller_handles_multiple_events(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -384,7 +435,7 @@ async def test_poller_tracks_version_no_duplicates(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -441,7 +492,7 @@ async def test_poller_advances_version_per_event_no_duplicates_on_error(tmp_path
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -477,7 +528,7 @@ async def test_poller_retries_on_connection_error(tmp_path: Path) -> None:
     # Inject error for first call, then clear it
     server.inject_error("events_since", -32000, "temporary failure")
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -527,7 +578,7 @@ async def test_poller_stop_terminates_loop(tmp_path: Path) -> None:
         client = RpcPivotClient()
         await client.connect(socket_path)
 
-        messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+        messages = list[TuiMessage]()
         poller = EventPoller(client, messages.append)
 
         async with anyio.create_task_group() as tg:
@@ -590,7 +641,7 @@ async def test_poller_converts_pipeline_reloaded(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -634,7 +685,7 @@ async def test_poller_converts_pipeline_reloaded_with_error(tmp_path: Path) -> N
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -680,7 +731,7 @@ async def test_poller_oneshot_stops_on_end_of_stream(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -739,7 +790,7 @@ async def test_poller_handles_malformed_stage_started(tmp_path: Path) -> None:
     # Missing required fields
     server.inject_event({"type": "stage_started", "stage": 123, "index": "bad", "total": 1})
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -769,7 +820,7 @@ async def test_poller_handles_malformed_log_line(tmp_path: Path) -> None:
     server = FakeRpcServer()
     server.inject_event({"type": "log_line", "stage": "train", "line": 42, "is_stderr": "nope"})
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -824,7 +875,7 @@ async def test_poller_started_carries_explanation(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -866,7 +917,7 @@ async def test_poller_started_without_explanation(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -925,7 +976,7 @@ async def test_poller_completed_carries_output_summary(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -975,7 +1026,7 @@ async def test_poller_completed_without_output_summary(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -1031,7 +1082,7 @@ async def test_process_batch_skips_malformed_event_continues_remaining(tmp_path:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -1076,7 +1127,7 @@ async def test_poller_stops_on_rpc_protocol_error_in_watch_mode() -> None:
             call_count += 1
             raise _RpcProtocolError("dict", "str")
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
     poller = EventPoller(
         cast("PivotRpc", cast("object", _FailingClient())),
         messages.append,
@@ -1106,7 +1157,7 @@ async def test_poller_stops_on_json_decode_error_in_watch_mode() -> None:
             call_count += 1
             raise _json.JSONDecodeError("bad json", "", 0)
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
     poller = EventPoller(
         cast("PivotRpc", cast("object", _FailingClient())),
         messages.append,
@@ -1142,7 +1193,7 @@ async def test_invalid_explanation_payload_skipped(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -1183,7 +1234,7 @@ async def test_explanation_dict_missing_stage_name_skipped(tmp_path: Path) -> No
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -1231,7 +1282,7 @@ async def test_explanation_missing_multiple_required_keys_skipped(tmp_path: Path
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -1347,7 +1398,7 @@ async def test_unknown_stage_status_skipped(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:
@@ -1401,7 +1452,7 @@ async def test_oneshot_disconnect_stops_cleanly(tmp_path: Path) -> None:
         }
     )
 
-    messages = list[TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage]()
+    messages = list[TuiMessage]()
 
     await server.start(socket_path)
     try:

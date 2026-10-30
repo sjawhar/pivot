@@ -144,9 +144,14 @@ class QueryStatusResult(TypedDict):
 
 
 class QueryStagesResult(TypedDict):
-    """Result type for the 'stages' query."""
+    """Result type for the 'stages' query.
+
+    ``stages`` holds no template (``Pipeline.map``); ``templates`` maps each to the instances it
+    expanded into, an empty list until it expands.
+    """
 
     stages: list[str]
+    templates: dict[str, list[str]]
 
 
 class QueryStageInfoResult(TypedDict):
@@ -325,8 +330,13 @@ class AgentRpcHandler:
             case "stages":
                 pipeline = self._engine._pipeline  # pyright: ignore[reportPrivateUsage]
                 if pipeline is None:
-                    return QueryStagesResult(stages=list[str]())
-                return QueryStagesResult(stages=pipeline.list_stages())
+                    return QueryStagesResult(stages=list[str](), templates=dict[str, list[str]]())
+                return QueryStagesResult(
+                    stages=pipeline.list_stages(),
+                    templates={
+                        name: pipeline.instances_of(name) for name in pipeline.list_templates()
+                    },
+                )
             case "explain":
                 # Explain fingerprints the stage; the startup snapshot or a reload must finish
                 # first, and it explains the pipeline loaded once they have.

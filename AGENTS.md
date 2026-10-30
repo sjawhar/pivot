@@ -23,7 +23,8 @@ packages/pivot/src/pivot/
 ├── discovery.py   # Finds and loads pipeline.py
 ├── fingerprint.py # Code hashing, change detection
 ├── loaded_source.py # Source each user module was compiled from; fingerprinting reads it, not the file
-├── registry.py    # StageRegistry, RegistryStageInfo (built by Pipeline)
+├── registry.py    # StageRegistry, RegistryStageInfo, MapTemplate (built by Pipeline)
+├── expansion.py   # Expanding mapped stages (Pipeline.map) from the producer's recorded listing
 ├── stage_def.py   # StageParams, output writing helpers
 ├── state_dir.py   # core.state_dir: resolution, creation, per-invocation warnings, 0.5.2 layout
 ├── loaders.py     # File I/O (CSV, JSON, Pickle, etc.)
@@ -146,6 +147,7 @@ with Pipeline("demo") as pipeline:
 - **Outputs**: the return type; format inferred (`DataFrame`→JSONL, `dict`/`list`→YAML, `str`→text) or set with `Annotated[T, loader]`; `TypedDict` for several outputs; `metric`/`plot`/`incremental` tags; `Annotated[dict[str, T], directory]` for a variable set of files. Pivot chooses paths (`data/<pipeline>/<stage>.<ext>`, a directory `data/<pipeline>/<stage>/`)
 - **Parameters**: one `StageParams` subclass per stage, defined beside it; `params.yaml` overrides by stage name
 - **Variants**: Python loops, `pipeline.variant("name")`; composition: imported handles, `Pipeline.include()`
+- **Mapping**: `pipeline.map(handle)` over a `directory` output makes a template (`registry.MapTemplate`); a run that finds the producer current adds one instance `<stage>@<key>` per file (`Scheduler.extend`), and every command expands by the same rule from the producer's lock and listing (`expansion.py`, `status.expand_current`). No expansion is saved
 - Stages must be **pure, module-level functions** (workers receive them by pickling); config belongs in `StageParams`, not module-level collections
 
 User-facing guide: `skills/writing-pivot-stages/SKILL.md`.

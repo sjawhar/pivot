@@ -612,6 +612,9 @@ class PipelineStatus(enum.StrEnum):
 
     CACHED = "cached"
     STALE = "stale"
+    # A stage mapped over a directory output (``Pipeline.map``) whose producer is not current,
+    # so the command cannot know its instances; its reason says what it waits for
+    NOT_EXPANDED = "not_expanded"
 
 
 class TrackedFileStatus(enum.StrEnum):
@@ -703,7 +706,7 @@ class ExplainStageJson(TypedDict):
     """JSON-serializable stage explanation for status --explain --json output."""
 
     name: str
-    status: Literal["stale", "cached"]
+    status: Literal["stale", "cached", "not_expanded"]
     reason: str
     will_run: bool
     is_forced: bool
@@ -790,6 +793,7 @@ class TuiMessageType(enum.StrEnum):
     STATUS = "status"
     WATCH = "watch"
     RELOAD = "reload"
+    EXPANDED = "expanded"
 
 
 class WatchStatus(enum.StrEnum):
@@ -929,6 +933,7 @@ WatchJsonEvent = (
 #   2. StageStartEvent         Before each stage executes
 #   3. StageCompleteEvent      After each stage finishes
 #   ... (repeat 2-3 for each stage)
+#   StagesExpandedEvent        When a mapped stage (``Pipeline.map``) adds its instances
 #   4. ExecutionResultEvent    Final summary
 #
 
@@ -939,6 +944,7 @@ class RunEventType(enum.StrEnum):
     SCHEMA_VERSION = "schema_version"
     STAGE_START = "stage_start"
     STAGE_COMPLETE = "stage_complete"
+    STAGES_EXPANDED = "stages_expanded"
     EXECUTION_RESULT = "execution_result"
 
 
@@ -976,6 +982,15 @@ class StageCompleteEvent(TypedDict):
     timestamp: str  # ISO 8601 UTC
 
 
+class StagesExpandedEvent(TypedDict):
+    """A mapped stage's template (``Pipeline.map``) added its instances to the run: one stage
+    per file of the directory it is mapped over, ``<template>@<key>``, in key order."""
+
+    type: Literal[RunEventType.STAGES_EXPANDED]
+    template: str
+    stages: list[str]
+
+
 class ExecutionResultEvent(TypedDict):
     """Final summary event after pipeline completes."""
 
@@ -988,7 +1003,13 @@ class ExecutionResultEvent(TypedDict):
     timestamp: str  # ISO 8601 UTC
 
 
-RunJsonEvent = SchemaVersionEvent | StageStartEvent | StageCompleteEvent | ExecutionResultEvent
+RunJsonEvent = (
+    SchemaVersionEvent
+    | StageStartEvent
+    | StageCompleteEvent
+    | StagesExpandedEvent
+    | ExecutionResultEvent
+)
 
 
 # =============================================================================

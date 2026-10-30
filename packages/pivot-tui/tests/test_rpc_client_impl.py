@@ -113,16 +113,31 @@ async def test_status_active(tmp_path: Path) -> None:
 @pytest.mark.anyio
 async def test_stages(tmp_path: Path) -> None:
     async with _connected(tmp_path / "t.sock") as (server, client):
-        server.set_stages(["train", "eval", "report"])
+        server.set_stages(["train", "eval", "demo/cut@a"])
+        server.set_templates({"demo/cut": ["demo/cut@a"], "demo/build": []})
         result = await client.stages()
-        assert result == ["train", "eval", "report"]
+        assert result == {
+            "stages": ["train", "eval", "demo/cut@a"],
+            "templates": {"demo/cut": ["demo/cut@a"], "demo/build": []},
+        }
 
 
 @pytest.mark.anyio
 async def test_stages_empty(tmp_path: Path) -> None:
     async with _connected(tmp_path / "t.sock") as (_server, client):
         result = await client.stages()
-        assert result == []
+        assert result == {"stages": [], "templates": {}}
+
+
+@pytest.mark.anyio
+async def test_stages_template_without_an_instance_list_raises_rpc_protocol_error() -> None:
+    """A template mapped to anything but a list of names is a protocol error."""
+    from pivot_tui.rpc_client_impl import _as_templates
+
+    with pytest.raises(RpcProtocolError, match="expected list"):
+        _as_templates({"demo/cut": "demo/cut@a"})
+    with pytest.raises(RpcProtocolError, match="expected dict"):
+        _as_templates(["demo/cut"])
 
 
 # --- stage_info ---

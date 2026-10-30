@@ -337,6 +337,87 @@ defined. A directory of files whose loader only writes, such as
 `MatplotlibFigure()`, is a valid output, but no stage can depend on it or on
 one of its files.
 
+### One stage per file: `pipeline.map`
+
+`pipeline.map(handle)` makes a stage run once per file of a directory output,
+for a set of files no one knows while `pipeline.py` loads:
+
+```python
+from typing import Annotated
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def plan(
+    entries: dict[str, int],
+) -> Annotated[dict[str, dict[str, int]], directory, loaders.YAML[dict[str, int]]()]:
+    return {f"{name}.yaml": {"value": value} for name, value in entries.items()}
+
+
+@stage
+def cut(entry: dict[str, int]) -> dict[str, int]:
+    return {"cut": entry["value"] * 2}
+
+
+@stage
+def build(cut: dict[str, int]) -> dict[str, int]:
+    return {"built": cut["cut"] + 1000}
+
+
+with Pipeline("p") as pipeline:
+    planned = plan(pipeline.input("plan.yaml", t=dict[str, int]))
+    build(cut(pipeline.map(planned)))
+```
+
+`cut` and `build` are *mapped stages*. When a `pivot repro` finds `p/plan`
+current (it ran, or was skipped with its output present), it adds one instance
+of each per file of `data/p/plan/`, named `<stage>@<key>`, where the key is the
+file's path without its extension: `p/cut@a`, `p/build@a`, and so on. It runs
+them in the same run. Each instance is an ordinary stage with its own lock and
+outputs (`data/p/cut@a.yaml`); `p/cut@a` depends on `data/p/plan/a.yaml` alone,
+and `p/build@a` on `p/cut@a`. So an edit that changes one file reruns that
+key's chain only, and a new file runs the producer and the new chain only.
+
+- **Keys.** The keys come from the listing the producer's lock records for the
+  directory (see "Listing files" above), the same bytes restore, push and pull
+  read; a `--no-commit` run, which records no listing, reads the directory it wrote. A
+  key follows the variant-name rule (letters, digits, `_`, `.`, `-`), so a file
+  in a subdirectory, or two files with one key (`a.yaml`, `a.json`), fail the
+  mapped stage in the run, naming the files; so does an instance whose name or
+  output path another stage holds. A failed expansion adds no instance.
+- **What expands.** `pivot repro <producer>` runs the producer and its
+  upstream only, and expands nothing. `pivot repro p/cut` runs `p/plan`, then
+  every instance of `p/cut`. An instance name (`pivot repro p/cut@a`) stands for
+  its mapped stage. `pivot run p/cut` is refused: a mapped stage expands only in
+  a run that finds its producer current. Nothing about an expansion is saved: each
+  run expands afresh.
+- **The other commands** (`status`, `list`, `dag`, `checkout`, `verify`,
+  `push`, `pull`, `repro --dry-run` and `--explain`) expand each mapped stage
+  by the same rule, from the producer's lock and listing, when the producer is
+  current: its lock matches, and its output is in the cache or, with a remote
+  configured, missing from it and restorable by `pivot pull`. A fresh clone
+  therefore lists every instance before any pull. Until then a mapped stage is
+  *not yet expanded*: `pivot status` shows it (`not_expanded` in `--json`) with
+  what it waits for, `pivot list` lists it under "Mapped stages, not yet
+  expanded" (`templates` in `--json`), and `pivot dag` labels its node.
+  `checkout`, `push` and `pull` refuse a target naming it, and `verify` fails
+  it. `pull` first fetches the listing of a current producer that the clone
+  lacks, then expands.
+- **Mapping rules.** `pipeline.map` takes a stage's directory output, or a
+  directory field of a multi-output stage (`out.parts`). It refuses an input, one
+  file of a directory, any other output, and a handle that is already mapped. A
+  stage called with a mapped stage's output is mapped over the same files; one
+  stage cannot be mapped over two directories, and no stage can take every
+  instance's output at once (a stage that receives a mapped handle is mapped).
+- **Parameters.** `params.yaml` key `p/cut` applies to every instance, and
+  `p/cut@a` to one, whether or not a run has added it; each is checked against
+  the mapped stage's `StageParams`. A mapped variant's own name
+  (`p/cut@x`) is refused: its instances read `p/cut` and `p/cut@x@<key>`.
+- **Files left behind.** A key that leaves the plan has no instance in the next
+  run; its lock, listing and outputs stay, and `pivot status` does not count them
+  as orphaned.
+
 ## Incremental outputs
 
 Tag a return value with `incremental` when the stage needs its own prior output.

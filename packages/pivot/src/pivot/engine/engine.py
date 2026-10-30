@@ -25,6 +25,7 @@ import anyio.to_thread
 from pivot import (
     config,
     exceptions,
+    expansion,
     fingerprint,
     parameters,
     project,
@@ -176,9 +177,9 @@ class _MapRun:
     """One run's templates (``Pipeline.map``) and what adding their instances needs.
 
     A template is a node of the run's schedule with no resources. When its upstream stages
-    have finished, its producer among them, the engine reads the producer's directory and adds
-    one instance per file. ``stage_order``, ``all_stages`` and ``committed_before`` are the
-    run's own records, which each expansion extends.
+    have finished, its producer among them, the engine reads the producer's recorded listing of
+    the directory and adds one instance per file. ``stage_order``, ``all_stages`` and
+    ``committed_before`` are the run's own records, which each expansion extends.
     """
 
     templates: set[str]
@@ -191,8 +192,10 @@ class _MapRun:
     capacities: dict[str, int]
     store: store_mod.WorkspaceStore
     cache_dir: pathlib.Path
+    default_state_dir: pathlib.Path
     project_root: pathlib.Path
     force: bool
+    no_commit: bool
     allow_uncached_incremental: bool
 
 
@@ -313,55 +316,55 @@ def _stage_request(info: RegistryStageInfo, capacities: dict[str, int]) -> dict[
 def _refuse_single_stage_templates(
     stages: list[str], templates: dict[str, registry.MapTemplate]
 ) -> None:
-    """Refuse a run of named stages only (``pivot run``) that names a template: a template
-    expands when its producer is current in the same run, and such a run resolves no producer.
+    """Refuse a run of named stages only (``pivot run``) that names a template
+    (``expansion.single_stage_refusal``).
 
     Raises:
         PipelineConfigError: Naming the first template and the command that expands it.
     """
     for name in stages:
         if name in templates:
-            source = templates[name]["source"]
-            raise exceptions.PipelineConfigError(
-                f"'{name}' is mapped over the files of '{types.identity_key(source)}': it "
-                + f"expands only in a run that also runs or skips '{source.producer}'. Run "
-                + f"`pivot repro {name}`."
-            )
+            raise expansion.single_stage_refusal(name, templates[name])
 
 
 def _read_map_keys(source: types.ArtifactIdentity, map_run: _MapRun) -> list[tuple[str, str]]:
-    """The (key, file key) of each file of directory output ``source``, as its producer, now
-    current, left it in the workspace (``registry.map_instance_keys``).
+    """The (key, file key) of each file of directory output ``source``, whose producer has
+    finished in this run, by the listing the producer recorded for it
+    (``expansion.read_keys``): the one its lock records, which it just wrote or matched.
 
-    The walk is the one a directory artifact's listing is made from
-    (``cache.walk_artifact_members``): a link into the cache that a symlink checkout leaves is a
-    file, and any other link is not part of the directory. It holds READ on the directory, the
-    lock every stage reading it as a dependency takes, so another pivot run cannot rewrite it
-    mid-walk.
+    A ``--no-commit`` run writes no lock, listing or cache object, so its producer's listing is
+    the directory it left in the workspace, hashed as recording a listing hashes it
+    (``cache.hash_directory``). That hash holds READ on the directory, the lock every stage
+    reading it as a dependency takes, so another pivot run cannot rewrite it mid-walk.
 
     Raises:
-        PipelineConfigError: The directory is missing, or a file's key cannot name a stage.
+        ListingMissingError: The lock records no listing that the committed file or the cache
+            holds, or (``--no-commit``) the directory is missing.
+        CorruptListingError: That listing cannot be used.
+        PipelineConfigError: A file's key cannot name a stage, or two files share a key.
     """
     producer = map_run.all_stages[source.producer]
+    files_dir = map_run.cache_dir / "files"
+    default_state_dir = map_run.default_state_dir
+    if not map_run.no_commit:
+        return expansion.read_keys(
+            source,
+            producer,
+            expansion.stage_lock(producer, default_state_dir).read(cache_dir=files_dir),
+            default_state_dir=default_state_dir,
+            cache_dir=files_dir,
+        )
     output = next(out for out in producer["outs"] if out.identity == source)
     directory = map_run.store.resolve_display_path(output)
-    files = list[tuple[str, os.DirEntry[str]]]()
-    lock_dir = registry.get_stage_state_dir(producer, config.get_state_dir()) / "locks"
+    lock_dir = registry.get_stage_state_dir(producer, default_state_dir) / "locks"
     requests = artifact_lock.expand_lock_requests({"source": output}, [], map_run.project_root)
     try:
         with artifact_lock.LocalFlockLockService(lock_dir).acquire_many(requests):
-            cache.walk_artifact_members(
-                os.fspath(directory),
-                "",
-                cache.resolve_cache_root(map_run.cache_dir / "files"),
-                files,
-                list[str](),
-                list[pathlib.Path](),
-            )
+            hashed = cache.hash_directory(directory, cache_dir=files_dir)
     except FileNotFoundError:
         shown = project.to_relative_path(directory, map_run.project_root)
-        raise exceptions.PipelineConfigError(f"the directory {shown} is missing") from None
-    return registry.map_instance_keys(relpath for relpath, _ in files)
+        raise exceptions.ListingMissingError(f"the directory {shown} is missing") from None
+    return expansion.keys_of(hashed["listing"])
 
 
 def _incremental_refusal(
@@ -1213,6 +1216,14 @@ class Engine:
         pipeline = self._require_pipeline()
         return {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
 
+    def _get_graph_stages(self) -> dict[str, RegistryStageInfo]:
+        """Every stage and every template (``Pipeline.map``), as a run's graph holds them."""
+        pipeline = self._require_pipeline()
+        return {
+            **self._get_all_stages(),
+            **{name: pipeline.get_template(name)["info"] for name in pipeline.list_templates()},
+        }
+
     # =========================================================================
     # Stage State Management
     # =========================================================================
@@ -1237,9 +1248,13 @@ class Engine:
         return self._scheduler.get_state(stage)
 
     def _get_stage_index(self, stage_name: str) -> tuple[int, int]:
-        """Get (1-based index, total count) for a stage."""
-        stage_keys = list(self._scheduler.stage_states.keys())
+        """Get (1-based index, total count) for a stage. A template (``Pipeline.map``) is a node
+        of the schedule but no stage: it counts in neither, and its own index is 0."""
+        templates = self._map_run.templates if self._map_run is not None else set[str]()
+        stage_keys = [name for name in self._scheduler.stage_states if name not in templates]
         total_stages = len(stage_keys)
+        if stage_name in templates:
+            return 0, total_stages
         try:
             stage_index = stage_keys.index(stage_name) + 1
         except ValueError:
@@ -1491,8 +1506,10 @@ class Engine:
                 capacities=capacities,
                 store=store,
                 cache_dir=cache_dir,
+                default_state_dir=default_state_dir,
                 project_root=project_root,
                 force=force,
+                no_commit=no_commit,
                 allow_uncached_incremental=allow_uncached_incremental,
             )
             if run_templates
@@ -3261,11 +3278,13 @@ class Engine:
         await self._handle_run_requested(event)
 
     def _get_watch_coordinator(self) -> engine_watch.WatchCoordinator | None:
-        """Lazily build watch planning from the current pipeline and graph."""
+        """Lazily build watch planning from the current pipeline and graph. The graph holds each
+        template (``Pipeline.map``) as a run's does, so a change to an input a template reads
+        runs the template, which expands again (``_get_graph_stages``)."""
         if self._pipeline is None:
             return None
         if self._graph is None:
-            self._graph = engine_graph.build_graph(self._get_all_stages())
+            self._graph = engine_graph.build_graph(self._get_graph_stages())
 
         if self._watch_coordinator is None or self._watch_coordinator.graph is not self._graph:
             pipeline = self._require_pipeline()
@@ -3276,7 +3295,7 @@ class Engine:
             )
             self._watch_coordinator = engine_watch.WatchCoordinator(
                 self._graph,
-                engine_watch.build_artifact_paths(self._get_all_stages(), store),
+                engine_watch.build_artifact_paths(self._get_graph_stages(), store),
             )
         return self._watch_coordinator
 

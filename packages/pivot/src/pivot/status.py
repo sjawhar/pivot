@@ -56,6 +56,7 @@ from pivot import (
     config,
     display,
     exceptions,
+    expansion,
     explain,
     import_artifact,
     metrics,
@@ -89,7 +90,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Collection, Iterable, Mapping
 
     import networkx as nx
     from networkx import DiGraph
@@ -101,6 +102,9 @@ logger = logging.getLogger(__name__)
 
 UPSTREAM_STALE_REASON_PREFIX = "Upstream stale"
 """Reason prefix for a stage that is current on its own but has a stale upstream."""
+
+NOT_EXPANDED_REASON_PREFIX = "Not yet expanded"
+"""Reason prefix for a mapped stage (``Pipeline.map``) whose producer is not current."""
 
 
 def _discover_tracked_files(
@@ -136,15 +140,20 @@ def _get_explanations_in_parallel(
     allow_missing: bool = False,
     tracked_files: dict[str, PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
+    *,
+    known: Collection[str] = (),
 ) -> dict[str, StageExplanation]:
-    """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing)."""
+    """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing), for each
+    stage of ``execution_order`` but ``known``. A known stage's lock is still read: a stage that
+    reads one file of its directory output finds that file's hash in it."""
     default_state_dir = config.locate_state_dir()
-    max_workers = min(8, len(execution_order))
+    pending = [name for name in execution_order if name not in known]
+    max_workers = min(8, len(pending))
     locks = explain.read_locks(execution_order, all_stages, default_state_dir, store.cache_dir)
     unreadable = dict[ArtifactIdentity, str]()
     producer_hashes = explain.producer_output_hashes(
         locks,
-        (ref for name in execution_order for ref in all_stages[name]["deps"].values()),
+        (ref for name in pending for ref in all_stages[name]["deps"].values()),
         {name: explain.stages_dir(all_stages[name], default_state_dir) for name in locks},
         store.cache_dir,
         unreadable,
@@ -154,7 +163,7 @@ def _get_explanations_in_parallel(
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = dict[Future[StageExplanation], str]()
-        for stage_name in execution_order:
+        for stage_name in pending:
             stage_info = all_stages[stage_name]
             fingerprint = cast("dict[str, str]", stage_info["fingerprint"])
             stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
@@ -217,6 +226,43 @@ def _make_workspace_store(pipeline: registry.PipelineLike) -> store_mod.Workspac
     )
 
 
+def _explanations_for(
+    execution_order: list[str],
+    all_stages: dict[str, RegistryStageInfo],
+    pipeline: registry.PipelineLike,
+    *,
+    force: bool,
+    allow_missing: bool,
+    known: Mapping[str, StageExplanation] | None,
+) -> dict[str, StageExplanation]:
+    """Each stage of ``execution_order``'s own explanation, before its upstream is counted
+    (``_compute_explanations_with_upstream``): ``known``'s where it holds one, computed with the
+    same ``force`` and ``allow_missing``, else read now."""
+    tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
+    with fingerprint_mod.fingerprint_pass():
+        for stage_name in execution_order:
+            pipeline.ensure_fingerprint(stage_name)
+    overrides = parameters.load_params_yaml(pipeline)
+    reused = {name: known[name] for name in execution_order if known is not None and name in known}
+    pending = [name for name in execution_order if name not in reused]
+    if not pending:
+        return reused
+    return {
+        **reused,
+        **_get_explanations_in_parallel(
+            execution_order,
+            overrides,
+            all_stages=all_stages,
+            force=force,
+            allow_missing=allow_missing,
+            tracked_files=tracked_files,
+            tracked_trie=tracked_trie,
+            store=_make_workspace_store(pipeline),
+            known=reused.keys(),
+        ),
+    }
+
+
 def get_pipeline_explanations(
     stages: list[str] | None,
     single_stage: bool,
@@ -225,11 +271,14 @@ def get_pipeline_explanations(
     force: bool = False,
     allow_missing: bool = False,
     graph: nx.DiGraph[str] | None = None,
+    *,
+    known: Mapping[str, StageExplanation] | None = None,
 ) -> list[StageExplanation]:
+    """Explain each stage of ``stages``' execution order. ``known`` holds explanations already
+    computed with the same ``force`` and ``allow_missing`` (``expand_current``'s)."""
     _t = metrics.start()
     try:
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
-            tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
             if graph is None:
                 graph = engine_graph.build_graph(all_stages)
             stage_graph = engine_graph.get_stage_dag(graph)
@@ -240,27 +289,131 @@ def get_pipeline_explanations(
             if not execution_order:
                 return []
 
-            with fingerprint_mod.fingerprint_pass():
-                for stage_name in execution_order:
-                    pipeline.ensure_fingerprint(stage_name)
-            overrides = parameters.load_params_yaml(pipeline)
-
-            store = _make_workspace_store(pipeline)
-            explanations_by_name = _get_explanations_in_parallel(
+            explanations_by_name = _explanations_for(
                 execution_order,
-                overrides,
-                all_stages=all_stages,
+                all_stages,
+                pipeline,
                 force=force,
                 allow_missing=allow_missing,
-                tracked_files=tracked_files,
-                tracked_trie=tracked_trie,
-                store=store,
+                known=known,
             )
-
             explanations = [explanations_by_name[name] for name in execution_order]
             return _compute_explanations_with_upstream(explanations, stage_graph)
     finally:
         metrics.end("status.get_pipeline_explanations", _t)
+
+
+def pullable_stages(stages: Iterable[tuple[str, str, list[str]]]) -> set[str]:
+    """The stages, of (name, reason, stale upstream stages) in execution order with their
+    upstream counted, that ``pivot pull`` brings up to date without recomputing anything.
+
+    A stage is pullable when its outputs are missing from the cache
+    (``explain.OUTPUTS_MISSING_REASON``) and every stale upstream is itself pullable: in a plain
+    clone the downstream stages are stale only because their upstream's outputs are missing too,
+    and pull restores all of them. A stage current on its own (e.g. a committed metric) passes
+    through when its stale upstreams are pullable, but has nothing to pull itself. A stage
+    downstream of a stage that must recompute is recomputed by repro.
+    """
+    pullable = set[str]()
+    for name, reason, upstream_stale in stages:
+        if not pullable.issuperset(upstream_stale):
+            continue
+        if reason == explain.OUTPUTS_MISSING_REASON or reason.startswith(
+            UPSTREAM_STALE_REASON_PREFIX
+        ):
+            pullable.add(name)
+    return pullable
+
+
+def expand_current(
+    pipeline: registry.PipelineLike,
+    *,
+    force: bool = False,
+    allow_missing: bool = False,
+) -> tuple[expansion.Expansion, dict[str, StageExplanation]]:
+    """Expand each mapped stage (``Pipeline.map``) of ``pipeline`` whose producer is current,
+    as a run would before running its instances (``expansion.expand_current``).
+
+    Whether a producer is current is the explain path's decision (``get_pipeline_explanations``
+    over the producers and their upstream stages): its explanation, its upstream counted, says it
+    would not run; or, with a remote configured, only that it and its stale upstream stages are
+    pullable (``pullable_stages``): its lock matches, and its output, missing from the cache, is
+    restored from the remote. Every other template stays unexpanded, naming what it waits for.
+
+    Returns the expansion and the explanations it computed, before their upstream is counted,
+    for the caller to pass on as ``known`` (computed with ``force`` and ``allow_missing``).
+    """
+    pipeline.reset_expansions()
+    templates = pipeline.list_templates()
+    if not templates:
+        return expansion.Expansion(expanded={}, not_expanded={}, listings={}), {}
+    _t = metrics.start()
+    try:
+        with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
+            all_stages = {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
+            producers = {pipeline.get_template(name)["source"].producer for name in templates}
+            stage_graph = engine_graph.get_stage_dag(engine_graph.build_graph(all_stages))
+            order = engine_graph.get_execution_order(
+                stage_graph, sorted(producers & set(all_stages)), single_stage=False
+            )
+            raw = (
+                _explanations_for(
+                    order,
+                    all_stages,
+                    pipeline,
+                    force=force,
+                    allow_missing=allow_missing,
+                    known=None,
+                )
+                if order
+                else {}
+            )
+            enriched = _compute_explanations_with_upstream(
+                [raw[name] for name in order], stage_graph
+            )
+            current = {exp["stage_name"] for exp in enriched if not exp["will_run"]}
+            if remote_config.list_remotes():
+                current |= pullable_stages(
+                    (exp["stage_name"], exp["reason"], exp["upstream_stale"]) for exp in enriched
+                )
+            waiting = {
+                exp["stage_name"]: exp["reason"] or "stale"
+                for exp in enriched
+                if exp["stage_name"] not in current
+            }
+            default_state_dir = config.locate_state_dir()
+            files_dir = config.locate_cache_dir() / "files"
+            locks = explain.read_locks(
+                sorted(producers & current), all_stages, default_state_dir, files_dir
+            )
+            result = expansion.expand_current(
+                pipeline,
+                locks,
+                waiting,
+                default_state_dir=default_state_dir,
+                cache_dir=files_dir,
+            )
+            return result, raw
+    finally:
+        metrics.end("status.expand_current", _t)
+
+
+def not_expanded_status(
+    result: expansion.Expansion, templates: Iterable[str] | None = None
+) -> list[PipelineStatusInfo]:
+    """A ``NOT_EXPANDED`` row for each template ``result`` left unexpanded, of ``templates``
+    (None: every one), in the order the pipeline holds them."""
+    wanted = None if templates is None else set(templates)
+    return [
+        PipelineStatusInfo(
+            name=name,
+            status=PipelineStatus.NOT_EXPANDED,
+            reason=f"{NOT_EXPANDED_REASON_PREFIX}: {why}",
+            upstream_stale=[],
+        )
+        for name, why in result["not_expanded"].items()
+        if wanted is None or name in wanted
+    ]
 
 
 def _compute_explanations_with_upstream(
@@ -316,11 +469,14 @@ def get_pipeline_status(
     pipeline: registry.PipelineLike,
     allow_missing: bool = False,
     graph: nx.DiGraph[str] | None = None,
+    *,
+    known: Mapping[str, StageExplanation] | None = None,
 ) -> tuple[list[PipelineStatusInfo], DiGraph[str]]:
+    """The status of each stage of ``stages``' execution order; ``known`` as
+    ``get_pipeline_explanations`` takes it."""
     _t = metrics.start()
     try:
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
-            tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
             if graph is None:
                 graph = engine_graph.build_graph(all_stages)
             stage_graph = engine_graph.get_stage_dag(graph)
@@ -331,22 +487,14 @@ def get_pipeline_status(
             if not execution_order:
                 return [], stage_graph
 
-            with fingerprint_mod.fingerprint_pass():
-                for stage_name in execution_order:
-                    pipeline.ensure_fingerprint(stage_name)
-            overrides = parameters.load_params_yaml(pipeline)
-
-            store = _make_workspace_store(pipeline)
-            explanations_by_name = _get_explanations_in_parallel(
+            explanations_by_name = _explanations_for(
                 execution_order,
-                overrides,
-                all_stages=all_stages,
+                all_stages,
+                pipeline,
+                force=False,
                 allow_missing=allow_missing,
-                tracked_files=tracked_files,
-                tracked_trie=tracked_trie,
-                store=store,
+                known=known,
             )
-
             explanations = [explanations_by_name[name] for name in execution_order]
             enriched = _compute_explanations_with_upstream(explanations, stage_graph)
             return _explanations_to_status(enriched), stage_graph

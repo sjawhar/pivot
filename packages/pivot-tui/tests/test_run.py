@@ -22,9 +22,10 @@ from pivot.types import (
     WatchStatus,
 )
 from pivot_tui import run as run_tui
+from pivot_tui.client import StagesResult
 from pivot_tui.screens import ConfirmCommitScreen
 from pivot_tui.testing import FakeRpcServer
-from pivot_tui.types import LogEntry, StageInfo
+from pivot_tui.types import LogEntry, StageInfo, TuiExpandedMessage
 from pivot_tui.widgets import (
     StageListPanel,
     StageLogPanel,
@@ -1456,3 +1457,214 @@ def test_handle_status_no_snapshot_fields_leaves_none() -> None:
         app._handle_status(msg)
     assert app._stages["train"].live_input_snapshot is None
     assert app._stages["train"].live_output_snapshot is None
+
+
+# =============================================================================
+# Mapped stages (Pipeline.map): templates and their instances
+# =============================================================================
+
+_REFUSAL = "cannot expand over the files of 'demo/plan': file 'a b.yaml' cannot name a stage"
+
+
+def _expanded(template: str, stages: list[str]) -> run_tui.TuiUpdate:
+    return run_tui.TuiUpdate(
+        TuiExpandedMessage(type=TuiMessageType.EXPANDED, template=template, stages=stages)
+    )
+
+
+def _status(stage: str, status: StageStatus, reason: str = "") -> run_tui.TuiUpdate:
+    return run_tui.TuiUpdate(
+        TuiStatusMessage(
+            type=TuiMessageType.STATUS,
+            stage=stage,
+            index=2,
+            total=2,
+            status=status,
+            reason=reason,
+            elapsed=0.0,
+            run_id="run-1",
+        )
+    )
+
+
+def _reload(stages: list[str]) -> run_tui.TuiUpdate:
+    return run_tui.TuiUpdate(
+        TuiReloadMessage(
+            type=TuiMessageType.RELOAD,
+            stages=stages,
+            stages_added=[],
+            stages_removed=[],
+            stages_modified=[],
+            error=None,
+        )
+    )
+
+
+def _templates_client(*answers: dict[str, list[str]]) -> AsyncMock:
+    """A client whose successive ``stages`` answers name these templates."""
+    client = AsyncMock()
+    client.stages.side_effect = [
+        StagesResult(stages=list[str](), templates=templates) for templates in answers
+    ]
+    return client
+
+
+def _row_text(app: run_tui.PivotApp, stage: str) -> str:
+    return str(app.query_one("#stage-list", StageListPanel)._rows[stage].content)
+
+
+@pytest.mark.asyncio
+async def test_expansion_adds_the_instance_rows_under_their_template() -> None:
+    """The instances join the list right after their template and group under it."""
+    app = run_tui.PivotApp(stage_names=["demo/plan", "demo/cut", "demo/report"])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.post_message(_expanded("demo/cut", ["demo/cut@a", "demo/cut@b"]))
+        await pilot.pause()
+
+        order = ["demo/plan", "demo/cut", "demo/cut@a", "demo/cut@b", "demo/report"]
+        assert app._stage_order == order
+        assert [app._stages[name].index for name in order] == [1, 2, 3, 4, 5]
+        assert {app._stages[name].total for name in order} == {5}
+        panel = app.query_one("#stage-list", StageListPanel)
+        assert list(panel._rows) == order, "every stage has a row, in list order"
+        assert "(2)" in str(panel._group_headers["demo/cut"].content), "the group counts instances"
+        assert "@a" in _row_text(app, "demo/cut@a")
+        assert "expanded (2)" in _row_text(app, "demo/cut")
+        assert app._stages["demo/cut"].status == StageStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_a_new_expansion_replaces_the_template_rows_of_the_last() -> None:
+    """A later run's expansion drops the instances it no longer holds and keeps the others."""
+    app = run_tui.PivotApp(stage_names=["demo/cut"], watch_mode=True)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.post_message(_expanded("demo/cut", ["demo/cut@a", "demo/cut@b"]))
+        await pilot.pause()
+        kept = app._stages["demo/cut@b"]
+        app.post_message(_expanded("demo/cut", ["demo/cut@b", "demo/cut@c"]))
+        await pilot.pause()
+
+        assert app._stage_order == ["demo/cut", "demo/cut@b", "demo/cut@c"]
+        assert "demo/cut@a" not in app._stages
+        assert app._stages["demo/cut@b"] is kept, "a kept instance keeps its state and history"
+        assert "expanded (2)" in _row_text(app, "demo/cut")
+
+
+@pytest.mark.asyncio
+async def test_template_row_reads_not_yet_expanded_from_the_stages_answer(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The engine's ``stages`` answer marks a template; its row says so until it expands."""
+    socket_path = tmp_path / "pivot.sock"
+    server = FakeRpcServer()
+    server.set_stages(["demo/plan"])
+    server.set_templates({"demo/cut": []})
+    await server.start(socket_path)
+    await wait_for_socket(socket_path)
+    try:
+        app = run_tui.PivotApp(stage_names=["demo/plan", "demo/cut"], socket_path=socket_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app._stages["demo/cut"].is_template
+            assert "not yet expanded" in _row_text(app, "demo/cut")
+            assert "expanded" not in _row_text(app, "demo/plan"), "a stage is not a template"
+
+            app.post_message(_expanded("demo/cut", ["demo/cut@a", "demo/cut@b", "demo/cut@c"]))
+            await pilot.pause()
+            assert "expanded (3)" in _row_text(app, "demo/cut")
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_template_the_answer_shows_expanded_gets_its_instance_rows() -> None:
+    """An answer taken after the expansion, before its event arrives, adds the instance rows."""
+    client = _templates_client({"demo/cut": ["demo/cut@a"]})
+    app = run_tui.PivotApp(stage_names=["demo/plan", "demo/cut"], client=client)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        assert app._stage_order == ["demo/plan", "demo/cut", "demo/cut@a"]
+        assert "expanded (1)" in _row_text(app, "demo/cut")
+
+
+@pytest.mark.asyncio
+async def test_refused_expansion_shows_failed_with_its_reason() -> None:
+    """A refused expansion fails the template; the reason is in its log, the row says failed."""
+    client = _templates_client({"demo/cut": []})
+    app = run_tui.PivotApp(stage_names=["demo/plan", "demo/cut"], client=client)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        app.post_message(_status("demo/cut", StageStatus.FAILED, _REFUSAL))
+        await pilot.pause()
+
+        info = app._stages["demo/cut"]
+        assert info.status == StageStatus.FAILED
+        assert [(entry.line, entry.is_stderr) for entry in info.logs] == [(_REFUSAL, True)]
+        row = _row_text(app, "demo/cut")
+        assert "expansion failed" in row
+        assert tui_status.get_status_symbol(StageStatus.FAILED)[0] in row
+
+
+@pytest.mark.asyncio
+async def test_status_for_a_stage_the_list_lacks_adds_its_row_in_run_mode() -> None:
+    """A run-mode status for a stage with no row (an instance whose expansion was missed) adds
+    the row."""
+    app = run_tui.PivotApp(stage_names=["demo/cut"])
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.post_message(_status("demo/cut@a", StageStatus.IN_PROGRESS))
+        await pilot.pause()
+
+        assert "demo/cut@a" in app.query_one("#stage-list", StageListPanel)._rows
+
+
+@pytest.mark.asyncio
+async def test_reload_keeps_template_rows_and_asks_for_the_templates_again() -> None:
+    """A reload's stage list holds no template; the rows stay, before any instance the list holds,
+    and the next ``stages`` answer says how far each is expanded."""
+    client = _templates_client({"demo/cut": []}, {"demo/cut": ["demo/cut@a"]})
+    app = run_tui.PivotApp(stage_names=["demo/plan", "demo/cut"], watch_mode=True, client=client)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        app.post_message(_reload(["demo/plan", "demo/cut@a", "demo/report"]))
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        assert client.stages.await_count == 2, "the reload asks for the templates again"
+        assert app._stage_order == ["demo/plan", "demo/cut", "demo/cut@a", "demo/report"]
+        assert "expanded (1)" in _row_text(app, "demo/cut")
+
+
+@pytest.mark.asyncio
+async def test_reload_drops_a_removed_template_and_adds_a_new_one() -> None:
+    """After a reload, the ``stages`` answer is the pipeline's set of templates."""
+    client = _templates_client({"demo/cut": []}, {"demo/build": []})
+    app = run_tui.PivotApp(stage_names=["demo/plan", "demo/cut"], watch_mode=True, client=client)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        app.post_message(_reload(["demo/plan"]))
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        assert app._stage_order == ["demo/plan", "demo/build"]
+        assert "not yet expanded" in _row_text(app, "demo/build")

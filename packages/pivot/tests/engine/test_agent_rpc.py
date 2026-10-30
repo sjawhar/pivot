@@ -10,14 +10,14 @@ import shutil
 import socket
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Annotated, cast
 from unittest.mock import MagicMock
 
 import anyio
 import anyio.to_thread
 import pytest
 
-from pivot import executor
+from pivot import compose, executor, loaders
 from pivot.compose import Pipeline
 from pivot.engine.agent_rpc import (
     AgentRpcHandler,
@@ -45,6 +45,18 @@ def _helper_valid_stage() -> dict[str, int]:
 def _helper_explained_stage(input_file: str) -> str:
     _ = input_file
     return "explained"
+
+
+@compose.stage
+def _helper_plan(
+    raw: dict[str, int],
+) -> Annotated[dict[str, dict[str, int]], compose.directory, loaders.YAML[dict[str, int]]()]:
+    return {f"{name}.yaml": {"value": value} for name, value in raw.items()}
+
+
+@compose.stage
+def _helper_cut(entry: dict[str, int]) -> dict[str, int]:
+    return entry
 
 
 _diff_expected: DataDiffResult | None = None
@@ -802,11 +814,34 @@ async def test_agent_rpc_handler_stages_query_without_pipeline(tmp_path: Path) -
                 response = json.loads(response_line.decode())
 
                 assert "result" in response
-                assert response["result"]["stages"] == [], (
-                    "Should return empty list without pipeline"
+                assert response["result"] == {"stages": [], "templates": {}}, (
+                    "Should return no stage and no template without pipeline"
                 )
 
             tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_stages_query_maps_each_template_to_its_instances(tmp_path: Path) -> None:
+    """The answer names each template beside the stages, with the instances it expanded into;
+    an empty list before it expands. A template is never one of the stages."""
+    with Pipeline("p", root=tmp_path) as pipeline:
+        plan = _helper_plan(pipeline.input("plan.yaml", t=dict[str, int]))
+        _helper_cut(pipeline.map(plan))
+    engine = MagicMock()
+    engine._pipeline = pipeline
+    handler = AgentRpcHandler(engine=engine)
+
+    before = await handler.handle_query("stages")
+    pipeline.expand_template("p/_helper_cut", [("a", "a.yaml"), ("b", "b.yaml")])
+    after = await handler.handle_query("stages")
+
+    assert before == {"stages": ["p/_helper_plan"], "templates": {"p/_helper_cut": []}}
+    instances = ["p/_helper_cut@a", "p/_helper_cut@b"]
+    assert after == {
+        "stages": ["p/_helper_plan", *instances],
+        "templates": {"p/_helper_cut": instances},
+    }
 
 
 @pytest.mark.anyio

@@ -67,7 +67,7 @@ The TUI uses a two-panel layout:
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Stage List** (left) — shows all stages with status symbols. Variants of one stage (`train@a`, `train@b`) are grouped together and stages are sorted by DAG level. Use `j`/`k` to navigate, `/` to filter by name, `Enter` to collapse groups.
+**Stage List** (left) — shows all stages with status symbols. Variants of one stage (`train@a`, `train@b`) are grouped together and stages are sorted by DAG level. A mapped stage (`pipeline.map`) reads `not yet expanded` until the run expands it, then `expanded (N)`, and its instances (`cut@a`, `cut@b`) appear grouped under it; a refused expansion shows failed, with the reason in its Logs tab. Use `j`/`k` to navigate, `/` to filter by name, `Enter` to collapse groups.
 
 **Detail Panel** (right) — three tabs:
 

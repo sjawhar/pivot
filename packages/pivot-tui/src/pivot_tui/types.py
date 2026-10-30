@@ -2,9 +2,33 @@ from __future__ import annotations
 
 import collections
 import dataclasses
-from typing import NamedTuple
+from typing import Literal, NamedTuple, TypedDict
 
-from pivot.types import OutputChange, StageExplanation, StageStatus, parse_stage_name
+from pivot.types import (
+    OutputChange,
+    StageExplanation,
+    StageStatus,
+    TuiLogMessage,
+    TuiMessageType,
+    TuiReloadMessage,
+    TuiStatusMessage,
+    TuiWatchMessage,
+    parse_stage_name,
+)
+
+
+class TuiExpandedMessage(TypedDict):
+    """A run added a template's instances (``Pipeline.map``, the engine's ``stages_expanded``):
+    one stage per file of the directory it is mapped over, ``<template>@<key>``, in key order."""
+
+    type: Literal[TuiMessageType.EXPANDED]
+    template: str
+    stages: list[str]
+
+
+type TuiMessage = (
+    TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage | TuiExpandedMessage
+)
 
 
 class LogEntry(NamedTuple):
@@ -64,6 +88,9 @@ class StageInfo:
     # Live snapshots for display during execution (before lock files are updated)
     live_input_snapshot: StageExplanation | None = None
     live_output_snapshot: list[OutputChange] | None = None
+    # A template (``Pipeline.map``) runs nothing itself: its row reads its latest expansion
+    is_template: bool = False
+    instances: list[str] | None = None  # None until it expands
 
     def __post_init__(self) -> None:
         """Compute base_name and variant from name."""

@@ -45,7 +45,7 @@ Example response:
 | `cancel` | Command | - | Request cancellation of current execution |
 | `set_on_error` | Command | `mode` | Set error handling (`"fail"` or `"keep_going"`) |
 | `status` | Query | - | Get current execution state |
-| `stages` | Query | - | List all registered stages |
+| `stages` | Query | - | List the registered stages and the mapped stages' templates |
 | `stage_info` | Query | `stage` | Get detailed info for a specific stage |
 | `explain` | Query | `stage` | Get explanation of why a stage will run |
 | `events_since` | Query | `version` | Poll for events since a version cursor |
@@ -117,13 +117,14 @@ Get the current state of the pipeline or a specific run.
 
 ### stages
 
-List all registered stages and their metadata.
+List the registered stages, and each template of a mapped stage (`pipeline.map`) with the instances it expanded into.
 
 **Parameters:** None
 
 **Returns:**
 
-- `stages`: List of stage objects with `name`, `deps`, and `outs`
+- `stages`: The stage names: every stage the pipeline registered, and each instance a run has expanded so far (`<template>@<key>`). Never a template.
+- `templates`: Each template's name mapped to its instances in key order (`Pipeline.instances_of`). An empty list means the template has not expanded yet, or expanded over an empty directory; the `stages_expanded` event tells the two apart. A run expands a template once the stages upstream of it finish, and each run starts with every template unexpanded.
 
 **Example:**
 
@@ -135,14 +136,14 @@ List all registered stages and their metadata.
 {
   "jsonrpc": "2.0",
   "result": {
-    "stages": [
-      {"name": "preprocess", "deps": ["data/raw.csv"], "outs": ["data/clean.csv"]},
-      {"name": "train", "deps": ["data/clean.csv"], "outs": ["models/model.pkl"]}
-    ]
+    "stages": ["demo/plan", "demo/cut@a", "demo/cut@b"],
+    "templates": {"demo/cut": ["demo/cut@a", "demo/cut@b"], "demo/report": []}
   },
   "id": 3
 }
 ```
+
+The TUI asks once it connects, and again after each reload, so that a template's row reads "not yet expanded" before the `stages_expanded` event arrives.
 
 ### cancel
 

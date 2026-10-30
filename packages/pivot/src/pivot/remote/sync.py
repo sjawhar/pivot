@@ -704,6 +704,48 @@ def pull(
     )
 
 
+async def _fetch_objects_async(
+    cache_dir: pathlib.Path,
+    remote: protocol.RemoteStorage,
+    state_db: state_mod.StateDB,
+    remote_name: str,
+    hashes: set[str],
+    jobs: int | None,
+) -> TransferSummary:
+    check_remote_url(state_db, remote_name, remote)
+    files_dir = cache_dir / "files"
+    missing = sorted(hashes - get_local_cache_hashes(cache_dir))
+    if not missing:
+        return TransferSummary(transferred=0, skipped=len(hashes), failed=0, errors=[])
+    results = await remote.download_batch(
+        [(hash_, cache.get_cache_path(files_dir, hash_)) for hash_ in missing],
+        concurrency=jobs if jobs is not None else config.get_remote_jobs(),
+        readonly=True,
+    )
+    transferred = [r for r in results if r["success"]]
+    state_db.remote_hashes_add(remote_name, [r["hash"] for r in transferred])
+    return TransferSummary(
+        transferred=len(transferred),
+        skipped=len(hashes) - len(missing),
+        failed=len(results) - len(transferred),
+        errors=[r["error"] for r in results if not r["success"] and "error" in r],
+    )
+
+
+def fetch_objects(
+    cache_dir: pathlib.Path,
+    remote: protocol.RemoteStorage,
+    state_db: state_mod.StateDB,
+    remote_name: str,
+    hashes: set[str],
+    jobs: int | None = None,
+) -> TransferSummary:
+    """Download the cache objects at ``hashes`` the cache lacks, and nothing else: a
+    directory's listing, so a pull can name its files (and expand a mapped stage over them)
+    before it fetches any."""
+    return asyncio.run(_fetch_objects_async(cache_dir, remote, state_db, remote_name, hashes, jobs))
+
+
 def create_remote_from_name(name: str | None = None) -> tuple[protocol.RemoteStorage, str]:
     """Open the configured remote by name (default if None). Returns (remote, name)."""
     url = remote_config.get_remote_url(name)
