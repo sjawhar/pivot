@@ -138,9 +138,10 @@ class _Pattern(NamedTuple):
     dir_only: bool  # a trailing "/": it matches a directory only
     basename: bool  # no "/" in it: it matches an entry's own name, at any depth
     match: Callable[[bytes], bool]  # tests the entry's name (basename) or its whole path
-    # ``match`` for deciding whether an input directory, or a directory above one, is ignored.
-    # It differs only for a line over _MAX_STAR_RUNS (``_parse``), so that both decisions err
-    # toward hashing more: such a line keeps members, and ignores input directories.
+    # ``match`` for deciding whether an input directory, or a directory above one, is ignored
+    # (``_for_input_directories``). It differs only for a line over _MAX_STAR_RUNS (``_parse``),
+    # so that both decisions err toward hashing more: such a negation matches every member and
+    # no input directory, and any other such line no member and every input directory.
     input_match: Callable[[bytes], bool]
 
 
@@ -149,46 +150,44 @@ def _encode(path: str) -> bytes:
     return os.fsencode(unicodedata.normalize("NFC", path) if _PRECOMPOSE else path)
 
 
-def _deciding(
-    patterns: tuple[_Pattern, ...], path: bytes, is_dir: bool, *, input_dir: bool = False
-) -> _Pattern | None:
+def _deciding(patterns: tuple[_Pattern, ...], path: bytes, is_dir: bool) -> _Pattern | None:
     """The last pattern that matches ``path`` alone (git's ``last_matching_pattern_from_list``),
-    if any; with ``input_dir``, by each pattern's ``input_match``."""
+    if any."""
     name = path[path.rfind(b"/") + 1 :]
     for pattern in reversed(patterns):
         if pattern.dir_only and not is_dir:
             continue
-        match = pattern.input_match if input_dir else pattern.match
-        if match(name if pattern.basename else path):
+        if pattern.match(name if pattern.basename else path):
             return pattern
     return None
 
 
-def _excluding(
-    patterns: tuple[_Pattern, ...], path: bytes, is_dir: bool, *, input_dir: bool = False
-) -> _Pattern | None:
+def _excluding(patterns: tuple[_Pattern, ...], path: bytes, is_dir: bool) -> _Pattern | None:
     """The pattern that excludes ``path`` itself, or None when no pattern does."""
-    deciding = _deciding(patterns, path, is_dir, input_dir=input_dir)
+    deciding = _deciding(patterns, path, is_dir)
     return None if deciding is None or deciding.negated else deciding
 
 
-def _ignored_at(
-    patterns: tuple[_Pattern, ...], path_str: str, is_dir: bool, *, input_dir: bool = False
-) -> _Pattern | None:
+def _ignored_at(patterns: tuple[_Pattern, ...], path_str: str, is_dir: bool) -> _Pattern | None:
     """The pattern that ignores ``path_str``: the one that ignores the first directory above it
     that is ignored, else the one that ignores it, else None (git's parent rule). The project
     root, ``.``, is never ignored: git's walk never tests it (the module docstring names how
-    ``git check-ignore .`` differs). ``input_dir`` decides it as an input directory
-    (``_Pattern.input_match``)."""
+    ``git check-ignore .`` differs)."""
     if path_str == ".":
         return None
     path = _encode(path_str)
     end = path.find(b"/", 1)
     while end != -1:
-        if (excluding := _excluding(patterns, path[:end], True, input_dir=input_dir)) is not None:
+        if (excluding := _excluding(patterns, path[:end], True)) is not None:
             return excluding
         end = path.find(b"/", end + 1)
-    return _excluding(patterns, path, is_dir, input_dir=input_dir)
+    return _excluding(patterns, path, is_dir)
+
+
+def _for_input_directories(patterns: tuple[_Pattern, ...]) -> tuple[_Pattern, ...]:
+    """``patterns`` as they decide whether an input directory, or a directory above one, is
+    ignored: each matches by its ``input_match``."""
+    return tuple(pattern._replace(match=pattern.input_match) for pattern in patterns)
 
 
 class IgnoreFilter:
@@ -285,10 +284,13 @@ class IgnoreFilter:
         at_root = directory_str == "."
         # A line over the star-run limit is matched here by its ``input_match``, which errs
         # toward "ignored": an over-limit negation never decides that this input (or a directory
-        # above it) is not ignored, and an over-limit positive line always decides that it is.
-        # Either way the input is hashed whole, where filtering it might leave out a file git
-        # keeps; a rerun too many is safe.
-        excluding = None if at_root else _ignored_at(patterns, directory_str, True, input_dir=True)
+        # above it) is not ignored, and an over-limit positive line matches every input
+        # directory, so an input is hashed whole unless a later line unignores it and every
+        # directory above it. Filtering instead might leave out a file git keeps; a rerun too
+        # many is safe.
+        excluding = (
+            None if at_root else _ignored_at(_for_input_directories(patterns), directory_str, True)
+        )
         if excluding is not None:
             self._warn_ignored_directory(directory_str, excluding)
             return None
@@ -316,6 +318,16 @@ class IgnoreFilter:
             if directory in self._warned_dirs:
                 return
             self._warned_dirs.add(directory)
+        if excluding.input_match is _matches_everything:  # a line over _MAX_STAR_RUNS
+            logger.warning(
+                "Input directory %s is taken to be ignored by .pivotignore (pattern %r at %s): "
+                + "the line has more runs of '*' than Pivot matches, so Pivot takes it to match "
+                + "every input directory and hashes every file in this one. Shorten the pattern.",
+                directory,
+                excluding.text,
+                excluding.source,
+            )
+            return
         logger.warning(
             "Input directory %s is ignored by .pivotignore (pattern %r at %s), so Pivot hashes "
             + "every file in it: .pivotignore leaves files out only inside a directory it does "
@@ -479,7 +491,8 @@ def _parse(data: bytes, source_name: str) -> tuple[_Pattern, ...]:
                 f"Pattern on line {line_number} of {source_name} ('{text}') has {recursing} "
                 + "runs of '*' that try more than one place; Pivot matches at most "
                 + f"{_MAX_STAR_RUNS}, so it takes it to match no member and every input "
-                + "directory, which is hashed whole. Shorten it."
+                + "directory, so an input is hashed whole unless a later line unignores it and "
+                + "every directory above it. Shorten it."
             )
             match, input_match = _matches_nothing, _matches_everything
         patterns.append(

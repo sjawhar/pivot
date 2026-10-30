@@ -939,7 +939,13 @@ _NEGATION_WARNING = (
 _PATTERN_WARNING = (
     "Pattern on line {line} of .pivotignore ('{text}') has 257 runs of '*' that try more than "
     + "one place; Pivot matches at most 256, so it takes it to match no member and every input "
-    + "directory, which is hashed whole. Shorten it."
+    + "directory, so an input is hashed whole unless a later line unignores it and every "
+    + "directory above it. Shorten it."
+)
+_OVER_LIMIT_INPUT_WARNING = (
+    "Input directory {directory} is taken to be ignored by .pivotignore (pattern {text!r} at "
+    + ".pivotignore:{line}): the line has more runs of '*' than Pivot matches, so Pivot takes "
+    + "it to match every input directory and hashes every file in this one. Shorten the pattern."
 )
 
 
@@ -978,13 +984,17 @@ def test_an_over_limit_negation_unignores_no_input_directory(tmp_path: pathlib.P
     """`build/` ignores build and every path below it. A directory-only negation over the limit
     matches every *member*, but decides neither that an input directory nor that a directory
     above one is not ignored, so an input at build or at build/sub gets no filter and is hashed
-    whole; one elsewhere still gets a filter."""
+    whole. An input elsewhere still gets a filter, and in it the negation matches every member:
+    its build directory is kept, not left out by `build/`."""
     (tmp_path / ".pivotignore").write_text("build/\n*.txt\n!" + "*a" * 257 + "/\n")
     filter_instance = ignore.IgnoreFilter(project_root=tmp_path)
 
     assert filter_instance.member_filter("build") is None
     assert filter_instance.member_filter("build/sub") is None, "the parent build is ignored"
-    assert filter_instance.member_filter("src") is not None
+    src_filter = filter_instance.member_filter("src")
+    assert src_filter is not None
+    assert src_filter("build", True) is False, "a member the negation matches is kept"
+    assert src_filter("notes.txt", False) is True, "the negation is directory-only"
 
 
 def test_a_pattern_too_long_to_match_matches_no_member(
@@ -1005,13 +1015,17 @@ def test_a_pattern_too_long_to_match_matches_no_member(
     ]
 
 
-def test_an_over_limit_pattern_ignores_every_input_directory(tmp_path: pathlib.Path) -> None:
-    """A positive line over the limit matches no member but every input directory, so every
-    input is hashed whole. Dropping it there would filter an input git ignores by it: here git
-    ignores the 258-byte input directory a×128/a×129 (so grade.py in it too), and `*.txt` would
-    then leave out its counted.txt."""
+def test_an_over_limit_pattern_ignores_every_input_directory(
+    tmp_path: pathlib.Path, caplog: LogCaptureFixture
+) -> None:
+    """A positive line over the limit matches no member but every input directory, so an input
+    is hashed whole unless a later line unignores it and every directory above it, with a
+    warning that names the line. Dropping it there would filter an input git ignores by it:
+    here git ignores the 258-byte input directory a×128/a×129 (so grade.py in it too), and
+    `*.txt` would then leave out its counted.txt."""
     deep = "a" * 128 + "/" + "a" * 129
-    patterns = "*a" * 128 + "/" + "*a" * 129 + "\n*.txt\n"
+    long_line = "*a" * 128 + "/" + "*a" * 129
+    patterns = long_line + "\n*.txt\n"
     project = tmp_path / "project"
     (project / deep).mkdir(parents=True)
     (project / deep / "counted.txt").write_text("x\n")
@@ -1021,11 +1035,23 @@ def test_an_over_limit_pattern_ignores_every_input_directory(tmp_path: pathlib.P
     filter_instance = ignore.IgnoreFilter(project_root=project)
 
     git_kept = _helper_git_kept(tmp_path / "home", project, patterns)
+    with caplog.at_level("WARNING", logger="pivot.ignore"):
+        deep_ignored = filter_instance.is_ignored(deep, is_dir=True)
+        deep_filter = filter_instance.member_filter(deep)
+        src_filter = filter_instance.member_filter("src")
+
     assert "kept.py" in git_kept
     assert f"{deep}/grade.py" not in git_kept, "git ignores the input directory by the line"
-    assert not filter_instance.is_ignored(deep, is_dir=True), "no member: as before"
-    assert filter_instance.member_filter(deep) is None, "an input directory: hashed whole"
-    assert filter_instance.member_filter("src") is None, "every input directory"
+    assert not deep_ignored, "no member: as before"
+    assert deep_filter is None, "an input directory: hashed whole"
+    assert src_filter is None, "every input directory"
+    assert [record.getMessage() for record in caplog.records] == [
+        _PATTERN_WARNING.format(line=1, text=long_line),
+        *(
+            _OVER_LIMIT_INPUT_WARNING.format(directory=directory, text=long_line, line=1)
+            for directory in (deep, "src")
+        ),
+    ]
 
 
 def test_the_limit_is_256_runs_of_star_that_try_more_than_one_place(

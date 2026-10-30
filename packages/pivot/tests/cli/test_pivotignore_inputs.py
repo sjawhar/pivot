@@ -375,58 +375,55 @@ def test_a_file_a_negation_of_257_starstar_components_keeps_reruns_its_stage(
     assert _ran(root, home) == {"p/lane": "ran"}
 
 
-@pytest.mark.parametrize("input_path", ["build", "build/sub"])
-def test_an_over_limit_directory_negation_keeps_an_ignored_input_whole(
-    tmp_path: pathlib.Path, input_path: str
+@pytest.mark.parametrize(
+    ("input_path", "lines", "edited"),
+    [
+        pytest.param("build", "!" + "*a" * 257 + "/", "counted.txt", id="negation-input-build"),
+        pytest.param(
+            "build/sub", "!" + "*a" * 257 + "/", "counted.txt", id="negation-input-below-build"
+        ),
+        pytest.param(
+            "a" * 128 + "/" + "a" * 129,
+            "*a" * 128 + "/" + "*a" * 129,
+            "counted.txt",
+            id="pattern-git-ignores-the-input",
+        ),
+        pytest.param(
+            "tasks/server",
+            "!tasks/server/" + "*a" * 128 + "/" + "*a" * 129 + "*.txt",
+            "a" * 128 + "/" + "a" * 129 + ".txt",
+            id="negation-re-includes-a-member",
+        ),
+    ],
+)
+def test_an_over_limit_line_never_leaves_out_a_file_the_input_counts(
+    tmp_path: pathlib.Path, input_path: str, lines: str, edited: str
 ) -> None:
-    """An input at build, or at build/sub below it, is ignored by the starter rule `build/`. A
-    directory-only negation over the limit falls back to matching every *member*, but decides
-    neither that the input directory nor that a directory above it is not ignored: the input is
-    hashed whole, so counted.txt makes its stage stale when it changes. At e5821017
-    member_filter used that fallback for the input too, filtered the directory and left
-    counted.txt out, so the edit read cached; with the fallback skipped only for the input
-    itself, not for the directories above it, build/sub still did."""
+    """A line over Pivot's limit of 256 runs of `*` errs toward counting a file, so an edit to
+    a file the input counts under git's rule makes its stage stale. After `*.txt`:
+
+    - At build, or at build/sub below it, the starter rule `build/` ignores the input. A
+      directory-only negation over the limit matches every *member*, but decides neither that
+      the input directory nor that a directory above it is not ignored, so the input is hashed
+      whole. At e5821017 member_filter used that fallback for the input too and left
+      counted.txt out; with it skipped only for the input itself, build/sub still did.
+    - git ignores the 258-byte input directory a×128/a×129 by a line of 257 runs. Pivot takes
+      it to match every input directory, so the input is hashed whole. Before, the line was
+      dropped and `*.txt` left counted.txt out.
+    - A negation of 258 runs re-includes a×128/a×129.txt inside the filtered input
+      tasks/server; it matches every member, so the file counts (mutant G1, matching members
+      as input directories, left it out)."""
     home, root = _project(tmp_path, _INPUT_PIPELINE.replace("tasks/server", input_path))
     (root / ".pivotignore").write_text(
-        "\n".join(ignore.get_default_patterns()) + "\n*.txt\n!" + "*a" * 257 + "/\n"
+        "\n".join(ignore.get_default_patterns()) + "\n*.txt\n" + lines + "\n"
     )
     source = root / input_path
-    source.mkdir(parents=True)
+    (source / edited).parent.mkdir(parents=True)
     (source / "grade.py").write_text("print('grade')\n")
-    (source / "counted.txt").write_text("one\n")
+    (source / edited).write_text("one\n")
     assert _ran(root, home) == {"p/lane": "ran"}
 
-    (source / "counted.txt").write_text("two\n")
-
-    # The fallback warning follows the JSON in this command's combined test output.
-    status_output = _ok(helpers.run_pivot(root, home, "-q", "status", "--json"))
-    status, _ = json.JSONDecoder().raw_decode(status_output[status_output.index("{") :])
-    assert {stage["name"]: stage["status"] for stage in status["stages"]} == {"p/lane": "stale"}
-    assert _ran(root, home) == {"p/lane": "ran"}
-
-
-def test_an_over_limit_pattern_keeps_an_input_git_ignores_whole(tmp_path: pathlib.Path) -> None:
-    """git ignores the 258-byte input directory a×128/a×129 by a line of 257 runs of `*`. Over
-    Pivot's limit, that line matches every input directory, so the input is hashed whole and an
-    edit to counted.txt makes its stage stale. Before, the line was dropped, the input was
-    filtered, `*.txt` left counted.txt out, and the edit read cached."""
-    input_path = "a" * 128 + "/" + "a" * 129
-    home, root = _project(tmp_path, _INPUT_PIPELINE.replace("tasks/server", input_path))
-    (root / ".pivotignore").write_text(
-        "\n".join(ignore.get_default_patterns())
-        + "\n*.txt\n"
-        + "*a" * 128
-        + "/"
-        + "*a" * 129
-        + "\n"
-    )
-    source = root / input_path
-    source.mkdir(parents=True)
-    (source / "grade.py").write_text("print('grade')\n")
-    (source / "counted.txt").write_text("one\n")
-    assert _ran(root, home) == {"p/lane": "ran"}
-
-    (source / "counted.txt").write_text("two\n")
+    (source / edited).write_text("two\n")
 
     # The over-limit warning follows the JSON in this command's combined test output.
     status_output = _ok(helpers.run_pivot(root, home, "-q", "status", "--json"))

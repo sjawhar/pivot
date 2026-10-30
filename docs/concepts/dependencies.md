@@ -97,9 +97,10 @@ directory and writes `__pycache__/*.pyc` there leaves the stage cached.
   other such line not to, so every file git might keep is kept. For an *input
   directory* (the input's own directory, or one above it) it is the other way
   round: a negation matches none, so an earlier `build/` rule still makes an
-  input at `build` hash whole, and any other such line matches every one, so
-  every input is hashed whole. At worst a stage reruns when git's rule would
-  not count the file.
+  input at `build` hash whole, and any other such line matches every input
+  directory, so an input is hashed whole unless a later line unignores it and
+  every directory above it. At worst a stage reruns when git's rule would not
+  count the file.
 - It does not apply to stage outputs, to data you `pivot track`, or to the
   cache: every file in a directory output or a tracked directory is hashed,
   cached and restored, a `.pyc` included. A stage that reads another stage's
