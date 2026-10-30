@@ -6,6 +6,7 @@ import json
 import uuid
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
 
+from pivot.storage import cache
 from pivot.types import (
     ArtifactTag,
     DepEntry,
@@ -51,10 +52,13 @@ class RunManifest(TypedDict):
 
 
 class RunCacheEntry(TypedDict):
-    """Run cache entry for skip detection."""
+    """Run cache entry for skip detection. ``reads`` lists the objects the run read by hash
+    (``pivot.read_by_hash``), sorted, each once, when it read any: a restore writes them into
+    the lock it writes, and an entry whose objects are gone restores nothing."""
 
     run_id: str
     output_hashes: list[OutputHashEntry]
+    reads: NotRequired[list[str]]
 
 
 class OutputHashEntry(TypedDict):
@@ -206,4 +210,13 @@ def deserialize_run_cache_entry(data: bytes) -> RunCacheEntry:
     if missing:
         msg = f"Invalid RunCacheEntry: missing keys {missing}"
         raise ValueError(msg)
-    return RunCacheEntry(run_id=parsed["run_id"], output_hashes=parsed["output_hashes"])
+    entry = RunCacheEntry(run_id=parsed["run_id"], output_hashes=parsed["output_hashes"])
+    if "reads" in parsed:
+        reads = parsed["reads"]
+        if not isinstance(reads, list) or not all(
+            cache.is_valid_hash(item) for item in cast("list[object]", reads)
+        ):
+            msg = f"Invalid RunCacheEntry: reads is not a list of content hashes: {reads!r}"
+            raise ValueError(msg)
+        entry["reads"] = cast("list[str]", reads)
+    return entry
