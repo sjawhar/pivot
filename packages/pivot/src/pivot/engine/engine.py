@@ -33,6 +33,7 @@ from pivot import (
     types,
 )
 from pivot import state_dir as state_dir_mod
+from pivot.config import io as config_io
 from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine import scheduler as engine_scheduler
@@ -97,6 +98,11 @@ _logger = logging.getLogger(__name__)
 # (``extra={"pivot_condition": (PIPELINE_ERROR_CONDITION, error)}``), so a TUI session can leave
 # out the records of an error a later reload fixed.
 PIPELINE_ERROR_CONDITION = "pipeline_error"
+
+# What a watch or serve session says when its pipeline's state directory moved under it.
+_RELOAD_THE_SESSION = (
+    "Save .pivot/config.yaml or pipeline.py to reload the pipeline, or start the session again"
+)
 
 # Process-lifetime sequence counter for OutputEvent.seq monotonicity across Engine instances
 _seq_counter = itertools.count(1)
@@ -1142,8 +1148,25 @@ class Engine:
         """Orchestrate parallel stage execution with the async event loop."""
         import datetime
 
+        from pivot import discovery, run_history
         from pivot import exceptions as pivot_exceptions
-        from pivot import run_history
+
+        # Its stages record their locks in the state directory the pipeline loaded with, and
+        # `pivot gc` reads the one `core.state_dir` names now: a run after the value, or a link
+        # it names, changed would write locks naming objects no collection keeps. A watch or
+        # serve session reloads when `.pivot/config.yaml` changes (`_reload_and_rerun`); a move
+        # no edit announced (a re-pointed link) makes it refuse every run until a reload (L3w).
+        # Any other run raises.
+        if self._watches_filesystem():
+            try:
+                discovery.require_current_state_dirs(
+                    self._require_pipeline(), remedy=_RELOAD_THE_SESSION
+                )
+            except pivot_exceptions.PipelineConfigError as exc:
+                await self._invalidate_pipeline([str(exc)])
+                return {}
+        else:
+            discovery.require_current_state_dirs(self._require_pipeline())
 
         # Record start time for run history
         started_at = datetime.datetime.now(datetime.UTC).isoformat()
@@ -2893,6 +2916,11 @@ class Engine:
 
         # Invalidate caches
         self._invalidate_caches()
+        # A reload loads the pipeline as a new command would: it reads the project's
+        # configuration again, `core.state_dir` included, so an edit of it moves the session's
+        # runs to the directory `pivot gc` reads (L3w). Entries the old pipeline produced stay
+        # filed under the directory they were produced in.
+        config_io.clear_config_cache()
 
         # Invalidate manifest cache entries for changed source files
         fingerprint.invalidate_manifests_for_paths(event["paths"])

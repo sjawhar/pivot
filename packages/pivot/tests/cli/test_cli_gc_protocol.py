@@ -24,9 +24,12 @@ import subprocess
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, NamedTuple
+import uuid
+from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
 
+import boto3
 import pytest
+import xxhash
 import yaml
 
 from pivot import run_history, types
@@ -2278,6 +2281,16 @@ def _unregister(cache_dir: pathlib.Path, root: pathlib.Path) -> None:
     assert not _registered(cache_dir, root)
 
 
+def _unlist(root: pathlib.Path, cache_dir: pathlib.Path) -> None:
+    """Leave ``cache_dir`` out of the caches ``root``'s state directory lists, as a pivot release
+    (which keeps no list) leaves it."""
+    cache_id = naming.read_cache_id(cache_dir)
+    for record in naming.cache_records(root / ".pivot"):
+        if record.cache_id == cache_id:
+            record.record.unlink()
+    assert cache_id not in {record.cache_id for record in naming.cache_records(root / ".pivot")}
+
+
 def _unregistered_gated_project(
     tmp_path: pathlib.Path, checkout: str = "symlink"
 ) -> tuple[pathlib.Path, pathlib.Path]:
@@ -2419,6 +2432,9 @@ def test_a_library_run_with_another_cache_registers_where_it_restores_tracked_fi
     tracked_object = cache.get_cache_path(shared / "files", cache.hash_file(tracked)[0])
     assert tracked_object.exists(), tracked_object
     _unregister(shared, root)
+    # As a project last run by a pivot release, which keeps no list of caches: else the engine's
+    # unit in C2 would register it in C1 through that list, before the restore's own registration.
+    _unlist(root, shared)
     tracked.unlink()
     other_cache = tmp_path / "other-cache"
     other_cache.mkdir()
@@ -2516,11 +2532,15 @@ def test_a_library_run_refuses_an_included_pipeline_rooted_elsewhere(
 # =============================================================================
 
 
-def _use_cache(root: pathlib.Path, cache_dir: pathlib.Path) -> None:
+def _use_cache(
+    root: pathlib.Path, cache_dir: pathlib.Path, *, retention: int | None = None
+) -> None:
     """Point the project at ``cache_dir`` with copy checkout, so no workspace link keeps an
-    object: only the project's records and its registration can."""
+    object: only the project's records and its registration can. ``retention`` keeps that many
+    runs of history (and their run-cache rows)."""
+    core = "" if retention is None else f"core:\n  run_history_retention: {retention}\n"
     (root / ".pivot" / "config.yaml").write_text(
-        f"cache:\n  dir: {cache_dir}\n  checkout_mode:\n  - copy\n"
+        f"cache:\n  dir: {cache_dir}\n  checkout_mode:\n  - copy\n{core}"
     )
 
 
@@ -2561,10 +2581,10 @@ def test_a_copy_of_a_project_that_moved_on_through_another_cache_refuses(
     tmp_path: pathlib.Path, order: str
 ) -> None:
     """N1: a project uses C2 and C1; its disk is cloned; the original then names objects
-    through C1 only, which rotates C1's nonce and not C2's. The clone's entry in C2 still holds
-    the nonce its state directory holds, so a collection of C2 run where the clone is visible
-    must read the project's entry in C1 too, find a nonce the clone does not hold, and refuse,
-    naming the project and C1."""
+    through C1 only. That step rotates the project's nonce in its entry in C2 too, so the
+    clone's state directory holds an older nonce for C2 than C2's entry, and a collection of C2
+    run where the clone is visible refuses, naming the project. A nonce mismatch never
+    suggests `pivot forget-cache`: no list a copy edits can make an entry current."""
     setup = _two_cache_project(tmp_path, order)
     clone = tmp_path / "clone-of-the-disk"
     shutil.copytree(setup.root, clone, symlinks=True)
@@ -2582,9 +2602,8 @@ def test_a_copy_of_a_project_that_moved_on_through_another_cache_refuses(
     out = refused.stdout + refused.stderr
     flat = " ".join(out.split())
     assert refused.returncode != 0, out
-    c1_id = naming.read_cache_id(setup.c1)
-    assert str(setup.root) in flat and "cache-one" in flat and f"id {c1_id}" in flat, out
-    assert "different nonce" in flat and "pivot forget-cache" in flat, out
+    assert str(setup.root) in flat and "older or different nonce" in flat, out
+    assert "forget-cache" not in flat, out
     assert cache.get_cache_path(setup.c2 / "files", dead).exists(), "a refusal removed an object"
     assert setup.output_in_c2.exists(), out
 
@@ -2609,19 +2628,66 @@ def test_a_project_that_uses_two_caches_is_collected_when_both_entries_are_curre
     assert setup.output_in_c2.exists(), "gc removed an object the project's run-cache row names"
 
 
-def test_an_unreadable_listed_cache_refuses_until_the_project_forgets_it(
-    tmp_path: pathlib.Path,
+class _MovedOnCopy(NamedTuple):
+    peer: pathlib.Path
+    root: pathlib.Path
+    c1: pathlib.Path
+    c2: pathlib.Path
+    named_again: pathlib.Path
+
+
+def _copy_then_move_on(tmp_path: pathlib.Path, mode: str) -> _MovedOnCopy:
+    """N1 as the reviewer's `p19_caches.sh` drives it, with a directory for the disk. P (copy
+    checkout, one run of history) runs v1 then v2 in C2, so v1's output X is in C2 and named by
+    nothing. Before the disk is copied, ``mode`` decides P's use of C1: none (`plain`), a
+    `pivot checkout` in C1 (`c1first`), the same with C1 on the copied disk (`c1local`), or from
+    another mount namespace (`c1view`, which needs passwordless sudo). The original then runs v1
+    again in C1 (from another mount namespace for `c1view`), so its lock names X again. Last the
+    copy is put at the disk's path, and the original moved aside, so this host sees the copy
+    where P was."""
+    disk = tmp_path / "disk"
+    disk.mkdir()
+    c1 = disk / "cache-one" if mode == "c1local" else tmp_path / "cache-one"
+    c2 = tmp_path / "cache-two"
+    c1.mkdir()
+    peer = _shared_project(tmp_path / "peer", c2)
+    _ok(_run(peer, "repro"))
+    root = _project(disk / "project")
+    raw = root / "data" / "raw" / "input.txt"
+    _use_cache(root, c2, retention=1)
+    raw.write_text("v1 only this project reads\n")
+    _ok(_run(root, "repro"))
+    named_again = _shared_object(c2, tmp_path, "V1 ONLY THIS PROJECT READS\n")
+    assert named_again.exists(), named_again
+    raw.write_text("v2 only this project reads\n")
+    _ok(_run(root, "repro"))
+    _use_cache(root, c1, retention=1)
+    if mode == "c1view":
+        _ok(_in_view(root, "checkout"))
+    elif mode != "plain":
+        _ok(_run(root, "checkout"))
+    copied = tmp_path / "copied-disk"
+    shutil.copytree(disk, copied, symlinks=True)
+    raw.write_text("v1 only this project reads\n")
+    _ok(_in_view(root, "repro") if mode == "c1view" else _run(root, "repro"))
+    key = named_again.parent.name + named_again.name
+    assert key in (root / ".pivot" / "stages" / "shadow" / "shout.lock").read_text()
+    disk.rename(tmp_path / "original-disk")
+    copied.rename(disk)
+    return _MovedOnCopy(peer, root, c1, c2, named_again)
+
+
+@pytest.mark.parametrize("mode", ["plain", "c1local", "c1view"])
+def test_a_copy_refuses_once_the_original_names_through_a_cache_it_did_not_list(
+    tmp_path: pathlib.Path, mode: str
 ) -> None:
-    """A listed cache that cannot be read (deleted, or on a disk that is gone) leaves the
-    project's freshness unproven, so a collection of the other cache refuses, naming it.
-    `pivot forget-cache` removes it from the project's list, and changes nothing else: the
-    removed cache keeps its objects and the project's entry, the other cache stays listed, and
-    the next collection proceeds."""
-    setup = _two_cache_project(tmp_path, "c2-then-c1")
-    c1_id = naming.read_cache_id(setup.c1)
-    c1_files_before = sorted(p.relative_to(setup.c1) for p in setup.c1.rglob("*"))
-    away = tmp_path / "unmounted-disk"
-    setup.c1.rename(away)
+    """N1, the topologies a collection-time check of the copy's own list cannot see: the
+    original first uses C1 after the copy (`plain`), C1 was copied with the disk (`c1local`), or
+    the original uses C1 from another mount namespace, another view (`c1view`). In each, the
+    original's step in C1 rotates its nonce in C2 (`c1view`: registers that view in C2, a cache
+    another view listed), so a collection of C2 where the copy is visible refuses, keeps X, and
+    never suggests `pivot forget-cache`."""
+    setup = _copy_then_move_on(tmp_path, mode)
     dead = _publish(setup.c2 / "files", tmp_path, "named by nothing\n")
 
     refused = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
@@ -2629,8 +2695,82 @@ def test_an_unreadable_listed_cache_refuses_until_the_project_forgets_it(
     out = refused.stdout + refused.stderr
     flat = " ".join(out.split())
     assert refused.returncode != 0, out
-    assert "cache-one" in flat and "cannot be read" in flat, out
-    assert f"pivot forget-cache {c1_id}" in flat, out
+    assert str(setup.root) in flat and "nonce" in flat, out
+    assert "forget-cache" not in flat, out
+    assert setup.named_again.exists(), f"gc removed X, which the original's lock names: {out}"
+    assert cache.get_cache_path(setup.c2 / "files", dead).exists(), "a refusal removed an object"
+
+
+def test_forget_cache_in_a_copy_never_makes_a_collection_accept_it(tmp_path: pathlib.Path) -> None:
+    """N1 `forget`: C1 is out of the copy's reach. The collection of C2 refuses for the nonce
+    the original rotated there, without suggesting `pivot forget-cache`; a copy's user who runs
+    it anyway removes C1 from the copy's list, and the next collection refuses all the same:
+    no list in the copy changes C2's entry."""
+    setup = _copy_then_move_on(tmp_path, "c1first")
+    c1_id = naming.read_cache_id(setup.c1)
+    setup.c1.rename(tmp_path / "out-of-the-copys-reach")
+
+    first = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
+
+    first_out = first.stdout + first.stderr
+    assert first.returncode != 0, first_out
+    assert "forget-cache" not in first_out, first_out
+    _ok(_run(setup.root, "forget-cache", c1_id))
+    assert c1_id not in {record.cache_id for record in naming.cache_records(setup.root / ".pivot")}
+
+    second = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
+
+    second_out = second.stdout + second.stderr
+    assert second.returncode != 0, second_out
+    assert setup.named_again.exists(), f"gc removed X after the copy forgot C1: {second_out}"
+
+
+@pytest.mark.parametrize("unreachable", ["moved away", "another cache at its path"])
+def test_a_naming_step_warns_once_about_a_listed_cache_it_cannot_reach(
+    tmp_path: pathlib.Path, unreachable: str
+) -> None:
+    """A listed cache a naming step cannot reach does not fail the step. The command warns once,
+    naming the cache and `pivot forget-cache` (safe only in the project itself), and the view's
+    record marks the cache unconfirmed. A collection of the step's own cache still checks every
+    listed cache and refuses while that one cannot be reached, naming `pivot forget-cache`.
+    `pivot forget-cache` removes it from this view's list and changes nothing else: the next
+    command does not warn, the next collection proceeds, and the removed cache keeps its files."""
+    setup = _two_cache_project(tmp_path, "c2-then-c1")
+    c1_id = naming.read_cache_id(setup.c1)
+    c1_files_before = sorted(p.relative_to(setup.c1) for p in setup.c1.rglob("*"))
+    away = tmp_path / "unmounted-disk"
+    setup.c1.rename(away)
+    if unreachable == "another cache at its path":
+        (setup.c1 / naming.REGISTER_DIR).mkdir(parents=True)
+        (setup.c1 / naming.REGISTER_DIR / naming.CACHE_ID_FILE).write_text("f" * 32 + "\n")
+    _use_cache(setup.root, setup.c2)
+    (setup.root / "data" / "raw" / "input.txt").write_text("a run with C1 out of reach\n")
+
+    ran = _ok(_run(setup.root, "repro"))
+
+    flat = " ".join(ran.split())
+    assert flat.count("cannot reach it") == 1, ran
+    assert f"cache {setup.c1} (id {c1_id})" in flat, ran
+    assert f"pivot forget-cache {c1_id}` here, in the project itself: never in a copy" in flat, ran
+    why = (
+        f"another cache is at that path now (id {'f' * 32})"
+        if unreachable == "another cache at its path"
+        else "it cannot be read"
+    )
+    assert why in flat, ran
+    marked = [r for r in naming.cache_records(setup.root / ".pivot") if r.cache_id == c1_id]
+    assert marked and all(record.unconfirmed_since for record in marked), marked
+    dead = _publish(setup.c2 / "files", tmp_path, "named by nothing\n")
+    refused = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
+    refusal = " ".join((refused.stdout + refused.stderr).split())
+    assert refused.returncode != 0, refusal
+    where = (
+        f"another cache is at that path now (id {'f' * 32})"
+        if unreachable == "another cache at its path"
+        else "that cache cannot be read"
+    )
+    assert f"(id {c1_id}), where {where}" in refusal, refusal
+    assert f"pivot forget-cache {c1_id}` in the project itself, never in a copy" in refusal, refusal
     assert cache.get_cache_path(setup.c2 / "files", dead).exists(), "a refusal removed an object"
 
     unknown = _run(setup.root, "forget-cache", str(tmp_path / "never-a-cache"))
@@ -2640,45 +2780,138 @@ def test_an_unreadable_listed_cache_refuses_until_the_project_forgets_it(
     assert c1_id in forgotten and "Nothing in that cache changed" in forgotten, forgotten
     listed = {record.cache_id for record in naming.cache_records(setup.root / ".pivot")}
     assert listed == {naming.read_cache_id(setup.c2)}, listed
-
+    again = _ok(_run(setup.root, "checkout"))
+    assert "cannot reach it" not in again, again
     collected = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
-
     assert collected.returncode == 0, collected.stdout + collected.stderr
     assert not cache.get_cache_path(setup.c2 / "files", dead).exists(), collected.stdout
-    assert setup.output_in_c2.exists(), collected.stdout
-    away.rename(setup.c1)
-    assert sorted(p.relative_to(setup.c1) for p in setup.c1.rglob("*")) == c1_files_before, (
-        "forget-cache changed the cache it removed from the list"
-    )
+    if unreachable == "moved away":
+        away.rename(setup.c1)
+        assert sorted(p.relative_to(setup.c1) for p in setup.c1.rglob("*")) == c1_files_before, (
+            "forget-cache changed the cache it removed from the list"
+        )
 
 
-def test_a_listed_path_that_now_holds_another_cache_refuses(tmp_path: pathlib.Path) -> None:
-    """A listed cache's path that now holds a different cache (its id differs) is not the cache
-    the project registered in, so its entry there proves nothing."""
-    setup = _two_cache_project(tmp_path, "c2-then-c1")
-    setup.c1.rename(tmp_path / "old-cache-one")
-    setup.c1.mkdir()
-    (setup.c1 / naming.REGISTER_DIR).mkdir()
-    (setup.c1 / naming.REGISTER_DIR / naming.CACHE_ID_FILE).write_text("f" * 32 + "\n")
-
-    refused = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
-
-    flat = " ".join((refused.stdout + refused.stderr).split())
-    assert refused.returncode != 0, flat
-    assert f"another cache is at that path now (id {'f' * 32})" in flat, flat
-
-
-def test_a_listed_cache_without_the_projects_entry_refuses(tmp_path: pathlib.Path) -> None:
-    """A listed cache that holds no entry for the project (its entry was deleted there) gives
-    no nonce to compare, so the project's freshness is unproven and the collection refuses."""
+def test_a_naming_step_registers_again_in_a_listed_cache_that_lost_the_projects_entry(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A naming step in C2 brings the project's entry in every listed cache up to date: in C1,
+    whose entry for the project was deleted, it registers in full again, with a nonce pair that
+    matches."""
     setup = _two_cache_project(tmp_path, "c2-then-c1")
     _unregister(setup.c1, setup.root)
+    _use_cache(setup.root, setup.c2)
+
+    _ok(_run(setup.root, "checkout"))
+
+    assert _registered(setup.c1, setup.root), "the step in C2 left C1 without the project's entry"
+    entry = _entry(setup.c1, setup.root)
+    state_nonce, entry_nonce = naming.read_nonce_pair(
+        setup.root / ".pivot",
+        naming.view_key_of(*naming.this_view()),
+        naming.read_cache_id(setup.c1),
+        naming.entry_nonce_path(entry),
+    )
+    assert state_nonce == entry_nonce
+
+
+def test_forget_cache_refuses_a_cache_this_view_reaches_and_leaves_other_views_records(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot forget-cache` is only for a cache this view cannot reach: while C1 holds the
+    project's current entry it refuses and removes nothing. Once C1 is out of reach it removes
+    this view's record of C1 alone; a record another view of the project (another host or mount
+    namespace; written here by hand) holds for C1 stays, for that view to remove."""
+    setup = _two_cache_project(tmp_path, "c2-then-c1")
+    c1_id = naming.read_cache_id(setup.c1)
+    gc_views = setup.root / ".pivot" / "state.lmdb" / naming.VIEW_NONCE_DIR
+    own = sorted(gc_views.glob(f"*-{c1_id}.cache"))
+    assert len(own) == 1, own
+
+    refused = _run(setup.root, "forget-cache", c1_id)
+
+    flat = " ".join((refused.stdout + refused.stderr).split())
+    assert refused.returncode != 0, flat
+    assert "forget-cache is only for a cache this view can no longer reach" in flat, flat
+    assert own[0].exists(), "a refusal removed the record"
+
+    other_view = gc_views / f"{'0' * 16}-{c1_id}.cache"
+    other_view.write_text(json.dumps({"cache": str(setup.c1)}))
+    setup.c1.rename(tmp_path / "out-of-reach")
+    forgotten = _ok(_run(setup.root, "forget-cache", c1_id))
+
+    assert "this view of the project" in " ".join(forgotten.split()), forgotten
+    assert not own[0].exists(), "this view's record of C1 is still listed"
+    assert other_view.exists(), "forget-cache removed another view's record"
+
+
+def test_a_collection_checks_the_caches_every_view_of_a_project_lists(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A collection checks every cache any view of a project lists, not only the entry's view's:
+    a record another view (a container's mount namespace; written here by hand) holds for C1,
+    where that view has no entry, refuses the collection of C2, naming the record to delete if
+    that view is gone, and never suggests `pivot forget-cache`, which removes only this view's
+    records. Without the record, the collection proceeds."""
+    setup = _two_cache_project(tmp_path, "c2-then-c1")
+    c1_id = naming.read_cache_id(setup.c1)
+    record = (
+        setup.root / ".pivot" / "state.lmdb" / naming.VIEW_NONCE_DIR / f"{'0' * 16}-{c1_id}.cache"
+    )
+    record.write_text(json.dumps({"cache": str(setup.c1)}))
+    dead = _publish(setup.c2 / "files", tmp_path, "named by nothing\n")
 
     refused = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
 
     flat = " ".join((refused.stdout + refused.stderr).split())
     assert refused.returncode != 0, flat
-    assert "cache-one" in flat and "is missing" in flat, flat
+    assert "Another view of the project" in flat and f"delete {record}" in flat, flat
+    assert "forget-cache" not in flat, flat
+    assert cache.get_cache_path(setup.c2 / "files", dead).exists(), "a refusal removed an object"
+    record.unlink()
+    collected = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert not cache.get_cache_path(setup.c2 / "files", dead).exists(), collected.stdout
+
+
+def test_a_copy_of_a_cache_whose_objects_are_shared_refuses(tmp_path: pathlib.Path) -> None:
+    """N1 with a `files/` link: C1 is on the copied disk, but its object store is a link to
+    shared storage, so the copy holds its own copy of C1's register over the same objects. The
+    original's step in C1 never reaches the copy's register, but it rotates the project's nonce
+    in C2, which both reach. The copy's own `pivot gc` of its C1 checks C2 too, refuses, and
+    keeps X, which the original's lock names, in the shared store."""
+    disk = tmp_path / "disk"
+    disk.mkdir()
+    shared = tmp_path / "shared-objects"
+    shared.mkdir()
+    c1, c2 = disk / "cache-one", tmp_path / "cache-two"
+    c1.mkdir()
+    (c1 / "files").symlink_to(shared)
+    root = _project(disk / "project")
+    raw = root / "data" / "raw" / "input.txt"
+    _use_cache(root, c2, retention=1)
+    _ok(_run(root, "repro"))  # C2 is listed
+    _use_cache(root, c1, retention=1)
+    raw.write_text("v1 only this project reads\n")
+    _ok(_run(root, "repro"))
+    named_again = _shared_object(c1, tmp_path, "V1 ONLY THIS PROJECT READS\n")
+    assert named_again.exists() and named_again.resolve().is_relative_to(shared), named_again
+    raw.write_text("v2 only this project reads\n")
+    _ok(_run(root, "repro"))
+    copied = tmp_path / "copied-disk"
+    shutil.copytree(disk, copied, symlinks=True)
+    raw.write_text("v1 only this project reads\n")
+    _ok(_run(root, "repro"))  # the original names X again, through C1
+    disk.rename(tmp_path / "original-disk")
+    copied.rename(disk)
+
+    refused = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    flat = " ".join((refused.stdout + refused.stderr).split())
+    assert refused.returncode != 0, flat
+    assert "cache-two" in flat and "different nonce" in flat, flat
+    assert "forget-cache" not in flat, flat
+    assert named_again.exists(), f"the copy's gc removed X from the shared store: {flat}"
 
 
 # =============================================================================
@@ -2734,3 +2967,169 @@ def test_pivot_gc_keeps_an_object_a_stage_read_by_hash_after_its_pvt_is_gone(
         _ok(_run(root, "commit"))
         lock = yaml.safe_load((root / ".pivot" / "stages" / "p" / "plan.lock").read_text())
         assert lock["reads"] == [content_hash], lock
+
+
+# =============================================================================
+# Round 16: an object a running stage read by hash, and a nonce pair half rotated
+# =============================================================================
+
+# `use` reads the object its pin names (a cache hit takes no naming unit), then, when asked,
+# marks that it read it and waits to be released.
+_READ_THEN_HOLD_PIPELINE = """\
+import os
+import pathlib
+import time
+
+import pivot
+from pivot import Pipeline, stage
+
+
+@stage
+def use(pin: str) -> str:
+    data = pivot.read_by_hash(pin.strip()).read_text()
+    gate = os.environ.get("GC_TEST_GATE")
+    if gate:
+        pathlib.Path(gate, "started").write_text("")
+        deadline = time.monotonic() + 120
+        while not pathlib.Path(gate, "go").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+    return "used " + data
+
+
+with Pipeline("rd") as pipeline:
+    use(pipeline.input("pin.txt", t=str))
+"""
+
+
+class _S3Client(Protocol):
+    """The boto3 S3 client calls these tests make; boto3 ships no stubs."""
+
+    def create_bucket(self, **kwargs: object) -> object: ...
+
+    def put_object(self, **kwargs: object) -> object: ...
+
+
+def _remote_holding(root: pathlib.Path, endpoint: str, data: bytes) -> dict[str, str]:
+    """Point the project at a fresh bucket on the moto server at ``endpoint`` as its one remote,
+    holding ``data`` as an object another project pushed; return the env that reaches it."""
+    env = _env(
+        AWS_ENDPOINT_URL=endpoint,
+        AWS_ACCESS_KEY_ID="x",
+        AWS_SECRET_ACCESS_KEY="x",
+        AWS_DEFAULT_REGION="us-east-1",
+    )
+    bucket = f"gc-reads-{uuid.uuid4().hex[:8]}"
+    s3 = cast(
+        "_S3Client",
+        boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            region_name="us-east-1",
+            aws_access_key_id="x",
+            aws_secret_access_key="x",
+        ),
+    )
+    s3.create_bucket(Bucket=bucket)
+    key = xxhash.xxh64(data).hexdigest()
+    s3.put_object(Bucket=bucket, Key=f"cache/files/{key[:2]}/{key[2:]}", Body=data)
+    _ok(_run(root, "config", "set", "remotes.origin", f"s3://{bucket}/cache", env=env))
+    return env
+
+
+@pytest.mark.parametrize("commit", ["run", "no-commit then commit"])
+@pytest.mark.parametrize("remote", ["none", "holds the object"])
+def test_a_commit_never_names_an_object_a_collection_removed_while_the_stage_ran(
+    tmp_path: pathlib.Path, moto_services: dict[str, str], commit: str, remote: str
+) -> None:
+    """R1: a stage reads an object by hash on a cache hit, which takes no naming unit and names
+    nothing until the lock does. A peer's `pivot gc` removes it while the stage still runs. The
+    commit (the stage's own, or `pivot commit` of a `--no-commit` run) must not write a lock
+    whose `reads` names an object the cache no longer holds: it fetches the object again from
+    the remote before its naming unit, and inside the unit refuses, failing the stage and
+    committing nothing, when the object is still missing."""
+    shared = tmp_path / "shared-cache"
+    peer = _shared_project(tmp_path / "peer", shared)
+    _ok(_run(peer, "repro"))
+    root = _shared_project(tmp_path / "project", shared, "copy")
+    (root / "pipeline.py").write_text(_READ_THEN_HOLD_PIPELINE)
+    snapshot = b"an old snapshot, read only by hash\n"
+    key = _publish(shared / "files", tmp_path, snapshot.decode())
+    read_object = cache.get_cache_path(shared / "files", key)
+    (root / "data" / "raw" / "pin.txt").write_text(f"{key}\n")
+    env = _env() if remote == "none" else _remote_holding(root, moto_services["s3"], snapshot)
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    args = ("repro",) if commit == "run" else ("repro", "--no-commit")
+    proc = _start(root, *args, env={**env, "GC_TEST_GATE": str(gate)})
+    _wait_for(gate / "started", proc, 120)
+
+    collected = _run(peer, "gc", "--yes", "--grace-hours", "0")
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert not read_object.exists(), "the peer's gc kept the object only the running stage read"
+    (gate / "go").write_text("")
+    ran, _ = proc.communicate(timeout=180)
+    if commit == "run":
+        committed = subprocess.CompletedProcess(args, proc.returncode, ran, "")
+    else:
+        assert proc.returncode == 0, ran
+        committed = subprocess.run(
+            [_PIVOT, "commit"], cwd=root, env=env, capture_output=True, text=True, timeout=180
+        )
+
+    out = committed.stdout + committed.stderr
+    stage_lock = root / ".pivot" / "stages" / "rd" / "use.lock"
+    if remote == "none":
+        assert committed.returncode != 0, out
+        assert "no longer in the cache" in " ".join(out.split()), out
+        assert not stage_lock.exists(), f"a lock names {key}, which the cache no longer holds"
+    else:
+        assert committed.returncode == 0, out
+        assert yaml.safe_load(stage_lock.read_text())["reads"] == [key]
+        assert read_object.exists(), f"the lock names {key}, which the commit did not fetch again"
+
+
+def _flock_waiter_on(path: pathlib.Path) -> bool:
+    """Whether a process waits for an flock on ``path`` (a `->` line of `/proc/locks`)."""
+    inode = path.stat().st_ino
+    for line in pathlib.Path("/proc/locks").read_text().splitlines():
+        fields = line.split()
+        if "->" in fields and "FLOCK" in fields and fields[-3].endswith(f":{inode}"):
+            return True
+    return False
+
+
+def test_a_collection_waits_for_a_nonce_rotation_another_cache_has_half_written(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A naming step in C1 rotates the project's nonce pair for C2 without C2's naming lock: the
+    state directory's nonce first, then the entry's, both under the state nonce file's exclusive
+    flock. A collection of C2 that read the pair between the two writes would find them unequal
+    and refuse a live project; it reads under the shared flock, so it waits for the rotation to
+    finish and then collects."""
+    setup = _two_cache_project(tmp_path, "c2-then-c1")
+    entry = _entry(setup.c2, setup.root)
+    view_key = naming.view_key_of(*naming.this_view())
+    state_nonce = (
+        setup.root
+        / ".pivot"
+        / "state.lmdb"
+        / naming.VIEW_NONCE_DIR
+        / f"{view_key}-{naming.read_cache_id(setup.c2)}"
+    )
+    fresh = f"{os.urandom(16).hex()}\n".encode()
+    dead = _publish(setup.c2 / "files", tmp_path, "named by nothing\n")
+    fd = os.open(state_nonce, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        assert os.pwrite(fd, fresh, 0) == len(fresh)  # the state side written, the entry's not
+        proc = _start_gc(setup.peer)
+        _wait_until("it waits for the rotation", lambda: _flock_waiter_on(state_nonce), proc)
+        naming.entry_nonce_path(entry).write_bytes(fresh)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    out = _finish(proc)
+
+    assert not cache.get_cache_path(setup.c2 / "files", dead).exists(), out
+    assert setup.output_in_c2.exists(), out

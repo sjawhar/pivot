@@ -1,13 +1,14 @@
 """Collect the cache objects no live record names.
 
-Liveness is read from disk, never inferred. Five classes of record name an object: a stage
-lock (``outs`` and ``deps``), a ``.pvt`` file, a run-cache row, a workspace link into the
-cache, and a ref under ``<cache>/files/refs``. Each contributes a file's hash, or, for a
-directory, the hash of its listing — which is itself the cache object at that hash, and the
-name of its whole-directory tree under ``<cache>/trees`` — and every file hash that listing
-names (``storage/listing.py``). A directory whose listing this collection cannot read refuses
-it: the members are unknown, and a collection that cannot read a record never licences a
-delete.
+Liveness is read from disk, never inferred. Six classes of record name an object: a stage
+lock (``outs``, ``deps`` and the objects its run read by hash, ``reads``), a ``.pvt`` file, a
+run-cache row (its outputs and its ``reads``), a ``nocommit:`` record's ``reads`` (which
+``pivot commit`` writes into the lock), a workspace link into the cache, and a ref under
+``<cache>/files/refs``. Each contributes a file's hash, or, for a directory, the hash of its
+listing — which is itself the cache object at that hash, and the name of its whole-directory
+tree under ``<cache>/trees`` — and every file hash that listing names (``storage/listing.py``).
+A directory whose listing this collection cannot read refuses it: the members are unknown, and
+a collection that cannot read a record never licences a delete.
 
 A cache outside the project root can hold another project's outputs, whose locks this project
 cannot read. Pivot therefore keeps a register of the projects that use a cache, at
@@ -78,7 +79,6 @@ class _RegisteredProject(TypedDict):
     project_id: str | None
     machine: str
     mount_ns: int | None
-    nonce: str | None
     mounts: list[str] | None
     # The state directory the writer recorded, as its mounts are spelled in its view.
     recorded_state_dir: str
@@ -219,10 +219,6 @@ def _project_from_entry(path: pathlib.Path) -> _RegisteredProject:
     mounts = entry.get("mounts")
     machine = entry.get("machine")
     mount_ns = entry.get("mount_ns")
-    try:
-        nonce: str | None = naming.read_nonce_file(naming.entry_nonce_path(path))
-    except (OSError, ValueError):
-        nonce = None
     scope = ProjectScope(
         root=pathlib.Path(root),
         # The collector resolves the project's current state directory before it reads records.
@@ -244,7 +240,6 @@ def _project_from_entry(path: pathlib.Path) -> _RegisteredProject:
         else None,
         machine=machine if isinstance(machine, str) else "",
         mount_ns=mount_ns if isinstance(mount_ns, int) and not isinstance(mount_ns, bool) else None,
-        nonce=nonce,
         mounts=cast("list[str] | None", mounts),
         recorded_state_dir=state_dir if isinstance(state_dir, str) else str(scope["state_dir"]),
     )
@@ -347,24 +342,29 @@ def _view_nonce_reason(
 
     An inode number is not proof: containers from one image (overlayfs) and VMs cloned from one
     disk show different state directories with the same inode. The entry's view wrote a fresh
-    nonce into its state directory just before the entry; reading the same nonce here proves this
-    view reads those bytes (one directory, as over NFS), not a clone or an overlay copy.
+    nonce into its state directory and into the entry's nonce file just before the entry, and
+    rewrites both at every naming step, in this cache and in every other cache the project
+    lists (``naming.naming_unit``, ``naming._confirm_listed_caches``). Reading the same nonce in
+    both here proves this view reads the bytes that view last wrote (one directory, as over
+    NFS), not a clone or an overlay copy: a copy keeps the nonce of the moment it was taken,
+    and the project's next naming step in any cache it reaches replaces this cache's. The pair
+    is read under the shared lock writers take across both writes (``naming.read_nonce_pair``),
+    since a step in another cache rewrites this cache's pair without this cache's naming lock.
     """
     scope = registered["scope"]
     view_key = naming.view_key_of(scope["host"], registered["machine"], registered["mount_ns"])
-    if registered["nonce"] is None:
-        detail = "the entry has no readable view nonce"
+    try:
+        # The entry's cache is the one whose register holds it (`<cache>/projects/`)
+        cache_id = naming.read_cache_id(entry.parent.parent)
+        state_nonce, entry_nonce = naming.read_nonce_pair(
+            scope["state_dir"], view_key, cache_id, naming.entry_nonce_path(entry)
+        )
+    except (OSError, ValueError) as e:
+        detail = f"no nonce pair for that view readable here: {_error_text(e)}"
     else:
-        try:
-            # The entry's cache is the one whose register holds it (`<cache>/projects/`)
-            cache_id = naming.read_cache_id(entry.parent.parent)
-            nonce = naming.read_view_nonce(scope["state_dir"], view_key, cache_id)
-        except (OSError, ValueError) as e:
-            detail = f"no nonce for that view readable here: {_error_text(e)}"
-        else:
-            if nonce == registered["nonce"]:
-                return None
-            detail = "this state directory holds an older or different nonce for that view"
+        if state_nonce == entry_nonce:
+            return None
+        detail = "this state directory holds an older or different nonce for that view"
     return (
         scope_label(scope),
         f"{_recorded_where(scope)}, and this host cannot prove it reads the state that view last "
@@ -378,77 +378,69 @@ def _view_nonce_reason(
 def _other_caches_reason(
     entry: pathlib.Path, registered: _RegisteredProject, project_id: str
 ) -> tuple[str, str] | None:
-    """Why this view cannot prove the entry's project has named nothing through another cache
-    since this state directory was written, or None.
+    """Why this view cannot prove that every other cache the project lists holds the entry this
+    state directory last wrote there, or None.
 
     The entry's own nonce proves this state directory is the one its view last wrote for this
-    cache. A copy of the project (a cloned disk) keeps that nonce while the original goes on
-    naming objects through another cache it uses, and its records then are not the original's.
-    Only something the original writes to shared storage after the copy can tell the copy
-    apart: the nonce of its entry in each other cache. So every other cache the state directory
-    lists for the entry's view (``naming.cache_records``) must be readable where it is recorded,
-    hold the same cache, and hold an entry for the project whose nonce is the one this state
-    directory holds for it. A project that uses one cache lists only it, and nothing more is
-    read.
+    cache, and every naming step rewrites that pair in every cache the project lists
+    (``naming._confirm_listed_caches``). Each other listed cache is checked too: a copy of the
+    project (a cloned disk) that holds this cache's root with its object store elsewhere (its
+    ``files/`` a link to shared storage) has its own copy of this register, which the original's
+    steps never reach, and only the original's entries in a cache both share tell the copy
+    apart. So every cache any view of the project lists (``naming.cache_records``) must be
+    readable where that view recorded it, hold the same cache, and hold that view's entry for
+    the project with the nonce this state directory holds for it. A project that uses one cache
+    lists only it, and nothing more is read.
     """
     scope = registered["scope"]
-    view_key = naming.view_key_of(scope["host"], registered["machine"], registered["mount_ns"])
     try:
         this_cache = naming.read_cache_id(entry.parent.parent)
-        records = naming.cache_records(scope["state_dir"], view_key)
+        records = naming.cache_records(scope["state_dir"])
     except (OSError, ValueError) as e:
         return (
             scope_label(scope),
             f"{_recorded_where(scope)}, and the list of caches it uses in {scope['state_dir']} "
             + f"cannot be read ({_error_text(e)}). Make it readable and re-run",
         )
+    here: str | None = None
     for record in records:
         if record.cache_id == this_cache:
             continue
-        problem = _listed_cache_problem(record, scope, project_id)
+        problem = naming.listed_cache_problem(record, scope["root"], scope["state_dir"], project_id)
         if problem is None:
             continue
+        if here is None:
+            here = naming.view_key_of(*naming.this_view())
         where = record.cache_dir if record.cache_dir is not None else record.record
-        return (
-            scope_label(scope),
+        found = (
             f"{_recorded_where(scope)}, and it also uses the cache {where} (id "
-            + f"{record.cache_id}), where {problem}. This host cannot tell whether the project "
-            + "named objects through that cache that this path does not show: this path may "
-            + "hold a copy of the project (a cloned disk) that the project has moved on from. If "
-            + "it is the project, run any pivot command in it against that cache, which brings "
-            + "that record up to date; if the project no longer uses that cache, run `pivot "
-            + f"forget-cache {record.cache_id}` in it. Then re-run",
+            + f"{record.cache_id}), where {problem.detail}."
         )
-    return None
-
-
-def _listed_cache_problem(
-    record: naming.CacheRecord, scope: ProjectScope, project_id: str
-) -> str | None:
-    """What stops this view from proving one listed cache holds the project's latest entry."""
-    if record.cache_dir is None:
-        return f"the record {record.record} of where that cache is cannot be read"
-    try:
-        cache_id = naming.read_cache_id(record.cache_dir)
-    except (OSError, ValueError) as e:
-        return f"that cache cannot be read ({_error_text(e)})"
-    if cache_id != record.cache_id:
-        return f"another cache is at that path now (id {cache_id})"
-    entry = naming.register_path(record.cache_dir, scope["root"], project_id, record.view_key)
-    try:
-        state_nonce, entry_nonce = naming.read_nonce_pair(
-            scope["state_dir"], record.view_key, record.cache_id, naming.entry_nonce_path(entry)
-        )
-    except FileNotFoundError as e:
-        missing = "its nonce in this state directory" if e.filename is None else e.filename
-        return f"the project's entry there cannot be checked ({missing} is missing)"
-    except (OSError, ValueError) as e:
-        return f"the project's entry there cannot be checked ({_error_text(e)})"
-    if state_nonce != entry_nonce:
-        return (
-            "the project's entry holds a different nonce from the one this state directory "
-            + "holds for it"
-        )
+        if problem.state is naming.ListedCacheState.STALE:
+            remedy = (
+                " This path may hold a copy of the project (a cloned disk) that the project has "
+                + "moved on from: every naming step of the project brings that entry up to date. "
+                + "Run `pivot gc` where the project itself is visible"
+            )
+        elif record.view_key != here:
+            remedy = (
+                " Another view of the project (another host or mount namespace) listed that "
+                + f"cache in {record.record}. Run `pivot gc` where that view reaches the cache; "
+                + f"if that view is gone for good, delete {record.record} and re-run"
+            )
+        elif problem.state is naming.ListedCacheState.NO_ENTRY:
+            remedy = (
+                " Run any pivot command in the project that reaches that cache, which registers "
+                + "it there again, then re-run"
+            )
+        else:
+            remedy = (
+                " If the project reaches that cache at another path, run any pivot command in it "
+                + "there. If no view of the project uses that cache any more, run `pivot "
+                + f"forget-cache {record.cache_id}` in the project itself, never in a copy of it. "
+                + "Then re-run"
+            )
+        return scope_label(scope), found + remedy
     return None
 
 

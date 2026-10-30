@@ -75,7 +75,7 @@ _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     "forget-cache": (
         "pivot.cli.forget_cache",
         "forget_cache",
-        "Remove a cache from the list of caches this project uses.",
+        "Remove a cache from the caches this view of the project lists.",
     ),
     "fingerprint": (
         "pivot.cli.fingerprint",

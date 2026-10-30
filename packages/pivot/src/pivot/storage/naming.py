@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import enum
 import errno
 import fcntl
 import hashlib
@@ -27,6 +28,7 @@ import time
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 
 from pivot import exceptions
+from pivot import state_dir as state_dir_mod
 from pivot.storage import cache
 
 if TYPE_CHECKING:
@@ -164,13 +166,15 @@ def _cache_record_path(state_dir: pathlib.Path, view_key: str, cache_id: str) ->
 
 
 class CacheRecord(NamedTuple):
-    """One cache a project's state directory lists: the view that uses it, the cache's id, and
-    where that view found it (None when the record cannot be read)."""
+    """One cache a project's state directory lists: the view that uses it, the cache's id, where
+    that view found it (None when the record cannot be read), and since when that view's naming
+    steps could not reach it (None while they do)."""
 
     record: pathlib.Path
     view_key: str
     cache_id: str
     cache_dir: pathlib.Path | None
+    unconfirmed_since: str | None
 
 
 def cache_records(state_dir: pathlib.Path, view_key: str | None = None) -> list[CacheRecord]:
@@ -195,14 +199,16 @@ def cache_records(state_dir: pathlib.Path, view_key: str | None = None) -> list[
         ):
             continue
         path = directory / name
-        document = entry_from_file(path)
-        cache_dir = None if document is None else document.get("cache")
+        document = entry_from_file(path) or {}
+        cache_dir = document.get("cache")
+        since = document.get("unconfirmed_since")
         records.append(
             CacheRecord(
                 path,
                 record_view,
                 cache_id,
                 pathlib.Path(cache_dir) if isinstance(cache_dir, str) and cache_dir else None,
+                since if isinstance(since, str) else None,
             )
         )
     return records
@@ -211,12 +217,30 @@ def cache_records(state_dir: pathlib.Path, view_key: str | None = None) -> list[
 def _record_cache(
     state_dir: pathlib.Path, view_key: str, cache_id: str, cache_dir: pathlib.Path
 ) -> None:
-    """List ``cache_dir`` among the caches this view of the project uses, unless it is listed
-    there already. Raises OSError."""
+    """List ``cache_dir`` among the caches this view of the project uses, as reached now (no
+    ``unconfirmed_since``), unless it is listed so already. Raises OSError."""
     path = _cache_record_path(state_dir, view_key, cache_id)
     desired: dict[str, object] = {"cache": os.path.abspath(cache_dir)}
     if entry_from_file(path) != desired:
         _replace_readable(str(path), (json.dumps(desired, sort_keys=True) + "\n").encode())
+
+
+def _mark_unconfirmed(record: CacheRecord) -> None:
+    """Record in this view's record of a listed cache since when its naming steps could not
+    reach it (``unconfirmed_since``), once: the first step that reaches it again clears it
+    (``_record_cache``)."""
+    if record.unconfirmed_since is not None:
+        return
+    document: dict[str, object] = {
+        "unconfirmed_since": _entry_timestamp(time.time()),
+        **({} if record.cache_dir is None else {"cache": str(record.cache_dir)}),
+    }
+    try:
+        _replace_readable(
+            str(record.record), (json.dumps(document, sort_keys=True) + "\n").encode()
+        )
+    except OSError as e:
+        logger.debug("Cannot record that %s is unconfirmed: %s", record.record, e)
 
 
 def read_nonce_pair(
@@ -335,10 +359,71 @@ def read_nonce_file(path: pathlib.Path) -> str:
     return nonce
 
 
-def read_view_nonce(state_dir: pathlib.Path, view_key: str, cache_id: str) -> str:
-    """Read one view's nonce for one cache in the state directory. Raises OSError or
-    ValueError."""
-    return read_nonce_file(_view_nonce_path(state_dir, view_key, cache_id))
+class ListedCacheState(enum.Enum):
+    """Why a listed cache's entry for the project is not proven current (``listed_cache_problem``)."""
+
+    # The record, the cache at its path, or another cache there: this view cannot reach it.
+    UNREACHABLE = "unreachable"
+    # The cache holds no entry, or no nonce, for that view of the project.
+    NO_ENTRY = "no entry"
+    # The entry's nonce is not the one the state directory holds: one of them is a copy's.
+    STALE = "stale"
+
+
+class ListedCacheProblem(NamedTuple):
+    state: ListedCacheState
+    detail: str
+
+
+def listed_cache_problem(
+    record: CacheRecord, project_root: pathlib.Path, state_dir: pathlib.Path, project_id: str
+) -> ListedCacheProblem | None:
+    """What stops this process from proving that one cache the project lists holds, for the
+    record's view, the entry whose nonce the state directory holds; None when it does. A
+    collection refuses on any problem (``gc._other_caches_reason``); `pivot forget-cache`
+    refuses to remove a cache that has none."""
+    if record.cache_dir is None:
+        return ListedCacheProblem(
+            ListedCacheState.UNREACHABLE,
+            f"the record {record.record} of where that cache is cannot be read",
+        )
+    try:
+        found = read_cache_id(record.cache_dir)
+    except (OSError, ValueError) as e:
+        return ListedCacheProblem(
+            ListedCacheState.UNREACHABLE, f"that cache cannot be read ({_error_text(e)})"
+        )
+    if found != record.cache_id:
+        return ListedCacheProblem(
+            ListedCacheState.UNREACHABLE, f"another cache is at that path now (id {found})"
+        )
+    entry = register_path(record.cache_dir, project_root, project_id, record.view_key)
+    try:
+        state_nonce, entry_nonce = read_nonce_pair(
+            state_dir, record.view_key, record.cache_id, entry_nonce_path(entry)
+        )
+    except FileNotFoundError as e:
+        missing = "its nonce in this state directory" if e.filename is None else e.filename
+        return ListedCacheProblem(
+            ListedCacheState.NO_ENTRY,
+            f"the project's entry there cannot be checked ({missing} is missing)",
+        )
+    except (OSError, ValueError) as e:
+        return ListedCacheProblem(
+            ListedCacheState.NO_ENTRY,
+            f"the project's entry there cannot be checked ({_error_text(e)})",
+        )
+    if state_nonce != entry_nonce:
+        return ListedCacheProblem(
+            ListedCacheState.STALE,
+            "the project's entry there holds a different nonce from the one this state "
+            + "directory holds for it",
+        )
+    return None
+
+
+def _error_text(error: OSError | ValueError) -> str:
+    return error.strerror if isinstance(error, OSError) and error.strerror else str(error)
 
 
 def _cache_id_path(cache_dir: pathlib.Path) -> pathlib.Path:
@@ -530,6 +615,8 @@ class _VerifiedRegistration(NamedTuple):
     state_nonce_fd: int
     register_nonce_path: str
     register_nonce_fd: int
+    view_key: str
+    cache_id: str
 
 
 _VERIFIED_REGISTRATIONS = dict[_RegistrationKey, _VerifiedRegistration]()
@@ -699,8 +786,8 @@ def register_project(
         project_id: str | None = _ensure_project_id(state_dir, project_root)
         cache_id = _ensure_cache_id(cache_dir)
         state_fd = _open_view_nonce(state_dir, view_key, cache_id)
-        # Listed before its first nonce, so no nonce for a cache exists that a collection of
-        # another cache the project uses would not check (``gc._other_caches_reason``).
+        # Listed before its first nonce, so no nonce for a cache exists that the project's
+        # naming steps in its other caches would not rotate (``_confirm_listed_caches``).
         _record_cache(state_dir, view_key, cache_id, cache_dir)
     except (OSError, ValueError) as e:
         logger.debug("Cannot write the project id, cache id or view nonce for %s: %s", state_dir, e)
@@ -761,6 +848,8 @@ def register_project(
                     state_nonce_fd=state_fd,
                     register_nonce_path=str(entry_nonce_path(path)),
                     register_nonce_fd=register_fd,
+                    view_key=view_key,
+                    cache_id=cache_id,
                 )
                 state_fd = register_fd = None  # the memo owns them now
                 watch = None
@@ -775,11 +864,183 @@ def register_project(
                 os.close(fd)
 
 
+class _ListedCaches(NamedTuple):
+    """This process's copy of one project's list of caches (``cache_records``, every view's):
+    the list's directory, its identity when it was read (None while it may still change within
+    one timestamp tick), and the records."""
+
+    directory: str
+    identity: _FileIdentity | None
+    records: list[CacheRecord]
+
+
+# Per state directory. Read again when the directory changes (a record added, marked, cleared or
+# removed); kept only once the directory's mtime is 2 s old, so a record added within the same
+# timestamp tick is never missed. A nonce rotation rewrites its files in place, so it never
+# changes the directory.
+_LISTED_CACHES = dict[pathlib.Path, _ListedCaches]()
+
+
+def _listed_caches(state_dir: pathlib.Path) -> list[CacheRecord]:
+    """Every cache any view of the project lists (``cache_records``), one ``stat`` while the
+    list is unchanged. Raises OSError when the list cannot be read."""
+    cached = _LISTED_CACHES.get(state_dir)
+    directory = (
+        cached.directory
+        if cached is not None
+        else os.fspath(state_dir / "state.lmdb" / VIEW_NONCE_DIR)
+    )
+    try:
+        stats = os.stat(directory)
+    except FileNotFoundError:
+        return []
+    identity = (stats.st_dev, stats.st_ino, stats.st_mtime_ns)
+    if cached is not None and cached.identity == identity:
+        return cached.records
+    records = cache_records(state_dir)
+    settled = time.time_ns() - stats.st_mtime_ns > 2_000_000_000
+    _LISTED_CACHES[state_dir] = _ListedCaches(directory, identity if settled else None, records)
+    return records
+
+
+def _confirm_listed_caches(
+    cache_dir: pathlib.Path, project_root: pathlib.Path, state_dir: pathlib.Path
+) -> None:
+    """At each naming step in ``cache_dir``, rotate this view's nonce in the project's entry in
+    every other cache the project lists, in any view, registering this view there first where
+    it has no entry yet.
+
+    A copy of the project (a cloned disk) keeps every nonce as it was when it was taken, and
+    only a write the project makes to shared storage after that tells the two apart. A step in
+    one cache writes records that may name objects in another (a lock that names again an
+    object an earlier run left there), so the step rewrites this view's pair for every cache the
+    project lists: then a collection of any of them, which checks only its own entries
+    (``gc._view_nonce_reason``), refuses the copy once the project took one step anywhere that
+    could reach that cache. The list is every view's (a cache another mount namespace or host
+    used counts), but a step writes only this view's own nonces and entries: were it to rotate
+    another view's, a copy's own steps would make the original's entries match the copy.
+
+    Each other cache costs a nonce rotation while this process's registration there holds
+    (``register_project``'s memo); its first step in a process registers there in full. With
+    one cache, this reads one ``stat``. A step in another cache rewrites this cache's pair
+    without this cache's naming lock, so a collection reads each pair under the lock writers
+    hold across both writes (``read_nonce_pair``).
+
+    A cache this view lists that this step cannot reach (it cannot be read, another cache is at
+    its path, or its register cannot be written) does not fail the step: this view's record of
+    it is marked unconfirmed (``_mark_unconfirmed``) and the command warns once
+    (``_warn_unreachable``). Until a step reaches it again, a copy of the project that can reach
+    it may collect this project's objects there; they are then fetched or run again, never used
+    stale. A cache only other views list, which this view cannot reach (a host cache a
+    container does not mount), is passed over without a word: this view never named anything
+    there, and a collection still checks that view's entry (``gc._other_caches_reason``).
+    """
+    verified = _VERIFIED_REGISTRATIONS.get((cache_dir, project_root, state_dir))
+    this_cache: str | None
+    if verified is not None:
+        view_key, this_cache = verified.view_key, verified.cache_id
+    else:
+        view_key = view_key_of(*this_view())
+        try:
+            this_cache = read_cache_id(cache_dir)
+        except (OSError, ValueError):
+            this_cache = None
+    try:
+        records = _listed_caches(state_dir)
+    except (OSError, ValueError) as e:
+        # ValueError: a configured state directory no path can be (a NUL byte, #503), which
+        # holds no list either; its registration wrote an entry without an id.
+        logger.debug("Cannot read the caches %s lists: %s", state_dir, e)
+        return
+    by_cache = dict[str, list[CacheRecord]]()
+    for record in records:
+        if record.cache_id != this_cache:
+            by_cache.setdefault(record.cache_id, []).append(record)
+    for cache_id, listed in by_cache.items():
+        own = next((record for record in listed if record.view_key == view_key), None)
+        # Where this view found the cache first, then where any other view did.
+        paths = list(
+            dict.fromkeys(
+                record.cache_dir
+                for record in sorted(listed, key=lambda record: record is not own)
+                if record.cache_dir is not None
+            )
+        )
+        problem = f"its record {listed[0].record} cannot be read"
+        reached: pathlib.Path | None = None
+        for path in paths:
+            why = _confirm_cache(path, cache_id, project_root, state_dir)
+            if why is None:
+                reached = path
+                break
+            problem = why
+        if reached is not None:
+            if own is not None and own.unconfirmed_since is not None:
+                with contextlib.suppress(OSError):
+                    _record_cache(state_dir, view_key, cache_id, reached)
+            continue
+        if own is None:
+            logger.debug(
+                "Cannot reach %s, which another view of %s lists: %s", cache_id, state_dir, problem
+            )
+            continue
+        _mark_unconfirmed(own)
+        _warn_unreachable(cache_id, own.cache_dir or own.record, problem)
+
+
+def _confirm_cache(
+    cache_dir: pathlib.Path, cache_id: str, project_root: pathlib.Path, state_dir: pathlib.Path
+) -> str | None:
+    """Rotate this view's nonce in the project's entry in the cache ``cache_id`` at
+    ``cache_dir``, registering there in full when this process holds no registration there;
+    why it cannot, or None."""
+    key = (cache_dir, project_root, state_dir)
+    if _registration_unchanged(key):
+        try:
+            _rotate_view_nonce(key)
+            return None
+        except OSError as e:
+            logger.debug("Cannot rotate the view nonce for %s: %s", cache_dir, e)
+    _forget_registration(key)
+    try:
+        found = read_cache_id(cache_dir)
+    except (OSError, ValueError) as e:
+        return f"it cannot be read ({_error_text(e)})"
+    if found != cache_id:
+        return f"another cache is at that path now (id {found})"
+    try:
+        register_project(cache_dir, project_root, state_dir)
+    except exceptions.CacheError as e:
+        cause = e.__cause__
+        reason = cause.strerror if isinstance(cause, OSError) and cause.strerror else cause or e
+        return f"its register cannot be written ({reason})"
+    return None
+
+
+def _warn_unreachable(cache_id: str, where: pathlib.Path, problem: str) -> None:
+    """Warn, once per command, that a listed cache's entry for this project was not brought up
+    to date (``state_dir.first_unreachable_cache_report``)."""
+    if not state_dir_mod.first_unreachable_cache_report(cache_id):
+        return
+    logger.warning(
+        "This project also uses the cache %s (id %s), and this command cannot reach it: %s. "
+        + "Its entry for this project there was not brought up to date, so until a pivot "
+        + "command in this project reaches that cache again, a copy of this project (a cloned "
+        + "disk) that can reach it could collect this project's objects there; they would then "
+        + "be fetched or run again. If no view of this project uses that cache any more, run "
+        + "`pivot forget-cache %s` here, in the project itself: never in a copy of it.",
+        where,
+        cache_id,
+        problem,
+        cache_id,
+    )
+
+
 def _unrecorded_project(
     cache_dir: pathlib.Path, path: pathlib.Path, error: OSError | ValueError
 ) -> exceptions.CacheError:
     """The refusal when a writer cannot add its project to a shared cache's register."""
-    reason = error.strerror if isinstance(error, OSError) and error.strerror else str(error)
+    reason = _error_text(error)
     return exceptions.CacheError(
         f"Cannot record this project in the cache register at {path}: {reason}. "
         + f"This command names objects in the cache {cache_dir}, and a `pivot gc` run in another "
@@ -867,6 +1128,7 @@ def naming_unit(
             locked = False
         if project is not None:
             register_project(cache_dir, *project)
+            _confirm_listed_caches(cache_dir, *project)
         yield
     finally:
         if locked:

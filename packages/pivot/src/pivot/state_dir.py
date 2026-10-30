@@ -126,6 +126,9 @@ class StateDirInvocation(typing.TypedDict):
     # the file's identity when it was decoded (device, inode, size, change time) and what it
     # records. A file whose identity changed is decoded again, as during a ``--watch`` session.
     recorded_locks: "dict[str, tuple[tuple[int, int, int, int], tuple[DirectoryRecord, ...]]]"
+    # The listed caches a naming step of this record could not reach and already warned about
+    # (``first_unreachable_cache_report``).
+    unreachable_caches: set[str]
 
 
 # Set by the CLI callback for one CLI invocation, by a worker for one stage, and by a library
@@ -143,6 +146,22 @@ _invocation = contextvars.ContextVar[StateDirInvocation | None](
 def _reported() -> StateDirWarnings | None:
     invocation = _invocation.get()
     return None if invocation is None else invocation["reported"]
+
+
+def first_unreachable_cache_report(cache_id: str) -> bool:
+    """Whether to warn now that a naming step could not reach ``cache_id``, a cache the project
+    lists (``naming._warn_unreachable``): once per record that reports (a CLI invocation that is
+    not ``--quiet``, a library entry point's record), at every step outside any record, and
+    never in a worker's stage, whose command's own naming step reaches the same caches first."""
+    invocation = _invocation.get()
+    if invocation is None:
+        return True
+    if (invocation["reported"] is None and not invocation["library"]) or (
+        cache_id in invocation["unreachable_caches"]
+    ):
+        return False
+    invocation["unreachable_caches"].add(cache_id)
+    return True
 
 
 def lock_ordering() -> LockOrdering | None:
@@ -609,8 +628,9 @@ def begin_invocation(
     Its resolutions start with ``state_dirs`` and it reads the config of any other project
     afresh. A worker's stage passes the resolution its Pivot process decided for the command,
     the outcome for a path that cannot be used included, so the worker reads every state file
-    where its Pivot process does, and a ``core.state_dir`` edited during a ``--watch`` session
-    never reaches it. With ``report``, each state-directory problem is warned once; without it,
+    where its Pivot process does. A ``core.state_dir`` edited during a ``--watch`` session
+    reaches a worker only through the reload the edit starts, whose pipeline resolves it again.
+    With ``report``, each state-directory problem is warned once; without it,
     none is, except that a ``library`` record reports an unusable path at each pipeline load.
     """
     reported = (
@@ -639,6 +659,7 @@ def begin_invocation(
             recorded_locks=dict[
                 str, tuple[tuple[int, int, int, int], tuple["DirectoryRecord", ...]]
             ](),
+            unreachable_caches=set[str](),
         )
     )
 

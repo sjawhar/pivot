@@ -1,9 +1,11 @@
 import json
+import logging
 import pathlib
 import shutil
 
 import pytest
 
+from pivot import state_dir as state_dir_mod
 from pivot.storage import gc, naming
 
 
@@ -226,3 +228,63 @@ def test_two_views_that_share_a_view_key_refuse_each_others_entry(
 
     assert live == [], "the view that did not write last accepted the other's entry"
     assert len(unreadable) == 1, unreadable
+
+
+def test_a_unit_registers_its_view_in_a_cache_only_another_view_listed(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N1 `c1view` without a mount namespace: view 1 of the project uses C2; its state directory
+    is copied; view 2 then names objects through C1 only. View 2's step registers it in C2 too,
+    a cache only view 1 listed, writing a nonce the copy never held, so a collection of C2 that
+    reads the copy refuses. View 1's own pair is never touched by view 2."""
+    root, state_dir, c2 = _project(tmp_path)
+    c1 = tmp_path / "cache-one"
+    c1.mkdir()
+    monkeypatch.setattr(naming, "this_view", lambda: ("host", "machine", 1))
+    _unit(c2, root, state_dir)
+    view_one = naming.project_register_path(c2, root, state_dir)
+    assert view_one is not None
+    view_one_nonce = naming.entry_nonce_path(view_one).read_text()
+    copy = tmp_path / "copy-state"
+    shutil.copytree(state_dir, copy, symlinks=True)
+    naming._VERIFIED_REGISTRATIONS.clear()  # view 2 is another process
+    monkeypatch.setattr(naming, "this_view", lambda: ("host", "machine", 2))
+
+    _unit(c1, root, state_dir)
+
+    view_two = naming.project_register_path(c2, root, state_dir)
+    assert view_two is not None and view_two.exists(), "view 2's step left C2 without its entry"
+    assert naming.entry_nonce_path(view_one).read_text() == view_one_nonce
+    _swap(state_dir, copy)
+    try:
+        _live, unreadable = gc.read_register(c2)
+    finally:
+        _swap(state_dir, copy)
+    assert any(str(view_two) in reason for _label, reason in unreadable), unreadable
+
+
+def test_a_unit_warns_once_per_command_about_a_listed_cache_it_cannot_reach(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A listed cache a naming step cannot reach draws one warning per command, however many
+    units the command takes, and none from a worker's stage (a record that reports nothing and
+    is no library entry point), whose command's own step warns."""
+    root, state_dir, cache_dir = _project(tmp_path)
+    other = tmp_path / "other-cache"
+    other.mkdir()
+    _unit(other, root, state_dir)
+    other.rename(tmp_path / "gone")
+
+    def warnings_of(*, report: bool) -> list[str]:
+        caplog.clear()
+        token = state_dir_mod.begin_invocation(report=report)
+        try:
+            with caplog.at_level(logging.WARNING, logger=naming.__name__):
+                _unit(cache_dir, root, state_dir)
+                _unit(cache_dir, root, state_dir)
+        finally:
+            state_dir_mod.end_invocation(token)
+        return [r.getMessage() for r in caplog.records if "cannot reach it" in r.getMessage()]
+
+    assert len(warnings_of(report=True)) == 1
+    assert warnings_of(report=False) == []

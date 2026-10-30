@@ -243,7 +243,13 @@ When multiple `pivot` processes share the same StateDB:
   output the stage lacks, and status only when every stale upstream stage has a recovery too;
   `pivot status` suggests `pivot pull` from that field, never from the reason's text. A trust-me
   `pivot commit <stage>` keeps the previous lock's `reads` only when that lock records the same
-  code, params, dependency hashes and outputs.
+  code, params, dependency hashes and outputs. A read by hash names nothing until a lock does:
+  a stage that found its object in the cache took no naming unit, so a collection may remove
+  it while the stage runs. Each commit (a stage's, and `pivot commit`'s for the `reads` it
+  writes) fetches again, before its naming unit, every read object the cache no longer holds
+  (`reads.fetch_missing`, recording each fetch in the remote index), and inside the unit
+  refuses to write a lock naming one that is still missing (`reads.require_cached`): the stage
+  fails, nothing is committed, and its next run reads the object again.
 
 ## Output Ownership
 
@@ -522,16 +528,29 @@ load, not the configuration now): its stages' locks would sit where no collectio
 **A registered project is live only after a real read.** `read_register` resolves the state
 directory from that project's own `core.state_dir`, requires the entry's project id there, and
 requires the entry's nonce in that view's nonce file, read in the collector's own view: an
-inode number is not proof (an overlay copy or a cloned disk shares it). The project must also be
-current in **every other cache its state directory lists** for that view
-(`gc._other_caches_reason`): a registration lists its cache in
-`gc-views/<view>-<cache id>.cache` before that cache's first nonce (`naming._record_cache`), and
-a collection reads the project's entry nonce in each other listed cache and the state
-directory's nonce for it, under the writers' shared lock (`naming.read_nonce_pair`). A copy of
-the project keeps every nonce while the original names through another cache, which rotates
-only that cache's nonce; that write to shared storage is the only thing the copy can see, so
-an unreadable, replaced or mismatched listed cache refuses (N1). `pivot forget-cache` removes a
-cache from the list and deletes nothing. For this view's entries every recorded mount must be
+inode number is not proof (an overlay copy or a cloned disk shares it). The pair is read under
+the lock writers hold across both writes (`naming.read_nonce_pair`, the state nonce file's
+`flock`), because a unit in **another** cache rewrites it without this cache's naming lock: every
+unit, after registering in its own cache, rotates this view's nonce in every other cache the
+project lists in **any** view (`naming._confirm_listed_caches`), registering this view there
+first where it has no entry. A registration lists its cache in `gc-views/<view>-<cache id>.cache`
+before that cache's first nonce (`naming._record_cache`). A copy of the project (a cloned disk)
+keeps every nonce, and a write the original makes to shared storage after the copy is the only
+thing that tells them apart, so a collection refuses a copy once the original took a unit
+anywhere that could reach that cache (N1). A collection also checks every cache any view of the
+project lists (`gc._other_caches_reason`, `naming.listed_cache_problem`): each must be readable
+at the recorded path, hold the listed cache id, and hold that view's entry with the state
+directory's nonce. That covers a copy that holds its own copy of a register over shared objects
+(a cache root on the cloned disk whose `files/` links to shared storage), which the original's
+units never reach. A unit writes only its own view's nonces and entries: rotating another view's
+would let a copy's units make the original's entries match the copy. A cache this view lists
+that a unit cannot reach does not fail it: the record gets `unconfirmed_since`
+(`naming._mark_unconfirmed`) and the command warns once (`naming._warn_unreachable`,
+`state_dir.first_unreachable_cache_report`); a cache only another view lists is passed over. A
+copy that reaches such a cache may then collect it, and the original fetches or runs again; a
+collection refuses while a listed cache cannot be read. `pivot forget-cache` removes only this
+view's record, refuses a cache this view reaches whose entry is current, and deletes nothing; a
+stale-nonce refusal never suggests it. For this view's entries every recorded mount must be
 mounted; another view's entry may record only its root and state directory. Any missing
 evidence refuses collection and names the entry. `resolve_scopes` then
 opens every scope's root, `.pivot` and state directory. When `core.state_dir` differs from
@@ -542,8 +561,8 @@ has not changed (`_watch_mount_table`: an open `/proc/self/mounts` on procfs, po
 `POLLPRI` the kernel raises at every mount change in this namespace; without such a watch the
 memo never engages), and both open nonce files are still the ones at their paths. It never skips
 the nonce rotation: every unit rewrites both fixed-size nonce files in place (`_rotate_nonces`;
-only a registration truncates them), which a collection reads only under the exclusive lock. No
-collection read uses the memo.
+only a registration truncates them) under the state nonce file's exclusive `flock`, so a
+collection never reads a pair half written. No collection read uses the memo.
 
 **A directory's members come from its listing.** A lock, `.pvt` or run-cache row records a
 directory by its listing's hash, size and file count (#523). `collect_roots` keeps that hash

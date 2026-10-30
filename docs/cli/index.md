@@ -1167,10 +1167,11 @@ pivot gc [OPTIONS]
 | `--remove-linked` | Also remove objects a directory entry outside the cache still hardlinks |
 | `--json` | Write one JSON document to stdout; notes go to stderr |
 
-Pivot keeps every object named by a stage lock (`outs` and `deps`), a `.pvt` file, a
-run-cache row, a workspace link or a cache ref, in this project and in every project the
-cache records; every object published in the last `--grace-hours`; and every object some
-directory entry outside the cache still hardlinks. It removes the rest. See
+Pivot keeps every object named by a stage lock (`outs`, `deps` and `reads`, the objects its run
+read by hash), a `.pvt` file, a run-cache row (its outputs and `reads`), a `--no-commit` run's
+record of what it read by hash, a workspace link or a cache ref, in this project and in every
+project the cache records; every object published in the last `--grace-hours`; and every object
+some directory entry outside the cache still hardlinks. It removes the rest. See
 [Caching](../concepts/caching.md#what-keeps-a-cache-object-alive) for the whole rule, and
 for what `pivot gc` does with a cache several projects share. A `--projects` path must be a
 real pivot project (a directory with a readable `.pivot` marker); its records are read from
@@ -1224,15 +1225,17 @@ After a collection, `pivot diff` and `pivot get --rev` may need `pivot fetch` fo
 whose objects were removed.
 
 A project that has used more than one cache (`cache.dir` changed, or a library run with another
-`cache_dir`) lists each in its state directory. `pivot gc` of any of them reads the project's
-entry in every other one, and refuses when one cannot be read or holds an older entry; see
+`cache_dir`) lists each in its state directory, and every naming step brings the project's entry
+in each listed cache up to date. `pivot gc` of any of them refuses an entry that holds an older
+nonce than the state directory it reads (a copy of the project), and checks every other cache
+any view of the project lists the same way, refusing while one cannot be read; see
 [Caching](../concepts/caching.md#a-project-that-uses-more-than-one-cache).
 
 ---
 
 ### `pivot forget-cache`
 
-Remove a cache from the list of caches this project uses.
+Remove a cache from the caches this view of the project lists.
 
 ```bash
 pivot forget-cache CACHE
@@ -1240,13 +1243,18 @@ pivot forget-cache CACHE
 
 **Arguments:**
 
-- `CACHE` - The cache's path, or its id, as a `pivot gc` refusal names it
+- `CACHE` - The cache's path, or its id, as a warning or a `pivot gc` refusal names it
 
-Use it when the project no longer uses that cache, for example one that was deleted or is on a
-disk that is gone. It changes only the project's list: it deletes nothing from any cache, and a
-collection of the removed cache still reads this project's entry there. Any pivot command that
-uses the removed cache lists it again. An unknown CACHE fails and prints the caches the project
-lists.
+Use it when this view of the project (this host and mount namespace) can no longer reach a cache
+it lists and no longer uses it, for example one that was deleted or is on a disk that is gone,
+and only in the project itself, never in a copy of it. While a cache is listed, every naming step
+brings the project's entry there up to date, a step that cannot reach it warns, and `pivot gc`
+refuses while it cannot be read; removing it stops all three for this view. It refuses a cache
+this view reaches whose entry for the project is current, and removes nothing then. It removes
+only this view's record: a record another view holds stays, for that view to remove (or, if that
+view is gone for good, for you to delete at the path a refusal names). It deletes nothing from
+any cache, and any pivot command that uses the removed cache lists it again. An unknown CACHE
+fails and prints the caches this view lists.
 
 ```bash
 pivot forget-cache /mnt/old-disk/pivot-cache

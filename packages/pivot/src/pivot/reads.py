@@ -42,7 +42,7 @@ from pivot.storage import cache, lock, state
 
 if TYPE_CHECKING:
     import pathlib
-    from collections.abc import Callable, Collection, Coroutine, Generator
+    from collections.abc import Callable, Collection, Coroutine, Generator, Mapping
 
     from pivot.remote import protocol
 
@@ -275,6 +275,60 @@ def _default_remote() -> tuple[str, protocol.RemoteStorage] | str:
     except exceptions.RemoteError as error:
         return f"no remote can be used ({error})"
     return name, storage
+
+
+def fetch_missing(hashes: Collection[str], current: Recording) -> dict[str, str]:
+    """Before a commit's naming unit, fetch again from the default remote each of ``hashes``,
+    objects the run read by hash, that the cache at ``current.cache_dir`` no longer holds, and
+    record each fetch in ``current``. Returns why each one that could not be fetched was not.
+
+    A read names nothing until the commit's lock (or ``pivot commit``'s) does: a stage that
+    found its object in the cache took no naming unit and refreshed no timestamp, so a
+    collection of the cache may remove it while the stage runs. The download runs here, outside
+    the unit, as every download does; ``require_cached`` refuses inside the unit an object still
+    not in the cache.
+    """
+    cache_dir = current.cache_dir
+    failed = dict[str, str]()
+    if cache_dir is None:
+        return failed
+    for content_hash in sorted(set(hashes)):
+        if cache.resolve_cache_object_path(cache_dir, content_hash, notice=False) is not None:
+            continue
+        try:
+            _ = _fetch(current, cache_dir, content_hash)
+        except exceptions.ObjectReadError as error:
+            failed[content_hash] = str(error)
+    return failed
+
+
+def require_cached(
+    hashes: Collection[str], cache_dir: pathlib.Path | None, why: Mapping[str, str]
+) -> None:
+    """Inside a commit's naming unit: refuse to name an object the run read by hash that the
+    cache no longer holds. ``why`` is ``fetch_missing``'s reason for each it could not fetch.
+
+    Raises:
+        ObjectReadError: An object is not in the cache (a collection removed it while the stage
+            ran, and it could not be fetched again, or it was removed again since).
+    """
+    if cache_dir is None:
+        return
+    gone = [
+        content_hash
+        for content_hash in sorted(set(hashes))
+        if cache.resolve_cache_object_path(cache_dir, content_hash, notice=False) is None
+    ]
+    if not gone:
+        return
+    details = "; ".join(f"{h} ({why[h]})" if h in why else h for h in gone)
+    raise exceptions.ObjectReadError(
+        "Objects the stage read by hash are no longer in the cache, and cannot be fetched "
+        + f"again: {details}. A read names nothing until the commit writes the lock, so a "
+        + "`pivot gc` of the cache while the stage ran could remove them. Nothing was "
+        + "committed: run the stage again once each object is back (`pivot pull`, or the run "
+        + "that produces it)"
+    )
 
 
 def lock_unavailable(

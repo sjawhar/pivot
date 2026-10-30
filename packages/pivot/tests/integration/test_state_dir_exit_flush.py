@@ -4,9 +4,10 @@ whenever and wherever the flush that writes it runs, and whenever the value is e
 A flush runs where the producer no longer does. A TUI session's engine thread keeps
 fingerprinting a reload after the quit has returned from the command, so process exit flushes
 what that thread queued; a library caller flushes at process exit as well, after whatever its
-program did next. Neither reads `core.state_dir` again, so a value edited in between takes
-nothing: the session's entries stay in `s1`, the library's in `libstate`, and the edited
-directory is never created.
+program did next. Neither reads `core.state_dir` again, so a change in between takes nothing:
+the session's entries stay in `s1` when the link the value names moves to `s2` (an edit of the
+value itself reloads a watch session, a new load), the library's in `libstate`, and the edited
+directory gets nothing.
 
 Every library entry point holds one state-directory record for its call
 (`state_dir.entry_invocation`), and a pipeline's fingerprints and runs start it from the
@@ -350,7 +351,14 @@ def _wait_for(
 def test_a_tui_quit_while_the_engine_fingerprints_writes_its_caches_to_its_own_state_dir(
     tmp_path: pathlib.Path,
 ) -> None:
+    """The reload's fingerprint caches go to `s1`, the directory it loaded with, though the
+    directory `core.state_dir` names moves to `s2` before the quit's flush. The value names a
+    link, re-pointed rather than edited: an edit of `.pivot/config.yaml` reloads a watch session
+    into the new directory (L3w), which is a load of its own."""
     home, root = _project(tmp_path, "s1")
+    (root / "s1").mkdir()
+    (root / "state").symlink_to("s1")
+    (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: state\n")
     log = tmp_path / "pivot.log"
     started = root / "reload_started"
     with log.open("wb") as output:
@@ -368,7 +376,10 @@ def test_a_tui_quit_while_the_engine_fingerprints_writes_its_caches_to_its_own_s
         # the quit below returns from the command.
         (root / "pipeline.py").write_text(_reload_pipeline(_RELOAD_STAGES))
         _wait_for(proc, log, started.exists, "reload")
-        (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: s2\n")
+        (root / "s2").mkdir()
+        relinked = root / "state.relinked"
+        relinked.symlink_to("s2")
+        relinked.replace(root / "state")
         proc.send_signal(signal.SIGINT)
         proc.wait(timeout=60)
     finally:
@@ -378,7 +389,7 @@ def test_a_tui_quit_while_the_engine_fingerprints_writes_its_caches_to_its_own_s
 
     output_text = log.read_text(errors="replace")
     assert proc.returncode == 0, output_text
-    assert not (root / "s2").exists(), sorted(p.name for p in (root / "s2").iterdir())
+    assert not any((root / "s2").iterdir()), sorted(p.name for p in (root / "s2").iterdir())
     assert _cached_keys(root / "s1", b"sm:") > 0, output_text
     assert _cached_keys(root / "s1", b"fp:") > 0, output_text
 

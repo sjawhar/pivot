@@ -1306,19 +1306,6 @@ def _execute_stage(
                         output_paths, cache_dir=store_cache_dir(store), pending=read
                     )
                     file_hash_entries.extend(cache.deferred_file_hash_entries(read))
-                else:
-                    # Hash and publish before the naming unit, so a large output's reading and
-                    # copying holds no lock a waiting collection would turn into a stall for
-                    # every other commit on the cache.
-                    with stage_io.PIVOT_IO:
-                        prepared = _prepare_outputs_with_store(
-                            output_paths,
-                            store,
-                            project_state_dir,
-                            hashed_dirs,
-                            claims,
-                            written["pvt_members"],
-                        )
                 # Under --no-commit, write no lock, cache object, generation or run-cache
                 # entry. Leave the record of what ran, which `pivot commit` writes if the outputs
                 # are still these, and hand file-hash cache entries to the coordinator for its
@@ -1361,10 +1348,17 @@ def _execute_stage(
                             claims,
                             written["pvt_members"],
                         )
+                    # A read by hash names nothing until the lock does, so a collection may have
+                    # removed an object the stage read on a cache hit: fetch each such object
+                    # again before the unit (no download inside one), and refuse inside it any
+                    # that is still not in the cache.
+                    unfetched = reads.fetch_missing(read_hashes, recorded)
+                    fetched = recorded.fetched()
                     # Naming-lock unit (shared), the naming step only: re-check each object (one
                     # a collection removed since is published again), link the outputs, write the
                     # lock that names them. gc cannot delete while this unit is open.
                     with naming.naming_unit(naming_root, project=(project_root, project_state_dir)):
+                        reads.require_cached(read_hashes, recorded.cache_dir, unfetched)
                         with stage_io.PIVOT_IO:
                             output_hashes = _commit_outputs_with_store(
                                 output_paths,

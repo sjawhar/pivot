@@ -10,7 +10,17 @@ from __future__ import annotations
 import logging
 import pathlib
 
-from pivot import config, exceptions, parameters, project, registry, run_history, skip, types
+from pivot import (
+    config,
+    exceptions,
+    parameters,
+    project,
+    reads,
+    registry,
+    run_history,
+    skip,
+    types,
+)
 from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
 from pivot.storage import cache, listing, lock, naming
@@ -233,6 +243,27 @@ def _commit_stages(
                 failed.append(stage_name)
                 continue
 
+            # A read by hash names nothing until a lock does: an object the run read (its
+            # nocommit: record's, or the previous lock's that a trust-me commit keeps) may have
+            # left the cache since. Fetch each again before the unit (no download inside one);
+            # inside it, the reads the lock will record must be in the cache.
+            fetches = reads.Recording(worker.store_cache_dir(store))
+            unfetched = reads.fetch_missing(
+                [
+                    *(
+                        run_record["reads"]
+                        if run_record is not None and "reads" in run_record
+                        else []
+                    ),
+                    *(
+                        previous_lock["reads"]
+                        if previous_lock is not None and "reads" in previous_lock
+                        else []
+                    ),
+                ],
+                fetches,
+            )
+
             # 7. Under the naming lock (shared), the naming step only: re-check and link each
             # output (an object a collection removed since is published again), record its
             # materialized file hash (#516), then write the lock and the listings that name them.
@@ -355,6 +386,13 @@ def _commit_stages(
                     stage_outs,
                 )
 
+                try:
+                    reads.require_cached(read_hashes, fetches.cache_dir, unfetched)
+                except exceptions.ObjectReadError as exc:
+                    logger.error("Stage '%s': %s — skipping", stage_name, exc)
+                    failed.append(stage_name)
+                    continue
+
                 # 7. Write production lock
                 new_lock_data = LockData(
                     code_manifest=code_manifest,
@@ -426,6 +464,8 @@ def _commit_stages(
                 ]
             if file_hash_entries:
                 deferred["file_hash_entries"] = file_hash_entries
+            if fetched := fetches.fetched():
+                deferred["remote_hashes"] = fetched
 
             stage_db.apply_deferred_writes(stage_name, out_paths, deferred)
 

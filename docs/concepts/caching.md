@@ -222,23 +222,45 @@ run rather than collect this cache on one project's records alone.
 ### A Project That Uses More Than One Cache
 
 A project registers in every cache it names objects in: a changed `cache.dir`, or a library run
-given another `cache_dir`. Its state directory lists each one, with where this view found it,
-in `<state dir>/state.lmdb/gc-views/<view>-<cache id>.cache`, beside that cache's nonce. A copy
-of the project (a cloned disk) keeps the nonce of every cache, and only the original goes on
-naming objects; a step in one cache replaces only that cache's nonce. So a collection of any
-cache the project lists also reads the project's entry in **every other cache it lists**, and
-accepts the project only when each of those entries holds the nonce its state directory holds
-for that cache. A listed cache that cannot be read where it is recorded, now holds another
-cache, holds no entry for the project, or holds a different nonce refuses the collection,
-naming the project and that cache. A project that uses one cache lists only it, and nothing
-more is read.
+given another `cache_dir`. Its state directory lists each one, with where the view that used it
+found it, in `<state dir>/state.lmdb/gc-views/<view>-<cache id>.cache`, written before that
+cache's first nonce. A copy of the project (a cloned disk) keeps the nonce of every cache as it
+was when it was taken, and only a write the original makes to shared storage after that tells
+the two apart. Pivot makes that write and checks it in two places:
 
-If the project is the original, run any pivot command in it against that cache (one naming
-step brings its entry up to date). If it no longer uses that cache (deleted, or on a disk that
-is gone), remove the cache from its list with
-[`pivot forget-cache`](../cli/index.md#pivot-forget-cache) CACHE, the path or id the refusal
-names. That changes only the project's list and deletes nothing from any cache; any pivot
-command that uses the removed cache lists it again.
+- **Every naming step, in any cache, rotates the project's nonce in its entry in every other
+  cache the project lists**, in any view: a cache another mount namespace or host of the project
+  used counts, and the step registers its own view there first. A step writes only its own
+  view's nonces and entries, never another view's, so a copy's own steps never make the
+  original's entries match the copy. Each other cache costs one nonce rotation per step (its
+  first step in a process registers there in full); a project that uses one cache lists only it,
+  and nothing more is written.
+- **A collection checks every cache any view of the project lists**, besides its own entries:
+  each must be readable where that view recorded it, hold the same cache, and hold that view's
+  entry with the nonce the state directory holds for it. This catches a copy whose own register
+  the original never writes, such as a cache root on the cloned disk whose `files/` links to
+  shared storage: the original's steps there reach only its own register, but they rotate the
+  project's nonce in the other caches it lists. A mismatch says the path may hold a copy and
+  never suggests `pivot forget-cache`.
+
+A cache this view lists that a naming step cannot reach (it cannot be read where it is recorded,
+another cache is at that path now, or its register cannot be written) does not fail the step.
+Pivot marks that cache `unconfirmed_since` in the view's record, and the command warns once,
+naming the cache and `pivot forget-cache`; a cache only another view lists (a host cache a
+container does not mount) is passed over without a word. Until a step reaches that cache again,
+**a copy of the project that can reach a cache the original cannot reach may collect that
+cache's copies of the original's objects**: the original then fetches those objects again or
+runs their stages again ("outputs missing"), and never uses a stale result. Pivot keeps the run
+going rather than refuse it for a cache it does not need. A collection, though, refuses while a
+listed cache cannot be reached.
+
+If this view of the project can no longer reach a cache it lists and no longer uses it (deleted,
+or on a disk that is gone), remove it with
+[`pivot forget-cache`](../cli/index.md#pivot-forget-cache) CACHE, the path or id the warning or
+refusal names, in the project itself: never in a copy of it. It removes only this view's record
+(another view removes its own; if that view is gone for good, delete the record file the
+refusal names), refuses a cache this view reaches whose entry for the project is current, and
+deletes nothing from any cache. Any pivot command that uses the removed cache lists it again.
 
 ## Per-Stage Lock Files
 
