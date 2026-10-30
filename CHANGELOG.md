@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v0.6.3 (2026-10-30)
+
+### Bug Fixes
+
+- **checkout**: Skip a stage's own .pvt members when finding tracked files
+  ([#540](https://github.com/sjawhar/pivot/pull/540),
+  [`5ca4bc2`](https://github.com/sjawhar/pivot/commit/5ca4bc2277a795a3dea91c517f44c7c7216b2050))
+
+### Testing
+
+- **storage**: Measure the hash_directory cost test in CPU time, median of N
+  ([#542](https://github.com/sjawhar/pivot/pull/542),
+  [`cea092a`](https://github.com/sjawhar/pivot/commit/cea092a63375367a539338cdc71ab1c75e1a54b8))
+
+
 ## v0.6.2 (2026-10-29)
 
 ### Bug Fixes
