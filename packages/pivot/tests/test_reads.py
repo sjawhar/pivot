@@ -18,7 +18,7 @@ import yaml
 
 import pivot
 from pivot import exceptions, reads
-from pivot.remote import keys
+from pivot.remote import keys, protocol
 from pivot.storage import cache, listing, lock, state
 from pivot.types import ArtifactIdentity, FileHash, LockData
 
@@ -249,94 +249,83 @@ def test_an_object_the_remote_lacks_fails_the_read_naming_the_remote(
 # =============================================================================
 
 
+def _helper_unreachable_remote(root: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Give the project at ``root`` one remote that refuses every connection; return its URL as
+    the remote index records it."""
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "x")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "x")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    url = "s3://unreachable/cache"
+    (root / ".pivot" / "config.yaml").write_text(yaml.safe_dump({"remotes": {"origin": url}}))
+    return protocol.open_remote(url).url
+
+
+def _helper_index(root: pathlib.Path, url: str, content_hash: str) -> None:
+    """Record in the remote index that remote `origin`, at ``url``, holds ``content_hash``, as
+    `pivot push` does."""
+    with state.StateDB(root / ".pivot") as state_db:
+        state_db.remote_set_url("origin", url)
+        state_db.remote_hashes_add("origin", [content_hash])
+
+
 def test_objects_in_the_cache_are_available(files_dir: pathlib.Path) -> None:
     content_hash = _helper_put(files_dir, b"one\n")
 
-    assert reads.unavailable([content_hash], files_dir, remember=True) is None
+    assert reads.unavailable([content_hash], files_dir) is None
 
 
 def test_objects_missing_with_no_remote_are_unavailable(files_dir: pathlib.Path) -> None:
     present = _helper_put(files_dir, b"one\n")
     first, second = sorted([_helper_hash(b"absent 1\n"), _helper_hash(b"absent 2\n")])
 
-    reason = reads.unavailable([second, present, first], files_dir, remember=True)
+    reason = reads.unavailable([second, present, first], files_dir)
 
     assert reason == (
         f"Read objects missing from the cache: {first}, {second} (no remote is configured)"
     )
 
 
-def test_objects_the_remote_holds_are_available_and_recorded_as_on_the_remote(
-    files_dir: pathlib.Path,
-    set_project_root: pathlib.Path,
-    moto_services: dict[str, str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    s3, bucket = _helper_remote(set_project_root, moto_services["s3"], monkeypatch)
-    content_hash = _helper_hash(b"snapshot\n")
-    s3.put_object(Bucket=bucket, Key=keys.hash_to_key("cache/", content_hash), Body=b"snapshot\n")
-    state_dir = set_project_root / ".pivot"
-
-    assert reads.unavailable([content_hash], files_dir, remember=True) is None
-    with state.StateDB(state_dir, readonly=True) as state_db:
-        assert state_db.remote_hash_exists("origin", content_hash), "the index should know it"
-
-
-def test_a_check_that_does_not_remember_leaves_the_remote_index_as_it_was(
-    files_dir: pathlib.Path,
-    set_project_root: pathlib.Path,
-    moto_services: dict[str, str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A worker checks with ``remember=False``: it writes the state database only through the
-    coordinator."""
-    s3, bucket = _helper_remote(set_project_root, moto_services["s3"], monkeypatch)
-    content_hash = _helper_hash(b"snapshot\n")
-    s3.put_object(Bucket=bucket, Key=keys.hash_to_key("cache/", content_hash), Body=b"snapshot\n")
-
-    assert reads.unavailable([content_hash], files_dir, remember=False) is None
-    with state.StateDB(set_project_root / ".pivot") as state_db:
-        assert not state_db.remote_hash_exists("origin", content_hash)
-
-
-def test_objects_neither_the_cache_nor_the_remote_holds_are_unavailable(
-    files_dir: pathlib.Path,
-    set_project_root: pathlib.Path,
-    moto_services: dict[str, str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _ = _helper_remote(set_project_root, moto_services["s3"], monkeypatch)
-    content_hash = _helper_hash(b"absent\n")
-
-    reason = reads.unavailable([content_hash], files_dir, remember=True)
-
-    assert reason == (
-        f"Read objects missing from the cache: {content_hash} (remote 'origin' does not hold them)"
-    )
-
-
-def test_objects_missing_while_the_remote_cannot_be_reached_are_unavailable(
+def test_objects_the_remote_index_records_are_available_without_asking_the_remote(
     files_dir: pathlib.Path, set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9")
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "x")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "x")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    (set_project_root / ".pivot" / "config.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "remotes": {"origin": "s3://unreachable/cache"},
-                "remote": {"retries": 0, "connect_timeout": 1},
-            }
-        )
+    """The check is local, as for outputs: the remote here refuses every connection, and an
+    object the index records on it counts as there at once."""
+    url = _helper_unreachable_remote(set_project_root, monkeypatch)
+    content_hash = _helper_hash(b"snapshot\n")
+    _helper_index(set_project_root, url, content_hash)
+
+    assert reads.unavailable([content_hash], files_dir) is None
+
+
+def test_objects_the_remote_index_does_not_record_are_unavailable_unasked(
+    files_dir: pathlib.Path,
+    set_project_root: pathlib.Path,
+    moto_services: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The remote holds the object, but nothing recorded that in the index, and the check asks
+    the remote nothing: plain `status` and `repro` stay local."""
+    s3, bucket = _helper_remote(set_project_root, moto_services["s3"], monkeypatch)
+    content_hash = _helper_hash(b"snapshot\n")
+    s3.put_object(Bucket=bucket, Key=keys.hash_to_key("cache/", content_hash), Body=b"snapshot\n")
+
+    reason = reads.unavailable([content_hash], files_dir)
+
+    assert reason == (
+        f"Read objects missing from the cache: {content_hash} (pivot has not seen them on "
+        + "remote 'origin'; `pivot pull` fetches them)"
     )
-    content_hash = _helper_hash(b"absent\n")
 
-    reason = reads.unavailable([content_hash], files_dir, remember=True)
 
-    assert reason is not None
-    assert reason.startswith(f"Read objects missing from the cache: {content_hash} (remote")
-    assert "could not be reached" in reason, reason
+def test_an_index_entry_for_another_url_of_the_remote_does_not_count(
+    files_dir: pathlib.Path, set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ = _helper_unreachable_remote(set_project_root, monkeypatch)
+    content_hash = _helper_hash(b"snapshot\n")
+    _helper_index(set_project_root, "s3://elsewhere/cache/", content_hash)
+
+    assert reads.unavailable([content_hash], files_dir) is not None
 
 
 # =============================================================================

@@ -184,14 +184,15 @@ with Pipeline("plan") as pipeline:
   records what that run read. A stage that reads nothing by hash has no `reads`.
   A pivot older than this one drops `reads` when it writes the lock: from a
   run-cache restore, or from `pivot commit` after this pivot's `--no-commit` run.
-- **A recorded object that is gone.** When an object the lock records is in
-  neither the cache nor the remote, the stage cannot be run again as it ran:
-  `pivot status` reports it stale, naming the objects and why, and `pivot repro`
-  runs it, where the read fails. An object the cache lacks costs one check of the
-  remote, which Pivot then remembers in its remote index, as `pivot push`,
-  `pivot pull` and `pivot status --remote` do: once the index records an object
-  on the remote, its later loss from the remote is found by the read, not by
-  `pivot status`.
+- **A recorded object that is not at hand.** `pivot status` and `pivot repro`
+  decide from local state, as they do for outputs, and contact no remote: an
+  object the lock records counts as available when it is in the cache, or when
+  the remote index (filled by `pivot push`, `pull`, `fetch` and `status --remote`)
+  records it on the default remote. Otherwise `pivot status` reports the stage
+  stale, naming the objects and why, and `pivot repro` runs it: its read fetches
+  the object from the remote, or fails naming it when the remote lacks it too.
+  An object the index records is not checked again, so its later loss from the
+  remote is found by the next read, not by `pivot status`.
 - **Pulling.** `pivot pull <stage>` fetches the objects its lock records under
   `reads`, as it fetches the stage's dependencies, so the stage can run again in
   the clone.

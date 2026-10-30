@@ -1069,9 +1069,7 @@ def _execute_stage(
                         dep_hashes,
                         unavailable_reads=None
                         if stage_info["force"]
-                        else reads.lock_unavailable(
-                            lock_data, store_cache_dir(store), remember=False
-                        ),
+                        else reads.lock_unavailable(lock_data, store_cache_dir(store)),
                     )
 
                     if outputs_unusable is not None and skip_reason is not None:
@@ -2614,7 +2612,7 @@ def can_skip_via_generation(
     )
     if normalized_outs != locked_out_paths:
         return False
-    if reads.lock_unavailable(lock_data, store_cache_dir(store), remember=False) is not None:
+    if reads.lock_unavailable(lock_data, store_cache_dir(store)) is not None:
         return False
     if not deps:
         return True
@@ -2905,9 +2903,7 @@ def _try_skip_via_run_cache_with_store(
     if entry is None:
         return None
     entry_reads = entry["reads"] if "reads" in entry else []
-    if entry_reads and (
-        reads.unavailable(entry_reads, store_cache_dir(store), remember=False) is not None
-    ):
+    if entry_reads and reads.unavailable(entry_reads, store_cache_dir(store)) is not None:
         return None
     output_hashes = dict[str, HashInfo]()
     for output in entry["output_hashes"]:

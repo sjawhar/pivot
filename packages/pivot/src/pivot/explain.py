@@ -328,9 +328,9 @@ def get_stage_explanation(
                 upstream_stale=[],
             )
 
-        # An object the run read by hash that is in neither the cache nor the remote makes the
-        # stage stale, as repro decides. `allow_missing` (verify --allow-missing, the engine's
-        # display) ignores what is missing locally, so it checks no objects either.
+        # An object the run read by hash that is not in the cache and not known to be on the
+        # remote makes the stage stale, as repro decides. `allow_missing` (verify --allow-missing,
+        # the engine's display) ignores what is missing locally, so it checks no objects either.
         decision = skip.check_stage(
             lock_data=lock_data,
             fingerprint=fingerprint,
@@ -341,7 +341,7 @@ def get_stage_explanation(
             force=force,
             unavailable_reads=None
             if allow_missing or force
-            else reads.lock_unavailable(lock_data, store.cache_dir, remember=True),
+            else reads.lock_unavailable(lock_data, store.cache_dir),
         )
         unavailable = list[types.ArtifactRef]()
         empty_dirs_unrecorded = list[types.ArtifactRef]()

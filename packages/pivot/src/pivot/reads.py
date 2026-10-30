@@ -11,9 +11,10 @@ as does the run-cache entry it files and the ``nocommit:`` record of a ``--no-co
 The declared input that names the hash is what reruns the stage when it changes: that input is a
 dependency like any other, hashed as Pivot hashes every dependency. ``reads`` records what the run
 read, so the lock says exactly which objects the outputs came from. A stage whose lock records an
-object that is in neither the cache nor the remote cannot be run again as it ran, so every skip
-decision counts it as changed (``unavailable``, passed to ``skip.check_stage``): ``status`` reports
-it stale and ``repro`` reruns it, where the read then fails, naming the object.
+object that is not in the cache and not known to be on the remote (``unavailable``, decided from
+local state as for outputs) counts as changed in every skip decision (``skip.check_stage``):
+``status`` reports it stale and ``repro`` reruns it, where the read fetches the object or fails
+naming it.
 
 The run's recording is process state, not a ``ContextVar``: a stage may read from threads it
 starts (a thread pool, joblib's threading backend), and on Python 3.13 a new thread does not
@@ -239,29 +240,26 @@ def _default_remote() -> tuple[str, protocol.RemoteStorage] | str:
 
 
 def lock_unavailable(
-    lock_data: types.LockData | None, cache_dir: pathlib.Path | None, *, remember: bool
+    lock_data: types.LockData | None, cache_dir: pathlib.Path | None
 ) -> str | None:
     """``unavailable`` for the objects ``lock_data`` records its run read; None for no lock, or
     one that records none. Every skip decision passes this to ``skip.check_stage``."""
     if lock_data is None or "reads" not in lock_data:
         return None
-    return unavailable(lock_data["reads"], cache_dir, remember=remember)
+    return unavailable(lock_data["reads"], cache_dir)
 
 
-def unavailable(
-    hashes: Collection[str], cache_dir: pathlib.Path | None, *, remember: bool
-) -> str | None:
-    """Why some of ``hashes``, objects a lock or run-cache entry records its run read, are in
-    neither the cache at ``cache_dir`` nor the project's default remote; None when each is in one
-    of them.
+def unavailable(hashes: Collection[str], cache_dir: pathlib.Path | None) -> str | None:
+    """Why some of ``hashes``, objects a lock or run-cache entry records its run read, are
+    neither in the cache at ``cache_dir`` nor known to be on the project's default remote; None
+    when each is in one of them.
 
-    The cache is looked up first, one ``lstat`` per object. Only objects the cache lacks reach the
-    remote: an object the project's remote index (StateDB ``remote:``, which ``pivot push`` and
-    ``pivot pull`` fill) records for that remote's URL counts as there, as ``pivot push`` counts
-    it; the rest are asked of the remote in one batch. With ``remember``, those it holds are added
-    to the index, best-effort, so the next check asks nothing; a worker passes False, since it
-    writes the state database only through the coordinator (``DeferredWrites``). A remote that
-    cannot be reached leaves them unavailable, with the reason.
+    The check is local, as for a stage's outputs, so plain ``status`` and ``repro`` never wait on
+    the network: the cache is looked up first, one ``lstat`` per object, and an object it lacks
+    counts as on the remote only when the project's remote index (StateDB ``remote:``, which
+    ``pivot push``, ``pull``, ``fetch`` and ``status --remote`` fill) records it for that
+    remote's URL, as ``pivot push`` counts it. No remote is contacted. ``pivot pull <stage>``
+    fetches the objects a stage's lock records, and a run's read fetches what it needs itself.
     """
     missing = sorted(
         content_hash
@@ -282,25 +280,12 @@ def unavailable(
             if state_db is not None and state_db.remote_get_url(name) == storage.url
             else set[str]()
         )
-    unknown = [content_hash for content_hash in missing if content_hash not in known]
-    if not unknown:
-        return None
-    try:
-        existence = _run_async(lambda: storage.bulk_exists(unknown))
-    except exceptions.RemoteError as error:
-        return _missing_reason(unknown, f"remote '{name}' could not be reached: {error}")
-    found = {content_hash for content_hash, exists in existence.items() if exists}
-    if found and remember:
-
-        def record(state_db: state.StateDB) -> None:
-            sync.check_remote_url(state_db, name, storage)
-            state_db.remote_hashes_add(name, found)
-
-        _ = state.save_best_effort(state_dir, record, what="objects found on the remote")
-    absent = [content_hash for content_hash in unknown if content_hash not in found]
+    absent = [content_hash for content_hash in missing if content_hash not in known]
     if not absent:
         return None
-    return _missing_reason(absent, f"remote '{name}' does not hold them")
+    return _missing_reason(
+        absent, f"pivot has not seen them on remote '{name}'; `pivot pull` fetches them"
+    )
 
 
 def _missing_reason(hashes: list[str], why: str) -> str:

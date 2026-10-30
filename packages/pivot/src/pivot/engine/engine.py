@@ -2162,7 +2162,7 @@ class Engine:
             unavailable_reads = (
                 None
                 if missing or unreadable
-                else reads.lock_unavailable(lock_data, worker.store_cache_dir(store), remember=True)
+                else reads.lock_unavailable(lock_data, worker.store_cache_dir(store))
             )
             return dep_hashes, missing, unreadable, unavailable_reads
 

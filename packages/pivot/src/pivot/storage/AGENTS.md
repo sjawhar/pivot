@@ -216,7 +216,10 @@ When multiple `pivot` processes share the same StateDB:
   that run read. Every skip decision passes `reads.lock_unavailable` to `skip.check_stage`
   (status, `explain`, the engine's pre-check and the worker's tier 2; the worker's tier 1
   declines on it, and a run-cache entry whose objects are gone is not used), so a lock that
-  records an object in neither the cache nor the remote is stale everywhere at once.
+  records an object neither in the cache nor known to be on the remote is stale everywhere at
+  once. The check is local, as for outputs: an object the cache lacks counts as on the remote
+  only when the remote index (`remote:`) records it for the remote's URL; it never contacts the
+  remote, so plain `status` and `repro` never wait on the network.
 
 ## Output Ownership
 
