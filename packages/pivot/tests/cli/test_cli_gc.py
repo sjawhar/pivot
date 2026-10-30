@@ -9,7 +9,7 @@ import os
 import shutil
 import threading
 import time
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, TypedDict, cast
 
 import pytest
 import yaml
@@ -435,6 +435,146 @@ def test_gc_refuses_a_lock_from_a_newer_schema(
     assert result.exit_code != 0, result.output
     assert str(lock_path) in result.output and "newer" in result.output, result.output
     assert _helper_keys(workspace) == before, "a refused collection removed an object"
+
+
+def _helper_rewrite_lock(
+    space: Workspace, key: str, value: object, *, remove: bool = False
+) -> pathlib.Path:
+    """Set (or, with ``remove``, delete) ``key`` in the stage lock's YAML and write it back."""
+    lock_path = space["stages_dir"] / f"{_STAGE}.lock"
+    document = cast("dict[str, object]", yaml.safe_load(lock_path.read_text()))
+    if remove:
+        del document[key]
+    else:
+        document[key] = value
+    lock_path.write_text(yaml.safe_dump(document))
+    return lock_path
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "remove", "reason"),
+    [
+        pytest.param(
+            "schema_version",
+            "4",
+            False,
+            "schema_version '4', which is not a whole number",
+            id="schema version a string",
+        ),
+        pytest.param(
+            "schema_version",
+            3.5,
+            False,
+            "schema_version 3.5, which is not a whole number",
+            id="schema version a float",
+        ),
+        pytest.param(
+            "deps", None, True, "no deps key, which every lock holds", id="lock key missing"
+        ),
+        pytest.param(
+            "outs", "not a list", False, "a field outs it cannot read", id="field of the wrong type"
+        ),
+    ],
+)
+def test_gc_refuses_a_lock_it_cannot_fully_interpret(
+    workspace: Workspace,
+    runner: click.testing.CliRunner,
+    key: str,
+    value: object,
+    remove: bool,
+    reason: str,
+) -> None:
+    """A lock with a schema version that is not a whole number, a lock key missing, or a field
+    of the wrong type may hold objects in a form this pivot cannot read (a newer pivot's), so a
+    collection refuses, naming the lock and the reason, rather than read the text's keys."""
+    named = _helper_publish(workspace, "named by the lock")
+    _helper_publish(workspace, "unnamed")
+    _helper_write_lock(workspace, outs={None: types.FileHash(hash=named)})
+    lock_path = _helper_rewrite_lock(workspace, key, value, remove=remove)
+    before = _helper_keys(workspace)
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code != 0, result.output
+    flat = " ".join(result.output.split())
+    assert str(lock_path) in flat and reason in flat, result.output
+    assert _helper_keys(workspace) == before, "a refused collection removed an object"
+
+
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        pytest.param(
+            "<<<<<<< HEAD\npath: data\nhash: 0123456789abcdef\n=======\n>>>>>>> other\n",
+            "does not parse as YAML",
+            id="conflict markers",
+        ),
+        pytest.param(
+            "path: data\nhash: 0123456789abcdef\nsize: 3\nreads: [fedcba9876543210]\n",
+            "no .pvt this pivot reads",
+            id="unknown key",
+        ),
+        pytest.param(
+            "path: data\nhash: not-a-cache-key\nsize: 3\n", "is not a cache key", id="bad hash"
+        ),
+    ],
+)
+def test_gc_refuses_a_pvt_it_cannot_fully_interpret(
+    workspace: Workspace, runner: click.testing.CliRunner, text: str, reason: str
+) -> None:
+    """A tracked directory's `.pvt` names its files only through its listing, so the text of
+    one pivot cannot read says nothing of which objects it keeps (P20). A collection refuses,
+    naming the `.pvt`, and removes nothing."""
+    dead = _helper_publish(workspace, "named by nothing")
+    pvt = workspace["root"] / "data.pvt"
+    pvt.write_text(text)
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code != 0, result.output
+    flat = " ".join(result.output.split())
+    assert str(pvt) in flat and reason in flat, result.output
+    assert "keeping every cache object" not in result.output, result.output
+    assert dead in _helper_keys(workspace), "a refused collection removed an object"
+
+
+@pytest.mark.parametrize(
+    ("row", "reason"),
+    [
+        pytest.param(b"{not json", "does not parse as JSON", id="not json"),
+        pytest.param(
+            b'{"run_id": "__committed__", "output_hashes": [], "reads": []}',
+            "its keys are output_hashes, reads, run_id",
+            id="unknown row key",
+        ),
+        pytest.param(
+            b'{"run_id": "__committed__", "output_hashes": [{"hash": "0123456789abcdef", "reads": 1}]}',
+            "holds the key reads",
+            id="unknown output key",
+        ),
+        pytest.param(
+            b'{"run_id": 7, "output_hashes": []}', "its run_id is not a string", id="wrong type"
+        ),
+    ],
+)
+def test_gc_refuses_a_run_cache_row_it_cannot_fully_interpret(
+    workspace: Workspace, runner: click.testing.CliRunner, row: bytes, reason: str
+) -> None:
+    """A run-cache row restores outputs without a lock; one this pivot cannot read may name any
+    object, so a collection refuses, naming the row."""
+    dead = _helper_publish(workspace, "named by nothing")
+    _helper_write_run_cache_row(workspace, types.FileHash(hash=dead))
+    with state.StateDB(workspace["state_dir"]) as db:
+        ((name, _),) = db.list_run_cache_rows()
+        with db._write_transaction() as txn:  # a damaged row, as no pivot writes one
+            txn.put(state._RUNCACHE_PREFIX + name.encode(), row)
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code != 0, result.output
+    flat = " ".join(result.output.split())
+    assert name in flat and reason in flat, result.output
+    assert dead in _helper_keys(workspace), "a refused collection removed an object"
 
 
 def test_gc_keeps_a_trees_members_while_the_tree_lives(

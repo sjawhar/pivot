@@ -227,16 +227,7 @@ def gc_cmd(
             roots = gc.collect_roots(
                 scopes, cache_dir, prune_state_dir=state_dir, valid_run_ids=valid_run_ids
             )
-            keep_all = bool(roots["unreadable"] or roots["outward_dirs"])
-            if roots["unreadable"]:
-                _echo(
-                    "Warning: could not read "
-                    + ", ".join(roots["unreadable"])
-                    + " as a stage lock; keeping every cache object, because a lock pivot "
-                    + "cannot read may name any of them. Nothing was removed. Fix the lock and "
-                    + "re-run.",
-                    to_stderr=True,
-                )
+            keep_all = bool(roots["outward_dirs"])
             if roots["outward_dirs"]:
                 _echo(
                     "Warning: could not follow symlinked directories that leave the project, "
@@ -274,7 +265,7 @@ def gc_cmd(
                 with gc.naming_exclusive(cache_dir):
                     scopes = gc.resolve_scopes(cache_dir, project_root, state_dir, project_paths)
                     roots = gc.collect_roots(scopes, cache_dir)
-                    keep_all = bool(roots["unreadable"] or roots["outward_dirs"])
+                    keep_all = bool(roots["outward_dirs"])
                     removed = gc.ObjectCount(objects=0, bytes=0)
                     if not keep_all:
                         pruned = _apply_prune(state_dir, retention)

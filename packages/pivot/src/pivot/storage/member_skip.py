@@ -69,10 +69,12 @@ def own_member_skip(
     stages: Mapping[str, RegistryStageInfo],
     default_state_dir: pathlib.Path,
     cache_dir: pathlib.Path,
-) -> track.PvtSkip:
-    """Whether a ``*.pvt`` file that parses is a stage's own member of its output
+) -> Callable[[pathlib.Path, track.PvtData | None], bool]:
+    """Whether a ``*.pvt`` file is a stage's own member of its output
     (``ownership.stage_members``, the rule every write, restore and commit uses): ``skip`` for
-    ``track.discover_pvt_files``, with ``cache_dir`` the cache object root.
+    ``track.discover_pvt_files``, with ``cache_dir`` the cache object root. ``data`` is the
+    file's parsed content, or None for one that does not parse, which is a member wherever the
+    stage records a member at its path (`pivot gc` asks this of a ``.pvt`` it cannot read).
 
     A ``*.pvt`` in an output of ``stages`` (the command's) is decided by the registry and the
     stage's lock. Any other is a member when a directory output that another stage's lock
@@ -96,7 +98,7 @@ def own_member_skip(
         functools.partial(_recorded, project_root, default_state_dir, cache_dir, stages)
     )
 
-    def skip(pvt_path: pathlib.Path, data: track.PvtData) -> bool:
+    def skip(pvt_path: pathlib.Path, data: track.PvtData | None) -> bool:
         path = ownership.normalized(pvt_path)
         loaded = [output for output in path.parents if output in outputs]
         if loaded:

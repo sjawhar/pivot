@@ -485,6 +485,19 @@ does not refuse. `build_plan` lists both stores, `files/` and `trees/`, and a sy
 `trees/` names that tree. An entry #538 left beside an output (`.pivot_backup_<token>.*`) is
 walked like any other.
 
+**A record gc cannot fully interpret refuses the collection, naming it.** There is no "keep
+what the text names" fallback: since #523 a directory's `.pvt` and lock name its files only
+through its listing, so the text of a record that does not parse proves nothing (P20, a `.pvt`
+left with merge conflict markers). `_lock_keys`, `_pvt_keys` and `_run_cache_keys` raise
+`_UninterpretableRecordError` for YAML or JSON that does not parse, a document that is not that
+record, a missing key, a key, schema version or field this pivot does not know or cannot read
+(`lock.recorded_hashes` returns `UninterpretableLock` with the reason), and a `.pvt` hash that is
+not a cache key; `collect_roots` turns it into `ProjectUnreadableError`. A newer pivot's new
+key (PIPE P2's lock `reads:`) therefore refuses until this pivot learns it: add such a key to
+`lock._LOCK_KEYS` and to `recorded_hashes`' roots in the same change. The one exception is a
+`.pvt` a stage wrote into its own output (`member_skip.own_member_skip`, which takes `None`
+for one that does not parse): it is data, and names nothing when it does not parse.
+
 ### Where flock is refused
 
 **gc refuses, writers proceed.** On a filesystem that refuses `flock` (NFS `nolock`, Lustre

@@ -50,7 +50,7 @@ from pivot.storage import cache, listing, lock, member_skip, state, track
 from pivot.types import is_dir_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Callable, Generator, Iterable
 
     from pivot.types import DirHash
 
@@ -77,8 +77,6 @@ NAMING_TURNSTILE = "naming.turnstile"
 # Every marker file beside a whole-directory tree object, removed with the tree.
 _TREE_MARKER_SUFFIXES = cache.TREE_MARKER_SUFFIXES
 DEFAULT_GRACE_HOURS = 24.0
-# A cache key as it appears in the text of a record pivot cannot parse.
-_KEY_RE = re.compile(r"(?<![0-9a-zA-Z])[0-9a-f]{16}(?![0-9a-zA-Z])")
 # A project's identity lives in its state database directory, which the state directory's
 # ignore file keeps out of git, so two checkouts of one repository never share it. A copy (`cp
 # -a`, a container image, a cloned disk) keeps the id; the view nonce tells it apart.
@@ -164,11 +162,6 @@ class Roots(TypedDict):
     run_cache: set[str]
     linked: set[str]  # workspace links and cache refs
     counts: RootCounts
-    # The records a scope held that the collection could not read: locks that did not parse
-    # (M6: non-UTF-8/truncated/conflicted) or did not decode. A non-empty list means a record of
-    # an unknown shape could name any object, so a collection keeps every object and removes
-    # none.
-    unreadable: list[str]
     # Directories inside a scope that are symlinks leaving the project. The collection does not
     # follow one (BET-301 containment) and does not read its records, so it keeps every object
     # and removes none, naming the links so the user can fix the layout.
@@ -1340,18 +1333,23 @@ class _Listings:
         )
 
 
-def _text_keys(path: pathlib.Path) -> set[str]:
-    """Every cache key in the text of a record pivot cannot parse.
-
-    A record whose shape pivot does not recognise is no evidence that its objects are dead,
-    so every key it could name is taken as a root. Over-approximating keeps objects.
-    """
-    logger.warning("Cannot read %s as a pivot record; keeping every cache object it names", path)
-    return set(_KEY_RE.findall(path.read_text(errors="replace")))
+class _UninterpretableRecordError(Exception):
+    """A record this pivot cannot fully interpret (a stage lock, a ``.pvt``, a run-cache row):
+    ``collect_roots`` refuses and names it. Its message is the record and the reason."""
 
 
-class _UninterpretableLockError(Exception):
-    """A stage lock holds a schema or key this pivot does not know; ``collect_roots`` refuses."""
+def _uninterpretable_record(kind: str, path: pathlib.Path | str, reason: str) -> str:
+    """The refusal for one record this pivot cannot fully read, naming it and what to do."""
+    return (
+        f"cannot fully read the {kind} {path}: {reason}. A record pivot cannot fully read may "
+        + "name any cache object, so none may be removed. Resolve it (a merge left unfinished: "
+        + "finish it), or collect with the pivot that wrote it"
+    )
+
+
+def _yaml_problem(error: yaml.YAMLError | UnicodeDecodeError) -> str:
+    """A parse error's first line, for a refusal: git conflict markers read as a scanner error."""
+    return str(error).strip().splitlines()[0] if str(error).strip() else type(error).__name__
 
 
 def _lock_keys(path: pathlib.Path, listings: _Listings) -> set[str]:
@@ -1359,22 +1357,25 @@ def _lock_keys(path: pathlib.Path, listings: _Listings) -> set[str]:
     directory it records, read from that directory's listing (``lock.recorded_hashes``).
 
     ``open`` raising ``OSError`` refuses the run (the lock cannot be read, so what it names is
-    unknown); ``yaml.load`` raising ``yaml.YAMLError`` (a committed lock left with git conflict
-    markers, a truncated one) is caught by ``collect_roots``, which then keeps every object
-    rather than let a lock it cannot parse licence a delete. A lock with a newer schema, or a
-    key this pivot does not know, may name objects there (a newer pivot's list of objects a run
-    read by hash): ``_UninterpretableLockError``, which refuses the run and names the lock."""
-    with open(path) as f:
-        data: object = yaml.load(f, Loader=yaml_config.Loader)
+    unknown). A lock this pivot cannot fully interpret refuses it too
+    (``_UninterpretableRecordError``, naming the lock): YAML that does not parse (a git merge's
+    conflict markers, a truncated file), not a lock, a lock key missing, a schema version that
+    is not a whole number or is newer than this pivot's, a key it does not know (a newer
+    pivot's list of objects a run read by hash), or a field it cannot read."""
+    try:
+        with open(path) as f:
+            data: object = yaml.load(f, Loader=yaml_config.Loader)
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        raise _UninterpretableRecordError(
+            _uninterpretable_record(
+                "stage lock", path, f"it does not parse as YAML ({_yaml_problem(e)})"
+            )
+        ) from e
     recorded = lock.recorded_hashes(data)
     if isinstance(recorded, lock.UninterpretableLock):
-        raise _UninterpretableLockError(
-            f"the stage lock {path} holds {recorded.reason}; a newer pivot may record cache "
-            + "objects there, so this pivot cannot tell which objects it names. Collect with "
-            + "the pivot that wrote it, or a newer one"
+        raise _UninterpretableRecordError(
+            _uninterpretable_record("stage lock", path, f"it holds {recorded.reason}")
         )
-    if recorded is None:
-        return _text_keys(path)
     keys = set(recorded.keys)
     for record in recorded.directories:
         keys.update(entry["hash"] for entry in listings.members(record, path)["files"])
@@ -1382,22 +1383,66 @@ def _lock_keys(path: pathlib.Path, listings: _Listings) -> set[str]:
 
 
 def _pvt_keys(
-    path: pathlib.Path, object_root: pathlib.Path, stage_member: track.PvtSkip
+    path: pathlib.Path,
+    object_root: pathlib.Path,
+    stage_member: Callable[[pathlib.Path, track.PvtData | None], bool],
 ) -> set[str]:
     """Every key a ``.pvt`` names: its hash and, for a directory, every file of its listing
-    (``track.tracked_members``: the listing committed beside it, the cache's object, or the one
-    an older pivot's ``.pvt`` holds inline).
+    (``track.tracked_members``: the listing committed beside it, or the cache's object). An
+    older pivot's directory ``.pvt`` lists its files inline: those, and the directory hash it
+    records (that format's whole-tree object), are its keys.
+
+    A ``.pvt`` this pivot cannot fully interpret refuses the collection
+    (``_UninterpretableRecordError``, naming it): YAML that does not parse (a git merge's
+    conflict markers), a key or field it does not read, or a hash that is not a cache key. Since
+    #523 a directory's ``.pvt`` names its files only through its listing, so no reading of the
+    text alone can say which objects such a ``.pvt`` keeps.
 
     A ``.pvt`` a stage wrote into its own directory output (#540, ``stage_member``) is that
-    stage's data, not a record: nothing restores from it, so a directory it names may have no
-    listing anywhere. Its keys are still kept, but a listing it lacks does not refuse the
-    collection. Every other ``.pvt`` is a tracked file, and its missing listing does.
+    stage's data, not a record: nothing restores from it. One that parses keeps its keys, but a
+    listing it lacks does not refuse; one that does not parse names nothing. Every other ``.pvt``
+    is a tracked file's record.
     """
-    data = track.read_pvt_file(path)
-    if data is None:
-        return _text_keys(path)
+    try:
+        with open(path) as f:
+            document: object = yaml.load(f, Loader=yaml_config.Loader)
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        if stage_member(path, None):
+            return set()
+        raise _UninterpretableRecordError(
+            _uninterpretable_record(
+                "tracked-file record", path, f"it does not parse as YAML ({_yaml_problem(e)})"
+            )
+        ) from e
+    parsed = track.parse_pvt(document)
+    if not isinstance(parsed, tuple):
+        if stage_member(path, None):
+            return set()
+        if isinstance(parsed, str):
+            reason = parsed
+        elif isinstance(document, dict):
+            held = ", ".join(sorted(str(key) for key in cast("dict[object, object]", document)))
+            reason = f"no .pvt this pivot reads (its keys: {held})"
+        else:
+            reason = f"no .pvt: its YAML is {type(document).__name__}, not a mapping"
+        raise _UninterpretableRecordError(
+            _uninterpretable_record("tracked-file record", path, reason)
+        )
+    data, inline = parsed
     record = track.pvt_to_hash_info(data)
+    if not cache.is_valid_hash(record["hash"]):
+        raise _UninterpretableRecordError(
+            _uninterpretable_record(
+                "tracked-file record", path, f"its hash {record['hash']!r} is not a cache key"
+            )
+        )
     keys = {record["hash"]}
+    if inline is not None:
+        legacy = cast("dict[str, object]", document).get("hash")
+        if cache.is_valid_hash(legacy):
+            keys.add(cast("str", legacy))
+        keys.update(entry["hash"] for entry in inline["files"])
+        return keys
     if is_dir_hash(record):
         try:
             members = track.tracked_members(track.get_data_path(path), data, object_root)
@@ -1449,11 +1494,49 @@ def _state_records(stages_dir: pathlib.Path) -> _StateRecords:
     return _StateRecords(sorted(locks), listings)
 
 
-def _row_keys(
-    output: run_history.OutputHashEntry, source: pathlib.Path, listings: _Listings
-) -> set[str]:
-    """Every key one run-cache output entry names: its own, and each file of a directory's
-    listing — the one an older pivot's row holds inline, else the one ``listings`` reads."""
+# Every key a run-cache row this pivot or an older one writes, and every key of one of its
+# output entries (``run_history.OutputHashEntry``; ``manifest`` and ``empty_dirs`` are an older
+# pivot's inline directory). A key outside these may be a newer pivot's record of objects.
+_ROW_KEYS = frozenset({"run_id", "output_hashes"})
+_ROW_OUTPUT_KEYS = frozenset({"path", "hash", "size", "nfiles", "manifest", "empty_dirs"})
+
+
+def _is_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _row_error(row: object) -> str | None:
+    """Why a parsed run-cache row is not one this pivot can fully interpret, or None."""
+    if not isinstance(row, dict):
+        return f"its JSON is {type(row).__name__}, not an object"
+    fields = cast("dict[object, object]", row)
+    held = {str(key) for key in fields}
+    if held ^ _ROW_KEYS:
+        return f"its keys are {', '.join(sorted(held)) or 'none'}, not run_id and output_hashes"
+    if not isinstance(fields["run_id"], str):
+        return "its run_id is not a string"
+    outputs = fields["output_hashes"]
+    if not isinstance(outputs, list):
+        return "its output_hashes is not a list"
+    for index, raw in enumerate(cast("list[object]", outputs)):
+        if not isinstance(raw, dict):
+            return f"output_hashes[{index}] is not an object"
+        output = cast("dict[object, object]", raw)
+        extra = sorted(str(key) for key in set(output) - _ROW_OUTPUT_KEYS)
+        if extra:
+            return f"output_hashes[{index}] holds the key {', '.join(extra)}, which this pivot does not know"
+        if not cache.is_valid_hash(output.get("hash")):
+            return f"output_hashes[{index}].hash is not a cache key"
+        for count in ("size", "nfiles"):
+            if count in output and not _is_count(output[count]):
+                return f"output_hashes[{index}].{count} is not a count"
+    return None
+
+
+def _row_keys(output: run_history.OutputHashEntry, source: str, listings: _Listings) -> set[str]:
+    """Every key one run-cache output entry ``_row_error`` passed names: its own, and each file
+    of a directory's listing — the one an older pivot's row holds inline, else the one
+    ``listings`` reads."""
     record = run_history.entry_to_output_hash(output)
     if record is None:
         # An older pivot's row lists a directory's files inline; one that records neither is a
@@ -1461,14 +1544,20 @@ def _row_keys(
         raw = cast("dict[str, object]", cast("object", output))
         inline = listing.from_inline(raw.get("manifest"), raw.get("empty_dirs", []))
         if inline is None:
-            raise exceptions.ListingMissingError(
-                f"{source} holds a run-cache row recording the directory {output['hash']} "
-                + "without its size, file count or files; what it names is unknown"
+            raise _UninterpretableRecordError(
+                _uninterpretable_record(
+                    "run-cache row",
+                    source,
+                    f"it records the directory {output['hash']} without its size, file count "
+                    + "or files",
+                )
             )
         return {output["hash"], *(entry["hash"] for entry in inline["files"])}
     keys = {record["hash"]}
     if is_dir_hash(record):
-        keys.update(entry["hash"] for entry in listings.members(record, source)["files"])
+        keys.update(
+            entry["hash"] for entry in listings.members(record, pathlib.Path(source))["files"]
+        )
     return keys
 
 
@@ -1477,6 +1566,10 @@ def _run_cache_keys(
 ) -> tuple[set[str], int]:
     """Every key the run-cache rows of one project's database name, and the number of rows.
 
+    Each row is read as stored, and one this pivot cannot fully interpret (JSON that does not
+    parse, a key it does not know, a field of the wrong type, a hash that is not a cache key)
+    refuses the collection, naming it (``_UninterpretableRecordError``).
+
     ``valid_run_ids`` restricts the rows to those a run-history prune would keep — its sentinel
     rows (``__``-prefixed) and the rows of runs within the retention — so the plan counts an
     object whose only record is a row the confirmed run will drop (``StateDB.prune_runs``)."""
@@ -1484,18 +1577,32 @@ def _run_cache_keys(
     if not database.exists():
         return set(), 0
     with state.StateDB(state_dir, readonly=True) as db:
-        entries = db.list_run_cache_entries()
+        stored = db.list_run_cache_rows()
+    rows = list[tuple[str, run_history.RunCacheEntry]]()
+    for name, data in stored:
+        source = f"{database} {name}"
+        try:
+            row: object = json.loads(data.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise _UninterpretableRecordError(
+                _uninterpretable_record("run-cache row", source, f"it does not parse as JSON ({e})")
+            ) from e
+        if (error := _row_error(row)) is not None:
+            raise _UninterpretableRecordError(
+                _uninterpretable_record("run-cache row", source, error)
+            )
+        rows.append((source, cast("run_history.RunCacheEntry", row)))
     if valid_run_ids is not None:
-        entries = [
-            entry
-            for entry in entries
+        rows = [
+            (source, entry)
+            for source, entry in rows
             if entry["run_id"].startswith("__") or entry["run_id"] in valid_run_ids
         ]
     keys = set[str]()
-    for entry in entries:
+    for source, entry in rows:
         for output in entry["output_hashes"]:
-            keys |= _row_keys(output, database, listings)
-    return keys, len(entries)
+            keys |= _row_keys(output, source, listings)
+    return keys, len(rows)
 
 
 def _scope_state_dirs(scope: ProjectScope) -> tuple[pathlib.Path, ...]:
@@ -1643,8 +1750,9 @@ def collect_roots(
 
     Raises:
         ProjectUnreadableError: a project in scope cannot be read, so what it names is
-            unknown and nothing may be removed. A directory record whose listing is neither in
-            the cache nor committed is one such project: its files are unknown.
+            unknown and nothing may be removed: a record it cannot open, a stage lock, ``.pvt``
+            or run-cache row it cannot fully interpret (each named), or a directory record whose
+            listing is neither in the cache nor committed.
     """
     object_root = cache_dir / OBJECTS_DIR
     tree_root = cache_dir / TREES_DIR
@@ -1653,7 +1761,6 @@ def collect_roots(
         run_cache=set[str](),
         linked=set[str](),
         counts=RootCounts(locks=0, pvt_files=0, rows=0, links=0),
-        unreadable=list[str](),
         outward_dirs=list[str](),
     )
     for scope in scopes:
@@ -1675,14 +1782,7 @@ def collect_roots(
             for state_dir in _scope_state_dirs(scope):
                 for lock_path in records[state_dir].locks if state_dir in records else ():
                     roots["counts"]["locks"] += 1
-                    try:
-                        roots["named"] |= _lock_keys(lock_path, listings)
-                    except (yaml.YAMLError, UnicodeDecodeError):
-                        logger.warning(
-                            "Cannot read %s as a stage lock; keeping every cache object, because a lock pivot cannot read may name any of them",
-                            lock_path,
-                        )
-                        roots["unreadable"].append(str(lock_path))
+                    roots["named"] |= _lock_keys(lock_path, listings)
                 scope_valid = valid_run_ids if state_dir == prune_state_dir else None
                 rows_keys, rows = _run_cache_keys(state_dir, listings, scope_valid)
                 roots["counts"]["rows"] += rows
@@ -1705,7 +1805,7 @@ def collect_roots(
         except (
             exceptions.ListingMissingError,
             exceptions.CorruptListingError,
-            _UninterpretableLockError,
+            _UninterpretableRecordError,
         ) as e:
             raise ProjectUnreadableError(scope, str(e)) from e
 
@@ -1726,8 +1826,8 @@ def reread_run_cache(roots: Roots, scopes: Iterable[ProjectScope], cache_dir: pa
     A row that records a directory is read with its listing, as ``collect_roots`` reads one.
 
     Raises:
-        ProjectUnreadableError: a scope's database, or the listing of a directory one of its
-            rows records, cannot be read.
+        ProjectUnreadableError: a scope's database, a row this pivot cannot fully interpret,
+            or the listing of a directory one of its rows records, cannot be read.
     """
     object_root = cache_dir / OBJECTS_DIR
     tree_root = cache_dir / TREES_DIR
@@ -1752,7 +1852,11 @@ def reread_run_cache(roots: Roots, scopes: Iterable[ProjectScope], cache_dir: pa
             raise ProjectUnreadableError(
                 scope, e.strerror if isinstance(e, OSError) and e.strerror else str(e)
             ) from e
-        except (exceptions.ListingMissingError, exceptions.CorruptListingError) as e:
+        except (
+            exceptions.ListingMissingError,
+            exceptions.CorruptListingError,
+            _UninterpretableRecordError,
+        ) as e:
             raise ProjectUnreadableError(scope, str(e)) from e
     roots["run_cache"] = keys
     roots["counts"]["rows"] = rows
@@ -2027,12 +2131,13 @@ def build_plan(
                 size = _tree_bytes(pathlib.Path(entry.path)) if is_dir else stats.st_size
                 plan["scanned"]["objects"] += 1
                 plan["scanned"]["bytes"] += size
-                # A record pivot could not parse may name any object, so a collection that saw
-                # one keeps every object and removes none (``collect_roots``). Otherwise the
-                # object stays only when a record, the grace or the hardlink rule holds it.
+                # A symlinked directory that leaves a project hides the records under it, so a
+                # collection that met one keeps every object and removes none
+                # (``collect_roots``). Otherwise the object stays only when a record, the grace
+                # or the hardlink rule holds it. A record pivot cannot read refuses before this.
                 reason = (
                     "locks"
-                    if roots["unreadable"] or roots["outward_dirs"]
+                    if roots["outward_dirs"]
                     else _keep_reason(
                         key,
                         stats,

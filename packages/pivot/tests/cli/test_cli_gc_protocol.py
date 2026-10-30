@@ -1979,10 +1979,7 @@ from pivot import Pipeline, directory, stage
 
 @stage
 def split(text: str) -> Annotated[dict[str, str], directory]:
-    return {
-        "a.txt": text,
-        "inner.pvt": "path: inner\\nhash: 0123456789abcdef\\nsize: 3\\nnfiles: 1\\n",
-    }
+    return {"a.txt": text, "inner.pvt": MEMBER}
 
 
 with Pipeline("shadow") as pipeline:
@@ -1990,12 +1987,23 @@ with Pipeline("shadow") as pipeline:
 """
 
 
-def test_pivot_gc_reads_a_stages_own_pvt_member_as_its_data(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize(
+    "member",
+    [
+        pytest.param(
+            "path: inner\nhash: 0123456789abcdef\nsize: 3\nnfiles: 1\n", id="names a directory"
+        ),
+        pytest.param("<<<<<<< not a pvt\n: [\n", id="does not parse"),
+    ],
+)
+def test_pivot_gc_reads_a_stages_own_pvt_member_as_its_data(
+    tmp_path: pathlib.Path, member: str
+) -> None:
     """#540: a stage may write a `*.pvt` into its own directory output; it is the stage's data,
-    not a tracked file. One that names a directory no listing describes must not make the
-    collection refuse, and the output's own objects stay."""
+    not a tracked file. One that names a directory no listing describes, or one that does not
+    parse, must not make the collection refuse, and the output's own objects stay."""
     root = _project(tmp_path / "project")
-    (root / "pipeline.py").write_text(_MEMBER_PIPELINE)
+    (root / "pipeline.py").write_text(f"MEMBER = {member!r}\n" + _MEMBER_PIPELINE)
     _ok(_run(root, "repro"))
     objects = root / ".pivot" / "cache" / "files"
     record = _directory_record(root)
@@ -2010,3 +2018,69 @@ def test_pivot_gc_reads_a_stages_own_pvt_member_as_its_data(tmp_path: pathlib.Pa
     for path in member_objects:
         assert path.exists(), f"gc removed {path}, a member of the stage's output"
     assert not cache.get_cache_path(objects, dead).exists(), out
+
+
+_GIT = ["git", "-c", "user.email=gc@test", "-c", "user.name=gc", "-c", "merge.conflictstyle=merge"]
+
+
+def _git(root: pathlib.Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([*_GIT, *args], cwd=root, check=check, capture_output=True, text=True)
+
+
+def _fill_images(images: pathlib.Path, tag: str) -> None:
+    if images.exists():
+        cache.clear_path(images)
+    images.mkdir(parents=True)
+    for name in ("a", "b"):
+        (images / f"{name}-{tag}.bin").write_bytes(f"{name} image bytes for {tag}\n".encode() * 50)
+
+
+def test_pivot_gc_refuses_a_tracked_directory_left_in_a_merge_conflict(
+    tmp_path: pathlib.Path,
+) -> None:
+    """P20: a tracked directory re-tracked on two branches; `git merge` leaves conflict markers
+    in its `.pvt` and `.pvt.listing`. The data is not in git, so the feature branch's files are
+    in the cache alone, named only by feature's listing. A collection must refuse, naming the
+    `.pvt`, and remove none of them; taking feature's side then restores its files."""
+    root = _project(tmp_path / "project")
+    (root / ".gitignore").write_text("/data/images/\n")
+    images = root / "data" / "images"
+    _fill_images(images, "main")
+    _ok(_run(root, "track", "data/images"))
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "track images (main)")
+    trunk = _git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    _git(root, "checkout", "-q", "-b", "feature")
+    _fill_images(images, "feat")
+    _ok(_run(root, "track", "--force", "data/images"))
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "re-track images (feature)")
+    objects = root / ".pivot" / "cache" / "files"
+    feature_listing = listing.decode((root / "data" / "images.pvt.listing").read_bytes())
+    feature_objects = [
+        cache.get_cache_path(objects, entry["hash"]) for entry in feature_listing["files"]
+    ]
+    _git(root, "checkout", "-q", trunk)
+    _ok(_run(root, "checkout", "--force", "data/images"))
+    _fill_images(images, "main2")
+    _ok(_run(root, "track", "--force", "data/images"))
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "re-track images (main2)")
+    merge = _git(root, "merge", "feature", check=False)
+    conflicted = _git(root, "diff", "--name-only", "--diff-filter=U").stdout.split()
+    assert merge.returncode != 0 and "data/images.pvt" in conflicted, merge.stdout + merge.stderr
+    assert all(path.exists() for path in feature_objects), feature_objects
+
+    refused = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    out = refused.stdout + refused.stderr
+    flat = " ".join(out.split())
+    assert refused.returncode != 0, out
+    assert str(root / "data" / "images.pvt") in flat and "does not parse" in flat, out
+    assert "keeping every cache object" not in out, out
+    for path in feature_objects:
+        assert path.exists(), f"gc removed {path}, a file only feature's listing names"
+    _git(root, "checkout", "--theirs", "data/images.pvt", "data/images.pvt.listing")
+    _git(root, "add", "data/images.pvt", "data/images.pvt.listing")
+    _ok(_run(root, "checkout", "--force", "data/images"))
+    assert sorted(path.name for path in images.iterdir()) == ["a-feat.bin", "b-feat.bin"]

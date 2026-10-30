@@ -1185,21 +1185,23 @@ class StateDB:
             return None
         return run_history.deserialize_run_cache_entry(value)
 
-    def list_run_cache_entries(self) -> list[RunCacheEntry]:
-        """Every run cache entry in the database, for a collection that must keep what they
-        name. Materialized inside the read transaction, which is then closed."""
+    def list_run_cache_rows(self) -> list[tuple[str, bytes]]:
+        """Every run cache row in the database as stored: its key (``stage:input_hash``) and its
+        bytes, for a collection that must keep what each names and must refuse one it cannot
+        read whole. Materialized inside the read transaction, which is then closed."""
         self._check_closed()
-        entries = list[run_history.RunCacheEntry]()
+        rows = list[tuple[str, bytes]]()
         with self._read_transaction() as txn:
             cursor = txn.cursor()
             if cursor.set_range(_RUNCACHE_PREFIX):
                 key = cursor.key()
                 while key.startswith(_RUNCACHE_PREFIX):
-                    entries.append(run_history.deserialize_run_cache_entry(cursor.value()))
+                    name = key[len(_RUNCACHE_PREFIX) :].decode(errors="backslashreplace")
+                    rows.append((name, bytes(cursor.value())))
                     if not cursor.next():
                         break
                     key = cursor.key()
-        return entries
+        return rows
 
     def lookup_run_cache_many(
         self, keys: Iterable[tuple[str, str]]

@@ -210,7 +210,7 @@ def test_gc_prunes_no_run_history_when_it_removes_nothing(
     assert "Nothing was removed" in result.output, result.output
     with state.StateDB(workspace["state_dir"], readonly=True) as db:
         assert len(db.list_runs()) == 2, "a refused collection pruned the run history"
-        assert len(db.list_run_cache_entries()) == 1, "a refused collection dropped a row"
+        assert len(db.list_run_cache_rows()) == 1, "a refused collection dropped a row"
 
 
 # =============================================================================
@@ -299,21 +299,24 @@ def test_gc_reports_a_lock_it_cannot_parse_as_a_pivot_error(
     workspace: Workspace, runner: click.testing.CliRunner
 ) -> None:
     """Lock files are committed, so a merge leaves conflict markers in one, and a disk error
-    truncates one. `yaml.load` then raises out of `_lock_keys` and the user is shown the
-    repr of a yaml exception. A record pivot cannot read must refuse the run (or keep every
-    key in its text, as a record of an unknown shape does), and say so.
+    truncates one. `yaml.load` then raised out of `_lock_keys` and the user was shown the
+    repr of a yaml exception. A record pivot cannot read refuses the run, names the lock and
+    says why, and removes nothing.
     """
     dead = _helper_publish(workspace, "dead")
     (workspace["stages_dir"] / "demo").mkdir(parents=True, exist_ok=True)
-    (workspace["stages_dir"] / "demo" / "conflicted.lock").write_text(
+    conflicted = workspace["stages_dir"] / "demo" / "conflicted.lock"
+    conflicted.write_text(
         "<<<<<<< HEAD\nouts:\n- hash: 0123456789abcdef\n=======\n"
         + "outs:\n- hash: fedcba9876543210\n>>>>>>> other\n"
     )
 
     result = _helper_run(runner, "--yes", "--grace-hours", "0")
 
-    assert "ScannerError" not in result.output, result.output
-    assert "Nothing was removed" in result.output or dead in _helper_keys(workspace), result.output
+    assert "Traceback" not in result.output and "ScannerError" not in result.output, result.output
+    assert result.exit_code != 0, result.output
+    assert str(conflicted) in result.output and "does not parse" in result.output, result.output
+    assert dead in _helper_keys(workspace), result.output
 
 
 # =============================================================================

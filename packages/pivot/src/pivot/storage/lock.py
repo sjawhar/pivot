@@ -898,7 +898,9 @@ class RecordedHashes(NamedTuple):
 
 
 class UninterpretableLock(NamedTuple):
-    """A lock that holds something this pivot does not know, which may name cache objects."""
+    """A lock this pivot cannot fully interpret, so it may name cache objects this pivot cannot
+    see: one that is not a lock, lacks a key, has a schema or a key this pivot does not know, or
+    holds a field it cannot read."""
 
     reason: str
 
@@ -915,17 +917,27 @@ _ENTRY_KEYS = frozenset(
 )
 
 
-def _unknown_content(document: dict[object, object]) -> str | None:
-    """Why a lock document holds something this pivot cannot interpret, or None."""
-    version = _schema_version(document)
-    if version is not None and version > SCHEMA_VERSION:
+def _uninterpretable(document: object) -> str | None:
+    """Why a parsed lock file is not one this pivot can fully interpret before its entries are
+    read, or None: not a mapping, a lock key missing, a schema version that is not a number or
+    is newer than this pivot's, or a key this pivot does not know."""
+    if not isinstance(document, dict):
+        return f"no lock: its YAML is {type(document).__name__}, not a mapping"
+    mapping = cast("dict[object, object]", document)
+    missing = sorted(_REQUIRED_LOCK_KEYS - mapping.keys())
+    if missing:
+        return f"no {', '.join(missing)} key, which every lock holds"
+    version = mapping.get("schema_version", 0)
+    if not _is_int(version):
+        return f"schema_version {version!r}, which is not a whole number"
+    if cast("int", version) > SCHEMA_VERSION:
         return f"schema_version {version}, newer than this pivot's {SCHEMA_VERSION}"
-    unknown = sorted(str(key) for key in document if key not in _LOCK_KEYS)
+    unknown = sorted(str(key) for key in mapping if key not in _LOCK_KEYS)
     if unknown:
         return f"the top-level key {', '.join(unknown)}, which this pivot does not know"
-    records = document.get(_RECORDS_KEY, document)
+    records = mapping.get(_RECORDS_KEY, mapping)
     lists = cast("dict[object, object]", records) if isinstance(records, dict) else {}
-    if records is not document and set(lists) - {"deps", "outs"}:
+    if records is not mapping and set(lists) - {"deps", "outs"}:
         extra = ", ".join(sorted(str(key) for key in set(lists) - {"deps", "outs"}))
         return f"the key {extra} under {_RECORDS_KEY}, which this pivot does not know"
     for list_key in ("deps", "outs"):
@@ -939,39 +951,42 @@ def _unknown_content(document: dict[object, object]) -> str | None:
     return None
 
 
-def recorded_hashes(document: object) -> RecordedHashes | UninterpretableLock | None:
+def recorded_hashes(document: object) -> RecordedHashes | UninterpretableLock:
     """What a parsed lock file names, for `pivot gc`: every cache key the lock itself holds and
-    the directories whose members a reader must read from a listing. None when the document is
-    not a lock this pivot can read, which makes a collector keep every key in its text.
+    the directories whose members a reader must read from a listing.
 
-    A lock (it has every lock key) with a schema newer than this pivot's, or a key this pivot
-    does not know at the top level, under ``records`` or in an entry, is ``UninterpretableLock``:
-    a newer pivot may record objects there, so a collector refuses rather than read the rest.
+    Any lock this pivot cannot fully interpret is ``UninterpretableLock``, with the reason: not a
+    mapping, a lock key missing, a schema version that is not a whole number or is newer than
+    this pivot's, a key this pivot does not know (at the top level, under ``records`` or in an
+    entry), an inline listing it cannot read, or a field ``lock_data_error`` refuses. A newer
+    pivot may record objects in any of those, so a collector refuses rather than read the rest.
 
     A lock an older pivot wrote lists each directory's files inline (``_convert_old``). Its
     members, the directory hash it recorded and the hash of the listing this pivot derives from
     it are all in ``keys``, so a collection keeps the whole-tree object of that format as well
     as the listing object any read of that lock stored.
     """
-    if _schema_version(document) is not None:
-        reason = _unknown_content(cast("dict[object, object]", document))
-        if reason is not None:
-            return UninterpretableLock(reason)
+    reason = _uninterpretable(document)
+    if reason is not None:
+        return UninterpretableLock(reason)
     keys = set[str]()
     directories = list[DirHash]()
     listed = True
     if _is_old_format(document):
         converted = _convert_old(document)
         if converted is None:
-            return None
+            return UninterpretableLock("a directory listed inline that this pivot cannot read")
         keys |= converted.legacy_hashes
         for directory_hash, members in converted.inline.items():
             keys.add(directory_hash)
             keys.update(entry["hash"] for entry in members["files"])
         document = converted.document
         listed = False
-    if lock_data_error(document) is not None:
-        return None
+    error = lock_data_error(document)
+    if error is not None:
+        return UninterpretableLock(
+            str(error) if isinstance(error, UnsafeLockPath) else f"a field {error} it cannot read"
+        )
     data = _from_document(document)
     for entry in (*data["deps"], *data["outs"]):
         hash_info = entry_hash_info(entry)

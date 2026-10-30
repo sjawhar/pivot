@@ -93,6 +93,15 @@ files inline, and those, with the directory hash it recorded, are kept as they a
 killed run left beside an output (`.pivot_backup_<token>.*`) is walked like any other, so the
 links it still holds keep their objects until a later restore of that path removes it.
 
+A record the collection cannot fully read refuses it, naming the record: a stage lock, `.pvt`
+or run-cache row whose text does not parse (a git merge left conflict markers in it, a
+truncated file), one that is not that kind of record, one that lacks a key or holds a key, a
+schema version or a field this pivot does not know (a newer pivot may record objects there),
+and a `.pvt` whose hash is not a cache key. Since a directory's `.pvt` and lock name its files
+only through its listing, no reading of such a record's text could say which objects it
+keeps. Finish the merge (or fix the file) and collect again. A `.pvt` a stage wrote into its
+own output that does not parse is that stage's data, and names nothing.
+
 Two more rules cover objects no record names yet:
 
 - **A grace period.** A stage publishes its objects before it writes the lock that names
