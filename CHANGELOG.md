@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.6.4 (2026-10-30)
+
+### Bug Fixes
+
+- **storage**: Honour .pivotignore when hashing a stage's directory inputs
+  ([#539](https://github.com/sjawhar/pivot/pull/539),
+  [`503374b`](https://github.com/sjawhar/pivot/commit/503374ba59b4e6fd77516d4391296e6f02b0aa8f))
+
+
 ## v0.6.3 (2026-10-30)
 
 ### Bug Fixes
