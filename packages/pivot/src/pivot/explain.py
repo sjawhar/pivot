@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 import pydantic
 
-from pivot import exceptions, parameters, project, registry, skip, types
+from pivot import exceptions, parameters, project, reads, registry, skip, types
 from pivot.executor import worker
 from pivot.storage import listing, lock, state, track
 from pivot.storage import store as store_mod
@@ -35,9 +35,21 @@ if TYPE_CHECKING:
 OUTPUTS_MISSING_REASON = "Outputs missing from cache"
 """Reason for a stage whose lock is current but whose cacheable outputs are absent locally.
 
-``pivot status`` counts stages with this reason as restorable by ``pivot pull``, so it is
-never used when the only unavailable outputs are metrics, which are not cached.
+It is never used when the only unavailable outputs are metrics, which are not cached. The
+explanation's ``recovery`` is ``Recovery.PULL_OUTPUTS`` only when ``pivot pull`` restores every
+output the stage lacks (``_pull_restores_all``): beside an edited metric, the stage still runs.
 """
+
+
+def _pull_restores_all(
+    unavailable: list[types.ArtifactRef], empty_dirs_unrecorded: list[types.ArtifactRef]
+) -> bool:
+    """Whether ``pivot pull`` restores every output of ``unavailable``: none is a metric, which is
+    not cached, and no output holds empty directories its listing does not record, which a
+    restore would delete."""
+    return not empty_dirs_unrecorded and all(
+        ref.tag is not types.ArtifactTag.METRIC for ref in unavailable
+    )
 
 
 def _unavailable_outputs_reason(
@@ -347,6 +359,9 @@ def get_stage_explanation(
                 upstream_stale=[],
             )
 
+        # An object the run read by hash that is not in the cache and not known to be on the
+        # remote makes the stage stale, as repro decides. `allow_missing` (verify --allow-missing,
+        # the engine's display) ignores what is missing locally, so it checks no objects either.
         decision = skip.check_stage(
             lock_data=lock_data,
             fingerprint=fingerprint,
@@ -355,6 +370,9 @@ def get_stage_explanation(
             out_paths=[out.identity for out in outs],
             explain=True,
             force=force,
+            unavailable_reads=None
+            if allow_missing or force
+            else reads.lock_unavailable(lock_data, store.cache_dir),
         )
         unavailable = list[types.ArtifactRef]()
         empty_dirs_unrecorded = list[types.ArtifactRef]()
@@ -390,7 +408,7 @@ def get_stage_explanation(
             unavailable = restoration.unavailable
             empty_dirs_unrecorded = restoration.empty_dirs_unrecorded
         if not decision["changed"] and (unavailable or empty_dirs_unrecorded):
-            return StageExplanation(
+            explanation = StageExplanation(
                 stage_name=stage_name,
                 will_run=True,
                 is_forced=force,
@@ -404,7 +422,10 @@ def get_stage_explanation(
                 dep_changes=[],
                 upstream_stale=[],
             )
-        return StageExplanation(
+            if unavailable and _pull_restores_all(unavailable, empty_dirs_unrecorded):
+                explanation["recovery"] = types.Recovery.PULL_OUTPUTS
+            return explanation
+        explanation = StageExplanation(
             stage_name=stage_name,
             will_run=decision["changed"],
             is_forced=force,
@@ -414,3 +435,8 @@ def get_stage_explanation(
             dep_changes=decision.get("dep_changes", []),
             upstream_stale=[],
         )
+        # Pull fetches the read objects the decision names; it recovers the stage only when it
+        # also restores every output the stage lacks.
+        if "recovery" in decision and _pull_restores_all(unavailable, empty_dirs_unrecorded):
+            explanation["recovery"] = decision["recovery"]
+        return explanation

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import lmdb
+import networkx as nx
 import pytest
 
 from pivot import config, exceptions, executor, explain, registry, status
@@ -10,7 +11,7 @@ from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import cache, listing, track
 from pivot.storage import state as state_mod
-from pivot.types import RemoteStatus, StageExplanation
+from pivot.types import Recovery, RemoteStatus, StageExplanation
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -139,6 +140,70 @@ def test_pipeline_status_upstream_stale(
 
     assert stage_b["status"] == "stale"
     assert "test/stage_a" in stage_b["upstream_stale"]
+
+
+def _helper_explanation(
+    name: str, *, will_run: bool, recovery: Recovery | None = None
+) -> StageExplanation:
+    explanation = StageExplanation(
+        stage_name=name,
+        will_run=will_run,
+        is_forced=False,
+        reason=explain.OUTPUTS_MISSING_REASON if will_run else "",
+        code_changes=[],
+        param_changes=[],
+        dep_changes=[],
+        upstream_stale=[],
+    )
+    if recovery is not None:
+        explanation["recovery"] = recovery
+    return explanation
+
+
+def test_status_carries_each_stages_recovery_and_marks_one_stale_only_for_its_upstream() -> None:
+    """`pivot status` chooses its `pivot pull` suggestion from these fields, never from reasons:
+    a stale stage keeps its own, one current on its own but downstream of a stale stage is
+    `upstream`, and one with nothing stale has none."""
+    graph: nx.DiGraph[str] = nx.DiGraph()
+    graph.add_edge("p/use", "p/make")  # consumer -> producer
+    graph.add_node("p/alone")
+    explanations = [
+        _helper_explanation("p/make", will_run=True, recovery=Recovery.PULL_OUTPUTS),
+        _helper_explanation("p/use", will_run=False),
+        _helper_explanation("p/alone", will_run=False),
+    ]
+
+    enriched = status._compute_explanations_with_upstream(explanations, graph)
+    rows = status._explanations_to_status(enriched)
+
+    expected = {"p/make": Recovery.PULL_OUTPUTS, "p/use": Recovery.UPSTREAM}
+    for entries in (
+        {e["stage_name"]: e["recovery"] for e in enriched if "recovery" in e},
+        {row["name"]: row["recovery"] for row in rows if "recovery" in row},
+    ):
+        assert entries == expected
+
+
+def test_a_stage_downstream_of_one_that_must_run_has_no_recovery() -> None:
+    """`p/run` must run, so whatever it writes reaches the stages downstream of it: pulling cannot
+    bring them up to date, whatever their own state, so neither has a recovery."""
+    graph: nx.DiGraph[str] = nx.DiGraph()
+    graph.add_edge("p/fetch", "p/run")  # consumer -> producer
+    graph.add_edge("p/below", "p/run")
+    explanations = [
+        _helper_explanation("p/run", will_run=True),
+        _helper_explanation("p/fetch", will_run=True, recovery=Recovery.PULL_READS),
+        _helper_explanation("p/below", will_run=False),
+    ]
+
+    enriched = status._compute_explanations_with_upstream(explanations, graph)
+
+    assert {e["stage_name"]: e["upstream_stale"] for e in enriched} == {
+        "p/run": [],
+        "p/fetch": ["p/run"],
+        "p/below": ["p/run"],
+    }
+    assert [e["stage_name"] for e in enriched if "recovery" in e] == []
 
 
 def test_pipeline_status_specific_stages(
@@ -640,6 +705,45 @@ def test_suggestions_missing_outputs_without_remote_omits_pull() -> None:
         push_count=0,
         pull_count=0,
         missing_outputs_count=2,
+        remote_configured=False,
+    )
+
+    assert len(suggestions) == 1
+    assert "pivot repro" in suggestions[0]
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [
+        (1, "Run `pivot pull` to fetch the objects 1 stage read by hash from the remote"),
+        (3, "Run `pivot pull` to fetch the objects 3 stages read by hash from the remote"),
+    ],
+)
+def test_suggestions_missing_read_objects_with_remote_suggests_pull_first(
+    count: int, expected: str
+) -> None:
+    """Objects stages read by hash are missing from the cache, and the remote may hold them:
+    pull fetches them, so it comes before re-running the stages."""
+    suggestions = status.get_suggestions(
+        stale_count=count,
+        modified_count=0,
+        push_count=0,
+        pull_count=0,
+        missing_reads_count=count,
+        remote_configured=True,
+    )
+
+    assert suggestions[0] == expected
+    assert "pivot repro" in suggestions[1]
+
+
+def test_suggestions_missing_read_objects_without_remote_omits_pull() -> None:
+    suggestions = status.get_suggestions(
+        stale_count=1,
+        modified_count=0,
+        push_count=0,
+        pull_count=0,
+        missing_reads_count=1,
         remote_configured=False,
     )
 

@@ -247,8 +247,9 @@ def _deferred_writes_to_apply(
 
     Only RAN/CACHED stages persist. A normal run persists its whole deferred dict, file hashes
     included, in the one ``apply_deferred_writes`` transaction. Under ``--no-commit`` only the
-    ``nocommit:`` record is authoritative, and the file hashes are returned for the best-effort
-    ``state.save_file_hashes``.
+    ``nocommit:`` record and the remote index entries for what the run's reads fetched (the
+    remote holds those whether or not the run is committed) are authoritative, and the file
+    hashes are returned for the best-effort ``state.save_file_hashes``.
     """
     if result["status"] not in (StageStatus.RAN, StageStatus.CACHED):
         return None, []
@@ -257,12 +258,25 @@ def _deferred_writes_to_apply(
     deferred = result["deferred_writes"]
     if not no_commit:
         return deferred, []
-    writes = (
-        types.DeferredWrites(no_commit_record=deferred["no_commit_record"])
-        if "no_commit_record" in deferred
-        else None
-    )
-    return writes, deferred["file_hash_entries"] if "file_hash_entries" in deferred else []
+    writes = types.DeferredWrites()
+    if "no_commit_record" in deferred:
+        writes["no_commit_record"] = deferred["no_commit_record"]
+    if "remote_hashes" in deferred:
+        writes["remote_hashes"] = deferred["remote_hashes"]
+    return writes or None, deferred["file_hash_entries"] if "file_hash_entries" in deferred else []
+
+
+def _split_project_writes(
+    writes: types.DeferredWrites, stage_state_dir: pathlib.Path, project_state_dir: pathlib.Path
+) -> tuple[types.DeferredWrites, types.DeferredWrites | None]:
+    """Split off the remote index entries for what a stage's reads fetched when the stage keeps
+    its records outside the project's state directory (a pipeline included from another root):
+    ``reads.unavailable``, ``pivot pull`` and ``pivot push`` read the index in the project's.
+    Returns the writes for the stage's state directory and those for the project's, or None."""
+    if "remote_hashes" not in writes or stage_state_dir == project_state_dir:
+        return writes, None
+    stage_writes = writes.copy()
+    return stage_writes, types.DeferredWrites(remote_hashes=stage_writes.pop("remote_hashes"))
 
 
 class Engine:
@@ -1405,9 +1419,18 @@ class Engine:
                                                 types.identity_key(out.identity)
                                                 for out in stage_info["outs"]
                                             ]
+                                            writes, project_writes = _split_project_writes(
+                                                writes, stage_state_dir, default_state_dir
+                                            )
                                             _get_state_db(stage_state_dir).apply_deferred_writes(
                                                 stage_name, output_paths, writes
                                             )
+                                            if project_writes is not None:
+                                                _get_state_db(
+                                                    default_state_dir
+                                                ).apply_deferred_writes(
+                                                    stage_name, [], project_writes
+                                                )
                                         if file_hash_entries:
                                             state_mod.save_file_hashes(
                                                 stage_state_dir, file_hash_entries, create=False
@@ -2051,7 +2074,7 @@ class Engine:
         needs WRITE on them. Without it, nothing is written: a cached stage whose outputs
         need restoring returns ``NEEDS_RESTORE``, for the caller to decide again under WRITE.
         """
-        from pivot import run_history
+        from pivot import reads, run_history
         from pivot import skip as skip_mod
         from pivot.storage import lock
 
@@ -2152,7 +2175,9 @@ class Engine:
             )
             return generation_outcome
 
-        def _hash_deps() -> tuple[dict[str, HashInfo], list[str], list[str]]:
+        def _hash_deps() -> tuple[
+            dict[str, HashInfo], list[str], list[str], types.UnavailableReads | None
+        ]:
             state_db = _get_skip_state_db()
             try:
                 dep_hashes, missing, unreadable, file_hash_entries = worker.hash_dependencies(
@@ -2162,9 +2187,16 @@ class Engine:
                 if skip_state_dbs is None:
                     state_db.close()
             _save_file_hashes(file_hash_entries)
-            return dep_hashes, missing, unreadable
+            unavailable_reads = (
+                None
+                if missing or unreadable
+                else reads.lock_unavailable(lock_data, worker.store_cache_dir(store))
+            )
+            return dep_hashes, missing, unreadable, unavailable_reads
 
-        dep_hashes, missing, unreadable = await anyio.to_thread.run_sync(_hash_deps)
+        dep_hashes, missing, unreadable, unavailable_reads = await anyio.to_thread.run_sync(
+            _hash_deps
+        )
         dep_hashes_by_identity = {
             types.identity_from_key(key): info for key, info in dep_hashes.items()
         }
@@ -2180,6 +2212,7 @@ class Engine:
             out_identities,
             explain=False,
             force=False,
+            unavailable_reads=unavailable_reads,
         )
         if decision["changed"]:
             return _SkipOutcome.RUN

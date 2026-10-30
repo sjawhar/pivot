@@ -19,6 +19,8 @@ from pivot.types import (
     HashInfo,
     LockData,
     ParamChange,
+    Recovery,
+    UnavailableReads,
 )
 
 # A lock's code manifest carries one of these prefixes, followed by module names, when its run
@@ -87,6 +89,7 @@ def check_stage(
     explain: bool = False,
     force: bool = False,
     run_cache_allowed: bool = True,
+    unavailable_reads: UnavailableReads | None = None,
 ) -> ChangeDecision:
     """Single source of truth for Tier 2 skip detection.
 
@@ -97,9 +100,15 @@ def check_stage(
     satisfied from the run cache: an entry at the stage's input hash was filed by a run the check
     did not see, so the stage must run.
 
+    ``unavailable_reads`` says why objects the lock records its run read by hash are in neither
+    the cache nor the remote (``reads.unavailable``), or is None. Such a stage cannot be run again
+    as it ran, so it is changed, with that reason when nothing else changed; then, when a usable
+    remote may hold the objects, ``recovery`` says ``pivot pull`` fetches them.
+
     Callers are responsible for:
     - Tier 1 (generation check via can_skip_via_generation) before calling this
     - Tier 3 (run cache) after this returns changed=True, when run_cache_allowed
+    - ``unavailable_reads`` for the lock they pass
     """
     marked_reason = rerun_mark_reason(lock_data["code_manifest"]) if lock_data is not None else None
     if marked_reason is not None:
@@ -134,6 +143,8 @@ def check_stage(
                 reason="Output paths changed",
                 run_cache_allowed=run_cache_allowed,
             )
+        if unavailable_reads is not None:
+            return _unavailable_reads_decision(unavailable_reads, run_cache_allowed)
         return ChangeDecision(changed=False, reason="", run_cache_allowed=run_cache_allowed)
 
     # Explain path: full diffs for all categories.
@@ -144,19 +155,33 @@ def check_stage(
     locked_out_paths = sorted(lock_data["output_hashes"].keys())
     out_changed = sorted(out_paths) != locked_out_paths
 
-    changed = force or bool(code_changes or param_changes or dep_changes or out_changed)
-    reason = marked_reason or _first_reason(
-        code_changes, param_changes, dep_changes, out_changed, force
-    )
+    if not (code_changes or param_changes or dep_changes or out_changed) and (
+        unavailable_reads is not None
+    ):
+        decision = _unavailable_reads_decision(unavailable_reads, run_cache_allowed)
+    else:
+        decision = ChangeDecision(
+            changed=force or bool(code_changes or param_changes or dep_changes or out_changed),
+            reason=marked_reason
+            or _first_reason(code_changes, param_changes, dep_changes, out_changed, force),
+            run_cache_allowed=run_cache_allowed,
+        )
+    decision["code_changes"] = code_changes
+    decision["param_changes"] = param_changes
+    decision["dep_changes"] = dep_changes
+    return decision
 
-    return ChangeDecision(
-        changed=changed,
-        reason=reason,
-        code_changes=code_changes,
-        param_changes=param_changes,
-        dep_changes=dep_changes,
-        run_cache_allowed=run_cache_allowed,
+
+def _unavailable_reads_decision(
+    unavailable_reads: UnavailableReads, run_cache_allowed: bool
+) -> ChangeDecision:
+    """The decision for a lock nothing changed but whose read objects are unavailable."""
+    decision = ChangeDecision(
+        changed=True, reason=unavailable_reads["reason"], run_cache_allowed=run_cache_allowed
     )
+    if unavailable_reads["pullable"]:
+        decision["recovery"] = Recovery.PULL_READS
+    return decision
 
 
 def _first_reason(

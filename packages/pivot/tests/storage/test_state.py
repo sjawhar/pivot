@@ -1040,6 +1040,49 @@ def test_apply_deferred_writes_file_hash_entries(tmp_path: pathlib.Path) -> None
     assert result == file_hash
 
 
+_URL = "s3://bucket/cache/"
+_FETCHED: DeferredWrites = {
+    "remote_hashes": [
+        {"name": "origin", "url": _URL, "hashes": ["0123456789abcdef", "fedcba9876543210"]}
+    ]
+}
+
+
+@pytest.mark.parametrize(
+    "stored_url", [pytest.param(None, id="no-url-stored"), pytest.param(_URL, id="same-url")]
+)
+def test_apply_deferred_writes_records_what_reads_fetched_in_the_remote_index(
+    tmp_path: pathlib.Path, stored_url: str | None
+) -> None:
+    """The objects a run's reads fetched from a remote count as on it, as `pivot pull` counts
+    what it downloads; a remote the index has no URL for gets the fetch's."""
+    with state.StateDB(tmp_path) as db:
+        if stored_url is not None:
+            db.remote_set_url("origin", stored_url)
+        db.apply_deferred_writes("stage", [], _FETCHED)
+
+        assert db.remote_get_url("origin") == _URL
+        assert db.remote_hashes_intersection(
+            "origin", {"0123456789abcdef", "fedcba9876543210", "1111111111111111"}
+        ) == {"0123456789abcdef", "fedcba9876543210"}
+
+
+def test_apply_deferred_writes_leaves_an_index_kept_for_another_url_alone(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The index records another URL for the remote, so the fetch says nothing about the bucket
+    it describes: nothing is added, and the index stays as it was."""
+    with state.StateDB(tmp_path) as db:
+        db.remote_set_url("origin", "s3://elsewhere/cache/")
+        db.remote_hashes_add("origin", ["2222222222222222"])
+        db.apply_deferred_writes("stage", [], _FETCHED)
+
+        assert db.remote_get_url("origin") == "s3://elsewhere/cache/"
+        assert db.remote_hashes_intersection(
+            "origin", {"0123456789abcdef", "fedcba9876543210", "2222222222222222"}
+        ) == {"2222222222222222"}
+
+
 def _helper_stat_on_device(fs_stat: os.stat_result, device: int) -> os.stat_result:
     """``fs_stat`` with only its device changed: the same inode number, size and mtime_ns, as
     a file on another filesystem can have."""
@@ -1856,6 +1899,13 @@ _PVT = {"pvt_members": {"data/out/a.pvt": "77aa"}}
         pytest.param(
             {**_RAN, "later_field": [1]}, {**_RAN, "later_field": [1]}, id="unknown-key-as-stored"
         ),
+        pytest.param(
+            {**_RAN, "reads": ["0123456789abcdef"]},
+            {**_RAN, "reads": ["0123456789abcdef"]},
+            id="reads",
+        ),
+        pytest.param({**_RAN, "reads": ["../etc/passwd"]}, _RAN, id="malformed-reads"),
+        pytest.param({**_RAN, "reads": "0123456789abcdef"}, _RAN, id="reads-not-a-list"),
     ],
 )
 def test_a_no_commit_record_reads_each_valid_field_it_knows(
@@ -1886,6 +1936,11 @@ _OLDER_RUN = {
             json.dumps({**_OLDER_RUN, **_PVT}).encode(),
             {**_RAN, **_PVT},
             id="an-older-run-and-another-field",
+        ),
+        pytest.param(
+            json.dumps({**_OLDER_RUN, "reads": ["0123456789abcdef"], **_PVT}).encode(),
+            {**_RAN, **_PVT},
+            id="an-older-run-that-read-by-hash",
         ),
         pytest.param(b"not json", _RAN, id="unreadable-record"),
     ],

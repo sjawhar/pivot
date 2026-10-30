@@ -82,6 +82,7 @@ from pivot.types import (
     ParamChange,
     PipelineStatus,
     PipelineStatusInfo,
+    Recovery,
     RemoteSyncInfo,
     StageExplanation,
     TrackedFileInfo,
@@ -267,8 +268,14 @@ def _compute_explanations_with_upstream(
     explanations: list[StageExplanation],
     graph: DiGraph[str],
 ) -> list[StageExplanation]:
-    """Process explanations and add upstream_stale field for stages stale due to upstream."""
+    """Process explanations and add upstream_stale field for stages stale due to upstream.
+
+    ``recovery`` stays only when it brings the stage up to date without running it: a stage that
+    will run keeps its own, and one current on its own gets ``Recovery.UPSTREAM``, but only when
+    every stale upstream stage has a recovery too. A stage downstream of one that must run gets
+    none, since that run's outputs reach it. ``explanations`` arrive in execution order."""
     stale_stages = set[str]()
+    recovered = set[str]()
     results = list[StageExplanation]()
 
     for exp in explanations:
@@ -304,6 +311,14 @@ def _compute_explanations_with_upstream(
             dep_changes=exp["dep_changes"],
             upstream_stale=upstream_stale,
         )
+        if recovered.issuperset(upstream_stale):
+            if exp["will_run"]:
+                if "recovery" in exp:
+                    new_exp["recovery"] = exp["recovery"]
+            elif upstream_stale:
+                new_exp["recovery"] = Recovery.UPSTREAM
+        if "recovery" in new_exp:
+            recovered.add(exp["stage_name"])
         results.append(new_exp)
 
     return results
@@ -356,15 +371,18 @@ def get_pipeline_status(
 
 def _explanations_to_status(explanations: list[StageExplanation]) -> list[PipelineStatusInfo]:
     """Convert enriched explanations to PipelineStatusInfo list."""
-    return [
-        PipelineStatusInfo(
+    rows = list[PipelineStatusInfo]()
+    for exp in explanations:
+        row = PipelineStatusInfo(
             name=exp["stage_name"],
             status=PipelineStatus.STALE if exp["will_run"] else PipelineStatus.CACHED,
             reason=exp["reason"],
             upstream_stale=exp["upstream_stale"],
         )
-        for exp in explanations
-    ]
+        if "recovery" in exp:
+            row["recovery"] = exp["recovery"]
+        rows.append(row)
+    return rows
 
 
 def get_tracked_files_status(
@@ -516,6 +534,7 @@ def get_suggestions(
     pull_count: int,
     orphan_count: int = 0,
     missing_outputs_count: int = 0,
+    missing_reads_count: int = 0,
     remote_configured: bool = False,
 ) -> list[str]:
     suggestions = list[str]()
@@ -526,6 +545,14 @@ def get_suggestions(
         suggestions.append(
             f"Run `pivot pull` to restore outputs of {missing_outputs_count} "
             + f"{_pluralize(missing_outputs_count, 'stage')} from the remote"
+        )
+
+    # Objects stages read by hash, missing from the cache: pulling fetches them, and the
+    # stages are then current without running.
+    if missing_reads_count > 0 and remote_configured:
+        suggestions.append(
+            f"Run `pivot pull` to fetch the objects {missing_reads_count} "
+            + f"{_pluralize(missing_reads_count, 'stage')} read by hash from the remote"
         )
 
     if stale_count > 0:

@@ -265,6 +265,38 @@ def test_deserialize_run_cache_entry_missing_keys() -> None:
         run_history.deserialize_run_cache_entry(incomplete)
 
 
+def test_a_run_cache_entry_keeps_the_objects_its_run_read_by_hash() -> None:
+    entry = run_history.RunCacheEntry(
+        run_id="20250110_143000_abc12345",
+        output_hashes=[run_history.OutputHashEntry(path="p/plan", hash="0123456789abcdef")],
+        reads=["fedcba9876543210"],
+    )
+
+    deserialized = run_history.deserialize_run_cache_entry(run_history.serialize_to_bytes(entry))
+
+    assert deserialized == entry
+
+
+def test_a_run_cache_entry_of_a_run_that_read_nothing_has_no_reads() -> None:
+    stored = json.dumps({"run_id": "r", "output_hashes": []}).encode()
+
+    assert "reads" not in run_history.deserialize_run_cache_entry(stored)
+
+
+@pytest.mark.parametrize(
+    "reads",
+    [
+        pytest.param("0123456789abcdef", id="not-a-list"),
+        pytest.param(["../../etc/passwd"], id="not-a-hash"),
+    ],
+)
+def test_a_run_cache_entry_with_malformed_reads_is_invalid(reads: object) -> None:
+    stored = json.dumps({"run_id": "r", "output_hashes": [], "reads": reads}).encode()
+
+    with pytest.raises(ValueError, match="reads"):
+        run_history.deserialize_run_cache_entry(stored)
+
+
 # =============================================================================
 # StateDB run history tests
 # =============================================================================
