@@ -409,8 +409,10 @@ key's chain only, and a new file runs the producer and the new chain only.
   `p/plan` and `p/cut@a`, no other instance. When `p/plan` is current, a key it has
   no file for is refused as `pivot status` refuses it (`Unknown stage(s):
   p/cut@zzz`); when it is not, the run refuses the key once `p/plan` has run and
-  has no file for it. `pivot run p/cut` is refused: a mapped stage expands only in
-  a run that finds its producer current. Nothing about an expansion is saved: each
+  has no file for it, failing `p/cut` with `Unknown stage(s): p/cut@zzz, needed by
+  the target p/build@zzz` for a target further down the chain. `pivot run p/cut`
+  is refused: a mapped stage expands only in a run that finds its producer current.
+  Nothing about an expansion is saved: each
   run expands afresh. A watch run (`pivot repro --watch`) expands as any run does,
   including the run that follows a reload after an edit to the code or to
   `params.yaml`.

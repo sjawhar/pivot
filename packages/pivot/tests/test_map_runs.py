@@ -312,22 +312,36 @@ def test_a_template_target_beside_its_instance_expands_every_key(
     assert _statuses(results) == {"p/_stage_plan": _RAN, **_chains(["a", "b"], _RAN)}, results
 
 
+@pytest.mark.parametrize(
+    ("target", "reason"),
+    [
+        pytest.param(
+            "p/_stage_cut@zzz", "Unknown stage(s): p/_stage_cut@zzz", id="the-named-instance"
+        ),
+        pytest.param(
+            "p/_stage_build@zzz",
+            "Unknown stage(s): p/_stage_cut@zzz, needed by the target p/_stage_build@zzz",
+            id="an-instance-downstream",
+        ),
+    ],
+)
 def test_a_named_key_the_producer_writes_no_file_for_fails_the_template(
-    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch, target: str, reason: str
 ) -> None:
     """The producer ran in this run, so only the run can tell the key is not in the plan: it
-    fails the template as `pivot status` refuses the name, and blocks its chain."""
+    fails the first template over that key as `pivot status` refuses the name, naming the
+    target the run was asked for when that is an instance further down the chain."""
     root = set_project_root
     _project(root, monkeypatch, {"a": 1})
     pipeline = _chain_pipeline(root)
 
-    results = executor.run(pipeline=pipeline, stages=["p/_stage_build@zzz"], on_error="keep_going")
+    results = executor.run(pipeline=pipeline, stages=[target], on_error="keep_going")
 
     statuses = _statuses(results)
     assert statuses["p/_stage_plan"] == _RAN
     assert statuses["p/_stage_cut"] == StageStatus.FAILED, results
-    assert results["p/_stage_cut"]["reason"] == "Unknown stage(s): p/_stage_cut@zzz"
-    assert statuses["p/_stage_build"] == StageStatus.BLOCKED
+    assert results["p/_stage_cut"]["reason"] == reason
+    assert "p/_stage_build" not in target or statuses["p/_stage_build"] == StageStatus.BLOCKED
     assert pipeline.instances_of("p/_stage_cut") == []
 
 

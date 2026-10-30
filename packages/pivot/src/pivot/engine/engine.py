@@ -188,9 +188,9 @@ class _MapRun:
     # Each source directory's (key, file key) pairs, read once per run so chained templates
     # expand over the same keys
     keys: dict[types.ArtifactIdentity, list[tuple[str, str]]]
-    # The keys a template expands when the run's targets name instances (``_mapped_targets``);
-    # a template it does not hold expands every key
-    wanted: dict[str, set[str]]
+    # The keys a template expands when the run's targets name instances (``_mapped_targets``),
+    # each with the targets that need it; a template it does not hold expands every key
+    wanted: dict[str, dict[str, set[str]]]
     stage_order: list[str]
     all_stages: dict[str, RegistryStageInfo]
     committed_before: dict[pathlib.Path, tuple[int, int, int] | None]
@@ -334,18 +334,19 @@ def _refuse_single_stage_templates(
 
 def _mapped_targets(
     stages: list[str], templates: dict[str, registry.MapTemplate]
-) -> tuple[list[str], dict[str, set[str]]]:
+) -> tuple[list[str], dict[str, dict[str, set[str]]]]:
     """Run targets ``stages`` with each instance name (``<template>@<key>``) replaced by its
     template, and the keys each template expands so the run adds the named instances alone,
     each with its chain: an instance's key for its template and for every template that one is
-    mapped over. A template named itself, or upstream of one named itself, expands every key
-    and has no entry; so does every template when no target names an instance.
+    mapped over, each key with the targets that need it. A template named itself, or upstream
+    of one named itself, expands every key and has no entry; so does every template when no
+    target names an instance.
 
     The instances of a run's expansions are gone when this is called (``reset_expansions``), so
     a watch run's affected instance and a name the user gave are both reached this way.
     """
-    # Each template's keys; None for every key
-    wanted = dict[str, set[str] | None]()
+    # Each template's keys, each with the targets that need it; None for every key
+    wanted = dict[str, dict[str, set[str]] | None]()
     targets = list[str]()
     for stage in stages:
         template = None if stage in templates else registry.template_of(stage, templates)
@@ -355,24 +356,43 @@ def _mapped_targets(
             targets.append(stage)
             continue
         targets.append(template)
-        keys = wanted.setdefault(template, set[str]())
+        keys = wanted.setdefault(template, dict[str, set[str]]())
         if keys is not None:
-            keys.add(stage[len(template) + 1 :])
+            keys.setdefault(stage[len(template) + 1 :], set[str]()).add(stage)
     pending = list(wanted)
     while pending:
         name = pending.pop()
         keys = wanted[name]
         for upstream in {dep for dep in templates[name]["mapped_deps"].values() if dep is not None}:
-            if upstream in wanted:
-                before = wanted[upstream]
-                if before is None or (keys is not None and keys <= before):
-                    continue
-                wanted[upstream] = None if keys is None else before | keys
-            else:
-                wanted[upstream] = None if keys is None else set(keys)
+            before = wanted.get(upstream, dict[str, set[str]]())
+            if upstream in wanted and before is None:
+                continue
+            if keys is None:
+                wanted[upstream] = None
+                pending.append(upstream)
+                continue
+            merged = {key: set(needing) for key, needing in (before or {}).items()}
+            for key, needing in keys.items():
+                merged.setdefault(key, set[str]()).update(needing)
+            if upstream in wanted and merged == before:
+                continue
+            wanted[upstream] = merged
             pending.append(upstream)
     filtered = {name: keys for name, keys in wanted.items() if keys is not None}
     return list(dict.fromkeys(targets)), filtered
+
+
+def _unknown_keys_reason(template: str, missing: list[str], wanted: dict[str, set[str]]) -> str:
+    """Why a run whose targets name keys ``missing`` of ``template`` fails it: those instances,
+    as `pivot status` refuses their names, and each target further down the chain that needs
+    them."""
+    unknown = [f"{template}@{key}" for key in missing]
+    reason = str(exceptions.StageNotFoundError(unknown))
+    needing = sorted({target for key in missing for target in wanted[key]}.difference(unknown))
+    if needing:
+        noun = "target" if len(needing) == 1 else "targets"
+        reason += f", needed by the {noun} {', '.join(needing)}"
+    return reason
 
 
 def _read_map_keys(source: types.ArtifactIdentity, map_run: _MapRun) -> list[tuple[str, str]]:
@@ -1363,7 +1383,7 @@ class Engine:
         templates = {name: pipeline.get_template(name) for name in pipeline.list_templates()}
         # A target naming an instance (a watch run's affected stage, or a name the user gave) is
         # reached through its template, which then adds that instance alone, with its chain
-        wanted = dict[str, set[str]]()
+        wanted = dict[str, dict[str, set[str]]]()
         if stages:
             stages, wanted = _mapped_targets(stages, templates)
         executor_core.verify_tracked_files(
@@ -2217,6 +2237,8 @@ class Engine:
         template = pipeline.get_template(name)
         source = template["source"]
         await self._set_stage_state(name, StageExecutionState.PREPARING)
+        reason: str | None = None
+        added = list[str]()
         try:
             keys = map_run.keys.get(source)
             if keys is None:
@@ -2224,35 +2246,30 @@ class Engine:
                 map_run.keys[source] = keys
             if name in map_run.wanted:
                 wanted = map_run.wanted[name]
-                missing = sorted(wanted.difference(key for key, _ in keys))
+                # A named key no file has reads as `pivot status` reads its target
+                missing = sorted(wanted.keys() - {key for key, _ in keys})
                 if missing:
-                    raise exceptions.StageNotFoundError(
-                        [f"{name}@{key}" for key in missing],
-                        available_stages=[f"{name}@{key}" for key, _ in keys],
-                    )
+                    reason = _unknown_keys_reason(name, missing, wanted)
                 keys = [(key, file_key) for key, file_key in keys if key in wanted]
-            planned = {
-                info["name"]: info
-                for info in (registry.instantiate(template, key, file) for key, file in keys)
-            }
-            problem = await anyio.to_thread.run_sync(
-                lambda: _incremental_refusal(
-                    list(planned),
-                    planned,
-                    allow_uncached_incremental=map_run.allow_uncached_incremental,
-                    force=map_run.force,
+            if reason is None:
+                planned = {
+                    info["name"]: info
+                    for info in (registry.instantiate(template, key, file) for key, file in keys)
+                }
+                problem = await anyio.to_thread.run_sync(
+                    lambda: _incremental_refusal(
+                        list(planned),
+                        planned,
+                        allow_uncached_incremental=map_run.allow_uncached_incremental,
+                        force=map_run.force,
+                    )
                 )
-            )
-            if problem is not None:
-                raise problem
-            added = pipeline.expand_template(name, keys)
+                if problem is not None:
+                    raise problem
+                added = pipeline.expand_template(name, keys)
         except exceptions.PivotError as exc:
-            # A named key no file has reads as `pivot status` reads its target
-            reason = (
-                str(exc)
-                if isinstance(exc, exceptions.StageNotFoundError)
-                else expansion.refusal_reason(source, exc)
-            )
+            reason = expansion.refusal_reason(source, exc)
+        if reason is not None:
             _logger.error("Stage %s failed: %s", name, reason)
             await self._emit_terminal_stage(
                 name, StageStatus.FAILED, reason, results, run_id=run_id
