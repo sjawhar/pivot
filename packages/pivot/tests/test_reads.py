@@ -1,7 +1,6 @@
 """`pivot.read_by_hash`: the object a content hash names, read inside a stage run, the check
 of whether the objects a lock records are still in the cache or the remote, and
-`pivot.output_hash`, the content hash a stage's committed lock records for an output. A test
-whose docstring names an acceptance round of sjawhar/pivot#544 pins a defect that round found."""
+`pivot.output_hash`, the content hash a stage's committed lock records for an output."""
 
 from __future__ import annotations
 
@@ -20,7 +19,8 @@ import xxhash
 import yaml
 
 import pivot
-from pivot import exceptions, reads
+from pivot import compose, exceptions, executor, reads
+from pivot.executor import core as executor_core
 from pivot.remote import keys, protocol
 from pivot.storage import cache, listing, lock, state
 from pivot.types import ArtifactIdentity, FileHash, LockData, RemoteHashes, UnavailableReads
@@ -145,12 +145,10 @@ def _forked_read(content_hash: str, queue: multiprocessing.Queue[str]) -> None:
 
 
 def test_a_read_in_a_forked_child_is_refused(files_dir: pathlib.Path) -> None:
-    """Acceptance round 1, defect 2. A stage that forks a child process which calls
-    `read_by_hash` got the object, but the child's copy of the recording is lost, so the stage's
-    lock recorded no `reads` (observed: edge/forked's lock had no `reads`, and `pivot status` said
-    cached after the object left the cache and the remote). Reads are recorded only in the
-    stage's own process and its threads, so the child's read is refused, naming that rule
-    (decision D2 of the acceptance)."""
+    """A process the stage forks gets a copy of the recording that no lock ever reads, so a
+    read there would leave the lock without `reads`, and `pivot status` would call the stage
+    cached after the object left the cache and the remote. Reads are recorded only in the
+    stage's own process and its threads, so the child's read is refused, naming that rule."""
     content_hash = _helper_put(files_dir, b"one\n")
     ctx = multiprocessing.get_context("fork")
     queue: multiprocessing.Queue[str] = ctx.Queue()
@@ -283,11 +281,10 @@ def test_a_read_from_a_coroutine_fetches_the_object_from_the_remote(
     moto_services: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Acceptance round 1, defect 1. A stage whose helper code runs an event loop calls
-    `read_by_hash` (a plain function) from a coroutine. With the object only on the remote, the
-    read raised `RuntimeError: asyncio.run() cannot be called from a running event loop`
-    (observed: `pivot repro` of edge/asyncer), not the object. The docstring promises any thread
-    of the stage's process may call it, and the event loop's thread is one."""
+    """A stage whose helper code runs an event loop calls `read_by_hash`, a plain function, from
+    a coroutine. With the object only on the remote, the read still fetches it: the download
+    cannot start a second event loop on the thread already running one, so it runs on a thread
+    of its own."""
     s3, bucket = _helper_remote(set_project_root, moto_services["s3"], monkeypatch)
     content_hash = _helper_hash(b"snapshot\n")
     s3.put_object(Bucket=bucket, Key=keys.hash_to_key("cache/", content_hash), Body=b"snapshot\n")
@@ -424,6 +421,49 @@ def test_an_index_entry_for_another_url_of_the_remote_does_not_count(
     assert reads.unavailable([content_hash], files_dir) is not None
 
 
+def _plan_pinned(pin: str) -> dict[str, list[str]]:
+    return {"rows": [pivot.read_by_hash(content_hash).read_text() for content_hash in pin.split()]}
+
+
+def test_what_a_stage_of_another_root_fetched_counts_as_on_the_project_remote(
+    files_dir: pathlib.Path,
+    set_project_root: pathlib.Path,
+    moto_services: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A pipeline included from another root keeps its stages' records in that root's state
+    directory, but the remote index that `pivot status`, `pull` and `push` read is the
+    project's: what such a stage's read fetched is recorded there, so the cache losing the object
+    leaves it available."""
+    s3, bucket = _helper_remote(set_project_root, moto_services["s3"], monkeypatch)
+    snapshot = _helper_hash(b"snapshot\n")
+    s3.put_object(Bucket=bucket, Key=keys.hash_to_key("cache/", snapshot), Body=b"snapshot\n")
+    (set_project_root / "data" / "raw").mkdir(parents=True)
+    (set_project_root / "data" / "raw" / "counted.pin").write_text(f"{snapshot}\n")
+    other = tmp_path_factory.mktemp("other")
+    (other / ".pivot").mkdir()
+    with compose.Pipeline("other", root=other) as included:
+        compose.stage(_plan_pinned)(included.input("counted.pin", t=str))
+    pipeline = compose.Pipeline("all", root=set_project_root)
+    pipeline.include(included)
+    monkeypatch.chdir(set_project_root)
+    # Workers a pool reuses keep the environment they started with; the read in the stage needs
+    # this test's endpoint for the remote, and later tests need workers without it.
+    _ = executor_core.create_fresh_executor(1)
+    try:
+        results = executor.run(pipeline=pipeline)
+    finally:
+        monkeypatch.undo()
+        _ = executor_core.create_fresh_executor(1)
+
+    assert results["other/_plan_pinned"]["status"] == "ran", results
+    with state.StateDB(set_project_root / ".pivot") as state_db:
+        assert state_db.remote_hashes_intersection("origin", {snapshot}) == {snapshot}
+    cache.get_cache_path(files_dir, snapshot).unlink()
+    assert reads.unavailable([snapshot], files_dir) is None
+
+
 # =============================================================================
 # The repair a corrupt remote object's hash mismatch prints
 # =============================================================================
@@ -431,12 +471,10 @@ def test_an_index_entry_for_another_url_of_the_remote_does_not_count(
 
 @pytest.mark.usefixtures("set_project_root")
 def test_the_hash_mismatch_repair_names_a_read_by_hash_among_what_records_a_hash() -> None:
-    """Acceptance round 4, D10. A run whose `pivot.read_by_hash` fetched an object records it in
-    the remote index, as `pivot pull` does (`DeferredWrites.remote_hashes`). The repair that a
-    hash mismatch prints (`keys.check_digest`, and docs/guides/remote-storage.md) listed only
-    `pivot push`, `pull`, `fetch` and `status --remote` as what records a hash. A user who
-    followed it could push from a machine whose stage read the object: that machine has recorded
-    the hash, so its `pivot push` skips it and the remote stays corrupt."""
+    """A run whose `pivot.read_by_hash` downloaded an object records it in the remote index, as
+    `pivot pull` does, and `pivot push` then skips it. So the repair a hash mismatch prints
+    (`keys.check_digest`) names such a stage among what records a hash: a user who pushed from a
+    machine whose stage read the object would leave the remote corrupt."""
     with pytest.raises(exceptions.RemoteError) as caught:
         keys.check_digest("0123456789abcdef", "fedcba9876543210", "bucket/cache/files/01/23")
 
@@ -445,7 +483,7 @@ def test_the_hash_mismatch_repair_names_a_read_by_hash_among_what_records_a_hash
 
 
 def test_remote_storage_guide_names_a_read_by_hash_among_what_records_a_hash() -> None:
-    """Acceptance round 4, D10, the guide's copy of the same repair."""
+    """The remote-storage guide's copy of the same repair names it too."""
     guide = pathlib.Path(__file__).resolve().parents[3] / "docs/guides/remote-storage.md"
     text = guide.read_text()
     (paragraph,) = [p for p in text.split("\n\n") if "Pivot records hashes those commands" in p]
@@ -490,6 +528,39 @@ def test_output_hash_is_the_hash_the_stage_lock_records_for_that_output(
 
     assert pivot.output_hash("p/plan", "plan") == _PLAN
     assert pivot.output_hash("p/plan", "index") == index, "a directory's is its listing's"
+
+
+def test_output_hash_inside_a_stage_run_is_refused(
+    set_project_root: pathlib.Path, files_dir: pathlib.Path
+) -> None:
+    """Another stage's lock is no input of the stage that reads it, so a new output there would
+    never rerun that stage, and status would call its stale output cached. Inside a stage run,
+    `output_hash` refuses, naming the pin file to declare instead."""
+    _ = _helper_write_lock(set_project_root)
+
+    with (
+        reads.recording(files_dir),
+        pytest.raises(exceptions.ObjectReadError, match="write the hash into a pin file"),
+    ):
+        _ = pivot.output_hash("p/plan", "plan")
+
+
+def test_output_hash_in_a_process_a_stage_started_is_refused(
+    set_project_root: pathlib.Path, files_dir: pathlib.Path
+) -> None:
+    _ = _helper_write_lock(set_project_root)
+
+    with reads.recording(files_dir):
+        child = subprocess.run(
+            [sys.executable, "-c", "import pivot; pivot.output_hash('p/plan', 'plan')"],
+            cwd=set_project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    assert child.returncode != 0
+    assert "write the hash into a pin file" in child.stderr, child.stderr
 
 
 @pytest.mark.parametrize(

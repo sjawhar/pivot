@@ -265,6 +265,19 @@ def _deferred_writes_to_apply(
     return writes or None, deferred["file_hash_entries"] if "file_hash_entries" in deferred else []
 
 
+def _split_project_writes(
+    writes: types.DeferredWrites, stage_state_dir: pathlib.Path, project_state_dir: pathlib.Path
+) -> tuple[types.DeferredWrites, types.DeferredWrites | None]:
+    """Split off the remote index entries for what a stage's reads fetched when the stage keeps
+    its records outside the project's state directory (a pipeline included from another root):
+    ``reads.unavailable``, ``pivot pull`` and ``pivot push`` read the index in the project's.
+    Returns the writes for the stage's state directory and those for the project's, or None."""
+    if "remote_hashes" not in writes or stage_state_dir == project_state_dir:
+        return writes, None
+    stage_writes = writes.copy()
+    return stage_writes, types.DeferredWrites(remote_hashes=stage_writes.pop("remote_hashes"))
+
+
 class Engine:
     """Async coordinator for pipeline execution using anyio.
 
@@ -1403,9 +1416,18 @@ class Engine:
                                                 types.identity_key(out.identity)
                                                 for out in stage_info["outs"]
                                             ]
+                                            writes, project_writes = _split_project_writes(
+                                                writes, stage_state_dir, default_state_dir
+                                            )
                                             _get_state_db(stage_state_dir).apply_deferred_writes(
                                                 stage_name, output_paths, writes
                                             )
+                                            if project_writes is not None:
+                                                _get_state_db(
+                                                    default_state_dir
+                                                ).apply_deferred_writes(
+                                                    stage_name, [], project_writes
+                                                )
                                         if file_hash_entries:
                                             state_mod.save_file_hashes(
                                                 stage_state_dir, file_hash_entries, create=False

@@ -112,10 +112,24 @@ def output_hash(
     of the project at ``root`` (None: the current project) alone: no pipeline is loaded and
     nothing is hashed, so one process can read several projects' locks.
 
+    Call it outside a stage, from the command that writes a pin. Inside a stage run (or in a
+    process the stage started) it refuses: the lock it reads is not one of the stage's declared
+    inputs, so a new output there would never rerun the stage, and ``pivot status`` would call
+    the stage's stale output cached.
+
     Raises:
+        ObjectReadError: Called inside a stage run, or in a process a stage started.
         OutputMissingError: The stage has no lock Pivot can read, or its lock records no such
             output.
     """
+    if _Active.recording is not None or _STAGE_PROCESS_ENV in os.environ:
+        raise exceptions.ObjectReadError(
+            f"pivot.output_hash({stage_name!r}) was called inside a stage run: the lock it reads "
+            + "is not one of the stage's inputs, so a new output there would not rerun the "
+            + "stage. Outside the stage, write the hash into a pin file, declare that file as "
+            + "the stage's input (`pipeline.input(..., t=str)`), and pass the hash it holds to "
+            + "`pivot.read_by_hash`"
+        )
     project_root = project.get_project_root() if root is None else root
     stages_dir = lock.get_stages_dir(state_dir_mod.locate_state_dir(project_root))
     lock_data = lock.StageLock(stage_name, stages_dir).read(warn_old_format=False)

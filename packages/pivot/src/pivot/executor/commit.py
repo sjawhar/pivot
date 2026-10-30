@@ -249,14 +249,16 @@ def _commit_stages(
             # The outputs a --no-commit run wrote came from the code that run fingerprinted, which
             # may differ from the code on disk now: record that run's manifest, its marks
             # included, and the objects it read by hash. Otherwise (no record, or outputs edited
-            # since) record the outputs on disk against the current code, the "trust me" commit,
-            # which no read produced. A run that executed code the fingerprint does not describe
-            # marked its lock; committing the same outputs keeps that mark, so the stage is still
-            # not reusable.
+            # since) record the outputs on disk against the current code, the "trust me" commit.
+            # A run that executed code the fingerprint does not describe marked its lock;
+            # committing the same outputs keeps that mark, so the stage is still not reusable.
+            # The same outputs also came from the objects that lock lists under `reads`, so those
+            # stay too; other outputs no read produced.
             read_hashes = list[str]()
-            if run_manifest is not None and run_outputs == {
+            output_content_hashes = {
                 key: hash_info["hash"] for key, hash_info in output_hashes_by_key.items()
-            }:
+            }
+            if run_manifest is not None and run_outputs == output_content_hashes:
                 code_manifest = run_manifest
                 if run_record is not None and "reads" in run_record:
                     read_hashes = run_record["reads"]
@@ -265,6 +267,16 @@ def _commit_stages(
                     previous_lock["code_manifest"] if previous_lock is not None else None,
                     fingerprint,
                 )
+                if (
+                    previous_lock is not None
+                    and "reads" in previous_lock
+                    and {
+                        types.identity_key(identity): hash_info["hash"]
+                        for identity, hash_info in previous_lock["output_hashes"].items()
+                    }
+                    == output_content_hashes
+                ):
+                    read_hashes = previous_lock["reads"]
             reusable = skip.rerun_mark_reason(code_manifest) is None
             input_hash = run_history.stage_input_hash(
                 skip.strip_rerun_marks(code_manifest),

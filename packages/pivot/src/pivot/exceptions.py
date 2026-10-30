@@ -323,7 +323,8 @@ class ListingMissingError(CacheError):
 class ObjectReadError(CacheError):
     """``pivot.read_by_hash`` cannot hand its stage the object a content hash names: the value is
     not a content hash, neither the cache nor the remote holds the object, or the bytes found do
-    not hash to it. The message names the hash and why."""
+    not hash to it. The message names the hash and why. ``pivot.output_hash`` raises it when
+    called inside a stage run, whose inputs do not include the lock it reads."""
 
 
 class ParamsError(PivotError):

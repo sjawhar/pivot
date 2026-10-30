@@ -176,14 +176,25 @@ with Pipeline("plan") as pipeline:
   a stage's one unnamed output, a `TypedDict` field's name otherwise), read from
   the lock file alone, so a command that writes a pin can name the output it
   pins. It raises `pivot.exceptions.OutputMissingError` when no lock records it.
+  Call it outside the stage: inside a stage run it raises
+  `pivot.exceptions.ObjectReadError`, since the lock it reads is not one of the
+  stage's inputs, and a new output there would never rerun the stage. Write the
+  hash into a pin file and declare that file instead.
 - **What reruns the stage.** The input that names the hash, as any input does:
   a new hash in `counted.pin` reruns `plan`.
 - **What the lock records.** Each hash the run read, once, sorted, under
   `reads`, beside the stage's declared dependencies. A run-cache restore records
   what the restored run read, and `pivot commit` after `pivot repro --no-commit`
-  records what that run read. A stage that reads nothing by hash has no `reads`.
+  records what that run read. `pivot commit <stage>` with no such run records
+  the outputs on disk: when they are the outputs the lock already records, it
+  keeps the lock's `reads`, since those outputs came from those objects; other
+  outputs get none. A stage that reads nothing by hash has no `reads`.
   A pivot older than this one drops `reads` when it writes the lock: from a
   run-cache restore, or from `pivot commit` after this pivot's `--no-commit` run.
+  And when a `--no-commit` run of an older pivot follows this pivot's own, the
+  older pivot keeps this pivot's `reads` in the record, so `pivot commit` then
+  records objects the later run may not have read: that can only make the stage
+  stale or `pivot pull` fetch an extra object, never skip a run that is needed.
 - **A recorded object that is not at hand.** `pivot status` and `pivot repro`
   decide from local state, as they do for outputs, and contact no remote: an
   object the lock records counts as available when it is in the cache, or when

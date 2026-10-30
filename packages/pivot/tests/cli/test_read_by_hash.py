@@ -1,11 +1,10 @@
 """A stage reads an object by the content hash a declared input names (`pivot.read_by_hash`).
 
-Each test drives the installed `pivot` binary in a fresh project, the way a user does. The
-project's one stage, `p/plan`, reads its pipeline input `counted.pin`, a file of content hashes,
+Each test drives the installed `pivot` binary in a fresh project, the way a user does. In most,
+the project's one stage, `p/plan`, reads its pipeline input `counted.pin`, a file of content hashes,
 and reads each object the pin names by its hash. The objects reach the cache through
 `pivot track`, as a snapshot another project pushed would reach it through `pivot pull`, or sit
-only on a moto S3 remote, as such a snapshot does before anything fetches it. A test whose
-docstring names an acceptance round of sjawhar/pivot#544 pins a defect that round found.
+only on a moto S3 remote, as such a snapshot does before anything fetches it.
 """
 
 from __future__ import annotations
@@ -268,6 +267,46 @@ def test_a_pin_that_holds_no_content_hash_fails_the_read(tmp_path: pathlib.Path)
     assert "is not a content hash" in out, out
 
 
+_OUTPUT_HASH_IN_STAGE = """\
+import pivot
+from pivot import Pipeline, stage
+
+
+@stage
+def count(src: str) -> str:
+    return src
+
+
+@stage
+def plan(other: str) -> dict:
+    return {"rows": [pivot.read_by_hash(pivot.output_hash("p/count")).read_text()]}
+
+
+with Pipeline("p") as pipeline:
+    count(pipeline.input("src.txt", t=str))
+    plan(pipeline.input("other.txt", t=str))
+"""
+
+
+def test_a_stage_that_asks_another_stages_lock_for_a_hash_fails_naming_the_pin_to_declare(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`p/plan` takes its hash from `p/count`'s lock, which is not one of its inputs: a new
+    `p/count` output would leave `p/plan` cached on the old object, and `pivot status` would say
+    nothing. The run fails instead, saying to pin the hash in a declared input."""
+    root = _project(tmp_path / "p")
+    (root / "pipeline.py").write_text(_OUTPUT_HASH_IN_STAGE)
+    (root / "data/raw/src.txt").write_text("v1\n")
+    (root / "data/raw/other.txt").write_text("nothing here\n")
+
+    repro = _pivot(root, "repro")
+
+    out = repro.stdout + repro.stderr
+    assert repro.returncode != 0, out
+    assert "write the hash into a pin file" in out, out
+    assert not (root / _LOCK).exists(), "the stage that failed should write no lock"
+
+
 # =============================================================================
 # The remote
 # =============================================================================
@@ -388,11 +427,9 @@ def test_status_reports_stale_when_neither_the_cache_nor_the_remote_holds_a_read
 def test_an_object_a_read_fetched_from_the_remote_counts_as_on_it(
     tmp_path: pathlib.Path, moto_services: dict[str, str]
 ) -> None:
-    """Acceptance round 3, D7. The stage's read fetched the snapshot from remote `origin`. When
-    the cache later loses it (a cache cleanup, gc), `pivot status` reported the stage stale with
-    "pivot has not seen them on remote 'origin'", although this project downloaded it from there,
-    and `pivot repro` reran the stage. `pivot pull` records what it downloads in the remote index;
-    a read's fetch now does too."""
+    """The stage's read fetched the snapshot from remote `origin`, which the run records in the
+    remote index, as `pivot pull` records what it downloads. So when the cache later loses the
+    object (a cache cleanup, gc), the stage stays cached: the remote is known to hold it."""
     root, env, _, snapshot = _helper_fetched_project(tmp_path, moto_services["s3"])
     _helper_remove_object(root, snapshot)
 
@@ -404,10 +441,9 @@ def test_an_object_a_read_fetched_from_the_remote_counts_as_on_it(
 def test_status_suggests_pull_for_stages_stale_only_for_missing_read_objects(
     tmp_path: pathlib.Path, moto_services: dict[str, str]
 ) -> None:
-    """Acceptance round 3, D8. In a fresh clone every reading stage is stale with "`pivot pull`
-    fetches them", but the suggestions said only "Run `pivot repro` to execute N stale stages",
-    which reruns each stage rather than fetching its objects. For missing outputs, status counts
-    the stages `pivot pull` restores and suggests it; it now counts these too."""
+    """In a fresh clone the stage is stale only because the object it read is not in the cache.
+    `pivot pull` fetches it without rerunning the stage, so the suggestions name it, as they do
+    for missing outputs, rather than only `pivot repro`."""
     root, env, bucket, _ = _helper_fetched_project(tmp_path, moto_services["s3"])
     clone = _helper_clone(tmp_path, root, env, bucket)
 
@@ -441,10 +477,8 @@ def test_status_json_says_pull_fetches_what_a_stage_read(
 def test_a_targeted_pull_fetches_the_objects_the_stage_read(
     tmp_path: pathlib.Path, moto_services: dict[str, str]
 ) -> None:
-    """Acceptance round 1, defect 5. `pivot pull <stage>` fetched the stage's outputs and its
-    cached dependencies (`include_deps=True`) so the stage can run from the clone, but not the
-    objects its lock's `reads` names (observed in S8, 8c: none of A2, B1, L reached the clone's
-    cache)."""
+    """`pivot pull <stage>` fetches the objects the stage's lock lists under `reads`, beside its
+    outputs and cached dependencies, so the stage can run again from the clone."""
     root = _project(tmp_path / "p")
     env, _, bucket = _helper_remote(root, moto_services["s3"])
     snapshot = _helper_object(root, "taken: lemma_a\n")
@@ -462,21 +496,17 @@ def test_a_targeted_pull_fetches_the_objects_the_stage_read(
     )
 
 
-# A plain `pivot status` is a local command in every released pivot. With the defaults
-# (remote.retries 10, botocore's legacy backoff), the remote check it made in round 2 for a read
-# object the cache lacks waited more than 5 minutes against a refused connection on
-# pivot-slices-3, where remote.retries 0 took 1.3 s and 0.6.3's status 3.2 s.
+# A plain `pivot status` answers from local state. With the default retries (remote.retries 10,
+# botocore's legacy backoff), asking a remote that refuses connections about a read object would
+# take minutes; this bound is far above the seconds a local answer takes.
 _STATUS_BUDGET_SECONDS = 60
 
 
 def test_status_with_an_unreachable_remote_answers_promptly(tmp_path: pathlib.Path) -> None:
-    """Acceptance round 2, D6. A stage's lock records an object the cache no longer holds, and
-    the remote refuses connections (a laptop offline, a CI job without credentials for the
-    network). Plain `pivot status`, which 0.6.3 answers from local state alone, asked the remote
-    about the object and, with the default retry settings, did not answer for minutes. Under
-    decision D6 it contacts no remote for read objects, as for outputs, and answers within a
-    minute: the stage is stale because pivot has not seen the object on the remote (adapted from
-    the red test's "could not be reached", which assumed a remote query)."""
+    """A stage's lock records an object the cache no longer holds, and the remote refuses
+    connections (a laptop offline, a CI job without network credentials). Plain `pivot status`
+    contacts no remote for read objects, as for outputs, and answers within a minute: the stage
+    is stale because pivot has not seen the object on the remote."""
     env = _env(
         AWS_ENDPOINT_URL="http://127.0.0.1:9",
         AWS_ACCESS_KEY_ID="x",
@@ -555,6 +585,44 @@ def test_commit_after_a_no_commit_run_records_what_that_run_read(tmp_path: pathl
 
     assert _helper_lock_reads(root) == [snapshot]
     assert _helper_status(root) == ("cached", "")
+
+
+def test_committing_a_stage_whose_outputs_are_unchanged_keeps_what_its_run_read(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pivot commit <stage>` with no `--no-commit` run to record records the outputs on disk.
+    When they are the outputs the lock already records, they came from the objects that lock
+    lists, so its `reads` stay, in the lock and in the run-cache entry the commit files: a later
+    restore from that entry still records them."""
+    root = _project(tmp_path / "p")
+    first = _helper_object(root, "taken: lemma_a\n")
+    second = _helper_object(root, "taken: lemma_b\n")
+    _helper_pin(root, first)
+    _ok(_pivot(root, "repro"))
+
+    _ok(_pivot(root, "commit", "p/plan"))
+
+    assert _helper_lock_reads(root) == [first]
+    _helper_pin(root, second)
+    _ok(_pivot(root, "repro"))
+    _helper_pin(root, first)
+    proc = _pivot(root, "repro", "--json")
+    assert _helper_completed(proc)["p/plan"] == ("cached", "unchanged (run cache)"), proc.stdout
+    assert _helper_lock_reads(root) == [first], "the entry the commit filed keeps the reads"
+
+
+def test_committing_edited_outputs_records_no_reads(tmp_path: pathlib.Path) -> None:
+    """Outputs edited by hand came from no read, so the commit that records them lists none."""
+    root = _project(tmp_path / "p")
+    snapshot = _helper_object(root, "taken: lemma_a\n")
+    _helper_pin(root, snapshot)
+    _ok(_pivot(root, "repro"))
+    (root / _OUTPUT).unlink()  # it may be a link to the read-only cache object
+    (root / _OUTPUT).write_text("rows:\n- edited by hand\n")
+
+    _ok(_pivot(root, "commit", "p/plan"))
+
+    assert _helper_lock_reads(root) is None
 
 
 def test_an_object_a_no_commit_run_fetched_counts_as_on_the_remote(
