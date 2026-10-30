@@ -457,13 +457,13 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
         _end_import_session(_import_session)
     root = root.resolve()
     file_under_root = dict[str, bool]()
-    preexisting_root_modules = dict[str, _stdlib_types.ModuleType]()
-    outside_root = set[str]()
-    for module_name, module in sys.modules.items():
-        if _module_is_under_root(module, root, file_under_root):
-            preexisting_root_modules[module_name] = module
-        elif fingerprint.is_user_code(module):
-            outside_root.add(module_name)
+    # A snapshot: another thread can import while this one starts a session (a watch reload runs
+    # discovery on a worker thread while the event loop, the TUI and the RPC server run).
+    preexisting_root_modules = {
+        module_name: module
+        for module_name, module in list(sys.modules.items())
+        if _module_is_under_root(module, root, file_under_root)
+    }
     root_str = str(root)
     caller_path_entries = [
         (index, entry) for index, entry in enumerate(sys.path) if entry == root_str
@@ -481,44 +481,7 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
         file_under_root,
         preexisting_pickle_by_value_modules=cloudpickle.list_registry_pickle_by_value(),
     )
-    _displace_modules_the_root_provides(_import_session, outside_root)
     return _import_session
-
-
-# The running program's main module, and the name a worker loads its parent's main module under.
-_MAIN_MODULES: Final = frozenset({"__main__", "__mp_main__"})
-
-
-def _displace_modules_the_root_provides(session: _ImportSession, outside_root: set[str]) -> None:
-    """Displace, until the session ends, each top-level user module loaded from outside the root
-    (``outside_root``) that the root also provides, with its submodules.
-
-    With the root first on ``sys.path``, project code's ``import helpers`` loads the root's
-    ``helpers.py``, as it does in a ``pivot`` process and in a worker, which imports by name a
-    module the stage's code refers to but discovery did not send by value. A ``helpers`` that
-    the program running Pivot imported from elsewhere would be returned from ``sys.modules``
-    instead: the stage's fingerprint would describe that module while its worker ran the root's
-    file. Libraries stay, as Pivot and its workers hold them too, with their submodules, even one
-    that counts as user code because it has no file (``six.moves``). A directory without
-    ``__init__.py`` provides nothing: a module or package found anywhere on ``sys.path`` wins over
-    a namespace portion.
-    """
-    try:
-        finder = _project_finder_for(str(session.root))
-    except ImportError:
-        # The root is not a directory (a discovery of a project that is not there): it provides
-        # no module.
-        return
-    provides = dict[str, bool]()
-    for module_name in outside_root:
-        top = module_name.partition(".")[0]
-        if top in _MAIN_MODULES or top not in outside_root:
-            continue
-        if (verdict := provides.get(top)) is None:
-            spec = finder.find_spec(top)
-            verdict = provides[top] = spec is not None and spec.loader is not None
-        if verdict:
-            _displace_module(module_name, session)
 
 
 def import_session_root() -> pathlib.Path | None:

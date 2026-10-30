@@ -13,6 +13,7 @@ import pathlib
 import py_compile
 import subprocess
 import sys
+import threading
 import types as _stdlib_types
 from typing import TYPE_CHECKING
 
@@ -20,12 +21,14 @@ import cloudpickle
 import pytest
 
 import pivot_tui
-from pivot import discovery, executor, fingerprint, loaded_source, project
+from pivot import discovery, exceptions, fingerprint, loaded_source, project
 from pivot.storage import state
 from tests import conftest
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+    from pivot.registry import PipelineLike
 
 
 def test_find_config_in_dir_ignores_pivot_yaml(tmp_path: pathlib.Path) -> None:
@@ -1086,144 +1089,6 @@ def test_discovery_keeps_project_module_preimported_by_caller(
         assert sys.modules["stages"] is stages
 
 
-_PLAIN_PIPELINE = """\
-import helpers
-from pivot import Pipeline, stage
-
-
-@stage
-def use_plain(seed: str) -> str:
-    return helpers.plain()
-
-
-with Pipeline("p") as pipeline:
-    use_plain(pipeline.input("seed.txt"))
-"""
-
-
-def _load_program_module(name: str, path: pathlib.Path) -> _stdlib_types.ModuleType:
-    """The module a program that runs Pivot imported from ``path`` under ``name``."""
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_a_programs_own_helpers_module_does_not_hide_an_edit_to_the_projects(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A program that runs Pivot in its own process (`executor.run`, as a notebook does) has
-    imported its own `helpers`, which has no `plain`, from outside the project. The stage runs
-    the project's `helpers.py` in its worker, so that is the module its lock must describe: an
-    edit to it reruns the stage instead of leaving plain-v1 cached. When the session ends, the
-    program has its own module back."""
-    program = tmp_path / "program"
-    program.mkdir()
-    (program / "helpers.py").write_text('def greet() -> str:\n    return "the program\'s"\n')
-    programs_helpers = _load_program_module("helpers", program / "helpers.py")
-    monkeypatch.setitem(sys.modules, "helpers", programs_helpers)
-    root = tmp_path / "project"
-    (root / ".git").mkdir(parents=True)
-    (root / ".pivot").mkdir()
-    (root / "data" / "raw").mkdir(parents=True)
-    (root / "data" / "raw" / "seed.txt").write_text("seed\n")
-    helpers = root / "helpers.py"
-    helpers.write_text('def plain() -> str:\n    return "plain-v1"\n')
-    (root / "pipeline.py").write_text(_PLAIN_PIPELINE)
-    monkeypatch.setattr(project, "_project_root_cache", root)
-    output = root / "data" / "p" / "use_plain.txt"
-
-    first = executor.run()
-    assert first["p/use_plain"]["status"] == "ran", first
-    assert output.read_text() == "plain-v1"
-    helpers.write_text(helpers.read_text().replace("-v1", "-v2"))
-    second = executor.run()
-
-    assert second["p/use_plain"]["status"] == "ran", second
-    assert output.read_text() == "plain-v2"
-    assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
-    assert sys.modules["helpers"] is programs_helpers
-
-
-def test_discovery_takes_over_a_programs_package_and_its_submodule_for_the_session(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The program holds its own `helpers` package and `helpers.text`; the project's `helpers`
-    package has a `text` module too. Project code reads the project's while the session lasts,
-    and the program gets both of its modules back when the session ends."""
-    program = tmp_path / "program" / "helpers"
-    program.mkdir(parents=True)
-    (program / "__init__.py").write_text("")
-    (program / "text.py").write_text("VALUE = 'program'\n")
-    package = _load_program_module("helpers", program / "__init__.py")
-    text = _load_program_module("helpers.text", program / "text.py")
-    monkeypatch.setitem(sys.modules, "helpers", package)
-    monkeypatch.setitem(sys.modules, "helpers.text", text)
-    root = tmp_path / "project"
-    (root / "helpers").mkdir(parents=True)
-    (root / "helpers" / "__init__.py").write_text("")
-    (root / "helpers" / "text.py").write_text("VALUE = 'project'\n")
-    (root / "pipeline.py").write_text(
-        "from pivot.compose import Pipeline, stage\nfrom helpers.text import VALUE\n\n\n"
-        + "@stage\ndef build() -> str:\n    return VALUE\n\n\n"
-        + 'with Pipeline("project") as pipeline:\n    build()\n'
-    )
-    monkeypatch.setattr(project, "_project_root_cache", root)
-
-    pipeline = discovery.discover_pipeline(project_root=root)
-
-    assert pipeline is not None
-    assert pipeline.get_stage("project/build")["func"]() == "project"
-    assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
-    assert sys.modules["helpers"] is package
-    assert sys.modules["helpers.text"] is text
-
-
-def test_discovery_keeps_a_library_the_root_has_a_module_for(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Pivot and its workers hold their libraries: a root `json.py` displaces none of them, nor
-    a submodule of one that counts as user code because it has no file (as `six.moves`)."""
-    fileless = _stdlib_types.ModuleType("json.fileless")
-    monkeypatch.setitem(sys.modules, "json.fileless", fileless)
-    root = _write_sibling_stage_project(tmp_path / "project", "project").parent
-    (root / "json.py").write_text("VALUE = 'project'\n")
-    monkeypatch.setattr(project, "_project_root_cache", root)
-
-    assert discovery.discover_pipeline(project_root=root) is not None
-
-    assert sys.modules["json"] is json
-    assert sys.modules["json.fileless"] is fileless
-
-
-@pytest.mark.parametrize(
-    ("name", "root_file"),
-    [
-        pytest.param("__main__", "__main__.py", id="main-module"),
-        pytest.param("helpers", "helpers/notes.txt", id="namespace-portion"),
-    ],
-)
-def test_discovery_keeps_a_programs_module_the_root_does_not_take_over(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, name: str, root_file: str
-) -> None:
-    """The program's main module stays, whatever the root holds, and a directory without
-    `__init__.py` is a namespace portion, which a module found on `sys.path` wins over."""
-    program = tmp_path / "program"
-    program.mkdir()
-    (program / "held.py").write_text("VALUE = 'program'\n")
-    held = _load_program_module(name, program / "held.py")
-    monkeypatch.setitem(sys.modules, name, held)
-    root = _write_sibling_stage_project(tmp_path / "project", "project").parent
-    (root / root_file).parent.mkdir(parents=True, exist_ok=True)
-    (root / root_file).write_text("VALUE = 'project'\n")
-    monkeypatch.setattr(project, "_project_root_cache", root)
-
-    assert discovery.discover_pipeline(project_root=root) is not None
-
-    assert sys.modules[name] is held
-
-
 def test_discover_pipeline_missing_pipeline_variable_names_instance(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -1290,3 +1155,173 @@ def test_second_discovery_keeps_libraries_from_venv_inside_root(
     assert first is not None
     assert second is not None, "the second discovery should load pipeline.py again"
     assert second.list_stages() == ["venv/train"]
+
+
+_PLAIN = 'def plain() -> str:\n    return "plain"\n'
+_HELD_PIPELINE = """\
+import helpers
+from pivot import Pipeline, stage
+
+
+@stage
+def use_plain() -> str:
+    return helpers.plain()
+
+
+with Pipeline("p") as pipeline:
+    use_plain()
+"""
+_WORKER_IMPORTS_ANOTHER_FILE = "is .+ in this process, but a worker imports it by name from"
+
+
+def _held_module(
+    name: str, path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> _stdlib_types.ModuleType:
+    """Load `path` as module `name` into `sys.modules`, as the program that runs Pivot did."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_PLAIN)
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _held_project(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, files: dict[str, str], pipeline: str
+) -> PipelineLike:
+    root = tmp_path / "project"
+    for name, text in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text)
+    (root / "pipeline.py").write_text(pipeline)
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    loaded = discovery.discover_pipeline(project_root=root)
+    assert loaded is not None
+    return loaded
+
+
+@pytest.mark.parametrize(
+    ("held_file", "root_file"),
+    [
+        pytest.param("program/helpers.py", "helpers.py", id="outside-the-root"),
+        pytest.param("project/notebooks/helpers.py", "helpers.py", id="notebook-under-the-root"),
+        pytest.param("program/helpers/__init__.py", "helpers/notes.txt", id="root-namespace-dir"),
+    ],
+)
+def test_a_module_the_program_holds_from_another_file_fails_the_stages_fingerprint(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, held_file: str, root_file: str
+) -> None:
+    """The program that runs Pivot (a notebook, a script, a test) imported its own `helpers`
+    before it ran the pipeline, whose `import helpers` returns it from `sys.modules`. A worker
+    imports `helpers` by name, with the root first on its `sys.path`, so it would run the
+    project's file while the fingerprint describes the program's: the fingerprint fails, naming
+    both, instead of a stale `cached` after the project's file is edited."""
+    _held_module("helpers", tmp_path / held_file, monkeypatch)
+    pipeline = _held_project(tmp_path, monkeypatch, {root_file: _PLAIN}, _HELD_PIPELINE)
+
+    with pytest.raises(exceptions.PivotError, match=_WORKER_IMPORTS_ANOTHER_FILE) as raised:
+        pipeline.ensure_fingerprint("p/use_plain")
+
+    assert str((tmp_path / held_file).resolve()) in str(raised.value)
+    assert "rename one of the two modules" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "held",
+    [
+        pytest.param(("helpers", "helpers.sub"), id="package-and-submodule"),
+        pytest.param(("helpers.sub",), id="submodule-only"),
+    ],
+)
+def test_a_submodule_the_program_holds_from_another_file_fails_the_stages_fingerprint(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, held: tuple[str, ...]
+) -> None:
+    """The program holds `helpers.sub` (with or without its `helpers`) from its own package;
+    the project's `helpers` package has a `sub` too, which a worker would import."""
+    files = {"helpers": "program/helpers/__init__.py", "helpers.sub": "program/helpers/sub.py"}
+    for name in held:
+        _held_module(name, tmp_path / files[name], monkeypatch)
+    pipeline = _held_project(
+        tmp_path,
+        monkeypatch,
+        {"helpers/__init__.py": "", "helpers/sub.py": _PLAIN},
+        _HELD_PIPELINE.replace("import helpers\n", "from helpers import sub\n").replace(
+            "helpers.plain()", "sub.plain()"
+        ),
+    )
+
+    with pytest.raises(exceptions.PivotError, match="module 'helpers.sub' is .+sub.py"):
+        pipeline.ensure_fingerprint("p/use_plain")
+
+
+def test_a_library_the_program_holds_with_a_project_modules_name_fails_the_stages_fingerprint(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A library the program imported (here from a `site-packages` directory) is recorded by
+    name; a worker would import the project's `sitemod.py` in its place."""
+    held = tmp_path / "lib" / "site-packages" / "sitemod.py"
+    _held_module("sitemod", held, monkeypatch)
+    pipeline = _held_project(
+        tmp_path,
+        monkeypatch,
+        {"sitemod.py": _PLAIN},
+        _HELD_PIPELINE.replace("import helpers\n", "from sitemod import plain\n").replace(
+            "helpers.plain()", "plain()"
+        ),
+    )
+
+    with pytest.raises(exceptions.PivotError, match=f"module 'sitemod' is {held.resolve()}"):
+        pipeline.ensure_fingerprint("p/use_plain")
+
+
+def test_a_module_the_program_holds_from_the_projects_file_fingerprints(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The program imported the project's own `helpers.py`: a worker imports the same file."""
+    _held_module("helpers", tmp_path / "project" / "helpers.py", monkeypatch)
+    pipeline = _held_project(tmp_path, monkeypatch, {}, _HELD_PIPELINE)
+
+    assert "module:helpers" in pipeline.ensure_fingerprint("p/use_plain")
+
+
+def test_the_programs_main_module_is_never_compared(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker receives the main module's functions by value and never imports it by name, so
+    a `__main__.py` first on `sys.path` is not what it runs."""
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "__main__.py").write_text(_PLAIN)
+    monkeypatch.syspath_prepend(str(root))
+    _held_module("__main__", tmp_path / "program" / "run.py", monkeypatch)
+
+    loaded_source.check_worker_imports({"module:__main__": ""})
+
+
+def test_discovery_survives_another_thread_changing_sys_modules(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A watch reload discovers on a worker thread while the event loop, the TUI and the RPC
+    server import: starting a session reads a snapshot of `sys.modules`, never the live dict."""
+    root = _write_sibling_stage_project(tmp_path / "project", "project").parent
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    stop = threading.Event()
+    names = [f"_pivot_churn_{index}" for index in range(50)]
+
+    def churn() -> None:
+        while not stop.is_set():
+            for name in names:
+                sys.modules[name] = _stdlib_types.ModuleType(name)
+            for name in names:
+                sys.modules.pop(name, None)
+
+    thread = threading.Thread(target=churn, daemon=True)
+    thread.start()
+    try:
+        for _ in range(30):
+            assert discovery.discover_pipeline(project_root=root) is not None
+    finally:
+        stop.set()
+        thread.join()

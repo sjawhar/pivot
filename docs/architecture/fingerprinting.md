@@ -352,16 +352,6 @@ interrupted. The session itself (its modules, its `sys.path` entry and its recor
 the next discovery ends it. A worker installs its own loader and recorder for its life
 (`discovery.install_user_code_loader`).
 
-A session puts the project root first on `sys.path`, so project code's `import helpers` loads the
-root's `helpers.py`, as it does in a `pivot` process and in a worker. A program that runs Pivot
-in its own process (`executor.run`, a notebook) may already hold a user module of that name from
-elsewhere, which `sys.modules` would return instead: the stage would be fingerprinted from that
-module while its worker, which imports a module discovery did not send by value from its file,
-ran the root's. So a session displaces each top-level user module loaded from outside the root
-that the root also provides, with its submodules, and puts them back when it ends
-(`discovery._displace_modules_the_root_provides`). Libraries stay, with their submodules, as Pivot
-and its workers hold them too, and so does the program's main module.
-
 Fingerprinting reads the recorded bytes, not the file: `loaded_source.getsource` puts their lines
 into `linecache` as an entry without an mtime, which `linecache.checkcache` leaves alone, before
 it calls `inspect.getsource`; `fingerprint._source_digest`, which keys the `fp:` and `sm:` caches,
@@ -369,6 +359,20 @@ returns their digest; and a `@no_fingerprint` stage's `file:` hash is their dige
 module was recorded from (a `code_deps` entry that is not a module) is read from disk, as before.
 The lines are split as `linecache` splits a file (`tokenize.open`, universal newlines, a final
 newline added), so an unedited project keeps its recorded fingerprints.
+
+A worker imports a module by name with the `sys.path` it inherits (loky copies the coordinator's
+when the worker starts), where an import session puts the project root first. A program that runs
+Pivot in its own process (a notebook, a script, a test suite) may hold a module of that name
+loaded from another file, which `import` in `pipeline.py` returns from `sys.modules`; the stage
+would then be fingerprinted from one file while its worker runs another, and an edit to the
+project's file would leave a stale `cached`. So when a stage's fingerprint is computed,
+`loaded_source.check_worker_imports` resolves each module the manifest names (the user modules
+of its `module:` entries and the top-level module of each `ext:` library callable) with
+`importlib.machinery.PathFinder` on `sys.path`, without importing it, and raises when the file
+differs from the one `sys.modules` holds, naming both. The remedy is a new process (the `pivot`
+command) or renaming one module. A name nothing on `sys.path` holds is left to the finder that
+loaded it, and the program's `__main__` is never compared: a worker gets its functions by value.
+Pivot changes nothing in the program's `sys.modules`.
 
 A worker imports some user modules itself, from their files: a stage's module discovery does not
 send by value (outside the root, or under it in a `src` layout), a module outside the root that
