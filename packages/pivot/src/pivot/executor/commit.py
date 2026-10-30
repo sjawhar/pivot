@@ -310,19 +310,42 @@ def _commit_stages(
 
                 # The outputs a --no-commit run wrote came from the code that run fingerprinted,
                 # which may differ from the code on disk now: record that run's manifest, its
-                # marks included. Otherwise (no record, or outputs edited since) record the
-                # outputs on disk against the current code, the "trust me" commit. A run that
-                # executed code the fingerprint does not describe marked its lock; committing the
-                # same outputs keeps that mark, so the stage is still not reusable.
-                if run_manifest is not None and run_outputs == {
+                # marks included, and the objects it read by hash. Otherwise (no record, or
+                # outputs edited since) record the outputs on disk against the current code, the
+                # "trust me" commit. A run that executed code the fingerprint does not describe
+                # marked its lock; committing the same outputs keeps that mark, so the stage is
+                # still not reusable. The previous lock's `reads` stay only when it records this
+                # whole provenance: the same code, params, dependencies and outputs. A changed
+                # input (a new pin) can leave the outputs' bytes alone while naming other
+                # objects, and the old list would have status check what the old pin named and
+                # never what the new one does; then no reads are recorded, and only a fresh run
+                # or a matching --no-commit record records them.
+                read_hashes = list[str]()
+                output_content_hashes = {
                     key: hash_info["hash"] for key, hash_info in output_hashes_by_key.items()
-                }:
+                }
+                if run_manifest is not None and run_outputs == output_content_hashes:
                     code_manifest = run_manifest
+                    if run_record is not None and "reads" in run_record:
+                        read_hashes = run_record["reads"]
                 else:
                     code_manifest = skip.carry_rerun_marks(
                         previous_lock["code_manifest"] if previous_lock is not None else None,
                         fingerprint,
                     )
+                    if (
+                        previous_lock is not None
+                        and "reads" in previous_lock
+                        and previous_lock["code_manifest"] == code_manifest
+                        and skip.params_equal(previous_lock["params"], current_params)
+                        and previous_lock["dep_hashes"] == dep_hashes_by_identity
+                        and {
+                            types.identity_key(identity): hash_info["hash"]
+                            for identity, hash_info in previous_lock["output_hashes"].items()
+                        }
+                        == output_content_hashes
+                    ):
+                        read_hashes = previous_lock["reads"]
                 reusable = skip.rerun_mark_reason(code_manifest) is None
                 input_hash = run_history.stage_input_hash(
                     skip.strip_rerun_marks(code_manifest),
@@ -340,6 +363,8 @@ def _commit_stages(
                     output_hashes=dict(sorted(output_hashes_by_identity.items())),
                     output_paths=output_paths_by_identity,
                 )
+                if read_hashes:
+                    new_lock_data["reads"] = read_hashes
                 try:
                     production_lock.write(
                         new_lock_data,
@@ -383,6 +408,8 @@ def _commit_stages(
                         run_id=run_id,
                         output_hashes=output_entries,
                     )
+                    if read_hashes:
+                        deferred["run_cache_entry"]["reads"] = read_hashes
             if not reusable:
                 older_key = worker.older_pivot_input_hash(
                     fingerprint,

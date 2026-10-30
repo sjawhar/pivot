@@ -78,8 +78,10 @@ git records, and keeps every object that any of these names:
 |--------|----------------|---------------|
 | Stage lock `outs` | `.pivot/stages/**/<stage>.lock` | each output's hash; for a directory, its listing's hash (the listing object and the whole-directory tree) **and** every file its listing names |
 | Stage lock `deps` | the same file | each input's hash, which may outlive the stage that produced it |
+| Stage lock `reads` | the same file | each object the run read by hash ([`pivot.read_by_hash`](dependencies.md#objects-named-by-hash)) |
 | `.pvt` file | anywhere under the project root | a tracked file's hash, or a tracked directory's listing hash and every file its listing names |
-| Run-cache row | `.pivot/state.lmdb/` | the output hashes a previous run can restore without executing, a directory's members included |
+| Run-cache row | `.pivot/state.lmdb/` | the output hashes a previous run can restore without executing, a directory's members included, and the objects that run read by hash |
+| `--no-commit` record | `.pivot/state.lmdb/` | the objects an uncommitted run read by hash, which `pivot commit` writes into the lock |
 | Workspace link | `data/**` and any tracked path | the object a `symlink` checkout points at: a file, or a whole directory's tree under `trees/` |
 | Cache ref | `.pivot/cache/files/refs/**` | the object a `kind: cache` store published |
 
@@ -249,6 +251,7 @@ successful run:
 | `params` | Serialised [parameters](parameters.md) dict |
 | `deps` | One entry per input: producer, key, content hash |
 | `outs` | One entry per output: key, project-relative POSIX path, content hash |
+| `reads` | The content hashes of the objects the run read by hash ([`pivot.read_by_hash`](dependencies.md#objects-named-by-hash)), sorted, each once; absent when it read none |
 
 This is the ground truth for "what did the stage look like last time it
 ran?" The skip algorithm compares current state against these fields.

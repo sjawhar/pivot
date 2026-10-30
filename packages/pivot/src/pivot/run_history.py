@@ -6,6 +6,7 @@ import json
 import uuid
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
 
+from pivot.storage import cache
 from pivot.types import (
     ArtifactTag,
     DepEntry,
@@ -51,10 +52,13 @@ class RunManifest(TypedDict):
 
 
 class RunCacheEntry(TypedDict):
-    """Run cache entry for skip detection."""
+    """Run cache entry for skip detection. ``reads`` lists the objects the run read by hash
+    (``pivot.read_by_hash``), sorted, each once, when it read any: a restore writes them into
+    the lock it writes, and an entry whose objects are gone restores nothing."""
 
     run_id: str
     output_hashes: list[OutputHashEntry]
+    reads: NotRequired[list[str]]
 
 
 class OutputHashEntry(TypedDict):
@@ -104,11 +108,12 @@ def entry_to_output_hash(entry: OutputHashEntry) -> FileHash | DirHash | None:
 OLDER_DIRECTORY_KEYS = frozenset({"manifest", "empty_dirs"})
 # Every key `pivot gc` accepts in a run-cache row and in one of its output entries, written out
 # rather than read from ``RunCacheEntry`` and ``OutputHashEntry``: gc keeps the object at an
-# output's ``hash`` and every file of a directory's listing, and nothing else. A field added to
-# either TypedDict that can name a cache object must be added here and rooted in
-# ``storage/gc.py`` in the same change; until then gc refuses a row that holds it.
-# ``tests/test_run_history.py`` pins these to the TypedDicts.
+# output's ``hash``, every file of a directory's listing, and every object the row's ``reads``
+# lists, and nothing else. A field added to either TypedDict that can name a cache object must
+# be added here and rooted in ``storage/gc.py`` in the same change; until then gc refuses a row
+# that holds it. ``tests/test_run_history.py`` pins these to the TypedDicts.
 RUN_CACHE_ROW_KEYS = frozenset({"run_id", "output_hashes"})
+RUN_CACHE_ROW_OPTIONAL_KEYS = frozenset({"reads"})
 OUTPUT_ENTRY_REQUIRED_KEYS = frozenset({"path", "hash"})
 OUTPUT_ENTRY_OPTIONAL_KEYS = frozenset({"size", "nfiles"})
 
@@ -118,7 +123,8 @@ def _is_count(value: object) -> bool:
 
 
 def run_cache_entry_error(row: object) -> str | None:
-    """Why a parsed run-cache row does not hold exactly ``RUN_CACHE_ROW_KEYS``, each output exactly
+    """Why a parsed run-cache row does not hold ``RUN_CACHE_ROW_KEYS`` with any of
+    ``RUN_CACHE_ROW_OPTIONAL_KEYS`` (``reads``, a list of content hashes), each output exactly
     ``OUTPUT_ENTRY_REQUIRED_KEYS`` with any of ``OUTPUT_ENTRY_OPTIONAL_KEYS`` (or an older pivot's
     inline directory, ``OLDER_DIRECTORY_KEYS``), or None.
 
@@ -130,11 +136,22 @@ def run_cache_entry_error(row: object) -> str | None:
         return f"its JSON is {type(row).__name__}, not an object"
     fields = cast("dict[object, object]", row)
     held = {str(key) for key in fields}
-    if held ^ RUN_CACHE_ROW_KEYS:
+    unknown = sorted(held - RUN_CACHE_ROW_KEYS - RUN_CACHE_ROW_OPTIONAL_KEYS)
+    missing = sorted(RUN_CACHE_ROW_KEYS - held)
+    if unknown or missing:
         expected = " and ".join(sorted(RUN_CACHE_ROW_KEYS))
-        return f"its keys are {', '.join(sorted(held)) or 'none'}, not {expected}"
+        return (
+            f"its keys are {', '.join(sorted(held)) or 'none'}, not {expected} (and optionally "
+            + f"{', '.join(sorted(RUN_CACHE_ROW_OPTIONAL_KEYS))})"
+        )
     if not isinstance(fields["run_id"], str):
         return "its run_id is not a string"
+    if "reads" in fields:
+        read = fields["reads"]
+        if not isinstance(read, list) or not all(
+            cache.is_valid_hash(item) for item in cast("list[object]", read)
+        ):
+            return "its reads is not a list of content hashes"
     outputs = fields["output_hashes"]
     if not isinstance(outputs, list):
         return "its output_hashes is not a list"
@@ -268,4 +285,13 @@ def deserialize_run_cache_entry(data: bytes) -> RunCacheEntry:
     if missing:
         msg = f"Invalid RunCacheEntry: missing keys {missing}"
         raise ValueError(msg)
-    return RunCacheEntry(run_id=parsed["run_id"], output_hashes=parsed["output_hashes"])
+    entry = RunCacheEntry(run_id=parsed["run_id"], output_hashes=parsed["output_hashes"])
+    if "reads" in parsed:
+        reads = parsed["reads"]
+        if not isinstance(reads, list) or not all(
+            cache.is_valid_hash(item) for item in cast("list[object]", reads)
+        ):
+            msg = f"Invalid RunCacheEntry: reads is not a list of content hashes: {reads!r}"
+            raise ValueError(msg)
+        entry["reads"] = cast("list[str]", reads)
+    return entry

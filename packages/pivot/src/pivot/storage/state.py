@@ -17,7 +17,7 @@ import lmdb
 
 from pivot import exceptions, run_history
 from pivot import state_dir as state_dir_mod
-from pivot.storage import mounts
+from pivot.storage import cache, mounts
 from pivot.types import FileHashEntry
 
 logger = logging.getLogger(__name__)
@@ -43,8 +43,13 @@ _SM_PREFIX = b"sm:"  # Stage manifest cache entries
 # Per stage, until a lock is written for it: what a --no-commit run of it ran, for `pivot commit`,
 # and the `*.pvt` files Pivot wrote into its outputs as its own (`pvt_members`)
 _NOCOMMIT_PREFIX = b"nocommit:"
-# The keys `types.NoCommitRecord` declares, each a str -> str mapping the reader validates alone.
+# The keys `types.NoCommitRecord` declares that are each a str -> str mapping the reader validates
+# alone; its fourth, `reads`, is a list of content hashes, validated alone too.
 _NO_COMMIT_FIELDS = ("code_manifest", "output_hashes", "pvt_members")
+_NO_COMMIT_READS = "reads"
+# The keys a --no-commit run writes (`types.NoCommitRun`): applying its record replaces all of
+# them, so the reads of an earlier run that read more never stay beside this run's outputs.
+_NO_COMMIT_RUN_FIELDS = ("code_manifest", "output_hashes", _NO_COMMIT_READS)
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024
@@ -411,6 +416,12 @@ def _is_str_dict(value: object) -> typing.TypeGuard[dict[str, str]]:
     return isinstance(value, dict) and all(
         isinstance(key, str) and isinstance(item, str)
         for key, item in typing.cast("dict[object, object]", value).items()
+    )
+
+
+def _is_hash_list(value: object) -> typing.TypeGuard[list[str]]:
+    return isinstance(value, list) and all(
+        cache.is_valid_hash(item) for item in typing.cast("list[object]", value)
     )
 
 
@@ -1223,7 +1234,8 @@ class StateDB:
         """The stage's `nocommit:` record, or None (absent, or not a JSON object).
 
         Each key `types.NoCommitRecord` declares (`code_manifest`, `output_hashes`,
-        `pvt_members`) is validated on its own: a malformed one is dropped and hides no other.
+        `pvt_members`, `reads`) is validated on its own: a malformed one is dropped and hides no
+        other.
         Every other key reads as stored, and a record without these keys reads as present.
         """
         self._check_closed()
@@ -1235,7 +1247,32 @@ class StateDB:
         for field in _NO_COMMIT_FIELDS:
             if field in record and not _is_str_dict(record[field]):
                 del record[field]
+        if _NO_COMMIT_READS in record and not _is_hash_list(record[_NO_COMMIT_READS]):
+            del record[_NO_COMMIT_READS]
         return typing.cast("NoCommitRecord", typing.cast("object", record))
+
+    def list_no_commit_reads(self) -> set[str]:
+        """The objects every stage's `nocommit:` record lists as read by hash (`reads`), as
+        `pivot commit` would write them into a lock: a malformed list is dropped, as
+        ``get_no_commit_record`` drops it. For a collection, which must keep them until then.
+        Materialized inside the read transaction, which is then closed."""
+        self._check_closed()
+        values = list[bytes]()
+        with self._read_transaction() as txn:
+            cursor = txn.cursor()
+            if cursor.set_range(_NOCOMMIT_PREFIX):
+                key = cursor.key()
+                while key.startswith(_NOCOMMIT_PREFIX):
+                    values.append(bytes(cursor.value()))
+                    if not cursor.next():
+                        break
+                    key = cursor.key()
+        read = set[str]()
+        for value in values:
+            record = _json_object(value)
+            if record is not None and _is_hash_list(record.get(_NO_COMMIT_READS)):
+                read.update(typing.cast("list[str]", record[_NO_COMMIT_READS]))
+        return read
 
     def add_no_commit_pvt_members(self, stage_name: str, members: Mapping[str, str]) -> None:
         """Add `members` (path relative to the project root -> content hash) to the `*.pvt`
@@ -1376,11 +1413,31 @@ class StateDB:
                 if "file_hash_entries" in deferred:
                     _put_file_hashes(txn, deferred["file_hash_entries"])
 
+                # The objects the run's reads fetched (`reads.Recording.fetched`) count as on that
+                # remote, as `pivot pull` counts what it downloads. As in `sync.check_remote_url`,
+                # a remote with no URL stored takes the fetch's; unlike it, an index kept for
+                # another URL is left alone rather than cleared: the fetch adds nothing to it.
+                if "remote_hashes" in deferred:
+                    for fetched in deferred["remote_hashes"]:
+                        url_key = _REMOTE_URL_PREFIX + fetched["name"].encode()
+                        stored_url = txn.get(url_key)
+                        if stored_url is None:
+                            txn.put(url_key, fetched["url"].encode("utf-8"))
+                        elif stored_url.decode("utf-8") != fetched["url"]:
+                            continue
+                        prefix = _REMOTE_PREFIX + fetched["name"].encode() + b":"
+                        for hash_ in fetched["hashes"]:
+                            txn.put(prefix + hash_.encode(), b"1")
+
                 nocommit_key = _NOCOMMIT_PREFIX + stage_name.encode()
                 if "no_commit_record" in deferred:
-                    # Set the run's keys (`types.NoCommitRun`: both, always) and keep every other
-                    # key: another feature writes its keys into the same record.
-                    record = _json_object(txn.get(nocommit_key)) or dict[str, object]()
+                    # Replace the run's keys (`types.NoCommitRun`) and keep every other key:
+                    # another feature writes its keys into the same record.
+                    record = {
+                        key: value
+                        for key, value in (_json_object(txn.get(nocommit_key)) or {}).items()
+                        if key not in _NO_COMMIT_RUN_FIELDS
+                    }
                     record.update(deferred["no_commit_record"])
                     txn.put(nocommit_key, json.dumps(record).encode())
                 elif "clear_no_commit_record" in deferred and deferred["clear_no_commit_record"]:

@@ -837,15 +837,16 @@ def _yaml_problem(error: yaml.YAMLError | UnicodeDecodeError) -> str:
 
 
 def _lock_keys(path: pathlib.Path, listings: _Listings) -> set[str]:
-    """Every key a stage lock names: each ``outs`` and ``deps`` hash, and every file of each
-    directory it records, read from that directory's listing (``lock.recorded_hashes``).
+    """Every key a stage lock names: each ``outs`` and ``deps`` hash, each object its run read
+    by hash (``reads``), and every file of each directory it records, read from that
+    directory's listing (``lock.recorded_hashes``).
 
     ``open`` raising ``OSError`` refuses the run (the lock cannot be read, so what it names is
     unknown). A lock this pivot cannot fully interpret refuses it too
     (``_UninterpretableRecordError``, naming the lock): YAML that does not parse (a git merge's
     conflict markers, a truncated file), not a lock, a lock key missing, a schema version that
     is not a whole number or is newer than this pivot's, a key it does not know (a newer
-    pivot's list of objects a run read by hash), or a field it cannot read."""
+    pivot's record of objects), or a field it cannot read."""
     try:
         with open(path) as f:
             data: object = yaml.load(f, Loader=yaml_config.Loader)
@@ -1017,6 +1018,11 @@ def _run_cache_keys(
 ) -> tuple[set[str], int]:
     """Every key the run-cache rows of one project's database name, and the number of rows.
 
+    A row names each output's hash, each file of a directory output's listing, and each object
+    the run read by hash (``reads``). The keys also hold every object a stage's `nocommit:`
+    record lists as read (``StateDB.list_no_commit_reads``): `pivot commit` writes those into
+    the lock, so they are live until then. A run-history prune drops no `nocommit:` record.
+
     Each row is read as stored, and one this pivot cannot fully interpret (JSON that does not
     parse, a key it does not know, a field of the wrong type, a hash that is not a cache key)
     refuses the collection, naming it (``_UninterpretableRecordError``).
@@ -1029,6 +1035,7 @@ def _run_cache_keys(
         return set(), 0
     with state.StateDB(state_dir, readonly=True) as db:
         stored = db.list_run_cache_rows()
+        no_commit_reads = db.list_no_commit_reads()
     rows = list[tuple[str, run_history.RunCacheEntry]]()
     for name, data in stored:
         source = f"{database} {name}"
@@ -1049,8 +1056,10 @@ def _run_cache_keys(
             for source, entry in rows
             if entry["run_id"].startswith("__") or entry["run_id"] in valid_run_ids
         ]
-    keys = set[str]()
+    keys = set(no_commit_reads)
     for source, entry in rows:
+        if "reads" in entry:
+            keys.update(entry["reads"])
         for output in entry["output_hashes"]:
             keys |= _row_keys(output, source, listings)
     return keys, len(rows)

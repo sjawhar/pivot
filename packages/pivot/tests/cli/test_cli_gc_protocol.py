@@ -27,6 +27,7 @@ import time
 from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
+import yaml
 
 from pivot import run_history, types
 from pivot.storage import cache, gc, listing, lock, naming, state, track
@@ -2678,3 +2679,58 @@ def test_a_listed_cache_without_the_projects_entry_refuses(tmp_path: pathlib.Pat
     flat = " ".join((refused.stdout + refused.stderr).split())
     assert refused.returncode != 0, flat
     assert "cache-one" in flat and "is missing" in flat, flat
+
+
+# =============================================================================
+# Round 15: the objects a run read by hash are live (#544)
+# =============================================================================
+
+_READ_BY_HASH_PIPELINE = """\
+import pivot
+from pivot import Pipeline, stage
+
+
+@stage
+def plan(pin: str) -> dict:
+    return {"rows": [pivot.read_by_hash(h).read_text().strip() for h in pin.split()]}
+
+
+with Pipeline("p") as pipeline:
+    plan(pipeline.input("counted.pin", t=str))
+"""
+
+
+@pytest.mark.parametrize("commit", ["run", "no-commit then commit"])
+def test_pivot_gc_keeps_an_object_a_stage_read_by_hash_after_its_pvt_is_gone(
+    tmp_path: pathlib.Path, commit: str
+) -> None:
+    """#544: a stage reads an object by the hash its pin names; the lock, the run-cache row and
+    (under `--no-commit`) the `nocommit:` record list it under `reads`. Once the `.pvt` that
+    brought it into the cache is gone, those records alone name it, and a collection keeps it."""
+    root = _project(tmp_path / "project")
+    (root / "pipeline.py").write_text(_READ_BY_HASH_PIPELINE)
+    snapshot = root / "store" / "snapshot.txt"
+    snapshot.parent.mkdir()
+    snapshot.write_text("a row only read by hash\n")
+    _ok(_run(root, "track", "store/snapshot.txt"))
+    content_hash = cache.hash_file(snapshot)[0]
+    read_object = cache.get_cache_path(root / ".pivot" / "cache" / "files", content_hash)
+    (root / "data" / "raw" / "counted.pin").write_text(f"{content_hash}\n")
+    if commit == "run":
+        _ok(_run(root, "repro"))
+    else:
+        _ok(_run(root, "repro", "--no-commit"))
+    snapshot.unlink()
+    snapshot.with_name("snapshot.txt.pvt").unlink()
+    dead = _publish(root / ".pivot" / "cache" / "files", tmp_path, "named by nothing\n")
+
+    collected = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode == 0, out
+    assert read_object.exists(), f"gc removed {read_object}, which the stage read by hash"
+    assert not cache.get_cache_path(root / ".pivot" / "cache" / "files", dead).exists(), out
+    if commit != "run":
+        _ok(_run(root, "commit"))
+        lock = yaml.safe_load((root / ".pivot" / "stages" / "p" / "plan.lock").read_text())
+        assert lock["reads"] == [content_hash], lock

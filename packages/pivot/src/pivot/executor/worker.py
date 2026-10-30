@@ -56,6 +56,7 @@ from pivot import (
     metrics,
     parameters,
     project,
+    reads,
     run_history,
     skip,
     stage_def,
@@ -1081,6 +1082,9 @@ def _execute_stage(
                         current_fingerprint,
                         current_params,
                         dep_hashes,
+                        unavailable_reads=None
+                        if stage_info["force"]
+                        else reads.lock_unavailable(lock_data, store_cache_dir(store)),
                     )
 
                     if outputs_unusable is not None and skip_reason is not None:
@@ -1182,6 +1186,8 @@ def _execute_stage(
                                     ),
                                     output_paths=lock_output_paths(stage_outs, store, project_root),
                                 )
+                                if run_cache_skip["reads"]:
+                                    new_lock_data["reads"] = run_cache_skip["reads"]
                                 _raise_if_stopped()
                                 deferred = _commit_lock_and_build_deferred(
                                     stage_info,
@@ -1206,7 +1212,10 @@ def _execute_stage(
                                 )
 
                 covered_modules = frozenset(fingerprint.covered_user_modules(current_fingerprint))
-                with _track_stage_imports(covered_modules) as stage_imports:
+                with (
+                    _track_stage_imports(covered_modules) as stage_imports,
+                    reads.recording(store_cache_dir(store)) as recorded,
+                ):
                     written = _run_stage_function_with_store(
                         stage_info["func"],
                         stage_name,
@@ -1226,6 +1235,8 @@ def _execute_stage(
                         claims,
                     )
                 output_paths = written["paths"]
+                read_hashes = recorded.hashes()
+                fetched = recorded.fetched()
                 # A @no_fingerprint stage declares its code as files (`code_deps`); that
                 # declaration is its contract, so its imports are not checked.
                 uncovered = (
@@ -1315,22 +1326,27 @@ def _execute_stage(
                 # wrote: each was recorded before it was written, and the record stays until a
                 # lock is written.
                 if no_commit:
+                    no_commit_record = NoCommitRun(
+                        code_manifest=lock_manifest,
+                        output_hashes={
+                            key: hash_info["hash"]
+                            for key, hash_info in sorted(output_hashes.items())
+                        },
+                    )
+                    if read_hashes:
+                        no_commit_record["reads"] = read_hashes
+                    no_commit_writes = DeferredWrites(
+                        file_hash_entries=file_hash_entries, no_commit_record=no_commit_record
+                    )
+                    if fetched:
+                        no_commit_writes["remote_hashes"] = fetched
                     return StageResult(
                         status=StageStatus.RAN,
                         reason=run_reason,
                         input_hash=input_hash,
                         output_lines=ring_buffer.snapshot(),
                         metrics=metrics.get_entries(),
-                        deferred_writes=DeferredWrites(
-                            file_hash_entries=file_hash_entries,
-                            no_commit_record=NoCommitRun(
-                                code_manifest=lock_manifest,
-                                output_hashes={
-                                    key: hash_info["hash"]
-                                    for key, hash_info in sorted(output_hashes.items())
-                                },
-                            ),
-                        ),
+                        deferred_writes=no_commit_writes,
                     )
                 else:
                     # Hash and publish before the naming unit, so a large output's reading and
@@ -1381,6 +1397,8 @@ def _execute_stage(
                             output_hashes=_to_identity_hashes(dict(sorted(output_hashes.items()))),
                             output_paths=lock_output_paths(stage_outs, store, project_root),
                         )
+                        if read_hashes:
+                            new_lock_data["reads"] = read_hashes
 
                         # Single StateDB open for post-execution work. _open_state_db is #530's
                         # one-line unexpected-error boundary; keep it inside the naming unit.
@@ -1398,6 +1416,8 @@ def _execute_stage(
                                 reusable=not uncovered and not edited and not unreadable,
                                 file_hash_entries=file_hash_entries,
                             )
+                            if fetched:
+                                deferred["remote_hashes"] = fetched
                             return StageResult(
                                 status=StageStatus.RAN,
                                 reason=run_reason,
@@ -1770,8 +1790,11 @@ def _check_skip_or_run(
     current_fingerprint: dict[str, str],
     current_params: dict[str, Any],
     dep_hashes: dict[str, HashInfo],
+    *,
+    unavailable_reads: types.UnavailableReads | None = None,
 ) -> tuple[str | None, str, str, bool]:
-    """Determine if stage can skip or must run."""
+    """Determine if stage can skip or must run. ``unavailable_reads`` is
+    ``reads.lock_unavailable`` of ``lock_data``."""
     out_identities = [out.identity for out in stage_info["outs"]]
     dep_hashes_by_identity = _to_identity_hashes(dep_hashes)
     input_hash = run_history.stage_input_hash(
@@ -1789,6 +1812,7 @@ def _check_skip_or_run(
         out_paths=out_identities,
         run_cache_allowed=not stage_info["incremental_inputs"]
         and not stage_info["unsafe_fingerprint"],
+        unavailable_reads=unavailable_reads,
     )
     if decision["changed"]:
         return None, decision["reason"], input_hash, decision["run_cache_allowed"]
@@ -2671,7 +2695,9 @@ def can_skip_via_generation(
     state_db: state.StateDB,
     store: store_mod.Store,
 ) -> bool:
-    """Check generation counters and cached dependency hashes without rehashing."""
+    """Check generation counters and cached dependency hashes without rehashing. A lock that
+    records objects its run read by hash that are now unavailable (``reads.lock_unavailable``)
+    is left to the lock comparison, which names them."""
     if lock_data["code_manifest"] != fingerprint:
         return False
     if not skip.params_equal(lock_data["params"], current_params):
@@ -2682,6 +2708,8 @@ def can_skip_via_generation(
         types.identity_key(identity) for identity in lock_data["output_hashes"]
     )
     if normalized_outs != locked_out_paths:
+        return False
+    if reads.lock_unavailable(lock_data, store_cache_dir(store)) is not None:
         return False
     if not deps:
         return True
@@ -2820,6 +2848,7 @@ def _commit_lock_and_build_deferred(
         input_hash,
         output_hashes,
         state_db,
+        reads=lock_data["reads"] if "reads" in lock_data else [],
         reusable=reusable,
         legacy_input_hash=None
         if reusable
@@ -2843,6 +2872,7 @@ def _build_deferred_writes(
     output_hashes: dict[str, HashInfo],
     state_db: state.StateDB,
     *,
+    reads: list[str],
     reusable: bool = True,
     legacy_input_hash: str | None = None,
     file_hash_entries: list[FileHashEntry] | None = None,
@@ -2854,7 +2884,8 @@ def _build_deferred_writes(
     cover, or modules changed after the coordinator loaded them) files no run-cache entry and
     deletes any entry at its input hash and at ``legacy_input_hash``, the unmarked key an older
     pivot files under; its lock carries a key no fingerprint has and `skip.check_stage` never
-    consults the run cache for it, so no tier skips it.
+    consults the run cache for it, so no tier skips it. A filed entry carries ``reads``, the
+    objects the run read by hash, for the lock a restore from it writes.
     """
     # A lock written now supersedes the stage's whole nocommit: record: what a --no-commit run
     # left for `pivot commit`, and the `*.pvt` members it lists.
@@ -2894,6 +2925,8 @@ def _build_deferred_writes(
                 run_id=stage_info["run_id"],
                 output_hashes=output_entries,
             )
+            if reads:
+                result["run_cache_entry"]["reads"] = reads
     if not reusable:
         result["run_cache_delete_input_hashes"] = [
             input_hash,
@@ -2917,6 +2950,7 @@ class RunCacheSkipResult(TypedDict):
     output_hashes: dict[str, HashInfo]
     outputs_restored: bool
     file_hash_entries: list[FileHashEntry]
+    reads: list[str]  # the objects the restored run read by hash, for the lock it writes
 
 
 def _run_cache_output_hash(
@@ -2977,10 +3011,15 @@ def _try_skip_via_run_cache_with_store(
     ``run_history.compute_input_hash``), read in memory (``_run_cache_output_hash``).
 
     No lock records the entry's outputs until one is written (never, under ``--no-commit``), so
-    each restore records the ``*.pvt`` members it writes as the stage's (``claims``) first.
+    each restore records the ``*.pvt`` members it writes as the stage's (``claims``) first. An
+    entry whose run read objects by hash that are now unavailable (``reads.unavailable``) is not
+    used: the lock written from it would record objects the stage cannot read again.
     """
     entry = _run_cache_row(state_db, stage_name, input_hash, legacy_input_hash, stage_outs)
     if entry is None:
+        return None
+    entry_reads = entry["reads"] if "reads" in entry else []
+    if entry_reads and reads.unavailable(entry_reads, store_cache_dir(store)) is not None:
         return None
     output_hashes = dict[str, HashInfo]()
     for output in entry["output_hashes"]:
@@ -3010,4 +3049,5 @@ def _try_skip_via_run_cache_with_store(
         output_hashes=output_hashes,
         outputs_restored=restoration.outputs_restored,
         file_hash_entries=restored_entries,
+        reads=entry_reads,
     )

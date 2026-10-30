@@ -24,16 +24,19 @@ if TYPE_CHECKING:
 
 
 def test_gc_accepts_exactly_the_run_cache_keys_the_typed_dicts_declare() -> None:
-    """`pivot gc` roots only an output's ``hash`` and a directory's listing, and accepts only the
-    keys ``run_history`` lists. A field added to ``RunCacheEntry`` or ``OutputHashEntry`` must be
-    added to that list, and rooted in gc if it can name a cache object, in the same change: this
-    fails until the list and the TypedDicts agree."""
+    """`pivot gc` roots an output's ``hash``, a directory's listing and a row's ``reads``, and
+    accepts only the keys ``run_history`` lists. A field added to ``RunCacheEntry`` or
+    ``OutputHashEntry`` must be added to that list, and rooted in gc if it can name a cache
+    object, in the same change: this fails until the list and the TypedDicts agree."""
     hints = get_type_hints(run_history.OutputHashEntry, include_extras=True)
     optional = {key for key, hint in hints.items() if get_origin(hint) is NotRequired}
+    row_hints = get_type_hints(run_history.RunCacheEntry, include_extras=True)
+    row_optional = {key for key, hint in row_hints.items() if get_origin(hint) is NotRequired}
 
     assert set(hints) - optional == run_history.OUTPUT_ENTRY_REQUIRED_KEYS
     assert optional == run_history.OUTPUT_ENTRY_OPTIONAL_KEYS
-    assert set(get_type_hints(run_history.RunCacheEntry)) == run_history.RUN_CACHE_ROW_KEYS
+    assert set(row_hints) - row_optional == run_history.RUN_CACHE_ROW_KEYS
+    assert row_optional == run_history.RUN_CACHE_ROW_OPTIONAL_KEYS
 
 
 def test_a_run_cache_row_with_an_unlisted_output_key_is_not_one_gc_reads() -> None:
@@ -43,6 +46,14 @@ def test_a_run_cache_row_with_an_unlisted_output_key_is_not_one_gc_reads() -> No
     error = run_history.run_cache_entry_error(row)
 
     assert error is not None and "x" in error, error
+
+
+def test_a_run_cache_row_whose_reads_are_not_hashes_is_not_one_gc_reads() -> None:
+    """`reads` names objects: one gc cannot read as content hashes keeps nothing it can trust."""
+    row = {"run_id": "r", "output_hashes": [], "reads": ["not-a-key"]}
+
+    assert run_history.run_cache_entry_error(row) == "its reads is not a list of content hashes"
+    assert run_history.run_cache_entry_error({**row, "reads": ["0123456789abcdef"]}) is None
 
 
 def test_generate_run_id_format() -> None:
@@ -285,6 +296,38 @@ def test_deserialize_run_cache_entry_missing_keys() -> None:
     incomplete = json.dumps({"run_id": "test"}).encode()
     with pytest.raises(ValueError, match="missing keys"):
         run_history.deserialize_run_cache_entry(incomplete)
+
+
+def test_a_run_cache_entry_keeps_the_objects_its_run_read_by_hash() -> None:
+    entry = run_history.RunCacheEntry(
+        run_id="20250110_143000_abc12345",
+        output_hashes=[run_history.OutputHashEntry(path="p/plan", hash="0123456789abcdef")],
+        reads=["fedcba9876543210"],
+    )
+
+    deserialized = run_history.deserialize_run_cache_entry(run_history.serialize_to_bytes(entry))
+
+    assert deserialized == entry
+
+
+def test_a_run_cache_entry_of_a_run_that_read_nothing_has_no_reads() -> None:
+    stored = json.dumps({"run_id": "r", "output_hashes": []}).encode()
+
+    assert "reads" not in run_history.deserialize_run_cache_entry(stored)
+
+
+@pytest.mark.parametrize(
+    "reads",
+    [
+        pytest.param("0123456789abcdef", id="not-a-list"),
+        pytest.param(["../../etc/passwd"], id="not-a-hash"),
+    ],
+)
+def test_a_run_cache_entry_with_malformed_reads_is_invalid(reads: object) -> None:
+    stored = json.dumps({"run_id": "r", "output_hashes": [], "reads": reads}).encode()
+
+    with pytest.raises(ValueError, match="reads"):
+        run_history.deserialize_run_cache_entry(stored)
 
 
 # =============================================================================

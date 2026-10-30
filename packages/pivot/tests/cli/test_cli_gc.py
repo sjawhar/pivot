@@ -395,25 +395,98 @@ def test_gc_keeps_what_an_older_pivots_lock_lists_inline(
 def test_gc_refuses_a_lock_with_a_key_it_does_not_know(
     workspace: Workspace, runner: click.testing.CliRunner, where: str
 ) -> None:
-    """A newer pivot may add a key to a stage lock that lists objects (a run's reads by hash),
-    at the top level or in an entry. A collection that skipped it would remove what it names,
-    so it refuses, naming the lock, and removes nothing."""
+    """A newer pivot may add a key to a stage lock that lists objects, at the top level or in an
+    entry. A collection that skipped it would remove what it names, so it refuses, naming the
+    lock, and removes nothing."""
     named = _helper_publish(workspace, "named by outs")
     read = _helper_publish(workspace, "named only by an unknown key")
     _helper_write_lock(workspace, outs={None: types.FileHash(hash=named)})
     lock_path = workspace["stages_dir"] / f"{_STAGE}.lock"
     document = yaml.safe_load(lock_path.read_text())
     if where == "top level":
-        document["reads"] = [read]
+        document["writes"] = [read]
     else:
-        document["outs"][0]["reads"] = [read]
+        document["outs"][0]["writes"] = [read]
     lock_path.write_text(yaml.safe_dump(document))
 
     result = _helper_run(runner, "--yes", "--grace-hours", "0")
 
     assert result.exit_code != 0, result.output
-    assert str(lock_path) in result.output and "reads" in result.output, result.output
+    assert str(lock_path) in result.output and "writes" in result.output, result.output
     assert _helper_keys(workspace) == {named, read}, "a refused collection removed an object"
+
+
+def test_gc_keeps_every_object_a_locks_reads_names(
+    workspace: Workspace, runner: click.testing.CliRunner
+) -> None:
+    """#544: a lock lists the objects its run read by hash under a top-level `reads`. Each is
+    live: the input that names it reruns the stage, and the lock is what keeps it."""
+    named = _helper_publish(workspace, "named by outs")
+    first = _helper_publish(workspace, "read by hash, first")
+    second = _helper_publish(workspace, "read by hash, second")
+    dead = _helper_publish(workspace, "named by nothing")
+    _helper_write_lock(workspace, outs={None: types.FileHash(hash=named)})
+    lock_path = workspace["stages_dir"] / f"{_STAGE}.lock"
+    document = yaml.safe_load(lock_path.read_text())
+    document["reads"] = sorted([first, second])
+    lock_path.write_text(yaml.safe_dump(document))
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code == 0, result.output
+    assert _helper_keys(workspace) == {named, first, second}, result.output
+    assert dead not in _helper_keys(workspace)
+
+
+def test_gc_refuses_a_lock_whose_reads_are_not_hashes(
+    workspace: Workspace, runner: click.testing.CliRunner
+) -> None:
+    """A `reads` this pivot cannot read as content hashes names objects it cannot see."""
+    named = _helper_publish(workspace, "named by outs")
+    _helper_publish(workspace, "unnamed")
+    _helper_write_lock(workspace, outs={None: types.FileHash(hash=named)})
+    lock_path = workspace["stages_dir"] / f"{_STAGE}.lock"
+    document = yaml.safe_load(lock_path.read_text())
+    document["reads"] = ["not-a-key"]
+    lock_path.write_text(yaml.safe_dump(document))
+    before = _helper_keys(workspace)
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code != 0, result.output
+    flat = " ".join(result.output.split())
+    assert str(lock_path) in flat and "a field reads it cannot read" in flat, result.output
+    assert _helper_keys(workspace) == before, "a refused collection removed an object"
+
+
+def test_gc_keeps_what_a_run_cache_rows_and_a_no_commit_records_reads_name(
+    workspace: Workspace, runner: click.testing.CliRunner
+) -> None:
+    """A run-cache row restores a stage and writes its `reads` into the lock; a `nocommit:`
+    record's `reads` goes into the lock `pivot commit` writes. Both are live until then."""
+    output = _helper_publish(workspace, "a row's output")
+    row_read = _helper_publish(workspace, "read by the row's run")
+    pending_read = _helper_publish(workspace, "read by an uncommitted run")
+    dead = _helper_publish(workspace, "named by nothing")
+    _helper_write_run_cache_row(workspace, types.FileHash(hash=output))
+    with state.StateDB(workspace["state_dir"]) as db:
+        ((name, data),) = db.list_run_cache_rows()
+        row = json.loads(data)
+        row["reads"] = [row_read]
+        with db._write_transaction() as txn:  # a row as a run that read by hash files it
+            txn.put(state._RUNCACHE_PREFIX + name.encode(), json.dumps(row).encode())
+            txn.put(
+                state._NOCOMMIT_PREFIX + b"demo/uncommitted",
+                json.dumps(
+                    {"code_manifest": {}, "output_hashes": {}, "reads": [pending_read]}
+                ).encode(),
+            )
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert result.exit_code == 0, result.output
+    assert {output, row_read, pending_read} <= _helper_keys(workspace), result.output
+    assert dead not in _helper_keys(workspace), result.output
 
 
 def test_gc_refuses_a_lock_from_a_newer_schema(
@@ -547,8 +620,8 @@ def test_gc_refuses_a_pvt_it_cannot_fully_interpret(
     [
         pytest.param(b"{not json", "does not parse as JSON", id="not json"),
         pytest.param(
-            b'{"run_id": "__committed__", "output_hashes": [], "reads": []}',
-            "its keys are output_hashes, reads, run_id",
+            b'{"run_id": "__committed__", "output_hashes": [], "writes": []}',
+            "its keys are output_hashes, run_id, writes",
             id="unknown row key",
         ),
         pytest.param(
