@@ -2317,18 +2317,3 @@ def test_background_child_holding_stage_stdout_does_not_keep_the_worker_alive(
         if pid_file.exists():
             with contextlib.suppress(ProcessLookupError):
                 os.kill(int(pid_file.read_text()), signal.SIGKILL)
-
-
-# =============================================================================
-# Dependency hashing
-# =============================================================================
-
-
-def test_hash_dependencies_hashes_a_path_list(tmp_path: pathlib.Path) -> None:
-    path = tmp_path / "a.txt"
-    path.write_text("content")
-
-    hashes, missing, unreadable, _ = worker.hash_dependencies([str(path)])
-
-    assert hashes == {str(path): FileHash(hash=cache.hash_file(path, None)[0])}
-    assert (missing, unreadable) == ([], [])

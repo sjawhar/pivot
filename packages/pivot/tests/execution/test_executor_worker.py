@@ -8,6 +8,7 @@ This module retains the worker primitives those suites depend on.
 
 from __future__ import annotations
 
+import pathlib
 import queue
 import subprocess
 import sys
@@ -16,14 +17,13 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from pivot import types
+from pivot import loaders, types
 from pivot.executor import worker
-from pivot.storage import listing
+from pivot.storage import listing, store
 from pivot.types import OutputMessage
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    import pathlib
 
 
 def _queue_lines(output_queue: mp.Queue[OutputMessage]) -> list[tuple[str, bool]]:
@@ -134,37 +134,27 @@ def test_ring_buffer_thread_safe() -> None:
     assert len(ring.snapshot()) == 400
 
 
-def test_hash_dependencies_files_and_missing(tmp_path: pathlib.Path) -> None:
-    """Legacy external path list hashes files and reports only missing entries."""
-    existing = tmp_path / "existing.txt"
-    existing.write_text("content")
-    missing = tmp_path / "missing.txt"
-
-    hashes, missing_paths, unreadable, entries = worker.hash_dependencies(
-        [str(existing), str(missing)]
-    )
-
-    assert str(existing) in hashes
-    assert missing_paths == [str(missing)]
-    assert unreadable == []
-    assert entries[0][0] == str(existing)
-
-
 def test_hash_dependencies_directory_preserves_its_listing(tmp_path: pathlib.Path) -> None:
     """Directory hashing returns its record and keeps every file in the separate listing."""
-    directory = tmp_path / "data"
-    directory.mkdir()
+    directory = tmp_path / "data" / "raw" / "data"
+    directory.mkdir(parents=True)
     (directory / "a.txt").write_text("a")
     (directory / "b.txt").write_text("b")
+    ref = types.ArtifactRef(
+        identity=types.ArtifactIdentity(producer="data", key=None),
+        format=loaders.PathOnly(),
+        python_type=pathlib.Path,
+        tag=types.ArtifactTag.INPUT,
+    )
 
     hashed_dirs = dict[str, listing.HashedDirectory]()
     hashes, missing, unreadable, _ = worker.hash_dependencies(
-        [str(directory)], hashed_dirs=hashed_dirs
+        {"data": ref}, store.WorkspaceStore(tmp_path, "p", {}), hashed_dirs=hashed_dirs
     )
 
     assert missing == []
     assert unreadable == []
-    directory_hash = hashes[str(directory)]
+    directory_hash = hashes["data"]
     assert types.is_dir_hash(directory_hash)
     members = hashed_dirs[directory_hash["hash"]]["listing"]
     assert {entry["relpath"] for entry in members["files"]} == {"a.txt", "b.txt"}

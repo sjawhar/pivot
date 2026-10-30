@@ -16,7 +16,11 @@ The Engine monitors:
 - **Input data files** - Files declared with `pipeline.input()`
 - **Configuration files** - `pipeline.py`, `params.yaml`, `params.yml`, `.pivotignore` (`engine/sources.py` `_CONFIG_FILE_NAMES`)
 
-When changes are detected, only affected stages and their downstream dependencies re-run.
+When changes are detected, only affected stages and their downstream dependencies re-run. A
+change inside a `pipeline.input()` directory at a path the project's `.pivotignore` names affects
+no stage, since the directory's hash leaves it out (`WatchCoordinator._is_ignored_input_change`,
+through the engine's one `ignore.IgnoreFilter`). A change inside a stage's directory output is
+never left out: a downstream stage depends on that output's whole hash.
 
 ## Architecture
 
