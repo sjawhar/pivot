@@ -3397,3 +3397,72 @@ def test_a_copy_given_its_own_project_id_never_collects_the_originals_objects(
     assert refused.returncode != 0, flat
     assert "holds a different project id" in flat, flat
     assert original_object.exists(), "the copy's gc removed the original's object"
+
+
+# `cut` runs once per file of `plan`'s directory output (`pipeline.map`, #545): its instances are
+# `mp/cut@<key>`, each with its own lock.
+_MAPPED_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, loaders, stage
+
+
+@stage
+def plan(
+    plan: dict[str, int],
+) -> Annotated[dict[str, dict[str, int]], directory, loaders.YAML[dict[str, int]]()]:
+    return {f"{name}.yaml": {"value": value} for name, value in plan.items()}
+
+
+@stage
+def cut(entry: dict[str, int]) -> dict[str, int]:
+    return {"cut": entry["value"] * 7}
+
+
+with Pipeline("mp") as pipeline:
+    cut(pipeline.map(plan(pipeline.input("plan.yaml", t=dict[str, int]))))
+"""
+
+
+def test_the_locks_of_a_mapped_stages_instances_keep_their_objects_once_unexpanded(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A mapped stage's instances (`mp/cut@a`, `mp/cut@b`) each record their output in a lock of
+    their own. Once `b` leaves the plan, the next run no longer expands `mp/cut@b`, but its lock
+    stays, and a collection reads every lock on disk, expanded or not: a peer's `pivot gc`
+    (with one run of history, so no run-cache row keeps them) keeps both instances' objects and
+    removes only what no record names."""
+    shared = tmp_path / "shared-cache"
+    peer = _shared_project(tmp_path / "peer", shared)
+    _ok(_run(peer, "repro"))
+    root = _shared_project(tmp_path / "project", shared, "copy")
+    _use_cache(root, shared, retention=1)
+    (root / "pipeline.py").write_text(_MAPPED_PIPELINE)
+    plan = root / "data" / "raw" / "plan.yaml"
+    plan.write_text("a: 1\nb: 2\n")
+    _ok(_run(root, "repro"))
+    stages = root / ".pivot" / "stages" / "mp"
+    locks = {path.name: path for path in stages.glob("cut@*.lock")}
+    assert set(locks) == {"cut@a.lock", "cut@b.lock"}, sorted(p.name for p in stages.iterdir())
+    objects = {
+        name: cache.get_cache_path(
+            shared / "files", yaml.safe_load(path.read_text())["outs"][0]["hash"]
+        )
+        for name, path in locks.items()
+    }
+    assert all(path.exists() for path in objects.values()), objects
+    b_lock = locks["cut@b.lock"].read_text()
+
+    plan.write_text("a: 1\n")
+    second = _ok(_run(root, "repro"))
+    assert "cut@b" not in second, f"the run still expanded mp/cut@b: {second}"
+    assert locks["cut@b.lock"].read_text() == b_lock, "the unexpanded instance's lock changed"
+    dead = _publish(shared / "files", tmp_path, "named by nothing\n")
+
+    collected = _run(peer, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode == 0, out
+    assert not cache.get_cache_path(shared / "files", dead).exists(), out
+    assert objects["cut@a.lock"].exists(), f"gc removed mp/cut@a's output: {out}"
+    assert objects["cut@b.lock"].exists(), f"gc removed the unexpanded mp/cut@b's output: {out}"

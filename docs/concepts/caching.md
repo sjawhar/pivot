@@ -93,7 +93,10 @@ wrote into its own directory output is the stage's data, not a record; its objec
 but a listing it lacks does not refuse. A lock an older pivot wrote lists each directory's
 files inline, and those, with the directory hash it recorded, are kept as they are. An entry a
 killed run left beside an output (`.pivot_backup_<token>.*`) is walked like any other, so the
-links it still holds keep their objects until a later restore of that path removes it.
+links it still holds keep their objects until a later restore of that path removes it. Each
+instance of a mapped stage (`<stage>@<key>`, from `pipeline.map`) records its
+outputs in a lock of its own, and a collection reads every lock on disk: an instance the last
+run no longer expanded, because its key file is gone, keeps its objects like any other stage.
 
 A record the collection cannot fully read refuses it, naming the record: a stage lock, `.pvt`
 or run-cache row whose text does not parse (a git merge left conflict markers in it, a
