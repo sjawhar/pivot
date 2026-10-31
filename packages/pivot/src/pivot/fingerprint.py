@@ -259,17 +259,18 @@ _held_loaders: contextvars.ContextVar[list[tuple[Any, str]] | None] = contextvar
     "_held_loaders", default=None
 )
 
-# The ids of the loaders `get_loader_fingerprint` is fingerprinting, outermost first: a loader its
-# config holds again (a cycle) is not fingerprinted again (`_held_loader_entries`).
+# The ids of the loaders `get_loader_fingerprint` is fingerprinting, outermost first: a loader that
+# one of their walks reaches again (a cycle) is not fingerprinted again (`_held_loader_entries`).
 _loader_stack: contextvars.ContextVar[tuple[int, ...]] = contextvars.ContextVar(
     "_loader_stack", default=()
 )
 
 # The manifests of the held loaders fingerprinted for one stage (`stage_fingerprint_scope`), by
-# the digest of their identity, so a loader held many times is walked once. Kept per stage, not
-# per pass: a held loader's walk reports its refusals with the stage that holds it.
-_held_memo: contextvars.ContextVar[dict[str, dict[str, str]] | None] = contextvars.ContextVar(
-    "_held_memo", default=None
+# their class object's id and their canonical form, so a loader held many times is walked once.
+# Kept per stage, not per pass: a held loader's walk reports its refusals with the stage that
+# holds it.
+_held_memo: contextvars.ContextVar[dict[tuple[int, str], dict[str, str]] | None] = (
+    contextvars.ContextVar("_held_memo", default=None)
 )
 
 # Per-pass memo, keyed by kind and object id, for function identities (`function_identity`),
@@ -2123,24 +2124,47 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     - Loader: All of the above
     - Always: 'loader:<module>.<qualname>:config' for dataclass field values
 
-    A user loader class's own `load`, `save` and `empty`, and the functions and classes bound
-    in its config fields, are walked like stage helpers, so the module values they read are
-    tracked or refused. Methods inherited from `pivot.loaders` are framework code and are
-    only hashed. A pivot loader the config holds (`Outer(Inner())`, also inside a container, a
-    partial or a dataclass in a field) gets this fingerprint too, under `held:<digest>:`
-    (`_merge_held_loaders`).
+    A user loader class's methods, `load`, `save` and `empty` and every other user-defined
+    method on it and on its user base classes (a helper `load` calls as `self.helper()`), and
+    the functions and classes bound in its config fields, are walked like stage helpers, so the
+    module values they read are tracked or refused. Methods inherited from `pivot.loaders` are
+    framework code and are only hashed. A pivot loader the config holds (`Outer(Inner())`, also
+    inside a container, a partial or a dataclass in a field) gets this fingerprint too, under
+    `held:<digest>:` (`_merge_held_loaders`).
+
+    The loader is marked as being fingerprinted for the whole call (`_loader_stack`), so a
+    loader its own walk reaches again (its config holds it, or a dataclass default its code
+    reads does) is not walked again.
     """
+    stack_token = _loader_stack.set((*_loader_stack.get(), id(cast("object", loader))))
+    try:
+        return _loader_manifest(loader)
+    finally:
+        _loader_stack.reset(stack_token)
+
+
+def _loader_manifest(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> dict[str, str]:
+    """The manifest `get_loader_fingerprint` gives `loader`."""
     manifest = dict[str, str]()
-    class_name = _definition_ref(type(loader))
+    loader_type = type(loader)
+    class_name = _definition_ref(loader_type)
     visited = set[int]()
 
     # Import here to avoid circular import
     from pivot import loaders as loaders_module
 
     for method_name in ("load", "save", "empty"):
-        method = _user_defined_method(type(loader), method_name)
+        method = _user_defined_method(loader_type, method_name)
         if method is not None:
             _process_callable_dependency(f"{class_name}.{method_name}", method, manifest, visited)
+    stage_name = _current_stage_name.get() or loader_type.__qualname__
+    for label, member in _user_methods(loader_type):
+        if label in ("load", "save", "empty"):
+            continue
+        binding_ref = f"{class_name}.{label}"
+        _process_captured_value(
+            binding_ref, binding_ref, member, loader_type, manifest, visited, stage_name, chain=None
+        )
 
     # Use each method definition rather than a temporary bound method so the
     # weak AST hash cache retains the entry across loader fingerprint calls.
@@ -2175,11 +2199,7 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     if config_str:
         manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
     if held:
-        stack_token = _loader_stack.set((*_loader_stack.get(), id(loader_any)))
-        try:
-            _merge_held_loaders(manifest, held, record=False)
-        finally:
-            _loader_stack.reset(stack_token)
+        _merge_held_loaders(manifest, held, record=False)
 
     return manifest
 
@@ -2231,21 +2251,25 @@ def _is_pivot_loader(value: Any) -> bool:
 
 def _held_loader_entries(held: list[tuple[Any, str]]) -> dict[str, dict[str, str]]:
     """The manifest of each distinct pivot loader in `held`, as `get_loader_fingerprint` gives a
-    top-level loader of its class, keyed and ordered by the digest of its identity (its canonical
-    form: its class and fields). A loader held many times is walked once (`_held_memo`), and one
-    being fingerprinted already, which its own config holds again (a cycle), is left out: its
-    entries are in the manifest that holds it. A held loader's walk records no read of its own;
-    its holder's caller records one read for all of them (`hl`, `_merge_held_loaders`)."""
+    top-level loader of its class, keyed and ordered by the digest of its canonical form (its
+    class's name and its fields).
+
+    A loader is distinct by its class object and its canonical form, so two classes one factory
+    made (`make_reader("a")`, `make_reader("b")`), which share a name and a form, are each
+    walked; when their manifests differ, each is keyed by the digest of its form and its
+    manifest instead, so neither overwrites the other. A loader held many times is walked once
+    per stage (`_held_memo`), and one being fingerprinted already (`_loader_stack`: a cycle) is
+    left out, since its entries are in the manifest that holds it. A held loader's walk records
+    no read of its own; its holder's caller records one read for all of them (`hl`,
+    `_merge_held_loaders`)."""
     stack = _loader_stack.get()
     memo = _held_memo.get()
-    found = dict[str, dict[str, str]]()
+    walked = dict[tuple[int, str], dict[str, str]]()
     for loader, identity in held:
-        if id(loader) in stack:
+        key = (id(type(cast("object", loader))), identity)
+        if id(loader) in stack or key in walked:
             continue
-        digest = xxhash.xxh64(identity.encode()).hexdigest()
-        if digest in found:
-            continue
-        entries = None if memo is None else memo.get(digest)
+        entries = None if memo is None else memo.get(key)
         if entries is None:
             reads_token = _recorded_reads.set(None)
             try:
@@ -2253,8 +2277,21 @@ def _held_loader_entries(held: list[tuple[Any, str]]) -> dict[str, dict[str, str
             finally:
                 _recorded_reads.reset(reads_token)
             if memo is not None:
-                memo[digest] = entries
-        found[digest] = entries
+                memo[key] = entries
+        walked[key] = entries
+    by_form = dict[str, list[dict[str, str]]]()
+    for (_class_id, identity), entries in walked.items():
+        group = by_form.setdefault(xxhash.xxh64(identity.encode()).hexdigest(), [])
+        if entries not in group:
+            group.append(entries)
+    found = dict[str, dict[str, str]]()
+    for digest, group in by_form.items():
+        for entries in group:
+            if len(group) > 1:
+                content = f"{digest}\0{json.dumps(entries, sort_keys=True)}"
+                found[xxhash.xxh64(content.encode()).hexdigest()] = entries
+            else:
+                found[digest] = entries
     return dict(sorted(found.items()))
 
 
@@ -3544,11 +3581,18 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     if not isinstance(value, type) and dataclasses.is_dataclass(cast("object", value)):
         inner = (*active, id(value))
         fields = {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
-        canonical = [_definition_ref(type(value)), _canonicalize_value_for_hash(fields, inner)]
+        held = _held_loaders.get()
+        if held is None or not _is_pivot_loader(value):
+            return [_definition_ref(type(value)), _canonicalize_value_for_hash(fields, inner)]
         # While a holder's value is serialized, each pivot loader in it is noted with its form,
-        # for the holder to fingerprint (`_collecting_held_loaders`).
-        if (held := _held_loaders.get()) is not None and _is_pivot_loader(value):
-            held.append((value, json.dumps(canonical)))
+        # for the holder to fingerprint (`_collecting_held_loaders`). The loaders a held loader
+        # holds in turn are in its own fingerprint, so they are not noted for its holder.
+        token = _held_loaders.set(None)
+        try:
+            canonical = [_definition_ref(type(value)), _canonicalize_value_for_hash(fields, inner)]
+        finally:
+            _held_loaders.reset(token)
+        held.append((value, json.dumps(canonical)))
         return canonical
     if type(value).__repr__ is object.__repr__ and _has_attribute(value, "__dict__"):
         inner = (*active, id(value))

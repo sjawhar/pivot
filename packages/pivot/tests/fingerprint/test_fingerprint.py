@@ -1848,6 +1848,88 @@ def test_a_loader_held_many_times_is_walked_once_in_a_stage(monkeypatch: pytest.
     assert [type(loader) for loader in walked] == [_HoldingReader, _HeldReader, _HoldingReader]
 
 
+def test_a_chain_of_held_loaders_grows_by_one_loader_per_level():
+    """`_HoldingReader` nested N deep around `_HeldReader()`: each manifest holds only its
+    immediate held loader's, which holds its own in turn, so the keys grow by a constant per
+    level, not exponentially."""
+    sizes = list[int]()
+    value: typing.Any = _HeldReader()
+    for _ in range(8):
+        value = _HoldingReader(value)
+        sizes.append(len(fingerprint.get_loader_fingerprint(value)))
+
+    steps = {after - before for before, after in zip(sizes, sizes[1:], strict=False)}
+    assert len(steps) == 1, sizes
+
+
+def _make_reader(suffix: str) -> typing.Any:
+    @dataclasses.dataclass(frozen=True)
+    class Made(loaders.Reader[str]):
+        def load(self, path: pathlib.Path) -> str:
+            return path.read_text() + suffix
+
+    return Made
+
+
+def test_two_classes_one_factory_made_are_each_fingerprinted():
+    """`_make_reader("first")` and `_make_reader("A")` share a name and a canonical form: both
+    are walked, neither overwrites the other, and editing the second's suffix changes the
+    holder's manifest."""
+    first, second, edited = _make_reader("first"), _make_reader("A"), _make_reader("B")
+    both = fingerprint.get_loader_fingerprint(_HoldingReader((first(), second())))
+    after = fingerprint.get_loader_fingerprint(_HoldingReader((first(), edited())))
+
+    for made in (first(), second()):
+        assert set(fingerprint.get_loader_fingerprint(made).items()) <= _entries(both)
+    assert both != after
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReadsADefault(loaders.Reader[str]):
+    """A loader whose `load` reads a dataclass whose field default is this loader again."""
+
+    suffix: str = "ok"
+
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text() + _LoaderDefaults().reader.suffix
+
+
+@dataclasses.dataclass(frozen=True)
+class _LoaderDefaults:
+    reader: typing.Any = _ReadsADefault()
+
+
+@pytest.mark.parametrize(
+    "loader", [_ReadsADefault(), _HoldingReader(_ReadsADefault())], ids=["top-level", "held"]
+)
+def test_a_loader_its_own_walk_reaches_again_is_fingerprinted_once(loader: typing.Any):
+    """`_ReadsADefault.load` reads `_LoaderDefaults`, whose field default is a `_ReadsADefault`:
+    the walk reaches that loader again while it is fingerprinting it, and stops there."""
+    manifest = fingerprint.get_loader_fingerprint(loader)
+
+    assert _definition_key("class", _LoaderDefaults) in {key for key, _ in _entries(manifest)}
+
+
+@dataclasses.dataclass(frozen=True)
+class _CallsAHelper(loaders.Reader[str]):
+    def load(self, path: pathlib.Path) -> str:
+        return self.decorate(path.read_text())
+
+    def decorate(self, text: str) -> str:
+        return text + "A"
+
+
+def test_a_loaders_helper_method_is_walked_top_level_and_held():
+    """`load` calls `self.decorate()`: every user method of the loader's class is walked, so
+    `decorate` is an entry of a top-level and of a held `_CallsAHelper()`."""
+    key = _definition_key("func", _CallsAHelper.decorate)
+    top = fingerprint.get_loader_fingerprint(_CallsAHelper())
+    held = fingerprint.get_loader_fingerprint(_HoldingReader(_CallsAHelper()))
+
+    assert top[key] == fingerprint.hash_function_ast(_CallsAHelper.decorate)
+    assert (key, top[key]) in _entries(held)
+
+
 @pytest.mark.parametrize(
     ("func", "path"),
     [

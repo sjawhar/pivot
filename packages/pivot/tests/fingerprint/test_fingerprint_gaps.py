@@ -1979,6 +1979,153 @@ def test_an_edit_to_an_inherited_load_reruns_its_stage(
     _assert_an_edit_reruns_once(project, tmp_path / "home", edited)
 
 
+_CALLS_A_HELPER = """\
+import dataclasses
+import pathlib
+
+from pivot import loaders
+
+
+@dataclasses.dataclass(frozen=True)
+class Inner(loaders.Reader[str]):
+    def load(self, path: pathlib.Path) -> str:
+        return self.decorate(path.read_text().splitlines()[0])
+
+    def decorate(self, text: str) -> str:
+        return text + "A"
+"""
+
+
+@pytest.mark.parametrize("held", [False, True], ids=["top-level", "held"])
+def test_an_edit_to_a_loaders_helper_method_reruns_its_stage(
+    tmp_path: pathlib.Path, held: bool
+) -> None:
+    """`Inner.load` calls `self.decorate()`. Every user method of a loader's class is walked,
+    top-level or held, so an edit to `decorate` alone reruns the stage."""
+    stage = _held_stage("Outer(Inner())" if held else "Inner()")
+    project = _project(
+        tmp_path, {"inner.py": _CALLS_A_HELPER, "pipeline.py": _HELD_INSTANCE_HEADER + stage}
+    )
+    _assert_an_edit_reruns_once(project, tmp_path / "home", "inner.py")
+
+
+_READS_A_DEFAULT = """\
+import dataclasses
+import pathlib
+
+from pivot import loaders
+
+
+@dataclasses.dataclass(frozen=True)
+class Inner(loaders.Reader[str]):
+    suffix: str = "ok"
+
+    def load(self, path: pathlib.Path) -> str:
+        from config import Defaults
+
+        return path.read_text().splitlines()[0] + Defaults().reader.suffix
+"""
+
+_DEFAULTS = """\
+import dataclasses
+import typing
+
+from inner import Inner
+
+
+@dataclasses.dataclass(frozen=True)
+class Defaults:
+    reader: typing.Any = Inner()
+"""
+
+
+@pytest.mark.parametrize("held", [False, True], ids=["top-level", "held"])
+def test_a_loader_its_own_walk_reaches_again_runs_and_caches(
+    tmp_path: pathlib.Path, held: bool
+) -> None:
+    """`Inner.load` imports `config.Defaults`, whose field default is an `Inner()`: the walk
+    reaches a loader it is fingerprinting already, stops there, and the stage runs and then
+    caches, as at main."""
+    home = tmp_path / "home"
+    pipeline = _HELD_INSTANCE_HEADER.replace(
+        "from inner import Inner\n", "import config  # noqa: F401\nfrom inner import Inner\n"
+    )
+    project = _project(
+        tmp_path,
+        {
+            "inner.py": _READS_A_DEFAULT,
+            "config.py": _DEFAULTS,
+            "pipeline.py": pipeline + _held_stage("Outer(Inner())" if held else "Inner()"),
+        },
+    )
+    output = project / "data" / "t" / "use.txt"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof Usingok"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_FACTORY = """\
+import dataclasses
+import pathlib
+
+from pivot import loaders
+
+
+def make_reader(suffix: str) -> type:
+    @dataclasses.dataclass(frozen=True)
+    class Made(loaders.Reader[str]):
+        def load(self, path: pathlib.Path) -> str:
+            return path.read_text().splitlines()[0] + suffix
+
+    return Made
+"""
+
+_TWO_FACTORY_CLASSES = """\
+import dataclasses
+import pathlib
+
+from factory import make_reader
+from pivot import Pipeline, loaders, stage
+
+First = make_reader("first")
+Second = make_reader("A")
+
+
+@dataclasses.dataclass(frozen=True)
+class Both(loaders.Reader[str]):
+    readers: tuple
+
+    def load(self, path: pathlib.Path) -> str:
+        return "|".join(reader.load(path) for reader in self.readers)
+
+
+@stage
+def use(text: str) -> str:
+    return text
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", format=Both((First(), Second()))))
+"""
+
+
+def test_an_edit_to_one_of_two_factory_classes_reruns_its_stage(tmp_path: pathlib.Path) -> None:
+    """`First` and `Second` come from one factory, so they share a name and a canonical form.
+    Each is fingerprinted, so changing the suffix `Second` is made with reruns the stage."""
+    home = tmp_path / "home"
+    project = _project(tmp_path, {"factory.py": _FACTORY, "pipeline.py": _TWO_FACTORY_CLASSES})
+    output = project / "data" / "t" / "use.txt"
+    line = "Local Set Default Proof Using"
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == f"{line}first|{line}A"
+    _edit(project, "pipeline.py", 'make_reader("A")', 'make_reader("B")')
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == f"{line}first|{line}B"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
 _MAPPED_PARTIAL_STAGES = """\
 from typing import Annotated
 
