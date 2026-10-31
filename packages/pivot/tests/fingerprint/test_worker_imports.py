@@ -949,6 +949,62 @@ def test_an_expanded_instance_records_its_by_name_modules_outside_the_lock(
         assert not any("byname:" in key for key in entries), (name, entries)
 
 
+_MAPPED_OUTPUT_LOADER = """\
+import dataclasses
+import pathlib
+from typing import Annotated
+
+import wi_mq
+from pivot import Pipeline, directory, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Located(loaders.Loader[str, str]):
+    def load(self, path: pathlib.Path) -> str:
+        return wi_mq.plain()
+
+    def save(self, data: str, path: pathlib.Path) -> None:
+        path.write_text(wi_mq.plain())
+
+
+@stage
+def plan(
+    entries: dict[str, int],
+) -> Annotated[dict[str, dict[str, int]], directory, loaders.YAML[dict[str, int]]()]:
+    return {f"{name}.yaml": {"value": value} for name, value in entries.items()}
+
+
+@stage
+def cut(entry: dict[str, int]) -> Annotated[str, Located()]:
+    return str(entry["value"])
+
+
+with Pipeline("p") as pipeline:
+    planned = plan(pipeline.input("plan.yaml", t=dict[str, int]))
+    cut(pipeline.map(planned))
+"""
+
+
+def test_an_expanded_instances_output_loader_module_is_compared(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The output loader of the mapped stage `p/cut` reads the project's `wi_mq`, which the
+    program holds from its own file: the instance's fingerprint fails as a static stage's does.
+    The loader's entries are placed under the instance's own output key (`out:p/cut@a:`), so the
+    check reads them only when the instance's output keys are the ones passed (#546)."""
+    held = tmp_path / "program" / "wi_mq.py"
+    _held("wi_mq", held, monkeypatch)
+    pipeline = _discover(
+        tmp_path, monkeypatch, {"wi_mq.py": _PLAIN, **_PLAN}, _MAPPED_OUTPUT_LOADER
+    )
+    assert pipeline.expand_template("p/cut", [("a", "a.yaml")]) == ["p/cut@a"]
+
+    with pytest.raises(exceptions.PivotError, match=_ANOTHER_FILE) as instance:
+        pipeline.ensure_fingerprint("p/cut@a")
+
+    assert f"module 'wi_mq' is {held.resolve()} in this process" in str(instance.value)
+
+
 @pytest.mark.parametrize(
     ("mapped", "stage", "output"),
     [
