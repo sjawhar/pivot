@@ -151,7 +151,15 @@ raw = pipeline.input("semicolons.csv", format=loaders.CSV(sep=";"))
 
 A custom loader is a module-level frozen dataclass that extends `Reader`,
 `Writer`, or `Loader`. Fields become options, and their values are part of
-the fingerprint.
+the fingerprint. Its code is too: `load`, `save`, `empty` and the methods
+and properties they call on `self` (or through `super()`), so an edit to a
+helper that `load` calls as `self.decorate()` re-runs the stages that use it.
+A method nothing calls is not part of the fingerprint. A field
+can hold another loader (`Outer(Inner())`, a tuple of loaders, or a dataclass
+that holds one): Pivot fingerprints the held loader as it fingerprints a loader
+you pass directly, so an edit to `Inner.load` re-runs the stages that read
+through `Outer`. A loader inside a pydantic model is not reached, and an
+instance of your own class that is not a loader counts by its fields only.
 
 ```python
 # pipeline.py

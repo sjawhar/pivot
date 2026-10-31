@@ -501,14 +501,16 @@ def _track_stage_imports(covered: frozenset[str]) -> Generator[_StageImports]:
 def _untrusted_modules(
     stage_info: WorkerStageInfo,
     fingerprint_manifest: dict[str, str],
+    output_keys: frozenset[str],
     stage_imports: _StageImports,
     project_root: pathlib.Path,
 ) -> tuple[list[str], list[str]]:
     """The user modules this stage used whose code it cannot vouch for: (edited, unreadable).
 
-    What it used: the modules its manifest hashes, the module that defines the stage, and the
-    modules it imported while it ran. A `@no_fingerprint` stage's code is its declared files, so
-    for it the modules loaded from those files count instead of its imports.
+    What it used: the modules its manifest hashes (its output keys `output_keys` place its
+    outputs' loader entries), the module that defines the stage, and the modules it imported
+    while it ran. A `@no_fingerprint` stage's code is its declared files, so for it the modules
+    loaded from those files count instead of its imports.
 
     A worker first judges every user module it loaded that no recorder saw compile, as discovery
     does (`loaded_source.record_unseen_modules`): a module a stage's module loaded with a loader
@@ -545,6 +547,7 @@ def _untrusted_modules(
         used.update(stage_imports.added_in_window)
     return loaded_source.check_stage(
         manifest,
+        output_keys,
         used,
         stage_info["loaded_sources_token"],
         stage_info["loaded_sources"] if "loaded_sources" in stage_info else None,
@@ -1171,11 +1174,9 @@ def _execute_stage(
                                 deferred_writes=deferred,
                             )
 
+                output_keys = frozenset(types.identity_key(out.identity) for out in stage_outs)
                 covered_modules = frozenset(
-                    fingerprint.covered_user_modules(
-                        current_fingerprint,
-                        {types.identity_key(out.identity) for out in stage_outs},
-                    )
+                    fingerprint.covered_user_modules(current_fingerprint, output_keys)
                 )
                 with (
                     _track_stage_imports(covered_modules) as stage_imports,
@@ -1230,7 +1231,7 @@ def _execute_stage(
                         f"{skip.UNCOVERED_IMPORT_KEY_PREFIX}{modules}": "",
                     }
                 edited, unreadable = _untrusted_modules(
-                    stage_info, current_fingerprint, stage_imports, project_root
+                    stage_info, current_fingerprint, output_keys, stage_imports, project_root
                 )
                 if edited:
                     edited_modules = ", ".join(edited)

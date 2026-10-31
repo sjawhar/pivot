@@ -14,6 +14,8 @@ types the fingerprinting policy allows.
 - No dependency, output field or stage name, each kind of manifest entry included, is read as
   a module a loader covers or as a by-name entry, and a lock keeps every entry but the stage's
   `byname:` ones.
+- No dependency, output field or stage named like a kind of code entry marks a module as one
+  whose code the stage used.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ import pydantic
 import pytest
 from hypothesis import strategies as st
 
-from pivot import fingerprint, loaders, parameters, run_history, stage_def
+from pivot import fingerprint, loaded_source, loaders, parameters, run_history, stage_def
 from pivot.types import DepEntry
 
 if TYPE_CHECKING:
@@ -370,3 +372,44 @@ def test_no_dependency_output_or_stage_name_is_read_as_a_module_or_by_name_entry
     assert fingerprint.without_by_name(manifest) == {
         key: value for key, value in manifest.items() if key != "byname:json"
     }
+
+
+# The kinds of entry that hash a module's code or values (`loaded_source._CODE_KINDS`).
+_CODE_KINDS = ("func", "class", "const", "default", "schema", "partial", "loader")
+
+
+_DIGEST = "0123456789abcdef"
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["one-output", "fields"])
+@pytest.mark.parametrize("kind", _CODE_KINDS)
+@hypothesis.settings(_SETTINGS, max_examples=10)
+@hypothesis.given(st.data())
+def test_no_dependency_output_field_or_stage_name_marks_a_module_used(
+    kind: str, keyed: bool, data: st.DataObject
+) -> None:
+    """Stage `<kind>/<kind>` (function `<kind>`) has a dependency named each code kind, alone and
+    as a list's item, wired as the registry wires it, and one output or a field named each; each
+    of its loaders, and the stage itself, holds a loader (`held:<digest>:`). Every word of every
+    key is a user module the worker knows. Only the entries drawn to hash a module's code, the
+    stage's own or a loader's, mark it as one the stage used (`loaded_source._manifest_modules`)."""
+    stage = f"{kind}/{kind}"
+    outputs = {f"{stage}:{field}" for field in _CODE_KINDS} if keyed else {stage}
+    prefixes = [f"dep:{name}:" for name in _CODE_KINDS]
+    prefixes += [f"dep:{name}[0]:" for name in _CODE_KINDS]
+    prefixes += [f"out:{key}:" for key in sorted(outputs)]
+    prefixes += [f"{prefix}held:{_DIGEST}:" for prefix in ["", *prefixes]]
+    manifest = {f"self:{kind}": "1", f"module:{kind}": "", f"ext:{kind}.value": f"{kind}.value"}
+    for name in _CODE_KINDS:
+        manifest.update({f"wire:{name}": "x", f"wire:{name}:path": "x", f"wire:{name}:paths": "[]"})
+    for prefix in prefixes:
+        fingerprint.merge_loader_fingerprint(manifest, prefix, loaders.YAML())
+    manifest.update({f"out:{key}:tag": "data" for key in outputs})
+    using = data.draw(st.lists(st.sampled_from(["", *prefixes]), unique=True))
+    member = "Reads:load" if kind == "loader" else "value"
+    manifest.update({f"{prefix}{kind}:used{i}.{member}": "h" for i, prefix in enumerate(using)})
+    used = {f"used{index}" for index in range(len(using))}
+    known = {*_ENTRY_KINDS, "load", "save", "empty", "config", "data", "x", "Reads", "held"}
+    known.update({_DIGEST, *used})
+
+    assert loaded_source._manifest_modules(manifest, outputs, known) == used
