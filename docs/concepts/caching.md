@@ -183,7 +183,8 @@ that holds it, a VM cloned from its disk) keeps the id and can keep its director
 numbers, so neither proves which project a view reads. Every naming step therefore writes one
 fresh nonce to `<state dir>/state.lmdb/gc-views/<view>-<cache id>` and to the entry's sibling
 `projects/<digest>.nonce`, so a clone taken while a writer runs holds a nonce the writer's next
-step replaces. The cache id is a random value in the cache's `projects/cache-id`, so a project
+step replaces. The cache id is a random value in `projects/cache-id` of the cache's register
+(the cache root, or beside the object store when `files/` is a link; see below), so a project
 that uses two caches keeps one nonce for each, and registering in one never invalidates the
 other's entry.
 A project that sets a new `core.state_dir` copies the id from its `.pivot` state.
@@ -238,18 +239,28 @@ cache root, or, when the cache root's `files/` is a link, in the directory that 
 directory it links to. So every cache root that uses one object store (several roots whose
 `files/` link one directory, or a root whose `files/` links another root's `files/`) shares one
 register and one lock, and a collection through any of them reads every project that names
-objects in the store. Each root keeps its own whole-directory trees (`trees/`); a collection
-removes only its own root's trees, and keeps the listing and members of a tree another root of
-the store holds. That directory must be writable by every user who names objects in the store.
+objects in the store. Whole-directory trees (`trees/`) live in two places in a linked layout:
+a stage's commit through any root writes its tree beside the object store (`trees/` next to the
+register), which every root of the store shares, and `pivot track` or a restore through a root
+writes it under that root's own `trees/`. A collection through a root lists both of its tree
+stores, removes a dead tree from either, and keeps a tree under another root of the store when
+a project links it. The directory that holds the store must be writable by every user who names
+objects in the store.
 When the object store is the root of a mount of its own (a mount point or a bind mount), the
 directory that holds it is on another filesystem, which other hosts and mount namespaces that
 mount the store need not reach, so the register cannot follow the store: it stays at the cache
-root, and `pivot gc` refuses, naming the layout. That is so when `files/` links to such a mount,
-and when `files/` is itself a mount point (another device than the cache root, or a bind mount
-the mount table lists). Writers keep working either way. Two layouts are supported instead:
-mount the filesystem at the cache root (or point `cache.dir` at a directory inside it), so
-`files/` is a plain directory of that filesystem; or keep the objects in a directory inside the
-mounted filesystem and link `files/` to it.
+root. That is so when `files/` links to such a mount, and when `files/` is itself a mount point
+(another device than the cache root, or a bind mount the mount table lists). Pivot refuses both
+layouts: every command that names objects (a run, `pivot commit`, `pivot track`, `pivot
+checkout`) refuses before it names anything, and `pivot gc` refuses, each naming the layout. So
+no host or container writes into a store whose register is not where every user of the store
+looks (a container given only another root's `files/` would register in its own cache root, out
+of sight of that root's collection). Two layouts are supported instead: mount the filesystem at
+the cache root (or point `cache.dir` at a directory inside it), so `files/` is a plain directory
+of that filesystem; or keep the objects in a directory inside the mounted filesystem and link
+`files/` to it. A collection resolves where the register and the store are once, when it
+starts, and works through that for every step; if `files/` is re-pointed, or a store directory
+replaced, while it runs, it refuses before deleting anything more.
 
 ### A Project That Uses More Than One Cache
 
@@ -280,10 +291,12 @@ Pivot marks that cache `unconfirmed_since` in the view's record, and the command
 naming the cache and `pivot forget-cache`; a cache only another view lists (a host cache a
 container does not mount) is passed over without a word. Until a step reaches that cache again,
 **a copy of the project that can reach a cache the original cannot reach may collect that
-cache's copies of the original's objects**: the original then fetches those objects again or
-runs their stages again ("outputs missing"), and never uses a stale result. Pivot keeps the run
-going rather than refuse it for a cache it does not need. A collection, though, refuses while a
-listed cache cannot be reached.
+cache's copies of the original's objects**: the original then reports those outputs missing and
+gets a stage output back by fetching it or running its stage again, never using a stale result;
+a tracked file with no remote copy is lost (see
+[A Copy That Writes First](#a-copy-that-writes-first)). Pivot keeps the run going rather than
+refuse it for a cache it does not need. A collection, though, refuses while a listed cache
+cannot be reached.
 
 If this view of the project can no longer reach a cache it lists and no longer uses it (deleted,
 or on a disk that is gone), remove it with
@@ -302,8 +315,11 @@ are stale and every collection where the copy is visible refuses, as above. **Wh
 writes first** (it re-tracks a file or runs a stage) while the original stays idle, its step
 rotates the nonces the original's entries share, and a collection where the copy is visible
 then reads the copy's records as the original's. It can remove objects that only the
-original's records name. The original then reports those outputs missing, and `pivot pull`
-(when a remote holds them) or a rerun restores them; it never uses a stale result. No design
+original's records name. The original then reports those outputs missing. A stage output comes
+back with `pivot pull` (when a remote holds it) or a rerun, and is never used stale. **A tracked
+file or directory may be lost for good**: its object exists only in the cache unless it was
+pushed, no stage produces it, and in symlink checkout the workspace holds only a link to the
+removed object, so with no remote copy it cannot be restored at all. No design
 without an identity a disk copy cannot carry can catch this case, so pivot documents it as a
 limit rather than refuse every collection. Keying entries on something a copy does not carry,
 such as the boot id, does not close it either: the copy still reads its own records under the

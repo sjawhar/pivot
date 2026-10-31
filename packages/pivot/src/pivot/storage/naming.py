@@ -137,9 +137,9 @@ OBJECTS_DIR = "files"
 
 class StoreLayout(NamedTuple):
     """Where one cache root keeps its register (``register_root``); where its ``files/``
-    resolves to when it is a link (``linked_store``); and whether that linked store is the root
-    of a mount of its own, so that no register can follow it (``unshared``; a ``files/`` that is
-    itself a mount point is ``unshared_store``'s to find, for a collection)."""
+    resolves to when it is a link (``linked_store``); and whether its object store is the root
+    of a mount of its own, so that no register can follow it (``unshared``): ``files/`` itself a
+    mount point, or a link to one."""
 
     register_root: pathlib.Path
     linked_store: pathlib.Path | None
@@ -157,80 +157,96 @@ def store_layout(cache_root: pathlib.Path) -> StoreLayout:
     to, and the register lives in that directory's parent: a cache root whose own ``files/`` is
     that directory keeps its register there too, and so does every other root that links it. A
     store that is the root of a mount of its own (a mount point, or a bind mount) has a parent
-    on another filesystem, which another host or mount namespace does not reach through the
-    store: its register stays at the cache root, and the layout is ``unshared``, for which a
-    collection refuses (``gc.resolve_scopes``). A plain layout costs one ``lstat``; a linked one,
-    once this process has resolved it, an ``lstat`` and a ``stat`` of ``files/`` and one poll of
-    the mount watch (``_LINKED_LAYOUTS``).
+    on another filesystem, which another host or mount namespace that mounts the store does not
+    reach: its register stays at the cache root, and the layout is ``unshared``. That is a
+    ``files/`` link to a mount root, and a ``files/`` that is itself a mount point. Nothing may
+    name objects there (``naming_unit``) or collect them (``gc.resolve_scopes``), since no
+    register shows every project of the store (``unshared_store_problem``). A plain layout costs
+    one ``lstat`` of ``files/``, one poll of the mount watch and a dictionary lookup once this
+    process has resolved it; a linked one also a ``stat`` of ``files/`` (``_STORE_LAYOUTS``).
     """
-    files = os.fspath(cache_root) + "/" + OBJECTS_DIR
+    known = _STORE_LAYOUTS.get(cache_root)
+    files = os.fspath(cache_root) + "/" + OBJECTS_DIR if known is None else known.files
     try:
-        link = os.lstat(files)
+        stats = os.lstat(files)
     except (OSError, ValueError):
         return StoreLayout(cache_root, None, unshared=False)
-    if not stat.S_ISLNK(link.st_mode):
-        return StoreLayout(cache_root, None, unshared=False)
-    try:
-        target = os.stat(files)
-    except OSError:
-        target = None
-    link_identity = (link.st_dev, link.st_ino, link.st_ctime_ns)
-    store_identity = None if target is None else (target.st_dev, target.st_ino)
+    linked = stat.S_ISLNK(stats.st_mode)
+    target: tuple[int, int] | None = None
+    if linked:
+        try:
+            resolved = os.stat(files)
+            target = (resolved.st_dev, resolved.st_ino)
+        except OSError:
+            target = None
+    identity = (stats.st_dev, stats.st_ino, stats.st_mode, target)
     generation = _mount_generation()
-    known = _LINKED_LAYOUTS.get(cache_root)
     if (
         known is not None
         and generation is not None
-        and known.identity == (link_identity, store_identity, generation)
+        and known.generation == generation
+        and known.identity == identity
     ):
         return known.layout
-    store = pathlib.Path(os.path.realpath(files))
-    if _mount_root(store):
-        layout = StoreLayout(cache_root, store, unshared=True)
+    if linked:
+        store = pathlib.Path(os.path.realpath(files))
+        if _mount_root(store):
+            layout = StoreLayout(cache_root, store, unshared=True)
+        else:
+            layout = StoreLayout(store.parent, store, unshared=False)
     else:
-        layout = StoreLayout(store.parent, store, unshared=False)
-    _LINKED_LAYOUTS[cache_root] = _KnownLayout((link_identity, store_identity, generation), layout)
+        mounted = stat.S_ISDIR(stats.st_mode) and _mount_root(pathlib.Path(os.path.realpath(files)))
+        layout = StoreLayout(cache_root, None, unshared=mounted)
+    _STORE_LAYOUTS.pop(cache_root, None)
+    _STORE_LAYOUTS[cache_root] = _KnownLayout(files, identity, generation, layout)
+    while len(_STORE_LAYOUTS) > _MAX_STORE_LAYOUTS:
+        del _STORE_LAYOUTS[next(iter(_STORE_LAYOUTS))]
     return layout
 
 
 class _KnownLayout(NamedTuple):
-    # The link's (dev, ino, ctime), the directory it resolves to (dev, ino), and the mount-change
-    # count, when the layout was resolved.
-    identity: tuple[tuple[int, int, int], tuple[int, int] | None, int | None]
+    files: str
+    # ``files/``'s (dev, inode, mode), and for a link the directory it resolves to (dev, inode).
+    identity: tuple[int, int, int, tuple[int, int] | None]
+    # The mount-change count (``_mount_generation``) when the layout was resolved.
+    generation: int | None
     layout: StoreLayout
 
 
-# This process's resolution of each linked layout, kept while the link, the directory it resolves
-# to and the mount table are unchanged: resolving one reads the mount table (``_mount_root``).
-# A re-pointed link is a new link (another inode); a re-pointed link further along the path
-# resolves to another directory; a mount on the store changes the count.
-_LINKED_LAYOUTS = dict[pathlib.Path, _KnownLayout]()
+# This process's resolution of each cache root's layout, kept while ``files/`` is the same entry
+# (and, for a link, resolves to the same directory) and the mount table has not changed:
+# resolving one may read the mount table (``_mount_root``). A link replaced (``ln -sfn``) is a
+# new entry or resolves elsewhere; a link further along the path re-pointed resolves elsewhere;
+# a mount at ``files/``, on the store or at the cache root changes the count. The latest
+# ``_MAX_STORE_LAYOUTS`` cache roots are kept; another is resolved again at its next use.
+_STORE_LAYOUTS = dict[pathlib.Path, _KnownLayout]()
+_MAX_STORE_LAYOUTS = 64
+
+
+def unshared_store_problem(cache_root: pathlib.Path, layout: StoreLayout) -> str:
+    """Why nothing may name or collect objects through ``cache_root`` when its object store is
+    the root of a mount of its own (``StoreLayout.unshared``), and the supported layouts: what a
+    writer's refusal (``naming_unit``) and a collection's (``gc.resolve_scopes``) both say."""
+    if layout.linked_store is not None:
+        where = f"its files/ links to {layout.linked_store}, which is a mount of its own"
+    else:
+        store = os.path.realpath(cache_root / OBJECTS_DIR)
+        where = f"its files/ ({store}) is a mount of its own"
+    return (
+        f"{where}\n(a mount point or a bind mount). Pivot keeps a cache's register beside its "
+        "object store, in\nthe directory that holds it, so that every cache root using one store "
+        "shares one register.\nHere that directory is on another filesystem, which other hosts "
+        "and mount namespaces that\nmount the store do not reach, so the register stays at the "
+        "cache root and cannot show every\nproject that names objects in the store. Supported "
+        "layouts: mount the filesystem at the cache\nroot (or set cache.dir to a directory "
+        "inside it), so files/ is a plain directory of it; or keep\nthe objects in a directory "
+        "inside the mounted filesystem and link files/ to that directory."
+    )
 
 
 def register_root(cache_root: pathlib.Path) -> pathlib.Path:
     """The directory that holds ``cache_root``'s register (``store_layout``)."""
     return store_layout(cache_root).register_root
-
-
-def unshared_store(cache_root: pathlib.Path) -> pathlib.Path | None:
-    """The object store of ``cache_root`` when it is the root of a mount of its own, so that no
-    register can follow it to where every user of the store reaches; None otherwise.
-
-    That is a ``files/`` link to a mount root (``store_layout``'s ``unshared``), and a ``files/``
-    that is itself a mount point: on another device than the cache root, or a bind mount the
-    mount table lists. Either way the register stays at the cache root, on a filesystem other
-    hosts and mount namespaces that mount the store need not see, so a collection refuses
-    (``gc.resolve_scopes``) rather than read a register that may not show every project of the
-    store. Writers keep working: their register is the cache root's, as before. Only a
-    collection calls this (it may read the mount table), never a naming step.
-    """
-    layout = store_layout(cache_root)
-    if layout.linked_store is not None:
-        return layout.linked_store if layout.unshared else None
-    files = pathlib.Path(os.path.realpath(cache_root / OBJECTS_DIR))
-    if not files.is_dir():
-        return None
-    return files if _mount_root(files) else None
 
 
 def _mount_root(path: pathlib.Path) -> bool:
@@ -817,7 +833,8 @@ def _registration_unchanged(key: _RegistrationKey, root: pathlib.Path) -> bool:
     """Whether this process already registered ``key`` against the evidence it sees now, in
     the register under ``root`` (``register_root``: a re-pointed ``files/`` link moves it)."""
     verified = _VERIFIED_REGISTRATIONS.get(key)
-    if verified is None or verified.register_root != root:
+    # The layout memo hands back the same path object while the register has not moved.
+    if verified is None or (verified.register_root is not root and verified.register_root != root):
         return False
     if _mount_generation() != verified.mount_generation:
         return False
@@ -1137,10 +1154,11 @@ def _confirm_listed_caches(
     its path, or its register cannot be written) does not fail the step: this view's record of
     it is marked unconfirmed (``_mark_unconfirmed``) and the command warns once
     (``_warn_unreachable``). Until a step reaches it again, a copy of the project that can reach
-    it may collect this project's objects there; they are then fetched or run again, never used
-    stale. A cache only other views list, which this view cannot reach (a host cache a
-    container does not mount), is passed over without a word: this view never named anything
-    there, and a collection still checks that view's entry (``gc._other_caches_reason``).
+    it may collect this project's objects there: a stage output is then fetched or run again,
+    never used stale, and a tracked file with no remote copy is lost. A cache only other views
+    list, which this view cannot reach (a host cache a container does not mount), is passed over
+    without a word: this view never named anything there, and a collection still checks that
+    view's entry (``gc._other_caches_reason``).
     """
     verified = _VERIFIED_REGISTRATIONS.get((cache_dir, project_root, state_dir))
     this_cache: str | None
@@ -1234,8 +1252,9 @@ def _warn_unreachable(cache_id: str, where: pathlib.Path, problem: str) -> None:
         "This project also uses the cache %s (id %s), and this command cannot reach it: %s. "
         + "Its entry for this project there was not brought up to date, so until a pivot "
         + "command in this project reaches that cache again, a copy of this project (a cloned "
-        + "disk) that can reach it could collect this project's objects there; they would then "
-        + "be fetched or run again. If no view of this project uses that cache any more, run "
+        + "disk) that can reach it could collect this project's objects there: stage outputs "
+        + "would then be fetched or run again, and a tracked file no remote holds would be "
+        + "lost. If no view of this project uses that cache any more, run "
         + "`pivot forget-cache %s` here, in the project itself: never in a copy of it.",
         where,
         cache_id,
@@ -1268,11 +1287,13 @@ def naming_lock_paths(cache_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.P
     Never pass the object root itself: its own register root is a different directory, and so
     a different, unshared lock.
     """
-    return _lock_paths_at(register_root(cache_root))
+    return lock_paths_in(register_root(cache_root))
 
 
-def _lock_paths_at(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
-    """``naming_lock_paths`` in the register root ``root``."""
+def lock_paths_in(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """``naming_lock_paths`` in the register root ``root`` (``StoreLayout.register_root``): what
+    a naming unit and a collection's snapshot (``gc.StoreSnapshot``) use, each having resolved
+    the layout once."""
     return root / NAMING_TURNSTILE, root / NAMING_LOCK
 
 
@@ -1300,13 +1321,23 @@ def naming_unit(
     ``pivot gc`` refuses to collect there. Where the lock files cannot be opened (they do not
     exist yet and this user cannot create them), the unit refuses: another user's collection
     could create them and delete while this writer named objects unlocked. The one exception
-    is a read-only filesystem, where nothing — a collection included — can delete.
+    is a read-only filesystem, where nothing — a collection included — can delete. A cache whose
+    object store is the root of a mount of its own (``StoreLayout.unshared``) is refused too: its
+    register is not where every view that mounts the store looks, so a collection through
+    another root of the store could not see this project.
 
     Raises:
-        exceptions.CacheError: the lock files cannot be opened on a writable filesystem.
+        exceptions.CacheError: the lock files cannot be opened on a writable filesystem, or the
+            object store is the root of a mount of its own.
     """
     layout = store_layout(cache_dir)
-    ts_path, nm_path = _lock_paths_at(layout.register_root)
+    if layout.unshared:
+        raise exceptions.CacheError(
+            f"Refusing to name objects in {cache_dir}: "
+            + unshared_store_problem(cache_dir, layout)
+            + "\nNothing was recorded."
+        )
+    ts_path, nm_path = lock_paths_in(layout.register_root)
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         ts_fd = cache.open_cache_lock(ts_path)

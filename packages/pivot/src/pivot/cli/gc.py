@@ -184,10 +184,13 @@ def gc_cmd(
     cache_dir = config.get_cache_dir()
     object_root = cache_dir / naming.OBJECTS_DIR
     state_dir = config.get_state_dir()
+    # The layout is resolved once, for every step of this collection (RP), and its directories
+    # stay open until the command ends.
+    snapshot = ctx.with_resource(gc.store_snapshot(cache_dir))
 
-    scopes = gc.resolve_scopes(cache_dir, project_root, state_dir, project_paths, dry_run=dry_run)
+    scopes = gc.resolve_scopes(snapshot, project_root, state_dir, project_paths, dry_run=dry_run)
     if not dry_run:
-        naming.register_project(cache_dir, project_root, state_dir)
+        naming.register_project(cache_dir, project_root, state_dir, layout=snapshot.layout)
 
     if not cache_dir.is_dir():
         # N4: a cache that has never stored anything has nothing to collect. Pivot does not
@@ -217,7 +220,7 @@ def gc_cmd(
     retention = config.get_run_history_retention()
     would_prune, valid_run_ids = _plan_prune(state_dir, retention)
 
-    with gc.collection_lock(cache_dir):
+    with gc.collection_lock(snapshot):
         # The plan and the prompt stay OUTSIDE the naming lock, so a dry run and a prompted
         # user do not block writers. The confirmed non-dry path takes the naming lock
         # exclusively to re-read the register, prune, collect roots and delete — while it
@@ -225,7 +228,7 @@ def gc_cmd(
         # by construction and needs no re-read in execute_plan.
         try:
             roots = gc.collect_roots(
-                scopes, cache_dir, prune_state_dir=state_dir, valid_run_ids=valid_run_ids
+                scopes, snapshot, prune_state_dir=state_dir, valid_run_ids=valid_run_ids
             )
             keep_all = bool(roots["outward_dirs"])
             if roots["outward_dirs"]:
@@ -241,7 +244,7 @@ def gc_cmd(
                     to_stderr=True,
                 )
             plan = gc.build_plan(
-                cache_dir, roots, grace_hours=grace_hours, remove_linked=remove_linked
+                snapshot, roots, grace_hours=grace_hours, remove_linked=remove_linked
             )
 
             removed = gc.ObjectCount(objects=len(plan["doomed"]), bytes=plan["doomed_bytes"])
@@ -262,9 +265,9 @@ def gc_cmd(
                 # waited can be missed (P7): the register, every record, and, after the prune,
                 # the run-cache rows that remain. The plan read before the lock only limits
                 # which objects are candidates; it never licenses a deletion on its own.
-                with gc.naming_exclusive(cache_dir):
-                    scopes = gc.resolve_scopes(cache_dir, project_root, state_dir, project_paths)
-                    roots = gc.collect_roots(scopes, cache_dir)
+                with gc.naming_exclusive(snapshot):
+                    scopes = gc.resolve_scopes(snapshot, project_root, state_dir, project_paths)
+                    roots = gc.collect_roots(scopes, snapshot)
                     keep_all = bool(roots["outward_dirs"])
                     removed = gc.ObjectCount(objects=0, bytes=0)
                     if not keep_all:
@@ -275,10 +278,11 @@ def gc_cmd(
                                 + "(core.run_history_retention).",
                                 to_stderr=notes_to_stderr,
                             )
-                            gc.reread_run_cache(roots, scopes, cache_dir)
+                            gc.reread_run_cache(roots, scopes, snapshot)
                         if plan["doomed"]:
                             removed = gc.execute_plan(
                                 plan,
+                                snapshot=snapshot,
                                 roots=roots,
                                 grace_hours=grace_hours,
                                 remove_linked=remove_linked,

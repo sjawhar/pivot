@@ -486,14 +486,14 @@ def _other_view_reason(
 
 
 def _cache_mount_reasons(
-    cache_dir: pathlib.Path, points: frozenset[str] | None
+    snapshot: StoreSnapshot, points: frozenset[str] | None
 ) -> list[tuple[str, str]]:
     """Why the cache's register or refs may be hidden by a mount this view cannot confirm.
 
     Each view's record is checked: this view's recorded mounts must be mounted now, and another
     view's record may name no mount under the cache root, since this view cannot check it.
     """
-    directory = naming.register_root(cache_dir) / naming.CACHE_MOUNTS_DIR
+    directory = snapshot.layout.register_root / naming.CACHE_MOUNTS_DIR
     try:
         with os.scandir(directory) as entries:
             paths = sorted(pathlib.Path(e.path) for e in entries if e.name.endswith(".json"))
@@ -550,7 +550,7 @@ def _cache_mount_reasons(
 
 
 def read_register(
-    cache_dir: pathlib.Path,
+    snapshot: StoreSnapshot,
 ) -> tuple[list[ProjectScope], list[tuple[str, str]]]:
     """Return the register's live projects and the entries a collection cannot use.
 
@@ -558,12 +558,12 @@ def read_register(
     id in the registered project's current state directory, which comes from that project's own
     ``core.state_dir`` resolver. On the registering host, every recorded mount below the project
     must still be mounted. ``resolve_scopes`` then opens every scope's root, `.pivot` and state
-    directory before any record is read.
+    directory before any record is read. The register is the one ``snapshot`` resolved.
     """
-    register = naming.register_root(cache_dir) / naming.REGISTER_DIR
+    register = snapshot.layout.register_root / naming.REGISTER_DIR
     live = list[ProjectScope]()
     points = naming.mount_points(naming.read_mount_table())  # always read now; never the memo
-    unreadable = _cache_mount_reasons(cache_dir, points)
+    unreadable = _cache_mount_reasons(snapshot, points)
     try:
         with os.scandir(register) as entries:
             paths = sorted(
@@ -617,26 +617,25 @@ def refusal_external(cache_dir: pathlib.Path, project_root: pathlib.Path) -> str
     )
 
 
-def refusal_unshared_store(cache_dir: pathlib.Path, store: pathlib.Path) -> str:
+def refusal_unshared_store(cache_dir: pathlib.Path, layout: naming.StoreLayout) -> str:
     """What a collection says when the cache's object store is the root of a mount of its own,
-    so that the register cannot follow it (``naming.unshared_store``): ``files/`` is itself a
-    mount point, or a link to one."""
-    files = cache_dir / naming.OBJECTS_DIR
-    where = (
-        f"its files/ links to {store}, which is a mount of its own"
-        if files.is_symlink()
-        else f"its files/ ({store}) is a mount of its own"
-    )
+    so that the register cannot follow it (``naming.StoreLayout.unshared``): ``files/`` is
+    itself a mount point, or a link to one. Writers refuse it with the same text."""
     return (
-        f"Refusing to collect {cache_dir}: {where}\n(a mount point or a bind mount). Pivot keeps "
-        "a cache's register beside its object store, in\nthe directory that holds it, so that "
-        "every cache root using one store shares one register.\nHere that directory is on "
-        "another filesystem, which other hosts and mount namespaces that\nmount the store do "
-        "not reach, so the register stays at the cache root and cannot show every\nproject that "
-        "names objects in the store. Supported layouts: mount the filesystem at the cache\nroot "
-        "(or set cache.dir to a directory inside it), so files/ is a plain directory of it; or "
-        "keep\nthe objects in a directory inside the mounted filesystem and link files/ to that "
-        "directory.\nNothing was removed."
+        f"Refusing to collect {cache_dir}: "
+        + naming.unshared_store_problem(cache_dir, layout)
+        + "\nNothing was removed."
+    )
+
+
+def refusal_store_moved(snapshot: StoreSnapshot, reason: str) -> str:
+    """What a collection says when the cache no longer resolves to the store it resolved at its
+    start (``StoreSnapshot.check``)."""
+    return (
+        f"Refusing to go on collecting {snapshot.cache_dir}: {reason}. This collection read the "
+        f"register,\nthe records and the plan for the store {snapshot.object_root}, and removes "
+        "nothing once the\ncache's layout has changed under it: a files/ link re-pointed or a "
+        "store directory replaced\nwhile it ran. Run pivot gc again. Nothing further was removed."
     )
 
 
@@ -670,7 +669,7 @@ def refusal_unreadable(
 
 
 def resolve_scopes(
-    cache_dir: pathlib.Path,
+    snapshot: StoreSnapshot,
     project_root: pathlib.Path,
     state_dir: pathlib.Path,
     extra: Iterable[pathlib.Path],
@@ -689,16 +688,19 @@ def resolve_scopes(
     Raises:
         exceptions.CacheCollectionRefusedError: a ``--projects`` path is not a pivot project
             this cache can read, or the cache is external and records no usable project, or an
-            entry cannot be read.
+            entry cannot be read, or the object store is the root of a mount of its own.
     """
+    cache_dir = snapshot.cache_dir
     here = ProjectScope(
         root=project_root, state_dir=state_dir, host=socket.gethostname(), last_write="now"
     )
-    if (store := naming.unshared_store(cache_dir)) is not None:
-        raise exceptions.CacheCollectionRefusedError(refusal_unshared_store(cache_dir, store))
+    if snapshot.layout.unshared:
+        raise exceptions.CacheCollectionRefusedError(
+            refusal_unshared_store(cache_dir, snapshot.layout)
+        )
     # Always read the register (BLK-3), before any --projects registration can replace evidence
     # a collection must check: an internal cache can have a registered peer too.
-    live, unreadable = read_register(cache_dir)
+    live, unreadable = read_register(snapshot)
     if unreadable:
         raise exceptions.CacheCollectionRefusedError(
             refusal_unreadable(cache_dir, len(live) + len(unreadable), unreadable, REMEDY_REGISTER)
@@ -743,7 +745,7 @@ def resolve_scopes(
             ) from e
         named.append(scope)
         if not dry_run:
-            naming.register_project(cache_dir, root, scope_state_dir)
+            naming.register_project(cache_dir, root, scope_state_dir, layout=snapshot.layout)
 
     # The external-only refusal: a cache outside the project root with no registered or named
     # project, and none on the command line, is someone else's cache.
@@ -1115,17 +1117,85 @@ class _WalkResult(NamedTuple):
     listings: list[pathlib.Path]
 
 
-def tree_roots(cache_dir: pathlib.Path) -> list[pathlib.Path]:
-    """The cache's whole-directory tree stores. A stage's commit puts a tree beside the object
-    store it resolves ``files/`` to, which is the register root (``naming.store_layout``); a
-    command given the unresolved ``files/`` (``pivot track``, a restore) puts it under the cache
-    root. In a plain layout the two are one directory. Both are this cache's: every project that
-    can link either is in the register a collection reads."""
-    roots = [naming.register_root(cache_dir) / TREES_DIR]
-    own = cache_dir / TREES_DIR
-    if os.path.realpath(own) != os.path.realpath(roots[0]):
-        roots.append(own)
-    return roots
+class StoreSnapshot(NamedTuple):
+    """The cache's store layout as one collection resolved it at its start (RP).
+
+    Every lock, register read, record walk, plan and unlink of the collection goes through it,
+    never through ``files/`` again: a ``files/`` link re-pointed while the collection runs would
+    otherwise send a later step to another store, whose register this collection never read.
+    ``object_root`` and ``trees`` are real paths, so a plan's paths name the snapshot's store
+    whatever the link says later, and each existing directory of the snapshot is held open
+    (``anchors``) so ``check`` can tell when a path no longer names the directory the collection
+    opened (a store directory renamed and another put in its place).
+
+    ``trees`` holds the whole-directory tree stores: a stage's commit puts a tree beside the
+    object store it resolves ``files/`` to, which is the register root; a command given the
+    unresolved ``files/`` (``pivot track``, a restore) puts it under the cache root. In a plain
+    layout the two are one directory. Both are this cache's: every project that can link either
+    is in the register a collection reads.
+    """
+
+    cache_dir: pathlib.Path
+    layout: naming.StoreLayout
+    object_root: pathlib.Path
+    trees: tuple[pathlib.Path, ...]
+    anchors: tuple[tuple[pathlib.Path, int], ...]
+
+    def check(self) -> None:
+        """Refuse to go on when the cache no longer resolves to this snapshot: ``files/`` now
+        resolves to another directory, or a directory of the snapshot is no longer the one the
+        collection opened.
+
+        Raises:
+            exceptions.CacheCollectionRefusedError: the layout changed under the collection.
+        """
+        current = _resolved_store(self.cache_dir)
+        if current != self.object_root:
+            raise exceptions.CacheCollectionRefusedError(
+                refusal_store_moved(self, f"its files/ now resolves to {current}")
+            )
+        for path, fd in self.anchors:
+            try:
+                now = os.stat(path)
+            except OSError as e:
+                raise exceptions.CacheCollectionRefusedError(
+                    refusal_store_moved(self, f"{path} cannot be read ({_error_text(e)})")
+                ) from e
+            held = os.fstat(fd)
+            if (now.st_dev, now.st_ino) != (held.st_dev, held.st_ino):
+                raise exceptions.CacheCollectionRefusedError(
+                    refusal_store_moved(self, f"{path} is no longer the directory it opened")
+                )
+
+
+def _resolved_store(cache_dir: pathlib.Path) -> pathlib.Path:
+    """Where ``cache_dir``'s ``files/`` resolves to now."""
+    return pathlib.Path(os.path.realpath(cache_dir / naming.OBJECTS_DIR))
+
+
+@contextlib.contextmanager
+def store_snapshot(cache_dir: pathlib.Path) -> Generator[StoreSnapshot]:
+    """Resolve the cache's store layout once, for one collection, holding each of its existing
+    directories open until the collection ends (``StoreSnapshot``)."""
+    layout = naming.store_layout(cache_dir)
+    object_root = _resolved_store(cache_dir)
+    trees = [pathlib.Path(os.path.realpath(layout.register_root / TREES_DIR))]
+    own_trees = pathlib.Path(os.path.realpath(cache_dir / TREES_DIR))
+    if own_trees != trees[0]:
+        trees.append(own_trees)
+    register_root = pathlib.Path(os.path.realpath(layout.register_root))
+    anchors = list[tuple[pathlib.Path, int]]()
+    try:
+        for path in dict.fromkeys((register_root, object_root, *trees)):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            anchors.append((path, fd))
+        yield StoreSnapshot(cache_dir, layout, object_root, tuple(trees), tuple(anchors))
+    finally:
+        for _path, fd in anchors:
+            os.close(fd)
 
 
 def _walk_project(
@@ -1258,7 +1328,7 @@ def _tree_of_store(real: pathlib.Path, resolved_objects: pathlib.Path) -> bool:
 
 def collect_roots(
     scopes: Iterable[ProjectScope],
-    cache_dir: pathlib.Path,
+    snapshot: StoreSnapshot,
     *,
     prune_state_dir: pathlib.Path | None = None,
     valid_run_ids: set[str] | None = None,
@@ -1274,8 +1344,9 @@ def collect_roots(
             or run-cache row it cannot fully interpret (each named), or a directory record whose
             listing is neither in the cache nor committed.
     """
-    object_root = cache_dir / naming.OBJECTS_DIR
-    trees = tree_roots(cache_dir)
+    cache_dir = snapshot.cache_dir
+    object_root = snapshot.object_root
+    trees = list(snapshot.trees)
     roots = Roots(
         named=set[str](),
         run_cache=set[str](),
@@ -1336,7 +1407,7 @@ def collect_roots(
     return roots
 
 
-def reread_run_cache(roots: Roots, scopes: Iterable[ProjectScope], cache_dir: pathlib.Path) -> None:
+def reread_run_cache(roots: Roots, scopes: Iterable[ProjectScope], snapshot: StoreSnapshot) -> None:
     """Replace ``roots``' run-cache keys with every row the scopes' databases hold now.
 
     Called under the exclusive naming lock after a run-history prune, so the rows the prune
@@ -1347,8 +1418,9 @@ def reread_run_cache(roots: Roots, scopes: Iterable[ProjectScope], cache_dir: pa
         ProjectUnreadableError: a scope's database, a row this pivot cannot fully interpret,
             or the listing of a directory one of its rows records, cannot be read.
     """
-    object_root = cache_dir / naming.OBJECTS_DIR
-    trees = tree_roots(cache_dir)
+    cache_dir = snapshot.cache_dir
+    object_root = snapshot.object_root
+    trees = list(snapshot.trees)
     keys = set[str]()
     rows = 0
     for scope in scopes:
@@ -1384,8 +1456,8 @@ def reread_run_cache(roots: Roots, scopes: Iterable[ProjectScope], cache_dir: pa
 
 
 @contextlib.contextmanager
-def collection_lock(cache_dir: pathlib.Path) -> Generator[None]:
-    """Hold the cache's ``gc.lock`` exclusively so two collections never run on one cache.
+def collection_lock(snapshot: StoreSnapshot) -> Generator[None]:
+    """Hold the cache's ``gc.lock`` exclusively so two collections never run on one store.
 
     Lock order: gc.lock is taken FIRST, before the naming lock.
 
@@ -1393,7 +1465,8 @@ def collection_lock(cache_dir: pathlib.Path) -> Generator[None]:
         exceptions.CacheCollectionRefusedError: another collection holds it, or the cache
             cannot be written, or ``flock`` is refused on this filesystem.
     """
-    path = naming.register_root(cache_dir) / GC_LOCK
+    cache_dir = snapshot.cache_dir
+    path = snapshot.layout.register_root / GC_LOCK
     try:
         fd = cache.open_cache_lock(path)
     except OSError as e:
@@ -1425,14 +1498,15 @@ def collection_lock(cache_dir: pathlib.Path) -> Generator[None]:
 
 
 @contextlib.contextmanager
-def naming_exclusive(cache_dir: pathlib.Path) -> Generator[None]:
+def naming_exclusive(snapshot: StoreSnapshot) -> Generator[None]:
     """Hold the naming lock exclusive: no writer can name a cache object while this is held.
 
     Lock order: gc.lock → naming.turnstile (EX) → naming.lock (EX); no prefix lock under it.
     The turnstile prevents writer starvation: gc takes it exclusive first so new commit
-    units queue, then gc takes naming exclusive to wait for in-flight units to finish.
+    units queue, then gc takes naming exclusive to wait for in-flight units to finish. The lock
+    files are the ones beside the register ``snapshot`` resolved.
     """
-    ts_path, nm_path = naming.naming_lock_paths(cache_dir)
+    ts_path, nm_path = naming.lock_paths_in(snapshot.layout.register_root)
     ts_fd = cache.open_cache_lock(ts_path)
     nm_fd = cache.open_cache_lock(nm_path)
     try:
@@ -1504,7 +1578,7 @@ def _tree_bytes(path: pathlib.Path) -> int:
 
 
 def build_plan(
-    cache_dir: pathlib.Path,
+    snapshot: StoreSnapshot,
     roots: Roots,
     *,
     grace_hours: float,
@@ -1516,9 +1590,10 @@ def build_plan(
     Both stores are listed: the objects under ``files`` (a file's content, and a directory's
     listing) and the whole-directory trees under ``trees``, which a symlink checkout links to.
     One directory hash names its listing object and its tree, so the record that names the
-    directory keeps both.
+    directory keeps both. Every path is under the snapshot's real store paths, never through
+    ``files/``, so a link re-pointed later cannot send an unlink elsewhere.
     """
-    object_root = cache_dir / naming.OBJECTS_DIR
+    object_root = snapshot.object_root
     cutoff = (time.time() if now is None else now) - grace_hours * 3600
     plan = Plan(
         scanned=ObjectCount(objects=0, bytes=0),
@@ -1531,9 +1606,7 @@ def build_plan(
         doomed_bytes=0,
         linked=ObjectCount(objects=0, bytes=0),
     )
-    tree_dirs = [
-        prefix for tree_root in tree_roots(cache_dir) for prefix in _prefix_dirs(tree_root)
-    ]
+    tree_dirs = [prefix for tree_root in snapshot.trees for prefix in _prefix_dirs(tree_root)]
     for prefix_dir in [*_prefix_dirs(object_root), *tree_dirs]:
         with _prefix_locked(prefix_dir), os.scandir(prefix_dir) as entries:
             for entry in sorted(entries, key=lambda e: e.name):
@@ -1616,6 +1689,7 @@ def _keep_reason(
 def execute_plan(
     plan: Plan,
     *,
+    snapshot: StoreSnapshot,
     roots: Roots,
     grace_hours: float,
     remove_linked: bool,
@@ -1628,17 +1702,29 @@ def execute_plan(
     unlinks. Each object is still re-checked against the grace and the hardlink rule (a checkout
     already in flight before the lock was taken may have hardlinked it).
 
+    The plan's paths are under the snapshot's real store paths. Before the first deletion in
+    each prefix directory the snapshot is checked again (``StoreSnapshot.check``): when
+    ``files/`` resolves elsewhere now, or a store directory is no longer the one the collection
+    opened, the collection refuses and removes nothing further.
+
     No prefix lock is taken here: while gc holds the exclusive naming lock it must never wait
     for another process, or every writer on the cache would wait behind it. A publisher staging
     into a prefix (which holds that prefix's lock shared for its whole copy) needs no exclusion
     from these deletions: it publishes outside any naming unit, and its unit re-checks every
     object, publishing again any removed here, before a record names it. Temporary entries are
     never in the plan (``build_plan`` lists each prefix under its lock and takes only keys).
+
+    Raises:
+        exceptions.CacheCollectionRefusedError: the cache's layout changed under the collection.
     """
     cutoff = (time.time() if now is None else now) - grace_hours * 3600
     removed = ObjectCount(objects=0, bytes=0)
+    checked: pathlib.Path | None = None
     for doomed in sorted(plan["doomed"], key=lambda d: d["path"]):
         path = doomed["path"]
+        if path.parent != checked:
+            snapshot.check()
+            checked = path.parent
         try:
             stats = path.lstat()
         except FileNotFoundError:

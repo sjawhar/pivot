@@ -196,7 +196,7 @@ def _assert_waits_for_a_collection(
     what = f"pivot {' '.join(args)}"
     assert not landed(), f"{what}: its record is there before it ran"
     assert obj is None or not obj.exists(), f"{what}: its object is cached before it ran"
-    with gc.naming_exclusive(cache_dir):
+    with gc.store_snapshot(cache_dir) as snapshot, gc.naming_exclusive(snapshot):
         proc = _start(root, *args, env=_env())
         try:
             if obj is not None:
@@ -237,7 +237,7 @@ def test_a_stage_commit_waits_while_a_collection_holds_the_naming_lock(
     )
     try:
         _wait_for(gate / "started", proc, timeout=120)
-        with gc.naming_exclusive(cache_dir):
+        with gc.store_snapshot(cache_dir) as snapshot, gc.naming_exclusive(snapshot):
             (gate / "go").write_text("")
             _publishes_outside_then_rechecks(
                 proc, "a stage commit", output_object, lambda: _locks(root) != before
@@ -305,7 +305,7 @@ def test_a_run_cache_skip_waits_while_a_collection_holds_the_naming_lock(
     proc = _start(root, "repro", env=_env(PYTHONPATH=str(hook), GC_TEST_ROW_GATE=str(gate)))
     try:
         _wait_for(gate / "started", proc, timeout=120)
-        with gc.naming_exclusive(cache_dir):
+        with gc.store_snapshot(cache_dir) as snapshot, gc.naming_exclusive(snapshot):
             (gate / "go").write_text("")
             time.sleep(3.0)  # the restore follows the lookup within milliseconds
             assert proc.poll() is None, "a run-cache skip did not wait for the collection"
@@ -1437,7 +1437,7 @@ def test_pivot_track_refuses_to_republish_a_file_that_changed_since_it_was_hashe
     notes.write_text("the bytes pivot hashed\n")
     obj = _object_for(root, "the bytes pivot hashed\n")
 
-    with gc.naming_exclusive(cache_dir):
+    with gc.store_snapshot(cache_dir) as snapshot, gc.naming_exclusive(snapshot):
         proc = _start(root, "track", "notes.txt", env=_env())
         try:
             _changes_after_publishing(proc, obj, notes, "bytes written after the hash\n")
@@ -1466,7 +1466,7 @@ def test_pivot_commit_refuses_to_republish_an_output_that_changed_since_it_was_h
     output = root / "data" / "shadow" / "shout.txt"
     obj = _object_for(root, "HASHED BEFORE THE UNIT\n")
 
-    with gc.naming_exclusive(cache_dir):
+    with gc.store_snapshot(cache_dir) as snapshot, gc.naming_exclusive(snapshot):
         proc = _start(root, "commit", env=_env())
         try:
             _changes_after_publishing(proc, obj, output, "REWRITTEN AFTER THE HASH\n")
@@ -3311,23 +3311,174 @@ def test_one_collection_at_a_time_runs_on_one_object_store(tmp_path: pathlib.Pat
     assert cache.get_cache_path(store, dead).exists(), "a refusal removed an object"
 
 
-def test_a_cache_whose_files_link_to_a_mount_of_its_own_refuses_collection(
+# Loaded through PYTHONPATH into `pivot gc`: pauses it when it calls `GC_TEST_PAUSE_AT`
+# (`execute_plan`: under the exclusive naming lock, after its re-read of the register and the
+# records; `naming_exclusive`: after the plan, before the exclusive lock) until the test writes
+# `go`.
+_PLAN_HOOK = """\
+import os
+import pathlib
+import time
+
+_gate = os.environ.get("GC_TEST_PLAN_GATE")
+if _gate:
+    from pivot.storage import gc as _gc
+
+    _point = os.environ["GC_TEST_PAUSE_AT"]
+    _original = getattr(_gc, _point)
+
+    def _held(*args, **kwargs):
+        pathlib.Path(_gate, "paused").write_text("")
+        deadline = time.monotonic() + 120
+        while not pathlib.Path(_gate, "go").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return _original(*args, **kwargs)
+
+    setattr(_gc, _point, _held)
+"""
+
+
+@pytest.mark.parametrize("window", ["under the exclusive lock", "before the exclusive lock"])
+@pytest.mark.parametrize("change", ["re-pointed link", "replaced store directory"])
+def test_a_collection_refuses_when_its_store_moves_while_it_runs(
+    tmp_path: pathlib.Path, change: str, window: str
+) -> None:
+    """RP: root R links store S1 (project P), root R2 links S2 (project Q); P and Q produce the
+    same object K, so K is in both stores. P moves on, so K is named by nothing in S1, while Q's
+    lock names K in S2. P's `pivot gc` pauses, either under its exclusive lock at `execute_plan`
+    or after its plan and before that lock, and then R's `files/` is re-pointed to S2, or S1's
+    directory is renamed and S2's put at its path. A collection resolved the layout at each step,
+    so it unlinked K through the new link, from S2 (and, in the second window, took S2's lock
+    while it removed trees in S1). It now resolves the layout once, before `gc.lock`
+    (`gc.store_snapshot`), uses that for every lock, read and unlink, and checks it before
+    deleting: it refuses, nothing is removed from either store, and Q's K stays."""
+    s1, s2 = tmp_path / "d1" / "store", tmp_path / "d2" / "store"
+    r, r2 = tmp_path / "r", tmp_path / "r2"
+    for directory in (s1, s2, r, r2):
+        directory.mkdir(parents=True)
+    (r / "files").symlink_to(s1)
+    (r2 / "files").symlink_to(s2)
+    p = _shared_project(tmp_path / "P", r, "copy")
+    _use_cache(p, r, retention=1)
+    q = _shared_project(tmp_path / "Q", r2, "copy")
+    for root in (p, q):
+        (root / "data" / "raw" / "input.txt").write_text("the same text in both stores\n")
+        _ok(_run(root, "repro"))
+    key = cache.hash_file(q / "data" / "shadow" / "shout.txt")[0]
+    (p / "data" / "raw" / "input.txt").write_text("P moved on\n")
+    _ok(_run(p, "repro"))
+    assert cache.get_cache_path(s1, key).exists() and cache.get_cache_path(s2, key).exists()
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_PLAN_HOOK)
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    proc = _start(
+        p,
+        "gc",
+        "--yes",
+        "--grace-hours",
+        "0",
+        env=_env(
+            PYTHONPATH=str(hook),
+            GC_TEST_PLAN_GATE=str(gate),
+            GC_TEST_PAUSE_AT="execute_plan"
+            if window == "under the exclusive lock"
+            else "naming_exclusive",
+        ),
+    )
+    try:
+        _wait_for(gate / "paused", proc, timeout=120)
+        if change == "re-pointed link":
+            relinked = r / "files.relinked"
+            relinked.symlink_to(s2)
+            relinked.replace(r / "files")
+            q_object = cache.get_cache_path(s2, key)
+            p_object = cache.get_cache_path(s1, key)
+        else:
+            s1.rename(s1.with_name("store-before"))
+            s2.rename(s1)
+            q_object = cache.get_cache_path(s1, key)
+            p_object = cache.get_cache_path(s1.with_name("store-before"), key)
+        (gate / "go").write_text("")
+        out, _ = proc.communicate(timeout=180)
+    except BaseException:
+        proc.kill()
+        raise
+
+    flat = " ".join(out.split())
+    assert proc.returncode != 0, flat
+    assert "Refusing to go on collecting" in flat, flat
+    assert q_object.exists(), f"the collection removed Q's object from the other store: {flat}"
+    assert p_object.exists(), f"the collection removed an object after its store moved: {flat}"
+
+
+def test_a_collection_lists_the_trees_under_its_own_cache_root(tmp_path: pathlib.Path) -> None:
+    """A linked layout has two tree stores: beside the object store, where a stage's commit puts
+    a tree, and under the cache root itself, where a command given the unresolved `files/` puts
+    one. A collection lists both (`gc.StoreSnapshot.trees`): a dead tree under the collecting
+    root's own `trees/` is removed, and the live one stays."""
+    store = tmp_path / "shared" / "objects"
+    store.mkdir(parents=True)
+    c1 = tmp_path / "cache-one"
+    c1.mkdir()
+    (c1 / "files").symlink_to(store)
+    b = _project(tmp_path / "b")
+    (b / ".pivot" / "config.yaml").write_text(
+        f"cache:\n  dir: {c1}\n  checkout_mode:\n  - symlink\ncore:\n  run_history_retention: 1\n"
+    )
+    (b / "pipeline.py").write_text(_DIRECTORY_PIPELINE)
+    raw = b / "data" / "raw" / "input.txt"
+    raw.write_text("first\n")
+    _ok(_run(b, "repro"))
+    split = b / "data" / "shadow" / "split"
+    first = split.resolve()
+    assert first.is_relative_to(store.parent.resolve() / "trees"), first
+    raw.write_text("second\n")
+    _ok(_run(b, "repro"))
+    second = split.resolve()
+    assert second != first, second
+    moved = c1 / "trees" / first.parent.name / first.name
+    moved.parent.mkdir(parents=True)
+    shutil.copytree(first, moved, symlinks=True)
+    cache.clear_path(first)
+
+    collected = _run(b, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode == 0, out
+    assert not moved.exists(), f"gc did not list the trees under its own cache root: {out}"
+    assert second.is_dir(), f"gc removed the live tree: {out}"
+
+
+def test_a_cache_whose_files_link_to_a_mount_of_its_own_refuses_writers_and_collection(
     tmp_path: pathlib.Path,
 ) -> None:
     """A `files/` link to the root of a mount of its own: the directory that holds the store is
     on another filesystem, which other hosts or mount namespaces need not reach, so the register
-    cannot follow the store. Writers keep the register at the cache root, as before, and a
-    collection refuses, naming the layout, rather than collect on a register that may not show
-    every project of the store."""
+    cannot follow the store. A writer refuses before it names anything (and registers nowhere),
+    and a collection refuses, both naming the layout and the supported ones, rather than write
+    or collect on a register that may not show every project of the store."""
     mount_point = tmp_path / "objects-mount"
     with _tmpfs_mount(mount_point):
         cache_root = tmp_path / "cache"
         cache_root.mkdir()
         (cache_root / "files").symlink_to(mount_point)
         root = _shared_project(tmp_path / "project", cache_root, "copy")
-        _ok(_run(root, "repro"))
-        assert naming.register_root(cache_root) == cache_root
-        assert _registered(cache_root, root)
+
+        written = _run(root, "repro")
+
+        wrote = " ".join((written.stdout + written.stderr).split())
+        assert written.returncode != 0, wrote
+        assert (
+            f"Refusing to name objects in {cache_root}: its files/ links to {mount_point}, "
+            + "which is a mount of its own"
+        ) in wrote, wrote
+        assert "mount the filesystem at the cache root" in wrote, wrote
+        assert not (root / ".pivot" / "stages").exists() or not list(
+            (root / ".pivot" / "stages").rglob("*.lock")
+        ), "a writer recorded a lock through the unshared store"
+        assert not _registered(cache_root, root)
         dead = _publish(mount_point, tmp_path, "named by nothing\n")
 
         refused = _run(root, "gc", "--yes", "--grace-hours", "0")
@@ -3339,22 +3490,21 @@ def test_a_cache_whose_files_link_to_a_mount_of_its_own_refuses_collection(
 
 
 @pytest.mark.parametrize("mount", ["another device", "bind mount"])
-def test_a_cache_whose_files_is_a_mount_point_refuses_collection(
+def test_a_cache_whose_files_is_a_mount_point_refuses_writers_and_collection(
     tmp_path: pathlib.Path, mount: str
 ) -> None:
     """`files/` itself a mount point (`another device`: a tmpfs; `bind mount`: a directory on
     the same device, which only the mount table shows, in a mount namespace): the register stays
     at the cache root, on a filesystem other hosts that mount the store need not see, so it
-    cannot show every project of the store. Writers keep working; a collection refuses, naming
-    the layout and the supported ones, and removes nothing."""
+    cannot show every project of the store. A writer refuses before it names anything, and a
+    collection refuses, both naming the layout and the supported ones; nothing is removed."""
     cache_root = tmp_path / "cache"
     files = cache_root / "files"
     if mount == "another device":
         files.mkdir(parents=True)
         with _tmpfs_mount(files):
             root = _shared_project(tmp_path / "project", cache_root, "copy")
-            _ok(_run(root, "repro"))
-            assert _registered(cache_root, root)
+            written = _run(root, "repro")
             dead = _publish(files, tmp_path, "named by nothing\n")
             refused = _run(root, "gc", "--yes", "--grace-hours", "0")
             kept = cache.get_cache_path(files, dead).exists()
@@ -3364,21 +3514,65 @@ def test_a_cache_whose_files_is_a_mount_point_refuses_collection(
         store = tmp_path / "store-on-the-same-disk"
         shutil.copytree(files, store)
         dead = _publish(store, tmp_path, "named by nothing\n")
-        refused = _in_view(
-            root,
-            "gc",
-            "--yes",
-            "--grace-hours",
-            "0",
-            setup=f"mount --bind {shlex.quote(str(store))} {shlex.quote(str(files))}",
-        )
+        (root / "data" / "raw" / "input.txt").write_text("a run in the view\n")
+        bind = f"mount --bind {shlex.quote(str(store))} {shlex.quote(str(files))}"
+        written = _in_view(root, "repro", setup=bind)
+        refused = _in_view(root, "gc", "--yes", "--grace-hours", "0", setup=bind)
         kept = cache.get_cache_path(store, dead).exists()
 
+    wrote = " ".join((written.stdout + written.stderr).split())
+    assert written.returncode != 0, wrote
+    assert (
+        f"Refusing to name objects in {cache_root}: its files/ ({files.resolve()}) is a mount "
+        + "of its own"
+    ) in wrote, wrote
     flat = " ".join((refused.stdout + refused.stderr).split())
     assert refused.returncode != 0, flat
     assert f"its files/ ({files.resolve()}) is a mount of its own" in flat, flat
     assert "mount the filesystem at the cache root" in flat, flat
     assert kept, f"a refusal removed an object: {flat}"
+
+
+@pytest.mark.parametrize("bound", ["files/", "the whole cache root"])
+def test_a_view_that_binds_another_roots_files_cannot_write_into_it(
+    tmp_path: pathlib.Path, bound: str
+) -> None:
+    """S8: a plain cache root H (project P, on the host) whose `files/` another mount namespace
+    binds at its own cache root R's `files/` (project Q there, as a container given only the
+    objects). Q's steps would register at R, where P's collection of H never looks, and that
+    collection removed Q's object. Now Q's writer refuses through the bound `files/`, so no view
+    writes into a store whose register is elsewhere. The control binds the whole cache root H at
+    R, a supported layout: Q's run works, registers in H's register, and P's collection keeps
+    Q's object."""
+    h, r = tmp_path / "H", tmp_path / "R"
+    p = _shared_project(tmp_path / "P", h, "copy")
+    _ok(_run(p, "repro"))
+    q = _shared_project(tmp_path / "Q", r, "copy")
+    (q / "data" / "raw" / "input.txt").write_text("only Q, in its view\n")
+    if bound == "files/":
+        (r / "files").mkdir(parents=True)
+        bind = f"mount --bind {shlex.quote(str(h / 'files'))} {shlex.quote(str(r / 'files'))}"
+    else:
+        r.mkdir()
+        bind = f"mount --bind {shlex.quote(str(h))} {shlex.quote(str(r))}"
+
+    ran = _in_view(q, "repro", setup=bind)
+
+    out = " ".join((ran.stdout + ran.stderr).split())
+    q_output = q / "data" / "shadow" / "shout.txt"
+    if bound == "files/":
+        assert ran.returncode != 0, out
+        assert f"Refusing to name objects in {r}: its files/ ({r / 'files'}) is a mount" in out
+        assert "mount the filesystem at the cache root" in out, out
+        assert not (q / ".pivot" / "stages" / "shadow" / "shout.lock").exists(), out
+        return
+    assert ran.returncode == 0, out
+    q_object = cache.get_cache_path(h / "files", cache.hash_file(q_output)[0])
+    assert q_object.exists(), "Q's object is not in H's store"
+    assert _registered(h, q), "Q's view did not register in H's register"
+    collected = _run(p, "gc", "--yes", "--grace-hours", "0")
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert q_object.exists(), f"P's gc of H removed Q's object: {collected.stdout}"
 
 
 def test_a_view_that_cannot_write_a_listed_cache_leaves_it_unlisted(tmp_path: pathlib.Path) -> None:

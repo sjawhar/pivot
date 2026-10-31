@@ -4,10 +4,12 @@ import logging
 import os
 import pathlib
 import shutil
+import subprocess
 import threading
 
 import pytest
 
+from pivot import exceptions
 from pivot import state_dir as state_dir_mod
 from pivot.storage import gc, naming
 
@@ -25,6 +27,12 @@ def _project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, pathli
 def _unit(cache_dir: pathlib.Path, root: pathlib.Path, state_dir: pathlib.Path) -> None:
     with naming.naming_unit(cache_dir, project=(root, state_dir)):
         pass
+
+
+def _read_register(cache_dir: pathlib.Path) -> tuple[list[gc.ProjectScope], list[tuple[str, str]]]:
+    """What a collection of ``cache_dir`` reads from its register."""
+    with gc.store_snapshot(cache_dir) as snapshot:
+        return gc.read_register(snapshot)
 
 
 def test_a_naming_unit_reregisters_after_the_mount_table_changes(
@@ -205,7 +213,7 @@ def test_a_clone_taken_while_a_writer_runs_holds_a_nonce_its_next_unit_replaces(
 
     _swap(state_dir, clone)  # the clone's view: its copy at the same path
     try:
-        live, unreadable = gc.read_register(cache_dir)
+        live, unreadable = _read_register(cache_dir)
     finally:
         _swap(state_dir, clone)
     assert live == [], "the clone's collection accepted the running writer's entry"
@@ -230,7 +238,7 @@ def test_two_views_that_share_a_view_key_refuse_each_others_entry(
     finally:
         _swap(state_dir, clone)
 
-    live, unreadable = gc.read_register(cache_dir)
+    live, unreadable = _read_register(cache_dir)
 
     assert live == [], "the view that did not write last accepted the other's entry"
     assert len(unreadable) == 1, unreadable
@@ -263,7 +271,7 @@ def test_a_unit_registers_its_view_in_a_cache_only_another_view_listed(
     assert naming.entry_nonce_path(view_one).read_text() == view_one_nonce
     _swap(state_dir, copy)
     try:
-        _live, unreadable = gc.read_register(c2)
+        _live, unreadable = _read_register(c2)
     finally:
         _swap(state_dir, copy)
     assert any(str(view_two) in reason for _label, reason in unreadable), unreadable
@@ -335,11 +343,12 @@ def test_registrations_across_many_caches_hold_a_bounded_number_of_descriptors(
     process (a watch or serve session, a library caller) that registers in many caches must not
     hold more descriptors with each new one. It keeps the most recently used registrations, and
     every registration shares one mount-table watch: 100 registrations across 100 caches leave
-    the open-descriptor count where 20 left it."""
+    the open-descriptor count where 20 left it. The memo of each cache root's store layout is
+    bounded too."""
     root, state_dir, _cache_dir = _project(tmp_path)
     caches = [tmp_path / f"cache-{i}" for i in range(100)]
     for cache_dir in caches:
-        cache_dir.mkdir()
+        (cache_dir / "files").mkdir(parents=True)
 
     def open_descriptors() -> int:
         return len(os.listdir("/proc/self/fd"))
@@ -355,6 +364,7 @@ def test_registrations_across_many_caches_hold_a_bounded_number_of_descriptors(
     assert after_hundred == after_twenty, (before, after_twenty, after_hundred)
     assert after_hundred - before <= 2 * naming._MAX_VERIFIED_REGISTRATIONS + 1
     assert len(naming._VERIFIED_REGISTRATIONS) <= naming._MAX_VERIFIED_REGISTRATIONS
+    assert len(naming._STORE_LAYOUTS) <= naming._MAX_STORE_LAYOUTS
     # An evicted registration is done in full again, and is then remembered.
     naming.register_project(caches[0], root, state_dir)
     assert (caches[0], root, state_dir) in naming._VERIFIED_REGISTRATIONS
@@ -390,3 +400,27 @@ def test_a_writer_through_a_linked_root_waits_for_the_lock_a_collection_takes(
         os.close(fd)
     assert entered.wait(30.0), "the unit never took the lock once it was free"
     writer.join(30.0)
+
+
+def test_a_mount_that_leaves_files_the_same_directory_still_changes_its_layout(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A process keeps each cache root's store layout while `files/` is the same entry and the
+    mount table has not changed (`naming._STORE_LAYOUTS`). `files/` bind-mounted onto itself
+    keeps its device and inode, and only the mount table shows it; the mount-change count must
+    then make the next step see an unshared store, so a writer refuses it."""
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True, check=False).returncode:
+        pytest.skip("bind-mounting needs passwordless sudo")
+    root, state_dir, cache_dir = _project(tmp_path)
+    files = cache_dir / "files"
+    files.mkdir()
+    _unit(cache_dir, root, state_dir)
+    assert not naming.store_layout(cache_dir).unshared
+    subprocess.run(["sudo", "-n", "mount", "--bind", str(files), str(files)], check=True)
+    try:
+        assert naming.store_layout(cache_dir).unshared, "the layout memo kept a stale answer"
+        with pytest.raises(exceptions.CacheError, match="is a mount of its own"):
+            _unit(cache_dir, root, state_dir)
+    finally:
+        subprocess.run(["sudo", "-n", "umount", str(files)], check=True)
+    assert not naming.store_layout(cache_dir).unshared

@@ -486,15 +486,27 @@ the directory it resolves to (`naming.register_root`). Every root that uses one 
 linking one directory, or a root linking a plain root's `files/`) then shares one register and
 one lock, so a collection through any root reads every project that names objects in the
 store, and a disk copy of a cache root whose `files/` links shared storage keeps no register of
-its own (SF). Each root keeps its own `trees/`; a collection removes only its own root's trees,
-and a link into another root's `trees/` whose `files/` resolves to the same store names that
-tree's key (`gc._tree_of_store`). A link to the root of a mount of its own (a mount point, or a
+its own (SF). Trees live in two places in a linked layout: a stage's commit writes a tree beside
+the store (`<register root>/trees`, shared by every root), and `pivot track` or a restore given
+the unresolved `files/` writes one under the cache root's own `trees/`. A collection lists both
+(`gc.StoreSnapshot.trees`), and a link into another root's `trees/` whose `files/` resolves to
+the same store names that tree's key (`gc._tree_of_store`). A link to the root of a mount of its own (a mount point, or a
 bind mount the mount table lists) is `unshared`: that store's parent is on another filesystem
-that other views need not reach, so the register stays at the cache root (writers work as
-before) and `gc.resolve_scopes` refuses, naming the layout. A `files/` that is itself a mount
-point (another `st_dev` than the cache root, or listed in the mount table) is refused the same
-way (`naming.unshared_store`, which only a collection calls, since it may read the mount table;
-writers keep the register at the cache root). The registration memo records the register
+that other views need not reach, so the register stays at the cache root and
+`gc.resolve_scopes` refuses, naming the layout. A `files/` that is itself a mount
+point (another `st_dev` than the cache root, or listed in the mount table) is `unshared` too
+(`naming.store_layout`). A process resolves each cache root's layout once and keeps it in
+`naming._STORE_LAYOUTS` (the latest 64 roots) while `files/`'s own `lstat` identity (and, for a
+link, the directory it resolves to) and the mount-change count are unchanged, so a naming step
+costs one `lstat`, one poll and a lookup, and reads the mount table only after a change. Writers refuse an
+`unshared` layout in `naming_unit` with the text a collection's refusal has
+(`naming.unshared_store_problem`): no view may write into a store whose register is not where
+every view that mounts the store looks (S8). A collection resolves the layout once
+(`gc.store_snapshot`): the register, the locks, the record walk, the plan and every unlink use
+the snapshot's real paths, each existing directory held open, and `execute_plan` re-checks the
+snapshot before each prefix's deletions (`StoreSnapshot.check`: `files/` resolving elsewhere, or
+a store directory no longer the one opened, refuses), so a `files/` re-pointed during a
+collection cannot send an unlink to another store (RP). The registration memo records the register
 root and re-registers in full when it moves (a re-pointed `files/`). The register root must be
 writable by every writer; when it is not, the writer refuses and names it.
 
@@ -510,7 +522,7 @@ Only a test standing in for a writer passes `project=None`. A full registration 
 first unit, or after its evidence changed) tries to write the project id to
 `<state dir>/state.lmdb/pivot-project-id`, then one fresh nonce to this view's
 `<state dir>/state.lmdb/gc-views/<view>-<cache id>` (the cache id is a random value in
-`<cache>/projects/cache-id`, so each cache a project uses has its own nonce and registering in
+`projects/cache-id` in the cache's register (`naming.register_root`), so each cache a project uses has its own nonce and registering in
 one never makes another cache's entry stale) and the entry's sibling `<digest>.nonce`, then the entry
 with the mount points at or below the project root and state directory, and cache-root submounts
 in `<cache>/mounts/`. An entry that already records exactly that (its timestamp aside) and was
