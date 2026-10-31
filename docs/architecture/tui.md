@@ -40,9 +40,9 @@ Each thread has its own anyio event loop — socket connections are never shared
 
 ### Message Flow
 
-1. **Engine emits events** (`stage_started`, `stage_completed`, `log_line`, `engine_state_changed`, `pipeline_reloaded`) into an `EventBuffer` sink. The buffer is exposed via the RPC server's `events_since` method.
+1. **Engine emits events** (`stage_started`, `stage_completed`, `log_line`, `engine_state_changed`, `pipeline_reloaded`, `stages_expanded`) into an `EventBuffer` sink. The buffer is exposed via the RPC server's `events_since` method.
 
-2. **EventPoller** (in its own thread) polls `events_since(version)` every 100ms, converts raw events to typed TUI messages (`TuiStatusMessage`, `TuiLogMessage`, `TuiWatchMessage`, `TuiReloadMessage`), and posts them to the TUI via `app.post_message()`.
+2. **EventPoller** (in its own thread) polls `events_since(version)` every 100ms, converts raw events to typed TUI messages (`TuiStatusMessage`, `TuiLogMessage`, `TuiWatchMessage`, `TuiReloadMessage`, `TuiExpandedMessage`), and posts them to the TUI via `app.post_message()`.
 
 3. **TUI commands** (`run`, `cancel`, `commit`, `set_on_error`, `diff_output`) go directly from the TUI's main thread to the engine via its own RPC client connection.
 
@@ -57,7 +57,7 @@ Each thread has its own anyio event loop — socket connections are never shared
 
 ## Message Types
 
-All message types are defined in `src/pivot/types.py`:
+`TuiStatusMessage`, `TuiLogMessage`, `TuiWatchMessage` and `TuiReloadMessage` are defined in `src/pivot/types.py`; `TuiExpandedMessage` and the `TuiMessage` union of all five are in `pivot_tui/types.py`:
 
 | Message | Source | Purpose |
 |---------|--------|---------|
@@ -65,6 +65,7 @@ All message types are defined in `src/pivot/types.py`:
 | `TuiLogMessage` | Worker | stdout/stderr lines from stage execution |
 | `TuiWatchMessage` | Watch engine | Watch status (waiting, detecting, restarting, error) |
 | `TuiReloadMessage` | Watch engine | Stage list changed after code reload, or why the edited pipeline is invalid |
+| `TuiExpandedMessage` | Coordinator | A mapped stage's template (`pipeline.map`) added its instances to the run |
 
 Key fields:
 
@@ -72,6 +73,7 @@ Key fields:
 - **TuiLogMessage**: `type`, `stage`, `line`, `is_stderr`, `timestamp`
 - **TuiWatchMessage**: `type`, `status` (WatchStatus enum), `message`
 - **TuiReloadMessage**: `type`, `stages` (current stage names), `stages_added`, `stages_removed`, `stages_modified`, `error`. When `error` is set (a syntax error, a missing `pipeline` variable, a stage that fails to fingerprint, a `params.yaml` that fails its checks, or a run that found a stage over its resource capacity or an input missing), the app keeps its stage list, titles itself `Pipeline invalid - waiting for fix`, and shows the error on a line under the header until a message with `error` unset clears it: a good reload, or the data change that finds the missing input.
+- **TuiExpandedMessage**: `type`, `template`, `stages` (the instance names `<template>@<key>`, in key order). The poller converts the engine's `stages_expanded` event into it.
 
 ## Execution History
 
@@ -123,6 +125,26 @@ Stages with variants (e.g., `train@small`, `train@large`) are grouped under a co
   → ● train@small         0.5s
     ✓ train@large         1.2s
 ```
+
+### Mapped Stages
+
+A mapped stage (`pipeline.map`) is a template until a run expands it into one instance per file of the directory it is mapped over. The template's row shows where it is, in place of a run time:
+
+```
+▼ demo/cut (3)  ●3
+    demo/cut              expanded (3) ●
+    @a                    0:01 ●
+    @b                    0:01 ●
+    @c                    0:02 ●
+```
+
+- **`not yet expanded`**: the template has not expanded in this session, or the latest run blocked it (its producer failed): that run added no instance, so the rows of the last expansion go. The app learns which stages are templates from the `stages` RPC answer's `templates` (see [Agent Server](agent-server.md)), asked once its client connects and again after each reload.
+- **`expanded (N)`**: on a `TuiExpandedMessage` the app marks the template completed, puts the instance rows right after it, numbers every row by its place in the list, and rebuilds the list. The instance names are `<template>@<key>`, so they group under the template as variants do; the group header counts the instances, not the template. A later expansion (the next watch run) replaces the last one: an instance it keeps keeps its state and history, an instance it lacks loses its row. An answer to the `stages` query that shows a template expanded before its event arrives adds the instance rows too.
+- **`expansion failed`**: a refused expansion (an instance name that cannot name a stage, an output path another stage holds) reaches the app as a failed `TuiStatusMessage` for the template. The row shows the failed symbol, the rows of the last expansion go, and the reason goes to the template's Logs tab as a stderr line, since a template runs nothing of its own.
+
+A reload's stage list holds no template, so the app keeps each template row, before the first of its instances the list holds, and the next `stages` answer sets how far the new pipeline expanded it, adds a row for a template the edit added and drops the row of one it removed.
+
+Whenever a status arrives for a stage the list does not hold (in run mode as in watch mode: a new stage, an instance whose expansion was missed, a stage only its log lines announced), the app rebuilds the rows.
 
 ### Status Symbols
 

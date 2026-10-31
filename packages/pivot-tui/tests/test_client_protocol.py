@@ -17,6 +17,7 @@ from pivot_tui.client import (
     PivotClient,
     PivotRpc,
     StageInfoResult,
+    StagesResult,
     VersionedEvent,
 )
 
@@ -45,8 +46,8 @@ class MockClient:
     async def status(self) -> EngineStatus:
         return EngineStatus(state="idle", running=list[str](), pending=list[str]())
 
-    async def stages(self) -> list[str]:
-        return list[str]()
+    async def stages(self) -> StagesResult:
+        return StagesResult(stages=list[str](), templates=dict[str, list[str]]())
 
     async def stage_info(self, stage: str) -> StageInfoResult:
         return StageInfoResult(
@@ -123,8 +124,8 @@ class MockRpc:
     async def status(self) -> EngineStatus:
         return EngineStatus(state="idle", running=list[str](), pending=list[str]())
 
-    async def stages(self) -> list[str]:
-        return list[str]()
+    async def stages(self) -> StagesResult:
+        return StagesResult(stages=list[str](), templates=dict[str, list[str]]())
 
     async def stage_info(self, stage: str) -> StageInfoResult:
         return StageInfoResult(
@@ -203,6 +204,7 @@ def test_response_typed_dicts_constructible() -> None:
     )
     versioned_event = VersionedEvent(version=1, event={"type": "log_line"})
     event_batch = EventBatch(version=1, events=[versioned_event])
+    stages = StagesResult(stages=["demo/cut@a"], templates={"demo/cut": ["demo/cut@a"]})
     explanation = StageExplanation(
         stage_name="stage",
         will_run=True,
@@ -220,3 +222,4 @@ def test_response_typed_dicts_constructible() -> None:
     assert versioned_event["version"] == 1
     assert event_batch["events"][0]["event"]["type"] == "log_line"
     assert explanation["stage_name"] == "stage"
+    assert stages["templates"] == {"demo/cut": ["demo/cut@a"]}

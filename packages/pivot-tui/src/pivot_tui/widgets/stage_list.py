@@ -47,6 +47,15 @@ def _build_status_summary(counts: status.StatusCounts) -> str:
     return " " + " ".join(parts) if parts else ""
 
 
+def _template_label(info: StageInfo) -> str:
+    """What a template's row (``Pipeline.map``) reads in place of a run time."""
+    if info.status == StageStatus.FAILED:
+        return "expansion failed"
+    if info.instances is None:
+        return "not yet expanded"
+    return f"expanded ({len(info.instances)})"
+
+
 class StageGroupHeader(textual.widgets.Static):
     """Header for a group of stages with the same base name.
 
@@ -86,9 +95,10 @@ class StageGroupHeader(textual.widgets.Static):
         if is_selected is not None:
             self._is_selected = is_selected
 
-        # Compute status counts from fresh stage data
-        if stages:
-            counts = status.count_statuses(stages)
+        # Compute status counts from fresh stage data; a template counts as none of its group
+        members = [stage for stage in stages if not stage.is_template] if stages else []
+        if members:
+            counts = status.count_statuses(members)
         else:
             counts: status.StatusCounts = {"running": 0, "completed": 0, "failed": 0}
 
@@ -192,10 +202,12 @@ class StageRow(textual.widgets.Static):
             display_name = self._info.name
         name_escaped = display.escape_markup(display_name)
 
-        # Format elapsed time (only for running/completed/failed)
+        # Format elapsed time (only for running/completed/failed); a template reads its expansion
         elapsed_str = ""
         elapsed = self._info.elapsed
-        if (
+        if self._info.is_template:
+            elapsed_str = f"{_template_label(self._info)} "
+        elif (
             elapsed is not None
             and not math.isnan(elapsed)
             and not math.isinf(elapsed)
@@ -303,9 +315,10 @@ class StageListPanel(textual.containers.VerticalScroll):
         for base_name, group_stages in groups.items():
             is_multi_member_group = len(group_stages) >= 2
 
-            # For multi-member groups, yield a header first
+            # For multi-member groups, yield a header first; it counts the template's instances,
+            # not the template
             if is_multi_member_group:
-                stage_names = [s.name for s in group_stages]
+                stage_names = [s.name for s in group_stages if not s.is_template]
                 header = StageGroupHeader(base_name, stage_names)
                 header.set_collapsed(base_name in self._collapsed_groups)
                 self._group_headers[base_name] = header
@@ -337,6 +350,10 @@ class StageListPanel(textual.containers.VerticalScroll):
             header.update(self._format_header())
         except textual.css.query.NoMatches:
             pass  # Header not yet mounted during initial compose
+
+    def has_stage(self, name: str) -> bool:
+        """Whether the list holds ``name``: its row exists, or the next recompose builds it."""
+        return name in self._stage_by_name
 
     def update_stage(
         self, name: str, selected_name: str | None = None, info: StageInfo | None = None

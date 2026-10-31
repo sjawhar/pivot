@@ -55,6 +55,8 @@ from pivot_tui.types import (
     LogEntry,
     PendingHistoryState,
     StageInfo,
+    TuiExpandedMessage,
+    TuiMessage,
 )
 from pivot_tui.widgets import (
     DebugPanel,
@@ -114,11 +116,9 @@ class MessagePoster(Protocol):
 class TuiUpdate(textual.message.Message):
     """Custom message for executor updates."""
 
-    msg: TuiLogMessage | TuiStatusMessage | TuiWatchMessage | TuiReloadMessage
+    msg: TuiMessage
 
-    def __init__(
-        self, msg: TuiLogMessage | TuiStatusMessage | TuiWatchMessage | TuiReloadMessage
-    ) -> None:
+    def __init__(self, msg: TuiMessage) -> None:
         self.msg = msg
         super().__init__()
 
@@ -389,6 +389,8 @@ class PivotApp(textual.app.App[None]):
                     exc_info=True,
                 )
                 self._client = None
+        if self._client is not None:
+            self._load_templates(self._client, add_missing=False)
         if self._log_file is not None:
             self._stats_log_timer = self.set_interval(1.0, self._write_stats_to_log)
         self.call_after_refresh(self._update_detail_panel)
@@ -426,6 +428,8 @@ class PivotApp(textual.app.App[None]):
                     self._handle_watch(msg)
                 case TuiMessageType.RELOAD:
                     self._handle_reload(msg)
+                case TuiMessageType.EXPANDED:
+                    self._handle_expanded(msg)
         except Exception:
             _logger.exception("Error handling TUI update for %s: %s", msg["type"], msg)
 
@@ -524,6 +528,10 @@ class PivotApp(textual.app.App[None]):
             info.live_input_snapshot = msg["explanation"]
         if "output_summary" in msg:
             info.live_output_snapshot = msg["output_summary"]
+        if info.is_template and status == StageStatus.FAILED:
+            self._show_template_failure(info)
+        if info.is_template and status in (StageStatus.FAILED, StageStatus.BLOCKED):
+            self._drop_template_rows(info)
 
         # Watch mode: history capture
         if self._watch_mode:
@@ -539,33 +547,171 @@ class PivotApp(textual.app.App[None]):
             ):
                 self._finalize_history_entry(stage, status, msg["reason"], msg["elapsed"], run_id)
 
-        # Update UI
-        if is_new_stage and self._watch_mode:
+        # Update UI: a stage the list does not show yet (a new stage, an instance whose expansion
+        # was missed, a stage only its logs announced) needs the rows rebuilt.
+        stage_list = self._try_query_one("#stage-list", StageListPanel)
+        if stage_list is not None and not stage_list.has_stage(stage):
             self._rebuild_stage_list()
-        else:
-            stage_list = self._try_query_one("#stage-list", StageListPanel)
-            if stage_list:
-                # Pass info to sync row's StageInfo reference (fixes reference divergence)
-                stage_list.update_stage(stage, self._selected_stage_name, info=info)
-            if stage == self._selected_stage_name or not self._watch_mode:
-                self._update_detail_panel()
+        elif stage_list is not None:
+            # Pass info to sync row's StageInfo reference (fixes reference divergence)
+            stage_list.update_stage(stage, self._selected_stage_name, info=info)
+        if stage == self._selected_stage_name or not self._watch_mode:
+            self._update_detail_panel()
+        self._update_run_title()
 
-        # Run mode: update title with progress
-        if not self._watch_mode:
-            completed = sum(
-                1
-                for s in self._stages.values()
-                if s.status
-                in (
-                    StageStatus.COMPLETED,
-                    StageStatus.RAN,
-                    StageStatus.CACHED,
-                    StageStatus.BLOCKED,
-                    StageStatus.CANCELLED,
-                    StageStatus.FAILED,
-                )
+    def _update_run_title(self) -> None:  # pragma: no cover
+        """Run mode: show how many stages have finished."""
+        if self._watch_mode:
+            return
+        completed = sum(
+            1
+            for s in self._stages.values()
+            if s.status
+            in (
+                StageStatus.COMPLETED,
+                StageStatus.RAN,
+                StageStatus.CACHED,
+                StageStatus.BLOCKED,
+                StageStatus.CANCELLED,
+                StageStatus.FAILED,
             )
-            self.title = f"pivot run ({completed}/{len(self._stages)})"
+        )
+        self.title = f"pivot run ({completed}/{len(self._stages)})"
+
+    # =========================================================================
+    # Mapped stages (Pipeline.map): a template stands for its instances until it expands
+    # =========================================================================
+
+    def _handle_expanded(self, msg: TuiExpandedMessage) -> None:  # pragma: no cover
+        """Add a template's instance rows under it and rebuild the list."""
+        template = msg["template"]
+        selected = self._selected_stage_name
+        self._expand_template_rows(template, msg["stages"])
+        self._show_stage_list_changes(selected)
+        if self._selected_stage_name == template:
+            self._update_detail_panel()
+        self._update_run_title()
+
+    def _expand_template_rows(self, template: str, instances: list[str]) -> None:
+        """Record ``template``'s expansion into ``instances``, placed right after it.
+
+        Instance names are ``<template>@<key>``, so the stage list groups them under the
+        template. A later expansion (a later watch run) replaces this one: an instance it keeps
+        keeps its state and history, an instance it lacks loses its row.
+        """
+        info = self._stages.get(template)
+        if info is None:
+            info = StageInfo(template, 0, 0)
+            self._stages[template] = info
+            self._stage_order.append(template)
+        dropped = set(info.instances or ()) - set(instances)
+        for name in dropped:
+            _ = self._stages.pop(name, None)
+            _ = self._pending_history.pop(name, None)
+        info.is_template = True
+        info.instances = list(instances)
+        info.status = StageStatus.COMPLETED
+        info.reason = ""
+        moved = dropped.union(instances)
+        order = [name for name in self._stage_order if name not in moved]
+        position = order.index(template) + 1
+        order[position:position] = instances
+        self._stage_order = order
+        for name in instances:
+            if name not in self._stages:
+                self._stages[name] = StageInfo(name, 0, 0)
+
+    def _drop_template_rows(self, info: StageInfo) -> None:
+        """A template that failed or was blocked in this run added no instance: drop the rows
+        its last expansion added, so the list shows no instance this run does not have, and the
+        template row reads why it has none."""
+        dropped = set(info.instances or ())
+        info.instances = None
+        if not dropped:
+            return
+        for name in dropped:
+            _ = self._stages.pop(name, None)
+            _ = self._pending_history.pop(name, None)
+        self._stage_order = [name for name in self._stage_order if name not in dropped]
+        self._show_stage_list_changes(self._selected_stage_name)
+
+    def _show_template_failure(self, info: StageInfo) -> None:  # pragma: no cover
+        """Show a refused expansion's reason in the template's log, where a failed stage shows
+        its own output: a template runs nothing, so the reason is all it has."""
+        if not info.reason:
+            return
+        entry = LogEntry(info.reason, True, time.time())
+        info.logs.append(entry)
+        if self._selected_stage_name == info.name and (
+            stage_log_panel := self._try_query_one("#stage-logs", StageLogPanel)
+        ):
+            stage_log_panel.add_log(entry.line, entry.is_stderr, entry.timestamp)
+
+    @textual.work(group="rpc")
+    async def _load_templates(
+        self, client: PivotClient, *, add_missing: bool
+    ) -> None:  # pragma: no cover
+        """Ask the engine which stages are templates and how far each has expanded.
+
+        Without the answer a template row still reads its expansion once the event arrives, so
+        an engine already gone (a short run ends first) is not worth a warning.
+        """
+        from pivot_tui.rpc_client_impl import RpcError
+
+        try:
+            answer = await client.stages()
+        except (TimeoutError, *_CONNECTION_ERRORS):
+            _logger.debug("Could not ask the engine for its templates", exc_info=True)
+            return
+        except RpcError as exc:
+            _logger.warning("Could not ask the engine for its templates: %s", exc)
+            return
+        self._apply_templates(answer["templates"], add_missing=add_missing)
+
+    def _apply_templates(self, templates: dict[str, list[str]], *, add_missing: bool) -> None:
+        """Mark the template rows from the engine's ``stages`` answer.
+
+        A template the answer shows expanded gets its instance rows, unless the expansion event
+        already gave it them. With ``add_missing`` (after a reload, whose list is the whole
+        pipeline's) the answer is every template: a template the list lacks gets a row, and a
+        template row the answer no longer names goes.
+        """
+        selected = self._selected_stage_name
+        if add_missing:
+            for name in [
+                n for n, s in self._stages.items() if s.is_template and n not in templates
+            ]:
+                del self._stages[name]
+                _ = self._pending_history.pop(name, None)
+            self._stage_order = [name for name in self._stage_order if name in self._stages]
+        for name, instances in templates.items():
+            info = self._stages.get(name)
+            if info is None:
+                if not add_missing:
+                    continue  # not one of this run's stages
+                info = StageInfo(name, 0, 0)
+                self._stages[name] = info
+                self._stage_order.append(name)
+            if not info.is_template:
+                info.is_template = True
+                if info.status == StageStatus.FAILED:
+                    self._show_template_failure(info)
+            if instances and info.instances is None:
+                self._expand_template_rows(name, instances)
+        self._show_stage_list_changes(selected)
+        self._update_run_title()
+
+    def _show_stage_list_changes(self, selected: str | None) -> None:  # pragma: no cover
+        """Number the stages by their place in the list and rebuild its rows; refresh the detail
+        panel if the selection had to move off ``selected``."""
+        total = len(self._stage_order)
+        for index, name in enumerate(self._stage_order, 1):
+            self._stages[name].index = index
+            self._stages[name].total = total
+        self._recompute_selection_idx()
+        self._rebuild_stage_list()
+        if self._selected_stage_name != selected:
+            self._update_detail_panel()
 
     def _handle_watch(self, msg: TuiWatchMessage) -> None:  # pragma: no cover
         """Handle watch status update (watch mode only)."""
@@ -607,8 +753,11 @@ class PivotApp(textual.app.App[None]):
             return
 
         new_stages = msg["stages"]
+        # A reload's list holds no template: keep the template rows, each before the first
+        # instance the list holds, and ask the engine how far the new pipeline expanded them.
+        templates = [name for name in self._stage_order if self._stages[name].is_template]
         old_stages = set(self._stage_order)
-        new_stage_set = set(new_stages)
+        new_stage_set = set(new_stages).union(templates)
 
         for name in old_stages - new_stage_set:
             if name in self._stages:
@@ -621,15 +770,23 @@ class PivotApp(textual.app.App[None]):
             info = StageInfo(name, len(self._stages) + 1, len(new_stages))
             self._stages[name] = info
 
-        self._stage_order = new_stages
-        for i, name in enumerate(self._stage_order, 1):
-            if name in self._stages:
-                self._stages[name].index = i
-                self._stages[name].total = len(self._stage_order)
+        order = list(new_stages)
+        for name in templates:
+            info = self._stages[name]
+            info.instances = None
+            info.status = StageStatus.READY
+            info.reason = ""
+            first_instance = next(
+                (i for i, stage in enumerate(order) if self._stages[stage].base_name == name),
+                len(order),
+            )
+            order.insert(first_instance, name)
+        self._stage_order = order
 
-        self._recompute_selection_idx()
-        self._rebuild_stage_list()
+        self._show_stage_list_changes(self._selected_stage_name)
         self._update_detail_panel()
+        if self._client is not None:
+            self._load_templates(self._client, add_missing=True)
 
         # Show notification with reload summary
         summary = format_reload_summary(

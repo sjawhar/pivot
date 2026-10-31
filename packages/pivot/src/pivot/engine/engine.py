@@ -25,6 +25,7 @@ import anyio.to_thread
 from pivot import (
     config,
     exceptions,
+    expansion,
     fingerprint,
     ignore,
     parameters,
@@ -57,12 +58,13 @@ from pivot.engine.types import (
     SinkStateChanged,
     StageCompleted,
     StageExecutionState,
+    StagesExpanded,
     StageStarted,
     StageStateChanged,
 )
 from pivot.executor import core as executor_core
 from pivot.executor import worker
-from pivot.storage import member_skip, naming, ownership
+from pivot.storage import artifact_lock, cache, member_skip, naming, ownership
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -81,7 +83,7 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable, Collection, Iterator
 
     import networkx as nx
     from anyio.abc import TaskGroup
@@ -175,6 +177,41 @@ class _MissingDependencyRun:
             missing.is_relative_to(path) or missing.is_relative_to(resolved_path)
             for missing in itertools.chain(self.input_paths, self.resolved_input_paths)
         )
+
+
+@dataclass(slots=True)
+class _MapRun:
+    """One run's templates (``Pipeline.map``) and what adding their instances needs.
+
+    A template is a node of the run's schedule with no resources. When its upstream stages
+    have finished, its producer among them, the engine reads the producer's recorded listing of
+    the directory and adds one instance per file, or, for a template in ``wanted``, the instance
+    of each key it names. ``stage_order``, ``all_stages`` and ``committed_before`` are the run's
+    own records, which each expansion extends.
+    """
+
+    templates: set[str]
+    # Each source directory's (key, file key) pairs, read once per run so chained templates
+    # expand over the same keys; the engine's own record, kept after the run
+    # (``Engine.expansion_keys``)
+    keys: dict[types.ArtifactIdentity, list[tuple[str, str]]]
+    # The keys a template expands when the run's targets name instances (``_mapped_targets``),
+    # each with the targets that need it; a template it does not hold expands every key
+    wanted: dict[str, dict[str, set[str]]]
+    stage_order: list[str]
+    all_stages: dict[str, RegistryStageInfo]
+    committed_before: dict[pathlib.Path, tuple[int, int, int] | None]
+    capacities: dict[str, int]
+    store: store_mod.WorkspaceStore
+    cache_dir: pathlib.Path
+    default_state_dir: pathlib.Path
+    project_root: pathlib.Path
+    force: bool
+    no_commit: bool
+    allow_uncached_incremental: bool
+    # Whether the run starts no stage after its first failure, a template's included
+    # (``OnError.FAIL``)
+    fail_fast: bool
 
 
 def _file_identity(path: pathlib.Path) -> tuple[int, int, int] | None:
@@ -285,6 +322,211 @@ def _split_project_writes(
     return stage_writes, types.DeferredWrites(remote_hashes=stage_writes.pop("remote_hashes"))
 
 
+def _stage_request(info: RegistryStageInfo, capacities: dict[str, int]) -> dict[str, int]:
+    """A stage's scheduler request: one cpu plus its declared resources, ``"all"`` being the
+    resource's capacity. A resource with no capacity gets capacity 1 in ``capacities``.
+
+    Raises:
+        ValidationError: The stage requests more of a resource than its capacity.
+    """
+    request = {"cpu": 1}
+    # compose validated each request: a positive int, or "all" for cpu only.
+    for resource, amount in info["resources"].items():
+        capacity = capacities.setdefault(resource, 1)
+        request[resource] = capacity if amount == "all" else int(amount)
+    for resource, amount in request.items():
+        capacity = capacities[resource]
+        if amount > capacity:
+            msg = f"Stage {info['name']!r} requests {amount} units of resource {resource!r}, but its capacity is {capacity}"
+            raise exceptions.ValidationError(msg)
+    return request
+
+
+def _refuse_single_stage_templates(
+    stages: list[str], templates: dict[str, registry.MapTemplate]
+) -> None:
+    """Refuse a run of named stages only (``pivot run``) that names a template
+    (``expansion.single_stage_refusal``).
+
+    Raises:
+        PipelineConfigError: Naming the first template and the command that expands it.
+    """
+    for name in stages:
+        if name in templates:
+            raise expansion.single_stage_refusal(name, templates[name])
+
+
+def _run_target(stage: str, templates: Collection[str]) -> str:
+    """The name a run schedules for target ``stage``: an instance (``<template>@<key>``) is
+    reached through its template (``_mapped_targets``); any other target is itself."""
+    if stage in templates:
+        return stage
+    return registry.template_of(stage, templates) or stage
+
+
+def _mapped_targets(
+    stages: list[str], templates: dict[str, registry.MapTemplate]
+) -> tuple[list[str], dict[str, dict[str, set[str]]]]:
+    """Run targets ``stages`` with each instance name (``<template>@<key>``) replaced by its
+    template, and the keys each template expands so the run adds the named instances alone,
+    each with its chain: an instance's key for its template and for every template that one is
+    mapped over, each key with the targets that need it. A template named itself, or upstream
+    of one named itself, expands every key and has no entry; so does every template when no
+    target names an instance.
+
+    The instances of a run's expansions are gone when this is called (``reset_expansions``), so
+    a watch run's affected instance and a name the user gave are both reached this way.
+    """
+    # Each template's keys, each with the targets that need it; None for every key
+    wanted = dict[str, dict[str, set[str]] | None]()
+    targets = list[str]()
+    for stage in stages:
+        template = None if stage in templates else registry.template_of(stage, templates)
+        if template is None:
+            if stage in templates:
+                wanted[stage] = None
+            targets.append(stage)
+            continue
+        targets.append(template)
+        keys = wanted.setdefault(template, dict[str, set[str]]())
+        if keys is not None:
+            keys.setdefault(stage[len(template) + 1 :], set[str]()).add(stage)
+    pending = list(wanted)
+    while pending:
+        name = pending.pop()
+        keys = wanted[name]
+        for upstream in {dep for dep in templates[name]["mapped_deps"].values() if dep is not None}:
+            before = wanted.get(upstream, dict[str, set[str]]())
+            if upstream in wanted and before is None:
+                continue
+            if keys is None:
+                wanted[upstream] = None
+                pending.append(upstream)
+                continue
+            merged = {key: set(needing) for key, needing in (before or {}).items()}
+            for key, needing in keys.items():
+                merged.setdefault(key, set[str]()).update(needing)
+            if upstream in wanted and merged == before:
+                continue
+            wanted[upstream] = merged
+            pending.append(upstream)
+    filtered = {name: keys for name, keys in wanted.items() if keys is not None}
+    return list(dict.fromkeys(targets)), filtered
+
+
+def _unknown_keys_reason(template: str, missing: list[str], wanted: dict[str, set[str]]) -> str:
+    """Why a run whose targets name keys ``missing`` of ``template`` fails it: those instances,
+    as `pivot status` refuses their names, and each target further down the chain that needs
+    them."""
+    unknown = [f"{template}@{key}" for key in missing]
+    reason = str(exceptions.StageNotFoundError(unknown))
+    needing = sorted({target for key in missing for target in wanted[key]}.difference(unknown))
+    if needing:
+        noun = "target" if len(needing) == 1 else "targets"
+        reason += f", needed by the {noun} {', '.join(needing)}"
+    return reason
+
+
+def _read_map_keys(source: types.ArtifactIdentity, map_run: _MapRun) -> list[tuple[str, str]]:
+    """The (key, file key) of each file of directory output ``source``, whose producer has
+    finished in this run, by the listing the producer recorded for it
+    (``expansion.read_keys``): the one its lock records, which it just wrote or matched.
+
+    A ``--no-commit`` run writes no lock, listing or cache object, so its producer's listing is
+    the directory it left in the workspace, hashed as recording a listing hashes it
+    (``cache.hash_directory``). That hash holds READ on the directory, the lock every stage
+    reading it as a dependency takes, so another pivot run cannot rewrite it mid-walk.
+
+    Raises:
+        ListingMissingError: The lock records no listing that the committed file or the cache
+            holds, or (``--no-commit``) the directory is missing.
+        CorruptListingError: That listing cannot be used.
+        PipelineConfigError: A file's key cannot name a stage, or two files share a key.
+    """
+    producer = map_run.all_stages[source.producer]
+    files_dir = map_run.cache_dir / "files"
+    default_state_dir = map_run.default_state_dir
+    if not map_run.no_commit:
+        return expansion.read_keys(
+            source,
+            producer,
+            expansion.stage_lock(producer, default_state_dir).read(cache_dir=files_dir),
+            default_state_dir=default_state_dir,
+            cache_dir=files_dir,
+        )
+    output = next(out for out in producer["outs"] if out.identity == source)
+    directory = map_run.store.resolve_display_path(output)
+    lock_dir = registry.get_stage_state_dir(producer, default_state_dir) / "locks"
+    requests = artifact_lock.expand_lock_requests({"source": output}, [], map_run.project_root)
+    try:
+        with artifact_lock.LocalFlockLockService(lock_dir).acquire_many(requests):
+            hashed = cache.hash_directory(directory, cache_dir=files_dir)
+    except FileNotFoundError:
+        shown = project.to_relative_path(directory, map_run.project_root)
+        raise exceptions.ListingMissingError(f"the directory {shown} is missing") from None
+    return expansion.keys_of(hashed["listing"])
+
+
+def _incremental_refusal(
+    stage_order: list[str],
+    stages: dict[str, RegistryStageInfo],
+    *,
+    allow_uncached_incremental: bool,
+    force: bool,
+) -> exceptions.PivotError | None:
+    """Why a run must not start ``stage_order``, or None: an incremental output on disk that
+    the cache does not hold, which running would delete (unless ``allow_uncached_incremental``),
+    or an incremental stage whose lock an older pivot rewrote over this pivot's, as that pivot may
+    have restarted the output from empty (unless ``force``, which accepts its lock on purpose)."""
+    if not allow_uncached_incremental:
+        uncached = executor_core.check_uncached_incremental_outputs(stage_order, stages)
+        if uncached:
+            files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
+            return exceptions.UncachedIncrementalOutputError(
+                "The following incremental output files exist but are not in cache:\n"
+                + f"{files_list}\n\n"
+                + "Running the pipeline will DELETE these files and they cannot be restored.\n"
+                + "To proceed anyway, use --allow-uncached-incremental or back up these "
+                + "files first."
+            )
+    if not force:
+        restarted = executor_core.check_restarted_incremental_outputs(stage_order, stages)
+        if restarted:
+            return exceptions.RestartedIncrementalOutputError(
+                "Pivot will not run these stages:\n"
+                + "\n".join(f"  - {reason}" for reason in restarted)
+            )
+    return None
+
+
+def _first_failed(results: dict[str, executor_core.ExecutionSummary]) -> str:
+    """The first stage of ``results`` that failed."""
+    return next(
+        (name for name, result in results.items() if result["status"] == StageStatus.FAILED),
+        "unknown",
+    )
+
+
+def _failed_upstream(
+    graph: nx.DiGraph[str] | None, stage: str, results: dict[str, executor_core.ExecutionSummary]
+) -> str | None:
+    """The failure a blocked ``stage`` reports: the nearest stage above it in bipartite graph
+    ``graph`` that failed in ``results``; None when none did (a stage fail-fast blocked)."""
+    if graph is None:
+        return None
+    seen = {stage}
+    pending = collections.deque([stage])
+    while pending:
+        for name in engine_graph.get_upstream_stages(graph, pending.popleft()):
+            if name in seen:
+                continue
+            if name in results and results[name]["status"] == StageStatus.FAILED:
+                return name
+            seen.add(name)
+            pending.append(name)
+    return None
+
+
 class Engine:
     """Async coordinator for pipeline execution using anyio.
 
@@ -362,6 +604,18 @@ class Engine:
     _missing_dependency_run: _MissingDependencyRun | None
     # Set while no code reload is in flight; replaced by a fresh Event when one starts
     _reload_done: anyio.Event
+    # The running run's templates, or None when it has none
+    _map_run: _MapRun | None
+    # Each source directory's (key, file key) pairs that the running or latest run read to
+    # expand its templates (Pipeline.map); emptied when a run starts
+    _expansion_keys: dict[types.ArtifactIdentity, list[tuple[str, str]]]
+    # Why the running or latest run failed each template it could not expand; emptied when a
+    # run starts
+    _expansion_failures: dict[str, str]
+    # RPC calls reading the registry in a worker thread (``reading_registry``), and an event set
+    # while none does: no run start or expansion changes the registry under them
+    _registry_readers: int
+    _registry_unread: anyio.Event
 
     def __init__(
         self, *, pipeline: registry.PipelineLike | None = None, all_pipelines: bool = False
@@ -427,6 +681,12 @@ class Engine:
         self._missing_dependency_run = None
         self._reload_done = anyio.Event()
         self._reload_done.set()
+        self._map_run = None
+        self._expansion_keys = dict[types.ArtifactIdentity, list[tuple[str, str]]]()
+        self._expansion_failures = dict[str, str]()
+        self._registry_readers = 0
+        self._registry_unread = anyio.Event()
+        self._registry_unread.set()
 
     @property
     def state(self) -> EngineState:
@@ -447,6 +707,39 @@ class Engine:
     def is_reloading(self) -> bool:
         """Whether a code reload is in flight: import, fingerprints, then the re-run's start."""
         return not self._reload_done.is_set()
+
+    def expansion_keys(self, template: str) -> frozenset[str] | None:
+        """The keys of the files of template ``template``'s source directory (``Pipeline.map``)
+        that the running or latest run read to expand it, which name each instance it can have;
+        None when no run has read them since that run started."""
+        source = self._require_pipeline().get_template(template)["source"]
+        keys = self._expansion_keys.get(source)
+        return None if keys is None else frozenset(key for key, _ in keys)
+
+    def expansion_failure(self, template: str) -> str | None:
+        """Why the running or latest run failed template ``template`` (``Pipeline.map``) when it
+        could not add its instances; None when no run has failed it since that run started."""
+        return self._expansion_failures.get(template)
+
+    @contextlib.asynccontextmanager
+    async def reading_registry(self) -> AsyncIterator[None]:
+        """Hold off every change to the registry while the caller reads it in a worker thread:
+        a run start removing the instances (``reset_expansions``) and an expansion adding them
+        wait until the block ends."""
+        if self._registry_readers == 0:
+            self._registry_unread = anyio.Event()
+        self._registry_readers += 1
+        try:
+            yield
+        finally:
+            self._registry_readers -= 1
+            if self._registry_readers == 0:
+                self._registry_unread.set()
+
+    async def _wait_for_registry_readers(self) -> None:
+        """Wait until no caller reads the registry in a worker thread (``reading_registry``)."""
+        while self._registry_readers:
+            await self._registry_unread.wait()
 
     @property
     def sources(self) -> list[EventSource]:
@@ -1012,12 +1305,20 @@ class Engine:
     def _drop_removed_stages(self, request: RunRequested) -> RunRequested | None:
         """``request`` without stages a reload removed since it was made; None if none remain.
 
-        An empty stage list would mean every stage, so a request left with none is dropped.
+        A template (``Pipeline.map``) the reloaded pipeline holds stays, and so does an instance
+        of one, which the run reaches through its template. An empty stage list would mean every
+        stage, so a request left with none is dropped.
         """
         if request["stages"] is None:
             return request
-        current = set(self._list_stages())
-        stages = [stage for stage in request["stages"] if stage in current]
+        pipeline = self._require_pipeline()
+        templates = pipeline.list_templates()
+        current = {*pipeline.list_stages(), *templates}
+        stages = [
+            stage
+            for stage in request["stages"]
+            if stage in current or registry.template_of(stage, templates) is not None
+        ]
         if not stages:
             return None
         kept = request.copy()
@@ -1093,6 +1394,14 @@ class Engine:
         pipeline = self._require_pipeline()
         return {name: pipeline.get_stage(name) for name in pipeline.list_stages()}
 
+    def _get_graph_stages(self) -> dict[str, RegistryStageInfo]:
+        """Every stage and every template (``Pipeline.map``), as a run's graph holds them."""
+        pipeline = self._require_pipeline()
+        return {
+            **self._get_all_stages(),
+            **{name: pipeline.get_template(name)["info"] for name in pipeline.list_templates()},
+        }
+
     # =========================================================================
     # Stage State Management
     # =========================================================================
@@ -1117,9 +1426,13 @@ class Engine:
         return self._scheduler.get_state(stage)
 
     def _get_stage_index(self, stage_name: str) -> tuple[int, int]:
-        """Get (1-based index, total count) for a stage."""
-        stage_keys = list(self._scheduler.stage_states.keys())
+        """Get (1-based index, total count) for a stage. A template (``Pipeline.map``) is a node
+        of the schedule but no stage: it counts in neither, and its own index is 0."""
+        templates = self._map_run.templates if self._map_run is not None else set[str]()
+        stage_keys = [name for name in self._scheduler.stage_states if name not in templates]
         total_stages = len(stage_keys)
+        if stage_name in templates:
+            return 0, total_stages
         try:
             stage_index = stage_keys.index(stage_name) + 1
         except ValueError:
@@ -1190,7 +1503,26 @@ class Engine:
         # none, the loaded pipeline's by the registry and any other's by its lock. A tracked
         # file it restores comes from the configured cache, and it registers there first: a
         # library caller can run the engine with another `cache_dir`.
+        pipeline = self._pipeline
+        if pipeline is None:
+            raise pivot_exceptions.PipelineNotFoundError("No active pipeline registered.")
+        # Each run expands its templates afresh (Pipeline.map): no expansion, no key a run read
+        # and no failed expansion is kept from a run to the next, so the stages are the
+        # pipeline's own until a producer is current.
+        # A run start removes every instance, so it waits for a thread reading the registry
+        await self._wait_for_registry_readers()
+        pipeline.reset_expansions()
+        self._expansion_keys.clear()
+        self._expansion_failures.clear()
         all_stages = self._get_all_stages()
+        templates = {name: pipeline.get_template(name) for name in pipeline.list_templates()}
+        # The run history records the targets as given, an instance's name among them
+        targets = list(stages) if stages else list[str]()
+        # A target naming an instance (a watch run's affected stage, or a name the user gave) is
+        # reached through its template, which then adds that instance alone, with its chain
+        wanted = dict[str, dict[str, set[str]]]()
+        if stages:
+            stages, wanted = _mapped_targets(stages, templates)
         executor_core.verify_tracked_files(
             project_root,
             checkout_missing=checkout_missing,
@@ -1199,11 +1531,10 @@ class Engine:
             ),
         )
 
-        # Build bipartite graph (single source of truth)
-        graph = engine_graph.build_graph(all_stages)
-        pipeline = self._pipeline
-        if pipeline is None:
-            raise pivot_exceptions.PipelineNotFoundError("No active pipeline registered.")
+        # Build bipartite graph (single source of truth). A template is a node of it, reading
+        # its source directory, until the run expands it.
+        graph_stages = {**all_stages, **{name: t["info"] for name, t in templates.items()}}
+        graph = engine_graph.build_graph(graph_stages)
         store = store_mod.WorkspaceStore(
             project_root=project_root,
             pipeline_name=pipeline.name,
@@ -1216,7 +1547,7 @@ class Engine:
         ):
             _logger.warning(warning)
         runnable, dep_errors = engine_graph.get_runnable_stages(
-            all_stages, store, all_pipelines=self._all_pipelines, on_error=on_error
+            graph_stages, store, all_pipelines=self._all_pipelines, on_error=on_error
         )
         if runnable is not None:
             # Skip broken stages but continue with healthy pipelines
@@ -1254,11 +1585,12 @@ class Engine:
             if stages and dep_errors:
                 # Across all pipelines with keep-going, a stage still missing an input stays out
                 stages = [stage for stage in stages if stage in runnable]
+                targets = [t for t in targets if _run_target(t, templates) in runnable]
                 if not stages:
                     return {}
         if dep_errors:
             graph = engine_graph.build_graph(runnable)
-        all_stages = runnable
+        all_stages = {name: info for name, info in runnable.items() if name not in templates}
         self._graph = graph
 
         # Extract stage-only DAG for execution order
@@ -1272,6 +1604,8 @@ class Engine:
                     unknown,
                     available_stages=list(registered),
                 )
+            if single_stage:
+                _refuse_single_stage_templates(stages, templates)
 
         execution_order = engine_graph.get_execution_order(
             stage_dag, stages, single_stage=single_stage
@@ -1279,54 +1613,50 @@ class Engine:
 
         if not execution_order:
             return {}
+        # The templates this run expands: those its order holds. A run targeted at a producer
+        # holds only it and its upstream, so it expands nothing.
+        run_templates = [name for name in execution_order if name in templates]
+        stage_order = [name for name in execution_order if name not in templates]
 
-        # Check for uncached incremental output files that would be lost.
-        if not allow_uncached_incremental:
-            uncached = executor_core.check_uncached_incremental_outputs(
-                execution_order, self._get_all_stages()
-            )
-            if uncached:
-                files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
-                raise pivot_exceptions.UncachedIncrementalOutputError(
-                    "The following incremental output files exist but are not in cache:\n"
-                    + f"{files_list}\n\n"
-                    + "Running the pipeline will DELETE these files and they cannot be restored.\n"
-                    + "To proceed anyway, use --allow-uncached-incremental or back up these "
-                    + "files first."
-                )
-
-        # Refuse an incremental stage whose lock an older pivot rewrote over this pivot's: that
-        # pivot may have restarted the output from empty. `--force` accepts its lock on purpose.
-        if not force:
-            restarted = executor_core.check_restarted_incremental_outputs(
-                execution_order, self._get_all_stages()
-            )
-            if restarted:
-                raise pivot_exceptions.RestartedIncrementalOutputError(
-                    "Pivot will not run these stages:\n"
-                    + "\n".join(f"  - {reason}" for reason in restarted)
-                )
+        # Check for uncached incremental output files that would be lost, and for incremental
+        # stages an older pivot may have restarted from empty.
+        refusal = _incremental_refusal(
+            stage_order,
+            self._get_all_stages(),
+            allow_uncached_incremental=allow_uncached_incremental,
+            force=force,
+        )
+        if refusal is not None:
+            raise refusal
 
         # The pool never needs more workers than stages that can run at once, but the cpu
-        # resource capacity is the configured worker count, whatever this run schedules.
+        # resource capacity is the configured worker count, whatever this run schedules. A run
+        # that expands templates adds stages whose number it cannot know yet, and a pool cannot
+        # grow mid-run, so it may hold the configured count; workers still start as stages need
+        # them (executor_core.submit).
         cpu_capacity = executor_core.configured_worker_count(max_workers) if parallel else 1
         effective_max_workers = (
             1
             if not parallel
-            else engine_graph.get_width(stage_dag, execution_order, limit=cpu_capacity)
+            else cpu_capacity
+            if run_templates
+            else engine_graph.get_width(stage_dag, stage_order, limit=cpu_capacity)
         )
 
         try:
             stage_resources, capacities = self._resolve_stage_resources(
-                execution_order,
+                stage_order,
                 cpu_capacity,
                 resource_capacity,
+                templates=[templates[name]["info"] for name in run_templates],
             )
         except exceptions.ValidationError as exc:
             if not self._watches_filesystem():
                 raise
             await self._invalidate_pipeline([str(exc)])
             return {}
+        # A template holds no resource: it runs nothing, its instances do
+        stage_resources.update({name: {} for name in run_templates})
 
         # Load config. Startup and every reload check params.yaml, so in watch mode an error
         # here is an edit the watcher has not reported yet: the pipeline becomes invalid.
@@ -1375,7 +1705,28 @@ class Engine:
 
         # The lock and listing files as they stand before this run, so the run names each one
         # it writes that git ignores, whatever path wrote it (a run, a run-cache restore).
-        committed_before = self._committed_files(execution_order, all_stages, project_root)
+        committed_before = self._committed_files(stage_order, all_stages, project_root)
+        self._map_run = (
+            _MapRun(
+                templates=set(run_templates),
+                keys=self._expansion_keys,
+                wanted=wanted,
+                stage_order=stage_order,
+                all_stages=all_stages,
+                committed_before=committed_before,
+                capacities=capacities,
+                store=store,
+                cache_dir=cache_dir,
+                default_state_dir=default_state_dir,
+                project_root=project_root,
+                force=force,
+                no_commit=no_commit,
+                allow_uncached_incremental=allow_uncached_incremental,
+                fail_fast=on_error == OnError.FAIL,
+            )
+            if run_templates
+            else None
+        )
 
         try:
             # Ensure default StateDB exists before skip checks
@@ -1519,43 +1870,7 @@ class Engine:
 
                             # Check error mode
                             if on_error == OnError.FAIL:
-                                has_failed = any(
-                                    s == StageExecutionState.COMPLETED
-                                    and n in results
-                                    and results[n]["status"] == StageStatus.FAILED
-                                    for n, s in self._scheduler.stage_states.items()
-                                )
-                                if has_failed:
-                                    first_failed = next(
-                                        n
-                                        for n, s in self._scheduler.stage_states.items()
-                                        if s == StageExecutionState.COMPLETED
-                                        and n in results
-                                        and results[n]["status"] == StageStatus.FAILED
-                                    )
-                                    blocked = self._scheduler.apply_fail_fast()
-                                    for name, old_state in blocked:
-                                        await self.emit(
-                                            StageStateChanged(
-                                                type="stage_state_changed",
-                                                stage=name,
-                                                state=StageExecutionState.BLOCKED,
-                                                previous_state=old_state,
-                                            )
-                                        )
-                                    # Emit terminal events for blocked stages not yet in results
-                                    for name, state in self._scheduler.stage_states.items():
-                                        if (
-                                            state == StageExecutionState.BLOCKED
-                                            and name not in results
-                                        ):
-                                            await self._emit_terminal_stage(
-                                                name,
-                                                StageStatus.BLOCKED,
-                                                f"upstream '{first_failed}' failed",
-                                                results,
-                                                run_id=run_id,
-                                            )
+                                await self._apply_fail_fast(results, run_id)
 
                             # Start more stages if slots available
                             if not self._scheduler.stop_starting_new:
@@ -1578,24 +1893,19 @@ class Engine:
                             if name not in results:
                                 missing_by_state.setdefault(state.name, []).append(name)
                         if missing_by_state:
-                            for state_name, stages in missing_by_state.items():
+                            for state_name, names in missing_by_state.items():
                                 _logger.debug(
                                     "Stages not in results (state=%s): %s",
                                     state_name,
-                                    stages[:10] if len(stages) > 10 else stages,
+                                    names[:10] if len(names) > 10 else names,
                                 )
 
                         # Handle any blocked stages not yet processed
                         for name, state in self._scheduler.stage_states.items():
                             if state == StageExecutionState.BLOCKED and name not in results:
-                                failed_upstream = next(
-                                    (
-                                        n
-                                        for n, r in results.items()
-                                        if r["status"] == StageStatus.FAILED
-                                    ),
-                                    "unknown",
-                                )
+                                failed_upstream = _failed_upstream(
+                                    self._graph, name, results
+                                ) or _first_failed(results)
                                 await self._emit_terminal_stage(
                                     name,
                                     StageStatus.BLOCKED,
@@ -1632,10 +1942,13 @@ class Engine:
 
             if self._worker_pool is not None and self._worker_pool.in_run:
                 self._worker_pool.end_run()
+            self._map_run = None
 
-        # Write run history after execution completes
+        # Write run history after execution completes. The record's order holds each instance
+        # the run added (stage_order grows with every expansion), and no template; its targets
+        # are the run's as given.
         ended_at = datetime.datetime.now(datetime.UTC).isoformat()
-        targeted_stages = stages if stages else execution_order
+        targeted_stages = targets if targets else stage_order
         retention = config.get_run_history_retention()
 
         self._write_run_history(
@@ -1643,7 +1956,7 @@ class Engine:
             results=results,
             stage_durations=stage_durations,
             targeted_stages=targeted_stages,
-            execution_order=execution_order,
+            execution_order=stage_order,
             started_at=started_at,
             ended_at=ended_at,
             retention=retention,
@@ -1684,6 +1997,45 @@ class Engine:
             return_when=concurrent.futures.FIRST_COMPLETED,
         )
         return done
+
+    async def _apply_fail_fast(
+        self, results: dict[str, executor_core.ExecutionSummary], run_id: str
+    ) -> None:
+        """Once a stage of the run has failed, start no stage (``OnError.FAIL``): block each
+        one not started, reporting the failure above it, or the first failure of the run."""
+        first_failed = next(
+            (
+                name
+                for name, state in self._scheduler.stage_states.items()
+                if state == StageExecutionState.COMPLETED
+                and name in results
+                and results[name]["status"] == StageStatus.FAILED
+            ),
+            None,
+        )
+        if first_failed is None:
+            return
+        blocked = self._scheduler.apply_fail_fast()
+        for name, old_state in blocked:
+            await self.emit(
+                StageStateChanged(
+                    type="stage_state_changed",
+                    stage=name,
+                    state=StageExecutionState.BLOCKED,
+                    previous_state=old_state,
+                )
+            )
+        # Emit terminal events for blocked stages not yet in results
+        for name, state in self._scheduler.stage_states.items():
+            if state == StageExecutionState.BLOCKED and name not in results:
+                failed_upstream = _failed_upstream(self._graph, name, results) or first_failed
+                await self._emit_terminal_stage(
+                    name,
+                    StageStatus.BLOCKED,
+                    f"upstream '{failed_upstream}' failed",
+                    results,
+                    run_id=run_id,
+                )
 
     async def _drain_output_queue(
         self,
@@ -1761,11 +2113,15 @@ class Engine:
         execution_order: list[str],
         cpu_capacity: int,
         cli_resource_capacity: dict[str, int],
+        *,
+        templates: list[RegistryStageInfo] | None = None,
     ) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
         """Resolve configured and CLI resource capacities for a scheduler run.
 
         ``cpu`` defaults to ``cpu_capacity`` (the worker count) unless config or
-        ``--resources`` sets it.
+        ``--resources`` sets it. Each of ``templates`` (``Pipeline.map``) is resolved as its
+        instances will be (``_stage_request``), so a resource only they name has a capacity
+        and a request above it fails before the run starts; it gets no request of its own.
         """
         capacities = {
             name.casefold(): capacity for name, capacity in config.get_resource_capacities().items()
@@ -1775,19 +2131,12 @@ class Engine:
         )
         capacities.setdefault("cpu", cpu_capacity)
 
-        requests = dict[str, dict[str, int]]()
-        for stage_name in execution_order:
-            request = {"cpu": 1}
-            # compose validated each request: a positive int, or "all" for cpu only.
-            for resource, amount in self._get_stage(stage_name)["resources"].items():
-                capacity = capacities.setdefault(resource, 1)
-                request[resource] = capacity if amount == "all" else int(amount)
-            for resource, amount in request.items():
-                capacity = capacities[resource]
-                if amount > capacity:
-                    msg = f"Stage {stage_name!r} requests {amount} units of resource {resource!r}, but its capacity is {capacity}"
-                    raise exceptions.ValidationError(msg)
-            requests[stage_name] = request
+        requests = {
+            stage_name: _stage_request(self._get_stage(stage_name), capacities)
+            for stage_name in execution_order
+        }
+        for template in templates or []:
+            _ = _stage_request(template, capacities)
         return requests, capacities
 
     async def _initialize_orchestration(
@@ -1876,7 +2225,7 @@ class Engine:
         # Closed after the loop to avoid repeated LMDB open/close per stage.
         skip_state_dbs = dict[pathlib.Path, state_mod.StateDB]()
         try:
-            for stage_name in list(self._scheduler.stage_states.keys()):
+            for stage_name in self._stage_names_as_added():
                 if started >= max_to_start:
                     break
 
@@ -1884,6 +2233,16 @@ class Engine:
                     break
 
                 if not self._can_start_stage(stage_name):
+                    continue
+
+                # A template starts no worker: it adds its instances, which this loop reaches.
+                # One that fails under fail-fast stops this pass, as a failed stage stops the next.
+                if self._map_run is not None and stage_name in self._map_run.templates:
+                    await self._expand_template(stage_name, self._map_run, results, run_id)
+                    # An expanded template has no result; a failed one has its failure
+                    if self._map_run.fail_fast and stage_name in results:
+                        await self._apply_fail_fast(results, run_id)
+                        break
                     continue
 
                 # Reserve every resource before checking the next ready stage.
@@ -1993,6 +2352,144 @@ class Engine:
             for db in skip_state_dbs.values():
                 db.close()
 
+    def _stage_names_as_added(self) -> Iterator[str]:
+        """Each stage of the schedule in order, then each a template adds while this iterates."""
+        states = self._scheduler.stage_states
+        names = list(states)
+        position = 0
+        while True:
+            if position == len(names):
+                if len(states) == len(names):
+                    return
+                names.extend(itertools.islice(states, len(names), None))
+            yield names[position]
+            position += 1
+
+    async def _expand_template(
+        self,
+        name: str,
+        map_run: _MapRun,
+        results: dict[str, executor_core.ExecutionSummary],
+        run_id: str,
+    ) -> None:
+        """Add template ``name``'s instances to the run (``Pipeline.map``), then complete it.
+
+        Its upstream stages have finished, its producer among them, so the producer's directory
+        holds what the producer wrote or restored. Each file becomes one instance
+        (``registry.map_instance_keys``), or, when the run's targets name instances, each file of
+        a key they name (``_MapRun.wanted``); each is added to the registry, the run's graph and
+        its schedule. The template then completes, so a template mapped over its instances can
+        expand next. A refusal (a file whose key cannot name a stage, a named key no file has,
+        an instance whose name or output path another stage holds, an instance's incremental
+        output the run would lose) fails the template with the reason and adds none of its
+        instances.
+        """
+        pipeline = self._require_pipeline()
+        template = pipeline.get_template(name)
+        source = template["source"]
+        await self._set_stage_state(name, StageExecutionState.PREPARING)
+        reason: str | None = None
+        added = list[str]()
+        try:
+            keys = map_run.keys.get(source)
+            if keys is None:
+                keys = await anyio.to_thread.run_sync(_read_map_keys, source, map_run)
+                map_run.keys[source] = keys
+            if name in map_run.wanted:
+                wanted = map_run.wanted[name]
+                # A named key no file has reads as `pivot status` reads its target
+                missing = sorted(wanted.keys() - {key for key, _ in keys})
+                if missing:
+                    reason = _unknown_keys_reason(name, missing, wanted)
+                keys = [(key, file_key) for key, file_key in keys if key in wanted]
+            if reason is None:
+                planned = {
+                    info["name"]: info
+                    for info in (registry.instantiate(template, key, file) for key, file in keys)
+                }
+                problem = await anyio.to_thread.run_sync(
+                    lambda: _incremental_refusal(
+                        list(planned),
+                        planned,
+                        allow_uncached_incremental=map_run.allow_uncached_incremental,
+                        force=map_run.force,
+                    )
+                )
+                if problem is not None:
+                    raise problem
+                # Adding instances waits for a thread reading the registry, as a run start does
+                await self._wait_for_registry_readers()
+                added = pipeline.expand_template(name, keys)
+        except exceptions.PivotError as exc:
+            reason = expansion.refusal_reason(source, exc)
+        if reason is not None:
+            _logger.error("Stage %s failed: %s", name, reason)
+            self._expansion_failures[name] = reason
+            await self._emit_terminal_stage(
+                name, StageStatus.FAILED, reason, results, run_id=run_id
+            )
+            await self._complete_template(name, failed=True, results=results, run_id=run_id)
+            return
+
+        infos = {stage: pipeline.get_stage(stage) for stage in added}
+        map_run.all_stages.update(infos)
+        map_run.stage_order.extend(added)
+        map_run.committed_before.update(self._committed_files(added, infos, map_run.project_root))
+        if self._graph is None:
+            raise RuntimeError(f"Template {name} expanded outside a run")
+        engine_graph.add_stages(self._graph, infos)
+        self._watch_coordinator = None  # its output paths now miss the instances' outputs
+        states = self._scheduler.extend(
+            added,
+            self._graph,
+            stage_resources={
+                stage: _stage_request(info, map_run.capacities) for stage, info in infos.items()
+            },
+        )
+        for stage, state in states:
+            await self.emit(
+                StageStateChanged(
+                    type="stage_state_changed",
+                    stage=stage,
+                    state=state,
+                    previous_state=StageExecutionState.PENDING,
+                )
+            )
+        await self.emit(StagesExpanded(type="stages_expanded", template=name, stages=added))
+        await self._complete_template(name, failed=False, results=results, run_id=run_id)
+        for stage, state in states:
+            if state == StageExecutionState.BLOCKED:
+                failed_upstream = _failed_upstream(self._graph, stage, results) or _first_failed(
+                    results
+                )
+                await self._emit_terminal_stage(
+                    stage,
+                    StageStatus.BLOCKED,
+                    f"upstream '{failed_upstream}' failed",
+                    results,
+                    run_id=run_id,
+                )
+
+    async def _complete_template(
+        self,
+        name: str,
+        *,
+        failed: bool,
+        results: dict[str, executor_core.ExecutionSummary],
+        run_id: str,
+    ) -> None:
+        """Mark a template finished in the schedule and release what waited on it: a template
+        mapped over its instances becomes ready, or blocked when this one failed."""
+        await self._set_stage_state(name, StageExecutionState.COMPLETED)
+        newly_ready, newly_blocked = self._scheduler.on_stage_completed(name, failed)
+        await self._emit_dependents(newly_ready, newly_blocked)
+        # A template that fails in the coordinator may leave no worker to wait for, so the
+        # stages it blocks are reported now, not after the run's worker loop.
+        for stage, _ in newly_blocked:
+            await self._emit_terminal_stage(
+                stage, StageStatus.BLOCKED, f"upstream '{name}' failed", results, run_id=run_id
+            )
+
     async def _try_skip_in_coordinator(
         self,
         stage_name: str,
@@ -2006,7 +2503,7 @@ class Engine:
         run_id: str,
         skip_state_dbs: dict[pathlib.Path, state_mod.StateDB] | None = None,
     ) -> bool:
-        from pivot.storage import artifact_lock, lock
+        from pivot.storage import lock
 
         if force:
             return False
@@ -2469,7 +2966,19 @@ class Engine:
 
         failed = result["status"] == StageStatus.FAILED
         newly_ready, newly_blocked = self._scheduler.on_stage_completed(stage_name, failed)
+        await self._emit_dependents(newly_ready, newly_blocked)
 
+        # Process any deferred events for this stage
+        await self._process_deferred_events(stage_name)
+
+        return duration_ms
+
+    async def _emit_dependents(
+        self,
+        newly_ready: list[str],
+        newly_blocked: list[tuple[str, StageExecutionState]],
+    ) -> None:
+        """Emit the state changes a completion caused downstream."""
         # Emit events for newly ready stages (PENDING → READY)
         for ready_name in newly_ready:
             await self.emit(
@@ -2491,11 +3000,6 @@ class Engine:
                     previous_state=old_state,
                 )
             )
-
-        # Process any deferred events for this stage
-        await self._process_deferred_events(stage_name)
-
-        return duration_ms
 
     async def _finalize_cancelled_stages(
         self,
@@ -2943,7 +3447,9 @@ class Engine:
         # Flush manifest cache so cached manifests survive the reload
         fingerprint.flush_manifest_cache()
 
-        all_stages = self._get_all_stages()
+        # The reloaded pipeline holds no expansion: each template (Pipeline.map) is a stage of
+        # the graph and of the re-run, which expands it, as the first run did
+        all_stages = self._get_graph_stages()
         # Hot-reload: build the graph without checking dependencies, which may be missing while
         # the user edits
         self._graph = engine_graph.build_graph(all_stages)
@@ -3034,11 +3540,13 @@ class Engine:
         await self._handle_run_requested(event)
 
     def _get_watch_coordinator(self) -> engine_watch.WatchCoordinator | None:
-        """Lazily build watch planning from the current pipeline and graph."""
+        """Lazily build watch planning from the current pipeline and graph. The graph holds each
+        template (``Pipeline.map``) as a run's does, so a change to an input a template reads
+        runs the template, which expands again (``_get_graph_stages``)."""
         if self._pipeline is None:
             return None
         if self._graph is None:
-            self._graph = engine_graph.build_graph(self._get_all_stages())
+            self._graph = engine_graph.build_graph(self._get_graph_stages())
 
         if self._watch_coordinator is None or self._watch_coordinator.graph is not self._graph:
             pipeline = self._require_pipeline()
@@ -3050,7 +3558,7 @@ class Engine:
             )
             self._watch_coordinator = engine_watch.WatchCoordinator(
                 self._graph,
-                engine_watch.build_artifact_paths(self._get_all_stages(), store),
+                engine_watch.build_artifact_paths(self._get_graph_stages(), store),
                 store,
             )
         return self._watch_coordinator

@@ -410,6 +410,21 @@ def _require_same_stage(
     )
 
 
+def _require_same_template(
+    name: str, existing: registry.MapTemplate, incoming: registry.MapTemplate, root: pathlib.Path
+) -> None:
+    """Allow one template reached twice; refuse two different ones under one name, as
+    ``_require_same_stage`` does for stages."""
+    _require_same_stage(name, existing["info"], incoming["info"], root)
+    if existing["source"] != incoming["source"]:
+        raise exceptions.PipelineConfigError(
+            f"Stage '{name}' is defined twice, mapped over "
+            + f"'{types.identity_key(existing['source'])}' and "
+            + f"'{types.identity_key(incoming['source'])}'. Pipeline names must be unique "
+            + "within a project; rename one of the pipelines."
+        )
+
+
 def _require_one_state_dir(
     including: str,
     included: str,
@@ -536,6 +551,33 @@ def _emit_stage_info(
     )
 
 
+def _register_node(
+    reg: registry.StageRegistry, node: _StageNode, info: registry.RegistryStageInfo
+) -> None:
+    """Add a stage to ``reg``, or a template when the stage call was mapped."""
+    if node.map_source is None:
+        reg.add_existing(info)
+        return
+    mapped_deps = dict[str, str | None]()
+
+    def note(dep_name: str, handle: ArtifactHandle) -> None:
+        if handle._map is None:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            return
+        if handle._is_map_entry():  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            mapped_deps[dep_name] = None
+        else:
+            mapped_deps[dep_name] = f"{handle._pipeline._name}/{handle._source.name}"  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle and Pipeline
+
+    for param_name, handle in node.input_handles.items():
+        note(param_name, handle)
+    for param_name, handles in node.list_input_handles.items():
+        for i, handle in enumerate(handles):
+            note(f"{param_name}[{i}]", handle)
+    reg.add_template(
+        registry.MapTemplate(info=info, source=node.map_source.identity(), mapped_deps=mapped_deps)
+    )
+
+
 class Pipeline:
     _name: str
     _root: pathlib.Path
@@ -548,6 +590,7 @@ class Pipeline:
     _variant_stack: list[str]
     _registry: registry.StageRegistry
     _included_stages: dict[str, registry.RegistryStageInfo]
+    _included_templates: dict[str, registry.MapTemplate]
     _previous_markers: list[_PreviousOutputMarker]
     _constructing: bool
     _loaded_pipelines: set[str]
@@ -571,6 +614,7 @@ class Pipeline:
         self._registry = registry.StageRegistry()
         self._previous_markers = list[_PreviousOutputMarker]()
         self._included_stages = dict[str, registry.RegistryStageInfo]()
+        self._included_templates = dict[str, registry.MapTemplate]()
         self._constructing = False
         self._loaded_pipelines = {name}
         self._resolved_state_dirs = dict[pathlib.Path, state_dir_mod.StateDirResolution]()
@@ -653,6 +697,31 @@ class Pipeline:
         self._require_materialized()
         return self._registry.get(name)
 
+    def list_templates(self) -> list[str]:
+        """The stages mapped over a directory output (``map``), not yet expanded."""
+        self._require_materialized()
+        return self._registry.list_templates()
+
+    def get_template(self, name: str) -> registry.MapTemplate:
+        self._require_materialized()
+        return self._registry.get_template(name)
+
+    def expand_template(
+        self, name: str, keys: collections.abc.Sequence[tuple[str, str]]
+    ) -> list[str]:
+        """Add template ``name``'s instances (``registry.StageRegistry.expand``)."""
+        self._require_materialized()
+        return self._registry.expand(name, keys)
+
+    def instances_of(self, name: str) -> list[str]:
+        self._require_materialized()
+        return self._registry.instances_of(name)
+
+    def reset_expansions(self) -> None:
+        """Remove every instance: each run expands its templates afresh."""
+        self._require_materialized()
+        self._registry.reset_expansions()
+
     def ensure_fingerprint(self, name: str) -> dict[str, str]:
         self._require_materialized()
         with state_dir_mod.entry_invocation(self._resolved_state_dirs):
@@ -670,11 +739,53 @@ class Pipeline:
         return self._registry.snapshot()
 
     def include(self, other: registry.PipelineLike) -> None:
+        """Add ``other``'s stages, templates and input bindings to this pipeline.
+
+        All or nothing: the include works on copies of this pipeline's records, and outside a
+        construction block on a copy of its registry, which it keeps only once every check has
+        passed. A refused include (a conflicting stage, template, input binding, output path or
+        state directory) leaves the pipeline as it was.
+        """
         if other is self:
             from pivot.exceptions import PipelineConfigError
 
             raise PipelineConfigError(f"Pipeline '{self.name}' cannot include itself")
+        kept = (
+            self._included_stages,
+            self._included_templates,
+            self._inputs,
+            self._input_names_by_path,
+            self._loaded_pipelines,
+            self._included_state_dirs,
+            self._resolved_state_dirs,
+            self._registry,
+        )
+        self._included_stages = dict(self._included_stages)
+        self._included_templates = dict(self._included_templates)
+        self._inputs = dict(self._inputs)
+        self._input_names_by_path = dict(self._input_names_by_path)
+        self._loaded_pipelines = set(self._loaded_pipelines)
+        self._included_state_dirs = dict(self._included_state_dirs)
+        self._resolved_state_dirs = dict(self._resolved_state_dirs)
+        if not self._constructing:
+            self._registry = self._registry.copy()
+        try:
+            self._include(other)
+        except BaseException:
+            (
+                self._included_stages,
+                self._included_templates,
+                self._inputs,
+                self._input_names_by_path,
+                self._loaded_pipelines,
+                self._included_state_dirs,
+                self._resolved_state_dirs,
+                self._registry,
+            ) = kept
+            raise
 
+    def _include(self, other: registry.PipelineLike) -> None:
+        """``include``'s checks and changes, on the copies it made."""
         # One project's state stays in one directory; checked before anything changes.
         for root, resolution in other.resolved_state_dirs.items():
             held = self._held_state_dir(root)
@@ -694,6 +805,26 @@ class Pipeline:
             self._included_stages[stage_name] = stage_info
             if not self._constructing:
                 self._registry.add_existing(copy.deepcopy(stage_info))
+
+        known_templates = (
+            self._included_templates
+            if self._constructing
+            else {
+                name: self._registry.get_template(name) for name in self._registry.list_templates()
+            }
+        )
+        for template_name in other.list_templates():
+            incoming_template = other.get_template(template_name)
+            existing_template = known_templates.get(template_name)
+            if existing_template is not None:
+                _require_same_template(
+                    template_name, existing_template, incoming_template, self._root
+                )
+                continue
+            template = copy.deepcopy(incoming_template)
+            self._included_templates[template_name] = template
+            if not self._constructing:
+                self._registry.add_template(copy.deepcopy(template))
 
         for name, path in other.input_bindings.items():
             if name in self._inputs:
@@ -784,14 +915,14 @@ class Pipeline:
             stage_info = _emit_stage_info(
                 foreign_node, qualified_name, stage_state_dirs[foreign_pipeline._root]
             )
-            new_registry.add_existing(stage_info)
+            _register_node(new_registry, foreign_node, stage_info)
 
         self._merge_foreign_input_bindings(closure)
 
         for node in self._stages:
             qualified_name = f"{self._name}/{node.name}"
             stage_info = _emit_stage_info(node, qualified_name, stage_state_dirs[self._root])
-            new_registry.add_existing(stage_info)
+            _register_node(new_registry, node, stage_info)
 
         materialized_stages = set(new_registry.list_stages())
         for stage_name, stage_info in self._included_stages.items():
@@ -802,6 +933,14 @@ class Pipeline:
                 continue
             new_registry.add_existing(copy.deepcopy(stage_info))
             materialized_stages.add(stage_name)
+        materialized_templates = set(new_registry.list_templates())
+        for template_name, template in self._included_templates.items():
+            if template_name in materialized_templates:
+                _require_same_template(
+                    template_name, new_registry.get_template(template_name), template, self._root
+                )
+                continue
+            new_registry.add_template(copy.deepcopy(template))
 
         self._check_inputs_against_outputs(new_registry)
 
@@ -1095,6 +1234,10 @@ class Pipeline:
                 )
 
         variant_str = "@".join(self._variant_stack) if self._variant_stack else None
+        map_source = self._call_map_source(
+            qualified_name,
+            [*input_handles.values(), *(h for hs in list_input_handles.values() for h in hs)],
+        )
 
         # Read @no_fingerprint marks from this @stage wrapper, never from the shared function:
         # functools.wraps copies marks set below @stage, and marks set above land here directly.
@@ -1112,22 +1255,35 @@ class Pipeline:
             list_input_handles=list_input_handles,
             collection_params=collection_params,
             incremental_inputs=incremental_inputs,
+            map_source=map_source,
         )
         self._stages.append(node)
 
-        if len(output_specs) == 1:
-            return ArtifactHandle(
-                pipeline=self,
-                source=node,
-                output_key=None,
-                python_type=output_specs[0].python_type,
-            )
         return ArtifactHandle(
             pipeline=self,
             source=node,
             output_key=None,
-            python_type=dict,
+            python_type=output_specs[0].python_type if len(output_specs) == 1 else dict,
+            map_source=map_source,
         )
+
+    def _call_map_source(
+        self, qualified_name: str, handles: list[ArtifactHandle]
+    ) -> _MapSource | None:
+        """The directory a stage call is mapped over: the one its mapped handles share, or None
+        when it has none. Handles mapped over two directories are a validation error."""
+        sources = [handle._map for handle in handles if handle._map is not None]  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+        if not sources:
+            return None
+        first = sources[0]
+        other = next((source for source in sources if not source.same(first)), None)
+        if other is not None:
+            self._validation_errors.append(
+                f"{qualified_name}: mapped over both '{types.identity_key(first.identity())}' "
+                + f"and '{types.identity_key(other.identity())}'; a stage maps over the files "
+                + "of one directory output."
+            )
+        return first
 
     def _error_handle(self) -> ArtifactHandle:
         """A placeholder handle for a stage call refused with a validation error."""
@@ -1146,6 +1302,61 @@ class Pipeline:
         marker = _PreviousOutputMarker(pipeline=self, key=key)
         self._previous_markers.append(marker)
         return marker
+
+    def map(self, handle: object) -> Any:
+        """Stand for each file of a directory output, one at a time.
+
+        A stage called with the returned handle is mapped: a run that finds the directory's
+        producer current adds one instance of it per file, named ``<stage>@<key>``, where
+        ``key`` is the file's path inside the directory without its extension. Each instance
+        depends on its own file only. A stage called with a mapped stage's handle is mapped
+        over the same files, its instance of each key depending on that key's instance.
+        """
+        if not isinstance(handle, ArtifactHandle):
+            raise exceptions.PipelineConfigError(
+                "pipeline.map() takes what a stage call returned (or one of its fields), "
+                + f"not a {type(handle).__name__}."
+            )
+        if not isinstance(handle._source, _StageNode):  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            raise exceptions.PipelineConfigError(
+                "pipeline.map() takes a directory output of a stage; "
+                + f"'{handle._source.name}' is an input."  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            )
+        source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+        qualified_name = f"{handle._pipeline._name}/{source.name}"  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle and Pipeline
+        if handle._map is not None:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            raise exceptions.PipelineConfigError(
+                f"pipeline.map() cannot map a handle of stage '{qualified_name}': it is already "
+                + "mapped over "
+                + f"'{types.identity_key(handle._map.identity())}', and a map over a mapped "  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                + "stage's output is not supported."
+            )
+        if handle._member is not None:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            raise exceptions.PipelineConfigError(
+                f"pipeline.map() takes a whole directory output; {handle._member!r} is one file "  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                + f"of a directory output of stage '{qualified_name}'."
+            )
+        spec = handle._selected_directory()  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+        if spec is None:
+            key = handle._output_key  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            shown = "the return value" if key is None else _output_label(key)
+            raise exceptions.PipelineConfigError(
+                f"pipeline.map() needs a directory output: {shown} of stage '{qualified_name}' "
+                + "is not a directory output. Tag a dict[str, T] return value with `directory`, "
+                + "or select a directory field of a multi-output stage (handle.field)."
+            )
+        map_source = _MapSource(
+            pipeline=handle._pipeline,  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            node=source,
+            output_key=None if spec.key == SINGLE_OUTPUT_KEY else spec.key,
+        )
+        return ArtifactHandle(
+            handle._pipeline,  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            source,
+            handle._output_key,  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            get_args(spec.python_type)[1],
+            map_source=map_source,
+        )
 
     def _validate(self) -> None:
         for marker in self._previous_markers:
@@ -1576,6 +1787,25 @@ class _StageNode:
     code_deps: list[str] = dataclasses.field(default_factory=list)
     incremental_inputs: dict[str, str] = dataclasses.field(default_factory=dict)
     resources: dict[str, int | str] = dataclasses.field(default_factory=dict)
+    # Set on a template: a stage called with a mapped handle (``Pipeline.map``)
+    map_source: _MapSource | None = None
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _MapSource:
+    """The directory output a mapped handle stands for one file of: ``node``'s output keyed
+    ``output_key`` (None for its single output), in ``pipeline``."""
+
+    pipeline: Pipeline
+    node: _StageNode
+    output_key: str | None
+
+    def identity(self) -> types.ArtifactIdentity:
+        return types.ArtifactIdentity(f"{self.pipeline._name}/{self.node.name}", self.output_key)  # pyright: ignore[reportPrivateUsage] - compose owns Pipeline
+
+    def same(self, other: _MapSource) -> bool:
+        """Whether both stand for one directory: the same node's same output."""
+        return self.node is other.node and self.output_key == other.output_key
 
 
 @dataclasses.dataclass
@@ -1606,6 +1836,7 @@ class ArtifactHandle:
     _output_key: str | None
     _python_type: type
     _member: str | None
+    _map: _MapSource | None
 
     def __init__(
         self,
@@ -1614,30 +1845,46 @@ class ArtifactHandle:
         output_key: str | None,
         python_type: type,
         member: str | None = None,
+        map_source: _MapSource | None = None,
     ) -> None:
-        """``member`` is the path of one file inside a directory output, as the user wrote it."""
+        """``member`` is the path of one file inside a directory output, as the user wrote it.
+
+        ``map_source`` makes the handle mapped (``Pipeline.map``): it stands for each key's file
+        of that directory when ``source`` is the directory's producer (a mapped entry), and for
+        each key's instance of a template when ``source`` is the template.
+        """
         self._pipeline = pipeline
         self._source = source
         self._output_key = output_key
         self._python_type = python_type
         self._member = member
+        self._map = map_source
+
+    def _is_map_entry(self) -> bool:
+        return self._map is not None and self._source is self._map.node
 
     def __getattr__(self, name: str) -> ArtifactHandle:
         if name.startswith("_"):
             raise AttributeError(name)
         if not isinstance(self._source, _StageNode):
             raise AttributeError(f"Input '{self._source.name}' has no sub-outputs")
+        if self._is_map_entry():
+            raise AttributeError(self._map_entry_has_no_parts_message())
         if self._member is not None:
             raise AttributeError(self._member_has_no_parts_message())
         spec = _select_output(self._source.output_specs, name)
         if spec is None:
             raise AttributeError(_no_such_output_message(self._source, name))
-        return ArtifactHandle(self._pipeline, self._source, name, spec.python_type)
+        return ArtifactHandle(
+            self._pipeline, self._source, name, spec.python_type, map_source=self._map
+        )
 
     def __getitem__(self, key: str) -> ArtifactHandle:
         """Select an output of a multi-output stage, or one file of a directory output."""
         if not isinstance(self._source, _StageNode):
             raise KeyError(f"Input '{self._source.name}' has no sub-outputs")
+        if self._is_map_entry():
+            raise KeyError(self._map_entry_has_no_parts_message())
         if self._member is not None:
             raise KeyError(self._member_has_no_parts_message())
         directory_spec = self._selected_directory()
@@ -1645,12 +1892,19 @@ class ArtifactHandle:
             # _parse_output_type checked that a directory output's type is dict[str, T]
             file_type = get_args(directory_spec.python_type)[1]
             return ArtifactHandle(
-                self._pipeline, self._source, self._output_key, file_type, member=key
+                self._pipeline,
+                self._source,
+                self._output_key,
+                file_type,
+                member=key,
+                map_source=self._map,
             )
         spec = _select_output(self._source.output_specs, key)
         if spec is None:
             raise KeyError(_no_such_output_message(self._source, key))
-        return ArtifactHandle(self._pipeline, self._source, key, spec.python_type)
+        return ArtifactHandle(
+            self._pipeline, self._source, key, spec.python_type, map_source=self._map
+        )
 
     def __iter__(self) -> Never:
         """Refuse ``for``: a handle names outputs that no stage has written yet.
@@ -1672,6 +1926,14 @@ class ArtifactHandle:
             f"{self._member!r} is one file of a directory output of stage "
             + f"'{self._pipeline.name}/{self._source.name}'; it has no outputs or files of its "
             + "own. Pass the handle itself."
+        )
+
+    def _map_entry_has_no_parts_message(self) -> str:
+        assert self._map is not None
+        return (
+            "A mapped handle stands for one file of the directory output of stage "
+            + f"'{types.identity_key(self._map.identity())}', the file of each key; it has no "
+            + "outputs or files of its own. Pass the handle itself."
         )
 
     def _selected_directory(self) -> _OutputSpec | None:

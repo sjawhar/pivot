@@ -4,7 +4,7 @@ from typing import TypedDict
 
 import click
 
-from pivot import display, project, types
+from pivot import display, expansion, project, types
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -20,10 +20,21 @@ class StageJsonOutput(TypedDict):
     variant: str | None
 
 
+class TemplateJsonOutput(TypedDict):
+    """JSON output for one stage mapped over a directory output (``Pipeline.map``)."""
+
+    name: str
+    source: str  # the directory output it is mapped over
+    expanded: bool
+    instances: list[str]  # the instances it expanded into, empty when not expanded
+    reason: str | None  # why it is not expanded; None when it is
+
+
 class ListJsonOutput(TypedDict):
     """JSON output for pivot list --json."""
 
     stages: list[StageJsonOutput]
+    templates: list[TemplateJsonOutput]
 
 
 def _get_output_sources(stage_list: list[str]) -> dict[types.ArtifactIdentity, str]:
@@ -33,20 +44,39 @@ def _get_output_sources(stage_list: list[str]) -> dict[types.ArtifactIdentity, s
     }
 
 
+def _templates_json(result: expansion.Expansion) -> list[TemplateJsonOutput]:
+    pipeline = cli_helpers.get_pipeline()
+    return [
+        TemplateJsonOutput(
+            name=name,
+            source=types.identity_key(pipeline.get_template(name)["source"]),
+            expanded=name in result["expanded"],
+            instances=result["expanded"][name] if name in result["expanded"] else [],
+            reason=result["not_expanded"][name] if name in result["not_expanded"] else None,
+        )
+        for name in pipeline.list_templates()
+    ]
+
+
 @cli_decorators.pivot_command("list", allow_all=True)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 @click.option("--deps", "show_deps", is_flag=True, help="Show stage dependencies")
 @click.pass_context
 def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
-    """List registered stages."""
+    """List registered stages.
+
+    A stage mapped over a directory output lists as its instances when its producer is current,
+    and under "Mapped stages, not yet expanded" otherwise.
+    """
     cli_ctx = cli_helpers.get_cli_context(ctx)
     verbose = cli_ctx["verbose"]
     quiet = cli_ctx["quiet"]
+    result, _ = cli_helpers.expand_mapped_stages()
     stage_list = cli_helpers.list_stages()
 
     if not stage_list:
         if as_json:
-            click.echo(display.to_json(ListJsonOutput(stages=[])))
+            click.echo(display.to_json(ListJsonOutput(stages=[], templates=[])))
         elif not quiet:
             click.echo("No stages registered.")
             click.echo("Create a pipeline.py with stage functions.")
@@ -65,7 +95,8 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
                     variant=info["variant"],
                 )
             )
-        click.echo(display.to_json(ListJsonOutput(stages=stages), indent=2))
+        output = ListJsonOutput(stages=stages, templates=_templates_json(result))
+        click.echo(display.to_json(output, indent=2))
         return
 
     # Quiet mode: no output, just exit code
@@ -109,3 +140,10 @@ def list_cmd(ctx: click.Context, as_json: bool, show_deps: bool) -> None:
                     click.echo(
                         f"      {cli_targets.format_identity_display(out.identity, output_path)}"
                     )
+
+    if result["not_expanded"]:
+        click.echo()
+        click.echo(f"Mapped stages, not yet expanded ({len(result['not_expanded'])}):")
+        for name, reason in result["not_expanded"].items():
+            click.echo(f"  {name}")
+            click.echo(f"    {display.escape_control(reason)}")

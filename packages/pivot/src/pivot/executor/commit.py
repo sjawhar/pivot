@@ -36,6 +36,7 @@ def commit_stages(
     stage_names: list[str] | None = None,
     force: bool = False,
     *,
+    stale_only: bool = False,
     warn_left_out_symlinks: bool = True,
 ) -> tuple[list[str], list[str]]:
     """Commit current workspace state for stages.
@@ -50,6 +51,9 @@ def commit_stages(
         pipeline: The pipeline whose stages are committed.
         stage_names: Specific stages to commit. None means all stale stages.
         force: If True, commit even if lock file is unchanged.
+        stale_only: Commit only the stale stages of ``stage_names``, as None commits only the
+            stale stages of all: ``pivot commit`` commits the instances of mapped stages
+            (``Pipeline.map``) this way once their producers are committed.
         warn_left_out_symlinks: Log the warning naming symlinks a directory output leaves
             out. A quiet command turns it off.
 
@@ -62,7 +66,11 @@ def commit_stages(
     """
     with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
         return _commit_stages(
-            pipeline, stage_names, force, warn_left_out_symlinks=warn_left_out_symlinks
+            pipeline,
+            stage_names,
+            force,
+            stale_only=stale_only or stage_names is None,
+            warn_left_out_symlinks=warn_left_out_symlinks,
         )
 
 
@@ -71,6 +79,7 @@ def _commit_stages(
     stage_names: list[str] | None,
     force: bool,
     *,
+    stale_only: bool,
     warn_left_out_symlinks: bool,
 ) -> tuple[list[str], list[str]]:
     all_stage_names = pipeline.list_stages()
@@ -176,13 +185,8 @@ def _commit_stages(
                 stage_lock=production_lock,
             )
 
-            # 5. If not force and no explicit stages, check lock — skip if unchanged
-            if (
-                not force
-                and stage_names is None
-                and previous_lock is not None
-                and run_manifest is None
-            ):
+            # 5. If not force and committing stale stages only, check lock — skip if unchanged
+            if not force and stale_only and previous_lock is not None and run_manifest is None:
                 decision = skip.check_stage(
                     lock_data=previous_lock,
                     fingerprint=fingerprint,

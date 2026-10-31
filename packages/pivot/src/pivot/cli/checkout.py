@@ -731,6 +731,8 @@ def checkout(
 
     If no targets specified, restores all tracked files and stage outputs.
     Use --only-missing to skip files that already exist (safe for local modifications).
+    A stage mapped over a directory output restores its instances' outputs once its producer
+    is current; naming one whose producer is not current is refused.
     """
     if force and only_missing:
         raise click.ClickException("--force and --only-missing are mutually exclusive")
@@ -755,11 +757,14 @@ def checkout(
         [cache.CheckoutMode(checkout_mode)] if checkout_mode else config.get_checkout_mode_order()
     )
 
-    # Get stage output info from lock files (cached outputs only)
+    # Get stage output info from lock files (cached outputs only), each mapped stage expanded
+    # into its instances when its producer is current, as a run would expand it
     pipeline = cli_decorators.get_pipeline_from_context()
     stage_outputs = dict[str, Expected]()
     output_state_dirs = dict[str, pathlib.Path]()
     if pipeline is not None:
+        result, _ = cli_helpers.expand_mapped_stages()
+        targets = cli_helpers.require_expanded_targets(targets, result)
         stage_outputs, output_state_dirs = _get_stage_output_info(cache_dir)
 
     # Discover tracked files: a stage's own .pvt member of its output, in any pipeline, is none

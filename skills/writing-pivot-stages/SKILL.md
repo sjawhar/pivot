@@ -250,6 +250,22 @@ output, Pivot does not see the change.
 
 Variants are Python loops. Calling the same stage again in one pipeline creates `name@1`, `name@2`, and so on. For readable names, wrap the call in `with pipeline.variant("x2"):` to get `scale@x2`; nested variant blocks give `name@outer@inner`. Variant names use letters, digits, `_`, `.` and `-` only. Fan in by passing a list of handles to one stage.
 
+When the set of items is known only once a stage has run, map over that stage's `directory` output instead of looping:
+
+```python
+with Pipeline("p") as pipeline:
+    planned = plan(pipeline.input("plan.yaml", t=dict[str, int]))  # -> Annotated[dict[str, dict], directory, loaders.YAML[dict]()]
+    build(cut(pipeline.map(planned)))
+```
+
+- `pipeline.map(handle)` takes a stage's `directory` output (or a directory field, `out.parts`). A stage called with the mapped handle runs once per file: a `pivot repro` that finds the producer current adds `p/cut@<key>` for each file, the key being the file's path without its extension, and runs them in the same run. A stage called with a mapped stage's output (`build(cut(...))`) is mapped over the same keys, `p/build@a` reading `p/cut@a`.
+- Each instance depends on its own file only: editing one file reruns that key's chain; a new file runs the producer and the new chain only.
+- Keys follow the variant-name rule: files in subdirectories, or two files with one key (`a.yaml`, `a.json`), fail the mapped stage. A producer that writes `{"a b.yaml": ...}` cannot be mapped.
+- `pivot repro p/plan` expands nothing; `pivot repro p/cut` runs `p/plan` and every `p/cut@<key>`; `pivot repro p/build@a` runs `p/plan`, `p/cut@a` and `p/build@a` only (with `--force`, no other instance is forced), and a key `p/plan` has no file for is refused; `pivot run p/cut` is refused. `pivot status`, `list`, `dag`, `checkout`, `verify`, `push`, `pull`, `commit` and `params show` show the instances when the producer is current, and the mapped stage as "not yet expanded" otherwise.
+- `params.yaml`: `p/cut` applies to every instance, `p/cut@a` to one, even before a run added it.
+- No stage can take every instance's output (no fan-in over a map), and one stage cannot be mapped over two directories.
+- An instance's name belongs to its mapped stage: beside a mapped `p/cut`, a variant `p/cut@a`, a second call (`p/cut@1`) or a mapped call in a variant is refused when the pipeline loads. Call one of them inside a `pipeline.variant(...)` block (`p/cut@small` and `p/cut@big` can both be mapped).
+
 ## Several modules and pipelines
 
 Imports resolve from the project root (the directory holding `.pivot/`): a root `pipeline.py` imports sibling modules directly (`from stages import clean`); a pipeline in a subdirectory imports with the full path (`from report.helpers import x`, `from prep.pipeline import kept`). Larger projects keep one module per stage, each holding its own `StageParams` (`stages/clean.py` with `CleanParams` and `clean`), and `pipeline.py` only imports and wires them.
@@ -343,6 +359,10 @@ Commit `pipeline.py`, `data/raw/` inputs you own, and `.pivot/stages/` (lock and
 | `depends on input '<name>' (path data/raw/<name>), which does not exist` | Put the file at `data/raw/<name>` or pass `path=` |
 | `must have a return type annotation` | Annotate the return; `-> None` stages have no outputs |
 | `Invalid variant name 'big one': use only letters, digits and the characters _ . -` | Rename the variant; `/`, `@` and spaces are not allowed |
+| `pipeline.map() needs a directory output` | Map a stage's `directory` output, or a directory field (`out.parts`) |
+| `cannot expand over the files of '<stage>'` (a run, or "not yet expanded" in `pivot status`) | Rename the producer's files so each key (path without extension) is a valid variant name and unique |
+| `'<stage>' is mapped over the files of '<producer>'` | Use `pivot repro <stage>`; `pivot run` cannot expand a mapped stage |
+| `has the name of an instance of mapped stage '<stage>'` | Call the mapped stage, or the stage beside it, inside a `pipeline.variant(...)` block |
 | `is tagged directory but its type is <type>` | A `directory` output's type is `dict[str, T]`, from file path to value |
 | `whose loader <loader> cannot read it back` | Give that output a full `Loader`, or stop passing its handle to a stage |
 | `depends on file 'x' of stage '<stage>': key must include file extension` | Index a directory handle by the file's path as the producer writes it, extension included: `parts["train.jsonl"]` |

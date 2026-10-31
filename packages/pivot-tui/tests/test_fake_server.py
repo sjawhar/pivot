@@ -60,6 +60,8 @@ class _FakeRpcServer(Protocol):
 
     def set_stages(self, stages: list[str]) -> None: ...
 
+    def set_templates(self, templates: dict[str, list[str]]) -> None: ...
+
     def set_status(
         self, state: str, running: list[str] | None = None, pending: list[str] | None = None
     ) -> None: ...
@@ -144,15 +146,17 @@ async def test_fake_rpc_server_stages_method(tmp_path: Path) -> None:
     socket_path = tmp_path / "fake.sock"
     server = FakeRpcServer()
     server.set_stages(["train", "eval"])
+    server.set_templates({"demo/cut": []})
     await server.start(socket_path)
     try:
         await _wait_for_socket(socket_path)
         response: dict[str, object] = await _send_request(
             socket_path, {"jsonrpc": "2.0", "method": "stages", "id": 4}
         )
-        assert response.get("result") == {"stages": ["train", "eval"]}, (
-            "Stages should return configured list"
-        )
+        assert response.get("result") == {
+            "stages": ["train", "eval"],
+            "templates": {"demo/cut": []},
+        }, "Stages should return the configured stages and templates"
     finally:
         await server.stop()
 

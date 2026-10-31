@@ -23,6 +23,7 @@ __all__ = [
     # Output events
     "EngineStateChanged",
     "PipelineReloaded",
+    "StagesExpanded",
     "OutputChangeSummary",
     "StageStarted",
     "StageCompleted",
@@ -155,6 +156,17 @@ class PipelineReloaded(TypedDict):
     error: str | None
 
 
+class StagesExpanded(TypedDict):
+    """A run added a template's instances (``Pipeline.map``): one stage per file of the
+    directory it is mapped over, ``<template>@<key>``, in key order."""
+
+    type: Literal["stages_expanded"]
+    seq: NotRequired[int]
+    run_id: NotRequired[str]
+    template: str
+    stages: list[str]
+
+
 class StageStarted(TypedDict):
     """A stage began executing."""
 
@@ -255,6 +267,7 @@ class EngineDiagnostic(TypedDict):
 OutputEvent = (
     EngineStateChanged
     | PipelineReloaded
+    | StagesExpanded
     | StageStarted
     | StageCompleted
     | StageStateChanged

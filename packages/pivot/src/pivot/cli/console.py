@@ -158,9 +158,18 @@ class Console:
             "Dependency Changes:", explanation["dep_changes"], "identity", "old_hash", "new_hash"
         )
 
-    def explain_summary(self, will_run: int, unchanged: int) -> None:
+    def explain_not_expanded(self, name: str, reason: str) -> None:
+        """Print a mapped stage (``Pipeline.map``) not yet expanded, and what it waits for."""
+        self._echo(f"\nStage: {self._color(name, 'bold')}")
+        self._echo(f"  Status: {self._color('NOT YET EXPANDED', 'cyan')}")
+        self._echo(f"  Reason: {display.escape_control(reason, keep_newlines=True)}")
+
+    def explain_summary(self, will_run: int, unchanged: int, not_expanded: int = 0) -> None:
         """Print summary after explain output."""
         self._echo("")
         run_text = self._color(str(will_run), "green") if will_run > 0 else str(will_run)
         unchanged_text = self._color(str(unchanged), "yellow") if unchanged > 0 else str(unchanged)
-        self._echo(f"Summary: {run_text} will run, {unchanged_text} unchanged")
+        summary = f"Summary: {run_text} will run, {unchanged_text} unchanged"
+        if not_expanded:
+            summary += f", {self._color(str(not_expanded), 'cyan')} not yet expanded"
+        self._echo(summary)

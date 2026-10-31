@@ -188,13 +188,13 @@ async def test_agent_rpc_handler_unknown_method() -> None:
 
 @pytest.mark.anyio
 async def test_agent_rpc_handler_stages_query_no_pipeline() -> None:
-    """AgentRpcHandler.handle_query returns empty list when no pipeline."""
+    """AgentRpcHandler.handle_query returns no stage and no template when no pipeline."""
     async with Engine() as engine:
         handler = AgentRpcHandler(engine=engine)
 
         result = await handler.handle_query("stages")
 
-        assert result == {"stages": []}
+        assert result == {"stages": [], "templates": {}}
 
 
 # =============================================================================

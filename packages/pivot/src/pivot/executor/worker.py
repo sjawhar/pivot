@@ -1211,7 +1211,12 @@ def _execute_stage(
                                     deferred_writes=deferred,
                                 )
 
-                covered_modules = frozenset(fingerprint.covered_user_modules(current_fingerprint))
+                covered_modules = frozenset(
+                    fingerprint.covered_user_modules(
+                        current_fingerprint,
+                        {types.identity_key(out.identity) for out in stage_outs},
+                    )
+                )
                 with (
                     _track_stage_imports(covered_modules) as stage_imports,
                     reads.recording(store_cache_dir(store)) as recorded,

@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.7.1 (2026-10-31)
+
+### Bug Fixes
+
+- **fingerprint**: Fail a stage whose by-name module is not the module its worker imports
+  ([#543](https://github.com/sjawhar/pivot/pull/543),
+  [`80855fb`](https://github.com/sjawhar/pivot/commit/80855fb7df2c998ebff8396d0e3fc0923106dbbc))
+
+
 ## v0.7.0 (2026-10-30)
 
 ### Features

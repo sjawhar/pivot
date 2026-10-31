@@ -30,6 +30,7 @@ from pivot.engine.types import (
     SinkState,
     StageCompleted,
     StageExecutionState,
+    StagesExpanded,
     StageStarted,
     StageStateChanged,
 )
@@ -164,6 +165,32 @@ def test_format_error_detail_indents_each_line() -> None:
     assert leading_spaces[0] == leading_spaces[1], "Indentation should be consistent"
     assert "Line 1" in rendered[0], "First error line should be present"
     assert "Line 2" in rendered[1], "Second error line should be present"
+
+
+@pytest.mark.parametrize(
+    ("stages", "expected"),
+    [
+        pytest.param(["demo/cut@a"], "demo/cut: expanded into 1 stage", id="one"),
+        pytest.param(
+            ["demo/cut@a", "demo/cut@b", "demo/cut@c"],
+            "demo/cut: expanded into 3 stages",
+            id="many",
+        ),
+        pytest.param([], "demo/cut: expanded into 0 stages", id="empty-directory"),
+    ],
+)
+def test_format_expansion_line_counts_the_instances(stages: list[str], expected: str) -> None:
+    line = sinks._format_expansion_line(
+        StagesExpanded(type="stages_expanded", template="demo/cut", stages=stages)
+    )
+    assert _helper_render_markup(line).strip() == expected
+
+
+def test_format_expansion_line_escapes_markup_in_the_name() -> None:
+    line = sinks._format_expansion_line(
+        StagesExpanded(type="stages_expanded", template="demo/[bold]cut", stages=["x"])
+    )
+    assert _helper_render_markup(line).strip() == "demo/[bold]cut: expanded into 1 stage"
 
 
 # =============================================================================
@@ -849,6 +876,110 @@ async def test_static_sink_reports_each_watch_run_separately() -> None:
     assert reports[0].count("demo/a") == 1, "first run's report prints when it ends"
     assert reports[1].count("demo/a") == 2, "second run prints its own report"
     assert output.getvalue() == reports[1], "close prints nothing already reported"
+
+
+@pytest.mark.parametrize("sink_type", [sinks.StaticConsoleSink, sinks.LiveConsoleSink])
+async def test_sink_prints_one_line_when_a_template_expands(
+    sink_type: type[sinks.StaticConsoleSink] | type[sinks.LiveConsoleSink],
+) -> None:
+    """The expansion prints when it happens, as one line; each instance prints in the run's report,
+    and consecutive cached instances still collapse into one line."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=200)
+    sink = sink_type(console=console)
+    instances = ["demo/cut@a", "demo/cut@b", "demo/cut@c"]
+
+    await sink.handle(_helper_engine_state(EngineState.ACTIVE))
+    await sink.handle(
+        StagesExpanded(
+            type="stages_expanded", seq=3, run_id="run-1", template="demo/cut", stages=instances
+        )
+    )
+    at_expansion = output.getvalue()
+    for index, stage in enumerate(instances, start=2):
+        await sink.handle(
+            StageCompleted(
+                type="stage_completed",
+                seq=3 + index,
+                stage=stage,
+                status=StageStatus.CACHED,
+                reason="unchanged",
+                duration_ms=0.0,
+                index=index,
+                total=4,
+                run_id="run-1",
+                input_hash=None,
+            )
+        )
+    await sink.handle(_helper_engine_state(EngineState.IDLE))
+    report = output.getvalue().removeprefix(at_expansion)
+
+    assert at_expansion.strip() == "demo/cut: expanded into 3 stages", at_expansion
+    assert "demo/cut: expanded" not in report, "the expansion is not printed twice"
+    assert "[2–4/4] ○ 3 cached" in report, report
+
+
+@pytest.mark.parametrize("sink_type", [sinks.StaticConsoleSink, sinks.LiveConsoleSink])
+async def test_sink_prints_a_failed_template_where_it_failed(
+    sink_type: type[sinks.StaticConsoleSink] | type[sinks.LiveConsoleSink],
+) -> None:
+    """A template (``Pipeline.map``) counts in no total, so its completion carries index 0. A
+    template that fails once its producer has run prints after the producer's line, and before
+    the line of a stage that finished after it."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=200)
+    sink = sink_type(console=console)
+    failed = StageCompleted(
+        type="stage_completed",
+        seq=2,
+        stage="demo/cut",
+        status=StageStatus.FAILED,
+        reason="Unknown stage(s): demo/cut@zzz",
+        duration_ms=0.0,
+        index=0,
+        total=2,
+        run_id="run-1",
+        input_hash=None,
+    )
+
+    await sink.handle(_helper_engine_state(EngineState.ACTIVE))
+    await sink.handle(_helper_completed("demo/plan", index=1, total=2, run_id="run-1"))
+    await sink.handle(failed)
+    await sink.handle(_helper_completed("demo/static", index=2, total=2, run_id="run-1"))
+    await sink.handle(_helper_engine_state(EngineState.IDLE))
+    report = output.getvalue()
+
+    assert report.index("demo/plan") < report.index("demo/cut") < report.index("demo/static"), (
+        report
+    )
+
+
+async def test_static_sink_counts_a_blocked_template_in_a_group_of_blocked_stages() -> None:
+    """A template blocked after a blocked stage collapses into one line with it, its index 0
+    starting the range as a template's always has."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, no_color=True, width=200)
+    sink = sinks.StaticConsoleSink(console=console)
+
+    await sink.handle(_helper_engine_state(EngineState.ACTIVE))
+    for stage, index in (("demo/static", 3), ("demo/cut", 0)):
+        await sink.handle(
+            StageCompleted(
+                type="stage_completed",
+                seq=index,
+                stage=stage,
+                status=StageStatus.BLOCKED,
+                reason="upstream 'demo/config' failed",
+                duration_ms=0.0,
+                index=index,
+                total=3,
+                run_id="run-1",
+                input_hash=None,
+            )
+        )
+    await sink.handle(_helper_engine_state(EngineState.IDLE))
+
+    assert "[0–3/3] ○ 2 blocked" in output.getvalue(), output.getvalue()
 
 
 # =============================================================================

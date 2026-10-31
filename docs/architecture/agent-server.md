@@ -45,7 +45,7 @@ Example response:
 | `cancel` | Command | - | Request cancellation of current execution |
 | `set_on_error` | Command | `mode` | Set error handling (`"fail"` or `"keep_going"`) |
 | `status` | Query | - | Get current execution state |
-| `stages` | Query | - | List all registered stages |
+| `stages` | Query | - | List the registered stages and the mapped stages' templates |
 | `stage_info` | Query | `stage` | Get detailed info for a specific stage |
 | `explain` | Query | `stage` | Get explanation of why a stage will run |
 | `events_since` | Query | `version` | Poll for events since a version cursor |
@@ -117,13 +117,14 @@ Get the current state of the pipeline or a specific run.
 
 ### stages
 
-List all registered stages and their metadata.
+List the registered stages, and each template of a mapped stage (`pipeline.map`) with the instances it expanded into.
 
 **Parameters:** None
 
 **Returns:**
 
-- `stages`: List of stage objects with `name`, `deps`, and `outs`
+- `stages`: The stage names: every stage the pipeline registered, and each instance a run has expanded so far (`<template>@<key>`). Never a template.
+- `templates`: Each template's name mapped to its instances in key order (`Pipeline.instances_of`). An empty list means the template has not expanded yet, or expanded over an empty directory; the `stages_expanded` event tells the two apart. A run expands a template once the stages upstream of it finish, and each run starts with every template unexpanded.
 
 **Example:**
 
@@ -135,14 +136,28 @@ List all registered stages and their metadata.
 {
   "jsonrpc": "2.0",
   "result": {
-    "stages": [
-      {"name": "preprocess", "deps": ["data/raw.csv"], "outs": ["data/clean.csv"]},
-      {"name": "train", "deps": ["data/clean.csv"], "outs": ["models/model.pkl"]}
-    ]
+    "stages": ["demo/plan", "demo/cut@a", "demo/cut@b"],
+    "templates": {"demo/cut": ["demo/cut@a", "demo/cut@b"], "demo/report": []}
   },
   "id": 3
 }
 ```
+
+The TUI asks once it connects, and again after each reload, so that a template's row reads "not yet expanded" before the `stages_expanded` event arrives.
+
+### Mapped stage names in `run`, `stage_info` and `explain`
+
+A template (`demo/cut`) and an instance (`demo/cut@a`) are names these methods take, as the CLI does. `engine/stage_queries.py` answers all three:
+
+- `run` takes both: a run reaches an instance through its template and adds that instance alone, with its chain.
+- `stage_info` of a template gives the stage as declared, its mapped dependency reading the producer's whole directory. An instance the template has expanded into gives its own info; any other instance of it is refused with what it waits for, the first of these that holds:
+  - the running or latest run failed the template, or a template it is mapped over (`Engine.expansion_failure`): `'demo/cut@a' is not yet expanded: 'demo/cut' failed in the latest run: cannot expand over the files of 'demo/plan': ...`, or `'demo/build' is mapped over 'demo/cut', which failed in the latest run: ...`;
+  - the run's targets named other instances of it: `'demo/cut@b' is not yet expanded: 'demo/cut' added only the instances its run's targets name`;
+  - otherwise: `'demo/cut@a' is not yet expanded: 'demo/cut' adds its instances when a run finds 'demo/plan' current`.
+- `explain` of a template explains each instance it expanded into: `will_run` is true when one would run, and `reason` reads `Expanded into 3 stages; would run: demo/cut@b (Input dependencies changed)` or `Expanded into 3 stages; none would run`. A template that has not expanded, or an instance not expanded, gets `will_run: true` and a reason starting `Not yet expanded:`, followed by what it waits for as `stage_info` gives it.
+- Once a run has read the producer's files to expand a template (`Engine.expansion_keys`: until the next run starts), an instance whose key no file has names no stage: `stage_info` and `explain` refuse it as `pivot status` refuses its name, `Unknown stage(s): demo/cut@zzz`.
+- `explain` reads lock files in a worker thread, but takes the registry's stages and the `params.yaml` overrides on the event loop first: a run start removes every instance there, so the thread never reads a registry a run start is changing.
+- `commit` reads the registry in its worker thread, so it holds `Engine.reading_registry()` while the thread runs: a run start's removal of the instances, and an expansion's adding them, wait until the commit has read every stage.
 
 ### cancel
 

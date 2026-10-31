@@ -11,6 +11,9 @@ types the fingerprinting policy allows.
 - Changing one token of the body (a literal, the argument, an operator) changes the manifest.
 - A ``params.yaml`` override changes a stage's run-cache key exactly when it changes the
   stage's effective params, and never changes another stage's key.
+- No dependency, output field or stage name, each kind of manifest entry included, is read as
+  a module a loader covers or as a by-name entry, and a lock keeps every entry but the stage's
+  `byname:` ones.
 """
 
 from __future__ import annotations
@@ -27,9 +30,10 @@ from typing import TYPE_CHECKING
 
 import hypothesis
 import pydantic
+import pytest
 from hypothesis import strategies as st
 
-from pivot import fingerprint, parameters, run_history, stage_def
+from pivot import fingerprint, loaders, parameters, run_history, stage_def
 from pivot.types import DepEntry
 
 if TYPE_CHECKING:
@@ -322,3 +326,47 @@ def test_base_stage_override_reaches_variants_unless_the_variant_overrides_it(
     assert _effective(variant, {_STAGE: overrides, variant: {"label": "variant"}})["label"] == (
         "variant"
     )
+
+
+# =============================================================================
+# Loader entries of a stage manifest
+# =============================================================================
+
+# Each kind of manifest entry, and the words of a loader's prefix and an output's tag: every one
+# is a valid parameter, field and stage name, and must stay that name.
+_ENTRY_KINDS = (
+    *("self", "func", "class", "const", "default", "wire", "partial", "ext", "byname"),
+    *("module", "loader", "schema", "builtin", "file", "dep", "out", "tag", "path", "paths"),
+)
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["one-output", "fields"])
+@pytest.mark.parametrize("kind", _ENTRY_KINDS)
+@hypothesis.settings(_SETTINGS, max_examples=10)
+@hypothesis.given(st.data())
+def test_no_dependency_output_or_stage_name_is_read_as_a_module_or_by_name_entry(
+    kind: str, keyed: bool, data: st.DataObject
+) -> None:
+    """Stage `<kind>/<kind>` has a dependency named each kind of entry, alone and as a list's
+    item, and one output or a field named each kind. Its manifest is built as the registry
+    builds it, from a framework loader whose own manifest names no module, plus a `module:` entry
+    for each loader drawn to cover one: only those and the stage's own `byname:` entry name
+    modules, and a lock keeps every entry but that one."""
+    stage = f"{kind}/{kind}"
+    outputs = {f"{stage}:{field}" for field in _ENTRY_KINDS} if keyed else {stage}
+    prefixes = [f"dep:{name}:" for name in _ENTRY_KINDS]
+    prefixes += [f"dep:{name}[0]:" for name in _ENTRY_KINDS]
+    prefixes += [f"out:{key}:" for key in sorted(outputs)]
+    manifest = {"self:use": "1", "byname:json": ""}
+    for prefix in prefixes:
+        fingerprint.merge_loader_fingerprint(manifest, prefix, loaders.YAML())
+    manifest.update({f"out:{key}:tag": "data" for key in outputs})
+    covering = data.draw(st.lists(st.sampled_from(prefixes), unique=True))
+    covered = {f"covered{index}" for index in range(len(covering))}
+    manifest.update({f"{prefix}module:covered{i}": "" for i, prefix in enumerate(covering)})
+
+    assert fingerprint.covered_user_modules(manifest, outputs) == covered
+    assert fingerprint.by_name_modules(manifest, outputs) == {"json", *covered}
+    assert fingerprint.without_by_name(manifest) == {
+        key: value for key, value in manifest.items() if key != "byname:json"
+    }
