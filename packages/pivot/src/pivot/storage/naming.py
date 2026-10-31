@@ -23,6 +23,7 @@ import pathlib
 import re
 import select
 import socket
+import stat
 import subprocess
 import time
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
@@ -36,9 +37,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The register of the projects that use a cache: one entry per view of a project. A sibling of
-# the object store, so no cache scan sees it (``remote/sync.py`` descends two-character prefix
-# directories only).
+# The register of the projects that use a cache: one entry per view of a project. Beside the
+# object store (``store_layout``: at the cache root, or in the directory that holds a store
+# ``files/`` links to), so no cache scan sees it (``remote/sync.py`` descends two-character
+# prefix directories only).
 REGISTER_DIR = "projects"
 # The naming lock excludes gc-from-writers. Writers hold it shared for each commit unit (from
 # the object existence check to the durable record that names it); gc holds it exclusive while
@@ -128,18 +130,120 @@ def this_view() -> tuple[str, str, int | None]:
     return socket.gethostname(), _machine_id(), _mount_namespace()
 
 
+# The object store, under the cache root. When it is a link, the register follows the store it
+# resolves to (``store_layout``).
+OBJECTS_DIR = "files"
+
+
+class StoreLayout(NamedTuple):
+    """Where one cache root keeps its register (``register_root``); where its ``files/``
+    resolves to when it is a link (``linked_store``); and whether that store is the root of a
+    mount of its own, so that no register can follow it (``unshared``)."""
+
+    register_root: pathlib.Path
+    linked_store: pathlib.Path | None
+    unshared: bool
+
+
+def store_layout(cache_root: pathlib.Path) -> StoreLayout:
+    """Where ``cache_root`` keeps its register, its cache id, its mount records and its naming
+    and collection locks: beside its object store, so that every cache root using one object
+    store shares one register and one lock, and a collection through any of them reads every
+    project that names objects there.
+
+    In a plain layout (``files/`` is a directory, or does not exist yet) that is the cache root
+    itself, as before. When ``files/`` is a link, the object store is the directory it resolves
+    to, and the register lives in that directory's parent: a cache root whose own ``files/`` is
+    that directory keeps its register there too, and so does every other root that links it. A
+    store that is the root of a mount of its own (a mount point, or a bind mount) has a parent
+    on another filesystem, which another host or mount namespace does not reach through the
+    store: its register stays at the cache root, and the layout is ``unshared``, for which a
+    collection refuses (``gc.resolve_scopes``). A plain layout costs one ``lstat``; a linked one,
+    once this process has resolved it, an ``lstat`` and a ``stat`` of ``files/`` and one poll of
+    the mount watch (``_LINKED_LAYOUTS``).
+    """
+    files = os.fspath(cache_root) + "/" + OBJECTS_DIR
+    try:
+        link = os.lstat(files)
+    except (OSError, ValueError):
+        return StoreLayout(cache_root, None, unshared=False)
+    if not stat.S_ISLNK(link.st_mode):
+        return StoreLayout(cache_root, None, unshared=False)
+    try:
+        target = os.stat(files)
+    except OSError:
+        target = None
+    link_identity = (link.st_dev, link.st_ino, link.st_ctime_ns)
+    store_identity = None if target is None else (target.st_dev, target.st_ino)
+    generation = _mount_generation()
+    known = _LINKED_LAYOUTS.get(cache_root)
+    if (
+        known is not None
+        and generation is not None
+        and known.identity == (link_identity, store_identity, generation)
+    ):
+        return known.layout
+    store = pathlib.Path(os.path.realpath(files))
+    if _mount_root(store):
+        layout = StoreLayout(cache_root, store, unshared=True)
+    else:
+        layout = StoreLayout(store.parent, store, unshared=False)
+    _LINKED_LAYOUTS[cache_root] = _KnownLayout((link_identity, store_identity, generation), layout)
+    return layout
+
+
+class _KnownLayout(NamedTuple):
+    # The link's (dev, ino, ctime), the directory it resolves to (dev, ino), and the mount-change
+    # count, when the layout was resolved.
+    identity: tuple[tuple[int, int, int], tuple[int, int] | None, int | None]
+    layout: StoreLayout
+
+
+# This process's resolution of each linked layout, kept while the link, the directory it resolves
+# to and the mount table are unchanged: resolving one reads the mount table (``_mount_root``).
+# A re-pointed link is a new link (another inode); a re-pointed link further along the path
+# resolves to another directory; a mount on the store changes the count.
+_LINKED_LAYOUTS = dict[pathlib.Path, _KnownLayout]()
+
+
+def register_root(cache_root: pathlib.Path) -> pathlib.Path:
+    """The directory that holds ``cache_root``'s register (``store_layout``)."""
+    return store_layout(cache_root).register_root
+
+
+def _mount_root(path: pathlib.Path) -> bool:
+    """Whether ``path`` is the root of a mount in this view: on another device than its
+    parent, or a mount point the mount table lists (a bind mount keeps its device)."""
+    try:
+        if os.stat(path).st_dev != os.stat(path.parent).st_dev:
+            return True
+    except OSError:
+        return False
+    table = read_mount_table()
+    points = None if table is None else mount_points(table)
+    return points is not None and str(path) in points
+
+
 def register_path(
     cache_dir: pathlib.Path, project_root: pathlib.Path, project_id: str, view_key: str
 ) -> pathlib.Path:
-    """Return the register entry one view of a project owns in a cache.
+    """Return the register entry one view of a project owns in a cache (in the register beside
+    the cache's object store, ``store_layout``).
 
     The key holds the root, the project id and the view (hostname, machine id and mount
     namespace). Each host and each mount view of a project writes its own entry, so no writer
     replaces another's mount evidence, and host-local projects at one path keep separate entries.
     """
+    return _entry_path(register_root(cache_dir), project_root, project_id, view_key)
+
+
+def _entry_path(
+    root: pathlib.Path, project_root: pathlib.Path, project_id: str, view_key: str
+) -> pathlib.Path:
+    """``register_path`` in the register under ``root``, a ``register_root``."""
     key = f"{project_root}\0{project_id}\0{view_key}"
     digest = hashlib.sha256(key.encode()).hexdigest()[:16]
-    return cache_dir / REGISTER_DIR / f"{digest}.json"
+    return root / REGISTER_DIR / f"{digest}.json"
 
 
 def project_register_path(
@@ -426,13 +530,20 @@ def _error_text(error: OSError | ValueError) -> str:
     return error.strerror if isinstance(error, OSError) and error.strerror else str(error)
 
 
-def _cache_id_path(cache_dir: pathlib.Path) -> pathlib.Path:
-    return cache_dir / REGISTER_DIR / CACHE_ID_FILE
+def _cache_id_path(root: pathlib.Path) -> pathlib.Path:
+    return root / REGISTER_DIR / CACHE_ID_FILE
 
 
 def read_cache_id(cache_dir: pathlib.Path) -> str:
-    """Read the cache's id without following a symlink. Raises OSError or ValueError."""
-    path = _cache_id_path(cache_dir)
+    """Read the id of the cache at ``cache_dir`` from its register (``store_layout``) without
+    following a symlink. Raises OSError or ValueError."""
+    return read_cache_id_at(register_root(cache_dir))
+
+
+def read_cache_id_at(root: pathlib.Path) -> str:
+    """Read the cache id in the register under ``root``, a ``register_root`` (the parent of a
+    register entry's directory). Raises OSError or ValueError."""
+    path = _cache_id_path(root)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     with os.fdopen(fd) as file:
         cache_id = file.read().strip()
@@ -441,12 +552,12 @@ def read_cache_id(cache_dir: pathlib.Path) -> str:
     return cache_id
 
 
-def _ensure_cache_id(cache_dir: pathlib.Path) -> str:
-    """Return the cache's id, creating it once (the first writer's link wins). Raises OSError or
-    ValueError."""
+def _ensure_cache_id(root: pathlib.Path) -> str:
+    """Return the id of the cache whose register is under ``root``, creating it once (the first
+    writer's link wins). Raises OSError or ValueError."""
     with contextlib.suppress(FileNotFoundError):
-        return read_cache_id(cache_dir)
-    register = cache_dir / REGISTER_DIR
+        return read_cache_id_at(root)
+    register = root / REGISTER_DIR
     register.mkdir(exist_ok=True)
     staged = register / f".{CACHE_ID_FILE}.{os.urandom(8).hex()}"
     try:
@@ -455,10 +566,10 @@ def _ensure_cache_id(cache_dir: pathlib.Path) -> str:
             os.fchmod(file.fileno(), 0o644)  # every user of the cache reads it
             file.write(os.urandom(16).hex() + "\n")
         with contextlib.suppress(FileExistsError):
-            os.link(staged, _cache_id_path(cache_dir))
+            os.link(staged, _cache_id_path(root))
     finally:
         staged.unlink(missing_ok=True)
-    return read_cache_id(cache_dir)
+    return read_cache_id_at(root)
 
 
 def _project_id_path(state_dir: pathlib.Path) -> pathlib.Path:
@@ -530,6 +641,7 @@ class _MountWatch(NamedTuple):
 
     fd: int
     poller: select.poll
+    pid: int
 
 
 def _watch_mount_table() -> _MountWatch | None:
@@ -560,16 +672,46 @@ def _watch_mount_table() -> _MountWatch | None:
         return None
     poller = select.poll()
     poller.register(fd, select.POLLPRI)
-    return _MountWatch(fd, poller)
+    return _MountWatch(fd, poller, os.getpid())
 
 
-def _mount_table_changed(watch: _MountWatch) -> bool:
-    """Whether this namespace's mount table changed since ``watch`` was armed or last polled."""
+class _SharedMountWatch:
+    """The process's one mount watch, and how many changes of the mount table it has reported.
+    A poll re-arms the watch, so the registrations share the count, not the poll: each records
+    the count when it read the table (``_mount_generation``), and a later count tells it the
+    table changed."""
+
+    __slots__: tuple[str, ...] = ("generation", "watch")
+
+    def __init__(self) -> None:
+        self.watch: _MountWatch | None = None
+        self.generation: int = 0
+
+
+_SHARED_MOUNT_WATCH = _SharedMountWatch()
+
+
+def _mount_generation() -> int | None:
+    """How many changes of this namespace's mount table this process's watch has seen, polling
+    it now; None where there is no watch (``_watch_mount_table``), when no memo engages. Opens
+    the watch at the first call in a process (a forked child opens its own)."""
+    shared = _SHARED_MOUNT_WATCH
+    watch = shared.watch
+    if watch is None or watch.pid != os.getpid():
+        watch = shared.watch = _watch_mount_table()
+        shared.generation += 1
+        if watch is None:
+            return None
     try:
         events = watch.poller.poll(0)
     except OSError:
-        return True
-    return any(event & (select.POLLPRI | select.POLLERR) for _fd, event in events)
+        os.close(watch.fd)
+        shared.watch = None
+        shared.generation += 1
+        return None
+    if any(event & (select.POLLPRI | select.POLLERR) for _fd, event in events):
+        shared.generation += 1
+    return shared.generation
 
 
 def mount_points(table: bytes | None) -> frozenset[str] | None:
@@ -596,17 +738,24 @@ def mount_points(table: bytes | None) -> frozenset[str] | None:
 
 # A writer-side shortcut only. Each naming unit registers its project. A full registration reads
 # the id and the mount table and writes the entry. This records, per process, what it checked:
-# a watch on the mount table (``_watch_mount_table``: one poll reports every mount change since
-# the registration read it) and the identity of the project id file and of the entry, with both
-# nonce files kept open. While those are unchanged and each open nonce file is still the one at
-# its path, a unit skips the reads but never the nonce rotation (`_rotate_view_nonce`). A
-# collection never reads this: `read_register` and `collect_roots` always read the files.
+# the mount-change count of the process's watch on the mount table (``_mount_generation``: one
+# poll reports every mount change since the registration read it) and the identity of the
+# project id file and of the entry, with both nonce files kept open. While those are unchanged
+# and each open nonce file is still the one at its path, a unit skips the reads but never the
+# nonce rotation (`_rotate_view_nonce`). A collection never reads this: `read_register` and
+# `collect_roots` always read the files. It holds two descriptors per registration, so it keeps
+# the `_MAX_VERIFIED_REGISTRATIONS` latest registrations and closes the rest: a long-lived process
+# (a watch or serve session, a library caller) that registers in many caches holds a bounded
+# number, and a registration it evicted is only done in full again at its next use, which puts
+# it back. A unit that uses the memo does not reorder it, so a hit costs no dictionary write.
 _RegistrationKey = tuple[pathlib.Path, pathlib.Path, pathlib.Path]
 _FileIdentity = tuple[int, int, int]
+_MAX_VERIFIED_REGISTRATIONS = 16
 
 
 class _VerifiedRegistration(NamedTuple):
-    watch: _MountWatch
+    register_root: pathlib.Path
+    mount_generation: int
     id_path: str
     id_identity: _FileIdentity
     entry_path: str
@@ -619,6 +768,7 @@ class _VerifiedRegistration(NamedTuple):
     cache_id: str
 
 
+# Oldest registration first.
 _VERIFIED_REGISTRATIONS = dict[_RegistrationKey, _VerifiedRegistration]()
 
 
@@ -641,10 +791,13 @@ def _still_open_at(path: str, fd: int) -> bool:
     return (at_path.st_dev, at_path.st_ino) == (opened.st_dev, opened.st_ino)
 
 
-def _registration_unchanged(key: _RegistrationKey) -> bool:
-    """Whether this process already registered ``key`` against the evidence it sees now."""
+def _registration_unchanged(key: _RegistrationKey, root: pathlib.Path) -> bool:
+    """Whether this process already registered ``key`` against the evidence it sees now, in
+    the register under ``root`` (``register_root``: a re-pointed ``files/`` link moves it)."""
     verified = _VERIFIED_REGISTRATIONS.get(key)
-    if verified is None or _mount_table_changed(verified.watch):
+    if verified is None or verified.register_root != root:
+        return False
+    if _mount_generation() != verified.mount_generation:
         return False
     if _file_identity(verified.id_path) != verified.id_identity:
         return False
@@ -655,12 +808,19 @@ def _registration_unchanged(key: _RegistrationKey) -> bool:
     )
 
 
+def _remember_registration(key: _RegistrationKey, verified: _VerifiedRegistration) -> None:
+    """Keep ``verified`` as the latest registration, closing the oldest beyond
+    `_MAX_VERIFIED_REGISTRATIONS`."""
+    _VERIFIED_REGISTRATIONS[key] = verified
+    while len(_VERIFIED_REGISTRATIONS) > _MAX_VERIFIED_REGISTRATIONS:
+        _forget_registration(next(iter(_VERIFIED_REGISTRATIONS)))
+
+
 def _forget_registration(key: _RegistrationKey) -> None:
     verified = _VERIFIED_REGISTRATIONS.pop(key, None)
     if verified is not None:
         os.close(verified.state_nonce_fd)
         os.close(verified.register_nonce_fd)
-        os.close(verified.watch.fd)
 
 
 def _rotate_view_nonce(key: _RegistrationKey) -> None:
@@ -705,18 +865,25 @@ def _write_json(path: pathlib.Path, value: object) -> None:
     cache.atomic_write_file(path, write)
 
 
-def _cache_mounts_path(cache_dir: pathlib.Path, view_key: str) -> pathlib.Path:
-    return cache_dir / CACHE_MOUNTS_DIR / f"{view_key}.json"
+def _cache_mounts_path(root: pathlib.Path, view_key: str) -> pathlib.Path:
+    return root / CACHE_MOUNTS_DIR / f"{view_key}.json"
 
 
-def _record_cache_mounts(cache_dir: pathlib.Path, points: frozenset[str] | None) -> None:
-    """Record, for this view, the mount points below the cache root a register read depends on."""
+def _record_cache_mounts(
+    cache_dir: pathlib.Path, layout: StoreLayout, points: frozenset[str] | None
+) -> None:
+    """Record, for this view, the mount points a read of the cache's register and refs depends
+    on: those below the cache root, or, when the register follows a linked object store, those
+    below that register and that store (every root of the store records the same)."""
     host, machine, mount_ns = this_view()
-    path = _cache_mounts_path(cache_dir, view_key_of(host, machine, mount_ns))
-    real_cache = os.path.realpath(cache_dir)
-    mounts = _mounts_under(points, [cache_dir])
-    if mounts is not None:
-        mounts = [mount for mount in mounts if mount != real_cache]
+    path = _cache_mounts_path(layout.register_root, view_key_of(host, machine, mount_ns))
+    if layout.linked_store is None or layout.unshared:
+        real_cache = os.path.realpath(cache_dir)
+        mounts = _mounts_under(points, [cache_dir])
+        if mounts is not None:
+            mounts = [mount for mount in mounts if mount != real_cache]
+    else:
+        mounts = _mounts_under(points, [layout.register_root / REGISTER_DIR, layout.linked_store])
     desired = {"host": host, "machine": machine, "mount_ns": mount_ns, "mounts": mounts}
     if entry_from_file(path) != desired:
         path.parent.mkdir(exist_ok=True)
@@ -748,7 +915,11 @@ def _entry_is_current(path: pathlib.Path, fields: dict[str, object], *, now: flo
 
 
 def register_project(
-    cache_dir: pathlib.Path, project_root: pathlib.Path, state_dir: pathlib.Path
+    cache_dir: pathlib.Path,
+    project_root: pathlib.Path,
+    state_dir: pathlib.Path,
+    *,
+    layout: StoreLayout | None = None,
 ) -> None:
     """Record this project as a user of ``cache_dir`` with evidence a collection can verify.
 
@@ -760,22 +931,26 @@ def register_project(
     its mount table or project id changes; every other unit only rotates the nonce. The register
     write itself must succeed before a writer names an object, so its failure refuses that
     writer. ``EROFS`` on the cache is the one exception: no collection can delete from a
-    read-only cache.
+    read-only cache. ``layout`` is the cache's ``store_layout`` when the caller already has it (a
+    naming unit resolves it once, for its lock and this registration).
     """
     if not cache_dir.is_dir():
         return
+    if layout is None:
+        layout = store_layout(cache_dir)
+    root = layout.register_root
     key = (cache_dir, project_root, state_dir)
-    if _registration_unchanged(key):
+    if _registration_unchanged(key, root):
         try:
             _rotate_view_nonce(key)
             return
         except OSError as e:
             logger.debug("Cannot rotate the view nonce in %s: %s", state_dir, e)
     _forget_registration(key)
-    path = cache_dir / REGISTER_DIR
-    # The watch before the bytes: it reports every mount change after it is armed, so a change
-    # between the two only costs this process one more registration.
-    watch = _watch_mount_table()
+    path = root / REGISTER_DIR
+    # The count before the bytes: the watch reports every mount change after this poll, so a
+    # change between the two only costs this process one more registration.
+    generation = _mount_generation()
     table = read_mount_table()
     host, machine, mount_ns = this_view()
     view_key = view_key_of(host, machine, mount_ns)
@@ -784,7 +959,7 @@ def register_project(
     cache_id = ""
     try:
         project_id: str | None = _ensure_project_id(state_dir, project_root)
-        cache_id = _ensure_cache_id(cache_dir)
+        cache_id = _ensure_cache_id(root)
         state_fd = _open_view_nonce(state_dir, view_key, cache_id)
         # Listed before its first nonce, so no nonce for a cache exists that the project's
         # naming steps in its other caches would not rotate (``_confirm_listed_caches``).
@@ -793,7 +968,7 @@ def register_project(
         logger.debug("Cannot write the project id, cache id or view nonce for %s: %s", state_dir, e)
         project_id = None
     try:
-        path = register_path(cache_dir, project_root, project_id or "", view_key)
+        path = _entry_path(root, project_root, project_id or "", view_key)
         points = mount_points(table)
         try:
             mounts = _mounts_under(points, [project_root, state_dir])
@@ -829,37 +1004,47 @@ def register_project(
                     mounts=mounts,
                 ),
             )
-        _record_cache_mounts(cache_dir, points)
+        _record_cache_mounts(cache_dir, layout, points)
         if project_id is not None and state_fd is not None and register_fd is not None:
             # This view's entry without an id, written while the state directory could not
             # hold one, is superseded: the entry just written covers the same root and view.
-            register_path(cache_dir, project_root, "", view_key).unlink(missing_ok=True)
+            _entry_path(root, project_root, "", view_key).unlink(missing_ok=True)
             id_path = str(_project_id_path(state_dir))
             id_identity = _file_identity(id_path)
             entry_identity = _file_identity(path)
-            if watch is not None and id_identity is not None and entry_identity is not None:
-                _VERIFIED_REGISTRATIONS[key] = _VerifiedRegistration(
-                    watch=watch,
-                    id_path=id_path,
-                    id_identity=id_identity,
-                    entry_path=str(path),
-                    entry_identity=entry_identity,
-                    state_nonce_path=str(_view_nonce_path(state_dir, view_key, cache_id)),
-                    state_nonce_fd=state_fd,
-                    register_nonce_path=str(entry_nonce_path(path)),
-                    register_nonce_fd=register_fd,
-                    view_key=view_key,
-                    cache_id=cache_id,
+            if generation is not None and id_identity is not None and entry_identity is not None:
+                _remember_registration(
+                    key,
+                    _VerifiedRegistration(
+                        register_root=root,
+                        mount_generation=generation,
+                        id_path=id_path,
+                        id_identity=id_identity,
+                        entry_path=str(path),
+                        entry_identity=entry_identity,
+                        state_nonce_path=str(_view_nonce_path(state_dir, view_key, cache_id)),
+                        state_nonce_fd=state_fd,
+                        register_nonce_path=str(entry_nonce_path(path)),
+                        register_nonce_fd=register_fd,
+                        view_key=view_key,
+                        cache_id=cache_id,
+                    ),
                 )
                 state_fd = register_fd = None  # the memo owns them now
-                watch = None
     except (OSError, ValueError) as e:
         if isinstance(e, OSError) and e.errno == errno.EROFS:
             logger.debug("%s is on a read-only filesystem; nothing can delete there", path)
+            if cache_id and not path.exists():
+                # This view cannot write the register, so it can never hold an entry there
+                # and names nothing there (another view, which can write it, registers the
+                # project). It does not list the cache either: a collection of its other
+                # caches would otherwise wait for an entry no command of this view can write.
+                with contextlib.suppress(OSError):
+                    _cache_record_path(state_dir, view_key, cache_id).unlink(missing_ok=True)
             return
         raise _unrecorded_project(cache_dir, path, e) from e
     finally:
-        for fd in (state_fd, register_fd, None if watch is None else watch.fd):
+        for fd in (state_fd, register_fd):
             if fd is not None:
                 os.close(fd)
 
@@ -975,7 +1160,8 @@ def _confirm_listed_caches(
                 break
             problem = why
         if reached is not None:
-            if own is not None and own.unconfirmed_since is not None:
+            # A registration that found the register read-only unlisted the cache instead.
+            if own is not None and own.unconfirmed_since is not None and own.record.exists():
                 with contextlib.suppress(OSError):
                     _record_cache(state_dir, view_key, cache_id, reached)
             continue
@@ -995,7 +1181,7 @@ def _confirm_cache(
     ``cache_dir``, registering there in full when this process holds no registration there;
     why it cannot, or None."""
     key = (cache_dir, project_root, state_dir)
-    if _registration_unchanged(key):
+    if _registration_unchanged(key, register_root(cache_dir)):
         try:
             _rotate_view_nonce(key)
             return None
@@ -1053,12 +1239,19 @@ def naming_lock_paths(cache_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.P
     """The cache's naming turnstile and naming lock, the one pair every writer and `pivot gc` use.
 
     ``cache_root`` is the cache root as configured: the directory that holds ``files/``
-    (``config.get_cache_dir()``, or the engine's ``cache_dir``), however its path is spelled. The
-    lock files live in that directory, so any spelling of it reaches the same files. Never pass a
-    path derived from the object root: ``files`` may be a symlink to another disk, and the parent
-    of where it really is would be a different directory, and so a different, unshared lock.
+    (``config.get_cache_dir()``, or the engine's ``cache_dir``), however its path is spelled.
+    The lock files live beside the cache's register (``store_layout``): in the cache root in a
+    plain layout, and in the directory that holds the object store when ``files/`` is a link to
+    it, so every cache root that uses one object store takes one lock, whatever its spelling.
+    Never pass the object root itself: its own register root is a different directory, and so
+    a different, unshared lock.
     """
-    return cache_root / NAMING_TURNSTILE, cache_root / NAMING_LOCK
+    return _lock_paths_at(register_root(cache_root))
+
+
+def _lock_paths_at(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """``naming_lock_paths`` in the register root ``root``."""
+    return root / NAMING_TURNSTILE, root / NAMING_LOCK
 
 
 @contextlib.contextmanager
@@ -1090,7 +1283,8 @@ def naming_unit(
     Raises:
         exceptions.CacheError: the lock files cannot be opened on a writable filesystem.
     """
-    ts_path, nm_path = naming_lock_paths(cache_dir)
+    layout = store_layout(cache_dir)
+    ts_path, nm_path = _lock_paths_at(layout.register_root)
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         ts_fd = cache.open_cache_lock(ts_path)
@@ -1127,7 +1321,7 @@ def naming_unit(
             )
             locked = False
         if project is not None:
-            register_project(cache_dir, *project)
+            register_project(cache_dir, *project, layout=layout)
             _confirm_listed_caches(cache_dir, *project)
         yield
     finally:
@@ -1161,6 +1355,8 @@ def _unopenable_naming_lock(
     return exceptions.CacheError(
         f"Cannot open {path} ({error.strerror or error}): this command names objects in the "
         + f"cache {cache_dir} and must hold its naming lock, or a `pivot gc` run by another user "
-        + "could remove them meanwhile. Make the cache root writable for this user, or have "
-        + "someone who can write it run any pivot command there once to create the lock files."
+        + "could remove them meanwhile. Make "
+        + f"{path.parent} writable for this user (the cache root, or the directory that holds the "
+        + "object store its files/ links to), or have someone who can write it run any pivot "
+        + "command there once to create the lock files."
     )

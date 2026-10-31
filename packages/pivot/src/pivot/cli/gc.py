@@ -182,7 +182,7 @@ def gc_cmd(
     # Reads the register as earlier runs left it: this project's own entry, written by every
     # other command, would otherwise make an unrecorded cache look recorded.
     cache_dir = config.get_cache_dir()
-    object_root = cache_dir / gc.OBJECTS_DIR
+    object_root = cache_dir / naming.OBJECTS_DIR
     state_dir = config.get_state_dir()
 
     scopes = gc.resolve_scopes(cache_dir, project_root, state_dir, project_paths, dry_run=dry_run)

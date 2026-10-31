@@ -476,7 +476,25 @@ Sites: `executor/worker.py` (normal commit and run-cache skip), `executor/commit
 commit`), `cli/track.py` (`pivot track`), `storage/restore.py` (restore from revision), and
 `config.register_cache_use` (a register write). Every site and `pivot gc` take the lock files
 from `naming.naming_lock_paths(<cache root as configured>)`, never from a path derived from the
-resolved object root (a `files/` symlink would split the lock).
+resolved object root.
+
+**The register and the locks belong to the object store, not the cache root**
+(`naming.store_layout`). The register (`projects/`, with `cache-id`), the cache mount records
+(`mounts/`), `naming.lock`, `naming.turnstile` and `gc.lock` live in the cache root in a plain
+layout (`files/` a directory, or absent), unchanged; when `files/` is a link, in the parent of
+the directory it resolves to (`naming.register_root`). Every root that uses one store (two roots
+linking one directory, or a root linking a plain root's `files/`) then shares one register and
+one lock, so a collection through any root reads every project that names objects in the
+store, and a disk copy of a cache root whose `files/` links shared storage keeps no register of
+its own (SF). Each root keeps its own `trees/`; a collection removes only its own root's trees,
+and a link into another root's `trees/` whose `files/` resolves to the same store names that
+tree's key (`gc._tree_of_store`). A link to the root of a mount of its own (a mount point, or a
+bind mount the mount table lists) is `unshared`: that store's parent is on another filesystem
+that other views need not reach, so the register stays at the cache root (writers work as
+before) and `gc.resolve_scopes` refuses, naming the layout. A plain root whose own `files/` is a
+mount keeps its register at the root, as before. The registration memo records the register
+root and re-registers in full when it moves (a re-pointed `files/`). The register root must be
+writable by every writer; when it is not, the writer refuses and names it.
 
 The writer side (the naming lock, the register and the registration memo) lives in
 `storage/naming.py`; the collector in `storage/gc.py` imports it to read the register. Writers
@@ -557,9 +575,13 @@ opens every scope's root, `.pivot` and state directory. When `core.state_dir` di
 `.pivot`, collection reads both state layouts so a 0.5.2 lock in `.pivot` still protects its
 object. The writer-side registration memo (`_VERIFIED_REGISTRATIONS`) only lets a naming unit
 skip the id, mount and entry reads while the id file and the entry are unchanged, the mount table
-has not changed (`_watch_mount_table`: an open `/proc/self/mounts` on procfs, polled for the
-`POLLPRI` the kernel raises at every mount change in this namespace; without such a watch the
-memo never engages), and both open nonce files are still the ones at their paths. It never skips
+has not changed (`_mount_generation`: the process's one open `/proc/self/mounts` on procfs,
+polled for the `POLLPRI` the kernel raises at every mount change in this namespace, which bumps a
+count each registration compares with the count it read the table at; without such a watch the
+memo never engages), and both open nonce files are still the ones at their paths. It holds two
+descriptors per registration and keeps the `_MAX_VERIFIED_REGISTRATIONS` latest registrations,
+closing the rest, so a watch or serve session or a library caller that registers in many caches
+holds a bounded number. It never skips
 the nonce rotation: every unit rewrites both fixed-size nonce files in place (`_rotate_nonces`;
 only a registration truncates them) under the state nonce file's exclusive `flock`, so a
 collection never reads a pair half written. No collection read uses the memo.

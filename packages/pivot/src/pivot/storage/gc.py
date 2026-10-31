@@ -49,14 +49,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Cache objects live under this directory of the cache; the register is its sibling, so no
-# cache scan sees it (``remote/sync.py`` descends two-character prefix directories only).
-OBJECTS_DIR = "files"
+# Cache objects live under ``<cache>/files`` (``naming.OBJECTS_DIR``); the register is beside the
+# object store (``naming.store_layout``), so no cache scan sees it (``remote/sync.py`` descends
+# two-character prefix directories only).
 # Whole-directory trees a symlink checkout links to, one per directory hash
-# (``cache.tree_path``). A tree's bytes are copies of its members, so it is collected on its
-# own; the record that names the directory keeps both it and the listing object.
+# (``cache.tree_path``), under each cache root. A tree's bytes are copies of its members, so it is
+# collected on its own; the record that names the directory keeps both it and the listing object.
 TREES_DIR = "trees"
-# Held exclusively for a whole collection, so two collections never run on one cache.
+# Held exclusively for a whole collection, beside the register, so two collections never run on
+# one object store.
 GC_LOCK = "gc.lock"
 # Every marker file beside a whole-directory tree object, removed with the tree.
 _TREE_MARKER_SUFFIXES = cache.TREE_MARKER_SUFFIXES
@@ -354,8 +355,8 @@ def _view_nonce_reason(
     scope = registered["scope"]
     view_key = naming.view_key_of(scope["host"], registered["machine"], registered["mount_ns"])
     try:
-        # The entry's cache is the one whose register holds it (`<cache>/projects/`)
-        cache_id = naming.read_cache_id(entry.parent.parent)
+        # The entry's cache is the one whose register holds it (`<register root>/projects/`)
+        cache_id = naming.read_cache_id_at(entry.parent.parent)
         state_nonce, entry_nonce = naming.read_nonce_pair(
             scope["state_dir"], view_key, cache_id, naming.entry_nonce_path(entry)
         )
@@ -394,7 +395,7 @@ def _other_caches_reason(
     """
     scope = registered["scope"]
     try:
-        this_cache = naming.read_cache_id(entry.parent.parent)
+        this_cache = naming.read_cache_id_at(entry.parent.parent)
         records = naming.cache_records(scope["state_dir"])
     except (OSError, ValueError) as e:
         return (
@@ -422,16 +423,27 @@ def _other_caches_reason(
                 + "moved on from: every naming step of the project brings that entry up to date. "
                 + "Run `pivot gc` where the project itself is visible"
             )
+        elif record.view_key != here and problem.state is naming.ListedCacheState.NO_ENTRY:
+            remedy = (
+                " Another view of the project (another host or mount namespace) listed that "
+                + f"cache in {record.record}. Run any pivot command of the project in that view "
+                + "that reaches the cache: it registers that view there, or, where that view "
+                + "cannot write the cache (a read-only mount), removes that record. If that view "
+                + f"is gone for good, delete {record.record} and re-run"
+            )
         elif record.view_key != here:
             remedy = (
                 " Another view of the project (another host or mount namespace) listed that "
-                + f"cache in {record.record}. Run `pivot gc` where that view reaches the cache; "
-                + f"if that view is gone for good, delete {record.record} and re-run"
+                + f"cache in {record.record}. Run `pivot gc` where that view reaches the cache, "
+                + f"or, if that view no longer uses it, `pivot forget-cache {record.cache_id}` in "
+                + "the project in that view; if that view is gone for good, delete "
+                + f"{record.record} and re-run"
             )
         elif problem.state is naming.ListedCacheState.NO_ENTRY:
             remedy = (
-                " Run any pivot command in the project that reaches that cache, which registers "
-                + "it there again, then re-run"
+                " Run any pivot command in the project that reaches that cache: it registers the "
+                + "project there again, or, where this view cannot write the cache (a read-only "
+                + "mount), removes the record. Then re-run"
             )
         else:
             remedy = (
@@ -481,7 +493,7 @@ def _cache_mount_reasons(
     Each view's record is checked: this view's recorded mounts must be mounted now, and another
     view's record may name no mount under the cache root, since this view cannot check it.
     """
-    directory = cache_dir / naming.CACHE_MOUNTS_DIR
+    directory = naming.register_root(cache_dir) / naming.CACHE_MOUNTS_DIR
     try:
         with os.scandir(directory) as entries:
             paths = sorted(pathlib.Path(e.path) for e in entries if e.name.endswith(".json"))
@@ -548,7 +560,7 @@ def read_register(
     must still be mounted. ``resolve_scopes`` then opens every scope's root, `.pivot` and state
     directory before any record is read.
     """
-    register = cache_dir / naming.REGISTER_DIR
+    register = naming.register_root(cache_dir) / naming.REGISTER_DIR
     live = list[ProjectScope]()
     points = naming.mount_points(naming.read_mount_table())  # always read now; never the memo
     unreadable = _cache_mount_reasons(cache_dir, points)
@@ -602,6 +614,21 @@ def refusal_external(cache_dir: pathlib.Path, project_root: pathlib.Path) -> str
         "  pivot gc --projects /path/to/other-project --projects /path/to/another\n"
         "If this project is the only user, run: pivot gc --projects .\n"
         "Nothing was removed."
+    )
+
+
+def refusal_unshared_store(cache_dir: pathlib.Path, store: pathlib.Path) -> str:
+    """What a collection says when the cache's ``files/`` links to the root of a mount of its
+    own, so that the register cannot follow the object store (``naming.store_layout``)."""
+    return (
+        f"Refusing to collect {cache_dir}: its files/ links to {store}, which is a mount of its "
+        "own\n(a mount point or a bind mount). Pivot keeps a cache's register beside its object "
+        "store, in the\ndirectory that holds it, so that every cache root using one store shares "
+        "one register. Here that\ndirectory is on another filesystem, which other hosts and "
+        "mount namespaces do not reach through\nthe store, so the register stays at the cache "
+        "root and cannot show every project that names\nobjects in the store. Move the objects "
+        "into a directory inside the mounted filesystem and link\nfiles/ to that directory "
+        "instead. Nothing was removed."
     )
 
 
@@ -659,6 +686,11 @@ def resolve_scopes(
     here = ProjectScope(
         root=project_root, state_dir=state_dir, host=socket.gethostname(), last_write="now"
     )
+    layout = naming.store_layout(cache_dir)
+    if layout.unshared and layout.linked_store is not None:
+        raise exceptions.CacheCollectionRefusedError(
+            refusal_unshared_store(cache_dir, layout.linked_store)
+        )
     # Always read the register (BLK-3), before any --projects registration can replace evidence
     # a collection must check: an internal cache can have a registered peer too.
     live, unreadable = read_register(cache_dir)
@@ -1078,18 +1110,31 @@ class _WalkResult(NamedTuple):
     listings: list[pathlib.Path]
 
 
+def tree_roots(cache_dir: pathlib.Path) -> list[pathlib.Path]:
+    """The cache's whole-directory tree stores. A stage's commit puts a tree beside the object
+    store it resolves ``files/`` to, which is the register root (``naming.store_layout``); a
+    command given the unresolved ``files/`` (``pivot track``, a restore) puts it under the cache
+    root. In a plain layout the two are one directory. Both are this cache's: every project that
+    can link either is in the register a collection reads."""
+    roots = [naming.register_root(cache_dir) / TREES_DIR]
+    own = cache_dir / TREES_DIR
+    if os.path.realpath(own) != os.path.realpath(roots[0]):
+        roots.append(own)
+    return roots
+
+
 def _walk_project(
     root: pathlib.Path,
     object_root: pathlib.Path,
-    tree_root: pathlib.Path,
+    trees: list[pathlib.Path],
     skip: pathlib.Path | None,
 ) -> _WalkResult:
     """Every ``.pvt`` file under ``root``, every key a symlink there resolves to, every
     committed listing file, and every symlinked directory that leaves the project.
 
     A file-by-file symlink checkout links each member to its object; a whole-directory
-    checkout links the directory itself to its tree under ``tree_root``. Both are read here.
-    ``skip`` is the cache itself, listed object by object rather than walked.
+    checkout links the directory itself to its tree under one of ``trees`` (``tree_roots``).
+    Both are read here. ``skip`` is the cache itself, listed object by object rather than walked.
 
     A symlinked directory is walked when the place it really is lies inside ``root``
     (``project.real_location_outside``, BET-301's containment rule, against ``root`` resolved
@@ -1108,7 +1153,7 @@ def _walk_project(
     seen = set[tuple[int, int]]()
     resolved_root = root.resolve()
     resolved_objects = object_root.resolve()
-    resolved_trees = tree_root.resolve()
+    resolved_trees = [tree_root.resolve() for tree_root in trees]
     stack = [root]
     while stack:
         directory = stack.pop()
@@ -1165,7 +1210,7 @@ def _link_target(
     path: pathlib.Path,
     resolved_root: pathlib.Path,
     resolved_objects: pathlib.Path,
-    resolved_trees: pathlib.Path,
+    resolved_trees: list[pathlib.Path],
 ) -> _LinkTarget:
     """Where the symlinked directory ``path`` really is: inside the project, outside it, or in
     the cache (listed object by object, never walked), with the key of the whole-directory tree
@@ -1176,16 +1221,34 @@ def _link_target(
     ``<cache>/files`` or ``<cache>/trees`` is the cache's own: the cache root can be a broad
     scratch directory that also holds a user's data (``PIVOT_CACHE_DIR=/scratch``), and records
     under it are records like any others, so a link there that leaves the project counts as
-    leaving it.
+    leaving it. The one other link that names objects of this cache is a whole-directory tree
+    under another cache root whose ``files/`` resolves to this cache's object store: the
+    register is shared by every root of the store (``naming.store_layout``), so a project
+    registered through another root links that root's trees, and the tree's key keeps its
+    listing and members here (the tree itself is that root's to collect).
     """
     outside = project.real_location_outside(path, resolved_root)
     real = path.resolve() if outside is None else outside
     if real.is_relative_to(resolved_objects):
         return _LinkTarget("cache", None)
-    if real.is_relative_to(resolved_trees):
+    if any(real.is_relative_to(tree_root) for tree_root in resolved_trees):
         key = real.parent.name + real.name
         return _LinkTarget("cache", key if cache.is_valid_hash(key) else None)
+    if outside is not None and _tree_of_store(real, resolved_objects):
+        key = real.parent.name + real.name
+        if cache.is_valid_hash(key):
+            return _LinkTarget("cache", key)
     return _LinkTarget("inside" if outside is None else "outside", None)
+
+
+def _tree_of_store(real: pathlib.Path, resolved_objects: pathlib.Path) -> bool:
+    """Whether ``real`` (a resolved path) is ``<root>/trees/XX/YYYY…`` under a cache root whose
+    ``files/`` resolves to ``resolved_objects``."""
+    trees = real.parent.parent
+    return (
+        trees.name == TREES_DIR
+        and pathlib.Path(os.path.realpath(trees.parent / naming.OBJECTS_DIR)) == resolved_objects
+    )
 
 
 def collect_roots(
@@ -1206,8 +1269,8 @@ def collect_roots(
             or run-cache row it cannot fully interpret (each named), or a directory record whose
             listing is neither in the cache nor committed.
     """
-    object_root = cache_dir / OBJECTS_DIR
-    tree_root = cache_dir / TREES_DIR
+    object_root = cache_dir / naming.OBJECTS_DIR
+    trees = tree_roots(cache_dir)
     roots = Roots(
         named=set[str](),
         run_cache=set[str](),
@@ -1219,7 +1282,7 @@ def collect_roots(
         try:
             # Every listing this project committed is indexed before its records are read, so a
             # record whose listing the cache has lost is still read from the file beside it.
-            walked = _walk_project(scope["root"], object_root, tree_root, cache_dir)
+            walked = _walk_project(scope["root"], object_root, trees, cache_dir)
             listings = _Listings(object_root)
             records = dict[pathlib.Path, _StateRecords]()
             for state_dir in _scope_state_dirs(scope):
@@ -1262,7 +1325,7 @@ def collect_roots(
     refs = object_root / "refs"
     if refs.is_dir():
         roots["counts"]["links"] += len(
-            ref_keys := _walk_project(refs, object_root, tree_root, None).keys
+            ref_keys := _walk_project(refs, object_root, trees, None).keys
         )
         roots["linked"] |= ref_keys
     return roots
@@ -1279,15 +1342,15 @@ def reread_run_cache(roots: Roots, scopes: Iterable[ProjectScope], cache_dir: pa
         ProjectUnreadableError: a scope's database, a row this pivot cannot fully interpret,
             or the listing of a directory one of its rows records, cannot be read.
     """
-    object_root = cache_dir / OBJECTS_DIR
-    tree_root = cache_dir / TREES_DIR
+    object_root = cache_dir / naming.OBJECTS_DIR
+    trees = tree_roots(cache_dir)
     keys = set[str]()
     rows = 0
     for scope in scopes:
         try:
             listings = _Listings(object_root)
             for listing_path in _walk_project(
-                scope["root"], object_root, tree_root, cache_dir
+                scope["root"], object_root, trees, cache_dir
             ).listings:
                 listings.add(listing_path)
             for state_dir in _scope_state_dirs(scope):
@@ -1325,7 +1388,7 @@ def collection_lock(cache_dir: pathlib.Path) -> Generator[None]:
         exceptions.CacheCollectionRefusedError: another collection holds it, or the cache
             cannot be written, or ``flock`` is refused on this filesystem.
     """
-    path = cache_dir / GC_LOCK
+    path = naming.register_root(cache_dir) / GC_LOCK
     try:
         fd = cache.open_cache_lock(path)
     except OSError as e:
@@ -1450,7 +1513,7 @@ def build_plan(
     One directory hash names its listing object and its tree, so the record that names the
     directory keeps both.
     """
-    object_root = cache_dir / OBJECTS_DIR
+    object_root = cache_dir / naming.OBJECTS_DIR
     cutoff = (time.time() if now is None else now) - grace_hours * 3600
     plan = Plan(
         scanned=ObjectCount(objects=0, bytes=0),
@@ -1463,7 +1526,10 @@ def build_plan(
         doomed_bytes=0,
         linked=ObjectCount(objects=0, bytes=0),
     )
-    for prefix_dir in [*_prefix_dirs(object_root), *_prefix_dirs(cache_dir / TREES_DIR)]:
+    tree_dirs = [
+        prefix for tree_root in tree_roots(cache_dir) for prefix in _prefix_dirs(tree_root)
+    ]
+    for prefix_dir in [*_prefix_dirs(object_root), *tree_dirs]:
         with _prefix_locked(prefix_dir), os.scandir(prefix_dir) as entries:
             for entry in sorted(entries, key=lambda e: e.name):
                 key = prefix_dir.name + entry.name

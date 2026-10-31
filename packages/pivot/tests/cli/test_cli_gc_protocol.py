@@ -430,8 +430,8 @@ def test_a_collection_runs_while_a_stage_executes(tmp_path: pathlib.Path) -> Non
 
 
 def _naming_paths(cache_dir: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
-    """The turnstile and naming lock in the cache root, where `pivot gc` takes them."""
-    return cache_dir / naming.NAMING_TURNSTILE, cache_dir / naming.NAMING_LOCK
+    """The turnstile and naming lock beside the cache's register, where `pivot gc` takes them."""
+    return naming.naming_lock_paths(cache_dir)
 
 
 def _probe_blocked(path: pathlib.Path) -> bool:
@@ -2265,7 +2265,7 @@ with Pipeline("ug") as pipeline:
 
 
 def _registered(cache_dir: pathlib.Path, root: pathlib.Path) -> bool:
-    register = cache_dir / naming.REGISTER_DIR
+    register = naming.register_root(cache_dir) / naming.REGISTER_DIR
     return register.is_dir() and any(
         json.loads(entry.read_text()).get("root") == str(root) for entry in register.glob("*.json")
     )
@@ -2274,7 +2274,7 @@ def _registered(cache_dir: pathlib.Path, root: pathlib.Path) -> bool:
 def _unregister(cache_dir: pathlib.Path, root: pathlib.Path) -> None:
     """Leave ``root`` out of the register, as a project last run by a pivot release (which
     writes no entry) or one whose entry a user deleted is."""
-    for entry in (cache_dir / naming.REGISTER_DIR).glob("*.json"):
+    for entry in (naming.register_root(cache_dir) / naming.REGISTER_DIR).glob("*.json"):
         if json.loads(entry.read_text()).get("root") == str(root):
             entry.unlink()
             entry.with_suffix(".nonce").unlink(missing_ok=True)
@@ -2608,6 +2608,40 @@ def test_a_copy_of_a_project_that_moved_on_through_another_cache_refuses(
     assert setup.output_in_c2.exists(), out
 
 
+def test_a_copy_refuses_through_another_cache_the_original_reached_when_it_could_not_reach_this_one(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The cross-cache check at collection time (`gc._other_caches_reason`): a project uses C2
+    and C1, and a copy of it is taken. The original's next step, through C1, cannot reach C2 (it
+    is out of the original's reach then), so C2's entry keeps the nonce the copy holds, and only
+    C1's entry moves on. A collection of C2 where the copy is visible accepts C2's own entry, but
+    reads the copy's older nonce for C1 against C1's entry, and refuses; it never suggests
+    `pivot forget-cache`."""
+    setup = _two_cache_project(tmp_path, "c2-then-c1")
+    clone = tmp_path / "clone-of-the-disk"
+    shutil.copytree(setup.root, clone, symlinks=True)
+    away = tmp_path / "cache-two-out-of-reach"
+    setup.c2.rename(away)
+    _use_cache(setup.root, setup.c1)
+    (setup.root / "data" / "raw" / "input.txt").write_text("the original moved on\n")
+    ran = _ok(_run(setup.root, "repro"))
+    assert "cannot reach it" in ran, ran
+    away.rename(setup.c2)
+    setup.root.rename(tmp_path / "original-elsewhere")
+    clone.rename(setup.root)
+    dead = _publish(setup.c2 / "files", tmp_path, "named by nothing\n")
+
+    refused = _run(setup.peer, "gc", "--yes", "--grace-hours", "0")
+
+    out = refused.stdout + refused.stderr
+    flat = " ".join(out.split())
+    assert refused.returncode != 0, out
+    assert "cache-one" in flat and "different nonce" in flat, out
+    assert "forget-cache" not in flat, out
+    assert cache.get_cache_path(setup.c2 / "files", dead).exists(), "a refusal removed an object"
+    assert setup.output_in_c2.exists(), out
+
+
 @pytest.mark.parametrize("order", ["c2-then-c1", "c1-then-c2"])
 def test_a_project_that_uses_two_caches_is_collected_when_both_entries_are_current(
     tmp_path: pathlib.Path, order: str
@@ -2876,10 +2910,10 @@ def test_a_collection_checks_the_caches_every_view_of_a_project_lists(
 
 def test_a_copy_of_a_cache_whose_objects_are_shared_refuses(tmp_path: pathlib.Path) -> None:
     """N1 with a `files/` link: C1 is on the copied disk, but its object store is a link to
-    shared storage, so the copy holds its own copy of C1's register over the same objects. The
-    original's step in C1 never reaches the copy's register, but it rotates the project's nonce
-    in C2, which both reach. The copy's own `pivot gc` of its C1 checks C2 too, refuses, and
-    keeps X, which the original's lock names, in the shared store."""
+    shared storage, and the project also uses C2. C1's register lives beside the shared store,
+    not on the disk (`naming.store_layout`), so the original's step in C1 rotates the nonce of
+    the very entry the copy's collection of its C1 reads (and the nonce in C2 too). The copy's
+    `pivot gc` refuses and keeps X, which the original's lock names, in the shared store."""
     disk = tmp_path / "disk"
     disk.mkdir()
     shared = tmp_path / "shared-objects"
@@ -2909,7 +2943,7 @@ def test_a_copy_of_a_cache_whose_objects_are_shared_refuses(tmp_path: pathlib.Pa
 
     flat = " ".join((refused.stdout + refused.stderr).split())
     assert refused.returncode != 0, flat
-    assert "cache-two" in flat and "different nonce" in flat, flat
+    assert "older or different nonce" in flat, flat
     assert "forget-cache" not in flat, flat
     assert named_again.exists(), f"the copy's gc removed X from the shared store: {flat}"
 
@@ -3133,3 +3167,233 @@ def test_a_collection_waits_for_a_nonce_rotation_another_cache_has_half_written(
 
     assert not cache.get_cache_path(setup.c2 / "files", dead).exists(), out
     assert setup.output_in_c2.exists(), out
+
+
+# =============================================================================
+# Round 17: the register follows the object store; a read-only view lists nothing it cannot
+# register in; a copy given its own identity
+# =============================================================================
+
+
+def _store_objects(store: pathlib.Path) -> set[str]:
+    """The keys of every object in the object store ``store``."""
+    return {
+        prefix.name + obj.name
+        for prefix in store.iterdir()
+        if prefix.is_dir() and len(prefix.name) == 2
+        for obj in prefix.iterdir()
+        if not obj.name.startswith(".")
+    }
+
+
+def test_a_disk_copy_of_a_cache_root_whose_objects_are_shared_refuses(
+    tmp_path: pathlib.Path,
+) -> None:
+    """SF: one cache root on the cloned disk, its `files/` a link to shared storage; P (copy
+    checkout, one run of history) uses only it. The disk is copied after v1, and the original
+    then runs v2, naming Y. The register and the naming lock follow the object store
+    (`naming.store_layout`), into the directory that holds it, which both disks reach: the
+    original's v2 step rotates its nonce where the copy's collection reads it, so the copy's
+    `pivot gc` of its own cache root refuses instead of removing Y."""
+    store = tmp_path / "shared" / "objects"
+    store.mkdir(parents=True)
+    with _disk_images(tmp_path, store) as work:
+        cache_root = work / "cache"
+        cache_root.mkdir()
+        (cache_root / "files").symlink_to(store)
+        root = _project(work / "project")
+        _use_cache(root, cache_root, retention=1)
+        raw = root / "data" / "raw" / "input.txt"
+        raw.write_text("v1 only this project reads\n")
+        _ok(_run(root, "repro"))
+        node2 = _clone_disk(tmp_path)
+        raw.write_text("v2 only this project reads\n")
+        _ok(_run(root, "repro"))
+        y = _shared_object(cache_root, tmp_path, "V2 ONLY THIS PROJECT READS\n")
+        key = y.parent.name + y.name
+        assert key in (root / ".pivot" / "stages" / "shadow" / "shout.lock").read_text()
+        register = naming.register_root(cache_root)
+
+        collected = _in_view(
+            root, "gc", "--yes", "--grace-hours", "0", hostname="pivot-node2", setup=node2
+        )
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode != 0, out
+    assert "nonce" in " ".join(out.split()), out
+    assert cache.get_cache_path(store, key).exists(), f"the copy's gc removed Y: {out}"
+    assert register == store.resolve().parent, register
+
+
+@pytest.mark.parametrize(
+    "layout", ["two links", "two links, a tree under C2", "a link to a plain root's store"]
+)
+def test_cache_roots_that_use_one_object_store_share_its_register(
+    tmp_path: pathlib.Path, layout: str
+) -> None:
+    """SF without a copy: two cache roots use one object store, A's through C1 and B's through
+    C2, which links C1's store (or both link a third directory). Each root kept a register of
+    its own, so A's collection of C1 read only A and removed B's objects. Both now keep one
+    register and one lock beside the store, and A's collection reads B too. It keeps B's
+    directory output, whose symlink checkout links a tree, and removes only what no record
+    names. A stage's commit puts the tree beside the store (`gc.tree_roots`); a command given
+    C2's unresolved `files/` (a `kind: cache` store, a restore) puts it under C2 itself, which
+    the test makes by hand: a link there still names the tree's key (`gc._tree_of_store`)."""
+    if layout.startswith("two links"):
+        store = tmp_path / "shared" / "objects"
+        store.mkdir(parents=True)
+        c1, c2 = tmp_path / "cache-one", tmp_path / "cache-two"
+        for cache_root in (c1, c2):
+            cache_root.mkdir()
+            (cache_root / "files").symlink_to(store)
+    else:
+        c1, c2 = tmp_path / "plain-root", tmp_path / "linking-root"
+        store = c1 / "files"
+        store.mkdir(parents=True)
+        c2.mkdir()
+        (c2 / "files").symlink_to(store)
+    a = _shared_project(tmp_path / "a", c1, "copy")
+    _ok(_run(a, "repro"))
+    b = _shared_project(tmp_path / "b", c2, "symlink")
+    (b / "pipeline.py").write_text(_DIRECTORY_PIPELINE)
+    (b / "data" / "raw" / "input.txt").write_text("only b reads this\n")
+    _ok(_run(b, "repro"))
+    split = b / "data" / "shadow" / "split"
+    tree = split.resolve()
+    assert tree.is_relative_to(store.resolve().parent / "trees"), tree
+    if layout == "two links, a tree under C2":
+        moved = c2 / "trees" / tree.parent.name / tree.name
+        moved.parent.mkdir(parents=True)
+        shutil.copytree(tree, moved, symlinks=True)
+        split.unlink()
+        split.symlink_to(moved)
+    named = _store_objects(store)
+    dead = _publish(store, tmp_path, "named by nothing\n")
+
+    collected = _run(a, "gc", "--yes", "--grace-hours", "0")
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode == 0, out
+    assert _store_objects(store) - {dead} == named, f"gc of C1 removed B's objects: {out}"
+    assert not cache.get_cache_path(store, dead).exists(), out
+    assert (split / "a.txt").read_text(), "B's output no longer resolves"
+    assert split.resolve().is_dir(), "gc removed B's tree"
+    assert _registered(c1, b), "B is not in the register a collection of C1 reads"
+    resolved = {naming.register_root(c).resolve() for c in (c1, c2)}
+    assert resolved == {store.resolve().parent}, resolved
+    locks = {tuple(p.resolve() for p in naming.naming_lock_paths(c)) for c in (c1, c2)}
+    assert len(locks) == 1, locks
+
+
+def test_one_collection_at_a_time_runs_on_one_object_store(tmp_path: pathlib.Path) -> None:
+    """`gc.lock` lives beside the register too, so two collections through two cache roots of
+    one object store never run together: while one holds the store's `gc.lock` (taken here
+    through C1), a collection through C2 refuses and removes nothing."""
+    store = tmp_path / "shared" / "objects"
+    store.mkdir(parents=True)
+    c1, c2 = tmp_path / "cache-one", tmp_path / "cache-two"
+    for cache_root in (c1, c2):
+        cache_root.mkdir()
+        (cache_root / "files").symlink_to(store)
+    root = _shared_project(tmp_path / "project", c2, "copy")
+    _ok(_run(root, "repro"))
+    dead = _publish(store, tmp_path, "named by nothing\n")
+    fd = cache.open_cache_lock(naming.register_root(c1) / gc.GC_LOCK)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        refused = _run(root, "gc", "--yes", "--grace-hours", "0")
+    finally:
+        os.close(fd)
+
+    out = refused.stdout + refused.stderr
+    assert refused.returncode != 0, out
+    assert "another pivot gc holds" in " ".join(out.split()), out
+    assert cache.get_cache_path(store, dead).exists(), "a refusal removed an object"
+
+
+def test_a_cache_whose_files_link_to_a_mount_of_its_own_refuses_collection(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A `files/` link to the root of a mount of its own: the directory that holds the store is
+    on another filesystem, which other hosts or mount namespaces need not reach, so the register
+    cannot follow the store. Writers keep the register at the cache root, as before, and a
+    collection refuses, naming the layout, rather than collect on a register that may not show
+    every project of the store."""
+    mount_point = tmp_path / "objects-mount"
+    with _tmpfs_mount(mount_point):
+        cache_root = tmp_path / "cache"
+        cache_root.mkdir()
+        (cache_root / "files").symlink_to(mount_point)
+        root = _shared_project(tmp_path / "project", cache_root, "copy")
+        _ok(_run(root, "repro"))
+        assert naming.register_root(cache_root) == cache_root
+        assert _registered(cache_root, root)
+        dead = _publish(mount_point, tmp_path, "named by nothing\n")
+
+        refused = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+        flat = " ".join((refused.stdout + refused.stderr).split())
+        assert refused.returncode != 0, flat
+        assert f"its files/ links to {mount_point}, which is a mount of its own" in flat, flat
+        assert cache.get_cache_path(mount_point, dead).exists(), "a refusal removed an object"
+
+
+def test_a_view_that_cannot_write_a_listed_cache_leaves_it_unlisted(tmp_path: pathlib.Path) -> None:
+    """A mount namespace in which C2 is read-only takes a naming step in C1. Confirming C2 there
+    cannot write C2's register, so that view never holds an entry in C2; it must not list C2
+    either, or every collection of C1 would refuse for an entry no command of that view can
+    write. The host's collection of C1 proceeds; the host's own record of C2 stays."""
+    setup = _two_cache_project(tmp_path, "c2-then-c1")
+    c2_id = naming.read_cache_id(setup.c2)
+    state_dir = setup.root / ".pivot"
+    host_view = naming.view_key_of(*naming.this_view())
+    read_only = (
+        f"mount --bind {shlex.quote(str(setup.c2))} {shlex.quote(str(setup.c2))}\n"
+        + f"mount -o remount,ro,bind {shlex.quote(str(setup.c2))}"
+    )
+
+    _ok(_in_view(setup.root, "checkout", setup=read_only))
+
+    dead = _publish(setup.c1 / "files", tmp_path, "named by nothing\n")
+    collected = _run(setup.root, "gc", "--yes", "--grace-hours", "0")
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert not cache.get_cache_path(setup.c1 / "files", dead).exists(), collected.stdout
+    c2_records = [r for r in naming.cache_records(state_dir) if r.cache_id == c2_id]
+    assert [r.view_key for r in c2_records] == [host_view], c2_records
+    assert len(naming.cache_records(state_dir)) == 3, "the read-only view did not list C1"
+
+
+def test_a_copy_given_its_own_project_id_never_collects_the_originals_objects(
+    tmp_path: pathlib.Path,
+) -> None:
+    """CW's documented practice: a copy of a project (here a copy of its directory, at the
+    original's path on this host) whose project id file is deleted before its first pivot
+    command records a new id. When the copy then reruns and collects the shared cache, the
+    original's entry no longer names the project at that path ("a different project id"), so
+    the collection refuses instead of reading the copy as the original, and the original's
+    object, which only its own records name, stays."""
+    shared = tmp_path / "shared-cache"
+    peer = _shared_project(tmp_path / "peer", shared)
+    _ok(_run(peer, "repro"))
+    root = _shared_project(tmp_path / "project", shared, "copy")
+    _use_cache(root, shared, retention=1)
+    (root / "data" / "raw" / "input.txt").write_text("the original's input\n")
+    _ok(_run(root, "repro"))
+    original_object = _shared_object(shared, tmp_path, "THE ORIGINAL'S INPUT\n")
+    assert original_object.exists()
+    copy = tmp_path / "copy-of-the-disk"
+    shutil.copytree(root, copy, symlinks=True)
+    root.rename(tmp_path / "original-elsewhere")
+    copy.rename(root)
+    (root / ".pivot" / "state.lmdb" / naming.PROJECT_ID_FILE).unlink()
+    # The copy writes first: its run, with one run of history, leaves the original's output
+    # named by no record of the copy's.
+    (root / "data" / "raw" / "input.txt").write_text("the copy's own input\n")
+    _ok(_run(root, "repro"))
+
+    refused = _run(root, "gc", "--yes", "--grace-hours", "0")
+
+    flat = " ".join((refused.stdout + refused.stderr).split())
+    assert refused.returncode != 0, flat
+    assert "holds a different project id" in flat, flat
+    assert original_object.exists(), "the copy's gc removed the original's object"

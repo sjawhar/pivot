@@ -118,10 +118,13 @@ Two more rules cover objects no record names yet:
 A collection is safe to run while pipelines use the same cache, by mutual exclusion rather
 than timing. Every pivot command that names a cache object — a stage committing its outputs
 or restoring them from the run cache, `pivot commit`, `pivot track`, `pivot get --rev`, and a
-project recording itself in a shared cache — holds `naming.lock` in the cache root shared
-while it names: from its last check that the objects it needs are in the cache to the record
-that names them. The lock lives in the cache root (the directory that holds `files/`), so it is
-one file however the cache path is spelled, even when `files/` is a symlink to another disk.
+project recording itself in a shared cache — holds `naming.lock` shared while it names: from
+its last check that the objects it needs are in the cache to the record that names them. The
+lock lives beside the cache's register: in the cache root (the directory that holds `files/`),
+or, when `files/` is a link, in the directory that holds the store it links to (see
+[A Cache Several Projects Share](#a-cache-several-projects-share)). So it is one file however
+the cache path is spelled, and one
+file for every cache root that uses the same object store.
 Every writer hashes and copies its outputs (and `pivot get --rev` reads git and downloads)
 before taking it, then re-checks the objects under it, publishing again any a collection removed
 meanwhile, so a large output never holds the lock. `pivot gc` holds the same lock exclusive while it
@@ -130,7 +133,8 @@ deletes, so no object can be named between that re-read and its removal. The sha
 never covers a stage's execution, and a turnstile keeps a stream of writers from starving a
 collection. The plan and the prompt run before the lock is taken, so a dry run or a waiting
 prompt blocks nobody; nothing read before the lock decides what is deleted.
-A collection also takes `<cache>/gc.lock`, so two collections never run on one cache, and lists
+A collection also takes `gc.lock`, beside the naming lock, so two collections never run on one
+object store, and lists
 each prefix directory under its `.pivot_cache.lock`, waiting there for a publish in progress
 before it takes the naming lock; under the naming lock it waits for nothing. It lists both
 stores, `files/` and `trees/`, and removes a directory tree with its `.content-checked` marker
@@ -195,13 +199,19 @@ anything. Read-only commands such as
 command refuses before it names an object. A project id is best-effort through #503's state
 resolver. If the state directory cannot store it, the entry has no id, the writer still
 follows 0.5.2 behavior, and gc refuses that entry with recovery instructions. A read-only cache
-is the one exception to a register-write failure, because no collection can delete from it.
+is the one exception to a register-write failure, because no collection can delete from it
+there. A view (a host or mount namespace) that sees a cache read-only, while another view
+writes it, does not list that cache in the project's state directory either: it can never write
+an entry there, and a collection of the project's other caches would otherwise wait for one.
 
 A collection reads every entry, and an entry is live only after the collection finds its
 project id in the project's current state directory and reads there, in its own view, the
-nonce in the entry's `.nonce` file. A project shared over NFS shows another host's latest nonce, so it
-stays collectable; a container's overlay or a cloned disk holds at most an older nonce, so the
-collection refuses rather than read that copy as the project. An absent or unreadable root,
+nonce in the entry's `.nonce` file. A project shared over NFS shows another host's latest nonce,
+so it stays collectable. A container's overlay or a cloned disk holds the nonce of the moment it
+was copied: once the original takes another naming step, the copy's nonce is older, and a
+collection where the copy is visible refuses rather than read that copy as the project. Until
+then the copy and the original are the same bytes (see
+[A Copy That Writes First](#a-copy-that-writes-first)). An absent or unreadable root,
 state directory, id or nonce refuses the collection and names the entry: the project may be on
 a disk that is not mounted, in another mount namespace, or on another host, and a different
 project may hold the same local path there. For an entry from this view,
@@ -218,6 +228,23 @@ need no flag. A `--projects` path must be a real pivot project — a directory w
 `.pivot` state directory. A path that is not one (the cache itself, a parent directory, a
 worktree that was deleted and re-created, a typo) names no records, so pivot refuses the whole
 run rather than collect this cache on one project's records alone.
+
+The register (`projects/`), with the cache's id, its mount records (`mounts/`) and its lock
+files (`naming.lock`, `naming.turnstile`, `gc.lock`), lives beside the object store: in the
+cache root, or, when the cache root's `files/` is a link, in the directory that holds the
+directory it links to. So every cache root that uses one object store (several roots whose
+`files/` link one directory, or a root whose `files/` links another root's `files/`) shares one
+register and one lock, and a collection through any of them reads every project that names
+objects in the store. Each root keeps its own whole-directory trees (`trees/`); a collection
+removes only its own root's trees, and keeps the listing and members of a tree another root of
+the store holds. That directory must be writable by every user who names objects in the store.
+When `files/` links to the root of a mount of its own (a mount point or a bind mount), that
+directory is on another filesystem, which other hosts and mount namespaces need not reach
+through the store: the register stays at the cache root, and `pivot gc` refuses, naming the
+layout. Link `files/` to a directory inside the mounted filesystem instead. Two cache roots whose
+`files/` are each a mount of one store (rather than a link to it) keep two registers that pivot
+cannot relate, and a collection through one cannot see the other's projects: share a store
+through links, or through one cache root.
 
 ### A Project That Uses More Than One Cache
 
@@ -237,11 +264,10 @@ the two apart. Pivot makes that write and checks it in two places:
   and nothing more is written.
 - **A collection checks every cache any view of the project lists**, besides its own entries:
   each must be readable where that view recorded it, hold the same cache, and hold that view's
-  entry with the nonce the state directory holds for it. This catches a copy whose own register
-  the original never writes, such as a cache root on the cloned disk whose `files/` links to
-  shared storage: the original's steps there reach only its own register, but they rotate the
-  project's nonce in the other caches it lists. A mismatch says the path may hold a copy and
-  never suggests `pivot forget-cache`.
+  entry with the nonce the state directory holds for it. A mismatch says the path may hold a
+  copy and never suggests `pivot forget-cache`. (A cache root copied with the disk whose
+  `files/` links to shared storage keeps its register beside the shared store, not on the disk,
+  so the original's steps there rotate the nonce the copy's collection reads.)
 
 A cache this view lists that a naming step cannot reach (it cannot be read where it is recorded,
 another cache is at that path now, or its register cannot be written) does not fail the step.
@@ -261,6 +287,35 @@ refusal names, in the project itself: never in a copy of it. It removes only thi
 (another view removes its own; if that view is gone for good, delete the record file the
 refusal names), refuses a cache this view reaches whose entry for the project is current, and
 deletes nothing from any cache. Any pivot command that uses the removed cache lists it again.
+
+### A Copy That Writes First
+
+A copy of a project made by copying its disk (a VM snapshot, a cloned volume, `cp -a` at the
+same path) holds the original's project id and nonces. Nothing in shared storage tells the two
+apart until one of them takes a naming step. When the original writes first, the copy's nonces
+are stale and every collection where the copy is visible refuses, as above. **When the copy
+writes first** (it re-tracks a file or runs a stage) while the original stays idle, its step
+rotates the nonces the original's entries share, and a collection where the copy is visible
+then reads the copy's records as the original's. It can remove objects that only the
+original's records name. The original then reports those outputs missing, and `pivot pull`
+(when a remote holds them) or a rerun restores them; it never uses a stale result. No design
+without an identity a disk copy cannot carry can catch this case, so pivot documents it as a
+limit rather than refuse every collection. Keying entries on something a copy does not carry,
+such as the boot id, does not close it either: the copy still reads its own records under the
+original's entry whichever view keys it, and a reboot of the original looks the same as a clone.
+
+Avoid it in either of two ways:
+
+- Run `pivot gc` on a shared cache from one designated machine that holds the original
+  projects and never a copy of them, and give copies their own cache (`cache.dir`, or
+  `PIVOT_CACHE_DIR`) before they run.
+- Before a copy runs any pivot command, give it its own identity: delete
+  `<state dir>/state.lmdb/pivot-project-id` in the copy (and `.pivot/state.lmdb/pivot-project-id`
+  too when `core.state_dir` names another directory, since a new state directory takes its id
+  from `.pivot`). Its next command records a new project id. A collection where the copy is
+  visible then finds that the original's entry names a different project at that path, and
+  refuses instead of reading the copy as the original. Do not delete that entry to make the
+  collection proceed; run the collection where the original is visible.
 
 ## Per-Stage Lock Files
 

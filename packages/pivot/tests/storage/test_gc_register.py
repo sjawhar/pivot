@@ -1,7 +1,10 @@
+import fcntl
 import json
 import logging
+import os
 import pathlib
 import shutil
+import threading
 
 import pytest
 
@@ -31,11 +34,14 @@ def test_a_naming_unit_reregisters_after_the_mount_table_changes(
     a disk is mounted under the project between two of them, the second records the mount, so
     a collection can refuse once it is unmounted. Here the table is a regular file, which no
     kernel watch covers (`_watch_mount_table` refuses it), so every unit registers in full;
-    `test_a_naming_unit_records_a_mount_that_appeared_since_the_last_one` covers the watch."""
+    `test_a_naming_unit_records_a_mount_that_appeared_since_the_last_one` covers the watch. The
+    process's one watch is opened anew, as in a process that starts with this table: one an
+    earlier test opened on `/proc/self/mounts` would see no change to the regular file."""
     root, state_dir, cache_dir = _project(tmp_path)
     table = tmp_path / "mounts"
     table.write_bytes(b"/dev/root / ext4 rw 0 0\n")
     monkeypatch.setattr(naming, "_MOUNTS_TABLE", table)
+    monkeypatch.setattr(naming, "_SHARED_MOUNT_WATCH", naming._SharedMountWatch())
     _unit(cache_dir, root, state_dir)
     entry = naming.project_register_path(cache_dir, root, state_dir)
     assert entry is not None
@@ -288,3 +294,99 @@ def test_a_unit_warns_once_per_command_about_a_listed_cache_it_cannot_reach(
 
     assert len(warnings_of(report=True)) == 1
     assert warnings_of(report=False) == []
+
+
+def test_a_unit_registers_again_when_files_is_relinked(tmp_path: pathlib.Path) -> None:
+    """The registration memo lets a long-lived writer's units skip the reads while the evidence
+    it checked is unchanged. Re-pointing the cache's `files/` to another object store moves the
+    register beside that store (`naming.store_layout`), so the next unit registers there in
+    full instead of rotating the nonce of an entry no collection of the store reads; so does a
+    second re-pointing, which the process's memo of the linked layout must notice."""
+    root, state_dir, cache_dir = _project(tmp_path)
+    _unit(cache_dir, root, state_dir)
+    before = naming.project_register_path(cache_dir, root, state_dir)
+    assert before is not None and before.exists()
+    store = tmp_path / "shared" / "objects"
+    store.mkdir(parents=True)
+    (cache_dir / "files").symlink_to(store)
+
+    _unit(cache_dir, root, state_dir)
+
+    after = naming.project_register_path(cache_dir, root, state_dir)
+    assert after is not None and after.parent.parent == store.resolve().parent
+    assert after.exists(), "the unit after the relink left the store's register without an entry"
+    other = tmp_path / "other-shared" / "objects"
+    other.mkdir(parents=True)
+    relinked = cache_dir / "files.relinked"
+    relinked.symlink_to(other)
+    relinked.replace(cache_dir / "files")
+
+    _unit(cache_dir, root, state_dir)
+
+    again = naming.project_register_path(cache_dir, root, state_dir)
+    assert again is not None and again.parent.parent == other.resolve().parent
+    assert again.exists(), "the unit after the second relink wrote no entry beside that store"
+
+
+def test_registrations_across_many_caches_hold_a_bounded_number_of_descriptors(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The registration memo keeps both nonce files of each registration open, so a long-lived
+    process (a watch or serve session, a library caller) that registers in many caches must not
+    hold more descriptors with each new one. It keeps the most recently used registrations, and
+    every registration shares one mount-table watch: 100 registrations across 100 caches leave
+    the open-descriptor count where 20 left it."""
+    root, state_dir, _cache_dir = _project(tmp_path)
+    caches = [tmp_path / f"cache-{i}" for i in range(100)]
+    for cache_dir in caches:
+        cache_dir.mkdir()
+
+    def open_descriptors() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    before = open_descriptors()
+    for cache_dir in caches[:20]:
+        naming.register_project(cache_dir, root, state_dir)
+    after_twenty = open_descriptors()
+    for cache_dir in caches[20:]:
+        naming.register_project(cache_dir, root, state_dir)
+    after_hundred = open_descriptors()
+
+    assert after_hundred == after_twenty, (before, after_twenty, after_hundred)
+    assert after_hundred - before <= 2 * naming._MAX_VERIFIED_REGISTRATIONS + 1
+    assert len(naming._VERIFIED_REGISTRATIONS) <= naming._MAX_VERIFIED_REGISTRATIONS
+    # An evicted registration is done in full again, and is then remembered.
+    naming.register_project(caches[0], root, state_dir)
+    assert (caches[0], root, state_dir) in naming._VERIFIED_REGISTRATIONS
+
+
+def test_a_writer_through_a_linked_root_waits_for_the_lock_a_collection_takes(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A naming unit resolves the cache's layout once, for its lock and its registration. Through
+    a cache root whose `files/` links another root's store, it takes the naming lock beside that
+    store, the one a collection through either root holds (`naming.naming_lock_paths`): while
+    that lock is held exclusively, the unit waits."""
+    root, state_dir, plain = _project(tmp_path)
+    (plain / "files").mkdir()
+    linking = tmp_path / "linking-root"
+    linking.mkdir()
+    (linking / "files").symlink_to(plain / "files")
+    _unit(plain, root, state_dir)
+    _ts_path, nm_path = naming.naming_lock_paths(plain)
+    entered = threading.Event()
+
+    def write() -> None:
+        _unit(linking, root, state_dir)
+        entered.set()
+
+    fd = os.open(nm_path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        writer = threading.Thread(target=write, daemon=True)
+        writer.start()
+        assert not entered.wait(1.0), "the unit through the linking root took another lock"
+    finally:
+        os.close(fd)
+    assert entered.wait(30.0), "the unit never took the lock once it was free"
+    writer.join(30.0)

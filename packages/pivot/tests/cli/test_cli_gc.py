@@ -41,7 +41,7 @@ def _helper_workspace(root: pathlib.Path, cache_dir: pathlib.Path) -> Workspace:
     state_dir = root / ".pivot"
     stages_dir = state_dir / "stages"
     stages_dir.mkdir(parents=True, exist_ok=True)
-    object_root = cache_dir / gc.OBJECTS_DIR
+    object_root = cache_dir / naming.OBJECTS_DIR
     object_root.mkdir(parents=True, exist_ok=True)
     scratch = root.parent / f"scratch-{root.name}"
     scratch.mkdir(exist_ok=True)
