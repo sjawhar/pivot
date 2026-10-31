@@ -84,7 +84,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 32 records each module a worker imports by name (`byname:` entries) and, in a cached
 # manifest, where each such module resolves (`o`), which a hit re-checks.
 # Version 33 fingerprints a pivot loader that a partial's arguments or a dataclass field default
-# holds as a top-level loader is fingerprinted (`_held_loader_entries`, `held:` entries).
+# holds as a top-level loader is fingerprinted (`_held_loader_entries`, `held:` entries), and
+# hashes a class with no source by what defines it, not by its address (`_sourceless_class_hash`).
 _CACHE_SCHEMA_VERSION = 33
 _REPR_SIZE_LIMIT = 10_000
 
@@ -252,11 +253,67 @@ _walk_path: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
 # under it, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep apart.
 _owner_ref: contextvars.ContextVar[str | None] = contextvars.ContextVar("_owner_ref", default=None)
 
+
+class _HeldLoader(typing.NamedTuple):
+    """A pivot loader a serialized value holds (`_serialize_collecting`)."""
+
+    loader: Any
+    text: str  # its canonical form as JSON
+    classes: tuple[int, ...]  # the ids of its class and of the loaders' classes inside it
+    path: tuple[list[str], ...]  # its position: a cell per step, filled once its container sorts
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _LoaderForm:
+    """The canonical form of one pivot loader, kept for one stage (`_form_memo`)."""
+
+    loader: Any  # held so its id is not reused while the memo lives
+    canonical: Any
+    text: str
+    classes: tuple[int, ...]
+
+
 # The pivot loaders `_canonicalize_value_for_hash` meets while it serializes a value whose held
-# loaders are fingerprinted (`_collecting_held_loaders`), each with its canonical form as JSON;
-# None outside one.
-_held_loaders: contextvars.ContextVar[list[tuple[Any, str]] | None] = contextvars.ContextVar(
+# loaders are fingerprinted (`_serialize_collecting`); None outside one, and inside a held
+# loader's own form, whose loaders are its own fingerprint's.
+_held_loaders: contextvars.ContextVar[list[_HeldLoader] | None] = contextvars.ContextVar(
     "_held_loaders", default=None
+)
+
+# The position of the value being canonicalized inside the value `_serialize_collecting`
+# serializes: the part's name, then a cell per container step. An ordered container's step is
+# the item's index; a set's or a dict's is the item's rank in the sorted canonical form, written
+# once the container sorts, so it does not follow the hash seed (equal forms share a rank).
+_held_path: contextvars.ContextVar[tuple[list[str], ...]] = contextvars.ContextVar(
+    "_held_path", default=()
+)
+
+# The ids of the classes of the pivot loaders met inside the loader being canonicalized, so two
+# loaders with one form but different classes (two classes one factory made) keep apart in the
+# walk memo (`_held_memo`); None outside a loader's form.
+_form_classes: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar(
+    "_form_classes", default=None
+)
+
+# Whether the canonical form of the loader being canonicalized holds a `["cycle", N]`. Only a
+# form with none is kept (`_form_memo`): a loader whose form holds no cycle holds nothing that
+# holds it back, so its form is the same on any path it is met on; None outside a loader's form.
+_form_cycle: contextvars.ContextVar[list[bool] | None] = contextvars.ContextVar(
+    "_form_cycle", default=None
+)
+
+# The canonical forms of the pivot loaders met while one stage, or one top-level
+# `get_loader_fingerprint` call, is fingerprinted, by the loader's id: a chain of held loaders is
+# canonicalized once, not once per level (`_loader_memos`).
+_form_memo: contextvars.ContextVar[dict[int, _LoaderForm] | None] = contextvars.ContextVar(
+    "_form_memo", default=None
+)
+
+# The entries a loader's class decides (`_loader_class_entries`), by the class's id, with the
+# class held so the id is not reused, for one stage or one top-level call (`_loader_memos`): many
+# loaders of one class, held or not, walk the class once. Per stage, as `_held_memo`.
+_loader_class_memo: contextvars.ContextVar[dict[int, tuple[type, dict[str, str]]] | None] = (
+    contextvars.ContextVar("_loader_class_memo", default=None)
 )
 
 # The ids of the loaders `get_loader_fingerprint` is fingerprinting, outermost first: a loader that
@@ -266,12 +323,31 @@ _loader_stack: contextvars.ContextVar[tuple[int, ...]] = contextvars.ContextVar(
 )
 
 # The manifests of the held loaders fingerprinted for one stage (`stage_fingerprint_scope`), by
-# their class object's id and their canonical form, so a loader held many times is walked once.
-# Kept per stage, not per pass: a held loader's walk reports its refusals with the stage that
-# holds it.
-_held_memo: contextvars.ContextVar[dict[tuple[int, str], dict[str, str]] | None] = (
-    contextvars.ContextVar("_held_memo", default=None)
-)
+# their canonical form and the ids of the classes in it, each with the loader it was walked for
+# (held so those classes live), so a loader held many times is walked once. Kept per stage, not
+# per pass: a held loader's walk reports its refusals with the stage that holds it.
+_held_memo: contextvars.ContextVar[
+    dict[tuple[str, tuple[int, ...]], tuple[Any, dict[str, str]]] | None
+] = contextvars.ContextVar("_held_memo", default=None)
+
+
+@contextlib.contextmanager
+def _loader_memos() -> Iterator[None]:
+    """Keep the loader memos (`_form_memo`, `_loader_class_memo`, `_held_memo`) for the block,
+    unless an enclosing stage scope or call keeps them already."""
+    form = _form_memo.set({}) if _form_memo.get() is None else None
+    classes = _loader_class_memo.set({}) if _loader_class_memo.get() is None else None
+    held = _held_memo.set({}) if _held_memo.get() is None else None
+    try:
+        yield
+    finally:
+        if held is not None:
+            _held_memo.reset(held)
+        if classes is not None:
+            _loader_class_memo.reset(classes)
+        if form is not None:
+            _form_memo.reset(form)
+
 
 # Per-pass memo, keyed by kind and object id, for function identities (`function_identity`),
 # type-hint classes (`_hint_classes`), user-class members (`_user_methods`) and mark decisions
@@ -897,8 +973,9 @@ def _default_token(value: Any) -> str:
 # `bi:MODULE` a loaded module a function body imports, `u` the function behind a C-level
 # wrapper, `pf`, `pa:INDEX` and `pk:KEY` a partial's parts, `i:INDEX`, `k:REPR` and `s:INDEX`
 # container members, `hc:INDEX` a class in type hints and `fc:INDEX` a class in a model's field
-# annotations. `hints` and `schema` read the visited object itself, and so does `hl`: the
-# fingerprints of the pivot loaders it holds (`_held_loaders_token`).
+# annotations. `hints` and `schema` read the visited object itself, and so do `hl` and `hd`: the
+# fingerprints of the pivot loaders a partial's arguments (`hl`) or a dataclass field default
+# (`hd`) holds (`_held_loaders_token`).
 _UNREAD = object()
 
 
@@ -974,8 +1051,8 @@ def _read_token(owner: Any, step: str) -> str:
         return f"{_schema_hash(owner)}|{field_classes}"
     if step.startswith("fd:"):
         return _dataclass_field_token(owner, step.partition(":")[2])
-    if step == "hl":
-        return _held_loaders_token(owner)
+    if step in ("hl", "hd"):
+        return _held_loaders_token(owner, step)
     value = _read_step(owner, step)
     if value is _UNREAD:
         return "absent"
@@ -1259,16 +1336,21 @@ def stage_fingerprint_scope(stage_name: str) -> Iterator[StageFingerprintScope]:
 
     Wraps a stage's manifest and its input and output loader fingerprints, so a refusal found
     in loader config is reported with the stage's own refusals. A pivot loader the stage's
-    values hold is walked once in it (`_held_memo`).
+    values hold is canonicalized once (`_form_memo`) and walked once (`_held_memo`) in it, and a
+    loader class's own entries are computed once (`_loader_class_memo`).
     """
     scope = StageFingerprintScope(unsafe=False)
     token = _current_stage_name.set(stage_name)
     scope_token = _stage_scope.set(scope)
     memo_token = _held_memo.set({})
+    form_token = _form_memo.set({})
+    class_token = _loader_class_memo.set({})
     try:
         with _collected_capture_errors(), _type_facts_scope():
             yield scope
     finally:
+        _loader_class_memo.reset(class_token)
+        _form_memo.reset(form_token)
         _held_memo.reset(memo_token)
         _stage_scope.reset(scope_token)
         _current_stage_name.reset(token)
@@ -1587,12 +1669,11 @@ def _process_dataclass_defaults(cls: type, manifest: dict[str, str], visited: se
         _record_read(cls, step)
         binding_ref = f"{class_ref}.{name}"
         if field.default is not dataclasses.MISSING:
-            with _collecting_held_loaders() as held:
-                serialized = _serialize_value_for_hash(field.default)
+            (serialized,), held = _serialize_collecting([("default", field.default)])
             manifest[f"default:{binding_ref}"] = xxhash.xxh64(serialized.encode()).hexdigest()
             if held:
                 with _walking(step):
-                    _merge_held_loaders(manifest, held, record=True)
+                    _merge_held_loaders(manifest, held, read="hd")
             continue
         if field.default_factory is dataclasses.MISSING:
             continue
@@ -2124,83 +2205,104 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     - Loader: All of the above
     - Always: 'loader:<module>.<qualname>:config' for dataclass field values
 
-    A user loader class's methods, `load`, `save` and `empty` and every other user-defined
-    method on it and on its user base classes (a helper `load` calls as `self.helper()`), and
-    the functions and classes bound in its config fields, are walked like stage helpers, so the
-    module values they read are tracked or refused. Methods inherited from `pivot.loaders` are
+    A user loader class's `load`, `save` and `empty`, the user members of the class that their
+    code reaches (`_reachable_loader_members`: a helper `load` calls as `self.decorate()`, a
+    property it reads, transitively), and the functions and classes bound in its config fields,
+    are walked like stage helpers, so the module values they read are tracked or refused. A
+    member no such code reads is not walked. Methods inherited from `pivot.loaders` are
     framework code and are only hashed. A pivot loader the config holds (`Outer(Inner())`, also
     inside a container, a partial or a dataclass in a field) gets this fingerprint too, under
     `held:<digest>:` (`_merge_held_loaders`).
 
     The loader is marked as being fingerprinted for the whole call (`_loader_stack`), so a
     loader its own walk reaches again (its config holds it, or a dataclass default its code
-    reads does) is not walked again.
+    reads does) is not walked again. The loader memos are kept for the call (`_loader_memos`),
+    unless a stage's scope keeps them already.
     """
     stack_token = _loader_stack.set((*_loader_stack.get(), id(cast("object", loader))))
     try:
-        return _loader_manifest(loader)
+        with _loader_memos():
+            return _loader_manifest(loader)
     finally:
         _loader_stack.reset(stack_token)
 
 
 def _loader_manifest(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> dict[str, str]:
-    """The manifest `get_loader_fingerprint` gives `loader`."""
+    """The manifest `get_loader_fingerprint` gives `loader`: its class's entries
+    (`_loader_class_entries`), then the walk of the values its config fields bind, its config
+    hash, and the loaders its config holds."""
+    loader_type: type[Any] = type(cast("object", loader))
+    class_name = _definition_ref(loader_type)
+    manifest = dict(_loader_class_entries(loader_type))
+    visited = set[int]()
+    loader_any = cast("Any", loader)
+    fields = dataclasses.fields(loader_any)
+    for field in fields:
+        value = getattr(loader_any, field.name)
+        _process_bound_values(f"{class_name}.{field.name}", value, manifest, visited)
+    texts, held = _serialize_collecting(
+        [(field.name, getattr(loader_any, field.name)) for field in fields]
+    )
+    # The text `loader_config_text` gives.
+    config_str = ",".join(f"{field.name}={text}" for field, text in zip(fields, texts, strict=True))
+    if config_str:
+        manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
+    if held:
+        _merge_held_loaders(manifest, held, read=None)
+
+    return manifest
+
+
+def _loader_class_entries(loader_type: type[Any]) -> dict[str, str]:
+    """The entries of a loader's manifest that its class decides: the walks of its user-defined
+    `load`, `save` and `empty` and of the members they reach, and the hashes of its `load`,
+    `save` and overridden `empty`. Kept for the stage (`_loader_class_memo`), so many loaders of
+    one class walk it once."""
+    memo = _loader_class_memo.get()
+    cached = None if memo is None else memo.get(id(loader_type))
+    if cached is not None:
+        return cached[1]
     manifest = dict[str, str]()
-    loader_type = type(loader)
     class_name = _definition_ref(loader_type)
     visited = set[int]()
 
     # Import here to avoid circular import
     from pivot import loaders as loaders_module
 
-    for method_name in ("load", "save", "empty"):
+    for method_name in _LOADER_METHODS:
         method = _user_defined_method(loader_type, method_name)
         if method is not None:
             _process_callable_dependency(f"{class_name}.{method_name}", method, manifest, visited)
     stage_name = _current_stage_name.get() or loader_type.__qualname__
-    for label, member in _user_methods(loader_type):
-        if label in ("load", "save", "empty"):
-            continue
-        binding_ref = f"{class_name}.{label}"
+    for binding_ref, member in _reachable_loader_members(loader_type):
         _process_captured_value(
             binding_ref, binding_ref, member, loader_type, manifest, visited, stage_name, chain=None
         )
 
     # Use each method definition rather than a temporary bound method so the
     # weak AST hash cache retains the entry across loader fingerprint calls.
-    if isinstance(loader, loaders_module.Writer):
-        manifest[f"loader:{class_name}:save"] = hash_function_ast(_method_function(loader.save))
+    methods = cast("Any", loader_type)
+    if issubclass(loader_type, loaders_module.Writer):
+        manifest[f"loader:{class_name}:save"] = hash_function_ast(_method_function(methods.save))
 
     # Fingerprint load() if this is a Reader
-    if isinstance(loader, loaders_module.Reader):
-        manifest[f"loader:{class_name}:load"] = hash_function_ast(_method_function(loader.load))
+    if issubclass(loader_type, loaders_module.Reader):
+        manifest[f"loader:{class_name}:load"] = hash_function_ast(_method_function(methods.load))
 
         # Only fingerprint empty() if it's overridden in a Loader subclass
-        if isinstance(loader, loaders_module.Loader):
-            # Cast to Loader[Any, Any] - isinstance narrows but basedpyright keeps Unknown params
-            typed_loader = cast("loaders_module.Loader[Any, Any]", loader)
-            for cls in type(typed_loader).__mro__:
+        if issubclass(loader_type, loaders_module.Loader):
+            for cls in loader_type.__mro__:
                 if cls is loaders_module.Loader:
                     # Reached Loader base class without finding override
                     break
                 if "empty" in cls.__dict__:
                     # Found override in a subclass
                     manifest[f"loader:{class_name}:empty"] = hash_function_ast(
-                        _method_function(typed_loader.empty)
+                        _method_function(methods.empty)
                     )
                     break
-
-    loader_any = cast("Any", loader)
-    for field in dataclasses.fields(loader_any):
-        value = getattr(loader_any, field.name)
-        _process_bound_values(f"{class_name}.{field.name}", value, manifest, visited)
-    with _collecting_held_loaders() as held:
-        config_str = loader_config_text(loader_any)
-    if config_str:
-        manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
-    if held:
-        _merge_held_loaders(manifest, held, record=False)
-
+    if memo is not None:
+        memo[id(methods)] = (methods, manifest)
     return manifest
 
 
@@ -2226,17 +2328,36 @@ def _merge_prefixed(manifest: dict[str, str], prefix: str, entries: Mapping[str,
             manifest.setdefault(key, value)
 
 
-@contextlib.contextmanager
-def _collecting_held_loaders() -> Iterator[list[tuple[Any, str]]]:
-    """Collect each pivot loader the canonical form meets while the block serializes a value
-    (`_held_loaders`), with its canonical form as JSON: the serialization that records the value
-    already visits it, so no new traversal is made."""
-    held = list[tuple[Any, str]]()
-    token = _held_loaders.set(held)
+def _partial_parts(partial_obj: Any) -> list[tuple[str, Any]]:
+    """A partial's arguments and keywords, each named, as `_serialize_collecting` takes them."""
+    return [("args", partial_obj.args), ("kwargs", partial_obj.keywords)]
+
+
+def _serialize_collecting(
+    parts: Sequence[tuple[str, Any]],
+) -> tuple[list[str], list[_HeldLoader]]:
+    """Serialize each part (`_serialize_value_for_hash`), and collect each pivot loader its
+    canonical form meets (`_canonical_loader`) with its position: the part's name, then a step
+    per container (`_held_path`). The serialization that records the value already visits
+    them, so no new traversal is made."""
+    held = list[_HeldLoader]()
+    texts = list[str]()
+    held_token = _held_loaders.set(held)
     try:
-        yield held
+        for name, value in parts:
+            path_token = _held_path.set(([name],))
+            try:
+                texts.append(_serialize_value_for_hash(value))
+            finally:
+                _held_path.reset(path_token)
     finally:
-        _held_loaders.reset(token)
+        _held_loaders.reset(held_token)
+    return texts, held
+
+
+def _held_position(item: _HeldLoader) -> str:
+    """Where a held loader sits in the value that holds it (`_held_path`), as text."""
+    return "/".join(cell[0] for cell in item.path)
 
 
 def _is_pivot_loader(value: Any) -> bool:
@@ -2249,50 +2370,88 @@ def _is_pivot_loader(value: Any) -> bool:
     )
 
 
-def _held_loader_entries(held: list[tuple[Any, str]]) -> dict[str, dict[str, str]]:
-    """The manifest of each distinct pivot loader in `held`, as `get_loader_fingerprint` gives a
-    top-level loader of its class, keyed and ordered by the digest of its canonical form (its
-    class's name and its fields).
+def _held_loader_entries(held: list[_HeldLoader]) -> dict[str, dict[str, str]]:
+    """The manifest of each pivot loader in `held`, as `get_loader_fingerprint` gives a
+    top-level loader of its class, keyed by the digest of its position in the value that holds
+    it (`_held_path`), so a swap of two loaders or an edit to one of two equal-looking ones is a
+    change. Two loaders share a position only as equal forms in a set; each of those is keyed by
+    its position and its manifest.
 
-    A loader is distinct by its class object and its canonical form, so two classes one factory
-    made (`make_reader("a")`, `make_reader("b")`), which share a name and a form, are each
-    walked; when their manifests differ, each is keyed by the digest of its form and its
-    manifest instead, so neither overwrites the other. A loader held many times is walked once
-    per stage (`_held_memo`), and one being fingerprinted already (`_loader_stack`: a cycle) is
-    left out, since its entries are in the manifest that holds it. A held loader's walk records
-    no read of its own; its holder's caller records one read for all of them (`hl`,
-    `_merge_held_loaders`)."""
+    The loaders are walked in the order of their positions and forms, which follows no hash
+    seed: one being fingerprinted already (`_loader_stack`: a cycle) is left out, since its
+    entries are in the manifest that holds it, so the order decides which of two loaders in a
+    cycle holds the other's entries. Loaders that share a position and a form but not their
+    classes are each walked with the memo as it stood before them, so their order does not
+    matter either. A loader held many times is walked once per stage (`_held_memo`, by its form
+    and the classes in it: two classes one factory made keep apart). A held loader's walk
+    records no read of its own; its holder's caller records one read for all of them
+    (`_merge_held_loaders`)."""
+    with _loader_memos():
+        return _held_loaders_walked(held)
+
+
+def _held_loaders_walked(held: list[_HeldLoader]) -> dict[str, dict[str, str]]:
+    """`_held_loader_entries`, with the loader memos kept (`_loader_memos`)."""
     stack = _loader_stack.get()
     memo = _held_memo.get()
-    walked = dict[tuple[int, str], dict[str, str]]()
-    for loader, identity in held:
-        key = (id(type(cast("object", loader))), identity)
-        if id(loader) in stack or key in walked:
-            continue
-        entries = None if memo is None else memo.get(key)
-        if entries is None:
-            reads_token = _recorded_reads.set(None)
-            try:
-                entries = get_loader_fingerprint(loader)
-            finally:
-                _recorded_reads.reset(reads_token)
-            if memo is not None:
-                memo[key] = entries
-        walked[key] = entries
-    by_form = dict[str, list[dict[str, str]]]()
-    for (_class_id, identity), entries in walked.items():
-        group = by_form.setdefault(xxhash.xxh64(identity.encode()).hexdigest(), [])
-        if entries not in group:
-            group.append(entries)
-    found = dict[str, dict[str, str]]()
-    for digest, group in by_form.items():
-        for entries in group:
-            if len(group) > 1:
-                content = f"{digest}\0{json.dumps(entries, sort_keys=True)}"
-                found[xxhash.xxh64(content.encode()).hexdigest()] = entries
-            else:
-                found[digest] = entries
-    return dict(sorted(found.items()))
+    ordered = sorted(
+        (item for item in held if id(item.loader) not in stack),
+        key=lambda item: (_held_position(item), item.text),
+    )
+    walked = dict[tuple[str, tuple[int, ...]], dict[str, str]]()
+    by_position = dict[str, list[dict[str, str]]]()
+    index = 0
+    while index < len(ordered):
+        position, text = _held_position(ordered[index]), ordered[index].text
+        end = index
+        while end < len(ordered) and (
+            _held_position(ordered[end]),
+            ordered[end].text,
+        ) == (position, text):
+            end += 1
+        group = ordered[index:end]
+        apart = len({item.classes for item in group}) > 1
+        before = None if memo is None or not apart else dict(memo)
+        for item in group:
+            key = (item.text, item.classes)
+            entries = walked.get(key)
+            if entries is None:
+                entries = _walk_held_loader(item.loader, key, memo, before)
+                walked[key] = entries
+            found = by_position.setdefault(position, [])
+            if entries not in found:
+                found.append(entries)
+        index = end
+    keyed = dict[str, dict[str, str]]()
+    for position, found in by_position.items():
+        for entries in found:
+            content = position if len(found) == 1 else f"{position}\0{_held_token({'': entries})}"
+            keyed[xxhash.xxh64(content.encode()).hexdigest()] = entries
+    return dict(sorted(keyed.items()))
+
+
+def _walk_held_loader(
+    loader: Any,
+    key: tuple[str, tuple[int, ...]],
+    memo: dict[tuple[str, tuple[int, ...]], tuple[Any, dict[str, str]]] | None,
+    before: dict[tuple[str, tuple[int, ...]], tuple[Any, dict[str, str]]] | None,
+) -> dict[str, str]:
+    """`get_loader_fingerprint(loader)` with no read recorded, kept in the stage's `memo` under
+    `key`; with `before`, walked with a copy of it as the memo instead (`_held_loader_entries`)."""
+    cached = None if memo is None else memo.get(key)
+    if cached is not None:
+        return cached[1]
+    reads_token = _recorded_reads.set(None)
+    memo_token = None if before is None else _held_memo.set(dict(before))
+    try:
+        entries = get_loader_fingerprint(loader)
+    finally:
+        if memo_token is not None:
+            _held_memo.reset(memo_token)
+        _recorded_reads.reset(reads_token)
+    if memo is not None:
+        memo[key] = (loader, entries)
+    return entries
 
 
 def _held_token(entries: Mapping[str, Mapping[str, str]]) -> str:
@@ -2301,28 +2460,27 @@ def _held_token(entries: Mapping[str, Mapping[str, str]]) -> str:
 
 
 def _merge_held_loaders(
-    manifest: dict[str, str], held: list[tuple[Any, str]], *, record: bool
+    manifest: dict[str, str], held: list[_HeldLoader], *, read: str | None
 ) -> None:
     """Add to `manifest` the fingerprint of each pivot loader in `held`, under
     `held:<digest>:` (`_held_loader_entries`; the digest is hexadecimal, so the prefix holds no
-    `:` and no user name: `_held_entry`). With `record`, inside a cacheable stage walk, record
-    one read (`hl`) of the value being visited, whose token is those fingerprints: a cache hit
-    fingerprints its held loaders again, as each run fingerprints a top-level loader."""
+    `:` and no user name: `_held_entry`). With `read` (`hl` for a partial's arguments, `hd` for
+    a dataclass field default), inside a cacheable stage walk, record one read of the value
+    being visited, whose token is those fingerprints: a cache hit fingerprints its held loaders
+    again, as each run fingerprints a top-level loader."""
     entries = _held_loader_entries(held)
     for digest, loader_entries in entries.items():
         _merge_prefixed(manifest, f"held:{digest}:", loader_entries)
     reads = _recorded_reads.get()
-    if record and entries and reads is not None:
-        reads.append(((*_walk_path.get(), "hl"), _held_token(entries)))
+    if read is not None and entries and reads is not None:
+        reads.append(((*_walk_path.get(), read), _held_token(entries)))
 
 
-def _held_loaders_token(value: Any) -> str:
-    """The `hl` read token of `value` (`_merge_held_loaders`), a partial (its arguments and
-    keywords) or a dataclass field default: the fingerprints of the pivot loaders it holds."""
-    parts = (value.args, value.keywords) if isinstance(value, functools.partial) else (value,)
-    with _collecting_held_loaders() as held:
-        for part in parts:
-            _canonicalize_value_for_hash(part)
+def _held_loaders_token(value: Any, step: str) -> str:
+    """The read token of `value` (`_merge_held_loaders`): for `hl` a partial, its arguments and
+    keywords; for `hd` a dataclass field default. The fingerprints of the loaders it holds."""
+    parts = _partial_parts(value) if step == "hl" else [("default", value)]
+    _texts, held = _serialize_collecting(parts)
     return _held_token(_held_loader_entries(held))
 
 
@@ -2351,6 +2509,112 @@ def _user_defined_method(cls: type, name: str) -> Callable[..., Any] | None:
                 return function
             return None
     return None
+
+
+_LOADER_METHODS = ("load", "save", "empty")
+
+
+def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
+    """The user members of a loader class that its user-defined `load`, `save` and `empty`
+    reach, each with its manifest reference (`<module>.<defining class>.<label>`).
+
+    Code reaches a member by reading `self.<name>` (or `cls.<name>`: an attribute of a
+    method's first parameter) or `super().<name>`, and the functions such names hold reach
+    further: a helper method, a property's getter and setter, a static or class method. A name
+    is looked up on the class's MRO as Python looks it up, from after the defining class for
+    `super()`. A dataclass field is config (`loader_config_text`), not a member; a name a
+    library class answers is framework code. A member no reaching code reads is not walked, so
+    an unused helper adds no entry and no refusal.
+    """
+
+    def collect() -> list[tuple[str, Any]]:
+        mro = loader_type.__mro__
+        fields = (
+            {field.name for field in dataclasses.fields(loader_type)}
+            if dataclasses.is_dataclass(loader_type)
+            else set[str]()
+        )
+        found = list[tuple[str, Any]]()
+        seen = set[tuple[int, str]]()
+        work = list[tuple[Any, type, bool]]()  # a function, its class, whether it takes self
+        for name in _LOADER_METHODS:
+            resolved = _loader_member(mro, name, 0, fields)
+            if resolved is None:
+                continue
+            owner, raw = resolved
+            seen.add((id(owner), name))
+            function = getattr(raw, "__func__", raw)
+            if inspect.isfunction(function):
+                work.append((function, owner, not isinstance(raw, staticmethod)))
+        while work:
+            function, defined_in, takes_self = work.pop()
+            tree = _source_tree(function)
+            if tree is None:
+                continue
+            for via_super, name in _member_reads(tree, takes_self):
+                start = mro.index(defined_in) + 1 if via_super else 0
+                resolved = _loader_member(mro, name, start, fields)
+                if resolved is None:
+                    continue
+                owner, raw = resolved
+                if (id(owner), name) in seen:
+                    continue
+                seen.add((id(owner), name))
+                owner_ref = _definition_ref(owner)
+                for label, member in _class_member_parts(name, raw):
+                    if member is None:
+                        continue
+                    value = _user_member_value(member)
+                    if value is _UNREAD:
+                        continue
+                    found.append((f"{owner_ref}.{label}", value))
+                    if inspect.isfunction(value):
+                        work.append((value, owner, not isinstance(raw, staticmethod)))
+        return found
+
+    return _memoized("loader-members", loader_type, collect)
+
+
+def _loader_member(
+    mro: tuple[type, ...], name: str, start: int, fields: set[str]
+) -> tuple[type, Any] | None:
+    """The user class on `mro[start:]` that holds `name` and the raw member it holds, as an
+    attribute lookup finds it; None for a dataclass field, an absent name, or a name a library
+    class holds first."""
+    if name in fields:
+        return None
+    for klass in mro[start:]:
+        if name in vars(klass):
+            return (klass, vars(klass)[name]) if is_user_code(klass) else None
+    return None
+
+
+def _member_reads(tree: ast.Module, takes_self: bool) -> list[tuple[bool, str]]:
+    """The class members a method's body reads: `(False, name)` for `self.name`, through the
+    method's first parameter when it takes one, and `(True, name)` for `super().name`."""
+    function = next(
+        (node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))),
+        None,
+    )
+    if function is None:
+        return []
+    parameters = [*function.args.posonlyargs, *function.args.args]
+    receiver = parameters[0].arg if takes_self and parameters else None
+    reads = list[tuple[bool, str]]()
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Attribute):
+            continue
+        base = node.value
+        if receiver is not None and isinstance(base, ast.Name) and base.id == receiver:
+            reads.append((False, node.attr))
+        elif (
+            isinstance(base, ast.Call)
+            and isinstance(base.func, ast.Name)
+            and base.func.id == "super"
+            and not base.args
+        ):
+            reads.append((True, node.attr))
+    return reads
 
 
 def _is_unsafe_fingerprinting_enabled() -> bool:
@@ -3058,13 +3322,11 @@ def _process_partial_dependency(
     instance (`partial(Scaler(3).apply)`, `partial(default_rng(SEED).normal)`) or a callable
     instance is refused like a bare one, since no hash records the state it carries.
     """
-    with _collecting_held_loaders() as held:
-        args_str = _serialize_value_for_hash(partial_obj.args)
-        kwargs_str = _serialize_value_for_hash(partial_obj.keywords)
+    (args_str, kwargs_str), held = _serialize_collecting(_partial_parts(partial_obj))
     manifest[f"partial:{binding_ref}.args"] = xxhash.xxh64(args_str.encode()).hexdigest()
     manifest[f"partial:{binding_ref}.kwargs"] = xxhash.xxh64(kwargs_str.encode()).hexdigest()
     if held:
-        _merge_held_loaders(manifest, held, record=True)
+        _merge_held_loaders(manifest, held, read="hl")
 
     underlying = partial_obj.func
     _record_read(partial_obj, "pf")
@@ -3470,6 +3732,9 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         pattern = cast("re.Pattern[Any]", value)
         return ["re.Pattern", _canonicalize_value_for_hash(pattern.pattern), pattern.flags]
     if id(value) in active:
+        cycle = _form_cycle.get()
+        if cycle is not None:
+            cycle[0] = True
         return ["cycle", len(active) - active.index(id(value))]
     # An exact dict, list, tuple, set, frozenset or bytes skips every branch up to the container
     # branches: an exact instance has no `__dict__`, is not callable, and neither its type nor
@@ -3550,15 +3815,22 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         if isinstance(value, (functools.partial, functools.partialmethod)):
             partial_value = cast("Any", value)
             inner = (*active, id(partial_value))
-            return [
-                "partial",
-                _canonicalize_value_for_hash(partial_value.func, inner),
-                _canonicalize_value_for_hash(partial_value.args, inner),
-                _canonicalize_value_for_hash(partial_value.keywords, inner),
-            ]
+            parts = (
+                ("f", partial_value.func),
+                ("a", partial_value.args),
+                ("k", partial_value.keywords),
+            )
+            if _held_loaders.get() is None:
+                return [
+                    "partial",
+                    *(_canonicalize_value_for_hash(part, inner) for _, part in parts),
+                ]
+            return ["partial", *(_canonical_at(step, part, inner) for step, part in parts)]
     if isinstance(value, dict):
         mapping = cast("dict[Any, Any]", value)
         inner = (*active, id(mapping))
+        if _held_loaders.get() is not None:
+            return ["dict", _canonical_entries_at(mapping, inner)]
         entries = [
             [_canonicalize_value_for_hash(key, inner), _canonicalize_value_for_hash(item, inner)]
             for key, item in mapping.items()
@@ -3568,8 +3840,11 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     if isinstance(value, (list, tuple, set, frozenset)):
         collection = cast("list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]", value)
         inner = (*active, id(collection))
+        unordered = isinstance(collection, (set, frozenset))
+        if _held_loaders.get() is not None:
+            return [type(collection).__name__, _canonical_items_at(collection, inner, unordered)]
         items = [_canonicalize_value_for_hash(item, inner) for item in collection]
-        if isinstance(collection, (set, frozenset)):
+        if unordered:
             items.sort(key=json.dumps)
         return [type(collection).__name__, items]
     if isinstance(value, types.ModuleType):
@@ -3580,20 +3855,10 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         return ["secret", parameters.secret_digest(value)]
     if not isinstance(value, type) and dataclasses.is_dataclass(cast("object", value)):
         inner = (*active, id(value))
+        if _is_pivot_loader(value):
+            return _canonical_loader(value, inner)
         fields = {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
-        held = _held_loaders.get()
-        if held is None or not _is_pivot_loader(value):
-            return [_definition_ref(type(value)), _canonicalize_value_for_hash(fields, inner)]
-        # While a holder's value is serialized, each pivot loader in it is noted with its form,
-        # for the holder to fingerprint (`_collecting_held_loaders`). The loaders a held loader
-        # holds in turn are in its own fingerprint, so they are not noted for its holder.
-        token = _held_loaders.set(None)
-        try:
-            canonical = [_definition_ref(type(value)), _canonicalize_value_for_hash(fields, inner)]
-        finally:
-            _held_loaders.reset(token)
-        held.append((value, json.dumps(canonical)))
-        return canonical
+        return [_definition_ref(type(value)), _canonicalize_value_for_hash(fields, inner)]
     if type(value).__repr__ is object.__repr__ and _has_attribute(value, "__dict__"):
         inner = (*active, id(value))
         attributes: Any = vars(value)
@@ -3605,6 +3870,121 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
             attributes = {name: item for name, item in own.items() if name != _BY_NAME_MARK}
         return [_definition_ref(type(value)), _canonicalize_value_for_hash(attributes, inner)]
     return [type(value).__name__, repr(value)]
+
+
+def _canonical_at(step: str, value: Any, active: tuple[int, ...]) -> Any:
+    """`_canonicalize_value_for_hash(value, active)`, one `step` further on `_held_path`."""
+    token = _held_path.set((*_held_path.get(), [step]))
+    try:
+        return _canonicalize_value_for_hash(value, active)
+    finally:
+        _held_path.reset(token)
+
+
+def _ranked(texts: list[str], cells: list[list[str]], prefix: str) -> list[int]:
+    """The indexes of `texts` in sorted order. Each cell gets its text's rank in that order,
+    after `prefix`; equal texts share a rank, so no rank follows the hash seed."""
+    order = sorted(range(len(texts)), key=texts.__getitem__)
+    rank = 0
+    for position, index in enumerate(order):
+        if position and texts[index] != texts[order[position - 1]]:
+            rank = position
+        cells[index][0] = f"{prefix}{rank}"
+    return order
+
+
+def _canonical_items_at(
+    items: Collection[Any], active: tuple[int, ...], unordered: bool
+) -> list[Any]:
+    """The canonical forms of a list's, tuple's or set's items while held loaders are collected:
+    each item one step further on `_held_path`, its index, or for a set its rank among the sorted
+    forms (`_ranked`); a set's forms are sorted, as `_canonicalize_value_for_hash` sorts them."""
+    path = _held_path.get()
+    forms = list[Any]()
+    cells = list[list[str]]()
+    for index, item in enumerate(items):
+        cell = ["" if unordered else str(index)]
+        token = _held_path.set((*path, cell))
+        try:
+            forms.append(_canonicalize_value_for_hash(item, active))
+        finally:
+            _held_path.reset(token)
+        cells.append(cell)
+    if not unordered:
+        return forms
+    return [forms[index] for index in _ranked([json.dumps(form) for form in forms], cells, "s")]
+
+
+def _canonical_entries_at(mapping: Mapping[Any, Any], active: tuple[int, ...]) -> list[Any]:
+    """A dict's sorted canonical `[key, value]` entries while held loaders are collected: each
+    entry one step further on `_held_path`, its rank among the sorted entries (`_ranked`), then
+    `k` for its key or `v` for its value."""
+    path = _held_path.get()
+    entries = list[Any]()
+    cells = list[list[str]]()
+    for key, item in mapping.items():
+        cell = [""]
+        entries.append(
+            [
+                _canonical_at_cell(path, cell, "k", key, active),
+                _canonical_at_cell(path, cell, "v", item, active),
+            ]
+        )
+        cells.append(cell)
+    return [entries[index] for index in _ranked([json.dumps(e) for e in entries], cells, "d")]
+
+
+def _canonical_at_cell(
+    path: tuple[list[str], ...], cell: list[str], step: str, value: Any, active: tuple[int, ...]
+) -> Any:
+    """`_canonicalize_value_for_hash(value, active)` at `path`, then `cell`, then `step`."""
+    token = _held_path.set((*path, cell, [step]))
+    try:
+        return _canonicalize_value_for_hash(value, active)
+    finally:
+        _held_path.reset(token)
+
+
+def _canonical_loader(loader: Any, inner: tuple[int, ...]) -> Any:
+    """The canonical form of a pivot loader, `[module.qualname, canonical({field: value})]` as
+    any dataclass instance's, `inner` ending with its id.
+
+    While a holder's value is serialized (`_serialize_collecting`), the loader is noted with
+    its form, the ids of the classes in it and its position, for the holder to fingerprint. The
+    loaders inside it are its own fingerprint's, so they are not noted for the holder. A form
+    that holds no cycle is the same wherever the loader sits, so it is kept for the stage
+    (`_form_memo`): a chain of held loaders is canonicalized once, not once per level."""
+    memo = _form_memo.get()
+    form = None if memo is None else memo.get(id(loader))
+    if form is None:
+        loader_type: type[Any] = type(cast("object", loader))
+        classes = list[int]()
+        cycle = [False]
+        held_token = _held_loaders.set(None)
+        classes_token = _form_classes.set(classes)
+        cycle_token = _form_cycle.set(cycle)
+        try:
+            fields = {
+                field.name: getattr(loader, field.name) for field in dataclasses.fields(loader)
+            }
+            canonical = [_definition_ref(loader_type), _canonicalize_value_for_hash(fields, inner)]
+        finally:
+            _form_cycle.reset(cycle_token)
+            _form_classes.reset(classes_token)
+            _held_loaders.reset(held_token)
+        form = _LoaderForm(loader, canonical, json.dumps(canonical), (id(loader_type), *classes))
+        if not cycle[0]:
+            if memo is not None:
+                memo[id(loader)] = form
+        elif (outer := _form_cycle.get()) is not None:
+            outer[0] = True
+    outer_classes = _form_classes.get()
+    if outer_classes is not None:
+        outer_classes.extend(form.classes)
+    held = _held_loaders.get()
+    if held is not None:
+        held.append(_HeldLoader(loader, form.text, form.classes, _held_path.get()))
+    return form.canonical
 
 
 def _add_callable_to_manifest(
@@ -3918,6 +4298,8 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
                 # Marshal captures constants as well as bytecode, so `x + 1` and `x + 999`
                 # differ. Remove embedded source paths before hashing to keep it portable.
                 return _hash_code_object(func.__code__)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType] - hasattr guards access
+            if isinstance(func, type):
+                return _sourceless_class_hash(func)
             # KNOWN ISSUE: Using id(func) is non-deterministic across runs
             # This affects lambdas without source code, causing unnecessary re-runs
             if is_user_code(func):
@@ -3949,6 +4331,103 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         return xxhash.xxh64(ast_str.encode()).hexdigest()
     finally:
         metrics.end("fingerprint._compute_function_hash", _t)
+
+
+# A repr that holds a memory address, which differs in each process.
+_ADDRESS = re.compile(r" at 0x[0-9a-fA-F]+")
+# Namespace entries every class has whose text says nothing of what defines it.
+_CLASS_NAMESPACE_NOISE = frozenset(("__dict__", "__weakref__", "__doc__"))
+
+
+def _sourceless_class_hash(cls: type) -> str:
+    """The hash of a class with no source of its own (`collections.namedtuple`,
+    `dataclasses.make_dataclass`, a functional `enum.Enum`, `type(...)`): its module, name and
+    bases, and each entry of its own namespace (`_sourceless_form`). It is the same in every
+    process, and it changes when what defines the class changes: its fields, its members, or
+    the code of a function it holds."""
+    namespace = vars(cls)
+    parts: list[Any] = [
+        "class",
+        cls.__module__,
+        cls.__qualname__,
+        [_definition_ref(base) for base in cls.__bases__],
+    ]
+    for name in sorted(namespace):
+        if name not in _CLASS_NAMESPACE_NOISE:
+            parts.append([name, _sourceless_form(namespace[name])])
+    return xxhash.xxh64(json.dumps(parts).encode()).hexdigest()
+
+
+def _sourceless_form(value: Any) -> Any:
+    """A form of one namespace entry of a class with no source (`_sourceless_class_hash`)
+    that holds no address: a function by its code, a library function by its name, a class by
+    its name, a dataclass's fields by their names, types and defaults, and any other value by
+    its canonical form, or by its type's name when that form holds an address."""
+    if isinstance(value, (staticmethod, classmethod)):
+        wrapper = cast("staticmethod[..., Any] | classmethod[Any, ..., Any]", value)
+        return [type(wrapper).__name__, _sourceless_form(cast("Any", wrapper).__func__)]
+    if isinstance(value, property):
+        return ["property", *(_sourceless_form(part) for part in (value.fget, value.fset))]
+    if inspect.isfunction(value):
+        return _sourceless_function_form(value)
+    if isinstance(value, type):
+        return ["class", _definition_ref(value)]
+    if isinstance(value, dataclasses.Field):
+        field = cast("dataclasses.Field[Any]", value)
+        return [
+            "field",
+            field.name,
+            _sourceless_form(field.type),
+            _sourceless_form(field.default),
+            _sourceless_form(field.default_factory),
+        ]
+    if value is dataclasses.MISSING:
+        return ["missing"]
+    if isinstance(value, dict) and any(
+        isinstance(item, dataclasses.Field) for item in cast("dict[Any, Any]", value).values()
+    ):
+        mapping = cast("dict[str, Any]", value)
+        return ["fields", [[name, _sourceless_form(item)] for name, item in mapping.items()]]
+    form = _canonicalize_value_for_hash(value)
+    if _ADDRESS.search(json.dumps(form)):
+        return ["opaque", _definition_ref(type(cast("object", value)))]
+    return form
+
+
+def _sourceless_function_form(function: types.FunctionType) -> Any:
+    """A function a class with no source holds: by its code hash when it was compiled from a
+    user source file, by its name when from a library file, and otherwise (code generated by
+    `exec`, as `namedtuple` and `make_dataclass` make it) by its code object and defaults."""
+    filename = function.__code__.co_filename
+    if _is_user_source_file(filename):
+        return ["function", hash_function_ast(function)]
+    if os.path.isfile(filename):
+        return ["external", f"{function.__module__}.{function.__qualname__}"]
+    return [
+        "code",
+        _code_form(function.__code__),
+        _sourceless_form(function.__defaults__),
+        _sourceless_form(function.__kwdefaults__),
+    ]
+
+
+def _code_form(code: types.CodeType) -> list[Any]:
+    """The parts of a code object that decide what it does, without its file name or line
+    numbers; constants by their canonical form, so a frozenset constant is not in hash-seed
+    order."""
+    return [
+        code.co_code.hex(),
+        [
+            _code_form(constant)
+            if isinstance(constant, types.CodeType)
+            else _canonicalize_value_for_hash(constant)
+            for constant in code.co_consts
+        ],
+        list(code.co_names),
+        list(code.co_varnames),
+        list(code.co_freevars),
+        [code.co_argcount, code.co_posonlyargcount, code.co_kwonlyargcount, code.co_flags],
+    ]
 
 
 def _normalize_ast(node: ast.AST) -> ast.AST:

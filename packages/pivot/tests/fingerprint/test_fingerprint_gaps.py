@@ -5,7 +5,9 @@
 import json
 import pathlib
 import py_compile
+import shutil
 import subprocess
+import sys
 
 import pytest
 import yaml
@@ -85,9 +87,13 @@ def _count(project: pathlib.Path) -> object:
     return yaml.safe_load((project / "data" / "t" / "count.yaml").read_text())["v"]
 
 
-def _repro_statuses(project: pathlib.Path, home: pathlib.Path) -> dict[str, str]:
-    """Run `pivot repro --json` and return each stage's completion status."""
-    result = helpers.run_pivot(project, home, "repro", "--json")
+def _repro_statuses(
+    project: pathlib.Path, home: pathlib.Path, seed: str | None = None
+) -> dict[str, str]:
+    """Run `pivot repro --json` (with `PYTHONHASHSEED=seed` when given) and return each stage's
+    completion status."""
+    extra_env = None if seed is None else {"PYTHONHASHSEED": seed}
+    result = helpers.run_pivot(project, home, "repro", "--json", extra_env=extra_env)
     assert result.returncode == 0, result.stdout + result.stderr
     statuses = dict[str, str]()
     for line in result.stdout.splitlines():
@@ -2100,30 +2106,248 @@ class Both(loaders.Reader[str]):
         return "|".join(reader.load(path) for reader in self.readers)
 
 
+@dataclasses.dataclass(frozen=True)
+class Wrap(loaders.Reader[str]):
+    inner: loaders.Reader[str]
+
+    def load(self, path: pathlib.Path) -> str:
+        return self.inner.load(path)
+
+
 @stage
 def use(text: str) -> str:
     return text
 
 
 with Pipeline("t") as pipeline:
-    use(pipeline.input("lines.txt", format=Both((First(), Second()))))
+    use(pipeline.input("lines.txt", format=FORMAT))
 """
 
+# A loader holding two classes one factory made, which look alike in the config text, and an
+# edit: to the suffix the second is made with, or a swap of the two.
+_FACTORY_EDITS = {
+    "edit-the-second": (
+        "Both((First(), Second()))",
+        ('make_reader("A")', 'make_reader("B")'),
+        "first|B",
+    ),
+    "swap": (
+        "Both((First(), Second()))",
+        ("Both((First(), Second()))", "Both((Second(), First()))"),
+        "A|first",
+    ),
+    "edit-the-second-wrapped": (
+        "Both((Wrap(First()), Wrap(Second())))",
+        ('make_reader("A")', 'make_reader("B")'),
+        "first|B",
+    ),
+}
 
-def test_an_edit_to_one_of_two_factory_classes_reruns_its_stage(tmp_path: pathlib.Path) -> None:
+
+@pytest.mark.parametrize("shape", sorted(_FACTORY_EDITS))
+def test_an_edit_to_one_of_two_factory_classes_reruns_its_stage(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
     """`First` and `Second` come from one factory, so they share a name and a canonical form.
-    Each is fingerprinted, so changing the suffix `Second` is made with reruns the stage."""
+    Each held loader is keyed by its position and fingerprinted on its own, so a new suffix for
+    `Second`, held directly or inside a holder, or a swap of the two reruns the stage."""
     home = tmp_path / "home"
-    project = _project(tmp_path, {"factory.py": _FACTORY, "pipeline.py": _TWO_FACTORY_CLASSES})
+    held, (old, new), after = _FACTORY_EDITS[shape]
+    pipeline = _TWO_FACTORY_CLASSES.replace("FORMAT", held)
+    project = _project(tmp_path, {"factory.py": _FACTORY, "pipeline.py": pipeline})
     output = project / "data" / "t" / "use.txt"
     line = "Local Set Default Proof Using"
     assert _repro_statuses(project, home) == {"t/use": "ran"}
     assert output.read_text() == f"{line}first|{line}A"
-    _edit(project, "pipeline.py", 'make_reader("A")', 'make_reader("B")')
+    _edit(project, "pipeline.py", old, new)
 
     assert _repro_statuses(project, home) == {"t/use": "ran"}
-    assert output.read_text() == f"{line}first|{line}B"
+    assert output.read_text() == "|".join(f"{line}{suffix}" for suffix in after.split("|"))
     assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_CYCLIC_SET = """\
+import dataclasses
+from typing import Any
+import pathlib
+
+from pivot import Pipeline, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class SetA(loaders.Reader[str]):
+    tag: str
+    other: Any = dataclasses.field(default=None, compare=False, hash=False)
+
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text().splitlines()[0] + self.tag
+
+
+@dataclasses.dataclass(frozen=True)
+class SetB(loaders.Reader[str]):
+    tag: str
+    other: Any = dataclasses.field(default=None, compare=False, hash=False)
+
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text().splitlines()[0] + self.tag
+
+
+A = SetA("A")
+B = SetB("B")
+object.__setattr__(A, "other", B)
+object.__setattr__(B, "other", A)
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class SetReader(loaders.Reader[str]):
+    readers: frozenset
+
+    def load(self, path: pathlib.Path) -> str:
+        return "|".join(sorted(reader.load(path) for reader in self.readers))
+
+
+@stage
+def use(text: str) -> str:
+    return text
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", format=SetReader(frozenset((A, B)))))
+"""
+
+
+def _first_of_the_set(seed: str) -> str:
+    """The member a two-member frozenset yields first under `PYTHONHASHSEED=seed`: the set
+    `frozenset((A, B))` of `_CYCLIC_SET`, whose members hash as `("A",)` and `("B",)` do."""
+    code = 'print(next(iter(frozenset((("A",), ("B",))))))'
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env={**helpers.clean_env(), "PYTHONHASHSEED": seed},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def test_a_set_of_loaders_in_a_cycle_is_reused_under_any_hash_seed(tmp_path: pathlib.Path) -> None:
+    """`SetA("A")` and `SetB("B")` hold each other and sit in a frozenset, whose order follows
+    the hash seed. A run under a seed that yields them in the other order reuses the first
+    run's result, and so does a run under the first seed again."""
+    home = tmp_path / "home"
+    project = _project(tmp_path, {"pipeline.py": _CYCLIC_SET})
+    seeds = dict[str, str]()
+    for seed in map(str, range(32)):
+        seeds.setdefault(_first_of_the_set(seed), seed)
+    assert len(seeds) == 2, seeds
+    first, other = seeds.values()
+
+    assert _repro_statuses(project, home, seed=first) == {"t/use": "ran"}
+    assert _repro_statuses(project, home, seed=other) == {"t/use": "cached"}
+    assert _repro_statuses(project, home, seed=first) == {"t/use": "cached"}
+
+
+_UNUSED_MEMBERS = """\
+import dataclasses
+import pathlib
+
+from pivot import loaders
+
+COLUMNS = ["a", "b"]
+NAME = "n"
+
+
+@dataclasses.dataclass(frozen=True)
+class Inner(loaders.Reader[str]):
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text().splitlines()[0] + "A"
+
+    def describe(self) -> str:
+        return ",".join(COLUMNS)
+
+    @property
+    def columns(self) -> list:
+        return COLUMNS
+
+    def name(self) -> str:
+        return NAME
+"""
+
+
+@pytest.mark.parametrize("held", [False, True], ids=["top-level", "held"])
+def test_a_member_no_loader_method_reaches_is_not_walked(
+    tmp_path: pathlib.Path, held: bool
+) -> None:
+    """`Inner.load` reads none of `describe`, `columns` and `name`. The first two read a list
+    global, which the walk would refuse, and the third a string. None of them is walked: the
+    stage runs, and an edit to the string only they read reuses the result."""
+    home = tmp_path / "home"
+    stage = _held_stage("Outer(Inner())" if held else "Inner()")
+    project = _project(
+        tmp_path, {"inner.py": _UNUSED_MEMBERS, "pipeline.py": _HELD_INSTANCE_HEADER + stage}
+    )
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    _edit(project, "inner.py", 'NAME = "n"', 'NAME = "m"')
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_SOURCELESS_LOADER = """\
+import collections
+import dataclasses
+import enum
+import pathlib
+
+from pivot import loaders
+
+DEFINITION
+
+
+@dataclasses.dataclass(frozen=True)
+class Inner(loaders.Reader[str]):
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text().splitlines()[0] + KIND.__name__[:0] + "A"
+"""
+
+# A class with no source of its own that `Inner.load` reads, and an edit to what defines it.
+_SOURCELESS_KINDS = {
+    "namedtuple": (
+        'KIND = collections.namedtuple("Row", "left right")',
+        ('"left right"', '"left middle"'),
+    ),
+    "make-dataclass": (
+        'KIND = dataclasses.make_dataclass("Gen", [("x", int)])',
+        ('("x", int)', '("y", int)'),
+    ),
+    "functional-enum": ('KIND = enum.Enum("Mode", "A B")', ('"A B"', '"A C"')),
+    "type-call": ('KIND = type("Made", (), {"x": 1})', ('{"x": 1}', '{"x": 2}')),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_SOURCELESS_KINDS))
+def test_a_class_with_no_source_is_hashed_the_same_in_every_process(
+    tmp_path: pathlib.Path, kind: str
+) -> None:
+    """`Inner.load` reads a class with no source of its own. Its hash is what defines it, not
+    its address, so an edit elsewhere in its module and a fresh state database reuse the result,
+    and an edit to its definition reruns the stage."""
+    home = tmp_path / "home"
+    definition, (old, new) = _SOURCELESS_KINDS[kind]
+    project = _project(
+        tmp_path,
+        {
+            "inner.py": _SOURCELESS_LOADER.replace("DEFINITION", definition),
+            "pipeline.py": _HELD_INSTANCE_HEADER + _held_stage("Inner()"),
+        },
+    )
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    _edit(project, "inner.py", "from pivot import loaders\n", "from pivot import loaders  # note\n")
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    shutil.rmtree(project / ".pivot" / "state.lmdb")
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "inner.py", old, new)
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
 
 
 _MAPPED_PARTIAL_STAGES = """\
