@@ -23,7 +23,7 @@ from pivot import state_dir as state_dir_mod
 from pivot.cli import decorators as cli_decorators
 from pivot.engine import engine, sinks
 from pivot.executor import core as executor_core
-from pivot.types import OnError
+from pivot.types import OnError, RunEventType, StagesExpandedEvent
 
 if TYPE_CHECKING:
     import concurrent.futures
@@ -403,6 +403,16 @@ class JsonlSink:
             case "pipeline_reloaded":
                 # All fields are JSON-serializable (strings and lists of strings)
                 self._callback(dict(event))
+            case "stages_expanded":
+                self._callback(
+                    dict(
+                        StagesExpandedEvent(
+                            type=RunEventType.STAGES_EXPANDED,
+                            template=event["template"],
+                            stages=event["stages"],
+                        )
+                    )
+                )
             case "engine_state_changed":
                 # Convert state enum to string for JSON serialization
                 self._callback(

@@ -271,8 +271,20 @@ def test_read_refuses_forged_listing_bytes_that_collide_with_the_cache(
 def test_read_names_both_places_when_neither_holds_the_listing(tmp_path: pathlib.Path) -> None:
     record = _helper_record(b"", size=0, nfiles=0)
 
-    with pytest.raises(exceptions.ListingMissingError, match=r"absent\.listing"):
+    with pytest.raises(
+        exceptions.ListingMissingError,
+        match=rf"neither \S*absent\.listing nor the cache object {record['hash']} exists$",
+    ):
         listing.read(tmp_path / "absent.listing", record, tmp_path / "files")
+
+
+def test_read_without_a_cache_says_the_listing_file_does_not_exist(
+    tmp_path: pathlib.Path,
+) -> None:
+    record = _helper_record(b"", size=0, nfiles=0)
+
+    with pytest.raises(exceptions.ListingMissingError, match=r"absent\.listing does not exist$"):
+        listing.read(tmp_path / "absent.listing", record, None)
 
 
 def test_write_replaces_a_listing_atomically_and_leaves_identical_bytes_alone(

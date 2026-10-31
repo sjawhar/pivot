@@ -141,17 +141,21 @@ def resolve_pipeline_file_targets(
 def resolve_targets_to_stages(
     targets: list[str],
     _bipartite_graph: nx.DiGraph[str],
+    *,
+    stages: Mapping[str, RegistryStageInfo] | None = None,
 ) -> tuple[set[str], list[str]]:
     """Resolve targets to stage names.
 
     Stage names are used directly. Artifact paths are resolved to the stages
     that produce them. File paths are resolved by matching against workspace
-    output paths of all registered stages.
+    output paths of all registered stages. ``stages`` are the stages a target may name, the
+    registered ones when None (a caller adds the templates not yet expanded,
+    ``cli_helpers.get_graph_stages``).
 
     Returns:
         Tuple of (resolved stage names, unresolved targets).
     """
-    all_stages = cli_helpers.get_all_stages()
+    all_stages = cli_helpers.get_all_stages() if stages is None else stages
     result = set[str]()
     unresolved = list[str]()
     # Workspace path -> producing stage, built only when a target is not a stage

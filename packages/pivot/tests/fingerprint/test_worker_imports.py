@@ -881,6 +881,161 @@ def test_a_module_a_worker_imports_before_it_gets_its_path_is_the_one_it_uses(
     assert "byname:uuid" in _walk(pipeline)
 
 
+# Mapped stages (Pipeline.map) ------------------------------------------------------------------
+
+
+def _mapped_pipeline(module: str, *, mapped: bool = True, static: bool = True) -> str:
+    """The producer `p/plan` writes a directory; with `mapped`, `p/cut` is mapped over it, and
+    with `static`, the static stage `p/use` reads all of it. Both read module `module` as a
+    global."""
+    return (
+        f"from typing import Annotated\n\nimport {module}\n"
+        + "from pivot import Pipeline, directory, loaders, stage\n\n\n"
+        + "@stage\ndef plan(\n    entries: dict[str, int],\n"
+        + ") -> Annotated[dict[str, dict[str, int]], directory, loaders.YAML[dict[str, int]]()]:\n"
+        + '    return {f"{name}.yaml": {"value": value} for name, value in entries.items()}\n\n\n'
+        + f"@stage\ndef cut(entry: dict[str, int]) -> str:\n    return {module}.plain()\n\n\n"
+        + "@stage\ndef use(entries: dict[str, dict[str, int]]) -> str:\n"
+        + f"    return {module}.plain()\n\n\n"
+        + 'with Pipeline("p") as pipeline:\n'
+        + '    planned = plan(pipeline.input("plan.yaml", t=dict[str, int]))\n'
+        + ("    cut(pipeline.map(planned))\n" if mapped else "")
+        + ("    use(planned)\n" if static else "")
+    )
+
+
+_PLAN = {"data/raw/plan.yaml": "a: 1\n"}
+
+
+def test_an_expanded_instance_whose_module_is_another_file_fails_as_a_static_stage_does(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The program holds its own `wi_mp`, and the root has another. The static stage `p/use`
+    and the instance `p/cut@a` both read it as a global, and each fingerprint fails with the
+    same refusal: an instance is fingerprinted as any stage is."""
+    held = tmp_path / "program" / "wi_mp.py"
+    _held("wi_mp", held, monkeypatch)
+    pipeline = _discover(
+        tmp_path, monkeypatch, {"wi_mp.py": _PLAIN, **_PLAN}, _mapped_pipeline("wi_mp")
+    )
+    assert pipeline.expand_template("p/cut", [("a", "a.yaml")]) == ["p/cut@a"]
+
+    with pytest.raises(exceptions.PivotError, match=_ANOTHER_FILE) as static:
+        pipeline.ensure_fingerprint("p/use")
+    with pytest.raises(exceptions.PivotError, match=_ANOTHER_FILE) as instance:
+        pipeline.ensure_fingerprint("p/cut@a")
+
+    assert f"module 'wi_mp' is {held.resolve()} in this process" in str(instance.value)
+    assert str(instance.value) == str(static.value).replace("'p/use'", "'p/cut@a'")
+
+
+def test_an_expanded_instance_records_its_by_name_modules_outside_the_lock(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The instance reads the library `wi_ml`, which the root has no file for, so its worker
+    imports the program's: the walk names it (`byname:`), and the instance's fingerprint, which
+    its lock records, does not, as for a static stage."""
+    site = tmp_path / "lib" / "site-packages"
+    _held("wi_ml", site / "wi_ml.py", monkeypatch)
+    monkeypatch.syspath_prepend(str(site))
+    pipeline = _discover(tmp_path, monkeypatch, _PLAN, _mapped_pipeline("wi_ml"))
+    pipeline.expand_template("p/cut", [("a", "a.yaml")])
+
+    walked = fingerprint.get_stage_fingerprint(pipeline.get_stage("p/cut@a")["func"])
+    recorded = {name: pipeline.ensure_fingerprint(name) for name in ("p/use", "p/cut@a")}
+
+    assert walked.get("byname:wi_ml") == "", walked
+    for name, entries in recorded.items():
+        assert not any("byname:" in key for key in entries), (name, entries)
+
+
+_MAPPED_OUTPUT_LOADER = """\
+import dataclasses
+import pathlib
+from typing import Annotated
+
+import wi_mq
+from pivot import Pipeline, directory, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Located(loaders.Loader[str, str]):
+    def load(self, path: pathlib.Path) -> str:
+        return wi_mq.plain()
+
+    def save(self, data: str, path: pathlib.Path) -> None:
+        path.write_text(wi_mq.plain())
+
+
+@stage
+def plan(
+    entries: dict[str, int],
+) -> Annotated[dict[str, dict[str, int]], directory, loaders.YAML[dict[str, int]]()]:
+    return {f"{name}.yaml": {"value": value} for name, value in entries.items()}
+
+
+@stage
+def cut(entry: dict[str, int]) -> Annotated[str, Located()]:
+    return str(entry["value"])
+
+
+with Pipeline("p") as pipeline:
+    planned = plan(pipeline.input("plan.yaml", t=dict[str, int]))
+    cut(pipeline.map(planned))
+"""
+
+
+def test_an_expanded_instances_output_loader_module_is_compared(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The output loader of the mapped stage `p/cut` reads the project's `wi_mq`, which the
+    program holds from its own file: the instance's fingerprint fails as a static stage's does.
+    The loader's entries are placed under the instance's own output key (`out:p/cut@a:`), so the
+    check reads them only when the instance's output keys are the ones passed (#546)."""
+    held = tmp_path / "program" / "wi_mq.py"
+    _held("wi_mq", held, monkeypatch)
+    pipeline = _discover(
+        tmp_path, monkeypatch, {"wi_mq.py": _PLAIN, **_PLAN}, _MAPPED_OUTPUT_LOADER
+    )
+    assert pipeline.expand_template("p/cut", [("a", "a.yaml")]) == ["p/cut@a"]
+
+    with pytest.raises(exceptions.PivotError, match=_ANOTHER_FILE) as instance:
+        pipeline.ensure_fingerprint("p/cut@a")
+
+    assert f"module 'wi_mq' is {held.resolve()} in this process" in str(instance.value)
+
+
+@pytest.mark.parametrize(
+    ("mapped", "stage", "output"),
+    [
+        pytest.param(False, "p/use", "use.txt", id="static-stage"),
+        pytest.param(True, "p/cut@a", "cut@a.txt", id="mapped-instance"),
+    ],
+)
+def test_a_stage_after_its_producer_whose_module_is_another_file_fails_the_run(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mapped: bool, stage: str, output: str
+) -> None:
+    """The producer runs; the run then reaches the stage that reads the program's `wi_mr`, the
+    static `p/use` or the instance `p/cut@a` the run adds, and fails at its fingerprint the same
+    way: no worker runs the root's `wi_mr` under a fingerprint of the program's."""
+    _held("wi_mr", tmp_path / "program" / "wi_mr.py", monkeypatch)
+    _discover(
+        tmp_path,
+        monkeypatch,
+        {"wi_mr.py": _PLAIN, **_PLAN},
+        _mapped_pipeline("wi_mr", mapped=mapped, static=not mapped),
+    )
+    data = tmp_path / "project" / "data" / "p"
+
+    # The engine's task group wraps the refusal of a stage that starts after another finishes
+    refusal = pytest.RaisesExc(exceptions.PivotError, match=f"Stage '{stage}'.*{_ANOTHER_FILE}")
+    with pytest.RaisesGroup(refusal, allow_unwrapped=True):
+        executor.run()
+
+    assert (data / "plan" / "a.yaml").exists()
+    assert not (data / output).exists()
+
+
 # The `pivot` command ----------------------------------------------------------------------------
 
 

@@ -10,15 +10,16 @@ import shutil
 import socket
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
-from unittest.mock import MagicMock
+from typing import TYPE_CHECKING, Annotated, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import anyio
 import anyio.to_thread
 import pytest
 
-from pivot import executor
+from pivot import compose, executor, loaders
 from pivot.compose import Pipeline
+from pivot.engine import sources
 from pivot.engine.agent_rpc import (
     AgentRpcHandler,
     AgentRpcSource,
@@ -26,6 +27,7 @@ from pivot.engine.agent_rpc import (
     CommitResult,
     EventBuffer,
     QueryResult,
+    QueryStageInfoResult,
     QueryStatusResult,
 )
 from pivot.engine.engine import Engine
@@ -35,6 +37,8 @@ from pivot.types import ChangeType, DataDiffResult, StageExplanation
 from tests import helpers
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pivot.registry import PipelineLike
 
 
@@ -45,6 +49,23 @@ def _helper_valid_stage() -> dict[str, int]:
 def _helper_explained_stage(input_file: str) -> str:
     _ = input_file
     return "explained"
+
+
+@compose.stage
+def _helper_plan(
+    raw: dict[str, int],
+) -> Annotated[dict[str, dict[str, int]], compose.directory, loaders.YAML[dict[str, int]]()]:
+    return {f"{name}.yaml": {"value": value} for name, value in raw.items()}
+
+
+@compose.stage
+def _helper_cut(entry: dict[str, int]) -> dict[str, int]:
+    return entry
+
+
+@compose.stage
+def _helper_build(cut: dict[str, int]) -> dict[str, int]:
+    return cut
 
 
 _diff_expected: DataDiffResult | None = None
@@ -802,11 +823,400 @@ async def test_agent_rpc_handler_stages_query_without_pipeline(tmp_path: Path) -
                 response = json.loads(response_line.decode())
 
                 assert "result" in response
-                assert response["result"]["stages"] == [], (
-                    "Should return empty list without pipeline"
+                assert response["result"] == {"stages": [], "templates": {}}, (
+                    "Should return no stage and no template without pipeline"
                 )
 
             tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_stages_query_maps_each_template_to_its_instances(tmp_path: Path) -> None:
+    """The answer names each template beside the stages, with the instances it expanded into;
+    an empty list before it expands. A template is never one of the stages."""
+    with Pipeline("p", root=tmp_path) as pipeline:
+        plan = _helper_plan(pipeline.input("plan.yaml", t=dict[str, int]))
+        _helper_cut(pipeline.map(plan))
+    engine = MagicMock()
+    engine._pipeline = pipeline
+    handler = AgentRpcHandler(engine=engine)
+
+    before = await handler.handle_query("stages")
+    pipeline.expand_template("p/_helper_cut", [("a", "a.yaml"), ("b", "b.yaml")])
+    after = await handler.handle_query("stages")
+
+    assert before == {"stages": ["p/_helper_plan"], "templates": {"p/_helper_cut": []}}
+    instances = ["p/_helper_cut@a", "p/_helper_cut@b"]
+    assert after == {
+        "stages": ["p/_helper_plan", *instances],
+        "templates": {"p/_helper_cut": instances},
+    }
+
+
+def _helper_mapped_pipeline(root: Path, *, chain: bool = False) -> Pipeline:
+    with Pipeline("p", root=root) as pipeline:
+        plan = _helper_plan(pipeline.input("plan.yaml", t=dict[str, int]))
+        cut = _helper_cut(pipeline.map(plan))
+        if chain:
+            _helper_build(cut)
+    return pipeline
+
+
+def _helper_mapped_handler(pipeline: Pipeline) -> AgentRpcHandler:
+    engine = MagicMock()
+    engine._pipeline = pipeline
+    engine.wait_for_fingerprints = AsyncMock()
+    # No run has read the producer's files, or failed a mapped stage
+    engine.expansion_keys = MagicMock(return_value=None)
+    engine.expansion_failure = MagicMock(return_value=None)
+    return AgentRpcHandler(engine=engine)
+
+
+@pytest.mark.anyio
+async def test_stage_info_takes_a_template_name(tmp_path: Path) -> None:
+    """A template's info is the stage as declared: it reads its producer's whole directory."""
+    handler = _helper_mapped_handler(_helper_mapped_pipeline(tmp_path))
+
+    info = cast(
+        "QueryStageInfoResult",
+        await handler.handle_query("stage_info", {"stage": "p/_helper_cut"}),
+    )
+
+    assert info["name"] == "p/_helper_cut"
+    assert [dep["producer"] for dep in info["deps"]] == ["p/_helper_plan"]
+    assert [out["producer"] for out in info["outs"]] == ["p/_helper_cut"]
+
+
+@pytest.mark.anyio
+async def test_an_instance_not_yet_expanded_is_named_as_waiting(tmp_path: Path) -> None:
+    """`stage_info` of an instance its template has not expanded into says so, and `explain` of
+    it, or of the template, explains that a run expands it, as `pivot status` reads it."""
+    handler = _helper_mapped_handler(_helper_mapped_pipeline(tmp_path))
+
+    with pytest.raises(ValueError, match=r"'p/_helper_cut@a' is not yet expanded: "):
+        await handler.handle_query("stage_info", {"stage": "p/_helper_cut@a"})
+    instance = cast(
+        "StageExplanation", await handler.handle_query("explain", {"stage": "p/_helper_cut@a"})
+    )
+    template = cast(
+        "StageExplanation", await handler.handle_query("explain", {"stage": "p/_helper_cut"})
+    )
+    with pytest.raises(ValueError, match="Unknown stage: p/_helper_nope"):
+        await handler.handle_query("explain", {"stage": "p/_helper_nope"})
+
+    for explanation, name in ((instance, "p/_helper_cut@a"), (template, "p/_helper_cut")):
+        assert explanation["stage_name"] == name
+        assert explanation["will_run"] is True
+        assert explanation["reason"].startswith("Not yet expanded: "), explanation
+        assert "p/_helper_plan" in explanation["reason"]
+
+
+def test_explain_of_an_expanded_template_names_the_instances_that_would_run(
+    set_project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explaining a template explains each instance it expanded into: it would run when one
+    would, and its reason names each of those with its own reason."""
+    monkeypatch.chdir(set_project_root)
+    (set_project_root / ".git").mkdir(exist_ok=True)
+    (set_project_root / "data" / "raw").mkdir(parents=True)
+    (set_project_root / "data" / "raw" / "plan.yaml").write_text("a: 1\nb: 2\n")
+    executor.run(pipeline=_helper_mapped_pipeline(set_project_root))
+    pipeline = _helper_mapped_pipeline(set_project_root)
+    pipeline.expand_template("p/_helper_cut", [("a", "a.yaml"), ("b", "b.yaml")])
+
+    async def _explain() -> tuple[StageExplanation, StageExplanation]:
+        async with Engine(pipeline=pipeline) as eng:
+            handler = AgentRpcHandler(engine=eng)
+            before = await handler.handle_query("explain", {"stage": "p/_helper_cut"})
+            # An instance with no lock has no previous run
+            (lock_file,) = (set_project_root / ".pivot").rglob("_helper_cut@b.lock")
+            lock_file.unlink()
+            after = await handler.handle_query("explain", {"stage": "p/_helper_cut"})
+            return cast("StageExplanation", before), cast("StageExplanation", after)
+
+    before, after = anyio.run(_explain)
+
+    assert before["will_run"] is False, before
+    assert before["reason"] == "Expanded into 2 stages; none would run"
+    assert after["will_run"] is True, after
+    assert after["reason"].startswith("Expanded into 2 stages; would run: p/_helper_cut@b ("), after
+    assert "p/_helper_cut@a" not in after["reason"]
+
+
+def test_run_takes_template_and_instance_names(tmp_path: Path) -> None:
+    """A run reaches an instance through its template, so both are stages a run may name."""
+    handler = _helper_mapped_handler(_helper_mapped_pipeline(tmp_path))
+
+    assert handler.validate_stages(["p/_helper_plan", "p/_helper_cut", "p/_helper_cut@a"]) is None
+    assert handler.validate_stages(["p/_helper_cut@a b"]) == "Unknown stages: p/_helper_cut@a b"
+
+
+def _helper_run_then_query(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stages: list[str] | None,
+    queries: list[tuple[str, str]],
+    plan: str = "a: 1\nb: 2\n",
+    *,
+    chain: bool = False,
+) -> list[object]:
+    """Run the mapped pipeline (``chain``: with `p/_helper_build` mapped over `p/_helper_cut`)
+    over the files of ``plan`` (by default a and b) in one engine (targets ``stages``), then ask
+    its handler each (method, stage) of ``queries``: each answer, or the ValueError it raised."""
+    monkeypatch.chdir(root)
+    (root / ".git").mkdir(exist_ok=True)
+    (root / "data" / "raw").mkdir(parents=True)
+    (root / "data" / "raw" / "plan.yaml").write_text(plan)
+
+    async def _run() -> list[object]:
+        async with Engine(pipeline=_helper_mapped_pipeline(root, chain=chain)) as eng:
+            eng.add_source(sources.OneShotSource(stages=stages, force=False, reason="test"))
+            await eng.run(exit_on_completion=True)
+            handler = AgentRpcHandler(engine=eng)
+            answers = list[object]()
+            for method, stage in queries:
+                try:
+                    answers.append(await handler.handle_query(method, {"stage": stage}))
+                except ValueError as exc:
+                    answers.append(exc)
+            return answers
+
+    return anyio.run(_run)
+
+
+def test_a_key_the_run_found_no_file_for_is_refused_as_pivot_status_refuses_it(
+    set_project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run read the files a and b to expand `p/_helper_cut`, so `p/_helper_cut@zzz` names no
+    stage: `explain` and `stage_info` refuse it as `pivot status` refuses the name, never as an
+    instance a run would add."""
+    answers = _helper_run_then_query(
+        set_project_root,
+        monkeypatch,
+        None,
+        [("explain", "p/_helper_cut@zzz"), ("stage_info", "p/_helper_cut@zzz")],
+    )
+
+    for answer in answers:
+        assert isinstance(answer, ValueError), answer
+        assert str(answer).startswith("Unknown stage(s): p/_helper_cut@zzz"), answer
+
+
+def test_an_instance_the_runs_targets_left_out_is_named_as_not_yet_expanded(
+    set_project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run targeted at `p/_helper_cut@a` adds that instance alone. `p/_helper_cut@b` is a file
+    it read, so it is not yet expanded because the run's targets did not name it; a key no file
+    has is still refused."""
+    explain, info, unknown = _helper_run_then_query(
+        set_project_root,
+        monkeypatch,
+        ["p/_helper_cut@a"],
+        [
+            ("explain", "p/_helper_cut@b"),
+            ("stage_info", "p/_helper_cut@b"),
+            ("explain", "p/_helper_cut@zzz"),
+        ],
+    )
+
+    why = "'p/_helper_cut' added only the instances its run's targets name"
+    assert explain == StageExplanation(
+        stage_name="p/_helper_cut@b",
+        will_run=True,
+        is_forced=False,
+        reason=f"Not yet expanded: {why}",
+        code_changes=[],
+        param_changes=[],
+        dep_changes=[],
+        upstream_stale=[],
+    )
+    assert isinstance(info, ValueError), info
+    assert str(info) == f"'p/_helper_cut@b' is not yet expanded: {why}"
+    assert isinstance(unknown, ValueError), unknown
+    assert str(unknown).startswith("Unknown stage(s): p/_helper_cut@zzz"), unknown
+
+
+def test_the_engine_keeps_the_keys_its_run_read_for_each_template(
+    set_project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No keys before a run reads the producer's files; the run's keys after it."""
+    monkeypatch.chdir(set_project_root)
+    (set_project_root / ".git").mkdir(exist_ok=True)
+    (set_project_root / "data" / "raw").mkdir(parents=True)
+    (set_project_root / "data" / "raw" / "plan.yaml").write_text("a: 1\nb: 2\n")
+
+    async def _run() -> tuple[frozenset[str] | None, frozenset[str] | None]:
+        async with Engine(pipeline=_helper_mapped_pipeline(set_project_root)) as eng:
+            before = eng.expansion_keys("p/_helper_cut")
+            eng.add_source(sources.OneShotSource(stages=None, force=False, reason="test"))
+            await eng.run(exit_on_completion=True)
+            return before, eng.expansion_keys("p/_helper_cut")
+
+    before, after = anyio.run(_run)
+
+    assert before is None
+    assert after == frozenset({"a", "b"})
+
+
+def test_explain_gives_the_failure_of_the_mapped_stage_the_run_failed(
+    set_project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run failed `p/_helper_cut`: the key of file `a b.yaml` cannot name a stage. `explain`
+    of it, of an instance of it, and of `p/_helper_build` mapped over it, gives that failure, not
+    what an expansion waits for; `stage_info` of the instance refuses it with the same failure."""
+    template, instance, info, chained = _helper_run_then_query(
+        set_project_root,
+        monkeypatch,
+        None,
+        [
+            ("explain", "p/_helper_cut"),
+            ("explain", "p/_helper_cut@c"),
+            ("stage_info", "p/_helper_cut@c"),
+            ("explain", "p/_helper_build@c"),
+        ],
+        plan="a b: 1\nc: 2\n",
+        chain=True,
+    )
+
+    failure = "'p/_helper_cut' failed in the latest run: cannot expand over the files of "
+    for explanation, name in ((template, "p/_helper_cut"), (instance, "p/_helper_cut@c")):
+        assert isinstance(explanation, dict), explanation
+        assert explanation["stage_name"] == name
+        assert explanation["will_run"] is True
+        assert explanation["reason"].startswith(f"Not yet expanded: {failure}"), explanation
+        assert "'a b.yaml'" in explanation["reason"], explanation
+    assert isinstance(info, ValueError), info
+    assert str(info).startswith(f"'p/_helper_cut@c' is not yet expanded: {failure}"), info
+    assert isinstance(chained, dict), chained
+    assert chained["reason"].startswith(
+        "Not yet expanded: 'p/_helper_build' is mapped over 'p/_helper_cut', which failed in the "
+        + "latest run: cannot expand over the files of "
+    ), chained
+
+
+def test_explain_reads_the_stages_before_a_run_start_removes_the_instances(
+    set_project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run start removes every instance (`reset_expansions`) on the event loop, which can run
+    while an explanation waits for its worker thread. The explanation reads the stages before
+    it waits, so it explains the instance as the registry held it."""
+    monkeypatch.chdir(set_project_root)
+    (set_project_root / ".git").mkdir(exist_ok=True)
+    (set_project_root / "data" / "raw").mkdir(parents=True)
+    (set_project_root / "data" / "raw" / "plan.yaml").write_text("a: 1\nb: 2\n")
+    executor.run(pipeline=_helper_mapped_pipeline(set_project_root))
+    pipeline = _helper_mapped_pipeline(set_project_root)
+    pipeline.expand_template("p/_helper_cut", [("a", "a.yaml"), ("b", "b.yaml")])
+    handler = _helper_mapped_handler(pipeline)
+    run_sync = anyio.to_thread.run_sync
+
+    async def _after_a_run_start(func: Callable[[], object]) -> object:
+        pipeline.reset_expansions()
+        return await run_sync(func)
+
+    async def _explain() -> object:
+        with monkeypatch.context() as patched:
+            patched.setattr(anyio.to_thread, "run_sync", _after_a_run_start)
+            return await handler.handle_query("explain", {"stage": "p/_helper_cut@a"})
+
+    explanation = cast("StageExplanation", anyio.run(_explain))
+
+    assert explanation["stage_name"] == "p/_helper_cut@a"
+    assert explanation["will_run"] is False, explanation
+    assert pipeline.list_stages() == ["p/_helper_plan"], "the run start removed the instances"
+
+
+def test_a_run_waits_for_an_rpc_commit_reading_the_stages(
+    set_project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RPC `commit` reads the registry in a worker thread. A run start removes every instance
+    (`reset_expansions`) and an expansion adds them (`expand_template`): the run makes neither
+    change until the commit has read every stage it listed."""
+    from pivot.executor import commit as commit_mod
+    from pivot.types import OnError
+
+    monkeypatch.chdir(set_project_root)
+    (set_project_root / ".git").mkdir(exist_ok=True)
+    (set_project_root / "data" / "raw").mkdir(parents=True)
+    (set_project_root / "data" / "raw" / "plan.yaml").write_text("a: 1\nb: 2\n")
+    executor.run(pipeline=_helper_mapped_pipeline(set_project_root))
+    pipeline = _helper_mapped_pipeline(set_project_root)
+    pipeline.expand_template("p/_helper_cut", [("a", "a.yaml"), ("b", "b.yaml")])
+    reading = threading.Event()
+    release = threading.Event()
+    read = threading.Event()
+    # Each registry change the run makes, and whether the commit was still reading
+    changes = list[tuple[str, bool]]()
+
+    def _commit_stages(committing: PipelineLike) -> tuple[list[str], list[str]]:
+        names = committing.list_stages()
+        reading.set()
+        release.wait(timeout=30)
+        committed = [committing.get_stage(name)["name"] for name in names]
+        read.set()
+        return committed, []
+
+    def _recorded(change: str, method: Callable[..., object]) -> Callable[..., object]:
+        def _record(*args: object) -> object:
+            changes.append((change, reading.is_set() and not read.is_set()))
+            return method(*args)
+
+        return _record
+
+    monkeypatch.setattr(commit_mod, "commit_stages", _commit_stages)
+    monkeypatch.setattr(pipeline, "reset_expansions", _recorded("reset", pipeline.reset_expansions))
+    monkeypatch.setattr(pipeline, "expand_template", _recorded("expand", pipeline.expand_template))
+
+    async def _run() -> object:
+        async with Engine(pipeline=pipeline) as eng:
+            handler = AgentRpcHandler(engine=eng)
+            output_recv = eng._output_recv
+            output_send = eng._output_send
+            assert output_recv is not None
+            assert output_send is not None
+            answers = list[object]()
+
+            async def _drain() -> None:
+                async for _ in output_recv:
+                    pass
+
+            async def _commit() -> None:
+                answers.append(await handler.handle_query("commit"))
+
+            async def _start_run() -> None:
+                await anyio.to_thread.run_sync(reading.wait)
+                await eng._orchestrate_execution(
+                    stages=None,
+                    force=False,
+                    single_stage=False,
+                    parallel=True,
+                    max_workers=1,
+                    resource_capacity={},
+                    no_commit=False,
+                    on_error=OnError.FAIL,
+                    cache_dir=None,
+                )
+
+            async def _release() -> None:
+                await anyio.to_thread.run_sync(reading.wait)
+                await anyio.sleep(0.5)
+                release.set()
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_drain)
+                async with anyio.create_task_group() as work:
+                    work.start_soon(_commit)
+                    work.start_soon(_start_run)
+                    work.start_soon(_release)
+                await output_send.aclose()
+            return answers[0]
+
+    answer = anyio.run(_run)
+
+    instances = ["p/_helper_cut@a", "p/_helper_cut@b"]
+    assert changes == [("reset", False), ("expand", False)], "no change while the commit read"
+    assert answer == CommitResult(committed=["p/_helper_plan", *instances], failed=[])
+    assert pipeline.instances_of("p/_helper_cut") == instances, "the run expanded afterwards"
 
 
 @pytest.mark.anyio

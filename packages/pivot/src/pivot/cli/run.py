@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import anyio
 import click
 
-from pivot import config
+from pivot import config, expansion
 from pivot.cli import _run_common, completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
@@ -393,10 +393,20 @@ def run(
     quiet = cli_ctx["quiet"]
     show_human_output = not as_json and not quiet
 
-    # Require at least one stage, then resolve bare names to registered stages
-    stages_list = _validate_stages_required(
-        cli_helpers.resolve_stage_names(cli_helpers.stages_to_list(stages))
-    )
+    # Require at least one stage, then resolve bare names to registered stages. A mapped stage
+    # (Pipeline.map) or one of its instances is refused: it expands only in `pivot repro`.
+    targets = cli_helpers.stages_to_list(stages)
+    if targets:
+        pipeline = cli_helpers.get_pipeline()
+        registered = set(pipeline.list_stages())
+        templates = pipeline.list_templates()
+        for target in targets:
+            template = (
+                None if target in registered else cli_helpers.template_target(target, templates)
+            )
+            if template is not None:
+                raise expansion.single_stage_refusal(target, pipeline.get_template(template))
+    stages_list = _validate_stages_required(cli_helpers.resolve_stage_names(targets))
 
     # Validate mutual exclusions
     _run_common.validate_display_mode(tui_flag, as_json)

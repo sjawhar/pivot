@@ -77,6 +77,8 @@ The CLI chooses between `StaticConsoleSink` and `LiveConsoleSink` automatically 
 
 Both console sinks treat each `engine_state_changed` event as a run boundary: they print the finished run's report and reset their counters, so every watch-mode run reports only its own stages.
 
+When a mapped stage's template (`pipeline.map`) expands, both console sinks print one line at once, such as `demo/cut: expanded into 3 stages`. They print no line per instance there: each instance appears in the run's report like any stage, and consecutive cached instances collapse into one line as other skips do.
+
 Sinks are supervised by the Engine: each sink receives events via its own bounded
 queue. Slow or failing sinks are temporarily disabled and re-enabled after
 exponential backoff, emitting `SinkStateChanged` events.

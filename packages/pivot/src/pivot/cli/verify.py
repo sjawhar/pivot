@@ -552,7 +552,12 @@ def verify(
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
 
-    stages_list = cli_helpers.resolve_stage_names(cli_helpers.stages_to_list(stages))
+    # Each mapped stage expands into its instances when its producer is current, as a run would
+    # expand it; one that cannot fails verification, since its instances cannot be checked.
+    result, known = cli_helpers.expand_mapped_stages(allow_missing=allow_missing)
+    stages_list, shown_templates = cli_helpers.resolve_mapped_targets(
+        cli_helpers.stages_to_list(stages), result
+    )
 
     # Check if any stages are registered
     all_stages = cli_helpers.get_all_stages()
@@ -569,6 +574,7 @@ def verify(
         all_stages=all_stages,
         pipeline=cli_helpers.get_pipeline(),
         allow_missing=allow_missing,
+        known=known,
     )
     pipeline_status = _status_from_explanations(explanations)
 
@@ -579,6 +585,12 @@ def verify(
     # own .pvt member of its output, in any pipeline, is no tracked file or directory.
     tracked_files = _project_tracked_files(cli_helpers.own_member_skip(cache_dir / "files"))
     passed, results = _verify_stages(pipeline_status, cache_dir, allow_missing, tracked_files)
+    not_expanded = status_mod.not_expanded_status(result, shown_templates)
+    results.extend(
+        StageVerifyInfo(name=row["name"], status="failed", reason=row["reason"], missing_files=[])
+        for row in not_expanded
+    )
+    passed = passed and not not_expanded
     if stages_list is None:
         tracked_failures = _tracked_listing_failures(cache_dir / "files", tracked_files)
         results.extend(tracked_failures)

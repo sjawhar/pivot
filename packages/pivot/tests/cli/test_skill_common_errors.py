@@ -26,6 +26,16 @@ _SKILL = pathlib.Path(__file__).parents[4] / "skills" / "writing-pivot-stages" /
 
 _HEAD = "import pandas as pd\n\nfrom pivot import Pipeline, loaders, stage\n\n\n"
 
+# A producer whose one file's key ("a b") cannot name a stage, and a stage mapped over it
+_MAP_PIPELINE = (
+    "from typing import Annotated\n\nfrom pivot import Pipeline, directory, loaders, stage\n\n\n"
+    + "@stage\ndef plan(raw: str) -> Annotated[dict[str, dict], directory, loaders.YAML[dict]()]:\n"
+    + '    return {"a b.yaml": {"v": 1}}\n\n\n'
+    + "@stage\ndef cut(entry: dict) -> dict:\n    return entry\n\n\n"
+    + 'with Pipeline("demo") as pipeline:\n'
+    + '    cut(pipeline.map(plan(pipeline.input("t.csv", t=str))))\n'
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class _Case:
@@ -163,6 +173,46 @@ _CASES = {
             + "    return matplotlib.figure.Figure()\n\n\n"
             + "@stage\ndef use(chart: object) -> dict:\n    return {}\n\n\n"
             + 'with Pipeline("demo") as pipeline:\n    use(chart(pipeline.input("t.csv")))\n'
+        },
+    ),
+    "map-not-a-directory": _Case(
+        doc="`pipeline.map() needs a directory output`",
+        observed="pipeline.map() needs a directory output",
+        files={
+            "pipeline.py": _HEAD
+            + "@stage\ndef s(raw: pd.DataFrame) -> pd.DataFrame:\n    return raw\n\n\n"
+            + "@stage\ndef u(row: pd.DataFrame) -> pd.DataFrame:\n    return row\n\n\n"
+            + 'with Pipeline("demo") as pipeline:\n'
+            + '    u(pipeline.map(s(pipeline.input("t.csv"))))\n'
+        },
+    ),
+    "map-key-cannot-name-a-stage": _Case(
+        doc="`cannot expand over the files of '<stage>'`",
+        observed="cannot expand over the files of 'demo/plan'",
+        files={"pipeline.py": _MAP_PIPELINE},
+        args=("repro",),
+    ),
+    "map-run-refused": _Case(
+        doc="`'<stage>' is mapped over the files of '<producer>'`",
+        observed="'demo/cut' is mapped over the files of 'demo/plan'",
+        files={"pipeline.py": _MAP_PIPELINE},
+        args=("run", "demo/cut"),
+    ),
+    "map-instance-name-taken": _Case(
+        doc="`has the name of an instance of mapped stage '<stage>'`",
+        observed="'demo/cut@a' has the name of an instance of mapped stage 'demo/cut'",
+        files={
+            "pipeline.py": "from typing import Annotated\n\n"
+            + "from pivot import Pipeline, directory, loaders, stage\n\n\n"
+            + "@stage\ndef plan(raw: str) -> "
+            + "Annotated[dict[str, dict], directory, loaders.YAML[dict]()]:\n"
+            + '    return {"a.yaml": {"v": 1}}\n\n\n'
+            + "@stage\ndef cut(entry: dict) -> dict:\n    return entry\n\n\n"
+            + 'with Pipeline("demo") as pipeline:\n'
+            + '    planned = plan(pipeline.input("t.csv", t=str))\n'
+            + "    cut(pipeline.map(planned))\n"
+            + '    with pipeline.variant("a"):\n'
+            + '        cut(planned["a.yaml"])\n'
         },
     ),
     "directory-file-without-extension": _Case(

@@ -11,9 +11,10 @@ from pivot.engine.types import (
     LogLine,
     PipelineReloaded,
     StageCompleted,
+    StagesExpanded,
     StageStarted,
 )
-from pivot.types import CompletionType, StageStatus
+from pivot.types import CompletionType, RunEventType, StageStatus
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -136,6 +137,33 @@ async def test_jsonl_sink_passes_pipeline_reloaded_with_error(
     assert len(collected_events) == 1
     assert collected_events[0]["type"] == "pipeline_reloaded"
     assert collected_events[0]["error"] == "SyntaxError in pipeline.py"
+
+
+@pytest.mark.anyio
+async def test_jsonl_sink_forwards_stages_expanded(
+    callback: Callable[[dict[str, object]], None],
+    collected_events: list[dict[str, object]],
+) -> None:
+    """A template's expansion reaches the stream as its name and its instances, in key order."""
+    sink = JsonlSink(callback)
+
+    event = StagesExpanded(
+        type="stages_expanded",
+        seq=7,
+        run_id="run-1",
+        template="demo/cut",
+        stages=["demo/cut@a", "demo/cut@b"],
+    )
+    await sink.handle(event)
+
+    assert collected_events == [
+        {
+            "type": RunEventType.STAGES_EXPANDED,
+            "template": "demo/cut",
+            "stages": ["demo/cut@a", "demo/cut@b"],
+        }
+    ]
+    assert RunEventType.STAGES_EXPANDED == "stages_expanded"
 
 
 @pytest.mark.anyio

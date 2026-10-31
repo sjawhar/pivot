@@ -34,11 +34,13 @@ from pivot_tui.rpc_client_impl import (
     decode_output_summary,
     decode_stage_explanation,
 )
+from pivot_tui.types import TuiExpandedMessage
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from pivot_tui.client import EventBatch, PivotRpc
+    from pivot_tui.types import TuiMessage
 
 __all__ = ["EventPoller"]
 
@@ -60,19 +62,18 @@ _EXPLANATION_REQUIRED_KEYS = frozenset(
     }
 )
 
-type _TuiMessage = TuiStatusMessage | TuiLogMessage | TuiWatchMessage | TuiReloadMessage
-
 
 class EventPoller:
     """Polls engine events and posts TUI messages.
 
     Continuously polls ``client.events_since(version)`` and converts raw event
     dicts into typed TUI messages (``TuiStatusMessage``, ``TuiLogMessage``,
-    ``TuiWatchMessage``, ``TuiReloadMessage``), posting each via *post_fn*.
+    ``TuiWatchMessage``, ``TuiReloadMessage``, ``TuiExpandedMessage``), posting each via
+    *post_fn*.
     """
 
     _client: PivotRpc
-    _post_fn: Callable[[_TuiMessage], object]
+    _post_fn: Callable[[TuiMessage], object]
     _version: int
     _stop_event: threading.Event
     _oneshot: bool
@@ -80,7 +81,7 @@ class EventPoller:
     def __init__(
         self,
         client: PivotRpc,
-        post_fn: Callable[[_TuiMessage], object],
+        post_fn: Callable[[TuiMessage], object],
         *,
         oneshot: bool = False,
     ) -> None:
@@ -154,7 +155,7 @@ class EventPoller:
 
 def _convert_event(
     event: dict[str, object],
-) -> _TuiMessage | None:
+) -> TuiMessage | None:
     """Convert a raw event dict to the appropriate TUI message, or None."""
     event_type = event.get("type")
     match event_type:
@@ -168,6 +169,8 @@ def _convert_event(
             return _make_watch_message(event)
         case "pipeline_reloaded":
             return _make_reload_message(event)
+        case "stages_expanded":
+            return _make_expanded_message(event)
         case _:
             return None
 
@@ -306,4 +309,20 @@ def _make_reload_message(event: dict[str, object]) -> TuiReloadMessage | None:
         stages_removed=cast("list[str]", stages_removed),
         stages_modified=cast("list[str]", stages_modified),
         error=error,
+    )
+
+
+def _make_expanded_message(event: dict[str, object]) -> TuiExpandedMessage:
+    template = event["template"]
+    if not isinstance(template, str):
+        raise RpcProtocolError("str (template)", type(template).__name__)
+    stages = event["stages"]
+    if not isinstance(stages, list):
+        raise RpcProtocolError("list (stages)", type(stages).__name__)
+    names = cast("list[object]", stages)
+    for name in names:
+        if not isinstance(name, str):
+            raise RpcProtocolError("list[str] (stages)", type(name).__name__)
+    return TuiExpandedMessage(
+        type=TuiMessageType.EXPANDED, template=template, stages=cast("list[str]", names)
     )

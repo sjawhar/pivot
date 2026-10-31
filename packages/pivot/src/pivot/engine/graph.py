@@ -215,7 +215,18 @@ def build_graph(
         CyclicGraphError: If graph contains cycles (always checked)
     """
     g: nx.DiGraph[str] = nx.DiGraph()
+    add_stages(g, stages)
 
+    # Always check for cycles - a cyclic graph is never valid
+    _check_acyclic(g)
+
+    return g
+
+
+def add_stages(g: nx.DiGraph[str], stages: dict[str, RegistryStageInfo]) -> None:
+    """Add each stage of ``stages`` to bipartite graph ``g``, with its dependency and output
+    edges, as ``build_graph`` does. A run adds a template's instances this way (``Pipeline.map``):
+    nothing in the graph depends on them, so they close no cycle."""
     for stage_name, info in stages.items():
         stage = stage_node(stage_name)
         g.add_node(stage, type=NodeType.STAGE)
@@ -233,11 +244,6 @@ def build_graph(
                 artifact = artifact_node(identity)
                 g.add_node(artifact, type=NodeType.ARTIFACT)
                 g.add_edge(stage, artifact)
-
-    # Always check for cycles - a cyclic graph is never valid
-    _check_acyclic(g)
-
-    return g
 
 
 def get_consumers(g: nx.DiGraph[str], identity: pivot_types.ArtifactIdentity) -> list[str]:

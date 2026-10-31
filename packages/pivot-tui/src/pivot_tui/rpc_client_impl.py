@@ -24,6 +24,7 @@ from pivot_tui.client import (
     EngineStatus,
     EventBatch,
     StageInfoResult,
+    StagesResult,
     VersionedEvent,
 )
 
@@ -127,9 +128,11 @@ class RpcPivotClient:
             pending=_as_str_list(r["pending"]),
         )
 
-    async def stages(self) -> list[str]:
+    async def stages(self) -> StagesResult:
         r = _as_dict(await self._call("stages"))
-        return _as_str_list(r["stages"])
+        return StagesResult(
+            stages=_as_str_list(r["stages"]), templates=_as_templates(r["templates"])
+        )
 
     async def stage_info(self, stage: str) -> StageInfoResult:
         r = _as_dict(await self._call("stage_info", {"stage": stage}))
@@ -270,6 +273,11 @@ def _as_str_list(value: object) -> list[str]:
             raise RpcProtocolError("list[str]", type(item).__name__)
         items.append(item)
     return items
+
+
+def _as_templates(value: object) -> dict[str, list[str]]:
+    """Decode the ``stages`` answer's ``templates``: each template's instance names."""
+    return {name: _as_str_list(instances) for name, instances in _as_dict(value).items()}
 
 
 def _as_identity(value: object) -> ArtifactIdentity:

@@ -28,6 +28,14 @@ class StageInfoResult(TypedDict):
     outs: list[ArtifactIdentity]
 
 
+class StagesResult(TypedDict):
+    """The engine's stages; ``templates`` maps each template (``Pipeline.map``), which
+    ``stages`` never holds, to the instances it expanded into: an empty list until it expands."""
+
+    stages: list[str]
+    templates: dict[str, list[str]]
+
+
 class VersionedEvent(TypedDict):
     version: int
     event: dict[str, object]
@@ -49,7 +57,7 @@ class PivotRpc(Protocol):
 
     async def status(self) -> EngineStatus: ...
 
-    async def stages(self) -> list[str]: ...
+    async def stages(self) -> StagesResult: ...
 
     async def stage_info(self, stage: str) -> StageInfoResult: ...
 

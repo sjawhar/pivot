@@ -67,6 +67,7 @@ class FakeRpcServer:
     _committed: list[str]
     _failed: list[str]
     _stages: list[str]
+    _templates: dict[str, list[str]]
     _status_state: Literal["idle", "active"]
     _running: list[str]
     _pending: list[str]
@@ -82,6 +83,7 @@ class FakeRpcServer:
 
     def __init__(self) -> None:
         self._stages = list[str]()
+        self._templates = dict[str, list[str]]()
         self._status_state = "idle"
         self._running = list[str]()
         self._pending = list[str]()
@@ -102,6 +104,10 @@ class FakeRpcServer:
 
     def set_stages(self, stages: list[str]) -> None:
         self._stages = list(stages)
+
+    def set_templates(self, templates: dict[str, list[str]]) -> None:
+        """Answer ``stages`` with these templates, each mapped to its instances."""
+        self._templates = {name: list(instances) for name, instances in templates.items()}
 
     def set_status(
         self,
@@ -268,7 +274,15 @@ class FakeRpcServer:
                     request_id,
                 )
             case "stages":
-                return self._json_rpc_response({"stages": list(self._stages)}, request_id)
+                return self._json_rpc_response(
+                    {
+                        "stages": list(self._stages),
+                        "templates": {
+                            name: list(instances) for name, instances in self._templates.items()
+                        },
+                    },
+                    request_id,
+                )
             case "stage_info":
                 stage = params.get("stage")
                 if not isinstance(stage, str):

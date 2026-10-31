@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import pathlib
+from typing import TYPE_CHECKING
 
 import click
 
@@ -12,6 +14,12 @@ from pivot.cli import helpers as cli_helpers
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import state, track
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from pivot.registry import PipelineLike
+    from pivot.remote import protocol
 
 
 @click.group()
@@ -40,6 +48,47 @@ def remote_list() -> None:
 def _get_targets_list(targets: tuple[str, ...]) -> list[str] | None:
     """Convert targets tuple to list, or None if empty."""
     return list(targets) if targets else None
+
+
+def _expand_mapped_targets(
+    targets: tuple[str, ...],
+    pipeline: PipelineLike | None,
+    *,
+    fetch_listings: Callable[[set[str]], None] | None = None,
+) -> tuple[str, ...]:
+    """``targets`` with each mapped stage (``Pipeline.map``) named in them replaced by its
+    instances, its producer current (``cli_helpers.expand_mapped_stages``). Without targets
+    nothing is expanded: every cached object, or every remote one, is transferred.
+
+    ``fetch_listings`` fetches the listings this clone lacks of the directories current
+    producers recorded (pull), after which the mapped stages expand again.
+
+    Raises:
+        click.ClickException: A target names a mapped stage that is not expanded, saying why.
+    """
+    if not targets or pipeline is None:
+        return targets
+    result, _ = cli_helpers.expand_mapped_stages()
+    if result["listings"] and fetch_listings is not None:
+        fetch_listings(set(result["listings"].values()))
+        result, _ = cli_helpers.expand_mapped_stages()
+    return cli_helpers.require_expanded_targets(targets, result)
+
+
+def _fetch_listings(
+    cache_dir: pathlib.Path,
+    state_dir: pathlib.Path,
+    remote_storage: protocol.RemoteStorage,
+    remote_name: str,
+    jobs: int,
+    hashes: set[str],
+) -> None:
+    """Fetch the directory listings at ``hashes`` from the remote into the cache."""
+    with state.StateDB(state_dir) as state_db:
+        result = transfer.fetch_objects(
+            cache_dir, remote_storage, state_db, remote_name, hashes, jobs
+        )
+    cli_helpers.print_transfer_errors(result["errors"])
 
 
 def _normalize_cli_targets(
@@ -110,6 +159,7 @@ def push(
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
     pipeline = cli_decorators.get_pipeline_from_context()
+    targets = _expand_mapped_targets(targets, pipeline)
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
 
     stage_names = set(all_stages) if all_stages is not None else None
@@ -202,6 +252,7 @@ def fetch(
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
     pipeline = cli_decorators.get_pipeline_from_context()
+    targets = _expand_mapped_targets(targets, pipeline)
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
 
     stage_names = set(all_stages) if all_stages is not None else None
@@ -298,8 +349,18 @@ def pull(
     state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
-    # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
+    # Per-stage state_dir lookup when pipeline is available (e.g., --all mode). A mapped stage
+    # whose producer is current but whose listing this clone lacks expands once pull fetched it.
     pipeline = cli_decorators.get_pipeline_from_context()
+    targets = _expand_mapped_targets(
+        targets,
+        pipeline,
+        fetch_listings=None
+        if dry_run
+        else functools.partial(
+            _fetch_listings, cache_dir, state_dir, remote_storage, resolved_name, jobs
+        ),
+    )
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
 
     stage_names = set(all_stages) if all_stages is not None else None

@@ -48,7 +48,7 @@ if TYPE_CHECKING:
 
     from pivot.cli import console as tui_console
     from pivot.executor import ExecutionSummary
-    from pivot.types import StageExplanation
+    from pivot.types import PipelineStatusInfo, StageExplanation
 
 
 _logger = logging.getLogger(__name__)
@@ -127,14 +127,18 @@ def _get_explanations(
     stages_list: list[str] | None,
     force: bool = False,
     allow_missing: bool = False,
-) -> list[StageExplanation]:
-    """Resolve dependencies, build graph, and return stage explanations.
+) -> tuple[list[StageExplanation], list[PipelineStatusInfo]]:
+    """Resolve dependencies, build graph, and return stage explanations, with a row for each
+    mapped stage not yet expanded (``status.expand_current``: the run would expand it once its
+    producer is current).
 
     Shared by --explain and --dry-run modes.
     """
     from pivot import status as status_mod
     from pivot.engine import graph as engine_graph
 
+    result, known = cli_helpers.expand_mapped_stages(force=force, allow_missing=allow_missing)
+    stages_list, shown_templates = cli_helpers.resolve_mapped_targets(stages_list, result)
     all_stages = cli_helpers.get_all_stages()
 
     # Build graph with validation when allow_missing is False
@@ -149,7 +153,7 @@ def _get_explanations(
                 raise dep_errors[0]
             raise exceptions.MultipleDependencyError(dep_errors)
 
-    return status_mod.get_pipeline_explanations(
+    explanations = status_mod.get_pipeline_explanations(
         stages_list,
         single_stage=False,
         all_stages=all_stages,
@@ -157,7 +161,9 @@ def _get_explanations(
         force=force,
         allow_missing=allow_missing,
         graph=graph,
+        known=known,
     )
+    return explanations, status_mod.not_expanded_status(result, shown_templates)
 
 
 def _output_explain(
@@ -168,8 +174,8 @@ def _output_explain(
     """Output detailed stage explanations using status logic."""
     from pivot.cli import status as status_cli
 
-    explanations = _get_explanations(stages_list, force, allow_missing)
-    status_cli.output_explain_text(explanations)
+    explanations, not_expanded = _get_explanations(stages_list, force, allow_missing)
+    status_cli.output_explain_text(explanations, not_expanded=not_expanded)
 
 
 def _dry_run(
@@ -179,14 +185,15 @@ def _dry_run(
     allow_missing: bool,
     quiet: bool,
 ) -> None:
-    """Show what would run without executing."""
+    """Show what would run without executing. A mapped stage not yet expanded would run: the
+    run expands it once its producer is current, then runs its instances."""
     # Quiet mode suppresses output (except JSON which is always emitted)
     if quiet and not as_json:
         return
 
-    explanations = _get_explanations(stages_list, force, allow_missing)
+    explanations, not_expanded = _get_explanations(stages_list, force, allow_missing)
 
-    if not explanations:
+    if not explanations and not not_expanded:
         if as_json:
             click.echo(display.to_json(_run_common.DryRunJsonOutput(stages={})))
         else:
@@ -194,22 +201,27 @@ def _dry_run(
         return
 
     if as_json:
-        output = _run_common.DryRunJsonOutput(
-            stages={
-                exp["stage_name"]: _run_common.DryRunJsonStageOutput(
-                    would_run=exp["will_run"],
-                    reason=exp["reason"] or "unchanged",
-                )
-                for exp in explanations
-            }
+        stages = {
+            exp["stage_name"]: _run_common.DryRunJsonStageOutput(
+                would_run=exp["will_run"],
+                reason=exp["reason"] or "unchanged",
+            )
+            for exp in explanations
+        }
+        stages.update(
+            (row["name"], _run_common.DryRunJsonStageOutput(would_run=True, reason=row["reason"]))
+            for row in not_expanded
         )
-        click.echo(display.to_json(output, indent=2))
+        click.echo(display.to_json(_run_common.DryRunJsonOutput(stages=stages), indent=2))
     else:
         click.echo("Would run:")
         for exp in explanations:
             status = "would run" if exp["will_run"] else "would skip"
             reason = display.escape_control(exp["reason"] or "unchanged", keep_newlines=True)
             click.echo(f"  {exp['stage_name']}: {status} ({reason})")
+        for row in not_expanded:
+            reason = display.escape_control(row["reason"], keep_newlines=True)
+            click.echo(f"  {row['name']}: would expand ({reason})")
 
 
 def _run_pipeline(
@@ -243,9 +255,16 @@ def _run_pipeline(
             SchemaVersionEvent(type=RunEventType.SCHEMA_VERSION, version=_JSONL_SCHEMA_VERSION)
         )
 
-    # Build DAG and get execution order for TUI display
+    # Build DAG and get execution order for TUI display. The DAG holds a mapped stage
+    # (Pipeline.map), not its instances: an instance is reached through its mapped stage.
     graph = cli_helpers.build_dag()
-    execution_order = engine_graph.get_execution_order(graph, stages_list, single_stage=False)
+    templates = cli_helpers.get_pipeline().list_templates()
+    graph_targets = (
+        None
+        if stages_list is None
+        else list(dict.fromkeys(registry.template_of(s, templates) or s for s in stages_list))
+    )
+    execution_order = engine_graph.get_execution_order(graph, graph_targets, single_stage=False)
 
     if not execution_order and not watch:
         # Emit execution result for JSONL mode
@@ -361,8 +380,8 @@ def _run_watch_mode(  # noqa: PLR0913 - many params needed for different modes
             resource_capacity=resource_capacity,
         )
 
-    # Build bipartite graph for watch paths
-    all_stages = cli_helpers.get_all_stages()
+    # Build bipartite graph for watch paths: a mapped stage's inputs are watched as a stage's
+    all_stages = cli_helpers.get_graph_stages()
     engine_graph.build_graph(all_stages)  # Cycle check only (graph result unused)
     watch_paths = _watch_paths_from_registry(all_stages)
 
@@ -509,8 +528,8 @@ def _run_serve_mode(
     use_all_pipelines = cli_decorators.get_all_pipelines_from_context()
 
     async def _serve() -> None:
-        # Build watch paths
-        all_stages = cli_helpers.get_all_stages()
+        # Build watch paths: a mapped stage's inputs are watched as a stage's
+        all_stages = cli_helpers.get_graph_stages()
         engine_graph.build_graph(all_stages)  # Cycle check only (graph result unused)
         watch_paths = _watch_paths_from_registry(all_stages)
 
@@ -945,22 +964,42 @@ def repro(
                     combined.include(pipeline)
                 cli_decorators.store_pipeline_in_context(combined)
 
-        # Fast-path: if all targets are registered stage names, skip graph construction
+        # Fast-path: if all targets are registered stage names, skip graph construction. A
+        # mapped stage (Pipeline.map) is a target too, and so is one of its instances, checked as
+        # `pivot status` checks it: the run reaches the instance through its mapped stage and
+        # runs that instance's chain alone.
         registered = set(cli_helpers.list_stages())
+        templates = cli_helpers.get_pipeline().list_templates()
+        stages_list = cli_helpers.resolve_run_targets(stages_list)
+        mapped = {
+            stage
+            for stage in stages_list
+            if stage in templates or registry.template_of(stage, templates) is not None
+        }
+        others = [stage for stage in stages_list if stage not in mapped]
 
-        resolved = set[str]()
+        resolved = set(mapped)
         unresolved = list[str]()
+        not_expanded = list[str]()
 
-        if stages_list and not all(s in registered for s in stages_list):
-            # Build graph and resolve file paths to producer stages (same as pivot dag)
-            all_stages = cli_helpers.get_all_stages()
-            bipartite_graph = engine_graph.build_graph(all_stages)
-            resolved, unresolved = cli_targets.resolve_targets_to_stages(
-                stages_list, bipartite_graph
+        if not all(s in registered for s in others):
+            # A mapped stage's declared output path names no stage: each instance writes its own
+            cli_helpers.refuse_template_output_targets(others)
+            # Resolve file paths to producer stages through the expansion, as `pivot dag` does:
+            # an instance's output path names the instance, whose chain the run reaches alone
+            result, _ = cli_helpers.expand_mapped_stages()
+            graph_stages = cli_helpers.get_graph_stages(result["expanded"])
+            bipartite_graph = engine_graph.build_graph(graph_stages)
+            found, unresolved = cli_targets.resolve_targets_to_stages(
+                others, bipartite_graph, stages=graph_stages
             )
-        elif stages_list:
+            # The run expands its templates afresh
+            cli_helpers.get_pipeline().reset_expansions()
+            resolved |= found
+            not_expanded = list(result["not_expanded"])
+        else:
             # All remaining targets are registered stages - no resolution needed
-            resolved = set(stages_list)
+            resolved |= set(others)
 
         # Merge pipeline-file resolved stages
         resolved |= pipeline_resolved
@@ -986,6 +1025,11 @@ def repro(
             msg += f"  Available stages: {available}"
             if len(registered) > 5:
                 msg += f" (and {len(registered) - 5} more)"
+            if not_expanded:
+                msg += (
+                    f"\n  Mapped stages not yet expanded: {', '.join(not_expanded)} (an instance's"
+                    + " output path names it once its producer is current)"
+                )
             msg += "\n  Run 'pivot list' to see all stages."
             raise click.ClickException(msg)
         stages_list = sorted(resolved)
