@@ -2,6 +2,21 @@
 
 <!-- version list -->
 
+## v0.8.0 (2026-10-31)
+
+### Bug Fixes
+
+- **fingerprint**: Record a dependency or output named byname in the lock
+  ([#546](https://github.com/sjawhar/pivot/pull/546),
+  [`76a7ae8`](https://github.com/sjawhar/pivot/commit/76a7ae82fb0da96090035963395cc20cb5c05a71))
+
+### Features
+
+- **compose**: Add pipeline.map to run a stage once per file of a directory output
+  ([#545](https://github.com/sjawhar/pivot/pull/545),
+  [`4250907`](https://github.com/sjawhar/pivot/commit/42509074944a03630f5e2c343a0dd9a671313f1c))
+
+
 ## v0.7.1 (2026-10-31)
 
 ### Bug Fixes
