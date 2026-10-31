@@ -403,13 +403,18 @@ def test_changed_function_different_fingerprint():
 
 
 def test_stdlib_module_attrs_not_tracked():
-    """Stdlib module attributes (math, os, json, etc.) are NOT tracked."""
+    """Stdlib module attributes (math, os, json, etc.) are NOT tracked; the module is named, since
+    a worker imports it by name (`byname:`)."""
     fp = fingerprint.get_stage_fingerprint(_helper_uses_math_pi)
     assert "self:_helper_uses_math_pi" in fp
-    assert not any("math" in key for key in fp if not key.startswith("self:")), fp
+    assert {key: value for key, value in fp.items() if not key.startswith("self:")} == {
+        "byname:math": ""
+    }, fp
 
     fp2 = fingerprint.get_stage_fingerprint(_helper_uses_multiple_math_attrs)
-    assert not any("math" in key for key in fp2 if not key.startswith("self:")), fp2
+    assert {key: value for key, value in fp2.items() if not key.startswith("self:")} == {
+        "byname:math": ""
+    }, fp2
 
 
 def test_aliased_function_captured():
@@ -767,9 +772,10 @@ def test_pivot_tui_installed_from_a_checkout_is_framework() -> None:
 
     assert fingerprint.is_user_code(pivot_tui.stats) is False
     assert fingerprint.is_user_code(pivot_tui.stats.get_memory_mb) is False
-    assert list(fingerprint.get_stage_fingerprint(_helper_reads_pivot_tui)) == [
-        "self:_helper_reads_pivot_tui"
-    ]
+    assert sorted(fingerprint.get_stage_fingerprint(_helper_reads_pivot_tui)) == [
+        "byname:pivot_tui",
+        "self:_helper_reads_pivot_tui",
+    ], "pivot_tui is named (a worker imports it by name), its source is not read"
 
 
 def _helper_install_distribution(site_dir: pathlib.Path, name: str, files: dict[str, str]) -> None:

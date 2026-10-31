@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.7.0 (2026-10-30)
+
+### Features
+
+- **storage**: Read an object by a hash a declared input names
+  ([#544](https://github.com/sjawhar/pivot/pull/544),
+  [`64c5db6`](https://github.com/sjawhar/pivot/commit/64c5db6cdcaead8c6874b15607aa111dfc041410))
+
+
 ## v0.6.4 (2026-10-30)
 
 ### Bug Fixes

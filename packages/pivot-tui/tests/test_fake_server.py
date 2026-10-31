@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING, Protocol, cast
 import anyio
 import pytest
 
-from helpers import wait_for_socket as _wait_for_socket
 from pivot_tui.testing import FakeRpcServer
+from pivot_tui_test_helpers import wait_for_socket as _wait_for_socket
 
 if TYPE_CHECKING:
     from collections.abc import Callable

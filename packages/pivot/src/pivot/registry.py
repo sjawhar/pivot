@@ -539,7 +539,8 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> tuple[dict
                 result[f"out:{out_key}:tag"] = out.tag.value
                 for key, value in fingerprint.get_loader_fingerprint(out.format).items():
                     result[f"out:{out_key}:{key}"] = value
-        return result, scope["unsafe"]
+            loaded_source.check_worker_imports(result)
+        return fingerprint.without_by_name(result), scope["unsafe"]
     except Exception as exc:
         raise exceptions.PivotError(f"Stage '{stage_name}': fingerprinting failed: {exc}") from exc
 

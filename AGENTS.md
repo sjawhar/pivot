@@ -23,6 +23,7 @@ packages/pivot/src/pivot/
 ├── discovery.py   # Finds and loads pipeline.py
 ├── fingerprint.py # Code hashing, change detection
 ├── loaded_source.py # Source each user module was compiled from; fingerprinting reads it, not the file
+├── import_origin.py # Where a worker would import a module from; a leaf a fresh interpreter runs
 ├── registry.py    # StageRegistry, RegistryStageInfo, MapTemplate (built by Pipeline)
 ├── expansion.py   # Expanding mapped stages (Pipeline.map) from the producer's recorded listing
 ├── stage_def.py   # StageParams, output writing helpers

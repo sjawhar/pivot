@@ -15,9 +15,9 @@ from typing import TYPE_CHECKING
 import anyio
 import pytest
 
-from helpers import wait_for_socket as _wait_for_socket
 from pivot_tui.rpc_client_impl import RpcError, RpcPivotClient, RpcProtocolError
 from pivot_tui.testing import FakeRpcServer
+from pivot_tui_test_helpers import wait_for_socket as _wait_for_socket
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator

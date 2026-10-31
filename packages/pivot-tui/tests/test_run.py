@@ -10,7 +10,6 @@ import textual.binding
 import textual.widgets
 
 import pivot_tui.rpc_client_impl
-from helpers import wait_for_socket
 from pivot.types import (
     ArtifactIdentity,
     StageStatus,
@@ -33,6 +32,7 @@ from pivot_tui.widgets import (
     TabbedDetailPanel,
 )
 from pivot_tui.widgets import status as tui_status
+from pivot_tui_test_helpers import wait_for_socket
 
 if TYPE_CHECKING:
     import pathlib

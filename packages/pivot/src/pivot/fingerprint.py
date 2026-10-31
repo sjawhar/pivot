@@ -81,7 +81,9 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 31 hashes a loaded module's functions from the source it was compiled from, under that
 # source's digest. Earlier entries hashed the file as `inspect` re-read it, which an edit after the
 # digest was taken could change.
-_CACHE_SCHEMA_VERSION = 31
+# Version 32 records each module a worker imports by name (`byname:` entries) and, in a cached
+# manifest, where each such module resolves (`o`), which a hit re-checks.
+_CACHE_SCHEMA_VERSION = 32
 _REPR_SIZE_LIMIT = 10_000
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
@@ -686,9 +688,12 @@ def _record_project_modules(source_map: dict[str, str]) -> None:
 def _try_manifest_cache_hit(stage_name: str, func: Callable[..., Any]) -> dict[str, str] | None:
     """Try to load a cached manifest; returns None on miss.
 
-    A hit needs every recorded source file unchanged and every live value the walk read to
-    give the same token again (`_recorded_reads_hold`). Values computed at import from the
-    environment or a data file change without touching any source file.
+    A hit needs every recorded source file unchanged, every live value the walk read to
+    give the same token again (`_recorded_reads_hold`), and every module the manifest names by
+    name to resolve where it did (`_by_name_origins`). Values computed at import from the
+    environment or a data file change without touching any source file, and a project file can
+    take over a name a library held (vendoring `helpers.py` where `helpers` was installed)
+    without changing any file the walk read.
     """
     db = _get_state_db()
     if db is None:
@@ -714,10 +719,12 @@ def _try_manifest_cache_hit(stage_name: str, func: Callable[..., Any]) -> dict[s
     manifest_raw: object = typed_data.get("m")
     sources_raw: object = typed_data.get("s")
     reads_raw: object = typed_data.get("r")
+    origins_raw: object = typed_data.get("o")
     if (
         not isinstance(manifest_raw, dict)
         or not isinstance(sources_raw, dict)
         or not isinstance(reads_raw, list)
+        or not isinstance(origins_raw, dict)
     ):
         return None
 
@@ -750,7 +757,20 @@ def _try_manifest_cache_hit(stage_name: str, func: Callable[..., Any]) -> dict[s
 
     if not _recorded_reads_hold(func, cast("list[object]", reads_raw)):
         return None
+    if _by_name_origins(manifest) != origins_raw:
+        return None
     return manifest
+
+
+def _by_name_origins(manifest: Mapping[str, str]) -> dict[str, list[str] | None]:
+    """Where a worker would import each module `manifest` names by name (`by_name_modules`),
+    predicted without importing it (`loaded_source.worker_origin`), in the JSON form a cached
+    manifest records."""
+    origins = dict[str, list[str] | None]()
+    for name in sorted(by_name_modules(manifest)):
+        origin = loaded_source.worker_origin(name)
+        origins[name] = None if origin is None else list(origin)
+    return origins
 
 
 class _ValueKind(enum.Enum):
@@ -1190,6 +1210,16 @@ def _collected_capture_errors() -> Iterator[None]:
         raise exceptions.StageDefinitionError("\n\n".join(dict.fromkeys(errors)))
 
 
+def refuse(message: str) -> None:
+    """Refuse the stage being fingerprinted: inside `stage_fingerprint_scope` the refusal is
+    reported with the stage's other refusals when the scope ends, else it is raised now. Unsafe
+    fingerprinting does not downgrade it (`loaded_source.check_worker_imports`)."""
+    errors = _capture_errors.get()
+    if errors is None:
+        raise exceptions.StageDefinitionError(message)
+    errors.append(message)
+
+
 class StageFingerprintScope(TypedDict):
     """What `stage_fingerprint_scope` learned about one stage's fingerprint."""
 
@@ -1261,6 +1291,7 @@ def get_stage_fingerprint_cached(stage_name: str, func: Callable[..., Any]) -> d
                         "m": manifest,
                         "s": source_map,
                         "r": [[list(path), read_token] for path, read_token in reads],
+                        "o": _by_name_origins(manifest),
                     },
                     separators=(",", ":"),
                 ).encode()
@@ -1765,6 +1796,42 @@ def covered_user_modules(manifest: dict[str, str]) -> set[str]:
     return covered
 
 
+def _mark_by_name(module_name: object, manifest: dict[str, str]) -> None:
+    """Record that a stage's worker imports module `module_name` by name to run code the walk
+    does not hash: a library module read as a global or imported in a function body, or the
+    module that defines a callable recorded by name (`ext:`). `loaded_source.check_worker_imports`
+    compares each with the module the worker would import, and the manifest cache re-checks
+    where each resolves (`_try_manifest_cache_hit`). A lock does not record these entries
+    (`without_by_name`)."""
+    if isinstance(module_name, str) and module_name:
+        manifest.setdefault(f"byname:{module_name}", "")
+
+
+def _by_name_entry(key: str) -> str | None:
+    """The module a `byname:` entry names, a loader's (`dep:…:byname:NAME`) included."""
+    if key.startswith("byname:"):
+        return key.removeprefix("byname:")
+    if key.startswith(_LOADER_KEY_PREFIXES) and ":byname:" in key:
+        return key.rpartition(":byname:")[2]
+    return None
+
+
+def by_name_modules(manifest: Mapping[str, str]) -> set[str]:
+    """Names of the modules a stage's worker imports by name, as far as its manifest says: the
+    user modules it covers (`covered_user_modules`) and the `byname:` entries, a loader's
+    (`dep:…:byname:NAME`, `out:…:byname:NAME`) included."""
+    names = covered_user_modules(dict(manifest))
+    names.update(name for key in manifest if (name := _by_name_entry(key)) is not None)
+    return names
+
+
+def without_by_name(manifest: Mapping[str, str]) -> dict[str, str]:
+    """`manifest` as a lock records it: without the `byname:` entries, which the worker-import
+    check and the manifest cache read. They name only modules whose code no entry hashes, so a
+    lock written before they existed stays current and an upgrade reruns nothing."""
+    return {key: value for key, value in manifest.items() if _by_name_entry(key) is None}
+
+
 def _is_library_spec(spec: importlib.machinery.ModuleSpec) -> bool:
     """Whether a top-level module's spec locates library code (`is_library_path`), or no file."""
     if spec.has_location and spec.origin is not None:
@@ -1811,6 +1878,7 @@ def _process_body_imports(
         if module is None:
             if _is_user_module_name(body_import.module):
                 raise _unloaded_body_import_error(func, body_import.module)
+            _mark_by_name(body_import.module, manifest)
             continue
         _mark_module_covered(body_import.module, manifest)
         imported = f"bi:{body_import.module}"
@@ -1837,6 +1905,7 @@ def _process_body_imports(
         if target is None:
             if _is_user_module_name(body_import.target):
                 raise _unloaded_body_import_error(func, body_import.target)
+            _mark_by_name(body_import.target, manifest)
             continue
         step = f"bi:{body_import.target}"
         if step != imported:
@@ -2510,7 +2579,10 @@ def _process_captured_value(
             if isinstance(value, type) and chain is not None:
                 _process_class_reads(chain, value, func, manifest, visited, stage_name)
         case _ValueKind.MODULE:
-            if chain is not None:
+            if not is_user_code(value):
+                # Its code is library code, not hashed; a worker imports it by name.
+                _mark_by_name(value.__name__, manifest)
+            elif chain is not None:
                 _process_module_dependency(chain, value, func, manifest, visited)
         case _ValueKind.SCALAR:
             text = _immutable_value_text(value)
@@ -2524,6 +2596,7 @@ def _process_captured_value(
             # A library function or class is named by where it is defined; its code is not
             # hashed, but rebinding the name to another one must change the manifest.
             manifest[f"ext:{binding_ref}"] = _library_name(value)
+            _mark_by_name(getattr(value, "__module__", None), manifest)
         case _ValueKind.LOGGER:
             return
 
@@ -2789,6 +2862,7 @@ def _process_partial_dependency(
             _add_callable_to_manifest(f"func:{callable_ref}", underlying, manifest, visited)
     elif callable(underlying):
         manifest[f"ext:{binding_ref}.func"] = _library_name(underlying)
+        _mark_by_name(getattr(underlying, "__module__", None), manifest)
     _process_partial_arguments(binding_ref, partial_obj, manifest, visited)
 
 
@@ -3334,11 +3408,9 @@ def _process_module_dependency(
     `const:settings.FACTOR`, a library function `ext:settings.AGG`, a partial or a logger gets
     the global rule, and a class or submodule has its own reads followed from the longer chain
     (`settings.Config.SCALE`). A cache hit re-reads each attribute (`a:NAME`). A library
-    module adds nothing: its attributes are library code, and `repr()` of objects like `np.c_`
-    holds an address.
+    module's attributes are not read: they are library code, and `repr()` of objects like `np.c_`
+    holds an address; the module is recorded by name (`_process_captured_value`).
     """
-    if not is_user_code(module):
-        return
     _mark_module_covered(module.__name__, manifest)
     stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
     for attribute in _attributes_read(func, chain):

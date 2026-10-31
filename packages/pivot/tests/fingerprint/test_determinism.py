@@ -65,7 +65,8 @@ def test_builtin_hash_format():
 
 
 def test_stdlib_module_attributes_not_in_fingerprint():
-    """Non-user-code module attributes (numpy, etc.) should not be fingerprinted.
+    """Non-user-code module attributes (numpy, etc.) should not be fingerprinted; the module is
+    named (`byname:numpy`), since a worker imports it by name.
 
     Uses subprocess to import numpy at module level (how real stages work).
     """
@@ -80,10 +81,10 @@ def stage_using_numpy():
     return combined
 
 manifest = fingerprint.get_stage_fingerprint(stage_using_numpy)
-numpy_keys = [k for k in manifest if not k.startswith("self:")]
+numpy_keys = [k for k in manifest if not k.startswith(("self:", "byname:"))]
 print(f"numpy_keys: {numpy_keys}")
-if numpy_keys:
-    print(f"ERROR: Unexpected library module attributes in fingerprint: {numpy_keys}")
+if numpy_keys or manifest.get("byname:numpy") != "":
+    print(f"ERROR: Unexpected library module attributes in fingerprint: {manifest}")
     exit(1)
 """
     result = subprocess.run(

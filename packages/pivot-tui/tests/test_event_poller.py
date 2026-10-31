@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, cast
 import anyio
 import pytest
 
-from helpers import wait_for_socket as _wait_for_socket
 from pivot.types import (
     ArtifactIdentity,
     ChangeType,
@@ -35,6 +34,7 @@ from pivot_tui.event_poller import EventPoller
 from pivot_tui.rpc_client_impl import RpcPivotClient
 from pivot_tui.testing import FakeRpcServer
 from pivot_tui.types import TuiExpandedMessage, TuiMessage
+from pivot_tui_test_helpers import wait_for_socket as _wait_for_socket
 
 if TYPE_CHECKING:
     from pathlib import Path
