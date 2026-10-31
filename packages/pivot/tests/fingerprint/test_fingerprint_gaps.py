@@ -1801,6 +1801,15 @@ class Outer(loaders.Reader[str]):
 
 
 @dataclasses.dataclass(frozen=True)
+class Outer2(loaders.Reader[str]):
+    scale: int
+    inner: loaders.Reader[str]
+
+    def load(self, path: pathlib.Path) -> str:
+        return self.inner.load(path) * self.scale
+
+
+@dataclasses.dataclass(frozen=True)
 class Settings:
     reader: loaders.Reader[str]
 
@@ -1818,43 +1827,101 @@ def _read(reader: loaders.Reader[str], path: pathlib.Path) -> str:
 
 
 READ = functools.partial(_read, Inner())
+READ_KEYWORD = functools.partial(_read, reader=Inner())
 
 
 """
 
-# Where `Inner()` is held: in a loader's config field, in a non-loader dataclass in a loader's
-# config field, and in the arguments of a partial the stage reads as a global.
-_HELD_INSTANCE_SHAPES = {
-    "loader-field": (
+
+def _held_stage(source: str) -> str:
+    return (
         '@stage\ndef use(text: str) -> str:\n    return text\n\n\nwith Pipeline("t") as pipeline:\n'
-        '    use(pipeline.input("lines.txt", format=Outer(Inner())))\n'
-    ),
-    "dataclass-in-a-loader-field": (
-        '@stage\ndef use(text: str) -> str:\n    return text\n\n\nwith Pipeline("t") as pipeline:\n'
-        '    use(pipeline.input("lines.txt", format=ThroughSettings(Settings(Inner()))))\n'
-    ),
-    "stage-level-partial": (
-        "@stage\ndef use(text: str) -> str:\n"
-        '    return READ(pathlib.Path("data/raw/lines.txt"))\n\n\n'
+        f'    use(pipeline.input("lines.txt", format={source}))\n'
+    )
+
+
+def _partial_stage(call: str) -> str:
+    return (
+        f"@stage\ndef use(text: str) -> str:\n    return {call}\n\n\n"
         'with Pipeline("t") as pipeline:\n    use(pipeline.input("lines.txt", t=str))\n'
+    )
+
+
+# Where the pivot loader `Inner()` is held: in a loader's config field, its second field, a
+# non-loader dataclass in a loader's field, and the arguments or keywords of a partial the stage
+# reads as a global.
+_HELD_INSTANCE_SHAPES = {
+    "loader-field": _held_stage("Outer(Inner())"),
+    "second-loader-field": _held_stage("Outer2(1, Inner())"),
+    "dataclass-in-a-loader-field": _held_stage("ThroughSettings(Settings(Inner()))"),
+    "stage-level-partial": _partial_stage('READ(pathlib.Path("data/raw/lines.txt"))'),
+    "stage-level-partial-keyword": _partial_stage(
+        'READ_KEYWORD(path=pathlib.Path("data/raw/lines.txt"))'
     ),
 }
+
+
+def _assert_an_edit_reruns_once(project: pathlib.Path, home: pathlib.Path, edited: str) -> None:
+    output = project / "data" / "t" / "use.txt"
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingA"
+    _edit(project, edited, '"A"', '"B"')
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingB"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
 
 
 @pytest.mark.parametrize("shape", sorted(_HELD_INSTANCE_SHAPES))
 def test_an_edit_to_a_held_loaders_code_reruns_its_stage(
     tmp_path: pathlib.Path, shape: str
 ) -> None:
-    """`Inner()` is held where the walk only serializes it: a loader's config field, a
-    dataclass in one, or a partial's arguments. `Inner.load` is in its own module, and no
-    annotation names `Inner`. An edit to `Inner.load` alone reruns the stage, and the next run
-    reuses the result."""
-    home = tmp_path / "home"
+    """The pivot loader `Inner()` is held where the walk only serializes it. `Inner.load` is in
+    its own module, and no annotation names `Inner`. An edit to `Inner.load` alone reruns the
+    stage, and the next run reuses the result."""
     project = _project(
         tmp_path,
         {
             "inner.py": _INNER_LOADER,
             "pipeline.py": _HELD_INSTANCE_HEADER + _HELD_INSTANCE_SHAPES[shape],
+        },
+    )
+    _assert_an_edit_reruns_once(project, tmp_path / "home", "inner.py")
+
+
+_IMPORTS_ITS_MODULE = """\
+import dataclasses
+import pathlib
+
+from pivot import loaders
+
+
+def helper(path: pathlib.Path) -> str:
+    return path.read_text().splitlines()[0] + "A"
+
+
+@dataclasses.dataclass(frozen=True)
+class Inner(loaders.Reader[str]):
+    def load(self, path: pathlib.Path) -> str:
+        import inner
+
+        return inner.helper(path)
+"""
+
+
+def test_an_edit_to_a_helper_a_held_loader_imports_in_its_body_reruns_its_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`Inner.load` imports its own module in its body and calls `helper`. The held loader's walk
+    covers `inner` only because it walks that import and hashes `helper`, as a top-level loader's
+    walk does, so an edit to `helper` reruns the stage with the new output (main reran the stage
+    on every run, marking the import uncovered)."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "inner.py": _IMPORTS_ITS_MODULE,
+            "pipeline.py": _HELD_INSTANCE_HEADER + _held_stage("Outer(Inner())"),
         },
     )
     output = project / "data" / "t" / "use.txt"
@@ -1864,7 +1931,52 @@ def test_an_edit_to_a_held_loaders_code_reruns_its_stage(
 
     assert _repro_statuses(project, home) == {"t/use": "ran"}
     assert output.read_text() == "Local Set Default Proof UsingB"
-    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_BASE_LOADER = _INNER_LOADER.replace("class Inner(", "class Base(")
+_INHERITS = "\n\n@dataclasses.dataclass(frozen=True)\nclass Inner(Base):\n    pass\n"
+_MIXIN = (
+    "import pathlib\n\n\nclass ReadMixin:\n    def load(self, path: pathlib.Path) -> str:\n"
+    '        return path.read_text().splitlines()[0] + "A"\n'
+)
+
+# `Inner.load` is a base class's `load` (in another module or in Inner's), or a mixin's: each
+# with the files that define it and the file the edit is in.
+_INHERITED_LOADS = {
+    "base-in-another-module": (
+        {
+            "base.py": _BASE_LOADER,
+            "inner.py": "import dataclasses\n\nfrom base import Base\n" + _INHERITS,
+        },
+        "base.py",
+    ),
+    "base-in-the-same-module": ({"inner.py": _BASE_LOADER + _INHERITS}, "inner.py"),
+    "mixin": (
+        {
+            "mixins.py": _MIXIN,
+            "inner.py": (
+                "import dataclasses\n\nfrom mixins import ReadMixin\nfrom pivot import loaders\n"
+                "\n\n@dataclasses.dataclass(frozen=True)\n"
+                "class Inner(ReadMixin, loaders.Reader[str]):\n    pass\n"
+            ),
+        },
+        "mixins.py",
+    ),
+}
+
+
+@pytest.mark.parametrize("held", [False, True], ids=["top-level", "held"])
+@pytest.mark.parametrize("inheritance", sorted(_INHERITED_LOADS))
+def test_an_edit_to_an_inherited_load_reruns_its_stage(
+    tmp_path: pathlib.Path, inheritance: str, held: bool
+) -> None:
+    """`Inner` inherits its `load`. Read as the input's loader itself, or held as
+    `Outer(Inner())`, an edit to the inherited `load` reruns the stage: a held loader gets a
+    top-level one's fingerprint, inherited user methods included."""
+    files, edited = _INHERITED_LOADS[inheritance]
+    stage = _held_stage("Outer(Inner())" if held else "Inner()")
+    project = _project(tmp_path, {**files, "pipeline.py": _HELD_INSTANCE_HEADER + stage})
+    _assert_an_edit_reruns_once(project, tmp_path / "home", edited)
 
 
 _MAPPED_PARTIAL_STAGES = """\
@@ -2029,9 +2141,9 @@ def test_a_loader_from_a_sourceless_module_is_a_use_of_it_held_or_on_an_output_f
 ) -> None:
     """`wlib` has no source (only `wlib.pyc`). Stage `held` reads its input through
     `Outer(Inner())`, `Inner` from `wlib`; stage `written` writes output field `func` with
-    `Writes()` from `wlib`. Each stage's manifest hashes `wlib`'s code, found under the held
-    loader's prefix and under the output field's, so each stage uses an unreadable module: it
-    carries the mark and is never reused."""
+    `Writes()` from `wlib`. Each stage's manifest hashes `wlib`'s code, under the held loader's
+    `held:<digest>:` prefix or the output field's `out:` prefix, so each stage uses an unreadable
+    module: it carries the mark and is never reused."""
     home = tmp_path / "home"
     project = _project(tmp_path, {"pipeline.py": _SOURCELESS_LOADERS_PIPELINE})
     (project / "data" / "raw" / "other.txt").write_text("other\n")

@@ -618,7 +618,18 @@ def test_a_loaders_module_named_by_name_is_compared(
         pipeline.ensure_fingerprint("p/use")
 
 
-_INNER_CLASS = "class Inner:\n    def read(self) -> str:\n        return __file__\n"
+_INNER_LOADER = """\
+import dataclasses
+import pathlib
+
+from pivot import loaders
+
+
+@dataclasses.dataclass(frozen=True)
+class Inner(loaders.Reader[str]):
+    def load(self, path: pathlib.Path) -> str:
+        return __file__
+"""
 
 _LOADER_HOLDS_AN_INSTANCE = """\
 import dataclasses
@@ -630,10 +641,10 @@ from pivot import Pipeline, loaders, stage
 
 @dataclasses.dataclass(frozen=True)
 class Outer(loaders.Reader[str]):
-    inner: object
+    inner: loaders.Reader[str]
 
     def load(self, path: pathlib.Path) -> str:
-        return path.read_text()
+        return self.inner.load(path)
 
 
 @stage
@@ -646,17 +657,16 @@ with Pipeline("p") as pipeline:
 """
 
 
-def test_the_module_of_a_class_whose_instance_a_loader_holds_is_compared(
+def test_the_module_of_a_loader_another_loader_holds_is_compared(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The input's loader holds `wi_inst.Inner()`, whose class the program holds from its own
-    `wi_inst.py` while the root has another. A worker unpickles the instance by importing
-    `wi_inst` by name, so the module its class's code is recorded from is compared like one the
-    stage reads."""
+    """The input's loader holds the loader `wi_inst.Inner()`, which the program holds from its
+    own `wi_inst.py` while the root has another. A worker runs `Inner.load`, importing `wi_inst`
+    by name, so the module the held loader's walk covers is compared like one the stage reads."""
     held = tmp_path / "program" / "wi_inst.py"
-    _held("wi_inst", held, monkeypatch, _INNER_CLASS)
+    _held("wi_inst", held, monkeypatch, _INNER_LOADER)
     pipeline = _discover(
-        tmp_path, monkeypatch, {"wi_inst.py": _INNER_CLASS}, _LOADER_HOLDS_AN_INSTANCE
+        tmp_path, monkeypatch, {"wi_inst.py": _INNER_LOADER}, _LOADER_HOLDS_AN_INSTANCE
     )
 
     with pytest.raises(exceptions.PivotError, match=rf"module 'wi_inst' is {_resolved(held)}"):

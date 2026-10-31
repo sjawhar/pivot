@@ -309,7 +309,8 @@ def test_a_stage_uses_modules_its_manifest_hashes_or_it_imported(
 
     assert check({f"func:{name}.value": "h"}, set()) == [name]
     assert check({f"dep:data:loader:{name}.Reader:load": "h"}, set()) == [name]
-    assert check({f"dep:data:class:{name}.Held": "h"}, set()) == [name]
+    assert check({f"dep:data:held:00ff:loader:{name}.Reader:load": "h"}, set()) == [name]
+    assert check({f"held:00ff:func:{name}.value": "h"}, set()) == [name]
     assert check({f"const:{name}.SCALE": "2"}, set()) == [name]
     assert check({}, {name}) == [name], "imported while the stage ran"
     assert check({f"ext:{name}.value": f"{name}.value", f"module:{name}": ""}, set()) == []

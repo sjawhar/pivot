@@ -378,6 +378,9 @@ def test_no_dependency_output_or_stage_name_is_read_as_a_module_or_by_name_entry
 _CODE_KINDS = ("func", "class", "const", "default", "schema", "partial", "loader")
 
 
+_DIGEST = "0123456789abcdef"
+
+
 @pytest.mark.parametrize("keyed", [False, True], ids=["one-output", "fields"])
 @pytest.mark.parametrize("kind", _CODE_KINDS)
 @hypothesis.settings(_SETTINGS, max_examples=10)
@@ -386,15 +389,16 @@ def test_no_dependency_output_field_or_stage_name_marks_a_module_used(
     kind: str, keyed: bool, data: st.DataObject
 ) -> None:
     """Stage `<kind>/<kind>` (function `<kind>`) has a dependency named each code kind, alone and
-    as a list's item, wired as the registry wires it, and one output or a field named each.
-    Every word of every key is a user module the worker knows. Only the entries drawn to hash a
-    module's code, the stage's own or a loader's, mark it as one the stage used
-    (`loaded_source._manifest_modules`)."""
+    as a list's item, wired as the registry wires it, and one output or a field named each; each
+    of its loaders, and the stage itself, holds a loader (`held:<digest>:`). Every word of every
+    key is a user module the worker knows. Only the entries drawn to hash a module's code, the
+    stage's own or a loader's, mark it as one the stage used (`loaded_source._manifest_modules`)."""
     stage = f"{kind}/{kind}"
     outputs = {f"{stage}:{field}" for field in _CODE_KINDS} if keyed else {stage}
     prefixes = [f"dep:{name}:" for name in _CODE_KINDS]
     prefixes += [f"dep:{name}[0]:" for name in _CODE_KINDS]
     prefixes += [f"out:{key}:" for key in sorted(outputs)]
+    prefixes += [f"{prefix}held:{_DIGEST}:" for prefix in ["", *prefixes]]
     manifest = {f"self:{kind}": "1", f"module:{kind}": "", f"ext:{kind}.value": f"{kind}.value"}
     for name in _CODE_KINDS:
         manifest.update({f"wire:{name}": "x", f"wire:{name}:path": "x", f"wire:{name}:paths": "[]"})
@@ -405,6 +409,7 @@ def test_no_dependency_output_field_or_stage_name_marks_a_module_used(
     member = "Reads:load" if kind == "loader" else "value"
     manifest.update({f"{prefix}{kind}:used{i}.{member}": "h" for i, prefix in enumerate(using)})
     used = {f"used{index}" for index in range(len(using))}
-    known = {*_ENTRY_KINDS, "load", "save", "empty", "config", "data", "x", "Reads", *used}
+    known = {*_ENTRY_KINDS, "load", "save", "empty", "config", "data", "x", "Reads", "held"}
+    known.update({_DIGEST, *used})
 
     assert loaded_source._manifest_modules(manifest, outputs, known) == used
