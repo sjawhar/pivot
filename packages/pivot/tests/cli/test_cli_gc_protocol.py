@@ -3450,10 +3450,11 @@ def test_a_directory_replaced_after_the_check_never_receives_a_removal(
     snapshot check before a prefix's removals and pauses. Then S1's store directory is renamed
     and S2's (whose project Q names K) put at its path; or S1's prefix directory of K is renamed
     aside and S2's moved to its name; or it is renamed aside and replaced by a link to S2's; or
-    S2's prefix directory is bind-mounted over it. Removals through paths reached Q's K. They now
-    go through the prefix directory the plan listed, opened from the held store and held since:
-    the collection removes P's dead K from the directory it listed, wherever that now is or
-    whatever covers it, and Q's K stays."""
+    S2's prefix directory is bind-mounted over it. Removals through paths reached Q's K. Now the
+    removals open the prefix again from the held store, without following a link, and require
+    the device and inode the plan recorded: after a store swap the prefix is found in the held
+    store and P's dead K goes from there; a replaced or covered prefix is refused, naming it,
+    and nothing is removed there. Q's K stays in every case."""
     if (
         replaced == "prefix bind mount"
         and subprocess.run(["sudo", "-n", "true"], capture_output=True, check=False).returncode
@@ -3525,10 +3526,91 @@ def test_a_directory_replaced_after_the_check_never_receives_a_removal(
 
     flat = " ".join(out.split())
     assert q_object.exists(), f"the collection removed Q's object through a replaced path: {flat}"
-    assert proc.returncode == 0, flat
-    assert not p_object.exists(), (
-        f"P's dead object was not removed where the plan listed it: {flat}"
+    if replaced == "store directory":
+        assert proc.returncode == 0, flat
+        assert not p_object.exists(), f"P's dead object was not removed from the held store: {flat}"
+        return
+    assert proc.returncode != 0, flat
+    listed = s1.resolve() / prefix
+    assert f"the prefix directory {listed} is no longer the directory the plan listed" in flat
+    assert "so nothing was removed there" in flat, flat
+    if replaced == "prefix bind mount":
+        p_object = cache.get_cache_path(s1, key)  # the mount is gone: P's own K shows again
+    assert p_object.exists(), f"a refusal removed P's object: {flat}"
+
+
+def test_a_prefix_removed_and_made_again_after_the_plan_follows_no_link(
+    tmp_path: pathlib.Path,
+) -> None:
+    """After the plan, S1's prefix directory of K is removed entirely, with P's K in it, and a
+    new directory is made at its path, by a run of `mkdir`s that may hand it the removed
+    directory's inode (no descriptor holds the old one); the new directory holds a plain copy of
+    Q's object K. When the inode was reused, the removals open a directory with the device and
+    inode the plan recorded and re-check each condemned name there: the copy, made after the
+    collection's cutoff, is kept (the grace re-check), and the collection exits 0, having
+    reached nothing outside that directory. When the inode was not reused, the collection
+    refuses, naming the prefix. Q's K in S2 stays either way."""
+    s1, s2 = tmp_path / "d1" / "store", tmp_path / "d2" / "store"
+    r, r2 = tmp_path / "r", tmp_path / "r2"
+    for directory in (s1, s2, r, r2):
+        directory.mkdir(parents=True)
+    (r / "files").symlink_to(s1)
+    (r2 / "files").symlink_to(s2)
+    p = _shared_project(tmp_path / "P", r, "copy")
+    _use_cache(p, r, retention=1)
+    q = _shared_project(tmp_path / "Q", r2, "copy")
+    for root in (p, q):
+        (root / "data" / "raw" / "input.txt").write_text("the same text in both stores\n")
+        _ok(_run(root, "repro"))
+    key = cache.hash_file(q / "data" / "shadow" / "shout.txt")[0]
+    (p / "data" / "raw" / "input.txt").write_text("P moved on\n")
+    _ok(_run(p, "repro"))
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_CHECK_HOOK)
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    proc = _start(
+        p,
+        "gc",
+        "--yes",
+        "--grace-hours",
+        "0",
+        env=_env(PYTHONPATH=str(hook), GC_TEST_CHECK_GATE=str(gate)),
     )
+    prefix = s1 / key[:2]
+    q_object = cache.get_cache_path(s2, key)
+    try:
+        _wait_for(gate / "paused", proc, timeout=120)
+        old_inode = prefix.stat().st_ino
+        cache.clear_path(prefix)
+        reused = False
+        for attempt in range(4000):
+            candidate = s1 / f"made-{attempt}"
+            candidate.mkdir()
+            if candidate.stat().st_ino == old_inode:
+                candidate.rename(prefix)
+                reused = True
+                break
+        if not reused:
+            prefix.mkdir()
+        copy = prefix / key[2:]
+        shutil.copyfile(q_object, copy)
+        (gate / "go").write_text("")
+        out, _ = proc.communicate(timeout=180)
+    except BaseException:
+        proc.kill()
+        raise
+
+    flat = " ".join(out.split())
+    assert q_object.exists(), f"the collection reached Q's object in S2: {flat}"
+    if reused:
+        assert proc.returncode == 0, flat
+        assert copy.exists(), f"the copy made after the collection's cutoff was removed: {flat}"
+    else:
+        assert proc.returncode != 0, flat
+        assert "so nothing was removed there" in flat, flat
+        assert copy.exists(), f"a refusal removed the new directory's copy: {flat}"
 
 
 def test_a_tree_store_that_appears_during_a_collection_is_never_read(
@@ -3581,50 +3663,199 @@ def test_a_tree_store_that_appears_during_a_collection_is_never_read(
     assert (q / "data" / "shadow" / "split" / "a.txt").read_text(), "Q's output no longer resolves"
 
 
-@pytest.mark.parametrize("checkout", ["symlink", "copy"])
+def _read_only_view(cache_dir: pathlib.Path) -> str:
+    """A mount-namespace setup in which ``cache_dir`` is read-only (`_in_view`)."""
+    quoted = shlex.quote(str(cache_dir))
+    return f"mount --bind {quoted} {quoted}\nmount -o remount,ro,bind {quoted}"
+
+
+def _files_under(target: pathlib.Path) -> list[pathlib.Path]:
+    """``target`` itself when it is a file, else every file under it (following a link to a
+    tree, as a reader would)."""
+    if not target.is_dir():
+        return [target] if target.exists() or target.is_symlink() else []
+    return sorted(path for path in target.rglob("*") if not path.is_dir())
+
+
+@pytest.mark.parametrize("kind", ["file", "directory"])
+@pytest.mark.parametrize("checkout", ["symlink", "hardlink", "copy"])
+@pytest.mark.parametrize("view", ["read-only", "writable"])
 def test_a_view_that_sees_the_cache_read_only_never_links_from_it(
-    tmp_path: pathlib.Path, checkout: str
+    tmp_path: pathlib.Path, view: str, checkout: str, kind: str
 ) -> None:
-    """A container given the shared cache H read-only: its project Q (never run on the host)
-    tracks X, an object P put in H and no longer names. Q's `pivot checkout` there cannot
-    register Q in H, so a link would name X where the host's `pivot gc` cannot see it, and that
-    gc removes X. In link mode the checkout refuses, naming copy mode and a read-write mount, and
-    links nothing. In copy mode it restores a copy, which is Q's own data: the host's gc may then
-    remove X, and Q's file still reads."""
+    """B3: P tracks X (a file, or a directory) in the shared cache H, then tracks other bytes
+    there, so nothing of P's names X. Q (never run on the host) holds P's old `.pvt` and runs
+    `pivot checkout`. Where H is read-only Q cannot register in H, so a link would name X where
+    the host's `pivot gc` cannot see it: in symlink and hardlink checkout the command refuses,
+    naming `cache.checkout_mode: [copy]` and a read-write mount, and links nothing; in copy
+    checkout it restores copies, Q's own data, which still read after P's gc. The control: where
+    H is writable Q registers, links (or copies) in any mode, and after P's gc X is still in H
+    and Q's files read."""
     shared = tmp_path / "H"
     p = _shared_project(tmp_path / "P", shared, "symlink")
-    notes = p / "data" / "notes.bin"
-    notes.write_text("notes v1\n")
-    _ok(_run(p, "track", "data/notes.bin"))
-    record = p / "data" / "notes.bin.pvt"
-    x = _tracked_object(record, shared)
     q = _shared_project(tmp_path / "Q", shared, checkout)
-    (q / "data" / "notes.bin.pvt").write_text(record.read_text())
-    notes.unlink()
-    notes.write_text("notes v2\n")
-    _ok(_run(p, "track", "--force", "data/notes.bin"))
-    assert x.exists()
-    read_only = (
-        f"mount --bind {shlex.quote(str(shared))} {shlex.quote(str(shared))}\n"
-        + f"mount -o remount,ro,bind {shlex.quote(str(shared))}"
+    if kind == "file":
+        name = "data/notes.bin"
+        (p / name).write_text("notes v1\n")
+    else:
+        name = "images"
+        _fill_images(p / name, "v1")
+    _ok(_run(p, "track", name))
+    record = p / f"{name}.pvt"
+    listing_file = listing.tracked_listing_path(record)
+    (q / f"{name}.pvt").parent.mkdir(parents=True, exist_ok=True)
+    (q / f"{name}.pvt").write_text(record.read_text())
+    if listing_file.exists():
+        listing.tracked_listing_path(q / f"{name}.pvt").write_bytes(listing_file.read_bytes())
+    v1 = {path.relative_to(p): path.read_bytes() for path in _files_under(p / name)}
+    keys = {cache.hash_file(p / rel)[0] for rel in v1}
+    if kind == "file":
+        cache.clear_path(p / name)
+        (p / name).write_text("notes v2\n")
+    else:
+        _fill_images(p / name, "v2")
+    _ok(_run(p, "track", "--force", name))
+    assert all(cache.get_cache_path(shared / "files", key).exists() for key in keys)
+
+    restored = (
+        _in_view(q, "checkout", setup=_read_only_view(shared))
+        if view == "read-only"
+        else _run(q, "checkout")
     )
 
-    restored = _in_view(q, "checkout", setup=read_only)
-
     flat = " ".join((restored.stdout + restored.stderr).split())
-    q_notes = q / "data" / "notes.bin"
-    if checkout == "symlink":
+    target = q / name
+    linked = view == "read-only" and checkout != "copy"
+    if linked:
         assert restored.returncode != 0, flat
-        assert "Refusing to link" in flat and "cache.checkout_mode to [copy]" in flat, flat
+        assert "Refusing to link" in flat and "`cache.checkout_mode: [copy]`" in flat, flat
         assert "mount the cache read-write" in flat, flat
-        assert not q_notes.is_symlink(), f"Q linked X from a cache it is not registered in: {flat}"
+        assert not target.is_symlink(), f"Q linked X from a cache it is not registered in: {flat}"
+        for path in _files_under(target):
+            assert not path.is_symlink() and path.stat().st_nlink == 1, f"{path} is a link: {flat}"
     else:
         assert restored.returncode == 0, flat
-        assert not q_notes.is_symlink() and q_notes.read_text() == "notes v1\n", flat
+        assert {path.relative_to(q): path.read_bytes() for path in _files_under(target)} == v1
     collected = _run(p, "gc", "--yes", "--grace-hours", "0")
     assert collected.returncode == 0, collected.stdout + collected.stderr
-    if checkout == "copy":
-        assert q_notes.read_text() == "notes v1\n", "Q's copy no longer reads after the host's gc"
+    if view == "writable":
+        assert all(cache.get_cache_path(shared / "files", key).exists() for key in keys), (
+            f"P's gc removed X, which the registered Q names: {collected.stdout}"
+        )
+    if not linked:
+        assert {path.relative_to(q): path.read_bytes() for path in _files_under(target)} == v1, (
+            "Q's files no longer read after P's gc"
+        )
+
+
+def test_a_directory_commit_from_a_read_only_view_never_links_the_tree(
+    tmp_path: pathlib.Path,
+) -> None:
+    """B3': P (symlink checkout, one run of history) commits the directory output of v1, tree
+    T1, then v2, so nothing of P's names T1 once a collection prunes the v1 row. Q, a project
+    with the same pipeline at v1 that never ran, runs `pivot repro` where the cache H is
+    read-only: its commit found T1 in the cache and linked its output to it with Q unregistered,
+    and P's `pivot gc` then removed T1 under Q's link. The commit now refuses before it removes
+    the output, which stays as the stage wrote it, and Q's files still read after P's gc."""
+    shared = tmp_path / "H"
+    p = _shared_project(tmp_path / "P", shared, "symlink")
+    q = _shared_project(tmp_path / "Q", shared, "symlink")
+    for root in (p, q):
+        (root / ".pivot" / "config.yaml").write_text(
+            f"cache:\n  dir: {shared}\n  checkout_mode:\n  - symlink\n"
+            + "core:\n  run_history_retention: 1\n"
+        )
+        (root / "pipeline.py").write_text(_DIRECTORY_PIPELINE)
+        (root / "data" / "raw" / "input.txt").write_text("v1 both projects\n")
+    _ok(_run(p, "repro"))
+    t1 = (p / "data" / "shadow" / "split").resolve()
+    assert t1.is_relative_to(shared.resolve() / "trees"), t1
+    (p / "data" / "raw" / "input.txt").write_text("v2 only P\n")
+    _ok(_run(p, "repro"))
+
+    ran = _in_view(q, "repro", setup=_read_only_view(shared))
+
+    flat = " ".join((ran.stdout + ran.stderr).split())
+    split = q / "data" / "shadow" / "split"
+    assert ran.returncode != 0, flat
+    assert "Refusing to link" in flat and "mount the cache read-write" in flat, flat
+    assert not split.is_symlink(), f"Q's output was linked to T1 while Q is unregistered: {flat}"
+    assert (split / "a.txt").read_text() == "v1 both projects\n", flat
+    collected = _run(p, "gc", "--yes", "--grace-hours", "0")
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert (split / "a.txt").read_text() == "v1 both projects\n", "Q's output no longer reads"
+
+
+def test_a_directory_track_from_a_read_only_view_links_nothing(tmp_path: pathlib.Path) -> None:
+    """B3' audit, `pivot track`: track never links the workspace to the cache, in any checkout
+    mode (`cli/track.py` publishes the objects and writes the listing and `.pvt`; the user's
+    directory stays). P tracks `images` (symlink checkout), then tracks other bytes there, so
+    nothing of P's names the first objects. Q holds the first bytes in its own `images` and
+    tracks them where the cache H is read-only: the objects are already there, so track
+    succeeds, unregistered, and leaves Q's directory a plain directory. P's gc then removes the
+    first objects, and Q's files still read: they were never a link."""
+    shared = tmp_path / "H"
+    p = _shared_project(tmp_path / "P", shared, "symlink")
+    q = _shared_project(tmp_path / "Q", shared, "symlink")
+    _fill_images(p / "images", "first")
+    _ok(_run(p, "track", "images"))
+    first = track.read_pvt_file(p / "images.pvt")
+    assert first is not None
+    _fill_images(p / "images", "second")
+    _ok(_run(p, "track", "--force", "images"))
+    _fill_images(q / "images", "first")
+
+    tracked = _in_view(q, "track", "images", setup=_read_only_view(shared))
+
+    flat = " ".join((tracked.stdout + tracked.stderr).split())
+    images = q / "images"
+    assert tracked.returncode == 0, flat
+    assert not images.is_symlink(), f"track linked Q's directory into the cache: {flat}"
+    q_record = track.read_pvt_file(q / "images.pvt")
+    assert q_record is not None and q_record["hash"] == first["hash"], flat
+    collected = _run(p, "gc", "--yes", "--grace-hours", "0")
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert sorted(path.name for path in images.iterdir()) == ["a-first.bin", "b-first.bin"]
+    assert (images / "a-first.bin").read_bytes().startswith(b"a image bytes for first")
+
+
+def test_a_collection_of_many_prefixes_fits_a_small_descriptor_limit(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A collection opens one prefix directory at a time, so it needs the same few descriptors
+    however many prefixes hold dead objects. With `ulimit -n 64` (below macOS's default of 256)
+    and dead objects in well over 64 prefixes, `pivot gc` removes every one of them; holding a
+    descriptor per condemned prefix failed with "Too many open files"."""
+    shared = tmp_path / "shared-cache"
+    root = _shared_project(tmp_path / "project", shared, "copy")
+    _ok(_run(root, "repro"))
+    dead = [_publish(shared / "files", tmp_path, f"dead object {i}\n") for i in range(300)]
+    prefixes = {key[:2] for key in dead}
+    assert len(prefixes) > 100, len(prefixes)
+
+    collected = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'ulimit -n 64 && exec "$0" "$@"',
+            _PIVOT,
+            "gc",
+            "--yes",
+            "--grace-hours",
+            "0",
+        ],
+        cwd=root,
+        env=_env(),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    out = collected.stdout + collected.stderr
+    assert collected.returncode == 0, out
+    assert "Too many open files" not in out, out
+    left = [key for key in dead if cache.get_cache_path(shared / "files", key).exists()]
+    assert not left, f"{len(left)} dead objects stayed: {out}"
 
 
 def test_a_collection_lists_the_trees_under_its_own_cache_root(tmp_path: pathlib.Path) -> None:

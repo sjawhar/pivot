@@ -11,7 +11,7 @@ import pytest
 
 from pivot import exceptions
 from pivot import state_dir as state_dir_mod
-from pivot.storage import gc, naming
+from pivot.storage import cache, gc, naming
 
 
 def _project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
@@ -33,6 +33,30 @@ def _read_register(cache_dir: pathlib.Path) -> tuple[list[gc.ProjectScope], list
     """What a collection of ``cache_dir`` reads from its register."""
     with gc.store_snapshot(cache_dir) as snapshot:
         return gc.read_register(snapshot)
+
+
+def test_a_link_refusal_is_per_cache_and_lifts_once_a_registration_succeeds(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A naming step that cannot register in a read-only cache makes the process refuse links
+    into that cache (`cache.refuse_links_from`). The refusal is per cache: a link into another
+    cache is not refused. A long-lived process that later gains write access lifts it at its
+    next registration there (`naming.register_project`), so it is never stuck refusing."""
+    monkeypatch.setattr(cache, "_UNREGISTERED_ROOTS", dict[str, str]())
+    root, state_dir, cache_dir = _project(tmp_path)
+    other = tmp_path / "other-cache"
+    other.mkdir()
+    target = cache_dir / "files" / "ab" / "cdef0123456789"
+    link = tmp_path / "link"
+    cache.refuse_links_from(cache_dir, (cache_dir, naming.register_root(cache_dir)))
+
+    with pytest.raises(exceptions.CacheError, match="Refusing to link"):
+        cache.refuse_unregistered_link(target, link)
+    cache.refuse_unregistered_link(other / "files" / "ab" / "cdef0123456789", link)
+
+    naming.register_project(cache_dir, root, state_dir)
+
+    cache.refuse_unregistered_link(target, link)
 
 
 def test_a_naming_unit_reregisters_after_the_mount_table_changes(

@@ -1166,7 +1166,10 @@ FALLBACK_ERRNO = _NO_HARDLINK_ERRNO | {errno.EXDEV, errno.EACCES}
 # the cache's filesystem is read-only here (``naming.register_project``), by real path, to the
 # cache root as configured. Nothing is linked from them: that cache's collection, run where it
 # is writable, reads only its register, so it cannot see this project's links
-# (``refuse_unregistered_link``). A later registration that succeeds lifts the refusal.
+# (``refuse_unregistered_link``). The refusal is per cache: one cache's never touches another,
+# and the next registration that succeeds in that cache lifts it (``allow_links_from``), so a
+# long-lived process that gains write access lifts it at its next naming unit there, which every
+# path that links takes before it links.
 _UNREGISTERED_ROOTS = dict[str, str]()
 
 
@@ -1203,9 +1206,9 @@ def refuse_unregistered_link(target: pathlib.Path | str, link: pathlib.Path) -> 
                 f"Refusing to link {link} to {target}: this command could not register the "
                 + f"project in the cache {cache_root}, whose filesystem is read-only here, so a "
                 + "`pivot gc` of that cache, run where it is writable, cannot see that this "
-                + "project uses the object and may remove it. Restore copies instead (set "
-                + "cache.checkout_mode to [copy]: a copy is this project's own data), or mount "
-                + "the cache read-write."
+                + "project uses the object and may remove it; a symlink and a hardlink both "
+                + "name it. Restore copies instead: set `cache.checkout_mode: [copy]` (a copy is "
+                + "this project's own data), or mount the cache read-write."
             )
 
 
@@ -2036,6 +2039,8 @@ def _store_directory(
                     + "to let this commit publish it again"
                 )
 
+            # Before the output is removed: a refusal leaves it as the stage wrote it.
+            refuse_unregistered_link(cache_dir_path, path)
             if before_remove is None:
                 _clear_path(path)
             else:

@@ -1132,9 +1132,11 @@ class StoreSnapshot(NamedTuple):
     whatever the link says later, and each store directory that exists at the start is held
     open (``anchors``); one that does not stays absent for the whole collection (``anchor``).
     ``check`` tells when a path no longer names the directory the collection opened (a store
-    directory renamed and another put in its place). The plan lists each prefix directory
-    through a descriptor opened from the held store and held to the end (``prefixes``,
-    ``hold_prefix``), and every removal goes through that descriptor, never a path.
+    directory renamed and another put in its place). Every prefix directory is opened from the
+    held store, never through a path and never following a link (``open_prefix``): the plan
+    lists it through such a descriptor and records its identity, and the removals open it again
+    in bounded batches, require that identity and remove through the descriptor
+    (``execute_plan``).
 
     ``trees`` holds the whole-directory tree stores: a stage's commit puts a tree beside the
     object store it resolves ``files/`` to, which is the register root; a command given the
@@ -1148,7 +1150,6 @@ class StoreSnapshot(NamedTuple):
     object_root: pathlib.Path
     trees: tuple[pathlib.Path, ...]
     anchors: tuple[tuple[pathlib.Path, int], ...]
-    prefixes: dict[pathlib.Path, int]
 
     def check(self) -> None:
         """Refuse to go on when the cache no longer resolves to this snapshot: ``files/`` now
@@ -1183,22 +1184,15 @@ class StoreSnapshot(NamedTuple):
         its path meanwhile (a directory, or a link to another cache's store)."""
         return next((fd for path, fd in self.anchors if path == store), None)
 
-    def hold_prefix(self, prefix: pathlib.Path) -> int | None:
+    def open_prefix(self, prefix: pathlib.Path) -> int | None:
         """Open the prefix directory ``prefix`` (``<store>/<xx>``) from the held store, never
-        through its path and never following a link, and hold it until the collection ends
-        (``store_snapshot``); None when its store is not held or no directory is there.
-
-        The plan lists the prefix through this descriptor and every removal in it goes through
-        the same one, so a prefix directory renamed aside and replaced (by another directory,
-        or by a link to another store's prefix) after the plan receives nothing."""
-        held = self.prefixes.get(prefix)
-        if held is not None:
-            return held
+        through its path and never following a link; None when its store is not held or no
+        directory is there (nothing, a file, or a link). The caller closes it."""
         anchor = self.anchor(prefix.parent)
         if anchor is None:
             return None
         try:
-            fd = os.open(
+            return os.open(
                 prefix.name,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                 dir_fd=anchor,
@@ -1209,33 +1203,33 @@ class StoreSnapshot(NamedTuple):
             if e.errno != errno.ELOOP:
                 raise
             return None
-        self.prefixes[prefix] = fd
-        return fd
 
-    def release_prefix(self, prefix: pathlib.Path) -> None:
-        """Close a held prefix directory the plan removes nothing from."""
-        fd = self.prefixes.pop(prefix, None)
-        if fd is not None:
-            os.close(fd)
+    def open_listed_prefix(self, prefix: pathlib.Path, listed: tuple[int, int]) -> int:
+        """Open the prefix directory the plan listed as ``prefix`` (``open_prefix``) and return
+        its descriptor; the caller closes it.
 
-    def held_prefix(self, prefix: pathlib.Path, listed: tuple[int, int]) -> int | None:
-        """The prefix directory the plan listed ``prefix`` through (``hold_prefix``), or None.
+        ``listed`` is its identity when the plan listed it (``Doomed.prefix``). A prefix
+        directory renamed aside and replaced since (by another directory, a link, or a mount
+        over it) is not that directory, and nothing in it is removed.
 
         Raises:
-            exceptions.CacheCollectionRefusedError: the held descriptor is not the directory
-                the plan recorded (``Doomed.prefix``).
+            exceptions.CacheCollectionRefusedError: no directory is there, or it is not the
+                directory the plan listed.
         """
-        fd = self.prefixes.get(prefix)
-        if fd is None:
-            return None
-        held = os.fstat(fd)
-        if (held.st_dev, held.st_ino) != listed:
-            raise exceptions.CacheCollectionRefusedError(
-                refusal_store_moved(
-                    self, f"{prefix} is no longer the directory the collection listed"
-                )
+        fd = self.open_prefix(prefix)
+        if fd is not None:
+            held = os.fstat(fd)
+            if (held.st_dev, held.st_ino) == listed:
+                return fd
+            os.close(fd)
+        raise exceptions.CacheCollectionRefusedError(
+            refusal_store_moved(
+                self,
+                f"the prefix directory {prefix} is no longer the directory the plan listed "
+                + "(it was replaced, or something is mounted over it), so nothing was removed "
+                + "there",
             )
-        return fd
+        )
 
 
 def _resolved_store(cache_dir: pathlib.Path) -> pathlib.Path:
@@ -1246,8 +1240,7 @@ def _resolved_store(cache_dir: pathlib.Path) -> pathlib.Path:
 @contextlib.contextmanager
 def store_snapshot(cache_dir: pathlib.Path) -> Generator[StoreSnapshot]:
     """Resolve the cache's store layout once, for one collection, holding each of its existing
-    directories open, and every prefix directory the plan holds, until the collection ends
-    (``StoreSnapshot``)."""
+    store directories open until the collection ends (``StoreSnapshot``)."""
     layout = naming.store_layout(cache_dir)
     object_root = _resolved_store(cache_dir)
     trees = [pathlib.Path(os.path.realpath(layout.register_root / TREES_DIR))]
@@ -1256,7 +1249,6 @@ def store_snapshot(cache_dir: pathlib.Path) -> Generator[StoreSnapshot]:
         trees.append(own_trees)
     register_root = pathlib.Path(os.path.realpath(layout.register_root))
     anchors = list[tuple[pathlib.Path, int]]()
-    prefixes = dict[pathlib.Path, int]()
     try:
         for path in dict.fromkeys((register_root, object_root, *trees)):
             try:
@@ -1264,9 +1256,9 @@ def store_snapshot(cache_dir: pathlib.Path) -> Generator[StoreSnapshot]:
             except (FileNotFoundError, NotADirectoryError):
                 continue
             anchors.append((path, fd))
-        yield StoreSnapshot(cache_dir, layout, object_root, tuple(trees), tuple(anchors), prefixes)
+        yield StoreSnapshot(cache_dir, layout, object_root, tuple(trees), tuple(anchors))
     finally:
-        for fd in (*prefixes.values(), *(fd for _path, fd in anchors)):
+        for _path, fd in anchors:
             os.close(fd)
 
 
@@ -1597,8 +1589,9 @@ def naming_exclusive(snapshot: StoreSnapshot) -> Generator[None]:
 @contextlib.contextmanager
 def _prefix_locked(prefix_fd: int) -> Generator[None]:
     """Hold one prefix directory's lock exclusively, excluding every staging publisher and
-    the temporary sweep while this directory is listed. ``prefix_fd`` is the directory, held
-    open (``StoreSnapshot.hold_prefix``); the lock file is opened in it, not through a path.
+    the temporary sweep while this directory is listed. ``prefix_fd`` is the directory, opened
+    from the held store (``StoreSnapshot.open_prefix``); the lock file is opened in it, not
+    through a path.
 
     Lock order: gc takes this only while it lists, before any naming lock and never under the
     exclusive one; a writer may take a prefix lock shared inside its naming unit."""
@@ -1658,9 +1651,11 @@ def build_plan(
     One directory hash names its listing object and its tree, so the record that names the
     directory keeps both. Only the store directories the snapshot holds are listed (a store
     absent when the collection started stays absent), each through its held descriptor, and
-    each prefix directory through one opened from it and held until the collection ends
-    (``StoreSnapshot.hold_prefix``); ``execute_plan`` removes through the same descriptor. The
-    plan's paths only name what it lists.
+    each prefix directory through one opened from it and closed once it is listed
+    (``StoreSnapshot.open_prefix``), whose device and inode each condemned object records
+    (``Doomed.prefix``) for ``execute_plan``. One prefix descriptor is open at a time, so the
+    collection needs a fixed number of descriptors whatever ``ulimit -n`` allows. The plan's
+    paths only name what it lists.
     """
     cutoff = (time.time() if now is None else now) - grace_hours * 3600
     plan = Plan(
@@ -1680,18 +1675,18 @@ def build_plan(
             continue
         for name in _prefix_names(store_fd):
             prefix_dir = store / name
-            prefix_fd = snapshot.hold_prefix(prefix_dir)
+            prefix_fd = snapshot.open_prefix(prefix_dir)
             if prefix_fd is None:
                 continue
-            listed = os.fstat(prefix_fd)
-            prefix = (listed.st_dev, listed.st_ino)
-            dooms = len(plan["doomed"])
-            with _prefix_locked(prefix_fd), os.scandir(prefix_fd) as entries:
-                _plan_prefix(
-                    plan, prefix_dir, prefix_fd, prefix, entries, roots, cutoff, remove_linked
-                )
-            if len(plan["doomed"]) == dooms:
-                snapshot.release_prefix(prefix_dir)
+            try:
+                listed = os.fstat(prefix_fd)
+                prefix = (listed.st_dev, listed.st_ino)
+                with _prefix_locked(prefix_fd), os.scandir(prefix_fd) as entries:
+                    _plan_prefix(
+                        plan, prefix_dir, prefix_fd, prefix, entries, roots, cutoff, remove_linked
+                    )
+            finally:
+                os.close(prefix_fd)
     return plan
 
 
@@ -1800,14 +1795,16 @@ def execute_plan(
     unlinks. Each object is still re-checked against the grace and the hardlink rule (a checkout
     already in flight before the lock was taken may have hardlinked it).
 
-    No removal goes through a path. Each prefix directory's removals go through the descriptor
-    the plan listed it through, opened from the held store when the plan was built and held
-    since (``StoreSnapshot.held_prefix``): a store directory, or a prefix directory, renamed
-    aside and replaced after the plan (by another directory or by a link to another store)
-    receives nothing, and the objects the plan condemned go from the directory it listed.
-    Before the first deletion in each prefix directory the snapshot is still checked again
-    (``StoreSnapshot.check``): ``files/`` resolving elsewhere, or a store directory no longer the
-    one the collection opened, refuses, and nothing further is removed.
+    No removal goes through a path. Before the first deletion in each prefix directory the
+    snapshot is checked again (``StoreSnapshot.check``: ``files/`` resolving elsewhere, or a
+    store directory no longer the one the collection opened, refuses), and the prefix directory
+    is opened again from the held store, without following a link, and must be the directory the
+    plan listed: the ``fstat`` of the opened descriptor must show the device and inode the plan
+    recorded (``StoreSnapshot.open_listed_prefix``). Every ``stat``, unlink and tree removal of
+    that prefix goes through that descriptor, which is closed before the next prefix is opened.
+    So a store directory, or a prefix directory, renamed aside and replaced after the plan (by
+    another directory, a link, or a mount over it) receives nothing: the collection refuses,
+    naming the prefix, and removes nothing there or after it.
 
     No prefix lock is taken here: while gc holds the exclusive naming lock it must never wait
     for another process, or every writer on the cache would wait behind it. A publisher staging
@@ -1823,47 +1820,53 @@ def execute_plan(
     removed = ObjectCount(objects=0, bytes=0)
     current: pathlib.Path | None = None
     prefix_fd: int | None = None
-    for doomed in sorted(plan["doomed"], key=lambda d: d["path"]):
-        path = doomed["path"]
-        if path.parent != current:
-            current = path.parent
-            snapshot.check()
-            prefix_fd = snapshot.held_prefix(path.parent, doomed["prefix"])
-        if prefix_fd is None:
-            continue
-        name = path.name
-        try:
-            stats = os.stat(name, dir_fd=prefix_fd, follow_symlinks=False)
-        except FileNotFoundError:
+    try:
+        for doomed in sorted(plan["doomed"], key=lambda d: d["path"]):
+            path = doomed["path"]
+            if path.parent != current:
+                current = path.parent
+                if prefix_fd is not None:
+                    os.close(prefix_fd)
+                    prefix_fd = None
+                snapshot.check()
+                prefix_fd = snapshot.open_listed_prefix(path.parent, doomed["prefix"])
+            assert prefix_fd is not None
+            name = path.name
+            try:
+                stats = os.stat(name, dir_fd=prefix_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                removed["objects"] += 1
+                removed["bytes"] += doomed["bytes"]
+                continue
+            key = path.parent.name + name
+            if (
+                _keep_reason(
+                    key,
+                    stats,
+                    roots,
+                    is_dir=doomed["is_dir"],
+                    cutoff=cutoff,
+                    remove_linked=remove_linked,
+                )
+                is not None
+            ):
+                continue
+            # M5: unlink markers before the tree, so a partial rmtree never leaves a marker on
+            # a truncated tree that a later checkout would trust.
+            if doomed["is_dir"]:
+                for suffix in _TREE_MARKER_SUFFIXES:
+                    with contextlib.suppress(OSError):
+                        os.unlink(name + suffix, dir_fd=prefix_fd)
+            try:
+                _remove_at(prefix_fd, name, is_dir=stat.S_ISDIR(stats.st_mode))
+            except OSError as e:
+                logger.warning("Cannot remove cache object %s: %s", path, e)
+                continue
             removed["objects"] += 1
             removed["bytes"] += doomed["bytes"]
-            continue
-        key = path.parent.name + name
-        if (
-            _keep_reason(
-                key,
-                stats,
-                roots,
-                is_dir=doomed["is_dir"],
-                cutoff=cutoff,
-                remove_linked=remove_linked,
-            )
-            is not None
-        ):
-            continue
-        # M5: unlink markers before the tree, so a partial rmtree never leaves a marker on a
-        # truncated tree that a later checkout would trust.
-        if doomed["is_dir"]:
-            for suffix in _TREE_MARKER_SUFFIXES:
-                with contextlib.suppress(OSError):
-                    os.unlink(name + suffix, dir_fd=prefix_fd)
-        try:
-            _remove_at(prefix_fd, name, is_dir=stat.S_ISDIR(stats.st_mode))
-        except OSError as e:
-            logger.warning("Cannot remove cache object %s: %s", path, e)
-            continue
-        removed["objects"] += 1
-        removed["bytes"] += doomed["bytes"]
+    finally:
+        if prefix_fd is not None:
+            os.close(prefix_fd)
     return removed
 
 

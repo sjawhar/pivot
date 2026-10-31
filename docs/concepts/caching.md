@@ -265,7 +265,11 @@ the cache root (or point `cache.dir` at a directory inside it), so `files/` is a
 of that filesystem; or keep the objects in a directory inside the mounted filesystem and link
 `files/` to it. A collection resolves where the register and the store are once, when it
 starts, and works through that for every step; if `files/` is re-pointed, or a store directory
-replaced, while it runs, it refuses before deleting anything more.
+or one of its two-character prefix directories is replaced (or covered by a mount) while it
+runs, it refuses before deleting anything more, naming what moved. It opens one prefix
+directory at a time, so it needs only a few open files whatever `ulimit -n` allows. Races that
+need root or FUSE, such as a mount made inside a dead tree while the collection removes it, are
+not covered: whoever can make them can delete the cache's objects directly.
 
 ### A Project That Uses More Than One Cache
 

@@ -508,13 +508,21 @@ every view that mounts the store looks (S8). A collection resolves the layout on
 real paths, and each store directory that exists at the start is held open (`anchors`); one that
 does not stays absent for the whole collection, whatever appears at its path (no listing, no
 removal: `StoreSnapshot.anchor`). The plan lists each prefix directory through a descriptor
-opened from the held store with `O_DIRECTORY | O_NOFOLLOW` and held to the end of the
-collection (`StoreSnapshot.hold_prefix`, `Doomed.prefix`), and `execute_plan` removes through
-that same descriptor (`StoreSnapshot.held_prefix`, `gc._remove_at`: every `lstat`, unlink and
-tree removal relative to it, never a path), after re-checking the snapshot before each prefix
+opened from the held store with `O_DIRECTORY | O_NOFOLLOW` (`StoreSnapshot.open_prefix`),
+records the device and inode of that descriptor in each condemned object (`Doomed.prefix`) and
+closes it before the next prefix. `execute_plan` re-checks the snapshot before each prefix
 (`StoreSnapshot.check`: `files/` resolving elsewhere, or a store directory no longer the one
-opened, refuses). So no `files/` re-pointed and no store or prefix directory renamed aside and
-replaced (by a directory or a link) during a collection can receive a removal (RP). The
+opened, refuses), opens the prefix again the same way, requires the `fstat` of the opened
+descriptor to show the recorded device and inode (`StoreSnapshot.open_listed_prefix`; a
+mismatch refuses, naming the prefix, and nothing is removed there), removes through it
+(`gc._remove_at`: every `stat`, unlink and tree removal relative to it, never a path) and closes
+it. So no `files/` re-pointed and no store or prefix directory renamed aside and replaced (by a
+directory, a link or a mount over it) during a collection can receive a removal (RP), and a
+collection needs a fixed number of descriptors whatever `ulimit -n` is. A prefix removed and
+made again after the plan, which may reuse the removed directory's inode, holds only what was
+put in it since: the removals there reach its own entries and follow no link. Races that need
+root or FUSE (a mount made inside a dead tree while it is removed) are out of scope: whoever
+can make them can delete the objects directly. The
 registration memo records the register
 root and re-registers in full when it moves (a re-pointed `files/`). The register root must be
 writable by every writer; when it is not, the writer refuses and names it.
