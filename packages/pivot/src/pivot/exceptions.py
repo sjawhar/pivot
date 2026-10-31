@@ -266,6 +266,14 @@ class UncachedIncrementalOutputError(CacheError):
     """Raised when an incremental output exists without a cache entry."""
 
 
+class CacheCollectionRefusedError(CacheError):
+    """Raised when `pivot gc` will not collect a cache, having removed nothing.
+
+    The message is the whole explanation: which cache, why it was refused, and what the user
+    can run instead.
+    """
+
+
 class RestartedIncrementalOutputError(CacheError):
     """Raised when an older pivot rewrote the lock this pivot wrote for a stage with an
     incremental output (``lock.restart_proofs``): that pivot may have restarted the output

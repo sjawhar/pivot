@@ -74,6 +74,8 @@ _COMMANDS: dict[str, tuple[str, ...]] = {
     "doctor": ("doctor",),
     "fetch": ("fetch",),
     "fingerprint": ("fingerprint", "reset"),
+    "forget-cache": ("forget-cache", "0123456789abcdef0123456789abcdef"),
+    "gc": ("gc", "--dry-run"),
     "get": ("get", "--rev", "HEAD", "data/raw/input.txt"),
     "history": ("history",),
     "import": ("import", "/nonexistent-source-repo", "out.txt"),
@@ -93,6 +95,10 @@ _COMMANDS: dict[str, tuple[str, ...]] = {
     "update": ("update",),
     "verify": ("verify",),
 }
+
+# `gc` and `forget-cache` are new after 0.5.2. The table still lists them, but has no historical
+# exit code to compare.
+_LEGACY_COMMANDS = tuple(command for command in _COMMANDS if command not in {"gc", "forget-cache"})
 
 # The tail of the one warning a command that runs prints about the unusable configuration.
 _DEFAULT_WARNING = "; Pivot uses the default .pivot."
@@ -489,7 +495,7 @@ def base_project(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
 
 
 @pytest.mark.parametrize("case", list(_CASES))
-@pytest.mark.parametrize("command", list(_COMMANDS))
+@pytest.mark.parametrize("command", _LEGACY_COMMANDS)
 def test_command_exits_as_on_052(
     base_project: pathlib.Path, tmp_path: pathlib.Path, case: str, command: str
 ) -> None:
@@ -525,7 +531,7 @@ def test_command_exits_as_on_052(
         assert len(errors) == 1, result.stderr
 
 
-@pytest.mark.parametrize("command", list(_COMMANDS))
+@pytest.mark.parametrize("command", _LEGACY_COMMANDS)
 def test_every_created_configured_state_directory_has_the_template(
     base_project: pathlib.Path, tmp_path: pathlib.Path, command: str
 ) -> None:
@@ -559,7 +565,7 @@ def _capture(pivot: str) -> None:
     """Print each case's exit codes under ``pivot`` as the literal table, then one line per run."""
     with tempfile.TemporaryDirectory(prefix="cap") as tmp:
         base = _build_base(pathlib.Path(tmp) / "base", pivot)
-        runs = [(case, command) for case in _CASES for command in _COMMANDS]
+        runs = [(case, command) for case in _CASES for command in _LEGACY_COMMANDS]
 
         def run_one(index: int) -> tuple[str, str, subprocess.CompletedProcess[str]]:
             case, command = runs[index]

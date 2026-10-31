@@ -243,7 +243,13 @@ When multiple `pivot` processes share the same StateDB:
   output the stage lacks, and status only when every stale upstream stage has a recovery too;
   `pivot status` suggests `pivot pull` from that field, never from the reason's text. A trust-me
   `pivot commit <stage>` keeps the previous lock's `reads` only when that lock records the same
-  code, params, dependency hashes and outputs.
+  code, params, dependency hashes and outputs. A read by hash names nothing until a lock does:
+  a stage that found its object in the cache took no naming unit, so a collection may remove
+  it while the stage runs. Each commit (a stage's, and `pivot commit`'s for the `reads` it
+  writes) fetches again, before its naming unit, every read object the cache no longer holds
+  (`reads.fetch_missing`, recording each fetch in the remote index), and inside the unit
+  refuses to write a lock naming one that is still missing (`reads.require_cached`): the stage
+  fails, nothing is committed, and its next run reads the object again.
 
 ## Output Ownership
 
@@ -430,3 +436,236 @@ When multiple `pivot` processes share the same StateDB:
 Generation, dependency and run-cache keys hold artifact identities and project-relative paths, so they mean the same thing on every machine. File-hash keys and the identity index hold absolute paths on purpose: an entry describes one file on this machine, checked by its `stat`.
 
 See `docs/solutions/2026-02-01-statedb-path-strategies.md` for path handling patterns.
+
+## Cache Lock Order (the naming-lock protocol)
+
+`pivot gc` is the only pivot command that deletes a user's cached data. Its safety rests on
+mutual exclusion with writers, not on timing. The protocol uses two reader/writer locks plus a
+turnstile to prevent starvation. **The lock order must never be inverted; any path that takes
+them in another order is a deadlock bug.**
+
+```
+gc:      gc.lock (EX)  →  prefix .pivot_cache.lock (EX, one at a time, to list)  →  naming.turnstile (EX)  →  naming.lock (EX)
+writer:  naming.turnstile (SH)  →  naming.lock (SH)  →  (turnstile UN)  →  prefix .pivot_cache.lock (SH, only to re-publish)
+```
+
+- **`gc.lock`** (EX, non-blocking): excludes two gc runs on one cache. Taken first, held for the
+  whole run including the prompt. Writers must NOT take it.
+- **`naming.turnstile`** (EX for gc, SH for writers): the turnstile prevents writer starvation.
+  gc takes it exclusive (new writers queue), then takes naming exclusive (waits for in-flight
+  units). Writers take it shared, then naming shared, then release turnstile immediately.
+- **`naming.lock`** (EX for gc, SH for writers): the mutual-exclusion lock. While gc holds it
+  exclusive, no writer can name a cache object. While a writer holds it shared, gc waits.
+- **Prefix `.pivot_cache.lock`** (EX for gc's listing, SH for a staging publisher): gc lists a
+  prefix only under it, so it waits for a publish in progress there before it takes any naming
+  lock. gc **never** takes a prefix lock while it holds `naming.lock` exclusive: it must not
+  wait on another process there, or every writer waits behind it. Its deletions need no prefix
+  lock, because a publisher outside a naming unit is re-checked inside one before anything
+  names its object.
+
+### Writer commit unit
+
+A naming unit covers only the **naming step**: from the **last existence check on each cache
+object** to the **durable record that names it** (lock file, `.pvt`, run-cache row or workspace
+link). It must NEVER span stage execution, hashing, copying or a download. Hash and publish
+before the unit; download outside it; inside it, re-check every object (publishing again any a
+collection removed since) and then link and write the record. See `naming.naming_unit`,
+`WorkspaceStore.prepare_commit` / `finish_commit`, and `cache.publish_hashed_output`.
+
+Sites: `executor/worker.py` (normal commit and run-cache skip), `executor/commit.py` (`pivot
+commit`), `cli/track.py` (`pivot track`), `storage/restore.py` (restore from revision), and
+`config.register_cache_use` (a register write). Every site and `pivot gc` take the lock files
+from `naming.naming_lock_paths(<cache root as configured>)`, never from a path derived from the
+resolved object root.
+
+**The register and the locks belong to the object store, not the cache root**
+(`naming.store_layout`). The register (`projects/`, with `cache-id`), the cache mount records
+(`mounts/`), `naming.lock`, `naming.turnstile` and `gc.lock` live in the cache root in a plain
+layout (`files/` a directory, or absent), unchanged; when `files/` is a link, in the parent of
+the directory it resolves to (`naming.register_root`). Every root that uses one store (two roots
+linking one directory, or a root linking a plain root's `files/`) then shares one register and
+one lock, so a collection through any root reads every project that names objects in the
+store, and a disk copy of a cache root whose `files/` links shared storage keeps no register of
+its own (SF). Trees live in two places in a linked layout: a stage's commit writes a tree beside
+the store (`<register root>/trees`, shared by every root), and `pivot track` or a restore given
+the unresolved `files/` writes one under the cache root's own `trees/`. A collection lists both
+(`gc.StoreSnapshot.trees`), and a link into another root's `trees/` whose `files/` resolves to
+the same store names that tree's key (`gc._tree_of_store`). A link to the root of a mount of its own (a mount point, or a
+bind mount the mount table lists) is `unshared`: that store's parent is on another filesystem
+that other views need not reach, so the register stays at the cache root and
+`gc.resolve_scopes` refuses, naming the layout. A `files/` that is itself a mount
+point (another `st_dev` than the cache root, or listed in the mount table) is `unshared` too
+(`naming.store_layout`). A process resolves each cache root's layout once and keeps it in
+`naming._STORE_LAYOUTS` (the latest 64 roots) while `files/`'s own `lstat` identity (device,
+inode, mode and ctime; for a link also the device, inode and ctime of the directory it resolves
+to, so an inode reused by `rm` and `mkdir` is a new entry) and the mount-change count are
+unchanged, so a naming step costs one `lstat`, one poll and a lookup, and reads the mount table
+only after a change. Writers refuse an
+`unshared` layout in `naming_unit` with the text a collection's refusal has
+(`naming.unshared_store_problem`): no view may write into a store whose register is not where
+every view that mounts the store looks (S8). A collection resolves the layout once
+(`gc.store_snapshot`): the register, the locks, the record walk and the plan use the snapshot's
+real paths, and each store directory that exists at the start is held open (`anchors`); one that
+does not stays absent for the whole collection, whatever appears at its path (no listing, no
+removal: `StoreSnapshot.anchor`). The plan lists each prefix directory through a descriptor
+opened from the held store with `O_DIRECTORY | O_NOFOLLOW` (`StoreSnapshot.open_prefix`),
+records the device and inode of that descriptor in each condemned object (`Doomed.prefix`) and
+closes it before the next prefix. `execute_plan` re-checks the snapshot before each prefix
+(`StoreSnapshot.check`: `files/` resolving elsewhere, or a store directory no longer the one
+opened, refuses), opens the prefix again the same way, requires the `fstat` of the opened
+descriptor to show the recorded device and inode (`StoreSnapshot.open_listed_prefix`; a
+mismatch refuses, naming the prefix, and nothing is removed there), removes through it
+(`gc._remove_at`: every `stat`, unlink and tree removal relative to it, never a path) and closes
+it. So no `files/` re-pointed and no store or prefix directory renamed aside and replaced (by a
+directory, a link or a mount over it) during a collection can receive a removal (RP), and a
+collection needs a fixed number of descriptors whatever `ulimit -n` is. A prefix removed and
+made again after the plan, which may reuse the removed directory's inode, holds only what was
+put in it since: the removals there reach its own entries and follow no link. Races that need
+root or FUSE (a mount made inside a dead tree while it is removed) are out of scope: whoever
+can make them can delete the objects directly. The
+registration memo records the register
+root and re-registers in full when it moves (a re-pointed `files/`). The register root must be
+writable by every writer; when it is not, the writer refuses and names it.
+
+The writer side (the naming lock, the register and the registration memo) lives in
+`storage/naming.py`; the collector in `storage/gc.py` imports it to read the register. Writers
+import only `naming`, so a worker process never pays to import the collector (its module body,
+with a dozen `TypedDict`s and `member_skip`, cost about 2.7 ms of CPU per process).
+
+**Every unit registers its project** (`naming_unit(cache_root, project=(root, state_dir))`),
+under the shared lock and before anything is named, so every process that names an object is
+in the register, whichever command it runs and whether or not the cache existed when it began.
+Only a test standing in for a writer passes `project=None`. A full registration (a process's
+first unit, or after its evidence changed) tries to write the project id to
+`<state dir>/state.lmdb/pivot-project-id`, then one fresh nonce to this view's
+`<state dir>/state.lmdb/gc-views/<view>-<cache id>` (the cache id is a random value in
+`projects/cache-id` in the cache's register (`naming.register_root`), so each cache a project uses has its own nonce and registering in
+one never makes another cache's entry stale) and the entry's sibling `<digest>.nonce`, then the entry
+with the mount points at or below the project root and state directory, and cache-root submounts
+in `<cache>/mounts/`. An entry that already records exactly that (its timestamp aside) and was
+written in the last hour is kept rather than rewritten (`_entry_is_current`), so a worker pool
+writes one entry, not one per process. The entry records no pivot version: nothing reads one,
+and looking it up walks the installation's metadata (about 30 ms of CPU in a cold run).
+**Every `repro` and `run` registers its project before any stage runs or restores**
+(`Engine._orchestrate_execution`, one unit per run when the cache exists). A worker takes a
+naming unit for a run-cache lookup only when a row exists for the stage (`worker._run_cache_row`),
+so a stage that executes takes its first unit at its commit, possibly hours later, and a stage
+skipped with its outputs in place takes none: without the engine's unit, a project out of the
+register (last run by a pivot release, or whose entry was deleted) would stay out of it while
+its changed stages run, and a peer's `pivot gc` would remove what only its locks name (U1). The
+engine registers the identity every worker registers: the project root and its configured
+state directory (`state_dir.locate_state_dir`).
+Entries, nonces and cache mount records are keyed per view (hostname, machine id and mount
+namespace). An id or nonce write failure leaves an entry without them, so a collection refuses
+it but the writer preserves #503's unusable-state behavior. A register write failure refuses the
+writer. The only exception is `EROFS` on the cache: a read-only cache cannot be collected
+either. A naming step that cannot register there names nothing by linking: the process makes
+no symlink or hardlink into that cache (`cache.refuse_links_from`, `cache.links_refused`) until
+a registration there succeeds. A restore or commit whose checkout modes include copy copies
+instead (`_checkout_with_fallback`; the whole-tree symlink branches of `_store_directory` and
+`_restore_directory_from_cache` step aside to it), so the default order works in a view that
+sees a writable cache read-only; with no copy among the modes it refuses
+(`cache.refuse_unregistered_link`).
+A restore that links a cache object into a workspace outside a naming unit runs after a
+registering unit **in the cache it restores from** (`naming.register_use(cache_root, …)`, with
+the same `cache_root` the restore reads): `checkout` and `pull` through
+`config.register_cache_use`; a skipped stage's restore in `execute_stage` (exported, so it may
+run without the engine) through `restore_outputs_to_hashes(register=…)`, once and only when a
+restore happens, in the cache its store spec names; the engine's own skipped-stage restore after
+its pre-run registration in the `cache_dir` its store is built from; `--checkout-missing` in
+`verify_tracked_files`, which restores from the configured cache and registers there itself,
+since a library caller can give the engine another `cache_dir` (L1). A restore inside a naming
+unit (the run-cache restore) passes no `register`: that unit registered, and a nested unit could
+wait on a collection that waits on the outer one. `executor.core.run(pipeline=...)` refuses a
+supplied pipeline, or one it includes, with a `root=` other than the project root, as discovery
+does (`discovery.require_project_roots`, which checks the roots the pipeline recorded at its
+load, not the configuration now): its stages' locks would sit where no collection reads (L2).
+
+**A registered project is live only after a real read.** `read_register` resolves the state
+directory from that project's own `core.state_dir`, requires the entry's project id there, and
+requires the entry's nonce in that view's nonce file, read in the collector's own view: an
+inode number is not proof (an overlay copy or a cloned disk shares it). The pair is read under
+the lock writers hold across both writes (`naming.read_nonce_pair`, the state nonce file's
+`flock`), because a unit in **another** cache rewrites it without this cache's naming lock: every
+unit, after registering in its own cache, rotates this view's nonce in every other cache the
+project lists in **any** view (`naming._confirm_listed_caches`), registering this view there
+first where it has no entry. A registration lists its cache in `gc-views/<view>-<cache id>.cache`
+before that cache's first nonce (`naming._record_cache`). A copy of the project (a cloned disk)
+keeps every nonce, and a write the original makes to shared storage after the copy is the only
+thing that tells them apart, so a collection refuses a copy once the original took a unit
+anywhere that could reach that cache (N1). A collection also checks every cache any view of the
+project lists (`gc._other_caches_reason`, `naming.listed_cache_problem`): each must be readable
+at the recorded path, hold the listed cache id, and hold that view's entry with the state
+directory's nonce. That covers a copy that holds its own copy of a register over shared objects
+(a cache root on the cloned disk whose `files/` links to shared storage), which the original's
+units never reach. A unit writes only its own view's nonces and entries: rotating another view's
+would let a copy's units make the original's entries match the copy. A cache this view lists
+that a unit cannot reach does not fail it: the record gets `unconfirmed_since`
+(`naming._mark_unconfirmed`) and the command warns once (`naming._warn_unreachable`,
+`state_dir.first_unreachable_cache_report`); a cache only another view lists is passed over. A
+copy that reaches such a cache may then collect it, and the original fetches or runs again; a
+collection refuses while a listed cache cannot be read. `pivot forget-cache` removes only this
+view's record, refuses a cache this view reaches whose entry is current, and deletes nothing; a
+stale-nonce refusal never suggests it. For this view's entries every recorded mount must be
+mounted; another view's entry may record only its root and state directory. Any missing
+evidence refuses collection and names the entry. `resolve_scopes` then
+opens every scope's root, `.pivot` and state directory. When `core.state_dir` differs from
+`.pivot`, collection reads both state layouts so a 0.5.2 lock in `.pivot` still protects its
+object. The writer-side registration memo (`_VERIFIED_REGISTRATIONS`) only lets a naming unit
+skip the id, mount and entry reads while the id file and the entry are unchanged, the mount table
+has not changed (`_mount_generation`: the process's one open `/proc/self/mounts` on procfs,
+polled for the `POLLPRI` the kernel raises at every mount change in this namespace, which bumps a
+count each registration compares with the count it read the table at; without such a watch the
+memo never engages), and both open nonce files are still the ones at their paths. It holds two
+descriptors per registration and keeps the `_MAX_VERIFIED_REGISTRATIONS` latest registrations,
+closing the rest, so a watch or serve session or a library caller that registers in many caches
+holds a bounded number. It never skips
+the nonce rotation: every unit rewrites both fixed-size nonce files in place (`_rotate_nonces`;
+only a registration truncates them) under the state nonce file's exclusive `flock`, so a
+collection never reads a pair half written. No collection read uses the memo.
+
+**A directory's members come from its listing.** A lock, `.pvt` or run-cache row records a
+directory by its listing's hash, size and file count (#523). `collect_roots` keeps that hash
+(the listing object in `files/` and the tree in `trees/`) and every file the listing names,
+read from the cache's object, else from a listing file committed in the project
+(`gc._Listings`, indexed by digest only on a cache miss). A recorded directory whose listing is
+in neither place refuses the collection (`ListingMissingError` → `ProjectUnreadableError`).
+`lock.recorded_hashes` reads a lock in either format: an older pivot's inline listings, and
+the directory hash it recorded, are kept as they are. A `.pvt` a stage wrote into its own
+directory output (`member_skip.own_member_skip`, #540) keeps its keys, but a listing it lacks
+does not refuse. `build_plan` lists both stores, `files/` and `trees/`, and a symlink into
+`trees/` names that tree. An entry #538 left beside an output (`.pivot_backup_<token>.*`) is
+walked like any other.
+
+**A record gc cannot fully interpret refuses the collection, naming it.** There is no "keep
+what the text names" fallback: since #523 a directory's `.pvt` and lock name its files only
+through its listing, so the text of a record that does not parse proves nothing (P20, a `.pvt`
+left with merge conflict markers). `_lock_keys`, `_pvt_keys` and `_run_cache_keys` raise
+`_UninterpretableRecordError` for YAML or JSON that does not parse, a document that is not that
+record, a missing key, a key, schema version or field this pivot does not know or cannot read
+(`lock.recorded_hashes` returns `UninterpretableLock` with the reason), and a `.pvt` hash that is
+not a cache key; `collect_roots` turns it into `ProjectUnreadableError`. A newer pivot's new
+key therefore refuses until this pivot learns it: a key that names objects joins
+`lock._LOCK_KEYS` and `recorded_hashes`' roots in the same change, as `reads` (#544) did. Every
+object a run read by hash is a root wherever it is recorded: a lock's top-level `reads`, a
+run-cache row's `reads`, and a `nocommit:` record's `reads` (`StateDB.list_no_commit_reads`),
+which `pivot commit` writes into the lock. The one exception is a
+`.pvt` a stage wrote into its own output (`member_skip.own_member_skip`, which takes `None`
+for one that does not parse): it is data, and names nothing when it does not parse.
+
+### Where flock is refused
+
+**gc refuses, writers proceed.** On a filesystem that refuses `flock` (NFS `nolock`, Lustre
+without `flock`), `collection_lock` refuses the gc run outright — no objects are deleted. Writers
+proceed unlocked because there is no collector to race. If a future change makes gc collect on
+such a mount, the writers must also take the lock. This pair is by design; do not change one side
+without the other.
+
+### Where the lock files cannot be opened
+
+**Writers refuse.** If a writer cannot open `naming.turnstile` or `naming.lock` (they do not
+exist yet and this user cannot create them in the cache root), `naming_unit` raises
+`CacheError` naming the file and the remedy: another user's `pivot gc` could create the files
+and delete while this writer named objects unlocked. The only exception is `EROFS`: on a
+read-only filesystem nothing, a collection included, can delete. Lock files that exist but are
+not writable are opened read-only and locked (`cache.open_cache_lock`).

@@ -1196,6 +1196,24 @@ class StateDB:
             return None
         return run_history.deserialize_run_cache_entry(value)
 
+    def list_run_cache_rows(self) -> list[tuple[str, bytes]]:
+        """Every run cache row in the database as stored: its key (``stage:input_hash``) and its
+        bytes, for a collection that must keep what each names and must refuse one it cannot
+        read whole. Materialized inside the read transaction, which is then closed."""
+        self._check_closed()
+        rows = list[tuple[str, bytes]]()
+        with self._read_transaction() as txn:
+            cursor = txn.cursor()
+            if cursor.set_range(_RUNCACHE_PREFIX):
+                key = cursor.key()
+                while key.startswith(_RUNCACHE_PREFIX):
+                    name = key[len(_RUNCACHE_PREFIX) :].decode(errors="backslashreplace")
+                    rows.append((name, bytes(cursor.value())))
+                    if not cursor.next():
+                        break
+                    key = cursor.key()
+        return rows
+
     def lookup_run_cache_many(
         self, keys: Iterable[tuple[str, str]]
     ) -> dict[tuple[str, str], RunCacheEntry]:
@@ -1232,6 +1250,29 @@ class StateDB:
         if _NO_COMMIT_READS in record and not _is_hash_list(record[_NO_COMMIT_READS]):
             del record[_NO_COMMIT_READS]
         return typing.cast("NoCommitRecord", typing.cast("object", record))
+
+    def list_no_commit_reads(self) -> set[str]:
+        """The objects every stage's `nocommit:` record lists as read by hash (`reads`), as
+        `pivot commit` would write them into a lock: a malformed list is dropped, as
+        ``get_no_commit_record`` drops it. For a collection, which must keep them until then.
+        Materialized inside the read transaction, which is then closed."""
+        self._check_closed()
+        values = list[bytes]()
+        with self._read_transaction() as txn:
+            cursor = txn.cursor()
+            if cursor.set_range(_NOCOMMIT_PREFIX):
+                key = cursor.key()
+                while key.startswith(_NOCOMMIT_PREFIX):
+                    values.append(bytes(cursor.value()))
+                    if not cursor.next():
+                        break
+                    key = cursor.key()
+        read = set[str]()
+        for value in values:
+            record = _json_object(value)
+            if record is not None and _is_hash_list(record.get(_NO_COMMIT_READS)):
+                read.update(typing.cast("list[str]", record[_NO_COMMIT_READS]))
+        return read
 
     def add_no_commit_pvt_members(self, stage_name: str, members: Mapping[str, str]) -> None:
         """Add `members` (path relative to the project root -> content hash) to the `*.pvt`
@@ -1424,8 +1465,10 @@ class StateDB:
             limit_gb = _MAP_SIZE / (1024**3)
             percent = used_bytes / _MAP_SIZE * 100
             logger.warning(
-                f"State database at {used_gb:.1f}GB ({percent:.0f}%%), approaching "
-                + f"{limit_gb:.0f}GB limit. Run `pivot gc` or delete {self._lmdb_path}/ to free space."
+                f"State database at {used_gb:.1f}GB ({percent:.0f}%), approaching "
+                + f"{limit_gb:.0f}GB limit. Run `pivot gc` to prune run history and unused "
+                + "cache objects; the database file itself shrinks only when you delete "
+                + f"{self._lmdb_path}/"
             )
 
     def __enter__(self) -> Self:

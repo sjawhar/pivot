@@ -773,6 +773,9 @@ def checkout(
     )
 
     state_dir = config.locate_state_dir()
+    # Checkout links objects from records already on disk, outside a publishing naming unit,
+    # so the project must be in the cache register before any link exists (`pull` comes here).
+    config.register_cache_use()
 
     # Every target adds its read or restored file hashes to one thread-safe batch. Saving once
     # per state directory keeps a many-target checkout from serializing one LMDB write per file.

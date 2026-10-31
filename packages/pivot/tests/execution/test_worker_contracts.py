@@ -45,7 +45,7 @@ import pytest
 from pivot import exceptions, loaders, stage_def, stage_io, types
 from pivot import project as pivot_project
 from pivot.executor import worker
-from pivot.storage import artifact_lock, cache, lock, ownership, state, track
+from pivot.storage import artifact_lock, cache, lock, naming, ownership, state, track
 from pivot.storage import store as store_mod
 from pivot.types import (
     FileHash,
@@ -437,6 +437,47 @@ def test_run_cache_restores_an_earlier_input_version(
         "unchanged (run cache)",
     )
     assert _output_path(project).read_text() == "V2"
+
+
+def test_a_skipped_stage_restoring_its_output_registers_in_the_cache_it_restores_from(
+    project: pathlib.Path,
+    worker_env: pathlib.Path,
+    output_queue: mp.Queue[OutputMessage],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`execute_stage` is exported, so a caller without the engine's pre-run registration (a
+    library, a test) can restore a skipped stage's missing output. The restore links an object
+    of the store's cache outside a publishing unit, so the project must be in that cache's
+    register before it, or a peer's `pivot gc` never reads the lock that names the object. A
+    hook at the restore checks the order, not only the register afterwards."""
+    commit = _stage_info(_upper, project, worker_env, no_commit=False)
+    assert _run_and_apply(commit, worker_env, output_queue)["status"] == StageStatus.RAN
+    register = worker_env / naming.REGISTER_DIR
+    for entry in register.glob("*.json"):
+        entry.unlink()
+    naming._VERIFIED_REGISTRATIONS.clear()  # as a fresh process starts
+    _output_path(project).unlink()
+
+    def roots() -> list[object]:
+        return [json.loads(entry.read_text())["root"] for entry in register.glob("*.json")]
+
+    at_restore = list[bool]()
+    restore = store_mod.WorkspaceStore.restore_from_cache
+
+    def watched(self: store_mod.WorkspaceStore, *args: Any, **kwargs: Any) -> bool:
+        at_restore.append(str(project) in roots())
+        return restore(self, *args, **kwargs)
+
+    monkeypatch.setattr(store_mod.WorkspaceStore, "restore_from_cache", watched)
+
+    result = worker.execute_stage(_STAGE, commit, worker_env, output_queue)
+
+    assert result["status"] == StageStatus.CACHED, result["reason"]
+    assert _output_path(project).read_text() == "HELLO"
+    assert at_restore == [True], "the restore linked an object before the project registered"
+    assert str(project) in roots(), (
+        "the restore linked an object of a cache it is not registered in"
+    )
 
 
 def test_uncommitted_run_cache_restore_hands_back_only_its_file_hashes(

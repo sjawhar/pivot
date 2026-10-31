@@ -103,6 +103,81 @@ def entry_to_output_hash(entry: OutputHashEntry) -> FileHash | DirHash | None:
     return FileHash(hash=entry["hash"])
 
 
+# The keys of an output entry an older pivot filed for a directory, listing its files inline
+# (``entry_to_output_hash`` returns None for one; ``listing.from_inline`` reads it).
+OLDER_DIRECTORY_KEYS = frozenset({"manifest", "empty_dirs"})
+# Every key `pivot gc` accepts in a run-cache row and in one of its output entries, written out
+# rather than read from ``RunCacheEntry`` and ``OutputHashEntry``: gc keeps the object at an
+# output's ``hash``, every file of a directory's listing, and every object the row's ``reads``
+# lists, and nothing else. A field added to either TypedDict that can name a cache object must
+# be added here and rooted in ``storage/gc.py`` in the same change; until then gc refuses a row
+# that holds it. ``tests/test_run_history.py`` pins these to the TypedDicts.
+RUN_CACHE_ROW_KEYS = frozenset({"run_id", "output_hashes"})
+RUN_CACHE_ROW_OPTIONAL_KEYS = frozenset({"reads"})
+OUTPUT_ENTRY_REQUIRED_KEYS = frozenset({"path", "hash"})
+OUTPUT_ENTRY_OPTIONAL_KEYS = frozenset({"size", "nfiles"})
+
+
+def _is_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def run_cache_entry_error(row: object) -> str | None:
+    """Why a parsed run-cache row does not hold ``RUN_CACHE_ROW_KEYS`` with any of
+    ``RUN_CACHE_ROW_OPTIONAL_KEYS`` (``reads``, a list of content hashes), each output exactly
+    ``OUTPUT_ENTRY_REQUIRED_KEYS`` with any of ``OUTPUT_ENTRY_OPTIONAL_KEYS`` (or an older pivot's
+    inline directory, ``OLDER_DIRECTORY_KEYS``), or None.
+
+    For a reader that must not skip what it cannot read (`pivot gc`): a key outside the schema
+    may be a newer pivot's record of objects. ``deserialize_run_cache_entry`` checks only what a
+    lookup needs.
+    """
+    if not isinstance(row, dict):
+        return f"its JSON is {type(row).__name__}, not an object"
+    fields = cast("dict[object, object]", row)
+    held = {str(key) for key in fields}
+    unknown = sorted(held - RUN_CACHE_ROW_KEYS - RUN_CACHE_ROW_OPTIONAL_KEYS)
+    missing = sorted(RUN_CACHE_ROW_KEYS - held)
+    if unknown or missing:
+        expected = " and ".join(sorted(RUN_CACHE_ROW_KEYS))
+        return (
+            f"its keys are {', '.join(sorted(held)) or 'none'}, not {expected} (and optionally "
+            + f"{', '.join(sorted(RUN_CACHE_ROW_OPTIONAL_KEYS))})"
+        )
+    if not isinstance(fields["run_id"], str):
+        return "its run_id is not a string"
+    if "reads" in fields:
+        read = fields["reads"]
+        if not isinstance(read, list) or not all(
+            cache.is_valid_hash(item) for item in cast("list[object]", read)
+        ):
+            return "its reads is not a list of content hashes"
+    outputs = fields["output_hashes"]
+    if not isinstance(outputs, list):
+        return "its output_hashes is not a list"
+    allowed = OUTPUT_ENTRY_REQUIRED_KEYS | OUTPUT_ENTRY_OPTIONAL_KEYS | OLDER_DIRECTORY_KEYS
+    for index, raw in enumerate(cast("list[object]", outputs)):
+        if not isinstance(raw, dict):
+            return f"output_hashes[{index}] is not an object"
+        output = cast("dict[object, object]", raw)
+        keys = {str(key) for key in output}
+        extra = sorted(keys - allowed)
+        if extra:
+            return (
+                f"output_hashes[{index}] holds the key {', '.join(extra)}, which this pivot does "
+                + "not know"
+            )
+        missing = sorted(OUTPUT_ENTRY_REQUIRED_KEYS - keys)
+        if missing:
+            return f"output_hashes[{index}] has no {', '.join(missing)}"
+        if not isinstance(output["path"], str) or not isinstance(output["hash"], str):
+            return f"output_hashes[{index}] has a path or hash that is not a string"
+        for count in ("size", "nfiles"):
+            if count in output and not _is_count(output[count]):
+                return f"output_hashes[{index}].{count} is not a count"
+    return None
+
+
 def generate_run_id() -> str:
     """Generate unique run ID: YYYYMMDD_HHMMSS_<uuid8>."""
     timestamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")

@@ -34,6 +34,7 @@ from pivot import (
     types,
 )
 from pivot import state_dir as state_dir_mod
+from pivot.config import io as config_io
 from pivot.engine import agent_rpc
 from pivot.engine import graph as engine_graph
 from pivot.engine import scheduler as engine_scheduler
@@ -63,7 +64,7 @@ from pivot.engine.types import (
 )
 from pivot.executor import core as executor_core
 from pivot.executor import worker
-from pivot.storage import artifact_lock, cache, member_skip, ownership
+from pivot.storage import artifact_lock, cache, member_skip, naming, ownership
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -99,6 +100,11 @@ _logger = logging.getLogger(__name__)
 # (``extra={"pivot_condition": (PIPELINE_ERROR_CONDITION, error)}``), so a TUI session can leave
 # out the records of an error a later reload fixed.
 PIPELINE_ERROR_CONDITION = "pipeline_error"
+
+# What a watch or serve session says when its pipeline's state directory moved under it.
+_RELOAD_THE_SESSION = (
+    "Save .pivot/config.yaml or pipeline.py to reload the pipeline, or start the session again"
+)
 
 # Process-lifetime sequence counter for OutputEvent.seq monotonicity across Engine instances
 _seq_counter = itertools.count(1)
@@ -1455,8 +1461,25 @@ class Engine:
         """Orchestrate parallel stage execution with the async event loop."""
         import datetime
 
+        from pivot import discovery, run_history
         from pivot import exceptions as pivot_exceptions
-        from pivot import run_history
+
+        # Its stages record their locks in the state directory the pipeline loaded with, and
+        # `pivot gc` reads the one `core.state_dir` names now: a run after the value, or a link
+        # it names, changed would write locks naming objects no collection keeps. A watch or
+        # serve session reloads when `.pivot/config.yaml` changes (`_reload_and_rerun`); a move
+        # no edit announced (a re-pointed link) makes it refuse every run until a reload (L3w).
+        # Any other run raises.
+        if self._watches_filesystem():
+            try:
+                discovery.require_current_state_dirs(
+                    self._require_pipeline(), remedy=_RELOAD_THE_SESSION
+                )
+            except pivot_exceptions.PipelineConfigError as exc:
+                await self._invalidate_pipeline([str(exc)])
+                return {}
+        else:
+            discovery.require_current_state_dirs(self._require_pipeline())
 
         # Record start time for run history
         started_at = datetime.datetime.now(datetime.UTC).isoformat()
@@ -1464,9 +1487,22 @@ class Engine:
         if cache_dir is None:
             cache_dir = config.get_cache_dir()
 
-        # Verify tracked files before building DAG: a stage's own .pvt member of its output is
-        # none, the loaded pipeline's by the registry and any other's by its lock
         project_root = project.get_project_root()
+        default_state_dir = config.get_state_dir()
+        # Register the project before any stage runs or restores. A stage that executes takes
+        # its first naming unit at its commit, possibly hours later; a stage skipped with its
+        # outputs in place takes none; and a peer's `pivot gc` reads only registered projects.
+        # One registration per run (about 1.4 ms of CPU); every worker registers the same
+        # identity, the project root and its configured state directory. A run started while a
+        # collection deletes waits for it here, once, before its first stage. A cache that does
+        # not exist yet holds nothing to collect, and the first commit's unit creates the cache
+        # and registers.
+        naming.register_use(cache_dir, project_root, state_dir_mod.locate_state_dir(project_root))
+
+        # Verify tracked files before building DAG: a stage's own .pvt member of its output is
+        # none, the loaded pipeline's by the registry and any other's by its lock. A tracked
+        # file it restores comes from the configured cache, and it registers there first: a
+        # library caller can run the engine with another `cache_dir`.
         pipeline = self._pipeline
         if pipeline is None:
             raise pivot_exceptions.PipelineNotFoundError("No active pipeline registered.")
@@ -1634,9 +1670,8 @@ class Engine:
         checkout_modes = config.get_checkout_mode_order()
         self._current_overrides = overrides
 
-        # Get project paths for worker info
+        # Get project paths for worker info.
         project_root = project.get_project_root()
-        default_state_dir = config.get_state_dir()
         run_id = self._current_run_id or run_history.generate_run_id()
         self._current_run_id = run_id  # May already be set by _handle_run_requested
 
@@ -3385,6 +3420,11 @@ class Engine:
 
         # Invalidate caches
         self._invalidate_caches()
+        # A reload loads the pipeline as a new command would: it reads the project's
+        # configuration again, `core.state_dir` included, so an edit of it moves the session's
+        # runs to the directory `pivot gc` reads (L3w). Entries the old pipeline produced stay
+        # filed under the directory they were produced in.
+        config_io.clear_config_cache()
 
         # Invalidate manifest cache entries for changed source files
         fingerprint.invalidate_manifests_for_paths(event["paths"])

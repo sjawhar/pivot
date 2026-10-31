@@ -10,7 +10,7 @@ import click
 from pivot import config, discovery, git, project
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
-from pivot.storage import cache, listing, member_skip, ownership, state
+from pivot.storage import cache, listing, member_skip, naming, ownership, state
 from pivot.storage import track as track_mod
 
 if TYPE_CHECKING:
@@ -198,21 +198,21 @@ def _track_single_path(
         raise click.ClickException(_orphan_refusal(path_str, orphan))
     warning = "\n".join(warnings) if warnings else None
 
-    # Hash and cache
+    # Hash and publish before the naming unit, so reading and copying a large file or directory
+    # holds no lock that a waiting collection would turn into a stall for every other commit on
+    # the cache. A newly published object is protected by the grace period in the meantime.
     listing_path = listing.tracked_listing_path(pvt_path)
     listing_data: bytes | None = None
     if path.is_dir():
         hashed = cache.hash_directory(
             path, cache_dir=cache_dir, warn_left_out_symlinks=warn_left_out_symlinks, pending=read
         )
-        for entry in hashed["listing"]["files"]:
-            file_path = path / entry["relpath"]
-            file_cache_path = cache.get_cache_path(cache_dir, entry["hash"])
-            cache.copy_to_cache(file_path, file_cache_path, executable=entry["isexec"])
+        objects = [
+            (path / entry["relpath"], entry["hash"], entry["isexec"])
+            for entry in hashed["listing"]["files"]
+        ]
         record = hashed["record"]
         listing_data = hashed["data"]
-        listing.store_object(cache_dir, record["hash"], listing_data)
-
         pvt_data = track_mod.PvtData(
             path=path.name,
             hash=record["hash"],
@@ -221,15 +221,12 @@ def _track_single_path(
         )
     else:
         file_hash, file_stat = cache.hash_file(path, pending=read)
-        file_size = file_stat.st_size
-        file_cache_path = cache.get_cache_path(cache_dir, file_hash)
-        cache.copy_to_cache(path, file_cache_path)
-
-        pvt_data = track_mod.PvtData(
-            path=path.name,
-            hash=file_hash,
-            size=file_size,
-        )
+        objects = [(path, file_hash, False)]
+        pvt_data = track_mod.PvtData(path=path.name, hash=file_hash, size=file_stat.st_size)
+    for source, key, executable in objects:
+        cache.copy_to_cache(source, cache.get_cache_path(cache_dir, key), executable=executable)
+    if listing_data is not None:
+        listing.store_object(cache_dir, pvt_data["hash"], listing_data)
 
     # Pivot writes or removes only a listing it wrote for this target.
     if _foreign_listing(listing_path, existing_tracked.get(abs_path_str), listing_data, cache_dir):
@@ -239,12 +236,26 @@ def _track_single_path(
             + "wrote for it; move it aside (pivot never overwrites or removes a file it did not "
             + "write)"
         )
-    # Write the .pvt after its listing, so no .pvt names a listing not yet written.
-    if listing_data is not None:
-        listing.write(listing_path, listing_data)
-    else:
-        listing_path.unlink(missing_ok=True)  # the listing of a directory tracked here before
-    track_mod.write_pvt_file(pvt_path, pvt_data)
+    # Naming-lock unit (shared), the naming step only: re-check under the lock that every object
+    # is still in the cache — one that already existed was not published above (a cache hit
+    # publishes nothing), so a collection may have removed it since — publish any that is gone,
+    # the directory's listing object included, then write the listing and the .pvt that name
+    # them. gc cannot delete while this unit is open.
+    with naming.naming_unit(
+        config.get_cache_dir(), project=(project.get_project_root(), config.get_state_dir())
+    ):
+        for source, key, executable in objects:
+            # verify: an object republished here must still hold the bytes that were hashed.
+            cache.copy_to_cache(
+                source, cache.get_cache_path(cache_dir, key), executable=executable, verify=True
+            )
+        # Write the .pvt after its listing, so no .pvt names a listing not yet written.
+        if listing_data is not None:
+            listing.store_object(cache_dir, pvt_data["hash"], listing_data)
+            listing.write(listing_path, listing_data)
+        else:
+            listing_path.unlink(missing_ok=True)  # the listing of a directory tracked here before
+        track_mod.write_pvt_file(pvt_path, pvt_data)
     written = [pvt_path] if listing_data is None else [pvt_path, listing_path]
 
     ignored = git.ignored_paths(project_root, written)

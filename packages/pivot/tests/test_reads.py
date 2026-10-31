@@ -20,7 +20,6 @@ import yaml
 
 import pivot
 from pivot import compose, exceptions, executor, reads
-from pivot.executor import core as executor_core
 from pivot.remote import keys, protocol
 from pivot.storage import cache, listing, lock, state
 from pivot.types import ArtifactIdentity, FileHash, LockData, RemoteHashes, UnavailableReads
@@ -425,17 +424,21 @@ def _plan_pinned(pin: str) -> dict[str, list[str]]:
     return {"rows": [pivot.read_by_hash(content_hash).read_text() for content_hash in pin.split()]}
 
 
-def test_what_a_stage_of_another_root_fetched_counts_as_on_the_project_remote(
+def test_a_library_run_of_a_pipeline_included_from_another_root_is_refused_before_any_read(
     files_dir: pathlib.Path,
     set_project_root: pathlib.Path,
     moto_services: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
-    """A pipeline included from another root keeps its stages' records in that root's state
-    directory, but the remote index that `pivot status`, `pull` and `push` read is the
-    project's: what such a stage's read fetched is recorded there, so the cache losing the object
-    leaves it available."""
+    """A pipeline included from another root would keep its stages' locks, `reads` included, in
+    that root's state directory, where no `pivot gc` of this project reads them, so a collection
+    could remove the objects they read. Discovery refuses such a pipeline, and so does a
+    library run (`executor.run(pipeline=...)`, PR #535's L2): before any stage runs, so nothing
+    is read or fetched and no lock is written under the other root.
+
+    (#544 ran this pipeline to check that its stage's fetch lands in the project's remote index;
+    with every stage now under the project root, the project's state directory holds both.)"""
     s3, bucket = _helper_remote(set_project_root, moto_services["s3"], monkeypatch)
     snapshot = _helper_hash(b"snapshot\n")
     s3.put_object(Bucket=bucket, Key=keys.hash_to_key("cache/", snapshot), Body=b"snapshot\n")
@@ -448,20 +451,14 @@ def test_what_a_stage_of_another_root_fetched_counts_as_on_the_project_remote(
     pipeline = compose.Pipeline("all", root=set_project_root)
     pipeline.include(included)
     monkeypatch.chdir(set_project_root)
-    # Workers a pool reuses keep the environment they started with; the read in the stage needs
-    # this test's endpoint for the remote, and later tests need workers without it.
-    _ = executor_core.create_fresh_executor(1)
-    try:
-        results = executor.run(pipeline=pipeline)
-    finally:
-        monkeypatch.undo()
-        _ = executor_core.create_fresh_executor(1)
 
-    assert results["other/_plan_pinned"]["status"] == "ran", results
+    with pytest.raises(exceptions.PipelineConfigError, match=r"sets root="):
+        executor.run(pipeline=pipeline)
+
+    assert not list(other.rglob("*.lock")), "a lock was written under the other root"
+    assert not cache.get_cache_path(files_dir, snapshot).exists(), "the refused run read"
     with state.StateDB(set_project_root / ".pivot") as state_db:
-        assert state_db.remote_hashes_intersection("origin", {snapshot}) == {snapshot}
-    cache.get_cache_path(files_dir, snapshot).unlink()
-    assert reads.unavailable([snapshot], files_dir) is None
+        assert state_db.remote_hashes_intersection("origin", {snapshot}) == set()
 
 
 # =============================================================================
