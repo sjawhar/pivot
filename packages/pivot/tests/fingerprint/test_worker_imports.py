@@ -52,10 +52,13 @@ def _pipeline(imports: str, call: str) -> str:
     )
 
 
-def _held(name: str, path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
-    """Load `path` as module `name` into `sys.modules`, as the program that runs Pivot did."""
+def _held(
+    name: str, path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, text: str = _PLAIN
+) -> types.ModuleType:
+    """Load `path` (holding `text`) as module `name` into `sys.modules`, as the program that runs
+    Pivot did."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_PLAIN)
+    path.write_text(text)
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -542,7 +545,7 @@ def test_namespace_packages_compare_by_their_directories(
 _LOADER_READS_A_MODULE = """\
 import dataclasses
 import pathlib
-from typing import Annotated
+from typing import Annotated, TypedDict
 
 import wi_loader
 from pivot import Pipeline, loaders, stage
@@ -557,9 +560,13 @@ class Located(loaders.Loader[str, str]):
         path.write_text(wi_loader.plain())
 
 
+class Fields(TypedDict):
+    FIELD: Annotated[str, OUTPUT]
+
+
 @stage
-def use(raw: str) -> Annotated[str, OUTPUT]:
-    return raw
+def use(raw: str) -> RETURNS:
+    return VALUE
 
 
 with Pipeline("p") as pipeline:
@@ -568,29 +575,91 @@ with Pipeline("p") as pipeline:
 
 
 @pytest.mark.parametrize(
-    ("input_loader", "output_loader"),
+    ("held_in", "input_loader", "output_loader", "field"),
     [
-        pytest.param("Located()", "loaders.Text()", id="input"),
-        pytest.param("loaders.Text()", "Located()", id="output"),
+        pytest.param("lib/site-packages", "Located()", "loaders.Text()", None, id="input"),
+        pytest.param("lib/site-packages", "loaders.Text()", "Located()", None, id="output"),
+        *(
+            pytest.param("program", "loaders.Text()", "Located()", field, id=f"user-{field}")
+            for field in ("plain", "byname", "module")
+        ),
     ],
 )
 def test_a_loaders_module_named_by_name_is_compared(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, input_loader: str, output_loader: str
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    held_in: str,
+    input_loader: str,
+    output_loader: str,
+    field: str | None,
 ) -> None:
-    """An input's or output's loader reads library module `wi_loader`, which the program holds
-    from `site-packages` while the root has its own `wi_loader.py`. The worker runs the loader
-    too, so the module is compared like one the stage reads."""
-    site = tmp_path / "lib" / "site-packages"
-    _held("wi_loader", site / "wi_loader.py", monkeypatch)
+    """An input's or output's loader reads module `wi_loader`, which the program holds from
+    another file than the root's `wi_loader.py`: a library from `site-packages` (a `byname:`
+    entry), or its own user module (a `module:` entry under the output's prefix, which the
+    stage's output keys place, for a field named `plain`, `byname` or `module` alike). The worker
+    runs the loader too, so the module is compared like one the stage reads."""
+    held_file = tmp_path / held_in / "wi_loader.py"
+    _held("wi_loader", held_file, monkeypatch)
+    returns = "Annotated[str, OUTPUT]" if field is None else "Fields"
+    value = "raw" if field is None else f"{{{field!r}: raw}}"
     pipeline = _discover(
         tmp_path,
         monkeypatch,
         {"wi_loader.py": _PLAIN},
-        _LOADER_READS_A_MODULE.replace("INPUT", input_loader).replace("OUTPUT", output_loader),
+        _LOADER_READS_A_MODULE.replace("RETURNS", returns)
+        .replace("VALUE", value)
+        .replace("FIELD", field or "unused")
+        .replace("INPUT", input_loader)
+        .replace("OUTPUT", output_loader),
     )
-    held = _resolved(site / "wi_loader.py")
+    held = _resolved(held_file)
 
     with pytest.raises(exceptions.PivotError, match=rf"module 'wi_loader' is {held}"):
+        pipeline.ensure_fingerprint("p/use")
+
+
+_INNER_CLASS = "class Inner:\n    def read(self) -> str:\n        return __file__\n"
+
+_LOADER_HOLDS_AN_INSTANCE = """\
+import dataclasses
+import pathlib
+
+import wi_inst
+from pivot import Pipeline, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Outer(loaders.Reader[str]):
+    inner: object
+
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text()
+
+
+@stage
+def use(raw: str) -> str:
+    return raw
+
+
+with Pipeline("p") as pipeline:
+    use(pipeline.input("raw.txt", format=Outer(wi_inst.Inner())))
+"""
+
+
+def test_the_module_of_a_class_whose_instance_a_loader_holds_is_compared(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The input's loader holds `wi_inst.Inner()`, whose class the program holds from its own
+    `wi_inst.py` while the root has another. A worker unpickles the instance by importing
+    `wi_inst` by name, so the module its class's code is recorded from is compared like one the
+    stage reads."""
+    held = tmp_path / "program" / "wi_inst.py"
+    _held("wi_inst", held, monkeypatch, _INNER_CLASS)
+    pipeline = _discover(
+        tmp_path, monkeypatch, {"wi_inst.py": _INNER_CLASS}, _LOADER_HOLDS_AN_INSTANCE
+    )
+
+    with pytest.raises(exceptions.PivotError, match=rf"module 'wi_inst' is {_resolved(held)}"):
         pipeline.ensure_fingerprint("p/use")
 
 
@@ -1163,9 +1232,19 @@ def test_a_dependency_and_an_output_named_byname_rerun_when_their_loader_changes
     assert json.loads(output.read_text()) == {"written": 1, "read": 1, "x": 0}
     lock = yaml.safe_load((root / ".pivot" / "stages" / "p" / "use.lock").read_text())
     recorded = {key for key in lock["code_manifest"] if "byname" in key}
-    assert recorded >= {
+    assert recorded == {
+        "wire:byname",
+        "wire:byname:path",
+        "dep:byname:func:pipeline.Reads.load",
+        "dep:byname:func:pipeline.Reads.save",
+        "dep:byname:module:pipeline",
         "dep:byname:loader:pipeline.Reads:load",
+        "dep:byname:loader:pipeline.Reads:save",
         "out:p/use:byname:tag",
+        "out:p/use:byname:func:pipeline.Writes.load",
+        "out:p/use:byname:func:pipeline.Writes.save",
+        "out:p/use:byname:module:pipeline",
+        "out:p/use:byname:loader:pipeline.Writes:load",
         "out:p/use:byname:loader:pipeline.Writes:save",
     }, recorded
 
@@ -1173,3 +1252,25 @@ def test_a_dependency_and_an_output_named_byname_rerun_when_their_loader_changes
     _pivot(root, "repro")
 
     assert json.loads(output.read_text()) == edited
+
+
+def test_a_lock_records_no_byname_entry_of_a_user_loader_that_reads_a_library(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Stage `p/use` reads dependency `plain` and writes output field `plain`, each through a
+    user loader whose code reads library module `json` (a `byname:json` entry of its walk). The
+    lock records each loader's entries under its prefix but no `byname:` entry, under a prefix
+    or not: a lock written before those entries existed stays current."""
+    root = _cli_project(tmp_path, {"pipeline.py": _NAMED_BYNAME.replace("byname", "plain")})
+    (root / "data" / "raw").mkdir(parents=True, exist_ok=True)
+    (root / "data" / "raw" / "raw.json").write_text('{"x": 0}')
+
+    _pivot(root, "repro")
+
+    lock = yaml.safe_load((root / ".pivot" / "stages" / "p" / "use.lock").read_text())
+    recorded = set(lock["code_manifest"])
+    assert {
+        "dep:plain:loader:pipeline.Reads:load",
+        "out:p/use:plain:loader:pipeline.Writes:save",
+    } <= recorded, recorded
+    assert [key for key in recorded if "byname" in key] == [], recorded

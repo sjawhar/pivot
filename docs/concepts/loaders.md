@@ -151,7 +151,10 @@ raw = pipeline.input("semicolons.csv", format=loaders.CSV(sep=";"))
 
 A custom loader is a module-level frozen dataclass that extends `Reader`,
 `Writer`, or `Loader`. Fields become options, and their values are part of
-the fingerprint.
+the fingerprint. A field can hold another loader, or any instance of your own
+class (`Outer(Inner())`, `Outer(Settings(Inner()))`): Pivot fingerprints that
+class's code as well, so an edit to `Inner.load` re-runs the stages that read
+through `Outer`.
 
 ```python
 # pipeline.py

@@ -83,7 +83,10 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # digest was taken could change.
 # Version 32 records each module a worker imports by name (`byname:` entries) and, in a cached
 # manifest, where each such module resolves (`o`), which a hit re-checks.
-_CACHE_SCHEMA_VERSION = 32
+# Version 33 records the code of the class of each user class instance a partial's arguments, a
+# dataclass field default or a StageParams default holds (`_record_instance_classes`), so an
+# edit to its methods reruns the stage.
+_CACHE_SCHEMA_VERSION = 33
 _REPR_SIZE_LIMIT = 10_000
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
@@ -249,6 +252,12 @@ _walk_path: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
 # Manifest reference of the function being walked. Its closure cells and defaults are keyed
 # under it, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep apart.
 _owner_ref: contextvars.ContextVar[str | None] = contextvars.ContextVar("_owner_ref", default=None)
+
+# The classes of the user class instances `_canonicalize_value_for_hash` meets inside
+# `_instance_classes_of`; None outside it.
+_instance_classes: contextvars.ContextVar[list[type] | None] = contextvars.ContextVar(
+    "_instance_classes", default=None
+)
 
 # Per-pass memo, keyed by kind and object id, for function identities (`function_identity`),
 # type-hint classes (`_hint_classes`), user-class members (`_user_methods`) and mark decisions
@@ -873,8 +882,9 @@ def _default_token(value: Any) -> str:
 # class's module, `m:NAME` a callable user class member, `fd:NAME` a dataclass field default,
 # `bi:MODULE` a loaded module a function body imports, `u` the function behind a C-level
 # wrapper, `pf`, `pa:INDEX` and `pk:KEY` a partial's parts, `i:INDEX`, `k:REPR` and `s:INDEX`
-# container members, `hc:INDEX` a class in type hints and `fc:INDEX` a class in a model's field
-# annotations. `hints` and `schema` read the visited object itself.
+# container members, `hc:INDEX` a class in type hints, `fc:INDEX` a class in a model's field
+# annotations and `ic:INDEX` the class of a user class instance the value holds
+# (`_instance_classes_of`). `hints` and `schema` read the visited object itself.
 _UNREAD = object()
 
 
@@ -921,6 +931,8 @@ def _read_step(owner: Any, step: str) -> Any:
                 return _hint_classes(owner)[int(arg)]
             case "fc":
                 return _model_field_classes(owner)[int(arg)]
+            case "ic":
+                return _instance_classes_of(owner)[int(arg)]
             case _:
                 return _UNREAD
     except (
@@ -1560,6 +1572,8 @@ def _process_dataclass_defaults(cls: type, manifest: dict[str, str], visited: se
         if field.default is not dataclasses.MISSING:
             serialized = _serialize_value_for_hash(field.default)
             manifest[f"default:{binding_ref}"] = xxhash.xxh64(serialized.encode()).hexdigest()
+            with _walking(step):
+                _record_instance_classes(field.default, manifest)
             continue
         if field.default_factory is dataclasses.MISSING:
             continue
@@ -1796,15 +1810,26 @@ def _loader_entry(key: str, outputs: Collection[str]) -> str | None:
     return entry if colon and f"{stage}:{field}" in outputs else None
 
 
+def manifest_entries(manifest: Mapping[str, str], outputs: Collection[str]) -> Iterator[str]:
+    """Each entry of a stage manifest as the walk that made it keyed it: a stage's own key as it
+    is, and a loader's without its `dep:`/`out:` prefix (`_loader_entry`, which the stage's
+    output keys `outputs` place). An entry's kind is its first segment, so no dependency,
+    output, field or stage name is read as a kind."""
+    for key in manifest:
+        if not key.startswith(("dep:", "out:")):
+            yield key
+        elif (entry := _loader_entry(key, outputs)) is not None:
+            yield entry
+
+
 def covered_user_modules(manifest: Mapping[str, str], outputs: Collection[str]) -> set[str]:
     """Names of the user modules a stage manifest covers: its `module:NAME` entries, the stage's
-    own and its loaders' (`_loader_entry`, which the stage's output keys `outputs` place)."""
-    covered = set[str]()
-    for key in manifest:
-        entry = key if key.startswith("module:") else _loader_entry(key, outputs)
-        if entry is not None and entry.startswith("module:"):
-            covered.add(entry.removeprefix("module:"))
-    return covered
+    own and its loaders' (`manifest_entries`, which the stage's output keys `outputs` place)."""
+    return {
+        entry.removeprefix("module:")
+        for entry in manifest_entries(manifest, outputs)
+        if entry.startswith("module:")
+    }
 
 
 def _mark_by_name(module_name: object, manifest: dict[str, str]) -> None:
@@ -1820,9 +1845,9 @@ def _mark_by_name(module_name: object, manifest: dict[str, str]) -> None:
 
 def _by_name_entry(key: str) -> str | None:
     """The module a `byname:` entry names. Only a key that starts with `byname:` is one: a
-    loader's entries join the stage's own without a prefix (`merge_loader_fingerprint`), and each
-    other key starts with a fixed kind (`self:`, `dep:`, `out:`, `wire:`, ...), so no dependency,
-    output, stage or module name spells one."""
+    loader's `byname:` entries join the stage's own without a prefix (`merge_loader_fingerprint`),
+    and each other key starts with a fixed kind (`self:`, `dep:`, `out:`, `wire:`, ...), so no
+    dependency, output, stage or module name spells one."""
     if key.startswith("byname:"):
         return key.removeprefix("byname:")
     return None
@@ -2072,7 +2097,8 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     A user loader class's own `load`, `save` and `empty`, and the functions and classes bound
     in its config fields, are walked like stage helpers, so the module values they read are
     tracked or refused. Methods inherited from `pivot.loaders` are framework code and are
-    only hashed.
+    only hashed. The class of each user class instance the config holds, a loader held in a
+    field (`Outer(Inner())`) included, is recorded by its code (`_record_instance_classes`).
     """
     manifest = dict[str, str]()
     class_name = _definition_ref(type(loader))
@@ -2114,6 +2140,7 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     for field in dataclasses.fields(loader_any):
         value = getattr(loader_any, field.name)
         _process_bound_values(f"{class_name}.{field.name}", value, manifest, visited)
+        _record_instance_classes(value, manifest)
     config_str = loader_config_text(loader_any)
     if config_str:
         manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
@@ -2762,6 +2789,8 @@ def _process_default_values(
         if isinstance(value, stage_def.StageParams):
             serialized = _serialize_value_for_hash(value)
             manifest[f"default:{binding_ref}"] = xxhash.xxh64(serialized.encode()).hexdigest()
+            with _walking(step):
+                _record_instance_classes(value, manifest)
             continue
         if _is_artifact_handles(value, compose.ArtifactHandle):
             continue
@@ -2872,6 +2901,7 @@ def _process_partial_dependency(
     kwargs_str = _serialize_value_for_hash(partial_obj.keywords)
     manifest[f"partial:{binding_ref}.args"] = xxhash.xxh64(args_str.encode()).hexdigest()
     manifest[f"partial:{binding_ref}.kwargs"] = xxhash.xxh64(kwargs_str.encode()).hexdigest()
+    _record_instance_classes(partial_obj, manifest)
 
     underlying = partial_obj.func
     _record_read(partial_obj, "pf")
@@ -2946,7 +2976,9 @@ def _process_bound_values(
     chain that holds a mark takes the mark decision (`_mark_decision`) before any unwrap: one
     recorded by name, or one with a user class instance above the mark, is left to the
     canonical form of the same binding, which every caller computes (`loader_config_text`, the
-    partial's `args` and `keywords`): it names the first and refuses the second.
+    partial's `args` and `keywords`): it names the first and refuses the second. Any other
+    instance is left to that canonical form, and its caller records its class's code
+    (`_record_instance_classes`).
     """
     if isinstance(value, functools.partial):
         partial_obj = cast("functools.partial[Any]", value)
@@ -3223,6 +3255,35 @@ def _annotation_classes(annotation: Any) -> list[type]:
 _BUILTIN_TYPES = frozenset({dict, list, tuple, set, frozenset, bytes})
 
 
+def _instance_classes_of(value: Any) -> list[type]:
+    """The classes of the user class instances `value`'s canonical form holds
+    (`_canonicalize_value_for_hash`), in the order it meets them, each once."""
+    classes = list[type]()
+    token = _instance_classes.set(classes)
+    try:
+        _canonicalize_value_for_hash(value)
+    finally:
+        _instance_classes.reset(token)
+    return list({id(cls): cls for cls in classes}.values())
+
+
+def _record_instance_classes(value: Any, manifest: dict[str, str]) -> None:
+    """Record the code of the class of each user class instance that `value` holds (a loader's
+    config field, a partial, a dataclass field's or a StageParams default): `class:<definition>:
+    instance`, the hash of its source, methods included, with its module covered. A canonical
+    form names an instance's class and dumps its fields, not its code, so an edit to
+    `Inner.load` in `Outer(Inner())`, `Outer(Settings(Inner()))` or `partial(read, Inner())`
+    would otherwise read cached. The canonical form already visits these values, and the class's
+    members are not walked, so this makes no new traversal and no new refusal. The key is not the
+    `class:<definition>` a walked class gets, so it never stops the walk of a class the stage
+    also reaches by name. Each class is read as step `ic:INDEX` from `value`, so a manifest
+    cache hit reads it again."""
+    for index, cls in enumerate(_instance_classes_of(value)):
+        _record_read(value, f"ic:{index}")
+        _mark_module_covered(cls.__module__, manifest)
+        manifest[f"class:{_definition_ref(cls)}:instance"] = hash_function_ast(cls)
+
+
 def _serialize_value_for_hash(value: Any) -> str:
     """Serialize a value to a stable string for hashing."""
     return json.dumps(_canonicalize_value_for_hash(value))
@@ -3301,6 +3362,14 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
                 _refuse_class_above_mark(value)
         else:
             decision = None
+        # Inside `_instance_classes_of`, note the class of a user class instance, unless the
+        # value is recorded by name.
+        if (
+            (classes := _instance_classes.get()) is not None
+            and decision is not _BY_NAME
+            and _is_user_class_instance(value)
+        ):
+            classes.append(value_type)
         # Main dumped every value with a `model_dump` (`hasattr`) that is not a class; so does
         # this walk, by one of the routes `_probe_own_attribute` picks (`_model_dump_route`). A
         # class is never dumped, whatever its metaclass reports. A real type whose route its MRO

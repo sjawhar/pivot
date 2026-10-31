@@ -2,7 +2,9 @@
 
 """CLI regressions for fingerprint gaps found during PR #496 acceptance testing."""
 
+import json
 import pathlib
+import py_compile
 import subprocess
 
 import pytest
@@ -81,6 +83,17 @@ def _assert_not_reusable(
 
 def _count(project: pathlib.Path) -> object:
     return yaml.safe_load((project / "data" / "t" / "count.yaml").read_text())["v"]
+
+
+def _repro_statuses(project: pathlib.Path, home: pathlib.Path) -> dict[str, str]:
+    """Run `pivot repro --json` and return each stage's completion status."""
+    result = helpers.run_pivot(project, home, "repro", "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    statuses = dict[str, str]()
+    for line in result.stdout.splitlines():
+        if line.startswith("{") and (event := json.loads(line)).get("type") == "stage_complete":
+            statuses[event["stage"]] = event["status"]
+    return statuses
 
 
 _DYNAMIC_IMPORT_SHAPES = {
@@ -1755,3 +1768,280 @@ def test_dynamic_name_refusal_reads_a_function_reached_only_through_wrapped(
     message = result.stdout + result.stderr
     assert result.returncode != 0, message
     assert "'count' uses getattr() with non-literal attribute" in message, message
+
+
+_INNER_LOADER = """\
+import dataclasses
+import pathlib
+
+from pivot import loaders
+
+
+@dataclasses.dataclass(frozen=True)
+class Inner(loaders.Reader[str]):
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text().splitlines()[0] + "A"
+"""
+
+_HELD_INSTANCE_HEADER = """\
+import dataclasses
+import functools
+import pathlib
+
+from inner import Inner
+from pivot import Pipeline, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Outer(loaders.Reader[str]):
+    inner: loaders.Reader[str]
+
+    def load(self, path: pathlib.Path) -> str:
+        return self.inner.load(path)
+
+
+@dataclasses.dataclass(frozen=True)
+class Settings:
+    reader: loaders.Reader[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class ThroughSettings(loaders.Reader[str]):
+    settings: Settings
+
+    def load(self, path: pathlib.Path) -> str:
+        return self.settings.reader.load(path)
+
+
+def _read(reader: loaders.Reader[str], path: pathlib.Path) -> str:
+    return reader.load(path)
+
+
+READ = functools.partial(_read, Inner())
+
+
+"""
+
+# Where `Inner()` is held: in a loader's config field, in a non-loader dataclass in a loader's
+# config field, and in the arguments of a partial the stage reads as a global.
+_HELD_INSTANCE_SHAPES = {
+    "loader-field": (
+        '@stage\ndef use(text: str) -> str:\n    return text\n\n\nwith Pipeline("t") as pipeline:\n'
+        '    use(pipeline.input("lines.txt", format=Outer(Inner())))\n'
+    ),
+    "dataclass-in-a-loader-field": (
+        '@stage\ndef use(text: str) -> str:\n    return text\n\n\nwith Pipeline("t") as pipeline:\n'
+        '    use(pipeline.input("lines.txt", format=ThroughSettings(Settings(Inner()))))\n'
+    ),
+    "stage-level-partial": (
+        "@stage\ndef use(text: str) -> str:\n"
+        '    return READ(pathlib.Path("data/raw/lines.txt"))\n\n\n'
+        'with Pipeline("t") as pipeline:\n    use(pipeline.input("lines.txt", t=str))\n'
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_HELD_INSTANCE_SHAPES))
+def test_an_edit_to_a_held_loaders_code_reruns_its_stage(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """`Inner()` is held where the walk only serializes it: a loader's config field, a
+    dataclass in one, or a partial's arguments. `Inner.load` is in its own module, and no
+    annotation names `Inner`. An edit to `Inner.load` alone reruns the stage, and the next run
+    reuses the result."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "inner.py": _INNER_LOADER,
+            "pipeline.py": _HELD_INSTANCE_HEADER + _HELD_INSTANCE_SHAPES[shape],
+        },
+    )
+    output = project / "data" / "t" / "use.txt"
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingA"
+    _edit(project, "inner.py", '"A"', '"B"')
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingB"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_MAPPED_PARTIAL_STAGES = """\
+from typing import Annotated
+
+from pivot import directory
+
+
+@stage
+def plan(
+    entries: dict[str, int],
+) -> Annotated[dict[str, dict[str, int]], directory, loaders.YAML[dict[str, int]]()]:
+    return {f"{name}.yaml": {"value": value} for name, value in entries.items()}
+
+
+@stage
+def cut(entry: dict[str, int]) -> str:
+    return READ(pathlib.Path("data/raw/lines.txt"))
+
+
+with Pipeline("t") as pipeline:
+    planned = plan(pipeline.input("plan.yaml", t=dict[str, int]))
+    cut(pipeline.map(planned))
+"""
+
+
+def test_an_edit_to_a_held_loaders_code_reruns_a_mapped_instance(tmp_path: pathlib.Path) -> None:
+    """The mapped stage `t/cut` calls `READ`, a global `functools.partial(_read, Inner())`. Its
+    instance `t/cut@a` is fingerprinted as any stage is: an edit to `Inner.load` alone reruns
+    the instance, not its producer, and the next run reuses both."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {"inner.py": _INNER_LOADER, "pipeline.py": _HELD_INSTANCE_HEADER + _MAPPED_PARTIAL_STAGES},
+    )
+    (project / "data" / "raw" / "plan.yaml").write_text("a: 1\n")
+    output = project / "data" / "t" / "cut@a.txt"
+    assert _repro_statuses(project, home) == {"t/plan": "ran", "t/cut@a": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingA"
+    _edit(project, "inner.py", '"A"', '"B"')
+
+    assert _repro_statuses(project, home) == {"t/plan": "cached", "t/cut@a": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingB"
+    assert _repro_statuses(project, home) == {"t/plan": "cached", "t/cut@a": "cached"}
+
+
+_KIND_FIELDS_PIPELINE = """\
+from typing import TypedDict
+
+import tag  # noqa: F401 - sourceless, and read by no stage
+from pivot import Pipeline, stage
+
+
+class Kinds(TypedDict):
+    func: str
+    const: str
+    default: str
+    schema: str
+    partial: str
+    loader: str
+
+
+class Other(TypedDict):
+    other: str
+
+
+@stage
+def kinds(text: str) -> Kinds:
+    return {"func": text, "const": text, "default": text, "schema": text, "partial": text,
+            "loader": text}
+
+
+@stage
+def other(text: str) -> Other:
+    return {"other": text}
+
+
+with Pipeline("t") as pipeline:
+    kinds(pipeline.input("lines.txt", t=str))
+    other(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_an_output_field_named_like_a_code_kind_does_not_mark_a_module_its_tag_names(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`pipeline.py` imports `tag`, a user module with no source (only `tag.pyc`) that no stage
+    reads. Stage `kinds` has output fields named like the kinds of entry that hash a module's
+    code (`func`, `loader`, ...), whose tags are `out:t/kinds:<field>:tag`: none of them is a use
+    of module `tag`, so the stage is reused like stage `other`, and its lock carries no mark."""
+    home = tmp_path / "home"
+    project = _project(tmp_path, {"pipeline.py": _KIND_FIELDS_PIPELINE})
+    (tmp_path / "tag.py").write_text("VALUE = 1\n")
+    py_compile.compile(str(tmp_path / "tag.py"), cfile=str(project / "tag.pyc"), doraise=True)
+
+    assert _repro_statuses(project, home) == {"t/kinds": "ran", "t/other": "ran"}
+    assert _repro_statuses(project, home) == {"t/kinds": "cached", "t/other": "cached"}
+
+    lock = yaml.safe_load((project / ".pivot" / "stages" / "t" / "kinds.lock").read_text())
+    marks = [key for key in lock["code_manifest"] if key.startswith("unreadable-source:")]
+    assert marks == []
+
+
+_SOURCELESS_LOADERS = """\
+import dataclasses
+import pathlib
+
+from pivot import loaders
+
+
+@dataclasses.dataclass(frozen=True)
+class Inner(loaders.Reader[str]):
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text().splitlines()[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class Writes(loaders.Writer[str]):
+    def save(self, data: str, path: pathlib.Path) -> None:
+        path.write_text(data)
+"""
+
+_SOURCELESS_LOADERS_PIPELINE = """\
+import dataclasses
+import pathlib
+from typing import Annotated, TypedDict
+
+from pivot import Pipeline, loaders, stage
+from wlib import Inner, Writes
+
+
+@dataclasses.dataclass(frozen=True)
+class Outer(loaders.Reader[str]):
+    inner: loaders.Reader[str]
+
+    def load(self, path: pathlib.Path) -> str:
+        return self.inner.load(path)
+
+
+class Written(TypedDict):
+    func: Annotated[str, Writes()]
+
+
+@stage
+def held(text: str) -> str:
+    return text
+
+
+@stage
+def written(text: str) -> Written:
+    return {"func": text}
+
+
+with Pipeline("t") as pipeline:
+    held(pipeline.input("lines.txt", format=Outer(Inner())))
+    written(pipeline.input("other.txt", t=str))
+"""
+
+
+def test_a_loader_from_a_sourceless_module_is_a_use_of_it_held_or_on_an_output_field(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`wlib` has no source (only `wlib.pyc`). Stage `held` reads its input through
+    `Outer(Inner())`, `Inner` from `wlib`; stage `written` writes output field `func` with
+    `Writes()` from `wlib`. Each stage's manifest hashes `wlib`'s code, found under the held
+    loader's prefix and under the output field's, so each stage uses an unreadable module: it
+    carries the mark and is never reused."""
+    home = tmp_path / "home"
+    project = _project(tmp_path, {"pipeline.py": _SOURCELESS_LOADERS_PIPELINE})
+    (project / "data" / "raw" / "other.txt").write_text("other\n")
+    (tmp_path / "wlib.py").write_text(_SOURCELESS_LOADERS)
+    py_compile.compile(str(tmp_path / "wlib.py"), cfile=str(project / "wlib.pyc"), doraise=True)
+
+    for _ in range(2):
+        assert _repro_statuses(project, home) == {"t/held": "ran", "t/written": "ran"}
+
+    for stage in ("held", "written"):
+        lock = yaml.safe_load((project / ".pivot" / "stages" / "t" / f"{stage}.lock").read_text())
+        marks = [key for key in lock["code_manifest"] if key.startswith("unreadable-source:")]
+        assert marks == ["unreadable-source:wlib"], (stage, lock["code_manifest"])

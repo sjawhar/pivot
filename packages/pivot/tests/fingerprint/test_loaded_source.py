@@ -270,7 +270,7 @@ def test_a_sourceless_module_is_recorded_as_unreadable(
 
     assert loaded_source._record_fields(loaded_source.digests()[name])[1] == "", "no digest"
     assert _reason(name).startswith(_untrusted(importlib.machinery.SourcelessFileLoader))
-    edited, unreadable = loaded_source.check_stage({f"func:{name}.value": "x"}, set(), "", None)
+    edited, unreadable = loaded_source.check_stage({f"func:{name}.value": "x"}, (), set(), "", None)
     assert (edited, unreadable) == ([], [name])
 
 
@@ -294,9 +294,10 @@ def test_an_unreadable_record_made_while_the_module_ran_does_not_stand(
 def test_a_stage_uses_modules_its_manifest_hashes_or_it_imported(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Only the modules a stage used are compared: one whose code its manifest hashes, or one it
-    imported while it ran. A by-name `ext:` entry (a helper whose body never reruns its callers)
-    and a `module:` coverage entry are not uses of the module's code."""
+    """Only the modules a stage used are compared: one whose code its manifest hashes, its
+    loaders' included, or one it imported while it ran. A by-name `ext:` entry (a helper whose
+    body never reruns its callers), a `module:` coverage entry and an output field named like a
+    kind (`out:p/a:func:tag`) are not uses of the module's code."""
     helper = _load(tmp_path / "helper.py", "def value():\n    return 1\n", monkeypatch)
     name = helper.__name__
     edited_record = {name: f"{(tmp_path / 'helper.py').resolve()}\0{'0' * 16}"}
@@ -304,13 +305,15 @@ def test_a_stage_uses_modules_its_manifest_hashes_or_it_imported(
     token = loaded_source._token_of(edited_record)
 
     def check(manifest: dict[str, str], imported: set[str]) -> list[str]:
-        return loaded_source.check_stage(manifest, imported, token, None)[0]
+        return loaded_source.check_stage(manifest, {"p/a:func"}, imported, token, None)[0]
 
     assert check({f"func:{name}.value": "h"}, set()) == [name]
     assert check({f"dep:data:loader:{name}.Reader:load": "h"}, set()) == [name]
+    assert check({f"dep:data:class:{name}.Held": "h"}, set()) == [name]
     assert check({f"const:{name}.SCALE": "2"}, set()) == [name]
     assert check({}, {name}) == [name], "imported while the stage ran"
     assert check({f"ext:{name}.value": f"{name}.value", f"module:{name}": ""}, set()) == []
+    assert check({f"out:p/a:func:{name}": "data", f"wire:func:{name}": "x"}, set()) == []
     assert check({"self:unrelated": "h"}, set()) == [], "another stage's module is not compared"
 
 
@@ -327,7 +330,9 @@ def test_check_stage_compares_by_module_name_and_file(
     coordinator = {name: _text(tmp_path / "module.py", data)}
     loaded_source.set_coordinator(coordinator)
 
-    edited, _ = loaded_source.check_stage({}, {name}, loaded_source._token_of(coordinator), None)
+    edited, _ = loaded_source.check_stage(
+        {}, (), {name}, loaded_source._token_of(coordinator), None
+    )
 
     assert edited == [name]
 
@@ -342,9 +347,11 @@ def test_check_stage_uses_digests_a_stage_carries(
     loaded_source.set_coordinator(started_with)
     sent = {shared.__name__: _text(tmp_path / "shared.py", b"VALUE = 1\n"), "other": "/o.py\0x"}
 
-    assert loaded_source.check_stage({}, {shared.__name__}, "later", sent)[0] == [shared.__name__]
+    assert loaded_source.check_stage({}, (), {shared.__name__}, "later", sent)[0] == [
+        shared.__name__
+    ]
     assert loaded_source.check_stage(
-        {}, {shared.__name__}, loaded_source._token_of(started_with), None
+        {}, (), {shared.__name__}, loaded_source._token_of(started_with), None
     ) == ([], [])
 
 
@@ -358,7 +365,7 @@ def test_check_stage_counts_every_used_module_when_the_coordinator_moved_on(
     other = _load(tmp_path / "other.py", "VALUE = 3\n", monkeypatch)
     loaded_source.set_coordinator(loaded_source.digests())
 
-    edited, _ = loaded_source.check_stage({}, {shared.__name__}, "a-later-token", None)
+    edited, _ = loaded_source.check_stage({}, (), {shared.__name__}, "a-later-token", None)
 
     assert edited == [shared.__name__]
     assert other.__name__ not in edited
@@ -457,7 +464,7 @@ def test_a_module_whose_file_changed_since_the_process_started_is_unreadable(
     assert loaded_source.digest(str(path)) is None
     with caplog.at_level(logging.WARNING, logger="pivot.loaded_source"):
         for _ in range(2):
-            assert loaded_source.check_stage({f"func:{name}.value": "h"}, set(), "", None) == (
+            assert loaded_source.check_stage({f"func:{name}.value": "h"}, (), set(), "", None) == (
                 [],
                 [name],
             )
@@ -1053,7 +1060,7 @@ def test_a_worker_logs_the_coordinators_reason_for_an_unseen_module(
 
     with caplog.at_level(logging.WARNING, logger="pivot.loaded_source"):
         checked = loaded_source.check_stage(
-            {f"func:{name}.value": "h"}, set(), loaded_source._token_of(records), None
+            {f"func:{name}.value": "h"}, (), set(), loaded_source._token_of(records), None
         )
 
     assert checked == ([], [name])
@@ -1222,6 +1229,7 @@ def test_a_stage_checks_the_module_that_defines_it(
     edited, _ = worker._untrusted_modules(
         _stage_info(module.stage, coordinator),
         {"self:stage": "h"},
+        frozenset(),
         worker._StageImports(covered=frozenset()),
         tmp_path / "project",
     )
@@ -1248,6 +1256,7 @@ def test_a_stage_checks_the_modules_it_imported_while_it_ran(
     edited, _ = worker._untrusted_modules(
         _stage_info(stage_module.stage, coordinator),
         {},
+        frozenset(),
         worker._StageImports(covered=frozenset(), imported={imported.__name__}),
         tmp_path,
     )
@@ -1288,6 +1297,7 @@ def test_a_worker_judges_a_module_a_loader_called_directly_loaded(
     checked = worker._untrusted_modules(
         _stage_info(stage_module.stage, coordinator),
         {"const:direct.VALUE": "h"},
+        frozenset(),
         worker._StageImports(covered=frozenset()),
         tmp_path,
     )
@@ -1313,6 +1323,7 @@ def test_a_process_without_the_coordinators_records_judges_no_module_after_a_sta
     checked = worker._untrusted_modules(
         _stage_info(stage_module.stage, {}),
         {f"const:{name}.VALUE": "h"},
+        frozenset(),
         worker._StageImports(covered=frozenset(), imported={name}),
         tmp_path,
     )

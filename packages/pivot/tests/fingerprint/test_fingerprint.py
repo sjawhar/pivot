@@ -1,7 +1,9 @@
 # pyright: reportUnusedFunction=false, reportUnusedParameter=false, reportUnknownLambdaType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportImplicitOverride=false
 
 import ast
+import dataclasses
 import enum
+import functools
 import importlib
 import importlib.util
 import inspect
@@ -24,7 +26,7 @@ import xxhash
 from pydantic import BaseModel
 
 import pivot_tui.stats
-from pivot import ast_utils, exceptions, fingerprint, loaders, project
+from pivot import ast_utils, exceptions, fingerprint, loaders, project, stage_def
 from pivot.storage import state as state_mod
 
 
@@ -1668,6 +1670,156 @@ def test_loader_fingerprint_stable():
     fp2 = fingerprint.get_loader_fingerprint(loader)
 
     assert fp1 == fp2
+
+
+@dataclasses.dataclass(frozen=True)
+class _HeldReader(loaders.Reader[str]):
+    """A user loader another loader holds; its `load` reads library module `json`."""
+
+    suffix: str = "A"
+
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text() + json.dumps(self.suffix)
+
+
+@dataclasses.dataclass(frozen=True)
+class _HoldingReader(loaders.Reader[str]):
+    """A user loader whose config field `inner` holds a loader, or a value holding loaders."""
+
+    inner: typing.Any
+
+    def load(self, path: pathlib.Path) -> str:
+        return self.inner.load(path)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Settings:
+    """A user class that is not a loader; it can hold one."""
+
+    reader: typing.Any = None
+
+
+def _apply(reader: loaders.Reader[str], path: pathlib.Path) -> str:
+    return reader.load(path)
+
+
+_READ_THROUGH_PARTIAL = functools.partial(_apply, _HeldReader())
+
+
+def _reads_through_a_partial(path: pathlib.Path) -> str:
+    return _READ_THROUGH_PARTIAL(path)
+
+
+@dataclasses.dataclass(frozen=True)
+class _WithReaderDefault:
+    reader: typing.Any = _HeldReader()
+
+
+def _reads_a_dataclass_default(path: pathlib.Path) -> str:
+    return _WithReaderDefault().reader.load(path)
+
+
+_HELD_CLASS = _definition_key("class", _HeldReader) + ":instance"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(_HeldReader(), id="the-field"),
+        pytest.param((_HeldReader(), loaders.Text()), id="tuple"),
+        pytest.param([_Settings(), _HeldReader()], id="list-with-another-instance"),
+        pytest.param({"a:module:b": _HeldReader()}, id="dict-key-with-colons"),
+        pytest.param(frozenset({_HeldReader()}), id="frozenset"),
+        pytest.param(functools.partial(_apply, _HeldReader()), id="partial-argument"),
+        pytest.param(_Settings(_HeldReader()), id="inside-a-dataclass"),
+        pytest.param(_HoldingReader(_HeldReader()), id="a-holder-holding-one"),
+    ],
+)
+def test_a_user_class_instance_a_loader_config_holds_records_its_class(value: object):
+    """`_HoldingReader(value)`: the code of the class of each user class instance its config
+    holds, wherever the config's canonical form meets it, is recorded as
+    `class:<definition>:instance` with its module covered, so an edit to `_HeldReader.load`
+    changes the holder's manifest. No dict key or other user value enters a key."""
+    manifest = fingerprint.get_loader_fingerprint(_HoldingReader(value))
+
+    assert manifest[_HELD_CLASS] == fingerprint.hash_function_ast(_HeldReader), manifest
+    stage = {f"dep:raw:{key}": item for key, item in manifest.items()}
+    assert __name__ in fingerprint.covered_user_modules(stage, ())
+    assert not any("module:b" in key for key in manifest), manifest
+
+
+def test_a_library_loader_a_loader_config_holds_adds_no_entry():
+    """`loaders.Text()` is library code: its class and fields are in the config text, as before,
+    and it adds no entry."""
+    holder = fingerprint.get_loader_fingerprint(_HoldingReader(loaders.Text()))
+    empty = fingerprint.get_loader_fingerprint(_HoldingReader(None))
+
+    assert set(holder) == set(empty)
+
+
+def test_a_loader_that_holds_itself_is_walked_once():
+    """A loader that holds itself, directly or through another loader, is a cycle: the
+    canonical form records it, and its class is recorded."""
+    looped = _HoldingReader([])
+    looped.inner.append(looped)
+    first = _HoldingReader([])
+    first.inner.append(_HoldingReader(first))
+
+    for holder in (looped, first):
+        manifest = fingerprint.get_loader_fingerprint(holder)
+        assert _definition_key("class", _HoldingReader) + ":instance" in manifest, manifest
+
+
+def test_a_user_class_instance_a_stage_level_partial_holds_records_its_class():
+    """`functools.partial(_apply, _HeldReader())` read as a global: the stage walk records the
+    class of the instance in its arguments, read as step `ic:0` from the partial."""
+    manifest = fingerprint.get_stage_fingerprint(_reads_through_a_partial)
+
+    assert _HELD_CLASS in manifest, manifest
+    assert fingerprint._read_step(_READ_THROUGH_PARTIAL, "ic:0") is _HeldReader
+    assert fingerprint._read_step(_READ_THROUGH_PARTIAL, "ic:1") is fingerprint._UNREAD
+
+
+def test_a_user_class_instance_a_dataclass_field_default_holds_records_its_class():
+    """A dataclass the walk reaches has field default `_HeldReader()`: its class is recorded."""
+    manifest = fingerprint.get_stage_fingerprint(_reads_a_dataclass_default)
+
+    assert _definition_key("class", _WithReaderDefault) in manifest, manifest
+    assert _HELD_CLASS in manifest, manifest
+
+
+class _HelperParams(stage_def.StageParams):
+    scale: int = 2
+
+
+_HELPER_PARAMS = _HelperParams()
+
+
+def _helper_with_a_params_default(value: int, params: _HelperParams = _HELPER_PARAMS) -> int:
+    return value * params.scale
+
+
+def test_a_stageparams_default_records_its_class():
+    """A helper's StageParams default is an instance of a user class: its class is recorded."""
+    manifest = fingerprint.get_stage_fingerprint(_helper_with_a_params_default)
+
+    assert _definition_key("class", _HelperParams) + ":instance" in manifest, manifest
+
+
+@dataclasses.dataclass(frozen=True)
+class _CallableReader(loaders.Reader[str]):
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text()
+
+    def __call__(self, path: pathlib.Path) -> str:
+        return self.load(path)
+
+
+def test_a_held_loader_that_is_callable_is_refused():
+    """A callable loader in a config field is refused like any callable user class instance:
+    what its `__call__` reads is not walked."""
+    with pytest.raises(exceptions.StageDefinitionError, match="captures non-scalar variable"):
+        fingerprint.get_loader_fingerprint(_HoldingReader(_CallableReader()))
 
 
 # ==============================================================================
