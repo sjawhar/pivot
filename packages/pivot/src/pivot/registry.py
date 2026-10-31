@@ -530,16 +530,16 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> tuple[dict
                 result = fingerprint.get_stage_fingerprint_cached(stage_name, info["func"])
             result.update(_wiring_manifest(info))
             for dep_name, dep in info["deps"].items():
-                for key, value in fingerprint.get_loader_fingerprint(dep.format).items():
-                    result[f"dep:{dep_name}:{key}"] = value
+                fingerprint.merge_loader_fingerprint(result, f"dep:{dep_name}:", dep.format)
+            outputs = set[str]()
             for out in info["outs"]:
                 out_key = types.identity_key(out.identity)
+                outputs.add(out_key)
                 # The tag places the output (data/, metrics/, plots/, a directory) and decides
                 # how it is written, and a type alias can change it without touching the source.
                 result[f"out:{out_key}:tag"] = out.tag.value
-                for key, value in fingerprint.get_loader_fingerprint(out.format).items():
-                    result[f"out:{out_key}:{key}"] = value
-            loaded_source.check_worker_imports(result)
+                fingerprint.merge_loader_fingerprint(result, f"out:{out_key}:", out.format)
+            loaded_source.check_worker_imports(result, outputs)
         return fingerprint.without_by_name(result), scope["unsafe"]
     except Exception as exc:
         raise exceptions.PivotError(f"Stage '{stage_name}': fingerprinting failed: {exc}") from exc

@@ -1444,7 +1444,8 @@ def test_get_loader_fingerprint_returns_manifest():
 
 def test_covered_user_modules_reads_every_module_key_form():
     """Bare `module:` keys and the `dep:`/`out:`-prefixed keys a loader's walk adds both count;
-    other keys that mention a module do not."""
+    other keys that mention a module do not, nor a dependency or output named `module`, whose
+    prefix the stage's output keys end."""
     manifest = {
         "self:count": "a",
         "module:helpers": "",
@@ -1453,9 +1454,15 @@ def test_covered_user_modules_reads_every_module_key_form():
         "func:helpers.lib.value": "b",
         "const:module.NAME": "1",
         "dep:n:loader:helpers.myloader.Scaled:load": "c",
+        "dep:module:loader:pivot.loaders.YAML:load": "d",
+        "out:t/count:module:tag": "data",
     }
 
-    assert fingerprint.covered_user_modules(manifest) == {"helpers", "helpers.lib", "other.mod"}
+    assert fingerprint.covered_user_modules(manifest, {"t/count:out", "t/count:module"}) == {
+        "helpers",
+        "helpers.lib",
+        "other.mod",
+    }
 
 
 def test_loader_fingerprint_includes_load_method():
