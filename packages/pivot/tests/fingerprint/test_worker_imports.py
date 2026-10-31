@@ -17,6 +17,7 @@ from __future__ import annotations
 import email.mime.text
 import importlib.machinery
 import importlib.util
+import json
 import multiprocessing.process
 import os
 import pathlib
@@ -27,6 +28,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 import pytest
+import yaml
 from tests import helpers
 
 from pivot import discovery, exceptions, executor, fingerprint, loaded_source, project
@@ -503,7 +505,7 @@ def test_the_programs_main_module_is_never_compared(
     _held("__main__", tmp_path / "program" / "run.py", monkeypatch)
     hold_modules()
 
-    loaded_source.check_worker_imports({"module:__main__": ""})
+    loaded_source.check_worker_imports({"module:__main__": ""}, ())
 
 
 # The comparison, one rule at a time ------------------------------------------------------------
@@ -530,26 +532,66 @@ def test_namespace_packages_compare_by_their_directories(
     hold_modules()
 
     if not raises:
-        loaded_source.check_worker_imports({"module:wi_ns": ""})
+        loaded_source.check_worker_imports({"module:wi_ns": ""}, ())
         return
     held = _resolved(tmp_path / held_portion)
     with pytest.raises(exceptions.StageDefinitionError, match=f"namespace package in {held} in"):
-        loaded_source.check_worker_imports({"module:wi_ns": ""})
+        loaded_source.check_worker_imports({"module:wi_ns": ""}, ())
 
 
+_LOADER_READS_A_MODULE = """\
+import dataclasses
+import pathlib
+from typing import Annotated
+
+import wi_loader
+from pivot import Pipeline, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Located(loaders.Loader[str, str]):
+    def load(self, path: pathlib.Path) -> str:
+        return wi_loader.plain()
+
+    def save(self, data: str, path: pathlib.Path) -> None:
+        path.write_text(wi_loader.plain())
+
+
+@stage
+def use(raw: str) -> Annotated[str, OUTPUT]:
+    return raw
+
+
+with Pipeline("p") as pipeline:
+    use(pipeline.input("raw.txt", format=INPUT))
+"""
+
+
+@pytest.mark.parametrize(
+    ("input_loader", "output_loader"),
+    [
+        pytest.param("Located()", "loaders.Text()", id="input"),
+        pytest.param("loaders.Text()", "Located()", id="output"),
+    ],
+)
 def test_a_loaders_module_named_by_name_is_compared(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, hold_modules: Callable[[], None]
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, input_loader: str, output_loader: str
 ) -> None:
-    """An input's or output's loader records its modules under `dep:`/`out:`; they run in the
-    worker too."""
-    (tmp_path / "project").mkdir()
-    (tmp_path / "project" / "wi_loader.py").write_text(_PLAIN)
-    monkeypatch.syspath_prepend(str(tmp_path / "project"))
-    _held("wi_loader", tmp_path / "program" / "wi_loader.py", monkeypatch)
-    hold_modules()
+    """An input's or output's loader reads library module `wi_loader`, which the program holds
+    from `site-packages` while the root has its own `wi_loader.py`. The worker runs the loader
+    too, so the module is compared like one the stage reads."""
+    site = tmp_path / "lib" / "site-packages"
+    _held("wi_loader", site / "wi_loader.py", monkeypatch)
+    pipeline = _discover(
+        tmp_path,
+        monkeypatch,
+        {"wi_loader.py": _PLAIN},
+        _LOADER_READS_A_MODULE.replace("INPUT", input_loader).replace("OUTPUT", output_loader),
+    )
+    held = _resolved(site / "wi_loader.py")
 
-    with pytest.raises(exceptions.StageDefinitionError, match="module 'wi_loader'"):
-        loaded_source.check_worker_imports({"dep:raw:byname:wi_loader": ""})
+    with pytest.raises(exceptions.PivotError, match=rf"module 'wi_loader' is {held}"):
+        pipeline.ensure_fingerprint("p/use")
 
 
 def test_an_empty_path_entry_is_the_directory_the_process_started_in(
@@ -567,7 +609,7 @@ def test_an_empty_path_entry_is_the_directory_the_process_started_in(
     monkeypatch.setattr(sys, "path", [str(tmp_path / "project"), "", *sys.path])
     hold_modules()
 
-    loaded_source.check_worker_imports({"byname:wi_cwd": ""})
+    loaded_source.check_worker_imports({"byname:wi_cwd": ""}, ())
 
 
 def test_a_changed_sys_path_is_resolved_again(
@@ -580,12 +622,12 @@ def test_a_changed_sys_path_is_resolved_again(
     (tmp_path / "other" / "wi_moved.py").write_text(_PLAIN)
     monkeypatch.setattr(sys, "path", [str(tmp_path / "program"), *sys.path])
     hold_modules()
-    loaded_source.check_worker_imports({"byname:wi_moved": ""})
+    loaded_source.check_worker_imports({"byname:wi_moved": ""}, ())
     sys.path.insert(0, str(tmp_path / "other"))
 
     other = _resolved(tmp_path / "other" / "wi_moved.py")
     with pytest.raises(exceptions.StageDefinitionError, match=f"would import {other}"):
-        loaded_source.check_worker_imports({"byname:wi_moved": ""})
+        loaded_source.check_worker_imports({"byname:wi_moved": ""}, ())
 
 
 def test_a_relative_path_entry_is_predicted_in_the_working_directory_of_the_check(
@@ -605,12 +647,12 @@ def test_a_relative_path_entry_is_predicted_in_the_working_directory_of_the_chec
     hold_modules()
     # The program's own imports made the finder for `rel` here, in `first`.
     assert importlib.machinery.PathFinder.find_spec("wi_rl", ["rel"]) is not None
-    loaded_source.check_worker_imports({"byname:wi_rl": ""})
+    loaded_source.check_worker_imports({"byname:wi_rl": ""}, ())
     monkeypatch.chdir(tmp_path / "second")
 
     second = _resolved(tmp_path / "second" / "rel" / "wi_rl.py")
     with pytest.raises(exceptions.StageDefinitionError, match=f"would import {second}"):
-        loaded_source.check_worker_imports({"byname:wi_rl": ""})
+        loaded_source.check_worker_imports({"byname:wi_rl": ""}, ())
 
 
 def test_a_path_object_in_sys_path_is_skipped_as_the_import_system_skips_it(
@@ -671,18 +713,19 @@ def test_a_confirmation_that_cannot_run_fails_on_the_prediction(
         pipeline.ensure_fingerprint("p/use")
 
 
-def test_a_lock_leaves_out_every_by_name_entry() -> None:
-    """A stage's own `byname:` entries and its loaders' (`dep:`, `out:`) are left out of what a
-    lock records."""
-    manifest = {
-        "self:use": "1",
-        "byname:json": "",
-        "dep:raw:byname:json": "",
-        "out:p/use:byname:csv": "",
-        "dep:raw:loader": "2",
+def test_a_lock_keeps_every_entry_of_a_dependency_or_output_named_byname() -> None:
+    """Only a top-level `byname:` key is a by-name entry: a loader's join the stage's own without a
+    prefix. Each `dep:` and `out:` entry is the lock's, also of a dependency parameter or an
+    output field named `byname`."""
+    named_byname = {
+        "dep:byname:loader:pipeline.Reads:load": "2",
+        "out:p/use:byname:tag": "data",
+        "out:p/use:byname:loader:pipeline.Writes:save": "3",
     }
+    manifest = {"self:use": "1", "byname:json": "", **named_byname}
 
-    assert fingerprint.without_by_name(manifest) == {"self:use": "1", "dep:raw:loader": "2"}
+    assert fingerprint.without_by_name(manifest) == {"self:use": "1", **named_byname}
+    assert fingerprint.by_name_modules(manifest, {"p/use:byname"}) == {"json"}
 
 
 # Through a worker -----------------------------------------------------------------------------
@@ -897,3 +940,81 @@ def test_a_sitecustomize_module_with_a_root_files_name_runs_in_the_cli(
     output.unlink()
     _pivot(root, "run", "p/use", "--force", env=env)
     assert pathlib.Path(output.read_text()).resolve() == (startup / "wi_startup.py").resolve()
+
+
+_NAMED_BYNAME = """\
+import dataclasses
+import json
+import pathlib
+from typing import Annotated, TypedDict
+
+from pivot import Pipeline, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Reads(loaders.Loader[dict, dict]):
+    def load(self, path: pathlib.Path) -> dict:
+        return {"read": 1, **json.loads(path.read_text())}
+
+    def save(self, data: dict, path: pathlib.Path) -> None:
+        path.write_text(json.dumps(data))
+
+
+@dataclasses.dataclass(frozen=True)
+class Writes(loaders.Loader[dict, dict]):
+    def load(self, path: pathlib.Path) -> dict:
+        return json.loads(path.read_text())
+
+    def save(self, data: dict, path: pathlib.Path) -> None:
+        path.write_text(json.dumps({"written": 1, **data}))
+
+
+class Out(TypedDict):
+    byname: Annotated[dict, Writes()]
+
+
+@stage
+def use(byname: dict) -> Out:
+    return {"byname": byname}
+
+
+with Pipeline("p") as pipeline:
+    use(pipeline.input("raw.json", format=Reads()))
+"""
+
+
+@pytest.mark.parametrize(
+    ("edit", "edited"),
+    [
+        pytest.param(
+            ('"read": 1', '"read": 2'), {"written": 1, "read": 2, "x": 0}, id="dependency"
+        ),
+        pytest.param(
+            ('"written": 1', '"written": 2'), {"written": 2, "read": 1, "x": 0}, id="output"
+        ),
+    ],
+)
+def test_a_dependency_and_an_output_named_byname_rerun_when_their_loader_changes(
+    tmp_path: pathlib.Path, edit: tuple[str, str], edited: dict[str, int]
+) -> None:
+    """Stage `p/use` reads dependency parameter `byname` and writes output field `byname`. The
+    lock records the entries of each one's loader, which spell `byname` after `dep:` and the
+    output's name, so an edit to either loader reruns the stage."""
+    root = _cli_project(tmp_path, {"pipeline.py": _NAMED_BYNAME})
+    (root / "data" / "raw").mkdir(parents=True, exist_ok=True)
+    (root / "data" / "raw" / "raw.json").write_text('{"x": 0}')
+    _pivot(root, "repro")
+    (output,) = [path for path in (root / "data" / "p").rglob("*") if path.is_file()]
+    assert json.loads(output.read_text()) == {"written": 1, "read": 1, "x": 0}
+    lock = yaml.safe_load((root / ".pivot" / "stages" / "p" / "use.lock").read_text())
+    recorded = {key for key in lock["code_manifest"] if "byname" in key}
+    assert recorded >= {
+        "dep:byname:loader:pipeline.Reads:load",
+        "out:p/use:byname:tag",
+        "out:p/use:byname:loader:pipeline.Writes:save",
+    }, recorded
+
+    (root / "pipeline.py").write_text(_NAMED_BYNAME.replace(*edit))
+    _pivot(root, "repro")
+
+    assert json.loads(output.read_text()) == edited

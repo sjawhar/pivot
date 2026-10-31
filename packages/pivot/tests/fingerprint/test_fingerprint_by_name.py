@@ -790,7 +790,7 @@ def test_496_limit_uncovered_import_through_marked_helper(
 
     # The walk does not descend into the marked helper, so fbn_extra
     # is not in the covered set.
-    covered = fingerprint.covered_user_modules(fp)
+    covered = fingerprint.covered_user_modules(fp, ())
     assert "fbn_extra" not in covered, (
         "fbn_extra must not be covered: the walk did not descend into the marked helper"
     )
