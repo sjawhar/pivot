@@ -36,6 +36,7 @@ Pivot's fingerprinting system:
 | Default arguments | Yes (value) | `__defaults__`/`__kwdefaults__` checked like module-level values; a literal default is covered by the AST hash |
 | `functools.partial` | Yes | Bound args + underlying function; functions and classes in bound args walked like stage helpers |
 | Library functions and classes | Yes (name) | A global, closure cell, default or partial holding `np.mean` records `ext:<binding>` → `numpy.mean`, so rebinding it to `np.median` reruns the stage; library code itself is not hashed |
+| Library modules | Yes (name, not in the lock) | A library module read as a global (`np` in `np.mean(x)`) or imported in a function body, and the module that defines each library callable, is recorded by the walk as `byname:<module>`, which the worker-import check and the manifest cache read. The stage fingerprint a lock records leaves these entries out (`fingerprint.without_by_name`), so locks written before they existed stay current. Its attributes and code are not read |
 | Secrets outside a stage's params | Yes (digest) | A `SecretStr`, `SecretBytes` or `Secret[T]` in a `StageParams` default on a helper, a loader config field or a partial argument hashes as its keyed `hmac:` digest, the one the lock file records (`parameters.secret_digest`), so changing it reruns the stage without its value in any manifest |
 | Class attributes a stage reads | Yes (value) | `Cls.NAME` read directly on a user class that the function names (a global, cell or default holding the class), or reaches through a user module (`settings.Config.SCALE`). When `NAME` is written in a user class body, it follows the module-level rule: scalars, exact tuples and frozensets of scalars, and compiled regexes are recorded; mutable or nested values are refused; a plain function is walked; and a member of a user Enum is recorded by name and value. A pydantic or StageParams class read this way is covered by its schema hash, field defaults included. Attributes a library base or the language defines (an inherited stdlib dict, `NamedTuple._fields`, an Enum's `_member_names_`), and descriptors (property, classmethod, staticmethod), are left to the class AST hash |
 | Other class-level and module reads | No | Not tracked: `cls.SCALE` inside a classmethod, `Outer.Inner.X`, an attribute read through an instance (`Config().SCALE`), a `ClassVar` on a `StageParams` class, a module read through a local alias (`s = settings; s.SCALE`) or through the object a dynamic import returns (`load("settings").SCALE`), a literal `getattr(settings, "SCALE")`, and a module held in a class attribute (`Holder.lib.SCALE`). Put such configuration in the stage's `StageParams` |
@@ -360,6 +361,82 @@ module was recorded from (a `code_deps` entry that is not a module) is read from
 The lines are split as `linecache` splits a file (`tokenize.open`, universal newlines, a final
 newline added), so an unedited project keeps its recorded fingerprints.
 
+A worker imports by name each module discovery did not register by value, with the `sys.path`
+loky gives it (the coordinator's, `""` replaced by the directory the coordinator started in; it
+starts in the coordinator's working directory, and its `PathFinder` skips an entry that is not a
+`str`), where an import session puts the project root first. A program that runs Pivot in its own
+process (a notebook, a script, a test suite) may hold a module of that name loaded from another
+file, which `import` in `pipeline.py` returns from `sys.modules`; the stage would then be
+fingerprinted
+from one module while its worker runs another, and an edit to the project's file would leave a
+stale `cached`. So when a stage's fingerprint is computed, `loaded_source.check_worker_imports`
+takes each module the manifest names (`fingerprint.by_name_modules`: the `module:` entries and
+the `byname:` entries, a loader's included) that `sys.modules` held when the latest import session
+started (`loaded_source.note_held_modules`; kept after the session ends, so a pipeline fingerprinted
+after a later discovery found nothing is still compared) and still holds, leaving out a module
+cloudpickle
+sends by value and the program's `__main__` (a worker gets its functions by value). For each it
+predicts, without importing anything, where a worker would import it (`loaded_source.worker_origin`,
+`import_origin.find_spec`): a built-in or frozen module first, which no file shadows, then each
+finder of `sys.meta_path` in order, `PathFinder` searching the worker's `sys.path` (its `str`
+entries, a relative one joined to the working directory), a submodule in its package's spec's
+directories. Origins compare by resolved file, by kind for a built-in or frozen module, and for a
+namespace package by its sorted resolved directories. Only where the prediction differs from the
+held module does it start an interpreter as loky starts a worker (the same executable,
+environment and working directory; `loky.backend.popen_loky_posix` imported before it is given
+the worker's `sys.path`). That interpreter runs what a worker's start runs, `site` with
+`sitecustomize` and the `.pth` files and loky's own imports, so their code runs once more; it
+imports no project module. It reports the module its start already imported or else the spec an
+import would find, on a file descriptor of its own, since startup code may write to stdout
+(`import_origin.report_worker_origins`). The first such interpreter of a session, for one
+`sys.path` and working directory, also confirms every other held module the prediction places
+elsewhere (`loaded_source._held_suspects`), so one interpreter serves every stage of the session.
+The check refuses the stage only when that interpreter also places the module elsewhere, naming
+both origins, with the stage's other refusals (`fingerprint.refuse`); the remedy is renaming one
+of the modules, or a new process when the program imported its own module of that name. When the
+interpreter cannot run, the prediction decides and the error says so. Predictions and
+confirmations are kept per `sys.path` and working directory until the session ends. A module
+nothing would find, or whose finder raised, is left alone: the worker's import fails loudly. Pivot
+changes nothing in the program's `sys.modules`.
+
+Cost: every by-name module of every stage is predicted once per import session (memoized by
+name, `sys.path` and working directory). On a 1,000-stage project with three by-name modules per
+stage, `pivot status` took 3.0% longer (95% interval 2.5% to 3.6%) and an all-cached `pivot repro`
+1.7% longer than on main; on `fan-1000` (1,000 stages, each reading one library module, `zlib`),
+`pivot status` took 2.3% longer (95% interval 1.6% to 2.7%; 10 paired runs against main
+64c5db6c). An interpreter start costs about 80 ms, once per session and only when a held module is
+suspect.
+
+The manifest cache records where each of those modules resolved when the walk ran (`o`, the
+prediction above), and a hit re-predicts them: a project file that takes over a name a library
+held (vendoring `helpers.py` where `helpers` was installed) changes no file the walk read and no
+value it re-reads, so without this the cached manifest of the library would answer for the
+project's code.
+
+Limits of the comparison:
+
+- A module the session imported itself resolved on the worker's `sys.path` when it was imported,
+  so it is not compared; a file that appears or changes after that, during a run, is the worker's
+  to report (below). A module a program loads by file location or through its own finder while
+  the session runs (another thread of a notebook, between discovery's start and `pipeline.py`'s
+  import) is not compared, and the worker's own check does not see it either, because the worker
+  imports it when it unpickles the stage, before the stage's window opens.
+- A finder the program inserted in `sys.meta_path` after its interpreter started is assumed to be
+  in the worker too; one a `.pth` file or a `sitecustomize` installs is.
+- The prediction reads a package's spec, so a package whose `__init__` changes its `__path__`
+  (`pkgutil.extend_path`, or an append) has its submodules predicted in the directories of the
+  spec, not of the loaded package. A submodule found elsewhere is then confirmed in a new
+  interpreter, which reads specs too.
+- A worker of a warm pool keeps the `sys.path` it started with, while the check reads the current
+  one; the two differ only when the program changes `sys.path` between runs and loky reuses the
+  pool. In the same way, a pipeline object's fingerprints are kept (`ensure_fingerprint`), so
+  running the same pipeline object again after the program changes `sys.path` checks nothing
+  again; a new discovery does.
+- The parent's `PathFinder` keeps a finder per `sys.path` entry (`sys.path_importer_cache`), made
+  for a relative entry in the working directory of its first use. A relative entry with a `chdir`
+  between two stages of one session is predicted for the new working directory, while the
+  program's own imports still search the old one.
+
 A worker imports some user modules itself, from their files: a stage's module discovery does not
 send by value (outside the root, or under it in a `src` layout), a module outside the root that
 one sent by value refers to, and any module a stage body imports. Such a module holds the file as
@@ -524,6 +601,7 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 | `wire:` | Call-site artifact wiring: parameter bindings, collection kind/order, input paths | `wire:left` → `raw-a`, `wire:items` → `{"kind":"list","identities":["a","b"]}`, `wire:file:path` → `old.txt` |
 | `partial:` | `functools.partial` bound arguments | `partial:myproject.stage.bound.args` |
 | `ext:` | A library function or class a stage reads, named by its definition (its code is not hashed) | `ext:myproject.stages.agg` → `numpy.mean` |
+| `byname:` | A module a stage's worker imports by name to run code the walk does not hash: a library module read as a global or imported in a function body, and the module that defines each `ext:` callable. Compared with the module the worker would import (`loaded_source.check_worker_imports`), and re-resolved on a manifest cache hit. Recorded by the walk and the manifest cache only: a lock leaves it out (`fingerprint.without_by_name`) | `byname:numpy` |
 | `loader:` | Loader class methods and config | `loader:pivot.loaders.CSV:load` |
 | `schema:` | Pydantic model JSON schema | `schema:myproject.params.TrainParams` |
 | `builtin:` | Built-in types (for deterministic hashing) | `builtin:list` |

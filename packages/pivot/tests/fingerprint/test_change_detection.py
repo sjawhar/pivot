@@ -328,7 +328,8 @@ def test_function_rename_no_miss(module_dir: pathlib.Path) -> None:
 
 
 def test_stdlib_module_attrs_not_tracked(module_dir: pathlib.Path) -> None:
-    """Stdlib module attributes are NOT tracked in fingerprint."""
+    """Stdlib module attributes are NOT tracked in fingerprint; the module is named, since a
+    worker imports it by name (`byname:`)."""
     mod_py = module_dir / "test_nochange_stdlib.py"
     mod_py.write_text(
         "import json as json_mod\n\ndef stage():\n    return json_mod.dumps({'key': 'value'})\n"
@@ -337,8 +338,10 @@ def test_stdlib_module_attrs_not_tracked(module_dir: pathlib.Path) -> None:
     mod = _import_fresh("test_nochange_stdlib")
     fp = fingerprint.get_stage_fingerprint(mod.stage)
 
-    # json is stdlib - should NOT be in fingerprint
-    assert not any("json" in key for key in fp if not key.startswith("self:")), fp
+    # json is stdlib - its attributes and code are not in the fingerprint, only its name
+    assert {key: value for key, value in fp.items() if not key.startswith("self:")} == {
+        "byname:json": ""
+    }, fp
 
 
 # =============================================================================

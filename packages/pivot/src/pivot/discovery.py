@@ -457,9 +457,13 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
         _end_import_session(_import_session)
     root = root.resolve()
     file_under_root = dict[str, bool]()
+    # A snapshot: another thread can import while this one starts a session (a watch reload runs
+    # discovery on a worker thread while the event loop, the TUI and the RPC server run).
+    held = list(sys.modules.items())
+    loaded_source.note_held_modules(held)
     preexisting_root_modules = {
         module_name: module
-        for module_name, module in sys.modules.items()
+        for module_name, module in held
         if _module_is_under_root(module, root, file_under_root)
     }
     root_str = str(root)
