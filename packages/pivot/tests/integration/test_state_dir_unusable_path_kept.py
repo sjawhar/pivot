@@ -2,13 +2,14 @@
 
 `core.state_dir: s1`, where `s1` cannot become a directory when the pipeline loads (a regular
 file, or a link to a path under a regular file), so its stages record `.pivot`. A library caller
-then removes the file, re-points the link at a usable directory, or leaves the file, and runs the
-pipeline it loaded: its locks, its run record, its database entries, its fingerprint caches and
-its cache objects all go to `.pivot`, and the configured path gets nothing. The pipeline keeps
-the outcome its load decided; nothing checks the path again. Or the caller loads `pa` while `s1`
-is a file, removes the file, then loads `pb` and includes `pa`, after `pb`'s `with` block or
-inside it: `pa` keeps its state in `.pivot` and `pb` in `s1`, so the include is refused, naming
-both directories, and nothing runs.
+then leaves the file and runs the pipeline it loaded: its locks, its run record, its database
+entries, its fingerprint caches and its cache objects all go to `.pivot`, and the configured path
+gets nothing. Or the caller removes the file, or re-points the link at a usable directory, and
+then runs it: the configuration now names `s1`, where `pivot gc` reads, so the run refuses,
+naming both directories, and writes no lock. Or the caller loads `pa` while `s1` is a file,
+removes the file, then loads `pb` and includes `pa`, after `pb`'s `with` block or inside it:
+`pa` keeps its state in `.pivot` and `pb` in `s1`, so the include is refused, naming both
+directories, and nothing runs.
 """
 
 from __future__ import annotations
@@ -125,7 +126,11 @@ def main() -> None:
         except exceptions.PipelineConfigError as e:
             print("REFUSED " + str(e))
             return
-    results = executor.run(pipeline=pipeline)
+    try:
+        results = executor.run(pipeline=pipeline)
+    except exceptions.PipelineConfigError as e:
+        print("REFUSED " + str(e))
+        return
     print("RAN " + " ".join(sorted(f"{k}={v['status']}" for k, v in results.items())))
 
 
@@ -175,19 +180,13 @@ def _keys(state_dir: pathlib.Path, prefix: bytes) -> int:
         return len(list(db.iter_prefix(prefix)))
 
 
-@pytest.mark.parametrize("shape", _SINGLE_SHAPES)
 def test_a_pipeline_loaded_while_its_path_could_not_be_used_runs_in_pivot(
-    tmp_path: pathlib.Path, shape: str
+    tmp_path: pathlib.Path,
 ) -> None:
-    root, output = _run(tmp_path, shape)
+    root, output = _run(tmp_path, "file-kept")
 
     assert "RAN test/a=ran test/b=ran" in output, output
-    if shape == "file-removed":
-        assert not os.path.lexists(root / "s1"), output
-    elif shape == "link-re-pointed":
-        assert not list((root / "real").iterdir()), output
-    else:
-        assert (root / "s1").is_file(), output
+    assert (root / "s1").is_file(), output
     pivot_dir = root / ".pivot"
     locks = sorted(path.name for path in (pivot_dir / "stages" / "test").iterdir())
     assert locks == ["a.lock", "b.lock"], output
@@ -203,26 +202,22 @@ def test_a_pipeline_loaded_while_its_path_could_not_be_used_runs_in_pivot(
     assert len(objects) == 2, output
 
     # The library caller gets the command's warning once, at the load: the path cannot be used
-    # and Pivot uses `.pivot` (for a link under a file, it names that file, as a command does).
+    # and Pivot uses `.pivot`.
     real_root = os.path.realpath(root)
-    in_the_way = f"{real_root}/afile" if shape == "link-re-pointed" else f"{real_root}/s1"
-    role = "core.state_dir parent" if shape == "link-re-pointed" else "core.state_dir"
     warning = (
-        f"{role} must be a directory: {in_the_way} (core.state_dir in "
+        f"core.state_dir must be a directory: {real_root}/s1 (core.state_dir in "
         + f"{real_root}/.pivot/config.yaml). The state directory cannot be used; Pivot uses the "
         + "default .pivot."
     )
     assert output.splitlines().count(warning) == 1, output
     assert output.count("Pivot uses the default .pivot.") == 1, output
-    if shape == "file-kept":
-        # The same line a command prints while the path still cannot be used.
-        status = helpers.run_pivot(root, tmp_path / "home", "status")
-        assert status.stderr.splitlines().count(warning) == 1, status.stderr
+    # The same line a command prints while the path still cannot be used.
+    status = helpers.run_pivot(root, tmp_path / "home", "status")
+    assert status.stderr.splitlines().count(warning) == 1, status.stderr
 
-    if shape != "file-removed":
-        return
-    # A later command can use `s1`, so it reads the locks from `.pivot`; its notice must name
+    # Once a later command can use `s1`, it reads the locks from `.pivot`; its notice must name
     # every source of locks there, and a move that works although git tracks none of them.
+    (root / "s1").unlink()
     status = helpers.run_pivot(root, tmp_path / "home", "status")
     assert status.returncode == 0, status.stdout + status.stderr
     assert (
@@ -236,6 +231,25 @@ def test_a_pipeline_loaded_while_its_path_could_not_be_used_runs_in_pivot(
     moved = subprocess.run(shlex.split(move), cwd=root / "data", capture_output=True, check=False)
     assert moved.returncode == 0, moved.stderr
     assert sorted(path.name for path in (root / "s1" / "stages" / "test").iterdir()) == locks
+
+
+@pytest.mark.parametrize("shape", ["file-removed", "link-re-pointed"])
+def test_a_pipeline_loaded_while_its_path_could_not_be_used_refuses_to_run_once_it_can(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """Its stages record `.pivot`, and the configuration now names `s1`, where `pivot gc`
+    reads: a run would record its stages where no collection reads them, so it refuses."""
+    root, output = _run(tmp_path, shape)
+
+    real_root = os.path.realpath(root)
+    now = f"{real_root}/real" if shape == "link-re-pointed" else f"{real_root}/s1"
+    flat = " ".join(output.split())
+    assert "REFUSED" in flat and "RAN" not in flat, output
+    assert f"kept its state in {real_root}/.pivot" in flat and f"names {now}" in flat, output
+    assert "Load the pipeline again" in flat, output
+    assert not list(root.rglob("*.lock")), output
+    target = root / ("real" if shape == "link-re-pointed" else "s1")
+    assert not target.exists() or not list(target.iterdir()), output
 
 
 @pytest.mark.parametrize("shape", ["after-block", "inside-block"])

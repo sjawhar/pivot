@@ -10,10 +10,20 @@ from __future__ import annotations
 import logging
 import pathlib
 
-from pivot import config, exceptions, parameters, project, registry, run_history, skip, types
+from pivot import (
+    config,
+    exceptions,
+    parameters,
+    project,
+    reads,
+    registry,
+    run_history,
+    skip,
+    types,
+)
 from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
-from pivot.storage import cache, listing, lock
+from pivot.storage import cache, listing, lock, naming
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import ArtifactTag, DeferredWrites, HashInfo, LockData
@@ -187,40 +197,29 @@ def _commit_stages(
                 if not decision["changed"]:
                     continue
 
-            # 6. Hash and cache outputs
-            output_hashes_by_key = dict[str, HashInfo]()
-            output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
-            output_paths_by_identity = dict[types.ArtifactIdentity, str]()
-            file_hash_entries = list[types.FileHashEntry]()
+            # 6. Hash and publish every output before the naming unit, so a large output's
+            # reading and copying holds no lock a waiting collection would turn into a stall for
+            # every other commit on the cache.
+            prepared = dict[
+                types.ArtifactIdentity,
+                tuple[pathlib.Path, types.FileHash | listing.HashedDirectory],
+            ]()
             outputs_missing = False
             for out in stage_outs:
                 identity_key = types.identity_key(out.identity)
                 try:
                     out_path = store.resolve_display_path(out)
-                    hash_info = store.commit(
-                        out,
+                    prepared[out.identity] = (
                         out_path,
-                        state_dir=default_state_dir,
-                        warn_left_out_symlinks=warn_left_out_symlinks,
-                        hashed_dirs=hashed_dirs,
-                        claims=claims,
+                        store.prepare_commit(
+                            out,
+                            out_path,
+                            state_dir=default_state_dir,
+                            warn_left_out_symlinks=warn_left_out_symlinks,
+                            hashed_dirs=hashed_dirs,
+                            claims=claims,
+                        ),
                     )
-                    file_hash_entries.extend(
-                        cache.deferred_file_hash_entries(
-                            cache.known_file_hashes(
-                                out_path,
-                                hash_info,
-                                hashed_dirs[hash_info["hash"]]["listing"]
-                                if types.is_dir_hash(hash_info)
-                                else None,
-                            )
-                        )
-                    )
-                    output_hashes_by_key[identity_key] = hash_info
-                    output_hashes_by_identity[out.identity] = hash_info
-                    output_paths_by_identity[out.identity] = out_path.relative_to(
-                        project_root
-                    ).as_posix()
                 except FileNotFoundError:
                     logger.error(
                         "Stage '%s': output missing: %s — skipping", stage_name, identity_key
@@ -233,9 +232,7 @@ def _commit_stages(
                     break
                 except OSError:
                     logger.error(
-                        "Stage '%s': output unreadable: %s — skipping",
-                        stage_name,
-                        identity_key,
+                        "Stage '%s': output unreadable: %s — skipping", stage_name, identity_key
                     )
                     outputs_missing = True
                     break
@@ -250,76 +247,180 @@ def _commit_stages(
                 failed.append(stage_name)
                 continue
 
-            # The outputs a --no-commit run wrote came from the code that run fingerprinted, which
-            # may differ from the code on disk now: record that run's manifest, its marks
-            # included, and the objects it read by hash. Otherwise (no record, or outputs edited
-            # since) record the outputs on disk against the current code, the "trust me" commit.
-            # A run that executed code the fingerprint does not describe marked its lock;
-            # committing the same outputs keeps that mark, so the stage is still not reusable.
-            # The previous lock's `reads` stay only when it records this whole provenance: the
-            # same code, params, dependencies and outputs. A changed input (a new pin) can leave
-            # the outputs' bytes alone while naming other objects, and the old list would have
-            # status check what the old pin named and never what the new one does; then no reads
-            # are recorded, and only a fresh run or a matching --no-commit record records them.
-            read_hashes = list[str]()
-            output_content_hashes = {
-                key: hash_info["hash"] for key, hash_info in output_hashes_by_key.items()
-            }
-            if run_manifest is not None and run_outputs == output_content_hashes:
-                code_manifest = run_manifest
-                if run_record is not None and "reads" in run_record:
-                    read_hashes = run_record["reads"]
-            else:
-                code_manifest = skip.carry_rerun_marks(
-                    previous_lock["code_manifest"] if previous_lock is not None else None,
-                    fingerprint,
-                )
-                if (
-                    previous_lock is not None
-                    and "reads" in previous_lock
-                    and previous_lock["code_manifest"] == code_manifest
-                    and skip.params_equal(previous_lock["params"], current_params)
-                    and previous_lock["dep_hashes"] == dep_hashes_by_identity
-                    and {
-                        types.identity_key(identity): hash_info["hash"]
-                        for identity, hash_info in previous_lock["output_hashes"].items()
-                    }
-                    == output_content_hashes
-                ):
-                    read_hashes = previous_lock["reads"]
-            reusable = skip.rerun_mark_reason(code_manifest) is None
-            input_hash = run_history.stage_input_hash(
-                skip.strip_rerun_marks(code_manifest),
-                current_params,
-                stage_info["deps"].values(),
-                dep_hashes_by_identity,
-                stage_outs,
+            # A read by hash names nothing until a lock does: an object the run read (its
+            # nocommit: record's, or the previous lock's that a trust-me commit keeps) may have
+            # left the cache since. Fetch each again before the unit (no download inside one);
+            # inside it, the reads the lock will record must be in the cache.
+            fetches = reads.Recording(worker.store_cache_dir(store))
+            unfetched = reads.fetch_missing(
+                [
+                    *(
+                        run_record["reads"]
+                        if run_record is not None and "reads" in run_record
+                        else []
+                    ),
+                    *(
+                        previous_lock["reads"]
+                        if previous_lock is not None and "reads" in previous_lock
+                        else []
+                    ),
+                ],
+                fetches,
             )
 
-            # 7. Write production lock
-            new_lock_data = LockData(
-                code_manifest=code_manifest,
-                params=current_params,
-                dep_hashes=dict(sorted(dep_hashes_by_identity.items())),
-                output_hashes=dict(sorted(output_hashes_by_identity.items())),
-                output_paths=output_paths_by_identity,
-            )
-            if read_hashes:
-                new_lock_data["reads"] = read_hashes
-            try:
-                production_lock.write(
-                    new_lock_data,
-                    hashed_dirs=hashed_dirs,
-                    input_paths=worker.input_listing_paths(
-                        stage_info["deps"], store, new_lock_data["dep_hashes"]
-                    ),
-                    cache_dir=store.cache_dir,
-                    outs=stage_outs,
+            # 7. Under the naming lock (shared), the naming step only: re-check and link each
+            # output (an object a collection removed since is published again), record its
+            # materialized file hash (#516), then write the lock and the listings that name them.
+            with naming.naming_unit(
+                config.get_cache_dir(), project=(project_root, config.get_state_dir())
+            ):
+                output_hashes_by_key = dict[str, HashInfo]()
+                output_hashes_by_identity = dict[types.ArtifactIdentity, HashInfo]()
+                output_paths_by_identity = dict[types.ArtifactIdentity, str]()
+                file_hash_entries = list[types.FileHashEntry]()
+                for out in stage_outs:
+                    identity_key = types.identity_key(out.identity)
+                    out_path, hashed = prepared[out.identity]
+                    try:
+                        hash_info = store.finish_commit(
+                            out, out_path, hashed, state_dir=default_state_dir, claims=claims
+                        )
+                    except FileNotFoundError:
+                        logger.error(
+                            "Stage '%s': output missing: %s — skipping", stage_name, identity_key
+                        )
+                        outputs_missing = True
+                        break
+                    except exceptions.UnreadableLinkError as exc:
+                        logger.error("Stage '%s': %s — skipping", stage_name, exc)
+                        outputs_missing = True
+                        break
+                    except OSError:
+                        logger.error(
+                            "Stage '%s': output unreadable: %s — skipping",
+                            stage_name,
+                            identity_key,
+                        )
+                        outputs_missing = True
+                        break
+                    except exceptions.OutputOwnershipError as exc:
+                        # #538's swap check, at the link inside the unit: this stage's failure
+                        # alone, as at the check before the unit
+                        logger.error("Stage '%s': %s", stage_name, exc)
+                        outputs_missing = True
+                        break
+                    try:
+                        file_hash_entries.extend(
+                            cache.deferred_file_hash_entries(
+                                cache.known_file_hashes(
+                                    out_path,
+                                    hash_info,
+                                    hashed_dirs[hash_info["hash"]]["listing"]
+                                    if types.is_dir_hash(hash_info)
+                                    else None,
+                                )
+                            )
+                        )
+                    except exceptions.UnreadableLinkError as exc:
+                        logger.error("Stage '%s': %s — skipping", stage_name, exc)
+                        outputs_missing = True
+                        break
+                    except OSError:
+                        logger.error(
+                            "Stage '%s': output unreadable: %s — skipping",
+                            stage_name,
+                            identity_key,
+                        )
+                        outputs_missing = True
+                        break
+                    output_hashes_by_key[identity_key] = hash_info
+                    output_hashes_by_identity[out.identity] = hash_info
+                    output_paths_by_identity[out.identity] = out_path.relative_to(
+                        project_root
+                    ).as_posix()
+
+                if outputs_missing:
+                    failed.append(stage_name)
+                    continue
+
+                # The outputs a --no-commit run wrote came from the code that run fingerprinted,
+                # which may differ from the code on disk now: record that run's manifest, its
+                # marks included, and the objects it read by hash. Otherwise (no record, or
+                # outputs edited since) record the outputs on disk against the current code, the
+                # "trust me" commit. A run that executed code the fingerprint does not describe
+                # marked its lock; committing the same outputs keeps that mark, so the stage is
+                # still not reusable. The previous lock's `reads` stay only when it records this
+                # whole provenance: the same code, params, dependencies and outputs. A changed
+                # input (a new pin) can leave the outputs' bytes alone while naming other
+                # objects, and the old list would have status check what the old pin named and
+                # never what the new one does; then no reads are recorded, and only a fresh run
+                # or a matching --no-commit record records them.
+                read_hashes = list[str]()
+                output_content_hashes = {
+                    key: hash_info["hash"] for key, hash_info in output_hashes_by_key.items()
+                }
+                if run_manifest is not None and run_outputs == output_content_hashes:
+                    code_manifest = run_manifest
+                    if run_record is not None and "reads" in run_record:
+                        read_hashes = run_record["reads"]
+                else:
+                    code_manifest = skip.carry_rerun_marks(
+                        previous_lock["code_manifest"] if previous_lock is not None else None,
+                        fingerprint,
+                    )
+                    if (
+                        previous_lock is not None
+                        and "reads" in previous_lock
+                        and previous_lock["code_manifest"] == code_manifest
+                        and skip.params_equal(previous_lock["params"], current_params)
+                        and previous_lock["dep_hashes"] == dep_hashes_by_identity
+                        and {
+                            types.identity_key(identity): hash_info["hash"]
+                            for identity, hash_info in previous_lock["output_hashes"].items()
+                        }
+                        == output_content_hashes
+                    ):
+                        read_hashes = previous_lock["reads"]
+                reusable = skip.rerun_mark_reason(code_manifest) is None
+                input_hash = run_history.stage_input_hash(
+                    skip.strip_rerun_marks(code_manifest),
+                    current_params,
+                    stage_info["deps"].values(),
+                    dep_hashes_by_identity,
+                    stage_outs,
                 )
-            except exceptions.InvalidPathError as exc:
-                logger.error("%s — skipping", exc)
-                failed.append(stage_name)
-                continue
+
+                try:
+                    reads.require_cached(read_hashes, fetches.cache_dir, unfetched)
+                except exceptions.ObjectReadError as exc:
+                    logger.error("Stage '%s': %s — skipping", stage_name, exc)
+                    failed.append(stage_name)
+                    continue
+
+                # 7. Write production lock
+                new_lock_data = LockData(
+                    code_manifest=code_manifest,
+                    params=current_params,
+                    dep_hashes=dict(sorted(dep_hashes_by_identity.items())),
+                    output_hashes=dict(sorted(output_hashes_by_identity.items())),
+                    output_paths=output_paths_by_identity,
+                )
+                if read_hashes:
+                    new_lock_data["reads"] = read_hashes
+                try:
+                    production_lock.write(
+                        new_lock_data,
+                        hashed_dirs=hashed_dirs,
+                        input_paths=worker.input_listing_paths(
+                            stage_info["deps"], store, new_lock_data["dep_hashes"]
+                        ),
+                        cache_dir=store.cache_dir,
+                        outs=stage_outs,
+                    )
+                except exceptions.InvalidPathError as exc:
+                    logger.error("%s — skipping", exc)
+                    failed.append(stage_name)
+                    continue
 
             # 8. Update StateDB: dep generations, output generations, run cache entry
             run_id = run_history.generate_run_id()
@@ -367,6 +468,8 @@ def _commit_stages(
                 ]
             if file_hash_entries:
                 deferred["file_hash_entries"] = file_hash_entries
+            if fetched := fetches.fetched():
+                deferred["remote_hashes"] = fetched
 
             stage_db.apply_deferred_writes(stage_name, out_paths, deferred)
 

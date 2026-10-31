@@ -4,9 +4,10 @@ whenever and wherever the flush that writes it runs, and whenever the value is e
 A flush runs where the producer no longer does. A TUI session's engine thread keeps
 fingerprinting a reload after the quit has returned from the command, so process exit flushes
 what that thread queued; a library caller flushes at process exit as well, after whatever its
-program did next. Neither reads `core.state_dir` again, so a value edited in between takes
-nothing: the session's entries stay in `s1`, the library's in `libstate`, and the edited
-directory is never created.
+program did next. Neither reads `core.state_dir` again, so a change in between takes nothing:
+the session's entries stay in `s1` when the link the value names moves to `s2` (an edit of the
+value itself reloads a watch session, a new load), the library's in `libstate`, and the edited
+directory gets nothing.
 
 Every library entry point holds one state-directory record for its call
 (`state_dir.entry_invocation`), and a pipeline's fingerprints and runs start it from the
@@ -173,12 +174,15 @@ import sys
 def main() -> None:
     os.chdir(sys.argv[1])
 
-    from pivot import discovery, executor
+    from pivot import discovery, exceptions, executor
 
     pipeline = discovery.discover_pipeline()
     executor.run(pipeline=pipeline)
     pathlib.Path(".pivot/config.yaml").write_text("core:\\n  state_dir: otherstate\\n")
-    executor.run(pipeline=pipeline, force=True)
+    try:
+        executor.run(pipeline=pipeline, force=True)
+    except exceptions.PipelineConfigError as error:
+        print(f"REFUSED: {error}")
 
 
 if __name__ == "__main__":
@@ -347,7 +351,14 @@ def _wait_for(
 def test_a_tui_quit_while_the_engine_fingerprints_writes_its_caches_to_its_own_state_dir(
     tmp_path: pathlib.Path,
 ) -> None:
+    """The reload's fingerprint caches go to `s1`, the directory it loaded with, though the
+    directory `core.state_dir` names moves to `s2` before the quit's flush. The value names a
+    link, re-pointed rather than edited: an edit of `.pivot/config.yaml` reloads a watch session
+    into the new directory (L3w), which is a load of its own."""
     home, root = _project(tmp_path, "s1")
+    (root / "s1").mkdir()
+    (root / "state").symlink_to("s1")
+    (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: state\n")
     log = tmp_path / "pivot.log"
     started = root / "reload_started"
     with log.open("wb") as output:
@@ -365,7 +376,10 @@ def test_a_tui_quit_while_the_engine_fingerprints_writes_its_caches_to_its_own_s
         # the quit below returns from the command.
         (root / "pipeline.py").write_text(_reload_pipeline(_RELOAD_STAGES))
         _wait_for(proc, log, started.exists, "reload")
-        (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: s2\n")
+        (root / "s2").mkdir()
+        relinked = root / "state.relinked"
+        relinked.symlink_to("s2")
+        relinked.replace(root / "state")
         proc.send_signal(signal.SIGINT)
         proc.wait(timeout=60)
     finally:
@@ -375,7 +389,7 @@ def test_a_tui_quit_while_the_engine_fingerprints_writes_its_caches_to_its_own_s
 
     output_text = log.read_text(errors="replace")
     assert proc.returncode == 0, output_text
-    assert not (root / "s2").exists(), sorted(p.name for p in (root / "s2").iterdir())
+    assert not any((root / "s2").iterdir()), sorted(p.name for p in (root / "s2").iterdir())
     assert _cached_keys(root / "s1", b"sm:") > 0, output_text
     assert _cached_keys(root / "s1", b"fp:") > 0, output_text
 
@@ -451,18 +465,22 @@ def test_a_pipeline_loaded_again_after_an_edit_runs_in_the_new_state_dir(
     assert (root / "otherstate" / "stages" / "test" / "process.lock").is_file(), ran.stderr
 
 
-def test_a_reused_pipeline_keeps_its_state_dir_after_an_edit(tmp_path: pathlib.Path) -> None:
-    """A loaded pipeline's runs keep the directory its stages' locks are recorded in, so its
-    second run writes its locks, its run manifest and its caches where its first run did."""
+def test_a_reused_pipeline_refuses_to_run_after_its_state_dir_moves(tmp_path: pathlib.Path) -> None:
+    """A loaded pipeline's stages record the directory it loaded with. Once `core.state_dir`
+    names another, a run of it refuses, naming both directories, rather than write locks where
+    no `pivot gc` reads them; it writes nothing in either directory."""
     home, root = _project(tmp_path, "libstate")
 
     ran = _run_library_caller(tmp_path, home, root, _REUSED_PIPELINE_CALLER)
 
-    assert ran.returncode == 0, ran.stdout + ran.stderr
+    out = " ".join((ran.stdout + ran.stderr).split())
+    assert ran.returncode == 0, out
+    assert "REFUSED:" in out and "libstate" in out and "otherstate" in out, out
+    assert "Load the pipeline again" in out, out
     assert not (root / "otherstate").exists(), sorted(
         p.relative_to(root).as_posix() for p in (root / "otherstate").rglob("*")
     )
-    assert _cached_keys(root / "libstate", b"run:") == 2, ran.stdout + ran.stderr
+    assert _cached_keys(root / "libstate", b"run:") == 1, out
 
 
 def test_direct_fingerprints_of_one_pipeline_use_the_state_dir_it_loaded_with(

@@ -80,7 +80,7 @@ if _MODE:
                 shutil.copy2(raw / (output.name + ".pvt"), output.with_name(output.name + ".pvt"))
             elif (
                 _MODE == "commit"
-                and _called_from("commit", "store.py")
+                and _called_from("prepare_commit", "store.py")
                 and output.is_dir()
                 and not output.is_symlink()
             ):

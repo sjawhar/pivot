@@ -14,7 +14,7 @@ The Engine monitors:
 
 - **Stage function code** - Python files (`.py`) defining stages
 - **Input data files** - Files declared with `pipeline.input()`
-- **Configuration files** - `pipeline.py`, `params.yaml`, `params.yml`, `.pivotignore` (`engine/sources.py` `_CONFIG_FILE_NAMES`)
+- **Configuration files** - `pipeline.py`, `params.yaml`, `params.yml`, `.pivotignore` (`engine/sources.py` `_CONFIG_FILE_NAMES`), and the project's `.pivot/config.yaml`. Every reload reads the project's configuration again, so an edit of `core.state_dir` moves the session's later runs, and the locks they write, to the directory `pivot gc` reads. A run whose pipeline's state directory is no longer the configured one (a link the value names was re-pointed, which no edit announces) marks the pipeline invalid and runs nothing until a reload.
 
 When changes are detected, only affected stages and their downstream dependencies re-run. A
 change inside a `pipeline.input()` directory at a path the project's `.pivotignore` names affects
