@@ -23,7 +23,7 @@ import textwrap
 import types
 import typing
 import weakref
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
 import xxhash
@@ -763,11 +763,11 @@ def _try_manifest_cache_hit(stage_name: str, func: Callable[..., Any]) -> dict[s
 
 
 def _by_name_origins(manifest: Mapping[str, str]) -> dict[str, list[str] | None]:
-    """Where a worker would import each module `manifest` names by name (`by_name_modules`),
-    predicted without importing it (`loaded_source.worker_origin`), in the JSON form a cached
-    manifest records."""
+    """Where a worker would import each module `manifest`, the walk's, names by name
+    (`by_name_modules`; the walk records no loader's entries), predicted without importing it
+    (`loaded_source.worker_origin`), in the JSON form a cached manifest records."""
     origins = dict[str, list[str] | None]()
-    for name in sorted(by_name_modules(manifest)):
+    for name in sorted(by_name_modules(manifest, ())):
         origin = loaded_source.worker_origin(name)
         origins[name] = None if origin is None else list(origin)
     return origins
@@ -1775,24 +1775,35 @@ def _mark_module_covered(module_name: str, manifest: dict[str, str]) -> None:
             manifest.setdefault(f"module:{name}", "")
 
 
-# Loader manifests are merged into a stage's manifest under these prefixes (`dep:<parameter>:`,
-# `out:<output>:`), so a module a user loader covers appears as `dep:n:module:helpers.lib`.
-_LOADER_KEY_PREFIXES = ("dep:", "out:")
+def _loader_entry(key: str, outputs: Collection[str]) -> str | None:
+    """The key of a loader's own manifest (`get_loader_fingerprint`) that `key` holds in a stage
+    manifest (`merge_loader_fingerprint`), or None: `dep:<dependency>:KEY`, a dependency named by
+    its parameter (`name` or `name[i]`, no `:`), or `out:<output>:KEY`, `<output>` one of the
+    stage's `outputs` (`types.identity_key`: its stage, or its stage and field, neither with a
+    `:`). Those names end the prefix, not the key after it, so no parameter, field or stage named
+    like a kind of entry (`module`, `byname`, `func`, ...) is read as one."""
+    if key.startswith("dep:"):
+        _dependency, colon, entry = key.removeprefix("dep:").partition(":")
+        return entry if colon else None
+    if not key.startswith("out:"):
+        return None
+    stage, colon, entry = key.removeprefix("out:").partition(":")
+    if not colon:
+        return None
+    if stage in outputs:
+        return entry
+    field, colon, entry = entry.partition(":")
+    return entry if colon and f"{stage}:{field}" in outputs else None
 
 
-def covered_user_modules(manifest: dict[str, str]) -> set[str]:
-    """Names of the user modules a stage manifest covers, from every key form that marks one:
-    `module:NAME`, and `dep:…:module:NAME` / `out:…:module:NAME` for a loader's walk."""
+def covered_user_modules(manifest: Mapping[str, str], outputs: Collection[str]) -> set[str]:
+    """Names of the user modules a stage manifest covers: its `module:NAME` entries, the stage's
+    own and its loaders' (`_loader_entry`, which the stage's output keys `outputs` place)."""
     covered = set[str]()
     for key in manifest:
-        if key.startswith("module:"):
-            name = key.removeprefix("module:")
-        elif key.startswith(_LOADER_KEY_PREFIXES) and ":module:" in key:
-            name = key.rpartition(":module:")[2]
-        else:
-            continue
-        if name and ":" not in name:
-            covered.add(name)
+        entry = key if key.startswith("module:") else _loader_entry(key, outputs)
+        if entry is not None and entry.startswith("module:"):
+            covered.add(entry.removeprefix("module:"))
     return covered
 
 
@@ -1808,19 +1819,20 @@ def _mark_by_name(module_name: object, manifest: dict[str, str]) -> None:
 
 
 def _by_name_entry(key: str) -> str | None:
-    """The module a `byname:` entry names, a loader's (`dep:…:byname:NAME`) included."""
+    """The module a `byname:` entry names. Only a key that starts with `byname:` is one: a
+    loader's entries join the stage's own without a prefix (`merge_loader_fingerprint`), and each
+    other key starts with a fixed kind (`self:`, `dep:`, `out:`, `wire:`, ...), so no dependency,
+    output, stage or module name spells one."""
     if key.startswith("byname:"):
         return key.removeprefix("byname:")
-    if key.startswith(_LOADER_KEY_PREFIXES) and ":byname:" in key:
-        return key.rpartition(":byname:")[2]
     return None
 
 
-def by_name_modules(manifest: Mapping[str, str]) -> set[str]:
+def by_name_modules(manifest: Mapping[str, str], outputs: Collection[str]) -> set[str]:
     """Names of the modules a stage's worker imports by name, as far as its manifest says: the
-    user modules it covers (`covered_user_modules`) and the `byname:` entries, a loader's
-    (`dep:…:byname:NAME`, `out:…:byname:NAME`) included."""
-    names = covered_user_modules(dict(manifest))
+    user modules it covers (`covered_user_modules`, which the stage's output keys `outputs` place)
+    and the `byname:` entries, its loaders' included."""
+    names = covered_user_modules(manifest, outputs)
     names.update(name for key in manifest if (name := _by_name_entry(key)) is not None)
     return names
 
@@ -1828,7 +1840,8 @@ def by_name_modules(manifest: Mapping[str, str]) -> set[str]:
 def without_by_name(manifest: Mapping[str, str]) -> dict[str, str]:
     """`manifest` as a lock records it: without the `byname:` entries, which the worker-import
     check and the manifest cache read. They name only modules whose code no entry hashes, so a
-    lock written before they existed stays current and an upgrade reruns nothing."""
+    lock written before they existed stays current and an upgrade reruns nothing. Every `dep:`
+    and `out:` entry stays, a dependency or output named `byname` included."""
     return {key: value for key, value in manifest.items() if _by_name_entry(key) is None}
 
 
@@ -2106,6 +2119,21 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
         manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
 
     return manifest
+
+
+def merge_loader_fingerprint(
+    manifest: dict[str, str], prefix: str, loader: "loaders.Writer[Any] | loaders.Reader[Any]"
+) -> None:
+    """Add `loader`'s manifest (`get_loader_fingerprint`) to a stage's `manifest`: each entry
+    under `prefix` (`dep:<parameter>:`, `out:<output>:`), but the `byname:` entries as they are.
+    Those name modules the loader's code makes a worker import, not the dependency or output, so
+    a `byname:` entry is only ever a top-level key (`_by_name_entry`), which a lock leaves out,
+    and a dependency or output named `byname` keeps every entry of its own."""
+    for key, value in get_loader_fingerprint(loader).items():
+        if _by_name_entry(key) is None:
+            manifest[f"{prefix}{key}"] = value
+        else:
+            manifest.setdefault(key, value)
 
 
 def loader_config_text(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> str:

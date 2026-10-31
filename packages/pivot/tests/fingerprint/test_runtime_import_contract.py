@@ -275,3 +275,47 @@ def test_d5_concepts_doc_names_a_command_that_exists(tmp_path: pathlib.Path) -> 
         return
     concepts = (_REPO / "docs" / "concepts" / "fingerprinting.md").read_text()
     assert "pivot explain" not in " ".join(concepts.split())
+
+
+# D6 -------------------------------------------------------------------------------------------
+
+_FIELD_NAMED_MODULE = """\
+from typing import TypedDict
+
+from pivot import Pipeline, stage
+
+
+class Counted(TypedDict):
+    module: dict
+
+
+@stage
+def count(text: str) -> Counted:
+    scope = {}
+    exec("import tag as loaded", scope)
+    return {"module": {"v": scope["loaded"].VALUE + len(text.splitlines())}}
+
+
+with Pipeline("t") as pipeline:
+    count(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_d6_an_output_named_module_does_not_cover_a_module_its_tag_names(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Output field `module` records `out:t/count:module:tag`, its tag: not an entry of a loader
+    that covers user module `tag`. The stage imports `tag` at run time, so it is flagged, and an
+    edit to `tag.py` reruns it."""
+    home = tmp_path / "home"
+    project = _project(tmp_path, {"tag.py": "VALUE = 1\n", "pipeline.py": _FIELD_NAMED_MODULE})
+    flagged = helpers.run_pivot(project, home, "repro")
+    assert flagged.returncode == 0, flagged.stdout + flagged.stderr
+    assert _UNCOVERED in _flat(flagged)
+    (project / "tag.py").write_text("VALUE = 100\n")
+
+    edited = helpers.run_pivot(project, home, "repro", "--json")
+
+    assert '"stage": "t/count", "status": "ran"' in edited.stdout, edited.stdout
+    output = project / "data" / "t" / "count" / "module.yaml"
+    assert yaml.safe_load(output.read_text())["v"] == 103

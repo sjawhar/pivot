@@ -64,7 +64,7 @@ import xxhash
 from pivot import fingerprint, import_origin
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping
+    from collections.abc import Callable, Collection, Iterable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -487,11 +487,12 @@ def check_stage(
     return edited, unreadable
 
 
-def check_worker_imports(manifest: Mapping[str, str]) -> None:
-    """Refuse the stage when a module its manifest names (`fingerprint.by_name_modules`), which
-    the program that runs Pivot held before the import session started, is not the module its
-    worker would import (`fingerprint.refuse`: inside `fingerprint.stage_fingerprint_scope`, the
-    refusal is reported with the stage's other refusals).
+def check_worker_imports(manifest: Mapping[str, str], outputs: Collection[str]) -> None:
+    """Refuse the stage when a module its manifest names (`fingerprint.by_name_modules`, which the
+    stage's output keys `outputs` place), which the program that runs Pivot held before the
+    import session started, is not the module its worker would import (`fingerprint.refuse`:
+    inside `fingerprint.stage_fingerprint_scope`, the refusal is reported with the stage's other
+    refusals).
 
     A worker imports by name each module that discovery did not register by value, with the
     `sys.path` loky gives it (`worker_path`), where an import session puts the project root first.
@@ -514,7 +515,7 @@ def check_worker_imports(manifest: Mapping[str, str]) -> None:
     held_modules = _held
     by_value = cloudpickle.list_registry_pickle_by_value()
     suspects = dict[str, import_origin.Origin]()
-    for name in sorted(fingerprint.by_name_modules(manifest)):
+    for name in sorted(fingerprint.by_name_modules(manifest, outputs)):
         if (held := _suspect_origin(name, held_modules, by_value)) is not None:
             suspects[name] = held
     if not suspects:

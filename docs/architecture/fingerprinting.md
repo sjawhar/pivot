@@ -144,7 +144,10 @@ including one already in `sys.modules`, and the worker compares the `sys.modules
 after the stage, counting a newly resident module only when it has a `__file__` that
 `is_user_code` accepts. The modules a manifest covers come from one function,
 `fingerprint.covered_user_modules`: `module:<name>` keys, and the `dep:<parameter>:module:<name>`
-and `out:<output>:module:<name>` keys a user loader's walk adds.
+and `out:<output>:module:<name>` keys a user loader's walk adds. The prefix of a loader's key ends
+where the dependency's name (a parameter, which holds no `:`) or one of the stage's output keys
+(`<stage>` or `<stage>:<field>`) ends, never at a word in the key, so an output field named
+`module` (whose tag is `out:<stage>:module:tag`) covers no module `tag`.
 
 What a covered module's first import starts belongs to that import, whichever thread runs it and
 whenever it runs during the stage, as a module-level import of the module would have made it
@@ -601,7 +604,7 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 | `wire:` | Call-site artifact wiring: parameter bindings, collection kind/order, input paths | `wire:left` → `raw-a`, `wire:items` → `{"kind":"list","identities":["a","b"]}`, `wire:file:path` → `old.txt` |
 | `partial:` | `functools.partial` bound arguments | `partial:myproject.stage.bound.args` |
 | `ext:` | A library function or class a stage reads, named by its definition (its code is not hashed) | `ext:myproject.stages.agg` → `numpy.mean` |
-| `byname:` | A module a stage's worker imports by name to run code the walk does not hash: a library module read as a global or imported in a function body, and the module that defines each `ext:` callable. Compared with the module the worker would import (`loaded_source.check_worker_imports`), and re-resolved on a manifest cache hit. Recorded by the walk and the manifest cache only: a lock leaves it out (`fingerprint.without_by_name`) | `byname:numpy` |
+| `byname:` | A module a stage's worker imports by name to run code the walk does not hash: a library module read as a global or imported in a function body, and the module that defines each `ext:` callable. Compared with the module the worker would import (`loaded_source.check_worker_imports`), and re-resolved on a manifest cache hit. A loader's entries join the stage's own without the `dep:`/`out:` prefix (`fingerprint.merge_loader_fingerprint`), so only a key that starts with `byname:` is one, and a dependency or output named `byname` keeps its entries. Recorded by the walk and the manifest cache only: a lock leaves it out (`fingerprint.without_by_name`) | `byname:numpy` |
 | `loader:` | Loader class methods and config | `loader:pivot.loaders.CSV:load` |
 | `schema:` | Pydantic model JSON schema | `schema:myproject.params.TrainParams` |
 | `builtin:` | Built-in types (for deterministic hashing) | `builtin:list` |
