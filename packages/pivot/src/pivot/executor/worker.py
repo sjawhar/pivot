@@ -64,7 +64,7 @@ from pivot import (
     types,
 )
 from pivot import state_dir as state_dir_mod
-from pivot.storage import artifact_lock, cache, listing, lock, ownership, state
+from pivot.storage import artifact_lock, cache, listing, lock, naming, ownership, state
 from pivot.storage import store as store_mod
 from pivot.types import (
     DeferredWrites,
@@ -924,12 +924,26 @@ def _execute_stage(
     """
     # Clear metrics at start - each stage collects its own metrics
     metrics.clear()
-    _ = cache_dir
+    # ``cache_dir`` is the cache root the engine resolved from config (the directory holding
+    # ``files/``), as spelled there: the naming lock lives in it, the same file `pivot gc`
+    # locks. The store's object root is resolved, so a ``files`` symlink would move its parent.
+    naming_root = cache_dir
     ring_buffer = _OutputRingBuffer()
     state_dir = stage_info["state_dir"]
     project_root = stage_info["project_root"]
     project_state_dir = state_dir_mod.locate_state_dir(project_root)
     store = store_mod.store_from_spec(stage_info["store_spec"])
+
+    def register_before_restore() -> None:
+        """Register the project in the cache the store restores from, before a skipped stage
+        links that cache's objects outside a publishing unit. `execute_stage` is exported, so a
+        caller without the engine's registration restores here; the store spec names the
+        cache's object root as spelled in config (the store itself resolves it)."""
+        naming.register_use(
+            pathlib.Path(stage_info["store_spec"]["cache_dir"]).parent,
+            project_root,
+            project_state_dir,
+        )
 
     # Set project root cache explicitly - workers in reusable pool may have
     # stale cache from previous execution in different project/test.
@@ -1034,6 +1048,7 @@ def _execute_stage(
                                 report_changes=True,
                                 file_hash_entries=restored_entries,
                                 claims=claims,
+                                register=register_before_restore,
                             )
                             if restoration.available:
                                 return _make_result(
@@ -1096,6 +1111,7 @@ def _execute_stage(
                             report_changes=True,
                             file_hash_entries=restored_entries,
                             claims=claims,
+                            register=register_before_restore,
                         )
                         if restoration.available:
                             # The dependencies read to decide, and the outputs read or restored
@@ -1109,70 +1125,94 @@ def _execute_stage(
                         run_reason = _outputs_unusable_reason(restoration)
 
                     # Check run cache for previously executed configuration (skip if forcing)
-                    if run_reason and not stage_info["force"] and run_cache_allowed:
-                        run_cache_skip = _try_skip_via_run_cache_with_store(
-                            stage_name,
-                            input_hash,
+                    run_cache_wanted = (
+                        bool(run_reason) and not stage_info["force"] and run_cache_allowed
+                    )
+                    legacy_input_hash = (
+                        older_pivot_input_hash(
+                            current_fingerprint,
+                            current_params,
+                            stage_info["deps"].values(),
+                            _to_identity_hashes(dep_hashes),
                             stage_outs,
-                            store,
-                            state_db,
-                            state_dir=project_state_dir,
-                            legacy_input_hash=older_pivot_input_hash(
-                                current_fingerprint,
-                                current_params,
-                                stage_info["deps"].values(),
-                                _to_identity_hashes(dep_hashes),
-                                stage_outs,
-                                hashed_dirs,
-                                store_cache_dir(store),
-                            ),
-                            claims=claims,
+                            hashed_dirs,
+                            store_cache_dir(store),
                         )
-                        if run_cache_skip is not None:
-                            if no_commit:
-                                # Nothing is committed; the coordinator saves only the file
-                                # hashes, the dependencies read and the outputs restored.
-                                return _make_result(
-                                    StageStatus.CACHED,
-                                    "unchanged (run cache)",
-                                    ring_buffer,
-                                    input_hash=input_hash,
+                        if run_cache_wanted
+                        else None
+                    )
+                    if (
+                        run_cache_wanted
+                        and _run_cache_row(
+                            state_db, stage_name, input_hash, legacy_input_hash, stage_outs
+                        )
+                        is not None
+                    ):
+                        # Naming-lock unit (shared): the run-cache restore checks whether
+                        # objects exist and creates workspace links, then the lock file names
+                        # them. gc cannot delete while this unit is open. With no row to
+                        # restore, nothing is named and no unit is taken; the engine registered
+                        # the project before any stage ran (`Engine._orchestrate_execution`).
+                        with naming.naming_unit(
+                            naming_root, project=(project_root, project_state_dir)
+                        ):
+                            run_cache_skip = _try_skip_via_run_cache_with_store(
+                                stage_name,
+                                input_hash,
+                                stage_outs,
+                                store,
+                                state_db,
+                                state_dir=project_state_dir,
+                                legacy_input_hash=legacy_input_hash,
+                                claims=claims,
+                            )
+                            if run_cache_skip is not None:
+                                if no_commit:
+                                    # Nothing is committed; the coordinator saves only the file
+                                    # hashes, the dependencies read and the outputs restored.
+                                    return _make_result(
+                                        StageStatus.CACHED,
+                                        "unchanged (run cache)",
+                                        ring_buffer,
+                                        input_hash=input_hash,
+                                        file_hash_entries=file_hash_entries
+                                        + run_cache_skip["file_hash_entries"],
+                                    )
+                                new_lock_data = LockData(
+                                    code_manifest=current_fingerprint,
+                                    params=current_params,
+                                    dep_hashes=_to_identity_hashes(
+                                        dict(sorted(dep_hashes.items()))
+                                    ),
+                                    output_hashes=_to_identity_hashes(
+                                        dict(sorted(run_cache_skip["output_hashes"].items()))
+                                    ),
+                                    output_paths=lock_output_paths(stage_outs, store, project_root),
+                                )
+                                if run_cache_skip["reads"]:
+                                    new_lock_data["reads"] = run_cache_skip["reads"]
+                                _raise_if_stopped()
+                                deferred = _commit_lock_and_build_deferred(
+                                    stage_info,
+                                    new_lock_data,
+                                    input_hash,
+                                    run_cache_skip["output_hashes"],
+                                    production_lock,
+                                    state_db,
+                                    store=store,
+                                    hashed_dirs=hashed_dirs,
                                     file_hash_entries=file_hash_entries
                                     + run_cache_skip["file_hash_entries"],
+                                    increment_outputs=run_cache_skip["outputs_restored"],
                                 )
-                            new_lock_data = LockData(
-                                code_manifest=current_fingerprint,
-                                params=current_params,
-                                dep_hashes=_to_identity_hashes(dict(sorted(dep_hashes.items()))),
-                                output_hashes=_to_identity_hashes(
-                                    dict(sorted(run_cache_skip["output_hashes"].items()))
-                                ),
-                                output_paths=lock_output_paths(stage_outs, store, project_root),
-                            )
-                            if run_cache_skip["reads"]:
-                                new_lock_data["reads"] = run_cache_skip["reads"]
-                            _raise_if_stopped()
-                            deferred = _commit_lock_and_build_deferred(
-                                stage_info,
-                                new_lock_data,
-                                input_hash,
-                                run_cache_skip["output_hashes"],
-                                production_lock,
-                                state_db,
-                                store=store,
-                                hashed_dirs=hashed_dirs,
-                                file_hash_entries=file_hash_entries
-                                + run_cache_skip["file_hash_entries"],
-                                increment_outputs=run_cache_skip["outputs_restored"],
-                            )
-                            return StageResult(
-                                status=StageStatus.CACHED,
-                                reason="unchanged (run cache)",
-                                input_hash=input_hash,
-                                output_lines=ring_buffer.snapshot(),
-                                metrics=metrics.get_entries(),
-                                deferred_writes=deferred,
-                            )
+                                return StageResult(
+                                    status=StageStatus.CACHED,
+                                    reason="unchanged (run cache)",
+                                    input_hash=input_hash,
+                                    output_lines=ring_buffer.snapshot(),
+                                    metrics=metrics.get_entries(),
+                                    deferred_writes=deferred,
+                                )
 
                 output_keys = frozenset(types.identity_key(out.identity) for out in stage_outs)
                 covered_modules = frozenset(
@@ -1265,36 +1305,13 @@ def _execute_stage(
                         **lock_manifest,
                         f"{skip.UNREADABLE_SOURCE_KEY_PREFIX}{unreadable_modules}": "",
                     }
+                output_hashes = dict[str, HashInfo]()
                 if no_commit:
                     read = list[tuple[pathlib.Path, os.stat_result, str]]()
                     output_hashes = _hash_output_paths(
                         output_paths, cache_dir=store_cache_dir(store), pending=read
                     )
                     file_hash_entries.extend(cache.deferred_file_hash_entries(read))
-                else:
-                    with stage_io.PIVOT_IO:
-                        output_hashes = _commit_outputs_with_store(
-                            output_paths,
-                            store,
-                            project_state_dir,
-                            hashed_dirs,
-                            claims,
-                            written["pvt_members"],
-                        )
-                    for ref, path in output_paths.items():
-                        output_hash = output_hashes[types.identity_key(ref.identity)]
-                        file_hash_entries.extend(
-                            cache.deferred_file_hash_entries(
-                                cache.known_file_hashes(
-                                    path,
-                                    output_hash,
-                                    hashed_dirs[output_hash["hash"]]["listing"]
-                                    if is_dir_hash(output_hash)
-                                    else None,
-                                )
-                            )
-                        )
-
                 # Under --no-commit, write no lock, cache object, generation or run-cache
                 # entry. Leave the record of what ran, which `pivot commit` writes if the outputs
                 # are still these, and hand file-hash cache entries to the coordinator for its
@@ -1324,52 +1341,100 @@ def _execute_stage(
                         metrics=metrics.get_entries(),
                         deferred_writes=no_commit_writes,
                     )
+                else:
+                    # Hash and publish before the naming unit, so a large output's reading and
+                    # copying holds no lock a waiting collection would turn into a stall for
+                    # every other commit on the cache.
+                    with stage_io.PIVOT_IO:
+                        prepared = _prepare_outputs_with_store(
+                            output_paths,
+                            store,
+                            project_state_dir,
+                            hashed_dirs,
+                            claims,
+                            written["pvt_members"],
+                        )
+                    # A read by hash names nothing until the lock does, so a collection may have
+                    # removed an object the stage read on a cache hit: fetch each such object
+                    # again before the unit (no download inside one), and refuse inside it any
+                    # that is still not in the cache.
+                    unfetched = reads.fetch_missing(read_hashes, recorded)
+                    fetched = recorded.fetched()
+                    # Naming-lock unit (shared), the naming step only: re-check each object (one
+                    # a collection removed since is published again), link the outputs, write the
+                    # lock that names them. gc cannot delete while this unit is open.
+                    with naming.naming_unit(naming_root, project=(project_root, project_state_dir)):
+                        reads.require_cached(read_hashes, recorded.cache_dir, unfetched)
+                        with stage_io.PIVOT_IO:
+                            output_hashes = _commit_outputs_with_store(
+                                output_paths,
+                                store,
+                                project_state_dir,
+                                prepared,
+                                hashed_dirs,
+                                claims,
+                                written["pvt_members"],
+                            )
+                        for ref, path in output_paths.items():
+                            output_hash = output_hashes[types.identity_key(ref.identity)]
+                            file_hash_entries.extend(
+                                cache.deferred_file_hash_entries(
+                                    cache.known_file_hashes(
+                                        path,
+                                        output_hash,
+                                        hashed_dirs[output_hash["hash"]]["listing"]
+                                        if is_dir_hash(output_hash)
+                                        else None,
+                                    )
+                                )
+                            )
 
-                # Build lock data
-                new_lock_data = LockData(
-                    code_manifest=lock_manifest,
-                    params=current_params,
-                    dep_hashes=_to_identity_hashes(dict(sorted(dep_hashes.items()))),
-                    output_hashes=_to_identity_hashes(dict(sorted(output_hashes.items()))),
-                    output_paths=lock_output_paths(stage_outs, store, project_root),
-                )
-                if read_hashes:
-                    new_lock_data["reads"] = read_hashes
+                        # Build lock data
+                        new_lock_data = LockData(
+                            code_manifest=lock_manifest,
+                            params=current_params,
+                            dep_hashes=_to_identity_hashes(dict(sorted(dep_hashes.items()))),
+                            output_hashes=_to_identity_hashes(dict(sorted(output_hashes.items()))),
+                            output_paths=lock_output_paths(stage_outs, store, project_root),
+                        )
+                        if read_hashes:
+                            new_lock_data["reads"] = read_hashes
 
-                # Single StateDB open for post-execution work
-                with _open_state_db(state_dir) as state_db:
-                    _raise_if_stopped()
-                    deferred = _commit_lock_and_build_deferred(
-                        stage_info,
-                        new_lock_data,
-                        input_hash,
-                        output_hashes,
-                        production_lock,
-                        state_db,
-                        store=store,
-                        hashed_dirs=hashed_dirs,
-                        reusable=not uncovered and not edited and not unreadable,
-                        file_hash_entries=file_hash_entries,
-                    )
-                    if fetched:
-                        deferred["remote_hashes"] = fetched
-                    return StageResult(
-                        status=StageStatus.RAN,
-                        reason=run_reason,
-                        input_hash=input_hash,
-                        output_lines=ring_buffer.snapshot(),
-                        metrics=metrics.get_entries(),
-                        deferred_writes=deferred,
-                    )
+                        # Single StateDB open for post-execution work. _open_state_db is #530's
+                        # one-line unexpected-error boundary; keep it inside the naming unit.
+                        with _open_state_db(state_dir) as state_db:
+                            _raise_if_stopped()
+                            deferred = _commit_lock_and_build_deferred(
+                                stage_info,
+                                new_lock_data,
+                                input_hash,
+                                output_hashes,
+                                production_lock,
+                                state_db,
+                                store=store,
+                                hashed_dirs=hashed_dirs,
+                                reusable=not uncovered and not edited and not unreadable,
+                                file_hash_entries=file_hash_entries,
+                            )
+                            if fetched:
+                                deferred["remote_hashes"] = fetched
+                            return StageResult(
+                                status=StageStatus.RAN,
+                                reason=run_reason,
+                                input_hash=input_hash,
+                                output_lines=ring_buffer.snapshot(),
+                                metrics=metrics.get_entries(),
+                                deferred_writes=deferred,
+                            )
         except (
             exceptions.OutputMissingError,
+            exceptions.CacheError,
             exceptions.CacheRestoreError,
             exceptions.CorruptListingError,
             exceptions.StageDefinitionError,
             exceptions.InvalidPathError,
             exceptions.OutputOwnershipError,
             exceptions.MemberRecordError,
-            exceptions.UnreadableLinkError,
         ) as exc:
             return _make_result(
                 StageStatus.FAILED, exc.format_user_message(), ring_buffer, input_hash=input_hash
@@ -1577,6 +1642,7 @@ def restore_outputs_to_hashes(
     report_changes: Literal[False] = False,
     file_hash_entries: list[FileHashEntry] | None = None,
     claims: ownership.StageClaims | None = None,
+    register: Callable[[], None] | None = None,
 ) -> bool: ...
 
 
@@ -1593,6 +1659,7 @@ def restore_outputs_to_hashes(
     report_changes: Literal[True],
     file_hash_entries: list[FileHashEntry] | None = None,
     claims: ownership.StageClaims | None = None,
+    register: Callable[[], None] | None = None,
 ) -> OutputRestoreResult: ...
 
 
@@ -1608,6 +1675,7 @@ def restore_outputs_to_hashes(
     report_changes: bool = False,
     file_hash_entries: list[FileHashEntry] | None = None,
     claims: ownership.StageClaims | None = None,
+    register: Callable[[], None] | None = None,
 ) -> bool | OutputRestoreResult:
     """Verify outputs match recorded hashes and restore cacheable mismatches.
 
@@ -1615,8 +1683,11 @@ def restore_outputs_to_hashes(
     so an evicted listing object does not make a still-restorable output unavailable.
     ``file_hash_entries``, when given, receives a StateDB file-hash entry for every file the
     check had to read and every file restored from the cache, so the next check finds each
-    without reading it. ``claims`` (the stage's) decide which ``*.pvt`` files in an output are
-    the stage's own, and record the ones a restore writes that the lock does not list
+    without reading it. ``register``, when given, runs once before the first restore: a restore
+    links cache objects into the workspace outside a publishing unit, so the project must be in
+    the register of the cache it restores from first. A caller inside a naming unit passes none
+    (that unit registered). ``claims`` (the stage's) decide which ``*.pvt`` files in an output
+    are the stage's own, and record the ones a restore writes that the lock does not list
     (``store.WorkspaceStore.restore_from_cache``).
     """
     unavailable = list[types.ArtifactRef]()
@@ -1683,6 +1754,9 @@ def restore_outputs_to_hashes(
                     if not restore:
                         continue
                     restored = list[tuple[pathlib.Path, os.stat_result, str]]()
+                    if register is not None:
+                        register()
+                        register = None
                     if store.restore_from_cache(
                         ref,
                         expected_hash,
@@ -2351,25 +2425,53 @@ def _hash_output_paths(
     return output_hashes
 
 
-def _commit_outputs_with_store(
+def _prepare_outputs_with_store(
     outputs_by_ref: dict[types.ArtifactRef, pathlib.Path],
     store: store_mod.Store,
     project_state_dir: pathlib.Path,
     hashed_dirs: dict[str, listing.HashedDirectory],
     claims: ownership.StageClaims | None = None,
     written: dict[types.ArtifactRef, ownership.StageMembers] | None = None,
+) -> dict[types.ArtifactRef, types.FileHash | listing.HashedDirectory]:
+    """Hash and publish each output before the naming-lock unit (a workspace store only),
+    refusing first an output whose link would replace a user's ``*.pvt`` file.
+    ``hashed_dirs`` receives each hashed directory output, by hash."""
+    prepared = dict[types.ArtifactRef, types.FileHash | listing.HashedDirectory]()
+    for ref, path in outputs_by_ref.items():
+        if not path.exists():
+            raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
+        if isinstance(store, store_mod.WorkspaceStore):
+            prepared[ref] = store.prepare_commit(
+                ref,
+                path,
+                state_dir=project_state_dir,
+                hashed_dirs=hashed_dirs,
+                claims=claims,
+                written=written.get(ref) if written is not None else None,
+            )
+    return prepared
+
+
+def _commit_outputs_with_store(
+    outputs_by_ref: dict[types.ArtifactRef, pathlib.Path],
+    store: store_mod.Store,
+    project_state_dir: pathlib.Path,
+    prepared: dict[types.ArtifactRef, types.FileHash | listing.HashedDirectory],
+    hashed_dirs: dict[str, listing.HashedDirectory],
+    claims: ownership.StageClaims | None = None,
+    written: dict[types.ArtifactRef, ownership.StageMembers] | None = None,
 ) -> dict[str, HashInfo]:
-    """Commit each output to ``store``; ``hashed_dirs`` receives each directory output, by hash."""
+    """Inside the naming-lock unit: finish each prepared output, or commit it whole."""
     output_hashes = dict[str, HashInfo]()
     for ref, path in outputs_by_ref.items():
         if not path.exists():
             raise exceptions.OutputMissingError(f"Stage did not produce output: {path}")
         if isinstance(store, store_mod.WorkspaceStore):
-            output_hash = store.commit(
+            output_hash = store.finish_commit(
                 ref,
                 path,
+                prepared[ref],
                 state_dir=project_state_dir,
-                hashed_dirs=hashed_dirs,
                 claims=claims,
                 written=written.get(ref) if written is not None else None,
             )
@@ -2870,6 +2972,29 @@ def _run_cache_output_hash(
     return record
 
 
+def _run_cache_row(
+    state_db: state.StateDB,
+    stage_name: str,
+    input_hash: str,
+    legacy_input_hash: str | None,
+    stage_outs: list[types.ArtifactRef],
+) -> run_history.RunCacheEntry | None:
+    """The run-cache row that could restore this stage's outputs, or None: the one at
+    ``input_hash``, else the one an older pivot filed at ``legacy_input_hash``. A stage with a
+    metric output is never restored from the run cache.
+
+    Read twice per lookup: before the naming unit (so a stage with no row, as in every stage of
+    a cold run, takes no unit for it) and again inside it by ``_try_skip_via_run_cache_with_store``
+    (so a row a prune removed in between restores nothing).
+    """
+    if any(out.tag is types.ArtifactTag.METRIC for out in stage_outs):
+        return None
+    entry = state_db.lookup_run_cache(stage_name, input_hash)
+    if entry is None and legacy_input_hash is not None:
+        entry = state_db.lookup_run_cache(stage_name, legacy_input_hash)
+    return entry
+
+
 def _try_skip_via_run_cache_with_store(
     stage_name: str,
     input_hash: str,
@@ -2890,11 +3015,7 @@ def _try_skip_via_run_cache_with_store(
     entry whose run read objects by hash that are now unavailable (``reads.unavailable``) is not
     used: the lock written from it would record objects the stage cannot read again.
     """
-    if any(out.tag is types.ArtifactTag.METRIC for out in stage_outs):
-        return None
-    entry = state_db.lookup_run_cache(stage_name, input_hash)
-    if entry is None and legacy_input_hash is not None:
-        entry = state_db.lookup_run_cache(stage_name, legacy_input_hash)
+    entry = _run_cache_row(state_db, stage_name, input_hash, legacy_input_hash, stage_outs)
     if entry is None:
         return None
     entry_reads = entry["reads"] if "reads" in entry else []

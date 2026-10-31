@@ -23,6 +23,7 @@ Complete reference for all Pivot command-line commands.
 | Fetch to local cache | `pivot fetch` |
 | Pull outputs from remote | `pivot pull` |
 | Reset fingerprint cache | `pivot fingerprint reset` |
+| Free cache space | `pivot gc --dry-run` |
 | Watch for changes | `pivot repro --watch` |
 
 ---
@@ -1144,6 +1145,121 @@ pivot doctor [OPTIONS]
 | `--remote` | Also check remote connectivity |
 
 Configuration errors identify the invalid key and value and state the required format.
+
+---
+
+### `pivot gc`
+
+Remove the cache objects no record names.
+
+```bash
+pivot gc [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--dry-run` | Print the plan and remove nothing |
+| `--yes` / `-y` | Remove without asking. Required when stdin is not a terminal |
+| `--projects PATH` | Another project that shares this cache. Repeatable, and recorded in the cache's register |
+| `--grace-hours FLOAT` | Keep every object published in the last N hours (default 24) |
+| `--remove-linked` | Also remove objects a directory entry outside the cache still hardlinks |
+| `--json` | Write one JSON document to stdout; notes go to stderr |
+
+Pivot keeps every object named by a stage lock (`outs`, `deps` and `reads`, the objects its run
+read by hash), a `.pvt` file, a run-cache row (its outputs and `reads`), a `--no-commit` run's
+record of what it read by hash, a workspace link or a cache ref, in this project and in every
+project the cache records; every object published in the last `--grace-hours`; and every object
+some directory entry outside the cache still hardlinks. It removes the rest. See
+[Caching](../concepts/caching.md#what-keeps-a-cache-object-alive) for the whole rule, and
+for what `pivot gc` does with a cache several projects share. A `--projects` path must be a
+real pivot project (a directory with a readable `.pivot` marker); its records are read from
+that project's configured `core.state_dir`, which can be outside `.pivot`. A path whose state
+directory cannot be read is refused and nothing is removed. A registered project is read only
+when its root, `.pivot`, state directory and project id are visible; on the host that
+registered it, every recorded mount below it must also be mounted. Otherwise the run refuses,
+names the entry, and removes nothing. A symlinked directory in a project that leads outside it
+(`data -> /mnt/big/data`, or a plain `.venv -> /opt/venvs/x`), a symlink whose target is
+missing, or a link Pivot cannot classify as a cache object hides records. `pivot gc` keeps every
+object, removes nothing, and names the link. A link into the cache's own `files/` is a checkout;
+a link elsewhere under a broad cache root (such as `PIVOT_CACHE_DIR=/scratch`) is outside the
+project and keeps everything.
+
+When it collects, the run also prunes this project's run history to
+`core.run_history_retention`, as every pipeline run does, and counts the run-cache rows that
+prune drops in its plan. A `--dry-run` prunes nothing and reports exactly what a real run
+would remove; a refused run prunes nothing and removes nothing. Pruning does not shrink
+`.pivot/state.lmdb/`: deleting rows frees pages inside the file for reuse, and the file itself
+shrinks only when you delete the directory. The first `pivot gc` of a project that has never
+cached anything reports nothing to remove and exits 0.
+
+**Examples:**
+
+```bash
+# What would go, and how much space it holds
+pivot gc --dry-run
+
+# Collect, asking first on a terminal
+pivot gc
+
+# Collect from a script or a CI job
+pivot gc --yes
+
+# A cache two projects share, named once and recorded for later runs
+pivot gc --projects ../other-experiment
+
+# Nothing published in the last hour is kept
+pivot gc --yes --grace-hours 1
+```
+
+```
+$ pivot gc --dry-run
+Scanned 163,692 objects (33.5 GB) in /data/pivot-cache/files.
+Kept 141,398 objects (29.1 GB): 137,204 named by 235 locks and 812 run-cache entries in 2 projects,
+  3,996 by 110,024 workspace links, 198 published in the last 24.0h, 1,204 still hardlinked elsewhere.
+Would remove 22,294 objects (4.4 GB). Nothing was removed (--dry-run).
+```
+
+After a collection, `pivot diff` and `pivot get --rev` may need `pivot fetch` for a revision
+whose objects were removed.
+
+A project that has used more than one cache (`cache.dir` changed, or a library run with another
+`cache_dir`) lists each in its state directory, and every naming step brings the project's entry
+in each listed cache up to date. `pivot gc` of any of them refuses an entry that holds an older
+nonce than the state directory it reads (a copy of the project), and checks every other cache
+any view of the project lists the same way, refusing while one cannot be read; see
+[Caching](../concepts/caching.md#a-project-that-uses-more-than-one-cache).
+
+---
+
+### `pivot forget-cache`
+
+Remove a cache from the caches this view of the project lists.
+
+```bash
+pivot forget-cache CACHE
+```
+
+**Arguments:**
+
+- `CACHE` - The cache's path, or its id, as a warning or a `pivot gc` refusal names it
+
+Use it when this view of the project (this host and mount namespace) can no longer reach a cache
+it lists and no longer uses it, for example one that was deleted or is on a disk that is gone,
+and only in the project itself, never in a copy of it. While a cache is listed, every naming step
+brings the project's entry there up to date, a step that cannot reach it warns, and `pivot gc`
+refuses while it cannot be read; removing it stops all three for this view. It refuses a cache
+this view reaches whose entry for the project is current, and removes nothing then. It removes
+only this view's record: a record another view holds stays, for that view to remove (or, if that
+view is gone for good, for you to delete at the path a refusal names). It deletes nothing from
+any cache, and any pivot command that uses the removed cache lists it again. An unknown CACHE
+fails and prints the caches this view lists.
+
+```bash
+pivot forget-cache /mnt/old-disk/pivot-cache
+pivot forget-cache 3f2a1c0d9e8b7a653f2a1c0d9e8b7a65
+```
 
 ---
 

@@ -661,6 +661,49 @@ def _require_project_state(pipeline: PipelineLike, project_root: pathlib.Path) -
             )
 
 
+def require_project_roots(pipeline: PipelineLike, project_root: pathlib.Path) -> None:
+    """Refuse a pipeline given to the library, or one it includes, whose ``root=`` is not the
+    project root: its stages' locks would sit in that root's state directory, where no
+    collection of this project reads them. Discovery refuses the same pipeline as it loads
+    (``_require_project_state``). The roots are the ones the pipeline recorded when it loaded
+    (``resolved_state_dirs``); ``require_current_state_dirs`` checks their directories.
+    """
+    for root in (pipeline.root, *pipeline.resolved_state_dirs):
+        if root.resolve() != project_root:
+            raise exceptions.PipelineConfigError(
+                f"Pipeline '{pipeline.name}' or a pipeline it includes sets root={root}, but a "
+                + f"pipeline always uses the project's .pivot and data/ ({project_root}); "
+                + "remove root="
+            )
+
+
+# What a library caller does when ``require_current_state_dirs`` refuses its pipeline.
+_RELOAD_THE_PIPELINE = (
+    "Load the pipeline again (discover_pipeline(), or import pipeline.py again) and run that"
+)
+
+
+def require_current_state_dirs(pipeline: PipelineLike, remedy: str = _RELOAD_THE_PIPELINE) -> None:
+    """Refuse a pipeline whose state directory, as it recorded it when it loaded
+    (``resolved_state_dirs``), is not the one its project's ``core.state_dir`` names now.
+
+    Its stages' locks would go on to the directory it loaded with, while `pivot gc` reads the
+    project's current one (and its ``.pivot``), so those locks would name objects no collection
+    keeps. That happens after an edit of ``core.state_dir``, of a symbolic link it names, or of
+    whether the path it names can be used. The refusal ends with ``remedy``: a library caller
+    loads the pipeline again; a watch session reloads it (``Engine``).
+    """
+    for root, recorded in pipeline.resolved_state_dirs.items():
+        loaded_with = state_dir_mod.resolved_state_dir(root, recorded)
+        current = state_dir_mod.resolved_state_dir(root, state_dir_mod.current_resolution(root))
+        if loaded_with != current:
+            raise exceptions.PipelineConfigError(
+                f"Pipeline '{pipeline.name}' was loaded when the project at {root} kept its state "
+                + f"in {loaded_with}, and its core.state_dir now names {current}: its runs would "
+                + f"record their stages where no `pivot gc` reads them. {remedy}"
+            )
+
+
 def find_config_in_dir(directory: pathlib.Path) -> pathlib.Path | None:
     """Find the pipeline config file in a directory.
 

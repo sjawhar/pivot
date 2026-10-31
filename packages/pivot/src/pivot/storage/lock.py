@@ -822,6 +822,8 @@ class _ConvertedLock(NamedTuple):
     document: dict[str, object]
     output_listings: dict[str | None, listing.DirListing]  # by output key
     listing_bytes: dict[str, bytes]  # every inline listing's bytes, by directory hash
+    inline: dict[str, listing.DirListing]  # every inline listing, by this format's hash
+    legacy_hashes: set[str]  # the directory hashes that lock recorded, this format's apart
 
 
 def _convert_old(data: object) -> _ConvertedLock | None:
@@ -833,6 +835,8 @@ def _convert_old(data: object) -> _ConvertedLock | None:
     document: dict[str, object] = {**old, "schema_version": SCHEMA_VERSION}
     output_listings = dict[str | None, listing.DirListing]()
     listing_bytes = dict[str, bytes]()
+    inline = dict[str, listing.DirListing]()
+    legacy_hashes = set[str]()
     for list_key in ("deps", "outs"):
         entries = old[list_key]
         if not isinstance(entries, list):
@@ -861,11 +865,14 @@ def _convert_old(data: object) -> _ConvertedLock | None:
             )
             converted.append(new_entry)
             listing_bytes[record["hash"]] = data_bytes
+            inline[record["hash"]] = members
+            if cache.is_valid_hash(entry.get("hash")):
+                legacy_hashes.add(cast("str", entry["hash"]))
             key = entry.get("key")
             if list_key == "outs" and (key is None or isinstance(key, str)):
                 output_listings[key] = members
         document[list_key] = converted
-    return _ConvertedLock(_shaped(document), output_listings, listing_bytes)
+    return _ConvertedLock(_shaped(document), output_listings, listing_bytes, inline, legacy_hashes)
 
 
 def parse_committed(document: object) -> CommittedLock | UnsafeLockPath | None:
@@ -889,6 +896,133 @@ def parse_committed(document: object) -> CommittedLock | UnsafeLockPath | None:
     if error is not None:
         return None
     return CommittedLock(_from_document(document), listings)
+
+
+class RecordedHashes(NamedTuple):
+    """Every cache object a lock names, for a reader that must keep all of them."""
+
+    keys: set[str]
+    """Each hash the lock holds itself: a file's, a directory's listing hash, and, for a lock an
+    older pivot wrote, that lock's own directory hash (its whole-tree object) and every file its
+    inline listing names."""
+    directories: list[DirHash]
+    """The directories whose members live in a listing the reader must read. A lock an older
+    pivot wrote lists them inline, so it yields none."""
+
+
+class UninterpretableLock(NamedTuple):
+    """A lock this pivot cannot fully interpret, so it may name cache objects this pivot cannot
+    see: one that is not a lock, lacks a key, has a schema or a key this pivot does not know, or
+    holds a field it cannot read."""
+
+    reason: str
+
+
+# Every key a lock this pivot or an older one writes, at the top level, under ``records`` and in
+# a ``deps`` or ``outs`` entry. ``dep_generations`` is an old pivot's (generation counts, no
+# hashes; read as nothing). ``reads`` lists the objects the run read by hash, and is a root. A
+# key outside these may be a newer pivot's list of hashes, so a reader that must keep every
+# object a lock names refuses it; a key that names objects joins this list and the roots in
+# ``recorded_hashes`` in the same change.
+_LOCK_KEYS = frozenset(
+    {
+        "schema_version",
+        "code_manifest",
+        "params",
+        "deps",
+        "outs",
+        _RECORDS_KEY,
+        "dep_generations",
+        _READS_KEY,
+    }
+)
+_ENTRY_KEYS = frozenset(
+    {"producer", "key", "hash", _DIR_HASH_KEY, "size", "nfiles", "path", "manifest", "empty_dirs"}
+)
+
+
+def _uninterpretable(document: object) -> str | None:
+    """Why a parsed lock file is not one this pivot can fully interpret before its entries are
+    read, or None: not a mapping, a lock key missing, a schema version that is not a number or
+    is newer than this pivot's, or a key this pivot does not know."""
+    if not isinstance(document, dict):
+        return f"no lock: its YAML is {type(document).__name__}, not a mapping"
+    mapping = cast("dict[object, object]", document)
+    missing = sorted(_REQUIRED_LOCK_KEYS - mapping.keys())
+    if missing:
+        return f"no {', '.join(missing)} key, which every lock holds"
+    version = mapping.get("schema_version", 0)
+    if not _is_int(version):
+        return f"schema_version {version!r}, which is not a whole number"
+    if cast("int", version) > SCHEMA_VERSION:
+        return f"schema_version {version}, newer than this pivot's {SCHEMA_VERSION}"
+    unknown = sorted(str(key) for key in mapping if key not in _LOCK_KEYS)
+    if unknown:
+        return f"the top-level key {', '.join(unknown)}, which this pivot does not know"
+    records = mapping.get(_RECORDS_KEY, mapping)
+    lists = cast("dict[object, object]", records) if isinstance(records, dict) else {}
+    if records is not mapping and set(lists) - {"deps", "outs"}:
+        extra = ", ".join(sorted(str(key) for key in set(lists) - {"deps", "outs"}))
+        return f"the key {extra} under {_RECORDS_KEY}, which this pivot does not know"
+    for list_key in ("deps", "outs"):
+        entries = lists.get(list_key)
+        for raw in cast("list[object]", entries) if isinstance(entries, list) else ():
+            if isinstance(raw, dict):
+                extra = set(cast("dict[object, object]", raw)) - _ENTRY_KEYS
+                if extra:
+                    names = ", ".join(sorted(str(key) for key in extra))
+                    return f"the key {names} in a {list_key} entry, which this pivot does not know"
+    return None
+
+
+def recorded_hashes(document: object) -> RecordedHashes | UninterpretableLock:
+    """What a parsed lock file names, for `pivot gc`: every cache key the lock itself holds (each
+    ``deps`` and ``outs`` hash, and each object its run read by hash, ``reads``) and the
+    directories whose members a reader must read from a listing.
+
+    Any lock this pivot cannot fully interpret is ``UninterpretableLock``, with the reason: not a
+    mapping, a lock key missing, a schema version that is not a whole number or is newer than
+    this pivot's, a key this pivot does not know (at the top level, under ``records`` or in an
+    entry), an inline listing it cannot read, or a field ``lock_data_error`` refuses. A newer
+    pivot may record objects in any of those, so a collector refuses rather than read the rest.
+
+    A lock an older pivot wrote lists each directory's files inline (``_convert_old``). Its
+    members, the directory hash it recorded and the hash of the listing this pivot derives from
+    it are all in ``keys``, so a collection keeps the whole-tree object of that format as well
+    as the listing object any read of that lock stored.
+    """
+    reason = _uninterpretable(document)
+    if reason is not None:
+        return UninterpretableLock(reason)
+    keys = set[str]()
+    directories = list[DirHash]()
+    listed = True
+    if _is_old_format(document):
+        converted = _convert_old(document)
+        if converted is None:
+            return UninterpretableLock("a directory listed inline that this pivot cannot read")
+        keys |= converted.legacy_hashes
+        for directory_hash, members in converted.inline.items():
+            keys.add(directory_hash)
+            keys.update(entry["hash"] for entry in members["files"])
+        document = converted.document
+        listed = False
+    error = lock_data_error(document)
+    if error is not None:
+        return UninterpretableLock(
+            str(error) if isinstance(error, UnsafeLockPath) else f"a field {error} it cannot read"
+        )
+    data = _from_document(document)
+    # `lock_data_error` refused a `reads` that is not a list of content hashes, and an older
+    # pivot's lock keeps its top-level keys through `_convert_old`, so this is every one.
+    if _READS_KEY in data:
+        keys.update(data[_READS_KEY])
+    for entry in (*data["deps"], *data["outs"]):
+        hash_info = entry_hash_info(entry)
+        keys.add(hash_info["hash"])
+        if listed and is_dir_hash(hash_info):
+            directories.append(hash_info)
+    return RecordedHashes(keys, directories)
 
 
 def _record_dir_fields(entry: DepEntry | OutEntry, hash_info: HashInfo) -> None:

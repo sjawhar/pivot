@@ -646,12 +646,14 @@ class Pipeline:
         Its stages' locks are recorded in these directories (``state_dir.resolved_state_dir``).
         Its fingerprints and its runs start their state-directory record with them
         (``state_dir.entry_invocation``), so a ``core.state_dir`` edited after the load leaves
-        this pipeline in one directory; a caller who wants the new one loads the pipeline again.
-        A value that could not be used is kept as its error, so the entry points fall back to
-        ``.pivot`` (or fail) as at the load, without reading the configuration again. A path that
-        could not become a directory is kept as its fallback (``state_dir.kept_by_pipeline``):
-        the stages' locks are in ``.pivot``, so every reader in its fingerprints and runs uses
-        ``.pivot`` too, whether or not the path can be used by then.
+        its fingerprints in one directory. A run (``executor.run(pipeline=...)``) refuses once
+        the directory the configuration names differs from these
+        (``discovery.require_current_state_dirs``): its locks would go where ``pivot gc`` no
+        longer reads. A caller who wants the new directory loads the pipeline again. A value that
+        could not be used is kept as its error, so the entry points fall back to ``.pivot`` (or
+        fail) as at the load. A path that could not become a directory is kept as its fallback
+        (``state_dir.kept_by_pipeline``): the stages' locks are in ``.pivot``, so every reader in
+        its fingerprints uses ``.pivot`` too, and a run refuses once the path can be used.
         Read-only: ``include()`` alone adds to it.
         """
         return _stdlib_types.MappingProxyType(self._resolved_state_dirs)

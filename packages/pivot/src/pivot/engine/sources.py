@@ -31,12 +31,15 @@ _CONFIG_FILE_NAMES = (
     "params.yml",
     ".pivotignore",
 )
+# The project's configuration: a reload reads it again, `core.state_dir` included, so a session's
+# runs record their locks where `pivot gc` reads them (L3w).
+_PROJECT_CONFIG_SUFFIX = "/.pivot/config.yaml"
 
 
 def _is_code_or_config(path: str) -> bool:
     """Check if a path is a code or config file."""
     # Use string operations to avoid Path object overhead
-    if path.endswith(_CODE_FILE_SUFFIXES):
+    if path.endswith(_CODE_FILE_SUFFIXES) or path.endswith(_PROJECT_CONFIG_SUFFIX):
         return True
     # Extract filename from path (everything after last /)
     slash_idx = path.rfind("/")

@@ -13,7 +13,7 @@ import yaml
 
 from pivot import config, exceptions, git, project, types, yaml_config
 from pivot import state_dir as state_dir_mod
-from pivot.storage import cache, listing, lock, ownership, state, track
+from pivot.storage import cache, listing, lock, naming, ownership, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
@@ -381,6 +381,47 @@ def _skipped(dest_path: pathlib.Path, force: bool) -> RestoreResult | None:
     return None
 
 
+def _restore_named(
+    dest_path: pathlib.Path,
+    output_hash: HashInfo,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
+    target: ownership.ForcedRestore,
+    *,
+    state_dir: pathlib.Path,
+    members: listing.DirListing | None = None,
+    recorded: list[tuple[pathlib.Path, os.stat_result, str]] | None = None,
+) -> bool:
+    """Restore ``dest_path`` from the cache inside a naming-lock unit (shared), under the
+    target state directory's restore lock and ownership checks (``_replace_checked``).
+
+    ``restore_from_cache`` checks each object exists and creates the workspace link or copy;
+    the record naming the objects is in git (the revision's lock), so the link is the
+    workspace's only record in symlink mode. gc cannot delete while this unit is open.
+    ``cache_dir`` is the cache root, as `pivot gc` locks it; objects are read from its ``files``.
+    Materialized files are appended to ``recorded`` for #516's StateDB file-hash queue. The
+    state directory is the stage's own directory for a stage target, otherwise the configured
+    directory from ``config.locate_state_dir()``.
+    """
+    with naming.naming_unit(cache_dir, project=(project.get_project_root(), state_dir)):
+        return _replace_checked(
+            dest_path,
+            target,
+            state_dir,
+            lambda token, before_swap: cache.restore_from_cache(
+                dest_path,
+                output_hash,
+                cache_dir / "files",
+                checkout_modes=checkout_modes,
+                state_dir=state_dir,
+                lock_token=token,
+                members=members,
+                before_swap=before_swap,
+                recorded=recorded,
+            ),
+        )
+
+
 def restore_file(
     rel_path: str,
     output_hash: HashInfo | None,
@@ -401,7 +442,10 @@ def restore_file(
     Tries the local cache, then git, then downloads the cache objects the output still misses
     from the remote ``remote_factory`` opens; it is called only when that download is needed.
     A remote that raised ``RemoteUnreachableError`` is named in the result's
-    ``unreachable_remote``.
+    ``unreachable_remote``. Each restore from the cache runs in a naming-lock unit
+    (``_restore_named``); git reads and remote downloads run outside it, so a slow network
+    holds no lock a waiting collection would turn into a stall for every other commit.
+
     ``target`` is what the restore replaces (``_restore_targets``). Each write checks it again
     under the restore lock, just before it builds the replacement, and once more at the swap; a
     refusal is this target's error. For a stage output restored to its own path, the ``*.pvt``
@@ -495,21 +539,15 @@ def _restore_from_sources(
                     cache.resolve_cache_object_path(files_dir, output_hash["hash"]) is not None
                 )
             if should_try_cache:
-                success = _replace_checked(
+                success = _restore_named(
                     dest_path,
+                    cached_hash,
+                    cache_dir,
+                    checkout_modes,
                     target,
-                    state_dir,
-                    lambda token, before_swap: cache.restore_from_cache(
-                        dest_path,
-                        cached_hash,
-                        files_dir,
-                        checkout_modes=checkout_modes,
-                        state_dir=state_dir,
-                        lock_token=token,
-                        members=members,
-                        before_swap=before_swap,
-                        recorded=restored,
-                    ),
+                    state_dir=state_dir,
+                    members=members,
+                    recorded=restored,
                 )
         except exceptions.OutputOwnershipError:
             raise
@@ -573,26 +611,37 @@ def _restore_from_sources(
             missing_hashes = cache.missing_cache_objects(
                 output_hash, members, files_dir, checkout_modes
             )
-            if missing_hashes:
-                source = "remote"
-                remote = remote_factory()
-                _download(remote, files_dir, missing_hashes)
-            success = _replace_checked(
-                dest_path,
-                target,
-                state_dir,
-                lambda token, before_swap: cache.restore_from_cache(
+            # Two attempts: an object downloaded before the naming unit can be removed by a
+            # collection run with no grace before the unit is taken; download it again then.
+            success = False
+            for _attempt in range(2):
+                if missing_hashes:
+                    source = "remote"
+                    # The one write `get` makes into the cache: the creating getter prepares the
+                    # cache directory, and a custom `cache.dir` inside the state directory, each
+                    # with its ignore file, before any object is downloaded into it.
+                    config.get_cache_dir()
+                    remote = remote or remote_factory()
+                    _download(remote, files_dir, missing_hashes)
+                success = _restore_named(
                     dest_path,
                     cached_hash,
-                    files_dir,
-                    checkout_modes=checkout_modes,
+                    cache_dir,
+                    checkout_modes,
+                    target,
                     state_dir=state_dir,
-                    lock_token=token,
                     members=members,
-                    before_swap=before_swap,
                     recorded=downloaded,
-                ),
-            )
+                )
+                missing_hashes = (
+                    []
+                    if success
+                    else cache.missing_cache_objects(
+                        cached_hash, members, files_dir, checkout_modes
+                    )
+                )
+                if not missing_hashes:
+                    break
         except exceptions.OutputOwnershipError:
             raise
         except exceptions.RemoteError as e:

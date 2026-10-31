@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import multiprocessing
 import os
 import pathlib
@@ -1861,6 +1862,32 @@ def test_apply_deferred_writes_empty_output_paths_with_flag_true(
     with state.StateDB(db_path) as db:
         # Should not raise
         db.apply_deferred_writes("stage", [], deferred)
+
+
+def test_capacity_warning_names_pivot_gc_and_prints_one_percent_sign(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The warning reaches the user as written: one `%`, and a command that exists.
+
+    `logger.warning` is given a pre-formatted message with no arguments, so it applies no
+    %-formatting and a `%%` in the text would reach the user as `%%`.
+    """
+    db = state.StateDB(tmp_path)
+    db.list_runs()  # opens the environment at its real map size
+    monkeypatch.setattr(state, "_MAP_SIZE", 4096)
+
+    with caplog.at_level(logging.WARNING, logger="pivot.storage.state"), db:
+        pass
+
+    (record,) = caplog.records
+    message = record.getMessage()
+    assert "%%" not in message, message
+    assert "%), approaching" in message, message
+    assert "Run `pivot gc` to prune run history and unused cache objects" in message, message
+    assert (
+        "the database file itself shrinks only when you delete "
+        + f"{(tmp_path / 'state.lmdb').resolve()}/"
+    ) in message, message
 
 
 _RAN = {"code_manifest": {"func:helpers.plain": "1f2e"}, "output_hashes": {"p/use_plain": "9a8b"}}

@@ -382,7 +382,7 @@ class WorkspaceStore:
             path.mkdir(exist_ok=True)
         return path
 
-    def commit(
+    def prepare_commit(
         self,
         ref: types.ArtifactRef,
         path: pathlib.Path,
@@ -392,17 +392,17 @@ class WorkspaceStore:
         hashed_dirs: dict[str, listing.HashedDirectory] | None = None,
         claims: ownership.StageClaims | None = None,
         written: ownership.StageMembers | None = None,
-    ) -> types.HashInfo:
-        """Hash a written output once and, unless it is a metric, place it in the cache.
+    ) -> types.FileHash | listing.HashedDirectory:
+        """Hash a written output and publish its cache objects, outside any naming-lock unit.
 
         ``warn_left_out_symlinks`` logs the warning naming the symlinks a directory output
         leaves out; a quiet command turns it off. ``hashed_dirs`` receives a hashed directory by
-        its hash, so the lock writer has its listing. The stage's own ``*.pvt`` files in the
-        output are ``ownership.stage_members`` of ``claims`` and of the ones this run wrote there
-        (``written``); every other ``*.pvt`` there is a user's, and the commit refuses before
-        linking the output to the cache would replace it. A directory that symlink mode replaces
-        by a link to its cache tree is renamed aside and checked again there, as
-        ``prepare_output`` does, and goes back when that check refuses.
+        its hash, so ``finish_commit`` and the lock writer have its listing. The stage's own
+        ``*.pvt`` files in the output are ``ownership.stage_members`` of ``claims`` and of the
+        ones this run wrote there (``written``); every other ``*.pvt`` there is a user's, and the
+        commit refuses here, before anything is published, since linking the output to the cache
+        would replace it. ``finish_commit`` must follow inside the caller's unit before a record
+        names the returned hash.
         """
         hashed: types.FileHash | listing.HashedDirectory
         if path.is_dir():
@@ -420,6 +420,39 @@ class WorkspaceStore:
             self.refuse_output_replacements(
                 [ref], claims, None if written is None else {ref: written}
             )
+            cache.publish_hashed_output(
+                path,
+                hashed,
+                self._cache_dir,
+                self._checkout_modes,
+                state_dir=state_dir,
+            )
+        if "listing" in hashed:
+            _ = _record(hashed, hashed_dirs)
+        return hashed
+
+    def finish_commit(
+        self,
+        ref: types.ArtifactRef,
+        path: pathlib.Path,
+        hashed: types.FileHash | listing.HashedDirectory,
+        *,
+        state_dir: pathlib.Path | None = None,
+        claims: ownership.StageClaims | None = None,
+        written: ownership.StageMembers | None = None,
+    ) -> types.HashInfo:
+        """Inside the caller's naming-lock unit: re-check, publish any missing object, link, and
+        return the record a lock keeps for ``hashed``.
+
+        The objects ``prepare_commit`` published may have been removed by a collection run
+        before the unit was taken. ``store_hashed_output`` finds each object that remains with a
+        cheap existence check and publishes any that is gone again from ``path`` before it links
+        the workspace output, so the record that follows names only objects in the cache. A
+        directory that symlink mode replaces by a link to its cache tree is renamed aside and
+        checked again there (``claims`` and ``written`` as ``prepare_commit`` says), as
+        ``prepare_output`` does, and goes back when that check refuses.
+        """
+        if self._cache_dir is not None and ref.tag is not types.ArtifactTag.METRIC:
             target = self._write_target(ref, claims, written)
 
             def refuse_moved(entry: pathlib.Path) -> None:
@@ -433,9 +466,40 @@ class WorkspaceStore:
                 self._cache_dir,
                 self._checkout_modes,
                 state_dir=state_dir,
+                verify=True,
                 before_remove=refuse_moved,
             )
-        return _record(hashed, hashed_dirs) if "listing" in hashed else hashed
+        return hashed["record"] if "listing" in hashed else hashed
+
+    def commit(
+        self,
+        ref: types.ArtifactRef,
+        path: pathlib.Path,
+        *,
+        state_dir: pathlib.Path | None = None,
+        warn_left_out_symlinks: bool = True,
+        hashed_dirs: dict[str, listing.HashedDirectory] | None = None,
+        claims: ownership.StageClaims | None = None,
+        written: ownership.StageMembers | None = None,
+    ) -> types.HashInfo:
+        """Hash a written output once and, unless it is a metric, place it in the cache.
+
+        For a caller that holds no naming-lock unit. A pivot commit site calls
+        ``prepare_commit`` before its unit and ``finish_commit`` inside it. ``hashed_dirs``,
+        ``claims`` and ``written`` are as ``prepare_commit`` says.
+        """
+        hashed = self.prepare_commit(
+            ref,
+            path,
+            state_dir=state_dir,
+            warn_left_out_symlinks=warn_left_out_symlinks,
+            hashed_dirs=hashed_dirs,
+            claims=claims,
+            written=written,
+        )
+        return self.finish_commit(
+            ref, path, hashed, state_dir=state_dir, claims=claims, written=written
+        )
 
     def cached_listing(self, output_hash: types.DirHash) -> listing.DirListing | None:
         """The listing this store's cache holds for a directory, or None."""

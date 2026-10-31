@@ -1005,8 +1005,9 @@ _CANNOT_WRITE_ERRNO = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 _NO_FLOCK_ERRNO = frozenset({errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP})
 
 
-def _open_cache_lock(path: pathlib.Path) -> int:
-    """Open the lock file at ``path`` in a cache directory, creating it if needed.
+def _open_cache_lock(path: pathlib.Path, *, dir_fd: int | None = None) -> int:
+    """Open the lock file at ``path`` in a cache directory, creating it if needed. With
+    ``dir_fd``, ``path`` is a name in the directory open as ``dir_fd``, not a path.
 
     A cache directory can be shared by several users. The file is created writable by exactly
     those who can write its directory (they could delete it anyway), so each of them can take
@@ -1015,14 +1016,15 @@ def _open_cache_lock(path: pathlib.Path) -> int:
     lock file's mtime is the epoch: its directory has never been swept.
     """
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644, dir_fd=dir_fd)
     except FileExistsError:
         try:
-            return os.open(path, os.O_RDWR)
+            return os.open(path, os.O_RDWR, dir_fd=dir_fd)
         except PermissionError:
-            return os.open(path, os.O_RDONLY)
+            return os.open(path, os.O_RDONLY, dir_fd=dir_fd)
     with contextlib.suppress(OSError):
-        os.fchmod(fd, 0o444 | (path.parent.stat().st_mode & 0o222))
+        directory = os.fstat(dir_fd) if dir_fd is not None else path.parent.stat()
+        os.fchmod(fd, 0o444 | (directory.st_mode & 0o222))
     with contextlib.suppress(OSError):
         os.utime(fd, (0, 0))
     return fd
@@ -1114,7 +1116,9 @@ def staged_cache_file(cache_path: pathlib.Path) -> Generator[pathlib.Path]:
             staged.unlink(missing_ok=True)
 
 
-def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bool = False) -> None:
+def copy_to_cache(
+    src: pathlib.Path, cache_path: pathlib.Path, *, executable: bool = False, verify: bool = False
+) -> None:
     """Atomically copy file to cache with read-only permissions.
 
     ``executable`` records the source's executable bit on the cache object itself (0o555
@@ -1125,12 +1129,29 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bo
     The object is published with ``publish_cache_object`` and never changed afterwards, its
     mode included. An object already there is kept whatever executable bit it carries; a
     directory entry needing the other bit is checked out as a copy (``_checkout_with_fallback``).
+
+    ``verify`` hashes the staged copy and refuses to publish it under ``cache_path``'s key
+    unless it matches. A naming unit sets it when it re-publishes an object it hashed before
+    the unit: the source may have changed since, and storing new bytes under the old key would
+    hand them to every project whose record names that key.
+
+    Raises:
+        exceptions.CacheError: ``verify`` is set and the copy does not hash to the key.
     """
     if cache_path.exists():
         return
 
     with staged_cache_file(cache_path) as staged:
         shutil.copy2(src, staged)
+        if verify:
+            key = cache_path.parent.name + cache_path.name
+            copied, _ = hash_file(staged)
+            if copied != key:
+                raise exceptions.CacheError(
+                    f"{src} changed after pivot hashed it: it now hashes to {copied}, not "
+                    + f"{key}. Refusing to store it under the old key, and naming nothing. "
+                    + "Run the command again once the file is no longer being written."
+                )
         os.chmod(staged, 0o555 if executable else 0o444)
         _ = publish_cache_object(staged, cache_path)
 
@@ -1139,6 +1160,71 @@ def copy_to_cache(src: pathlib.Path, cache_path: pathlib.Path, *, executable: bo
 # the next checkout mode. EMLINK is not here: it is one object's limit, not the filesystem's
 # (see _checkout_with_fallback).
 FALLBACK_ERRNO = _NO_HARDLINK_ERRNO | {errno.EXDEV, errno.EACCES}
+
+
+# The cache roots a pivot command in this process could not register its project in because
+# the cache's filesystem is read-only here (``naming.register_project``), by real path, to the
+# cache root as configured. Nothing is linked from them: that cache's collection, run where it
+# is writable, reads only its register, so it cannot see this project's links
+# (``links_refused``). A checkout copies instead when COPY is among its modes and refuses
+# otherwise (``_checkout_with_fallback``). The refusal is per cache: one cache's never touches
+# another, and the next registration that succeeds in that cache lifts it
+# (``allow_links_from``), so a long-lived process that gains write access lifts it at its next
+# naming unit there, which every path that links takes before it links.
+_UNREGISTERED_ROOTS = dict[str, str]()
+
+
+def refuse_links_from(cache_root: pathlib.Path, roots: Iterable[pathlib.Path]) -> None:
+    """Refuse every link into ``roots`` (the cache root and its register root) from now on in
+    this process: the project could not register in ``cache_root``."""
+    for root in roots:
+        _UNREGISTERED_ROOTS[os.path.realpath(root)] = str(cache_root)
+
+
+def allow_links_from(roots: Iterable[pathlib.Path]) -> None:
+    """Lift ``refuse_links_from`` for ``roots``: the project registered there."""
+    if _UNREGISTERED_ROOTS:
+        for root in roots:
+            _ = _UNREGISTERED_ROOTS.pop(os.path.realpath(root), None)
+
+
+def links_refused(target: pathlib.Path | str) -> bool:
+    """Whether ``target``, a cache object or tree, is in a cache this process could not register
+    its project in, so that no link to it may be made (``refuse_unregistered_link``)."""
+    if not _UNREGISTERED_ROOTS:
+        return False
+    real = os.path.realpath(target)
+    return any(real == root or real.startswith(root + os.sep) for root in _UNREGISTERED_ROOTS)
+
+
+def refuse_unregistered_link(target: pathlib.Path | str, link: pathlib.Path) -> None:
+    """Refuse to make ``link`` a link (a symlink or a hardlink) to ``target``, a cache object
+    or tree, when ``target`` is in a cache this process could not register its project in.
+
+    A copy is the project's own data and needs no registration; a link names the object, and
+    a collection of that cache, which cannot see an unregistered project, would remove it. A
+    restore or commit whose checkout modes include COPY copies instead
+    (``_checkout_with_fallback``); this refuses only where COPY is not among them.
+
+    Raises:
+        exceptions.CacheError: ``target`` is in such a cache.
+    """
+    if not links_refused(target):
+        return
+    real = os.path.realpath(target)
+    cache_root = next(
+        cache_root
+        for root, cache_root in _UNREGISTERED_ROOTS.items()
+        if real == root or real.startswith(root + os.sep)
+    )
+    raise exceptions.CacheError(
+        f"Refusing to link {link} to {target}: this command could not register the "
+        + f"project in the cache {cache_root}, whose filesystem is read-only here, so a "
+        + "`pivot gc` of that cache, run where it is writable, cannot see that this "
+        + "project uses the object and may remove it; a symlink and a hardlink both "
+        + "name it. Restore copies instead: set `cache.checkout_mode: [copy]` (or add copy "
+        + "to the list; a copy is this project's own data), or mount the cache read-write."
+    )
 
 
 def _object_realpath(cache_path: pathlib.Path, cache_root: CacheRoot | None) -> str:
@@ -1313,6 +1399,20 @@ _TREE_LAYOUT_MARKER_SUFFIX = ".content-checked"
 _LEGACY_TREE_MARKER_SUFFIXES = (".layout-checked", ".verified")
 # Held exclusively while a tree is checked, marked, or (for a commit) repaired; never deleted.
 _TREE_LOCK_SUFFIX = ".lock"
+
+# --- the contract the collector reads this module through -------------------------------
+# ``storage/gc.py`` is the one consumer outside this module of the cache's own primitives: it
+# takes the same locks, reads the same checkout symlinks, removes objects with the same
+# remover, and removes the same tree markers. These names are that contract, so a change to
+# any of them is type-checked against the collector instead of being an untyped reach-in.
+PREFIX_LOCK = _PREFIX_LOCK
+NO_FLOCK_ERRNO = _NO_FLOCK_ERRNO
+open_cache_lock = _open_cache_lock
+clear_path = _clear_path
+get_symlink_cache_key = _get_symlink_cache_hash
+# Every marker beside a whole-directory tree object: the current content-checked one and the
+# layout-only/size-only ones older pivot versions wrote. A collected tree takes all of them.
+TREE_MARKER_SUFFIXES = (_TREE_LAYOUT_MARKER_SUFFIX, *_LEGACY_TREE_MARKER_SUFFIXES)
 
 
 def _tree_layout_marker(cache_dir_path: pathlib.Path) -> pathlib.Path:
@@ -1631,12 +1731,23 @@ def _checkout_with_fallback(
     restoring many files: a symlink then names the object's real path without resolving it per
     file (``_object_realpath``). None resolves it.
 
+    A cache this process could not register its project in (its filesystem is read-only here,
+    ``links_refused``) gets no link: a link would name its object where that cache's collection
+    cannot see the project. Its HARDLINK and SYMLINK modes are skipped when COPY is among the
+    modes, so the default order copies; with no COPY, the link is refused
+    (``refuse_unregistered_link``).
+
     Returns:
         What ``path`` holds, stat'd before it was renamed there (``_checkout_from_cache``).
     """
     if not checkout_modes:
         raise ValueError("checkout_modes cannot be empty")
     display = display_path if display_path is not None else path
+    if links_refused(cache_path):
+        if CheckoutMode.COPY not in checkout_modes:
+            refuse_unregistered_link(cache_path, display)
+        logger.debug(f"{cache_path} is in a cache this project is not registered in; copying")
+        checkout_modes = [CheckoutMode.COPY]
     for i, mode in enumerate(checkout_modes):
         is_last = i == len(checkout_modes) - 1
         if keep_existing_copy and mode == CheckoutMode.COPY and path.exists():
@@ -1798,9 +1909,10 @@ def _store_file(
     *,
     keep_existing_copy: bool,
     state_dir: pathlib.Path | None = None,
+    verify: bool = False,
 ) -> None:
     cache_path = get_cache_path(cache_dir, file_hash)
-    copy_to_cache(path, cache_path)
+    copy_to_cache(path, cache_path, verify=verify)
     with restore_lock(path, state_dir) as lock_token:
         staging_path = restore_staging_path(path, lock_token)
         _clear_path(staging_path)
@@ -1914,6 +2026,7 @@ def _store_directory(
     *,
     keep_existing_copy: bool,
     state_dir: pathlib.Path | None = None,
+    verify: bool = False,
     before_remove: Callable[[pathlib.Path], None] | None = None,
 ) -> None:
     """Put a directory's files and its listing in the cache, then link it per mode.
@@ -1928,13 +2041,20 @@ def _store_directory(
     for entry in manifest:
         file_path = path / entry["relpath"]
         cache_path = get_cache_path(cache_dir, entry["hash"])
-        copy_to_cache(file_path, cache_path, executable=entry["isexec"])
+        copy_to_cache(file_path, cache_path, executable=entry["isexec"], verify=verify)
     listing.store_object(cache_dir, hashed["record"]["hash"], hashed["data"])
 
     with restore_lock(path, state_dir) as lock_token:
-        if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK:
+        cache_dir_path = tree_path(cache_dir, hashed["record"]["hash"])
+        # A cache this process could not register in gets no link; with COPY among the modes the
+        # files stay copies, one by one (``_checkout_with_fallback``).
+        whole_tree = (
+            bool(checkout_modes)
+            and checkout_modes[0] == CheckoutMode.SYMLINK
+            and not (links_refused(cache_dir_path) and CheckoutMode.COPY in checkout_modes)
+        )
+        if whole_tree:
             # SYMLINK mode: cache entire directory, symlink to it
-            cache_dir_path = tree_path(cache_dir, hashed["record"]["hash"])
             if not cache_dir_path.exists():
                 _publish_tree(path, cache_dir_path, members, cache_dir)
 
@@ -1950,6 +2070,8 @@ def _store_directory(
                     + "to let this commit publish it again"
                 )
 
+            # Before the output is removed: a refusal leaves it as the stage wrote it.
+            refuse_unregistered_link(cache_dir_path, path)
             if before_remove is None:
                 _clear_path(path)
             else:
@@ -1972,6 +2094,42 @@ def _store_directory(
                 )
 
 
+def publish_hashed_output(
+    path: pathlib.Path,
+    hashed: FileHash | listing.HashedDirectory,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[CheckoutMode] | None = None,
+    *,
+    state_dir: pathlib.Path | None = None,
+) -> None:
+    """Copy an output whose hash is known into the cache, without linking the workspace path.
+
+    A commit calls this before its naming-lock unit, so reading and copying a large output holds
+    no lock a waiting collection could turn into a stall for every other commit. Inside the unit
+    it calls ``store_hashed_output``: each object is then present (a cheap check), any a
+    collection removed meanwhile is published again, and only then is the output linked and
+    named. ``hashed`` must describe ``path``'s current contents.
+    """
+    effective_modes = _resolve_checkout_modes(None, checkout_modes)
+    if "listing" not in hashed:
+        copy_to_cache(path, get_cache_path(cache_dir, hashed["hash"]))
+        return
+    members = hashed["listing"]
+    for entry in members["files"]:
+        copy_to_cache(
+            path / entry["relpath"],
+            get_cache_path(cache_dir, entry["hash"]),
+            executable=entry["isexec"],
+        )
+    listing.store_object(cache_dir, hashed["record"]["hash"], hashed["data"])
+    if effective_modes and effective_modes[0] == CheckoutMode.SYMLINK:
+        cache_dir_path = tree_path(cache_dir, hashed["record"]["hash"])
+        if not cache_dir_path.exists():
+            with restore_lock(path, state_dir):
+                if not cache_dir_path.exists():
+                    _publish_tree(path, cache_dir_path, members, cache_dir)
+
+
 def store_hashed_output(
     path: pathlib.Path,
     hashed: FileHash | listing.HashedDirectory,
@@ -1979,6 +2137,7 @@ def store_hashed_output(
     checkout_modes: list[CheckoutMode] | None = None,
     *,
     state_dir: pathlib.Path | None = None,
+    verify: bool = False,
     before_remove: Callable[[pathlib.Path], None] | None = None,
 ) -> None:
     """Put an output whose hash is already known into the cache, then link it per mode.
@@ -1986,9 +2145,12 @@ def store_hashed_output(
     ``hashed`` must describe ``path``'s current contents; nothing is hashed again. Each file is
     copied into the cache once, a directory's listing beside them, and the workspace path is
     linked to the cache entry with the first checkout mode that works. Reaching COPY leaves the
-    workspace file as it is, since it already holds the cached bytes. ``before_remove`` checks a
-    directory that SYMLINK mode replaces by a link to its cache tree (``_store_directory``); a
-    file, and each file of a directory in the other modes, is replaced without it.
+    workspace file as it is, since it already holds the cached bytes. ``verify`` hashes any file
+    it has to copy and refuses on a mismatch (``copy_to_cache``): a naming unit sets it, since
+    its hash was taken before the unit and the file may have changed since. ``before_remove``
+    checks a directory that SYMLINK mode replaces by a link to its cache tree
+    (``_store_directory``); a file, and each file of a directory in the other modes, is replaced
+    without it.
     """
     effective_modes = _resolve_checkout_modes(None, checkout_modes)
     if "listing" in hashed:
@@ -1999,6 +2161,7 @@ def store_hashed_output(
             effective_modes,
             keep_existing_copy=True,
             state_dir=state_dir,
+            verify=verify,
             before_remove=before_remove,
         )
     else:
@@ -2009,6 +2172,7 @@ def store_hashed_output(
             effective_modes,
             keep_existing_copy=True,
             state_dir=state_dir,
+            verify=verify,
         )
 
 
@@ -2151,7 +2315,13 @@ def _restore_directory_from_cache(
     """Restore a directory atomically. ``recorded`` is as ``restore_from_cache`` says: each
     file's stat is taken in the tree or staging directory, before the swap puts it in place."""
     cache_dir_path = resolve_cache_tree_path(cache_dir, output_hash["hash"])
-    symlink_fast_path = checkout_modes[0] == CheckoutMode.SYMLINK and cache_dir_path is not None
+    # A cache this process could not register in gets no link: with COPY among the modes the
+    # restore copies file by file (``_checkout_with_fallback``); without it, the fast path refuses.
+    symlink_fast_path = (
+        checkout_modes[0] == CheckoutMode.SYMLINK
+        and cache_dir_path is not None
+        and not (links_refused(cache_dir_path) and CheckoutMode.COPY in checkout_modes)
+    )
     if not symlink_fast_path:
         for entry in members["files"]:
             if resolve_cache_object_path(cache_dir, entry["hash"]) is None:
@@ -2214,6 +2384,7 @@ def _restore_directory_from_cache(
                 if recorded is not None
                 else []
             )
+            refuse_unregistered_link(cache_dir_path, path)
             temp_symlink.symlink_to(cache_dir_path.resolve())
             if before_swap is None:
                 _clear_path(path)

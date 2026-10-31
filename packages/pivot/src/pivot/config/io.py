@@ -373,6 +373,25 @@ def get_cache_dir() -> pathlib.Path:
     return cache_dir
 
 
+def register_cache_use() -> None:
+    """Register this project in a naming unit before a command links cache objects.
+
+    `checkout` and `pull` restore workspace links from records already on disk, outside the
+    naming units that publish objects; they call this first, so a collection reads those
+    records. (`repro` and `run` register once in the engine, before any stage runs or restores.)
+    Read-only commands never call it. It creates neither the cache nor the state directory: a
+    cache that does not exist holds nothing to collect, and a state directory that cannot be
+    written gives an entry without a project id, which a collection refuses.
+    """
+    from pivot.storage import naming
+
+    try:
+        root = project.get_project_root()
+    except exceptions.ProjectNotInitializedError:
+        return
+    naming.register_use(locate_cache_dir(), root, locate_state_dir())
+
+
 def locate_state_dir() -> pathlib.Path:
     """Return the current project's configured state directory without creating it.
 
@@ -387,6 +406,16 @@ def get_state_dir() -> pathlib.Path:
     """``locate_state_dir``, created when absent, for a command that writes state."""
     get_merged_config()
     return state_dir_mod.ensure_state_dir(project.get_project_root())
+
+
+def project_state_dir(root: pathlib.Path) -> pathlib.Path:
+    """Return ``root``'s state directory through the shared state-directory resolver.
+
+    This compatibility helper is for a collector reading another project's records. It creates
+    nothing, and resolves the project's own ``core.state_dir`` rather than this process's
+    configuration.
+    """
+    return state_dir_mod.locate_state_dir(root)
 
 
 def get_max_workers() -> int:
