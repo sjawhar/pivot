@@ -241,13 +241,15 @@ register and one lock, and a collection through any of them reads every project 
 objects in the store. Each root keeps its own whole-directory trees (`trees/`); a collection
 removes only its own root's trees, and keeps the listing and members of a tree another root of
 the store holds. That directory must be writable by every user who names objects in the store.
-When `files/` links to the root of a mount of its own (a mount point or a bind mount), that
-directory is on another filesystem, which other hosts and mount namespaces need not reach
-through the store: the register stays at the cache root, and `pivot gc` refuses, naming the
-layout. Link `files/` to a directory inside the mounted filesystem instead. Two cache roots whose
-`files/` are each a mount of one store (rather than a link to it) keep two registers that pivot
-cannot relate, and a collection through one cannot see the other's projects: share a store
-through links, or through one cache root.
+When the object store is the root of a mount of its own (a mount point or a bind mount), the
+directory that holds it is on another filesystem, which other hosts and mount namespaces that
+mount the store need not reach, so the register cannot follow the store: it stays at the cache
+root, and `pivot gc` refuses, naming the layout. That is so when `files/` links to such a mount,
+and when `files/` is itself a mount point (another device than the cache root, or a bind mount
+the mount table lists). Writers keep working either way. Two layouts are supported instead:
+mount the filesystem at the cache root (or point `cache.dir` at a directory inside it), so
+`files/` is a plain directory of that filesystem; or keep the objects in a directory inside the
+mounted filesystem and link `files/` to it.
 
 ### A Project That Uses More Than One Cache
 

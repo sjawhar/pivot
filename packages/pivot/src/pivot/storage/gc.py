@@ -618,17 +618,25 @@ def refusal_external(cache_dir: pathlib.Path, project_root: pathlib.Path) -> str
 
 
 def refusal_unshared_store(cache_dir: pathlib.Path, store: pathlib.Path) -> str:
-    """What a collection says when the cache's ``files/`` links to the root of a mount of its
-    own, so that the register cannot follow the object store (``naming.store_layout``)."""
+    """What a collection says when the cache's object store is the root of a mount of its own,
+    so that the register cannot follow it (``naming.unshared_store``): ``files/`` is itself a
+    mount point, or a link to one."""
+    files = cache_dir / naming.OBJECTS_DIR
+    where = (
+        f"its files/ links to {store}, which is a mount of its own"
+        if files.is_symlink()
+        else f"its files/ ({store}) is a mount of its own"
+    )
     return (
-        f"Refusing to collect {cache_dir}: its files/ links to {store}, which is a mount of its "
-        "own\n(a mount point or a bind mount). Pivot keeps a cache's register beside its object "
-        "store, in the\ndirectory that holds it, so that every cache root using one store shares "
-        "one register. Here that\ndirectory is on another filesystem, which other hosts and "
-        "mount namespaces do not reach through\nthe store, so the register stays at the cache "
-        "root and cannot show every project that names\nobjects in the store. Move the objects "
-        "into a directory inside the mounted filesystem and link\nfiles/ to that directory "
-        "instead. Nothing was removed."
+        f"Refusing to collect {cache_dir}: {where}\n(a mount point or a bind mount). Pivot keeps "
+        "a cache's register beside its object store, in\nthe directory that holds it, so that "
+        "every cache root using one store shares one register.\nHere that directory is on "
+        "another filesystem, which other hosts and mount namespaces that\nmount the store do "
+        "not reach, so the register stays at the cache root and cannot show every\nproject that "
+        "names objects in the store. Supported layouts: mount the filesystem at the cache\nroot "
+        "(or set cache.dir to a directory inside it), so files/ is a plain directory of it; or "
+        "keep\nthe objects in a directory inside the mounted filesystem and link files/ to that "
+        "directory.\nNothing was removed."
     )
 
 
@@ -686,11 +694,8 @@ def resolve_scopes(
     here = ProjectScope(
         root=project_root, state_dir=state_dir, host=socket.gethostname(), last_write="now"
     )
-    layout = naming.store_layout(cache_dir)
-    if layout.unshared and layout.linked_store is not None:
-        raise exceptions.CacheCollectionRefusedError(
-            refusal_unshared_store(cache_dir, layout.linked_store)
-        )
+    if (store := naming.unshared_store(cache_dir)) is not None:
+        raise exceptions.CacheCollectionRefusedError(refusal_unshared_store(cache_dir, store))
     # Always read the register (BLK-3), before any --projects registration can replace evidence
     # a collection must check: an internal cache can have a registered peer too.
     live, unreadable = read_register(cache_dir)

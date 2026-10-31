@@ -491,8 +491,10 @@ and a link into another root's `trees/` whose `files/` resolves to the same stor
 tree's key (`gc._tree_of_store`). A link to the root of a mount of its own (a mount point, or a
 bind mount the mount table lists) is `unshared`: that store's parent is on another filesystem
 that other views need not reach, so the register stays at the cache root (writers work as
-before) and `gc.resolve_scopes` refuses, naming the layout. A plain root whose own `files/` is a
-mount keeps its register at the root, as before. The registration memo records the register
+before) and `gc.resolve_scopes` refuses, naming the layout. A `files/` that is itself a mount
+point (another `st_dev` than the cache root, or listed in the mount table) is refused the same
+way (`naming.unshared_store`, which only a collection calls, since it may read the mount table;
+writers keep the register at the cache root). The registration memo records the register
 root and re-registers in full when it moves (a re-pointed `files/`). The register root must be
 writable by every writer; when it is not, the writer refuses and names it.
 

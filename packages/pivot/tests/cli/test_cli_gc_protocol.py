@@ -3338,6 +3338,49 @@ def test_a_cache_whose_files_link_to_a_mount_of_its_own_refuses_collection(
         assert cache.get_cache_path(mount_point, dead).exists(), "a refusal removed an object"
 
 
+@pytest.mark.parametrize("mount", ["another device", "bind mount"])
+def test_a_cache_whose_files_is_a_mount_point_refuses_collection(
+    tmp_path: pathlib.Path, mount: str
+) -> None:
+    """`files/` itself a mount point (`another device`: a tmpfs; `bind mount`: a directory on
+    the same device, which only the mount table shows, in a mount namespace): the register stays
+    at the cache root, on a filesystem other hosts that mount the store need not see, so it
+    cannot show every project of the store. Writers keep working; a collection refuses, naming
+    the layout and the supported ones, and removes nothing."""
+    cache_root = tmp_path / "cache"
+    files = cache_root / "files"
+    if mount == "another device":
+        files.mkdir(parents=True)
+        with _tmpfs_mount(files):
+            root = _shared_project(tmp_path / "project", cache_root, "copy")
+            _ok(_run(root, "repro"))
+            assert _registered(cache_root, root)
+            dead = _publish(files, tmp_path, "named by nothing\n")
+            refused = _run(root, "gc", "--yes", "--grace-hours", "0")
+            kept = cache.get_cache_path(files, dead).exists()
+    else:
+        root = _shared_project(tmp_path / "project", cache_root, "copy")
+        _ok(_run(root, "repro"))
+        store = tmp_path / "store-on-the-same-disk"
+        shutil.copytree(files, store)
+        dead = _publish(store, tmp_path, "named by nothing\n")
+        refused = _in_view(
+            root,
+            "gc",
+            "--yes",
+            "--grace-hours",
+            "0",
+            setup=f"mount --bind {shlex.quote(str(store))} {shlex.quote(str(files))}",
+        )
+        kept = cache.get_cache_path(store, dead).exists()
+
+    flat = " ".join((refused.stdout + refused.stderr).split())
+    assert refused.returncode != 0, flat
+    assert f"its files/ ({files.resolve()}) is a mount of its own" in flat, flat
+    assert "mount the filesystem at the cache root" in flat, flat
+    assert kept, f"a refusal removed an object: {flat}"
+
+
 def test_a_view_that_cannot_write_a_listed_cache_leaves_it_unlisted(tmp_path: pathlib.Path) -> None:
     """A mount namespace in which C2 is read-only takes a naming step in C1. Confirming C2 there
     cannot write C2's register, so that view never holds an entry in C2; it must not list C2

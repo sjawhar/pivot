@@ -137,8 +137,9 @@ OBJECTS_DIR = "files"
 
 class StoreLayout(NamedTuple):
     """Where one cache root keeps its register (``register_root``); where its ``files/``
-    resolves to when it is a link (``linked_store``); and whether that store is the root of a
-    mount of its own, so that no register can follow it (``unshared``)."""
+    resolves to when it is a link (``linked_store``); and whether that linked store is the root
+    of a mount of its own, so that no register can follow it (``unshared``; a ``files/`` that is
+    itself a mount point is ``unshared_store``'s to find, for a collection)."""
 
     register_root: pathlib.Path
     linked_store: pathlib.Path | None
@@ -209,6 +210,27 @@ _LINKED_LAYOUTS = dict[pathlib.Path, _KnownLayout]()
 def register_root(cache_root: pathlib.Path) -> pathlib.Path:
     """The directory that holds ``cache_root``'s register (``store_layout``)."""
     return store_layout(cache_root).register_root
+
+
+def unshared_store(cache_root: pathlib.Path) -> pathlib.Path | None:
+    """The object store of ``cache_root`` when it is the root of a mount of its own, so that no
+    register can follow it to where every user of the store reaches; None otherwise.
+
+    That is a ``files/`` link to a mount root (``store_layout``'s ``unshared``), and a ``files/``
+    that is itself a mount point: on another device than the cache root, or a bind mount the
+    mount table lists. Either way the register stays at the cache root, on a filesystem other
+    hosts and mount namespaces that mount the store need not see, so a collection refuses
+    (``gc.resolve_scopes``) rather than read a register that may not show every project of the
+    store. Writers keep working: their register is the cache root's, as before. Only a
+    collection calls this (it may read the mount table), never a naming step.
+    """
+    layout = store_layout(cache_root)
+    if layout.linked_store is not None:
+        return layout.linked_store if layout.unshared else None
+    files = pathlib.Path(os.path.realpath(cache_root / OBJECTS_DIR))
+    if not files.is_dir():
+        return None
+    return files if _mount_root(files) else None
 
 
 def _mount_root(path: pathlib.Path) -> bool:
