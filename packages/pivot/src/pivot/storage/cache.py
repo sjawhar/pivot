@@ -1005,8 +1005,9 @@ _CANNOT_WRITE_ERRNO = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 _NO_FLOCK_ERRNO = frozenset({errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP})
 
 
-def _open_cache_lock(path: pathlib.Path) -> int:
-    """Open the lock file at ``path`` in a cache directory, creating it if needed.
+def _open_cache_lock(path: pathlib.Path, *, dir_fd: int | None = None) -> int:
+    """Open the lock file at ``path`` in a cache directory, creating it if needed. With
+    ``dir_fd``, ``path`` is a name in the directory open as ``dir_fd``, not a path.
 
     A cache directory can be shared by several users. The file is created writable by exactly
     those who can write its directory (they could delete it anyway), so each of them can take
@@ -1015,14 +1016,15 @@ def _open_cache_lock(path: pathlib.Path) -> int:
     lock file's mtime is the epoch: its directory has never been swept.
     """
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644, dir_fd=dir_fd)
     except FileExistsError:
         try:
-            return os.open(path, os.O_RDWR)
+            return os.open(path, os.O_RDWR, dir_fd=dir_fd)
         except PermissionError:
-            return os.open(path, os.O_RDONLY)
+            return os.open(path, os.O_RDONLY, dir_fd=dir_fd)
     with contextlib.suppress(OSError):
-        os.fchmod(fd, 0o444 | (path.parent.stat().st_mode & 0o222))
+        directory = os.fstat(dir_fd) if dir_fd is not None else path.parent.stat()
+        os.fchmod(fd, 0o444 | (directory.st_mode & 0o222))
     with contextlib.suppress(OSError):
         os.utime(fd, (0, 0))
     return fd
@@ -1160,6 +1162,53 @@ def copy_to_cache(
 FALLBACK_ERRNO = _NO_HARDLINK_ERRNO | {errno.EXDEV, errno.EACCES}
 
 
+# The cache roots a pivot command in this process could not register its project in because
+# the cache's filesystem is read-only here (``naming.register_project``), by real path, to the
+# cache root as configured. Nothing is linked from them: that cache's collection, run where it
+# is writable, reads only its register, so it cannot see this project's links
+# (``refuse_unregistered_link``). A later registration that succeeds lifts the refusal.
+_UNREGISTERED_ROOTS = dict[str, str]()
+
+
+def refuse_links_from(cache_root: pathlib.Path, roots: Iterable[pathlib.Path]) -> None:
+    """Refuse every link into ``roots`` (the cache root and its register root) from now on in
+    this process: the project could not register in ``cache_root``."""
+    for root in roots:
+        _UNREGISTERED_ROOTS[os.path.realpath(root)] = str(cache_root)
+
+
+def allow_links_from(roots: Iterable[pathlib.Path]) -> None:
+    """Lift ``refuse_links_from`` for ``roots``: the project registered there."""
+    if _UNREGISTERED_ROOTS:
+        for root in roots:
+            _ = _UNREGISTERED_ROOTS.pop(os.path.realpath(root), None)
+
+
+def refuse_unregistered_link(target: pathlib.Path | str, link: pathlib.Path) -> None:
+    """Refuse to make ``link`` a link (a symlink or a hardlink) to ``target``, a cache object
+    or tree, when ``target`` is in a cache this process could not register its project in.
+
+    A copy is the project's own data and needs no registration; a link names the object, and
+    a collection of that cache, which cannot see an unregistered project, would remove it.
+
+    Raises:
+        exceptions.CacheError: ``target`` is in such a cache.
+    """
+    if not _UNREGISTERED_ROOTS:
+        return
+    real = os.path.realpath(target)
+    for root, cache_root in _UNREGISTERED_ROOTS.items():
+        if real == root or real.startswith(root + os.sep):
+            raise exceptions.CacheError(
+                f"Refusing to link {link} to {target}: this command could not register the "
+                + f"project in the cache {cache_root}, whose filesystem is read-only here, so a "
+                + "`pivot gc` of that cache, run where it is writable, cannot see that this "
+                + "project uses the object and may remove it. Restore copies instead (set "
+                + "cache.checkout_mode to [copy]: a copy is this project's own data), or mount "
+                + "the cache read-write."
+            )
+
+
 def _object_realpath(cache_path: pathlib.Path, cache_root: CacheRoot | None) -> str:
     """Return ``os.path.realpath(cache_path)`` for ``cache_path = get_cache_path(cache_dir, key)``.
 
@@ -1201,8 +1250,10 @@ def _stage_checkout(
     reached and the cache-object check settles it from its text (``_resolve_link``).
     """
     if checkout_mode == CheckoutMode.SYMLINK:
+        refuse_unregistered_link(cache_path, tmp_path)
         tmp_path.symlink_to(_object_realpath(cache_path, cache_root))
     elif checkout_mode == CheckoutMode.HARDLINK:
+        refuse_unregistered_link(cache_path, tmp_path)
         os.link(cache_path, tmp_path)
     else:
         shutil.copy2(cache_path, tmp_path)
@@ -2291,6 +2342,7 @@ def _restore_directory_from_cache(
                 if recorded is not None
                 else []
             )
+            refuse_unregistered_link(cache_dir_path, path)
             temp_symlink.symlink_to(cache_dir_path.resolve())
             if before_swap is None:
                 _clear_path(path)

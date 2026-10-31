@@ -496,17 +496,26 @@ that other views need not reach, so the register stays at the cache root and
 `gc.resolve_scopes` refuses, naming the layout. A `files/` that is itself a mount
 point (another `st_dev` than the cache root, or listed in the mount table) is `unshared` too
 (`naming.store_layout`). A process resolves each cache root's layout once and keeps it in
-`naming._STORE_LAYOUTS` (the latest 64 roots) while `files/`'s own `lstat` identity (and, for a
-link, the directory it resolves to) and the mount-change count are unchanged, so a naming step
-costs one `lstat`, one poll and a lookup, and reads the mount table only after a change. Writers refuse an
+`naming._STORE_LAYOUTS` (the latest 64 roots) while `files/`'s own `lstat` identity (device,
+inode, mode and ctime; for a link also the device, inode and ctime of the directory it resolves
+to, so an inode reused by `rm` and `mkdir` is a new entry) and the mount-change count are
+unchanged, so a naming step costs one `lstat`, one poll and a lookup, and reads the mount table
+only after a change. Writers refuse an
 `unshared` layout in `naming_unit` with the text a collection's refusal has
 (`naming.unshared_store_problem`): no view may write into a store whose register is not where
 every view that mounts the store looks (S8). A collection resolves the layout once
-(`gc.store_snapshot`): the register, the locks, the record walk, the plan and every unlink use
-the snapshot's real paths, each existing directory held open, and `execute_plan` re-checks the
-snapshot before each prefix's deletions (`StoreSnapshot.check`: `files/` resolving elsewhere, or
-a store directory no longer the one opened, refuses), so a `files/` re-pointed during a
-collection cannot send an unlink to another store (RP). The registration memo records the register
+(`gc.store_snapshot`): the register, the locks, the record walk and the plan use the snapshot's
+real paths, and each store directory that exists at the start is held open (`anchors`); one that
+does not stays absent for the whole collection, whatever appears at its path (no listing, no
+removal: `StoreSnapshot.anchor`). The plan lists each prefix directory through a descriptor
+opened from the held store with `O_DIRECTORY | O_NOFOLLOW` and held to the end of the
+collection (`StoreSnapshot.hold_prefix`, `Doomed.prefix`), and `execute_plan` removes through
+that same descriptor (`StoreSnapshot.held_prefix`, `gc._remove_at`: every `lstat`, unlink and
+tree removal relative to it, never a path), after re-checking the snapshot before each prefix
+(`StoreSnapshot.check`: `files/` resolving elsewhere, or a store directory no longer the one
+opened, refuses). So no `files/` re-pointed and no store or prefix directory renamed aside and
+replaced (by a directory or a link) during a collection can receive a removal (RP). The
+registration memo records the register
 root and re-registers in full when it moves (a re-pointed `files/`). The register root must be
 writable by every writer; when it is not, the writer refuses and names it.
 
@@ -542,7 +551,11 @@ Entries, nonces and cache mount records are keyed per view (hostname, machine id
 namespace). An id or nonce write failure leaves an entry without them, so a collection refuses
 it but the writer preserves #503's unusable-state behavior. A register write failure refuses the
 writer. The only exception is `EROFS` on the cache: a read-only cache cannot be collected
-either. A restore that links a cache object into a workspace outside a naming unit runs after a
+either. A naming step that cannot register there names nothing by linking: the process refuses
+every symlink or hardlink into that cache (`cache.refuse_links_from`,
+`cache.refuse_unregistered_link`) until a registration there succeeds, so a view that sees a
+writable cache read-only restores copies only (copy mode), which are the project's own data.
+A restore that links a cache object into a workspace outside a naming unit runs after a
 registering unit **in the cache it restores from** (`naming.register_use(cache_root, …)`, with
 the same `cache_root` the restore reads): `checkout` and `pull` through
 `config.register_cache_use`; a skipped stage's restore in `execute_stage` (exported, so it may

@@ -424,3 +424,69 @@ def test_a_mount_that_leaves_files_the_same_directory_still_changes_its_layout(
     finally:
         subprocess.run(["sudo", "-n", "umount", str(files)], check=True)
     assert not naming.store_layout(cache_dir).unshared
+
+
+def test_a_files_link_whose_inodes_were_reused_changes_its_layout(tmp_path: pathlib.Path) -> None:
+    """The layout memo keys `files/` and the directory it links to by inode as well as ctime. The
+    store directory is removed, a directory under another parent is made until it gets the same
+    inode (ext4 hands a just-freed inode out again), and `files/` is replaced by a link to it
+    that reuses the old link's inode too. Device, inode and mode all match the memo's; the ctimes
+    do not, so the next resolution puts the register beside the new store, not the old one."""
+    cache_dir = tmp_path / "cache"
+    store = tmp_path / "a" / "store"
+    other = tmp_path / "b"
+    for directory in (cache_dir, store, other):
+        directory.mkdir(parents=True)
+    files = cache_dir / "files"
+    files.symlink_to(store)
+    assert naming.store_layout(cache_dir).register_root == store.resolve().parent
+    store_inode, link_inode = os.stat(store).st_ino, os.lstat(files).st_ino
+    store.rmdir()
+    reused: pathlib.Path | None = None
+    for attempt in range(4000):
+        candidate = other / f"s{attempt}"
+        candidate.mkdir()
+        if os.stat(candidate).st_ino == store_inode:
+            reused = candidate
+            break
+    files.unlink()
+    files.symlink_to(reused if reused is not None else other / "s0")
+    if reused is None or os.lstat(files).st_ino != link_inode:
+        pytest.skip("this filesystem did not hand the freed inodes out again")
+
+    layout = naming.store_layout(cache_dir)
+
+    assert layout.register_root == reused.resolve().parent, "the layout memo kept the old store"
+    assert layout.linked_store == reused.resolve()
+
+
+def test_a_naming_step_reuses_the_layout_it_resolved_until_files_changes(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The layout memo keeps a naming step from reading the mount table: the first step resolves
+    the cache's layout (`naming._mount_root`, counted here), the next step reuses it while nothing
+    changed, and a `files/` replaced since (another directory at its path) is resolved again."""
+    root, state_dir, cache_dir = _project(tmp_path)
+    files = cache_dir / "files"
+    files.mkdir()
+    monkeypatch.setattr(naming, "_STORE_LAYOUTS", dict[pathlib.Path, naming._KnownLayout]())
+    resolved = list[pathlib.Path]()
+    mount_root = naming._mount_root
+
+    def counted(path: pathlib.Path) -> bool:
+        resolved.append(path)
+        return mount_root(path)
+
+    monkeypatch.setattr(naming, "_mount_root", counted)
+    _unit(cache_dir, root, state_dir)
+    first = len(resolved)
+    assert first >= 1, "the first step did not resolve the layout"
+
+    _unit(cache_dir, root, state_dir)
+    _unit(cache_dir, root, state_dir)
+
+    assert len(resolved) == first, f"later steps resolved the layout again: {resolved}"
+    files.rmdir()
+    files.mkdir()
+    _unit(cache_dir, root, state_dir)
+    assert len(resolved) > first, "a replaced files/ was not resolved again"

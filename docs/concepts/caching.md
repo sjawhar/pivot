@@ -207,6 +207,11 @@ is the one exception to a register-write failure, because no collection can dele
 there. A view (a host or mount namespace) that sees a cache read-only, while another view
 writes it, does not list that cache in the project's state directory either: it can never write
 an entry there, and a collection of the project's other caches would otherwise wait for one.
+Such a view links nothing from that cache either: a collection run where the cache is writable
+cannot see the unregistered project, so it could remove an object the link names. In symlink or
+hardlink checkout the command refuses, saying to restore copies (`cache.checkout_mode: [copy]`)
+or to mount the cache read-write; in copy checkout it restores copies, which are the project's
+own data whatever a collection later removes.
 
 A collection reads every entry, and an entry is live only after the collection finds its
 project id in the project's current state directory and reads there, in its own view, the

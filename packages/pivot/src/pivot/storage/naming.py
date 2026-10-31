@@ -172,14 +172,14 @@ def store_layout(cache_root: pathlib.Path) -> StoreLayout:
     except (OSError, ValueError):
         return StoreLayout(cache_root, None, unshared=False)
     linked = stat.S_ISLNK(stats.st_mode)
-    target: tuple[int, int] | None = None
+    target: tuple[int, int, int] | None = None
     if linked:
         try:
             resolved = os.stat(files)
-            target = (resolved.st_dev, resolved.st_ino)
+            target = (resolved.st_dev, resolved.st_ino, resolved.st_ctime_ns)
         except OSError:
             target = None
-    identity = (stats.st_dev, stats.st_ino, stats.st_mode, target)
+    identity = (stats.st_dev, stats.st_ino, stats.st_mode, stats.st_ctime_ns, target)
     generation = _mount_generation()
     if (
         known is not None
@@ -206,8 +206,9 @@ def store_layout(cache_root: pathlib.Path) -> StoreLayout:
 
 class _KnownLayout(NamedTuple):
     files: str
-    # ``files/``'s (dev, inode, mode), and for a link the directory it resolves to (dev, inode).
-    identity: tuple[int, int, int, tuple[int, int] | None]
+    # ``files/``'s (dev, inode, mode, ctime), and for a link the directory it resolves to (dev,
+    # inode, ctime). The ctimes tell a new entry from one that reused a removed one's inode.
+    identity: tuple[int, int, int, int, tuple[int, int, int] | None]
     # The mount-change count (``_mount_generation``) when the layout was resolved.
     generation: int | None
     layout: StoreLayout
@@ -217,8 +218,10 @@ class _KnownLayout(NamedTuple):
 # (and, for a link, resolves to the same directory) and the mount table has not changed:
 # resolving one may read the mount table (``_mount_root``). A link replaced (``ln -sfn``) is a
 # new entry or resolves elsewhere; a link further along the path re-pointed resolves elsewhere;
-# a mount at ``files/``, on the store or at the cache root changes the count. The latest
-# ``_MAX_STORE_LAYOUTS`` cache roots are kept; another is resolved again at its next use.
+# a directory removed and another made in its place (the inode reused) has a new ctime; a mount
+# at ``files/``, on the store or at the cache root changes the count. A directory's ctime also
+# moves when an entry is added to it (a new prefix directory), which only resolves it again.
+# The latest ``_MAX_STORE_LAYOUTS`` cache roots are kept; another is resolved at its next use.
 _STORE_LAYOUTS = dict[pathlib.Path, _KnownLayout]()
 _MAX_STORE_LAYOUTS = 64
 
@@ -982,6 +985,7 @@ def register_project(
     if _registration_unchanged(key, root):
         try:
             _rotate_view_nonce(key)
+            cache.allow_links_from((cache_dir, root))
             return
         except OSError as e:
             logger.debug("Cannot rotate the view nonce in %s: %s", state_dir, e)
@@ -1044,6 +1048,7 @@ def register_project(
                 ),
             )
         _record_cache_mounts(cache_dir, layout, points)
+        cache.allow_links_from((cache_dir, root))
         if project_id is not None and state_fd is not None and register_fd is not None:
             # This view's entry without an id, written while the state directory could not
             # hold one, is superseded: the entry just written covers the same root and view.
@@ -1074,12 +1079,14 @@ def register_project(
         if isinstance(e, OSError) and e.errno == errno.EROFS:
             logger.debug("%s is on a read-only filesystem; nothing can delete there", path)
             if cache_id and not path.exists():
-                # This view cannot write the register, so it can never hold an entry there
-                # and names nothing there (another view, which can write it, registers the
-                # project). It does not list the cache either: a collection of its other
-                # caches would otherwise wait for an entry no command of this view can write.
+                # This view cannot write the register, so it can never hold an entry there.
+                # It does not list the cache either: a collection of its other caches would
+                # otherwise wait for an entry no command of this view can write.
                 with contextlib.suppress(OSError):
                     _cache_record_path(state_dir, view_key, cache_id).unlink(missing_ok=True)
+            # A collection run where the cache is writable cannot see this project, so the
+            # command names nothing there by linking (a copy is the project's own data).
+            cache.refuse_links_from(cache_dir, (cache_dir, root))
             return
         raise _unrecorded_project(cache_dir, path, e) from e
     finally:
@@ -1345,6 +1352,10 @@ def naming_unit(
         if e.errno != errno.EROFS:
             raise _unopenable_naming_lock(cache_dir, ts_path, e) from e
         logger.debug("%s is on a read-only filesystem; nothing can delete there", ts_path)
+        if project is not None:
+            # No registration either: a collection run where the cache is writable cannot see
+            # this project, so the command names nothing there by linking.
+            cache.refuse_links_from(cache_dir, (cache_dir, layout.register_root))
         yield
         return
     try:
@@ -1354,6 +1365,8 @@ def naming_unit(
         if e.errno != errno.EROFS:
             raise _unopenable_naming_lock(cache_dir, nm_path, e) from e
         logger.debug("%s is on a read-only filesystem; nothing can delete there", nm_path)
+        if project is not None:
+            cache.refuse_links_from(cache_dir, (cache_dir, layout.register_root))
         yield
         return
     locked = True

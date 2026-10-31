@@ -3236,7 +3236,7 @@ def test_cache_roots_that_use_one_object_store_share_its_register(
     its own, so A's collection of C1 read only A and removed B's objects. Both now keep one
     register and one lock beside the store, and A's collection reads B too. It keeps B's
     directory output, whose symlink checkout links a tree, and removes only what no record
-    names. A stage's commit puts the tree beside the store (`gc.tree_roots`); a command given
+    names. A stage's commit puts the tree beside the store (`gc.StoreSnapshot.trees`); a command given
     C2's unresolved `files/` (a `kind: cache` store, a restore) puts it under C2 itself, which
     the test makes by hand: a link there still names the tree's key (`gc._tree_of_store`)."""
     if layout.startswith("two links"):
@@ -3411,6 +3411,220 @@ def test_a_collection_refuses_when_its_store_moves_while_it_runs(
     assert "Refusing to go on collecting" in flat, flat
     assert q_object.exists(), f"the collection removed Q's object from the other store: {flat}"
     assert p_object.exists(), f"the collection removed an object after its store moved: {flat}"
+
+
+# Loaded through PYTHONPATH into `pivot gc`: pauses it right after its first snapshot check in
+# `execute_plan` (the check before a prefix's removals) until the test writes `go`.
+_CHECK_HOOK = """\
+import os
+import pathlib
+import time
+
+_gate = os.environ.get("GC_TEST_CHECK_GATE")
+if _gate:
+    from pivot.storage import gc as _gc
+
+    _original = _gc.StoreSnapshot.check
+    _paused = []
+
+    def _held(self):
+        _original(self)
+        if not _paused:
+            _paused.append(True)
+            pathlib.Path(_gate, "paused").write_text("")
+            deadline = time.monotonic() + 120
+            while not pathlib.Path(_gate, "go").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+
+    _gc.StoreSnapshot.check = _held
+"""
+
+
+@pytest.mark.parametrize(
+    "replaced", ["store directory", "prefix directory", "prefix link", "prefix bind mount"]
+)
+def test_a_directory_replaced_after_the_check_never_receives_a_removal(
+    tmp_path: pathlib.Path, replaced: str
+) -> None:
+    """RP, the windows after the plan: P's `pivot gc` through R (`files/` → S1) passes its
+    snapshot check before a prefix's removals and pauses. Then S1's store directory is renamed
+    and S2's (whose project Q names K) put at its path; or S1's prefix directory of K is renamed
+    aside and S2's moved to its name; or it is renamed aside and replaced by a link to S2's; or
+    S2's prefix directory is bind-mounted over it. Removals through paths reached Q's K. They now
+    go through the prefix directory the plan listed, opened from the held store and held since:
+    the collection removes P's dead K from the directory it listed, wherever that now is or
+    whatever covers it, and Q's K stays."""
+    if (
+        replaced == "prefix bind mount"
+        and subprocess.run(["sudo", "-n", "true"], capture_output=True, check=False).returncode
+    ):
+        pytest.skip("a bind mount needs passwordless sudo")
+    s1, s2 = tmp_path / "d1" / "store", tmp_path / "d2" / "store"
+    r, r2 = tmp_path / "r", tmp_path / "r2"
+    for directory in (s1, s2, r, r2):
+        directory.mkdir(parents=True)
+    (r / "files").symlink_to(s1)
+    (r2 / "files").symlink_to(s2)
+    p = _shared_project(tmp_path / "P", r, "copy")
+    _use_cache(p, r, retention=1)
+    q = _shared_project(tmp_path / "Q", r2, "copy")
+    for root in (p, q):
+        (root / "data" / "raw" / "input.txt").write_text("the same text in both stores\n")
+        _ok(_run(root, "repro"))
+    key = cache.hash_file(q / "data" / "shadow" / "shout.txt")[0]
+    (p / "data" / "raw" / "input.txt").write_text("P moved on\n")
+    _ok(_run(p, "repro"))
+    assert cache.get_cache_path(s1, key).exists() and cache.get_cache_path(s2, key).exists()
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_CHECK_HOOK)
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    proc = _start(
+        p,
+        "gc",
+        "--yes",
+        "--grace-hours",
+        "0",
+        env=_env(PYTHONPATH=str(hook), GC_TEST_CHECK_GATE=str(gate)),
+    )
+    prefix = key[:2]
+    aside = s1.parent / f"{prefix}-before"
+    try:
+        _wait_for(gate / "paused", proc, timeout=120)
+        if replaced == "store directory":
+            s1.rename(s1.with_name("store-before"))
+            s2.rename(s1)
+            p_object = cache.get_cache_path(s1.with_name("store-before"), key)
+            q_object = cache.get_cache_path(s1, key)
+        elif replaced == "prefix directory":
+            (s1 / prefix).rename(aside)
+            (s2 / prefix).rename(s1 / prefix)
+            p_object = aside / key[2:]
+            q_object = cache.get_cache_path(s1, key)
+        elif replaced == "prefix link":
+            (s1 / prefix).rename(aside)
+            (s1 / prefix).symlink_to(s2 / prefix)
+            p_object = aside / key[2:]
+            q_object = cache.get_cache_path(s2, key)
+        else:
+            subprocess.run(
+                ["sudo", "-n", "mount", "--bind", str(s2 / prefix), str(s1 / prefix)], check=True
+            )
+            p_object = cache.get_cache_path(s1, key)  # Q's K shows here while the mount holds
+            q_object = cache.get_cache_path(s2, key)
+        assert q_object.exists() and p_object.exists()
+        (gate / "go").write_text("")
+        out, _ = proc.communicate(timeout=180)
+    except BaseException:
+        proc.kill()
+        raise
+    finally:
+        if replaced == "prefix bind mount":
+            subprocess.run(["sudo", "-n", "umount", str(s1 / prefix)], check=False)
+
+    flat = " ".join(out.split())
+    assert q_object.exists(), f"the collection removed Q's object through a replaced path: {flat}"
+    assert proc.returncode == 0, flat
+    assert not p_object.exists(), (
+        f"P's dead object was not removed where the plan listed it: {flat}"
+    )
+
+
+def test_a_tree_store_that_appears_during_a_collection_is_never_read(
+    tmp_path: pathlib.Path,
+) -> None:
+    """RP (c): R's `files/` links store S1 (project P, copy checkout), so its tree store
+    (beside S1) does not exist when P's `pivot gc` starts. The collection pauses before its plan,
+    and the tree store appears as a link to another cache's `trees/`, where project Q's
+    directory output (symlink checkout) lives. A store absent at the start stays absent for the
+    whole collection: it lists nothing there, and Q's tree stays."""
+    s1 = tmp_path / "d1" / "store"
+    r, qc = tmp_path / "r", tmp_path / "q-cache"
+    for directory in (s1, r):
+        directory.mkdir(parents=True)
+    (r / "files").symlink_to(s1)
+    p = _shared_project(tmp_path / "P", r, "copy")
+    _ok(_run(p, "repro"))
+    q = _shared_project(tmp_path / "Q", qc, "symlink")
+    (q / "pipeline.py").write_text(_DIRECTORY_PIPELINE)
+    (q / "data" / "raw" / "input.txt").write_text("only Q has this tree\n")
+    _ok(_run(q, "repro"))
+    q_tree = (q / "data" / "shadow" / "split").resolve()
+    assert q_tree.is_relative_to(qc.resolve() / "trees"), q_tree
+    assert not (s1.parent / "trees").exists() and not (r / "trees").exists()
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_PLAN_HOOK)
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    proc = _start(
+        p,
+        "gc",
+        "--yes",
+        "--grace-hours",
+        "0",
+        env=_env(PYTHONPATH=str(hook), GC_TEST_PLAN_GATE=str(gate), GC_TEST_PAUSE_AT="build_plan"),
+    )
+    try:
+        _wait_for(gate / "paused", proc, timeout=120)
+        (s1.parent / "trees").symlink_to(qc / "trees")
+        (gate / "go").write_text("")
+        out, _ = proc.communicate(timeout=180)
+    except BaseException:
+        proc.kill()
+        raise
+
+    flat = " ".join(out.split())
+    assert proc.returncode == 0, flat
+    assert q_tree.is_dir(), f"the collection removed Q's tree through a store that appeared: {flat}"
+    assert (q / "data" / "shadow" / "split" / "a.txt").read_text(), "Q's output no longer resolves"
+
+
+@pytest.mark.parametrize("checkout", ["symlink", "copy"])
+def test_a_view_that_sees_the_cache_read_only_never_links_from_it(
+    tmp_path: pathlib.Path, checkout: str
+) -> None:
+    """A container given the shared cache H read-only: its project Q (never run on the host)
+    tracks X, an object P put in H and no longer names. Q's `pivot checkout` there cannot
+    register Q in H, so a link would name X where the host's `pivot gc` cannot see it, and that
+    gc removes X. In link mode the checkout refuses, naming copy mode and a read-write mount, and
+    links nothing. In copy mode it restores a copy, which is Q's own data: the host's gc may then
+    remove X, and Q's file still reads."""
+    shared = tmp_path / "H"
+    p = _shared_project(tmp_path / "P", shared, "symlink")
+    notes = p / "data" / "notes.bin"
+    notes.write_text("notes v1\n")
+    _ok(_run(p, "track", "data/notes.bin"))
+    record = p / "data" / "notes.bin.pvt"
+    x = _tracked_object(record, shared)
+    q = _shared_project(tmp_path / "Q", shared, checkout)
+    (q / "data" / "notes.bin.pvt").write_text(record.read_text())
+    notes.unlink()
+    notes.write_text("notes v2\n")
+    _ok(_run(p, "track", "--force", "data/notes.bin"))
+    assert x.exists()
+    read_only = (
+        f"mount --bind {shlex.quote(str(shared))} {shlex.quote(str(shared))}\n"
+        + f"mount -o remount,ro,bind {shlex.quote(str(shared))}"
+    )
+
+    restored = _in_view(q, "checkout", setup=read_only)
+
+    flat = " ".join((restored.stdout + restored.stderr).split())
+    q_notes = q / "data" / "notes.bin"
+    if checkout == "symlink":
+        assert restored.returncode != 0, flat
+        assert "Refusing to link" in flat and "cache.checkout_mode to [copy]" in flat, flat
+        assert "mount the cache read-write" in flat, flat
+        assert not q_notes.is_symlink(), f"Q linked X from a cache it is not registered in: {flat}"
+    else:
+        assert restored.returncode == 0, flat
+        assert not q_notes.is_symlink() and q_notes.read_text() == "notes v1\n", flat
+    collected = _run(p, "gc", "--yes", "--grace-hours", "0")
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    if checkout == "copy":
+        assert q_notes.read_text() == "notes v1\n", "Q's copy no longer reads after the host's gc"
 
 
 def test_a_collection_lists_the_trees_under_its_own_cache_root(tmp_path: pathlib.Path) -> None:
