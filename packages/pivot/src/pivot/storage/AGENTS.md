@@ -559,10 +559,13 @@ Entries, nonces and cache mount records are keyed per view (hostname, machine id
 namespace). An id or nonce write failure leaves an entry without them, so a collection refuses
 it but the writer preserves #503's unusable-state behavior. A register write failure refuses the
 writer. The only exception is `EROFS` on the cache: a read-only cache cannot be collected
-either. A naming step that cannot register there names nothing by linking: the process refuses
-every symlink or hardlink into that cache (`cache.refuse_links_from`,
-`cache.refuse_unregistered_link`) until a registration there succeeds, so a view that sees a
-writable cache read-only restores copies only (copy mode), which are the project's own data.
+either. A naming step that cannot register there names nothing by linking: the process makes
+no symlink or hardlink into that cache (`cache.refuse_links_from`, `cache.links_refused`) until
+a registration there succeeds. A restore or commit whose checkout modes include copy copies
+instead (`_checkout_with_fallback`; the whole-tree symlink branches of `_store_directory` and
+`_restore_directory_from_cache` step aside to it), so the default order works in a view that
+sees a writable cache read-only; with no copy among the modes it refuses
+(`cache.refuse_unregistered_link`).
 A restore that links a cache object into a workspace outside a naming unit runs after a
 registering unit **in the cache it restores from** (`naming.register_use(cache_root, …)`, with
 the same `cache_root` the restore reads): `checkout` and `pull` through

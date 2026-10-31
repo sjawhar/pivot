@@ -1166,10 +1166,11 @@ FALLBACK_ERRNO = _NO_HARDLINK_ERRNO | {errno.EXDEV, errno.EACCES}
 # the cache's filesystem is read-only here (``naming.register_project``), by real path, to the
 # cache root as configured. Nothing is linked from them: that cache's collection, run where it
 # is writable, reads only its register, so it cannot see this project's links
-# (``refuse_unregistered_link``). The refusal is per cache: one cache's never touches another,
-# and the next registration that succeeds in that cache lifts it (``allow_links_from``), so a
-# long-lived process that gains write access lifts it at its next naming unit there, which every
-# path that links takes before it links.
+# (``links_refused``). A checkout copies instead when COPY is among its modes and refuses
+# otherwise (``_checkout_with_fallback``). The refusal is per cache: one cache's never touches
+# another, and the next registration that succeeds in that cache lifts it
+# (``allow_links_from``), so a long-lived process that gains write access lifts it at its next
+# naming unit there, which every path that links takes before it links.
 _UNREGISTERED_ROOTS = dict[str, str]()
 
 
@@ -1187,29 +1188,43 @@ def allow_links_from(roots: Iterable[pathlib.Path]) -> None:
             _ = _UNREGISTERED_ROOTS.pop(os.path.realpath(root), None)
 
 
+def links_refused(target: pathlib.Path | str) -> bool:
+    """Whether ``target``, a cache object or tree, is in a cache this process could not register
+    its project in, so that no link to it may be made (``refuse_unregistered_link``)."""
+    if not _UNREGISTERED_ROOTS:
+        return False
+    real = os.path.realpath(target)
+    return any(real == root or real.startswith(root + os.sep) for root in _UNREGISTERED_ROOTS)
+
+
 def refuse_unregistered_link(target: pathlib.Path | str, link: pathlib.Path) -> None:
     """Refuse to make ``link`` a link (a symlink or a hardlink) to ``target``, a cache object
     or tree, when ``target`` is in a cache this process could not register its project in.
 
     A copy is the project's own data and needs no registration; a link names the object, and
-    a collection of that cache, which cannot see an unregistered project, would remove it.
+    a collection of that cache, which cannot see an unregistered project, would remove it. A
+    restore or commit whose checkout modes include COPY copies instead
+    (``_checkout_with_fallback``); this refuses only where COPY is not among them.
 
     Raises:
         exceptions.CacheError: ``target`` is in such a cache.
     """
-    if not _UNREGISTERED_ROOTS:
+    if not links_refused(target):
         return
     real = os.path.realpath(target)
-    for root, cache_root in _UNREGISTERED_ROOTS.items():
-        if real == root or real.startswith(root + os.sep):
-            raise exceptions.CacheError(
-                f"Refusing to link {link} to {target}: this command could not register the "
-                + f"project in the cache {cache_root}, whose filesystem is read-only here, so a "
-                + "`pivot gc` of that cache, run where it is writable, cannot see that this "
-                + "project uses the object and may remove it; a symlink and a hardlink both "
-                + "name it. Restore copies instead: set `cache.checkout_mode: [copy]` (a copy is "
-                + "this project's own data), or mount the cache read-write."
-            )
+    cache_root = next(
+        cache_root
+        for root, cache_root in _UNREGISTERED_ROOTS.items()
+        if real == root or real.startswith(root + os.sep)
+    )
+    raise exceptions.CacheError(
+        f"Refusing to link {link} to {target}: this command could not register the "
+        + f"project in the cache {cache_root}, whose filesystem is read-only here, so a "
+        + "`pivot gc` of that cache, run where it is writable, cannot see that this "
+        + "project uses the object and may remove it; a symlink and a hardlink both "
+        + "name it. Restore copies instead: set `cache.checkout_mode: [copy]` (or add copy "
+        + "to the list; a copy is this project's own data), or mount the cache read-write."
+    )
 
 
 def _object_realpath(cache_path: pathlib.Path, cache_root: CacheRoot | None) -> str:
@@ -1253,10 +1268,8 @@ def _stage_checkout(
     reached and the cache-object check settles it from its text (``_resolve_link``).
     """
     if checkout_mode == CheckoutMode.SYMLINK:
-        refuse_unregistered_link(cache_path, tmp_path)
         tmp_path.symlink_to(_object_realpath(cache_path, cache_root))
     elif checkout_mode == CheckoutMode.HARDLINK:
-        refuse_unregistered_link(cache_path, tmp_path)
         os.link(cache_path, tmp_path)
     else:
         shutil.copy2(cache_path, tmp_path)
@@ -1718,12 +1731,23 @@ def _checkout_with_fallback(
     restoring many files: a symlink then names the object's real path without resolving it per
     file (``_object_realpath``). None resolves it.
 
+    A cache this process could not register its project in (its filesystem is read-only here,
+    ``links_refused``) gets no link: a link would name its object where that cache's collection
+    cannot see the project. Its HARDLINK and SYMLINK modes are skipped when COPY is among the
+    modes, so the default order copies; with no COPY, the link is refused
+    (``refuse_unregistered_link``).
+
     Returns:
         What ``path`` holds, stat'd before it was renamed there (``_checkout_from_cache``).
     """
     if not checkout_modes:
         raise ValueError("checkout_modes cannot be empty")
     display = display_path if display_path is not None else path
+    if links_refused(cache_path):
+        if CheckoutMode.COPY not in checkout_modes:
+            refuse_unregistered_link(cache_path, display)
+        logger.debug(f"{cache_path} is in a cache this project is not registered in; copying")
+        checkout_modes = [CheckoutMode.COPY]
     for i, mode in enumerate(checkout_modes):
         is_last = i == len(checkout_modes) - 1
         if keep_existing_copy and mode == CheckoutMode.COPY and path.exists():
@@ -2021,9 +2045,16 @@ def _store_directory(
     listing.store_object(cache_dir, hashed["record"]["hash"], hashed["data"])
 
     with restore_lock(path, state_dir) as lock_token:
-        if checkout_modes and checkout_modes[0] == CheckoutMode.SYMLINK:
+        cache_dir_path = tree_path(cache_dir, hashed["record"]["hash"])
+        # A cache this process could not register in gets no link; with COPY among the modes the
+        # files stay copies, one by one (``_checkout_with_fallback``).
+        whole_tree = (
+            bool(checkout_modes)
+            and checkout_modes[0] == CheckoutMode.SYMLINK
+            and not (links_refused(cache_dir_path) and CheckoutMode.COPY in checkout_modes)
+        )
+        if whole_tree:
             # SYMLINK mode: cache entire directory, symlink to it
-            cache_dir_path = tree_path(cache_dir, hashed["record"]["hash"])
             if not cache_dir_path.exists():
                 _publish_tree(path, cache_dir_path, members, cache_dir)
 
@@ -2284,7 +2315,13 @@ def _restore_directory_from_cache(
     """Restore a directory atomically. ``recorded`` is as ``restore_from_cache`` says: each
     file's stat is taken in the tree or staging directory, before the swap puts it in place."""
     cache_dir_path = resolve_cache_tree_path(cache_dir, output_hash["hash"])
-    symlink_fast_path = checkout_modes[0] == CheckoutMode.SYMLINK and cache_dir_path is not None
+    # A cache this process could not register in gets no link: with COPY among the modes the
+    # restore copies file by file (``_checkout_with_fallback``); without it, the fast path refuses.
+    symlink_fast_path = (
+        checkout_modes[0] == CheckoutMode.SYMLINK
+        and cache_dir_path is not None
+        and not (links_refused(cache_dir_path) and CheckoutMode.COPY in checkout_modes)
+    )
     if not symlink_fast_path:
         for entry in members["files"]:
             if resolve_cache_object_path(cache_dir, entry["hash"]) is None:

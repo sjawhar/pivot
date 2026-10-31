@@ -3677,8 +3677,25 @@ def _files_under(target: pathlib.Path) -> list[pathlib.Path]:
     return sorted(path for path in target.rglob("*") if not path.is_dir())
 
 
+# A checkout list by name: "default" is no `cache.checkout_mode`, so pivot's default order,
+# hardlink then symlink then copy; "symlink+copy" starts with a whole-directory symlink.
+_CHECKOUT_LISTS = {
+    "symlink": ["symlink"],
+    "hardlink": ["hardlink"],
+    "copy": ["copy"],
+    "default": [],
+    "symlink+copy": ["symlink", "copy"],
+}
+
+
+def _cache_config(shared: pathlib.Path, checkout: str, extra: str = "") -> str:
+    """A project config caching into ``shared`` with the named checkout list (``_CHECKOUT_LISTS``)."""
+    modes = "".join(f"  - {mode}\n" for mode in _CHECKOUT_LISTS[checkout])
+    return f"cache:\n  dir: {shared}\n" + (f"  checkout_mode:\n{modes}" if modes else "") + extra
+
+
 @pytest.mark.parametrize("kind", ["file", "directory"])
-@pytest.mark.parametrize("checkout", ["symlink", "hardlink", "copy"])
+@pytest.mark.parametrize("checkout", list(_CHECKOUT_LISTS))
 @pytest.mark.parametrize("view", ["read-only", "writable"])
 def test_a_view_that_sees_the_cache_read_only_never_links_from_it(
     tmp_path: pathlib.Path, view: str, checkout: str, kind: str
@@ -3686,14 +3703,16 @@ def test_a_view_that_sees_the_cache_read_only_never_links_from_it(
     """B3: P tracks X (a file, or a directory) in the shared cache H, then tracks other bytes
     there, so nothing of P's names X. Q (never run on the host) holds P's old `.pvt` and runs
     `pivot checkout`. Where H is read-only Q cannot register in H, so a link would name X where
-    the host's `pivot gc` cannot see it: in symlink and hardlink checkout the command refuses,
-    naming `cache.checkout_mode: [copy]` and a read-write mount, and links nothing; in copy
-    checkout it restores copies, Q's own data, which still read after P's gc. The control: where
+    the host's `pivot gc` cannot see it. With copy among the checkout modes (pivot's default
+    order, `[symlink, copy]`, `[copy]`) the checkout falls back to copies, Q's own data, which
+    still read after P's gc. With no copy (`[symlink]`, `[hardlink]`) it refuses, naming
+    `cache.checkout_mode: [copy]` and a read-write mount, and links nothing. The control: where
     H is writable Q registers, links (or copies) in any mode, and after P's gc X is still in H
     and Q's files read."""
     shared = tmp_path / "H"
     p = _shared_project(tmp_path / "P", shared, "symlink")
-    q = _shared_project(tmp_path / "Q", shared, checkout)
+    q = _project(tmp_path / "Q")
+    (q / ".pivot" / "config.yaml").write_text(_cache_config(shared, checkout))
     if kind == "file":
         name = "data/notes.bin"
         (p / name).write_text("notes v1\n")
@@ -3725,8 +3744,9 @@ def test_a_view_that_sees_the_cache_read_only_never_links_from_it(
 
     flat = " ".join((restored.stdout + restored.stderr).split())
     target = q / name
-    linked = view == "read-only" and checkout != "copy"
-    if linked:
+    # The lists with no copy, the only ones a read-only view refuses.
+    refused = view == "read-only" and checkout in ("symlink", "hardlink")
+    if refused:
         assert restored.returncode != 0, flat
         assert "Refusing to link" in flat and "`cache.checkout_mode: [copy]`" in flat, flat
         assert "mount the cache read-write" in flat, flat
@@ -3736,35 +3756,49 @@ def test_a_view_that_sees_the_cache_read_only_never_links_from_it(
     else:
         assert restored.returncode == 0, flat
         assert {path.relative_to(q): path.read_bytes() for path in _files_under(target)} == v1
+        if view == "read-only":
+            assert not target.is_symlink(), (
+                f"Q linked X from a cache it is not registered in: {flat}"
+            )
+            for path in _files_under(target):
+                assert not path.is_symlink() and path.stat().st_nlink == 1, (
+                    f"{path} is a link, not a copy: {flat}"
+                )
     collected = _run(p, "gc", "--yes", "--grace-hours", "0")
     assert collected.returncode == 0, collected.stdout + collected.stderr
     if view == "writable":
         assert all(cache.get_cache_path(shared / "files", key).exists() for key in keys), (
             f"P's gc removed X, which the registered Q names: {collected.stdout}"
         )
-    if not linked:
+    else:
+        assert not any(cache.get_cache_path(shared / "files", key).exists() for key in keys), (
+            f"P's gc kept X, which no registered project names: {collected.stdout}"
+        )
+    if not refused:
         assert {path.relative_to(q): path.read_bytes() for path in _files_under(target)} == v1, (
             "Q's files no longer read after P's gc"
         )
 
 
+@pytest.mark.parametrize("checkout", ["symlink", "symlink+copy", "default"])
 def test_a_directory_commit_from_a_read_only_view_never_links_the_tree(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, checkout: str
 ) -> None:
     """B3': P (symlink checkout, one run of history) commits the directory output of v1, tree
     T1, then v2, so nothing of P's names T1 once a collection prunes the v1 row. Q, a project
     with the same pipeline at v1 that never ran, runs `pivot repro` where the cache H is
     read-only: its commit found T1 in the cache and linked its output to it with Q unregistered,
-    and P's `pivot gc` then removed T1 under Q's link. The commit now refuses before it removes
-    the output, which stays as the stage wrote it, and Q's files still read after P's gc."""
+    and P's `pivot gc` then removed T1 under Q's link. With `[symlink]` the commit now refuses
+    before it removes the output; with copy among the modes (`[symlink, copy]`, pivot's default
+    order) it keeps the output's files as copies and succeeds. Either way the output stays a
+    directory of plain files, and they still read after P's gc."""
     shared = tmp_path / "H"
     p = _shared_project(tmp_path / "P", shared, "symlink")
-    q = _shared_project(tmp_path / "Q", shared, "symlink")
+    q = _project(tmp_path / "Q")
+    retention = "core:\n  run_history_retention: 1\n"
+    (p / ".pivot" / "config.yaml").write_text(_cache_config(shared, "symlink", retention))
+    (q / ".pivot" / "config.yaml").write_text(_cache_config(shared, checkout, retention))
     for root in (p, q):
-        (root / ".pivot" / "config.yaml").write_text(
-            f"cache:\n  dir: {shared}\n  checkout_mode:\n  - symlink\n"
-            + "core:\n  run_history_retention: 1\n"
-        )
         (root / "pipeline.py").write_text(_DIRECTORY_PIPELINE)
         (root / "data" / "raw" / "input.txt").write_text("v1 both projects\n")
     _ok(_run(p, "repro"))
@@ -3777,13 +3811,65 @@ def test_a_directory_commit_from_a_read_only_view_never_links_the_tree(
 
     flat = " ".join((ran.stdout + ran.stderr).split())
     split = q / "data" / "shadow" / "split"
-    assert ran.returncode != 0, flat
-    assert "Refusing to link" in flat and "mount the cache read-write" in flat, flat
+    if checkout == "symlink":
+        assert ran.returncode != 0, flat
+        assert "Refusing to link" in flat and "mount the cache read-write" in flat, flat
+    else:
+        assert ran.returncode == 0, flat
     assert not split.is_symlink(), f"Q's output was linked to T1 while Q is unregistered: {flat}"
+    for path in _files_under(split):
+        assert not path.is_symlink() and path.stat().st_nlink == 1, f"{path} is a link: {flat}"
     assert (split / "a.txt").read_text() == "v1 both projects\n", flat
     collected = _run(p, "gc", "--yes", "--grace-hours", "0")
     assert collected.returncode == 0, collected.stdout + collected.stderr
     assert (split / "a.txt").read_text() == "v1 both projects\n", "Q's output no longer reads"
+
+
+@pytest.mark.parametrize("checkout", ["symlink", "symlink+copy"])
+def test_a_directory_restore_from_a_read_only_view_never_links_the_tree(
+    tmp_path: pathlib.Path, checkout: str
+) -> None:
+    """A directory restore whose tree is in the cache (`pivot track` publishes none, so the B3
+    test never reaches it): P (symlink checkout, one run of history) commits the directory output
+    of v1, tree T1, then v2. Q holds P's v1 stage lock and runs `pivot checkout` where the cache H
+    is read-only, so the restore finds T1 complete and would link the output to it whole. With
+    `[symlink]` it refuses and links nothing; with `[symlink, copy]` it restores the output file
+    by file as copies. P's gc then removes T1, which nothing registered names, and Q's copies
+    still read."""
+    shared = tmp_path / "H"
+    p = _shared_project(tmp_path / "P", shared, "symlink")
+    q = _project(tmp_path / "Q")
+    retention = "core:\n  run_history_retention: 1\n"
+    (p / ".pivot" / "config.yaml").write_text(_cache_config(shared, "symlink", retention))
+    (q / ".pivot" / "config.yaml").write_text(_cache_config(shared, checkout, retention))
+    for root in (p, q):
+        (root / "pipeline.py").write_text(_DIRECTORY_PIPELINE)
+        (root / "data" / "raw" / "input.txt").write_text("v1 both projects\n")
+    _ok(_run(p, "repro"))
+    t1 = (p / "data" / "shadow" / "split").resolve()
+    assert t1.is_relative_to(shared.resolve() / "trees"), t1
+    shutil.copytree(p / ".pivot" / "stages", q / ".pivot" / "stages", dirs_exist_ok=True)
+    (p / "data" / "raw" / "input.txt").write_text("v2 only P\n")
+    _ok(_run(p, "repro"))
+
+    restored = _in_view(q, "checkout", setup=_read_only_view(shared))
+
+    flat = " ".join((restored.stdout + restored.stderr).split())
+    split = q / "data" / "shadow" / "split"
+    assert not split.is_symlink(), f"Q's output was linked to T1 while Q is unregistered: {flat}"
+    if checkout == "symlink":
+        assert restored.returncode != 0, flat
+        assert "Refusing to link" in flat and "mount the cache read-write" in flat, flat
+        assert not split.exists(), flat
+        return
+    assert restored.returncode == 0, flat
+    for path in _files_under(split):
+        assert not path.is_symlink() and path.stat().st_nlink == 1, f"{path} is a link: {flat}"
+    assert (split / "a.txt").read_text() == "v1 both projects\n", flat
+    collected = _run(p, "gc", "--yes", "--grace-hours", "0")
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert not t1.exists(), f"P's gc kept T1, which nothing registered names: {collected.stdout}"
+    assert (split / "a.txt").read_text() == "v1 both projects\n", "Q's copies no longer read"
 
 
 def test_a_directory_track_from_a_read_only_view_links_nothing(tmp_path: pathlib.Path) -> None:
