@@ -16,6 +16,7 @@ import math
 import os
 import pathlib
 import random
+import signal
 import subprocess
 import sys
 import time
@@ -2224,6 +2225,68 @@ def test_a_loader_walks_what_each_form_of_self_reaches(loader_class: type, expec
     reached = {ref for ref, _member in fingerprint._reachable_loader_members(loader_class)}
 
     assert reached == expected
+
+
+def _loop_wrapped(function: typing.Callable[..., str]) -> typing.Callable[..., str]:
+    """A decorator that makes the function its own `__wrapped__`: a chain that loops."""
+    function.__wrapped__ = function  # pyright: ignore[reportFunctionMemberAccess] - the loop is the point
+    return function
+
+
+@dataclasses.dataclass(frozen=True)
+class _LoopWrappedHelper(loaders.Reader[str]):
+    @_loop_wrapped
+    def helper(self, text: str) -> str:
+        return text + "A"
+
+    def load(self, path: pathlib.Path) -> str:
+        return self.helper(path.read_text())
+
+
+@dataclasses.dataclass(frozen=True)
+class _LoopWrappedLoad(loaders.Reader[str]):
+    @_loop_wrapped
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text()
+
+
+def _raise_timeout(signum: int, frame: object) -> None:
+    raise TimeoutError("the walk did not end")
+
+
+@pytest.mark.parametrize(
+    ("loader", "name"),
+    [
+        pytest.param(_LoopWrappedHelper(), "_LoopWrappedHelper.helper", id="reached-helper"),
+        pytest.param(_LoopWrappedLoad(), "_LoopWrappedLoad.load", id="load"),
+    ],
+)
+def test_a_wrapped_chain_that_loops_is_refused_not_followed_forever(loader: object, name: str):
+    """`load`, or a helper it reaches, is its own `__wrapped__`. The walk refuses the loader,
+    naming that function, within 10 seconds (an alarm turns a hang into a `TimeoutError`)."""
+    previous = signal.signal(signal.SIGALRM, _raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, 10)
+    try:
+        with pytest.raises(exceptions.StageDefinitionError) as refused:
+            fingerprint.get_loader_fingerprint(loader)  # pyright: ignore[reportArgumentType]
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+    assert f"'{name}' has a `__wrapped__` chain that loops" in str(refused.value)
+
+
+def test_each_stage_of_a_pass_whose_loader_reaches_a_looped_helper_is_refused():
+    """Two stages of one fingerprint pass read the loader whose `load` reaches a helper that is
+    its own `__wrapped__`. The pass shares the member walk (`_memoized`), and each stage is
+    refused, the second from the shared walk too."""
+    with fingerprint.fingerprint_pass():
+        for stage_name in ("t/first", "t/second"):
+            with (
+                pytest.raises(exceptions.StageDefinitionError, match="helper' has a `__wrapped__`"),
+                fingerprint.stage_fingerprint_scope(stage_name),
+            ):
+                fingerprint.get_loader_fingerprint(_LoopWrappedHelper())
 
 
 def test_a_class_constant_load_reads_is_recorded_as_a_value():

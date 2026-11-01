@@ -2092,6 +2092,45 @@ def test_an_edit_to_a_member_load_reaches_reruns_its_stage(
     _assert_an_edit_reruns_once(project, tmp_path / "home", "inner.py")
 
 
+_CYCLE = "def cycle(function):\n    function.__wrapped__ = function\n    return function\n"
+
+# A loader whose `load`, or a helper `load` reaches, is its own `__wrapped__`: (the inner.py
+# text, the function the refusal names).
+_LOOP_WRAPPED = {
+    "reached-helper": (
+        _REACHED_MEMBER.replace("HELPERS", _CYCLE)
+        .replace("MEMBERS", '    @cycle\n    def _suffix(self) -> str:\n        return "A"\n')
+        .replace("READ", "self._suffix()"),
+        "Inner._suffix",
+    ),
+    "load": (
+        _REACHED_MEMBER.replace("HELPERS", _CYCLE)
+        .replace("MEMBERS", "")
+        .replace("READ", '""')
+        .replace("    def load(", "    @cycle\n    def load("),
+        "Inner.load",
+    ),
+}
+
+
+@pytest.mark.parametrize("looped", sorted(_LOOP_WRAPPED))
+def test_a_loader_method_whose_wrapped_chain_loops_is_refused(
+    tmp_path: pathlib.Path, looped: str
+) -> None:
+    """`Inner.load`, or `_suffix`, which `load` reaches, is its own `__wrapped__` (its decorator
+    sets it). `pivot repro` refuses the stage, naming that function, and ends
+    (`helpers.run_pivot` stops a run after 300 seconds)."""
+    inner, name = _LOOP_WRAPPED[looped]
+    project = _project(
+        tmp_path, {"inner.py": inner, "pipeline.py": _HELD_INSTANCE_HEADER + _held_stage("Inner()")}
+    )
+
+    result = helpers.run_pivot(project, tmp_path / "home", "repro")
+
+    assert result.returncode != 0, result.stdout
+    assert f"'{name}' has a `__wrapped__` chain that loops" in result.stdout + result.stderr
+
+
 _ROW_FACTORY = """\
 import collections
 

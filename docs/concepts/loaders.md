@@ -158,7 +158,8 @@ builtin such as `str(self)` that runs `__str__`), so an edit to any of them
 re-runs the stages that use it. A method nothing reaches is not part of the
 fingerprint, unless your code uses `self` in a way Pivot cannot follow (passes
 it to a function, or applies an operator to it); then every method of the
-class is. A field
+class is. A reached method whose decorator makes it its own `__wrapped__` is
+refused, because Pivot cannot find the code it runs. A field
 can hold another loader (`Outer(Inner())`, a tuple of loaders, or a dataclass
 that holds one): Pivot fingerprints the held loader as it fingerprints a loader
 you pass directly, so an edit to `Inner.load` re-runs the stages that read

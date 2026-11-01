@@ -2269,9 +2269,12 @@ def _loader_class_entries(loader_type: type[Any]) -> dict[str, str]:
     # Import here to avoid circular import
     from pivot import loaders as loaders_module
 
+    # A method whose `__wrapped__` chain loops is refused by `_reachable_loader_members` and
+    # not walked here: the walk reads the source at the chain's end, and `unwrap` raises at the
+    # loop. Its hash below reads only its own bytecode (`hash_function_ast` of a wrapper).
     for method_name in _LOADER_METHODS:
         method = _user_defined_method(loader_type, method_name)
-        if method is not None:
+        if method is not None and not _wrapper_loops(method):
             _process_callable_dependency(f"{class_name}.{method_name}", method, manifest, visited)
     stage_name = _current_stage_name.get() or loader_type.__qualname__
     for binding_ref, member in _reachable_loader_members(loader_type):
@@ -2535,10 +2538,11 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
     member of the class is walked (`_all_loader_members`).
     """
 
-    def collect() -> list[tuple[str, Any]]:
+    def collect() -> tuple[list[tuple[str, Any]], list[str]]:
         mro = loader_type.__mro__
         fields = _dataclass_field_names(loader_type)
         found = list[tuple[str, Any]]()
+        looped = list[str]()
         seen = set[tuple[int, str]]()
         work = list[tuple[Any, type, bool]]()  # a function, its class, whether it takes self
         for name in _LOADER_METHODS:
@@ -2549,7 +2553,10 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
             seen.add((id(owner), name))
             function = getattr(raw, "__func__", raw)
             if inspect.isfunction(function):
-                work.extend(_member_functions(function, owner, raw))
+                if _wrapper_loops(function):
+                    looped.append(function.__qualname__)
+                else:
+                    work.extend(_member_functions(function, owner, raw))
         while work:
             function, defined_in, takes_self = work.pop()
             tree = _source_tree(function)
@@ -2557,7 +2564,7 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
                 continue
             reads, dynamic = _member_reads(tree, takes_self)
             if dynamic:
-                return _all_loader_members(loader_type, fields)
+                return _all_loader_members(loader_type, fields), looped
             for via_super, name in reads:
                 start = mro.index(defined_in) + 1 if via_super else 0
                 resolved = _loader_member(mro, name, start, fields)
@@ -2569,12 +2576,22 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
                 seen.add((id(owner), name))
                 owner_ref = _definition_ref(owner)
                 for label, value in _member_values(name, raw):
+                    if inspect.isfunction(value) and _wrapper_loops(value):
+                        looped.append(value.__qualname__)
+                        continue
                     found.append((f"{owner_ref}.{label}", value))
                     if inspect.isfunction(value):
                         work.extend(_member_functions(value, owner, raw))
-        return found
+        return found, looped
 
-    return _memoized("loader-members", loader_type, collect)
+    found, looped = _memoized("loader-members", loader_type, collect)
+    for qualname in looped:
+        refuse(
+            f"'{qualname}' has a `__wrapped__` chain that loops back to itself, so the code it "
+            + "runs cannot be found. Remove the loop from its decorator (functools.wraps sets "
+            + "`__wrapped__` to the function it wraps)."
+        )
+    return found
 
 
 def _dataclass_field_names(cls: type) -> set[str]:
@@ -2601,21 +2618,31 @@ def _member_values(name: str, raw: Any) -> list[tuple[str, Any]]:
     return values
 
 
+def _wrapper_loops(function: Any) -> bool:
+    """Whether `function`'s `__wrapped__` chain loops (`f.__wrapped__ = f`): it then has no
+    function at its end whose code the walk could read, so the reachable walk leaves it out and
+    refuses the stage, naming it (`_reachable_loader_members`). The chain is read through
+    `wrapper_chain`, whose loop guard ends it."""
+    *_, end = wrapper_chain(function)
+    return not isinstance(end, type) and hasattr(end, "__wrapped__")
+
+
 def _member_functions(function: Any, owner: type, raw: Any) -> list[tuple[Any, type, bool]]:
     """The functions whose bodies the reachable walk reads for a member function, each with
     the class that holds the member and whether it takes the instance first: each function a
-    `functools.wraps` chain wraps (`__wrapped__`) that user source defines, and each wrapper
-    on the chain but one that only forwards `*args` to what it wraps (it names no member, and
-    receives the instance unnamed, which `_member_reads` would read as a dynamic use)."""
+    `functools.wraps` chain wraps (`__wrapped__`, read through `wrapper_chain`, whose loop guard
+    ends it; the walk leaves out a chain that loops, `_wrapper_loops`) that user source defines, and
+    each wrapper on the chain but one that only forwards `*args` to what it wraps (it names no
+    member, and receives the instance unnamed, which `_member_reads` would read as a dynamic
+    use)."""
     takes_self = not isinstance(raw, staticmethod)
     functions = list[tuple[Any, type, bool]]()
-    current: Any = function
-    while inspect.isfunction(current):
-        wrapped = getattr(current, "__wrapped__", None)
-        forwards = wrapped is not None and current.__code__.co_argcount == 0
+    for current in wrapper_chain(function):
+        if not inspect.isfunction(current):
+            break
+        forwards = hasattr(current, "__wrapped__") and current.__code__.co_argcount == 0
         if not forwards and (current is function or _written_in_user_source(current)):
             functions.append((current, owner, takes_self))
-        current = wrapped
     return functions
 
 
