@@ -1274,6 +1274,23 @@ class StateDB:
                 read.update(typing.cast("list[str]", record[_NO_COMMIT_READS]))
         return read
 
+    def no_commit_stages(self, prefix: str) -> list[str]:
+        """The names of the stages starting with ``prefix`` that have a `nocommit:` record,
+        sorted; read in one short transaction."""
+        self._check_closed()
+        start = _NOCOMMIT_PREFIX + prefix.encode()
+        names = list[str]()
+        with self._read_transaction() as txn:
+            cursor = txn.cursor()
+            if cursor.set_range(start):
+                key = bytes(cursor.key())
+                while key.startswith(start):
+                    names.append(key[len(_NOCOMMIT_PREFIX) :].decode(errors="replace"))
+                    if not cursor.next():
+                        break
+                    key = bytes(cursor.key())
+        return names
+
     def add_no_commit_pvt_members(self, stage_name: str, members: Mapping[str, str]) -> None:
         """Add `members` (path relative to the project root -> content hash) to the `*.pvt`
         members the stage's `nocommit:` record lists, keeping every other entry and field.

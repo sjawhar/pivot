@@ -158,13 +158,16 @@ class PipelineReloaded(TypedDict):
 
 class StagesExpanded(TypedDict):
     """A run added a template's instances (``Pipeline.map``): one stage per file of the
-    directory it is mapped over, ``<template>@<key>``, in key order."""
+    directory it is mapped over, ``<template>@<key>``, in key order. ``removed`` names each
+    instance whose key left that directory's listing and which the run removed (its lock,
+    listings and outputs), sorted; absent when it removed none."""
 
     type: Literal["stages_expanded"]
     seq: NotRequired[int]
     run_id: NotRequired[str]
     template: str
     stages: list[str]
+    removed: NotRequired[list[str]]
 
 
 class StageStarted(TypedDict):

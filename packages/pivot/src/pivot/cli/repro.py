@@ -48,13 +48,15 @@ if TYPE_CHECKING:
 
     from pivot.cli import console as tui_console
     from pivot.executor import ExecutionSummary
+    from pivot.expansion import Expansion
     from pivot.types import PipelineStatusInfo, StageExplanation
 
 
 _logger = logging.getLogger(__name__)
 
-# JSONL schema version for forward compatibility
-_JSONL_SCHEMA_VERSION = 2
+# JSONL schema version for forward compatibility. 3: `stages_expanded` names the instances the
+# expansion removed (`removed`)
+_JSONL_SCHEMA_VERSION = 3
 
 
 def _configure_watch_sources(
@@ -123,21 +125,59 @@ def _configure_oneshot_source(
     )
 
 
+def _removable_templates(
+    templates: list[str],
+    result: Expansion,
+    *,
+    force: bool,
+    allow_uncached_incremental: bool,
+) -> list[str]:
+    """Of ``templates``, those a run expands without refusing: before it adds a mapped stage's
+    instances the run checks them for an incremental output it would lose
+    (``executor_core.incremental_refusal``), and a refused expansion, and every mapped stage
+    mapped over it, removes nothing."""
+    from pivot.executor import core as executor_core
+
+    pipeline = cli_helpers.get_pipeline()
+    refused = set[str]()
+    for name in templates:
+        upstream = {dep for dep in pipeline.get_template(name)["mapped_deps"].values() if dep}
+        instances = {stage: pipeline.get_stage(stage) for stage in result["expanded"].get(name, [])}
+        if upstream & refused or executor_core.incremental_refusal(
+            list(instances),
+            instances,
+            allow_uncached_incremental=allow_uncached_incremental,
+            force=force,
+        ):
+            refused.add(name)
+    return [name for name in templates if name not in refused]
+
+
 def _get_explanations(
     stages_list: list[str] | None,
     force: bool = False,
     allow_missing: bool = False,
-) -> tuple[list[StageExplanation], list[PipelineStatusInfo]]:
+    no_commit: bool = False,
+    allow_uncached_incremental: bool = False,
+) -> tuple[list[StageExplanation], list[PipelineStatusInfo], dict[str, str]]:
     """Resolve dependencies, build graph, and return stage explanations, with a row for each
     mapped stage not yet expanded (``status.expand_current``: the run would expand it once its
-    producer is current).
+    producer is current), and each orphaned instance the run would remove, mapped to its mapped
+    stage (``status.orphaned_instances``): of each mapped stage the run expands
+    (``cli_helpers.run_templates``) without refusing (``_removable_templates``), unless it
+    commits nothing.
 
     Shared by --explain and --dry-run modes.
     """
     from pivot import status as status_mod
     from pivot.engine import graph as engine_graph
 
+    removing = [] if no_commit else cli_helpers.run_templates(stages_list)
     result, known = cli_helpers.expand_mapped_stages(force=force, allow_missing=allow_missing)
+    removing = _removable_templates(
+        removing, result, force=force, allow_uncached_incremental=allow_uncached_incremental
+    )
+    orphans = status_mod.orphaned_instances(cli_helpers.get_pipeline(), result, removing)
     stages_list, shown_templates = cli_helpers.resolve_mapped_targets(stages_list, result)
     all_stages = cli_helpers.get_all_stages()
 
@@ -163,19 +203,28 @@ def _get_explanations(
         graph=graph,
         known=known,
     )
-    return explanations, status_mod.not_expanded_status(result, shown_templates)
+    return explanations, status_mod.not_expanded_status(result, shown_templates), orphans
 
 
 def _output_explain(
     stages_list: list[str] | None,
     force: bool = False,
     allow_missing: bool = False,
+    no_commit: bool = False,
+    allow_uncached_incremental: bool = False,
 ) -> None:
     """Output detailed stage explanations using status logic."""
+    from pivot import status as status_mod
     from pivot.cli import status as status_cli
 
-    explanations, not_expanded = _get_explanations(stages_list, force, allow_missing)
-    status_cli.output_explain_text(explanations, not_expanded=not_expanded)
+    explanations, not_expanded, orphans = _get_explanations(
+        stages_list, force, allow_missing, no_commit, allow_uncached_incremental
+    )
+    status_cli.output_explain_text(
+        explanations,
+        not_expanded=not_expanded,
+        orphaned=status_mod.orphaned_status(cli_helpers.get_pipeline(), orphans),
+    )
 
 
 def _dry_run(
@@ -184,16 +233,28 @@ def _dry_run(
     as_json: bool,
     allow_missing: bool,
     quiet: bool,
+    no_commit: bool,
+    allow_uncached_incremental: bool,
 ) -> None:
     """Show what would run without executing. A mapped stage not yet expanded would run: the
-    run expands it once its producer is current, then runs its instances."""
+    run expands it once its producer is current, then runs its instances. An instance whose key
+    left its producer's listing would be removed (``status.orphaned_instances``); nothing is."""
+    from pivot import expansion
+
     # Quiet mode suppresses output (except JSON which is always emitted)
     if quiet and not as_json:
         return
 
-    explanations, not_expanded = _get_explanations(stages_list, force, allow_missing)
+    explanations, not_expanded, orphans = _get_explanations(
+        stages_list, force, allow_missing, no_commit, allow_uncached_incremental
+    )
+    pipeline = cli_helpers.get_pipeline()
+    removals = {
+        instance: expansion.orphan_reason(pipeline.get_template(template))
+        for instance, template in orphans.items()
+    }
 
-    if not explanations and not not_expanded:
+    if not explanations and not not_expanded and not removals:
         if as_json:
             click.echo(display.to_json(_run_common.DryRunJsonOutput(stages={})))
         else:
@@ -212,7 +273,10 @@ def _dry_run(
             (row["name"], _run_common.DryRunJsonStageOutput(would_run=True, reason=row["reason"]))
             for row in not_expanded
         )
-        click.echo(display.to_json(_run_common.DryRunJsonOutput(stages=stages), indent=2))
+        output = _run_common.DryRunJsonOutput(stages=stages)
+        if removals:
+            output["would_remove"] = removals
+        click.echo(display.to_json(output, indent=2))
     else:
         click.echo("Would run:")
         for exp in explanations:
@@ -222,6 +286,10 @@ def _dry_run(
         for row in not_expanded:
             reason = display.escape_control(row["reason"], keep_newlines=True)
             click.echo(f"  {row['name']}: would expand ({reason})")
+        if removals:
+            click.echo("Would remove:")
+            for name, reason in removals.items():
+                click.echo(f"  {name}: {display.escape_control(reason, keep_newlines=True)}")
 
 
 def _run_pipeline(
@@ -1055,14 +1123,28 @@ def repro(
 
     # Handle explain mode
     if explain:
-        _output_explain(stages_list, force, allow_missing=allow_missing)
+        _output_explain(
+            stages_list,
+            force,
+            allow_missing=allow_missing,
+            no_commit=no_commit,
+            allow_uncached_incremental=allow_uncached_incremental,
+        )
         return
 
     on_error = _run_common.resolve_on_error(fail_fast, keep_going)
 
     # Handle dry-run mode
     if dry_run:
-        _dry_run(stages_list, force, as_json, allow_missing, quiet)
+        _dry_run(
+            stages_list,
+            force,
+            as_json,
+            allow_missing,
+            quiet,
+            no_commit,
+            allow_uncached_incremental,
+        )
         return
 
     try:

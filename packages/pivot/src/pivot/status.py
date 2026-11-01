@@ -107,6 +107,9 @@ UPSTREAM_STALE_REASON_PREFIX = "Upstream stale"
 NOT_EXPANDED_REASON_PREFIX = "Not yet expanded"
 """Reason prefix for a mapped stage (``Pipeline.map``) whose producer is not current."""
 
+ORPHANED_REASON_PREFIX = "Orphaned"
+"""Reason prefix for an instance of a mapped stage whose key left its producer's listing."""
+
 
 def _discover_tracked_files(
     allow_missing: bool, all_stages: dict[str, RegistryStageInfo]
@@ -417,6 +420,53 @@ def not_expanded_status(
     ]
 
 
+def orphaned_instances(
+    pipeline: registry.PipelineLike,
+    result: expansion.Expansion,
+    templates: Iterable[str] | None = None,
+) -> dict[str, str]:
+    """Each instance of a template ``result`` expanded, of ``templates`` (None: every one),
+    whose key left its producer's listing but which still keeps a lock, listing or restart proof
+    (``expansion.orphaned_instances``), mapped to its template: the next run that expands the
+    template removes it with its outputs. A template not expanded has none, since no plan is
+    known for it. In the order the pipeline holds the templates, each one's sorted."""
+    wanted = None if templates is None else set(templates)
+    default_state_dir = config.locate_state_dir()
+    found = dict[str, str]()
+    for name in pipeline.list_templates():
+        if name not in result["expanded"] or (wanted is not None and name not in wanted):
+            continue
+        found.update(
+            (instance, name)
+            for instance in expansion.orphaned_instances(
+                pipeline.get_template(name),
+                result["expanded"][name],
+                default_state_dir=default_state_dir,
+            )
+        )
+    return found
+
+
+def orphaned_status(
+    pipeline: registry.PipelineLike, orphans: Mapping[str, str]
+) -> list[PipelineStatusInfo]:
+    """An ``ORPHANED`` row for each of ``orphans`` (``orphaned_instances``: instance ->
+    template), saying why and which run removes it."""
+    return [
+        PipelineStatusInfo(
+            name=instance,
+            status=PipelineStatus.ORPHANED,
+            reason=(
+                f"{ORPHANED_REASON_PREFIX}: "
+                + f"{expansion.orphan_reason(pipeline.get_template(template))}; the next run "
+                + f"that expands '{template}' removes its lock and outputs"
+            ),
+            upstream_stale=[],
+        )
+        for instance, template in orphans.items()
+    ]
+
+
 def _compute_explanations_with_upstream(
     explanations: list[StageExplanation],
     graph: DiGraph[str],
@@ -647,9 +697,10 @@ def find_orphaned_lock_files(
     registered stage, output or input.
 
     A file of an instance of a template (``Pipeline.map``) is none: an instance is registered
-    only while a run has expanded its template, and a run decides which of them stay. Its lock is
-    named by the instance, its listing ``<instance>=<key>.listing`` and its restart proof
-    ``<instance>.incremental``, so each names the template (``registry.template_of``).
+    only while a run has expanded its template, and a run decides which of them stay; one whose
+    key left its producer's listing is an ``orphaned_status`` row, which the next run removes.
+    Its lock is named by the instance, its listing ``<instance>=<key>.listing`` and its restart
+    proof ``<instance>.incremental``, so each names the template (``registry.template_of``).
     """
     templates = pipeline.list_templates()
     default_state_dir = config.locate_state_dir()
@@ -695,6 +746,7 @@ def get_suggestions(
     missing_outputs_count: int = 0,
     missing_reads_count: int = 0,
     remote_configured: bool = False,
+    orphaned_instances: int = 0,
 ) -> list[str]:
     suggestions = list[str]()
 
@@ -738,6 +790,12 @@ def get_suggestions(
         suggestions.append(
             f"{orphan_count} orphaned lock or listing {_pluralize(orphan_count, 'file')} from "
             + "renamed/removed stages. Old outputs may still exist on disk."
+        )
+
+    if orphaned_instances > 0:
+        suggestions.append(
+            f"Run `pivot repro` to remove {orphaned_instances} orphaned "
+            + f"{_pluralize(orphaned_instances, 'instance')} of mapped stages"
         )
 
     return suggestions

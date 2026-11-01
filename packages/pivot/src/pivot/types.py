@@ -658,6 +658,9 @@ class PipelineStatus(enum.StrEnum):
     # A stage mapped over a directory output (``Pipeline.map``) whose producer is not current,
     # so the command cannot know its instances; its reason says what it waits for
     NOT_EXPANDED = "not_expanded"
+    # An instance of a mapped stage whose key left its producer's listing: no stage now, its
+    # lock, listings and outputs go in the next run that expands the mapped stage
+    ORPHANED = "orphaned"
 
 
 class TrackedFileStatus(enum.StrEnum):
@@ -750,7 +753,7 @@ class ExplainStageJson(TypedDict):
     """JSON-serializable stage explanation for status --explain --json output."""
 
     name: str
-    status: Literal["stale", "cached", "not_expanded"]
+    status: Literal["stale", "cached", "not_expanded", "orphaned"]
     reason: str
     will_run: bool
     is_forced: bool
@@ -1029,11 +1032,14 @@ class StageCompleteEvent(TypedDict):
 
 class StagesExpandedEvent(TypedDict):
     """A mapped stage's template (``Pipeline.map``) added its instances to the run: one stage
-    per file of the directory it is mapped over, ``<template>@<key>``, in key order."""
+    per file of the directory it is mapped over, ``<template>@<key>``, in key order. ``removed``
+    names each instance whose key left that directory's listing and which the run removed (its
+    lock, listings and outputs), sorted; absent when it removed none."""
 
     type: Literal[RunEventType.STAGES_EXPANDED]
     template: str
     stages: list[str]
+    removed: NotRequired[list[str]]
 
 
 class ExecutionResultEvent(TypedDict):

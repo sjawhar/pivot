@@ -103,11 +103,16 @@ def _format_error_detail(reason: str, *, total: int) -> list[str]:
 
 
 def _format_expansion_line(event: StagesExpanded) -> str:
-    """The one line a template's expansion (``Pipeline.map``) prints; its instances print as
-    any stage does."""
+    """The one line a template's expansion (``Pipeline.map``) prints, naming each instance it
+    removed because its key left the plan; its instances print as any stage does."""
     count = len(event["stages"])
     noun = "stage" if count == 1 else "stages"
-    return f"{display.escape_markup(event['template'])}: expanded into {count} {noun}"
+    line = f"{display.escape_markup(event['template'])}: expanded into {count} {noun}"
+    if "removed" not in event:
+        return line
+    removed = event["removed"]
+    whose = "whose key left" if len(removed) == 1 else "whose keys left"
+    return f"{line}; removed {display.escape_markup(', '.join(removed))}, {whose} the plan"
 
 
 def _categorize(event: StageCompleted) -> DisplayCategory:

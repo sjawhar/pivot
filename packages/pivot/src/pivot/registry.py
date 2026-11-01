@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 import pygtrie
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 
 from pivot import exceptions, fingerprint, loaded_source, project, stage_def, types
 from pivot.storage import cache, lock
@@ -426,6 +426,14 @@ def template_of(stage_name: str, templates: Iterable[str]) -> str | None:
     return None
 
 
+def run_target(stage: str, templates: Collection[str]) -> str:
+    """The name a run schedules for target ``stage``: an instance (``<template>@<key>``) is
+    reached through its template; any other target is itself."""
+    if stage in templates:
+        return stage
+    return template_of(stage, templates) or stage
+
+
 def _instance_name_error(name: str, template: str) -> str:
     """Why stage or template ``name`` cannot load beside template ``template``: it has the name
     of one of its instances, so a target, a lock and a ``params.yaml`` key could mean either."""
@@ -435,10 +443,21 @@ def _instance_name_error(name: str, template: str) -> str:
     )
 
 
+def instance_outputs(template: MapTemplate, key: str) -> list[types.ArtifactRef]:
+    """The outputs of template ``template``'s instance for ``key``, ``<template>@<key>``: each
+    output the template declares, as that instance's own."""
+    name = f"{template['info']['name']}@{key}"
+    return [
+        dataclasses.replace(out, identity=types.ArtifactIdentity(name, out.identity.key))
+        for out in template["info"]["outs"]
+    ]
+
+
 def instantiate(template: MapTemplate, key: str, file_key: str) -> RegistryStageInfo:
     """Template ``template``'s stage for one key: named ``<template>@<key>``, its entry reading
     file ``file_key`` of the source directory, each mapped dependency on an upstream template
-    reading that template's instance of the key, and its outputs its own."""
+    reading that template's instance of the key, and its outputs its own
+    (``instance_outputs``)."""
     declared = template["info"]
     name = f"{declared['name']}@{key}"
 
@@ -465,10 +484,7 @@ def instantiate(template: MapTemplate, key: str, file_key: str) -> RegistryStage
         func=declared["func"],
         name=name,
         deps=deps,
-        outs=[
-            dataclasses.replace(out, identity=types.ArtifactIdentity(name, out.identity.key))
-            for out in declared["outs"]
-        ],
+        outs=instance_outputs(template, key),
         incremental_inputs={
             param: types.ArtifactIdentity(name, identity.key)
             for param, identity in declared["incremental_inputs"].items()

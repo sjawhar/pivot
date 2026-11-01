@@ -167,6 +167,35 @@ async def test_jsonl_sink_forwards_stages_expanded(
 
 
 @pytest.mark.anyio
+async def test_jsonl_sink_forwards_the_instances_an_expansion_removed(
+    callback: Callable[[dict[str, object]], None],
+    collected_events: list[dict[str, object]],
+) -> None:
+    """An expansion that removed instances whose key left the plan names them."""
+    sink = JsonlSink(callback)
+
+    await sink.handle(
+        StagesExpanded(
+            type="stages_expanded",
+            seq=8,
+            run_id="run-1",
+            template="demo/cut",
+            stages=["demo/cut@a"],
+            removed=["demo/cut@b"],
+        )
+    )
+
+    assert collected_events == [
+        {
+            "type": RunEventType.STAGES_EXPANDED,
+            "template": "demo/cut",
+            "stages": ["demo/cut@a"],
+            "removed": ["demo/cut@b"],
+        }
+    ]
+
+
+@pytest.mark.anyio
 async def test_jsonl_sink_converts_engine_state_changed_enum_to_string(
     callback: Callable[[dict[str, object]], None],
     collected_events: list[dict[str, object]],
