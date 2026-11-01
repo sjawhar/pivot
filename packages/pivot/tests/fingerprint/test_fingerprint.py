@@ -2250,6 +2250,40 @@ class _LoopWrappedLoad(loaders.Reader[str]):
         return path.read_text()
 
 
+@dataclasses.dataclass(frozen=True)
+class _LoopWrappedInFallback(loaders.Reader[str]):
+    """`load` applies an operator to `self`, so the walk falls back to every member."""
+
+    @_loop_wrapped
+    def helper(self, text: str) -> str:
+        return text + "A"
+
+    def __add__(self, text: str) -> str:
+        return text
+
+    def load(self, path: pathlib.Path) -> str:
+        return self + path.read_text()
+
+
+@dataclasses.dataclass(frozen=True)
+class _LoopWrappedReachedAndInFallback(loaders.Reader[str]):
+    """`load` reaches `helper`, then `combine` applies an operator to `self`, so the fallback
+    finds `helper` again."""
+
+    @_loop_wrapped
+    def helper(self, text: str) -> str:
+        return text + "A"
+
+    def __add__(self, text: str) -> str:
+        return text
+
+    def combine(self, text: str) -> str:
+        return self + text
+
+    def load(self, path: pathlib.Path) -> str:
+        return self.combine(self.helper(path.read_text()))
+
+
 def _raise_timeout(signum: int, frame: object) -> None:
     raise TimeoutError("the walk did not end")
 
@@ -2259,21 +2293,36 @@ def _raise_timeout(signum: int, frame: object) -> None:
     [
         pytest.param(_LoopWrappedHelper(), "_LoopWrappedHelper.helper", id="reached-helper"),
         pytest.param(_LoopWrappedLoad(), "_LoopWrappedLoad.load", id="load"),
+        pytest.param(
+            _LoopWrappedInFallback(), "_LoopWrappedInFallback.helper", id="fallback-member"
+        ),
+        pytest.param(
+            _LoopWrappedReachedAndInFallback(),
+            "_LoopWrappedReachedAndInFallback.helper",
+            id="reached-and-fallback-member",
+        ),
     ],
 )
 def test_a_wrapped_chain_that_loops_is_refused_not_followed_forever(loader: object, name: str):
-    """`load`, or a helper it reaches, is its own `__wrapped__`. The walk refuses the loader,
-    naming that function, within 10 seconds (an alarm turns a hang into a `TimeoutError`)."""
+    """`load`, a helper it reaches, or a member the fallback to every member walks (an
+    operator on `self`) is its own `__wrapped__`. The walk refuses the stage, naming that
+    function once, also when it is both reached and in the fallback, within 10 seconds (an
+    alarm turns a hang into a `TimeoutError`)."""
     previous = signal.signal(signal.SIGALRM, _raise_timeout)
     signal.setitimer(signal.ITIMER_REAL, 10)
     try:
-        with pytest.raises(exceptions.StageDefinitionError) as refused:
+        with (
+            pytest.raises(exceptions.StageDefinitionError) as refused,
+            fingerprint.stage_fingerprint_scope("t/use"),
+        ):
             fingerprint.get_loader_fingerprint(loader)  # pyright: ignore[reportArgumentType]
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
 
-    assert f"'{name}' has a `__wrapped__` chain that loops" in str(refused.value)
+    assert str(refused.value).count(f"'{name}' has a `__wrapped__` chain that loops") == 1, (
+        refused.value
+    )
 
 
 def test_each_stage_of_a_pass_whose_loader_reaches_a_looped_helper_is_refused():

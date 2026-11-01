@@ -2536,6 +2536,12 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
     When reaching code uses `self` in a way no static form names (`self` passed to another
     function, `vars(self)`, an operator, `type(self)(...)`), any member may run, so every user
     member of the class is walked (`_all_loader_members`).
+
+    A function whose `__wrapped__` chain loops (`_wrapper_loops`) has no code the walk can
+    read: wherever the walk meets it (a loader method, a reached member, a member of the
+    fallback), it is left out and the stage is refused, naming it (a stage lists a repeated
+    refusal once, `_collected_capture_errors`). The refusal is made on each call, outside the
+    per-pass memo, so each stage that reads the walk is refused.
     """
 
     def collect() -> tuple[list[tuple[str, Any]], list[str]]:
@@ -2545,6 +2551,15 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
         looped = list[str]()
         seen = set[tuple[int, str]]()
         work = list[tuple[Any, type, bool]]()  # a function, its class, whether it takes self
+
+        def keep(value: Any) -> bool:
+            """Whether the walk keeps `value`: not a function whose `__wrapped__` chain loops
+            (`_wrapper_loops`), which goes to `looped` instead."""
+            if inspect.isfunction(value) and _wrapper_loops(value):
+                looped.append(value.__qualname__)
+                return False
+            return True
+
         for name in _LOADER_METHODS:
             resolved = _loader_member(mro, name, 0, fields)
             if resolved is None:
@@ -2552,11 +2567,8 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
             owner, raw = resolved
             seen.add((id(owner), name))
             function = getattr(raw, "__func__", raw)
-            if inspect.isfunction(function):
-                if _wrapper_loops(function):
-                    looped.append(function.__qualname__)
-                else:
-                    work.extend(_member_functions(function, owner, raw))
+            if inspect.isfunction(function) and keep(function):
+                work.extend(_member_functions(function, owner, raw))
         while work:
             function, defined_in, takes_self = work.pop()
             tree = _source_tree(function)
@@ -2564,7 +2576,8 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
                 continue
             reads, dynamic = _member_reads(tree, takes_self)
             if dynamic:
-                return _all_loader_members(loader_type, fields), looped
+                members = _all_loader_members(loader_type, fields)
+                return [(ref, value) for ref, value in members if keep(value)], looped
             for via_super, name in reads:
                 start = mro.index(defined_in) + 1 if via_super else 0
                 resolved = _loader_member(mro, name, start, fields)
@@ -2576,8 +2589,7 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
                 seen.add((id(owner), name))
                 owner_ref = _definition_ref(owner)
                 for label, value in _member_values(name, raw):
-                    if inspect.isfunction(value) and _wrapper_loops(value):
-                        looped.append(value.__qualname__)
+                    if not keep(value):
                         continue
                     found.append((f"{owner_ref}.{label}", value))
                     if inspect.isfunction(value):
