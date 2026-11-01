@@ -10,7 +10,7 @@ from tqdm.asyncio import tqdm as async_tqdm
 
 if TYPE_CHECKING:
     import pathlib
-    from collections.abc import Collection, Mapping
+    from collections.abc import Collection, Iterable, Mapping
 
     from networkx import DiGraph
 
@@ -112,6 +112,21 @@ def template_target(name: str, templates: list[str]) -> str | None:
         return template
     bare = [t for t in templates if registry.template_of(name, [t.rsplit("/", 1)[-1]])]
     return bare[0] if len(bare) == 1 else None
+
+
+def templates_and_upstream(templates: Iterable[str], pipeline: PipelineLike) -> list[str]:
+    """``templates`` (``Pipeline.map``) and every template each one is mapped over,
+    transitively, each once, in the order a depth-first walk from them meets it."""
+    walked = list[str]()
+    pending = list(templates)
+    while pending:
+        current = pending.pop()
+        if current in walked:
+            continue
+        walked.append(current)
+        mapped_deps = pipeline.get_template(current)["mapped_deps"].values()
+        pending.extend(dep for dep in mapped_deps if dep is not None)
+    return walked
 
 
 def mapped_name(name: str, templates: list[str]) -> str | None:
@@ -287,15 +302,10 @@ def resolve_mapped_targets(
             else:
                 unknown.append(stage)  # an instance of a key the expansion did not add
         else:
-            pending = [template]
-            while pending:
-                current = pending.pop()
-                if current in shown:
-                    continue
-                shown.append(current)
-                mapped = pipeline.get_template(current)
-                resolved.append(mapped["source"].producer)
-                pending.extend(dep for dep in mapped["mapped_deps"].values() if dep is not None)
+            for current in templates_and_upstream([template], pipeline):
+                if current not in shown:
+                    shown.append(current)
+                    resolved.append(pipeline.get_template(current)["source"].producer)
     if unknown:
         raise exceptions.StageNotFoundError(unknown, available_stages=[*registered, *templates])
     return list(dict.fromkeys(resolved)), shown

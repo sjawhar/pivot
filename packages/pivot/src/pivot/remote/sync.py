@@ -60,15 +60,18 @@ def _blob_hashes(
     *,
     require_members: bool = False,
     unlisted: dict[str, types.DirHash] | None = None,
+    unstored: set[str] | None = None,
 ) -> set[str]:
     """The cache objects that store an output: a file's object, or a directory's listing object
     and its files' objects.
 
     ``read_members`` reads a directory's listing (its committed listing file, else the cache's
     object). A listing neither the configured cache nor the legacy one holds is stored from the
-    committed file, so push sends it. A directory whose listing neither holds, or whose committed
-    listing cannot be used and the cache lacks, gives its listing object alone, and is added to
-    ``unlisted`` by its hash: a pull fetches the listing first, then names the files.
+    committed file, so push sends it; with ``unstored`` (a dry run) its hash is added there
+    instead and nothing is written, for the caller to count it as the cache's. A directory whose
+    listing neither holds, or whose committed listing cannot be used and the cache lacks, gives
+    its listing object alone, and is added to ``unlisted`` by its hash: a pull fetches the
+    listing first, then names the files.
 
     With ``require_members`` the caller (push) needs the member objects it would transfer, so a
     directory whose listing can be read from neither the committed file nor the cache raises
@@ -94,7 +97,10 @@ def _blob_hashes(
             unlisted[hash_info["hash"]] = hash_info
         return {hash_info["hash"]}
     if cache.resolve_cache_object_path(files_dir, hash_info["hash"]) is None:
-        listing.store_object(files_dir, hash_info["hash"], listing.encode(members))
+        if unstored is None:
+            listing.store_object(files_dir, hash_info["hash"], listing.encode(members))
+        else:
+            unstored.add(hash_info["hash"])
     return {hash_info["hash"], *(entry["hash"] for entry in members["files"])}
 
 
@@ -107,6 +113,7 @@ def _output_blobs(
     *,
     require_members: bool = False,
     unlisted: dict[str, types.DirHash] | None = None,
+    unstored: set[str] | None = None,
 ) -> set[str]:
     """The cache objects of a stage output, a directory's listing read beside its lock."""
     committed = listing.output_listing_path(stages_dir, identity)
@@ -125,6 +132,7 @@ def _output_blobs(
         files_dir,
         require_members=require_members,
         unlisted=unlisted,
+        unstored=unstored,
     )
 
 
@@ -135,6 +143,7 @@ def _tracked_blobs(
     *,
     require_members: bool = False,
     unlisted: dict[str, types.DirHash] | None = None,
+    unstored: set[str] | None = None,
 ) -> set[str]:
     """The cache objects of a tracked file or directory."""
     return _blob_hashes(
@@ -143,6 +152,7 @@ def _tracked_blobs(
         files_dir,
         require_members=require_members,
         unlisted=unlisted,
+        unstored=unstored,
     )
 
 
@@ -154,6 +164,7 @@ def _get_file_hash_from_stages(
     *,
     require_members: bool = False,
     unlisted: dict[str, types.DirHash] | None = None,
+    unstored: set[str] | None = None,
 ) -> set[str] | None:
     """The cache objects of a stage output named by its identity key, from the lock files."""
     if all_stages is not None:
@@ -179,6 +190,7 @@ def _get_file_hash_from_stages(
                         lock_data,
                         require_members=require_members,
                         unlisted=unlisted,
+                        unstored=unstored,
                     )
         return None
 
@@ -221,6 +233,7 @@ def _get_file_hash_from_stages(
                     lock_data,
                     require_members=require_members,
                     unlisted=unlisted,
+                    unstored=unstored,
                 )
 
     return None
@@ -234,6 +247,7 @@ def _get_file_hash_from_pvt(
     skip: track.PvtSkip | None,
     require_members: bool = False,
     unlisted: dict[str, types.DirHash] | None = None,
+    unstored: set[str] | None = None,
 ) -> set[str] | None:
     """The cache objects of a path tracked by a .pvt file; None when ``skip`` leaves that .pvt
     out (a stage's own member of its output, which tracks nothing)."""
@@ -253,6 +267,7 @@ def _get_file_hash_from_pvt(
         files_dir,
         require_members=require_members,
         unlisted=unlisted,
+        unstored=unstored,
     )
 
 
@@ -264,13 +279,15 @@ def _mapped_source_listing(
     files_dir: pathlib.Path,
     *,
     require_members: bool,
+    unstored: set[str] | None,
 ) -> set[str]:
     """The listing object of the directory output that ``stage_name``, an instance of a mapped
     stage (``Pipeline.map``), is mapped over; empty for any other stage.
 
     A clone without the producer's committed listing fetches this object to expand the mapped
     stage before it can pull or check out the instance, so the instance's set holds it. It is
-    stored from the committed listing when the cache lacks it, so push can send it.
+    stored from the committed listing when the cache lacks it, so push can send it, or added to
+    ``unstored`` (a dry run).
     """
     template = registry.template_of(stage_name, templates)
     if template is None:
@@ -285,7 +302,15 @@ def _mapped_source_listing(
     record = expansion.recorded_directory(source, lock_data)
     if record is None:
         return set()
-    _output_blobs(record, stages_dir, source, files_dir, lock_data, require_members=require_members)
+    _output_blobs(
+        record,
+        stages_dir,
+        source,
+        files_dir,
+        lock_data,
+        require_members=require_members,
+        unstored=unstored,
+    )
     return {record["hash"]}
 
 
@@ -298,6 +323,7 @@ def get_target_hashes(
     require_members: bool = False,
     templates: Mapping[str, MapTemplate] | None = None,
     unlisted: dict[str, types.DirHash] | None = None,
+    unstored: set[str] | None = None,
 ) -> set[str]:
     """The cache objects of ``targets`` (stage names or file paths): the objects that
     ``pivot pull`` of them and then ``pivot checkout`` of them use in a fresh clone, and the
@@ -318,7 +344,9 @@ def get_target_hashes(
     ``require_members`` (push), a directory whose committed listing cannot be read and whose
     listing object the cache lacks raises rather than naming an object that is not there
     (``_blob_hashes``); without it, such a directory names its listing object alone and is added
-    to ``unlisted``. A ``*.pvt`` file a stage wrote as its own member resolves nothing
+    to ``unlisted``. A directory listing the cache lacks is stored in it from the committed
+    listing; with ``unstored`` (a dry run) its hash is added there instead, and nothing is
+    written to the cache. A ``*.pvt`` file a stage wrote as its own member resolves nothing
     (``member_skip.own_member_skip``: the stages of ``all_stages`` by the registry, any other by
     its lock in ``state_dir``).
 
@@ -353,6 +381,7 @@ def get_target_hashes(
                     state_dir,
                     files_dir,
                     require_members=require_members,
+                    unstored=unstored,
                 )
             if target_identity.key is None:
                 target_state_dir = registry.get_stage_state_dir(stage_info, state_dir)
@@ -374,6 +403,7 @@ def get_target_hashes(
                                 lock_data,
                                 require_members=require_members,
                                 unlisted=unlisted,
+                                unstored=unstored,
                             )
                     # The objects the stage read by hash are always cache objects.
                     if "reads" in lock_data:
@@ -387,6 +417,7 @@ def get_target_hashes(
                 all_stages,
                 require_members=require_members,
                 unlisted=unlisted,
+                unstored=unstored,
             )
             if out_blobs is not None:
                 hashes |= out_blobs
@@ -420,6 +451,7 @@ def get_target_hashes(
             all_stages,
             require_members=require_members,
             unlisted=unlisted,
+            unstored=unstored,
         )
         if out_blobs is not None:
             hashes |= out_blobs
@@ -431,6 +463,7 @@ def get_target_hashes(
                     state_dir,
                     files_dir,
                     require_members=require_members,
+                    unstored=unstored,
                 )
             continue
 
@@ -441,6 +474,7 @@ def get_target_hashes(
             skip=skip,
             require_members=require_members,
             unlisted=unlisted,
+            unstored=unstored,
         )
         if pvt_blobs is not None:
             hashes |= pvt_blobs
@@ -521,9 +555,11 @@ def _push_hashes(
     targets: list[str] | None,
     all_stages: dict[str, RegistryStageInfo] | None,
     templates: Mapping[str, MapTemplate] | None,
+    unstored: set[str] | None = None,
 ) -> set[str]:
     """The objects a push of ``targets`` sends when the remote lacks them: their objects
-    (``get_target_hashes``), or every cached object when there are no targets.
+    (``get_target_hashes``, which adds to ``unstored`` a listing it would store), or every
+    cached object when there are no targets.
 
     Raises:
         UnknownTargetError: A target is not a stage, stage output or tracked path.
@@ -538,6 +574,7 @@ def _push_hashes(
             cache_dir=cache_dir,
             require_members=True,
             templates=templates,
+            unstored=unstored,
         )
     return get_local_cache_hashes(cache_dir)
 
@@ -682,9 +719,11 @@ def push_dry_run(
 
     ``state_db`` is read only, None when the project has none. Its index answers for the
     remote as it does for ``push``: unless it records another URL for this remote, which
-    ``push`` would clear first.
+    ``push`` would clear first. A directory listing ``push`` would store in the cache from its
+    committed file before sending it is not stored, and counts as the cache's.
     """
-    hashes = _push_hashes(cache_dir, state_dir, targets, all_stages, templates)
+    unstored = set[str]()
+    hashes = _push_hashes(cache_dir, state_dir, targets, all_stages, templates, unstored)
     if not hashes:
         return TransferSummary(transferred=0, skipped=0, failed=0, errors=[])
     indexed = set[str]()
@@ -699,11 +738,12 @@ def push_dry_run(
             jobs if jobs is not None else config.get_remote_jobs(),
         )
     )
+    unavailable = [hash_ for hash_ in plan["unavailable"] if hash_ not in unstored]
     return TransferSummary(
-        transferred=len(plan["upload"]),
+        transferred=len(plan["upload"]) + len(plan["unavailable"]) - len(unavailable),
         skipped=len(plan["on_remote"]),
-        failed=len(plan["unavailable"]),
-        errors=_unavailable_errors(remote_name, plan["unavailable"]),
+        failed=len(unavailable),
+        errors=_unavailable_errors(remote_name, unavailable),
     )
 
 
@@ -715,10 +755,12 @@ async def _pull_hashes(
     all_stages: dict[str, RegistryStageInfo] | None,
     templates: Mapping[str, MapTemplate] | None,
     unlisted: dict[str, types.DirHash] | None = None,
+    unstored: set[str] | None = None,
 ) -> set[str]:
     """The objects a pull of ``targets`` fetches when the cache lacks them: their objects
     (``get_target_hashes``, which adds each directory whose listing is not local to
-    ``unlisted``), or every object on the remote when there are no targets.
+    ``unlisted``, and to ``unstored`` a listing it would store), or every object on the remote
+    when there are no targets.
 
     Raises:
         UnknownTargetError: A target is not a stage, stage output or tracked path.
@@ -731,6 +773,7 @@ async def _pull_hashes(
             cache_dir=cache_dir,
             templates=templates,
             unlisted=unlisted,
+            unstored=unstored,
         )
     return await remote.list_hashes()
 
@@ -901,10 +944,12 @@ async def _pull_dry_run_async(
     templates: Mapping[str, MapTemplate] | None,
 ) -> TransferSummary:
     unlisted = dict[str, types.DirHash]()
+    unstored = set[str]()
     needed = await _pull_hashes(
-        cache_dir, state_dir, remote, targets, all_stages, templates, unlisted
+        cache_dir, state_dir, remote, targets, all_stages, templates, unlisted, unstored
     )
-    local = get_local_cache_hashes(cache_dir)
+    # A listing the pull would store from its committed file is not stored, and counts as local.
+    local = get_local_cache_hashes(cache_dir) | unstored
     missing = needed - local
     on_remote = await _held_by(remote, missing, jobs) if targets else missing
     # A directory whose listing is neither committed nor cached names its listing object alone;
@@ -940,7 +985,8 @@ def pull_dry_run(
     """What ``pull`` would download, downloading nothing into the cache and recording nothing:
     ``transferred`` counts the objects the cache lacks and the remote holds, the files of a
     listing only the remote holds included (read into a temporary directory and dropped), and
-    ``failed`` and ``errors`` the objects the remote lacks too."""
+    ``failed`` and ``errors`` the objects the remote lacks too. A directory listing ``pull``
+    would store in the cache from its committed file is not stored, and counts as the cache's."""
     return asyncio.run(
         _pull_dry_run_async(
             cache_dir,

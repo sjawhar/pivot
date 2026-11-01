@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import functools
 import pathlib
 from typing import TYPE_CHECKING
@@ -56,24 +57,66 @@ def _get_targets_list(targets: tuple[str, ...]) -> list[str] | None:
     return list(targets) if targets else None
 
 
-def _needed_templates(targets: tuple[str, ...], pipeline: PipelineLike) -> set[str]:
+# The key an instance output's path is placed with, to find where a key goes in that path. A
+# key holds no NUL (``lock.variant_name_error``), so it is never mistaken for one.
+_OPEN_KEY = "\x00"
+
+
+def _instance_output_template(target: str, pipeline: PipelineLike) -> str | None:
+    """The mapped stage (``Pipeline.map``) whose instance writes output path ``target``, from
+    the working directory, or a file inside it when the output is a directory:
+    ``data/p/cut@a.yaml`` is written by ``p/cut@a``, so it names ``p/cut``. None for any other
+    path. The instances need not be expanded: the path is matched against where each output of
+    the mapped stage is placed (``store.relative_output_path``), the key left open."""
+    from pivot import registry
+    from pivot.storage import store as store_mod
+
+    relative = project.relative_within(
+        project.normalize_path(target, base=pathlib.Path.cwd()), project.get_project_root()
+    )
+    if relative is None:
+        return None
+    path = relative.as_posix()
+    for name in pipeline.list_templates():
+        for out in pipeline.get_template(name)["info"]["outs"]:
+            open_identity = types.ArtifactIdentity(f"{name}@{_OPEN_KEY}", out.identity.key)
+            placed = store_mod.relative_output_path(
+                dataclasses.replace(out, identity=open_identity)
+            )
+            head, _, tail = placed.as_posix().partition(_OPEN_KEY)
+            if not path.startswith(head):
+                continue
+            segment, slash, inner = path[len(head) :].partition("/")
+            if not tail or tail.startswith("/"):
+                # A directory or keyed output: the key is a whole directory name
+                key = segment
+                after = slash + inner
+                matched = after == tail or (
+                    out.tag is types.ArtifactTag.DIRECTORY and after.startswith(tail + "/")
+                )
+            else:
+                # A single file: the key runs up to the output's extension
+                key = segment.removesuffix(tail)
+                matched = not slash and segment.endswith(tail)
+            if matched and key and registry.template_of(f"{name}@{key}", [name]) == name:
+                return name
+    return None
+
+
+def _needed_templates(targets: tuple[str, ...], pipeline: PipelineLike) -> list[str]:
     """The mapped stages (``Pipeline.map``) ``targets`` need expanded: each one they name, by
-    itself or by an instance (``cli_helpers.template_target``), and each one those are mapped
-    over, transitively."""
+    itself or by an instance (``cli_helpers.template_target``) or by an output path an instance
+    writes (``_instance_output_template``), and each one those are mapped over
+    (``cli_helpers.templates_and_upstream``)."""
     templates = pipeline.list_templates()
-    pending = [
-        name
-        for target in targets
-        if (name := cli_helpers.template_target(target, templates)) is not None
-    ]
-    needed = set[str]()
-    while pending:
-        name = pending.pop()
-        if name not in needed:
-            needed.add(name)
-            mapped_deps = pipeline.get_template(name)["mapped_deps"].values()
-            pending.extend(dep for dep in mapped_deps if dep is not None)
-    return needed
+    named = list[str]()
+    for target in targets:
+        name = cli_helpers.template_target(target, templates) or _instance_output_template(
+            target, pipeline
+        )
+        if name is not None:
+            named.append(name)
+    return cli_helpers.templates_and_upstream(named, pipeline)
 
 
 def _expand_mapped_targets(
@@ -218,7 +261,10 @@ def push(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    # A dry run writes nothing: it locates the cache and state directories without creating them.
+    # A dry run uploads and caches nothing and leaves the remote index as it is; it locates the
+    # cache and state directories without creating them. Expanding the mapped stages
+    # (Pipeline.map) its targets name opens the state database, which creates state.lmdb in the
+    # state directory when it has none.
     cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
     state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
@@ -318,8 +364,11 @@ def fetch(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    # A dry run writes nothing: it locates the cache and state directories without creating them,
-    # and reads a listing it needs from the remote into a temporary directory (_read_listings).
+    # A dry run downloads and caches nothing and leaves the remote index as it is; it locates the
+    # cache and state directories without creating them, and reads a listing it needs from the
+    # remote into a temporary directory (_read_listings). Expanding the mapped stages
+    # (Pipeline.map) its targets name opens the state database, which creates state.lmdb in the
+    # state directory when it has none.
     cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
     state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
@@ -435,8 +484,11 @@ def pull(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    # A dry run writes nothing: it locates the cache and state directories without creating them,
-    # and reads a listing it needs from the remote into a temporary directory (_read_listings).
+    # A dry run downloads, caches and restores nothing and leaves the remote index as it is; it
+    # locates the cache and state directories without creating them, and reads a listing it
+    # needs from the remote into a temporary directory (_read_listings). Expanding the mapped
+    # stages (Pipeline.map) its targets name opens the state database, which creates state.lmdb
+    # in the state directory when it has none.
     cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
     state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
