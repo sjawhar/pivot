@@ -1608,3 +1608,40 @@ def test_gc_refuses_a_tree_link_when_gvisor_follows_nofollow(
 
     assert hook_fired, "the test never replaced the nested tree directory during open"
     assert foreign_member.exists(), "gc removed a foreign member through a gVisor-followed link"
+
+
+def test_gc_keeps_a_tree_recreated_with_a_reused_inode(tmp_path: pathlib.Path) -> None:
+    """A tree removed after gc records it can reuse its inode. Its change time distinguishes the
+    replacement, so gc leaves the newly created tree and what it holds."""
+    prefix = tmp_path / "prefix"
+    tree = prefix / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "sub" / "old").write_text("the doomed tree member")
+    old = tree.lstat()
+    expected = old.st_dev, old.st_ino, old.st_ctime_ns
+    (tree / "sub" / "old").unlink()
+    (tree / "sub").rmdir()
+    tree.rmdir()
+    reused = False
+    for attempt in range(1, 4001):
+        candidate = prefix / f"made-{attempt}"
+        candidate.mkdir()
+        candidate_stat = candidate.lstat()
+        if candidate_stat.st_ino == old.st_ino:
+            candidate.rename(tree)
+            reused = True
+            break
+    if not reused:
+        pytest.skip("this filesystem did not reuse the removed tree inode")
+    if tree.lstat().st_ctime_ns == old.st_ctime_ns:
+        pytest.skip("this filesystem did not distinguish the reused inode by change time")
+    planted = tree / "planted"
+    planted.write_text("a tree made after the plan")
+    prefix_fd = os.open(prefix, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(OSError):
+            gc._remove_at(prefix_fd, tree.name, is_dir=True, expected=expected)
+    finally:
+        os.close(prefix_fd)
+
+    assert planted.exists(), "gc removed a tree recreated with the doomed tree's inode"

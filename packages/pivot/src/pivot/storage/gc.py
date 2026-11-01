@@ -1227,7 +1227,7 @@ def _resolved_store(cache_dir: pathlib.Path) -> pathlib.Path:
 
 
 def _open_directory_at(
-    parent_fd: int, name: str, *, expected: tuple[int, int] | None = None
+    parent_fd: int, name: str, *, expected: tuple[int, int, int] | None = None
 ) -> int | None:
     """Open the directory ``name`` in the directory open as ``parent_fd`` without following a
     link, and return its descriptor (the caller closes it); None when no directory of its own
@@ -1240,8 +1240,8 @@ def _open_directory_at(
     ``O_DIRECTORY | O_NOFOLLOW``, where Linux fails with ENOTDIR. So the entry is ``lstat``-ed
     first and anything but a directory, a link included, is refused; when a caller recorded the
     directory it expects, that identity is required too. Last, the descriptor opened must show
-    the device and inode that ``lstat`` saw, which refuses on either kernel a link or another
-    directory put at the name between the two calls.
+    the device, inode and change time that ``lstat`` saw, which refuses on either kernel a link
+    or another directory put at the name between the two calls.
     """
     try:
         seen = os.lstat(name, dir_fd=parent_fd)
@@ -1249,7 +1249,7 @@ def _open_directory_at(
         return None
     if not stat.S_ISDIR(seen.st_mode):
         return None
-    seen_identity = seen.st_dev, seen.st_ino
+    seen_identity = seen.st_dev, seen.st_ino, seen.st_ctime_ns
     if expected is not None and seen_identity != expected:
         return None
     try:
@@ -1263,7 +1263,7 @@ def _open_directory_at(
             raise
         return None
     opened = os.fstat(fd)
-    if (opened.st_dev, opened.st_ino) != seen_identity:
+    if (opened.st_dev, opened.st_ino, opened.st_ctime_ns) != seen_identity:
         os.close(fd)
         return None
     return fd
@@ -1894,7 +1894,7 @@ def execute_plan(
                     prefix_fd,
                     name,
                     is_dir=stat.S_ISDIR(stats.st_mode),
-                    expected=(stats.st_dev, stats.st_ino),
+                    expected=(stats.st_dev, stats.st_ino, stats.st_ctime_ns),
                 )
             except OSError as e:
                 logger.warning("Cannot remove cache object %s: %s", path, e)
@@ -1908,7 +1908,7 @@ def execute_plan(
 
 
 def _remove_at(
-    dir_fd: int, name: str, *, is_dir: bool, expected: tuple[int, int] | None = None
+    dir_fd: int, name: str, *, is_dir: bool, expected: tuple[int, int, int] | None = None
 ) -> None:
     """Remove the object ``name`` in the prefix directory open as ``dir_fd``, never through a
     path. A tree is emptied through descriptors, depth first and without recursion: each of its
@@ -1947,12 +1947,12 @@ def _remove_at(
 
 
 def _open_for_removal(
-    parent_fd: int, name: str, *, expected: tuple[int, int] | None = None
-) -> tuple[int, str, int, list[tuple[str, tuple[int, int] | None]]]:
+    parent_fd: int, name: str, *, expected: tuple[int, int, int] | None = None
+) -> tuple[int, str, int, list[tuple[str, tuple[int, int, int] | None]]]:
     """Open the directory ``name`` in the directory open as ``parent_fd`` to empty it: its
     parent's descriptor, its name, its own descriptor (made writable) and its entries. A child
-    directory keeps the device and inode seen while this parent was scanned; a file or link has
-    None and is unlinked without following it.
+    directory keeps the device, inode and change time seen while this parent was scanned; a file
+    or link has None and is unlinked without following it.
 
     Raises:
         OSError: no directory of its own is there (``_open_directory_at``).
@@ -1968,10 +1968,14 @@ def _open_for_removal(
     try:
         _writable_dir(fd)
         with os.scandir(fd) as entries:
-            children = list[tuple[str, tuple[int, int] | None]]()
+            children = list[tuple[str, tuple[int, int, int] | None]]()
             for entry in entries:
                 info = entry.stat(follow_symlinks=False)
-                identity = (info.st_dev, info.st_ino) if stat.S_ISDIR(info.st_mode) else None
+                identity = (
+                    (info.st_dev, info.st_ino, info.st_ctime_ns)
+                    if stat.S_ISDIR(info.st_mode)
+                    else None
+                )
                 children.append((entry.name, identity))
     except BaseException:
         os.close(fd)
