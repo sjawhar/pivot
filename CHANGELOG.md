@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.9.2 (2026-11-01)
+
+### Bug Fixes
+
+- **gc**: Refuse a directory symlink even when the runtime follows it under O_NOFOLLOW
+  ([#548](https://github.com/sjawhar/pivot/pull/548),
+  [`8223bdc`](https://github.com/sjawhar/pivot/commit/8223bdc73a2a13396d9a09906efeab55495ac554))
+
+
 ## v0.9.1 (2026-11-01)
 
 ### Bug Fixes

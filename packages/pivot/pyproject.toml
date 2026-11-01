@@ -1,6 +1,6 @@
 [project]
 name = "pivot"
-version = "0.9.1"
+version = "0.9.2"
 description = "High-performance Python pipeline tool with automatic code change detection"
 requires-python = ">=3.13,<3.14"
 readme = "README.md"
