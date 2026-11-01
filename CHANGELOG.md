@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.9.1 (2026-11-01)
+
+### Bug Fixes
+
+- **fingerprint**: Fingerprint a loader nested in another loader's config
+  ([#547](https://github.com/sjawhar/pivot/pull/547),
+  [`ded1002`](https://github.com/sjawhar/pivot/commit/ded1002fa9d479ef2f09662374c5ef401a999d2c))
+
+
 ## v0.9.0 (2026-11-01)
 
 ### Features
