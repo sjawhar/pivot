@@ -2115,7 +2115,7 @@ def _process_class_body_dependencies(
         value = ns[name]
         if isinstance(value, type) and is_user_code(value):
             with _walking(f"n:{name}"):
-                key = f"class:{_definition_ref(value)}"
+                key = f"class:{_unique_ref(value)}"
                 if key not in manifest:
                     _add_callable_to_manifest(key, value, manifest, visited)
                 if hasattr(value, "model_fields"):
@@ -2130,7 +2130,7 @@ def _process_class_body_dependencies(
         if resolved is None or not isinstance(resolved, type) or not is_user_code(resolved):
             continue
         with _walking(step):
-            key = f"class:{_definition_ref(resolved)}"
+            key = f"class:{_unique_ref(resolved)}"
             if key not in manifest:
                 _add_callable_to_manifest(key, resolved, manifest, visited)
             if hasattr(resolved, "model_fields"):
@@ -2518,22 +2518,26 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
     """The user members of a loader class that its user-defined `load`, `save` and `empty`
     reach, each with its manifest reference (`<module>.<defining class>.<label>`).
 
-    Code reaches a member by reading `self.<name>` (or `cls.<name>`: an attribute of a
-    method's first parameter) or `super().<name>`, and the functions such names hold reach
-    further: a helper method, a property's getter and setter, a static or class method. A name
-    is looked up on the class's MRO as Python looks it up, from after the defining class for
-    `super()`. A dataclass field is config (`loader_config_text`), not a member; a name a
-    library class answers is framework code. A member no reaching code reads is not walked, so
-    an unused helper adds no entry and no refusal.
+    Code reaches a member through the method's first parameter (`self`, or `cls`) in each
+    static form (`_member_reads`): `self.<name>`, `getattr(self, "<name>")`,
+    `type(self).<name>` and `self.__class__.<name>`, `super().<name>`, and the dunder methods a
+    builtin call on `self` runs (`str(self)` runs `__str__`). The functions such names hold reach
+    further: a helper method, a property's getter and setter, a static or class method, and
+    the function a `functools.wraps` wrapper wraps. A name is looked up on the class's MRO as
+    Python looks it up, from after the defining class for `super()`. A class constant read so
+    (`self.SUFFIX`) is a value the walk records or refuses as it does a global. A dataclass
+    field is config (`loader_config_text`), not a member; a name a library class answers is
+    framework code. A member no reaching code reads is not walked, so an unused helper adds no
+    entry and no refusal.
+
+    When reaching code uses `self` in a way no static form names (`self` passed to another
+    function, `vars(self)`, an operator, `type(self)(...)`), any member may run, so every user
+    member of the class is walked (`_all_loader_members`).
     """
 
     def collect() -> list[tuple[str, Any]]:
         mro = loader_type.__mro__
-        fields = (
-            {field.name for field in dataclasses.fields(loader_type)}
-            if dataclasses.is_dataclass(loader_type)
-            else set[str]()
-        )
+        fields = _dataclass_field_names(loader_type)
         found = list[tuple[str, Any]]()
         seen = set[tuple[int, str]]()
         work = list[tuple[Any, type, bool]]()  # a function, its class, whether it takes self
@@ -2545,13 +2549,16 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
             seen.add((id(owner), name))
             function = getattr(raw, "__func__", raw)
             if inspect.isfunction(function):
-                work.append((function, owner, not isinstance(raw, staticmethod)))
+                work.extend(_member_functions(function, owner, raw))
         while work:
             function, defined_in, takes_self = work.pop()
             tree = _source_tree(function)
             if tree is None:
                 continue
-            for via_super, name in _member_reads(tree, takes_self):
+            reads, dynamic = _member_reads(tree, takes_self)
+            if dynamic:
+                return _all_loader_members(loader_type, fields)
+            for via_super, name in reads:
                 start = mro.index(defined_in) + 1 if via_super else 0
                 resolved = _loader_member(mro, name, start, fields)
                 if resolved is None:
@@ -2561,18 +2568,80 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
                     continue
                 seen.add((id(owner), name))
                 owner_ref = _definition_ref(owner)
-                for label, member in _class_member_parts(name, raw):
-                    if member is None:
-                        continue
-                    value = _user_member_value(member)
-                    if value is _UNREAD:
-                        continue
+                for label, value in _member_values(name, raw):
                     found.append((f"{owner_ref}.{label}", value))
                     if inspect.isfunction(value):
-                        work.append((value, owner, not isinstance(raw, staticmethod)))
+                        work.extend(_member_functions(value, owner, raw))
         return found
 
     return _memoized("loader-members", loader_type, collect)
+
+
+def _dataclass_field_names(cls: type) -> set[str]:
+    """The names of a dataclass's fields; empty for any other class."""
+    if not dataclasses.is_dataclass(cls):
+        return set[str]()
+    return {field.name for field in dataclasses.fields(cls)}
+
+
+def _member_values(name: str, raw: Any) -> list[tuple[str, Any]]:
+    """The values of one class-dict member the walk records: each callable part it can run
+    that user code owns (`_class_member_parts`, `_user_member_value`), or the member itself
+    when it is a plain value (a class constant), which the walk records or refuses as it does
+    a global (`_process_captured_value`)."""
+    values = list[tuple[str, Any]]()
+    for label, member in _class_member_parts(name, raw):
+        if member is None:
+            continue
+        value = _user_member_value(member)
+        if value is not _UNREAD:
+            values.append((label, value))
+        elif not callable(member) and not _has_attribute(type(member), "__get__"):
+            values.append((label, member))
+    return values
+
+
+def _member_functions(function: Any, owner: type, raw: Any) -> list[tuple[Any, type, bool]]:
+    """The functions whose bodies the reachable walk reads for a member function, each with
+    the class that holds the member and whether it takes the instance first: each function a
+    `functools.wraps` chain wraps (`__wrapped__`) that user source defines, and each wrapper
+    on the chain but one that only forwards `*args` to what it wraps (it names no member, and
+    receives the instance unnamed, which `_member_reads` would read as a dynamic use)."""
+    takes_self = not isinstance(raw, staticmethod)
+    functions = list[tuple[Any, type, bool]]()
+    current: Any = function
+    while inspect.isfunction(current):
+        wrapped = getattr(current, "__wrapped__", None)
+        forwards = wrapped is not None and current.__code__.co_argcount == 0
+        if not forwards and (current is function or _written_in_user_source(current)):
+            functions.append((current, owner, takes_self))
+        current = wrapped
+    return functions
+
+
+def _all_loader_members(loader_type: type, fields: set[str]) -> list[tuple[str, Any]]:
+    """Every user member of a loader class but `load`, `save` and `empty` (which the loader's
+    walk hashes itself) and its dataclass fields: each callable part user code owns and each
+    plain value (`_member_values`) that a user class on the MRO defines and no earlier class
+    overrides, under its defining class. Dunder values (`__module__`, `__dataclass_fields__`)
+    and the ABC machinery's cache (`_abc_impl`) are the class machinery's, not members;
+    user-defined dunder methods are members."""
+    found = list[tuple[str, Any]]()
+    seen = set[str]()
+    for klass in loader_type.__mro__:
+        names = [name for name in vars(klass) if name not in seen]
+        seen.update(names)
+        if not is_user_code(klass):
+            continue
+        owner_ref = _definition_ref(klass)
+        for name in names:
+            if name in _LOADER_METHODS or name in fields or name == "_abc_impl":
+                continue
+            for label, value in _member_values(name, vars(klass)[name]):
+                if name.startswith("__") and name.endswith("__") and not callable(value):
+                    continue
+                found.append((f"{owner_ref}.{label}", value))
+    return found
 
 
 def _loader_member(
@@ -2589,32 +2658,136 @@ def _loader_member(
     return None
 
 
-def _member_reads(tree: ast.Module, takes_self: bool) -> list[tuple[bool, str]]:
-    """The class members a method's body reads: `(False, name)` for `self.name`, through the
-    method's first parameter when it takes one, and `(True, name)` for `super().name`."""
+# The dunder methods a builtin call on an instance runs, by the builtin's name; a call of any
+# other function on `self` is a dynamic use (`_member_reads`).
+_BUILTIN_DUNDERS: dict[str, tuple[str, ...]] = {
+    "str": ("__str__", "__repr__"),
+    "repr": ("__repr__",),
+    "ascii": ("__repr__",),
+    "format": ("__format__", "__str__", "__repr__"),
+    "print": ("__str__", "__repr__"),
+    "len": ("__len__",),
+    "bool": ("__bool__", "__len__"),
+    "hash": ("__hash__",),
+    "iter": ("__iter__", "__getitem__"),
+    "next": ("__next__",),
+    "reversed": ("__reversed__", "__len__", "__getitem__"),
+    "int": ("__int__", "__index__", "__trunc__"),
+    "float": ("__float__", "__index__"),
+    "complex": ("__complex__", "__float__", "__index__"),
+    "abs": ("__abs__",),
+    "round": ("__round__",),
+    "list": ("__iter__", "__getitem__", "__len__"),
+    "tuple": ("__iter__", "__getitem__", "__len__"),
+    "set": ("__iter__", "__getitem__"),
+    "frozenset": ("__iter__", "__getitem__"),
+    "sorted": ("__iter__", "__getitem__"),
+    "enumerate": ("__iter__", "__getitem__"),
+}
+# Builtins that read no member of the instance they are given.
+_MEMBERLESS_BUILTINS = frozenset(("isinstance", "issubclass", "id", "callable"))
+# Builtins that read the attribute their second argument names, when it is a literal.
+_NAMED_ATTRIBUTE_BUILTINS = frozenset(("getattr", "hasattr", "setattr", "delattr"))
+# f-string conversions (`ast.FormattedValue.conversion`) and the builtin each one calls.
+_FSTRING_CONVERSIONS = {-1: "format", ord("s"): "str", ord("r"): "repr", ord("a"): "ascii"}
+
+
+def _member_reads(tree: ast.Module, takes_self: bool) -> tuple[list[tuple[bool, str]], bool]:
+    """The class members a method's body reads through its first parameter (the receiver, when
+    it takes one), as `(via_super, name)`, and whether it uses the receiver in a way no static
+    form names (a dynamic use).
+
+    Static forms: `self.name`; `getattr(self, "name")` (also `hasattr`, `setattr`, `delattr`);
+    `type(self).name` and `self.__class__.name`; `super().name` and `super(C, self).name`
+    (`via_super`); a builtin call on `self` (`str(self)`, an f-string `{self}`), which reads the
+    dunders it runs (`_BUILTIN_DUNDERS`); and `isinstance(self, C)`, which reads none. Any other
+    use of the receiver (passed to another function, `getattr` with a computed name, which the
+    walk also refuses, `vars(self)`, an operator, `type(self)(...)`, a rebinding) is dynamic. A
+    method that takes the instance with only `*args` receives it unnamed, which is dynamic too."""
     function = next(
         (node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))),
         None,
     )
     if function is None:
-        return []
+        return [], False
     parameters = [*function.args.posonlyargs, *function.args.args]
+    if takes_self and not parameters and function.args.vararg is not None:
+        return [], True
     receiver = parameters[0].arg if takes_self and parameters else None
+    parents = {child: node for node in ast.walk(function) for child in ast.iter_child_nodes(node)}
     reads = list[tuple[bool, str]]()
     for node in ast.walk(function):
-        if not isinstance(node, ast.Attribute):
-            continue
-        base = node.value
-        if receiver is not None and isinstance(base, ast.Name) and base.id == receiver:
-            reads.append((False, node.attr))
-        elif (
-            isinstance(base, ast.Call)
-            and isinstance(base.func, ast.Name)
-            and base.func.id == "super"
-            and not base.args
-        ):
+        if isinstance(node, ast.Attribute) and _is_bare_super_call(node.value):
             reads.append((True, node.attr))
-    return reads
+            continue
+        if not (isinstance(node, ast.Name) and node.id == receiver):
+            continue
+        if not isinstance(node.ctx, ast.Load):
+            return reads, True
+        found = _receiver_use(node, parents)
+        if found is None:
+            return reads, True
+        reads.extend(found)
+    return reads, False
+
+
+def _is_bare_super_call(node: ast.AST) -> bool:
+    """Whether `node` is `super()` with no arguments."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "super"
+        and not node.args
+    )
+
+
+def _receiver_use(
+    node: ast.Name, parents: Mapping[ast.AST, ast.AST]
+) -> list[tuple[bool, str]] | None:
+    """The members one load of the receiver reads, as `(via_super, name)`, or None for a
+    dynamic use (`_member_reads`)."""
+    parent = parents.get(node)
+    if isinstance(parent, ast.Attribute) and parent.value is node:
+        if parent.attr != "__class__":
+            return [(False, parent.attr)]
+        return _class_attribute_use(parent, parents)
+    if isinstance(parent, ast.FormattedValue) and parent.value is node:
+        builtin = _FSTRING_CONVERSIONS.get(parent.conversion, "format")
+        return [(False, name) for name in _BUILTIN_DUNDERS[builtin]]
+    if not (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)):
+        return None
+    if node not in parent.args or parent.keywords:
+        return None
+    builtin = parent.func.id
+    if builtin in _MEMBERLESS_BUILTINS:
+        return []
+    if builtin in _NAMED_ATTRIBUTE_BUILTINS and parent.args[0] is node:
+        name = parent.args[1] if len(parent.args) > 1 else None
+        if isinstance(name, ast.Constant) and isinstance(name.value, str):
+            return [(False, name.value)]
+        return None
+    if builtin == "type" and len(parent.args) == 1:
+        return _class_attribute_use(parent, parents)
+    if builtin == "super" and len(parent.args) == 2 and parent.args[1] is node:
+        holder = parents.get(parent)
+        if isinstance(holder, ast.Attribute) and holder.value is parent:
+            return [(True, holder.attr)]
+        return None
+    if builtin in _BUILTIN_DUNDERS and len(parent.args) == 1:
+        return [(False, name) for name in _BUILTIN_DUNDERS[builtin]]
+    return None
+
+
+def _class_attribute_use(
+    node: ast.AST, parents: Mapping[ast.AST, ast.AST]
+) -> list[tuple[bool, str]] | None:
+    """The member `type(self).<name>` or `self.__class__.<name>` reads, `node` being
+    `type(self)` or `self.__class__`; None when the class is used otherwise (called, passed
+    on), a dynamic use."""
+    holder = parents.get(node)
+    if isinstance(holder, ast.Attribute) and holder.value is node:
+        return [(False, holder.attr)]
+    return None
 
 
 def _is_unsafe_fingerprinting_enabled() -> bool:
@@ -3304,9 +3477,9 @@ def _process_callable_dependency(
     binding_ref: str, func: Callable[..., Any], manifest: dict[str, str], visited: set[int]
 ) -> None:
     """Process a callable dependency and add to manifest."""
-    prefix = "class" if isinstance(func, type) else "func"
+    key = f"class:{_unique_ref(func)}" if isinstance(func, type) else None
     _add_callable_to_manifest(
-        f"{prefix}:{_callable_ref(func, binding_ref)}", func, manifest, visited
+        key or f"func:{_callable_ref(func, binding_ref)}", func, manifest, visited
     )
 
 
@@ -3546,7 +3719,7 @@ def _process_type_hint_dependencies(
     _record_read(func, "hints")
     for index, hint_class in enumerate(_hint_classes(func)):
         with _walking(f"hc:{index}"):
-            key = f"class:{_definition_ref(hint_class)}"
+            key = f"class:{_unique_ref(hint_class)}"
             if key not in manifest:
                 _add_callable_to_manifest(key, hint_class, manifest, visited)
             # Always hash Pydantic schema (even if class was already added via closure vars)
@@ -3601,7 +3774,7 @@ def _hash_pydantic_schema(
     visited: set[int],
 ) -> None:
     _record_read(model, "schema")
-    schema_key = f"schema:{_definition_ref(model)}"
+    schema_key = f"schema:{_unique_ref(model)}"
     if schema_key in manifest:
         return
     # Insert placeholder to prevent infinite recursion on self-referential models
@@ -3609,7 +3782,7 @@ def _hash_pydantic_schema(
     manifest[schema_key] = "<pending>"
     for index, field_class in enumerate(_model_field_classes(model)):
         with _walking(f"fc:{index}"):
-            key = f"class:{_definition_ref(field_class)}"
+            key = f"class:{_unique_ref(field_class)}"
             if key not in manifest:
                 _add_callable_to_manifest(key, field_class, manifest, visited)
             if hasattr(field_class, "model_fields"):
@@ -3868,6 +4041,9 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         if type(attributes) is dict and _BY_NAME_MARK in attributes:
             own = cast("dict[str, Any]", attributes)
             attributes = {name: item for name, item in own.items() if name != _BY_NAME_MARK}
+        hidden = _hidden_state.get()
+        if hidden is not None and _keeps_state_outside_dict(type(cast("object", value))):
+            hidden[0] = True
         return [_definition_ref(type(value)), _canonicalize_value_for_hash(attributes, inner)]
     return [type(value).__name__, repr(value)]
 
@@ -4082,6 +4258,15 @@ def _definition_ref(obj: Any) -> str:
     return f"{module}.{_get_qualname_for_cache(obj)}"
 
 
+def _unique_ref(cls: type) -> str:
+    """A class's reference in a manifest key: its definition name (`_definition_ref`), and for a
+    class with no source (`_has_no_source`) its hash too (`<name>@<hash>`). Such classes share a
+    name when one factory makes them (`collections.namedtuple` takes the factory's module), so
+    the name alone would key two of them alike and drop the second."""
+    ref = _definition_ref(cls)
+    return f"{ref}@{hash_function_ast(cls)}" if _has_no_source(cls) else ref
+
+
 def _binding_ref(func: Callable[..., Any], name: str) -> str:
     """Return a module-qualified reference for a value reached through `func`."""
     globals_dict = getattr(func, "__globals__", {})
@@ -4116,11 +4301,23 @@ def _should_skip_persistent_cache(func: Callable[..., Any]) -> bool:
     Skip for:
     - Closures: `<locals>` in qualname → qualname collision risk
     - Wrapped functions: has `__wrapped__` → source file mismatch risk
+    - A class with no source of its own (`_has_no_source`): its hash reads values that may
+      come from other files, and two such classes can share a module and a name
     """
     qualname = getattr(func, "__qualname__", "")
     if "<locals>" in qualname:
         return True
+    if _has_no_source(func):
+        return True
     return hasattr(func, "__wrapped__")
+
+
+def _has_no_source(obj: Any) -> bool:
+    """Whether `obj` is a class with no class statement of its own (`collections.namedtuple`,
+    `dataclasses.make_dataclass`, a functional `enum.Enum`, `type(...)`,
+    `pydantic.create_model`): the compiler sets `__firstlineno__` in a class statement's
+    namespace, and `inspect.getsource` finds a class by it."""
+    return isinstance(obj, type) and "__firstlineno__" not in vars(obj)
 
 
 def hash_function_ast(func: Callable[..., Any]) -> str:
@@ -4333,36 +4530,193 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         metrics.end("fingerprint._compute_function_hash", _t)
 
 
-# A repr that holds a memory address, which differs in each process.
-_ADDRESS = re.compile(r" at 0x[0-9a-fA-F]+")
-# Namespace entries every class has whose text says nothing of what defines it.
-_CLASS_NAMESPACE_NOISE = frozenset(("__dict__", "__weakref__", "__doc__"))
+# A memory address in a repr (`<object object at 0x7f...>`, pydantic-core's `Py(0x...)`), which
+# differs in each process.
+_ADDRESS = re.compile(r"0x[0-9a-fA-F]{6,}")
+# Namespace entries every class has whose text says nothing of what defines it; `_abc_impl` is
+# the ABC machinery's cache of registered and checked subclasses.
+_CLASS_NAMESPACE_NOISE = frozenset(("__dict__", "__weakref__", "__doc__", "_abc_impl"))
+# Namespace entries pydantic generates for a model from what `_pydantic_model_parts` records
+# (its fields, config, validators, private attributes and class variables): the core schema,
+# validator and serializer, whose reprs hold addresses and vary between processes, and the
+# rest of its bookkeeping.
+_PYDANTIC_GENERATED = frozenset(
+    (
+        "__abstractmethods__",
+        "__annotations__",
+        "__annotate__",
+        "__class_vars__",
+        "__private_attributes__",
+        "__signature__",
+        "model_config",
+    )
+)
+# Set while `_sourceless_parts` builds a form: `_canonicalize_value_for_hash` sets it when it
+# meets an instance whose state its form does not hold (`_keeps_state_outside_dict`).
+_hidden_state: contextvars.ContextVar[list[bool] | None] = contextvars.ContextVar(
+    "_hidden_state", default=None
+)
 
 
 def _sourceless_class_hash(cls: type) -> str:
     """The hash of a class with no source of its own (`collections.namedtuple`,
-    `dataclasses.make_dataclass`, a functional `enum.Enum`, `type(...)`): its module, name and
-    bases, and each entry of its own namespace (`_sourceless_form`). It is the same in every
-    process, and it changes when what defines the class changes: its fields, its members, or
-    the code of a function it holds."""
-    namespace = vars(cls)
+    `dataclasses.make_dataclass`, a functional `enum.Enum`, `type(...)`, `pydantic.create_model`):
+    what defines it (`_sourceless_parts`). It is the same in every process, and it changes when
+    what defines the class changes: its fields, its members, or the code of a function it holds.
+
+    An entry that holds a value whose form does not show it (a sentinel `object()` or a
+    `__slots__` object, whose repr is an address; a `random.Random`, whose state is in C) keeps
+    the rest of its form, without the address, so a change to any other entry is still seen. A
+    change to such a value itself is not visible in any form, so the class is then also hashed
+    with the source of the module that defines it (`_module_source_digest`): an edit to that
+    module reruns the stages that read the class, as it did when the class was hashed by its
+    address, and no new process and no fresh state database does."""
+    parts, opaque = _sourceless_parts(cls)
+    if opaque:
+        parts.append(["module-source", _module_source_digest(cls)])
+    return xxhash.xxh64(json.dumps(parts).encode()).hexdigest()
+
+
+def _sourceless_parts(cls: type) -> tuple[list[Any], bool]:
+    """What defines a class with no source, without addresses, and whether it holds a value its
+    form does not show (an address, or `_keeps_state_in_c`): its module, name and bases, then,
+    for a pydantic model, `_pydantic_model_parts`, and for any other class each entry of its own
+    namespace (`_sourceless_form`)."""
     parts: list[Any] = [
         "class",
         cls.__module__,
         cls.__qualname__,
         [_definition_ref(base) for base in cls.__bases__],
     ]
-    for name in sorted(namespace):
-        if name not in _CLASS_NAMESPACE_NOISE:
-            parts.append([name, _sourceless_form(namespace[name])])
-    return xxhash.xxh64(json.dumps(parts).encode()).hexdigest()
+    namespace = vars(cls)
+    hidden = [False]
+    token = _hidden_state.set(hidden)
+    try:
+        if "__pydantic_fields__" in namespace and "__pydantic_decorators__" in namespace:
+            parts.extend(_pydantic_model_parts(cls))
+        else:
+            for name in sorted(namespace):
+                if name not in _CLASS_NAMESPACE_NOISE:
+                    parts.append([name, _sourceless_form(namespace[name])])
+    finally:
+        _hidden_state.reset(token)
+    stripped = _without_addresses(parts, hidden)
+    return stripped, hidden[0]
+
+
+def _keeps_state_outside_dict(cls: type) -> bool:
+    """Whether instances of `cls` may hold state their `__dict__` does not: an instance larger
+    than a bare `object` keeps `__slots__` values or a C type's fields (`random.Random` keeps its
+    generator's state in `_random.Random`). A class statement's own `__dict__` and
+    `__weakref__` add no size."""
+    return cls.__basicsize__ > object.__basicsize__
+
+
+def _without_addresses(form: Any, found: list[bool]) -> Any:
+    """`form` with each memory address in its text replaced by `0x?`; `found[0]` is set when one
+    was."""
+    if isinstance(form, str):
+        text = _ADDRESS.sub("0x?", form)
+        if text != form:
+            found[0] = True
+        return text
+    if isinstance(form, list):
+        return [_without_addresses(item, found) for item in cast("list[Any]", form)]
+    if isinstance(form, dict):
+        mapping = cast("dict[str, Any]", form)
+        return {key: _without_addresses(item, found) for key, item in mapping.items()}
+    return form
+
+
+def _module_source_digest(cls: type) -> str | None:
+    """The digest of the source of the module that defines `cls` (`_source_digest`), or None
+    when the module has no source file."""
+    module = sys.modules.get(cls.__module__)
+    filename = None if module is None else vars(module).get("__file__")
+    if not isinstance(filename, str):
+        return None
+    try:
+        return _source_digest(filename)
+    except OSError:
+        return None
+
+
+def _pydantic_model_parts(cls: type) -> list[Any]:
+    """What defines a pydantic model with no source (`pydantic.create_model`), from what its
+    author declared: each field's name and the public attributes of its `FieldInfo` (annotation,
+    default, default factory, alias, constraints...), its config, the code and settings of each
+    validator, serializer and computed field, its private attributes and class variables, and
+    any other entry of its namespace. The core schema, validator and serializer pydantic builds
+    from these are left out: their reprs hold addresses, and they differ between processes."""
+    namespace = vars(cls)
+    model = cast("Any", cls)
+    fields = cast("dict[str, Any]", namespace["__pydantic_fields__"])
+    field_forms = list[Any]()
+    for name, info in fields.items():
+        slot_names = cast("tuple[str, ...]", getattr(type(cast("object", info)), "__slots__", ()))
+        slots = [slot for slot in slot_names if not slot.startswith("_")]
+        field_forms.append(
+            [name, [[slot, _sourceless_form(getattr(info, slot))] for slot in slots]]
+        )
+    decorators = namespace["__pydantic_decorators__"]
+    decorator_forms = list[Any]()
+    decorator_names = set[str]()
+    for group in dataclasses.fields(decorators):
+        for name, decorator in cast("dict[str, Any]", getattr(decorators, group.name)).items():
+            decorator_names.add(name)
+            function = getattr(decorator.func, "__func__", decorator.func)
+            decorator_forms.append(
+                [
+                    group.name,
+                    name,
+                    _sourceless_form(function),
+                    _decorator_info_form(decorator.info),
+                ]
+            )
+    private = cast("dict[str, Any]", namespace.get("__private_attributes__", {}))
+    private_forms = [
+        [name, _sourceless_form(attr.default), _sourceless_form(attr.default_factory)]
+        for name, attr in private.items()
+    ]
+    rest = [
+        [name, _sourceless_form(namespace[name])]
+        for name in sorted(namespace)
+        if name not in _CLASS_NAMESPACE_NOISE
+        and name not in _PYDANTIC_GENERATED
+        and not name.startswith("__pydantic_")
+        and name not in decorator_names
+        and name not in private
+    ]
+    return [
+        ["fields", field_forms],
+        ["config", _sourceless_form(dict(model.model_config))],
+        ["decorators", decorator_forms],
+        ["private", private_forms],
+        ["class-vars", sorted(cast("set[str]", namespace.get("__class_vars__", set[str]())))],
+        ["namespace", rest],
+    ]
+
+
+def _decorator_info_form(info: Any) -> Any:
+    """The settings of a pydantic validator, serializer or computed field (a dataclass such as
+    `FieldValidatorDecoratorInfo`), field by field (`_sourceless_form`), so a property or
+    function in it is recorded by its code."""
+    if not dataclasses.is_dataclass(info) or isinstance(info, type):
+        return _sourceless_form(info)
+    return [
+        _definition_ref(type(cast("object", info))),
+        [
+            [field.name, _sourceless_form(getattr(info, field.name))]
+            for field in dataclasses.fields(info)
+        ],
+    ]
 
 
 def _sourceless_form(value: Any) -> Any:
-    """A form of one namespace entry of a class with no source (`_sourceless_class_hash`)
-    that holds no address: a function by its code, a library function by its name, a class by
-    its name, a dataclass's fields by their names, types and defaults, and any other value by
-    its canonical form, or by its type's name when that form holds an address."""
+    """A form of one namespace entry of a class with no source (`_sourceless_class_hash`): a
+    function by its code, a library function by its name, a class by its name, a dataclass's
+    fields by their names, types and defaults, and any other value by its canonical form. A
+    memory address in a form is left out by `_sourceless_parts`."""
     if isinstance(value, (staticmethod, classmethod)):
         wrapper = cast("staticmethod[..., Any] | classmethod[Any, ..., Any]", value)
         return [type(wrapper).__name__, _sourceless_form(cast("Any", wrapper).__func__)]
@@ -4388,10 +4742,7 @@ def _sourceless_form(value: Any) -> Any:
     ):
         mapping = cast("dict[str, Any]", value)
         return ["fields", [[name, _sourceless_form(item)] for name, item in mapping.items()]]
-    form = _canonicalize_value_for_hash(value)
-    if _ADDRESS.search(json.dumps(form)):
-        return ["opaque", _definition_ref(type(cast("object", value)))]
-    return form
+    return _canonicalize_value_for_hash(value)
 
 
 def _sourceless_function_form(function: types.FunctionType) -> Any:

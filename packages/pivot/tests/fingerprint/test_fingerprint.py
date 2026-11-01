@@ -15,6 +15,8 @@ import logging
 import math
 import os
 import pathlib
+import random
+import subprocess
 import sys
 import time
 import types
@@ -2099,6 +2101,163 @@ class _FieldFunction(loaders.Reader[str]):
         return self.fmt(path.read_text())
 
 
+def _logged(function: typing.Callable[..., str]) -> typing.Callable[..., str]:
+    @functools.wraps(function)
+    def wrapper(*args: typing.Any, **kwargs: typing.Any) -> str:
+        return function(*args, **kwargs)
+
+    return wrapper
+
+
+def _reach_apply(obj: typing.Any) -> str:
+    return obj._suffix()
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReachBy(loaders.Reader[str]):
+    """A loader whose `unused` reads a list global and is reached by no static form."""
+
+    def _suffix(self) -> str:
+        return "A"
+
+    def unused(self) -> str:
+        return ",".join(_LABELS)
+
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text()
+
+
+@dataclasses.dataclass(frozen=True)
+class _ByGetattr(_ReachBy):
+    def load(self, path: pathlib.Path) -> str:
+        return getattr(self, "_suffix")()  # noqa: B009 - the literal getattr form is the point
+
+
+@dataclasses.dataclass(frozen=True)
+class _ByTypeOfSelf(_ReachBy):
+    def load(self, path: pathlib.Path) -> str:
+        return type(self)._suffix.__name__
+
+
+@dataclasses.dataclass(frozen=True)
+class _BySelfClass(_ReachBy):
+    def load(self, path: pathlib.Path) -> str:
+        return self.__class__._suffix.__name__
+
+
+@dataclasses.dataclass(frozen=True)
+class _ByWrappedHelper(_ReachBy):
+    @_logged
+    def _helper(self) -> str:
+        return self._suffix()
+
+    def load(self, path: pathlib.Path) -> str:
+        return self._helper()
+
+
+@dataclasses.dataclass(frozen=True)
+class _ByBuiltin(_ReachBy):
+    def __str__(self) -> str:
+        return self._suffix()
+
+    def load(self, path: pathlib.Path) -> str:
+        return f"{self!s}" + str(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ByConstant(_ReachBy):
+    SUFFIX: typing.ClassVar[str] = "A"
+
+    def load(self, path: pathlib.Path) -> str:
+        return self.SUFFIX + self._suffix()
+
+
+@dataclasses.dataclass(frozen=True)
+class _BySelfGiven(_ReachBy):
+    def load(self, path: pathlib.Path) -> str:
+        return _reach_apply(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ByOperator(_ReachBy):
+    def __add__(self, other: str) -> str:
+        return self._suffix() + other
+
+    def load(self, path: pathlib.Path) -> str:
+        return self + ""
+
+
+_SUFFIX_REF = f"{__name__}._ReachBy._suffix"
+_UNUSED_REF = f"{__name__}._ReachBy.unused"
+
+
+@pytest.mark.parametrize(
+    ("loader_class", "expected"),
+    [
+        pytest.param(_ByGetattr, {_SUFFIX_REF}, id="getattr-literal"),
+        pytest.param(_ByTypeOfSelf, {_SUFFIX_REF}, id="type-of-self"),
+        pytest.param(_BySelfClass, {_SUFFIX_REF}, id="self-class"),
+        pytest.param(
+            _ByWrappedHelper,
+            {_SUFFIX_REF, f"{__name__}._ByWrappedHelper._helper"},
+            id="wrapped-helper",
+        ),
+        pytest.param(
+            _ByBuiltin, {_SUFFIX_REF, f"{__name__}._ByBuiltin.__str__"}, id="builtin-dunder"
+        ),
+        pytest.param(
+            _ByConstant, {_SUFFIX_REF, f"{__name__}._ByConstant.SUFFIX"}, id="class-constant"
+        ),
+        pytest.param(_BySelfGiven, {_SUFFIX_REF, _UNUSED_REF}, id="self-given-to-a-function"),
+        pytest.param(
+            _ByOperator,
+            {_SUFFIX_REF, _UNUSED_REF, f"{__name__}._ByOperator.__add__"},
+            id="operator-on-self",
+        ),
+    ],
+)
+def test_a_loader_walks_what_each_form_of_self_reaches(loader_class: type, expected: set[str]):
+    """Each static form names the member it reaches: `getattr` with a literal, `type(self)`,
+    `self.__class__`, a `functools.wraps` helper's wrapped body, a builtin's dunder, a class
+    constant; no other member is walked. `self` given to a function or an operator on `self`
+    may reach any member, so every member is walked, `unused` included."""
+    reached = {ref for ref, _member in fingerprint._reachable_loader_members(loader_class)}
+
+    assert reached == expected
+
+
+def test_a_class_constant_load_reads_is_recorded_as_a_value():
+    """`self.SUFFIX` reads a class constant: its value is a `const:` entry of the loader."""
+    manifest = fingerprint.get_loader_fingerprint(_ByConstant())
+
+    assert f"const:{__name__}._ByConstant.SUFFIX" in manifest, manifest
+
+
+def _make_row(fields: str) -> type:
+    return collections.namedtuple("Row", fields)  # pyright: ignore[reportUntypedNamedTuple] - no source is the point
+
+
+_ROW_A = _make_row("a b")
+_ROW_B = _make_row("c d")
+
+
+def _reads_two_rows() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    return (_ROW_A._fields, _ROW_B._fields)
+
+
+def test_two_classes_with_no_source_and_one_name_have_two_keys():
+    """One factory makes two namedtuples, both `<this module>.Row`. Each is keyed by its name
+    and its hash, so both are entries of the walk, and neither is cached by its module's file."""
+    manifest = fingerprint.get_stage_fingerprint(_reads_two_rows)
+
+    keys = {key for key in manifest if key.startswith(f"class:{__name__}.Row@")}
+    assert keys == {
+        f"class:{__name__}.Row@{fingerprint.hash_function_ast(_ROW_A)}",
+        f"class:{__name__}.Row@{fingerprint.hash_function_ast(_ROW_B)}",
+    }
+    assert len(keys) == 2
+
+
 def test_a_config_field_load_reads_is_config_not_a_member():
     """`self.fmt` names a dataclass field: the loader's own value is walked as config, so the
     class's default, which reads a list global, is neither walked nor refused (a refusal would
@@ -2251,22 +2410,52 @@ def _chain(depth: int) -> typing.Any:
     return value
 
 
+_NO_SOURCE_MISSING = object()
+
+
+class _NoSourceBox:
+    """A value whose canonical form is its repr, which holds its address."""
+
+    __slots__: tuple[str, ...] = ("x",)
+
+    def __init__(self, x: int) -> None:
+        self.x: int = x
+
+
+def _no_source_check(cls: type, value: str) -> str:
+    return value
+
+
+def _no_source_check_edited(cls: type, value: str) -> str:
+    return value.strip()
+
+
 def _no_source_classes(variant: str) -> list[type]:
-    """Classes with no source of their own, made twice from one definition by `variant`."""
+    """Classes with no source of their own, made twice from one definition by `variant`; the
+    edited variant changes one entry of each."""
     second = variant == "edited"
     fields = "left middle" if second else "left right"
+    token = "B" if second else "A"
+    check = _no_source_check_edited if second else _no_source_check
     return [
         collections.namedtuple("_NoSourceRow", fields),  # pyright: ignore[reportUntypedNamedTuple] - no source is the point
         dataclasses.make_dataclass("_NoSourceGen", [("y" if second else "x", int)]),
         enum.Enum("_NoSourceMode", "A C" if second else "A B"),
         type("_NoSourceMade", (), {"x": 2 if second else 1}),
+        pydantic.create_model("_NoSourceModel", x=(int, 1), y=(str, token)),
+        pydantic.create_model(
+            "_NoSourceChecked",
+            x=(str, "v"),
+            __validators__={"check": pydantic.field_validator("x")(check)},
+        ),
     ]
 
 
 def test_a_class_with_no_source_is_hashed_by_what_defines_it():
-    """A namedtuple, a `make_dataclass` class, a functional enum and a `type(...)` class have no
-    source: each is hashed by its name, fields or members and code, not its address. Two made
-    from one definition hash alike; an edited definition hashes otherwise."""
+    """Classes with no source (namedtuples, `make_dataclass` classes, a functional enum, a
+    `type(...)` class, `pydantic.create_model` models) are hashed by their names, fields or
+    members and code, not their addresses: two made from one definition hash alike, an edit to
+    any entry hashes otherwise, and a model's validator is hashed by its code."""
     hashes = {
         variant: [fingerprint._compute_function_hash(cls) for cls in _no_source_classes(variant)]
         for variant in ("first", "again", "edited")
@@ -2275,6 +2464,183 @@ def test_a_class_with_no_source_is_hashed_by_what_defines_it():
     assert hashes["first"] == hashes["again"]
     for first, edited in zip(hashes["first"], hashes["edited"], strict=True):
         assert first != edited
+
+
+# Classes with no source with an entry whose form shows nothing (an `object()` sentinel, a
+# `__slots__` object, a `random.Random`) beside an entry holding `token`.
+
+
+def _sentinel_beside(token: str) -> type:
+    return collections.namedtuple(  # pyright: ignore[reportUntypedNamedTuple] - no source is the point
+        "_NoSourceSentinel", "a b c", defaults=(_NO_SOURCE_MISSING, token)
+    )
+
+
+def _slots_beside(token: str) -> type:
+    return collections.namedtuple(  # pyright: ignore[reportUntypedNamedTuple] - no source is the point
+        "_NoSourceSlots", "a box c", defaults=(_NoSourceBox(1), token)
+    )
+
+
+def _random_beside(token: str) -> type:
+    fields = [
+        ("rng", object, dataclasses.field(default=random.Random(1))),
+        ("y", str, dataclasses.field(default=token)),
+    ]
+    return dataclasses.make_dataclass("_NoSourceRandom", fields)
+
+
+def _model_sentinel_beside(token: str) -> type:
+    return pydantic.create_model(
+        "_NoSourceSentinelModel", x=(object, _NO_SOURCE_MISSING), y=(str, token)
+    )
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(_sentinel_beside, id="sentinel"),
+        pytest.param(_slots_beside, id="slots"),
+        pytest.param(_random_beside, id="random"),
+        pytest.param(_model_sentinel_beside, id="model-sentinel"),
+    ],
+)
+def test_an_edit_beside_a_value_no_form_shows_changes_the_hash(
+    make: typing.Callable[[str], type],
+):
+    """An entry whose form shows nothing leaves the rest of the class's entries in its hash: an
+    edit to the other default (`A` to `B`, in this one module) changes it, and two classes made
+    alike hash alike."""
+    first = fingerprint._compute_function_hash(make("A"))
+    again = fingerprint._compute_function_hash(make("A"))
+    edited = fingerprint._compute_function_hash(make("B"))
+
+    assert first == again, "Two classes made alike should hash alike"
+    assert first != edited, "An edit to a shown entry should change the hash"
+
+
+# A module of classes with no source, one of each kind `fingerprint._sourceless_class_hash`
+# handles; TOKEN is replaced by a value that each class shows in an entry.
+_NO_SOURCE_KINDS_MODULE = """\
+import collections
+import collections.abc
+import dataclasses
+import enum
+import random
+import typing
+
+import pydantic
+
+_MISSING = object()
+
+
+class Box:
+    __slots__ = ("x",)
+
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+
+def _upper(text: str) -> str:
+    return text.upper()
+
+
+def _check(cls: type, value: str) -> str:
+    return value + "TOKEN"
+
+
+NtPlain = collections.namedtuple("NtPlain", "a TOKEN")
+NtDefaults = collections.namedtuple("NtDefaults", "a b", defaults=(1, "TOKEN"))
+NtSentinel = collections.namedtuple("NtSentinel", "a b c", defaults=(_MISSING, "TOKEN"))
+NtSlots = collections.namedtuple("NtSlots", "a box c", defaults=(Box(1), "TOKEN"))
+MdPlain = dataclasses.make_dataclass(
+    "MdPlain", [("x", int), ("y", str, dataclasses.field(default="TOKEN"))]
+)
+MdSentinel = dataclasses.make_dataclass(
+    "MdSentinel",
+    [("x", object, dataclasses.field(default=_MISSING)), ("y", str, dataclasses.field(default="TOKEN"))],
+)
+MdRandom = dataclasses.make_dataclass(
+    "MdRandom",
+    [
+        ("rng", object, dataclasses.field(default=random.Random(1))),
+        ("y", str, dataclasses.field(default="TOKEN")),
+    ],
+)
+MdFrozen = dataclasses.make_dataclass("MdFrozen", [("TOKEN", int)], frozen=True)
+EnumNames = enum.Enum("EnumNames", "TOKEN Z")
+EnumValues = enum.Enum("EnumValues", {"X": "TOKEN"})
+IntEnumF = enum.IntEnum("IntEnumF", "TOKEN Z")
+FlagF = enum.Flag("FlagF", "TOKEN Z")
+TypeDict = type("TypeDict", (), {"x": "TOKEN", "fn": _upper})
+TypeLambda = type("TypeLambda", (), {"fmt": staticmethod(lambda s: s + "TOKEN")})
+TypeSet = type("TypeSet", (), {"names": frozenset({"a", "b", "TOKEN"})})
+TypeAbc = type(
+    "TypeAbc", (collections.abc.Sized,), {"__module__": __name__, "__len__": lambda self: len("TOKEN")}
+)
+CmPlain = pydantic.create_model("CmPlain", x=(str, "TOKEN"))
+CmConstrained = pydantic.create_model(
+    "CmConstrained", x=(typing.Annotated[str, pydantic.Field(min_length=1, alias="TOKEN")], "v")
+)
+CmValidator = pydantic.create_model(
+    "CmValidator", x=(str, "v"), __validators__={"check": pydantic.field_validator("x")(_check)}
+)
+CmConfig = pydantic.create_model("CmConfig", __config__=pydantic.ConfigDict(title="TOKEN"), x=(int, 1))
+CmBase = pydantic.create_model("CmBase", __base__=CmPlain, y=(str, "TOKEN"))
+CmSentinel = pydantic.create_model("CmSentinel", x=(object, _MISSING), y=(str, "TOKEN"))
+"""
+
+# The kinds above whose form cannot show one of their values, so they are hashed with their
+# module's source too.
+_NO_SOURCE_HIDDEN = {"NtSentinel", "NtSlots", "MdSentinel", "MdRandom", "CmSentinel"}
+
+_NO_SOURCE_HASH_SCRIPT = """\
+import json
+import sys
+
+sys.path.insert(0, ".")
+import kinds_mod
+from pivot import fingerprint
+
+out = {}
+for name, cls in vars(kinds_mod).items():
+    if isinstance(cls, type) and cls.__module__ == "kinds_mod" and name != "Box":
+        out[name] = fingerprint._compute_function_hash(cls)
+print(json.dumps(out))
+"""
+
+
+def _no_source_hashes(directory: pathlib.Path, text: str, seed: str) -> dict[str, str]:
+    """The hash of each class of `text`, saved as module `kinds_mod`, from a new interpreter run
+    under `PYTHONHASHSEED=seed`."""
+    (directory / "kinds_mod.py").write_text(text)
+    result = subprocess.run(
+        [sys.executable, "-c", _NO_SOURCE_HASH_SCRIPT],
+        cwd=directory,
+        env={**os.environ, "PYTHONHASHSEED": seed},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(result.stdout.splitlines()[-1])
+
+
+def test_a_class_with_no_source_is_hashed_alike_in_every_interpreter(tmp_path: pathlib.Path):
+    """For every kind of class with no source, two interpreters under different hash seeds give
+    one hash. An edit to an entry the class shows changes it; a comment edit in its module
+    changes it only for a class whose form hides a value (`_NO_SOURCE_HIDDEN`), which is hashed
+    with its module's source."""
+    (tmp_path / ".pivot").mkdir()
+    original = _NO_SOURCE_KINDS_MODULE.replace("TOKEN", "A")
+    first = _no_source_hashes(tmp_path, original, "1")
+    second = _no_source_hashes(tmp_path, original, "2")
+    commented = _no_source_hashes(tmp_path, original + "# note\n", "1")
+    edited = _no_source_hashes(tmp_path, _NO_SOURCE_KINDS_MODULE.replace("TOKEN", "B"), "1")
+
+    assert len(first) == 22, sorted(first)
+    assert first == second, "Two interpreters should give each class one hash"
+    assert {name for name in first if first[name] != commented[name]} == _NO_SOURCE_HIDDEN
+    assert {name for name in first if first[name] == edited[name]} == set()
 
 
 def test_a_chain_of_held_loaders_is_canonicalized_once_per_loader(

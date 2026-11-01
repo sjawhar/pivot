@@ -151,10 +151,14 @@ raw = pipeline.input("semicolons.csv", format=loaders.CSV(sep=";"))
 
 A custom loader is a module-level frozen dataclass that extends `Reader`,
 `Writer`, or `Loader`. Fields become options, and their values are part of
-the fingerprint. Its code is too: `load`, `save`, `empty` and the methods
-and properties they call on `self` (or through `super()`), so an edit to a
-helper that `load` calls as `self.decorate()` re-runs the stages that use it.
-A method nothing calls is not part of the fingerprint. A field
+the fingerprint. Its code is too: `load`, `save`, `empty` and the methods,
+properties and class constants they reach on `self` (`self.decorate()`,
+`getattr(self, "decorate")`, `type(self).decorate`, `super().load`, or a
+builtin such as `str(self)` that runs `__str__`), so an edit to any of them
+re-runs the stages that use it. A method nothing reaches is not part of the
+fingerprint, unless your code uses `self` in a way Pivot cannot follow (passes
+it to a function, or applies an operator to it); then every method of the
+class is. A field
 can hold another loader (`Outer(Inner())`, a tuple of loaders, or a dataclass
 that holds one): Pivot fingerprints the held loader as it fingerprints a loader
 you pass directly, so an edit to `Inner.load` re-runs the stages that read
