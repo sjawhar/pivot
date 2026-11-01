@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import dataclasses
 import functools
 import pathlib
 from typing import TYPE_CHECKING
@@ -18,8 +18,16 @@ from pivot.storage import state, track
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pivot.registry import PipelineLike
+    from pivot.expansion import Expansion
+    from pivot.registry import MapTemplate, PipelineLike
     from pivot.remote import protocol
+    from pivot.storage import listing
+
+# Gets the listings at the records given (by hash): those read for expansion (a dry run's), the
+# hashes downloaded into the cache (a fetch's or pull's), and why each one missing was not had
+type _ListingFetch = Callable[
+    [dict[str, types.DirHash]], tuple[dict[str, listing.DirListing], frozenset[str], list[str]]
+]
 
 
 @click.group()
@@ -50,29 +58,147 @@ def _get_targets_list(targets: tuple[str, ...]) -> list[str] | None:
     return list(targets) if targets else None
 
 
+# The key an instance output's path is placed with, to find where a key goes in that path. A
+# key holds no NUL (``lock.variant_name_error``), so it is never mistaken for one.
+_OPEN_KEY = "\x00"
+
+
+def _instance_output(target: str, pipeline: PipelineLike) -> str | None:
+    """The instance of a mapped stage (``Pipeline.map``) that writes output path ``target``,
+    from the working directory, or a file inside it when the output is a directory:
+    ``data/p/cut@a.yaml`` is written by ``p/cut@a``. None for any other path. The instances
+    need not be expanded: the path is matched against where each output of the mapped stage is
+    placed (``store.relative_output_path``), the key left open, so the key need not exist."""
+    from pivot import registry
+    from pivot.storage import store as store_mod
+
+    relative = project.relative_within(
+        project.normalize_path(target, base=pathlib.Path.cwd()), project.get_project_root()
+    )
+    if relative is None:
+        return None
+    path = relative.as_posix()
+    for name in pipeline.list_templates():
+        for out in pipeline.get_template(name)["info"]["outs"]:
+            open_identity = types.ArtifactIdentity(f"{name}@{_OPEN_KEY}", out.identity.key)
+            placed = store_mod.relative_output_path(
+                dataclasses.replace(out, identity=open_identity)
+            )
+            head, _, tail = placed.as_posix().partition(_OPEN_KEY)
+            if not path.startswith(head):
+                continue
+            segment, slash, inner = path[len(head) :].partition("/")
+            if not tail or tail.startswith("/"):
+                # A directory or keyed output: the key is a whole directory name
+                key = segment
+                after = slash + inner
+                matched = after == tail or (
+                    out.tag is types.ArtifactTag.DIRECTORY and after.startswith(tail + "/")
+                )
+            else:
+                # A single file: the key runs up to the output's extension
+                key = segment.removesuffix(tail)
+                matched = not slash and segment.endswith(tail)
+            if matched and key and registry.template_of(f"{name}@{key}", [name]) == name:
+                return f"{name}@{key}"
+    return None
+
+
+def _mapped_targets(
+    targets: tuple[str, ...], pipeline: PipelineLike
+) -> dict[str, tuple[str, str | None]]:
+    """Each target that names a mapped stage (``Pipeline.map``), by the mapped stage's name, an
+    instance's (``cli_helpers.mapped_name``) or an output path an instance writes
+    (``_instance_output``): the mapped stage, and the instance named (None for the mapped
+    stage itself)."""
+    from pivot import registry
+
+    templates = pipeline.list_templates()
+    mapped = dict[str, tuple[str, str | None]]()
+    for target in targets:
+        name = cli_helpers.mapped_name(target, templates) or _instance_output(target, pipeline)
+        if name in templates:
+            mapped[target] = (name, None)
+        elif name is not None and (template := registry.template_of(name, templates)):
+            mapped[target] = (template, name)
+    return mapped
+
+
+def _refuse_mapped_targets(mapped: dict[str, tuple[str, str | None]], result: Expansion) -> None:
+    """Refuse each target of ``mapped`` (``_mapped_targets``) whose mapped stage did not
+    expand, saying why, and each one naming an instance the expansion did not add.
+
+    Raises:
+        click.ClickException: Naming each such target.
+    """
+    refusals = dict[str, None]()
+    for target, (template, instance) in mapped.items():
+        if template in result["not_expanded"]:
+            refusals[f"'{template}' is not yet expanded: {result['not_expanded'][template]}"] = None
+        elif instance is not None and instance not in result["expanded"][template]:
+            refusals[f"'{target}': mapped stage '{template}' has no instance '{instance}'"] = None
+    if refusals:
+        raise click.ClickException("; ".join(refusals))
+
+
 def _expand_mapped_targets(
     targets: tuple[str, ...],
     pipeline: PipelineLike | None,
     *,
-    fetch_listings: Callable[[set[str]], None] | None = None,
-) -> tuple[str, ...]:
+    fetch_listings: _ListingFetch | None = None,
+) -> tuple[tuple[str, ...], frozenset[str]]:
     """``targets`` with each mapped stage (``Pipeline.map``) named in them replaced by its
     instances, its producer current (``cli_helpers.expand_mapped_stages``). Without targets
     nothing is expanded: every cached object, or every remote one, is transferred.
 
-    ``fetch_listings`` fetches the listings this clone lacks of the directories current
-    producers recorded (pull), after which the mapped stages expand again.
+    ``fetch_listings`` gets the listings this clone lacks of the directories that the targets'
+    mapped stages are mapped over: the mapped stages the targets name (``_mapped_targets``) and
+    those these are mapped over (``cli_helpers.templates_and_upstream``), no other. A fetch or
+    pull downloads them into the cache, a dry run reads them into a temporary directory. Then
+    the mapped stages expand again. Returns the targets and the hashes downloaded, which the
+    transfer that follows counts (``transfer.pull``'s ``prefetched``).
 
     Raises:
-        click.ClickException: A target names a mapped stage that is not expanded, saying why.
+        click.ClickException: A target names a mapped stage that is not expanded, saying why;
+            one whose listing could not be fetched, naming the listing; or an instance the
+            expansion does not add.
     """
     if not targets or pipeline is None:
-        return targets
+        return targets, frozenset()
     result, _ = cli_helpers.expand_mapped_stages()
-    if result["listings"] and fetch_listings is not None:
-        fetch_listings(set(result["listings"].values()))
-        result, _ = cli_helpers.expand_mapped_stages()
-    return cli_helpers.require_expanded_targets(targets, result)
+    mapped = _mapped_targets(targets, pipeline)
+    needed = cli_helpers.templates_and_upstream(
+        dict.fromkeys(template for template, _ in mapped.values()), pipeline
+    )
+    records = {
+        result["listings"][name]["hash"]: result["listings"][name]
+        for name in needed
+        if name in result["listings"]
+    }
+    downloaded = frozenset[str]()
+    if records and fetch_listings is not None:
+        fetched, downloaded, errors = fetch_listings(records)
+        result, _ = cli_helpers.expand_mapped_stages(fetched=fetched)
+        unfetched = sorted(name for name in needed if name in result["listings"])
+        if unfetched:
+            cli_helpers.print_transfer_errors(errors)
+            raise click.ClickException(
+                "; ".join(
+                    f"'{name}' cannot expand: the listing of "
+                    + f"'{types.identity_key(pipeline.get_template(name)['source'])}' "
+                    + f"({result['listings'][name]['hash']}) could not be fetched from the remote"
+                    for name in unfetched
+                )
+            )
+    _refuse_mapped_targets(mapped, result)
+    return cli_helpers.require_expanded_targets(targets, result), downloaded
+
+
+def _templates(pipeline: PipelineLike | None) -> dict[str, MapTemplate] | None:
+    """The pipeline's mapped stages (``Pipeline.map``), by name, for ``transfer``'s target set."""
+    if pipeline is None:
+        return None
+    return {name: pipeline.get_template(name) for name in pipeline.list_templates()}
 
 
 def _fetch_listings(
@@ -81,14 +207,24 @@ def _fetch_listings(
     remote_storage: protocol.RemoteStorage,
     remote_name: str,
     jobs: int,
-    hashes: set[str],
-) -> None:
-    """Fetch the directory listings at ``hashes`` from the remote into the cache."""
+    records: dict[str, types.DirHash],
+) -> tuple[dict[str, listing.DirListing], frozenset[str], list[str]]:
+    """Download the directory listings at ``records`` from the remote into the cache, where
+    expansion reads them (``_ListingFetch``)."""
     with state.StateDB(state_dir) as state_db:
-        result = transfer.fetch_objects(
-            cache_dir, remote_storage, state_db, remote_name, hashes, jobs
+        summary, downloaded = transfer.fetch_objects(
+            cache_dir, remote_storage, state_db, remote_name, set(records), jobs
         )
-    cli_helpers.print_transfer_errors(result["errors"])
+    return {}, downloaded, summary["errors"]
+
+
+def _read_listings(
+    remote_storage: protocol.RemoteStorage, jobs: int, records: dict[str, types.DirHash]
+) -> tuple[dict[str, listing.DirListing], frozenset[str], list[str]]:
+    """Read the directory listings at ``records`` from the remote into a temporary directory,
+    for a dry run's expansion: nothing is written to the cache (``_ListingFetch``)."""
+    listings, errors = transfer.read_remote_listings(remote_storage, records, jobs)
+    return listings, frozenset(), errors
 
 
 def _normalize_cli_targets(
@@ -145,75 +281,86 @@ def push(
 ) -> None:
     """Push cached outputs to remote storage.
 
-    TARGETS can be stage names or file paths. If specified, pushes only
-    those outputs. Otherwise, pushes all cached files.
+    TARGETS can be stage names or file paths. If specified, pushes those outputs: what
+    'pivot pull' of the same targets fetches. Otherwise, pushes all cached files. An object the
+    remote lacks and the local cache does not hold fails the push, naming it.
     """
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    # A dry run only reads, so it creates no state.
+    # A dry run uploads and caches nothing and leaves the remote index as it is; it locates the
+    # cache and state directories without creating them. Expanding the mapped stages
+    # (Pipeline.map) its targets name opens the state database, which creates state.lmdb in the
+    # state directory when it has none.
     cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
     state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
     pipeline = cli_decorators.get_pipeline_from_context()
-    targets = _expand_mapped_targets(targets, pipeline)
+    targets, _ = _expand_mapped_targets(targets, pipeline)
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
+    templates = _templates(pipeline)
 
     stage_names = set(all_stages) if all_stages is not None else None
     normalized = _normalize_cli_targets(targets, known_stages=stage_names)
     targets_list = _get_targets_list(normalized)
 
-    if targets_list:
-        local_hashes = transfer.get_target_hashes(
-            targets_list, state_dir, include_deps=False, all_stages=all_stages
-        )
+    if dry_run:
+        with state.open_readonly(state_dir, create=False) as readonly_db:
+            result = transfer.push_dry_run(
+                cache_dir,
+                state_dir,
+                remote_storage,
+                readonly_db,
+                resolved_name,
+                targets_list,
+                jobs,
+                all_stages=all_stages,
+                templates=templates,
+            )
     else:
-        local_hashes = transfer.get_local_cache_hashes(cache_dir)
+        # Remote hash tracking is project-level (not per-stage), so use the
+        # project-level StateDB regardless of --all mode.
+        with (
+            state.StateDB(state_dir) as state_db,
+            cli_helpers.TransferProgress("Uploaded", quiet=quiet) as progress,
+        ):
+            result = transfer.push(
+                cache_dir,
+                state_dir,
+                remote_storage,
+                state_db,
+                resolved_name,
+                targets_list,
+                jobs,
+                progress.callback,
+                all_stages=all_stages,
+                templates=templates,
+            )
 
-    if not local_hashes:
+    transferred = result["transferred"]
+    skipped = result["skipped"]
+    failed = result["failed"]
+    if not transferred + skipped + failed:
         if not quiet:
             click.echo("No files to push")
         return
 
-    if dry_run:
-        if not quiet:
-            shown = display.escape_control(resolved_name)
-            click.echo(f"Would push {len(local_hashes)} file(s) to '{shown}'")
-        return
-
-    # Remote hash tracking is project-level (not per-stage), so use the
-    # project-level StateDB regardless of --all mode.
-    with (
-        state.StateDB(state_dir) as state_db,
-        cli_helpers.TransferProgress("Uploaded", quiet=quiet) as progress,
-    ):
-        result = transfer.push(
-            cache_dir,
-            state_dir,
-            remote_storage,
-            state_db,
-            resolved_name,
-            targets_list,
-            jobs,
-            progress.callback,
-            all_stages=all_stages,
-        )
-
     if not quiet:
-        transferred = result["transferred"]
-        skipped = result["skipped"]
-        failed = result["failed"]
         shown = display.escape_control(resolved_name)
-        click.echo(
-            f"Pushed to '{shown}': {transferred} transferred, {skipped} skipped, {failed} failed"
-        )
+        if dry_run:
+            click.echo(f"Would push {transferred} file(s) to '{shown}'")
+        else:
+            click.echo(
+                f"Pushed to '{shown}': {transferred} transferred, {skipped} skipped, "
+                + f"{failed} failed"
+            )
 
     # Always print errors to stderr and exit non-zero on failures
     cli_helpers.print_transfer_errors(result["errors"])
-    if result["failed"] > 0:
+    if failed > 0:
         raise SystemExit(1)
 
 
@@ -235,8 +382,8 @@ def fetch(
     """Fetch cached outputs from remote storage to local cache.
 
     TARGETS can be stage names or file paths. If specified, fetches those
-    outputs (and dependencies for stages). Otherwise, fetches all available
-    files from remote.
+    outputs: what 'pivot checkout' of the same targets restores. Otherwise,
+    fetches all available files from remote.
 
     This command only downloads to the local cache. Use 'pivot pull' to also
     restore files to your workspace, or 'pivot checkout' to restore from cache.
@@ -245,33 +392,51 @@ def fetch(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    # A dry run only reads, so it creates no state.
+    # A dry run downloads and caches nothing and leaves the remote index as it is; it locates the
+    # cache and state directories without creating them, and reads a listing it needs from the
+    # remote into a temporary directory (_read_listings). Expanding the mapped stages
+    # (Pipeline.map) its targets name opens the state database, which creates state.lmdb in the
+    # state directory when it has none.
     cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
     state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
-    # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
+    # Per-stage state_dir lookup when pipeline is available (e.g., --all mode). A mapped stage
+    # whose producer is current but whose listing this clone lacks expands once fetch fetched it.
     pipeline = cli_decorators.get_pipeline_from_context()
-    targets = _expand_mapped_targets(targets, pipeline)
+    targets, prefetched = _expand_mapped_targets(
+        targets,
+        pipeline,
+        fetch_listings=functools.partial(_read_listings, remote_storage, jobs)
+        if dry_run
+        else functools.partial(
+            _fetch_listings, cache_dir, state_dir, remote_storage, resolved_name, jobs
+        ),
+    )
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
+    templates = _templates(pipeline)
 
     stage_names = set(all_stages) if all_stages is not None else None
     normalized = _normalize_cli_targets(targets, known_stages=stage_names)
     targets_list = _get_targets_list(normalized)
 
     if dry_run:
-        if targets_list:
-            needed = transfer.get_target_hashes(
-                targets_list, state_dir, include_deps=True, all_stages=all_stages
-            )
-        else:
-            needed = asyncio.run(remote_storage.list_hashes())
-
-        local = transfer.get_local_cache_hashes(cache_dir)
-        missing = needed - local
+        result = transfer.pull_dry_run(
+            cache_dir,
+            state_dir,
+            remote_storage,
+            resolved_name,
+            targets_list,
+            jobs,
+            all_stages=all_stages,
+            templates=templates,
+        )
         if not quiet:
             shown = display.escape_control(resolved_name)
-            click.echo(f"Would fetch {len(missing)} file(s) from '{shown}'")
+            click.echo(f"Would fetch {result['transferred']} file(s) from '{shown}'")
+        cli_helpers.print_transfer_errors(result["errors"])
+        if result["failed"] > 0:
+            raise SystemExit(1)
         return
 
     with (
@@ -288,6 +453,8 @@ def fetch(
             jobs,
             progress.callback,
             all_stages=all_stages,
+            templates=templates,
+            prefetched=prefetched,
         )
 
     if not quiet:
@@ -335,7 +502,8 @@ def pull(
     This matches the behavior of 'git pull' and 'dvc pull'.
 
     TARGETS can be stage names or file paths. If specified, pulls those
-    outputs (and dependencies for stages). Otherwise, pulls all available files.
+    outputs: what 'pivot checkout' of the same targets restores. Otherwise,
+    pulls all available files.
     """
     if force and only_missing:
         raise click.ClickException("--force and --only-missing are mutually exclusive")
@@ -344,7 +512,11 @@ def pull(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    # A dry run only reads, so it creates no state.
+    # A dry run downloads, caches and restores nothing and leaves the remote index as it is; it
+    # locates the cache and state directories without creating them, and reads a listing it
+    # needs from the remote into a temporary directory (_read_listings). Expanding the mapped
+    # stages (Pipeline.map) its targets name opens the state database, which creates state.lmdb
+    # in the state directory when it has none.
     cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
     state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
@@ -352,16 +524,17 @@ def pull(
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode). A mapped stage
     # whose producer is current but whose listing this clone lacks expands once pull fetched it.
     pipeline = cli_decorators.get_pipeline_from_context()
-    targets = _expand_mapped_targets(
+    targets, prefetched = _expand_mapped_targets(
         targets,
         pipeline,
-        fetch_listings=None
+        fetch_listings=functools.partial(_read_listings, remote_storage, jobs)
         if dry_run
         else functools.partial(
             _fetch_listings, cache_dir, state_dir, remote_storage, resolved_name, jobs
         ),
     )
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
+    templates = _templates(pipeline)
 
     stage_names = set(all_stages) if all_stages is not None else None
     normalized = _normalize_cli_targets(targets, known_stages=stage_names)
@@ -376,18 +549,22 @@ def pull(
 
     # Dry-run: show what would be fetched, don't proceed to checkout
     if dry_run:
-        if targets_list:
-            needed = transfer.get_target_hashes(
-                targets_list, state_dir, include_deps=True, all_stages=all_stages
-            )
-        else:
-            needed = asyncio.run(remote_storage.list_hashes())
-
-        local = transfer.get_local_cache_hashes(cache_dir)
-        missing = needed - local
+        result = transfer.pull_dry_run(
+            cache_dir,
+            state_dir,
+            remote_storage,
+            resolved_name,
+            targets_list,
+            jobs,
+            all_stages=all_stages,
+            templates=templates,
+        )
         if not quiet:
             shown = display.escape_control(resolved_name)
-            click.echo(f"Would pull {len(missing)} file(s) from '{shown}'")
+            click.echo(f"Would pull {result['transferred']} file(s) from '{shown}'")
+        cli_helpers.print_transfer_errors(result["errors"])
+        if result["failed"] > 0:
+            raise SystemExit(1)
         return
 
     # Step 1: Fetch from remote to cache
@@ -405,6 +582,8 @@ def pull(
             jobs,
             progress.callback,
             all_stages=all_stages,
+            templates=templates,
+            prefetched=prefetched,
         )
 
     if not quiet:

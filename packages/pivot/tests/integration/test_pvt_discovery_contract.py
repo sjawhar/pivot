@@ -354,11 +354,12 @@ def _helper_pushed_then_cleared(
 def test_fetch_dry_run_counts_a_tracked_input_under_a_nested_pivot_dir(
     runner: click.testing.CliRunner, tmp_path: pathlib.Path, bucket_url: str
 ) -> None:
-    """Audit D2, remote row `fetch --dry-run`: the stage's tracked input is selected too."""
+    """Audit D2, remote row `fetch --dry-run`: the stage's tracked input, named by its path
+    under a nested `.pivot` directory, is selected beside the stage's output."""
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         _helper_pushed_then_cleared(runner, cwd, bucket_url)
 
-        fetch_output = _helper_ok(runner, "fetch", "--dry-run", "p/use")
+        fetch_output = _helper_ok(runner, "fetch", "--dry-run", "p/use", "sub/.pivot/raw.txt")
 
         assert "Would fetch 2 file(s) from 'origin'" in fetch_output, (
             f"fetch must select the tracked input and the output:\n{fetch_output}"

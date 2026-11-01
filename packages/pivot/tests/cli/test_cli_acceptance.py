@@ -4653,30 +4653,26 @@ def test_checkout_takes_an_absolute_target_typed_through_a_symlink_to_the_projec
     assert f"Target '{outside}' resolves outside project root" in refused.stderr, refused.stderr
 
 
-@pytest.mark.parametrize(
-    ("command", "line"),
-    [
-        ("push", "Would push 3 file(s) to 'origin'"),
-        ("fetch", "Would fetch 2 file(s) from 'origin'"),
-        ("pull", "Would pull 2 file(s) from 'origin'"),
-    ],
-)
-def test_remote_commands_take_an_absolute_target_typed_through_a_symlink_to_the_project(
-    tmp_path: pathlib.Path, command: str, line: str
-) -> None:
-    """push, fetch and pull read an absolute target under a symlink to the project as the
-    relative target; a path outside the project is refused as before."""
+def _symlinked_remote_project(
+    tmp_path: pathlib.Path, endpoint: str
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path, dict[str, str]]:
+    """A run `_symlinked_project` whose default remote is an empty bucket on the moto server at
+    ``endpoint``. Returns the root, the symlink, the outside CSV and the env that reaches it."""
     root, link, outside = _symlinked_project(
         tmp_path, {"pipeline.py": _DIFF_PIPELINE, "data/raw/rows.csv": "part,v\ntrain,1\ntest,2\n"}
     )
     _ok(_pivot(root, "repro"))
-    _ok(_pivot(root, "config", "set", "remotes.origin", "s3://unused-bucket/cache"))
+    env, bucket, _ = _moto_bucket(endpoint, "symlinked")
+    _ok(_pivot(root, "config", "set", "remotes.origin", f"s3://{bucket}/cache"))
     _ok(_pivot(root, "config", "set", "default_remote", "origin"))
-    # Push names the directory's listing object and both of its files. With the local cache
-    # gone, fetch and pull name both files: the listing is stored again from its committed file.
-    shutil.rmtree(root / ".pivot" / "cache" / "files")
-    env = _env(AWS_ENDPOINT_URL="http://127.0.0.1:9", AWS_DEFAULT_REGION="us-east-1")
+    return root, link, outside, env
 
+
+def _helper_dry_runs_through_symlink(
+    link: pathlib.Path, outside: pathlib.Path, env: dict[str, str], command: str, line: str
+) -> None:
+    """`command --dry-run` reads an absolute target under ``link`` as the relative target, and
+    refuses a path outside the project as before."""
     relative = _ok(_pivot(link, command, "--dry-run", "data/d/split", env=env))
     absolute = _ok(_pivot(link, command, "--dry-run", str(link / "data" / "d" / "split"), env=env))
     refused = _pivot(link, command, "--dry-run", str(outside), env=env)
@@ -4685,6 +4681,34 @@ def test_remote_commands_take_an_absolute_target_typed_through_a_symlink_to_the_
     assert line in absolute, absolute
     assert refused.returncode == 1, refused.stdout + refused.stderr
     assert f"Target '{outside}' resolves outside project root" in refused.stderr, refused.stderr
+
+
+def test_push_takes_an_absolute_target_typed_through_a_symlink_to_the_project(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """Push names the directory's listing object and both of its files, none on the remote."""
+    _, link, outside, env = _symlinked_remote_project(tmp_path, moto_services["s3"])
+
+    _helper_dry_runs_through_symlink(link, outside, env, "push", "Would push 3 file(s) to 'origin'")
+
+
+@pytest.mark.parametrize(
+    ("command", "line"),
+    [
+        ("fetch", "Would fetch 2 file(s) from 'origin'"),
+        ("pull", "Would pull 2 file(s) from 'origin'"),
+    ],
+)
+def test_fetch_and_pull_take_an_absolute_target_typed_through_a_symlink_to_the_project(
+    tmp_path: pathlib.Path, moto_services: dict[str, str], command: str, line: str
+) -> None:
+    """With the output pushed and the local cache gone, fetch and pull name both files: the
+    listing is stored again from its committed file."""
+    root, link, outside, env = _symlinked_remote_project(tmp_path, moto_services["s3"])
+    _ok(_pivot(root, "push", env=env))
+    shutil.rmtree(root / ".pivot" / "cache" / "files")
+
+    _helper_dry_runs_through_symlink(link, outside, env, command, line)
 
 
 def test_track_takes_an_absolute_path_typed_through_a_symlink_to_the_project(

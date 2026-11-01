@@ -371,9 +371,9 @@ def test_verify_of_a_consumer_after_0_5_10_reran_only_its_producer(tmp_path: pat
 def test_pull_of_a_consumer_after_0_5_10_reran_only_its_producer(
     tmp_path: pathlib.Path, moto_services: dict[str, str]
 ):
-    """`pivot pull p/tally` in a fresh clone fetches tally's dependencies without a warning
-    about the producer's listing, as the base does, and `pivot checkout p/copy` restores the
-    tree."""
+    """`pivot pull p/tally p/copy` in a fresh clone fetches both stages' outputs without a
+    warning about the producer's listing, as the base does, and restores the tree the 0.5.10
+    producer wrote."""
     root = _producer_rerun_by_0_5_10(tmp_path)
     bucket = f"mix-{uuid.uuid4().hex[:8]}"
     env = _env(
@@ -404,8 +404,6 @@ def test_pull_of_a_consumer_after_0_5_10_reran_only_its_producer(
         ("config", "set", "default_remote", "origin"),
     ):
         _ok(_run(clone, _PIVOT, *argv, env=env))
-    pulled = _ok(_run(clone, _PIVOT, "pull", "p/tally", env=env))
+    pulled = _ok(_run(clone, _PIVOT, "pull", "p/tally", "p/copy", env=env))
     assert "copy=tree.listing" not in pulled, pulled
-    restored = _run(clone, _PIVOT, "checkout", "p/copy", env=env)
-    out = pulled + restored.stdout + restored.stderr
-    assert (clone / _TREE / "seed.txt").read_text() == "seed1\n", out
+    assert (clone / _TREE / "seed.txt").read_text() == "seed1\n", pulled

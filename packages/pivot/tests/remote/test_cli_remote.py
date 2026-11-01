@@ -57,27 +57,33 @@ def test_push_dry_run(
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
 ) -> None:
-    """Push dry run shows what would be pushed."""
+    """Push dry run counts the cached objects the remote lacks, as push uploads them."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
         monkeypatch.setattr(project, "_project_root_cache", None)
+        cache_dir = tmp_path / ".pivot" / "cache"
+        for hash_ in ("abc123def4567890", "789abc456def0123"):
+            cached = cache_dir / "files" / hash_[:2] / hash_[2:]
+            cached.parent.mkdir(parents=True)
+            cached.write_text(hash_)
 
-        mocker.patch.object(config_mod, "locate_cache_dir", return_value=tmp_path / ".pivot/cache")
+        mock_remote = mocker.MagicMock()
+        mock_remote.bulk_exists = mocker.AsyncMock(
+            return_value={"abc123def4567890": True, "789abc456def0123": False}
+        )
+        mocker.patch.object(config_mod, "locate_cache_dir", return_value=cache_dir)
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
-            return_value=(mocker.MagicMock(), "my-remote"),
-        )
-        mocker.patch.object(
-            transfer, "get_local_cache_hashes", return_value={"abc123def456", "789xyz456def"}
+            return_value=(mock_remote, "my-remote"),
         )
 
         result = runner.invoke(cli.cli, ["push", "--dry-run"])
 
-        assert result.exit_code == 0
-        assert "Would push 2 file(s) to 'my-remote'" in result.output
+        assert result.exit_code == 0, result.output
+        assert "Would push 1 file(s) to 'my-remote'" in result.output
 
 
 def test_push_dry_run_with_no_files_prints_the_release_line(
@@ -217,10 +223,7 @@ def test_push_with_targets(
             "create_remote_from_name",
             return_value=(mocker.MagicMock(), "origin"),
         )
-        mock_target_hashes = mocker.patch.object(
-            transfer, "get_target_hashes", return_value={"target_hash_1"}
-        )
-        mocker.patch.object(
+        mock_push = mocker.patch.object(
             transfer,
             "push",
             return_value=TransferSummary(transferred=1, skipped=0, failed=0, errors=[]),
@@ -232,9 +235,9 @@ def test_push_with_targets(
         result = runner.invoke(cli.cli, ["push", "train_model"])
 
         assert result.exit_code == 0
-        mock_target_hashes.assert_called_once()
-        call_args = mock_target_hashes.call_args
-        assert call_args.args[0] == ["train_model"], "Stage name should pass through unchanged"
+        mock_push.assert_called_once()
+        # Function signature: push(cache_dir, state_dir, remote, state_db, remote_name, targets, ...)
+        assert mock_push.call_args.args[5] == ["train_model"], "Stage name should pass unchanged"
 
 
 # =============================================================================
@@ -248,7 +251,8 @@ def test_fetch_dry_run_with_targets(
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
 ) -> None:
-    """Fetch dry run shows what would be fetched for targets."""
+    """Fetch dry run counts the targets' objects the cache lacks and the remote holds, and
+    fails naming each one the remote lacks too."""
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".pivot").mkdir()
         pathlib.Path(".git").mkdir()
@@ -260,19 +264,26 @@ def test_fetch_dry_run_with_targets(
             cli_helpers, "get_all_stages", return_value={"train_model": mocker.MagicMock()}
         )
 
+        mock_remote = mocker.MagicMock()
+        mock_remote.bulk_exists = mocker.AsyncMock(
+            return_value={"hash2": True, "hash3": True, "hash4": False}
+        )
         mocker.patch.object(config_mod, "locate_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
-            return_value=(mocker.MagicMock(), "my-remote"),
+            return_value=(mock_remote, "my-remote"),
         )
-        mocker.patch.object(transfer, "get_target_hashes", return_value={"hash1", "hash2", "hash3"})
+        mocker.patch.object(
+            transfer, "get_target_hashes", return_value={"hash1", "hash2", "hash3", "hash4"}
+        )
         mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"hash1"})
 
         result = runner.invoke(cli.cli, ["fetch", "--dry-run", "train_model"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output
         assert "Would fetch 2 file(s) from 'my-remote'" in result.output
+        assert "Cannot fetch hash4: remote 'my-remote' lacks it" in result.output
 
 
 def test_fetch_dry_run_all(
@@ -422,7 +433,7 @@ def test_pull_dry_run_with_targets(
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
 ) -> None:
-    """Pull dry run shows what would be pulled for targets."""
+    """Pull dry run counts the targets' objects the cache lacks and the remote holds."""
 
     with runner.isolated_filesystem(temp_dir=tmp_path):
         pathlib.Path(".pivot").mkdir()
@@ -435,18 +446,20 @@ def test_pull_dry_run_with_targets(
             cli_helpers, "get_all_stages", return_value={"train_model": mocker.MagicMock()}
         )
 
+        mock_remote = mocker.MagicMock()
+        mock_remote.bulk_exists = mocker.AsyncMock(return_value={"hash2": True, "hash3": True})
         mocker.patch.object(config_mod, "locate_cache_dir", return_value=tmp_path / ".pivot/cache")
         mocker.patch.object(
             transfer,
             "create_remote_from_name",
-            return_value=(mocker.MagicMock(), "my-remote"),
+            return_value=(mock_remote, "my-remote"),
         )
         mocker.patch.object(transfer, "get_target_hashes", return_value={"hash1", "hash2", "hash3"})
         mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"hash1"})
 
         result = runner.invoke(cli.cli, ["pull", "--dry-run", "train_model"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert "Would pull 2 file(s) from 'my-remote'" in result.output
 
 
