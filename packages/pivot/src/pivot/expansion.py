@@ -10,18 +10,27 @@ that wrote them did, whether or not the directory is on disk.
 A run decides "current" as it goes: the producer ran or was skipped in it (``engine``). A command
 decides it by the explain path ``status`` uses (``status.expand_current``): the producer's lock
 matches, and its output is in the cache or, missing from it, restorable from the remote.
+
+An instance whose key that listing no longer holds is orphaned (``orphaned_instances``): its lock,
+listings and outputs belong to no stage. The run that expands its template removes them
+(``engine``); before it, ``pivot status`` lists the instance and ``pivot repro --dry-run`` names
+it. A template that does not expand removes nothing, since no plan is known for it.
 """
 
 from __future__ import annotations
 
+import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
+import lmdb
+
 from pivot import exceptions, registry, types
+from pivot import state_dir as state_dir_mod
 from pivot.storage import listing, lock
+from pivot.storage import state as state_mod
 
 if TYPE_CHECKING:
-    import pathlib
-    from collections.abc import Mapping
+    from collections.abc import Collection, Mapping
 
 
 class Expansion(TypedDict):
@@ -186,3 +195,66 @@ def expand_current(
         except exceptions.PivotError as e:
             result["not_expanded"][name] = refusal_reason(source, e)
     return result
+
+
+def instance_files(
+    template: registry.MapTemplate, *, default_state_dir: pathlib.Path
+) -> dict[str, list[pathlib.Path]]:
+    """Each instance of ``template`` that keeps a file beside its lock, by name: its locks,
+    listings and restart proofs, every lock last (``lock.instance_files``), in its state
+    directory's stages directory and in the project's other one, of the 0.5.2 layout, when it
+    has one (``state_dir.other_stages_dir_for``)."""
+    info = template["info"]
+    stages_dir = lock.get_stages_dir(registry.get_stage_state_dir(info, default_state_dir))
+    other = state_dir_mod.other_stages_dir_for(stages_dir)
+    return lock.instance_files([stages_dir] if other is None else [stages_dir, other], info["name"])
+
+
+def no_commit_record_dirs(
+    template: registry.MapTemplate, *, default_state_dir: pathlib.Path
+) -> dict[str, list[pathlib.Path]]:
+    """Each instance of ``template`` that has a ``nocommit:`` record, mapped to every state
+    directory that holds one: a ``--no-commit`` run wrote its outputs, which no lock may record.
+    Both current and legacy state directories are readable during a ``core.state_dir`` move.
+    A database that cannot be read contributes none, as ``ownership.read_stage_claims`` reads it.
+    """
+    info = template["info"]
+    state_dir = registry.get_stage_state_dir(info, default_state_dir)
+    other = state_dir_mod.other_state_dir_for(state_dir)
+    name = info["name"]
+    records = dict[str, list[pathlib.Path]]()
+    for candidate in [state_dir] if other is None else [state_dir, other]:
+        try:
+            with state_mod.open_readonly(candidate, create=False) as state_db:
+                stages = [] if state_db is None else state_db.no_commit_stages(f"{name}@")
+        except (OSError, lmdb.Error, state_mod.StateDBError):
+            continue
+        for stage in stages:
+            if registry.template_of(stage, [name]) == name:
+                records.setdefault(stage, []).append(candidate)
+    return records
+
+
+def no_commit_instances(
+    template: registry.MapTemplate, *, default_state_dir: pathlib.Path
+) -> list[str]:
+    """Each instance of ``template`` that has a ``nocommit:`` record."""
+    return sorted(no_commit_record_dirs(template, default_state_dir=default_state_dir))
+
+
+def orphaned_instances(
+    template: registry.MapTemplate, keep: Collection[str], *, default_state_dir: pathlib.Path
+) -> list[str]:
+    """The instances of ``template`` not in ``keep``, the instances its producer's listing
+    holds, that keep a file beside a lock (``instance_files``) or have a ``nocommit:`` record
+    (``no_commit_instances``), sorted: their key left that listing, so the run that expands
+    ``template`` removes them."""
+    found = set(instance_files(template, default_state_dir=default_state_dir))
+    found.update(no_commit_instances(template, default_state_dir=default_state_dir))
+    return sorted(found.difference(keep))
+
+
+def orphan_reason(template: registry.MapTemplate) -> str:
+    """Why an instance of ``template`` is orphaned (``orphaned_instances``), in the one wording
+    ``pivot status``, ``pivot repro --dry-run`` and a run use."""
+    return f"its key left the listing of '{types.identity_key(template['source'])}'"

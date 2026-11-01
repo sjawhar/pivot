@@ -64,7 +64,7 @@ from pivot.engine.types import (
 )
 from pivot.executor import core as executor_core
 from pivot.executor import worker
-from pivot.storage import artifact_lock, cache, member_skip, naming, ownership
+from pivot.storage import artifact_lock, cache, lock, member_skip, naming, ownership
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -83,7 +83,7 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    from collections.abc import AsyncIterator, Callable, Collection, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 
     import networkx as nx
     from anyio.abc import TaskGroup
@@ -356,14 +356,6 @@ def _refuse_single_stage_templates(
             raise expansion.single_stage_refusal(name, templates[name])
 
 
-def _run_target(stage: str, templates: Collection[str]) -> str:
-    """The name a run schedules for target ``stage``: an instance (``<template>@<key>``) is
-    reached through its template (``_mapped_targets``); any other target is itself."""
-    if stage in templates:
-        return stage
-    return registry.template_of(stage, templates) or stage
-
-
 def _mapped_targets(
     stages: list[str], templates: dict[str, registry.MapTemplate]
 ) -> tuple[list[str], dict[str, dict[str, set[str]]]]:
@@ -381,16 +373,16 @@ def _mapped_targets(
     wanted = dict[str, dict[str, set[str]] | None]()
     targets = list[str]()
     for stage in stages:
-        template = None if stage in templates else registry.template_of(stage, templates)
-        if template is None:
-            if stage in templates:
-                wanted[stage] = None
-            targets.append(stage)
+        target = registry.run_target(stage, templates)
+        targets.append(target)
+        if target not in templates:
             continue
-        targets.append(template)
-        keys = wanted.setdefault(template, dict[str, set[str]]())
+        if target == stage:
+            wanted[target] = None
+            continue
+        keys = wanted.setdefault(target, dict[str, set[str]]())
         if keys is not None:
-            keys.setdefault(stage[len(template) + 1 :], set[str]()).add(stage)
+            keys.setdefault(stage.removeprefix(f"{target}@"), set[str]()).add(stage)
     pending = list(wanted)
     while pending:
         name = pending.pop()
@@ -467,36 +459,193 @@ def _read_map_keys(source: types.ArtifactIdentity, map_run: _MapRun) -> list[tup
     return expansion.keys_of(hashed["listing"])
 
 
-def _incremental_refusal(
-    stage_order: list[str],
-    stages: dict[str, RegistryStageInfo],
-    *,
-    allow_uncached_incremental: bool,
-    force: bool,
-) -> exceptions.PivotError | None:
-    """Why a run must not start ``stage_order``, or None: an incremental output on disk that
-    the cache does not hold, which running would delete (unless ``allow_uncached_incremental``),
-    or an incremental stage whose lock an older pivot rewrote over this pivot's, as that pivot may
-    have restarted the output from empty (unless ``force``, which accepts its lock on purpose)."""
-    if not allow_uncached_incremental:
-        uncached = executor_core.check_uncached_incremental_outputs(stage_order, stages)
-        if uncached:
-            files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
-            return exceptions.UncachedIncrementalOutputError(
-                "The following incremental output files exist but are not in cache:\n"
-                + f"{files_list}\n\n"
-                + "Running the pipeline will DELETE these files and they cannot be restored.\n"
-                + "To proceed anyway, use --allow-uncached-incremental or back up these "
-                + "files first."
+_OUTPUT_ROOTS = ("data", "metrics", "plots")
+"""The directories ``store.relative_output_path`` places every output under."""
+
+
+def _orphan_outputs(
+    instance: str,
+    lock_data: LockData | None,
+    records: Iterable[types.NoCommitRecord],
+) -> dict[types.ArtifactIdentity, str]:
+    """Where each output of ``instance``, a mapped-stage instance whose key left the plan, lies,
+    relative to the project root: each output its lock and `nocommit:` records name, at the
+    project-relative path those records name.
+
+    An older `nocommit:` record has no output paths. It proves a run wrote outputs but cannot
+    prove which paths current code owns, so this refuses its removal rather than infer a current
+    template path and delete a user's file.
+
+    Raises:
+        ValidationError: A record lacks a path, or records a path not under ``data``, ``metrics``
+            or ``plots`` named by ``instance``.
+    """
+    identities = set[types.ArtifactIdentity]()
+    paths = dict[types.ArtifactIdentity, str]()
+    if lock_data is not None:
+        identities.update(lock_data["output_hashes"])
+        if "output_paths" not in lock_data:
+            raise exceptions.ValidationError("its lock records outputs without their paths")
+        paths.update(lock_data["output_paths"])
+    for record in records:
+        if "output_hashes" not in record:
+            continue
+        if "output_paths" not in record:
+            raise exceptions.ValidationError("its --no-commit record records outputs without paths")
+        identities.update(types.identity_from_key(key) for key in record["output_hashes"])
+        paths.update(
+            (types.identity_from_key(identity), path)
+            for identity, path in record["output_paths"].items()
+        )
+    outputs = dict[types.ArtifactIdentity, str]()
+    for identity in identities:
+        path = paths.get(identity)
+        if identity.producer != instance:
+            continue
+        if path is None:
+            raise exceptions.ValidationError(
+                f"its record has no path for '{types.identity_key(identity)}'"
             )
-    if not force:
-        restarted = executor_core.check_restarted_incremental_outputs(stage_order, stages)
-        if restarted:
-            return exceptions.RestartedIncrementalOutputError(
-                "Pivot will not run these stages:\n"
-                + "\n".join(f"  - {reason}" for reason in restarted)
+        root, _, rest = path.partition("/")
+        if root not in _OUTPUT_ROOTS or not (
+            rest == instance or rest.startswith((f"{instance}.", f"{instance}/"))
+        ):
+            raise exceptions.ValidationError(
+                f"its record has the output path '{path}', which no output of it can have"
             )
-    return None
+        outputs[identity] = path
+    return outputs
+
+
+def _remove_orphan(template: registry.MapTemplate, instance: str, map_run: _MapRun) -> bool:
+    """Remove ``instance``, an instance of ``template`` whose key left the plan: its outputs at
+    the paths its lock and `nocommit:` record prove it wrote (``_orphan_outputs``), every
+    `nocommit:` record, then its listings, restart proof and lock, the lock last
+    (``lock.remove_stage_files``), so a removal cut short leaves what names the instance to the
+    next run. The cache keeps every object.
+
+    It holds WRITE on the instance's outputs, the lock a run writing them holds, and reads its
+    records again under it, so a run of an older plan still writing the instance finishes first
+    and what it wrote goes too. An output holding a user's file
+    (``WorkspaceStore.remove_outputs`` refuses before it removes anything), a legacy record with
+    no paths, or a file that cannot be removed keeps the instance, with a warning; returns
+    whether it went.
+    """
+    default_state_dir = map_run.default_state_dir
+    state_dir = registry.get_stage_state_dir(template["info"], default_state_dir)
+    files_dir = map_run.cache_dir / "files"
+    stage_lock = lock.StageLock(instance, lock.get_stages_dir(state_dir))
+
+    def read_records() -> tuple[LockData | None, dict[pathlib.Path, types.NoCommitRecord]]:
+        lock_data = stage_lock.read(cache_dir=files_dir, warn_old_format=False)
+        records = dict[pathlib.Path, types.NoCommitRecord]()
+        for directory in expansion.no_commit_record_dirs(
+            template, default_state_dir=default_state_dir
+        ).get(instance, []):
+            with state_mod.open_readonly(directory, create=False) as state_db:
+                if state_db is not None:
+                    record = state_db.get_no_commit_record(instance)
+                    if record is not None:
+                        records[directory] = record
+        return lock_data, records
+
+    try:
+        before_lock, before_records = read_records()
+        before = _orphan_outputs(instance, before_lock, before_records.values())
+        requests = [
+            artifact_lock.LockRequest(
+                key=types.identity_key(identity), mode=artifact_lock.LockMode.WRITE
+            )
+            for identity in before
+        ]
+        service = artifact_lock.LocalFlockLockService(state_dir / "locks")
+        with service.acquire_many(requests):
+            lock_data, records = read_records()
+            outputs = _orphan_outputs(instance, lock_data, records.values())
+            paths = {identity: map_run.project_root / path for identity, path in outputs.items()}
+            locked = lock_data["output_hashes"] if lock_data is not None else {}
+            combined = types.NoCommitRecord(
+                pvt_members={
+                    path: hash_
+                    for record in records.values()
+                    for path, hash_ in record.get("pvt_members", {}).items()
+                }
+            )
+            claims = ownership.stage_claims(
+                map_run.project_root,
+                {path: locked[identity] for identity, path in paths.items() if identity in locked},
+                combined,
+                cache_dir=files_dir,
+                listing_readers=ownership.lock_listing_readers(
+                    stage_lock, lock_data, paths, files_dir
+                ),
+            )
+            map_run.store.remove_outputs(
+                instance, list(paths.values()), claims, state_dir=state_dir
+            )
+            for directory in records:
+                with state_mod.StateDB(directory) as state_db:
+                    state_db.apply_deferred_writes(
+                        instance, [], types.DeferredWrites(clear_no_commit_record=True)
+                    )
+            files = expansion.instance_files(template, default_state_dir=default_state_dir)
+            lock.remove_stage_files(files.get(instance, []))
+    except (exceptions.PivotError, state_mod.StateDBError, OSError) as exc:
+        _logger.warning("Cannot remove '%s', whose key left the plan: %s", instance, exc)
+        return False
+    return True
+
+
+def _remove_orphans(
+    template: registry.MapTemplate, keys: list[tuple[str, str]], map_run: _MapRun
+) -> list[str]:
+    """Remove each instance of ``template`` whose key is neither among ``keys``, the listing
+    this run expanded it from, nor in its producer's listing as it stands now
+    (``expansion.orphaned_instances``, ``_remove_orphan``); return those removed, sorted.
+
+    The producer's listing is read again holding READ on its directory, the lock a run writing
+    it holds, and kept until every removal ends: another run that wrote the producer since this
+    one read it may have brought a key back, and none can while the lock is held. A listing that
+    cannot be read then removes nothing, with a warning.
+    """
+    name = template["info"]["name"]
+    default_state_dir = map_run.default_state_dir
+    planned = {f"{name}@{key}" for key, _ in keys}
+    if not expansion.orphaned_instances(template, planned, default_state_dir=default_state_dir):
+        return []
+    source = template["source"]
+    producer = map_run.all_stages[source.producer]
+    output = next(out for out in producer["outs"] if out.identity == source)
+    service = artifact_lock.LocalFlockLockService(
+        registry.get_stage_state_dir(producer, default_state_dir) / "locks"
+    )
+    requests = artifact_lock.expand_lock_requests({"source": output}, [], map_run.project_root)
+    with service.acquire_many(requests):
+        try:
+            current = expansion.read_keys(
+                source,
+                producer,
+                expansion.stage_lock(producer, default_state_dir).read(
+                    cache_dir=map_run.cache_dir / "files"
+                ),
+                default_state_dir=default_state_dir,
+                cache_dir=map_run.cache_dir / "files",
+            )
+        except exceptions.PivotError as exc:
+            _logger.warning(
+                "Cannot remove the instances of '%s' whose key left the plan: %s",
+                name,
+                expansion.refusal_reason(source, exc),
+            )
+            return []
+        keep = planned | {f"{name}@{key}" for key, _ in current}
+        return [
+            instance
+            for instance in expansion.orphaned_instances(
+                template, keep, default_state_dir=default_state_dir
+            )
+            if _remove_orphan(template, instance, map_run)
+        ]
 
 
 def _first_failed(results: dict[str, executor_core.ExecutionSummary]) -> str:
@@ -1585,7 +1734,7 @@ class Engine:
             if stages and dep_errors:
                 # Across all pipelines with keep-going, a stage still missing an input stays out
                 stages = [stage for stage in stages if stage in runnable]
-                targets = [t for t in targets if _run_target(t, templates) in runnable]
+                targets = [t for t in targets if registry.run_target(t, templates) in runnable]
                 if not stages:
                     return {}
         if dep_errors:
@@ -1620,7 +1769,7 @@ class Engine:
 
         # Check for uncached incremental output files that would be lost, and for incremental
         # stages an older pivot may have restarted from empty.
-        refusal = _incremental_refusal(
+        refusal = executor_core.incremental_refusal(
             stage_order,
             self._get_all_stages(),
             allow_uncached_incremental=allow_uncached_incremental,
@@ -2382,7 +2531,9 @@ class Engine:
         expand next. A refusal (a file whose key cannot name a stage, a named key no file has,
         an instance whose name or output path another stage holds, an instance's incremental
         output the run would lose) fails the template with the reason and adds none of its
-        instances.
+        instances. When the expansion succeeds, each instance whose key left the producer's
+        listing is removed (``_remove_orphans``) before the new instances are scheduled, unless
+        the run commits nothing; a refused expansion removes nothing.
         """
         pipeline = self._require_pipeline()
         template = pipeline.get_template(name)
@@ -2408,7 +2559,7 @@ class Engine:
                     for info in (registry.instantiate(template, key, file) for key, file in keys)
                 }
                 problem = await anyio.to_thread.run_sync(
-                    lambda: _incremental_refusal(
+                    lambda: executor_core.incremental_refusal(
                         list(planned),
                         planned,
                         allow_uncached_incremental=map_run.allow_uncached_incremental,
@@ -2430,6 +2581,14 @@ class Engine:
             )
             await self._complete_template(name, failed=True, results=results, run_id=run_id)
             return
+
+        # The instances whose key left the producer's listing go, whichever keys the run's
+        # targets name; a --no-commit run commits no lock, so it removes none
+        removed = list[str]()
+        if not map_run.no_commit:
+            removed = await anyio.to_thread.run_sync(
+                _remove_orphans, template, map_run.keys[source], map_run
+            )
 
         infos = {stage: pipeline.get_stage(stage) for stage in added}
         map_run.all_stages.update(infos)
@@ -2455,7 +2614,10 @@ class Engine:
                     previous_state=StageExecutionState.PENDING,
                 )
             )
-        await self.emit(StagesExpanded(type="stages_expanded", template=name, stages=added))
+        expanded = StagesExpanded(type="stages_expanded", template=name, stages=added)
+        if removed:
+            expanded["removed"] = removed
+        await self.emit(expanded)
         await self._complete_template(name, failed=False, results=results, run_id=run_id)
         for stage, state in states:
             if state == StageExecutionState.BLOCKED:
@@ -2503,8 +2665,6 @@ class Engine:
         run_id: str,
         skip_state_dbs: dict[pathlib.Path, state_mod.StateDB] | None = None,
     ) -> bool:
-        from pivot.storage import lock
-
         if force:
             return False
 
@@ -2608,7 +2768,6 @@ class Engine:
         """
         from pivot import reads, run_history
         from pivot import skip as skip_mod
-        from pivot.storage import lock
 
         deps = stage_info["deps"]
         listing_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
@@ -2823,7 +2982,6 @@ class Engine:
         Returns None if computation fails (explanation should never block execution).
         """
         from pivot import explain as explain_mod
-        from pivot.storage import lock
 
         def _compute() -> StageExplanation:
             pipeline = self._require_pipeline()
@@ -2875,7 +3033,6 @@ class Engine:
         Reads the lock file (just written by the worker) to get output hashes.
         Returns None if computation fails (should never block event emission).
         """
-        from pivot.storage import lock
 
         def _compute() -> list[OutputChangeSummary]:
             stage_info = self._get_stage(stage_name)
@@ -3110,7 +3267,7 @@ class Engine:
         file whose stat changes was written. Empty outside a git repository, where git ignores
         nothing."""
         from pivot import git
-        from pivot.storage import listing, lock
+        from pivot.storage import listing
 
         if not git.in_repository(project_root):
             return {}

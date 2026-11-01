@@ -1325,6 +1325,12 @@ def _execute_stage(
                             key: hash_info["hash"]
                             for key, hash_info in sorted(output_hashes.items())
                         },
+                        output_paths={
+                            types.identity_key(identity): path
+                            for identity, path in lock_output_paths(
+                                stage_outs, store, project_root
+                            ).items()
+                        },
                     )
                     if read_hashes:
                         no_commit_record["reads"] = read_hashes

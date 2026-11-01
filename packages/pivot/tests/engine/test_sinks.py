@@ -193,6 +193,33 @@ def test_format_expansion_line_escapes_markup_in_the_name() -> None:
     assert _helper_render_markup(line).strip() == "demo/[bold]cut: expanded into 1 stage"
 
 
+@pytest.mark.parametrize(
+    ("removed", "expected"),
+    [
+        pytest.param(
+            ["demo/cut@b"],
+            "demo/cut: expanded into 1 stage; removed demo/cut@b, whose key left the plan",
+            id="one",
+        ),
+        pytest.param(
+            ["demo/cut@b", "demo/cut@d"],
+            "demo/cut: expanded into 1 stage; removed demo/cut@b, demo/cut@d, whose keys left "
+            + "the plan",
+            id="many",
+        ),
+    ],
+)
+def test_format_expansion_line_names_the_instances_it_removed(
+    removed: list[str], expected: str
+) -> None:
+    line = sinks._format_expansion_line(
+        StagesExpanded(
+            type="stages_expanded", template="demo/cut", stages=["demo/cut@a"], removed=removed
+        )
+    )
+    assert " ".join(_helper_render_markup(line).split()) == expected
+
+
 # =============================================================================
 # StaticConsoleSink Tests
 # =============================================================================

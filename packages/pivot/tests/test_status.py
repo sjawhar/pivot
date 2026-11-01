@@ -769,6 +769,24 @@ def test_suggestions_none_needed() -> None:
     assert suggestions == []
 
 
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [
+        pytest.param(1, "Run `pivot repro` to remove 1 orphaned instance of mapped stages", id="1"),
+        pytest.param(
+            2, "Run `pivot repro` to remove 2 orphaned instances of mapped stages", id="2"
+        ),
+    ],
+)
+def test_suggestions_orphaned_instances_suggest_repro(count: int, expected: str) -> None:
+    """An instance of a mapped stage whose key left its producer's listing: a run removes it."""
+    suggestions = status.get_suggestions(
+        stale_count=0, modified_count=0, push_count=0, pull_count=0, orphaned_instances=count
+    )
+
+    assert suggestions == [expected]
+
+
 # =============================================================================
 # Graph Parameter Tests
 # =============================================================================

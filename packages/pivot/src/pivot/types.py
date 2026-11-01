@@ -159,32 +159,35 @@ class NoCommitRecord(TypedDict, total=False):
     `nocommit:<stage>`. A written lock supersedes it, and its whole record is removed.
 
     Two features write the record, each its own keys. `code_manifest` is the manifest a
-    `--no-commit` run's lock would have held, rerun marks included, `output_hashes` the outputs it
-    wrote, and `reads` the objects it read by hash (`pivot.read_by_hash`), when it read any: the
-    run writes these (`NoCommitRun`, `StateDB.apply_deferred_writes`), and `pivot commit` writes
-    that manifest and those reads when the manifest and outputs are present and the outputs on
-    disk still have these hashes. `pvt_members` maps each `*.pvt` file Pivot wrote in a directory
-    output (path relative to the project root) to its content hash; the feature that keeps those
-    files owns it.
+    `--no-commit` run's lock would have held, `output_hashes` and `output_paths` identify the
+    outputs it wrote, and `reads` lists the objects it read by hash (`pivot.read_by_hash`), when
+    it read any. The run writes these (`NoCommitRun`, `StateDB.apply_deferred_writes`), and
+    `pivot commit` writes that manifest and those reads when the manifest and outputs are present
+    and the outputs on disk still have these hashes. `pvt_members` maps each `*.pvt` file Pivot
+    wrote in a directory output (path relative to the project root) to its content hash; the
+    feature that keeps those files owns it.
 
     Every writer replaces only its own keys and keeps every other key, in one write transaction.
-    The reader (`StateDB.get_no_commit_record`) validates each of these four keys on its own and
+    The reader (`StateDB.get_no_commit_record`) validates each of these five keys on its own and
     returns every other key as stored, so a record that holds only one feature's keys reads as
     present, and a malformed key hides no other.
     """
 
     code_manifest: dict[str, str]
     output_hashes: dict[str, str]  # output identity key -> content hash
+    output_paths: dict[str, str]  # output identity key -> project-relative output path
     pvt_members: dict[str, str]  # `*.pvt` path relative to the project root -> content hash
     reads: list[str]  # content hashes the run read, sorted, each once
 
 
 class NoCommitRun(TypedDict):
-    """The keys of `NoCommitRecord` a `--no-commit` run writes: the manifest and outputs always,
-    never one alone, and `reads` when it read any. Applying it replaces all three."""
+    """The keys of `NoCommitRecord` a `--no-commit` run writes: the manifest, output hashes and
+    output paths always, never one alone, and `reads` when it read any. Applying it replaces all
+    four."""
 
     code_manifest: dict[str, str]
     output_hashes: dict[str, str]  # output identity key -> content hash
+    output_paths: dict[str, str]  # output identity key -> project-relative output path
     reads: NotRequired[list[str]]  # content hashes the run read, sorted, each once
 
 
@@ -658,6 +661,9 @@ class PipelineStatus(enum.StrEnum):
     # A stage mapped over a directory output (``Pipeline.map``) whose producer is not current,
     # so the command cannot know its instances; its reason says what it waits for
     NOT_EXPANDED = "not_expanded"
+    # An instance of a mapped stage whose key left its producer's listing: no stage now, its
+    # lock, listings and outputs go in the next run that expands the mapped stage
+    ORPHANED = "orphaned"
 
 
 class TrackedFileStatus(enum.StrEnum):
@@ -750,7 +756,7 @@ class ExplainStageJson(TypedDict):
     """JSON-serializable stage explanation for status --explain --json output."""
 
     name: str
-    status: Literal["stale", "cached", "not_expanded"]
+    status: Literal["stale", "cached", "not_expanded", "orphaned"]
     reason: str
     will_run: bool
     is_forced: bool
@@ -1029,11 +1035,14 @@ class StageCompleteEvent(TypedDict):
 
 class StagesExpandedEvent(TypedDict):
     """A mapped stage's template (``Pipeline.map``) added its instances to the run: one stage
-    per file of the directory it is mapped over, ``<template>@<key>``, in key order."""
+    per file of the directory it is mapped over, ``<template>@<key>``, in key order. ``removed``
+    names each instance whose key left that directory's listing and which the run removed (its
+    lock, listings and outputs), sorted; absent when it removed none."""
 
     type: Literal[RunEventType.STAGES_EXPANDED]
     template: str
     stages: list[str]
+    removed: NotRequired[list[str]]
 
 
 class ExecutionResultEvent(TypedDict):

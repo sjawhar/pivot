@@ -751,3 +751,37 @@ def check_restarted_incremental_outputs(
         if restarted:
             refused.append(f"{stage_name}: {lock.restarted_reason(stage_lock, restarted)}")
     return refused
+
+
+def incremental_refusal(
+    stage_order: list[str],
+    stages: dict[str, RegistryStageInfo],
+    *,
+    allow_uncached_incremental: bool,
+    force: bool,
+) -> exceptions.PivotError | None:
+    """Why a run must not start ``stage_order``, or None: an incremental output on disk that
+    the cache does not hold, which running would delete (unless ``allow_uncached_incremental``),
+    or an incremental stage whose lock an older pivot rewrote over this pivot's, as that pivot may
+    have restarted the output from empty (unless ``force``, which accepts its lock on purpose).
+    A run checks its stages before it starts and each mapped stage's instances before it adds
+    them; ``pivot repro --dry-run`` checks the same."""
+    if not allow_uncached_incremental:
+        uncached = check_uncached_incremental_outputs(stage_order, stages)
+        if uncached:
+            files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
+            return exceptions.UncachedIncrementalOutputError(
+                "The following incremental output files exist but are not in cache:\n"
+                + f"{files_list}\n\n"
+                + "Running the pipeline will DELETE these files and they cannot be restored.\n"
+                + "To proceed anyway, use --allow-uncached-incremental or back up these "
+                + "files first."
+            )
+    if not force:
+        restarted = check_restarted_incremental_outputs(stage_order, stages)
+        if restarted:
+            return exceptions.RestartedIncrementalOutputError(
+                "Pivot will not run these stages:\n"
+                + "\n".join(f"  - {reason}" for reason in restarted)
+            )
+    return None

@@ -455,9 +455,32 @@ key's chain only, and a new file runs the producer and the new chain only.
   `p/cut@a` to one, whether or not a run has added it; each is checked against
   the mapped stage's `StageParams`. A mapped variant's own name
   (`p/cut@x`) is refused: its instances read `p/cut` and `p/cut@x@<key>`.
-- **Files left behind.** A key that leaves the plan has no instance in the next
-  run; its lock, listing and outputs stay, and `pivot status` does not count them
-  as orphaned.
+- **Keys that leave the plan.** A run that expands a mapped stage removes each
+  of its instances whose key the producer's listing no longer holds (`p/cut@b`
+  once `p/plan` writes no `b.yaml`): its outputs in the workspace, at the paths
+  its lock or its `--no-commit` record records, its `nocommit:` record (in the
+  current or the previous state directory), then the listings beside its
+  lock and the lock. Before it removes anything it reads `p/plan`'s listing again,
+  holding the lock a run writing `p/plan` holds, so a key another run brought back
+  meanwhile stays. The cache keeps the objects; once no record names them,
+  `pivot gc` may remove them. The run says so in its expansion line, `p/cut:
+  expanded into 2 stages; removed p/cut@b, whose key left the plan` (`removed`
+  in the `stages_expanded` event of `--json`, schema version 3). Before that run,
+  `pivot status` lists such an instance as `orphaned`, with `Orphaned: its key
+  left the listing of 'p/plan'; the next run that expands 'p/cut' removes its lock
+  and outputs`, for each mapped stage a run of the same targets expands, and
+  `pivot repro --dry-run` names it under `Would remove:` (`would_remove` in
+  `--json`) and removes nothing. Nothing is removed for a mapped stage that does
+  not expand: in `pivot repro p/plan`, when `p/plan` is stale and fails, when the
+  expansion is refused (the dry-run checks the incremental outputs the run checks),
+  and in a `--no-commit` run, which commits no lock. The same eligibility check
+  decides what `pivot status` and the dry-run list. A `--no-commit` record from an
+  older Pivot records no paths, so the run cannot prove which file it owns: it keeps
+  the instance and the record and warns. Naming such an instance (`p/cut@b`) is
+  refused as any key `p/plan` has no file for. An output that holds a file someone
+  tracked there (a `.pvt` the instance did not write) keeps the instance whole,
+  every output of it included, and the run warns, naming the file: move the file
+  out and run again.
 
 ## Incremental outputs
 

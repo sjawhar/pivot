@@ -1890,7 +1890,11 @@ def test_capacity_warning_names_pivot_gc_and_prints_one_percent_sign(
     ) in message, message
 
 
-_RAN = {"code_manifest": {"func:helpers.plain": "1f2e"}, "output_hashes": {"p/use_plain": "9a8b"}}
+_RAN = {
+    "code_manifest": {"func:helpers.plain": "1f2e"},
+    "output_hashes": {"p/use_plain": "9a8b"},
+    "output_paths": {"p/use_plain": "data/p/use_plain.yaml"},
+}
 # The key another feature writes into the same record: `*.pvt` directory members.
 _PVT = {"pvt_members": {"data/out/a.pvt": "77aa"}}
 
@@ -1908,13 +1912,22 @@ _PVT = {"pvt_members": {"data/out/a.pvt": "77aa"}}
         ),
         pytest.param(
             {**_RAN, "code_manifest": {"func:helpers.plain": 1}},
-            {"output_hashes": _RAN["output_hashes"]},
+            {"output_hashes": _RAN["output_hashes"], "output_paths": _RAN["output_paths"]},
             id="malformed-manifest",
         ),
         pytest.param(
             {**_RAN, "output_hashes": ["p/use_plain"], **_PVT},
-            {"code_manifest": _RAN["code_manifest"], **_PVT},
+            {
+                "code_manifest": _RAN["code_manifest"],
+                "output_paths": _RAN["output_paths"],
+                **_PVT,
+            },
             id="malformed-outputs-and-another-field",
+        ),
+        pytest.param(
+            {**_RAN, "output_paths": ["data/p/use_plain.yaml"]},
+            {"code_manifest": _RAN["code_manifest"], "output_hashes": _RAN["output_hashes"]},
+            id="malformed-output-paths",
         ),
         pytest.param({**_RAN, "pvt_members": ["data/out/a.pvt"]}, _RAN, id="malformed-pvt-members"),
         pytest.param({**_RAN, "pvt_members": 7}, _RAN, id="pvt-members-not-an-object"),
@@ -1938,10 +1951,10 @@ _PVT = {"pvt_members": {"data/out/a.pvt": "77aa"}}
 def test_a_no_commit_record_reads_each_valid_field_it_knows(
     tmp_path: pathlib.Path, stored: object, expected: object
 ) -> None:
-    """Each key the record declares (the run's code manifest and output hashes, and the
-    `pvt_members` another feature writes) is validated on its own: a malformed one is dropped
-    and hides no other. A key the record does not declare reads as stored, and a record that
-    holds only another feature's key reads as present, never as absent."""
+    """Each key the record declares (the run's code manifest, output hashes and output paths,
+    and the `pvt_members` another feature writes) is validated on its own: a malformed one is
+    dropped and hides no other. A key the record does not declare reads as stored, and a record
+    that holds only another feature's key reads as present, never as absent."""
     with state.StateDB(tmp_path) as db:
         db.put_raw(b"nocommit:p/use_plain", json.dumps(stored).encode())
 
@@ -1983,6 +1996,7 @@ def test_applying_a_no_commit_record_replaces_its_keys_and_keeps_every_other(
         "no_commit_record": {
             "code_manifest": _RAN["code_manifest"],
             "output_hashes": _RAN["output_hashes"],
+            "output_paths": _RAN["output_paths"],
         }
     }
     with state.StateDB(tmp_path) as db:

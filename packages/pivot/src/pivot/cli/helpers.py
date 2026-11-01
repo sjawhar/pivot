@@ -295,6 +295,85 @@ def resolve_mapped_targets(
     return list(dict.fromkeys(resolved)), shown
 
 
+def run_order(targets: list[str] | None) -> list[str]:
+    """The execution order a ``pivot repro`` of ``targets`` uses before a template expands:
+    stages and templates, an instance target standing for its template
+    (``registry.run_target``). A target is a name as a command takes it, bare or qualified."""
+    from pivot import registry
+    from pivot.engine import graph as engine_graph
+
+    pipeline = get_pipeline()
+    templates = pipeline.list_templates()
+    # The run's graph: the pipeline's own stages, each template standing for its instances
+    stages = {
+        name: info
+        for name, info in get_graph_stages().items()
+        if name in templates or registry.template_of(name, templates) is None
+    }
+    named = None
+    if targets is not None:
+        named = [
+            registry.run_target(
+                mapped_name(target, templates) or names.resolve_stage_name(target, stages),
+                templates,
+            )
+            for target in targets
+        ]
+        named = list(dict.fromkeys(name for name in named if name in stages))
+        if not named:
+            return []
+    return engine_graph.get_execution_order(
+        engine_graph.get_stage_dag(engine_graph.build_graph(stages)), named, single_stage=False
+    )
+
+
+def run_templates(targets: list[str] | None) -> list[str]:
+    """The templates (``Pipeline.map``) a ``pivot repro`` of ``targets`` expands, in the order
+    the run reaches them (``run_order``). A run targeted at a producer holds only it and its
+    upstream stages, so it expands none."""
+    templates = set(get_pipeline().list_templates())
+    return [name for name in run_order(targets) if name in templates]
+
+
+def eligible_templates(
+    targets: list[str] | None,
+    result: Expansion,
+    *,
+    force: bool = False,
+    allow_uncached_incremental: bool = False,
+) -> list[str]:
+    """The templates a run of ``targets`` expands and can therefore remove an orphan of: those
+    in its ``run_order`` when no global incremental-output refusal stops the run and no template
+    incremental-output refusal stops that template or one it is mapped over. Status and
+    ``repro --dry-run`` use this rule so neither promises a removal a run never reaches."""
+    from pivot.executor import core as executor_core
+
+    pipeline = get_pipeline()
+    order = run_order(targets)
+    templates = set(pipeline.list_templates())
+    stages = get_graph_stages()
+    static = [name for name in order if name not in templates]
+    if executor_core.incremental_refusal(
+        static,
+        {name: stages[name] for name in static},
+        allow_uncached_incremental=allow_uncached_incremental,
+        force=force,
+    ):
+        return []
+    refused = set[str]()
+    for name in (name for name in order if name in templates):
+        upstream = {dep for dep in pipeline.get_template(name)["mapped_deps"].values() if dep}
+        instances = {stage: pipeline.get_stage(stage) for stage in result["expanded"].get(name, [])}
+        if upstream & refused or executor_core.incremental_refusal(
+            list(instances),
+            instances,
+            allow_uncached_incremental=allow_uncached_incremental,
+            force=force,
+        ):
+            refused.add(name)
+    return [name for name in order if name in templates and name not in refused]
+
+
 def get_workspace_store() -> WorkspaceStore | None:
     """Get a WorkspaceStore for display/path resolution, or None if no pipeline."""
     store_mod = importlib.import_module("pivot.storage.store")

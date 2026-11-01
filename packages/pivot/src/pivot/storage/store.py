@@ -325,9 +325,20 @@ class WorkspaceStore:
     ) -> ownership.ForcedRestore:
         """The forced-restore target for a stage write of ``ref``: its own ``*.pvt`` files are
         ``ownership.stage_members`` of ``claims`` and of what this run writes (``returned``)."""
-        output_path = ownership.normalized(self._resolve_output_path(ref))
+        return self._output_target(
+            self._resolve_output_path(ref), ref.identity.producer, claims, returned
+        )
+
+    def _output_target(
+        self,
+        path: pathlib.Path,
+        stage: str,
+        claims: ownership.StageClaims | None,
+        returned: ownership.StageMembers | None,
+    ) -> ownership.ForcedRestore:
+        """The forced-restore target for replacing ``stage``'s output at ``path``."""
         return ownership.ForcedRestore(
-            replacement=ownership.stage_output(output_path, ref.identity.producer),
+            replacement=ownership.stage_output(ownership.normalized(path), stage),
             restored=None,
             claims=None if claims is None else lambda: claims,
             written={} if returned is None else returned,
@@ -370,7 +381,41 @@ class WorkspaceStore:
         )
         path = self._resolve_path(ref)
         path.parent.mkdir(parents=True, exist_ok=True)
-        target = self._write_target(ref, claims, returned)
+        self._remove_checked(self._write_target(ref, claims, returned), path, state_dir)
+        if ref.tag is types.ArtifactTag.DIRECTORY:
+            path.mkdir(exist_ok=True)
+        return path
+
+    def remove_outputs(
+        self,
+        stage: str,
+        paths: list[pathlib.Path],
+        claims: ownership.StageClaims | None,
+        *,
+        state_dir: pathlib.Path,
+    ) -> None:
+        """Remove the outputs at ``paths`` of ``stage``, a stage that no longer exists (an
+        instance of a mapped stage whose key left its plan), from the workspace. Refuses before
+        it removes any of them if that would remove a user's file (``refuse_output_replacements``,
+        each path's own ``*.pvt`` files being ``ownership.stage_members`` of ``claims``); each is
+        checked again just before it is removed, as ``prepare_output`` checks it, under the
+        path's restore lock in ``state_dir``. The cache keeps every object."""
+        ownership.refuse_output_replacements(
+            self._project_root,
+            [ownership.stage_output(ownership.normalized(path), stage) for path in paths],
+            lambda path: ownership.stage_members(path, claims),
+        )
+        for path in paths:
+            self._remove_checked(self._output_target(path, stage, claims, None), path, state_dir)
+
+    def _remove_checked(
+        self,
+        target: ownership.ForcedRestore,
+        path: pathlib.Path,
+        state_dir: pathlib.Path | None,
+    ) -> None:
+        """Remove the entry at ``path`` (``cache.remove_output_checked``), checking what it
+        removes just before as a replacement of ``target`` (``ownership.swap_refusal``)."""
 
         def refuse_moved(entry: pathlib.Path) -> None:
             refusal = ownership.swap_refusal(self._project_root, target, entry)
@@ -378,9 +423,6 @@ class WorkspaceStore:
                 raise refusal
 
         cache.remove_output_checked(path, refuse_moved, state_dir)
-        if ref.tag is types.ArtifactTag.DIRECTORY:
-            path.mkdir(exist_ok=True)
-        return path
 
     def prepare_commit(
         self,

@@ -81,6 +81,7 @@ def status(
     expansion_result = expansion.Expansion(expanded={}, not_expanded={}, listings={})
     known = dict[str, StageExplanation]()
     shown_templates: list[str] | None = None
+    given_targets = stages_list
     if pipeline is not None:
         if show_stages:
             expansion_result, known = cli_helpers.expand_mapped_stages()
@@ -112,6 +113,7 @@ def status(
     pipeline_status = list[PipelineStatusInfo]()
     pipeline_explanations = list[StageExplanation]()
     not_expanded = list[PipelineStatusInfo]()
+    orphaned = list[PipelineStatusInfo]()
     tracked_status = list[TrackedFileInfo]()
     remote_status: RemoteSyncInfo | None = None
 
@@ -122,6 +124,16 @@ def status(
         graph = engine_graph.build_graph(all_stages)
         orphaned_locks = status_mod.find_orphaned_lock_files(all_stages, pipeline)
         not_expanded = status_mod.not_expanded_status(expansion_result, shown_templates)
+        # An instance whose key left its producer's listing: of each mapped stage a run of the
+        # same targets expands, by the run's own rule
+        orphaned = status_mod.orphaned_status(
+            pipeline,
+            status_mod.orphaned_instances(
+                pipeline,
+                expansion_result,
+                cli_helpers.eligible_templates(given_targets, expansion_result),
+            ),
+        )
 
         if explain:
             pipeline_explanations = status_mod.get_pipeline_explanations(
@@ -214,11 +226,12 @@ def status(
         missing_outputs_count=missing_outputs_count,
         missing_reads_count=missing_reads_count,
         remote_configured=missing_outputs_count + missing_reads_count > 0,
+        orphaned_instances=len(orphaned),
     )
 
     # Quiet mode: no output, exit 1 if there are issues needing attention
     if quiet and not output_json:
-        if stale_count > 0 or modified_count > 0 or not_expanded:
+        if stale_count > 0 or modified_count > 0 or not_expanded or orphaned:
             raise SystemExit(1)
         return
 
@@ -228,6 +241,7 @@ def status(
             _output_explain_json(
                 pipeline_explanations,
                 not_expanded,
+                orphaned,
                 tracked_status,
                 remote_status,
                 imports,
@@ -238,7 +252,7 @@ def status(
             )
         else:
             _output_json(
-                [*pipeline_status, *not_expanded],
+                [*pipeline_status, *not_expanded, *orphaned],
                 tracked_status,
                 remote_status,
                 imports,
@@ -256,10 +270,11 @@ def status(
                 suggestions,
                 show_tracked,
                 not_expanded=not_expanded,
+                orphaned=orphaned,
             )
         else:
             _output_text(
-                [*pipeline_status, *not_expanded],
+                [*pipeline_status, *not_expanded, *orphaned],
                 tracked_status,
                 remote_status,
                 suggestions,
@@ -306,6 +321,7 @@ def _output_json(
 def _output_explain_json(
     explanations: list[StageExplanation],
     not_expanded: list[PipelineStatusInfo],
+    orphaned: list[PipelineStatusInfo],
     tracked_status: list[TrackedFileInfo],
     remote_status: RemoteSyncInfo | None,
     imports: list[ImportStatusInfo] | None,
@@ -349,6 +365,21 @@ def _output_explain_json(
                 upstream_stale=row["upstream_stale"],
             )
             for row in not_expanded
+        )
+        # An instance whose key left its producer's listing: the run removes it, runs nothing
+        stages.extend(
+            ExplainStageJson(
+                name=row["name"],
+                status="orphaned",
+                reason=row["reason"],
+                will_run=False,
+                is_forced=False,
+                code_changes=[],
+                param_changes=[],
+                dep_changes=[],
+                upstream_stale=row["upstream_stale"],
+            )
+            for row in orphaned
         )
         data["stages"] = stages
 
@@ -409,13 +440,15 @@ def output_explain_text(
     show_tracked: bool = False,
     *,
     not_expanded: list[PipelineStatusInfo] | None = None,
+    orphaned: list[PipelineStatusInfo] | None = None,
 ) -> None:
     """Output detailed stage explanations as formatted text, then each mapped stage not yet
-    expanded (``not_expanded``) with what it waits for."""
+    expanded (``not_expanded``) with what it waits for, then each orphaned instance of a mapped
+    stage (``orphaned``), which the run removes."""
     sections_printed = 0
 
     # Always show stage explanations section
-    if not explanations and not not_expanded:
+    if not explanations and not not_expanded and not orphaned:
         click.echo("No stages to run")
     else:
         con = console.Console()
@@ -423,9 +456,16 @@ def output_explain_text(
             con.explain_stage(exp)
         for row in not_expanded or []:
             con.explain_not_expanded(row["name"], row["reason"])
+        for row in orphaned or []:
+            con.explain_orphaned(row["name"], row["reason"])
 
         will_run = sum(1 for e in explanations if e["will_run"])
-        con.explain_summary(will_run, len(explanations) - will_run, len(not_expanded or []))
+        con.explain_summary(
+            will_run,
+            len(explanations) - will_run,
+            len(not_expanded or []),
+            orphaned=len(orphaned or []),
+        )
     sections_printed += 1
 
     if show_tracked and tracked_status is not None:
@@ -447,7 +487,8 @@ def output_explain_text(
 
 
 def _print_pipeline_section(pipeline_status: list[PipelineStatusInfo], verbose: bool) -> None:
-    """Print pipeline status section. A mapped stage not yet expanded is always shown."""
+    """Print pipeline status section. A mapped stage not yet expanded, and an orphaned instance
+    of one, is always shown."""
     click.echo("Pipeline Status")
 
     if not pipeline_status:
@@ -455,12 +496,16 @@ def _print_pipeline_section(pipeline_status: list[PipelineStatusInfo], verbose: 
         return
 
     not_expanded = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.NOT_EXPANDED)
-    total = len(pipeline_status) - not_expanded
+    orphaned = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.ORPHANED)
+    total = len(pipeline_status) - not_expanded - orphaned
     stale = sum(1 for s in pipeline_status if s["status"] == PipelineStatus.STALE)
     click.echo(f"  {total} stages: {total - stale} cached, {stale} stale")
     if not_expanded:
         noun = "stage" if not_expanded == 1 else "stages"
         click.echo(f"  {not_expanded} mapped {noun} not yet expanded")
+    if orphaned:
+        noun = "instance" if orphaned == 1 else "instances"
+        click.echo(f"  {orphaned} orphaned {noun} of mapped stages")
     click.echo()
 
     stages_to_show = (
@@ -473,6 +518,7 @@ def _print_pipeline_section(pipeline_status: list[PipelineStatusInfo], verbose: 
         PipelineStatus.CACHED: "\u2713",
         PipelineStatus.STALE: "\u26a0",
         PipelineStatus.NOT_EXPANDED: "\u2026",
+        PipelineStatus.ORPHANED: "\u2212",
     }
     for stage in stages_to_show:
         reason = display.escape_control(stage["reason"], keep_newlines=True) or "-"

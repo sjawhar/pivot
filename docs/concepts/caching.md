@@ -95,8 +95,10 @@ files inline, and those, with the directory hash it recorded, are kept as they a
 killed run left beside an output (`.pivot_backup_<token>.*`) is walked like any other, so the
 links it still holds keep their objects until a later restore of that path removes it. Each
 instance of a mapped stage (`<stage>@<key>`, from `pipeline.map`) records its
-outputs in a lock of its own, and a collection reads every lock on disk: an instance the last
-run no longer expanded, because its key file is gone, keeps its objects like any other stage.
+outputs in a lock of its own, and a collection reads every lock on disk, of an instance a run
+expanded or not. The run that expands a mapped stage removes the lock of each instance whose key
+left its producer's listing, so once no other record names that instance's objects (a run-cache
+row, a `nocommit:` record), a collection may remove them.
 
 A record the collection cannot fully read refuses it, naming the record: a stage lock, `.pvt`
 or run-cache row whose text does not parse (a git merge left conflict markers in it, a

@@ -44,12 +44,12 @@ _SM_PREFIX = b"sm:"  # Stage manifest cache entries
 # and the `*.pvt` files Pivot wrote into its outputs as its own (`pvt_members`)
 _NOCOMMIT_PREFIX = b"nocommit:"
 # The keys `types.NoCommitRecord` declares that are each a str -> str mapping the reader validates
-# alone; its fourth, `reads`, is a list of content hashes, validated alone too.
-_NO_COMMIT_FIELDS = ("code_manifest", "output_hashes", "pvt_members")
+# alone; `reads` is a list of content hashes, validated alone too.
+_NO_COMMIT_FIELDS = ("code_manifest", "output_hashes", "output_paths", "pvt_members")
 _NO_COMMIT_READS = "reads"
 # The keys a --no-commit run writes (`types.NoCommitRun`): applying its record replaces all of
 # them, so the reads of an earlier run that read more never stay beside this run's outputs.
-_NO_COMMIT_RUN_FIELDS = ("code_manifest", "output_hashes", _NO_COMMIT_READS)
+_NO_COMMIT_RUN_FIELDS = ("code_manifest", "output_hashes", "output_paths", _NO_COMMIT_READS)
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024
@@ -1273,6 +1273,23 @@ class StateDB:
             if record is not None and _is_hash_list(record.get(_NO_COMMIT_READS)):
                 read.update(typing.cast("list[str]", record[_NO_COMMIT_READS]))
         return read
+
+    def no_commit_stages(self, prefix: str) -> list[str]:
+        """The names of the stages starting with ``prefix`` that have a `nocommit:` record,
+        sorted; read in one short transaction."""
+        self._check_closed()
+        start = _NOCOMMIT_PREFIX + prefix.encode()
+        names = list[str]()
+        with self._read_transaction() as txn:
+            cursor = txn.cursor()
+            if cursor.set_range(start):
+                key = bytes(cursor.key())
+                while key.startswith(start):
+                    names.append(key[len(_NOCOMMIT_PREFIX) :].decode(errors="replace"))
+                    if not cursor.next():
+                        break
+                    key = bytes(cursor.key())
+        return names
 
     def add_no_commit_pvt_members(self, stage_name: str, members: Mapping[str, str]) -> None:
         """Add `members` (path relative to the project root -> content hash) to the `*.pvt`
