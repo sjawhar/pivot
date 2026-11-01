@@ -19,6 +19,7 @@ import uuid
 from typing import Protocol, cast
 
 import boto3
+import pytest
 import xxhash
 import yaml
 
@@ -478,7 +479,7 @@ def test_a_targeted_pull_fetches_the_objects_the_stage_read(
     tmp_path: pathlib.Path, moto_services: dict[str, str]
 ) -> None:
     """`pivot pull <stage>` fetches the objects the stage's lock lists under `reads`, beside its
-    outputs and cached dependencies, so the stage can run again from the clone."""
+    outputs, so the stage can run again from the clone."""
     root = _project(tmp_path / "p")
     env, _, bucket = _helper_remote(root, moto_services["s3"])
     snapshot = _helper_object(root, "taken: lemma_a\n")
@@ -494,6 +495,139 @@ def test_a_targeted_pull_fetches_the_objects_the_stage_read(
     assert _helper_cache_object(clone, snapshot).is_file(), (
         "the object p/plan read should be pulled"
     )
+
+
+# =============================================================================
+# Targeted remote synchronization
+# =============================================================================
+
+
+def test_targeted_push_supplies_every_object_targeted_pull_needs(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """`pivot push p/plan` sends what `pivot pull p/plan` fetches: the stage's outputs and the
+    object its lock lists under `reads`. In a fresh clone the pull succeeds, the stage is
+    current, and a rerun reads the pulled object."""
+    root = _project(tmp_path / "source")
+    env, _, bucket = _helper_remote(root, moto_services["s3"])
+    snapshot = _helper_object(root, "taken: lemma_a\n")
+    _helper_pin(root, snapshot)
+    _ok(_pivot(root, "repro", env=env))
+    _helper_git(root, "add", "-A")
+    _helper_git(root, "commit", "-qm", "record run")
+    _ok(_pivot(root, "push", "p/plan", env=env))
+    clone = _helper_clone(tmp_path, root, env, bucket)
+
+    pulled = _pivot(clone, "pull", "p/plan", env=env)
+
+    assert pulled.returncode == 0, pulled.stdout + pulled.stderr
+    assert _helper_rows(clone) == ["taken: lemma_a"]
+    assert _helper_cache_object(clone, snapshot).is_file(), "the read object should be pulled"
+    assert _helper_status(clone, env) == ("cached", "")
+    rerun = _pivot(clone, "repro", "--force", "--json", "p/plan", env=env)
+    assert _helper_completed(rerun)["p/plan"][0] == "ran", rerun.stdout + rerun.stderr
+    assert _helper_rows(clone) == ["taken: lemma_a"]
+
+
+@pytest.mark.parametrize("command", ["push", "fetch", "pull"])
+def test_sync_commands_reject_an_unknown_target(
+    tmp_path: pathlib.Path, moto_services: dict[str, str], command: str
+) -> None:
+    """Each sync command rejects a target that is neither a stage nor a tracked file."""
+    root = _project(tmp_path / command)
+    env, _, _ = _helper_remote(root, moto_services["s3"])
+
+    result = _pivot(root, command, "not-a-target", env=env)
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 1, output
+    assert "not-a-target" in output
+    assert "Fetched from" not in output
+
+
+def test_push_fails_when_a_targeted_object_is_missing_locally(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """Push of a tracked file whose object the cache lost and the remote lacks fails, naming
+    the object, rather than counting it skipped."""
+    root = _project(tmp_path / "source")
+    env, _, _ = _helper_remote(root, moto_services["s3"])
+    (root / "store").mkdir()
+    (root / "store" / "snapshot.txt").write_text("taken: lemma_a\n")
+    _ok(_pivot(root, "track", "store/snapshot.txt"))
+    snapshot = xxhash.xxh64(b"taken: lemma_a\n").hexdigest()
+    _helper_remove_object(root, snapshot)
+
+    pushed = _pivot(root, "push", "store/snapshot.txt", env=env)
+
+    assert pushed.returncode == 1, pushed.stdout + pushed.stderr
+    assert snapshot in pushed.stdout + pushed.stderr
+    assert "1 failed" in pushed.stdout, pushed.stdout
+
+
+def test_status_remote_counts_objects_a_fresh_clone_can_pull(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """Remote status reports every object the remote holds when a fresh clone has none."""
+    root = _project(tmp_path / "source")
+    env, _, bucket = _helper_remote(root, moto_services["s3"])
+    snapshot = _helper_object(root, "taken: lemma_a\n")
+    _helper_pin(root, snapshot)
+    _ok(_pivot(root, "repro", env=env))
+    _ok(_pivot(root, "push", env=env))
+    _helper_git(root, "add", "-A")
+    _helper_git(root, "commit", "-qm", "record run")
+    clone = _helper_clone(tmp_path, root, env, bucket)
+
+    status = _pivot(clone, "status", "--remote", "--json", env=env)
+
+    assert status.returncode == 0, status.stdout + status.stderr
+    assert json.loads(status.stdout)["remote"]["pull_count"] == 2
+
+
+def test_push_dry_run_counts_only_objects_a_push_would_transfer(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """Push dry-run excludes objects already on the remote, as a following push does."""
+    root = _project(tmp_path / "source")
+    env, _, _ = _helper_remote(root, moto_services["s3"])
+    snapshot = _helper_object(root, "taken: lemma_a\n")
+    _helper_pin(root, snapshot)
+    _ok(_pivot(root, "repro", env=env))
+    _ok(_pivot(root, "push", env=env))
+
+    dry_run = _pivot(root, "push", "--dry-run", env=env)
+    pushed = _pivot(root, "push", env=env)
+
+    assert dry_run.returncode == 0, dry_run.stdout + dry_run.stderr
+    assert "Would push 0 file(s)" in dry_run.stdout
+    assert "0 transferred" in pushed.stdout + pushed.stderr
+
+
+def test_pull_dry_run_counts_the_files_of_a_listing_only_the_remote_holds(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """In a clone without a tracked directory's committed listing, the pull fetches the listing
+    from the remote and then the files it names. The dry run counts both, as the pull does."""
+    root = _project(tmp_path / "source")
+    env, _, bucket = _helper_remote(root, moto_services["s3"])
+    (root / "store").mkdir()
+    (root / "store" / "a.txt").write_text("a\n")
+    (root / "store" / "b.txt").write_text("b\n")
+    _ok(_pivot(root, "track", "store"))
+    _ok(_pivot(root, "push", "store", env=env))
+    _helper_git(root, "add", "-A")
+    _helper_git(root, "commit", "-qm", "track store")
+    clone = _helper_clone(tmp_path, root, env, bucket)
+    (clone / "store.pvt.listing").unlink()  # as if the listing was never committed
+
+    dry_run = _pivot(clone, "pull", "--dry-run", "store", env=env)
+    pulled = _pivot(clone, "pull", "store", env=env)
+
+    assert dry_run.returncode == 0, dry_run.stdout + dry_run.stderr
+    assert "Would pull 3 file(s)" in dry_run.stdout, dry_run.stdout
+    assert pulled.returncode == 0, pulled.stdout + pulled.stderr
+    assert "3 transferred" in pulled.stdout, pulled.stdout
 
 
 # A plain `pivot status` answers from local state. With the default retries (remote.retries 10,

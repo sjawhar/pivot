@@ -603,7 +603,8 @@ def get_remote_status(
     remote_name: str | None,
     cache_dir: pathlib.Path,
 ) -> RemoteSyncInfo:
-    """Get remote sync status.
+    """Get remote sync status: ``push_count`` objects an untargeted ``pivot push`` uploads and
+    ``pull_count`` objects an untargeted ``pivot pull`` downloads (``compare_status``).
 
     Raises:
         RemoteNotConfiguredError: If no remotes are configured
@@ -617,9 +618,6 @@ def get_remote_status(
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
     url = display.redact_url_credentials(remote_config.get_remote_url(resolved_name))
     local_hashes = transfer.get_local_cache_hashes(cache_dir)
-
-    if not local_hashes:
-        return RemoteSyncInfo(name=resolved_name, url=url, push_count=0, pull_count=0)
 
     with state_mod.StateDB(config.locate_state_dir()) as state_db:
         transfer.check_remote_url(state_db, resolved_name, remote_storage)

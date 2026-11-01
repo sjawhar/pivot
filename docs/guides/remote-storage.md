@@ -58,7 +58,7 @@ pivot push train
 # Push a specific file
 pivot push model/best.pkl
 
-# Preview what would be uploaded
+# Preview what would be uploaded: the files the remote does not hold yet
 pivot push --dry-run
 
 # More parallel uploads for large caches
@@ -152,7 +152,9 @@ directory's members are in its committed listing file. Push uploads the listing 
 files it names; pull downloads them. Always commit lock files and their listing files so other
 machines know what to pull.
 
-Pulling a stage also fetches the outputs of the upstream stages it depends on, and any dependency tracked with `pivot track`. It never fetches raw inputs committed to git (`data/raw/...`), metric outputs (git carries both), or files brought in with `pivot import`: those come from the source repo's remote, and `pivot update` refreshes them.
+Pushing and pulling a target transfer the same files: the ones `pivot checkout` of that target restores, plus the objects a stage read with `pivot.read_by_hash` (its lock lists them under `reads`), so the stage can run again in the clone. A mapped stage instance also carries the producer listing a clone needs to expand it. Pulling a stage does not fetch the outputs of the stages upstream of it or its inputs tracked with `pivot track`; name them as targets too, or run an untargeted `pivot pull`, which fetches every file on the remote. No pull fetches raw inputs committed to git (`data/raw/...`), metric outputs (git carries both), or files brought in with `pivot import`: those come from the source repo's remote, and `pivot update` refreshes them.
+
+A target that is not a stage, stage output or tracked path fails, naming it. A push that cannot send a file the remote lacks, because the local cache no longer holds it, fails and names the file's hash. `pivot status --remote` counts the files an untargeted push would upload and the files on the remote that the local cache lacks, so a fresh clone sees every file a pull would download.
 
 ## Multiple Remotes
 

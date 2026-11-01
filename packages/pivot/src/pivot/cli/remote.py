@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import functools
 import pathlib
 from typing import TYPE_CHECKING
@@ -18,7 +17,7 @@ from pivot.storage import state, track
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pivot.registry import PipelineLike
+    from pivot.registry import MapTemplate, PipelineLike
     from pivot.remote import protocol
 
 
@@ -61,7 +60,8 @@ def _expand_mapped_targets(
     nothing is expanded: every cached object, or every remote one, is transferred.
 
     ``fetch_listings`` fetches the listings this clone lacks of the directories current
-    producers recorded (pull), after which the mapped stages expand again.
+    producers recorded (fetch and pull, and their dry runs), after which the mapped stages
+    expand again.
 
     Raises:
         click.ClickException: A target names a mapped stage that is not expanded, saying why.
@@ -75,19 +75,31 @@ def _expand_mapped_targets(
     return cli_helpers.require_expanded_targets(targets, result)
 
 
+def _templates(pipeline: PipelineLike | None) -> dict[str, MapTemplate] | None:
+    """The pipeline's mapped stages (``Pipeline.map``), by name, for ``transfer``'s target set."""
+    if pipeline is None:
+        return None
+    return {name: pipeline.get_template(name) for name in pipeline.list_templates()}
+
+
 def _fetch_listings(
     cache_dir: pathlib.Path,
-    state_dir: pathlib.Path,
+    state_dir: pathlib.Path | None,
     remote_storage: protocol.RemoteStorage,
     remote_name: str,
     jobs: int,
     hashes: set[str],
 ) -> None:
-    """Fetch the directory listings at ``hashes`` from the remote into the cache."""
-    with state.StateDB(state_dir) as state_db:
-        result = transfer.fetch_objects(
-            cache_dir, remote_storage, state_db, remote_name, hashes, jobs
-        )
+    """Fetch the directory listings at ``hashes`` from the remote into the cache. A dry run
+    passes no ``state_dir``: it fetches them as the command would first, so it can expand the
+    mapped stages, and records nothing in the remote index."""
+    if state_dir is None:
+        result = transfer.fetch_objects(cache_dir, remote_storage, None, remote_name, hashes, jobs)
+    else:
+        with state.StateDB(state_dir) as state_db:
+            result = transfer.fetch_objects(
+                cache_dir, remote_storage, state_db, remote_name, hashes, jobs
+            )
     cli_helpers.print_transfer_errors(result["errors"])
 
 
@@ -145,8 +157,9 @@ def push(
 ) -> None:
     """Push cached outputs to remote storage.
 
-    TARGETS can be stage names or file paths. If specified, pushes only
-    those outputs. Otherwise, pushes all cached files.
+    TARGETS can be stage names or file paths. If specified, pushes those outputs: what
+    'pivot pull' of the same targets fetches. Otherwise, pushes all cached files. An object the
+    remote lacks and the local cache does not hold fails the push, naming it.
     """
     cli_ctx = cli_helpers.get_cli_context(ctx)
     quiet = cli_ctx["quiet"]
@@ -161,59 +174,66 @@ def push(
     pipeline = cli_decorators.get_pipeline_from_context()
     targets = _expand_mapped_targets(targets, pipeline)
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
+    templates = _templates(pipeline)
 
     stage_names = set(all_stages) if all_stages is not None else None
     normalized = _normalize_cli_targets(targets, known_stages=stage_names)
     targets_list = _get_targets_list(normalized)
 
-    if targets_list:
-        local_hashes = transfer.get_target_hashes(
-            targets_list, state_dir, include_deps=False, all_stages=all_stages
-        )
+    if dry_run:
+        with state.open_readonly(state_dir, create=False) as readonly_db:
+            result = transfer.push_dry_run(
+                cache_dir,
+                state_dir,
+                remote_storage,
+                readonly_db,
+                resolved_name,
+                targets_list,
+                jobs,
+                all_stages=all_stages,
+                templates=templates,
+            )
     else:
-        local_hashes = transfer.get_local_cache_hashes(cache_dir)
+        # Remote hash tracking is project-level (not per-stage), so use the
+        # project-level StateDB regardless of --all mode.
+        with (
+            state.StateDB(state_dir) as state_db,
+            cli_helpers.TransferProgress("Uploaded", quiet=quiet) as progress,
+        ):
+            result = transfer.push(
+                cache_dir,
+                state_dir,
+                remote_storage,
+                state_db,
+                resolved_name,
+                targets_list,
+                jobs,
+                progress.callback,
+                all_stages=all_stages,
+                templates=templates,
+            )
 
-    if not local_hashes:
+    transferred = result["transferred"]
+    skipped = result["skipped"]
+    failed = result["failed"]
+    if not transferred + skipped + failed:
         if not quiet:
             click.echo("No files to push")
         return
 
-    if dry_run:
-        if not quiet:
-            shown = display.escape_control(resolved_name)
-            click.echo(f"Would push {len(local_hashes)} file(s) to '{shown}'")
-        return
-
-    # Remote hash tracking is project-level (not per-stage), so use the
-    # project-level StateDB regardless of --all mode.
-    with (
-        state.StateDB(state_dir) as state_db,
-        cli_helpers.TransferProgress("Uploaded", quiet=quiet) as progress,
-    ):
-        result = transfer.push(
-            cache_dir,
-            state_dir,
-            remote_storage,
-            state_db,
-            resolved_name,
-            targets_list,
-            jobs,
-            progress.callback,
-            all_stages=all_stages,
-        )
-
     if not quiet:
-        transferred = result["transferred"]
-        skipped = result["skipped"]
-        failed = result["failed"]
         shown = display.escape_control(resolved_name)
-        click.echo(
-            f"Pushed to '{shown}': {transferred} transferred, {skipped} skipped, {failed} failed"
-        )
+        if dry_run:
+            click.echo(f"Would push {transferred} file(s) to '{shown}'")
+        else:
+            click.echo(
+                f"Pushed to '{shown}': {transferred} transferred, {skipped} skipped, "
+                + f"{failed} failed"
+            )
 
     # Always print errors to stderr and exit non-zero on failures
     cli_helpers.print_transfer_errors(result["errors"])
-    if result["failed"] > 0:
+    if failed > 0:
         raise SystemExit(1)
 
 
@@ -235,8 +255,8 @@ def fetch(
     """Fetch cached outputs from remote storage to local cache.
 
     TARGETS can be stage names or file paths. If specified, fetches those
-    outputs (and dependencies for stages). Otherwise, fetches all available
-    files from remote.
+    outputs: what 'pivot checkout' of the same targets restores. Otherwise,
+    fetches all available files from remote.
 
     This command only downloads to the local cache. Use 'pivot pull' to also
     restore files to your workspace, or 'pivot checkout' to restore from cache.
@@ -250,28 +270,45 @@ def fetch(
     state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
-    # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
+    # Per-stage state_dir lookup when pipeline is available (e.g., --all mode). A mapped stage
+    # whose producer is current but whose listing this clone lacks expands once fetch fetched it.
     pipeline = cli_decorators.get_pipeline_from_context()
-    targets = _expand_mapped_targets(targets, pipeline)
+    targets = _expand_mapped_targets(
+        targets,
+        pipeline,
+        fetch_listings=functools.partial(
+            _fetch_listings,
+            cache_dir,
+            None if dry_run else state_dir,
+            remote_storage,
+            resolved_name,
+            jobs,
+        ),
+    )
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
+    templates = _templates(pipeline)
 
     stage_names = set(all_stages) if all_stages is not None else None
     normalized = _normalize_cli_targets(targets, known_stages=stage_names)
     targets_list = _get_targets_list(normalized)
 
     if dry_run:
-        if targets_list:
-            needed = transfer.get_target_hashes(
-                targets_list, state_dir, include_deps=True, all_stages=all_stages
-            )
-        else:
-            needed = asyncio.run(remote_storage.list_hashes())
-
-        local = transfer.get_local_cache_hashes(cache_dir)
-        missing = needed - local
+        result = transfer.pull_dry_run(
+            cache_dir,
+            state_dir,
+            remote_storage,
+            resolved_name,
+            targets_list,
+            jobs,
+            all_stages=all_stages,
+            templates=templates,
+        )
         if not quiet:
             shown = display.escape_control(resolved_name)
-            click.echo(f"Would fetch {len(missing)} file(s) from '{shown}'")
+            click.echo(f"Would fetch {result['transferred']} file(s) from '{shown}'")
+        cli_helpers.print_transfer_errors(result["errors"])
+        if result["failed"] > 0:
+            raise SystemExit(1)
         return
 
     with (
@@ -288,6 +325,7 @@ def fetch(
             jobs,
             progress.callback,
             all_stages=all_stages,
+            templates=templates,
         )
 
     if not quiet:
@@ -335,7 +373,8 @@ def pull(
     This matches the behavior of 'git pull' and 'dvc pull'.
 
     TARGETS can be stage names or file paths. If specified, pulls those
-    outputs (and dependencies for stages). Otherwise, pulls all available files.
+    outputs: what 'pivot checkout' of the same targets restores. Otherwise,
+    pulls all available files.
     """
     if force and only_missing:
         raise click.ClickException("--force and --only-missing are mutually exclusive")
@@ -355,13 +394,17 @@ def pull(
     targets = _expand_mapped_targets(
         targets,
         pipeline,
-        fetch_listings=None
-        if dry_run
-        else functools.partial(
-            _fetch_listings, cache_dir, state_dir, remote_storage, resolved_name, jobs
+        fetch_listings=functools.partial(
+            _fetch_listings,
+            cache_dir,
+            None if dry_run else state_dir,
+            remote_storage,
+            resolved_name,
+            jobs,
         ),
     )
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
+    templates = _templates(pipeline)
 
     stage_names = set(all_stages) if all_stages is not None else None
     normalized = _normalize_cli_targets(targets, known_stages=stage_names)
@@ -376,18 +419,22 @@ def pull(
 
     # Dry-run: show what would be fetched, don't proceed to checkout
     if dry_run:
-        if targets_list:
-            needed = transfer.get_target_hashes(
-                targets_list, state_dir, include_deps=True, all_stages=all_stages
-            )
-        else:
-            needed = asyncio.run(remote_storage.list_hashes())
-
-        local = transfer.get_local_cache_hashes(cache_dir)
-        missing = needed - local
+        result = transfer.pull_dry_run(
+            cache_dir,
+            state_dir,
+            remote_storage,
+            resolved_name,
+            targets_list,
+            jobs,
+            all_stages=all_stages,
+            templates=templates,
+        )
         if not quiet:
             shown = display.escape_control(resolved_name)
-            click.echo(f"Would pull {len(missing)} file(s) from '{shown}'")
+            click.echo(f"Would pull {result['transferred']} file(s) from '{shown}'")
+        cli_helpers.print_transfer_errors(result["errors"])
+        if result["failed"] > 0:
+            raise SystemExit(1)
         return
 
     # Step 1: Fetch from remote to cache
@@ -405,6 +452,7 @@ def pull(
             jobs,
             progress.callback,
             all_stages=all_stages,
+            templates=templates,
         )
 
     if not quiet:

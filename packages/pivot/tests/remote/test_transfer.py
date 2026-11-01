@@ -268,59 +268,6 @@ def test_get_target_hashes_multiple_stage_outputs(lock_project: Path) -> None:
     assert result == {"a0" + "0" * 14, "a1" + "0" * 14}
 
 
-# -----------------------------------------------------------------------------
-# Target Dependency Hash Resolution Tests
-# -----------------------------------------------------------------------------
-
-
-def test_get_target_hashes_include_deps_file_outputs(lock_project: Path) -> None:
-    """A target stage's cached upstream file outputs are included."""
-    state_dir = lock_project / ".pivot"
-
-    _helper_write_lock(
-        state_dir,
-        "my_stage",
-        deps={
-            "upstream_a": FileHash(hash="de01a5b123456700"),
-            "upstream_b": FileHash(hash="de02a5b123456700"),
-        },
-    )
-
-    result = transfer.get_target_hashes(
-        ["my_stage"],
-        state_dir,
-        include_deps=True,
-        all_stages=_helper_make_all_stages("my_stage", "upstream_a", "upstream_b"),
-        cache_dir=state_dir / "cache",
-    )
-    assert result == {"de01a5b123456700", "de02a5b123456700"}
-
-
-def test_get_target_hashes_include_deps_directory_listing_and_files(lock_project: Path) -> None:
-    """An upstream directory dependency names its listing object and listed files."""
-    state_dir = lock_project / ".pivot"
-    directory = _helper_hashed_dir(
-        ("a.txt", "af11ea5b12345600", 10),
-        ("b.txt", "bf11ea5b12345600", 20),
-    )
-    _helper_write_lock(
-        state_dir,
-        "upstream",
-        outs={None: directory["record"]},
-        directories=(directory,),
-    )
-    _helper_write_lock(state_dir, "my_stage", deps={"upstream": directory["record"]})
-
-    result = transfer.get_target_hashes(
-        ["my_stage"],
-        state_dir,
-        include_deps=True,
-        all_stages=_helper_make_all_stages("my_stage", "upstream"),
-        cache_dir=state_dir / "cache",
-    )
-    assert result == {directory["record"]["hash"], "af11ea5b12345600", "bf11ea5b12345600"}
-
-
 def test_get_target_hashes_directory_without_listing_names_listing_object(
     lock_project: Path,
 ) -> None:
@@ -334,30 +281,50 @@ def test_get_target_hashes_directory_without_listing_names_listing_object(
         directories=(directory,),
     )
     stage_lock.output_listing_path(ArtifactIdentity("upstream", None)).unlink()
-    _helper_write_lock(state_dir, "my_stage", deps={"upstream": directory["record"]})
 
     result = transfer.get_target_hashes(
-        ["my_stage"],
+        ["upstream"],
         state_dir,
-        include_deps=True,
-        all_stages=_helper_make_all_stages("my_stage", "upstream"),
+        all_stages=_helper_make_all_stages("upstream"),
         cache_dir=state_dir / "cache",
     )
     assert result == {directory["record"]["hash"]}
 
 
-def test_get_target_hashes_include_deps_no_lock(lock_project: Path) -> None:
-    """A target stage with no lock has no dependency objects to transfer."""
+def test_get_target_hashes_names_no_dependency_of_a_stage(lock_project: Path) -> None:
+    """A stage target names its outputs, not the upstream outputs it depends on."""
     state_dir = lock_project / ".pivot"
+    _helper_write_lock(
+        state_dir,
+        "my_stage",
+        outs={None: FileHash(hash="0abc000000000000")},
+        deps={"upstream": FileHash(hash="de01a5b123456700")},
+    )
+    _helper_write_lock(state_dir, "upstream", outs={None: FileHash(hash="de01a5b123456700")})
 
     result = transfer.get_target_hashes(
-        ["missing_stage"],
+        ["my_stage"],
         state_dir,
-        include_deps=True,
-        all_stages=_helper_make_all_stages("missing_stage"),
+        all_stages=_helper_make_all_stages("my_stage", "upstream"),
         cache_dir=state_dir / "cache",
     )
-    assert result == set()
+    assert result == {"0abc000000000000"}
+
+
+def test_get_target_hashes_refuses_every_unknown_target(lock_project: Path) -> None:
+    """Targets that name no stage, output or tracked path are all refused, by name."""
+    state_dir = lock_project / ".pivot"
+    _helper_write_lock(state_dir, "my_stage", outs={None: FileHash(hash="0abc000000000000")})
+
+    with pytest.raises(exceptions.UnknownTargetError) as raised:
+        transfer.get_target_hashes(
+            ["no_stage", "my_stage", "missing.csv"],
+            state_dir,
+            all_stages=_helper_make_all_stages("my_stage"),
+            cache_dir=state_dir / "cache",
+        )
+
+    assert raised.value.targets == ["no_stage", "missing.csv"]
 
 
 # -----------------------------------------------------------------------------
@@ -365,49 +332,37 @@ def test_get_target_hashes_include_deps_no_lock(lock_project: Path) -> None:
 # -----------------------------------------------------------------------------
 
 
-async def test_compare_status_empty_hashes(lock_project: Path, mocker: MockerFixture) -> None:
-    """Empty local hashes returns empty status."""
-
+async def test_compare_status_counts_every_remote_object_for_an_empty_cache(
+    lock_project: Path, mocker: MockerFixture
+) -> None:
+    """With nothing cached (a fresh clone), every object on the remote is one a pull fetches."""
     mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
+    mock_remote.list_hashes = mocker.AsyncMock(return_value={"abc123def4567890"})
     mock_state = mocker.Mock(spec=state_mod.StateDB)
+    mock_state.remote_hashes_intersection.return_value = set()
 
     result = await transfer.compare_status(set(), mock_remote, mock_state, "origin")
 
-    assert result == RemoteStatus(local_only=set(), remote_only=set(), common=set())
-    mock_remote.bulk_exists.assert_not_called()
+    assert result == RemoteStatus(local_only=set(), remote_only={"abc123def4567890"}, common=set())
 
 
-async def test_compare_status_all_known_in_index(lock_project: Path, mocker: MockerFixture) -> None:
-    """All hashes known in index skips remote check."""
-
+async def test_compare_status_trusts_the_index_as_push_does(
+    lock_project: Path, mocker: MockerFixture
+) -> None:
+    """An object the index records counts as on the remote, as push skips it, even when the
+    listing no longer shows it; one the listing shows is recorded in the index."""
     mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
+    mock_remote.list_hashes = mocker.AsyncMock(
+        return_value={"def456abc7890123", "fedcba9876543210"}
+    )
     mock_state = mocker.Mock(spec=state_mod.StateDB)
-
-    local_hashes = {"abc123def4567890", "def456abc7890123"}
-    mock_state.remote_hashes_intersection.return_value = local_hashes
-
-    result = await transfer.compare_status(local_hashes, mock_remote, mock_state, "origin")
-
-    assert result["local_only"] == set()
-    assert result["common"] == local_hashes
-    mock_remote.bulk_exists.assert_not_called()
-
-
-async def test_compare_status_queries_unknown(lock_project: Path, mocker: MockerFixture) -> None:
-    """Unknown hashes query remote and update index."""
-
-    mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
-    mock_state = mocker.Mock(spec=state_mod.StateDB)
-
     local_hashes = {"abc123def4567890", "def456abc7890123", "111222333444555a"}
     mock_state.remote_hashes_intersection.return_value = {"abc123def4567890"}
-    mock_remote.bulk_exists = mocker.AsyncMock(
-        return_value={"def456abc7890123": True, "111222333444555a": False}
-    )
 
     result = await transfer.compare_status(local_hashes, mock_remote, mock_state, "origin")
 
     assert result["local_only"] == {"111222333444555a"}
+    assert result["remote_only"] == {"fedcba9876543210"}
     assert result["common"] == {"abc123def4567890", "def456abc7890123"}
     mock_state.remote_hashes_add.assert_called_once_with("origin", {"def456abc7890123"})
 
@@ -546,21 +501,22 @@ async def test_push_async_with_stages(lock_project: Path, mocker: MockerFixture)
 # -----------------------------------------------------------------------------
 
 
-async def test_pull_async_no_needed_hashes(lock_project: Path, mocker: MockerFixture) -> None:
-    """Pull with no needed hashes returns zero summary."""
+async def test_pull_async_refuses_an_unknown_target(
+    lock_project: Path, mocker: MockerFixture
+) -> None:
+    """Pull of a target that names nothing fails, naming it, and downloads nothing."""
 
     cache_dir = lock_project / ".pivot" / "cache"
     state_dir = lock_project / ".pivot"
     mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
 
-    result = await transfer._pull_async(
-        cache_dir, state_dir, mock_remote, mock_state, "origin", targets=["nonexistent"]
-    )
+    with pytest.raises(exceptions.UnknownTargetError, match="'nonexistent'"):
+        await transfer._pull_async(
+            cache_dir, state_dir, mock_remote, mock_state, "origin", targets=["nonexistent"]
+        )
 
-    assert result["transferred"] == 0
-    assert result["skipped"] == 0
-    assert result["failed"] == 0
+    mock_remote.download_batch.assert_not_called()
 
 
 async def test_pull_async_all_already_local(lock_project: Path, mocker: MockerFixture) -> None:
@@ -680,8 +636,10 @@ async def test_pull_async_handles_failures(lock_project: Path, mocker: MockerFix
     assert "Download failed" in result["errors"]
 
 
-async def test_pull_async_includes_deps(lock_project: Path, mocker: MockerFixture) -> None:
-    """Pull includes the hashes of upstream stage outputs a target stage depends on."""
+async def test_pull_async_requests_only_the_targets_objects(
+    lock_project: Path, mocker: MockerFixture
+) -> None:
+    """Pull of a stage requests its outputs, not the upstream output it depends on."""
 
     cache_dir = lock_project / ".pivot" / "cache"
     state_dir = lock_project / ".pivot"
@@ -698,10 +656,7 @@ async def test_pull_async_includes_deps(lock_project: Path, mocker: MockerFixtur
     mock_remote = mocker.Mock(spec=remote_mod.S3Remote)
     mock_state = mocker.Mock(spec=state_mod.StateDB)
     mock_remote.download_batch = mocker.AsyncMock(
-        return_value=[
-            TransferResult(hash=out_hash, success=True),
-            TransferResult(hash=dep_hash, success=True),
-        ]
+        return_value=[TransferResult(hash=out_hash, success=True)]
     )
 
     result = await transfer._pull_async(
@@ -715,8 +670,8 @@ async def test_pull_async_includes_deps(lock_project: Path, mocker: MockerFixtur
     )
 
     requested = {hash_ for hash_, _ in mock_remote.download_batch.call_args.args[0]}
-    assert requested == {out_hash, dep_hash}, "Should request the output and the upstream dep"
-    assert result["transferred"] == 2
+    assert requested == {out_hash}, "Should request the output only"
+    assert result["transferred"] == 1
 
 
 # -----------------------------------------------------------------------------
@@ -980,11 +935,7 @@ async def test_compare_status_integration(
     s3_remote: remote_mod.S3Remote,
     aioboto3_s3_client: S3Client,
 ) -> None:
-    """Integration: compare local vs remote status.
-
-    Note: compare_status only checks local hashes against remote, never
-    enumerates remote-only files. So we only set up the common hash.
-    """
+    """Integration: compare local vs remote status from the remote's listing."""
     hash_common = "de" + "f" * 14
     hash_local_only = "12" + "3" * 14
 
@@ -1011,12 +962,14 @@ async def test_compare_status_integration(
     state_db.close()
 
 
-async def test_pull_async_with_deps_integration(
+async def test_pull_async_target_leaves_dependencies_on_the_remote_integration(
     tmp_path: Path,
     s3_remote: remote_mod.S3Remote,
     aioboto3_s3_client: S3Client,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Integration: pull with dependency hashes."""
+    """Integration: a targeted pull fetches the stage's outputs; its dependency stays remote."""
+    monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     out_hash = xxhash.xxh64(b"main_file").hexdigest()
     dep_hash = xxhash.xxh64(b"dependency_file").hexdigest()
 
@@ -1055,10 +1008,8 @@ async def test_pull_async_with_deps_integration(
     )
 
     files_dir = cache_dir / "files"
-    out_path = cache_mod.get_cache_path(files_dir, out_hash)
-    dep_path = cache_mod.get_cache_path(files_dir, dep_hash)
-    assert out_path.read_bytes() == b"main_file"
-    assert dep_path.read_bytes() == b"dependency_file"
+    assert cache_mod.get_cache_path(files_dir, out_hash).read_bytes() == b"main_file"
+    assert not cache_mod.get_cache_path(files_dir, dep_hash).exists()
     state_db.close()
 
 
@@ -1111,22 +1062,18 @@ async def test_pull_async_directory_target_fetches_listing_then_files_integratio
     assert cache_mod.get_cache_path(files_dir, second_hash).read_bytes() == second
 
 
-async def test_pull_async_with_directory_dep_integration(
+async def test_pull_async_directory_target_with_committed_listing_integration(
     lock_project: Path,
     s3_remote: remote_mod.S3Remote,
     aioboto3_s3_client: S3Client,
 ) -> None:
-    """A targeted pull includes an upstream directory's listing object and listed files.
-
-    The committed listing is copied into the local cache, so only file objects are fetched.
-    """
-    output = b"main output"
-    dep_file = b"directory dependency file"
-    out_hash = xxhash.xxh64(output).hexdigest()
-    dep_file_hash = xxhash.xxh64(dep_file).hexdigest()
-    directory = _helper_hashed_dir(("input.txt", dep_file_hash, len(dep_file)))
-    for object_hash, content in ((out_hash, output), (dep_file_hash, dep_file)):
-        await _helper_put_remote_object(s3_remote, aioboto3_s3_client, object_hash, content)
+    """A targeted directory output with a committed listing names its listing object and
+    listed files. The committed listing is copied into the local cache, so only file objects
+    are fetched."""
+    member = b"directory output file"
+    member_hash = xxhash.xxh64(member).hexdigest()
+    directory = _helper_hashed_dir(("input.txt", member_hash, len(member)))
+    await _helper_put_remote_object(s3_remote, aioboto3_s3_client, member_hash, member)
 
     state_dir = lock_project / ".pivot"
     cache_dir = state_dir / "cache"
@@ -1137,12 +1084,6 @@ async def test_pull_async_with_directory_dep_integration(
         outs={None: directory["record"]},
         directories=(directory,),
     )
-    _helper_write_lock(
-        state_dir,
-        "my_stage",
-        outs={None: FileHash(hash=out_hash)},
-        deps={"upstream": directory["record"]},
-    )
 
     with state_mod.StateDB(state_dir) as state_db:
         result = await transfer._pull_async(
@@ -1151,14 +1092,13 @@ async def test_pull_async_with_directory_dep_integration(
             s3_remote,
             state_db,
             "origin",
-            targets=["my_stage"],
-            all_stages=_helper_make_all_stages("my_stage", "upstream"),
+            targets=["upstream"],
+            all_stages=_helper_make_all_stages("upstream"),
         )
 
-    assert result == {"transferred": 2, "skipped": 1, "failed": 0, "errors": []}
-    assert cache_mod.get_cache_path(files_dir, out_hash).read_bytes() == output
+    assert result == {"transferred": 1, "skipped": 1, "failed": 0, "errors": []}
     assert cache_mod.cached_listing(files_dir, directory["record"]) == directory["listing"]
-    assert cache_mod.get_cache_path(files_dir, dep_file_hash).read_bytes() == dep_file
+    assert cache_mod.get_cache_path(files_dir, member_hash).read_bytes() == member
 
 
 # -----------------------------------------------------------------------------

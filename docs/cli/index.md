@@ -284,7 +284,7 @@ pivot status [STAGES...] [OPTIONS]
 | `--stages-only` | Show only pipeline status |
 | `--tracked-only` | Show only tracked files |
 | `--remote-only` | Show only remote status |
-| `--remote` / `-r` | Include remote sync status |
+| `--remote` / `-r` | Include remote sync status: the files an untargeted `pivot push` would upload, and the files on the remote the local cache lacks, which an untargeted `pivot pull` would download (it lists the remote) |
 | `--check-imports` | Check for import updates (requires network). JSON adds an `imports` field. |
 | `--all` | Show status across all pipelines in the project |
 
@@ -816,14 +816,16 @@ pivot push [TARGETS...] [OPTIONS]
 
 **Arguments:**
 
-- `TARGETS` - Stage names or file paths to push (optional, pushes all if not specified)
+- `TARGETS` - Stage names or file paths to push (optional, pushes all if not specified). A target sends what `pivot pull` of the same target fetches: the stage's outputs and the objects its lock lists under `reads`, or the file's or tracked path's objects. A mapped stage's instance also sends the producer listing a clone needs to expand it. A target that is not a stage, stage output or tracked path fails, naming it.
+
+A file the remote lacks and the local cache does not hold fails the push (exit 1), naming its hash.
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
 | `--remote` / `-r NAME` | Remote name (uses default if not specified) |
-| `--dry-run` / `-n` | Show what would be pushed |
+| `--dry-run` / `-n` | Show how many files a push would upload, asking the remote which it holds; fails as the push would for a file it could not send |
 | `--jobs` / `-j N` | Parallel upload jobs (default: 20) |
 | `--all` | Push all stages (ignore target filtering) |
 
@@ -839,14 +841,14 @@ pivot pull [TARGETS...] [OPTIONS]
 
 **Arguments:**
 
-- `TARGETS` - Stage names or file paths to pull (optional, pulls all if not specified)
+- `TARGETS` - Stage names or file paths to pull (optional, pulls all if not specified). A target fetches what `pivot checkout` of it restores, and for a stage the objects its lock lists under `reads`, so it can run again; not the outputs of the stages upstream of it or its tracked inputs. A mapped stage's instance fetches the producer listing it needs to expand. A target that is not a stage, stage output or tracked path fails, naming it.
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
 | `--remote` / `-r NAME` | Remote name (uses default if not specified) |
-| `--dry-run` / `-n` | Show what would be pulled |
+| `--dry-run` / `-n` | Show how many files a pull would download; with targets, asks the remote which it holds and fails naming each file it lacks. It reads from the remote the listings the clone lacks, as the pull does: a mapped stage's producer listing into the cache, to expand the stage, and a directory's listing into a temporary directory, to count its files |
 | `--jobs` / `-j N` | Parallel download jobs |
 | `--force` / `-f` | Overwrite existing workspace files |
 | `--only-missing` | Only restore files that don't exist in workspace (the default without `--force`). A directory is replaced when every changed or extra file is pivot's own earlier output (an extra empty directory holds nothing to lose), and refused (naming the files) when one holds a local change the cache lacks |
@@ -865,14 +867,14 @@ pivot fetch [TARGETS...] [OPTIONS]
 
 **Arguments:**
 
-- `TARGETS` - Stage names or file paths to fetch (optional, fetches all if not specified)
+- `TARGETS` - Stage names or file paths to fetch (optional, fetches all if not specified), as `pivot pull` takes them
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
 | `--remote` / `-r NAME` | Remote name (uses default if not specified) |
-| `--dry-run` / `-n` | Show what would be fetched |
+| `--dry-run` / `-n` | Show how many files a fetch would download, as `pivot pull --dry-run` counts them |
 | `--jobs` / `-j N` | Parallel download jobs |
 | `--all` | Fetch all stages (ignore target filtering) |
 

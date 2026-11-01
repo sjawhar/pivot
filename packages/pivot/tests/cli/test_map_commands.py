@@ -499,6 +499,48 @@ def test_pull_fetches_a_listing_the_clone_lacks_before_it_expands(
     assert _read(clone, "cut@b") == {"cut": 4}, pulled
 
 
+@pytest.mark.usefixtures("moto_services")
+def test_push_of_a_mapped_stage_sends_the_listing_a_clone_needs_to_expand_it(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """`pivot pull p/cut` in a clone without the producer's committed listing fetches that
+    listing to expand p/cut, so `pivot push p/cut` sends it beside the instances' outputs."""
+    root, home = _project(tmp_path, {"a": 1, "b": 2})
+    env = _s3_remote(root, home, moto_services["s3"])
+    _ok(helpers.run_pivot(root, home, "repro", extra_env=env))
+    _ok(helpers.run_pivot(root, home, "push", "p/cut", extra_env=env))
+    clone = _clone(root, home, tmp_path / "clone")
+    for listing in (clone / ".pivot" / "stages" / "p").glob("plan=*.listing"):
+        listing.unlink()  # as if the listing was never committed
+
+    pulled = _ok(helpers.run_pivot(clone, home, "pull", "p/cut", extra_env=env))
+
+    assert _read(clone, "cut@a") == {"cut": 2}, pulled
+    assert _read(clone, "cut@b") == {"cut": 4}, pulled
+
+
+@pytest.mark.usefixtures("moto_services")
+def test_pull_dry_run_of_a_mapped_stage_counts_what_the_pull_fetches(
+    tmp_path: pathlib.Path, moto_services: dict[str, str]
+) -> None:
+    """In a clone without the producer's committed listing, `pivot pull --dry-run p/cut`
+    fetches that listing, as the pull does first, to expand p/cut, then counts the instances'
+    outputs the pull fetches."""
+    root, home = _project(tmp_path, {"a": 1, "b": 2})
+    env = _s3_remote(root, home, moto_services["s3"])
+    _ok(helpers.run_pivot(root, home, "repro", extra_env=env))
+    _ok(helpers.run_pivot(root, home, "push", "p/cut", extra_env=env))
+    clone = _clone(root, home, tmp_path / "clone")
+    for listing in (clone / ".pivot" / "stages" / "p").glob("plan=*.listing"):
+        listing.unlink()  # as if the listing was never committed
+
+    dry_run = _ok(helpers.run_pivot(clone, home, "pull", "--dry-run", "p/cut", extra_env=env))
+    pulled = _ok(helpers.run_pivot(clone, home, "pull", "p/cut", extra_env=env))
+
+    assert "Would pull 2 file(s)" in dry_run, dry_run
+    assert "2 transferred" in pulled, pulled
+
+
 def test_a_mapped_stage_or_an_instance_is_refused_by_pivot_run(tmp_path: pathlib.Path) -> None:
     root, home = _project(tmp_path, {"a": 1})
 
