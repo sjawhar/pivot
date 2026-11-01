@@ -797,8 +797,9 @@ def test_a_key_the_mapped_stage_lacks_is_refused_naming_the_instance(
     tmp_path: pathlib.Path, moto_services: dict[str, str], args: tuple[str, ...]
 ) -> None:
     """p/cut has keys a and b. A target naming key zz, by instance name or output path, reads
-    the listing it expands from, then fails saying p/cut has no such instance, and transfers
-    nothing."""
+    the listing it expands from, then fails saying p/cut has no such instance, and transfers no
+    output. A pull or fetch keeps the listing it downloaded to check the key; a dry run reads
+    it into a temporary directory and stores nothing."""
     clone, home, env = _clone_without_listing(tmp_path, moto_services["s3"])
 
     proc = helpers.run_pivot(clone, home, *args, extra_env=env)
@@ -807,6 +808,9 @@ def test_a_key_the_mapped_stage_lacks_is_refused_naming_the_instance(
     assert proc.returncode == 1, out
     assert "mapped stage 'p/cut' has no instance 'p/cut@zz'" in out, out
     assert "transferred" not in out and "Would" not in out, out
+    cached = {path.parent.name + path.name for path in _cache_objects(clone)}
+    # 9c83a0cb164bf36d is p/plan's listing of a.yaml and b.yaml
+    assert cached == (set[str]() if "--dry-run" in args else {"9c83a0cb164bf36d"}), out
 
 
 @pytest.mark.usefixtures("moto_services")
