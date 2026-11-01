@@ -1226,24 +1226,31 @@ def _resolved_store(cache_dir: pathlib.Path) -> pathlib.Path:
     return pathlib.Path(os.path.realpath(cache_dir / naming.OBJECTS_DIR))
 
 
-def _open_directory_at(parent_fd: int, name: str) -> int | None:
+def _open_directory_at(
+    parent_fd: int, name: str, *, expected: tuple[int, int] | None = None
+) -> int | None:
     """Open the directory ``name`` in the directory open as ``parent_fd`` without following a
     link, and return its descriptor (the caller closes it); None when no directory of its own
-    is there: nothing, a file, a link, or an entry replaced while it was opened.
+    is there: nothing, a file, a link, an entry replaced while it was opened, or a directory
+    whose identity is not ``expected``.
 
     Every prefix directory a collection lists, and every directory it removes from, is opened
     here (``_tree_bytes`` measures a tree with ``os.fwalk``, which makes the same comparison).
     ``O_NOFOLLOW`` alone does not hold: gVisor follows a link to a directory under
-    ``O_DIRECTORY | O_NOFOLLOW``, where Linux fails with ELOOP. So the entry is ``lstat``-ed
-    first and anything but a directory, a link included, is refused; then the descriptor opened
-    must show the device and inode that ``lstat`` saw, which refuses on either kernel a link or
-    another directory put at the name between the two calls.
+    ``O_DIRECTORY | O_NOFOLLOW``, where Linux fails with ENOTDIR. So the entry is ``lstat``-ed
+    first and anything but a directory, a link included, is refused; when a caller recorded the
+    directory it expects, that identity is required too. Last, the descriptor opened must show
+    the device and inode that ``lstat`` saw, which refuses on either kernel a link or another
+    directory put at the name between the two calls.
     """
     try:
         seen = os.lstat(name, dir_fd=parent_fd)
     except FileNotFoundError:
         return None
     if not stat.S_ISDIR(seen.st_mode):
+        return None
+    seen_identity = seen.st_dev, seen.st_ino
+    if expected is not None and seen_identity != expected:
         return None
     try:
         fd = os.open(
@@ -1256,7 +1263,7 @@ def _open_directory_at(parent_fd: int, name: str) -> int | None:
             raise
         return None
     opened = os.fstat(fd)
-    if (opened.st_dev, opened.st_ino) != (seen.st_dev, seen.st_ino):
+    if (opened.st_dev, opened.st_ino) != seen_identity:
         os.close(fd)
         return None
     return fd
@@ -1883,7 +1890,12 @@ def execute_plan(
                     with contextlib.suppress(OSError):
                         os.unlink(name + suffix, dir_fd=prefix_fd)
             try:
-                _remove_at(prefix_fd, name, is_dir=stat.S_ISDIR(stats.st_mode))
+                _remove_at(
+                    prefix_fd,
+                    name,
+                    is_dir=stat.S_ISDIR(stats.st_mode),
+                    expected=(stats.st_dev, stats.st_ino),
+                )
             except OSError as e:
                 logger.warning("Cannot remove cache object %s: %s", path, e)
                 continue
@@ -1895,14 +1907,18 @@ def execute_plan(
     return removed
 
 
-def _remove_at(dir_fd: int, name: str, *, is_dir: bool) -> None:
+def _remove_at(
+    dir_fd: int, name: str, *, is_dir: bool, expected: tuple[int, int] | None = None
+) -> None:
     """Remove the object ``name`` in the prefix directory open as ``dir_fd``, never through a
     path. A tree is emptied through descriptors, depth first and without recursion: each of its
     directories is opened from the one above it (``_open_directory_at``), and every unlink and
     rmdir is relative to an open directory, so a link or another directory put at a name while
-    the removal runs receives nothing. A tree's read-only directories are made writable as the
-    removal opens them; a file never is (it may be a hardlink a workspace shares), only the
-    directory that holds it.
+    the removal runs receives nothing. Each directory's identity is recorded while its parent is
+    scanned, and the root's is from ``execute_plan``'s non-following ``stat``: a replacement
+    directory is not removed. A tree's read-only directories are made writable as the removal
+    opens them; a file never is (it may be a hardlink a workspace shares), only the directory
+    that holds it.
 
     Raises:
         OSError: an entry cannot be removed, or a directory of the tree is no longer the one
@@ -1911,14 +1927,14 @@ def _remove_at(dir_fd: int, name: str, *, is_dir: bool) -> None:
     if not is_dir:
         _remove_entry(os.unlink, dir_fd, name)
         return
-    stack = [_open_for_removal(dir_fd, name)]
+    stack = [_open_for_removal(dir_fd, name, expected=expected)]
     try:
         while stack:
             parent_fd, entry, fd, children = stack[-1]
             if children:
-                child, child_is_dir = children.pop()
-                if child_is_dir:
-                    stack.append(_open_for_removal(fd, child))
+                child, identity = children.pop()
+                if identity is not None:
+                    stack.append(_open_for_removal(fd, child, expected=identity))
                 else:
                     _remove_entry(os.unlink, fd, child)
                 continue
@@ -1930,15 +1946,18 @@ def _remove_at(dir_fd: int, name: str, *, is_dir: bool) -> None:
             os.close(fd)
 
 
-def _open_for_removal(parent_fd: int, name: str) -> tuple[int, str, int, list[tuple[str, bool]]]:
+def _open_for_removal(
+    parent_fd: int, name: str, *, expected: tuple[int, int] | None = None
+) -> tuple[int, str, int, list[tuple[str, tuple[int, int] | None]]]:
     """Open the directory ``name`` in the directory open as ``parent_fd`` to empty it: its
-    parent's descriptor, its name, its own descriptor (made writable) and its entries, each
-    with whether it is a directory (a link is not).
+    parent's descriptor, its name, its own descriptor (made writable) and its entries. A child
+    directory keeps the device and inode seen while this parent was scanned; a file or link has
+    None and is unlinked without following it.
 
     Raises:
         OSError: no directory of its own is there (``_open_directory_at``).
     """
-    fd = _open_directory_at(parent_fd, name)
+    fd = _open_directory_at(parent_fd, name, expected=expected)
     if fd is None:
         raise OSError(
             errno.ENOTDIR,
@@ -1949,7 +1968,11 @@ def _open_for_removal(parent_fd: int, name: str) -> tuple[int, str, int, list[tu
     try:
         _writable_dir(fd)
         with os.scandir(fd) as entries:
-            children = [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in entries]
+            children = list[tuple[str, tuple[int, int] | None]]()
+            for entry in entries:
+                info = entry.stat(follow_symlinks=False)
+                identity = (info.st_dev, info.st_ino) if stat.S_ISDIR(info.st_mode) else None
+                children.append((entry.name, identity))
     except BaseException:
         os.close(fd)
         raise

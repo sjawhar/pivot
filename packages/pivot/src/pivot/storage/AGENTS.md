@@ -521,18 +521,20 @@ tree being removed is opened by one function, `gc._open_directory_at`: it `lstat
 relative to the open parent and refuses anything but a directory, opens it with
 `O_DIRECTORY | O_NOFOLLOW`, and refuses the descriptor unless its `fstat` shows the device and
 inode the `lstat` saw (`gc._tree_bytes` measures a tree with `os.fwalk`, which makes the same
-comparison itself). The flag
-alone is not enough: gVisor follows a link to a directory under `O_DIRECTORY | O_NOFOLLOW`, where
-Linux fails with ELOOP, so a prefix replaced by a link to another store's prefix after the store
-was listed would be listed and then emptied through the link. The `lstat` comparison refuses it
-on both kernels, and also a link put there only for the instant of the open. So no `files/`
-re-pointed and no store, prefix or tree directory renamed aside and replaced (by a directory, a
-link or a mount over it) during a collection can receive a removal (RP), and a collection needs
-a fixed number of descriptors whatever `ulimit -n` is. A prefix removed and made again after
-the plan, which may reuse the removed directory's inode, holds only what was put in it since:
-the removals there reach its own entries and follow no link. Races that need root or FUSE (a
-mount made inside a dead tree while it is removed) are out of scope: whoever can make them can
-delete the objects directly. The
+comparison itself). The flag alone is not enough: gVisor follows a link to a directory under
+`O_DIRECTORY | O_NOFOLLOW`, where Linux fails with ENOTDIR, so a prefix replaced by a link to
+another store's prefix after the store was listed would be listed and then emptied through the
+link. The `lstat` comparison refuses it on both kernels, and also a link put there only for the
+instant of the open. So no `files/` re-pointed and no store, prefix or tree directory renamed
+aside and replaced (by a directory, a link or a mount over it) during a collection can receive a
+removal through the replaced name. A directory placed in a doomed tree before its parent is
+scanned is part of that tree; one that replaces a recorded directory after the scan stops the
+object's removal. Each prefix takes a fixed number of descriptors while it is listed or deletes
+flat objects. Removing a tree takes one descriptor per level of depth; if it reaches EMFILE,
+`execute_plan` logs that object and leaves its remaining tree, then continues. The markers were
+already removed (M5), so no partial tree is trusted. Races that need root or FUSE (a mount made
+inside a dead tree while it is removed) are out of scope: whoever can make them can delete the
+objects directly. The
 registration memo records the register
 root and re-registers in full when it moves (a re-pointed `files/`). The register root must be
 writable by every writer; when it is not, the writer refuses and names it.
