@@ -31,13 +31,13 @@ class Expansion(TypedDict):
         expanded: Each expanded template's instances, in key order.
         not_expanded: Each template left unexpanded, with why.
         listings: For a template whose producer is current but whose listing neither the
-            committed file nor the cache holds, the hash of that listing: the cache object a
+            committed file nor the cache holds, the record of that listing: the cache object a
             pull fetches from the remote before it expands again.
     """
 
     expanded: dict[str, list[str]]
     not_expanded: dict[str, str]
-    listings: dict[str, str]
+    listings: dict[str, types.DirHash]
 
 
 def single_stage_refusal(
@@ -130,6 +130,7 @@ def expand_current(
     *,
     default_state_dir: pathlib.Path,
     cache_dir: pathlib.Path | None,
+    fetched: Mapping[str, listing.DirListing] | None = None,
 ) -> Expansion:
     """Expand afresh each template of ``pipeline`` whose source's producer is current.
 
@@ -139,6 +140,9 @@ def expand_current(
     stands. A template mapped over an upstream template's instances expands with it, over the
     same keys, and stays unexpanded when that one does. Each template expands all or nothing
     (``registry.StageRegistry.expand``); a refusal leaves it unexpanded with the reason.
+    ``fetched`` holds listings read from the remote, by directory hash, already checked against
+    their records: a listing neither committed nor cached is taken from it (a dry run's read,
+    which writes nothing to the cache).
     """
     pipeline.reset_expansions()
     result = Expansion(expanded={}, not_expanded={}, listings={})
@@ -172,9 +176,16 @@ def expand_current(
                 )
             except exceptions.ListingMissingError as e:
                 record = recorded_directory(source, locks[producer])
-                if record is not None:
-                    result["listings"][name] = record["hash"]
-                keys = refusal_reason(source, e)
+                members = None if record is None or fetched is None else fetched.get(record["hash"])
+                if members is not None:
+                    try:
+                        keys = keys_of(members)
+                    except exceptions.PipelineConfigError as error:
+                        keys = refusal_reason(source, error)
+                else:
+                    if record is not None:
+                        result["listings"][name] = record
+                    keys = refusal_reason(source, e)
             except (exceptions.CorruptListingError, exceptions.PipelineConfigError) as e:
                 keys = refusal_reason(source, e)
             keys_by_source[source] = keys

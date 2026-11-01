@@ -300,18 +300,19 @@ def get_target_hashes(
     unlisted: dict[str, types.DirHash] | None = None,
 ) -> set[str]:
     """The cache objects of ``targets`` (stage names or file paths): the objects that
-    ``pivot pull`` of them and then ``pivot checkout`` and a rerun of them use in a fresh clone.
-    ``pivot push``, ``fetch`` and ``pull`` of targets all transfer this set, so a push of a
-    target sends every object a pull of it asks for.
+    ``pivot pull`` of them and then ``pivot checkout`` of them use in a fresh clone, and the
+    objects a stage's lock records it read. ``pivot push``, ``fetch`` and ``pull`` of targets
+    all transfer this set, so a push of a target sends every object a pull of it asks for.
 
     A stage names its cached outputs (metrics are git-tracked) and the objects its lock records
-    under ``reads`` (``pivot.read_by_hash``), which a rerun reads; a stage output or tracked
-    path names its own objects; a directory names its listing object and its files' objects. No
-    target names its stage's dependencies, which are targets of their own; an untargeted pull
-    fetches every object on the remote. An instance of a mapped stage of ``templates`` also
-    names the listing object of the directory it is mapped over, which a clone fetches to
-    expand it (``_mapped_source_listing``). A registered stage, or a declared output, with no
-    recorded hash names nothing.
+    under ``reads`` (``pivot.read_by_hash``); a stage output or tracked path names its own
+    objects; a directory names its listing object and its files' objects. No target names its
+    stage's dependencies or tracked inputs: checkout does not restore them, and without them a
+    later run recomputes the upstream stages or stops naming a missing tracked input. They are
+    targets of their own; an untargeted pull fetches every object on the remote. An instance of
+    a mapped stage of ``templates`` also names the listing object of the directory it is mapped
+    over, which a clone fetches to expand it (``_mapped_source_listing``). A registered stage,
+    or a declared output, with no recorded hash names nothing.
 
     ``cache_dir`` is the cache root (``config.locate_cache_dir()`` when None). With
     ``require_members`` (push), a directory whose committed listing cannot be read and whose
@@ -746,9 +747,11 @@ async def _pull_async(
     all_stages: dict[str, RegistryStageInfo] | None = None,
     *,
     templates: Mapping[str, MapTemplate] | None = None,
+    prefetched: frozenset[str] | None = None,
 ) -> TransferSummary:
     """Pull cache files from remote (async implementation)."""
     _t = metrics.start()
+    prefetched = prefetched or frozenset[str]()
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
     check_remote_url(state_db, remote_name, remote)
@@ -756,14 +759,19 @@ async def _pull_async(
 
     if not needed_hashes:
         metrics.end("sync.pull_async", _t)
-        return TransferSummary(transferred=0, skipped=0, failed=0, errors=[])
+        return TransferSummary(transferred=len(prefetched), skipped=0, failed=0, errors=[])
 
     local_hashes = get_local_cache_hashes(cache_dir)
     missing_locally = needed_hashes - local_hashes
 
     if not missing_locally:
         metrics.end("sync.pull_async", _t)
-        return TransferSummary(transferred=0, skipped=len(needed_hashes), failed=0, errors=[])
+        return TransferSummary(
+            transferred=len(prefetched),
+            skipped=len(needed_hashes - prefetched),
+            failed=0,
+            errors=[],
+        )
 
     files_dir = cache_dir / "files"
     items = list[tuple[str, pathlib.Path]]()
@@ -798,8 +806,8 @@ async def _pull_async(
 
     metrics.end("sync.pull_async", _t)
     return TransferSummary(
-        transferred=len(transferred),
-        skipped=len(needed_hashes - downloaded),
+        transferred=len(transferred) + len(prefetched),
+        skipped=len(needed_hashes - downloaded - prefetched),
         failed=len(failed),
         errors=errors,
     )
@@ -817,9 +825,12 @@ def pull(
     all_stages: dict[str, RegistryStageInfo] | None = None,
     *,
     templates: Mapping[str, MapTemplate] | None = None,
+    prefetched: frozenset[str] | None = None,
 ) -> TransferSummary:
     """Pull cache files from remote storage. ``templates`` are the pipeline's mapped stages
-    (``get_target_hashes``)."""
+    (``get_target_hashes``). ``prefetched`` are the objects this command downloaded before the
+    pull (``fetch_objects``: listings mapped stages expand over); the summary counts them
+    transferred, never skipped."""
     return asyncio.run(
         _pull_async(
             cache_dir,
@@ -832,6 +843,7 @@ def pull(
             callback,
             all_stages,
             templates=templates,
+            prefetched=prefetched,
         )
     )
 
@@ -844,28 +856,38 @@ async def _held_by(remote: protocol.RemoteStorage, hashes: set[str], jobs: int) 
     return {hash_ for hash_, exists in existence.items() if exists}
 
 
-async def _listed_files(
-    remote: protocol.RemoteStorage, records: dict[str, types.DirHash], jobs: int
-) -> set[str]:
-    """The file objects the directory listings at ``records`` name, read from the remote into a
-    temporary directory and dropped: the files a pull fetches once it has those listings. A
-    listing that cannot be downloaded or read names none."""
+async def _read_remote_listings_async(
+    remote: protocol.RemoteStorage, records: Mapping[str, types.DirHash], jobs: int
+) -> tuple[dict[str, listing.DirListing], list[str]]:
+    listings = dict[str, listing.DirListing]()
     if not records:
-        return set()
+        return listings, []
     with tempfile.TemporaryDirectory() as scratch:
         files_dir = pathlib.Path(scratch)
-        _ = await remote.download_batch(
+        results = await remote.download_batch(
             [(hash_, cache.get_cache_path(files_dir, hash_)) for hash_ in sorted(records)],
             concurrency=jobs,
         )
-        files = set[str]()
-        for record in records.values():
+        errors = [r["error"] for r in results if not r["success"] and "error" in r]
+        for hash_, record in records.items():
             try:
-                members = listing.read(None, record, files_dir)
-            except (exceptions.ListingMissingError, exceptions.CorruptListingError):
-                continue
-            files.update(entry["hash"] for entry in members["files"])
-        return files
+                listings[hash_] = listing.read(None, record, files_dir)
+            except (exceptions.ListingMissingError, exceptions.CorruptListingError) as e:
+                errors.append(str(e))
+        return listings, errors
+
+
+def read_remote_listings(
+    remote: protocol.RemoteStorage, records: Mapping[str, types.DirHash], jobs: int | None = None
+) -> tuple[dict[str, listing.DirListing], list[str]]:
+    """The directory listings at ``records`` (by hash), read from the remote into a temporary
+    directory, checked against their records, and dropped: nothing is written to the cache or
+    the remote index (a dry run's read). Returns those read, and why each other one was not."""
+    return asyncio.run(
+        _read_remote_listings_async(
+            remote, records, jobs if jobs is not None else config.get_remote_jobs()
+        )
+    )
 
 
 async def _pull_dry_run_async(
@@ -887,9 +909,10 @@ async def _pull_dry_run_async(
     on_remote = await _held_by(remote, missing, jobs) if targets else missing
     # A directory whose listing is neither committed nor cached names its listing object alone;
     # the pull fetches that listing, then the files it names, so they are counted too.
-    files = await _listed_files(
+    listings, _ = await _read_remote_listings_async(
         remote, {hash_: record for hash_, record in unlisted.items() if hash_ in on_remote}, jobs
     )
+    files = {entry["hash"] for members in listings.values() for entry in members["files"]}
     extra = files - needed - local
     needed |= extra
     missing |= extra
@@ -935,45 +958,44 @@ def pull_dry_run(
 async def _fetch_objects_async(
     cache_dir: pathlib.Path,
     remote: protocol.RemoteStorage,
-    state_db: state_mod.StateDB | None,
+    state_db: state_mod.StateDB,
     remote_name: str,
     hashes: set[str],
     jobs: int | None,
-) -> TransferSummary:
-    if state_db is not None:
-        check_remote_url(state_db, remote_name, remote)
+) -> tuple[TransferSummary, frozenset[str]]:
+    check_remote_url(state_db, remote_name, remote)
     files_dir = cache_dir / "files"
     missing = sorted(hashes - get_local_cache_hashes(cache_dir))
     if not missing:
-        return TransferSummary(transferred=0, skipped=len(hashes), failed=0, errors=[])
+        return TransferSummary(transferred=0, skipped=len(hashes), failed=0, errors=[]), frozenset()
     results = await remote.download_batch(
         [(hash_, cache.get_cache_path(files_dir, hash_)) for hash_ in missing],
         concurrency=jobs if jobs is not None else config.get_remote_jobs(),
         readonly=True,
     )
-    transferred = [r for r in results if r["success"]]
-    if state_db is not None:
-        state_db.remote_hashes_add(remote_name, [r["hash"] for r in transferred])
-    return TransferSummary(
+    transferred = frozenset(r["hash"] for r in results if r["success"])
+    state_db.remote_hashes_add(remote_name, transferred)
+    summary = TransferSummary(
         transferred=len(transferred),
         skipped=len(hashes) - len(missing),
         failed=len(results) - len(transferred),
         errors=[r["error"] for r in results if not r["success"] and "error" in r],
     )
+    return summary, transferred
 
 
 def fetch_objects(
     cache_dir: pathlib.Path,
     remote: protocol.RemoteStorage,
-    state_db: state_mod.StateDB | None,
+    state_db: state_mod.StateDB,
     remote_name: str,
     hashes: set[str],
     jobs: int | None = None,
-) -> TransferSummary:
+) -> tuple[TransferSummary, frozenset[str]]:
     """Download the cache objects at ``hashes`` the cache lacks, and nothing else: a
     directory's listing, so a pull can name its files (and expand a mapped stage over them)
-    before it fetches any. With no ``state_db`` (a dry run) nothing is recorded in the remote
-    index."""
+    before it fetches any. Returns the summary and the hashes downloaded, for the pull that
+    follows to count (``pull``'s ``prefetched``)."""
     return asyncio.run(_fetch_objects_async(cache_dir, remote, state_db, remote_name, hashes, jobs))
 
 

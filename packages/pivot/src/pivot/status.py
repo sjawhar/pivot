@@ -326,9 +326,11 @@ def expand_current(
     *,
     force: bool = False,
     allow_missing: bool = False,
+    fetched: Mapping[str, listing.DirListing] | None = None,
 ) -> tuple[expansion.Expansion, dict[str, StageExplanation]]:
     """Expand each mapped stage (``Pipeline.map``) of ``pipeline`` whose producer is current,
-    as a run would before running its instances (``expansion.expand_current``).
+    as a run would before running its instances (``expansion.expand_current``, which takes a
+    listing the cache lacks from ``fetched``).
 
     Whether a producer is current is the explain path's decision (``get_pipeline_explanations``
     over the producers and their upstream stages): its explanation, its upstream counted, says it
@@ -393,6 +395,7 @@ def expand_current(
                 waiting,
                 default_state_dir=default_state_dir,
                 cache_dir=files_dir,
+                fetched=fetched,
             )
             return result, raw
     finally:

@@ -841,14 +841,14 @@ pivot pull [TARGETS...] [OPTIONS]
 
 **Arguments:**
 
-- `TARGETS` - Stage names or file paths to pull (optional, pulls all if not specified). A target fetches what `pivot checkout` of it restores, and for a stage the objects its lock lists under `reads`, so it can run again; not the outputs of the stages upstream of it or its tracked inputs. A mapped stage's instance fetches the producer listing it needs to expand. A target that is not a stage, stage output or tracked path fails, naming it.
+- `TARGETS` - Stage names or file paths to pull (optional, pulls all if not specified). A target fetches what `pivot checkout` of it restores, and for a stage the objects its lock lists under `reads`; not the outputs of the stages upstream of it or its tracked inputs, so a later `pivot repro` recomputes those stages or stops naming a missing tracked input unless they are pulled too. A mapped stage's instance fetches the producer listing it needs to expand; no listing of a mapped stage the targets do not need is fetched, and a needed one the remote lacks fails the pull, naming it. The summary counts every file the pull downloaded. A target that is not a stage, stage output or tracked path fails, naming it.
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
 | `--remote` / `-r NAME` | Remote name (uses default if not specified) |
-| `--dry-run` / `-n` | Show how many files a pull would download; with targets, asks the remote which it holds and fails naming each file it lacks. It reads from the remote the listings the clone lacks, as the pull does: a mapped stage's producer listing into the cache, to expand the stage, and a directory's listing into a temporary directory, to count its files |
+| `--dry-run` / `-n` | Show how many files a pull would download; with targets, asks the remote which it holds and fails naming each file it lacks. It reads from the remote into a temporary directory the listings the clone lacks that the pull would fetch, a mapped stage's producer listing (to expand the stage) and a directory's listing (to count its files), and writes nothing to the cache |
 | `--jobs` / `-j N` | Parallel download jobs |
 | `--force` / `-f` | Overwrite existing workspace files |
 | `--only-missing` | Only restore files that don't exist in workspace (the default without `--force`). A directory is replaced when every changed or extra file is pivot's own earlier output (an extra empty directory holds nothing to lose), and refused (naming the files) when one holds a local change the cache lacks |

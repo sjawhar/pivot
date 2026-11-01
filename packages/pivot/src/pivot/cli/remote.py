@@ -19,6 +19,13 @@ if TYPE_CHECKING:
 
     from pivot.registry import MapTemplate, PipelineLike
     from pivot.remote import protocol
+    from pivot.storage import listing
+
+# Gets the listings at the records given (by hash): those read for expansion (a dry run's), the
+# hashes downloaded into the cache (a fetch's or pull's), and why each one missing was not had
+type _ListingFetch = Callable[
+    [dict[str, types.DirHash]], tuple[dict[str, listing.DirListing], frozenset[str], list[str]]
+]
 
 
 @click.group()
@@ -49,30 +56,71 @@ def _get_targets_list(targets: tuple[str, ...]) -> list[str] | None:
     return list(targets) if targets else None
 
 
+def _needed_templates(targets: tuple[str, ...], pipeline: PipelineLike) -> set[str]:
+    """The mapped stages (``Pipeline.map``) ``targets`` need expanded: each one they name, by
+    itself or by an instance (``cli_helpers.template_target``), and each one those are mapped
+    over, transitively."""
+    templates = pipeline.list_templates()
+    pending = [
+        name
+        for target in targets
+        if (name := cli_helpers.template_target(target, templates)) is not None
+    ]
+    needed = set[str]()
+    while pending:
+        name = pending.pop()
+        if name not in needed:
+            needed.add(name)
+            mapped_deps = pipeline.get_template(name)["mapped_deps"].values()
+            pending.extend(dep for dep in mapped_deps if dep is not None)
+    return needed
+
+
 def _expand_mapped_targets(
     targets: tuple[str, ...],
     pipeline: PipelineLike | None,
     *,
-    fetch_listings: Callable[[set[str]], None] | None = None,
-) -> tuple[str, ...]:
+    fetch_listings: _ListingFetch | None = None,
+) -> tuple[tuple[str, ...], frozenset[str]]:
     """``targets`` with each mapped stage (``Pipeline.map``) named in them replaced by its
     instances, its producer current (``cli_helpers.expand_mapped_stages``). Without targets
     nothing is expanded: every cached object, or every remote one, is transferred.
 
-    ``fetch_listings`` fetches the listings this clone lacks of the directories current
-    producers recorded (fetch and pull, and their dry runs), after which the mapped stages
-    expand again.
+    ``fetch_listings`` gets the listings this clone lacks of the directories that the mapped
+    stages the targets need are mapped over (``_needed_templates``), and no other: a fetch or
+    pull downloads them into the cache, a dry run reads them into a temporary directory. Then
+    the mapped stages expand again. Returns the targets and the hashes downloaded, which the
+    transfer that follows counts (``transfer.pull``'s ``prefetched``).
 
     Raises:
-        click.ClickException: A target names a mapped stage that is not expanded, saying why.
+        click.ClickException: A target names a mapped stage that is not expanded, saying why,
+            or one whose listing could not be fetched, naming the listing.
     """
     if not targets or pipeline is None:
-        return targets
+        return targets, frozenset()
     result, _ = cli_helpers.expand_mapped_stages()
-    if result["listings"] and fetch_listings is not None:
-        fetch_listings(set(result["listings"].values()))
-        result, _ = cli_helpers.expand_mapped_stages()
-    return cli_helpers.require_expanded_targets(targets, result)
+    needed = _needed_templates(targets, pipeline)
+    records = {
+        result["listings"][name]["hash"]: result["listings"][name]
+        for name in needed
+        if name in result["listings"]
+    }
+    if not records or fetch_listings is None:
+        return cli_helpers.require_expanded_targets(targets, result), frozenset()
+    fetched, downloaded, errors = fetch_listings(records)
+    result, _ = cli_helpers.expand_mapped_stages(fetched=fetched)
+    unfetched = sorted(name for name in needed if name in result["listings"])
+    if unfetched:
+        cli_helpers.print_transfer_errors(errors)
+        raise click.ClickException(
+            "; ".join(
+                f"'{name}' cannot expand: the listing of "
+                + f"'{types.identity_key(pipeline.get_template(name)['source'])}' "
+                + f"({result['listings'][name]['hash']}) could not be fetched from the remote"
+                for name in unfetched
+            )
+        )
+    return cli_helpers.require_expanded_targets(targets, result), downloaded
 
 
 def _templates(pipeline: PipelineLike | None) -> dict[str, MapTemplate] | None:
@@ -84,23 +132,28 @@ def _templates(pipeline: PipelineLike | None) -> dict[str, MapTemplate] | None:
 
 def _fetch_listings(
     cache_dir: pathlib.Path,
-    state_dir: pathlib.Path | None,
+    state_dir: pathlib.Path,
     remote_storage: protocol.RemoteStorage,
     remote_name: str,
     jobs: int,
-    hashes: set[str],
-) -> None:
-    """Fetch the directory listings at ``hashes`` from the remote into the cache. A dry run
-    passes no ``state_dir``: it fetches them as the command would first, so it can expand the
-    mapped stages, and records nothing in the remote index."""
-    if state_dir is None:
-        result = transfer.fetch_objects(cache_dir, remote_storage, None, remote_name, hashes, jobs)
-    else:
-        with state.StateDB(state_dir) as state_db:
-            result = transfer.fetch_objects(
-                cache_dir, remote_storage, state_db, remote_name, hashes, jobs
-            )
-    cli_helpers.print_transfer_errors(result["errors"])
+    records: dict[str, types.DirHash],
+) -> tuple[dict[str, listing.DirListing], frozenset[str], list[str]]:
+    """Download the directory listings at ``records`` from the remote into the cache, where
+    expansion reads them (``_ListingFetch``)."""
+    with state.StateDB(state_dir) as state_db:
+        summary, downloaded = transfer.fetch_objects(
+            cache_dir, remote_storage, state_db, remote_name, set(records), jobs
+        )
+    return {}, downloaded, summary["errors"]
+
+
+def _read_listings(
+    remote_storage: protocol.RemoteStorage, jobs: int, records: dict[str, types.DirHash]
+) -> tuple[dict[str, listing.DirListing], frozenset[str], list[str]]:
+    """Read the directory listings at ``records`` from the remote into a temporary directory,
+    for a dry run's expansion: nothing is written to the cache (``_ListingFetch``)."""
+    listings, errors = transfer.read_remote_listings(remote_storage, records, jobs)
+    return listings, frozenset(), errors
 
 
 def _normalize_cli_targets(
@@ -165,14 +218,14 @@ def push(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    # A dry run only reads, so it creates no state.
+    # A dry run writes nothing: it locates the cache and state directories without creating them.
     cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
     state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
 
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode)
     pipeline = cli_decorators.get_pipeline_from_context()
-    targets = _expand_mapped_targets(targets, pipeline)
+    targets, _ = _expand_mapped_targets(targets, pipeline)
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
     templates = _templates(pipeline)
 
@@ -265,7 +318,8 @@ def fetch(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    # A dry run only reads, so it creates no state.
+    # A dry run writes nothing: it locates the cache and state directories without creating them,
+    # and reads a listing it needs from the remote into a temporary directory (_read_listings).
     cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
     state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
@@ -273,16 +327,13 @@ def fetch(
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode). A mapped stage
     # whose producer is current but whose listing this clone lacks expands once fetch fetched it.
     pipeline = cli_decorators.get_pipeline_from_context()
-    targets = _expand_mapped_targets(
+    targets, prefetched = _expand_mapped_targets(
         targets,
         pipeline,
-        fetch_listings=functools.partial(
-            _fetch_listings,
-            cache_dir,
-            None if dry_run else state_dir,
-            remote_storage,
-            resolved_name,
-            jobs,
+        fetch_listings=functools.partial(_read_listings, remote_storage, jobs)
+        if dry_run
+        else functools.partial(
+            _fetch_listings, cache_dir, state_dir, remote_storage, resolved_name, jobs
         ),
     )
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
@@ -326,6 +377,7 @@ def fetch(
             progress.callback,
             all_stages=all_stages,
             templates=templates,
+            prefetched=prefetched,
         )
 
     if not quiet:
@@ -383,7 +435,8 @@ def pull(
     quiet = cli_ctx["quiet"]
     jobs = jobs if jobs is not None else config.get_remote_jobs()
 
-    # A dry run only reads, so it creates no state.
+    # A dry run writes nothing: it locates the cache and state directories without creating them,
+    # and reads a listing it needs from the remote into a temporary directory (_read_listings).
     cache_dir = config.locate_cache_dir() if dry_run else config.get_cache_dir()
     state_dir = config.locate_state_dir() if dry_run else config.get_state_dir()
     remote_storage, resolved_name = transfer.create_remote_from_name(remote_name)
@@ -391,16 +444,13 @@ def pull(
     # Per-stage state_dir lookup when pipeline is available (e.g., --all mode). A mapped stage
     # whose producer is current but whose listing this clone lacks expands once pull fetched it.
     pipeline = cli_decorators.get_pipeline_from_context()
-    targets = _expand_mapped_targets(
+    targets, prefetched = _expand_mapped_targets(
         targets,
         pipeline,
-        fetch_listings=functools.partial(
-            _fetch_listings,
-            cache_dir,
-            None if dry_run else state_dir,
-            remote_storage,
-            resolved_name,
-            jobs,
+        fetch_listings=functools.partial(_read_listings, remote_storage, jobs)
+        if dry_run
+        else functools.partial(
+            _fetch_listings, cache_dir, state_dir, remote_storage, resolved_name, jobs
         ),
     )
     all_stages = cli_helpers.get_all_stages() if pipeline is not None else None
@@ -453,6 +503,7 @@ def pull(
             progress.callback,
             all_stages=all_stages,
             templates=templates,
+            prefetched=prefetched,
         )
 
     if not quiet:

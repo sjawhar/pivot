@@ -10,14 +10,14 @@ from tqdm.asyncio import tqdm as async_tqdm
 
 if TYPE_CHECKING:
     import pathlib
-    from collections.abc import Collection
+    from collections.abc import Collection, Mapping
 
     from networkx import DiGraph
 
     from pivot.cli import CliContext
     from pivot.expansion import Expansion
     from pivot.registry import PipelineLike, RegistryStageInfo
-    from pivot.storage import track
+    from pivot.storage import listing, track
     from pivot.storage.store import WorkspaceStore
     from pivot.types import StageExplanation
 
@@ -82,14 +82,20 @@ def get_graph_stages(expanded: Collection[str] = ()) -> dict[str, RegistryStageI
 
 
 def expand_mapped_stages(
-    *, force: bool = False, allow_missing: bool = False
+    *,
+    force: bool = False,
+    allow_missing: bool = False,
+    fetched: Mapping[str, listing.DirListing] | None = None,
 ) -> tuple[Expansion, dict[str, StageExplanation]]:
     """Expand each mapped stage of the Pipeline in context whose producer is current, as a run
-    would (``status.expand_current``), and return the expansion with the explanations it read.
-    A command that lists stages calls it first, so the stages it lists hold the instances."""
+    would (``status.expand_current``, a listing the cache lacks taken from ``fetched``), and
+    return the expansion with the explanations it read. A command that lists stages calls it
+    first, so the stages it lists hold the instances."""
     from pivot import status as status_mod
 
-    return status_mod.expand_current(get_pipeline(), force=force, allow_missing=allow_missing)
+    return status_mod.expand_current(
+        get_pipeline(), force=force, allow_missing=allow_missing, fetched=fetched
+    )
 
 
 def template_target(name: str, templates: list[str]) -> str | None:

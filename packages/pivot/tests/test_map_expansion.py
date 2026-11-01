@@ -184,7 +184,7 @@ def test_a_listing_neither_committed_nor_cached_is_named_for_pull_to_fetch(
     result, _ = status.expand_current(pipeline)
 
     assert "the listing of 'p/_stage_plan' is missing" in result["not_expanded"]["p/_stage_cut"]
-    assert result["listings"] == {"p/_stage_cut": record["hash"]}
+    assert result["listings"] == {"p/_stage_cut": record}
     assert result["not_expanded"]["p/_stage_build"] == (
         "mapped over the instances of 'p/_stage_cut', which is not expanded"
     )
