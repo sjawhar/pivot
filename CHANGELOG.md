@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.9.0 (2026-11-01)
+
+### Features
+
+- **cli**: Add pivot gc to remove cache objects no record names
+  ([#535](https://github.com/sjawhar/pivot/pull/535),
+  [`9f3f83f`](https://github.com/sjawhar/pivot/commit/9f3f83f678c2e85db5ac83e82b594cd94d6b24de))
+
+
 ## v0.8.0 (2026-10-31)
 
 ### Bug Fixes
