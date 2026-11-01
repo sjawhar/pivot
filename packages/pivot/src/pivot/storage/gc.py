@@ -1240,7 +1240,7 @@ def _open_directory_at(parent_fd: int, name: str) -> int | None:
     another directory put at the name between the two calls.
     """
     try:
-        seen = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        seen = os.lstat(name, dir_fd=parent_fd)
     except FileNotFoundError:
         return None
     if not stat.S_ISDIR(seen.st_mode):
