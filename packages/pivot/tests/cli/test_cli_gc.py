@@ -1405,3 +1405,102 @@ def test_gc_dry_run_refuses_a_named_project_whose_configured_state_dir_is_missin
     assert result.exit_code != 0, result.output
     assert "state directory" in result.output, result.output
     assert "Would remove" not in result.output, result.output
+
+
+# =============================================================================
+# A runtime that follows a link to a directory under O_DIRECTORY | O_NOFOLLOW
+# =============================================================================
+
+
+@pytest.mark.parametrize("replaced", ["after-listing", "while-opened"])
+def test_gc_removes_nothing_through_a_prefix_link_the_runtime_follows_under_nofollow(
+    workspace: Workspace,
+    runner: click.testing.CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    replaced: str,
+) -> None:
+    """gVisor opens a link to a directory under ``O_DIRECTORY | O_NOFOLLOW`` and follows it, where
+    Linux fails with ELOOP. A prefix directory replaced by a link to another store's prefix after
+    the plan listed the store must not be followed: the plan would list the other store's
+    objects and record that directory's identity, and the removal, following the same link,
+    would find that identity and delete them. ``after-listing`` leaves the link there;
+    ``while-opened`` puts it there only while each open runs, so an ``lstat`` before the open
+    sees the real directory and only the identity of the opened descriptor tells them apart."""
+    prefix = workspace["object_root"] / "ab"
+    prefix.mkdir()
+    foreign = workspace["scratch"] / "other-store" / prefix.name
+    foreign.mkdir(parents=True)
+    foreign_object = foreign / "0123456789abcd"
+    foreign_object.write_text("another store's object")
+    aside = prefix.with_name("aside")
+    real_open = os.open
+    real_prefix_names = gc._prefix_names
+
+    def link_after_listing(store_fd: int) -> list[str]:
+        names = real_prefix_names(store_fd)
+        if not prefix.is_symlink():
+            prefix.rmdir()
+            prefix.symlink_to(foreign, target_is_directory=True)
+        return names
+
+    def gvisor_open(
+        path: str | os.PathLike[str], flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if not (flags & os.O_DIRECTORY and flags & os.O_NOFOLLOW):
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+        flags &= ~os.O_NOFOLLOW  # the runtime follows a link to a directory all the same
+        if replaced != "while-opened" or os.fspath(path) != prefix.name:
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+        prefix.rename(aside)
+        prefix.symlink_to(foreign, target_is_directory=True)
+        try:
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+        finally:
+            prefix.unlink()
+            aside.rename(prefix)
+
+    if replaced == "after-listing":
+        monkeypatch.setattr(gc, "_prefix_names", link_after_listing)
+    monkeypatch.setattr(os, "open", gvisor_open)
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert foreign_object.exists(), "gc removed another store's object through a prefix link"
+    assert result.exit_code == 0, result.output
+    assert "Removed 0 objects" in result.output, result.output
+
+
+def test_gc_removes_nothing_through_a_tree_directory_replaced_by_a_link_during_removal(
+    workspace: Workspace, runner: click.testing.CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A whole-directory tree's directories are read-only, so its removal makes each one
+    writable as it reaches it. Every directory it removes from must stay the one it opened: a
+    subdirectory replaced by a link to another store's directory while the removal is inside it
+    must not send an unlink there. Retrying a refused unlink by its path from the prefix
+    directory follows that link."""
+    tree = workspace["cache_dir"] / gc.TREES_DIR / "cd" / "0123456789abcd"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "sub" / "member").write_text("the tree's own copy")
+    (tree / "sub").chmod(0o555)
+    tree.chmod(0o555)
+    foreign = workspace["scratch"] / "other-store"
+    foreign.mkdir()
+    foreign_member = foreign / "member"
+    foreign_member.write_text("another store's object")
+    real_unlink = os.unlink
+
+    def link_the_directory_then_unlink(
+        path: str | os.PathLike[str], *, dir_fd: int | None = None
+    ) -> None:
+        if os.fspath(path) == "member" and not (tree / "sub").is_symlink():
+            tree.chmod(0o755)
+            (tree / "sub").rename(tree / "aside")
+            (tree / "sub").symlink_to(foreign, target_is_directory=True)
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", link_the_directory_then_unlink)
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert foreign_member.exists(), "gc removed another store's file through a tree link"
+    assert result.exit_code == 0, result.output

@@ -30,7 +30,6 @@ import json
 import logging
 import os
 import pathlib
-import shutil
 import socket
 import stat
 import time
@@ -1133,10 +1132,10 @@ class StoreSnapshot(NamedTuple):
     open (``anchors``); one that does not stays absent for the whole collection (``anchor``).
     ``check`` tells when a path no longer names the directory the collection opened (a store
     directory renamed and another put in its place). Every prefix directory is opened from the
-    held store, never through a path and never following a link (``open_prefix``): the plan
-    lists it through such a descriptor and records its identity, and the removals open it again
-    in bounded batches, require that identity and remove through the descriptor
-    (``execute_plan``).
+    held store, never through a path and never following a link (``open_prefix``, through
+    ``_open_directory_at``): the plan lists it through such a descriptor and records its
+    identity, and the removals open it again in bounded batches, require that identity and
+    remove through the descriptor (``execute_plan``).
 
     ``trees`` holds the whole-directory tree stores: a stage's commit puts a tree beside the
     object store it resolves ``files/`` to, which is the register root; a command given the
@@ -1186,23 +1185,13 @@ class StoreSnapshot(NamedTuple):
 
     def open_prefix(self, prefix: pathlib.Path) -> int | None:
         """Open the prefix directory ``prefix`` (``<store>/<xx>``) from the held store, never
-        through its path and never following a link; None when its store is not held or no
-        directory is there (nothing, a file, or a link). The caller closes it."""
+        through its path and never following a link (``_open_directory_at``); None when its
+        store is not held or no directory of its own is there (nothing, a file, a link, or an
+        entry replaced while it was opened). The caller closes it."""
         anchor = self.anchor(prefix.parent)
         if anchor is None:
             return None
-        try:
-            return os.open(
-                prefix.name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=anchor,
-            )
-        except (FileNotFoundError, NotADirectoryError):
-            return None
-        except OSError as e:
-            if e.errno != errno.ELOOP:
-                raise
-            return None
+        return _open_directory_at(anchor, prefix.name)
 
     def open_listed_prefix(self, prefix: pathlib.Path, listed: tuple[int, int]) -> int:
         """Open the prefix directory the plan listed as ``prefix`` (``open_prefix``) and return
@@ -1235,6 +1224,42 @@ class StoreSnapshot(NamedTuple):
 def _resolved_store(cache_dir: pathlib.Path) -> pathlib.Path:
     """Where ``cache_dir``'s ``files/`` resolves to now."""
     return pathlib.Path(os.path.realpath(cache_dir / naming.OBJECTS_DIR))
+
+
+def _open_directory_at(parent_fd: int, name: str) -> int | None:
+    """Open the directory ``name`` in the directory open as ``parent_fd`` without following a
+    link, and return its descriptor (the caller closes it); None when no directory of its own
+    is there: nothing, a file, a link, or an entry replaced while it was opened.
+
+    Every prefix directory a collection lists, and every directory it removes from, is opened
+    here (``_tree_bytes`` measures a tree with ``os.fwalk``, which makes the same comparison).
+    ``O_NOFOLLOW`` alone does not hold: gVisor follows a link to a directory under
+    ``O_DIRECTORY | O_NOFOLLOW``, where Linux fails with ELOOP. So the entry is ``lstat``-ed
+    first and anything but a directory, a link included, is refused; then the descriptor opened
+    must show the device and inode that ``lstat`` saw, which refuses on either kernel a link or
+    another directory put at the name between the two calls.
+    """
+    try:
+        seen = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(seen.st_mode):
+        return None
+    try:
+        fd = os.open(
+            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd
+        )
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        if e.errno != errno.ELOOP:
+            raise
+        return None
+    opened = os.fstat(fd)
+    if (opened.st_dev, opened.st_ino) != (seen.st_dev, seen.st_ino):
+        os.close(fd)
+        return None
+    return fd
 
 
 @contextlib.contextmanager
@@ -1851,7 +1876,7 @@ def execute_plan(
                 is not None
             ):
                 continue
-            # M5: unlink markers before the tree, so a partial rmtree never leaves a marker on
+            # M5: unlink markers before the tree, so a partial removal never leaves a marker on
             # a truncated tree that a later checkout would trust.
             if doomed["is_dir"]:
                 for suffix in _TREE_MARKER_SUFFIXES:
@@ -1872,44 +1897,83 @@ def execute_plan(
 
 def _remove_at(dir_fd: int, name: str, *, is_dir: bool) -> None:
     """Remove the object ``name`` in the prefix directory open as ``dir_fd``, never through a
-    path. A tree's read-only directories are made writable as the removal meets them; a file
-    never is (it may be a hardlink a workspace shares), only the directory that holds it."""
+    path. A tree is emptied through descriptors, depth first and without recursion: each of its
+    directories is opened from the one above it (``_open_directory_at``), and every unlink and
+    rmdir is relative to an open directory, so a link or another directory put at a name while
+    the removal runs receives nothing. A tree's read-only directories are made writable as the
+    removal opens them; a file never is (it may be a hardlink a workspace shares), only the
+    directory that holds it.
+
+    Raises:
+        OSError: an entry cannot be removed, or a directory of the tree is no longer the one
+            the removal reached, and nothing in it was removed.
+    """
     if not is_dir:
-        try:
-            os.unlink(name, dir_fd=dir_fd)
-        except PermissionError:
-            _writable_dir_at(dir_fd, "")
-            os.unlink(name, dir_fd=dir_fd)
+        _remove_entry(os.unlink, dir_fd, name)
         return
-
-    def writable_and_retry(func: Callable[..., object], path: str, exc: BaseException) -> None:
-        # ``path`` is relative to ``dir_fd``: rmtree was given ``name`` and ``dir_fd``.
-        _writable_dir_at(dir_fd, os.path.dirname(path))
-        _writable_dir_at(dir_fd, path)
-        if func not in (os.unlink, os.rmdir):
-            raise exc
-        func(path, dir_fd=dir_fd)
-
-    shutil.rmtree(name, dir_fd=dir_fd, onexc=writable_and_retry)
-
-
-def _writable_dir_at(dir_fd: int, relative: str) -> None:
-    """Give the owner write permission on the directory ``relative`` to ``dir_fd`` (``""``:
-    ``dir_fd`` itself) when it lacks it; anything else, or a failure, is left as it is."""
+    stack = [_open_for_removal(dir_fd, name)]
     try:
-        stats = (
-            os.fstat(dir_fd)
-            if not relative
-            else os.stat(relative, dir_fd=dir_fd, follow_symlinks=False)
+        while stack:
+            parent_fd, entry, fd, children = stack[-1]
+            if children:
+                child, child_is_dir = children.pop()
+                if child_is_dir:
+                    stack.append(_open_for_removal(fd, child))
+                else:
+                    _remove_entry(os.unlink, fd, child)
+                continue
+            stack.pop()
+            os.close(fd)
+            _remove_entry(os.rmdir, parent_fd, entry)
+    finally:
+        for _parent_fd, _entry, fd, _children in stack:
+            os.close(fd)
+
+
+def _open_for_removal(parent_fd: int, name: str) -> tuple[int, str, int, list[tuple[str, bool]]]:
+    """Open the directory ``name`` in the directory open as ``parent_fd`` to empty it: its
+    parent's descriptor, its name, its own descriptor (made writable) and its entries, each
+    with whether it is a directory (a link is not).
+
+    Raises:
+        OSError: no directory of its own is there (``_open_directory_at``).
+    """
+    fd = _open_directory_at(parent_fd, name)
+    if fd is None:
+        raise OSError(
+            errno.ENOTDIR,
+            "no longer the directory being removed (a link or another directory took its "
+            + "name), so nothing in it was removed",
+            name,
         )
-        if not stat.S_ISDIR(stats.st_mode) or stats.st_mode & stat.S_IWUSR:
-            return
-        if relative:
-            os.chmod(relative, stats.st_mode | stat.S_IWUSR, dir_fd=dir_fd)
-        else:
-            os.fchmod(dir_fd, stats.st_mode | stat.S_IWUSR)
-    except OSError:
-        pass
+    try:
+        _writable_dir(fd)
+        with os.scandir(fd) as entries:
+            children = [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in entries]
+    except BaseException:
+        os.close(fd)
+        raise
+    return parent_fd, name, fd, children
+
+
+def _remove_entry(remove: Callable[..., object], dir_fd: int, name: str) -> None:
+    """Remove the entry ``name`` of the directory open as ``dir_fd`` with ``remove``
+    (``os.unlink`` or ``os.rmdir``), making that directory writable when it refuses for want
+    of permission."""
+    try:
+        remove(name, dir_fd=dir_fd)
+    except PermissionError:
+        _writable_dir(dir_fd)
+        remove(name, dir_fd=dir_fd)
+
+
+def _writable_dir(dir_fd: int) -> None:
+    """Give the owner write permission on the directory open as ``dir_fd`` when it lacks it;
+    a failure leaves it as it is."""
+    with contextlib.suppress(OSError):
+        mode = stat.S_IMODE(os.fstat(dir_fd).st_mode)
+        if not mode & stat.S_IWUSR:
+            os.fchmod(dir_fd, mode | stat.S_IWUSR)
 
 
 def result_document(
