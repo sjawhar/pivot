@@ -163,8 +163,10 @@ refused, because Pivot cannot find the code it runs. A field
 can hold another loader (`Outer(Inner())`, a tuple of loaders, or a dataclass
 that holds one): Pivot fingerprints the held loader as it fingerprints a loader
 you pass directly, so an edit to `Inner.load` re-runs the stages that read
-through `Outer`. A loader inside a pydantic model is not reached, and an
-instance of your own class that is not a loader counts by its fields only.
+through `Outer`. A field can also hold an instance of your own class that is
+not a loader: its fields count, and so does its class's code, every method of
+it, as if the stage named the class. A loader inside a pydantic model instance
+is not reached.
 
 ```python
 # pipeline.py
