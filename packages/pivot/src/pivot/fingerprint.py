@@ -86,7 +86,10 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 33 fingerprints a pivot loader that a partial's arguments or a dataclass field default
 # holds as a top-level loader is fingerprinted (`_held_loader_entries`, `held:` entries), and
 # hashes a class with no source by what defines it, not by its address (`_sourceless_class_hash`).
-_CACHE_SCHEMA_VERSION = 33
+# Version 34 walks the class of each user class instance a partial's arguments, a loader's config,
+# a dataclass field default or a StageParams default holds, as a stage that names the class gets
+# (`_held_class_entries`, `held:` entries).
+_CACHE_SCHEMA_VERSION = 34
 _REPR_SIZE_LIMIT = 10_000
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
@@ -190,8 +193,10 @@ _get_type_hints_cache: weakref.WeakKeyDictionary[Callable[..., Any], dict[str, A
     weakref.WeakKeyDictionary()
 )
 
-# Cache for _schema_hash results, keyed by pydantic model class.
-_schema_hash_cache: weakref.WeakKeyDictionary[type, str] = weakref.WeakKeyDictionary()
+# Cache for `_schema_parts` results, keyed by pydantic model class.
+_schema_hash_cache: weakref.WeakKeyDictionary[type, tuple[str, "_HeldValues"]] = (
+    weakref.WeakKeyDictionary()
+)
 
 # Module-level state for persistent AST hash caching.
 # Fingerprinting happens during discovery (single-threaded in coordinator process).
@@ -273,11 +278,29 @@ class _LoaderForm:
     classes: tuple[int, ...]
 
 
-# The pivot loaders `_canonicalize_value_for_hash` meets while it serializes a value whose held
-# loaders are fingerprinted (`_serialize_collecting`); None outside one, and inside a held
-# loader's own form, whose loaders are its own fingerprint's.
-_held_loaders: contextvars.ContextVar[list[_HeldLoader] | None] = contextvars.ContextVar(
-    "_held_loaders", default=None
+@dataclasses.dataclass(slots=True)
+class _HeldValues:
+    """What a value `_serialize_collecting` serializes holds: each pivot loader
+    (`_canonical_loader`), and each user class whose instances it holds that is not a pivot
+    loader's, with their positions (`_note_held_instance`)."""
+
+    loaders: list[_HeldLoader] = dataclasses.field(default_factory=list[_HeldLoader])
+    # Per type of a value met, by its id: the type (held so the id is not reused) and the
+    # positions of its instances, or None for a type whose instances the canonical form alone
+    # records (library code, a pivot loader's class).
+    instances: dict[int, tuple[type, list[tuple[list[str], ...]] | None]] = dataclasses.field(
+        default_factory=dict[int, tuple[type, list[tuple[list[str], ...]] | None]]
+    )
+
+    def __bool__(self) -> bool:
+        return bool(self.loaders) or any(paths for _type, paths in self.instances.values())
+
+
+# What `_canonicalize_value_for_hash` meets while it serializes a value whose held values are
+# fingerprinted (`_serialize_collecting`); None outside one, and inside a held loader's own form,
+# whose held values are its own fingerprint's.
+_held_values: contextvars.ContextVar[_HeldValues | None] = contextvars.ContextVar(
+    "_held_values", default=None
 )
 
 # The position of the value being canonicalized inside the value `_serialize_collecting`
@@ -316,16 +339,19 @@ _loader_class_memo: contextvars.ContextVar[dict[int, tuple[type, dict[str, str]]
     contextvars.ContextVar("_loader_class_memo", default=None)
 )
 
-# The ids of the loaders `get_loader_fingerprint` is fingerprinting, outermost first: a loader that
-# one of their walks reaches again (a cycle) is not fingerprinted again (`_held_loader_entries`).
+# The ids of the loaders `get_loader_fingerprint` is fingerprinting and of the classes of held
+# instances being walked (`_walk_held_class`), outermost first: a loader or class that one of their
+# walks reaches again (a cycle) is not walked again (`_held_loader_entries`, `_held_class_entries`).
 _loader_stack: contextvars.ContextVar[tuple[int, ...]] = contextvars.ContextVar(
     "_loader_stack", default=()
 )
 
 # The manifests of the held loaders fingerprinted for one stage (`stage_fingerprint_scope`), by
 # their canonical form and the ids of the classes in it, each with the loader it was walked for
-# (held so those classes live), so a loader held many times is walked once. Kept per stage, not
-# per pass: a held loader's walk reports its refusals with the stage that holds it.
+# (held so those classes live), so a loader held many times is walked once; and the class walk of
+# each held instance's class (`_walk_held_class`), by `("class", (id,))` with the class, so a class
+# with many instances is walked once. Kept per stage, not per pass: a held loader's or class's walk
+# reports its refusals with the stage that holds it.
 _held_memo: contextvars.ContextVar[
     dict[tuple[str, tuple[int, ...]], tuple[Any, dict[str, str]]] | None
 ] = contextvars.ContextVar("_held_memo", default=None)
@@ -956,11 +982,14 @@ def _value_token(value: Any) -> str:
 
 
 def _default_token(value: Any) -> str:
-    """Like `_value_token`, for a default argument (see `_process_default_values`)."""
+    """Like `_value_token`, for a default argument (see `_process_default_values`): a scalar,
+    an instance of a user subclass of one (a `str` subclass) included, is its repr."""
     from pivot import compose, stage_def
 
     if isinstance(value, stage_def.StageParams):
         return f"params:{_serialize_value_for_hash(value)}"
+    if isinstance(value, _SCALAR_TYPES):
+        return f"{type(value).__name__}:{value!r}"
     if _is_artifact_handles(value, compose.ArtifactHandle):
         return "handles"
     return _value_token(value)
@@ -973,9 +1002,11 @@ def _default_token(value: Any) -> str:
 # `bi:MODULE` a loaded module a function body imports, `u` the function behind a C-level
 # wrapper, `pf`, `pa:INDEX` and `pk:KEY` a partial's parts, `i:INDEX`, `k:REPR` and `s:INDEX`
 # container members, `hc:INDEX` a class in type hints and `fc:INDEX` a class in a model's field
-# annotations. `hints` and `schema` read the visited object itself, and so do `hl` and `hd`: the
-# fingerprints of the pivot loaders a partial's arguments (`hl`) or a dataclass field default
-# (`hd`) holds (`_held_loaders_token`).
+# annotations. `hints` and `schema` read the visited object itself, and so do `hl`, `hd` and `hs`:
+# the fingerprints of the pivot loaders, and the walks of the classes of the other user class
+# instances, that a partial's arguments (`hl`), a default (`hd`: a dataclass field's, or a
+# StageParams argument default) or a pydantic model's field defaults (`hs`) hold
+# (`_held_values_token`).
 _UNREAD = object()
 
 
@@ -1051,8 +1082,8 @@ def _read_token(owner: Any, step: str) -> str:
         return f"{_schema_hash(owner)}|{field_classes}"
     if step.startswith("fd:"):
         return _dataclass_field_token(owner, step.partition(":")[2])
-    if step in ("hl", "hd"):
-        return _held_loaders_token(owner, step)
+    if step in ("hl", "hd", "hs"):
+        return _held_values_token(owner, step)
     value = _read_step(owner, step)
     if value is _UNREAD:
         return "absent"
@@ -1601,10 +1632,15 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
 
 
 def _process_user_methods(cls: type, manifest: dict[str, str], visited: set[int]) -> None:
-    """Walk each callable user class member as a stage helper or refuse opaque state."""
+    """Walk each callable user class member as a stage helper or refuse opaque state. A member
+    whose `__wrapped__` chain loops (`_wrapper_loops`) has no code the walk can read: it is left
+    out and the stage is refused, naming it."""
     class_ref = _definition_ref(cls)
     stage_name = _current_stage_name.get() or cls.__qualname__
     for label, member in _user_methods(cls):
+        if inspect.isfunction(member) and _wrapper_loops(member):
+            _refuse_wrapper_loop(member.__qualname__)
+            continue
         step = f"m:{label}"
         _record_read(cls, step)
         with _walking(step):
@@ -1673,7 +1709,7 @@ def _process_dataclass_defaults(cls: type, manifest: dict[str, str], visited: se
             manifest[f"default:{binding_ref}"] = xxhash.xxh64(serialized.encode()).hexdigest()
             if held:
                 with _walking(step):
-                    _merge_held_loaders(manifest, held, read="hd")
+                    _merge_held(manifest, held, read="hd")
             continue
         if field.default_factory is dataclasses.MISSING:
             continue
@@ -1911,9 +1947,10 @@ def _loader_entry(key: str, outputs: Collection[str]) -> str | None:
 
 
 def _held_entry(key: str) -> str | None:
-    """The key of a held loader's own manifest that `key` holds (`_merge_held_loaders`), after
-    each `held:<digest>:` prefix: the digest is hexadecimal, so it holds no `:`. A key without
-    the prefix is returned as it is, and a malformed one (`held:<digest>` alone) is None."""
+    """The key of a held loader's or held class's own manifest that `key` holds (`_merge_held`),
+    after each `held:<digest>:` prefix: the digest is hexadecimal, so it holds no `:`. A key
+    without the prefix is returned as it is, and a malformed one (`held:<digest>` alone) is
+    None."""
     while key.startswith("held:"):
         _digest, colon, key = key.removeprefix("held:").partition(":")
         if not colon:
@@ -2211,8 +2248,9 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     are walked like stage helpers, so the module values they read are tracked or refused. A
     member no such code reads is not walked. Methods inherited from `pivot.loaders` are
     framework code and are only hashed. A pivot loader the config holds (`Outer(Inner())`, also
-    inside a container, a partial or a dataclass in a field) gets this fingerprint too, under
-    `held:<digest>:` (`_merge_held_loaders`).
+    inside a container, a partial or a dataclass in a field) gets this fingerprint too, and the
+    class of any other user class instance it holds gets the walk a stage that names the class
+    gets, each under `held:<digest>:` (`_merge_held`).
 
     The loader is marked as being fingerprinted for the whole call (`_loader_stack`), so a
     loader its own walk reaches again (its config holds it, or a dataclass default its code
@@ -2230,7 +2268,7 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
 def _loader_manifest(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> dict[str, str]:
     """The manifest `get_loader_fingerprint` gives `loader`: its class's entries
     (`_loader_class_entries`), then the walk of the values its config fields bind, its config
-    hash, and the loaders its config holds."""
+    hash, and the loaders and the classes of the other user class instances its config holds."""
     loader_type: type[Any] = type(cast("object", loader))
     class_name = _definition_ref(loader_type)
     manifest = dict(_loader_class_entries(loader_type))
@@ -2248,7 +2286,7 @@ def _loader_manifest(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> dic
     if config_str:
         manifest[f"loader:{class_name}:config"] = xxhash.xxh64(config_str.encode()).hexdigest()
     if held:
-        _merge_held_loaders(manifest, held, read=None)
+        _merge_held(manifest, held, read=None)
 
     return manifest
 
@@ -2338,14 +2376,15 @@ def _partial_parts(partial_obj: Any) -> list[tuple[str, Any]]:
 
 def _serialize_collecting(
     parts: Sequence[tuple[str, Any]],
-) -> tuple[list[str], list[_HeldLoader]]:
-    """Serialize each part (`_serialize_value_for_hash`), and collect each pivot loader its
-    canonical form meets (`_canonical_loader`) with its position: the part's name, then a step
-    per container (`_held_path`). The serialization that records the value already visits
-    them, so no new traversal is made."""
-    held = list[_HeldLoader]()
+) -> tuple[list[str], _HeldValues]:
+    """Serialize each part (`_serialize_value_for_hash`), and collect what its canonical form
+    meets, with its position: the part's name, then a step per container (`_held_path`). That is
+    each pivot loader (`_canonical_loader`) and each instance of another user class
+    (`_note_held_instance`). The serialization that records the value already visits them, so no
+    new traversal is made."""
+    held = _HeldValues()
     texts = list[str]()
-    held_token = _held_loaders.set(held)
+    held_token = _held_values.set(held)
     try:
         for name, value in parts:
             path_token = _held_path.set(([name],))
@@ -2354,23 +2393,50 @@ def _serialize_collecting(
             finally:
                 _held_path.reset(path_token)
     finally:
-        _held_loaders.reset(held_token)
+        _held_values.reset(held_token)
     return texts, held
 
 
-def _held_position(item: _HeldLoader) -> str:
-    """Where a held loader sits in the value that holds it (`_held_path`), as text."""
-    return "/".join(cell[0] for cell in item.path)
+def _held_position(path: tuple[list[str], ...]) -> str:
+    """A position in the value that holds a loader or an instance (`_held_path`), as text."""
+    return "/".join(cell[0] for cell in path)
 
 
 def _is_pivot_loader(value: Any) -> bool:
-    """Whether `value` is an instance of a pivot loader (`loaders.Reader` or `loaders.Writer`),
-    decided by identity along its class's MRO, so no class's `__hash__` or `__eq__` runs."""
+    """Whether `value` is an instance of a pivot loader (`loaders.Reader` or `loaders.Writer`)."""
+    return _is_pivot_loader_class(type(cast("object", value)))
+
+
+def _is_pivot_loader_class(cls: type[Any]) -> bool:
+    """Whether `cls` is a pivot loader class (`loaders.Reader` or `loaders.Writer`), decided by
+    identity along its MRO, so no class's `__hash__` or `__eq__` runs."""
     from pivot import loaders as loaders_module
 
     return any(
-        cls is loaders_module.Reader or cls is loaders_module.Writer for cls in type(value).__mro__
+        klass is loaders_module.Reader or klass is loaders_module.Writer for klass in cls.__mro__
     )
+
+
+def _note_held_instance(held: _HeldValues, value_type: type[Any]) -> None:
+    """Note an instance of `value_type` at the position being serialized (`_held_path`), when the
+    class is user code and not a pivot loader's (`_canonical_loader` notes a loader): its holder
+    then walks the class (`_held_class_entries`). Each type is decided once per held value."""
+    known = held.instances.get(id(value_type))
+    if known is None:
+        user = is_user_code(value_type) and not _is_pivot_loader_class(value_type)
+        known = (value_type, list[tuple[list[str], ...]]() if user else None)
+        held.instances[id(value_type)] = known
+    if known[1] is not None:
+        known[1].append(_held_path.get())
+
+
+def _held_entries(held: _HeldValues) -> dict[str, dict[str, str]]:
+    """The manifests of what `held` holds, each keyed by a digest of its position in the value
+    that holds it: each pivot loader's fingerprint (`_held_loader_entries`) and each other user
+    class's walk (`_held_class_entries`)."""
+    entries = _held_loader_entries(held.loaders)
+    entries.update(_held_class_entries(held))
+    return dict(sorted(entries.items()))
 
 
 def _held_loader_entries(held: list[_HeldLoader]) -> dict[str, dict[str, str]]:
@@ -2388,7 +2454,7 @@ def _held_loader_entries(held: list[_HeldLoader]) -> dict[str, dict[str, str]]:
     matter either. A loader held many times is walked once per stage (`_held_memo`, by its form
     and the classes in it: two classes one factory made keep apart). A held loader's walk
     records no read of its own; its holder's caller records one read for all of them
-    (`_merge_held_loaders`)."""
+    (`_merge_held`)."""
     with _loader_memos():
         return _held_loaders_walked(held)
 
@@ -2399,16 +2465,16 @@ def _held_loaders_walked(held: list[_HeldLoader]) -> dict[str, dict[str, str]]:
     memo = _held_memo.get()
     ordered = sorted(
         (item for item in held if id(item.loader) not in stack),
-        key=lambda item: (_held_position(item), item.text),
+        key=lambda item: (_held_position(item.path), item.text),
     )
     walked = dict[tuple[str, tuple[int, ...]], dict[str, str]]()
     by_position = dict[str, list[dict[str, str]]]()
     index = 0
     while index < len(ordered):
-        position, text = _held_position(ordered[index]), ordered[index].text
+        position, text = _held_position(ordered[index].path), ordered[index].text
         end = index
         while end < len(ordered) and (
-            _held_position(ordered[end]),
+            _held_position(ordered[end].path),
             ordered[end].text,
         ) == (position, text):
             end += 1
@@ -2457,34 +2523,96 @@ def _walk_held_loader(
     return entries
 
 
+def _held_class_entries(held: _HeldValues) -> dict[str, dict[str, str]]:
+    """The walk of each user class whose instances `held` holds (`_walk_held_class`), as a stage
+    that names the class gets it, keyed by the digest of the first position, in sorted order, of
+    its instances in the value that holds them, so the key follows no hash seed and a class with
+    many instances adds one walk. Classes whose first positions are equal (instances with equal
+    forms in a set) are each keyed by that position and their walk. A class being walked already
+    (`_loader_stack`: a cycle) is left out, since its entries are in the manifest that walks
+    it."""
+    with _loader_memos():
+        stack = _loader_stack.get()
+        firsts = sorted(
+            (
+                (min(_held_position(path) for path in paths), _definition_ref(cls), cls)
+                for cls, paths in held.instances.values()
+                if paths and id(cls) not in stack
+            ),
+            key=lambda first: first[:2],
+        )
+        by_position = dict[str, list[dict[str, str]]]()
+        for position, _ref, cls in firsts:
+            entries = _walk_held_class(cls)
+            found = by_position.setdefault(position, [])
+            if entries not in found:
+                found.append(entries)
+    keyed = dict[str, dict[str, str]]()
+    for position, found in by_position.items():
+        for entries in found:
+            content = f"class\0{position}"
+            if len(found) > 1:
+                content += f"\0{_held_token({'': entries})}"
+            keyed[xxhash.xxh64(content.encode()).hexdigest()] = entries
+    return keyed
+
+
+def _walk_held_class(cls: type[Any]) -> dict[str, str]:
+    """The entries the walk gives a stage that names `cls` (`_process_callable_dependency`): the
+    class's hash and the walk of each user member on its MRO, refusals included. Walked once per
+    stage (`_held_memo`), with `cls` marked as being walked (`_loader_stack`) and no read of its
+    own recorded: the holder's caller records one read for all it holds (`_merge_held`)."""
+    memo = _held_memo.get()
+    key = ("class", (id(cls),))
+    cached = None if memo is None else memo.get(key)
+    if cached is not None:
+        return cached[1]
+    entries = dict[str, str]()
+    reads_token = _recorded_reads.set(None)
+    stack_token = _loader_stack.set((*_loader_stack.get(), id(cls)))
+    try:
+        _process_callable_dependency(_definition_ref(cls), cls, entries, set[int]())
+    finally:
+        _loader_stack.reset(stack_token)
+        _recorded_reads.reset(reads_token)
+    if memo is not None:
+        memo[key] = (cls, entries)
+    return entries
+
+
 def _held_token(entries: Mapping[str, Mapping[str, str]]) -> str:
-    """The read token for the held loaders' manifests `entries` (`_held_loader_entries`)."""
+    """The read token for the held manifests `entries` (`_held_entries`)."""
     return xxhash.xxh64(json.dumps(entries, sort_keys=True).encode()).hexdigest()
 
 
-def _merge_held_loaders(
-    manifest: dict[str, str], held: list[_HeldLoader], *, read: str | None
-) -> None:
-    """Add to `manifest` the fingerprint of each pivot loader in `held`, under
-    `held:<digest>:` (`_held_loader_entries`; the digest is hexadecimal, so the prefix holds no
-    `:` and no user name: `_held_entry`). With `read` (`hl` for a partial's arguments, `hd` for
-    a dataclass field default), inside a cacheable stage walk, record one read of the value
-    being visited, whose token is those fingerprints: a cache hit fingerprints its held loaders
-    again, as each run fingerprints a top-level loader."""
-    entries = _held_loader_entries(held)
-    for digest, loader_entries in entries.items():
-        _merge_prefixed(manifest, f"held:{digest}:", loader_entries)
+def _merge_held(manifest: dict[str, str], held: _HeldValues, *, read: str | None) -> None:
+    """Add to `manifest` what `held` holds (`_held_entries`): each pivot loader's fingerprint and
+    each other user class's walk, under `held:<digest>:` (the digest is hexadecimal, so the
+    prefix holds no `:` and no user name: `_held_entry`). With `read` (`hl` for a partial's
+    arguments, `hd` for a default, `hs` for a pydantic model's field defaults), inside a
+    cacheable stage walk, record one read of the value being visited, whose token is those
+    manifests: a cache hit fingerprints its held loaders and walks its held classes again, as
+    each run fingerprints a top-level loader."""
+    entries = _held_entries(held)
+    for digest, held_manifest in entries.items():
+        _merge_prefixed(manifest, f"held:{digest}:", held_manifest)
     reads = _recorded_reads.get()
     if read is not None and entries and reads is not None:
         reads.append(((*_walk_path.get(), read), _held_token(entries)))
 
 
-def _held_loaders_token(value: Any, step: str) -> str:
-    """The read token of `value` (`_merge_held_loaders`): for `hl` a partial, its arguments and
-    keywords; for `hd` a dataclass field default. The fingerprints of the loaders it holds."""
-    parts = _partial_parts(value) if step == "hl" else [("default", value)]
-    _texts, held = _serialize_collecting(parts)
-    return _held_token(_held_loader_entries(held))
+def _held_values_token(value: Any, step: str) -> str:
+    """The read token of `value` (`_merge_held`): for `hl` a partial, its arguments and keywords;
+    for `hd` a default; for `hs` a pydantic model, its field defaults (`_schema_parts`). The
+    manifests of what it holds."""
+    if step == "hs":
+        if not hasattr(value, "model_json_schema"):
+            return "absent"
+        held = _schema_parts(value)[1]
+    else:
+        parts = _partial_parts(value) if step == "hl" else [("default", value)]
+        _texts, held = _serialize_collecting(parts)
+    return _held_token(_held_entries(held))
 
 
 def loader_config_text(loader: "loaders.Writer[Any] | loaders.Reader[Any]") -> str:
@@ -2598,11 +2726,7 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
 
     found, looped = _memoized("loader-members", loader_type, collect)
     for qualname in looped:
-        refuse(
-            f"'{qualname}' has a `__wrapped__` chain that loops back to itself, so the code it "
-            + "runs cannot be found. Remove the loop from its decorator (functools.wraps sets "
-            + "`__wrapped__` to the function it wraps)."
-        )
+        _refuse_wrapper_loop(qualname)
     return found
 
 
@@ -2632,11 +2756,22 @@ def _member_values(name: str, raw: Any) -> list[tuple[str, Any]]:
 
 def _wrapper_loops(function: Any) -> bool:
     """Whether `function`'s `__wrapped__` chain loops (`f.__wrapped__ = f`): it then has no
-    function at its end whose code the walk could read, so the reachable walk leaves it out and
-    refuses the stage, naming it (`_reachable_loader_members`). The chain is read through
-    `wrapper_chain`, whose loop guard ends it."""
+    function at its end whose code the walk could read, so the reachable walk and the class
+    member walk leave it out and refuse the stage, naming it (`_reachable_loader_members`,
+    `_process_user_methods`). The chain is read through `wrapper_chain`, whose loop guard ends
+    it."""
     *_, end = wrapper_chain(function)
     return not isinstance(end, type) and hasattr(end, "__wrapped__")
+
+
+def _refuse_wrapper_loop(qualname: str) -> None:
+    """Refuse the stage for function `qualname`, whose `__wrapped__` chain loops
+    (`_wrapper_loops`)."""
+    refuse(
+        f"'{qualname}' has a `__wrapped__` chain that loops back to itself, so the code it "
+        + "runs cannot be found. Remove the loop from its decorator (functools.wraps sets "
+        + "`__wrapped__` to the function it wraps)."
+    )
 
 
 def _member_functions(function: Any, owner: type, raw: Any) -> list[tuple[Any, type, bool]]:
@@ -3404,11 +3539,13 @@ def _process_default_values(
 
     A default is evaluated once, when its module loads, so `cols=COLUMNS` puts the name
     `COLUMNS` in the AST and never its value. A scalar or a StageParams instance is tracked by
-    value: a stage's own params hash does not cover a StageParams default on a helper. An
-    ArtifactHandle default, or a list or tuple of them, is skipped: the pipeline wires it as a
-    real input, which is hashed as a dependency. Any other value is treated like a captured
-    module value, unless its default is a literal that the function's AST hash already
-    records, such as `keys=("a", "b")`.
+    value: a stage's own params hash does not cover a StageParams default on a helper. When such
+    a value is an instance of a user class (a StageParams subclass, a `str` subclass, an IntEnum
+    member) or holds one, the class also gets the walk a stage that names it gets, with one read
+    (`hd`) of the default (`_merge_held`). An ArtifactHandle default, or a list or tuple of them,
+    is skipped: the pipeline wires it as a real input, which is hashed as a dependency. Any other
+    value is treated like a captured module value, unless its default is a literal that the
+    function's AST hash already records, such as `keys=("a", "b")`.
     """
     defaults = _function_defaults(func)
     if not defaults:
@@ -3422,12 +3559,19 @@ def _process_default_values(
         binding_ref = f"{func_ref}.{parameter}"
         step = f"d:{parameter}"
         _record_read(func, step)
-        if isinstance(value, _SCALAR_TYPES):
+        if isinstance(value, _SCALAR_TYPES) and not _is_user_class_instance(value):
             manifest[f"default:{binding_ref}"] = repr(value)
             continue
-        if isinstance(value, stage_def.StageParams):
-            serialized = _serialize_value_for_hash(value)
-            manifest[f"default:{binding_ref}"] = xxhash.xxh64(serialized.encode()).hexdigest()
+        if isinstance(value, (stage_def.StageParams, *_SCALAR_TYPES)):
+            (serialized,), held = _serialize_collecting([("default", value)])
+            manifest[f"default:{binding_ref}"] = (
+                repr(value)
+                if isinstance(value, _SCALAR_TYPES)
+                else xxhash.xxh64(serialized.encode()).hexdigest()
+            )
+            if held:
+                with _walking(step):
+                    _merge_held(manifest, held, read="hd")
             continue
         if _is_artifact_handles(value, compose.ArtifactHandle):
             continue
@@ -3532,13 +3676,15 @@ def _process_partial_dependency(
 
     The function is classified as any read value is (`_value_kind`): a method bound to an
     instance (`partial(Scaler(3).apply)`, `partial(default_rng(SEED).normal)`) or a callable
-    instance is refused like a bare one, since no hash records the state it carries.
+    instance is refused like a bare one, since no hash records the state it carries. A pivot
+    loader the arguments hold gets its fingerprint, and the class of any other user class
+    instance they hold its walk (`_merge_held`).
     """
     (args_str, kwargs_str), held = _serialize_collecting(_partial_parts(partial_obj))
     manifest[f"partial:{binding_ref}.args"] = xxhash.xxh64(args_str.encode()).hexdigest()
     manifest[f"partial:{binding_ref}.kwargs"] = xxhash.xxh64(kwargs_str.encode()).hexdigest()
     if held:
-        _merge_held_loaders(manifest, held, read="hl")
+        _merge_held(manifest, held, read="hl")
 
     underlying = partial_obj.func
     _record_read(partial_obj, "pf")
@@ -3614,7 +3760,8 @@ def _process_bound_values(
     recorded by name, or one with a user class instance above the mark, is left to the
     canonical form of the same binding, which every caller computes (`loader_config_text`, the
     partial's `args` and `keywords`): it names the first and refuses the second. A pivot loader
-    among them is fingerprinted by its caller (`_merge_held_loaders`).
+    among them is fingerprinted, and the class of any other user class instance walked, by its
+    caller (`_merge_held`).
     """
     if isinstance(value, functools.partial):
         partial_obj = cast("functools.partial[Any]", value)
@@ -3812,6 +3959,9 @@ def _hash_pydantic_schema(
     manifest: dict[str, str],
     visited: set[int],
 ) -> None:
+    """Record a pydantic model's schema hash (`_schema_parts`), walk each user class its field
+    annotations name, and add what its field defaults hold (`_merge_held`, read `hs`): each
+    pivot loader's fingerprint and each other user class's walk."""
     _record_read(model, "schema")
     schema_key = f"schema:{_unique_ref(model)}"
     if schema_key in manifest:
@@ -3828,11 +3978,20 @@ def _hash_pydantic_schema(
                 _hash_pydantic_schema(
                     cast("type[_PydanticModelProtocol]", field_class), manifest, visited
                 )
-    manifest[schema_key] = _schema_hash(model)
+    schema_hash, held = _schema_parts(model)
+    manifest[schema_key] = schema_hash
+    if held:
+        _merge_held(manifest, held, read="hs")
 
 
 def _schema_hash(model: type[_PydanticModelProtocol]) -> str:
-    """Hash a pydantic model's JSON schema and field defaults, once per class per process.
+    """Hash a pydantic model's JSON schema and field defaults (`_schema_parts`)."""
+    return _schema_parts(model)[0]
+
+
+def _schema_parts(model: type[_PydanticModelProtocol]) -> tuple[str, _HeldValues]:
+    """Hash a pydantic model's JSON schema and field defaults, and collect what the defaults
+    hold (`_serialize_collecting`), once per class per process.
 
     A field default is evaluated when the class is created, so it is a live value: a cache hit
     reads it again through this hash. A class is created once per import, so the hash is
@@ -3850,6 +4009,7 @@ def _schema_hash(model: type[_PydanticModelProtocol]) -> str:
     schema = _strip_schema_metadata(schema_raw)
     model_fields = cast("Mapping[str, Any]", getattr(model, "model_fields", {}))
     default_hashes = dict[str, str]()
+    defaults = list[tuple[str, Any]]()
     for field_name, field_info in model_fields.items():
         default = getattr(field_info, "default", None)
         default_factory = getattr(field_info, "default_factory", None)
@@ -3857,11 +4017,13 @@ def _schema_hash(model: type[_PydanticModelProtocol]) -> str:
             if default_factory is not None and callable(default_factory):
                 default_hashes[field_name] = hash_function_ast(default_factory)
             continue
-        value_str = _serialize_value_for_hash(default)
+        defaults.append((field_name, default))
+    texts, held = _serialize_collecting(defaults)
+    for (field_name, _default), value_str in zip(defaults, texts, strict=True):
         default_hashes[field_name] = xxhash.xxh64(value_str.encode()).hexdigest()
 
     payload = {"schema": schema, "defaults": default_hashes}
-    result = xxhash.xxh64(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    result = (xxhash.xxh64(json.dumps(payload, sort_keys=True).encode()).hexdigest(), held)
     with contextlib.suppress(TypeError):
         _schema_hash_cache[model] = result
     return result
@@ -3937,8 +4099,23 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     form is stable). A compiled regex becomes `["re.Pattern", canonical(pattern), flags]`, so
     its full pattern is recorded. Other leaves keep their `repr`, tagged with their type. A class
     is a leaf, even a pydantic model class, whatever its metaclass reports as `__class__`.
+
+    While `_serialize_collecting` collects what a value holds, each instance of a user class
+    that is not a pivot loader is noted with its position (`_note_held_instance`), an instance
+    of a user subclass of `str` or `int` (an IntEnum member) included, so its holder walks the
+    class; a pivot loader is noted by `_canonical_loader`. The form itself does not change.
     """
     if value is None or isinstance(value, (bool, int, float, str)):
+        scalar_type: type[Any] = type(cast("object", value))
+        if (
+            scalar_type is not str
+            and scalar_type is not int
+            and scalar_type is not float
+            and scalar_type is not bool
+            and value is not None
+            and (held := _held_values.get()) is not None
+        ):
+            _note_held_instance(held, scalar_type)
         return value
     if isinstance(value, re.Pattern):
         pattern = cast("re.Pattern[Any]", value)
@@ -3972,6 +4149,14 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
                 _refuse_class_above_mark(value)
         else:
             decision = None
+        # An instance of a user class is noted for its holder (`_note_held_instance`); one the
+        # walk records by name, or refuses above a mark, is decided by the mark.
+        if (
+            decision is None
+            and (held := _held_values.get()) is not None
+            and not issubclass(value_type, type)
+        ):
+            _note_held_instance(held, value_type)
         # Main dumped every value with a `model_dump` (`hasattr`) that is not a class; so does
         # this walk, by one of the routes `_probe_own_attribute` picks (`_model_dump_route`). A
         # class is never dumped, whatever its metaclass reports. A real type whose route its MRO
@@ -4032,7 +4217,7 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
                 ("a", partial_value.args),
                 ("k", partial_value.keywords),
             )
-            if _held_loaders.get() is None:
+            if _held_values.get() is None:
                 return [
                     "partial",
                     *(_canonicalize_value_for_hash(part, inner) for _, part in parts),
@@ -4041,7 +4226,7 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
     if isinstance(value, dict):
         mapping = cast("dict[Any, Any]", value)
         inner = (*active, id(mapping))
-        if _held_loaders.get() is not None:
+        if _held_values.get() is not None:
             return ["dict", _canonical_entries_at(mapping, inner)]
         entries = [
             [_canonicalize_value_for_hash(key, inner), _canonicalize_value_for_hash(item, inner)]
@@ -4053,7 +4238,7 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         collection = cast("list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]", value)
         inner = (*active, id(collection))
         unordered = isinstance(collection, (set, frozenset))
-        if _held_loaders.get() is not None:
+        if _held_values.get() is not None:
             return [type(collection).__name__, _canonical_items_at(collection, inner, unordered)]
         items = [_canonicalize_value_for_hash(item, inner) for item in collection]
         if unordered:
@@ -4166,16 +4351,17 @@ def _canonical_loader(loader: Any, inner: tuple[int, ...]) -> Any:
 
     While a holder's value is serialized (`_serialize_collecting`), the loader is noted with
     its form, the ids of the classes in it and its position, for the holder to fingerprint. The
-    loaders inside it are its own fingerprint's, so they are not noted for the holder. A form
-    that holds no cycle is the same wherever the loader sits, so it is kept for the stage
-    (`_form_memo`): a chain of held loaders is canonicalized once, not once per level."""
+    loaders and other user class instances inside it are its own fingerprint's, so they are not
+    noted for the holder. A form that holds no cycle is the same wherever the loader sits, so it
+    is kept for the stage (`_form_memo`): a chain of held loaders is canonicalized once, not once
+    per level."""
     memo = _form_memo.get()
     form = None if memo is None else memo.get(id(loader))
     if form is None:
         loader_type: type[Any] = type(cast("object", loader))
         classes = list[int]()
         cycle = [False]
-        held_token = _held_loaders.set(None)
+        held_token = _held_values.set(None)
         classes_token = _form_classes.set(classes)
         cycle_token = _form_cycle.set(cycle)
         try:
@@ -4186,7 +4372,7 @@ def _canonical_loader(loader: Any, inner: tuple[int, ...]) -> Any:
         finally:
             _form_cycle.reset(cycle_token)
             _form_classes.reset(classes_token)
-            _held_loaders.reset(held_token)
+            _held_values.reset(held_token)
         form = _LoaderForm(loader, canonical, json.dumps(canonical), (id(loader_type), *classes))
         if not cycle[0]:
             if memo is not None:
@@ -4196,9 +4382,9 @@ def _canonical_loader(loader: Any, inner: tuple[int, ...]) -> Any:
     outer_classes = _form_classes.get()
     if outer_classes is not None:
         outer_classes.extend(form.classes)
-    held = _held_loaders.get()
+    held = _held_values.get()
     if held is not None:
-        held.append(_HeldLoader(loader, form.text, form.classes, _held_path.get()))
+        held.loaders.append(_HeldLoader(loader, form.text, form.classes, _held_path.get()))
     return form.canonical
 
 

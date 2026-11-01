@@ -2788,3 +2788,206 @@ def test_a_loader_from_a_sourceless_module_is_a_use_of_it_held_or_on_an_output_f
         lock = yaml.safe_load((project / ".pivot" / "stages" / "t" / f"{stage}.lock").read_text())
         marks = [key for key in lock["code_manifest"] if key.startswith("unreadable-source:")]
         assert marks == ["unreadable-source:wlib"], (stage, lock["code_manifest"])
+
+
+_THING = 'class Thing:\n    def suffix(self) -> str:\n        return "A"\n'
+
+_CAPTURED_HEADER = """\
+import dataclasses
+import functools
+import pathlib
+from typing import Any
+
+from pivot import Pipeline, StageParams, loaders, stage
+from thing import Thing
+
+
+def _tag(thing: Any, text: str) -> str:
+    return text.splitlines()[0] + thing.suffix()
+
+
+"""
+
+
+def _captured_stage(call: str, source: str = 'pipeline.input("lines.txt", t=str)') -> str:
+    return (
+        f"@stage\ndef use(text: str) -> str:\n    return {call}\n\n\n"
+        f'with Pipeline("t") as pipeline:\n    use({source})\n'
+    )
+
+
+_GLOBAL_PARTIAL = "TAG = functools.partial(_tag, {})\n\n\n" + _captured_stage("TAG(text)")
+
+# Where the stage captures `Thing()` (a module global partial's argument or keyword, a loader's
+# config field, the field default of a dataclass the stage reads, the field default of the
+# StageParams default of a helper), and the other kinds of instance a global partial holds (a
+# class whose `suffix` a base class in another module defines, a `str` subclass, an enum member,
+# a dataclass, a pydantic model): each with its files and the file that defines `suffix`. No
+# annotation names the class, so the walk reaches it only through the instance.
+_CAPTURED_INSTANCES = {
+    "global-partial": ({"pipeline.py": _GLOBAL_PARTIAL.format("Thing()")}, "thing.py"),
+    "partial-keyword": (
+        {
+            "pipeline.py": "TAG = functools.partial(_tag, thing=Thing())\n\n\n"
+            + _captured_stage("TAG(text=text)")
+        },
+        "thing.py",
+    ),
+    "loader-config-field": (
+        {
+            "pipeline.py": "@dataclasses.dataclass(frozen=True)\n"
+            "class Tagged(loaders.Reader[str]):\n    thing: Any\n\n"
+            "    def load(self, path: pathlib.Path) -> str:\n"
+            "        return _tag(self.thing, path.read_text())\n\n\n"
+            + _captured_stage("text", 'pipeline.input("lines.txt", format=Tagged(Thing()))')
+        },
+        "thing.py",
+    ),
+    "dataclass-default": (
+        {
+            "pipeline.py": "@dataclasses.dataclass(frozen=True)\n"
+            "class Settings:\n    thing: Any = Thing()\n\n\n"
+            + _captured_stage("_tag(Settings().thing, text)")
+        },
+        "thing.py",
+    ),
+    "stageparams-default": (
+        {
+            "pipeline.py": "class TagParams(StageParams):\n    thing: Any = Thing()\n\n\n"
+            "def _tag_with(text: str, params: TagParams = TagParams()) -> str:\n"
+            "    return _tag(params.thing, text)\n\n\n" + _captured_stage("_tag_with(text)")
+        },
+        "thing.py",
+    ),
+    "inherited-method": (
+        {
+            "base.py": _THING.replace("class Thing:", "class Base:"),
+            "thing.py": "from base import Base\n\n\nclass Thing(Base):\n    pass\n",
+            "pipeline.py": _GLOBAL_PARTIAL.format("Thing()"),
+        },
+        "base.py",
+    ),
+    "str-subclass": (
+        {
+            "thing.py": _THING.replace("class Thing:", "class Thing(str):"),
+            "pipeline.py": _GLOBAL_PARTIAL.format('Thing("t")'),
+        },
+        "thing.py",
+    ),
+    "enum-member": (
+        {
+            "thing.py": "import enum\n\n\n"
+            + _THING.replace("class Thing:", "class Thing(enum.Enum):\n    ONE = 1\n"),
+            "pipeline.py": _GLOBAL_PARTIAL.format("Thing.ONE"),
+        },
+        "thing.py",
+    ),
+    "dataclass-instance": (
+        {
+            "thing.py": "import dataclasses\n\n\n@dataclasses.dataclass(frozen=True)\n"
+            + _THING.replace("class Thing:", "class Thing:\n    x: int = 1\n"),
+            "pipeline.py": _GLOBAL_PARTIAL.format("Thing()"),
+        },
+        "thing.py",
+    ),
+    "pydantic-model": (
+        {
+            "thing.py": "import pydantic\n\n\n"
+            + _THING.replace("class Thing:", "class Thing(pydantic.BaseModel):\n    x: int = 1\n"),
+            "pipeline.py": _GLOBAL_PARTIAL.format("Thing()"),
+        },
+        "thing.py",
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_CAPTURED_INSTANCES))
+def test_an_edit_to_a_method_of_a_captured_instance_reruns_its_stage(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """The stage captures an instance of a user class, which is not a pivot loader, where the
+    walk only serializes it. Its class is walked as for a stage that names it, so an edit to
+    the method the stage calls alone reruns the stage, and the next run reuses the result."""
+    home = tmp_path / "home"
+    files, edited = _CAPTURED_INSTANCES[shape]
+    pipeline = _CAPTURED_HEADER + files["pipeline.py"]
+    project = _project(tmp_path, {"thing.py": _THING, **files, "pipeline.py": pipeline})
+    output = project / "data" / "t" / "use.txt"
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingA"
+    _edit(project, edited, '"A"', '"B"')
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The method edit should rerun"
+    assert output.read_text() == "Local Set Default Proof UsingB"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_NOISE_HEADER = """\
+import collections
+import dataclasses
+import datetime
+import decimal
+import enum
+import fractions
+import functools
+import pathlib
+from typing import Any
+
+import pydantic
+
+from pivot import Pipeline, stage
+
+Row = collections.namedtuple("Row", "x y")
+Gen = dataclasses.make_dataclass("Gen", [("x", int)], frozen=True)
+Mode = enum.Enum("Mode", "A B")
+Made = type("Made", (), {"x": 1})
+Model = pydantic.create_model("Model", x=(int, 1))
+
+
+def _take(value: Any, text: str) -> str:
+    return text.splitlines()[0] + str(value)[:0]
+
+"""
+
+# Instances of classes with no source of their own, and of library classes, that a global
+# partial holds.
+_UNEDITED_INSTANCES = {
+    "namedtuple": "Row(1, 2)",
+    "make_dataclass": "Gen(1)",
+    "functional_enum": "Mode.A",
+    "type_call": "Made()",
+    "create_model": "Model()",
+    "decimal": 'decimal.Decimal("1.5")',
+    "fraction": "fractions.Fraction(1, 3)",
+    "date": "datetime.date(2020, 1, 1)",
+    "path": 'pathlib.PurePosixPath("a/b")',
+}
+
+
+def test_a_captured_instance_with_no_source_or_from_a_library_reruns_nothing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Each stage calls a global partial holding an instance of a class with no source of its
+    own (hashed by what defines it) or of a library class (not walked). Under a new hash seed, a
+    comment edit in the module that defines them and a fresh state database, every stage reuses
+    its first result."""
+    home = tmp_path / "home"
+    stages = "".join(
+        f"HOLD_{name} = functools.partial(_take, {expression})\n\n\n"
+        f"@stage\ndef use_{name}(text: str) -> str:\n    return HOLD_{name}(text)\n\n\n"
+        for name, expression in _UNEDITED_INSTANCES.items()
+    )
+    calls = "".join(
+        f'    use_{name}(pipeline.input("lines.txt", t=str))\n' for name in _UNEDITED_INSTANCES
+    )
+    pipeline = _NOISE_HEADER + "\n" + stages + f'with Pipeline("t") as pipeline:\n{calls}'
+    project = _project(tmp_path, {"pipeline.py": pipeline})
+    ran = {f"t/use_{name}": "ran" for name in _UNEDITED_INSTANCES}
+    cached = dict.fromkeys(ran, "cached")
+
+    assert _repro_statuses(project, home, seed="1") == ran
+    assert _repro_statuses(project, home, seed="2") == cached, "A new hash seed should reuse it"
+    _edit(project, "pipeline.py", "\n\ndef _take(", "\n\n# A comment.\ndef _take(")
+    assert _repro_statuses(project, home, seed="3") == cached, "A comment edit should reuse it"
+    shutil.rmtree(project / ".pivot" / "state.lmdb")
+    assert _repro_statuses(project, home, seed="4") == cached, "A fresh state should reuse it"

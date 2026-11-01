@@ -38,7 +38,11 @@ For each stage function, Pivot:
    manifest. A user class the stage reaches has its callable members walked:
    methods, descriptors such as properties, partial members, and nested user
    classes. A module value or helper read only inside a method
-   (`ScopeWalk().step(...)` reading a module-level regex) is tracked
+   (`ScopeWalk().step(...)` reading a module-level regex) is tracked. So is the
+   class of an instance a `functools.partial`, a loader's config, a dataclass
+   field default or a `StageParams` default holds (`partial(run, Scorer())`):
+   its class is walked as if the stage named it, so an edit to `Scorer.score`
+   re-runs the stage
 4. **Follows imports in the function body** — a user module discovery already
    loaded is walked like a module-level dependency, together with its packages
    and a submodule a `from` import names (`import pkg.sub`, `from pkg import
