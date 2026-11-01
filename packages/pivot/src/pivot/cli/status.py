@@ -129,7 +129,9 @@ def status(
         orphaned = status_mod.orphaned_status(
             pipeline,
             status_mod.orphaned_instances(
-                pipeline, expansion_result, cli_helpers.run_templates(given_targets)
+                pipeline,
+                expansion_result,
+                cli_helpers.eligible_templates(given_targets, expansion_result),
             ),
         )
 

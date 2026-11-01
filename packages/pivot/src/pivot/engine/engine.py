@@ -83,7 +83,7 @@ from pivot.types import (
 
 if TYPE_CHECKING:
     import multiprocessing as mp
-    from collections.abc import AsyncIterator, Callable, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 
     import networkx as nx
     from anyio.abc import TaskGroup
@@ -373,16 +373,16 @@ def _mapped_targets(
     wanted = dict[str, dict[str, set[str]] | None]()
     targets = list[str]()
     for stage in stages:
-        template = None if stage in templates else registry.template_of(stage, templates)
-        if template is None:
-            if stage in templates:
-                wanted[stage] = None
-            targets.append(stage)
+        target = registry.run_target(stage, templates)
+        targets.append(target)
+        if target not in templates:
             continue
-        targets.append(template)
-        keys = wanted.setdefault(template, dict[str, set[str]]())
+        if target == stage:
+            wanted[target] = None
+            continue
+        keys = wanted.setdefault(target, dict[str, set[str]]())
         if keys is not None:
-            keys.setdefault(stage[len(template) + 1 :], set[str]()).add(stage)
+            keys.setdefault(stage.removeprefix(f"{target}@"), set[str]()).add(stage)
     pending = list(wanted)
     while pending:
         name = pending.pop()
@@ -464,109 +464,127 @@ _OUTPUT_ROOTS = ("data", "metrics", "plots")
 
 
 def _orphan_outputs(
-    template: registry.MapTemplate,
     instance: str,
     lock_data: LockData | None,
-    record: types.NoCommitRecord | None,
+    records: Iterable[types.NoCommitRecord],
 ) -> dict[types.ArtifactIdentity, str]:
-    """Where each output of ``instance``, an instance of ``template`` whose key left the plan,
-    lies, relative to the project root: each output its lock records, at the path the lock
-    records for it, and each output its ``nocommit:`` record lists (a ``--no-commit`` run wrote
-    it). An output with no recorded path lies where the template now places it; one it no longer
-    declares, and with no recorded path, cannot be found and is left out.
+    """Where each output of ``instance``, a mapped-stage instance whose key left the plan, lies,
+    relative to the project root: each output its lock and `nocommit:` records name, at the
+    project-relative path those records name.
+
+    An older `nocommit:` record has no output paths. It proves a run wrote outputs but cannot
+    prove which paths current code owns, so this refuses its removal rather than infer a current
+    template path and delete a user's file.
 
     Raises:
-        ValidationError: A recorded path is not one an output of ``instance`` can have (under
-            ``data``, ``metrics`` or ``plots``, named by the instance).
+        ValidationError: A record lacks a path, or records a path not under ``data``, ``metrics``
+            or ``plots`` named by ``instance``.
     """
-    key = instance.removeprefix(f"{template['info']['name']}@")
-    declared = {
-        out.identity: store_mod.relative_output_path(out).as_posix()
-        for out in registry.instance_outputs(template, key)
-    }
     identities = set[types.ArtifactIdentity]()
-    recorded = dict[types.ArtifactIdentity, str]()
+    paths = dict[types.ArtifactIdentity, str]()
     if lock_data is not None:
         identities.update(lock_data["output_hashes"])
-        recorded = lock_data["output_paths"] if "output_paths" in lock_data else {}
-    if record is not None and "output_hashes" in record:
+        if "output_paths" not in lock_data:
+            raise exceptions.ValidationError("its lock records outputs without their paths")
+        paths.update(lock_data["output_paths"])
+    for record in records:
+        if "output_hashes" not in record:
+            continue
+        if "output_paths" not in record:
+            raise exceptions.ValidationError("its --no-commit record records outputs without paths")
         identities.update(types.identity_from_key(key) for key in record["output_hashes"])
+        paths.update(
+            (types.identity_from_key(identity), path)
+            for identity, path in record["output_paths"].items()
+        )
     outputs = dict[types.ArtifactIdentity, str]()
     for identity in identities:
-        path = recorded.get(identity, declared.get(identity))
-        if identity.producer != instance or path is None:
+        path = paths.get(identity)
+        if identity.producer != instance:
             continue
+        if path is None:
+            raise exceptions.ValidationError(
+                f"its record has no path for '{types.identity_key(identity)}'"
+            )
         root, _, rest = path.partition("/")
         if root not in _OUTPUT_ROOTS or not (
             rest == instance or rest.startswith((f"{instance}.", f"{instance}/"))
         ):
             raise exceptions.ValidationError(
-                f"its lock records the output path '{path}', which no output of it can have"
+                f"its record has the output path '{path}', which no output of it can have"
             )
         outputs[identity] = path
     return outputs
 
 
 def _remove_orphan(template: registry.MapTemplate, instance: str, map_run: _MapRun) -> bool:
-    """Remove ``instance``, an instance of ``template`` whose key left the plan: its outputs in
-    the workspace (``_orphan_outputs``), its ``nocommit:`` record, then its listings, restart
-    proof and lock, the lock last (``lock.remove_stage_files``), so a removal cut short leaves
-    what names the instance to the next run. The cache keeps every object.
+    """Remove ``instance``, an instance of ``template`` whose key left the plan: its outputs at
+    the paths its lock and `nocommit:` record prove it wrote (``_orphan_outputs``), every
+    `nocommit:` record, then its listings, restart proof and lock, the lock last
+    (``lock.remove_stage_files``), so a removal cut short leaves what names the instance to the
+    next run. The cache keeps every object.
 
     It holds WRITE on the instance's outputs, the lock a run writing them holds, and reads its
     records again under it, so a run of an older plan still writing the instance finishes first
-    and what it wrote goes too. An output holding a user's file (``WorkspaceStore.remove_outputs``
-    refuses before it removes anything), a record naming a path the instance cannot have, or a
-    file that cannot be removed keeps the instance, with a warning; returns whether it went.
+    and what it wrote goes too. An output holding a user's file
+    (``WorkspaceStore.remove_outputs`` refuses before it removes anything), a legacy record with
+    no paths, or a file that cannot be removed keeps the instance, with a warning; returns
+    whether it went.
     """
     default_state_dir = map_run.default_state_dir
     state_dir = registry.get_stage_state_dir(template["info"], default_state_dir)
     files_dir = map_run.cache_dir / "files"
     stage_lock = lock.StageLock(instance, lock.get_stages_dir(state_dir))
 
-    def read_records() -> tuple[LockData | None, types.NoCommitRecord | None]:
+    def read_records() -> tuple[LockData | None, dict[pathlib.Path, types.NoCommitRecord]]:
         lock_data = stage_lock.read(cache_dir=files_dir, warn_old_format=False)
-        with state_mod.open_readonly(state_dir, create=False) as state_db:
-            record = None if state_db is None else state_db.get_no_commit_record(instance)
-        return lock_data, record
+        records = dict[pathlib.Path, types.NoCommitRecord]()
+        for directory in expansion.no_commit_record_dirs(
+            template, default_state_dir=default_state_dir
+        ).get(instance, []):
+            with state_mod.open_readonly(directory, create=False) as state_db:
+                if state_db is not None:
+                    record = state_db.get_no_commit_record(instance)
+                    if record is not None:
+                        records[directory] = record
+        return lock_data, records
 
     try:
-        before = _orphan_outputs(template, instance, *read_records())
+        before_lock, before_records = read_records()
+        before = _orphan_outputs(instance, before_lock, before_records.values())
         requests = [
             artifact_lock.LockRequest(
                 key=types.identity_key(identity), mode=artifact_lock.LockMode.WRITE
             )
-            for identity in {
-                *before,
-                *(
-                    out.identity
-                    for out in registry.instance_outputs(
-                        template, instance.removeprefix(f"{template['info']['name']}@")
-                    )
-                ),
-            }
+            for identity in before
         ]
         service = artifact_lock.LocalFlockLockService(state_dir / "locks")
         with service.acquire_many(requests):
-            lock_data, record = read_records()
-            outputs = _orphan_outputs(template, instance, lock_data, record)
+            lock_data, records = read_records()
+            outputs = _orphan_outputs(instance, lock_data, records.values())
             paths = {identity: map_run.project_root / path for identity, path in outputs.items()}
             locked = lock_data["output_hashes"] if lock_data is not None else {}
-            claims = ownership.read_stage_claims(
+            combined = types.NoCommitRecord(
+                pvt_members={
+                    path: hash_
+                    for record in records.values()
+                    for path, hash_ in record.get("pvt_members", {}).items()
+                }
+            )
+            claims = ownership.stage_claims(
                 map_run.project_root,
-                instance,
-                state_dir,
                 {path: locked[identity] for identity, path in paths.items() if identity in locked},
+                combined,
                 cache_dir=files_dir,
                 listing_readers=ownership.lock_listing_readers(
                     stage_lock, lock_data, paths, files_dir
                 ),
             )
             map_run.store.remove_outputs(
-                instance, list(paths.values()), claims, state_dir=default_state_dir
+                instance, list(paths.values()), claims, state_dir=state_dir
             )
-            if record is not None:
-                with state_mod.StateDB(state_dir) as state_db:
+            for directory in records:
+                with state_mod.StateDB(directory) as state_db:
                     state_db.apply_deferred_writes(
                         instance, [], types.DeferredWrites(clear_no_commit_record=True)
                     )

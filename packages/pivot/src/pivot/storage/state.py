@@ -44,12 +44,12 @@ _SM_PREFIX = b"sm:"  # Stage manifest cache entries
 # and the `*.pvt` files Pivot wrote into its outputs as its own (`pvt_members`)
 _NOCOMMIT_PREFIX = b"nocommit:"
 # The keys `types.NoCommitRecord` declares that are each a str -> str mapping the reader validates
-# alone; its fourth, `reads`, is a list of content hashes, validated alone too.
-_NO_COMMIT_FIELDS = ("code_manifest", "output_hashes", "pvt_members")
+# alone; `reads` is a list of content hashes, validated alone too.
+_NO_COMMIT_FIELDS = ("code_manifest", "output_hashes", "output_paths", "pvt_members")
 _NO_COMMIT_READS = "reads"
 # The keys a --no-commit run writes (`types.NoCommitRun`): applying its record replaces all of
 # them, so the reads of an earlier run that read more never stay beside this run's outputs.
-_NO_COMMIT_RUN_FIELDS = ("code_manifest", "output_hashes", _NO_COMMIT_READS)
+_NO_COMMIT_RUN_FIELDS = ("code_manifest", "output_hashes", "output_paths", _NO_COMMIT_READS)
 
 # Default LMDB map size (10GB virtual - grows as needed)
 _MAP_SIZE = 10 * 1024 * 1024 * 1024

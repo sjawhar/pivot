@@ -19,6 +19,7 @@ it. A template that does not expand removes nothing, since no plan is known for 
 
 from __future__ import annotations
 
+import pathlib
 from typing import TYPE_CHECKING, TypedDict
 
 import lmdb
@@ -29,7 +30,6 @@ from pivot.storage import listing, lock
 from pivot.storage import state as state_mod
 
 if TYPE_CHECKING:
-    import pathlib
     from collections.abc import Collection, Mapping
 
 
@@ -210,21 +210,36 @@ def instance_files(
     return lock.instance_files([stages_dir] if other is None else [stages_dir, other], info["name"])
 
 
+def no_commit_record_dirs(
+    template: registry.MapTemplate, *, default_state_dir: pathlib.Path
+) -> dict[str, list[pathlib.Path]]:
+    """Each instance of ``template`` that has a ``nocommit:`` record, mapped to every state
+    directory that holds one: a ``--no-commit`` run wrote its outputs, which no lock may record.
+    Both current and legacy state directories are readable during a ``core.state_dir`` move.
+    A database that cannot be read contributes none, as ``ownership.read_stage_claims`` reads it.
+    """
+    info = template["info"]
+    state_dir = registry.get_stage_state_dir(info, default_state_dir)
+    other = state_dir_mod.other_state_dir_for(state_dir)
+    name = info["name"]
+    records = dict[str, list[pathlib.Path]]()
+    for candidate in [state_dir] if other is None else [state_dir, other]:
+        try:
+            with state_mod.open_readonly(candidate, create=False) as state_db:
+                stages = [] if state_db is None else state_db.no_commit_stages(f"{name}@")
+        except (OSError, lmdb.Error, state_mod.StateDBError):
+            continue
+        for stage in stages:
+            if registry.template_of(stage, [name]) == name:
+                records.setdefault(stage, []).append(candidate)
+    return records
+
+
 def no_commit_instances(
     template: registry.MapTemplate, *, default_state_dir: pathlib.Path
 ) -> list[str]:
-    """Each instance of ``template`` that has a ``nocommit:`` record: a ``--no-commit`` run wrote
-    its outputs, which no lock may record. A state database that cannot be read holds none, as
-    ``ownership.read_stage_claims`` reads it."""
-    name = template["info"]["name"]
-    try:
-        with state_mod.open_readonly(
-            registry.get_stage_state_dir(template["info"], default_state_dir), create=False
-        ) as state_db:
-            stages = [] if state_db is None else state_db.no_commit_stages(f"{name}@")
-    except (OSError, lmdb.Error, state_mod.StateDBError):
-        return []
-    return [stage for stage in stages if registry.template_of(stage, [name]) == name]
+    """Each instance of ``template`` that has a ``nocommit:`` record."""
+    return sorted(no_commit_record_dirs(template, default_state_dir=default_state_dir))
 
 
 def orphaned_instances(

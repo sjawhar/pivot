@@ -159,32 +159,35 @@ class NoCommitRecord(TypedDict, total=False):
     `nocommit:<stage>`. A written lock supersedes it, and its whole record is removed.
 
     Two features write the record, each its own keys. `code_manifest` is the manifest a
-    `--no-commit` run's lock would have held, rerun marks included, `output_hashes` the outputs it
-    wrote, and `reads` the objects it read by hash (`pivot.read_by_hash`), when it read any: the
-    run writes these (`NoCommitRun`, `StateDB.apply_deferred_writes`), and `pivot commit` writes
-    that manifest and those reads when the manifest and outputs are present and the outputs on
-    disk still have these hashes. `pvt_members` maps each `*.pvt` file Pivot wrote in a directory
-    output (path relative to the project root) to its content hash; the feature that keeps those
-    files owns it.
+    `--no-commit` run's lock would have held, `output_hashes` and `output_paths` identify the
+    outputs it wrote, and `reads` lists the objects it read by hash (`pivot.read_by_hash`), when
+    it read any. The run writes these (`NoCommitRun`, `StateDB.apply_deferred_writes`), and
+    `pivot commit` writes that manifest and those reads when the manifest and outputs are present
+    and the outputs on disk still have these hashes. `pvt_members` maps each `*.pvt` file Pivot
+    wrote in a directory output (path relative to the project root) to its content hash; the
+    feature that keeps those files owns it.
 
     Every writer replaces only its own keys and keeps every other key, in one write transaction.
-    The reader (`StateDB.get_no_commit_record`) validates each of these four keys on its own and
+    The reader (`StateDB.get_no_commit_record`) validates each of these five keys on its own and
     returns every other key as stored, so a record that holds only one feature's keys reads as
     present, and a malformed key hides no other.
     """
 
     code_manifest: dict[str, str]
     output_hashes: dict[str, str]  # output identity key -> content hash
+    output_paths: dict[str, str]  # output identity key -> project-relative output path
     pvt_members: dict[str, str]  # `*.pvt` path relative to the project root -> content hash
     reads: list[str]  # content hashes the run read, sorted, each once
 
 
 class NoCommitRun(TypedDict):
-    """The keys of `NoCommitRecord` a `--no-commit` run writes: the manifest and outputs always,
-    never one alone, and `reads` when it read any. Applying it replaces all three."""
+    """The keys of `NoCommitRecord` a `--no-commit` run writes: the manifest, output hashes and
+    output paths always, never one alone, and `reads` when it read any. Applying it replaces all
+    four."""
 
     code_manifest: dict[str, str]
     output_hashes: dict[str, str]  # output identity key -> content hash
+    output_paths: dict[str, str]  # output identity key -> project-relative output path
     reads: NotRequired[list[str]]  # content hashes the run read, sorted, each once
 
 

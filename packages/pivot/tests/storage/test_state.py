@@ -1890,7 +1890,11 @@ def test_capacity_warning_names_pivot_gc_and_prints_one_percent_sign(
     ) in message, message
 
 
-_RAN = {"code_manifest": {"func:helpers.plain": "1f2e"}, "output_hashes": {"p/use_plain": "9a8b"}}
+_RAN = {
+    "code_manifest": {"func:helpers.plain": "1f2e"},
+    "output_hashes": {"p/use_plain": "9a8b"},
+    "output_paths": {"p/use_plain": "data/p/use_plain.yaml"},
+}
 # The key another feature writes into the same record: `*.pvt` directory members.
 _PVT = {"pvt_members": {"data/out/a.pvt": "77aa"}}
 
@@ -1983,6 +1987,7 @@ def test_applying_a_no_commit_record_replaces_its_keys_and_keeps_every_other(
         "no_commit_record": {
             "code_manifest": _RAN["code_manifest"],
             "output_hashes": _RAN["output_hashes"],
+            "output_paths": _RAN["output_paths"],
         }
     }
     with state.StateDB(tmp_path) as db:

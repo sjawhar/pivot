@@ -414,3 +414,104 @@ def test_a_committed_run_removes_what_a_no_commit_run_wrote_for_a_dropped_key(
         assert not _outputs(root, instance).exists(), instance
     assert "removed" not in again, again
     assert _status_rows(root, home) == dict.fromkeys(["p/plan", *_KEPT], "cached")
+
+
+def _rewrite_no_commit_record(
+    state_dir: pathlib.Path, instance: str, update: Mapping[str, object]
+) -> None:
+    from pivot.storage import state
+
+    with state.StateDB(state_dir) as state_db:
+        record = dict(state_db.get_no_commit_record(instance) or {})
+        record.update(update)
+        state_db.apply_deferred_writes(
+            instance,
+            [],
+            {"no_commit_record": record},  # pyright: ignore[reportArgumentType] - test fixture
+        )
+
+
+def test_a_changed_template_with_a_no_commit_record_removes_only_the_recorded_path(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The no-commit record proves `cut@b.yaml`; changing `p/cut` to JSON must not make removal
+    delete an unproved `cut@b.json`."""
+    root, home = _project(tmp_path, no_commit=True)
+    user_json = root / "data" / "p" / "cut@b.json"
+    user_json.write_text('{"user": true}\n')
+    (root / "pipeline.py").write_text(
+        _PIPELINE.replace(
+            "def cut(entry: dict[str, int]) -> dict[str, int]:",
+            "def cut(\n    entry: dict[str, int],\n"
+            + ") -> Annotated[dict[str, int], loaders.JSON[dict[str, int]]()]:",
+        )
+    )
+    _write_plan(root, {"a": 1, "c": 3})
+
+    _ok(helpers.run_pivot(root, home, "repro"))
+
+    assert not (root / "data" / "p" / "cut@b.yaml").exists()
+    assert user_json.read_text() == '{"user": true}\n'
+
+
+def test_a_legacy_no_commit_record_without_paths_is_reported_and_kept(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A record from an older run has no paths, so the run cannot prove which current path it
+    owns. It warns, keeps the record and output, and status keeps reporting the orphan."""
+    root, home = _project(tmp_path, no_commit=True)
+    _rewrite_no_commit_record(root / ".pivot", "p/cut@b", {"output_paths": None})
+    _write_plan(root, {"a": 1, "c": 3})
+
+    ran = _ok(helpers.run_pivot(root, home, "repro"))
+
+    assert "Cannot remove 'p/cut@b', whose key left the plan" in ran, ran
+    assert "without paths" in ran, ran
+    assert _outputs(root, "p/cut@b").is_file()
+    assert _status_rows(root, home)["p/cut@b"] == "orphaned"
+
+
+def test_a_refused_incremental_run_promises_no_removal(tmp_path: pathlib.Path) -> None:
+    """A run that refuses an incremental stage before expansion never removes an orphan, so
+    status and dry-run list none."""
+    root, home = _dropped_by_the_producer_alone(tmp_path)
+    (root / "pipeline.py").write_text(
+        _PIPELINE.replace(
+            "from pivot import Pipeline, directory, loaders, stage",
+            "from pivot import Pipeline, directory, incremental, loaders, stage",
+        ).replace(
+            'with Pipeline("p") as pipeline:',
+            (
+                "@stage\n"
+                + "def grow(previous: str) -> Annotated[str, incremental]:\n"
+                + '    return previous + "x"\n\n\n'
+                + 'with Pipeline("p") as pipeline:\n'
+                + "    grow(pipeline.previous())"
+            ),
+        )
+    )
+    (root / "data" / "p" / "grow.txt").write_text("uncached\n")
+
+    rows = _status_rows(root, home)
+    dry_run = _ok(helpers.run_pivot(root, home, "repro", "--dry-run"))
+
+    assert "orphaned" not in rows.values(), rows
+    assert "Would remove" not in dry_run, dry_run
+
+
+def test_a_no_commit_record_in_the_old_state_directory_is_removed_from_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """After `core.state_dir` moves, the no-commit record stays readable in `.pivot`. The run
+    finds it and clears it from that database."""
+    root, home = _project(tmp_path, no_commit=True)
+    _ok(helpers.run_pivot(root, home, "config", "set", "core.state_dir", "state"))
+    _write_plan(root, {"a": 1, "c": 3})
+
+    ran = _ok(helpers.run_pivot(root, home, "repro"))
+
+    from pivot.storage import state
+
+    assert "removed p/cut@b, whose key left the plan" in ran, ran
+    with state.StateDB(root / ".pivot") as state_db:
+        assert state_db.get_no_commit_record("p/cut@b") is None
