@@ -142,11 +142,14 @@ def expand_current(
     (``registry.StageRegistry.expand``); a refusal leaves it unexpanded with the reason.
     ``fetched`` holds listings read from the remote, by directory hash, already checked against
     their records: a listing neither committed nor cached is taken from it (a dry run's read,
-    which writes nothing to the cache).
+    which writes nothing to the cache). A listing neither holds is named in ``listings`` for
+    every template mapped over that source, the ones that reuse its read included.
     """
     pipeline.reset_expansions()
     result = Expansion(expanded={}, not_expanded={}, listings={})
     keys_by_source = dict[types.ArtifactIdentity, list[tuple[str, str]] | str]()
+    # The record of each source's listing that is neither committed, cached nor fetched
+    missing_by_source = dict[types.ArtifactIdentity, types.DirHash]()
     for name in pipeline.list_templates():
         template = pipeline.get_template(name)
         source = template["source"]
@@ -184,11 +187,13 @@ def expand_current(
                         keys = refusal_reason(source, error)
                 else:
                     if record is not None:
-                        result["listings"][name] = record
+                        missing_by_source[source] = record
                     keys = refusal_reason(source, e)
             except (exceptions.CorruptListingError, exceptions.PipelineConfigError) as e:
                 keys = refusal_reason(source, e)
             keys_by_source[source] = keys
+        if source in missing_by_source:
+            result["listings"][name] = missing_by_source[source]
         if isinstance(keys, str):
             result["not_expanded"][name] = keys
             continue

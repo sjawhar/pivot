@@ -40,6 +40,10 @@ def _stage_build(cut: dict[str, int]) -> dict[str, int]:
     return {"built": cut["cut"] + 1000}
 
 
+def _stage_twin(entry: dict[str, int]) -> dict[str, int]:
+    return {"twin": entry["value"]}
+
+
 class _Fields(TypedDict):
     _stage_y: dict[str, int]
 
@@ -188,6 +192,40 @@ def test_a_listing_neither_committed_nor_cached_is_named_for_pull_to_fetch(
     assert result["not_expanded"]["p/_stage_build"] == (
         "mapped over the instances of 'p/_stage_cut', which is not expanded"
     )
+
+
+def test_every_template_over_a_missing_listing_names_it_for_pull_to_fetch(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two templates mapped over one producer's files both name its missing listing, the one
+    that reads it and the one that reuses that read, so a pull of either fetches it."""
+    root = set_project_root
+    monkeypatch.chdir(root)
+    _write_plan(root, {"a": 1, "b": 2})
+
+    def twin_pipeline() -> compose.Pipeline:
+        with compose.Pipeline("p", root=root) as pipeline:
+            plan = compose.stage(_stage_plan)(pipeline.input("plan.yaml", t=dict[str, int]))
+            compose.stage(_stage_cut)(pipeline.map(plan), params=_CutParams())
+            compose.stage(_stage_twin)(pipeline.map(plan))
+        return pipeline
+
+    executor.run(pipeline=twin_pipeline())
+    pipeline = twin_pipeline()
+    monkeypatch.setattr(remote_config, "list_remotes", lambda: {"origin": "s3://bucket/cache"})
+    producer = pipeline.get_stage("p/_stage_plan")
+    record = expansion.recorded_directory(
+        producer["outs"][0].identity,
+        expansion.stage_lock(producer, config.locate_state_dir()).read(),
+    )
+    assert record is not None
+    _empty_cache(root)
+    for listing in (root / ".pivot" / "stages" / "p").glob("_stage_plan=*.listing"):
+        listing.unlink()
+
+    result, _ = status.expand_current(pipeline)
+
+    assert result["listings"] == {"p/_stage_cut": record, "p/_stage_twin": record}
 
 
 def test_a_missing_listing_names_the_run_that_writes_it_again(

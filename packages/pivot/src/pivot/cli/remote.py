@@ -18,6 +18,7 @@ from pivot.storage import state, track
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from pivot.expansion import Expansion
     from pivot.registry import MapTemplate, PipelineLike
     from pivot.remote import protocol
     from pivot.storage import listing
@@ -62,12 +63,12 @@ def _get_targets_list(targets: tuple[str, ...]) -> list[str] | None:
 _OPEN_KEY = "\x00"
 
 
-def _instance_output_template(target: str, pipeline: PipelineLike) -> str | None:
-    """The mapped stage (``Pipeline.map``) whose instance writes output path ``target``, from
-    the working directory, or a file inside it when the output is a directory:
-    ``data/p/cut@a.yaml`` is written by ``p/cut@a``, so it names ``p/cut``. None for any other
-    path. The instances need not be expanded: the path is matched against where each output of
-    the mapped stage is placed (``store.relative_output_path``), the key left open."""
+def _instance_output(target: str, pipeline: PipelineLike) -> str | None:
+    """The instance of a mapped stage (``Pipeline.map``) that writes output path ``target``,
+    from the working directory, or a file inside it when the output is a directory:
+    ``data/p/cut@a.yaml`` is written by ``p/cut@a``. None for any other path. The instances
+    need not be expanded: the path is matched against where each output of the mapped stage is
+    placed (``store.relative_output_path``), the key left open, so the key need not exist."""
     from pivot import registry
     from pivot.storage import store as store_mod
 
@@ -99,24 +100,45 @@ def _instance_output_template(target: str, pipeline: PipelineLike) -> str | None
                 key = segment.removesuffix(tail)
                 matched = not slash and segment.endswith(tail)
             if matched and key and registry.template_of(f"{name}@{key}", [name]) == name:
-                return name
+                return f"{name}@{key}"
     return None
 
 
-def _needed_templates(targets: tuple[str, ...], pipeline: PipelineLike) -> list[str]:
-    """The mapped stages (``Pipeline.map``) ``targets`` need expanded: each one they name, by
-    itself or by an instance (``cli_helpers.template_target``) or by an output path an instance
-    writes (``_instance_output_template``), and each one those are mapped over
-    (``cli_helpers.templates_and_upstream``)."""
+def _mapped_targets(
+    targets: tuple[str, ...], pipeline: PipelineLike
+) -> dict[str, tuple[str, str | None]]:
+    """Each target that names a mapped stage (``Pipeline.map``), by the mapped stage's name, an
+    instance's (``cli_helpers.mapped_name``) or an output path an instance writes
+    (``_instance_output``): the mapped stage, and the instance named (None for the mapped
+    stage itself)."""
+    from pivot import registry
+
     templates = pipeline.list_templates()
-    named = list[str]()
+    mapped = dict[str, tuple[str, str | None]]()
     for target in targets:
-        name = cli_helpers.template_target(target, templates) or _instance_output_template(
-            target, pipeline
-        )
-        if name is not None:
-            named.append(name)
-    return cli_helpers.templates_and_upstream(named, pipeline)
+        name = cli_helpers.mapped_name(target, templates) or _instance_output(target, pipeline)
+        if name in templates:
+            mapped[target] = (name, None)
+        elif name is not None and (template := registry.template_of(name, templates)):
+            mapped[target] = (template, name)
+    return mapped
+
+
+def _refuse_mapped_targets(mapped: dict[str, tuple[str, str | None]], result: Expansion) -> None:
+    """Refuse each target of ``mapped`` (``_mapped_targets``) whose mapped stage did not
+    expand, saying why, and each one naming an instance the expansion did not add.
+
+    Raises:
+        click.ClickException: Naming each such target.
+    """
+    refusals = dict[str, None]()
+    for target, (template, instance) in mapped.items():
+        if template in result["not_expanded"]:
+            refusals[f"'{template}' is not yet expanded: {result['not_expanded'][template]}"] = None
+        elif instance is not None and instance not in result["expanded"][template]:
+            refusals[f"'{target}': mapped stage '{template}' has no instance '{instance}'"] = None
+    if refusals:
+        raise click.ClickException("; ".join(refusals))
 
 
 def _expand_mapped_targets(
@@ -129,40 +151,46 @@ def _expand_mapped_targets(
     instances, its producer current (``cli_helpers.expand_mapped_stages``). Without targets
     nothing is expanded: every cached object, or every remote one, is transferred.
 
-    ``fetch_listings`` gets the listings this clone lacks of the directories that the mapped
-    stages the targets need are mapped over (``_needed_templates``), and no other: a fetch or
+    ``fetch_listings`` gets the listings this clone lacks of the directories that the targets'
+    mapped stages are mapped over: the mapped stages the targets name (``_mapped_targets``) and
+    those these are mapped over (``cli_helpers.templates_and_upstream``), no other. A fetch or
     pull downloads them into the cache, a dry run reads them into a temporary directory. Then
     the mapped stages expand again. Returns the targets and the hashes downloaded, which the
     transfer that follows counts (``transfer.pull``'s ``prefetched``).
 
     Raises:
-        click.ClickException: A target names a mapped stage that is not expanded, saying why,
-            or one whose listing could not be fetched, naming the listing.
+        click.ClickException: A target names a mapped stage that is not expanded, saying why;
+            one whose listing could not be fetched, naming the listing; or an instance the
+            expansion does not add.
     """
     if not targets or pipeline is None:
         return targets, frozenset()
     result, _ = cli_helpers.expand_mapped_stages()
-    needed = _needed_templates(targets, pipeline)
+    mapped = _mapped_targets(targets, pipeline)
+    needed = cli_helpers.templates_and_upstream(
+        dict.fromkeys(template for template, _ in mapped.values()), pipeline
+    )
     records = {
         result["listings"][name]["hash"]: result["listings"][name]
         for name in needed
         if name in result["listings"]
     }
-    if not records or fetch_listings is None:
-        return cli_helpers.require_expanded_targets(targets, result), frozenset()
-    fetched, downloaded, errors = fetch_listings(records)
-    result, _ = cli_helpers.expand_mapped_stages(fetched=fetched)
-    unfetched = sorted(name for name in needed if name in result["listings"])
-    if unfetched:
-        cli_helpers.print_transfer_errors(errors)
-        raise click.ClickException(
-            "; ".join(
-                f"'{name}' cannot expand: the listing of "
-                + f"'{types.identity_key(pipeline.get_template(name)['source'])}' "
-                + f"({result['listings'][name]['hash']}) could not be fetched from the remote"
-                for name in unfetched
+    downloaded = frozenset[str]()
+    if records and fetch_listings is not None:
+        fetched, downloaded, errors = fetch_listings(records)
+        result, _ = cli_helpers.expand_mapped_stages(fetched=fetched)
+        unfetched = sorted(name for name in needed if name in result["listings"])
+        if unfetched:
+            cli_helpers.print_transfer_errors(errors)
+            raise click.ClickException(
+                "; ".join(
+                    f"'{name}' cannot expand: the listing of "
+                    + f"'{types.identity_key(pipeline.get_template(name)['source'])}' "
+                    + f"({result['listings'][name]['hash']}) could not be fetched from the remote"
+                    for name in unfetched
+                )
             )
-        )
+    _refuse_mapped_targets(mapped, result)
     return cli_helpers.require_expanded_targets(targets, result), downloaded
 
 

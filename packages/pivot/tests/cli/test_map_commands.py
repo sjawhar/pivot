@@ -67,6 +67,36 @@ with Pipeline("p") as pipeline:
 """
 )
 
+# The mapped pipeline with a second mapped stage over p/plan's files, p/pair (declared after
+# p/cut, two outputs), and p/explode mapped over p/pair's instances (a directory output)
+_PIPELINE_WITH_PAIR = (
+    _PIPELINE.split('with Pipeline("p")')[0].replace(
+        "from typing import Annotated", "from typing import Annotated, TypedDict"
+    )
+    + """class Pair(TypedDict):
+    left: dict[str, int]
+    right: dict[str, int]
+
+
+@stage
+def pair(entry: dict[str, int]) -> Pair:
+    return {"left": {"left": entry["value"]}, "right": {"right": entry["value"] + 1}}
+
+
+@stage
+def explode(
+    left: dict[str, int],
+) -> Annotated[dict[str, dict[str, int]], directory, loaders.YAML[dict[str, int]]()]:
+    return {f"{name}.yaml": {"value": value} for name, value in left.items()}
+
+
+with Pipeline("p") as pipeline:
+    planned = plan(pipeline.input("plan.yaml", t=dict[str, int]))
+    build(cut(pipeline.map(planned)))
+    explode(pair(pipeline.map(planned))["left"])
+"""
+)
+
 _INSTANCES = ["p/cut@a", "p/cut@b", "p/cut@c"]
 _CHAINS = sorted([*_INSTANCES, "p/build@a", "p/build@b", "p/build@c"])
 
@@ -688,6 +718,111 @@ def test_a_dry_run_reads_a_committed_listing_without_caching_it(
     _ok(helpers.run_pivot(clone, home, *args, extra_env=env))
 
     assert _cache_bytes(clone) == before
+
+
+@pytest.mark.usefixtures("moto_services")
+@pytest.mark.parametrize("dry_run", [False, True], ids=["pull", "dry-run"])
+@pytest.mark.parametrize(
+    ("target", "count", "restored", "content"),
+    [
+        ("p/pair@a", 3, "pair@a/left.yaml", {"left": 1}),
+        ("p/pair", 5, "pair@b/right.yaml", {"right": 3}),
+        # p/plan's listing and left.yaml; p/explode@a's own listing is committed, so the pull
+        # stores it from that file rather than fetching it
+        ("p/explode@a", 2, "explode@a/left.yaml", {"value": 1}),
+        ("data/p/pair@a/left.yaml", 2, "pair@a/left.yaml", {"left": 1}),
+        ("data/p/explode@a", 2, "explode@a/left.yaml", {"value": 1}),
+    ],
+)
+def test_pull_of_a_second_mapped_stage_over_one_producer_fetches_the_listing(
+    tmp_path: pathlib.Path,
+    moto_services: dict[str, str],
+    dry_run: bool,
+    target: str,
+    count: int,
+    restored: str,
+    content: dict[str, int],
+) -> None:
+    """p/pair is mapped over p/plan's files after p/cut, and p/explode over p/pair's instances.
+    In a clone without p/plan's committed listing, a pull of either, by stage, instance or
+    output path, fetches that listing first, then the target's outputs; its dry run counts the
+    same files and restores nothing."""
+    root, home = _project(tmp_path, {"a": 1, "b": 2})
+    (root / "pipeline.py").write_text(_PIPELINE_WITH_PAIR)
+    env = _s3_remote(root, home, moto_services["s3"])
+    _ok(helpers.run_pivot(root, home, "repro", extra_env=env))
+    _ok(helpers.run_pivot(root, home, "push", extra_env=env))
+    clone = _clone(root, home, tmp_path / "clone")
+    for listing in (clone / ".pivot" / "stages" / "p").glob("plan=*.listing"):
+        listing.unlink()  # as if the listing was never committed
+    args = ("pull", "--dry-run", target) if dry_run else ("pull", target)
+
+    out = _ok(helpers.run_pivot(clone, home, *args, extra_env=env))
+
+    output = clone / "data" / "p" / restored
+    if dry_run:
+        assert f"Would pull {count} file(s)" in out, out
+        assert not output.exists(), out
+    else:
+        assert f"{count} transferred" in out, out
+        assert yaml.safe_load(output.read_text()) == content, out
+
+
+def _clone_without_listing(
+    tmp_path: pathlib.Path, endpoint: str
+) -> tuple[pathlib.Path, pathlib.Path, dict[str, str]]:
+    """A clone of the run, pushed mapped project (keys a and b) without p/plan's committed
+    listing; returns the clone, the HOME and the env that reaches the remote."""
+    root, home = _project(tmp_path, {"a": 1, "b": 2})
+    env = _s3_remote(root, home, endpoint)
+    _ok(helpers.run_pivot(root, home, "repro", extra_env=env))
+    _ok(helpers.run_pivot(root, home, "push", extra_env=env))
+    clone = _clone(root, home, tmp_path / "clone")
+    for listing in (clone / ".pivot" / "stages" / "p").glob("plan=*.listing"):
+        listing.unlink()  # as if the listing was never committed
+    return clone, home, env
+
+
+@pytest.mark.usefixtures("moto_services")
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("pull", "p/cut@zz"),
+        ("pull", "data/p/cut@zz.yaml"),
+        ("pull", "--dry-run", "p/cut@zz"),
+        ("fetch", "data/p/cut@zz.yaml"),
+    ],
+)
+def test_a_key_the_mapped_stage_lacks_is_refused_naming_the_instance(
+    tmp_path: pathlib.Path, moto_services: dict[str, str], args: tuple[str, ...]
+) -> None:
+    """p/cut has keys a and b. A target naming key zz, by instance name or output path, reads
+    the listing it expands from, then fails saying p/cut has no such instance, and transfers
+    nothing."""
+    clone, home, env = _clone_without_listing(tmp_path, moto_services["s3"])
+
+    proc = helpers.run_pivot(clone, home, *args, extra_env=env)
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "mapped stage 'p/cut' has no instance 'p/cut@zz'" in out, out
+    assert "transferred" not in out and "Would" not in out, out
+
+
+@pytest.mark.usefixtures("moto_services")
+@pytest.mark.parametrize("target", ["data/p/cut@a.yaml", "p/cut@a"])
+def test_push_of_an_instance_without_its_listing_names_the_listing(
+    tmp_path: pathlib.Path, moto_services: dict[str, str], target: str
+) -> None:
+    """Push fetches nothing, so without p/plan's committed listing or its cache object p/cut
+    cannot expand: a push of an instance, by name or output path, fails naming that listing."""
+    clone, home, env = _clone_without_listing(tmp_path, moto_services["s3"])
+
+    proc = helpers.run_pivot(clone, home, "push", target, extra_env=env)
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode == 1, out
+    assert "'p/cut' is not yet expanded: the listing of 'p/plan' is missing" in out, out
 
 
 def test_a_mapped_stage_or_an_instance_is_refused_by_pivot_run(tmp_path: pathlib.Path) -> None:

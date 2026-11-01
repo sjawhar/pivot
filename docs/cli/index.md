@@ -816,7 +816,7 @@ pivot push [TARGETS...] [OPTIONS]
 
 **Arguments:**
 
-- `TARGETS` - Stage names or file paths to push (optional, pushes all if not specified). A target sends what `pivot pull` of the same target fetches: the stage's outputs and the objects its lock lists under `reads`, or the file's or tracked path's objects. A mapped stage's instance also sends the producer listing a clone needs to expand it. A target that is not a stage, stage output or tracked path fails, naming it.
+- `TARGETS` - Stage names or file paths to push (optional, pushes all if not specified). A target sends what `pivot pull` of the same target fetches: the stage's outputs and the objects its lock lists under `reads`, or the file's or tracked path's objects. A mapped stage's instance also sends the producer listing a clone needs to expand it. Push fetches nothing, so a mapped stage whose producer listing is neither committed nor cached cannot expand, and a push of it or of an instance, by name or output path, fails saying so. A target that is not a stage, stage output or tracked path fails, naming it.
 
 A file the remote lacks and the local cache does not hold fails the push (exit 1), naming its hash.
 
@@ -841,7 +841,7 @@ pivot pull [TARGETS...] [OPTIONS]
 
 **Arguments:**
 
-- `TARGETS` - Stage names or file paths to pull (optional, pulls all if not specified). A target fetches what `pivot checkout` of it restores, and for a stage the objects its lock lists under `reads`; not the outputs of the stages upstream of it or its tracked inputs, so a later `pivot repro` recomputes those stages or stops naming a missing tracked input unless they are pulled too. A mapped stage's instance, named by its stage name or by an output path it writes (`data/p/cut@a.yaml`), fetches the producer listing it needs to expand; no listing of a mapped stage the targets do not need is fetched, and a needed one the remote lacks fails the pull, naming it. The summary counts every file the pull downloaded. A target that is not a stage, stage output or tracked path fails, naming it.
+- `TARGETS` - Stage names or file paths to pull (optional, pulls all if not specified). A target fetches what `pivot checkout` of it restores, and for a stage the objects its lock lists under `reads`; not the outputs of the stages upstream of it or its tracked inputs, so a later `pivot repro` recomputes those stages or stops naming a missing tracked input unless they are pulled too. A mapped stage's instance, named by its stage name or by an output path it writes (`data/p/cut@a.yaml`), fetches the producer listing it needs to expand; no listing of a mapped stage the targets do not need is fetched, and a needed one the remote lacks fails the pull, naming it. An instance whose key the listing lacks (`p/cut@zz`) fails, naming the instance, and nothing is transferred. The summary counts every file the pull downloaded. A target that is not a stage, stage output or tracked path fails, naming it.
 
 **Options:**
 
