@@ -3373,6 +3373,32 @@ _DEFAULTS_FROM_ELSEWHERE = {
         ("VALUE = 1", "VALUE = 2"),
         ("1", "2"),
     ),
+    "slots-callback": (
+        'VALUE = "A"\n\n\nclass Callback:\n    __slots__ = ("callback",)\n\n'
+        "    def __init__(self, callback) -> None:\n        self.callback = callback\n\n"
+        "    def read(self) -> str:\n        return self.callback()\n",
+        {"DEFAULT": "settings.Callback(lambda: settings.VALUE)", "VIEW": ".read()"},
+        ('VALUE = "A"', 'VALUE = "B"'),
+        ("A", "B"),
+    ),
+    "hex-bytes": (
+        'DATA = b"0xabcdef"\n',
+        {"DEFAULT": "settings.DATA", "VIEW": ".decode()"},
+        ('b"0xabcdef"', 'b"0x123456"'),
+        ("0xabcdef", "0x123456"),
+    ),
+    "hex-path": (
+        'import pathlib\n\nPATH = pathlib.PurePosixPath("cache/0xabcdef")\n',
+        {"DEFAULT": "settings.PATH", "VIEW": ""},
+        ('"cache/0xabcdef"', '"cache/0x123456"'),
+        ("cache/0xabcdef", "cache/0x123456"),
+    ),
+    "exception-attribute": (
+        'ERROR = ValueError("bad")\nERROR.code = "A"\n',
+        {"DEFAULT": "settings.ERROR", "VIEW": ".code"},
+        ('ERROR.code = "A"', 'ERROR.code = "B"'),
+        ("A", "B"),
+    ),
 }
 
 
@@ -3413,6 +3439,169 @@ def test_an_edit_to_a_class_default_taken_from_another_module_reruns_its_stages(
     for name in ("named", "captured"):
         assert (project / "data" / "t" / f"{name}.txt").read_text() == f"{line}{after}"
     assert _repro_statuses(project, home, seed="2") == dict.fromkeys(stages, "cached")
+
+
+_TYPE_SUBCLASS_DEFAULTS = """\
+import dataclasses
+from typing import Any
+
+import settings
+
+
+@dataclasses.dataclass(frozen=True)
+class Base:
+    marker: Any = settings.LABEL
+
+
+Derived = type("Derived", (Base,), {})
+"""
+
+_TYPE_SUBCLASS_PIPELINE = """\
+import functools
+from typing import Any
+
+from pivot import Pipeline, stage
+
+import defaults
+
+
+def _fresh(value: Any, text: str) -> str:
+    return text.splitlines()[0] + str(type(value)().marker)
+
+
+CAPTURED = functools.partial(_fresh, defaults.Derived("explicit"))
+
+
+@stage
+def captured(text: str) -> str:
+    return CAPTURED(text)
+
+
+@stage
+def named(text: str) -> str:
+    return text.splitlines()[0] + str(defaults.Derived().marker)
+
+
+with Pipeline("t") as pipeline:
+    captured(pipeline.input("lines.txt", t=str))
+    named(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_an_edit_to_the_default_a_dataclass_subclass_without_a_statement_takes_reruns(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`defaults.Derived`, made by `type()` with an empty namespace, takes the `marker` default
+    of its dataclass base, which comes from `settings.LABEL`. The walk of `Derived` resolves its
+    defaults over its MRO, so an edit to `settings.py` alone reruns the stage that names
+    `Derived` and the one that captures an instance of it, with the new output."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'LABEL = "A"\n',
+            "defaults.py": _TYPE_SUBCLASS_DEFAULTS,
+            "pipeline.py": _TYPE_SUBCLASS_PIPELINE,
+        },
+    )
+    line = "Local Set Default Proof Using"
+    stages = ("t/named", "t/captured")
+
+    assert _repro_statuses(project, home) == dict.fromkeys(stages, "ran")
+    assert _repro_statuses(project, home) == dict.fromkeys(stages, "cached")
+    _edit(project, "settings.py", '"A"', '"B"')
+
+    assert _repro_statuses(project, home) == dict.fromkeys(stages, "ran"), "The edit should rerun"
+    for name in ("named", "captured"):
+        assert (project / "data" / "t" / f"{name}.txt").read_text() == f"{line}B"
+    assert _repro_statuses(project, home) == dict.fromkeys(stages, "cached")
+
+
+_RANDOM_READER_DEFAULT = """\
+import dataclasses
+import pathlib
+import random
+from typing import Any
+
+from pivot import loaders
+
+
+@dataclasses.dataclass(frozen=True)
+class RandomReader(loaders.Reader[str]):
+    rng: Any
+
+    def load(self, path: pathlib.Path) -> str:
+        return str(self.rng.random())
+
+
+@dataclasses.dataclass(frozen=True)
+class Box:
+    reader: Any = RandomReader(random.Random(1))
+"""
+
+_RANDOM_READER_PIPELINE = """\
+from pivot import Pipeline, stage
+
+import defaults
+
+
+@stage
+def use(text: str) -> str:
+    return text.splitlines()[0] + defaults.Box().reader.load(None)
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_a_loader_in_a_default_whose_config_holds_unreadable_state_is_refused(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`defaults.Box`'s default is a reader whose config holds a `random.Random`. A run records
+    the field's read first, which keeps the loader's form for the stage; the kept form still
+    reports the generator's state, so the stage is refused, naming the field, and writes no
+    output."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {"defaults.py": _RANDOM_READER_DEFAULT, "pipeline.py": _RANDOM_READER_PIPELINE},
+    )
+
+    result = helpers.run_pivot(project, home, "repro", "--json")
+    message = " ".join((result.stdout + result.stderr).split())
+    assert result.returncode != 0, f"The stage should be refused: {message}"
+    assert "the default of field 'defaults.Box.reader' keeps state pivot cannot read" in message
+    assert not (project / "data" / "t" / "use.txt").exists()
+
+
+def test_swapping_later_instances_of_two_factory_classes_in_one_list_reruns_its_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A partial holds `[First(), Second(), First(), Second()]`, two classes one factory made.
+    Swapping the last two leaves each class's first instance where it was; each class's walk
+    is keyed by every position of its instances, so the swap reruns the stage with the new
+    output."""
+    home = tmp_path / "home"
+    pipeline = (
+        _TWO_HOLDERS_HEADER
+        + "def _take_all(things: Any, text: str) -> str:\n"
+        + '    return text.splitlines()[0] + "".join(thing.suffix() for thing in things)\n\n\n'
+        + "MANY = functools.partial(_take_all, [First(), Second(), First(), Second()])\n\n\n"
+        + "@stage\ndef use(text: str) -> str:\n    return MANY(text)\n\n\n"
+        + 'with Pipeline("t") as pipeline:\n    use(pipeline.input("lines.txt", t=str))\n'
+    )
+    project = _project(tmp_path, {"factory.py": _FACTORY_MODULE, "pipeline.py": pipeline})
+    output = project / "data" / "t" / "use.txt"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingAZAZ"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "pipeline.py", "First(), Second()])", "Second(), First()])")
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The swap should rerun"
+    assert output.read_text() == "Local Set Default Proof UsingAZZA"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
 
 
 _CONFIG_HELD = """\

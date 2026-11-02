@@ -3550,6 +3550,186 @@ def test_an_edit_beside_a_value_no_form_shows_changes_the_hash(
     assert first != edited, "An edit to a shown entry should change the hash"
 
 
+_CALLBACK_VALUE = "A"
+
+
+class _Callback:
+    """A `__slots__` object that holds a callback its caller gives it."""
+
+    __slots__: tuple[str, ...] = ("callback",)
+
+    def __init__(self, callback: typing.Callable[[], str]) -> None:
+        self.callback: typing.Callable[[], str] = callback
+
+    def read(self) -> str:
+        return self.callback()
+
+
+@dataclasses.dataclass(frozen=True)
+class _WithCallbackDefault:
+    value: typing.Any = _Callback(lambda: _CALLBACK_VALUE)
+
+    def fresh(self) -> str:
+        return type(self)().value.read()
+
+
+def _names_a_callback_default() -> str:
+    return _WithCallbackDefault().value.read()
+
+
+def _fresh(thing: typing.Any) -> str:
+    return thing.fresh()
+
+
+_HOLDS_A_CALLBACK_HOLDER = functools.partial(_fresh, _WithCallbackDefault(None))
+
+
+def _captures_a_callback_holder() -> str:
+    return _HOLDS_A_CALLBACK_HOLDER()
+
+
+@pytest.mark.parametrize("stage", [_names_a_callback_default, _captures_a_callback_holder])
+def test_a_callback_in_an_instances_state_is_walked_with_the_globals_it_reads(
+    stage: typing.Callable[[], str],
+):
+    """A `__slots__` object in a dataclass's class-level default holds a lambda that reads
+    `_CALLBACK_VALUE`. For a stage that names the class, and for one that captures an instance
+    overriding the default, the lambda gets a stage helper's walk, so the global is in the
+    manifest, under `held:`."""
+    manifest = fingerprint.get_stage_fingerprint(stage)
+
+    key = f"const:{__name__}._CALLBACK_VALUE"
+    assert any(fingerprint._held_entry(entry) == key for entry in manifest), manifest
+
+
+def test_bytes_and_a_path_with_hex_text_are_hashed_by_value():
+    """Hex text in a value's own repr is its data: `b"0xabcdef"` and
+    `PurePosixPath("cache/0xabcdef")` defaults are hashed by value, not refused."""
+    for value, other in (
+        (b"0xabcdef", b"0x123456"),
+        (pathlib.PurePosixPath("cache/0xabcdef"), pathlib.PurePosixPath("cache/0x123456")),
+    ):
+        text, _held, opaque = fingerprint._dataclass_default_text(value)
+        assert not opaque, text
+        assert text != fingerprint._dataclass_default_text(other)[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class _RandomReader(loaders.Reader[float]):
+    rng: typing.Any
+
+    def load(self, path: pathlib.Path) -> float:
+        return self.rng.random()
+
+
+@dataclasses.dataclass(frozen=True)
+class _WithRandomReaderDefault:
+    reader: typing.Any = _RandomReader(random.Random(1))
+
+
+def _reads_a_random_reader_default() -> float:
+    return _WithRandomReaderDefault().reader.load(pathlib.Path("."))
+
+
+@pytest.mark.parametrize("recording", [False, True], ids=["walk", "recording"])
+def test_a_loader_in_a_default_whose_config_holds_unreadable_state_is_refused(recording: bool):
+    """A dataclass default is a reader whose config holds a `random.Random`. The stage is
+    refused whether or not the walk records its reads: recording first computes the field's
+    token, which keeps the loader's form, and the kept form still reports its state."""
+    with (
+        pytest.raises(exceptions.StageDefinitionError, match="_WithRandomReaderDefault.reader"),
+        fingerprint.stage_fingerprint_scope("t/use"),
+    ):
+        if recording:
+            _recording(_reads_a_random_reader_default)
+        else:
+            fingerprint.get_stage_fingerprint(_reads_a_random_reader_default)
+
+
+def _ordered_stage(order: str) -> typing.Callable[[str], str]:
+    """A stage whose partial holds instances of two classes one factory made, in `order`."""
+    made = {label: _make_captured(label) for label in "AB"}
+    holds = functools.partial(_tag_all, [made[label]() for label in order])
+
+    def stage(text: str) -> str:
+        return holds(text)
+
+    return stage
+
+
+def _tag_all(things: list[typing.Any], text: str) -> str:
+    return text + "".join(thing.suffix() for thing in things)
+
+
+def test_an_exception_default_is_hashed_by_its_args_and_attributes():
+    """A `ValueError` default is hashed by its type, its `args` and its `__dict__`: an edit to
+    an attribute set on it changes the text, and it is not refused."""
+    first, second = ValueError("bad"), ValueError("bad")
+    first.code = 1  # pyright: ignore[reportAttributeAccessIssue] - an extra attribute is the case
+    second.code = 2  # pyright: ignore[reportAttributeAccessIssue] - an extra attribute is the case
+
+    texts = [fingerprint._dataclass_default_text(value) for value in (first, second)]
+
+    assert not any(opaque for _text, _held, opaque in texts), texts
+    assert texts[0][0] != texts[1][0]
+
+
+@dataclasses.dataclass(frozen=True)
+class _LabelBase:
+    label: str = "A"
+
+
+# A class with no statement whose base is a dataclass: `_LabelSub()` takes the base's defaults.
+_LabelSub = type("_LabelSub", (_LabelBase,), {})
+_HOLDS_A_LABEL_SUB = functools.partial(str, _LabelSub())
+
+
+def _names_a_label_sub() -> str:
+    return _LabelSub().label
+
+
+def _captures_a_label_sub() -> str:
+    return _HOLDS_A_LABEL_SUB()
+
+
+@pytest.mark.parametrize("stage", [_names_a_label_sub, _captures_a_label_sub])
+def test_a_dataclass_subclass_without_a_statement_walks_its_bases_defaults(
+    stage: typing.Callable[[], str],
+):
+    """`_LabelSub`, made by `type()`, is walked for the members its MRO resolves, and its
+    dataclass defaults are resolved so too: the base's `label` default is tracked, named or
+    captured, and its read replays."""
+    manifest = fingerprint.get_stage_fingerprint(stage)
+    reads = [[list(path), token] for path, token in _recording(stage)]
+
+    key = f"default:{fingerprint._definition_ref(_LabelBase)}.label"
+    assert any(fingerprint._held_entry(entry) == key for entry in manifest), manifest
+    assert fingerprint._recorded_reads_hold(stage, typing.cast("list[object]", reads))
+
+
+def test_a_single_entry_dict_or_set_ranks_its_entry_first():
+    """A dict or set with one entry skips the sort, and its entry still gets the rank a sort
+    gives the first one, so a held value's position is the one a longer container gives its
+    smallest entry."""
+    _texts, held = fingerprint._serialize_collecting(
+        [("one", {"k": _Captured()}), ("set", frozenset((_Captured(),)))]
+    )
+
+    paths = next(paths for cls, paths in held.instances.values() if cls is _Captured)
+    assert paths is not None
+    assert sorted(fingerprint._held_position(path) for path in paths) == ["one/d0/v", "set/s0"]
+
+
+def test_swapping_later_instances_of_two_classes_in_one_list_changes_the_manifest():
+    """`[A(), B(), A(), B()]` to `[A(), B(), B(), A()]`: the first instance of each class stays
+    at its position, but each class's walk is keyed by every position, so the manifest
+    changes."""
+    before = fingerprint.get_stage_fingerprint(_ordered_stage("ABAB"))
+    after = fingerprint.get_stage_fingerprint(_ordered_stage("ABBA"))
+
+    assert before != after
+
+
 def test_a_class_with_no_source_holding_a_value_no_form_reads_is_refused_and_not_kept():
     """A class `make_dataclass` made with a `random.Random` default: its hash would not show a
     change to the generator's state, so hashing it refuses, naming the class and the entry. The

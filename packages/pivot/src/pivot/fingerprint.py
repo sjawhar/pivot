@@ -276,13 +276,17 @@ class _LoaderForm:
     canonical: Any
     text: str
     classes: tuple[int, ...]
+    # Whether the form, made while `_hidden_state` was set, holds a value whose state no form
+    # reads (`_addressless_leaf`), which a use of the kept form reports again.
+    opaque: bool
 
 
 @dataclasses.dataclass(slots=True)
 class _HeldValues:
     """What a value `_serialize_collecting` serializes holds: each pivot loader
-    (`_canonical_loader`), and each user class whose instances it holds that is not a pivot
-    loader's, with their positions (`_note_held_instance`)."""
+    (`_canonical_loader`), each user class whose instances it holds that is not a pivot
+    loader's, with their positions (`_note_held_instance`), and each user function or method
+    met in an instance's state, with its positions (`_note_held_callable`)."""
 
     loaders: list[_HeldLoader] = dataclasses.field(default_factory=list[_HeldLoader])
     # Per type of a value met, by its id: the type (held so the id is not reused) and the
@@ -291,9 +295,18 @@ class _HeldValues:
     instances: dict[int, tuple[type, list[tuple[list[str], ...]] | None]] = dataclasses.field(
         default_factory=dict[int, tuple[type, list[tuple[list[str], ...]] | None]]
     )
+    # Per user function or method met in an instance's state, by its id: the callable and its
+    # positions.
+    callables: dict[int, tuple[Any, list[tuple[list[str], ...]]]] = dataclasses.field(
+        default_factory=dict[int, tuple[Any, list[tuple[list[str], ...]]]]
+    )
 
     def __bool__(self) -> bool:
-        return bool(self.loaders) or any(paths for _type, paths in self.instances.values())
+        return (
+            bool(self.loaders)
+            or bool(self.callables)
+            or any(paths for _type, paths in self.instances.values())
+        )
 
 
 # What `_canonicalize_value_for_hash` meets while it serializes a value whose held values are
@@ -301,6 +314,14 @@ class _HeldValues:
 # whose held values are its own fingerprint's.
 _held_values: contextvars.ContextVar[_HeldValues | None] = contextvars.ContextVar(
     "_held_values", default=None
+)
+
+# Whether the value being canonicalized is in an instance's state (`_canonical_state`) or a
+# dataclass's class-level default (`_dataclass_default_text`): a user function or method there
+# is noted for its holder's walk (`_note_held_callable`). One a partial's arguments or a
+# loader's config hold directly, or in a container, is walked by `_process_bound_values`.
+_held_in_state: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_held_in_state", default=False
 )
 
 # The position of the value being canonicalized inside the value `_serialize_collecting`
@@ -326,10 +347,11 @@ _form_cycle: contextvars.ContextVar[list[bool] | None] = contextvars.ContextVar(
 )
 
 # The canonical forms of the pivot loaders met while one stage, or one top-level
-# `get_loader_fingerprint` call, is fingerprinted, by the loader's id: a chain of held loaders is
-# canonicalized once, not once per level (`_loader_memos`).
-_form_memo: contextvars.ContextVar[dict[int, _LoaderForm] | None] = contextvars.ContextVar(
-    "_form_memo", default=None
+# `get_loader_fingerprint` call, is fingerprinted, by the loader's id and the form mode (whether
+# `_hidden_state` is set): a chain of held loaders is canonicalized once, not once per level
+# (`_loader_memos`).
+_form_memo: contextvars.ContextVar[dict[tuple[int, bool], _LoaderForm] | None] = (
+    contextvars.ContextVar("_form_memo", default=None)
 )
 
 # The entries a loader's class decides (`_loader_class_entries`), by the class's id, with the
@@ -1701,10 +1723,39 @@ def _process_user_methods(cls: type, manifest: dict[str, str], visited: set[int]
     _process_dataclass_defaults(cls, manifest, visited)
 
 
+def _tracked_dataclass_fields(
+    cls: type,
+) -> tuple[type, Mapping[str, "dataclasses.Field[Any]"], list[str]] | None:
+    """The dataclass fields whose defaults the walk of `cls` tracks: the class that declares
+    them, its fields, and their names in order. They are `cls`'s own, named by its
+    annotations; or, for a class without a class statement whose base is a dataclass
+    (`type("Sub", (Base,), {})`), every field of the nearest dataclass on its MRO, since no
+    statement names that base for a walk of its own (`_held_class_items`) and `Sub()` takes its
+    defaults. None when `cls` tracks none."""
+    namespace = _class_namespace(cls)
+    own = namespace.get("__dataclass_fields__")
+    if own is not None:
+        annotations = cast("Mapping[str, Any]", namespace.get("__annotations__", {}))
+        return cls, cast("Mapping[str, dataclasses.Field[Any]]", own), list(annotations)
+    if _has_class_statement(cls):
+        return None
+    for klass in _class_mro(cls)[1:]:
+        inherited = _class_namespace(klass).get("__dataclass_fields__")
+        if inherited is not None:
+            fields = cast("Mapping[str, dataclasses.Field[Any]]", inherited)
+            return klass, fields, list(fields)
+    return None
+
+
+def _tracked_dataclass_field(cls: type, name: str) -> "dataclasses.Field[Any] | None":
+    """The field `name` of `_tracked_dataclass_fields(cls)`, or None."""
+    tracked = _tracked_dataclass_fields(cls)
+    return None if tracked is None else tracked[1].get(name)
+
+
 def _dataclass_field_value(cls: type, name: str) -> Any:
     """Return one dataclass field's default or factory, or `_UNREAD` when absent."""
-    fields = cast("Mapping[str, dataclasses.Field[Any]]", vars(cls).get("__dataclass_fields__", {}))
-    field = fields.get(name)
+    field = _tracked_dataclass_field(cls, name)
     if field is None:
         return _UNREAD
     if field.default is not dataclasses.MISSING:
@@ -1716,8 +1767,7 @@ def _dataclass_field_value(cls: type, name: str) -> Any:
 
 def _dataclass_field_token(cls: type, name: str) -> str:
     """Return a stable token for a dataclass field's live default or factory."""
-    fields = cast("Mapping[str, dataclasses.Field[Any]]", vars(cls).get("__dataclass_fields__", {}))
-    field = fields.get(name)
+    field = _tracked_dataclass_field(cls, name)
     if field is None:
         return "absent"
     if field.default_factory is not dataclasses.MISSING:
@@ -1742,25 +1792,31 @@ def _dataclass_default_text(value: Any) -> tuple[str, "_HeldValues", bool]:
     values. A value whose state neither shows (a `random.Random`, whose state is in C; a value
     whose repr holds an address) is out of reach: the stage is refused
     (`_refuse_opaque_default`), since a change to it would go unseen. A default the instance
-    overrides is hashed so too: a member may build an instance that takes it (`type(self)()`)."""
+    overrides is hashed so too: a member may build an instance that takes it (`type(self)()`).
+    A user function or method in the default (a callback a `__slots__` object holds) is noted
+    for the walk it gets as a stage helper (`_held_in_state`), so the globals it reads count."""
     hidden = [False]
     token = _hidden_state.set(hidden)
     try:
-        (text,), held = _serialize_collecting([("default", value)])
+        (text,), held = _serialize_collecting([("default", value)], in_state=True)
     finally:
         _hidden_state.reset(token)
     return text, held, hidden[0]
 
 
 def _process_dataclass_defaults(cls: type, manifest: dict[str, str], visited: set[int]) -> None:
-    """Track each own dataclass field's live default (`_dataclass_default_text`) or factory."""
+    """Track each dataclass field's live default (`_dataclass_default_text`) or factory that
+    `_tracked_dataclass_fields` names: `cls`'s own, or a base's for a class with no
+    statement."""
     if not dataclasses.is_dataclass(cls):
         return
-    fields = cast("Mapping[str, dataclasses.Field[Any]]", vars(cls).get("__dataclass_fields__", {}))
-    annotations = cast("Mapping[str, Any]", vars(cls).get("__annotations__", {}))
-    class_ref = _definition_ref(cls)
+    tracked = _tracked_dataclass_fields(cls)
+    if tracked is None:
+        return
+    owner, fields, names = tracked
+    class_ref = _definition_ref(owner)
     stage_name = _current_stage_name.get() or cls.__qualname__
-    for name in annotations:
+    for name in names:
         field = fields.get(name)
         if field is None:
             continue
@@ -2458,16 +2514,18 @@ def _partial_parts(partial_obj: Any) -> list[tuple[str, Any]]:
 
 
 def _serialize_collecting(
-    parts: Sequence[tuple[str, Any]],
+    parts: Sequence[tuple[str, Any]], *, in_state: bool = False
 ) -> tuple[list[str], _HeldValues]:
     """Serialize each part (`_serialize_value_for_hash`), and collect what its canonical form
     meets, with its position: the part's name, then a step per container (`_held_path`). That is
-    each pivot loader (`_canonical_loader`) and each instance of another user class
-    (`_note_held_instance`). The serialization that records the value already visits them, so no
-    new traversal is made."""
+    each pivot loader (`_canonical_loader`), each instance of another user class
+    (`_note_held_instance`), and each user function or method in an instance's state, or
+    anywhere in the parts with `in_state` (a class-level default), (`_note_held_callable`). The
+    serialization that records the value already visits them, so no new traversal is made."""
     held = _HeldValues()
     texts = list[str]()
     held_token = _held_values.set(held)
+    state_token = _held_in_state.set(in_state)
     try:
         for name, value in parts:
             path_token = _held_path.set(([name],))
@@ -2476,6 +2534,7 @@ def _serialize_collecting(
             finally:
                 _held_path.reset(path_token)
     finally:
+        _held_in_state.reset(state_token)
         _held_values.reset(held_token)
     return texts, held
 
@@ -2492,13 +2551,14 @@ def _is_pivot_loader(value: Any) -> bool:
 
 def _is_pivot_loader_class(cls: type[Any]) -> bool:
     """Whether `cls` is a pivot loader class (`loaders.Reader` or `loaders.Writer`), decided by
-    identity along its real MRO (`_class_mro`), so no code of its metaclass runs."""
-    from pivot import loaders as loaders_module
-
-    return any(
-        klass is loaders_module.Reader or klass is loaders_module.Writer
-        for klass in _class_mro(cls)
-    )
+    identity along its real MRO (`_class_mro`), so no code of its metaclass runs. While
+    `pivot.loaders` is not imported no class can be one, so it is not imported here: that import
+    brings in pandas."""
+    loaders_module = sys.modules.get("pivot.loaders")
+    if loaders_module is None:
+        return False
+    reader, writer = loaders_module.Reader, loaders_module.Writer
+    return any(klass is reader or klass is writer for klass in _class_mro(cls))
 
 
 def _is_user_class(cls: type[Any]) -> bool:
@@ -2524,14 +2584,84 @@ def _note_held_instance(held: _HeldValues, value_type: type[Any]) -> None:
         known[1].append(_held_path.get())
 
 
+def _note_held_callable(held: _HeldValues, value: Any) -> None:
+    """Note `value`, when it is a user function or method met in an instance's state
+    (`_held_in_state`), at the position being serialized (`_held_path`): its holder then gives it
+    the walk a stage helper gets (`_held_callable_entries`), globals and refusals included."""
+    if inspect.ismethod(value):
+        function = value.__func__
+    elif inspect.isfunction(value):
+        function = value
+    else:
+        return
+    if not is_user_code(function):
+        return
+    known = held.callables.get(id(value))
+    if known is None:
+        known = (value, list[tuple[list[str], ...]]())
+        held.callables[id(value)] = known
+    known[1].append(_held_path.get())
+
+
 def _held_entries(held: _HeldValues, holder: str) -> dict[str, dict[str, str]]:
     """The manifests of what `held` holds, each keyed by a digest of its position in the value
     that holds it and of the manifest itself: each pivot loader's fingerprint
-    (`_held_loader_entries`) and each other user class's walk (`_held_class_entries`). `holder`
+    (`_held_loader_entries`), each other user class's walk (`_held_class_entries`), and the walk
+    of each user function or method in an instance's state (`_held_callable_entries`). `holder`
     names that value, for the refusals a class walk makes."""
     entries = _held_loader_entries(held.loaders)
     entries.update(_held_class_entries(held, holder))
+    entries.update(_held_callable_entries(held))
     return dict(sorted(entries.items()))
+
+
+def _held_callable_entries(held: _HeldValues) -> dict[str, dict[str, str]]:
+    """The walk of each user function or method `held` met in an instance's state
+    (`_walk_held_callable`), keyed by the digest of every position it is at and of the walk
+    (`_held_key`)."""
+    keyed = dict[str, dict[str, str]]()
+    with _loader_memos():
+        memo = _held_memo.get()
+        found = sorted(
+            (
+                (
+                    sorted(_held_position(path) for path in paths),
+                    _definition_ref(value.__func__ if inspect.ismethod(value) else value),
+                    value,
+                )
+                for value, paths in held.callables.values()
+            ),
+            key=lambda item: item[:2],
+        )
+        for positions, ref, value in found:
+            entries = _walk_held_callable(value, ref, memo)
+            keyed[_held_key("callable", "\0".join(positions), entries)] = entries
+    return keyed
+
+
+def _walk_held_callable(
+    value: Any,
+    ref: str,
+    memo: dict[tuple[str, tuple[int, ...]], tuple[Any, dict[str, str]]] | None,
+) -> dict[str, str]:
+    """The walk a callable bound in a partial gets (`_process_bound_values`): a function's
+    globals, closure values and defaults, with the non-scalar refusal, and a method bound to an
+    instance refused. Kept in the stage's `memo` unless it refused (`_refusals_seen`); no read
+    of its own is recorded: the holder's caller records one for all it holds (`_merge_held`)."""
+    key = ("callable", (id(value),))
+    cached = None if memo is None else memo.get(key)
+    if cached is not None:
+        return cached[1]
+    entries = dict[str, str]()
+    reads_token = _recorded_reads.set(None)
+    try:
+        with _refusals_seen() as refusals:
+            _process_bound_values(ref, value, entries, set[int]())
+    finally:
+        _recorded_reads.reset(reads_token)
+    if memo is not None and not refusals:
+        memo[key] = (value, entries)
+    return entries
 
 
 def _held_key(kind: str, position: str, entries: Mapping[str, str]) -> str:
@@ -2671,10 +2801,12 @@ def _has_class_statement(cls: type[Any]) -> bool:
 
 def _held_class_entries(held: _HeldValues, holder: str) -> dict[str, dict[str, str]]:
     """The walk of each user class whose instances `held` holds, and of each user class on their
-    MROs (`_held_class_items`, `_walk_held_class`), keyed by the digest of the first position, in
-    sorted order, of the instances that reach it in the value that holds them and of the walk
-    (`_held_key`), so the key follows no hash seed, a class with many instances adds one walk,
-    and two classes one factory made keep apart wherever they are held.
+    MROs (`_held_class_items`, `_walk_held_class`), keyed by the digest of every position of the
+    instances that reach it in the value that holds them, in sorted order, and of the walk
+    (`_held_key`). So the key follows no hash seed, a class with many instances adds one walk,
+    two classes one factory made keep apart wherever they are held, and swapping instances of
+    two such classes at any positions (`[A(), B(), A(), B()]` to `[A(), B(), B(), A()]`)
+    changes the keys.
 
     The classes are walked in the order of their first positions and definition names, which
     follows no hash seed. One being walked already (`_loader_stack`: a cycle) is left out, since
@@ -2687,23 +2819,26 @@ def _held_class_entries(held: _HeldValues, holder: str) -> dict[str, dict[str, s
         stack = _loader_stack.get()
         memo = _held_memo.get()
         # Per class to walk, by its id: the first position of the instances that reach it, the
-        # class of the instance there (for the refusals), and the class itself.
-        reached = dict[int, tuple[str, type[Any], type[Any]]]()
+        # class of the instance there (for the refusals), the class itself, and every position
+        # of the instances that reach it.
+        reached = dict[int, tuple[str, type[Any], type[Any], set[str]]]()
         for cls, paths in held.instances.values():
             if not paths:
                 continue
-            position = min(_held_position(path) for path in paths)
+            positions = {_held_position(path) for path in paths}
+            position = min(positions)
             for item in _held_class_items(cls):
                 known = reached.get(id(item))
-                if known is None or (position, _definition_ref(cls)) < (
-                    known[0],
-                    _definition_ref(known[1]),
-                ):
-                    reached[id(item)] = (position, cls, item)
+                if known is None:
+                    reached[id(item)] = (position, cls, item, set(positions))
+                    continue
+                known[3].update(positions)
+                if (position, _definition_ref(cls)) < (known[0], _definition_ref(known[1])):
+                    reached[id(item)] = (position, cls, item, known[3])
         firsts = sorted(
             (
-                (position, _definition_ref(item), item, instance)
-                for position, instance, item in reached.values()
+                (position, _definition_ref(item), item, instance, every)
+                for position, instance, item, every in reached.values()
                 if id(item) not in stack
             ),
             key=lambda first: first[:2],
@@ -2715,13 +2850,13 @@ def _held_class_entries(held: _HeldValues, holder: str) -> dict[str, dict[str, s
                 end += 1
             group = firsts[index:end]
             before = None if memo is None or len(group) == 1 else dict(memo)
-            for position, _ref, item, instance in group:
+            for position, _ref, item, instance, every in group:
                 reach = (
                     f"an instance of '{_definition_ref(instance)}' that {holder} holds at "
                     + f"position '{position}'"
                 )
                 entries = _walk_held_class(item, reach, memo, before)
-                keyed[_held_key("class", position, entries)] = entries
+                keyed[_held_key("class", "\0".join(sorted(every)), entries)] = entries
             index = end
     return keyed
 
@@ -3237,8 +3372,9 @@ def _refuse_opaque_default(binding_ref: str, value: Any, stage_name: str) -> Non
         + "Pivot hashes a class-level default by its value, its attributes and its slots; this "
         + "one keeps its state elsewhere (in C, or behind a memory address in its repr), so a "
         + "change to it would go unseen, which can cause silent wrong outputs.\n"
-        + "Fix: build it with a default_factory, or move this value into the stage's "
-        + "StageParams.\n"
+        + "Fix: for a field, build the value with dataclasses.field(default_factory=...); for a "
+        + "ClassVar, which takes no factory, create the value where a method uses it; or move "
+        + "the value into the stage's StageParams.\n"
         + "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
     )
     _report_unsafe_capture(message)
@@ -3293,6 +3429,10 @@ _class_module = cast("Callable[[type], object]", type.__dict__["__module__"].__g
 _class_qualname = cast("Callable[[type], str]", type.__dict__["__qualname__"].__get__)
 _class_name = cast("Callable[[type], str]", type.__dict__["__name__"].__get__)
 _class_bases = cast("Callable[[type], tuple[type, ...]]", type.__dict__["__bases__"].__get__)
+# `BaseException`'s own descriptor for an exception's `args`, read so no override of it runs.
+_exception_args = cast(
+    "Callable[[BaseException], tuple[Any, ...]]", BaseException.__dict__["args"].__get__
+)
 # `type`'s own descriptors for the sizes `_slot_state` compares, read so too (`__dictoffset__` is
 # `_class_dictoffset`, below).
 _class_basicsize = cast("Callable[[type], int]", type.__dict__["__basicsize__"].__get__)
@@ -4418,13 +4558,16 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         else:
             decision = None
         # An instance of a user class is noted for its holder (`_note_held_instance`); one the
-        # walk records by name, or refuses above a mark, is decided by the mark.
+        # walk records by name, or refuses above a mark, is decided by the mark. A user function
+        # or method met in an instance's state is noted too (`_note_held_callable`).
         if (
             decision is None
             and (held := _held_values.get()) is not None
             and not issubclass(value_type, type)
         ):
             _note_held_instance(held, value_type)
+            if _held_in_state.get():
+                _note_held_callable(held, value)
         # Main dumped every value with a `model_dump` (`hasattr`) that is not a class; so does
         # this walk, by one of the routes `_probe_own_attribute` picks (`_model_dump_route`). A
         # class is never dumped, whatever its metaclass reports. A real type whose route its MRO
@@ -4450,7 +4593,7 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
                 # is.
                 pass
             else:
-                return _canonicalize_value_for_hash(dump(), (*active, id(value)))
+                return _canonical_state(dump(), (*active, id(value)))
         elif route is not None:
             # `ASK` or `ASK_KEPT`: a value that may answer names it does not keep (its class
             # defines `__getattr__`, or it reports another class) is asked by attribute lookup,
@@ -4470,7 +4613,7 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
             if callable(dump):
                 dumped = dump()
                 if route is _ASK_KEPT or type(dumped) is dict:
-                    return _canonicalize_value_for_hash(dumped, (*active, id(value)))
+                    return _canonical_state(dumped, (*active, id(value)))
         if inspect.isfunction(value):
             return ["function", _function_identity(value, active)]
         if decision is _BY_NAME and not _carries_instance(value):
@@ -4500,15 +4643,22 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
             [_canonicalize_value_for_hash(key, inner), _canonicalize_value_for_hash(item, inner)]
             for key, item in mapping.items()
         ]
-        entries.sort(key=json.dumps)
+        if len(entries) > 1:
+            entries.sort(key=json.dumps)
         return ["dict", entries]
     if isinstance(value, (list, tuple, set, frozenset)):
         collection = cast("list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any]", value)
         inner = (*active, id(collection))
         unordered = isinstance(collection, (set, frozenset))
-        if _held_values.get() is not None:
+        if _SCALAR_TYPE_IDS.issuperset(map(id, map(type, collection))):
+            # Each item's form is the item itself, and no loader, instance or callable is in
+            # it to note: the same form without a call or a held-path step per item. Types are
+            # compared by their ids, plain ints, so no metaclass `__hash__` or `__eq__` runs.
+            items = list(collection)
+        elif _held_values.get() is not None:
             return [type(collection).__name__, _canonical_items_at(collection, inner, unordered)]
-        items = [_canonicalize_value_for_hash(item, inner) for item in collection]
+        else:
+            items = [_canonicalize_value_for_hash(item, inner) for item in collection]
         if unordered:
             items.sort(key=json.dumps)
         return [type(collection).__name__, items]
@@ -4523,7 +4673,7 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
         if _is_pivot_loader(value):
             return _canonical_loader(value, inner)
         fields = {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
-        return [_definition_ref(type(value)), _canonicalize_value_for_hash(fields, inner)]
+        return [_definition_ref(type(value)), _canonical_state(fields, inner)]
     if type(value).__repr__ is object.__repr__ and _has_attribute(value, "__dict__"):
         inner = (*active, id(value))
         attributes: Any = vars(value)
@@ -4541,14 +4691,30 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
             else:
                 return [
                     _definition_ref(type(value)),
-                    _canonicalize_value_for_hash(attributes, inner),
-                    _canonicalize_value_for_hash(slots, inner),
+                    _canonical_state(attributes, inner),
+                    _canonical_state(slots, inner),
                 ]
-        return [_definition_ref(type(value)), _canonicalize_value_for_hash(attributes, inner)]
+        return [_definition_ref(type(value)), _canonical_state(attributes, inner)]
     hidden = _hidden_state.get()
     if hidden is not None:
         return _addressless_leaf(value, value_type, (*active, id(value)), hidden)
     return [type(value).__name__, repr(value)]
+
+
+def _canonical_state(value: Any, active: tuple[int, ...]) -> Any:
+    """`_canonicalize_value_for_hash(value, active)` for the state of an instance: its fields,
+    attributes, slots or `model_dump`. While a holder's value is serialized
+    (`_serialize_collecting`), a user function or method met in it is noted for the holder
+    (`_note_held_callable`, `_held_in_state`): its form records only its code, closure and
+    defaults, and the walk of the instance's class does not reach a callback given to its
+    constructor."""
+    if _held_values.get() is None or _held_in_state.get():
+        return _canonicalize_value_for_hash(value, active)
+    token = _held_in_state.set(True)
+    try:
+        return _canonicalize_value_for_hash(value, active)
+    finally:
+        _held_in_state.reset(token)
 
 
 def _addressless_leaf(
@@ -4560,17 +4726,24 @@ def _addressless_leaf(
     type and the state its slots and its `__dict__` hold (`_structural_state`), and no code of
     it runs: neither its repr, which may be user code or only the type and an address, nor any
     descriptor. A bare `object()` or a `__slots__ = ()` instance has no state. Any other leaf
-    (a library value with a repr of its own: a `Decimal`, a `date`, a `Path`) is its repr. A leaf
-    whose state neither shows (a C type's fields, `random.Random`; a repr that holds an address,
-    `threading.Lock`) sets `hidden[0]`, and its form holds only its type: no address, and no
-    state taken for its own. A string's content is never read as an address: it is a scalar, not
-    a leaf."""
+    (a library value with a repr of its own: `bytes`, a `Decimal`, a `date`, a `Path`) is its
+    repr, hex text in it included. A leaf whose state neither shows (a C type's fields,
+    `random.Random`; a repr that writes an object's address, `<... at 0x...>` as a
+    `threading.Lock`'s) sets `hidden[0]`, and its form holds only its type: no address, and no
+    state taken for its own. A string's content is never read as an address: it is a scalar,
+    not a leaf."""
     name = _class_name(value_type)
+    if isinstance(value, BaseException):
+        return [
+            name,
+            _object_repr_without_address(value_type),
+            _canonical_state(_exception_state(value_type, value), active),
+        ]
     if is_user_code(value_type) or _uses_object_repr(value_type):
         label = _object_repr_without_address(value_type)
         state = _structural_state(value_type, value)
         if state is not None:
-            return [name, label, _canonicalize_value_for_hash(state, active)]
+            return [name, label, _canonical_state(state, active)]
         hidden[0] = True
         return [name, label]
     text = repr(value)
@@ -4582,23 +4755,57 @@ def _addressless_leaf(
 
 def _structural_state(cls: type[Any], value: Any) -> dict[str, Any] | None:
     """The state of `value`, an instance of `cls`, its slots hold (`_slot_state`) and its
-    instance `__dict__` holds, read through the C descriptor a class on its real MRO keeps for it,
-    so no code of `cls` runs; None when its instances keep state elsewhere."""
+    instance `__dict__` holds (`_instance_dict`), read so no code of `cls` runs; None when its
+    instances keep state elsewhere."""
     slots = _slot_state(cls, value)
     if slots is None:
         return None
     state: dict[str, Any] = {"slots": slots}
+    instance_dict = _instance_dict(cls, value)
+    if instance_dict is not None:
+        state["dict"] = instance_dict
+    return state
+
+
+def _exception_state(cls: type[Any], value: BaseException) -> dict[str, Any]:
+    """The state of an exception instance: its `args`, read through `BaseException`'s own
+    descriptor, its instance `__dict__` (`_instance_dict`: an attribute set on it, its
+    `__notes__`), and the slots user classes on its MRO declare. Its traceback, cause and
+    context are where it was raised, not its value."""
+    state: dict[str, Any] = {"args": _exception_args(value)}
+    instance_dict = _instance_dict(cls, value)
+    if instance_dict is not None:
+        state["dict"] = instance_dict
+    slots = dict[str, Any]()
+    for index, klass in enumerate(_class_mro(cls)):
+        if not is_user_code(klass):
+            continue
+        for slot, raw in _class_namespace(klass).items():
+            if type(raw) is _MEMBER_DESCRIPTOR and slot not in ("__dict__", "__weakref__"):
+                try:
+                    slots[f"{index}:{_class_qualname(klass)}.{slot}"] = raw.__get__(value, cls)
+                except AttributeError:  # an unset slot
+                    continue
+    if slots:
+        state["slots"] = slots
+    return state
+
+
+def _instance_dict(cls: type[Any], value: Any) -> dict[str, Any] | None:
+    """`value`'s instance `__dict__`, without the by-name mark, read through the C descriptor
+    the class on `cls`'s real MRO that introduced it keeps for it, so no code of `cls` runs; None
+    when it has none."""
     for klass in _class_mro(cls):
         entry = _class_namespace(klass).get("__dict__")
         if (
             type(entry) is _GETSET_DESCRIPTOR or type(entry) is _MEMBER_DESCRIPTOR
         ) and entry.__objclass__ is klass:
             instance_dict: object = entry.__get__(value, cls)
-            if type(instance_dict) is dict:
-                own = cast("dict[str, Any]", instance_dict)
-                state["dict"] = {key: item for key, item in own.items() if key != _BY_NAME_MARK}
-            break
-    return state
+            if type(instance_dict) is not dict:
+                return None
+            own = cast("dict[str, Any]", instance_dict)
+            return {key: item for key, item in own.items() if key != _BY_NAME_MARK}
+    return None
 
 
 def _slot_state(cls: type[Any], value: Any) -> dict[str, Any] | None:
@@ -4654,9 +4861,13 @@ def _canonical_at(step: str, value: Any, active: tuple[int, ...]) -> Any:
         _held_path.reset(token)
 
 
-def _ranked(texts: list[str], cells: list[list[str]], prefix: str) -> list[int]:
+def _ranked(texts: list[str] | None, cells: list[list[str]], prefix: str) -> list[int]:
     """The indexes of `texts` in sorted order. Each cell gets its text's rank in that order,
-    after `prefix`; equal texts share a rank, so no rank follows the hash seed."""
+    after `prefix`; equal texts share a rank, so no rank follows the hash seed. A single cell
+    needs no texts (None): its rank is 0."""
+    if texts is None:
+        cells[0][0] = f"{prefix}0"
+        return [0]
     order = sorted(range(len(texts)), key=texts.__getitem__)
     rank = 0
     for position, index in enumerate(order):
@@ -4685,7 +4896,8 @@ def _canonical_items_at(
         cells.append(cell)
     if not unordered:
         return forms
-    return [forms[index] for index in _ranked([json.dumps(form) for form in forms], cells, "s")]
+    texts = None if len(forms) == 1 else [json.dumps(form) for form in forms]
+    return [forms[index] for index in _ranked(texts, cells, "s")]
 
 
 def _canonical_entries_at(mapping: Mapping[Any, Any], active: tuple[int, ...]) -> list[Any]:
@@ -4704,7 +4916,8 @@ def _canonical_entries_at(mapping: Mapping[Any, Any], active: tuple[int, ...]) -
             ]
         )
         cells.append(cell)
-    return [entries[index] for index in _ranked([json.dumps(e) for e in entries], cells, "d")]
+    texts = None if len(entries) == 1 else [json.dumps(entry) for entry in entries]
+    return [entries[index] for index in _ranked(texts, cells, "d")]
 
 
 def _canonical_at_cell(
@@ -4727,31 +4940,46 @@ def _canonical_loader(loader: Any, inner: tuple[int, ...]) -> Any:
     loaders and other user class instances inside it are its own fingerprint's, so they are not
     noted for the holder. A form that holds no cycle is the same wherever the loader sits, so it
     is kept for the stage (`_form_memo`): a chain of held loaders is canonicalized once, not once
-    per level."""
+    per level. It is kept per form mode (`_hidden_state` set or not), with whether it holds a
+    value whose state no form reads, which a later use in that mode reports again (`opaque`)."""
     memo = _form_memo.get()
-    form = None if memo is None else memo.get(id(loader))
+    hidden = _hidden_state.get()
+    key = (id(loader), hidden is not None)
+    form = None if memo is None else memo.get(key)
     if form is None:
         loader_type: type[Any] = type(cast("object", loader))
         classes = list[int]()
         cycle = [False]
+        opaque = [False]
         held_token = _held_values.set(None)
         classes_token = _form_classes.set(classes)
         cycle_token = _form_cycle.set(cycle)
+        hidden_token = None if hidden is None else _hidden_state.set(opaque)
         try:
             fields = {
                 field.name: getattr(loader, field.name) for field in dataclasses.fields(loader)
             }
             canonical = [_definition_ref(loader_type), _canonicalize_value_for_hash(fields, inner)]
         finally:
+            if hidden_token is not None:
+                _hidden_state.reset(hidden_token)
             _form_cycle.reset(cycle_token)
             _form_classes.reset(classes_token)
             _held_values.reset(held_token)
-        form = _LoaderForm(loader, canonical, json.dumps(canonical), (id(loader_type), *classes))
+        form = _LoaderForm(
+            loader,
+            canonical,
+            json.dumps(canonical),
+            (id(loader_type), *classes),
+            opaque[0],
+        )
         if not cycle[0]:
             if memo is not None:
-                memo[id(loader)] = form
+                memo[key] = form
         elif (outer := _form_cycle.get()) is not None:
             outer[0] = True
+    if hidden is not None and form.opaque:
+        hidden[0] = True
     outer_classes = _form_classes.get()
     if outer_classes is not None:
         outer_classes.extend(form.classes)
@@ -5142,9 +5370,15 @@ def _compute_function_hash(func: Callable[..., Any]) -> str:
         metrics.end("fingerprint._compute_function_hash", _t)
 
 
-# A memory address in a repr (`<object object at 0x7f...>`, pydantic-core's `Py(0x...)`), which
-# differs in each process.
-_ADDRESS = re.compile(r"0x[0-9a-fA-F]{6,}")
+# A memory address in a repr, in the forms that write an object's identity (`<object object at
+# 0x7f...>`, `<unlocked _thread.lock object at 0x7f...>`, pydantic-core's `Py(0x...)`), which
+# differ in each process. Hex text in a value's own repr (`b'0xabcdef'`,
+# `PurePosixPath('cache/0xabcdef')`) is that value's data, not an address.
+_ADDRESS = re.compile(r"(?:\bat |Py\()0x[0-9a-fA-F]{6,}")
+# The ids of the exact types whose instances are their own canonical form (`None`, `bool`,
+# `int`, `float`, `str`): a container whose items' types all have one of these ids is written
+# as its items (`_canonicalize_value_for_hash`).
+_SCALAR_TYPE_IDS = frozenset(map(id, (type(None), bool, int, float, str)))
 # Namespace entries every class has whose text says nothing of what defines it; `_abc_impl` is
 # the ABC machinery's cache of registered and checked subclasses.
 _CLASS_NAMESPACE_NOISE = frozenset(("__dict__", "__weakref__", "__doc__", "_abc_impl"))

@@ -251,11 +251,15 @@ and tracked by its content.
 
 A dataclass's class-level field default (`rng: Any = make_rng()`, a
 `ClassVar`) is evaluated when its class is created, so Pivot hashes its value
-for each stage that reaches the class: a string by its content, an object by
-its attributes and `__slots__`. A default whose state Pivot cannot read, such as
-a `random.Random` or a `threading.Lock`, refuses the stage, naming the field.
-Build it with `dataclasses.field(default_factory=...)`, or move the value into
-the stage's `StageParams`.
+for each stage that reaches the class: a string, `bytes` or a path by its
+content, an exception by its arguments and attributes, an object by its
+attributes and `__slots__`, and a function an object holds (a callback) with the
+module values it reads. A default whose state Pivot cannot read, such as a
+`random.Random`, a numpy `Generator` or a `threading.Lock`, refuses the stage,
+naming the field. For a field, build the value with
+`dataclasses.field(default_factory=...)`; a `ClassVar` takes no factory, so
+create its value in the method that uses it; or move the value into the stage's
+`StageParams`.
 
 An object whose `__getattr__` raises an error other than `AttributeError` for
 a name it does not have (a dict-backed config, an `AttrDict`, a lazy object)
