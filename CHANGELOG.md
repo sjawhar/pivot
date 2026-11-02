@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.9.3 (2026-11-02)
+
+### Bug Fixes
+
+- **remote**: Make push, pull and status agree on what a target needs
+  ([#549](https://github.com/sjawhar/pivot/pull/549),
+  [`98a132f`](https://github.com/sjawhar/pivot/commit/98a132f3742483062b92eadaba36d7337f5d7e73))
+
+
 ## v0.9.2 (2026-11-01)
 
 ### Bug Fixes
