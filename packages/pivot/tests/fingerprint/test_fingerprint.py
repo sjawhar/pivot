@@ -3533,22 +3533,37 @@ def _model_sentinel_beside(token: str) -> type:
     [
         pytest.param(_sentinel_beside, id="sentinel"),
         pytest.param(_slots_beside, id="slots"),
-        pytest.param(_random_beside, id="random"),
         pytest.param(_model_sentinel_beside, id="model-sentinel"),
     ],
 )
 def test_an_edit_beside_a_value_no_form_shows_changes_the_hash(
     make: typing.Callable[[str], type],
 ):
-    """An entry whose form shows nothing leaves the rest of the class's entries in its hash: an
-    edit to the other default (`A` to `B`, in this one module) changes it, and two classes made
-    alike hash alike."""
+    """An `object()` sentinel or a `__slots__` object leaves the rest of the class's entries in
+    its hash: an edit to the other default (`A` to `B`, in this one module) changes it, and two
+    classes made alike hash alike."""
     first = fingerprint._compute_function_hash(make("A"))
     again = fingerprint._compute_function_hash(make("A"))
     edited = fingerprint._compute_function_hash(make("B"))
 
     assert first == again, "Two classes made alike should hash alike"
     assert first != edited, "An edit to a shown entry should change the hash"
+
+
+def test_a_class_with_no_source_holding_a_value_no_form_reads_is_refused_and_not_kept():
+    """A class `make_dataclass` made with a `random.Random` default: its hash would not show a
+    change to the generator's state, so hashing it refuses, naming the class and the entry. The
+    AST hash cache keeps no entry for it, so a second stage that hashes it refuses too."""
+    made = _random_beside("A")
+
+    for stage in ("t/first", "t/second"):
+        with (
+            pytest.raises(exceptions.StageDefinitionError, match="no source of its own") as raised,
+            fingerprint.stage_fingerprint_scope(stage),
+        ):
+            fingerprint.hash_function_ast(made)
+        assert "'__dataclass_fields__'" in str(raised.value), raised.value
+        assert made not in fingerprint._hash_function_ast_cache
 
 
 # A module of classes with no source, one of each kind `fingerprint._sourceless_class_hash`
@@ -3622,10 +3637,10 @@ CmBase = pydantic.create_model("CmBase", __base__=CmPlain, y=(str, "TOKEN"))
 CmSentinel = pydantic.create_model("CmSentinel", x=(object, _MISSING), y=(str, "TOKEN"))
 """
 
-# The kinds above whose form cannot show one of their values, so they are hashed with their
-# module's source too: a `random.Random`, whose state is in C. A sentinel `object()` and a
-# `__slots__` object are shown by their type and slots (`_addressless_leaf`).
-_NO_SOURCE_HIDDEN = {"MdRandom"}
+# The kinds above whose form cannot show one of their values, which refuses: a `random.Random`,
+# whose state is in C. A sentinel `object()` and a `__slots__` object are shown by their type and
+# slots (`_addressless_leaf`).
+_NO_SOURCE_REFUSED = {"MdRandom"}
 
 _NO_SOURCE_HASH_SCRIPT = """\
 import json
@@ -3638,7 +3653,10 @@ from pivot import fingerprint
 out = {}
 for name, cls in vars(kinds_mod).items():
     if isinstance(cls, type) and cls.__module__ == "kinds_mod" and name != "Box":
-        out[name] = fingerprint._compute_function_hash(cls)
+        try:
+            out[name] = fingerprint._compute_function_hash(cls)
+        except fingerprint.exceptions.StageDefinitionError:
+            out[name] = "refused"
 print(json.dumps(out))
 """
 
@@ -3660,9 +3678,8 @@ def _no_source_hashes(directory: pathlib.Path, text: str, seed: str) -> dict[str
 
 def test_a_class_with_no_source_is_hashed_alike_in_every_interpreter(tmp_path: pathlib.Path):
     """For every kind of class with no source, two interpreters under different hash seeds give
-    one hash. An edit to an entry the class shows changes it; a comment edit in its module
-    changes it only for a class whose form hides a value (`_NO_SOURCE_HIDDEN`), which is hashed
-    with its module's source."""
+    one hash, and a comment edit in its module changes none. An edit to an entry the class shows
+    changes it. A class that holds a value no form reads (`_NO_SOURCE_REFUSED`) is refused."""
     (tmp_path / ".pivot").mkdir()
     original = _NO_SOURCE_KINDS_MODULE.replace("TOKEN", "A")
     first = _no_source_hashes(tmp_path, original, "1")
@@ -3672,8 +3689,9 @@ def test_a_class_with_no_source_is_hashed_alike_in_every_interpreter(tmp_path: p
 
     assert len(first) == 22, sorted(first)
     assert first == second, "Two interpreters should give each class one hash"
-    assert {name for name in first if first[name] != commented[name]} == _NO_SOURCE_HIDDEN
-    assert {name for name in first if first[name] == edited[name]} == set()
+    assert first == commented, "A comment edit should change no hash"
+    assert {name for name, digest in first.items() if digest == "refused"} == _NO_SOURCE_REFUSED
+    assert {name for name in first if first[name] == edited[name]} == _NO_SOURCE_REFUSED
 
 
 def test_a_chain_of_held_loaders_is_canonicalized_once_per_loader(

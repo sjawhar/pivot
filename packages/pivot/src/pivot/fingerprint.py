@@ -4993,8 +4993,12 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
                         # LMDB errors shouldn't break fingerprinting
                         pass
 
-        # 3. Compute hash
-        result = _compute_function_hash(func)
+        # 3. Compute hash. One whose computation refused (a class with no source that holds a
+        # value no form reads: `_sourceless_class_hash`) is not kept, so each use refuses again.
+        with _refusals_seen() as refusals:
+            result = _compute_function_hash(func)
+        if refusals:
+            return result
 
         # 4. Store in memory cache
         _hash_function_ast_cache[func] = result
@@ -5170,27 +5174,45 @@ def _sourceless_class_hash(cls: type) -> str:
     """The hash of a class with no source of its own (`collections.namedtuple`,
     `dataclasses.make_dataclass`, a functional `enum.Enum`, `type(...)`, `pydantic.create_model`):
     what defines it (`_sourceless_parts`). It is the same in every process, and it changes when
-    what defines the class changes: its fields, its members, or the code of a function it holds.
+    what defines the class changes: its fields, its members, the code of a function it holds,
+    and the state of a value it holds, also one another module built.
 
-    A sentinel `object()` or a `__slots__` object is written by its type and its slots
-    (`_addressless_leaf`). An entry that holds a value whose form does not show it (a
-    `random.Random`, whose state is in C; a value whose repr holds an address) keeps the rest of
-    its form, without the address, so a change to any other entry is still seen. A change to
-    such a value itself is not visible in any form, so the class is then also hashed with the
-    source of the module that defines it (`_module_source_digest`): an edit to that module reruns
-    the stages that read the class, as it did when the class was hashed by its address, and no
-    new process and no fresh state database does."""
+    Nothing in the form is rewritten: a string keeps its content. A sentinel `object()` or a
+    `__slots__` object is written by its type and its slots (`_addressless_leaf`). An entry that
+    holds a value whose state no form reads (a `random.Random`, whose state is in C; a library
+    value whose repr holds an address) refuses the stage, naming the class and the entry
+    (`_refuse_opaque_sourceless`): a change to it would go unseen. `hash_function_ast` keeps no
+    hash whose computation refused. Under unsafe fingerprinting the refusal is a warning, and the
+    class is also hashed with the source of the module that defines it."""
     parts, opaque = _sourceless_parts(cls)
     if opaque:
+        _refuse_opaque_sourceless(cls, opaque)
         parts.append(["module-source", _module_source_digest(cls)])
     return xxhash.xxh64(json.dumps(parts).encode()).hexdigest()
 
 
-def _sourceless_parts(cls: type) -> tuple[list[Any], bool]:
-    """What defines a class with no source, without addresses, and whether it holds a value its
-    form does not show (an address, or `_keeps_state_in_c`): its module, name and bases, then,
-    for a pydantic model, `_pydantic_model_parts`, and for any other class each entry of its own
-    namespace (`_sourceless_form`)."""
+def _refuse_opaque_sourceless(cls: type, entries: list[str]) -> None:
+    """Refuse a class with no source whose `entries` hold a value whose state no form reads
+    (`_sourceless_class_hash`), or warn under unsafe fingerprinting (`_report_unsafe_capture`)."""
+    stage_name = _current_stage_name.get() or "<unknown>"
+    message = (
+        f"Stage '{stage_name}': class '{_definition_ref(cls)}', which has no source of its own, "
+        + f"holds a value whose state pivot cannot read in {', '.join(entries)}.\n"
+        + "Pivot hashes such a class by what defines it; this value keeps its state elsewhere "
+        + "(in C, or behind a memory address in its repr), so a change to it would go unseen, "
+        + "which can cause silent wrong outputs.\n"
+        + "Fix: define the class with a class statement and build the value with a "
+        + "default_factory, or move the value into the stage's StageParams.\n"
+        + "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
+    )
+    _report_unsafe_capture(message)
+
+
+def _sourceless_parts(cls: type) -> tuple[list[Any], list[str]]:
+    """What defines a class with no source, and the entries that hold a value whose state no
+    form reads (`_addressless_leaf`): its module, name and bases, then, for a pydantic model,
+    `_pydantic_model_parts`, and for any other class each entry of its own namespace
+    (`_sourceless_form`). A form holds no memory address, and no text in it is rewritten."""
     parts: list[Any] = [
         "class",
         cls.__module__,
@@ -5199,18 +5221,23 @@ def _sourceless_parts(cls: type) -> tuple[list[Any], bool]:
     ]
     namespace = vars(cls)
     hidden = [False]
+    opaque = list[str]()
     token = _hidden_state.set(hidden)
     try:
         if "__pydantic_fields__" in namespace and "__pydantic_decorators__" in namespace:
             parts.extend(_pydantic_model_parts(cls))
+            if hidden[0]:
+                opaque.append("its fields, config or attributes")
         else:
             for name in sorted(namespace):
                 if name not in _CLASS_NAMESPACE_NOISE:
+                    hidden[0] = False
                     parts.append([name, _sourceless_form(namespace[name])])
+                    if hidden[0]:
+                        opaque.append(f"'{name}'")
     finally:
         _hidden_state.reset(token)
-    stripped = _without_addresses(parts, hidden)
-    return stripped, hidden[0]
+    return parts, opaque
 
 
 def _keeps_state_outside_dict(cls: type) -> bool:
@@ -5219,22 +5246,6 @@ def _keeps_state_outside_dict(cls: type) -> bool:
     generator's state in `_random.Random`). A class statement's own `__dict__` and
     `__weakref__` add no size."""
     return cls.__basicsize__ > object.__basicsize__
-
-
-def _without_addresses(form: Any, found: list[bool]) -> Any:
-    """`form` with each memory address in its text replaced by `0x?`; `found[0]` is set when one
-    was."""
-    if isinstance(form, str):
-        text = _ADDRESS.sub("0x?", form)
-        if text != form:
-            found[0] = True
-        return text
-    if isinstance(form, list):
-        return [_without_addresses(item, found) for item in cast("list[Any]", form)]
-    if isinstance(form, dict):
-        mapping = cast("dict[str, Any]", form)
-        return {key: _without_addresses(item, found) for key, item in mapping.items()}
-    return form
 
 
 def _module_source_digest(cls: type) -> str | None:

@@ -2621,6 +2621,89 @@ def test_a_dataclass_whose_class_level_default_keeps_its_state_in_c_is_refused(
     assert "default_factory" in message, message
 
 
+_SOURCELESS_FROM_SETTINGS = """\
+import collections
+import dataclasses
+import pathlib
+import random
+
+from pivot import loaders
+
+import settings
+
+DEFINITION
+
+
+@dataclasses.dataclass(frozen=True)
+class Inner(loaders.Reader[str]):
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text().splitlines()[0] + str(VIEW)
+"""
+
+
+def _sourceless_from_settings(
+    tmp_path: pathlib.Path, settings: str, definition: str, view: str
+) -> pathlib.Path:
+    """A project whose `Inner.load` reads `KIND`, a class with no source `inner.py` builds from
+    a value of `settings.py`, and writes `view` of it after the input's first line."""
+    inner = _SOURCELESS_FROM_SETTINGS.replace("DEFINITION", definition).replace("VIEW", view)
+    return _project(
+        tmp_path,
+        {
+            "settings.py": settings,
+            "inner.py": inner,
+            "pipeline.py": _HELD_INSTANCE_HEADER + _held_stage("Inner()"),
+        },
+    )
+
+
+def test_an_edit_to_a_string_a_class_with_no_source_holds_reruns_its_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`KIND`, a namedtuple with no source, takes the default `settings.HEX = "0xabcdef"`, which
+    looks like a memory address. Its form keeps the string as it is, so an edit to
+    `settings.py` alone reruns the stage with the new output, and the next run reuses it."""
+    home = tmp_path / "home"
+    project = _sourceless_from_settings(
+        tmp_path,
+        'HEX = "0xabcdef"\n',
+        'KIND = collections.namedtuple("Row", "a b", defaults=(settings.HEX,))',
+        "KIND(1).b",
+    )
+    output = project / "data" / "t" / "use.txt"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof Using0xabcdef"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "settings.py", '"0xabcdef"', '"0x123456"')
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The edit should rerun"
+    assert output.read_text() == "Local Set Default Proof Using0x123456"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+def test_a_class_with_no_source_holding_state_no_form_reads_is_refused(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`KIND`, a namedtuple with no source, takes the default `random.Random(settings.SEED)`:
+    its state is in C, so no hash of the class shows an edit to `settings.SEED`. The stage is
+    refused, naming the class, with the fix, and no output is written."""
+    home = tmp_path / "home"
+    project = _sourceless_from_settings(
+        tmp_path,
+        "SEED = 1\n",
+        'KIND = collections.namedtuple("Row", "a rng", defaults=(random.Random(settings.SEED),))',
+        "KIND(1).rng.randint(0, 9)",
+    )
+
+    result = helpers.run_pivot(project, home, "repro", "--json")
+    message = " ".join((result.stdout + result.stderr).split())
+    assert result.returncode != 0, f"The stage should be refused: {message}"
+    assert "class 'inner.Row', which has no source of its own, holds a value" in message, message
+    assert "StageParams" in message, message
+    assert not (project / "data" / "t" / "use.txt").exists()
+
+
 _MAPPED_PARTIAL_STAGES = """\
 from typing import Annotated
 
