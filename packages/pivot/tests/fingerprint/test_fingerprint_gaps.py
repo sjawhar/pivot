@@ -2991,3 +2991,198 @@ def test_a_captured_instance_with_no_source_or_from_a_library_reruns_nothing(
     assert _repro_statuses(project, home, seed="3") == cached, "A comment edit should reuse it"
     shutil.rmtree(project / ".pivot" / "state.lmdb")
     assert _repro_statuses(project, home, seed="4") == cached, "A fresh state should reuse it"
+
+
+_OPAQUE_DEFAULTS = '''\
+import dataclasses
+from typing import Any, ClassVar
+
+_MISSING = object()
+
+
+class Slotted:
+    __slots__ = ("x",)
+
+    def __init__(self) -> None:
+        self.x = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class Sentinel:
+    """A sentinel class default the instance overrides."""
+
+    token: Any = _MISSING
+
+    def value(self) -> str:
+        return str(self.token)
+
+
+@dataclasses.dataclass(frozen=True)
+class SlotsDefault:
+    """A `__slots__` object class default the instance overrides."""
+
+    box: Any = Slotted()
+
+    def value(self) -> str:
+        return str(self.box)
+
+
+@dataclasses.dataclass(frozen=True)
+class WithClassVar:
+    """A ClassVar that holds an object; not a field of the instance."""
+
+    marker: ClassVar[Any] = object()
+    x: int = 1
+
+    def value(self) -> str:
+        return str(self.x)
+'''
+
+_OPAQUE_DEFAULTS_PIPELINE = """\
+import functools
+from typing import Any
+
+from defaults import Sentinel, SlotsDefault, WithClassVar
+from pivot import Pipeline, stage
+
+
+def _take(thing: Any, text: str) -> str:
+    return text.splitlines()[0] + thing.value()
+
+
+SENTINEL = functools.partial(_take, Sentinel("explicit"))
+SLOTS = functools.partial(_take, SlotsDefault("explicit"))
+CLASSVAR = functools.partial(_take, WithClassVar())
+
+
+@stage
+def use_sentinel(text: str) -> str:
+    return SENTINEL(text)
+
+
+@stage
+def use_slots(text: str) -> str:
+    return SLOTS(text)
+
+
+@stage
+def use_classvar(text: str) -> str:
+    return CLASSVAR(text)
+
+
+with Pipeline("t") as pipeline:
+    use_sentinel(pipeline.input("lines.txt", t=str))
+    use_slots(pipeline.input("lines.txt", t=str))
+    use_classvar(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_a_captured_dataclass_with_class_defaults_no_form_shows_reruns_nothing_new(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Each stage captures a dataclass instance whose class keeps a default no form shows: an
+    `object()` sentinel or a `__slots__` object the instance overrides, or a `ClassVar` object.
+    The class walk hashes such a default by its type and its module's source, never by its
+    address, so the same hash seed, a new one, a fresh state database and a comment edit in
+    `pipeline.py` reuse the result. An edit to the module that defines the classes reruns them,
+    as for a class with no source that holds such a value."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path, {"defaults.py": _OPAQUE_DEFAULTS, "pipeline.py": _OPAQUE_DEFAULTS_PIPELINE}
+    )
+    names = ("t/use_sentinel", "t/use_slots", "t/use_classvar")
+    ran, cached = dict.fromkeys(names, "ran"), dict.fromkeys(names, "cached")
+
+    assert _repro_statuses(project, home, seed="1") == ran
+    assert _repro_statuses(project, home, seed="1") == cached, "The same seed should reuse it"
+    assert _repro_statuses(project, home, seed="2") == cached, "A new hash seed should reuse it"
+    shutil.rmtree(project / ".pivot" / "state.lmdb")
+    assert _repro_statuses(project, home, seed="3") == cached, "A fresh state should reuse it"
+    _edit(project, "pipeline.py", "\n\ndef _take(", "\n\n# A comment.\ndef _take(")
+    assert _repro_statuses(project, home, seed="4") == cached, "A comment edit should reuse it"
+    _edit(project, "defaults.py", "import dataclasses\n", "import dataclasses  # note\n")
+    assert _repro_statuses(project, home, seed="5") == ran
+
+
+_FACTORY_MODULE = """\
+def make(suffix: str) -> type:
+    class Made:
+        def suffix(self) -> str:
+            return suffix
+
+    return Made
+"""
+
+_TWO_HOLDERS_HEADER = """\
+import dataclasses
+import functools
+from typing import Any
+
+from factory import make
+from pivot import Pipeline, StageParams, stage
+
+
+def _take(thing: Any, text: str) -> str:
+    return text.splitlines()[0] + thing.suffix()
+
+
+First = make("A")
+Second = make("Z")
+
+
+"""
+
+# Two values of one stage that hold instances of two classes `factory.make` made, at the same
+# position in each: two partials, two field defaults of one dataclass, and two helpers'
+# StageParams defaults. The factory calls are module statements no walked code holds, so only
+# the walks of the classes see an edit to their arguments.
+_TWO_HOLDERS = {
+    "two-partials": (
+        "FIRST = functools.partial(_take, First())\n"
+        "SECOND = functools.partial(_take, Second())\n\n\n"
+        "@stage\ndef use(text: str) -> str:\n    return FIRST(text) + SECOND(text)\n"
+    ),
+    "two-fields": (
+        "@dataclasses.dataclass(frozen=True)\nclass Pair:\n"
+        "    first: Any = First()\n    second: Any = Second()\n\n\n"
+        "@stage\ndef use(text: str) -> str:\n"
+        "    return _take(Pair().first, text) + _take(Pair().second, text)\n"
+    ),
+    "two-params": (
+        "class FirstParams(StageParams):\n    made: Any = First()\n\n\n"
+        "class SecondParams(StageParams):\n    made: Any = Second()\n\n\n"
+        "def _first(text: str, params: Any = FirstParams()) -> str:\n"
+        "    return _take(params.made, text)\n\n\n"
+        "def _second(text: str, params: Any = SecondParams()) -> str:\n"
+        "    return _take(params.made, text)\n\n\n"
+        "@stage\ndef use(text: str) -> str:\n    return _first(text) + _second(text)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_TWO_HOLDERS))
+def test_an_edit_to_one_of_two_factory_classes_two_values_hold_reruns_its_stage(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """Two values of the stage hold instances of two classes one factory made, at the same
+    position in each. The first class's walk keeps its own key, so changing only the factory
+    argument that makes it reruns the stage with the new output; the second never overwrites
+    it."""
+    home = tmp_path / "home"
+    pipeline = (
+        _TWO_HOLDERS_HEADER
+        + _TWO_HOLDERS[shape]
+        + '\n\nwith Pipeline("t") as pipeline:\n    use(pipeline.input("lines.txt", t=str))\n'
+    )
+    project = _project(tmp_path, {"factory.py": _FACTORY_MODULE, "pipeline.py": pipeline})
+    output = project / "data" / "t" / "use.txt"
+    line = "Local Set Default Proof Using"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == f"{line}A{line}Z"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "pipeline.py", 'make("A")', 'make("B")')
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The edit should rerun"
+    assert output.read_text() == f"{line}B{line}Z"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
