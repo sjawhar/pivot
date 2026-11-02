@@ -2646,18 +2646,36 @@ def _walk_held_callable(
 ) -> dict[str, str]:
     """The walk a callable bound in a partial gets (`_process_bound_values`): a function's
     globals, closure values and defaults, with the non-scalar refusal, and a method bound to an
-    instance refused. Kept in the stage's `memo` unless it refused (`_refusals_seen`); no read
-    of its own is recorded: the holder's caller records one for all it holds (`_merge_held`)."""
+    instance refused. A method bound to a class is its underlying user function, whose globals
+    the class binding does not hide. The dependency set starts with the classes and callables
+    already being walked (`_loader_stack`): a callback that reads the class whose default holds
+    it is a back-reference, not a new walk. The callable is marked as being walked too, so a
+    callback reached again before its memo entry is complete terminates. A wrapper loop is
+    refused by name, as a class member's is. Kept in the stage's `memo` unless it refused
+    (`_refusals_seen`); no read of its own is recorded: the holder's caller records one for all
+    it holds (`_merge_held`)."""
+    function = value.__func__ if inspect.ismethod(value) else value
     key = ("callable", (id(value),))
     cached = None if memo is None else memo.get(key)
     if cached is not None:
         return cached[1]
     entries = dict[str, str]()
     reads_token = _recorded_reads.set(None)
+    stack = _loader_stack.get()
+    stack_token = _loader_stack.set((*stack, id(value)))
     try:
         with _refusals_seen() as refusals:
-            _process_bound_values(ref, value, entries, set[int]())
+            if _wrapper_loops(function):
+                _refuse_wrapper_loop(_definition_ref(function))
+            else:
+                target = (
+                    function
+                    if inspect.ismethod(value) and isinstance(value.__self__, type)
+                    else value
+                )
+                _process_bound_values(ref, target, entries, set(stack))
     finally:
+        _loader_stack.reset(stack_token)
         _recorded_reads.reset(reads_token)
     if memo is not None and not refusals:
         memo[key] = (value, entries)
@@ -2801,12 +2819,12 @@ def _has_class_statement(cls: type[Any]) -> bool:
 
 def _held_class_entries(held: _HeldValues, holder: str) -> dict[str, dict[str, str]]:
     """The walk of each user class whose instances `held` holds, and of each user class on their
-    MROs (`_held_class_items`, `_walk_held_class`), keyed by the digest of every position of the
-    instances that reach it in the value that holds them, in sorted order, and of the walk
-    (`_held_key`). So the key follows no hash seed, a class with many instances adds one walk,
-    two classes one factory made keep apart wherever they are held, and swapping instances of
-    two such classes at any positions (`[A(), B(), A(), B()]` to `[A(), B(), B(), A()]`)
-    changes the keys.
+    MROs (`_held_class_items`, `_walk_held_class`), keyed by the digest of every occurrence's
+    position in the value that holds them, in sorted order, and of the walk (`_held_key`). So the
+    key follows no hash seed, a class with many instances adds one walk, two classes one factory
+    made keep apart wherever they are held, and replacing one class at an equal unordered rank
+    changes the key: `frozenset([A(), A(), B()])` to `frozenset([A(), B(), B()])` keeps the
+    rank but changes that rank's multiplicity.
 
     The classes are walked in the order of their first positions and definition names, which
     follows no hash seed. One being walked already (`_loader_stack`: a cycle) is left out, since
@@ -2819,20 +2837,22 @@ def _held_class_entries(held: _HeldValues, holder: str) -> dict[str, dict[str, s
         stack = _loader_stack.get()
         memo = _held_memo.get()
         # Per class to walk, by its id: the first position of the instances that reach it, the
-        # class of the instance there (for the refusals), the class itself, and every position
-        # of the instances that reach it.
-        reached = dict[int, tuple[str, type[Any], type[Any], set[str]]]()
+        # class of the instance there (for the refusals), the class itself, and every occurrence
+        # of a position of the instances that reach it. This is a list, not a set: equal forms
+        # in an unordered collection share a rank, whose count still says how many instances of
+        # each class the value holds.
+        reached = dict[int, tuple[str, type[Any], type[Any], list[str]]]()
         for cls, paths in held.instances.values():
             if not paths:
                 continue
-            positions = {_held_position(path) for path in paths}
+            positions = [_held_position(path) for path in paths]
             position = min(positions)
             for item in _held_class_items(cls):
                 known = reached.get(id(item))
                 if known is None:
-                    reached[id(item)] = (position, cls, item, set(positions))
+                    reached[id(item)] = (position, cls, item, list(positions))
                     continue
-                known[3].update(positions)
+                known[3].extend(positions)
                 if (position, _definition_ref(cls)) < (known[0], _definition_ref(known[1])):
                     reached[id(item)] = (position, cls, item, known[3])
         firsts = sorted(
@@ -4733,6 +4753,11 @@ def _addressless_leaf(
     state taken for its own. A string's content is never read as an address: it is a scalar,
     not a leaf."""
     name = _class_name(value_type)
+    if type(value) is bytes or isinstance(value, pathlib.PurePath):
+        # A bytes sequence and a path's repr are their data, even when the data contains text
+        # that looks like an object identity (`b"<object at 0xabcdef>"`,
+        # `PurePosixPath("cache/at 0xabcdef")`): never apply the identity-repr heuristic.
+        return [name, repr(value)]
     if isinstance(value, BaseException):
         return [
             name,
@@ -4770,24 +4795,26 @@ def _structural_state(cls: type[Any], value: Any) -> dict[str, Any] | None:
 def _exception_state(cls: type[Any], value: BaseException) -> dict[str, Any]:
     """The state of an exception instance: its `args`, read through `BaseException`'s own
     descriptor, its instance `__dict__` (`_instance_dict`: an attribute set on it, its
-    `__notes__`), and the slots user classes on its MRO declare. Its traceback, cause and
-    context are where it was raised, not its value."""
+    `__notes__`), and every value descriptor on its MRO. This includes built-in exception state
+    outside `args` and the dict (`OSError.filename`, `UnicodeError.encoding`), and user classes'
+    slots. Its traceback, cause and context are where it was raised, not its value."""
     state: dict[str, Any] = {"args": _exception_args(value)}
     instance_dict = _instance_dict(cls, value)
     if instance_dict is not None:
         state["dict"] = instance_dict
-    slots = dict[str, Any]()
+    descriptors = dict[str, Any]()
     for index, klass in enumerate(_class_mro(cls)):
-        if not is_user_code(klass):
-            continue
-        for slot, raw in _class_namespace(klass).items():
-            if type(raw) is _MEMBER_DESCRIPTOR and slot not in ("__dict__", "__weakref__"):
-                try:
-                    slots[f"{index}:{_class_qualname(klass)}.{slot}"] = raw.__get__(value, cls)
-                except AttributeError:  # an unset slot
-                    continue
-    if slots:
-        state["slots"] = slots
+        for name, raw in _class_namespace(klass).items():
+            if name in _EXCEPTION_NONVALUE_ATTRIBUTES or (
+                type(raw) is not _GETSET_DESCRIPTOR and type(raw) is not _MEMBER_DESCRIPTOR
+            ):
+                continue
+            try:
+                descriptors[f"{index}:{_class_qualname(klass)}.{name}"] = raw.__get__(value, cls)
+            except AttributeError:  # an unset descriptor
+                continue
+    if descriptors:
+        state["descriptors"] = descriptors
     return state
 
 
@@ -5379,6 +5406,19 @@ _ADDRESS = re.compile(r"(?:\bat |Py\()0x[0-9a-fA-F]{6,}")
 # `int`, `float`, `str`): a container whose items' types all have one of these ids is written
 # as its items (`_canonicalize_value_for_hash`).
 _SCALAR_TYPE_IDS = frozenset(map(id, (type(None), bool, int, float, str)))
+# Exception attributes that describe where an exception was raised or duplicate state already
+# recorded elsewhere (`args`, `__dict__`), not its value (`_exception_state`).
+_EXCEPTION_NONVALUE_ATTRIBUTES = frozenset(
+    (
+        "args",
+        "__dict__",
+        "__traceback__",
+        "__cause__",
+        "__context__",
+        "__suppress_context__",
+        "__notes__",
+    )
+)
 # Namespace entries every class has whose text says nothing of what defines it; `_abc_impl` is
 # the ABC machinery's cache of registered and checked subclasses.
 _CLASS_NAMESPACE_NOISE = frozenset(("__dict__", "__weakref__", "__doc__", "_abc_impl"))

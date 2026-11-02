@@ -3399,6 +3399,45 @@ _DEFAULTS_FROM_ELSEWHERE = {
         ('ERROR.code = "A"', 'ERROR.code = "B"'),
         ("A", "B"),
     ),
+    "identity-bytes-at": (
+        'DATA = b"located at 0xabcdef"\n',
+        {"DEFAULT": "settings.DATA", "VIEW": ".decode()"},
+        ('b"located at 0xabcdef"', 'b"located at 0x123456"'),
+        ("located at 0xabcdef", "located at 0x123456"),
+    ),
+    "identity-bytes-py": (
+        'DATA = b"Py(0xabcdef)"\n',
+        {"DEFAULT": "settings.DATA", "VIEW": ".decode()"},
+        ('b"Py(0xabcdef)"', 'b"Py(0x123456)"'),
+        ("Py(0xabcdef)", "Py(0x123456)"),
+    ),
+    "identity-bytes-object": (
+        'DATA = b"<object at 0xabcdef>"\n',
+        {"DEFAULT": "settings.DATA", "VIEW": ".decode()"},
+        ('b"<object at 0xabcdef>"', 'b"<object at 0x123456>"'),
+        ("<object at 0xabcdef>", "<object at 0x123456>"),
+    ),
+    "identity-path-at": (
+        'import pathlib\n\nPATH = pathlib.PurePosixPath("cache/at 0xabcdef")\n',
+        {"DEFAULT": "settings.PATH", "VIEW": ""},
+        ('"cache/at 0xabcdef"', '"cache/at 0x123456"'),
+        ("cache/at 0xabcdef", "cache/at 0x123456"),
+    ),
+    "classmethod-callback": (
+        'VALUE = "A"\n\n\nclass ClassCallback:\n'
+        "    @classmethod\n    def read(cls) -> str:\n        return VALUE\n\n\n"
+        "class DictCallback:\n    def __init__(self, callback) -> None:\n"
+        "        self.callback = callback\n\n    def read(self) -> str:\n        return self.callback()\n",
+        {"DEFAULT": "settings.DictCallback(settings.ClassCallback.read)", "VIEW": ".read()"},
+        ('VALUE = "A"', 'VALUE = "B"'),
+        ("A", "B"),
+    ),
+    "os-exception": (
+        'ERROR = FileNotFoundError(2, "missing", "A")\n',
+        {"DEFAULT": "settings.ERROR", "VIEW": ".filename"},
+        ('FileNotFoundError(2, "missing", "A")', 'FileNotFoundError(2, "missing", "B")'),
+        ("A", "B"),
+    ),
 }
 
 
@@ -3602,6 +3641,112 @@ def test_swapping_later_instances_of_two_factory_classes_in_one_list_reruns_its_
     assert _repro_statuses(project, home) == {"t/use": "ran"}, "The swap should rerun"
     assert output.read_text() == "Local Set Default Proof UsingAZZA"
     assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+def test_replacing_a_factory_class_at_an_equal_set_rank_reruns_its_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A partial holds identity-distinct instances with equal forms in a frozenset. Changing
+    `[First, First, Second]` to `[First, Second, Second]` keeps every instance at rank `s0`.
+    The held class keys keep each rank's occurrence count, so the stage reruns with the new
+    output."""
+    home = tmp_path / "home"
+    pipeline = (
+        _TWO_HOLDERS_HEADER
+        + "def _take_all(things: Any, text: str) -> str:\n"
+        + '    return text.splitlines()[0] + "".join(sorted(thing.suffix() for thing in things))\n\n\n'
+        + "MANY = functools.partial(_take_all, frozenset((First(), First(), Second())))\n\n\n"
+        + "@stage\ndef use(text: str) -> str:\n    return MANY(text)\n\n\n"
+        + 'with Pipeline("t") as pipeline:\n    use(pipeline.input("lines.txt", t=str))\n'
+    )
+    project = _project(tmp_path, {"factory.py": _FACTORY_MODULE, "pipeline.py": pipeline})
+    output = project / "data" / "t" / "use.txt"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingAAZ"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "pipeline.py", "First(), First(), Second()", "First(), Second(), Second()")
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The multiplicity edit should rerun"
+    assert output.read_text() == "Local Set Default Proof UsingAZZ"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_CALLBACK_CYCLE = """\
+import dataclasses
+from typing import Any, ClassVar
+
+
+class Callback:
+    __slots__ = ("callback",)
+
+    def __init__(self, callback) -> None:
+        self.callback = callback
+
+    def read(self) -> str:
+        return self.callback()
+
+
+def class_callback() -> str:
+    return CycleBox.marker
+
+
+@dataclasses.dataclass(frozen=True)
+class CycleBox:
+    marker: ClassVar[str] = "safe"
+    value: Any = Callback(class_callback)
+"""
+
+_CALLBACK_CYCLE_PIPELINE = """\
+from pivot import Pipeline, stage
+
+import cycle
+
+
+@stage
+def use(text: str) -> str:
+    return text.splitlines()[0] + cycle.CycleBox().value.read()
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_a_callback_that_reads_its_enclosing_class_runs_and_caches(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A callback in a dataclass default reads that dataclass's class variable. The fingerprint
+    sees the class again as a back-reference, so `repro` runs once and caches instead of
+    recursing."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path, {"cycle.py": _CALLBACK_CYCLE, "pipeline.py": _CALLBACK_CYCLE_PIPELINE}
+    )
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert (project / "data" / "t" / "use.txt").read_text() == "Local Set Default Proof Usingsafe"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+def test_a_callback_whose_wrapped_chain_loops_is_refused_by_name(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A callback in a dataclass default has `__wrapped__` pointing to itself. `repro` refuses
+    the stage with Pivot's named wrapper-loop error and writes no output."""
+    home = tmp_path / "home"
+    looping = _CALLBACK_CYCLE.replace(
+        "def class_callback() -> str:\n    return CycleBox.marker\n",
+        'def class_callback() -> str:\n    return "safe"\n\n\nclass_callback.__wrapped__ = class_callback\n',
+    )
+    project = _project(tmp_path, {"cycle.py": looping, "pipeline.py": _CALLBACK_CYCLE_PIPELINE})
+
+    result = helpers.run_pivot(project, home, "repro", "--json")
+    message = " ".join((result.stdout + result.stderr).split())
+    assert result.returncode != 0, f"The stage should be refused: {message}"
+    assert "class_callback' has a `__wrapped__` chain that loops" in message, message
+    assert "ValueError" not in message, message
+    assert not (project / "data" / "t" / "use.txt").exists()
 
 
 _CONFIG_HELD = """\

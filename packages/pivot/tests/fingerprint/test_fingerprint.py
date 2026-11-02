@@ -3602,12 +3602,103 @@ def test_a_callback_in_an_instances_state_is_walked_with_the_globals_it_reads(
     assert any(fingerprint._held_entry(entry) == key for entry in manifest), manifest
 
 
-def test_bytes_and_a_path_with_hex_text_are_hashed_by_value():
-    """Hex text in a value's own repr is its data: `b"0xabcdef"` and
-    `PurePosixPath("cache/0xabcdef")` defaults are hashed by value, not refused."""
+def _callback_class_cycle() -> str:
+    return _CycleBox.marker
+
+
+@dataclasses.dataclass(frozen=True)
+class _CycleBox:
+    marker: typing.ClassVar[str] = "safe"
+    value: typing.Any = _Callback(_callback_class_cycle)
+
+
+def _reads_a_callback_cycle() -> str:
+    return _CycleBox().value.read()
+
+
+def test_a_callback_that_reads_the_class_holding_it_is_a_back_reference():
+    """A callback in `_CycleBox`'s default reads `_CycleBox.marker`: the enclosing class is
+    already in the held callable's dependency set, so the callback stops at the back-reference
+    instead of recursing, and the stage has a stable manifest."""
+    with fingerprint.stage_fingerprint_scope("t/use"):
+        first = fingerprint.get_stage_fingerprint(_reads_a_callback_cycle)
+        second = fingerprint.get_stage_fingerprint(_reads_a_callback_cycle)
+
+    assert first == second
+
+
+def _loop_callback() -> str:
+    return "safe"
+
+
+setattr(_loop_callback, "__wrapped__", _loop_callback)  # noqa: B010 - the loop under test
+
+
+@dataclasses.dataclass(frozen=True)
+class _LoopCallbackBox:
+    value: typing.Any = _Callback(_loop_callback)
+
+
+def _reads_a_loop_callback() -> str:
+    return _LoopCallbackBox().value.read()
+
+
+def test_a_callback_whose_wrapped_chain_loops_is_refused_by_name():
+    """A callback in default state whose `__wrapped__` chain loops is refused with Pivot's
+    named wrapper-loop error, not `inspect.unwrap`'s raw `ValueError`."""
+    with pytest.raises(exceptions.StageDefinitionError, match="__wrapped__.*loops") as raised:
+        fingerprint.get_stage_fingerprint(_reads_a_loop_callback)
+
+    assert "_loop_callback" in str(raised.value)
+
+
+_CLASS_CALLBACK_VALUE = "A"
+
+
+class _ClassCallback:
+    @classmethod
+    def read(cls) -> str:
+        return _CLASS_CALLBACK_VALUE
+
+
+class _DictCallback:
+    def __init__(self, callback: typing.Callable[[], str]) -> None:
+        self.callback: typing.Callable[[], str] = callback
+
+    def read(self) -> str:
+        return self.callback()
+
+
+@dataclasses.dataclass(frozen=True)
+class _WithClassMethodCallback:
+    value: typing.Any = _DictCallback(_ClassCallback.read)
+
+
+def _reads_a_classmethod_callback() -> str:
+    return _WithClassMethodCallback().value.read()
+
+
+def test_a_class_bound_method_in_state_walks_its_function_globals():
+    """A classmethod stored as a callback is normalized to its underlying function before its
+    held callable walk, so the global it reads is in the manifest."""
+    manifest = fingerprint.get_stage_fingerprint(_reads_a_classmethod_callback)
+
+    key = f"const:{__name__}._CLASS_CALLBACK_VALUE"
+    assert any(fingerprint._held_entry(entry) == key for entry in manifest), manifest
+
+
+def test_bytes_and_a_path_with_identity_looking_text_are_hashed_by_value():
+    """Identity-looking text inside bytes or a path is value data, not an object's repr:
+    `b"located at 0xabcdef"`, `b"Py(0xabcdef)"`, `b"<object at 0xabcdef>"` and a path with
+    `at 0xabcdef` are accepted, not refused, and each content change changes the form."""
     for value, other in (
-        (b"0xabcdef", b"0x123456"),
-        (pathlib.PurePosixPath("cache/0xabcdef"), pathlib.PurePosixPath("cache/0x123456")),
+        (b"located at 0xabcdef", b"located at 0x123456"),
+        (b"Py(0xabcdef)", b"Py(0x123456)"),
+        (b"<object at 0xabcdef>", b"<object at 0x123456>"),
+        (
+            pathlib.PurePosixPath("cache/at 0xabcdef"),
+            pathlib.PurePosixPath("cache/at 0x123456"),
+        ),
     ):
         text, _held, opaque = fingerprint._dataclass_default_text(value)
         assert not opaque, text
@@ -3657,7 +3748,7 @@ def _ordered_stage(order: str) -> typing.Callable[[str], str]:
     return stage
 
 
-def _tag_all(things: list[typing.Any], text: str) -> str:
+def _tag_all(things: collections.abc.Iterable[typing.Any], text: str) -> str:
     return text + "".join(thing.suffix() for thing in things)
 
 
@@ -3728,6 +3819,42 @@ def test_swapping_later_instances_of_two_classes_in_one_list_changes_the_manifes
     after = fingerprint.get_stage_fingerprint(_ordered_stage("ABBA"))
 
     assert before != after
+
+
+def _equal_set_stage(labels: str) -> typing.Callable[[str], str]:
+    """A stage whose partial holds identity-distinct instances of two classes one factory made.
+    Every instance has the same canonical form and unordered rank; `labels` controls the count
+    of each class."""
+    made = {label: _make_captured(label) for label in "AB"}
+    holds = functools.partial(_tag_all, frozenset(made[label]() for label in labels))
+
+    def stage(text: str) -> str:
+        return holds(text)
+
+    return stage
+
+
+def test_replacing_a_class_at_an_equal_unordered_rank_changes_the_manifest():
+    """`frozenset([A(), A(), B()])` to `frozenset([A(), B(), B()])`: equal forms share rank
+    `s0`, but each class walk's key preserves the rank's occurrence count, so the manifest
+    changes."""
+    before = fingerprint.get_stage_fingerprint(_equal_set_stage("AAB"))
+    after = fingerprint.get_stage_fingerprint(_equal_set_stage("ABB"))
+
+    assert before != after
+
+
+def test_a_builtin_exception_filename_is_hashed_as_value_state():
+    """`FileNotFoundError.args` omits its filename. The built-in OSError descriptor state is
+    included, so two otherwise identical defaults with different filenames have different
+    forms and are not refused."""
+    first = FileNotFoundError(2, "missing", "A")
+    second = FileNotFoundError(2, "missing", "B")
+
+    texts = [fingerprint._dataclass_default_text(value) for value in (first, second)]
+
+    assert not any(opaque for _text, _held, opaque in texts), texts
+    assert texts[0][0] != texts[1][0]
 
 
 def test_a_class_with_no_source_holding_a_value_no_form_reads_is_refused_and_not_kept():
