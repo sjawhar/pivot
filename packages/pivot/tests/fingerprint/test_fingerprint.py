@@ -19,6 +19,7 @@ import random
 import signal
 import subprocess
 import sys
+import threading
 import time
 import types
 import typing
@@ -1993,7 +1994,7 @@ def test_many_loaders_of_one_class_walk_the_class_once_in_a_stage(
         pytest.param(
             _reads_a_dataclass_default,
             ("g:_WithReaderDefault", "fd:reader"),
-            "hd",
+            "hf",
             dataclasses.fields(_WithReaderDefault)[0].default,
             id="dataclass",
         ),
@@ -2004,12 +2005,12 @@ def test_a_loader_a_stage_walk_holds_gets_its_fingerprint_and_one_read(
 ):
     """A global partial's argument, or a field default of a dataclass the stage uses, holds
     `_HeldReader()`: the stage walk holds its fingerprint and records one read of the value
-    (`hl` for a partial, `hd` for a default), which a manifest cache hit takes again."""
+    (`hl` for a partial, `hf` for a dataclass field default), which a cache hit takes again."""
     manifest = fingerprint.get_stage_fingerprint(func)
     reads = _recording(func)
 
     assert set(fingerprint.get_loader_fingerprint(_HeldReader()).items()) <= _entries(manifest)
-    assert [read for read in reads if read[0][-1] in ("hl", "hd")] == [
+    assert [read for read in reads if read[0][-1] in ("hl", "hf")] == [
         ((*path, step), fingerprint._held_values_token(value, step))
     ]
     assert fingerprint._recorded_reads_hold(func, [[list(p), token] for p, token in reads])
@@ -2099,7 +2100,7 @@ def _held_only(manifest: dict[str, str], cls: type) -> bool:
             _tags_through_a_dataclass_default,
             [
                 (
-                    ("g:_WithCapturedDefault", "fd:captured", "hd"),
+                    ("g:_WithCapturedDefault", "fd:captured", "hf"),
                     dataclasses.fields(_WithCapturedDefault)[0].default,
                 )
             ],
@@ -2118,14 +2119,15 @@ def test_a_captured_instance_gets_its_classs_walk_and_one_read_per_value(
     """A global partial's argument or keyword, the field default of a dataclass the stage
     reads, or the StageParams default of a stage's parameter holds `_Captured()`. The stage's
     manifest holds the walk a stage that names `_Captured` gets, under `held:<digest>:`, and the
-    walk records one read of each value that holds it (`hl` a partial, `hd` a default, `hs` a
-    model's field defaults), which a manifest cache hit takes again."""
+    walk records one read of each value that holds it (`hl` a partial, `hf` a dataclass field
+    default, `hd` a parameter's default, `hs` a model's field defaults), which a manifest cache
+    hit takes again."""
     manifest = fingerprint.get_stage_fingerprint(func)
     reads = _recording(func)
 
     assert _class_walk(_Captured) <= _entries(manifest)
     assert _held_only(manifest, _Captured), manifest
-    assert [read for read in reads if read[0][-1] in ("hl", "hd", "hs")] == [
+    assert [read for read in reads if read[0][-1] in ("hl", "hd", "hf", "hs")] == [
         (path, fingerprint._held_values_token(value, path[-1])) for path, value in reads_at
     ]
     assert fingerprint._recorded_reads_hold(func, [[list(p), token] for p, token in reads])
@@ -2657,28 +2659,295 @@ class _AddressRepr:
         return f"<_AddressRepr at {id(self):#x}>"
 
 
-def test_a_class_default_no_form_shows_is_hashed_without_its_address():
-    """The class-level defaults of a dataclass whose forms cannot show them (an `object()`
-    sentinel the instance overrides, a `__slots__` object, a `ClassVar` object, a value whose own
-    repr writes its address) are hashed by their type with `0x?` and the source digest of the
-    class's module: no address, so the same text in every process. A default its form shows is
-    hashed by that form alone."""
+class _RaisingRepr:
+    """A user class whose `__repr__` must not run while its class is walked."""
+
+    def __init__(self, label: str) -> None:
+        self.label: str = label
+
+    def __repr__(self) -> str:
+        raise RuntimeError("an unused default's repr ran")
+
+
+def test_a_class_default_is_hashed_by_its_state_without_an_address():
+    """A class-level default is hashed by what it holds, with no address and no repr run: an
+    `object()` sentinel and a `__slots__ = ()` instance by their type, a `__slots__` instance by
+    its slots, a user class with a repr of its own (one that raises, one that writes its address)
+    by its attributes and slots, and a string that looks like an address by its content."""
+    texts = {
+        name: fingerprint._dataclass_default_text(value)
+        for name, value in {
+            "sentinel": _NO_SOURCE_MISSING,
+            "slots-1": _NoSourceBox(1),
+            "slots-2": _NoSourceBox(2),
+            "raising-repr-a": _RaisingRepr("a"),
+            "raising-repr-b": _RaisingRepr("b"),
+            "address-repr": _AddressRepr(),
+            "hex-a": "0xabcdef12",
+            "hex-b": "0x12345678",
+        }.items()
+    }
+
+    assert all(not opaque for _text, _held, opaque in texts.values()), texts
+    assert all(
+        fingerprint._ADDRESS.search(text) is None
+        for text, *_ in texts.values()
+        if not text.startswith('"0x')
+    ), texts
+    assert texts["slots-1"][0] != texts["slots-2"][0]
+    assert texts["raising-repr-a"][0] != texts["raising-repr-b"][0]
+    assert (texts["hex-a"][0], texts["hex-b"][0]) == ('"0xabcdef12"', '"0x12345678"')
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(random.Random(1), id="random"),
+        pytest.param(threading.Lock(), id="lock"),
+    ],
+)
+def test_a_class_default_whose_state_no_form_reads_refuses_the_stage(value: object):
+    """A class-level default whose state is in C or behind an address in its repr cannot be
+    hashed: a stage that names the class is refused, naming the field, and the field's read
+    token is `refused`, so a manifest cache hit misses."""
 
     @dataclasses.dataclass(frozen=True)
-    class OpaqueDefaults:
-        token: typing.Any = _NO_SOURCE_MISSING
-        box: typing.Any = _NoSourceBox(1)
-        marker: typing.ClassVar[object] = object()
+    class Holds:
+        state: typing.Any = value
 
-    values = (_NO_SOURCE_MISSING, _NoSourceBox(1), OpaqueDefaults.marker, _AddressRepr())
-    for value in values:
-        text, _held = fingerprint._dataclass_default_text(OpaqueDefaults, value)
-        assert "0x?" in text and fingerprint._ADDRESS.search(text) is None, text
-        assert "module-source:" in text, text
-    assert fingerprint._dataclass_default_text(OpaqueDefaults, "plain")[0] == '"plain"'
-    manifest = fingerprint.get_stage_fingerprint(lambda: OpaqueDefaults("explicit"))
-    defaults = {key: value for key, value in manifest.items() if key.startswith("default:")}
-    assert {key.rsplit(".", 1)[1] for key in defaults} == {"token", "box", "marker"}, manifest
+    def names(x: int) -> int:
+        return x + bool(Holds().state)
+
+    with pytest.raises(exceptions.StageDefinitionError, match=r"default of field '.*Holds\.state'"):
+        fingerprint.get_stage_fingerprint(names)
+    assert fingerprint._dataclass_field_token(Holds, "state") == "refused"
+
+
+@dataclasses.dataclass(frozen=True)
+class _WithRaisingReprDefault:
+    """Has a docstring, so `dataclasses` does not build one from the default's repr."""
+
+    value: typing.Any = _RaisingRepr("unused")
+
+
+_HOLDS_RAISING_REPR_DEFAULT = functools.partial(str, _WithRaisingReprDefault("explicit"))
+
+
+def _captures_a_raising_repr_default() -> str:
+    return _HOLDS_RAISING_REPR_DEFAULT()
+
+
+def test_an_unused_default_whose_repr_raises_does_not_stop_a_captured_stage():
+    """A partial holds an instance that overrides its class's default, a user class instance
+    whose `__repr__` raises: walking the class hashes the default by its attributes, so the
+    repr never runs and the stage is fingerprinted."""
+    manifest = fingerprint.get_stage_fingerprint(_captures_a_raising_repr_default)
+
+    key = f"default:{fingerprint._definition_ref(_WithRaisingReprDefault)}.value"
+    assert any(fingerprint._held_entry(entry) == key for entry in manifest), manifest
+
+
+_FIELD_TOKEN_MODULE = """\
+import dataclasses
+from typing import Any
+
+
+class Box:
+    __slots__ = ("x",)
+
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+
+@dataclasses.dataclass(frozen=True)
+class Defaults:
+    sentinel: Any = object()
+    box: Any = Box(1)
+"""
+
+_FIELD_TOKEN_SCRIPT = """\
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import field_token_defaults as module
+from pivot import fingerprint
+
+print(json.dumps([fingerprint._dataclass_field_token(module.Defaults, name)
+                  for name in ("sentinel", "box")]))
+"""
+
+
+def test_a_dataclass_field_token_is_the_same_in_every_interpreter(tmp_path: pathlib.Path):
+    """The read token of a field whose default is an `object()` sentinel or a `__slots__`
+    object is the hash of the default's text with no address, so two interpreters with two hash
+    seeds give one token, and a manifest cache hit in the next process is taken."""
+    (tmp_path / "field_token_defaults.py").write_text(_FIELD_TOKEN_MODULE)
+    tokens = [
+        subprocess.run(
+            [sys.executable, "-c", _FIELD_TOKEN_SCRIPT, str(tmp_path)],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONHASHSEED": seed},
+        ).stdout
+        for seed in ("1", "2")
+    ]
+
+    assert tokens[0] == tokens[1], tokens
+    assert "refused" not in tokens[0], tokens
+
+
+_UNSAFE_BASE_VALUES = ["unused"]
+
+
+class _UnsafeBase:
+    def value(self) -> str:
+        return _UNSAFE_BASE_VALUES[0]
+
+
+def _safe_value(self: object) -> str:
+    return "safe"
+
+
+# A class with no statement that overrides its base's member: only the resolved member is walked.
+_SafeDerived = type("_SafeDerived", (_UnsafeBase,), {"value": _safe_value})
+_HOLDS_SAFE_DERIVED = functools.partial(_read_value, _SafeDerived())
+
+
+def _captures_safe_derived() -> str:
+    return _HOLDS_SAFE_DERIVED()
+
+
+def _names_safe_derived() -> str:
+    return _SafeDerived().value()
+
+
+@pytest.mark.parametrize("stage", [_captures_safe_derived, _names_safe_derived])
+def test_a_member_a_class_without_a_statement_overrides_is_not_walked(
+    stage: typing.Callable[[], str],
+):
+    """`_SafeDerived`, made by `type()`, overrides `value`, whose base version reads a list
+    global: a stage that names the class walks only the resolved member and is accepted, and so
+    is one that captures an instance of it."""
+    manifest = fingerprint.get_stage_fingerprint(stage)
+
+    key = _definition_key("func", _safe_value)
+    assert any(fingerprint._held_entry(entry) == key for entry in manifest), manifest
+    base = _definition_key("func", _UnsafeBase.value)
+    assert not any(fingerprint._held_entry(entry) == base for entry in manifest), manifest
+
+
+def test_walking_a_held_class_runs_no_metaclass_repr():
+    """The class of an instance a loader's config holds has a metaclass whose `__repr__` raises:
+    the class is walked without being passed to an API that formats it."""
+
+    class ReprMeta(type):
+        def __repr__(cls) -> str:
+            raise RuntimeError("metaclass __repr__ ran")
+
+    class ReprThing(metaclass=ReprMeta):
+        def value(self) -> str:
+            return "safe"
+
+    manifest = fingerprint.get_loader_fingerprint(_HoldingReader(ReprThing()))
+
+    key = f"func:{ReprThing.__module__}.{ReprThing.__qualname__}.value"
+    assert any(fingerprint._held_entry(held) == key for held in manifest), manifest
+
+
+def _swapped(first: str, second: str) -> typing.Callable[[str], str]:
+    """A stage whose two partials hold instances of two classes one factory made."""
+    first_holds = functools.partial(_tag, _make_captured(first)())
+    second_holds = functools.partial(_tag, _make_captured(second)())
+
+    def stage(text: str) -> str:
+        return first_holds(text) + second_holds(text)
+
+    return stage
+
+
+def test_swapping_two_captured_classes_between_two_values_changes_the_manifest():
+    """Two partials hold instances of classes one factory made with `A` and `Z`; swapping them
+    changes the stage's output, so it changes the manifest: each walk is keyed by the value that
+    holds it."""
+    before = fingerprint.get_stage_fingerprint(_swapped("A", "Z"))
+    after = fingerprint.get_stage_fingerprint(_swapped("Z", "A"))
+
+    assert before != after
+
+
+def _make_slotted(label: str) -> type:
+    class Slot:
+        __slots__: tuple[str, ...] = ()
+
+        def value(self) -> str:
+            return label
+
+    return Slot
+
+
+@dataclasses.dataclass(frozen=True)
+class _SetDefault:
+    values: typing.Any = frozenset((_make_slotted("A")(), _make_slotted("B")()))
+
+
+def _reads_a_set_default() -> str:
+    return "".join(sorted(item.value() for item in _SetDefault().values))
+
+
+def test_a_dataclass_default_holding_instances_replays_as_it_records():
+    """A dataclass default holds a set of two `__slots__` instances of classes one factory made:
+    the read the walk records for it (`hf`) is the one a cache hit takes again, in one process."""
+    reads: list[object] = [[list(path), token] for path, token in _recording(_reads_a_set_default)]
+
+    assert any(read[0][-1] == "hf" for read in _recording(_reads_a_set_default)), reads
+    assert fingerprint._recorded_reads_hold(_reads_a_set_default, reads)
+
+
+_READER_COLUMNS = ["a", "b"]
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReadsAListReader(loaders.Reader[str]):
+    """A loader whose `load` reads a list global, which the walk refuses."""
+
+    def load(self, path: pathlib.Path) -> str:
+        return ",".join(_READER_COLUMNS)
+
+
+_HOLDS_A_LIST_READER = functools.partial(_apply, _ReadsAListReader())
+
+
+def _takes_a_list_reader(path: pathlib.Path) -> str:
+    return _HOLDS_A_LIST_READER(path)
+
+
+@pytest.mark.parametrize(
+    ("holder", "stage", "name"),
+    [
+        pytest.param(
+            _HOLDS_READS_A_LIST, _takes_one_that_reads_a_list, "_COLUMNS", id="held-class"
+        ),
+        pytest.param(
+            _HOLDS_A_LIST_READER, _takes_a_list_reader, "_READER_COLUMNS", id="held-loader"
+        ),
+    ],
+)
+def test_a_refusal_while_a_cache_hit_is_checked_is_made_again_by_the_stage_walk(
+    holder: object, stage: typing.Callable[..., object], name: str
+):
+    """In one stage scope, checking a cache hit again walks the class a partial holds an
+    instance of, or the loader it holds and that loader's class, and the walk refuses; no walk
+    that refused is kept, so the stage walk that follows walks it again and refuses the
+    stage."""
+    with (
+        pytest.raises(exceptions.StageDefinitionError, match=f"non-scalar variable '{name}'"),
+        fingerprint.stage_fingerprint_scope("t/use"),
+    ):
+        assert fingerprint._read_token(holder, "hl") == "refused"
+        fingerprint.get_stage_fingerprint(stage)
 
 
 _LABELS = ["a", "b"]
@@ -3354,8 +3623,9 @@ CmSentinel = pydantic.create_model("CmSentinel", x=(object, _MISSING), y=(str, "
 """
 
 # The kinds above whose form cannot show one of their values, so they are hashed with their
-# module's source too.
-_NO_SOURCE_HIDDEN = {"NtSentinel", "NtSlots", "MdSentinel", "MdRandom", "CmSentinel"}
+# module's source too: a `random.Random`, whose state is in C. A sentinel `object()` and a
+# `__slots__` object are shown by their type and slots (`_addressless_leaf`).
+_NO_SOURCE_HIDDEN = {"MdRandom"}
 
 _NO_SOURCE_HASH_SCRIPT = """\
 import json

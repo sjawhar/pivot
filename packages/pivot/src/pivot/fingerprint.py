@@ -363,9 +363,9 @@ _held_reach: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "_held_reach", default=None
 )
 
-# The class a held class walk (`_walk_held_class`) is for: its member walk covers only that
-# class's own namespace (`_user_methods`), since each user base on its MRO is walked on its own
-# (`_held_class_items`); None outside such a walk.
+# The class with a class statement a held class walk (`_walk_held_class`) is for: its member walk
+# covers only that class's own namespace (`_user_methods`), since each user base its statement
+# names is walked on its own (`_held_class_items`); None outside such a walk.
 _held_own_class: contextvars.ContextVar[type | None] = contextvars.ContextVar(
     "_held_own_class", default=None
 )
@@ -1016,10 +1016,10 @@ def _default_token(value: Any) -> str:
 # `bi:MODULE` a loaded module a function body imports, `u` the function behind a C-level
 # wrapper, `pf`, `pa:INDEX` and `pk:KEY` a partial's parts, `i:INDEX`, `k:REPR` and `s:INDEX`
 # container members, `hc:INDEX` a class in type hints and `fc:INDEX` a class in a model's field
-# annotations. `hints` and `schema` read the visited object itself, and so do `hl`, `hd` and `hs`:
-# the fingerprints of the pivot loaders, and the walks of the classes of the other user class
-# instances, that a partial's arguments (`hl`), a default (`hd`: a dataclass field's, or a
-# StageParams argument default) or a pydantic model's field defaults (`hs`) hold
+# annotations. `hints` and `schema` read the visited object itself, and so do `hl`, `hd`, `hf`
+# and `hs`: the fingerprints of the pivot loaders, and the walks of the classes of the other user
+# class instances, that a partial's arguments (`hl`), a parameter's default (`hd`), a dataclass
+# field's class-level default (`hf`) or a pydantic model's field defaults (`hs`) hold
 # (`_held_values_token`).
 _UNREAD = object()
 
@@ -1096,7 +1096,7 @@ def _read_token(owner: Any, step: str) -> str:
         return f"{_schema_hash(owner)}|{field_classes}"
     if step.startswith("fd:"):
         return _dataclass_field_token(owner, step.partition(":")[2])
-    if step in ("hl", "hd", "hs"):
+    if step in ("hl", "hd", "hf", "hs"):
         return _held_values_token(owner, step)
     value = _read_step(owner, step)
     if value is _UNREAD:
@@ -1368,6 +1368,27 @@ def refuse(message: str) -> None:
     errors.append(message)
 
 
+@contextlib.contextmanager
+def _refusals_seen() -> Iterator[list[str]]:
+    """Collect the refusals made in the block, then report them where `refuse` would have. The
+    list says whether the block refused: a walk that refused leaves no entry in a memo (the stage
+    memos, `_loader_class_memo`), since its entries are partial and a later hit would not refuse.
+    A refusal while a manifest cache hit is checked again (`_recorded_reads_hold`) is then made
+    again by the stage walk that follows."""
+    errors = list[str]()
+    token = _capture_errors.set(errors)
+    try:
+        yield errors
+    finally:
+        _capture_errors.reset(token)
+    if not errors:
+        return
+    outer = _capture_errors.get()
+    if outer is None:
+        raise exceptions.StageDefinitionError("\n\n".join(dict.fromkeys(errors)))
+    outer.extend(errors)
+
+
 class StageFingerprintScope(TypedDict):
     """What `stage_fingerprint_scope` learned about one stage's fingerprint."""
 
@@ -1585,20 +1606,21 @@ def _get_stage_fingerprint_impl(func: Callable[..., Any], visited: set[int]) -> 
         if check_tree is not None:
             _check_dynamic_name_access(func, check_tree)
 
+    if isinstance(func, type):
+        # A class is walked by its statement and its members. `inspect.getclosurevars` refuses
+        # one, and its error formats the class with `repr`, which runs a metaclass `__repr__`.
+        _process_class_body_dependencies(func, manifest, visited)
+        _process_user_methods(func, manifest, visited)
+        return manifest
     _t_closure = metrics.start()
     try:
-        # Use cached result if available (getclosurevars is expensive at ~0.5ms). A class is no
-        # key: getclosurevars refuses it, and the lookup would run a metaclass `__hash__`.
-        closure_vars = None if isinstance(func, type) else _getclosurevars_cache.get(func)
+        # Use cached result if available (getclosurevars is expensive at ~0.5ms)
+        closure_vars = _getclosurevars_cache.get(func)
         if closure_vars is None:
             closure_vars = inspect.getclosurevars(func)
             _getclosurevars_cache[func] = closure_vars
     except (TypeError, AttributeError):
         metrics.end("fingerprint.getclosurevars", _t_closure)
-        if isinstance(func, type):
-            _process_class_body_dependencies(func, manifest, visited)
-            _process_user_methods(func, manifest, visited)
-            return manifest
         # A C-level wrapper such as functools.cache or lru_cache is not a Python function, so
         # getclosurevars rejects it. The function it wraps reads the module values, so walk
         # that function's globals, nonlocals and defaults instead. The unwrap stops at a user
@@ -1702,31 +1724,32 @@ def _dataclass_field_token(cls: type, name: str) -> str:
         return _value_token(field.default_factory)
     if field.default is dataclasses.MISSING:
         return "absent"
-    text, _held = _dataclass_default_text(cls, field.default)
+    text, _held, opaque = _dataclass_default_text(field.default)
+    if opaque and not _is_unsafe_fingerprinting_enabled():
+        return "refused"
     return f"field:{xxhash.xxh64(text.encode()).hexdigest()}"
 
 
-def _dataclass_default_text(cls: type, value: Any) -> tuple[str, "_HeldValues"]:
+def _dataclass_default_text(value: Any) -> tuple[str, "_HeldValues", bool]:
     """The text a dataclass field's class-level default `value` (a `ClassVar`'s too) is hashed
-    by, and what the value holds (`_serialize_collecting`).
+    by, what the value holds (`_serialize_collecting`), and whether part of its state is out of
+    reach of the text.
 
-    A value whose form cannot show it (an `object()` sentinel or a `__slots__` object, whose repr
-    is an address and is not called; a `random.Random`, whose state is in C) keeps the rest of
-    its form, without the address, and the text then holds the source digest of the module that
-    defines `cls`, as a class with no source is hashed (`_sourceless_class_hash`): an edit to
-    that module reruns the stages that read the class, and no new process, hash seed or fresh
-    state database does. A default the instance overrides is hashed so too: a member may build
-    an instance that takes it (`type(self)()`)."""
+    The text never holds a memory address, and nothing in it is rewritten: a string default
+    keeps its content. An `object()` sentinel, a `__slots__ = ()` instance or a `__slots__`
+    instance is written by its type and its slots, without calling the repr whose text is an
+    address (`_addressless_leaf`), so it is the same in every process and changes with its slots'
+    values. A value whose state neither shows (a `random.Random`, whose state is in C; a value
+    whose repr holds an address) is out of reach: the stage is refused
+    (`_refuse_opaque_default`), since a change to it would go unseen. A default the instance
+    overrides is hashed so too: a member may build an instance that takes it (`type(self)()`)."""
     hidden = [False]
     token = _hidden_state.set(hidden)
     try:
         (text,), held = _serialize_collecting([("default", value)])
     finally:
         _hidden_state.reset(token)
-    stripped = _ADDRESS.sub("0x?", text)
-    if hidden[0] or stripped != text:
-        stripped = f"{stripped}\0module-source:{_module_source_digest(cls)}"
-    return stripped, held
+    return text, held, hidden[0]
 
 
 def _process_dataclass_defaults(cls: type, manifest: dict[str, str], visited: set[int]) -> None:
@@ -1745,12 +1768,14 @@ def _process_dataclass_defaults(cls: type, manifest: dict[str, str], visited: se
         _record_read(cls, step)
         binding_ref = f"{class_ref}.{name}"
         if field.default is not dataclasses.MISSING:
-            text, held = _dataclass_default_text(cls, field.default)
+            text, held, opaque = _dataclass_default_text(field.default)
+            if opaque:
+                _refuse_opaque_default(binding_ref, field.default, stage_name)
             manifest[f"default:{binding_ref}"] = xxhash.xxh64(text.encode()).hexdigest()
             if held:
                 with _walking(step):
                     holder = f"the default of field '{binding_ref}'"
-                    _merge_held(manifest, held, read="hd", holder=holder)
+                    _merge_held(manifest, held, read="hf", holder=holder)
             continue
         if field.default_factory is dataclasses.MISSING:
             continue
@@ -2343,7 +2368,7 @@ def _loader_class_entries(loader_type: type[Any]) -> dict[str, str]:
     """The entries of a loader's manifest that its class decides: the walks of its user-defined
     `load`, `save` and `empty` and of the members they reach, and the hashes of its `load`,
     `save` and overridden `empty`. Kept for the stage (`_loader_class_memo`), so many loaders of
-    one class walk it once."""
+    one class walk it once; a walk that refused is not kept (`_refusals_seen`)."""
     memo = _loader_class_memo.get()
     cached = None if memo is None else memo.get(id(loader_type))
     if cached is not None:
@@ -2358,15 +2383,25 @@ def _loader_class_entries(loader_type: type[Any]) -> dict[str, str]:
     # A method whose `__wrapped__` chain loops is refused by `_reachable_loader_members` and
     # not walked here: the walk reads the source at the chain's end, and `unwrap` raises at the
     # loop. Its hash below reads only its own bytecode (`hash_function_ast` of a wrapper).
-    for method_name in _LOADER_METHODS:
-        method = _user_defined_method(loader_type, method_name)
-        if method is not None and not _wrapper_loops(method):
-            _process_callable_dependency(f"{class_name}.{method_name}", method, manifest, visited)
     stage_name = _current_stage_name.get() or loader_type.__qualname__
-    for binding_ref, member in _reachable_loader_members(loader_type):
-        _process_captured_value(
-            binding_ref, binding_ref, member, loader_type, manifest, visited, stage_name, chain=None
-        )
+    with _refusals_seen() as refusals:
+        for method_name in _LOADER_METHODS:
+            method = _user_defined_method(loader_type, method_name)
+            if method is not None and not _wrapper_loops(method):
+                _process_callable_dependency(
+                    f"{class_name}.{method_name}", method, manifest, visited
+                )
+        for binding_ref, member in _reachable_loader_members(loader_type):
+            _process_captured_value(
+                binding_ref,
+                binding_ref,
+                member,
+                loader_type,
+                manifest,
+                visited,
+                stage_name,
+                chain=None,
+            )
 
     # Use each method definition rather than a temporary bound method so the
     # weak AST hash cache retains the entry across loader fingerprint calls.
@@ -2390,7 +2425,7 @@ def _loader_class_entries(loader_type: type[Any]) -> dict[str, str]:
                         _method_function(methods.empty)
                     )
                     break
-    if memo is not None:
+    if memo is not None and not refusals:
         memo[id(methods)] = (methods, manifest)
     return manifest
 
@@ -2574,34 +2609,64 @@ def _walk_held_loader(
     before: dict[tuple[str, tuple[int, ...]], tuple[Any, dict[str, str]]] | None,
 ) -> dict[str, str]:
     """`get_loader_fingerprint(loader)` with no read recorded, kept in the stage's `memo` under
-    `key`; with `before`, walked with a copy of it as the memo instead (`_held_loader_entries`)."""
+    `key` unless it refused (`_refusals_seen`); with `before`, walked with a copy of it as the
+    memo instead (`_held_loader_entries`)."""
     cached = None if memo is None else memo.get(key)
     if cached is not None:
         return cached[1]
     reads_token = _recorded_reads.set(None)
     memo_token = None if before is None else _held_memo.set(dict(before))
     try:
-        entries = get_loader_fingerprint(loader)
+        with _refusals_seen() as refusals:
+            entries = get_loader_fingerprint(loader)
     finally:
         if memo_token is not None:
             _held_memo.reset(memo_token)
         _recorded_reads.reset(reads_token)
-    if memo is not None:
+    if memo is not None and not refusals:
         memo[key] = (loader, entries)
     return entries
 
 
 def _held_class_items(cls: type[Any]) -> list[type[Any]]:
-    """The classes a held instance of `cls` makes its holder walk: `cls` and each user class on
-    its MRO, read through `_class_mro`. Each is walked for its own namespace
-    (`_walk_held_class`), so every user member on the MRO is walked once, under the class that
-    defines it, and a base many held classes share is walked once per stage, not once per
-    class."""
-    return _memoized(
-        "held-items",
-        cls,
-        lambda: [klass for klass in _class_mro(cls) if klass is not object and is_user_code(klass)],
-    )
+    """The classes a held instance of `cls` makes its holder walk, as the walk of a stage that
+    names `cls` walks them: `cls`, and, when `cls` has a class statement, each user class among
+    its bases, which that statement names (`_process_class_body_dependencies`), and so on for
+    theirs. A class with a statement is walked for its own namespace (`_walk_held_class`), so
+    every member on such a chain is walked once, under the class that defines it, and a base many
+    held classes share is walked once per stage. A class without one (`type(...)`) is walked for
+    the members its MRO resolves, as a named one is: a member one of its classes overrides is
+    not walked, and nothing names its bases."""
+
+    def collect() -> list[type[Any]]:
+        found = list[type[Any]]()
+        pending = [cls]
+        while pending:
+            klass = pending.pop(0)
+            if klass is object or any(known is klass for known in found):
+                continue
+            if not is_user_code(klass):
+                continue
+            found.append(klass)
+            if _has_class_statement(klass):
+                pending.extend(_class_bases(klass))
+        return found
+
+    return _memoized("held-items", cls, collect)
+
+
+def _has_class_statement(cls: type[Any]) -> bool:
+    """Whether the source of `cls`'s class statement can be read, as the walk of a class body
+    reads it (`_process_class_body_dependencies`)."""
+
+    def read() -> bool:
+        try:
+            loaded_source.getsource(cls)
+        except (OSError, TypeError):
+            return False
+        return True
+
+    return _memoized("class-statement", cls, read)
 
 
 def _held_class_entries(held: _HeldValues, holder: str) -> dict[str, dict[str, str]]:
@@ -2670,12 +2735,13 @@ def _walk_held_class(
     """The walk a stage that names `cls` gives it (`_process_callable_dependency`): the class's
     hash, the classes its statement names, its dataclass defaults, and the walk of each user
     member, refusals included, each refusal saying how the stage reaches the class (`reach`,
-    `_held_reach`). The members are `cls`'s own (`_held_own_class`), and the user bases on its
-    MRO are only hashed here: each is walked on its own (`_held_class_items`). Kept in the
-    stage's `memo`, so a class is walked once per stage; with `before`, walked with a copy of it
-    as the memo instead (`_held_class_entries`). `cls` is marked as being walked
-    (`_loader_stack`), and the walk records no read of its own: the holder's caller records one
-    read for all it holds (`_merge_held`)."""
+    `_held_reach`). A class with a statement is walked for its own namespace (`_held_own_class`):
+    the user bases its statement names are walked on their own (`_held_class_items`). A class
+    without one is walked for the members its MRO resolves, as a named one is. Kept in the
+    stage's `memo` unless it refused (`_refusals_seen`), so a class is walked once per stage;
+    with `before`, walked with a copy of it as the memo instead (`_held_class_entries`). `cls`
+    is marked as being walked (`_loader_stack`), and the walk records no read of its own: the
+    holder's caller records one read for all it holds (`_merge_held`)."""
     key = ("class", (id(cls),))
     cached = None if memo is None else memo.get(key)
     if cached is not None:
@@ -2685,10 +2751,11 @@ def _walk_held_class(
     reads_token = _recorded_reads.set(None)
     stack_token = _loader_stack.set((*_loader_stack.get(), id(cls)))
     reach_token = _held_reach.set(reach)
-    own_token = _held_own_class.set(cls)
+    own_token = _held_own_class.set(cls if _has_class_statement(cls) else None)
     memo_token = None if before is None else _held_memo.set(dict(before))
     try:
-        _process_callable_dependency(_definition_ref(cls), cls, entries, bases)
+        with _refusals_seen() as refusals:
+            _process_callable_dependency(_definition_ref(cls), cls, entries, bases)
     finally:
         if memo_token is not None:
             _held_memo.reset(memo_token)
@@ -2696,7 +2763,7 @@ def _walk_held_class(
         _held_reach.reset(reach_token)
         _loader_stack.reset(stack_token)
         _recorded_reads.reset(reads_token)
-    if memo is not None:
+    if memo is not None and not refusals:
         memo[key] = (cls, entries)
     return entries
 
@@ -2710,16 +2777,19 @@ def _merge_held(
     manifest: dict[str, str], held: _HeldValues, *, read: str | None, holder: str
 ) -> None:
     """Add to `manifest` what `held` holds (`_held_entries`): each pivot loader's fingerprint and
-    each other user class's walk, under `held:<digest>:` (the digest is hexadecimal, so the
-    prefix holds no `:` and no user name: `_held_entry`). With `read` (`hl` for a partial's
-    arguments, `hd` for a default, `hs` for a pydantic model's field defaults), inside a
-    cacheable stage walk, record one read of the value being visited, whose token is those
-    manifests: a cache hit fingerprints its held loaders and walks its held classes again, as
-    each run fingerprints a top-level loader. `holder` names the value, for the refusals a class
-    walk makes."""
+    each other user class's walk, under `held:<digest>:`, the digest of `holder` and of the
+    manifest's own key (`_held_key`), so the entries keep the value that holds them: swapping
+    two loaders or instances between two values of a stage changes the manifest. The digest is
+    hexadecimal, so the prefix holds no `:` and no user name (`_held_entry`). With `read` (`hl`
+    for a partial's arguments, `hd` for a parameter's default, `hf` for a dataclass field's,
+    `hs` for a pydantic model's field defaults), inside a cacheable stage walk, record one read
+    of the value being visited, whose token is those manifests: a cache hit fingerprints its held
+    loaders and walks its held classes again, as each run fingerprints a top-level loader.
+    `holder` names the value, for the refusals a class walk makes too."""
     entries = _held_entries(held, holder)
     for digest, held_manifest in entries.items():
-        _merge_prefixed(manifest, f"held:{digest}:", held_manifest)
+        keyed = xxhash.xxh64(f"{holder}\0{digest}".encode()).hexdigest()
+        _merge_prefixed(manifest, f"held:{keyed}:", held_manifest)
     reads = _recorded_reads.get()
     if read is not None and entries and reads is not None:
         reads.append(((*_walk_path.get(), read), _held_token(entries)))
@@ -2727,10 +2797,12 @@ def _merge_held(
 
 def _held_values_token(value: Any, step: str) -> str:
     """The read token of `value` (`_merge_held`): for `hl` a partial, its arguments and keywords;
-    for `hd` a default; for `hs` a pydantic model, its field defaults (`_schema_parts`). The
-    manifests of what it holds. A refusal the walks make here is not reported: the token is then
-    `refused`, which no recorded token equals, so the cache misses and the stage walk reports it
-    with where the stage reads the value."""
+    for `hd` a parameter's default; for `hf` a dataclass field's class-level default, read as it
+    is recorded (`_dataclass_default_text`); for `hs` a pydantic model, its field defaults
+    (`_schema_parts`). The manifests of what it holds. A refusal the walks make here is not
+    reported: the token is then `refused`, which no recorded token equals, so the cache misses
+    and the stage walk reports it with where the stage reads the value. No walk that refused is
+    kept in a memo (`_refusals_seen`), so the stage walk makes the refusal again."""
     errors = list[str]()
     errors_token = _capture_errors.set(errors)
     try:
@@ -2738,6 +2810,8 @@ def _held_values_token(value: Any, step: str) -> str:
             if not hasattr(value, "model_json_schema"):
                 return "absent"
             held = _schema_parts(value)[1]
+        elif step == "hf":
+            held = _dataclass_default_text(value)[1]
         else:
             parts = _partial_parts(value) if step == "hl" else [("default", value)]
             _texts, held = _serialize_collecting(parts)
@@ -3147,6 +3221,31 @@ def _check_non_scalar_capture(
         + "Fix: move this value into the stage's StageParams, or read it from a pipeline input.\n"
         + "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
     )
+    _report_unsafe_capture(message)
+
+
+def _refuse_opaque_default(binding_ref: str, value: Any, stage_name: str) -> None:
+    """Refuse a dataclass's class-level default whose state no form shows
+    (`_dataclass_default_text`): a change to it would go unseen. Inside the walk of a held
+    instance's class, the message also says how the stage reaches that class (`_held_reach`)."""
+    reach = _held_reach.get()
+    where = "" if reach is None else f"It is in the class of {reach}.\n"
+    message = (
+        f"Stage '{stage_name}': the default of field '{binding_ref}' keeps state pivot cannot "
+        + f"read (type: {type(value).__name__}).\n"
+        + where
+        + "Pivot hashes a class-level default by its value, its attributes and its slots; this "
+        + "one keeps its state elsewhere (in C, or behind a memory address in its repr), so a "
+        + "change to it would go unseen, which can cause silent wrong outputs.\n"
+        + "Fix: build it with a default_factory, or move this value into the stage's "
+        + "StageParams.\n"
+        + "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
+    )
+    _report_unsafe_capture(message)
+
+
+def _report_unsafe_capture(message: str) -> None:
+    """Refuse the stage with `message` (`refuse`), or warn when unsafe fingerprinting is on."""
     if _is_unsafe_fingerprinting_enabled():
         _unsafe_capture_warning.set(True)
         if (scope := _stage_scope.get()) is not None:
@@ -3188,10 +3287,18 @@ def _attribute_or_none(value: Any, name: str) -> Any:
 # ends at its real length.
 _class_mro = cast("Callable[[Any], tuple[type, ...]]", type.__dict__["__mro__"].__get__)
 _class_namespace = cast("Callable[[type], Mapping[str, Any]]", type.__dict__["__dict__"].__get__)
-# `type`'s own descriptors for a class's `__module__`, `__qualname__` and `__name__`, read so too.
+# `type`'s own descriptors for a class's `__module__`, `__qualname__`, `__name__` and
+# `__bases__`, read so too.
 _class_module = cast("Callable[[type], object]", type.__dict__["__module__"].__get__)
 _class_qualname = cast("Callable[[type], str]", type.__dict__["__qualname__"].__get__)
 _class_name = cast("Callable[[type], str]", type.__dict__["__name__"].__get__)
+_class_bases = cast("Callable[[type], tuple[type, ...]]", type.__dict__["__bases__"].__get__)
+# `type`'s own descriptors for the sizes `_slot_state` compares, read so too (`__dictoffset__` is
+# `_class_dictoffset`, below).
+_class_basicsize = cast("Callable[[type], int]", type.__dict__["__basicsize__"].__get__)
+_class_weakrefoffset = cast("Callable[[type], int]", type.__dict__["__weakrefoffset__"].__get__)
+# The size of a pointer: a tuple's item is one.
+_POINTER_SIZE = tuple.__itemsize__
 # The C descriptors a class keeps for its instances' `__dict__` (a class's getset, a module's
 # member); reading the instance dict through one runs no code of the object or its class. An
 # entry's type is compared with them by identity: `==` would ask a metaclass `__eq__`.
@@ -4428,16 +4535,96 @@ def _canonicalize_value_for_hash(value: Any, active: tuple[int, ...] = ()) -> An
             attributes = {name: item for name, item in own.items() if name != _BY_NAME_MARK}
         hidden = _hidden_state.get()
         if hidden is not None and _keeps_state_outside_dict(type(cast("object", value))):
-            hidden[0] = True
+            slots = _slot_state(value_type, value)
+            if slots is None:
+                hidden[0] = True
+            else:
+                return [
+                    _definition_ref(type(value)),
+                    _canonicalize_value_for_hash(attributes, inner),
+                    _canonicalize_value_for_hash(slots, inner),
+                ]
         return [_definition_ref(type(value)), _canonicalize_value_for_hash(attributes, inner)]
     hidden = _hidden_state.get()
-    if hidden is not None and _uses_object_repr(value_type):
-        # A form that must not hold an address (`_hidden_state`): `object.__repr__` writes only
-        # the type and the address, so its text is written out without the address and without
-        # calling it, and the value counts as one the form cannot show.
-        hidden[0] = True
-        return [type(value).__name__, _object_repr_without_address(value_type)]
+    if hidden is not None:
+        return _addressless_leaf(value, value_type, (*active, id(value)), hidden)
     return [type(value).__name__, repr(value)]
+
+
+def _addressless_leaf(
+    value: Any, value_type: type[Any], active: tuple[int, ...], hidden: list[bool]
+) -> list[Any]:
+    """The form of a leaf in a form that must hold no address (`_hidden_state`).
+
+    An instance of a user class, or of a class that takes `object.__repr__`, is written by its
+    type and the state its slots and its `__dict__` hold (`_structural_state`), and no code of
+    it runs: neither its repr, which may be user code or only the type and an address, nor any
+    descriptor. A bare `object()` or a `__slots__ = ()` instance has no state. Any other leaf
+    (a library value with a repr of its own: a `Decimal`, a `date`, a `Path`) is its repr. A leaf
+    whose state neither shows (a C type's fields, `random.Random`; a repr that holds an address,
+    `threading.Lock`) sets `hidden[0]`, and its form holds only its type: no address, and no
+    state taken for its own. A string's content is never read as an address: it is a scalar, not
+    a leaf."""
+    name = _class_name(value_type)
+    if is_user_code(value_type) or _uses_object_repr(value_type):
+        label = _object_repr_without_address(value_type)
+        state = _structural_state(value_type, value)
+        if state is not None:
+            return [name, label, _canonicalize_value_for_hash(state, active)]
+        hidden[0] = True
+        return [name, label]
+    text = repr(value)
+    if _ADDRESS.search(text) is None:
+        return [name, text]
+    hidden[0] = True
+    return [name, "state behind an address"]
+
+
+def _structural_state(cls: type[Any], value: Any) -> dict[str, Any] | None:
+    """The state of `value`, an instance of `cls`, its slots hold (`_slot_state`) and its
+    instance `__dict__` holds, read through the C descriptor a class on its real MRO keeps for it,
+    so no code of `cls` runs; None when its instances keep state elsewhere."""
+    slots = _slot_state(cls, value)
+    if slots is None:
+        return None
+    state: dict[str, Any] = {"slots": slots}
+    for klass in _class_mro(cls):
+        entry = _class_namespace(klass).get("__dict__")
+        if (
+            type(entry) is _GETSET_DESCRIPTOR or type(entry) is _MEMBER_DESCRIPTOR
+        ) and entry.__objclass__ is klass:
+            instance_dict: object = entry.__get__(value, cls)
+            if type(instance_dict) is dict:
+                own = cast("dict[str, Any]", instance_dict)
+                state["dict"] = {key: item for key, item in own.items() if key != _BY_NAME_MARK}
+            break
+    return state
+
+
+def _slot_state(cls: type[Any], value: Any) -> dict[str, Any] | None:
+    """The values in the slots of `value`, an instance of `cls`, keyed by the position on the
+    MRO and the name of the class that declares each slot and by the slot's name; an unset slot
+    is left out. Each is read through its slot's own descriptor, so no code of `cls` runs.
+
+    None when instances of `cls` keep state that neither their slots nor their `__dict__` hold:
+    an instance's size is that of a bare `object`, plus a pointer per slot, per `__dict__` and
+    per `__weakref__` that is not managed by the interpreter; a larger one keeps a C type's
+    fields (`random.Random`'s generator state, an exception's arguments)."""
+    size = _class_basicsize(object)
+    found = dict[str, Any]()
+    for index, klass in enumerate(_class_mro(cls)):
+        for name, raw in _class_namespace(klass).items():
+            if type(raw) is not _MEMBER_DESCRIPTOR or name in ("__dict__", "__weakref__"):
+                continue
+            size += _POINTER_SIZE
+            try:
+                found[f"{index}:{_class_qualname(klass)}.{name}"] = raw.__get__(value, cls)
+            except AttributeError:  # an unset slot
+                continue
+    for offset in (_class_dictoffset(cls), _class_weakrefoffset(cls)):
+        if offset > 0:
+            size += _POINTER_SIZE
+    return found if size == _class_basicsize(cls) else None
 
 
 def _uses_object_repr(cls: type[Any]) -> bool:
@@ -4450,8 +4637,8 @@ def _uses_object_repr(cls: type[Any]) -> bool:
 
 
 def _object_repr_without_address(cls: type[Any]) -> str:
-    """The text `object.__repr__` gives an instance of `cls`, with `0x?` for its address, as
-    `_without_addresses` writes it, read with no code of `cls` or its metaclass run."""
+    """The text `object.__repr__` gives an instance of `cls`, with `0x?` for its address, read
+    with no code of `cls` or its metaclass run."""
     module = _class_module(cls)
     if type(module) is str and module != "builtins":
         return f"<{module}.{_class_qualname(cls)} object at 0x?>"
@@ -4664,7 +4851,13 @@ def _get_qualname_for_cache(func: Callable[..., Any]) -> str:
 
 
 def _definition_ref(obj: Any) -> str:
-    """Return an object's module-qualified definition name for a manifest key."""
+    """Return an object's module-qualified definition name for a manifest key. A class's names
+    are read through `type`'s own descriptors (`_class_module`, `_class_qualname`), so no
+    metaclass `__getattribute__` runs."""
+    if isinstance(obj, type):
+        module = _class_module(obj)
+        name = module if type(module) is str and module else "<unknown>"
+        return f"{name}.{_class_qualname(obj)}"
     module = getattr(obj, "__module__", None) or "<unknown>"
     return f"{module}.{_get_qualname_for_cache(obj)}"
 
@@ -4979,13 +5172,14 @@ def _sourceless_class_hash(cls: type) -> str:
     what defines it (`_sourceless_parts`). It is the same in every process, and it changes when
     what defines the class changes: its fields, its members, or the code of a function it holds.
 
-    An entry that holds a value whose form does not show it (a sentinel `object()` or a
-    `__slots__` object, whose repr is an address; a `random.Random`, whose state is in C) keeps
-    the rest of its form, without the address, so a change to any other entry is still seen. A
-    change to such a value itself is not visible in any form, so the class is then also hashed
-    with the source of the module that defines it (`_module_source_digest`): an edit to that
-    module reruns the stages that read the class, as it did when the class was hashed by its
-    address, and no new process and no fresh state database does."""
+    A sentinel `object()` or a `__slots__` object is written by its type and its slots
+    (`_addressless_leaf`). An entry that holds a value whose form does not show it (a
+    `random.Random`, whose state is in C; a value whose repr holds an address) keeps the rest of
+    its form, without the address, so a change to any other entry is still seen. A change to
+    such a value itself is not visible in any form, so the class is then also hashed with the
+    source of the module that defines it (`_module_source_digest`): an edit to that module reruns
+    the stages that read the class, as it did when the class was hashed by its address, and no
+    new process and no fresh state database does."""
     parts, opaque = _sourceless_parts(cls)
     if opaque:
         parts.append(["module-source", _module_source_digest(cls)])

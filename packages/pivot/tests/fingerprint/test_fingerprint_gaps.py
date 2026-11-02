@@ -2536,9 +2536,8 @@ class Box:
 """
 
 # A class with no source of its own that `Inner.load` reads, an edit to what defines it, and
-# the status a comment edit elsewhere in its module gives: `cached`, or `ran` for a class that
-# holds a value its form cannot show (an `object()` sentinel, a `__slots__` object, a
-# `random.Random`), which is then hashed with its module's source.
+# the status a comment edit elsewhere in its module gives: `cached`, also for a class that holds
+# an `object()` sentinel or a `__slots__` object, which its form shows by their type and slots.
 _SOURCELESS_KINDS = {
     "namedtuple": (
         'KIND = collections.namedtuple("Row", "left right")',
@@ -2560,24 +2559,12 @@ _SOURCELESS_KINDS = {
     "namedtuple-sentinel-default": (
         '_MISSING = object()\nKIND = collections.namedtuple("Row", "a b c", defaults=(_MISSING, "s1"))',
         ('"s1"', '"s2"'),
-        "ran",
-    ),
-    "dataclass-random-default": (
-        'KIND = dataclasses.make_dataclass("Gen", [("rng", object, dataclasses.field('
-        'default=random.Random(1))), ("y", str, dataclasses.field(default="d1"))])',
-        ('"d1"', '"d2"'),
-        "ran",
-    ),
-    "dataclass-random-seed": (
-        'KIND = dataclasses.make_dataclass("Gen", [("rng", object, dataclasses.field('
-        'default=random.Random(1))), ("y", str, dataclasses.field(default="d1"))])',
-        ("random.Random(1)", "random.Random(2)"),
-        "ran",
+        "cached",
     ),
     "namedtuple-slots-default": (
         _SLOTS_BOX + 'KIND = collections.namedtuple("Row", "a box c", defaults=(Box(1), "s1"))',
         ('"s1"', '"s2"'),
-        "ran",
+        "cached",
     ),
 }
 
@@ -2587,10 +2574,8 @@ def test_a_class_with_no_source_is_hashed_the_same_in_every_process(
     tmp_path: pathlib.Path, kind: str
 ) -> None:
     """`Inner.load` reads a class with no source of its own. Its hash is what defines it, not
-    its address, so a fresh state database reuses the result and an edit to any part of its
-    definition reruns the stage. A comment edit elsewhere in its module reuses it too, unless
-    the class holds a value its form cannot show; that class is hashed with its module's
-    source, so the edit reruns the stage."""
+    its address, so a fresh state database reuses the result, an edit to any part of its
+    definition reruns the stage, and a comment edit elsewhere in its module reuses it."""
     home = tmp_path / "home"
     definition, (old, new), after_comment = _SOURCELESS_KINDS[kind]
     project = _project(
@@ -2608,6 +2593,32 @@ def test_a_class_with_no_source_is_hashed_the_same_in_every_process(
     assert _repro_statuses(project, home) == {"t/use": "ran"}, "A definition edit should rerun"
     _edit(project, "inner.py", "from pivot import loaders\n", "from pivot import loaders  # note\n")
     assert _repro_statuses(project, home) == {"t/use": after_comment}
+
+
+def test_a_dataclass_whose_class_level_default_keeps_its_state_in_c_is_refused(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`Inner.load` reads a dataclass `make_dataclass` made, whose `rng` default is a
+    `random.Random`: its state is in C, so no hash shows a change to its seed. The stage is
+    refused, naming the field, with the fix."""
+    home = tmp_path / "home"
+    definition = (
+        'KIND = dataclasses.make_dataclass("Gen", [("rng", object, dataclasses.field('
+        'default=random.Random(1))), ("y", str, dataclasses.field(default="d1"))])'
+    )
+    project = _project(
+        tmp_path,
+        {
+            "inner.py": _SOURCELESS_LOADER.replace("DEFINITION", definition),
+            "pipeline.py": _HELD_INSTANCE_HEADER + _held_stage("Inner()"),
+        },
+    )
+
+    result = helpers.run_pivot(project, home, "repro", "--json")
+    message = " ".join((result.stdout + result.stderr).split())
+    assert result.returncode != 0, message
+    assert "the default of field 'inner.Gen.rng' keeps state pivot cannot read" in message
+    assert "default_factory" in message, message
 
 
 _MAPPED_PARTIAL_STAGES = """\
@@ -3080,12 +3091,11 @@ with Pipeline("t") as pipeline:
 def test_a_captured_dataclass_with_class_defaults_no_form_shows_reruns_nothing_new(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Each stage captures a dataclass instance whose class keeps a default no form shows: an
+    """Each stage captures a dataclass instance whose class keeps a default no repr shows: an
     `object()` sentinel or a `__slots__` object the instance overrides, or a `ClassVar` object.
-    The class walk hashes such a default by its type and its module's source, never by its
-    address, so the same hash seed, a new one, a fresh state database and a comment edit in
-    `pipeline.py` reuse the result. An edit to the module that defines the classes reruns them,
-    as for a class with no source that holds such a value."""
+    The class walk hashes such a default by its type and its slots, never by its address, so the
+    same hash seed, a new one, a fresh state database and a comment edit in either module reuse
+    the result."""
     home = tmp_path / "home"
     project = _project(
         tmp_path, {"defaults.py": _OPAQUE_DEFAULTS, "pipeline.py": _OPAQUE_DEFAULTS_PIPELINE}
@@ -3101,7 +3111,7 @@ def test_a_captured_dataclass_with_class_defaults_no_form_shows_reruns_nothing_n
     _edit(project, "pipeline.py", "\n\ndef _take(", "\n\n# A comment.\ndef _take(")
     assert _repro_statuses(project, home, seed="4") == cached, "A comment edit should reuse it"
     _edit(project, "defaults.py", "import dataclasses\n", "import dataclasses  # note\n")
-    assert _repro_statuses(project, home, seed="5") == ran
+    assert _repro_statuses(project, home, seed="5") == cached, "A comment edit should reuse it"
 
 
 _FACTORY_MODULE = """\
@@ -3186,3 +3196,209 @@ def test_an_edit_to_one_of_two_factory_classes_two_values_hold_reruns_its_stage(
     assert _repro_statuses(project, home) == {"t/use": "ran"}, "The edit should rerun"
     assert output.read_text() == f"{line}B{line}Z"
     assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+@pytest.mark.parametrize("shape", sorted(_TWO_HOLDERS))
+def test_swapping_two_factory_classes_between_two_values_reruns_its_stage(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """Two values of the stage hold instances of two classes one factory made. Swapping the
+    factory arguments between them leaves the same two class walks, now held by the other
+    value: each walk is keyed by the value that holds it, so the swap reruns the stage with the
+    swapped output."""
+    home = tmp_path / "home"
+    pipeline = (
+        _TWO_HOLDERS_HEADER
+        + _TWO_HOLDERS[shape]
+        + '\n\nwith Pipeline("t") as pipeline:\n    use(pipeline.input("lines.txt", t=str))\n'
+    )
+    project = _project(tmp_path, {"factory.py": _FACTORY_MODULE, "pipeline.py": pipeline})
+    output = project / "data" / "t" / "use.txt"
+    line = "Local Set Default Proof Using"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "pipeline.py", 'make("A")', 'make("Q")')
+    _edit(project, "pipeline.py", 'make("Z")', 'make("A")')
+    _edit(project, "pipeline.py", 'make("Q")', 'make("Z")')
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The swap should rerun"
+    assert output.read_text() == f"{line}Z{line}A"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_DEFAULT_FROM_ELSEWHERE_PIPELINE = """\
+import functools
+from typing import Any
+
+from pivot import Pipeline, stage
+
+import defaults
+
+
+def _fresh(thing: Any, text: str) -> str:
+    return text.splitlines()[0] + thing.fresh()
+
+
+CAPTURED = functools.partial(_fresh, defaults.Box(None))
+
+
+@stage
+def named(text: str) -> str:
+    return text.splitlines()[0] + defaults.Box().fresh()
+
+
+@stage
+def captured(text: str) -> str:
+    return CAPTURED(text)
+
+
+with Pipeline("t") as pipeline:
+    named(pipeline.input("lines.txt", t=str))
+    captured(pipeline.input("lines.txt", t=str))
+"""
+
+_DEFAULT_FROM_ELSEWHERE_BOX = """\
+import dataclasses
+from typing import Any
+
+import settings
+
+
+@dataclasses.dataclass(frozen=True)
+class Box:
+    value: Any = DEFAULT
+
+    def fresh(self) -> str:
+        return str(type(self)().valueVIEW)
+"""
+
+# A dataclass whose class-level default comes from another module: a string that looks like a
+# memory address, and a `__slots__` object built from a value; each with the edit to
+# `settings.py` that changes it, and the output before and after.
+_DEFAULTS_FROM_ELSEWHERE = {
+    "hex-string": (
+        'HEX = "0xabcdef"\n',
+        {"DEFAULT": "settings.HEX", "VIEW": ""},
+        ('"0xabcdef"', '"0x123456"'),
+        ("0xabcdef", "0x123456"),
+    ),
+    "slots-object": (
+        'VALUE = 1\n\n\nclass Slotted:\n    __slots__ = ("x",)\n\n'
+        "    def __init__(self, x: int) -> None:\n        self.x = x\n",
+        {"DEFAULT": "settings.Slotted(settings.VALUE)", "VIEW": ".x"},
+        ("VALUE = 1", "VALUE = 2"),
+        ("1", "2"),
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_DEFAULTS_FROM_ELSEWHERE))
+def test_an_edit_to_a_class_default_taken_from_another_module_reruns_its_stages(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """`defaults.Box`'s class-level default is built from `settings.py`. A stage that names the
+    class and one that captures an instance overriding the default (and reads a fresh instance's
+    default) run once and reuse their result under the same and a new hash seed; an edit to
+    `settings.py` that changes the default reruns both with the new output."""
+    home = tmp_path / "home"
+    settings_text, box_names, (old, new), (before, after) = _DEFAULTS_FROM_ELSEWHERE[shape]
+    box = _DEFAULT_FROM_ELSEWHERE_BOX
+    for name, text in box_names.items():
+        box = box.replace(name, text)
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": settings_text,
+            "defaults.py": box,
+            "pipeline.py": _DEFAULT_FROM_ELSEWHERE_PIPELINE,
+        },
+    )
+    line = "Local Set Default Proof Using"
+    stages = ("t/named", "t/captured")
+
+    assert _repro_statuses(project, home, seed="1") == dict.fromkeys(stages, "ran")
+    assert _repro_statuses(project, home, seed="1") == dict.fromkeys(stages, "cached")
+    assert _repro_statuses(project, home, seed="2") == dict.fromkeys(stages, "cached")
+    for name in ("named", "captured"):
+        assert (project / "data" / "t" / f"{name}.txt").read_text() == f"{line}{before}"
+    _edit(project, "settings.py", old, new)
+
+    assert _repro_statuses(project, home, seed="1") == dict.fromkeys(stages, "ran"), (
+        "The edit to the default should rerun"
+    )
+    for name in ("named", "captured"):
+        assert (project / "data" / "t" / f"{name}.txt").read_text() == f"{line}{after}"
+    assert _repro_statuses(project, home, seed="2") == dict.fromkeys(stages, "cached")
+
+
+_CONFIG_HELD = """\
+import json
+import pathlib
+
+VALUE = json.loads((pathlib.Path(__file__).parent / "config.json").read_text())["v"]
+
+
+class Held:
+    def value(self) -> str:
+        return str(VALUE)
+"""
+
+_CONFIG_PIPELINE = """\
+import functools
+from typing import Any
+
+from pivot import Pipeline, stage
+
+import held
+
+
+def _read(thing: Any, text: str) -> str:
+    return text.splitlines()[0] + thing.value()
+
+
+HELD = functools.partial(_read, held.Held())
+
+
+@stage
+def use(text: str) -> str:
+    return HELD(text)
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_a_refusal_found_on_a_cache_hit_refuses_the_stage_warm_and_fresh(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A captured class's method reads `VALUE`, which `held.py` loads from `config.json`, so no
+    source edit changes it. While it is a string the stage runs and caches. Once it is a list,
+    the walk refuses it: on the warm path, where the manifest cache's check walks the class
+    again and refuses, the stage walk that follows refuses too (the refused walk left nothing
+    in a memo), and so it does on the fresh path, with no state database. The output stays the
+    one the safe value made."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "held.py": _CONFIG_HELD,
+            "config.json": '{"v": "safe"}\n',
+            "pipeline.py": _CONFIG_PIPELINE,
+        },
+    )
+    output = project / "data" / "t" / "use.txt"
+    line = "Local Set Default Proof Using"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "config.json", '"safe"', '["unsafe-A"]')
+    for path in ("warm", "fresh"):
+        if path == "fresh":
+            shutil.rmtree(project / ".pivot" / "state.lmdb")
+        result = helpers.run_pivot(project, home, "repro", "--json")
+        message = " ".join((result.stdout + result.stderr).split())
+        assert result.returncode != 0, f"The {path} path should refuse: {message}"
+        assert "captures non-scalar variable 'VALUE'" in message, message
+        assert output.read_text() == f"{line}safe"
