@@ -1824,7 +1824,7 @@ def test_the_canonical_form_of_a_cache_wrapper_above_the_mark_holds_no_address(
         + "@functools.cache\n@fingerprint_by_name\ndef start():\n    return 1\n",
     )
     wrapper = _fresh("rk_canon_h").start
-    text = fingerprint._serialize_value_for_hash(functools.partial(print, wrapper))
+    text = fingerprint._form(functools.partial(print, wrapper)).text
     for address in (id(wrapper), id(wrapper.__wrapped__)):
         assert str(address) not in text, f"the canonical form holds address {address}: {text}"
     assert fingerprint._BY_NAME_MARK not in text, f"the canonical form holds the mark: {text}"
@@ -1859,7 +1859,7 @@ def test_the_canonical_form_of_an_object_that_holds_a_copy_of_the_mark_omits_the
     _write(module_dir / "rk_obj_h.py", _OBJECT_WITH_MARK)
     held = _fresh("rk_obj_h").HELD
     assert fingerprint._BY_NAME_MARK in vars(held)
-    text = fingerprint._serialize_value_for_hash(held)
+    text = fingerprint._form(held).text
     assert "rk_obj_h.Wrapping" in text, text
     assert fingerprint._BY_NAME_MARK not in text, f"the canonical form holds the mark: {text}"
 
@@ -1872,7 +1872,7 @@ sys.path.insert(0, sys.argv[1])
 import rk_canon_h
 from pivot import fingerprint
 
-print(fingerprint._serialize_value_for_hash(functools.partial(print, rk_canon_h.start)))
+print(fingerprint._form(functools.partial(print, rk_canon_h.start)).text)
 """
 
 
@@ -1887,9 +1887,7 @@ def test_the_canonical_form_of_a_marked_partial_argument_is_the_same_in_two_proc
         "import functools\n\nfrom pivot import fingerprint_by_name\n\n\n"
         + "@functools.cache\n@fingerprint_by_name\ndef start():\n    return 1\n",
     )
-    here = fingerprint._serialize_value_for_hash(
-        functools.partial(print, _fresh("rk_canon_h").start)
-    )
+    here = fingerprint._form(functools.partial(print, _fresh("rk_canon_h").start)).text
     child = subprocess.run(
         [sys.executable, "-c", _CANON_IN_CHILD, str(module_dir)],
         capture_output=True,
@@ -2235,12 +2233,8 @@ def test_the_replay_of_a_cache_over_a_decorator_over_the_mark_reads_what_the_wal
         "import rk_replay_h as h\n\n\ndef my_stage():\n    return h.start()\n",
     )
     stage = _fresh("rk_replay_h", "rk_replay_s").my_stage
-    reads = list[tuple[tuple[str, ...], str]]()
-    token = fingerprint._recorded_reads.set(reads)
-    try:
-        fingerprint.get_stage_fingerprint(stage)
-    finally:
-        fingerprint._recorded_reads.reset(token)
+    with fingerprint._collected_capture_errors():
+        reads = fingerprint._stage_manifest(stage, recording=True)[1]
     assert any(path[-1] == "u" for path, _ in reads), reads
     assert fingerprint._recorded_reads_hold(stage, [[list(path), read] for path, read in reads])
 
@@ -3113,16 +3107,19 @@ def test_without_the_mark_a_cache_over_a_class_decorator_is_not_refused(
 def test_the_canonical_form_refuses_a_class_decorator_above_the_mark(
     module_dir: pathlib.Path, shape: str
 ) -> None:
-    """A loader field reaches the canonical form without the walk's value classification. The
-    canonical form takes the mark decision before it names a library callable, so a library
-    wrapper over a class-based decorator over the mark is refused there too, rather than named
-    by the wrapper alone with the class's code left out."""
+    """A loader field reaches the form without the walk's value classification. The form takes
+    the mark decision before it names a library callable, so a library wrapper over a
+    class-based decorator over the mark is reported for refusal there too (`_admit` refuses a
+    `MARK` report), naming the class, rather than named by the wrapper alone with the class's
+    code left out."""
     decorators, verb, _edit_pair, cls = _R5_SHAPES[shape]
     _write(module_dir / "rk5_deco.py", _R5_DECO)
     _write(module_dir / "rk5_h.py", _R5_HELPER.format(decorators=decorators, verb=verb))
     helper = _fresh("rk5_deco", "rk5_h").helper
-    with pytest.raises(exceptions.StageDefinitionError, match=f"rk5_deco.{cls}"):
-        fingerprint._canonicalize_value_for_hash({"field": helper})
+    form = fingerprint._form({"field": helper})
+    marks = [obj for _, kind, obj in form.reports if kind is fingerprint._ReportKind.MARK]
+    assert marks, form
+    assert f"rk5_deco.{cls}" in fingerprint._class_above_mark_message(marks[0])
 
 
 _R6_DUMP_HELPER = """\
@@ -3953,26 +3950,31 @@ def test_a_value_that_is_not_callable_gets_mains_decision_with_a_mark_below(
     assert fingerprint.get_stage_fingerprint(module.my_stage)
 
 
+def _form_of(value: object) -> typing.Any:
+    """The form `_form` gives `value`, as JSON values."""
+    return json.loads(fingerprint._form(value).text)
+
+
 def test_the_canonical_form_of_an_object_whose_getattr_raises_is_that_of_a_plain_object(
     module_dir: pathlib.Path,
 ) -> None:
     """Main asked `hasattr(value, "model_dump")` of each value in the canonical form (a partial
     argument, a loader field, a helper's default), and a `__getattr__` that raises KeyError or
-    RuntimeError stopped the walk there. Such an object has no `model_dump` and no `__dict__`
-    beyond its own, so it is canonicalized as a plain object is; a pydantic model is still
-    dumped."""
+    RuntimeError stopped the walk there. The form asks the value nothing: it reads its
+    attributes and slots through C descriptors, so a `__getattr__` never runs and the object is
+    formed as a plain object is. A pydantic model is formed by its fields' state too."""
     _write(module_dir / "rk8_cfg.py", _R8_CONFIG)
     cfg = _fresh("rk8_cfg")
-    canonical = fingerprint._canonicalize_value_for_hash
-    assert canonical(cfg.KEY) == ["rk8_cfg.KeyConfig", canonical({"_data": {"scale": 3}})]
-    assert canonical(cfg.LAZY) == ["rk8_cfg.Lazy", canonical({"scale": 3})]
-    assert canonical(cfg.ATTR) == canonical({"scale": 3})
-    assert canonical(cfg.SLOT)[0] == "SlotKey"
+    scale = ["dict", [["scale", 3]]]
+    assert _form_of(cfg.KEY) == ["inst", "rk8_cfg.KeyConfig", {"d": [["_data", scale]]}]
+    assert _form_of(cfg.LAZY) == ["inst", "rk8_cfg.Lazy", {"d": [["scale", 3]]}]
+    assert _form_of(cfg.ATTR) == ["inst", "rk8_cfg.AttrDict", {"bv": scale}]
+    assert _form_of(cfg.SLOT) == ["inst", "rk8_cfg.SlotKey", {"s": [["0:SlotKey._data", scale]]}]
 
     class Model(pydantic.BaseModel):
         scale: int = 3
 
-    assert canonical(Model()) == canonical({"scale": 3})
+    assert _form_of(Model())[2]["d"] == [["scale", 3]]
 
 
 @typing.final
@@ -4343,21 +4345,21 @@ def test_the_canonical_form_of_an_object_that_answers_every_name_holds_its_state
     for factor in (3, 30):
         _write(module_dir / "rk9_cfg.py", _R9_CONFIG.format(factor=factor))
         cfg = _fresh("rk9_cfg")
-        forms.append(fingerprint._canonicalize_value_for_hash(getattr(cfg, obj)))
+        forms.append(fingerprint._form(getattr(cfg, obj)).text)
     assert forms[0] != forms[1], forms
 
 
-def test_a_pydantic_model_is_still_dumped_however_it_keeps_model_dump(
+def test_an_object_that_keeps_model_dump_is_formed_by_its_state(
     module_dir: pathlib.Path,
 ) -> None:
-    """`model_dump` on the class (a pydantic model), in the instance's own `__dict__`, or in a
-    slot still dumps. Only an object that answers the name without keeping it does not."""
+    """`model_dump` on the class (a pydantic model) or in the instance's own `__dict__` is never
+    called: the value is formed by its state, as any instance is, and an object that answers
+    every name is formed by its own attributes."""
 
     class Model(pydantic.BaseModel):
         scale: int = 3
 
-    canonical = fingerprint._canonicalize_value_for_hash
-    assert canonical(Model()) == canonical({"scale": 3})
+    assert _form_of(Model())[2]["d"] == [["scale", 3]]
 
     class OwnDict:
         model_dump: typing.Callable[[], dict[str, int]]
@@ -4365,11 +4367,12 @@ def test_a_pydantic_model_is_still_dumped_however_it_keeps_model_dump(
         def __init__(self) -> None:
             self.model_dump = lambda: {"scale": 3}
 
-    assert canonical(OwnDict()) == canonical({"scale": 3})
+    own = _form_of(OwnDict())
+    assert own[0] == "inst" and [name for name, _ in own[2]["d"]] == ["model_dump"], own
 
     _write(module_dir / "rk9_cfg.py", _R9_CONFIG.format(factor=3))
     cfg = _fresh("rk9_cfg")
-    assert canonical(cfg.TREE) == ["rk9_cfg.Tree", canonical({"factor": 3})]
+    assert _form_of(cfg.TREE) == ["inst", "rk9_cfg.Tree", {"d": [["factor", 3]]}]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -4406,7 +4409,7 @@ def classify(value):
     return (
         fingerprint._mark_decision(value),
         fingerprint._value_kind(value),
-        fingerprint._canonicalize_value_for_hash(value),
+        fingerprint._form(value).text,
     )
 
 
@@ -4448,10 +4451,10 @@ def test_without_a_mark_in_the_process_the_decision_reads_no_chain() -> None:
 # ---------------------------------------------------------------------------------------------
 
 
-def test_a_model_dump_the_object_does_not_hold_is_canonicalized_as_a_plain_object() -> None:
-    """The walk asks whether the value keeps `model_dump` of its own, which an unset slot and a
-    raising property answer; reading it then raises AttributeError, as it does for `hasattr` on
-    main, and the value takes the plain-object branch."""
+def test_a_model_dump_the_object_does_not_hold_is_formed_as_a_plain_object() -> None:
+    """An unset `model_dump` slot and a raising `model_dump` property are kept by the class
+    (`_keeps_own_attribute`), and the form reads neither: the value is formed by the state it
+    holds, with nothing raised."""
 
     class SlotModelDump:  # the class keeps `model_dump`; the instance never assigns the slot
         __slots__ = ("model_dump",)  # pyright: ignore[reportUnannotatedClassAttribute, reportUninitializedInstanceVariable] - the slot is left unset on purpose
@@ -4465,20 +4468,20 @@ def test_a_model_dump_the_object_does_not_hold_is_canonicalized_as_a_plain_objec
 
     for value in (SlotModelDump(), RaisingModelDump()):
         assert fingerprint._keeps_own_attribute(value, "model_dump")
-        canonical = fingerprint._canonicalize_value_for_hash(value)
-        assert canonical == [type(value).__name__, repr(value)], canonical
+        form = _form_of(value)
+        assert form[0] == "inst" and form[2] == {}, form
 
 
-def test_a_model_dump_that_raises_when_called_still_raises() -> None:
-    """Only reading `model_dump` is guarded. An AttributeError raised inside the call is the
-    model's own error, and it stops the fingerprint, as it does on main."""
+def test_a_model_dump_that_raises_when_called_is_never_called() -> None:
+    """The form never calls a value's `model_dump`, user code: one that raises inside the call
+    leaves the form as that of a plain object."""
 
     class CallRaises:
         def model_dump(self) -> dict[str, int]:
             raise AttributeError("raised inside model_dump")
 
-    with pytest.raises(AttributeError, match="raised inside model_dump"):
-        fingerprint._canonicalize_value_for_hash(CallRaises())
+    form = _form_of(CallRaises())
+    assert form[0] == "inst" and form[2] == {}, form
 
 
 # ---------------------------------------------------------------------------------------------
@@ -4559,35 +4562,33 @@ def _r11_project(tmp_path: pathlib.Path, name: str, helpers: str) -> pathlib.Pat
     )
 
 
-def test_a_secret_edit_behind_a_celery_proxy_reruns_the_stage(tmp_path: pathlib.Path) -> None:
-    """A `SecretStr` field of a model held behind `celery.local.Proxy` in a partial argument:
-    an edit to it reruns the stage and the output follows, as on main."""
+def _assert_refused(project: pathlib.Path, name: str, phrase: str) -> None:
+    """`pivot repro` fails loudly on stage `<name>/s`: its error holds `phrase` and advises a
+    pipeline input, and no output is written."""
+    result = _run(project, "repro")
+    text = _flat(result.stdout + result.stderr)
+    assert result.returncode != 0, text
+    assert phrase in text and "pipeline input" in text, text
+    assert not (project / "data" / name / "s.txt").exists()
+
+
+def test_a_model_behind_a_celery_proxy_is_refused(tmp_path: pathlib.Path) -> None:
+    """A model held behind `celery.local.Proxy` in a partial argument: the proxy computes its
+    attributes, and the model it forwards to is built when it is first used, by code no form
+    reads, so the stage is refused, naming the proxy, rather than fingerprinted without the
+    model. Main dumped the model by calling the proxy's `model_dump`, which runs its code."""
     pytest.importorskip("celery.local")
     project = _r11_project(tmp_path, "cs", _R11_CELERY)
-    out = project / "data" / "cs" / "s.txt"
-    assert _status(_run(project, "repro", "--json"), "cs/s")[0] == "ran"
-    assert _status(_run(project, "repro", "--json"), "cs/s") == ("cached", "unchanged")
-    assert out.read_text() == "22\n"
-
-    _edit(project / "lib" / "helpers.py", 'TOKEN = "alpha"', 'TOKEN = "betaXYZ"')
-    assert _status(_run(project, "repro", "--json"), "cs/s") == ("ran", "Code changed")
-    assert out.read_text() == "24\n"
+    _assert_refused(project, "cs", "' is a proxy (type: ")
 
 
-def test_a_model_behind_a_lazy_proxy_is_cached_on_the_second_repro(tmp_path: pathlib.Path) -> None:
-    """A model behind `lazy_object_proxy.Proxy` in a partial argument is fingerprinted by its
-    fields, not by the proxy's address: a second `pivot repro` keeps the stage cached, as on
-    main, and an edit to the field reruns it."""
+def test_a_model_behind_a_lazy_proxy_is_refused(tmp_path: pathlib.Path) -> None:
+    """A model behind `lazy_object_proxy.Proxy` in a partial argument: the proxy, a C type, keeps
+    the model's factory and the model in C, where no form reads them, so the stage is refused,
+    naming the proxy's type. Main dumped it by calling the proxy's `model_dump`."""
     pytest.importorskip("lazy_object_proxy")
     project = _r11_project(tmp_path, "px", _R11_LAZY)
-    out = project / "data" / "px" / "s.txt"
-    assert _status(_run(project, "repro", "--json"), "px/s")[0] == "ran"
-    assert _status(_run(project, "repro", "--json"), "px/s") == ("cached", "unchanged")
-    assert out.read_text() == "51\n"
-
-    _edit(project / "lib" / "helpers.py", "factor: int = 3\n", "factor: int = 30\n")
-    assert _status(_run(project, "repro", "--json"), "px/s") == ("ran", "Code changed")
-    assert out.read_text() == "510\n"
+    _assert_refused(project, "px", "keeps state Pivot cannot read (type: builtins.Proxy)")
 
 
 def _transparent_proxy(target: object) -> object:
@@ -4607,16 +4608,19 @@ def _transparent_proxy(target: object) -> object:
     return Proxy()
 
 
-def test_a_model_behind_a_transparent_proxy_is_dumped() -> None:
-    """The canonical form of a proxied model is the model's own dump, so it follows the fields."""
+def test_a_model_behind_a_transparent_proxy_follows_the_fields() -> None:
+    """The form takes a value's real type, never the `__class__` a proxy reports, and reads its
+    state through C, so no `__getattr__` forwards: the proxy is an instance of its own class.
+    That class holds the target in its methods' cells, which its key's identity forms, so the
+    form follows the target's fields."""
 
     class Settings(pydantic.BaseModel):
         factor: int = 3
 
-    canonical = fingerprint._canonicalize_value_for_hash
-    assert canonical(_transparent_proxy(Settings())) == canonical(Settings())
-    assert canonical(Settings()) == canonical({"factor": 3})
-    assert canonical(_transparent_proxy(Settings(factor=4))) == canonical({"factor": 4})
+    proxied = _form_of(_transparent_proxy(Settings()))
+    assert proxied[0] == "inst" and ".Proxy@" in proxied[1] and proxied[2] == {}, proxied
+    assert _form_of(_transparent_proxy(Settings(factor=4))) != proxied
+    assert _form_of(_transparent_proxy(Settings())) == proxied
 
 
 # ---------------------------------------------------------------------------------------------
@@ -4916,7 +4920,7 @@ KeyEqRaises.armed = True
 result = {}
 for name, value in shapes.items():
     try:
-        result[name] = fingerprint._canonicalize_value_for_hash(value)
+        result[name] = json.loads(fingerprint._form(value).text)
     except Exception as error:
         result[name] = f"{type(error).__name__}: {error}"
 print(json.dumps(result))
@@ -4924,20 +4928,18 @@ print(json.dumps(result))
 
 
 def test_the_model_dump_probe_runs_no_class_side_code() -> None:
-    """A class-level `__dict__` property that raises or returns a non-mapping, a `__dict__`
-    descriptor that belongs to another class or whose type's metaclass `__eq__` raises, a
-    metaclass `__getattribute__` that raises for `__mro__` or `__dict__`, a metaclass `__mro__`
-    property that raises, never ends, or hides a base that keeps `model_dump`, and a metaclass
-    that defines `__eq__` without `__hash__` or whose `__hash__` raises: each gets main's
-    canonical form, and none raises or hangs. A class whose only `__dict__` is a property and
-    whose real instance dict holds `model_dump` is dumped, as main's `hasattr` dumps it; and an
-    error from a key of that dict, the one error the lookup can raise, propagates as it does on
-    main. A class whose metaclass reports a `model_dump` keeper or a pydantic model as its
-    `__class__` is a class, never dumped as an instance (alone or as a value); an instance whose
-    `__dict__` is a dict subclass with a raising `__contains__` is read past it; and a `__dict__`
-    property that returns None or an int gives main's form. A proxy that forwards through
-    `__getattribute__`, with no `__getattr__`, and reports its target's class is asked as main
-    asks and dumped."""
+    """Each shape is formed with no class-side code run, and none raises or hangs. A class-level
+    `__dict__` property (raising, returning a non-mapping, None or an int, or hiding a real dict
+    that holds `model_dump`, also with a key whose `__eq__` raises), a `__dict__` descriptor of
+    another class, or one whose type's metaclass `__eq__` raises, leaves the real instance dict
+    to no C descriptor: the value is opaque, which refuses a stage that holds it, where main ran
+    the property or `model_dump`. A metaclass `__getattribute__` that raises for `__mro__` or
+    `__dict__`, a metaclass `__mro__` property that raises, never ends, or hides a base, and a
+    metaclass that defines `__eq__` without `__hash__` or whose `__hash__` raises: the instance
+    is formed by its attributes, read through C. A class whose metaclass reports a `model_dump`
+    keeper or a pydantic model as its `__class__` is a class label (alone or as a value); a dict
+    subclass as `__dict__` is read past its raising `__contains__`; a proxy that forwards through
+    `__getattribute__` is formed by its own state; a RootModel by its root."""
     done = subprocess.run(
         [sys.executable, "-c", _R11_CLASS_SIDE_CHILD],
         capture_output=True,
@@ -4946,47 +4948,67 @@ def test_the_model_dump_probe_runs_no_class_side_code() -> None:
         check=False,
     )
     assert done.returncode == 0, done.stderr[-1500:]
-    plain = ["dict", [["factor", 3]]]
     result = json.loads(done.stdout)
-    assert result.pop("rootmodel_int") == 3
-    assert result == {
-        "dict_property_raises": ["DictPropertyRaises", "DictPropertyRaises()"],
-        "dict_property_not_a_mapping": ["DictPropertyNotAMapping", "DictPropertyNotAMapping()"],
-        "meta_getattribute_raises_for_mro": ["__main__.MetaGetattributeMro", plain],
-        "meta_getattribute_raises_for_dict": ["__main__.MetaGetattributeDict", plain],
-        "meta_mro_property_raises": ["__main__.MetaMroRaises", plain],
-        "meta_mro_property_endless": ["__main__.MetaMroEndless", plain],
-        "meta_mro_property_hides_model_dump": ["dict", [["dumped", 1]]],
-        "dict_descriptor_of_another_class": [
-            "DictDescriptorOfAnotherClass",
-            "DictDescriptorOfAnotherClass()",
-        ],
-        "meta_eq_without_hash": ["__main__.MetaUnhashable", plain],
-        "meta_eq_without_hash_in_a_list": ["list", [["__main__.MetaUnhashable", plain]]],
-        "meta_hash_raises": ["__main__.MetaHashRaises", plain],
-        "dict_entry_whose_type_eq_raises": [
-            "DictEntryOfAnEqRaisingType",
-            "DictEntryOfAnEqRaisingType()",
-        ],
-        "dict_property_holds_model_dump": plain,
-        "dict_property_key_eq_raises": "RuntimeError: key __eq__ raises",
-        "namedtuple": ["Pair", [1, 2]],
-        "slots_without_dict": ["SlotsOnly", "SlotsOnly()"],
-        "class_meta_reports_classmethod_keeper": [
-            "Meta",
-            "<class '__main__.ClassKeeperClassmethod'>",
-        ],
-        "class_meta_reports_plain_keeper": ["Meta", "<class '__main__.ClassKeeperPlain'>"],
-        "class_meta_reports_pydantic_model": ["Meta", "<class '__main__.ClassReportsModel'>"],
-        "class_meta_reports_keeper_as_a_value": [
-            "dict",
-            [["cfg", ["Meta", "<class '__main__.ClassKeeperClassmethod'>"]]],
-        ],
-        "dict_subclass_with_raising_contains": ["__main__.DictSubclassAsDict", plain],
-        "dict_property_none": ["__main__.DictPropNone", None],
-        "dict_property_int": ["__main__.DictPropInt", 5],
-        "proxy_forwarding_by_getattribute": ["dict", [["state", "instance"]]],
+    root = result.pop("rootmodel_int")
+    assert root[0] == "inst" and root[2]["d"] == [["root", 3]], root
+    opaque = {
+        "dict_property_raises": "DictPropertyRaises",
+        "dict_property_not_a_mapping": "DictPropertyNotAMapping",
+        "dict_descriptor_of_another_class": "DictDescriptorOfAnotherClass",
+        "dict_entry_whose_type_eq_raises": "DictEntryOfAnEqRaisingType",
+        "dict_property_holds_model_dump": "DictPropertyHoldsDump",
+        "dict_property_key_eq_raises": "DictPropertyHoldsDump",
+        "dict_property_none": "DictPropNone",
+        "dict_property_int": "DictPropInt",
     }
+    plain = {
+        "meta_getattribute_raises_for_mro": "MetaGetattributeMro",
+        "meta_getattribute_raises_for_dict": "MetaGetattributeDict",
+        "meta_mro_property_raises": "MetaMroRaises",
+        "meta_mro_property_endless": "MetaMroEndless",
+        "meta_eq_without_hash": "MetaUnhashable",
+        "meta_hash_raises": "MetaHashRaises",
+        "dict_subclass_with_raising_contains": "DictSubclassAsDict",
+    }
+    for name, cls in opaque.items():
+        assert result.pop(name) == ["opaque", f"__main__.{cls}"], name
+    for name, cls in plain.items():
+        assert result.pop(name) == ["inst", f"__main__.{cls}", {"d": [["factor", 3]]}], name
+    assert result.pop("meta_eq_without_hash_in_a_list") == [
+        "list",
+        [["inst", "__main__.MetaUnhashable", {"d": [["factor", 3]]}]],
+    ]
+    assert result.pop("meta_mro_property_hides_model_dump") == [
+        "inst",
+        "__main__.MetaMroHidesDump",
+        {},
+    ]
+    assert result.pop("slots_without_dict") == [
+        "inst",
+        "__main__.SlotsOnly",
+        {"s": [["0:SlotsOnly.factor", 3]]},
+    ]
+    assert result.pop("proxy_forwarding_by_getattribute") == [
+        "inst",
+        "__main__.ForwardsByGetattribute",
+        {"d": [["_target", ["inst", "__main__.KeeperPlainMethod", {}]]]},
+    ]
+    pair = result.pop("namedtuple")
+    assert (
+        pair[0] == "inst"
+        and pair[1].startswith("__main__.Pair@")
+        and pair[2] == {"bv": ["tuple", [1, 2]]}
+    ), pair
+    for name, cls in (
+        ("class_meta_reports_classmethod_keeper", "ClassKeeperClassmethod"),
+        ("class_meta_reports_plain_keeper", "ClassKeeperPlain"),
+        ("class_meta_reports_pydantic_model", "ClassReportsModel"),
+    ):
+        label = result.pop(name)
+        assert label[0] == "class" and label[1].startswith(f"__main__.{cls}@"), (name, label)
+    value = result.pop("class_meta_reports_keeper_as_a_value")
+    assert value[0] == "dict" and value[1][0][1][0] == "class", value
+    assert result == {}, result
 
 
 _R11_DICT_PROPERTY = """\
@@ -5017,10 +5039,11 @@ RUN = functools.partial(scale, cfg=Settings())
 """
 
 
-def test_a_state_change_behind_model_dump_reruns_the_stage(tmp_path: pathlib.Path) -> None:
+def test_a_value_whose_dict_a_property_hides_is_refused(tmp_path: pathlib.Path) -> None:
     """A value whose class's only `__dict__` is a property, with `model_dump` in its real
-    instance dict, reporting state read from a file: an edit to that file reruns the stage and
-    the output follows, as on main, which dumps it through `hasattr`."""
+    instance dict, reporting state read from a file: no C descriptor reads that dict, so the
+    form cannot show the state, and the stage is refused rather than fingerprinted without it.
+    Main dumped it by calling `model_dump`, user code."""
     project = _project(
         tmp_path,
         {
@@ -5030,14 +5053,7 @@ def test_a_state_change_behind_model_dump_reruns_the_stage(tmp_path: pathlib.Pat
             "pipeline.py": _R11_PIPELINE.format(name="dp"),
         },
     )
-    out = project / "data" / "dp" / "s.txt"
-    assert _status(_run(project, "repro", "--json"), "dp/s")[0] == "ran"
-    assert _status(_run(project, "repro", "--json"), "dp/s") == ("cached", "unchanged")
-    assert out.read_text() == "51\n"
-
-    _edit(project / "lib" / "settings.json", '"factor": 3}', '"factor": 30}')
-    assert _status(_run(project, "repro", "--json"), "dp/s") == ("ran", "Code changed")
-    assert out.read_text() == "510\n"
+    _assert_refused(project, "dp", "keeps state Pivot cannot read")
 
 
 _R11_CELERY_PLAIN = """\
@@ -5068,13 +5084,13 @@ RUN = functools.partial(scale, cfg=celery.local.Proxy(Settings))
 """
 
 
-def test_a_state_change_behind_a_celery_proxy_of_a_plain_object_reruns(
+def test_a_celery_proxy_of_a_plain_object_is_refused(
     tmp_path: pathlib.Path,
 ) -> None:
     """A `celery.local.Proxy`, whose `repr` is its target's, of an object that is not a pydantic
-    model but keeps `model_dump`: the proxy reports the target's class as its `__class__`, so it
-    is asked for `model_dump` through the proxy as on main and dumped, and an edit to the state
-    behind `model_dump` reruns the stage."""
+    model but keeps `model_dump`, its state read from a file when the proxy first builds it: no
+    form reads what the proxy forwards to, so the stage is refused, naming the proxy. Main
+    dumped it through the proxy."""
     pytest.importorskip("celery.local")
     project = _project(
         tmp_path,
@@ -5085,14 +5101,7 @@ def test_a_state_change_behind_a_celery_proxy_of_a_plain_object_reruns(
             "pipeline.py": _R11_PIPELINE.format(name="cp"),
         },
     )
-    out = project / "data" / "cp" / "s.txt"
-    assert _status(_run(project, "repro", "--json"), "cp/s")[0] == "ran"
-    assert _status(_run(project, "repro", "--json"), "cp/s") == ("cached", "unchanged")
-    assert out.read_text() == "51\n"
-
-    _edit(project / "lib" / "settings.json", '"factor": 3}', '"factor": 30}')
-    assert _status(_run(project, "repro", "--json"), "cp/s") == ("ran", "Code changed")
-    assert out.read_text() == "510\n"
+    _assert_refused(project, "cp", "' is a proxy (type: ")
 
 
 _R12_CELERY_DELEGATING = """\
@@ -5128,13 +5137,12 @@ RUN = functools.partial(scale, cfg=celery.local.Proxy(Holder))
 """
 
 
-def test_a_state_change_behind_a_celery_proxy_of_a_delegating_object_reruns(
+def test_a_celery_proxy_of_a_delegating_object_is_refused(
     tmp_path: pathlib.Path,
 ) -> None:
     """A `celery.local.Proxy` of an object that keeps `model_dump` only in its own `__dict__`
-    (by delegation) and whose `repr` hides its state: no class on any MRO holds `model_dump`, so
-    only asking the proxy, as main asks, finds it. The value is dumped, and an edit to the state
-    behind `model_dump` reruns the stage."""
+    (by delegation) and whose `repr` hides its state: the stage is refused, naming the proxy,
+    as for any proxy. Main found `model_dump` by asking the proxy."""
     pytest.importorskip("celery.local")
     project = _project(
         tmp_path,
@@ -5145,34 +5153,24 @@ def test_a_state_change_behind_a_celery_proxy_of_a_delegating_object_reruns(
             "pipeline.py": _R11_PIPELINE.format(name="cd"),
         },
     )
-    out = project / "data" / "cd" / "s.txt"
-    assert _status(_run(project, "repro", "--json"), "cd/s")[0] == "ran"
-    assert _status(_run(project, "repro", "--json"), "cd/s") == ("cached", "unchanged")
-    assert out.read_text() == "51\n"
-
-    _edit(project / "lib" / "settings.json", '"factor": 3}', '"factor": 30}')
-    assert _status(_run(project, "repro", "--json"), "cd/s") == ("ran", "Code changed")
-    assert out.read_text() == "510\n"
+    _assert_refused(project, "cd", "' is a proxy (type: ")
 
 
-def test_a_mock_is_asked_as_main_asks_and_gets_a_safe_plain_form() -> None:
-    """A plain MagicMock takes ASK: its junk answer is not an exact dict, so the mock itself is
-    plain. A spec mock takes ASK_KEPT because its spec keeps `model_dump`, so main dumps its child
-    answer; that child takes ASK and is plain, which stops recursion."""
+def test_a_mock_is_formed_as_a_proxy_and_never_called() -> None:
+    """A MagicMock answers every name through `__getattr__`: a plain one and one with a spec are
+    each formed as a proxy and reported (`_ReportKind.PROXY`), which refuses a stage that holds
+    one, and nothing on them is called or made."""
 
     class KeepsDump:
         def model_dump(self) -> dict[str, int]:
             return {"factor": 3}
 
-    canonical = fingerprint._canonicalize_value_for_hash
-    plain = mock.MagicMock()
-    assert canonical(plain) == [type(plain).__name__, repr(plain)]
-
-    spec = mock.MagicMock(spec=KeepsDump)
-    form = canonical(spec)
-    dumped = spec.model_dump.return_value
-    assert spec.model_dump.called
-    assert form == [type(dumped).__name__, repr(dumped)], form
+    for value in (mock.MagicMock(), mock.MagicMock(spec=KeepsDump)):
+        form = fingerprint._form(value)
+        assert json.loads(form.text) == ["proxy", "unittest.mock.MagicMock"], form
+        assert [kind for _, kind, _ in form.reports] == [fingerprint._ReportKind.PROXY]
+        assert not value.mock_calls
+        assert not value._mock_children, value._mock_children
 
 
 _R13_FORWARDER = """\
@@ -5249,13 +5247,14 @@ RUN = functools.partial(scale, cfg={wrapper}(load()))
 
 
 @pytest.mark.parametrize("wrapper", ["InAttribute", "InSlot", "InClosure"])
-def test_a_field_and_a_secret_edit_behind_a_forwarder_rerun(
+def test_a_forwarder_whose_getattr_computes_its_names_is_refused(
     tmp_path: pathlib.Path, wrapper: str
 ) -> None:
-    """A hand-written forwarder of a pydantic model that delegates through `__getattr__` to a
-    target held in an attribute, a slot or a closure, reports its own class, and has a `repr`
-    that hides its state. Its class defines `__getattr__`, so it is asked for `model_dump` as main
-    asks and dumped: an edit to a field and an edit to a `SecretStr` each rerun the stage."""
+    """A hand-written forwarder of a pydantic model that delegates through `__getattr__` with a
+    computed name (`getattr(self._model, name)`) to a target held in an attribute, a slot or a
+    closure. Its class is walked as a class a stage names, whose rule refuses a `getattr` with a
+    computed name, so `pivot repro` refuses the stage, naming the class, and writes no output.
+    Main dumped it through `model_dump` and walked no class."""
     name = f"fw{wrapper.lower()}"
     project = _project(
         tmp_path,
@@ -5266,26 +5265,18 @@ def test_a_field_and_a_secret_edit_behind_a_forwarder_rerun(
             "pipeline.py": _R11_PIPELINE.format(name=name),
         },
     )
-    stage = f"{name}/s"
-    out = project / "data" / name / "s.txt"
-    assert _status(_run(project, "repro", "--json"), stage)[0] == "ran"
-    assert _status(_run(project, "repro", "--json"), stage) == ("cached", "unchanged")
-    assert out.read_text() == "56\n"
-
-    _edit(project / "lib" / "settings.json", '"scale": 3,', '"scale": 30,')
-    assert _status(_run(project, "repro", "--json"), stage) == ("ran", "Code changed")
-    assert out.read_text() == "515\n"
-
-    _edit(project / "lib" / "settings.json", '"token": "alpha"', '"token": "betaXYZ"')
-    assert _status(_run(project, "repro", "--json"), stage) == ("ran", "Code changed")
-    assert out.read_text() == "517\n"
+    result = _run(project, "repro")
+    text = _flat(result.stdout + result.stderr)
+    assert result.returncode != 0, text
+    assert f"'{wrapper}' uses getattr() with non-literal attribute" in text, text
+    assert not (project / "data" / name / "s.txt").exists()
 
 
-def test_an_ask_route_needs_an_exact_dict_but_an_ask_kept_route_dumps_as_main() -> None:
-    """On ASK, where no class keeps `model_dump`, an answer that is not callable or returns a
-    dict subclass, a list or a scalar gets the plain form. On ASK_KEPT, where a class keeps it,
-    main dumps whatever it returns: RootModel and a forwarder with a kept list return therefore
-    keep their state. A lookup that raises on ASK still means no."""
+def test_an_object_that_forwards_or_keeps_model_dump_is_formed_by_its_state() -> None:
+    """No `model_dump` is called, kept or answered: a user class that forwards through
+    `__getattr__`, answers every name, raises for a name it lacks, or keeps a `model_dump` (a
+    method, or a non-callable class attribute) is formed by its own attributes, read through C,
+    and its `__getattr__` never runs."""
 
     class Target:
         def __init__(self, dumped: object) -> None:
@@ -5334,21 +5325,19 @@ def test_an_ask_route_needs_an_exact_dict_but_an_ask_kept_route_dumps_as_main() 
         def __init__(self) -> None:
             self.factor: int = 3
 
-    canonical = fingerprint._canonicalize_value_for_hash
-    assert canonical(Forwarder(Target({"x": 1}))) == canonical({"x": 1})
-    for answer in (
-        collections.OrderedDict(x=1),
-        [("x", 1)],
-        7,
-        None,
-    ):
+    def state(value: object) -> list[list[object]]:
+        return _form_of(value)[2]["d"]
+
+    def own_attributes(value: object) -> list[list[object]]:
+        return [[name, _form_of(item)] for name, item in sorted(vars(value).items())]
+
+    first = Forwarder(Target({"x": 1}))
+    assert state(first) == [["factor", 3], ["target", _form_of(first.target)]]
+    for answer in (collections.OrderedDict(x=1), [("x", 1)], 7, None):
         value = Forwarder(Target(answer))
-        assert canonical(value)[1] == canonical(vars(value)), answer
-    assert canonical(AnswersNotCallable())[1] == canonical({"factor": 3})
-    raises = Raises()
-    assert canonical(raises)[1] == canonical({"factor": 3})
-    assert canonical(KeepsAndForwards()) == canonical([("x", 1)])
-    assert canonical(KeepsDataAndForwards())[1] == canonical({"factor": 3})
+        assert state(value) == own_attributes(value), answer
+    for value in (AnswersNotCallable(), Raises(), KeepsAndForwards(), KeepsDataAndForwards()):
+        assert state(value) == [["factor", 3]], type(value).__name__
 
 
 _R15_ROOT_MODEL = """\
@@ -5383,9 +5372,8 @@ RUN = functools.partial(apply, cfg=__CFG__)
 
 
 def test_root_model_list_keeps_secret_and_hidden_state() -> None:
-    """A RootModel's non-dict `model_dump()` returns the root list. That list holds its item's
-    secret and `repr=False` field, so either edit must change the canonical form rather than
-    taking the masked RootModel repr."""
+    """A RootModel is formed by its root, a list whose item's secret and `repr=False` field are
+    its state, so either edit changes the form, which never takes the masked repr."""
 
     class Item(pydantic.BaseModel):
         name: str
@@ -5393,27 +5381,28 @@ def test_root_model_list_keeps_secret_and_hidden_state() -> None:
         hidden: int = pydantic.Field(repr=False)
 
     Items = pydantic.RootModel[list[Item]]
-    canonical = fingerprint._canonicalize_value_for_hash
 
-    def form(token: str, hidden: int) -> typing.Any:
-        return canonical(Items([Item(name="item", token=pydantic.SecretStr(token), hidden=hidden)]))
+    def form(token: str, hidden: int) -> str:
+        items = Items([Item(name="item", token=pydantic.SecretStr(token), hidden=hidden)])
+        return fingerprint._form(items).text
 
     base = form("alpha", 1)
     assert base != form("betaXYZ", 1)
     assert base != form("alpha", 2)
+    assert "alpha" not in base
 
 
 def test_scalar_root_models_have_mains_forms() -> None:
-    """RootModel's non-dict dump is canonicalized as main canonicalizes that root: an int stays
-    an int and a SecretStr becomes its keyed secret digest, not RootModel's masked repr."""
+    """A RootModel is formed by its root: an int as the int, and a SecretStr as its keyed secret
+    digest, as main forms that root, not RootModel's masked repr."""
 
     Secret = pydantic.RootModel[pydantic.SecretStr]
     Count = pydantic.RootModel[int]
     secret = pydantic.SecretStr("alpha")
-    canonical = fingerprint._canonicalize_value_for_hash
 
-    assert canonical(Count(3)) == 3
-    assert canonical(Secret(secret)) == ["secret", parameters.secret_digest(secret)]
+    assert _form_of(Count(3))[2]["d"] == [["root", 3]]
+    digest = parameters.secret_digest(secret)
+    assert _form_of(Secret(secret))[2]["d"] == [["root", ["secret", digest]]]
 
 
 @pytest.mark.parametrize(
@@ -5423,11 +5412,12 @@ def test_scalar_root_models_have_mains_forms() -> None:
         ("rootcelery", "celery.local.Proxy(load)"),
     ],
 )
-def test_root_model_list_in_a_partial_keyword_or_celery_proxy_reruns(
+def test_root_model_list_in_a_partial_keyword_reruns_and_behind_a_celery_proxy_is_refused(
     tmp_path: pathlib.Path, name: str, cfg: str
 ) -> None:
-    """A RootModel list in a partial keyword or celery proxy is dumped as main dumps it. Its
-    secret and `repr=False` field therefore both rerun the stage when edited."""
+    """A RootModel list in a partial keyword is formed by its state: its secret and `repr=False`
+    field both rerun the stage when edited. Behind a celery proxy, which builds it when first
+    used, the stage is refused, naming the proxy."""
 
     if name == "rootcelery":
         pytest.importorskip("celery.local")
@@ -5444,6 +5434,9 @@ def test_root_model_list_in_a_partial_keyword_or_celery_proxy_reruns(
             "pipeline.py": _R11_PIPELINE.format(name=name),
         },
     )
+    if name == "rootcelery":
+        _assert_refused(project, name, "' is a proxy (type: ")
+        return
     stage = f"{name}/s"
     out = project / "data" / name / "s.txt"
     assert _status(_run(project, "repro", "--json"), stage)[0] == "ran"
@@ -5478,10 +5471,9 @@ def test_a_raising_mark_property_is_unmarked() -> None:
     fingerprint.mark_by_name(helper)
     value = Unmarked()
     assert not fingerprint.fingerprinted_by_name(value)
-    assert fingerprint._canonicalize_value_for_hash(value) == [
-        f"{Unmarked.__module__}.{Unmarked.__qualname__}",
-        ["dict", []],
-    ]
+    form = _form_of(value)
+    assert form[0::2] == ["inst", {}]
+    assert form[1].partition("@")[0] == f"{Unmarked.__module__}.{Unmarked.__qualname__}"
 
 
 def test_a_mark_in_the_fallback_table_beats_a_readonly_mark_property() -> None:
@@ -5535,17 +5527,12 @@ RUN = functools.partial(scale, cfg=celery.local.Proxy(Settings))
 
 def test_a_raising_model_dump_behind_a_celery_proxy_fails_loudly(tmp_path: pathlib.Path) -> None:
     """A `celery.local.Proxy` whose target's class keeps a `model_dump` property that raises
-    KeyError. The proxy reports the target's class, which keeps `model_dump`, so the attribute
-    exists and its error propagates, as from main's `hasattr`: `pivot repro` fails loudly and
-    writes no output, rather than fingerprinting the proxy by its `repr` and serving a stale
-    result."""
+    KeyError. The proxy computes its attributes, so the stage is refused, naming the proxy:
+    `pivot repro` fails loudly and writes no output, rather than fingerprinting the proxy by its
+    `repr` and serving a stale result. Main failed on the property's error."""
     pytest.importorskip("celery.local")
     project = _r11_project(tmp_path, "cr", _R13_CELERY_RAISING)
-    result = _run(project, "repro")
-    text = _flat(result.stdout + result.stderr)
-    assert result.returncode != 0, text
-    assert "model_dump property raised" in text, text
-    assert not (project / "data" / "cr" / "s.txt").exists()
+    _assert_refused(project, "cr", "' is a proxy (type: ")
 
 
 def test_the_static_probe_reads_only_an_own_dict_descriptor_and_lets_a_key_error_through() -> None:
@@ -5605,17 +5592,17 @@ def test_a_dict_subclass_instance_dict_is_read_past_its_contains_with_a_mark() -
     value.__dict__ = RaisingContains()
     fingerprint.mark_by_name(helper)
     assert not fingerprint.fingerprinted_by_name(value)
-    assert fingerprint._canonicalize_value_for_hash(value) == [
-        f"{Handler.__module__}.{Handler.__qualname__}",
-        ["dict", []],
-    ]
+    form = _form_of(value)
+    assert form[0::2] == ["inst", {}]
+    assert form[1].partition("@")[0] == f"{Handler.__module__}.{Handler.__qualname__}"
 
 
 def test_the_mark_is_read_and_written_past_a_dict_property() -> None:
     """In a process that holds a mark, a callable whose `__dict__` property returns None reads
-    as unmarked with no error, and the canonical form, which asks the mark decision, takes it
-    without error. Marked, the same shape reads as marked. The mark is written and read the
-    generic C way, past the class-level `__dict__` property."""
+    as unmarked with no error, and the form, which asks the mark decision, takes it without
+    error: no C descriptor reads its real dict, so it is opaque. Marked, the same shape reads
+    as marked. The mark is written and read the generic C way, past the class-level `__dict__`
+    property."""
 
     class DictNone:
         def __call__(self) -> int:
@@ -5632,7 +5619,7 @@ def test_the_mark_is_read_and_written_past_a_dict_property() -> None:
     fingerprint.mark_by_name(helper)  # a mark in the process
     value = DictNone()
     assert not fingerprint.fingerprinted_by_name(value)
-    assert fingerprint._canonicalize_value_for_hash(value)[1] is None
+    assert _form_of(value)[0] == "opaque"
     marked = DictNone()
     fingerprint.mark_by_name(marked)
     assert fingerprint.fingerprinted_by_name(marked)
@@ -5669,14 +5656,11 @@ def test_status_fingerprints_a_value_whose_metaclass_is_unhashable(tmp_path: pat
     assert status.returncode == 0, status.stdout + status.stderr
 
 
-def test_a_value_without_an_instance_dict_takes_the_dict_offset_short_cut(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_value_without_an_instance_dict_takes_the_dict_offset_short_cut() -> None:
     """A namedtuple and a `__slots__` class without `__dict__` have no instance dict (dict
-    offset 0), so the probe answers no without the generic lookup, which would raise and catch
-    an AttributeError for each. A class whose only `__dict__` is a property has a managed dict
-    and is still asked, and keeps main's result (its canonical forms against main's are in the
-    class-side child above)."""
+    offset 0), so the probe answers no from its type. A class whose only `__dict__` is a
+    property has a real instance dict that no C descriptor reads: the probe reads it through
+    `object.__getattribute__`, as main's `hasattr` does, and finds `model_dump` there."""
 
     class SlotsOnly:
         __slots__ = ("factor",)  # pyright: ignore[reportUnannotatedClassAttribute] - a `__slots__` class, the shape under test
@@ -5697,29 +5681,16 @@ def test_a_value_without_an_instance_dict_takes_the_dict_offset_short_cut(
         x: int
         y: int
 
-    pair = Pair(1, 2)
-    asked = list[str]()
-    generic = fingerprint._generic_getattribute
-
-    def recording(obj: object, name: str) -> object:
-        asked.append(type(obj).__name__)
-        return generic(obj, name)
-
-    monkeypatch.setattr(fingerprint, "_generic_getattribute", recording)
-    assert not fingerprint._keeps_own_attribute(pair, "model_dump")
+    assert not fingerprint._keeps_own_attribute(Pair(1, 2), "model_dump")
     assert not fingerprint._keeps_own_attribute(SlotsOnly(), "model_dump")
-    assert asked == []
     assert fingerprint._keeps_own_attribute(DictProperty(), "model_dump")
-    assert asked == ["DictProperty"]
 
 
 def test_a_fingerprint_pass_gives_each_value_the_canonical_form_it_gets_alone() -> None:
-    """Inside one `fingerprint_pass()` the real-MRO facts are memoised by type, and a type whose
-    MRO alone decides the `model_dump` route skips the probe: a hook-free type is asked by C
-    `hasattr`, a model takes `ASK_KEPT`. Every value, seen twice in the pass, gets the form it gets
-    outside a pass: a plain object, a frozen dataclass, a slots class, a `__dict__`-property
-    class, a raising `__getattr__`, a model, a RootModel, a forwarder, a `__getattribute__` proxy
-    and a spec mock. Only the four hook-free types and the two models are recorded."""
+    """Inside one `fingerprint_pass()` the layouts, routes and class identities are memoised.
+    Every value, seen twice in the pass, gets the form it gets outside a pass: a plain object, a
+    frozen dataclass, a slots class, a `__dict__`-property class, a raising `__getattr__`, a
+    model, a RootModel, a forwarder, a `__getattribute__` proxy and a spec mock."""
 
     class Plain:
         def __init__(self) -> None:
@@ -5801,31 +5772,22 @@ def test_a_fingerprint_pass_gives_each_value_the_canonical_form_it_gets_alone() 
         ReportsAndKeeps(KeepsDump()),
         ReportsAndKeeps(KeepsDump),
     ]
-    canonical = fingerprint._canonicalize_value_for_hash
-    alone = [canonical(value) for value in values]
+
+    def forms() -> list[str]:
+        return [fingerprint._form(value).text for value in values]
+
+    alone = forms()
     with fingerprint.fingerprint_pass():
-        first = [canonical(value) for value in values]
-        second = [canonical(value) for value in values]
-        memo = fingerprint._type_memo.get()
+        first = forms()
+        second = forms()
     assert first == alone
     assert second == alone
-    assert memo is not None
-    recorded = dict(memo[1].values())
-    assert recorded == {
-        Plain: None,
-        Point: None,
-        SlotsOnly: None,
-        DictProperty: None,
-        Model: fingerprint._DumpRoute.ASK_KEPT,
-        type(values[6]): fingerprint._DumpRoute.ASK_KEPT,
-    }
 
 
 def test_a_class_changed_between_passes_is_read_again() -> None:
-    """The real-MRO facts live for one pass, so a class changed after it is read again. Given a
-    raising `__getattr__` after the first pass, the second pass asks the value as main asks, where
-    the error means no; facts kept from the first pass would take the C `hasattr` route, which
-    lets the `KeyError` through."""
+    """Class identities live for one pass, so a class changed after it is read again: given a
+    `__getattr__` after the first pass, its key, and so the form of its instance, follows the
+    change in the next pass and outside one, and the `__getattr__` never runs."""
 
     class Late:
         def __init__(self) -> None:
@@ -5835,27 +5797,24 @@ def test_a_class_changed_between_passes_is_read_again() -> None:
         raise KeyError(name)
 
     value = Late()
-    canonical = fingerprint._canonicalize_value_for_hash
     with fingerprint.fingerprint_pass():
-        before = canonical(value)
+        before = fingerprint._form(value).text
     Late.__getattr__ = raising  # pyright: ignore[reportAttributeAccessIssue] - the class changes between passes, the shape under test
     with fingerprint.fingerprint_pass():
-        assert canonical(value) == before
-    assert canonical(value) == before
+        after = fingerprint._form(value).text
+    assert after != before
+    assert fingerprint._form(value).text == after
 
 
 def test_an_exact_builtin_takes_neither_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An exact built-in container or leaf carries no mark and keeps no `model_dump`, so the
-    canonical form asks neither the mark decision nor the `model_dump` probe for it, also in a
-    process that holds a mark."""
+    """An exact built-in container or leaf carries no mark, so the form asks no mark decision
+    for it, also in a process that holds a mark."""
     value = {"a": [1, (2.5, frozenset({3})), b"x", None, True], "b": {"c"}}
-    expected = fingerprint._canonicalize_value_for_hash(value)
+    expected = fingerprint._form(value).text
 
     def probed(*_: object) -> typing.NoReturn:
         raise AssertionError("an exact built-in was probed")
 
     monkeypatch.setattr(fingerprint, "_marks_made", True)
     monkeypatch.setattr(fingerprint, "_mark_decision", probed)
-    monkeypatch.setattr(fingerprint, "_model_dump_route", probed)
-    monkeypatch.setattr(fingerprint, "_probe_own_attribute", probed)
-    assert fingerprint._canonicalize_value_for_hash(value) == expected
+    assert fingerprint._form(value).text == expected

@@ -42,7 +42,9 @@ For each stage function, Pivot:
    class of an instance a `functools.partial`, a loader's config, a dataclass
    field default or a `StageParams` default holds (`partial(run, Scorer())`):
    its class is walked as if the stage named it, so an edit to `Scorer.score`
-   re-runs the stage
+   re-runs the stage. A scalar class attribute a member reads through `self`,
+   `cls`, `type(self)`, `self.__class__`, or literal `getattr` is tracked by
+   value just as `Class.NAME` is.
 4. **Follows imports in the function body** — a user module discovery already
    loaded is walked like a module-level dependency, together with its packages
    and a submodule a `from` import names (`import pkg.sub`, `from pkg import
@@ -263,6 +265,11 @@ naming the field. For a field, build the value with
 `dataclasses.field(default_factory=...)`; a `ClassVar` takes no factory, so
 create its value in the method that uses it; or move the value into the stage's
 `StageParams`.
+
+A partial argument or loader config that holds a library value whose type has no
+supported value form is refused for the same reason. For example,
+`random.Random` keeps its generator state in C, so Pivot cannot safely hash it.
+Read such data from a pipeline input or move its configuration into `StageParams`.
 
 An object whose `__getattr__` raises an error other than `AttributeError` for
 a name it does not have (a dict-backed config, an `AttrDict`, a lazy object)

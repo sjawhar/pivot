@@ -2095,52 +2095,48 @@ def test_an_edit_to_a_member_load_reaches_reruns_its_stage(
 _CYCLE = "def cycle(function):\n    function.__wrapped__ = function\n    return function\n"
 
 # A loader whose `load`, a helper `load` reaches, or a member the fallback to every member
-# walks (`load` applies an operator to `self`) is its own `__wrapped__`: (the inner.py text, the
-# function the refusal names).
+# walks (`load` applies an operator to `self`) is its own `__wrapped__`; each returns its "A".
 _LOOP_WRAPPED = {
     "reached-helper": (
         _REACHED_MEMBER.replace("HELPERS", _CYCLE)
         .replace("MEMBERS", '    @cycle\n    def _suffix(self) -> str:\n        return "A"\n')
-        .replace("READ", "self._suffix()"),
-        "Inner._suffix",
+        .replace("READ", "self._suffix()")
     ),
     "load": (
         _REACHED_MEMBER.replace("HELPERS", _CYCLE)
         .replace("MEMBERS", "")
-        .replace("READ", '""')
-        .replace("    def load(", "    @cycle\n    def load("),
-        "Inner.load",
+        .replace("READ", '"A"')
+        .replace("    def load(", "    @cycle\n    def load(")
     ),
     "fallback-member": (
         _REACHED_MEMBER.replace("HELPERS", _CYCLE)
         .replace(
             "MEMBERS",
             '    @cycle\n    def _suffix(self) -> str:\n        return "A"\n\n'
-            + "    def __add__(self, other: str) -> str:\n        return other\n",
+            + "    def __add__(self, other: str) -> str:\n        return other + self._suffix()\n",
         )
-        .replace("READ", '(self + "")'),
-        "Inner._suffix",
+        .replace("READ", '(self + "")')
     ),
 }
 
 
 @pytest.mark.parametrize("looped", sorted(_LOOP_WRAPPED))
-def test_a_loader_method_whose_wrapped_chain_loops_is_refused(
+def test_a_loader_method_whose_wrapped_chain_loops_is_walked_from_its_own_code(
     tmp_path: pathlib.Path, looped: str
 ) -> None:
     """`Inner.load`, `_suffix`, which `load` reaches, or `_suffix` as a member the fallback to
-    every member walks, is its own `__wrapped__` (its decorator sets it). `pivot repro` refuses
-    the stage, naming that function, and ends (`helpers.run_pivot` stops a run after 300
-    seconds)."""
-    inner, name = _LOOP_WRAPPED[looped]
+    every member walks, is its own `__wrapped__` (its decorator sets it). The walk reads that
+    function from its own code: `pivot repro` runs the stage and ends (`helpers.run_pivot`
+    stops a run after 300 seconds), an edit to the function's body reruns it, and the next run
+    reuses the result."""
     project = _project(
-        tmp_path, {"inner.py": inner, "pipeline.py": _HELD_INSTANCE_HEADER + _held_stage("Inner()")}
+        tmp_path,
+        {
+            "inner.py": _LOOP_WRAPPED[looped],
+            "pipeline.py": _HELD_INSTANCE_HEADER + _held_stage("Inner()"),
+        },
     )
-
-    result = helpers.run_pivot(project, tmp_path / "home", "repro")
-
-    assert result.returncode != 0, result.stdout
-    assert f"'{name}' has a `__wrapped__` chain that loops" in result.stdout + result.stderr
+    _assert_an_edit_reruns_once(project, tmp_path / "home", "inner.py")
 
 
 _ROW_FACTORY = """\
@@ -3206,6 +3202,20 @@ def make(suffix: str) -> type:
     return Made
 """
 
+# The same factory made with `type()`: its classes have no source and no `<locals>` in their
+# qualified name, and its module's name does not resolve to them.
+_TYPE_FACTORY_MODULE = """\
+def _suffix_of(suffix: str):
+    def suffix_method(self) -> str:
+        return suffix
+
+    return suffix_method
+
+
+def make(suffix: str) -> type:
+    return type("Made", (), {"suffix": _suffix_of(suffix)})
+"""
+
 _TWO_HOLDERS_HEADER = """\
 import dataclasses
 import functools
@@ -3281,21 +3291,24 @@ def test_an_edit_to_one_of_two_factory_classes_two_values_hold_reruns_its_stage(
     assert _repro_statuses(project, home) == {"t/use": "cached"}
 
 
+@pytest.mark.parametrize(
+    "factory", [_FACTORY_MODULE, _TYPE_FACTORY_MODULE], ids=["class-statement", "type-call"]
+)
 @pytest.mark.parametrize("shape", sorted(_TWO_HOLDERS))
 def test_swapping_two_factory_classes_between_two_values_reruns_its_stage(
-    tmp_path: pathlib.Path, shape: str
+    tmp_path: pathlib.Path, shape: str, factory: str
 ) -> None:
-    """Two values of the stage hold instances of two classes one factory made. Swapping the
-    factory arguments between them leaves the same two class walks, now held by the other
-    value: each walk is keyed by the value that holds it, so the swap reruns the stage with the
-    swapped output."""
+    """Two values of the stage hold instances of two classes one factory made, with a class
+    statement or with `type()`. Swapping the factory arguments between them leaves the same two
+    classes, now held by the other value: each is keyed by its identity inside a value, so the
+    swap reruns the stage with the swapped output."""
     home = tmp_path / "home"
     pipeline = (
         _TWO_HOLDERS_HEADER
         + _TWO_HOLDERS[shape]
         + '\n\nwith Pipeline("t") as pipeline:\n    use(pipeline.input("lines.txt", t=str))\n'
     )
-    project = _project(tmp_path, {"factory.py": _FACTORY_MODULE, "pipeline.py": pipeline})
+    project = _project(tmp_path, {"factory.py": factory, "pipeline.py": pipeline})
     output = project / "data" / "t" / "use.txt"
     line = "Local Set Default Proof Using"
 
@@ -3308,6 +3321,52 @@ def test_swapping_two_factory_classes_between_two_values_reruns_its_stage(
     assert _repro_statuses(project, home) == {"t/use": "ran"}, "The swap should rerun"
     assert output.read_text() == f"{line}Z{line}A"
     assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_NAMED_AND_HELD = """\
+import dataclasses
+import pathlib
+from typing import Any
+
+from factory import make
+from pivot import Pipeline, loaders, stage
+
+Made = make("A")
+
+
+@dataclasses.dataclass(frozen=True)
+class Reader(loaders.Reader[str]):
+    made: Any = None
+
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text().splitlines()[0] + self.made.suffix()
+
+
+@stage
+def use(text: str) -> str:
+    return text + Made().suffix()
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", format=Reader(Made())))
+"""
+
+
+def test_a_class_the_stage_names_and_its_loader_holds_is_cached_warm_and_cold(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The stage names `Made`, a class `factory.make` made (`<locals>` in its name), and its
+    input's loader holds an instance of it. The stage and its loaders are walked apart, so the
+    loader's entries are the same whether the stage's manifest comes from the cache (warm) or
+    from a walk (cold): the stage runs once, then is cached warm, cold, and warm again."""
+    home = tmp_path / "home"
+    project = _project(tmp_path, {"factory.py": _FACTORY_MODULE, "pipeline.py": _NAMED_AND_HELD})
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert _repro_statuses(project, home) == {"t/use": "cached"}, "A warm run should reuse it"
+    shutil.rmtree(project / ".pivot" / "state.lmdb")
+    assert _repro_statuses(project, home) == {"t/use": "cached"}, "A cold run should reuse it"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}, "A warm run should reuse it"
 
 
 _DEFAULT_FROM_ELSEWHERE_PIPELINE = """\
@@ -3729,11 +3788,12 @@ def test_a_callback_that_reads_its_enclosing_class_runs_and_caches(
     assert _repro_statuses(project, home) == {"t/use": "cached"}
 
 
-def test_a_callback_whose_wrapped_chain_loops_is_refused_by_name(
+def test_a_callback_whose_wrapped_chain_loops_runs_and_caches(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A callback in a dataclass default has `__wrapped__` pointing to itself. `repro` refuses
-    the stage with Pivot's named wrapper-loop error and writes no output."""
+    """A callback in a dataclass default has `__wrapped__` pointing to itself. The walk reads it
+    from its own code, so `repro` runs the stage, with no `ValueError` from `inspect.unwrap`, and
+    the next run reuses the result."""
     home = tmp_path / "home"
     looping = _CALLBACK_CYCLE.replace(
         "def class_callback() -> str:\n    return CycleBox.marker\n",
@@ -3741,12 +3801,9 @@ def test_a_callback_whose_wrapped_chain_loops_is_refused_by_name(
     )
     project = _project(tmp_path, {"cycle.py": looping, "pipeline.py": _CALLBACK_CYCLE_PIPELINE})
 
-    result = helpers.run_pivot(project, home, "repro", "--json")
-    message = " ".join((result.stdout + result.stderr).split())
-    assert result.returncode != 0, f"The stage should be refused: {message}"
-    assert "class_callback' has a `__wrapped__` chain that loops" in message, message
-    assert "ValueError" not in message, message
-    assert not (project / "data" / "t" / "use.txt").exists()
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert (project / "data" / "t" / "use.txt").read_text() == "Local Set Default Proof Usingsafe"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
 
 
 _CONFIG_HELD = """\

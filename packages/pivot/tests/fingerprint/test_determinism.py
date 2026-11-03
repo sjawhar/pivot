@@ -407,14 +407,16 @@ class Node:
 loop = [1]
 loop.append(loop)
 for value in (Node(2), Node(3), loop):
-    print(fingerprint._serialize_value_for_hash(value))
+    print(fingerprint._form(value).text)
 """
 
 
 def test_self_referencing_values_canonicalise_to_a_stable_cycle_token(
     tmp_path: pathlib.Path,
 ) -> None:
-    """An object or list that holds itself ends in `["cycle", N]`, the same in every process."""
+    """An object or list that holds itself ends in `["cycle", N]`, N the objects up the path to
+    it, the same in every process: one for a list that holds itself, and one for an instance
+    whose attribute holds it (its attributes are its state, not an object on the path)."""
     (tmp_path / ".pivot").mkdir()
     script = tmp_path / "cycle_values.py"
     script.write_text(_CYCLE_SCRIPT)
@@ -433,7 +435,7 @@ def test_self_referencing_values_canonicalise_to_a_stable_cycle_token(
     assert len(outputs) == 1, outputs
     node_two, node_three, loop = (json.loads(line) for line in outputs.pop().splitlines())
     assert node_two != node_three, "the attribute beside the cycle is still hashed"
-    assert '["cycle", 2]' in json.dumps(node_two), node_two
+    assert node_two == ["inst", "__main__.Node", {"d": [["factor", 2], ["me", ["cycle", 1]]]}]
     assert loop == ["list", [1, ["cycle", 1]]], loop
 
 
@@ -458,22 +460,26 @@ class _Named:
 
 
 def test_object_with_default_repr_is_canonicalised_by_class_and_attributes() -> None:
-    """The default repr holds a memory address, so two equal objects would hash apart."""
-    assert fingerprint._serialize_value_for_hash(_Opts(2)) == fingerprint._serialize_value_for_hash(
-        _Opts(2)
-    )
-    assert fingerprint._serialize_value_for_hash(_Opts(2)) != fingerprint._serialize_value_for_hash(
-        _Opts(3)
-    )
-    assert "0x" not in fingerprint._serialize_value_for_hash(_Opts(2))
-    assert fingerprint._canonicalize_value_for_hash(_Opts(2)) == [
+    """The default repr holds a memory address, so two equal objects would hash apart: an
+    instance is formed by its class's key and its attributes."""
+    assert fingerprint._form(_Opts(2)).text == fingerprint._form(_Opts(2)).text
+    assert fingerprint._form(_Opts(2)).text != fingerprint._form(_Opts(3)).text
+    assert "0x" not in fingerprint._form(_Opts(2)).text
+    assert json.loads(fingerprint._form(_Opts(2)).text) == [
+        "inst",
         f"{__name__}._Opts",
-        ["dict", [["depth", 2], ["tags", ["set", ["a", "b"]]]]],
+        {"d": [["depth", 2], ["tags", ["set", ["a", "b"]]]]},
     ]
 
 
-def test_object_with_its_own_repr_keeps_the_repr() -> None:
-    assert fingerprint._canonicalize_value_for_hash(_Named("x")) == ["_Named", "_Named('x')"]
+def test_object_with_its_own_repr_is_formed_by_its_state() -> None:
+    """A user class's own `__repr__` is user code, which the walk never runs: the instance is
+    formed by its attributes, as one with the default repr is."""
+    assert json.loads(fingerprint._form(_Named("x")).text) == [
+        "inst",
+        f"{__name__}._Named",
+        {"d": [["name", "x"]]},
+    ]
 
 
 class _Item(pydantic.BaseModel):

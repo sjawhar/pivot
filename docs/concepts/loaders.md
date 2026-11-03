@@ -159,14 +159,15 @@ re-runs the stages that use it. A method nothing reaches is not part of the
 fingerprint, unless your code uses `self` in a way Pivot cannot follow (passes
 it to a function, or applies an operator to it); then every method of the
 class is. A reached method whose decorator makes it its own `__wrapped__` is
-refused, because Pivot cannot find the code it runs. A field
+read from its own code. A field
 can hold another loader (`Outer(Inner())`, a tuple of loaders, or a dataclass
-that holds one): Pivot fingerprints the held loader as it fingerprints a loader
-you pass directly, so an edit to `Inner.load` re-runs the stages that read
-through `Outer`. A field can also hold an instance of your own class that is
-not a loader: its fields count, and so does its class's code, every method of
-it, as if the stage named the class. A loader inside a pydantic model instance
-is not reached.
+or pydantic model that holds one): Pivot records the held loader's config with
+`Outer`'s and fingerprints its class's code as it does for a loader you pass
+directly, so an edit to `Inner.load` re-runs the stages that read through
+`Outer`. A field can also hold an instance of your own class that is not a
+loader: its fields count, and so does its class's code, every method of it,
+as if the stage named the class. A held loader that defines `__call__` is
+refused, since Pivot does not read the code a call runs.
 
 ```python
 # pipeline.py

@@ -221,9 +221,9 @@ def test_secret_in_a_dataclass_partial_argument_hashes_by_keyed_digest(
     (tmp_path / ".pivot").mkdir()
     monkeypatch.setattr(project, "_project_root_cache", tmp_path)
     hashes = [
-        fingerprint._serialize_value_for_hash(
+        fingerprint._form(
             functools.partial(_helper_with_auth, _Auth(pydantic.SecretStr(value)))
-        )
+        ).text
         for value in ("first-secret", "second-secret")
     ]
 
@@ -400,6 +400,8 @@ def test_cached_function_in_partial_argument_is_walked():
 
 
 def test_library_function_in_partial_argument_is_not_walked():
+    """A library function in a partial's arguments is named by its form, not walked: its module
+    gets only the by-name import entry (`byname:`) a worker checks."""
     bound = functools.partial(_apply_all, [inspect.unwrap])
 
     def stage() -> int:
@@ -407,4 +409,4 @@ def test_library_function_in_partial_argument_is_not_walked():
 
     fp = fingerprint.get_stage_fingerprint(stage)
 
-    assert not any("inspect" in key for key in fp), list(fp)
+    assert [key for key in fp if "inspect" in key] == ["byname:inspect"], list(fp)

@@ -362,12 +362,6 @@ def _stage_uses_tuple_of_object() -> int:
         pytest.param(
             _make_stage_with_bound_method_cell(), "cell_method", "method", id="bound-method-cell"
         ),
-        pytest.param(
-            _stage_uses_partial_over_bound_method,
-            "_PARTIAL_OVER_METHOD.args[0]",
-            "method",
-            id="bound-method-in-partial",
-        ),
     ],
 )
 def test_non_scalar_closure_capture_raises(
@@ -386,6 +380,23 @@ def test_non_scalar_closure_capture_raises(
         "Should include suggestion"
     )
     assert "PIVOT_UNSAFE_FINGERPRINTING=1" in message, "Should include suppression hint"
+
+
+def test_a_method_bound_to_an_instance_in_a_partials_arguments_is_formed_with_its_receiver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A method bound to an instance in a partial's arguments is accepted: the partial's form
+    holds the method's function and its receiver's state, and the receiver's class gets the walk
+    a named class gets, so a new factor changes the partial's entry."""
+    manifest = fingerprint.get_stage_fingerprint(_stage_uses_partial_over_bound_method)
+    key = f"partial:{__name__}._PARTIAL_OVER_METHOD.args"
+    assert f"func:{__name__}.Scaler.apply" in manifest, manifest
+
+    monkeypatch.setattr(_PARTIAL_OVER_METHOD.args[0].__self__, "factor", 6)
+    assert (
+        fingerprint.get_stage_fingerprint(_stage_uses_partial_over_bound_method)[key]
+        != (manifest[key])
+    )
 
 
 def test_non_scalar_capture_errors_are_aggregated() -> None:
