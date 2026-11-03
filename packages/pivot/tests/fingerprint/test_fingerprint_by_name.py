@@ -4934,12 +4934,13 @@ def test_the_model_dump_probe_runs_no_class_side_code() -> None:
     another class, or one whose type's metaclass `__eq__` raises, leaves the real instance dict
     to no C descriptor: the value is opaque, which refuses a stage that holds it, where main ran
     the property or `model_dump`. A metaclass `__getattribute__` that raises for `__mro__` or
-    `__dict__`, a metaclass `__mro__` property that raises, never ends, or hides a base, and a
-    metaclass that defines `__eq__` without `__hash__` or whose `__hash__` raises: the instance
-    is formed by its attributes, read through C. A class whose metaclass reports a `model_dump`
-    keeper or a pydantic model as its `__class__` is a class label (alone or as a value); a dict
-    subclass as `__dict__` is read past its raising `__contains__`; a proxy that forwards through
-    `__getattribute__` is formed by its own state; a RootModel by its root."""
+    `__dict__` is user code that any read of the class runs: the instance is `["hooked", <class>]`,
+    which refuses a stage that holds it. A metaclass `__mro__` property that raises, never ends,
+    or hides a base, and a metaclass that defines `__eq__` without `__hash__` or whose `__hash__`
+    raises: the instance is formed by its attributes, read through C. A class whose metaclass
+    reports a `model_dump` keeper or a pydantic model as its `__class__` is a class label (alone or
+    as a value); a dict subclass as `__dict__` is read past its raising `__contains__`; a proxy
+    that forwards through `__getattribute__` is formed by its own state; a RootModel by its root."""
     done = subprocess.run(
         [sys.executable, "-c", _R11_CLASS_SIDE_CHILD],
         capture_output=True,
@@ -4961,9 +4962,12 @@ def test_the_model_dump_probe_runs_no_class_side_code() -> None:
         "dict_property_none": "DictPropNone",
         "dict_property_int": "DictPropInt",
     }
+    for name, cls in (
+        ("meta_getattribute_raises_for_mro", "MetaGetattributeMro"),
+        ("meta_getattribute_raises_for_dict", "MetaGetattributeDict"),
+    ):
+        assert result.pop(name) == ["hooked", f"__main__.{cls}"], name
     plain = {
-        "meta_getattribute_raises_for_mro": "MetaGetattributeMro",
-        "meta_getattribute_raises_for_dict": "MetaGetattributeDict",
         "meta_mro_property_raises": "MetaMroRaises",
         "meta_mro_property_endless": "MetaMroEndless",
         "meta_eq_without_hash": "MetaUnhashable",

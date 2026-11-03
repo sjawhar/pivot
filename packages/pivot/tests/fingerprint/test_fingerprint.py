@@ -2522,11 +2522,15 @@ def test_two_classes_one_factory_made_in_a_cycle_give_one_manifest_in_either_ord
 
 
 @pytest.mark.parametrize("position", ["dataclass-default", "loader-config", "partial"])
-def test_classifying_a_captured_instance_runs_no_metaclass_hook(position: str):
+def test_a_captured_instance_whose_metaclass_reads_attributes_in_code_is_refused_running_no_hook(
+    position: str,
+):
     """The class of a captured instance has a metaclass whose `__hash__` and `__eq__` raise, and
-    whose attribute lookup raises for `__mro__`. Noting the instance and walking its class read
-    the class through `type`'s own descriptors and keep it out of the caches keyed by class, so
-    no hook runs and the class is walked."""
+    whose `__getattribute__` raises for `__mro__` and notes every other name it is asked. Reading
+    anything of the class (its source, its fields, its members) would run that code, so the stage
+    is refused, naming the class and its metaclass, and no hook runs: not the raising ones, and
+    no attribute is asked of the class."""
+    asked = list[str]()
 
     class RaisingMeta(type):
         def __hash__(cls) -> int:
@@ -2538,6 +2542,7 @@ def test_classifying_a_captured_instance_runs_no_metaclass_hook(position: str):
         def __getattribute__(cls, name: str) -> typing.Any:
             if name == "__mro__":
                 raise RuntimeError("metaclass __mro__ lookup ran")
+            asked.append(name)
             return super().__getattribute__(name)
 
     class Hooked(metaclass=RaisingMeta):
@@ -2549,6 +2554,7 @@ def test_classifying_a_captured_instance_runs_no_metaclass_hook(position: str):
         hooked: typing.Any = Hooked()
 
     holds = functools.partial(_tag, Hooked())
+    loader = _HoldingReader(Hooked())
 
     def through_a_default(text: str) -> str:
         return _tag(Holder().hooked, text)
@@ -2556,14 +2562,21 @@ def test_classifying_a_captured_instance_runs_no_metaclass_hook(position: str):
     def through_a_partial(text: str) -> str:
         return holds(text)
 
-    if position == "loader-config":
-        manifest = fingerprint.get_loader_fingerprint(_HoldingReader(Hooked()))
-    else:
-        stage = through_a_default if position == "dataclass-default" else through_a_partial
-        manifest = fingerprint.get_stage_fingerprint(stage)
+    class_name = f"{Hooked.__module__}.{Hooked.__qualname__}"
+    asked.clear()
+    with pytest.raises(exceptions.StageDefinitionError) as refused:
+        if position == "loader-config":
+            fingerprint.get_loader_fingerprint(loader)
+        else:
+            stage = through_a_default if position == "dataclass-default" else through_a_partial
+            fingerprint.get_stage_fingerprint(stage)
 
-    key = f"func:{Hooked.__module__}.{Hooked.__qualname__}.suffix"
-    assert key in manifest, manifest
+    message = str(refused.value)
+    assert asked == [], f"The walk asked the class for {asked}"
+    assert f"class '{class_name}'" in message, message
+    assert "RaisingMeta', whose `__getattribute__` or `__getattr__` is user code" in message, (
+        message
+    )
 
 
 class _SuffixBase:
@@ -6159,3 +6172,178 @@ def test_function_hash_lookup_reads_the_current_projects_state_db(
     finally:
         sys.modules.pop("moved_stage", None)
         fingerprint._close_state_db()
+
+
+# ---------------------------------------------------------------------------------------------
+# The walk's worklist, cache-hit replay of value steps, wrapper loops behind a C cache, Enum
+# values and a rebuilt pydantic model
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_helper_chain_deeper_than_the_recursion_limit_is_fingerprinted(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each helper is a node of the walk, expanded from its worklist, never inside the expansion
+    of the helper that calls it, so a stage whose helpers call each other deeper than the
+    recursion limit gets an entry for each of them."""
+    depth = sys.getrecursionlimit() + 500
+    helpers = [f"def helper_{i}(x):\n    return helper_{i + 1}(x) + 1\n" for i in range(depth)]
+    helpers.append(f"def helper_{depth}(x):\n    return x\n")
+    helpers.append("def stage():\n    return helper_0(0)\n")
+    (tmp_path / "deep_helpers.py").write_text("\n\n".join(helpers))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        module = importlib.import_module("deep_helpers")
+        manifest = fingerprint.get_stage_fingerprint(module.stage)
+    finally:
+        sys.modules.pop("deep_helpers", None)
+
+    walked = [key for key in manifest if key.startswith("func:deep_helpers.helper_")]
+    assert len(walked) == depth + 1, f"{len(walked)} of {depth + 1} helpers were walked"
+
+
+_VALUE_STEPS_MODULE = """\
+import functools
+
+
+class First:
+    def __repr__(self) -> str:
+        return "z"
+
+    def suffix(self) -> str:
+        return "A"
+
+
+class Second:
+    def __repr__(self) -> str:
+        return "a"
+
+    def suffix(self) -> str:
+        return "B"
+
+
+def _count(held, x):
+    return x + len(held)
+
+
+HELD = functools.partial(_count, {held})
+
+
+def stage(x):
+    return HELD(x)
+"""
+
+
+@pytest.mark.parametrize(
+    "held",
+    [
+        pytest.param("frozenset([First(), Second()])", id="set-members"),
+        pytest.param('{"first": First(), "second": Second()}', id="dict-values"),
+    ],
+)
+def test_a_cache_hit_reaches_the_classes_inside_a_set_and_a_dict_again(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, held: str
+) -> None:
+    """A partial holds two instances in a set, ranked by their forms (`First` before `Second`,
+    though their reprs sort the other way), or as a dict's values, keyed by the keys' forms. The
+    walk records the reads of each class under the step to it (`s:RANK`, `k:KEY`), and a cache hit
+    in a new import follows the same steps to the same classes, so an unchanged value hits."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / "value_steps.py").write_text(_VALUE_STEPS_MODULE.format(held=held))
+    writes = dict[pathlib.Path, list[tuple[bytes, bytes]]]()
+    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
+    monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
+    try:
+        module = importlib.import_module("value_steps")
+        fingerprint.get_stage_fingerprint_cached("v/stage", module.stage)
+        ((_key, raw),) = _pending_manifest_entries()
+        reads = json.loads(raw)["r"]
+        del sys.modules["value_steps"]
+        module = importlib.import_module("value_steps")
+
+        assert fingerprint._recorded_reads_hold(module.stage, reads), "re-import alone must hit"
+    finally:
+        sys.modules.pop("value_steps", None)
+
+
+_LOOP_FACTOR = 3
+
+
+def _helper_looped_behind_a_cache(x: int) -> int:
+    return x * _LOOP_FACTOR
+
+
+_LOOPED_CACHE = functools.cache(_helper_looped_behind_a_cache)
+_helper_looped_behind_a_cache.__wrapped__ = _LOOPED_CACHE  # pyright: ignore[reportFunctionMemberAccess] - a wrapper loop
+
+
+def _helper_stage_calls_a_looped_cache() -> int:
+    return _LOOPED_CACHE(1)
+
+
+def test_a_cache_wrapper_whose_wrapped_chain_loops_walks_the_function_it_wraps():
+    """`functools.cache` wraps a helper whose `__wrapped__` points back to the cache wrapper. The
+    walk reads the chain up to where it loops and walks the helper behind the wrapper from its own
+    code, so the global the helper reads is recorded, and nothing raises."""
+    manifest = fingerprint.get_stage_fingerprint(_helper_stage_calls_a_looped_cache)
+
+    assert manifest[_const_key("_LOOP_FACTOR")] == "3", manifest
+
+
+def _helper_library_enum(value: str) -> typing.Any:
+    """A functional Enum that names a library module as its own, so it is a library Enum."""
+    return enum.Enum("LibraryChoice", {"PICK": value}, module="json")
+
+
+_HOLDS_LIBRARY_PICK_A = functools.partial(_tag, _helper_library_enum("A").PICK)
+_HOLDS_LIBRARY_PICK_B = functools.partial(_tag, _helper_library_enum("B").PICK)
+
+
+def _helper_stage_holds_library_pick_a(text: str) -> str:
+    return _HOLDS_LIBRARY_PICK_A(text)
+
+
+def _helper_stage_holds_library_pick_b(text: str) -> str:
+    return _HOLDS_LIBRARY_PICK_B(text)
+
+
+def test_a_library_enum_members_value_is_in_the_partials_form():
+    """Members of two library Enums of one name, with one member name and different values, give
+    different partial entries: the member is formed with its value."""
+    first = fingerprint.get_stage_fingerprint(_helper_stage_holds_library_pick_a)
+    second = fingerprint.get_stage_fingerprint(_helper_stage_holds_library_pick_b)
+
+    first_args = first[f"partial:{__name__}._HOLDS_LIBRARY_PICK_A.args"]
+    second_args = second[f"partial:{__name__}._HOLDS_LIBRARY_PICK_B.args"]
+    assert first_args != second_args, "A member's value must be in the partial's entry"
+
+
+class _RebuiltDefault(pydantic.BaseModel):
+    model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(
+        arbitrary_types_allowed=True
+    )
+    value: typing.Any = random.Random(1)
+
+
+def _helper_builds_a_rebuilt_model() -> object:
+    return _RebuiltDefault()
+
+
+def test_a_model_rebuilt_with_a_readable_default_is_accepted_in_the_next_pass(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A model's field default is a `random.Random`, whose state no form reads: the stage is
+    refused. After the default is replaced with a string and the model rebuilt, the next pass in
+    the same process accepts the stage: the schema hash kept for the model is not the one its old
+    default made."""
+    with fingerprint.fingerprint_pass(), pytest.raises(exceptions.StageDefinitionError):
+        fingerprint.get_stage_fingerprint(_helper_builds_a_rebuilt_model)
+    field = _RebuiltDefault.model_fields["value"]
+    monkeypatch.setattr(field, "default", "safe")
+    _RebuiltDefault.model_rebuild(force=True)
+
+    with fingerprint.fingerprint_pass():
+        manifest = fingerprint.get_stage_fingerprint(_helper_builds_a_rebuilt_model)
+
+    assert _definition_key("schema", _RebuiltDefault) in manifest, manifest

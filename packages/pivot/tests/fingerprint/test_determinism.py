@@ -304,6 +304,49 @@ def test_distinct_partial_arguments_have_distinct_fingerprints(
     assert first_args != second_args
 
 
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        pytest.param({"alpha": 1, "beta": 2}, {"beta": 2, "alpha": 1}, id="scalar-values"),
+        pytest.param(
+            {"alpha": [1], "beta": (2, [3])},
+            {"beta": (2, [3]), "alpha": [1]},
+            id="container-values",
+        ),
+    ],
+)
+def test_a_dict_partial_argument_has_one_fingerprint_in_any_insertion_order(
+    first: object, second: object
+) -> None:
+    """A dict is written as its entries sorted by their texts, not in insertion order (a dict
+    built from a set follows the hash seed), so the same entries inserted in another order give
+    the same fingerprint."""
+
+    def helper(value: object) -> object:
+        return value
+
+    first_partial = functools.partial(helper, first)
+    second_partial = functools.partial(helper, second)
+
+    def first_stage() -> object:
+        return first_partial()
+
+    def second_stage() -> object:
+        return second_partial()
+
+    first_args = next(
+        value
+        for key, value in fingerprint.get_stage_fingerprint(first_stage).items()
+        if key.endswith(".args")
+    )
+    second_args = next(
+        value
+        for key, value in fingerprint.get_stage_fingerprint(second_stage).items()
+        if key.endswith(".args")
+    )
+    assert first_args == second_args
+
+
 _FUNCTION_ARGUMENT_SCRIPT = """\
 import functools
 

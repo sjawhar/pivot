@@ -9,6 +9,7 @@ import decimal
 import enum
 import fractions
 import functools
+import gc
 import importlib
 import importlib.machinery
 import importlib.metadata
@@ -29,7 +30,15 @@ import types
 import typing
 import uuid
 import weakref
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import (
+    Callable,
+    Collection,
+    Generator,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
 import xxhash
@@ -200,10 +209,11 @@ _get_type_hints_cache: weakref.WeakKeyDictionary[Callable[..., Any], dict[str, A
     weakref.WeakKeyDictionary()
 )
 
-# Cache for `_schema_parts` results, keyed by pydantic model class.
-_schema_hash_cache: weakref.WeakKeyDictionary[type, tuple[str, list[tuple[str, "_Form"]]]] = (
-    weakref.WeakKeyDictionary()
-)
+# Cache for `_schema_parts` results, keyed by pydantic model class, each with the validator the
+# model had when it was computed: `model_rebuild` builds a new one, so a rebuilt model misses.
+_schema_hash_cache: weakref.WeakKeyDictionary[
+    type, tuple[object, tuple[str, list[tuple[str, "_Form"]]]]
+] = weakref.WeakKeyDictionary()
 
 # Module-level state for persistent AST hash caching.
 # Fingerprinting happens during discovery (single-threaded in coordinator process).
@@ -801,6 +811,7 @@ class _ValueKind(enum.Enum):
     MODULE = "module"
     LOGGER = "logger"
     SCALAR = "scalar"
+    HOOKED = "hooked"  # a class whose metaclass answers attribute reads with user code
 
 
 def _immutable_value_text(value: Any) -> str | None:
@@ -822,7 +833,10 @@ def _immutable_value_text(value: Any) -> str | None:
 
 
 def _value_kind(value: Any) -> _ValueKind:
-    """Classify a value a walked function reads; the walk and a cache hit share this.
+    """Classify a value a walked function reads; the walk and a cache hit share this. Decided on
+    the value's real type, so no `__class__` or `__getattribute__` of a user instance runs, and a
+    class whose metaclass answers attribute reads with user code is HOOKED before anything of it
+    is read (`_attribute_hook`).
 
     A value on a `__wrapped__` chain that holds a `@fingerprint_by_name` mark takes the mark
     decision (`_mark_decision`) first: a user class instance above the mark is
@@ -832,18 +846,22 @@ def _value_kind(value: Any) -> _ValueKind:
     mark = _mark_decision(value)
     if mark is _MarkDecision.REFUSED:
         return _ValueKind.CLASS_ABOVE_MARK
+    value_type: type[Any] = type(value)  # pyright: ignore[reportUnknownVariableType] - any class
+    if issubclass(value_type, type) and _attribute_hook(value) is not None:
+        return _ValueKind.HOOKED
     # functools.partial and partialmethod fail is_user_code() (module is functools/stdlib).
-    if isinstance(value, (functools.partial, functools.partialmethod)):
+    # `issubclass` with a class whose metaclass is `type` asks only the real MRO, in C.
+    if issubclass(value_type, (functools.partial, functools.partialmethod)):
         return _ValueKind.PARTIAL
     if mark is _MarkDecision.BY_NAME and not _carries_instance(value):
         return _ValueKind.EXTERNAL
-    if _is_callable_instance(value) or _is_user_class_instance(value) or _carries_instance(value):
+    if _is_user_class_instance(value) or _is_callable_instance(value) or _carries_instance(value):
         return _ValueKind.REFUSED
     if callable(value):
         return _ValueKind.USER if is_user_code(value) else _ValueKind.EXTERNAL
-    if isinstance(value, types.ModuleType):
+    if issubclass(value_type, types.ModuleType):
         return _ValueKind.MODULE
-    if isinstance(value, logging.Logger):
+    if issubclass(value_type, logging.Logger):
         return _ValueKind.LOGGER
     if _immutable_value_text(value) is not None:
         return _ValueKind.SCALAR
@@ -919,15 +937,16 @@ def _type_of(value: Any) -> type[Any]:
 #
 # Code edges: `g:NAME` a global (also recorded when absent), `c:NAME` a closure cell, `d:PARAM` a
 # default, `a:ATTR` a module attribute, `ca:ATTR` a class attribute (`Config.SCALE`, or `self.S`
-# in a member), `n:NAME` and `np:DOTTED` names in a class statement's annotations, `m:NAME` a
-# callable member of a user class's own namespace, `b:INDEX` a class's base, `ob:INDEX` a base its
-# class statement names that `__bases__` does not hold (`_statement_bases`), `fd:NAME` a dataclass
-# field default, `bi:MODULE` a loaded module a function body imports, `u` the function behind a
-# C-level wrapper, `hc:INDEX` a class in type hints, `fc:INDEX` a class in a model's field
-# annotations, `lm:NAME` a loader class's `load`, `save` or `empty`, `lr:REF` a member those
-# reach, `cfg:NAME` a loader's config field, `sd:NAME` a model's field default, and `ns:NAME` an
-# entry of the namespace of a class with no source. `hints` and `schema` read the visited object
-# itself.
+# in a member), read from the class body that holds it (`_class_attribute`), `mc` a pydantic
+# model's `model_config` a member reads, `n:NAME` and `np:DOTTED` names in a class statement's
+# annotations, `m:NAME` a callable member of a user class's own namespace, `b:INDEX` a class's
+# base, `ob:INDEX` a base its class statement names that `__bases__` does not hold
+# (`_statement_bases`), `fd:NAME` a dataclass field default, `bi:MODULE` a loaded module a function
+# body imports, `u` the function behind a C-level wrapper, `hc:INDEX` a class in type hints,
+# `fc:INDEX` a class in a model's field annotations, `lm:NAME` a loader class's `load`, `save` or
+# `empty`, `lr:REF` a member those reach, `cfg:NAME` a loader's config field, `sd:NAME` a model's
+# field default, and `ns:NAME` an entry of the namespace of a class with no source. `hints` and
+# `schema` read the visited object itself.
 #
 # Value steps, from a value to an object inside it (`_form`): `pf`, `pa:INDEX` and `pk:KEY` a
 # partial's parts, `i:INDEX` a list's, tuple's or deque's item, `s:RANK` a set's member by its
@@ -935,11 +954,12 @@ def _type_of(value: Any) -> type[Any]:
 # the key's form, `at:NAME` an instance attribute, `sl:LABEL` a slot (`_slot_values`), `bv` the
 # built-in value of an instance of a subclass of a built-in type (`_builtin_value`), `cls` the
 # class of an instance or a loader, `ea` an exception's arguments, `ec:NAME` a field of a
-# built-in exception (`_exception_fields`), `ev` a library Enum member's value, `mf` and `ms` a
+# built-in exception (`_exception_fields`), `ev` an Enum member's value, `mf` and `ms` a
 # bound method's function and object, `cm` the function of a classmethod or staticmethod, `pg`,
 # `ps` and `pd` a property's getter, setter and deleter, `cp` a cached property's function, `wr`
 # the function a cache wrapper wraps, `df` a defaultdict's factory, `mp:INDEX` a ChainMap's map,
-# and `nf:INDEX` an item of an object array.
+# `nf:INDEX` an item of an object array, `to` and `ta` a type alias's origin and arguments, and
+# `px` the mapping a `MappingProxyType` shows.
 _UNREAD = object()
 
 
@@ -954,8 +974,12 @@ def _read_step(owner: Any, step: str) -> Any:
                 return owner.__closure__[owner.__code__.co_freevars.index(arg)].cell_contents
             case "d":
                 return dict(_function_defaults(owner))[arg]
-            case "a" | "ca" | "cfg":
+            case "a" | "cfg":
                 return getattr(owner, arg)
+            case "ca":
+                return _class_attribute(owner, arg)
+            case "mc":
+                return _class_attribute(owner, "model_config")
             case "n":
                 return vars(sys.modules[owner.__module__])[arg]
             case "np":
@@ -1012,7 +1036,7 @@ def _value_part(owner: Any, kind: str, arg: str) -> Any:
         case "i":
             return owner[int(arg)]
         case "s":
-            members = list(owner)
+            members = owner.items if type(owner) is _Contents else list(owner)
             order, ranks = _ranked([_form(member).text for member in members])
             rank = int(arg)
             return next(members[index] for index in order if ranks[index] == rank)
@@ -1053,6 +1077,14 @@ def _value_part(owner: Any, kind: str, arg: str) -> Any:
             return owner.maps[int(arg)]
         case "nf":
             return owner.flat[int(arg)]
+        case "to":
+            return _GENERIC_ALIAS_ORIGIN(owner)
+        case "ta":
+            if _on_mro(_type_of(owner), types.GenericAlias):
+                return _GENERIC_ALIAS_ARGS(owner)
+            return _UNION_ARGS(owner)
+        case "px":
+            return _proxied_mapping(owner)
         case "ns":
             return _class_namespace(owner)[arg]
         case "sd":
@@ -1062,10 +1094,14 @@ def _value_part(owner: Any, kind: str, arg: str) -> Any:
 
 
 def _mapping_items(mapping: Any) -> Iterator[tuple[Any, Any]]:
-    """The items of a mapping `_form` writes (a dict, a dict subclass's built-in value, a
-    `MappingProxyType`), read through the built-in type's own method."""
+    """The items of a mapping `_form` writes by its entries (a dict, a `Counter`, an
+    `OrderedDict`, a `MappingProxyType` over a dict, the items of a dict subclass's built-in value:
+    `_Contents`), read through the built-in types' own C methods, so no method of a dict subclass,
+    of the mapping a proxy shows or of a key runs."""
+    if type(mapping) is _Contents:
+        return iter(mapping.items)
     if type(mapping) is types.MappingProxyType:
-        return iter(cast("types.MappingProxyType[Any, Any]", mapping).items())
+        return iter(_dict_items(_proxied_mapping(mapping)))
     return iter(_dict_items(mapping))
 
 
@@ -1088,6 +1124,8 @@ def _read_token(owner: Any, step: str) -> str:
     value = _read_step(owner, step)
     if value is _UNREAD:
         return "absent"
+    if step == "mc":
+        return f"config:{xxhash.xxh64(_form(value).text.encode()).hexdigest()}"
     if step.startswith("d:"):
         return _default_token(value)
     if step.startswith("ca:") and _is_user_enum_member(value):
@@ -1137,11 +1175,16 @@ def _recorded_reads_hold(func: Callable[..., Any], reads: list[object]) -> bool:
 
 
 def _walk_to(path: tuple[str, ...], owners: dict[tuple[str, ...], Any]) -> Any:
-    """Follow `path` from the stage function, reusing the objects already reached."""
-    if path not in owners:
-        parent = _walk_to(path[:-1], owners)
-        owners[path] = parent if parent is _UNREAD else _read_step(parent, path[-1])
-    return owners[path]
+    """Follow `path` from the stage function, reusing the objects already reached (the empty path
+    is the function), step by step, so a path of any length is followed."""
+    reached = len(path)
+    while path[:reached] not in owners:
+        reached -= 1
+    owner = owners[path[:reached]]
+    for end in range(reached + 1, len(path) + 1):
+        owner = owner if owner is _UNREAD else _read_step(owner, path[end - 1])
+        owners[path[:end]] = owner
+    return owner
 
 
 def flush_ast_hash_cache() -> None:
@@ -1316,8 +1359,8 @@ def get_stage_fingerprint(func: Callable[..., Any]) -> dict[str, str]:
     - 'const:<module>.<name>': Primitive constants, read as globals or as `module.NAME`
     - 'ext:<module>.<name>': Library functions and classes, named by definition
 
-    The walk runs in the node table of the stage's scope (`stage_fingerprint_scope`), or in one of
-    its own outside a scope, and the manifest is the projection of `func`'s node (`_project`).
+    The stage function's walk is a node table of its own (`_stage_manifest`; its loaders share
+    another, `_loaders_walk`), and the manifest is the projection of `func`'s node (`_project`).
     """
     _t = metrics.start()
     try:
@@ -1443,6 +1486,10 @@ _STEP_WORDS = {
     "df": "its default factory",
     "mp": "map {}",
     "nf": "item {}",
+    "to": "its origin",
+    "ta": "its arguments",
+    "px": "the mapping it shows",
+    "mc": "its model_config",
     "ns": "entry '{}' of its namespace",
     "sd": "the default of field '{}'",
     "cfg": "config field '{}'",
@@ -1753,8 +1800,13 @@ def _add_callable(value: Any, binding_ref: str = "", *, in_value: bool = False) 
     """Add an edge from the node being expanded to user function or class `value`, at the current
     path, with the expanding node's entry for it: `func:<key>` or `class:<key>`, its code hash, and
     the coverage of its module. A function is keyed by `_callable_ref` of the binding it is reached
-    through (`binding_ref`), a class by `_class_key`; a node keeps the key it was made with."""
+    through (`binding_ref`), a class by `_class_key`; a node keeps the key it was made with. A
+    class whose metaclass answers attribute reads with user code (`_attribute_hook`) is refused
+    instead, before anything of it is read."""
     if issubclass(type(value), type):
+        if _attribute_hook(value) is not None:
+            _record_refusal(_hooked_class_message(value), downgradable=True)
+            return
         prefix, kind, key = "class", _NodeKind.CLASS, _class_key(value, in_value=in_value)
         module_name = _class_module(value)
     else:
@@ -1985,14 +2037,16 @@ def _process_dataclass_defaults(cls: type) -> None:
 
 
 def _class_member_parts(name: str, raw: Any) -> list[tuple[str, Any]]:
-    """Return the concrete callable values one class-dict member can execute."""
-    if isinstance(raw, property):
+    """Return the concrete callable values one class-dict member can execute, decided on the
+    member's real type, so no `__class__` it defines is read."""
+    raw_type: type[Any] = type(raw)  # pyright: ignore[reportUnknownVariableType] - any class
+    if issubclass(raw_type, property):
         return [(name, raw.fget), (f"{name}.fset", raw.fset), (f"{name}.fdel", raw.fdel)]
-    if isinstance(raw, functools.cached_property):
+    if issubclass(raw_type, functools.cached_property):
         return [(name, cast("functools.cached_property[Any]", raw).func)]
-    if isinstance(raw, (classmethod, staticmethod)):
-        return [(name, cast("Any", raw.__func__))]
-    if isinstance(raw, functools.partialmethod):
+    if issubclass(raw_type, (classmethod, staticmethod)):
+        return [(name, raw.__func__)]
+    if issubclass(raw_type, functools.partialmethod):
         return [
             (
                 name,
@@ -2001,8 +2055,8 @@ def _class_member_parts(name: str, raw: Any) -> list[tuple[str, Any]]:
                 ),
             )
         ]
-    if isinstance(raw, functools.singledispatchmethod):
-        dispatcher = cast("Any", raw.dispatcher)
+    if issubclass(raw_type, functools.singledispatchmethod):
+        dispatcher = raw.dispatcher
         members = [(name, raw.func)]
         for registered_type, function in cast("Mapping[type, Any]", dispatcher.registry).items():
             if registered_type is object:
@@ -2042,9 +2096,9 @@ def _user_member_value(value: Any) -> Any:
     decision = _mark_decision(value)
     if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
         return value
-    if isinstance(value, functools.partial):
-        return cast("Any", value)
-    if inspect.isfunction(value):
+    if issubclass(type(value), functools.partial):
+        return value
+    if type(value) is types.FunctionType:
         if _written_in_user_source(value):
             return value
         unwrapped = _unwrap_quietly(value, _stop_at_mark)
@@ -2053,8 +2107,12 @@ def _user_member_value(value: Any) -> Any:
         if unwrapped is not value and inspect.isfunction(unwrapped):
             return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
         return _UNREAD
-    if isinstance(value, type):
+    if issubclass(type(value), type):
         return value if is_user_code(value) else _UNREAD
+    # A user class instance, decided on its real type, is kept when it is callable or a descriptor
+    # (`__get__` on its class), and nothing of it is asked, so no `__getattr__` of it runs.
+    if _is_user_class_instance(value):
+        return value if callable(value) or _type_defines(_type_of(value), "__get__") else _UNREAD
     if _is_callable_instance(value) or _carries_instance(value):
         return value
     if callable(value):
@@ -2063,9 +2121,14 @@ def _user_member_value(value: Any) -> Any:
             return unwrapped
         if unwrapped is not value and inspect.isfunction(unwrapped):
             return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
-    if _has_attribute(value, "__get__") and _is_user_class_instance(value):
-        return value
     return _UNREAD
+
+
+def _type_defines(cls: type[Any], name: str) -> bool:
+    """Whether a class on `cls`'s real MRO holds `name` in its own namespace, as Python looks up a
+    special method (`__get__`): read through `type`'s own descriptors, so nothing of an instance
+    or of a metaclass runs."""
+    return any(name in _class_namespace(klass) for klass in _class_mro(cls))
 
 
 def _user_methods(cls: type) -> list[tuple[str, Any]]:
@@ -2391,7 +2454,7 @@ def _process_class_body_dependencies(cls: type) -> None:
         if name not in ns:
             continue
         value = ns[name]
-        if isinstance(value, type) and is_user_code(value):
+        if issubclass(type(value), type) and is_user_code(value):
             with _walking(f"n:{name}"):
                 _add_callable(value)
 
@@ -2399,7 +2462,7 @@ def _process_class_body_dependencies(cls: type) -> None:
         step = f"np:{'.'.join(parts)}"
         _record_read(cls, step)
         resolved = _resolve_dotted_path(parts, ns)
-        if resolved is None or not isinstance(resolved, type) or not is_user_code(resolved):
+        if not issubclass(type(resolved), type) or not is_user_code(resolved):
             continue
         with _walking(step):
             _add_callable(resolved)
@@ -2607,9 +2670,8 @@ def _is_pivot_loader_class(cls: type[Any]) -> bool:
 
 
 def _is_user_class(cls: type[Any]) -> bool:
-    """`is_user_code(cls)` for a class whose metaclass defines `__hash__` or `__eq__`, decided from
-    the module that defines `cls` (its `__module__`, read through `type`'s own descriptor), so no
-    code of its metaclass runs: `is_user_code`'s cache would hash the class."""
+    """Whether `cls` is user code, decided from the module that defines it (its `__module__`, read
+    through `type`'s own descriptor), so no code of its metaclass runs (`is_user_code`)."""
     name = _class_module(cls)
     module = sys.modules.get(name) if type(name) is str and name != "builtins" else None
     return module is not None and is_user_code(module)
@@ -2730,7 +2792,7 @@ def _member_values(name: str, raw: Any) -> list[tuple[str, Any]]:
         value = _user_member_value(member)
         if value is not _UNREAD:
             values.append((label, value))
-        elif not callable(member) and not _has_attribute(type(member), "__get__"):
+        elif not callable(member) and not _type_defines(_type_of(member), "__get__"):
             values.append((label, member))
     return values
 
@@ -2937,22 +2999,25 @@ def _process_instance_class_attributes(cls: type) -> None:
     `cls.NAME`, `type(self).NAME`, `self.__class__.NAME` and their literal `getattr` forms
     (`_member_reads`). The class's abstract syntax tree alone cannot show the runtime value. A
     dataclass field read so is an instance's value, not the class's (`_process_dataclass_defaults`
-    tracks its default)."""
+    tracks its default). Each value is read from the class body that holds it
+    (`_class_attribute`), so no descriptor's `__get__` and no metaclass code runs. A pydantic
+    model's `model_config` is configuration its class body wrote: it is recorded by its form
+    (`mc`), not refused as a dict."""
     stage_name = _current_stage_name.get() or _class_qualname(cls)
     class_ref = _current_node().key
     fields = _dataclass_field_names(cls)
     namespace = _class_namespace(cls)
     seen = set[str]()
     for label, member in _user_methods(cls):
-        function = member.__func__ if inspect.ismethod(member) else member
+        function = member.__func__ if type(member) is types.MethodType else member
         # A member recorded by name (`@fingerprint_by_name`) is not read: its body is the mark's.
-        if not inspect.isfunction(function) or _recorded_by_name(function):
+        if type(function) is not types.FunctionType or _recorded_by_name(function):
             continue
         tree = _source_tree(function)
         if tree is None:
             continue
         raw = namespace.get(label)
-        reads, dynamic = _member_reads(tree, takes_self=not isinstance(raw, staticmethod))
+        reads, dynamic = _member_reads(tree, takes_self=not issubclass(type(raw), staticmethod))
         if dynamic:
             continue
         for _via_super, name in reads:
@@ -2964,19 +3029,59 @@ def _process_instance_class_attributes(cls: type) -> None:
             ):
                 continue
             seen.add(name)
+            binding_ref = f"{class_ref}.{name}"
+            if name == "model_config" and _is_pydantic_model(cls):
+                _process_model_config(cls, binding_ref)
+                continue
             step = f"ca:{name}"
             value = _read_step(cls, step)
             if value is _UNREAD:
                 continue
             _record_read(cls, step)
             with _walking(step):
-                binding_ref = f"{class_ref}.{name}"
                 if _is_user_enum_member(value):
                     _entries()[f"const:{binding_ref}"] = _enum_member_text(value)
                 else:
                     _process_captured_value(
                         binding_ref, binding_ref, value, function, stage_name, chain=None
                     )
+
+
+def _is_pydantic_model(cls: type[Any]) -> bool:
+    """Whether pydantic's `BaseModel` is on `cls`'s real MRO; none is while pydantic is not
+    imported."""
+    pydantic_main = sys.modules.get("pydantic.main")
+    model = getattr(pydantic_main, "BaseModel", None) if pydantic_main is not None else None
+    return model is not None and _on_mro(cls, model)
+
+
+def _process_model_config(cls: type[Any], binding_ref: str) -> None:
+    """Record the `model_config` of pydantic model `cls`, which a member reads through its
+    receiver, by its form (`default:<class>.model_config`, step `mc`): pydantic writes the
+    class's whole configuration there, and the schema hash leaves parts of it out (`title`). The
+    code it holds (an alias generator, a `json_schema_extra` function) is walked, and a value no
+    form reads refuses the stage (`_admit`)."""
+    value = _class_attribute(cls, "model_config")
+    if value is _UNREAD:
+        return
+    _record_read(cls, "mc")
+    with _walking("mc"):
+        form = _form(value)
+        _entries()[f"default:{binding_ref}"] = xxhash.xxh64(form.text.encode()).hexdigest()
+        _admit(form, binding_ref, _bound_opaque_message(binding_ref))
+
+
+def _class_attribute(cls: type[Any], name: str) -> Any:
+    """Class attribute `name` of `cls` as a class body wrote it: the entry of the nearest class on
+    `cls`'s real MRO that holds it (`_class_namespace`), or `_UNREAD`. Neither a metaclass
+    `__getattribute__` nor a descriptor's `__get__` runs; for what the walk tracks as a class
+    attribute (`_is_user_class_attribute`) that is what `getattr(cls, name)` gives, but for a
+    user descriptor, which stays itself: the walk refuses it as an instance."""
+    for klass in _class_mro(cls):
+        namespace = _class_namespace(klass)
+        if name in namespace:
+            return namespace[name]
+    return _UNREAD
 
 
 def _is_unsafe_fingerprinting_enabled() -> bool:
@@ -3079,23 +3184,11 @@ def _sourceless_opaque_message(ref: str, name: str) -> Callable[[tuple[str, ...]
     return message
 
 
-def _has_attribute(value: Any, name: str) -> bool:
-    """`hasattr(value, name)` for a value the walk reads, where an error other than
-    AttributeError from the lookup also means no attribute.
-
-    Python calls an object's `__getattr__` only for a name its class and `__dict__` lack. One
-    that raises KeyError or RuntimeError for that name (a dict-backed config, an `AttrDict`, a
-    lazy object) says the attribute is absent, but `hasattr` lets the error through, and the
-    walk would stop on it.
-    """
-    try:
-        return hasattr(value, name)
-    except Exception:  # the error of the value's own `__getattr__` or property
-        return False
-
-
 def _attribute_or_none(value: Any, name: str) -> Any:
-    """`getattr(value, name, None)`, with the errors `_has_attribute` takes as no attribute."""
+    """`getattr(value, name, None)`, where an error other than AttributeError from the lookup also
+    means no attribute: Python calls an object's `__getattr__` only for a name its class and
+    `__dict__` lack, and one that raises KeyError or RuntimeError for that name (a dict-backed
+    config, an `AttrDict`, a lazy object) says the attribute is absent."""
     try:
         return getattr(value, name, None)
     except Exception:  # the error of the value's own `__getattr__` or property
@@ -3160,8 +3253,10 @@ def _keeps_own_attribute(obj: Any, name: str) -> bool:
 
 
 def _is_user_class_instance(value: Any) -> bool:
-    """Return whether `value` is an instance of a user-defined class."""
-    return not isinstance(value, type) and is_user_code(type(value))
+    """Return whether `value` is an instance of a user-defined class, decided on its real type,
+    so no `__class__` it defines is read."""
+    value_type: type[Any] = type(value)  # pyright: ignore[reportUnknownVariableType] - any class
+    return not issubclass(value_type, type) and is_user_code(value_type)
 
 
 def _is_callable_instance(value: Any) -> bool:
@@ -3172,7 +3267,7 @@ def _is_callable_instance(value: Any) -> bool:
     """
     if (
         not callable(value)
-        or isinstance(value, (functools.partial, type))
+        or issubclass(type(value), (functools.partial, type))
         or inspect.isroutine(value)
     ):
         return False
@@ -3330,6 +3425,8 @@ def _process_captured_value(
             _mark_by_name(getattr(value, "__module__", None), entries)
         case _ValueKind.LOGGER:
             return
+        case _ValueKind.HOOKED:
+            _record_refusal(_hooked_class_message(value), downgradable=True)
 
 
 def _attributes_read(func: Callable[..., Any], chain: str) -> list[str]:
@@ -3372,9 +3469,8 @@ def _process_class_reads(chain: str, cls: type, func: Callable[..., Any], stage_
             continue
         step = f"ca:{attribute}"
         _record_read(cls, step)
-        try:
-            value = getattr(cls, attribute)
-        except AttributeError:
+        value = _class_attribute(cls, attribute)
+        if value is _UNREAD:
             continue
         with _walking(step):
             if _is_user_enum_member(value):
@@ -3399,14 +3495,16 @@ def _is_user_class_attribute(cls: type, attribute: str) -> bool:
     staticmethod, cached_property, a NamedTuple field), the `_sunder_` names the enum
     machinery puts on an Enum class (`_member_names_`, `_value2member_map_`), and the
     `_fields` and `_field_defaults` that NamedTuple and namedtuple put on a tuple subclass. The
-    MRO and namespaces are read through `type`'s own descriptors.
+    MRO and namespaces are read through `type`'s own descriptors, and a descriptor is told by its
+    class (`_type_defines`), so nothing of the value runs.
     """
     owner = next((klass for klass in _class_mro(cls) if attribute in _class_namespace(klass)), None)
     if owner is None or not is_user_code(owner):
         return False
     raw = _class_namespace(owner)[attribute]
-    if isinstance(raw, (classmethod, staticmethod)) or (
-        _has_attribute(raw, "__get__") and not callable(raw)
+    raw_type: type[Any] = type(raw)  # pyright: ignore[reportUnknownVariableType] - any class
+    if issubclass(raw_type, (classmethod, staticmethod)) or (
+        _type_defines(raw_type, "__get__") and not callable(raw)
     ):
         return False
     sunder = len(attribute) > 2 and attribute[0] == attribute[-1] == "_"
@@ -3416,8 +3514,9 @@ def _is_user_class_attribute(cls: type, attribute: str) -> bool:
 
 
 def _is_user_enum_member(value: Any) -> bool:
-    """Whether `value` is a member of an Enum defined in user code."""
-    return isinstance(value, enum.Enum) and is_user_code(type(value))
+    """Whether `value` is a member of an Enum defined in user code, decided on its real type."""
+    value_type: type[Any] = type(value)  # pyright: ignore[reportUnknownVariableType] - any class
+    return _on_mro(value_type, enum.Enum) and is_user_code(value_type)
 
 
 def _enum_member_text(member: enum.Enum) -> str:
@@ -3662,19 +3761,22 @@ def _hint_classes(func: Callable[..., Any]) -> list[type]:
 
 
 def _collect_hint_classes(hint: Any, found: list[type]) -> None:
-    """Add the user classes in one type hint to `found`, recursing into generics."""
+    """Add the user classes in one type hint to `found`, recursing into generics. A class is
+    decided on its real type first, so no metaclass attribute hook runs (`typing.get_origin`
+    would read its `__class__`)."""
     if hint is type(None):
+        return
+    if issubclass(type(hint), type):
+        if is_user_code(hint):
+            found.append(cast("type[Any]", hint))
         return
     origin = typing.get_origin(hint)
     if origin is not None:
         # Track user-defined generic classes (e.g., MyGeneric[int] -> hash MyGeneric)
-        if isinstance(origin, type) and is_user_code(origin):
+        if issubclass(type(origin), type) and is_user_code(origin):
             found.append(cast("type[Any]", origin))
         for arg in typing.get_args(hint):
             _collect_hint_classes(arg, found)
-        return
-    if isinstance(hint, type) and is_user_code(hint):
-        found.append(cast("type[Any]", hint))
 
 
 def _process_type_hint_dependencies(func: Callable[..., Any]) -> None:
@@ -3757,13 +3859,16 @@ def _schema_parts(
 
     A field default is evaluated when the class is created, so it is a live value: a cache hit
     reads it again through this hash. A class is created once per import, so the hash is
-    memoized by class identity; a class whose metaclass hashes by its own code is not a key
+    memoized by class identity, with the validator the class had (`__pydantic_validator__`, read
+    from its own namespace): `model_rebuild` builds a new one, so a model rebuilt with another
+    default misses. A class whose metaclass hashes by its own code is not a key
     (`_hashes_by_identity`).
     """
     keyed = _hashes_by_identity(model)
+    validator = _class_namespace(model).get("__pydantic_validator__")
     cached = _schema_hash_cache.get(model) if keyed else None
-    if cached is not None:
-        return cached
+    if cached is not None and cached[0] is validator:
+        return cached[1]
     from pivot import parameters
 
     schema_raw = model.model_json_schema(schema_generator=parameters.SortedSetJsonSchema)
@@ -3786,7 +3891,7 @@ def _schema_parts(
     result = (xxhash.xxh64(json.dumps(payload, sort_keys=True).encode()).hexdigest(), defaults)
     if keyed:
         with contextlib.suppress(TypeError):
-            _schema_hash_cache[model] = result
+            _schema_hash_cache[model] = (validator, result)
     return result
 
 
@@ -3802,11 +3907,12 @@ def _model_field_classes(model: Any) -> list[type]:
 
 
 def _annotation_classes(annotation: Any) -> list[type]:
-    """Return the user classes in a field annotation, recursing into generic arguments."""
+    """Return the user classes in a field annotation, recursing into generic arguments; a class
+    is decided on its real type first (`_collect_hint_classes`)."""
+    if issubclass(type(annotation), type):
+        return [cast("type[Any]", annotation)] if is_user_code(annotation) else []
     if typing.get_origin(annotation) is not None:
         return [cls for arg in typing.get_args(annotation) for cls in _annotation_classes(arg)]
-    if isinstance(annotation, type) and is_user_code(annotation):
-        return [cast("type[Any]", annotation)]
     return []
 
 
@@ -3832,6 +3938,9 @@ class _ReportKind(enum.Enum):
     # A library instance whose class computes its attributes (`_forwards_attributes`): a celery or
     # lazy proxy, a mock; the stage is refused (`_proxy_message`)
     PROXY = "proxy"
+    # A class whose metaclass answers attribute reads with user code (`_attribute_hook`), or an
+    # instance of one: the stage is refused (`_hooked_class_message`)
+    HOOKED = "hooked"
 
 
 # One thing a form reports: the steps from the value to it (`_read_step`), its kind, and the
@@ -3861,9 +3970,10 @@ def _form(value: Any) -> _Form:
     or whose layout holds state no descriptor shows (`random.Random`, a lock, a numpy
     `Generator`), is `["opaque", <type>]` and reported; no `repr` is read but for the exact value
     types whose C repr writes all of their content. No code of a user class runs, and no text is
-    rewritten. `_FormBuilder` says how cycles, sets and dicts are written."""
+    rewritten. `_FormBuilder` says how cycles, sets and dicts are written, and how a value nested
+    deeper than the recursion limit is formed."""
     if id(_type_of(value)) in _SCALAR_TYPE_IDS:
-        return _Form(json.dumps(value), ())  # the scalar row (`_FormBuilder.build`), unbuilt
+        return _Form(json.dumps(value), ())  # the scalar row (`_FormBuilder.enter`), unbuilt
     builder = _FormBuilder()
     return builder.finish(builder.build(value))
 
@@ -3874,8 +3984,8 @@ def _partial_forms(partial_obj: Any) -> tuple[_Form, _Form]:
     args = _FormBuilder()
     keywords = _FormBuilder()
     return (
-        args.finish(args.arguments(partial_obj.args)),
-        keywords.finish(keywords.keywords(partial_obj.keywords)),
+        args.finish(args.parts(args.argument_rows(partial_obj.args))),
+        keywords.finish(keywords.parts(keywords.keyword_rows(partial_obj.keywords))),
     )
 
 
@@ -3887,6 +3997,31 @@ _NO_CYCLE = sys.maxsize
 # The step a set member or a dict key takes while its form is built: its step (`s:RANK`,
 # `kk:TEXT`) depends on its form and on the others'.
 _PENDING_STEP = "?"
+# What the row of a value with parts yields for each part (`_FormBuilder.run`): the part's step
+# and the part. The row is sent the part's form and returns the value's.
+type _Request = tuple[str, Any]
+type _Rows = Generator[_Request, Any, Any]
+_GENERATOR = types.GeneratorType
+
+
+@typing.final
+class _Frame:
+    """One value `_FormBuilder.run` is forming: its row, the value (held, so its id is not reused
+    while the memo keeps its form) and its id (None for a row that forms no value of its own:
+    `_FormBuilder.parts`), its depth on the path, the `low` of the value that holds it, and where
+    its reports start."""
+
+    __slots__ = ("depth", "key", "low", "mark", "row", "value")
+
+    def __init__(
+        self, row: "_Rows | None", value: Any, key: int | None, depth: int, low: int, mark: int
+    ) -> None:
+        self.row = row
+        self.value = value
+        self.key = key
+        self.depth = depth
+        self.low = low
+        self.mark = mark
 
 
 @typing.final
@@ -3904,6 +4039,10 @@ class _FormBuilder:
     formed again where it is met: an object in it may then be on the path, and a cycle there.
     `low` is the smallest depth a cycle met in the subtree being formed points to. `labels` and
     `layouts` keep each class's key and layout.
+
+    A value is formed on an explicit stack, not by recursion (`run`): the row of a value with
+    parts is a generator that yields each part's step and the part (`_Request`) and is sent the
+    part's form, so a value nested deeper than Python's recursion limit is formed as any other.
 
     A set's members are written as their texts in sorted order, duplicates kept, each reporting
     under `s:<rank>` (`_ranked`); a dict's entries as `[key, value]` pairs sorted by their texts,
@@ -3930,7 +4069,7 @@ class _FormBuilder:
         self.reports = list[_Report]()
         self.quiet = 0
         self.low = _NO_CYCLE
-        self.memo = dict[int, tuple[Any, Any, list[_Report]]]()
+        self.memo = dict[int, tuple[Any, Any, int, int, int]]()
         self.labels = dict[int, str]()
         self.layouts = dict[int, _Layout]()
         self.routes = dict[int, Callable[[_FormBuilder, Any, type[Any]], Any]]()
@@ -3942,14 +4081,50 @@ class _FormBuilder:
         if not self.quiet:
             self.reports.append(((*self.path, *steps), kind, obj))
 
-    def at(self, step: str, value: Any) -> Any:
-        self.path.append(step)
-        try:
-            return self.build(value)
-        finally:
-            self.path.pop()
+    # -- the stack -------------------------------------------------------------------------------
 
     def build(self, value: Any) -> Any:
+        """The form of `value`: `enter`, then `run` for a value whose row forms parts."""
+        entered = self.enter(value)
+        if type(entered) is _Frame:
+            return self.run(entered)
+        return entered
+
+    def parts(self, row: _Rows) -> Any:
+        """The form `row` returns, for a row that forms no value of its own (a partial's arguments
+        or keywords, `_partial_forms`)."""
+        return self.run(_Frame(row, None, None, 0, self.low, len(self.reports)))
+
+    def run(self, frame: _Frame) -> Any:
+        """Run `frame`'s row, and the row of each part it asks for, on one stack, until `frame`'s
+        row returns its form: a part's step is on `path` while the part is formed."""
+        stack = [frame]
+        sent: Any = None
+        while True:
+            top = stack[-1]
+            try:
+                step, part = cast("_Rows", top.row).send(sent)
+            except StopIteration as done:
+                built = self.leave(top, done.value)
+                stack.pop()
+                if not stack:
+                    return built
+                self.path.pop()
+                sent = built
+                continue
+            self.path.append(step)
+            entered = self.enter(part)
+            if type(entered) is _Frame:
+                stack.append(entered)
+                sent = None
+            else:
+                self.path.pop()
+                sent = entered
+
+    def enter(self, value: Any) -> Any:
+        """`value`'s form when it takes no row that forms parts: a scalar, a cycle, a mark
+        decision, a leaf row, a subtree met before, or a row that returns its form at once; else
+        the `_Frame` of its row, with `value` on the path (`active`)."""
         value_type: type[Any] = type(value)  # pyright: ignore[reportUnknownVariableType] - any class
         if id(value_type) in _SCALAR_TYPE_IDS:
             return value
@@ -3967,25 +4142,49 @@ class _FormBuilder:
             return leaf(self, value)
         known = None if self.quiet else self.memo.get(key)
         if known is not None:
-            if known[2]:
+            _, built, start, end, base = known
+            if end > start:
                 prefix = tuple(self.path)
-                self.reports.extend((prefix + path, kind, obj) for path, kind, obj in known[2])
-            return known[1]
+                self.reports.extend(
+                    (prefix + path[base:], kind, obj) for path, kind, obj in self.reports[start:end]
+                )
+            return built
         depth = len(self.active)
         self.active[key] = depth
-        outer_low, self.low = self.low, _NO_CYCLE
-        mark = len(self.reports)
-        try:
-            row = _ROWS.get(id(value_type))
-            built = self.instance(value) if row is None else row(self, value)
-        finally:
-            del self.active[key]
+        frame = _Frame(None, value, key, depth, self.low, len(self.reports))
+        self.low = _NO_CYCLE
+        row = _ROWS.get(id(value_type))
+        made = self.instance(value) if row is None else row(self, value)
+        if type(made) is _GENERATOR:
+            frame.row = made
+            return frame
+        return self.leave(frame, made)
+
+    def leave(self, frame: _Frame, built: Any) -> Any:
+        """Take `frame`'s value off the path, and keep its form (`memo`) when no cycle in it points
+        to it or above."""
+        if frame.key is None:
+            return built
+        del self.active[frame.key]
         low = self.low
-        self.low = min(outer_low, low)
-        if not self.quiet and low > depth:
-            base = len(self.path)
-            reports = [(path[base:], kind, obj) for path, kind, obj in self.reports[mark:]]
-            self.memo[key] = (value, built, reports)
+        self.low = min(frame.low, low)
+        if not self.quiet and low > frame.depth:
+            # Its reports stay where they are, with where its own steps start in their paths: a
+            # set's or dict's `settle` rewrites a step above it only.
+            self.memo[frame.key] = (
+                frame.value,
+                built,
+                frame.mark,
+                len(self.reports),
+                len(self.path),
+            )
+        return built
+
+    def part_rows(self, head: list[Any], *parts: _Request) -> _Rows:
+        """`head`, then the form of each of `parts`, in order."""
+        built = list(head)
+        for request in parts:
+            built.append((yield request))
         return built
 
     # -- labels, marks and refusals --------------------------------------------------------------
@@ -4011,6 +4210,12 @@ class _FormBuilder:
     def opaque(self, value: Any) -> Any:
         self.report(_ReportKind.OPAQUE, value)
         return ["opaque", _definition_ref(type(value))]
+
+    def hooked(self, cls: type[Any]) -> Any:
+        """A class whose metaclass answers attribute reads with user code (`_attribute_hook`):
+        reported (`_ReportKind.HOOKED`) and named by its definition name, so none of it is read."""
+        self.report(_ReportKind.HOOKED, cls)
+        return ["hooked", _definition_ref(cls)]
 
     def label(self, cls: type[Any]) -> str:
         """`cls`'s key inside a value (`_class_key`)."""
@@ -4055,9 +4260,12 @@ class _FormBuilder:
         return ["re.Pattern", self.build(value.pattern), value.flags]
 
     def class_label(self, cls: type[Any]) -> Any:
-        """A class: a user class by its key (`label`), reported for its class node; a library
-        class by `type.__repr__`, which runs no metaclass code (main's text)."""
+        """A class: a user class by its key (`label`), reported for its class node, or, when its
+        metaclass answers attribute reads with user code, `hooked`; a library class by
+        `type.__repr__`, which runs no metaclass code (main's text)."""
         if is_user_code(cls):
+            if _attribute_hook(cls) is not None:
+                return self.hooked(cls)
             self.report(_ReportKind.CLASS, cls)
             return ["class", self.label(cls)]
         return [_class_name(type(cls)), type.__repr__(cls)]
@@ -4075,6 +4283,14 @@ class _FormBuilder:
         """A namedtuple's field accessor, by its index and doc, its C `__reduce__` arguments."""
         index, doc = value.__reduce__()[1]
         return ["tuplegetter", index, self.build(doc)]
+
+    def type_name(self, value: Any) -> Any:
+        """A `TypeVar`, `ParamSpec`, `TypeVarTuple` or `type` statement alias, by its kind and its
+        name, read through its type's own C member: a bound, a constraint or an alias's value is
+        evaluated lazily, by code, and says nothing a stage runs."""
+        value_type = _type_of(value)
+        name = _class_namespace(value_type)["__name__"].__get__(value)
+        return ["typevar", _class_name(value_type), name]
 
     def function(self, func: Any) -> Any:
         """A Python function: main's `["function", function_identity]`, reported for its function
@@ -4141,82 +4357,130 @@ class _FormBuilder:
         return self.build(value)
 
     # -- composite rows: their state is formed, one step per part --------------------------------
+    # A row returns the value's form when it forms no part, else the generator that forms them.
 
     def sequence(self, value: Any) -> Any:
         items = cast("list[Any] | tuple[Any, ...]", value)
+        name = type(value).__name__
         if _SCALAR_TYPE_IDS.issuperset(map(id, map(type, items))):
-            return [type(value).__name__, list(items)]
-        return [type(value).__name__, [self.at(f"i:{i}", item) for i, item in enumerate(items)]]
+            return [name, list(items)]
+        return self.item_rows(name, items)
+
+    def item_rows(self, name: str, items: Iterable[Any]) -> _Rows:
+        """`[name, forms]`, each item formed at `i:INDEX`."""
+        built = list[Any]()
+        for index, item in enumerate(items):
+            built.append((yield (f"i:{index}", item)))
+        return [name, built]
 
     def unordered(self, value: Any) -> Any:
-        members = cast("set[Any] | frozenset[Any]", value)
-        name = type(value).__name__
+        """An exact set or frozenset (iterating it runs no code: its members are hashed already)."""
+        return self.members(type(value).__name__, list(cast("set[Any] | frozenset[Any]", value)))
+
+    def members(self, name: str, members: list[Any]) -> Any:
+        """`[name, forms]` for a set's members, in sorted order (`member_rows`)."""
         if _SCALAR_TYPE_IDS.issuperset(map(id, map(type, members))):
-            items = list(members)
-            if len(items) > 1:
-                items.sort(key=json.dumps)
-            return [name, items]
+            if len(members) > 1:
+                members.sort(key=json.dumps)
+            return [name, members]
+        return self.member_rows(name, members)
+
+    def member_rows(self, name: str, members: list[Any]) -> _Rows:
+        """Each member's form, at `_PENDING_STEP` until all are formed, then sorted by text, its
+        reports settled at `s:RANK` (`_ranked`)."""
         forms = list[Any]()
         spans = list[tuple[int, int]]()
         for member in members:
-            form, span = self.pending(member)
-            forms.append(form)
-            spans.append(span)
+            start = len(self.reports)
+            forms.append((yield (_PENDING_STEP, member)))
+            spans.append((start, len(self.reports)))
         order, ranks = _ranked([json.dumps(form) for form in forms])
         for span, rank in zip(spans, ranks, strict=True):
             self.settle(span, f"s:{rank}")
         return [name, [forms[index] for index in order]]
 
-    def pending(self, value: Any) -> tuple[Any, tuple[int, int]]:
-        """The form of `value` at `_PENDING_STEP`, and the span of the reports it made."""
-        start = len(self.reports)
-        form = self.at(_PENDING_STEP, value)
-        return form, (start, len(self.reports))
-
     def settle(self, span: tuple[int, int], step: str) -> None:
-        """Give the reports in `span` (`pending`) their step in place of `_PENDING_STEP`."""
+        """Give the reports in `span` their step in place of `_PENDING_STEP`."""
         position = len(self.path)
         for index in range(*span):
             path, kind, obj = self.reports[index]
             self.reports[index] = ((*path[:position], step, *path[position + 1 :]), kind, obj)
 
-    def entries(self, items: list[tuple[Any, Any]], *, ordered: bool = False) -> list[Any]:
-        """A mapping's `[key, value]` pairs, sorted by their texts unless `ordered`."""
+    def mapped(self, tag: str, items: list[tuple[Any, Any]], *, ordered: bool) -> Any:
+        """`[tag, entries]` for a mapping's `(key, value)` items (`mapped_rows`)."""
         if _SCALAR_TYPE_IDS.issuperset(
             map(id, map(type, (part for pair in items for part in pair)))
         ):
-            entries = [[key, item] for key, item in items]
-        else:
-            entries = list[Any]()
-            for key, item in items:
-                key_form, span = self.pending(key)
-                key_text = json.dumps(key_form)
-                self.settle(span, f"kk:{key_text}")
-                entries.append([key_form, self.at(f"k:{key_text}", item)])
-        if not ordered and len(entries) > 1:
-            entries.sort(key=json.dumps)
-        return entries
+            return [tag, _sorted_entries([[key, item] for key, item in items], ordered)]
+        return self.mapped_rows(tag, items, ordered=ordered)
+
+    def mapped_rows(self, tag: str, items: list[tuple[Any, Any]], *, ordered: bool) -> _Rows:
+        """Each entry's `[key form, value form]`: its key's reports settled at `kk:<key text>`, its
+        value formed at `k:<key text>`; sorted by their texts unless `ordered`."""
+        entries = list[Any]()
+        for key, item in items:
+            start = len(self.reports)
+            key_form = yield (_PENDING_STEP, key)
+            key_text = json.dumps(key_form)
+            self.settle((start, len(self.reports)), f"kk:{key_text}")
+            entries.append([key_form, (yield (f"k:{key_text}", item))])
+        return [tag, _sorted_entries(entries, ordered)]
 
     def mapping(self, value: Any) -> Any:
-        """A dict, `Counter` or `MappingProxyType`: its entries in sorted order (main's rule)."""
+        """A dict or `Counter`: its entries in sorted order (main's rule)."""
         tag = "dict" if type(value) is dict else type(value).__name__
-        return [tag, self.entries(list(_mapping_items(value)))]
+        return self.mapped(tag, list(_dict_items(value)), ordered=False)
 
     def ordered_mapping(self, value: Any) -> Any:
-        return ["OrderedDict", self.entries(list(_mapping_items(value)), ordered=True)]
+        """An `OrderedDict`, in its own order (`OrderedDict.items`, which `move_to_end` changes)."""
+        return self.mapped("OrderedDict", list(_ordered_items(value)), ordered=True)
+
+    def mapping_proxy(self, value: Any) -> Any:
+        """A `MappingProxyType`, by the mapping it shows (`_proxied_mapping`): a dict's entries,
+        read through `dict`'s own method, or any other mapping formed by its state (`px`), so no
+        method of that mapping runs."""
+        shown = _proxied_mapping(value)
+        if type(shown) is dict:
+            return self.mapped("mappingproxy", list(_dict_items(shown)), ordered=False)
+        return self.part_rows(["mappingproxy"], ("px", shown))
+
+    def contents(self, value: "_Contents") -> Any:
+        """The members or entries of a subclass of a built-in hash container (`_Contents`), as the
+        container writes them."""
+        if value.tag == "set" or value.tag == "frozenset":
+            return self.members(value.tag, list(value.items))
+        return self.mapped(value.tag, value.items, ordered=value.tag == "OrderedDict")
 
     def default_mapping(self, value: Any) -> Any:
-        factory = self.at("df", value.default_factory)
-        return ["defaultdict", factory, self.entries(list(_mapping_items(value)))]
+        return self.default_rows(value.default_factory, list(_dict_items(value)))
+
+    def default_rows(self, factory: Any, items: list[tuple[Any, Any]]) -> _Rows:
+        factory_form = yield ("df", factory)
+        entries = self.mapped("defaultdict", items, ordered=False)
+        if type(entries) is _GENERATOR:
+            entries = yield from cast("_Rows", entries)
+        return ["defaultdict", factory_form, entries[1]]
 
     def deque_row(self, value: Any) -> Any:
-        return ["deque", value.maxlen, self.sequence(list(value))[1]]
+        items = list(value)
+        if _SCALAR_TYPE_IDS.issuperset(map(id, map(type, items))):
+            return ["deque", value.maxlen, items]
+        return self.deque_rows(value.maxlen, items)
+
+    def deque_rows(self, maxlen: int | None, items: list[Any]) -> _Rows:
+        _, built = yield from self.item_rows("deque", items)
+        return ["deque", maxlen, built]
 
     def chain_map(self, value: Any) -> Any:
-        return ["ChainMap", [self.at(f"mp:{i}", item) for i, item in enumerate(value.maps)]]
+        return self.part_rows(
+            ["ChainMap"], *((f"mp:{index}", item) for index, item in enumerate(value.maps))
+        )
 
     def namespace(self, value: Any) -> Any:
-        attributes = self.attributes(value, _type_of(value))
+        return self.namespace_rows(value, _type_of(value))
+
+    def namespace_rows(self, value: Any, value_type: type[Any]) -> _Rows:
+        attributes = yield from self.attribute_rows(value, value_type)
         if attributes is None:
             return self.opaque(value)
         return ["namespace", attributes]
@@ -4229,7 +4493,7 @@ class _FormBuilder:
         function = value.__func__
         if not is_user_code(function) and not _carries_instance(value):
             return self.external(value)
-        return ["method", self.at("mf", function), self.at("ms", value.__self__)]
+        return self.part_rows(["method"], ("mf", function), ("ms", value.__self__))
 
     def builtin(self, value: Any) -> Any:
         """A built-in function or method: by name (main's `["external", name]`), unless it is
@@ -4237,52 +4501,75 @@ class _FormBuilder:
         `random.Random`)."""
         if not _carries_instance(value):
             return self.external(value)
-        return ["bmethod", value.__qualname__, self.at("ms", value.__self__)]
+        return self.part_rows(["bmethod", value.__qualname__], ("ms", value.__self__))
 
     def partial(self, value: Any) -> Any:
-        return [
-            "partial",
-            self.at("pf", value.func),
-            self.arguments(value.args),
-            self.keywords(value.keywords),
-        ]
+        return self.partial_rows(value.func, value.args, value.keywords)
 
-    def arguments(self, args: tuple[Any, ...]) -> Any:
+    def partial_rows(self, func: Any, args: tuple[Any, ...], keywords: Mapping[str, Any]) -> _Rows:
+        func_form = yield ("pf", func)
+        args_form = yield from self.argument_rows(args)
+        keywords_form = yield from self.keyword_rows(keywords)
+        return ["partial", func_form, args_form, keywords_form]
+
+    def argument_rows(self, args: tuple[Any, ...]) -> _Rows:
         if _SCALAR_TYPE_IDS.issuperset(map(id, map(type, args))):
             return ["tuple", list(args)]
-        return ["tuple", [self.at(f"pa:{i}", item) for i, item in enumerate(args)]]
+        built = list[Any]()
+        for index, item in enumerate(args):
+            built.append((yield (f"pa:{index}", item)))
+        return ["tuple", built]
 
-    def keywords(self, keywords: Mapping[str, Any]) -> Any:
-        entries = [[name, self.at(f"pk:{name}", item)] for name, item in keywords.items()]
+    def keyword_rows(self, keywords: Mapping[str, Any]) -> _Rows:
+        entries = list[Any]()
+        for name, item in keywords.items():
+            entries.append([name, (yield (f"pk:{name}", item))])
         if len(entries) > 1:
             entries.sort(key=json.dumps)
         return ["dict", entries]
 
     def method_wrapper(self, value: Any) -> Any:
         """A classmethod or staticmethod object: its function."""
-        return [type(value).__name__, self.at("cm", value.__func__)]
+        return self.part_rows([type(value).__name__], ("cm", value.__func__))
 
     def property_row(self, value: property) -> Any:
-        return [
-            "property",
-            self.at("pg", value.fget),
-            self.at("ps", value.fset),
-            self.at("pd", value.fdel),
-        ]
+        return self.part_rows(
+            ["property"], ("pg", value.fget), ("ps", value.fset), ("pd", value.fdel)
+        )
 
     def cached_property_row(self, value: Any) -> Any:
-        return ["cached_property", self.at("cp", value.func)]
+        return self.part_rows(["cached_property"], ("cp", value.func))
 
     def cache_wrapper(self, value: Any) -> Any:
-        """A `functools.lru_cache` wrapper: the function it wraps and its cache settings."""
+        """A `functools.lru_cache` wrapper: the function it wraps and its cache settings, read from
+        the closure of the `cache_parameters` function `lru_cache` gave it (`_lru_cache_settings`),
+        which is not called; one whose `cache_parameters` was replaced keeps its settings where no
+        form reads them, in C, so it is opaque."""
         attributes = _instance_dict(_type_of(value), value) or {}
-        parameters = value.cache_parameters()
-        return [
-            "wrapped",
-            "functools._lru_cache_wrapper",
-            self.at("wr", attributes.get("__wrapped__")),
-            [parameters["maxsize"], parameters["typed"]],
-        ]
+        settings = _lru_cache_settings(attributes.get("cache_parameters"))
+        if settings is None:
+            return self.opaque(value)
+        return self.cache_rows(attributes.get("__wrapped__"), settings)
+
+    def cache_rows(self, wrapped: Any, settings: list[Any]) -> _Rows:
+        wrapped_form = yield ("wr", wrapped)
+        return ["wrapped", "functools._lru_cache_wrapper", wrapped_form, settings]
+
+    def type_alias(self, value: Any, _value_type: Any = None) -> Any:
+        """A `types.GenericAlias` (`list[int]`, `collections.abc.Callable[[int], str]`), by its
+        structure: its type, whether it is unpacked, its origin (`to`) and its arguments (`ta`),
+        each read through `GenericAlias`'s own C member, which no attribute the alias forwards to
+        its origin can shadow. A class in it is a label, as anywhere."""
+        return self.part_rows(
+            ["alias", _definition_ref(_type_of(value)), _GENERIC_ALIAS_UNPACKED(value)],
+            ("to", _GENERIC_ALIAS_ORIGIN(value)),
+            ("ta", _GENERIC_ALIAS_ARGS(value)),
+        )
+
+    def union_alias(self, value: Any) -> Any:
+        """A `types.UnionType` (`str | None`), by its arguments (`ta`), read through its own C
+        member."""
+        return self.part_rows(["union"], ("ta", _UNION_ARGS(value)))
 
     def instance(self, value: Any) -> Any:
         """An object of a type with no exact row: the row its type's real MRO decides
@@ -4296,13 +4583,17 @@ class _FormBuilder:
     def class_row(self, value: Any, _value_type: type[Any]) -> Any:
         return self.class_label(value)
 
+    def hooked_instance(self, _value: Any, value_type: type[Any]) -> Any:
+        """An instance of a class `hooked` names: its class's key would read the class."""
+        return self.hooked(value_type)
+
     def secret(self, value: Any, _value_type: type[Any]) -> Any:
         from pivot import parameters
 
         return ["secret", parameters.secret_digest(value)]
 
     def numpy_row(self, value: Any, value_type: type[Any]) -> Any:
-        return self.numpy(sys.modules["numpy"], value, _class_mro(value_type))
+        return self.numpy(sys.modules["numpy"], value, value_type)
 
     def user_instance(self, value: Any, value_type: type[Any]) -> Any:
         return self.state("inst", value, value_type, user=True)
@@ -4321,11 +4612,18 @@ class _FormBuilder:
         return self.state("inst", value, value_type, user=False)
 
     def state(self, tag: str, value: Any, value_type: type[Any], *, user: bool) -> Any:
-        """An instance by its state (`fields`): a user class by its key, reported for its class
+        """An instance by its state (`field_rows`): a user class by its key, reported for its class
         node at `cls`; a library class by its definition name. Opaque when its layout holds state
         no descriptor shows (`_layout`)."""
         layout = self.layout(value_type)
-        fields = self.fields(value, value_type, layout) if layout.readable else None
+        if not layout.readable:
+            return self.opaque(value)
+        return self.state_rows(tag, value, value_type, layout, user=user)
+
+    def state_rows(
+        self, tag: str, value: Any, value_type: type[Any], layout: "_Layout", *, user: bool
+    ) -> _Rows:
+        fields = yield from self.field_rows(value, value_type, layout)
         if fields is None:
             return self.opaque(value)
         if not user:
@@ -4333,27 +4631,27 @@ class _FormBuilder:
         self.report(_ReportKind.CLASS, value_type, "cls")
         return [tag, self.label(value_type), fields]
 
-    def fields(self, value: Any, value_type: type[Any], layout: "_Layout") -> Any:
+    def field_rows(self, value: Any, value_type: type[Any], layout: "_Layout") -> _Rows:
         """An instance's state: its `__dict__` (`d`, by attribute name), its slots (`s`, by
         `_slot_values` label) and the value of its built-in base type (`bv`), each read through C;
         None when its `__dict__` holds a name that is not a string."""
         state = dict[str, Any]()
-        attributes = self.attributes(value, value_type)
+        attributes = yield from self.attribute_rows(value, value_type)
         if attributes is None:
             return None
         if attributes:
             state["d"] = attributes
-        slots = [
-            [label, self.at(f"sl:{label}", item)] for label, item in _slot_values(value_type, value)
-        ]
+        slots = list[Any]()
+        for label, item in _slot_values(value_type, value):
+            slots.append([label, (yield (f"sl:{label}", item))])
         if slots:
             state["s"] = slots
         reader = _SOLID_READERS.get(id(layout.solid))
         if reader is not None:
-            state["bv"] = self.at("bv", reader(value))
+            state["bv"] = yield ("bv", reader(value))
         return state
 
-    def attributes(self, value: Any, value_type: type[Any]) -> list[Any] | None:
+    def attribute_rows(self, value: Any, value_type: type[Any]) -> _Rows:
         """The `[name, form]` pairs of `value`'s instance `__dict__`, by name, or None when a name
         is not an exact string. The dict is read through `dict`'s own C methods (`_dict_items`),
         so no method of a dict subclass or of a key runs."""
@@ -4362,14 +4660,24 @@ class _FormBuilder:
         if not all(type(name) is str for name, _ in items):
             return None
         items.sort(key=operator.itemgetter(0))
-        return [[name, self.at(f"at:{name}", item)] for name, item in items]
+        if _SCALAR_TYPE_IDS.issuperset(map(id, map(type, (item for _, item in items)))):
+            return [[name, item] for name, item in items]
+        built = list[Any]()
+        for name, item in items:
+            built.append([name, (yield (f"at:{name}", item))])
+        return built
 
     def loader(self, value: Any, value_type: type[Any]) -> Any:
         """A pivot loader: its class's key, reported for its loader-class node at `cls`, and its
         state, whose code its holder walks. A loader whose class defines `__call__` is reported
         as callable too (`_ReportKind.CALLABLE`)."""
         layout = self.layout(value_type)
-        fields = self.fields(value, value_type, layout) if layout.readable else None
+        if not layout.readable:
+            return self.opaque(value)
+        return self.loader_rows(value, value_type, layout)
+
+    def loader_rows(self, value: Any, value_type: type[Any], layout: "_Layout") -> _Rows:
+        fields = yield from self.field_rows(value, value_type, layout)
         if fields is None:
             return self.opaque(value)
         self.report(_ReportKind.LOADER, value_type, "cls")
@@ -4384,32 +4692,40 @@ class _FormBuilder:
         layout = self.layout(value_type)
         if not layout.readable:
             return self.opaque(value)
+        return self.exception_rows(value, value_type, layout)
+
+    def exception_rows(self, value: Any, value_type: type[Any], layout: "_Layout") -> _Rows:
         user = is_user_code(value_type)
         if user:
             self.report(_ReportKind.CLASS, value_type, "cls")
         state = dict[str, Any]()
-        state["args"] = self.at("ea", _exception_args(value))
+        state["args"] = yield ("ea", _exception_args(value))
         found = _exception_fields(value_type, value)
         if found:
-            state["c"] = [[name, self.at(f"ec:{name}", item)] for name, item in found]
-        fields = self.fields(value, value_type, layout)
-        if fields is None:
+            fields = list[Any]()
+            for name, item in found:
+                fields.append([name, (yield (f"ec:{name}", item))])
+            state["c"] = fields
+        own = yield from self.field_rows(value, value_type, layout)
+        if own is None:
             return self.opaque(value)
-        state.update(fields)
+        state.update(own)
         label = self.label(value_type) if user else _definition_ref(value_type)
         return ["exc", label, state]
 
     def enum_member(self, value: Any, value_type: type[Any]) -> Any:
-        """An Enum member: a user Enum's by its class's key and its name (its value is part of its
-        class: its AST, or its namespace), a library Enum's by its name and its value's form."""
+        """An Enum member: its class (a user Enum's by its key, reported for its class node; a
+        library Enum's by its definition name), its name and its value's form (`ev`). A value is
+        not in a class statement's syntax tree (`PICK = settings.VALUE`), so it is formed."""
         attributes = _instance_dict(value_type, value) or {}
         name = attributes.get("_name_")
         if is_user_code(value_type):
             self.report(_ReportKind.CLASS, value_type, "cls")
-            if type(name) is str:
-                return ["enum", self.label(value_type), name]
-            return ["enum", self.label(value_type), None, self.at("ev", attributes.get("_value_"))]
-        return ["enum", _definition_ref(value_type), name, self.at("ev", attributes.get("_value_"))]
+            label = self.label(value_type)
+        else:
+            label = _definition_ref(value_type)
+        head = ["enum", label, name if type(name) is str else None]
+        return self.part_rows(head, ("ev", attributes.get("_value_")))
 
     def logger(self, value: Any, value_type: type[Any]) -> Any:
         """A `logging.Logger`, by its name: configuration, not data (main's policy)."""
@@ -4419,29 +4735,111 @@ class _FormBuilder:
     def module_subclass(self, value: Any, _value_type: type[Any]) -> Any:
         return self.module(value)
 
-    def numpy(self, numpy: Any, value: Any, mro: tuple[type, ...]) -> Any:
-        """A numpy array, scalar or dtype by its data; `_UNREAD` for any other object."""
-        for klass in mro:
+    def numpy(self, numpy: Any, value: Any, value_type: type[Any]) -> Any:
+        """A numpy array, scalar or dtype by its data, read through numpy's own C descriptors and
+        methods, so no `dtype` or `tobytes` a subclass defines runs; a user subclass of a numpy
+        scalar adds its class's key, reported for its class node, and its `__dict__`. `_UNREAD`
+        for any other object."""
+        for klass in _class_mro(value_type):
             if klass is numpy.ndarray:
+                if value_type is not numpy.ndarray:
+                    return self.opaque(value)
                 dtype = value.dtype
-                if type(value) is not numpy.ndarray or (
-                    dtype.hasobject and dtype.fields is not None
-                ):
+                if dtype.hasobject and dtype.fields is not None:
                     return self.opaque(value)
                 if dtype.hasobject:
-                    items = [self.at(f"nf:{i}", item) for i, item in enumerate(value.flat)]
-                    return ["ndarray-obj", list(value.shape), items]
+                    head = ["ndarray-obj", list(value.shape)]
+                    items = ((f"nf:{index}", item) for index, item in enumerate(value.flat))
+                    return self.object_array_rows(head, items)
                 data = numpy.ascontiguousarray(value).tobytes()
                 return ["ndarray", dtype.descr, list(value.shape), xxhash.xxh64(data).hexdigest()]
             if klass is numpy.generic:
-                if value.dtype.hasobject:
+                dtype = _class_namespace(numpy.generic)["dtype"].__get__(value)
+                if dtype.hasobject:
                     return self.opaque(value)
-                return ["np", value.dtype.descr, value.tobytes().hex()]
+                data = numpy.generic.tobytes(value).hex()
+                if is_user_code(value_type):
+                    return self.numpy_scalar_rows(value, value_type, dtype.descr, data)
+                return ["np", dtype.descr, data]
             if klass is numpy.dtype:
                 return ["np.dtype", value.descr]
         return _UNREAD
 
+    def object_array_rows(self, head: list[Any], items: Iterator[_Request]) -> _Rows:
+        built = list[Any]()
+        for request in items:
+            built.append((yield request))
+        return [*head, built]
 
+    def numpy_scalar_rows(self, value: Any, value_type: type[Any], descr: Any, data: str) -> _Rows:
+        attributes = yield from self.attribute_rows(value, value_type)
+        if attributes is None:
+            return self.opaque(value)
+        self.report(_ReportKind.CLASS, value_type, "cls")
+        return ["np", self.label(value_type), descr, data, attributes]
+
+
+def _sorted_entries(entries: list[Any], ordered: bool) -> list[Any]:
+    """A mapping's `[key, value]` form pairs, sorted by their texts unless the mapping keeps an
+    order of its own (main's rule for a dict: its insertion order is not recorded)."""
+    if not ordered and len(entries) > 1:
+        entries.sort(key=json.dumps)
+    return entries
+
+
+def _proxied_mapping(proxy: Any) -> Any:
+    """The mapping a `MappingProxyType` shows, its one referent (`gc.get_referents`, the proxy's C
+    traversal), so no method of the proxy or of the mapping runs."""
+    return gc.get_referents(proxy)[0]
+
+
+@dataclasses.dataclass(frozen=True, slots=True, eq=False)
+class _Contents:
+    """The members (`set`, `frozenset`) or `(key, value)` items (`dict`, `OrderedDict`) of an
+    instance of a subclass of a built-in hash container, read through the container's own C
+    iterator (`_SOLID_READERS`) into a list: building a container of the base type again would
+    hash and compare them, running a member's `__hash__` or `__eq__`. `_form` writes it as the
+    container (`_FormBuilder.contents`), and a cache hit reaches inside it (`_value_part`)."""
+
+    tag: str
+    items: list[Any]
+
+
+def _lru_cache_settings(function: Any) -> list[Any] | None:
+    """The `maxsize` and `typed` of a `functools.lru_cache` wrapper, from the closure of the
+    `cache_parameters` function `lru_cache` gave it (one of `_LRU_PARAMETERS_CODES`), which is not
+    called; None when the wrapper holds another one."""
+    if type(function) is not types.FunctionType:
+        return None
+    code = function.__code__
+    if not any(code is known for known in _LRU_PARAMETERS_CODES):
+        return None
+    closure = function.__closure__ or ()
+    cells = dict(zip(code.co_freevars, closure, strict=True))
+    return [_cell_value(cells["maxsize"]), _cell_value(cells["typed"])]
+
+
+# The code of the `cache_parameters` functions `functools.lru_cache` gives a wrapper: one where it
+# wraps a function at once (`lru_cache(f)`), one where its decorator does (`lru_cache()(f)`).
+_LRU_PARAMETERS_CODES = tuple(
+    cast("types.FunctionType", vars(wrapper)["cache_parameters"]).__code__
+    for wrapper in (functools.lru_cache(len), functools.lru_cache()(len))
+)
+# `types.GenericAlias`'s and `types.UnionType`'s own C members, read so no attribute an alias
+# forwards to its origin answers instead.
+_GENERIC_ALIAS_ORIGIN = cast(
+    "Callable[[Any], Any]", _class_namespace(types.GenericAlias)["__origin__"].__get__
+)
+_GENERIC_ALIAS_ARGS = cast(
+    "Callable[[Any], tuple[Any, ...]]", _class_namespace(types.GenericAlias)["__args__"].__get__
+)
+_GENERIC_ALIAS_UNPACKED = cast(
+    "Callable[[Any], bool]", _class_namespace(types.GenericAlias)["__unpacked__"].__get__
+)
+_UNION_ARGS = cast(
+    "Callable[[Any], tuple[Any, ...]]",
+    _class_namespace(cast("type", cast("object", types.UnionType)))["__args__"].__get__,
+)
 # The type of a namedtuple's field accessor (`collections._tuplegetter`), which has no public name.
 _TUPLEGETTER = _type_of(_class_namespace(typing.NamedTuple("_Fields", [("field", int)]))["field"])
 _PURE_PATH_TYPES = (
@@ -4452,7 +4850,7 @@ _PURE_PATH_TYPES = (
     pathlib.PosixPath,
     pathlib.WindowsPath,
 )
-# The rows `_FormBuilder.build` takes by a value's exact type, by the type's id (a dict keyed by
+# The rows `_FormBuilder.enter` takes by a value's exact type, by the type's id (a dict keyed by
 # the type would hash it: a metaclass `__hash__`). Leaf rows hold no state of their own to walk.
 _LEAF_ROWS: dict[int, Callable[[_FormBuilder, Any], Any]] = {
     **{
@@ -4473,6 +4871,15 @@ _LEAF_ROWS: dict[int, Callable[[_FormBuilder, Any], Any]] = {
             *_PURE_PATH_TYPES,
         )
     },
+    **{
+        id(value_type): _FormBuilder.type_name
+        for value_type in (
+            typing.TypeVar,
+            typing.ParamSpec,
+            typing.TypeVarTuple,
+            typing.TypeAliasType,
+        )
+    },
     id(datetime.datetime): _FormBuilder.zoned,
     id(datetime.time): _FormBuilder.zoned,
     id(slice): _FormBuilder.slice_row,
@@ -4489,7 +4896,7 @@ _ROWS: dict[int, Callable[[_FormBuilder, Any], Any]] = {
     id(frozenset): _FormBuilder.unordered,
     id(dict): _FormBuilder.mapping,
     id(collections.Counter): _FormBuilder.mapping,
-    id(types.MappingProxyType): _FormBuilder.mapping,
+    id(types.MappingProxyType): _FormBuilder.mapping_proxy,
     id(collections.OrderedDict): _FormBuilder.ordered_mapping,
     id(collections.defaultdict): _FormBuilder.default_mapping,
     id(collections.deque): _FormBuilder.deque_row,
@@ -4504,6 +4911,9 @@ _ROWS: dict[int, Callable[[_FormBuilder, Any], Any]] = {
     id(property): _FormBuilder.property_row,
     id(functools.cached_property): _FormBuilder.cached_property_row,
     id(functools._lru_cache_wrapper): _FormBuilder.cache_wrapper,  # pyright: ignore[reportPrivateUsage] - the C cache wrapper's type has no public name
+    id(types.GenericAlias): _FormBuilder.type_alias,
+    id(types.UnionType): _FormBuilder.union_alias,
+    id(_Contents): _FormBuilder.contents,
 }
 # The rows `_FormBuilder.instance` takes by a class on a value's real MRO, by the class's id.
 _MRO_ROWS: dict[int, Callable[[_FormBuilder, Any, type[Any]], Any]] = {
@@ -4511,6 +4921,7 @@ _MRO_ROWS: dict[int, Callable[[_FormBuilder, Any, type[Any]], Any]] = {
     id(enum.Enum): _FormBuilder.enum_member,
     id(logging.Logger): _FormBuilder.logger,
     id(types.ModuleType): _FormBuilder.module_subclass,
+    id(types.GenericAlias): _FormBuilder.type_alias,
 }
 
 
@@ -4540,21 +4951,63 @@ _STATELESS_RECEIVERS = (types.ModuleType, type, bool, int, float, str, bytes, lo
 
 
 def _forwards_attributes(cls: type[Any]) -> bool:
-    """Whether a class on `cls`'s real MRO, other than a built-in one or pydantic's `BaseModel`,
-    defines `__getattr__` or `__getattribute__`: its instances' attributes are computed by its
-    code (a proxy forwards them to a target it builds when it is first used), read through
-    `type`'s own descriptors. `BaseModel.__getattr__` answers from the private and extra fields
-    the model's slots hold, which its form reads."""
+    """Whether a class on `cls`'s real MRO, other than a built-in one, a `typing` one or pydantic's
+    `BaseModel`, defines `__getattr__` or `__getattribute__`: its instances' attributes are
+    computed by its code (a proxy forwards them to a target it builds when it is first used),
+    read through `type`'s own descriptors. `BaseModel.__getattr__` answers from the private and
+    extra fields the model's slots hold, which its form reads; a `typing` alias (`List[int]`,
+    `Optional[str]`, `Literal["a"]`) forwards to its origin, and keeps its origin and arguments in
+    its `__dict__`, which its form reads."""
     pydantic_main = sys.modules.get("pydantic.main")
     model = getattr(pydantic_main, "BaseModel", None) if pydantic_main is not None else None
     return any(
         klass is not model
-        and _class_module(klass) != "builtins"
+        and _class_module(klass) not in ("builtins", "typing")
         and (
             "__getattr__" in _class_namespace(klass)
             or "__getattribute__" in _class_namespace(klass)
         )
         for klass in _class_mro(cls)
+    )
+
+
+def _attribute_hook(cls: type[Any]) -> type[Any] | None:
+    """The user class on the real MRO of `cls`'s metaclass that defines `__getattribute__` or
+    `__getattr__`, or None: with one, reading any attribute of `cls` (its source, its fields, its
+    members) runs that code, so the walk refuses `cls` before it reads anything of it. Decided
+    from `type`'s own descriptors, once per class per `fingerprint_pass()`."""
+    meta: type[Any] = type(cls)
+    if meta is type:
+        return None
+    return _memoized("attribute-hook", cls, lambda: _read_attribute_hook(meta))
+
+
+def _read_attribute_hook(meta: type[Any]) -> type[Any] | None:
+    for klass in _class_mro(meta):
+        if klass is type or klass is object:
+            return None
+        namespace = _class_namespace(klass)
+        hooks = "__getattribute__" in namespace or "__getattr__" in namespace
+        if hooks and _is_user_class(klass):
+            return klass
+    return None
+
+
+def _hooked_class_message(cls: type[Any]) -> str:
+    """The refusal of class `cls`, whose metaclass answers attribute reads with user code
+    (`_attribute_hook`)."""
+    stage_name = _current_stage_name.get() or "<unknown>"
+    hook = _attribute_hook(cls)
+    meta = _definition_ref(hook) if hook is not None else "?"
+    return (
+        f"Stage '{stage_name}': class '{_definition_ref(cls)}' has the metaclass '{meta}', whose "
+        + "`__getattribute__` or `__getattr__` is user code, so reading the class runs it.\n"
+        + "Pivot reads a class through `type`'s own descriptors and runs none of its code; this "
+        + "class answers attribute reads with code, so what it holds could change unseen, which "
+        + "can cause silent wrong outputs.\n"
+        + "Fix: remove `__getattribute__` and `__getattr__` from the metaclass, or move the "
+        + "values the stage needs into its StageParams.\n"
+        + _SUPPRESSION
     )
 
 
@@ -4612,6 +5065,8 @@ def _instance_route(value_type: type[Any]) -> Callable[[_FormBuilder, Any, type[
     `_MRO_ROWS` class, a numpy array, scalar or dtype, then a user or a library instance."""
     if issubclass(value_type, type):
         return _FormBuilder.class_row
+    if _attribute_hook(value_type) is not None:
+        return _FormBuilder.hooked_instance
     mro = _class_mro(value_type)
     if _is_secret_type(mro):
         return _FormBuilder.secret
@@ -4672,6 +5127,8 @@ class _Layout:
 
 # How `_form` reads the value of an instance of a subclass of a built-in type (`bv`), as an exact
 # object of that type, through the type's own C methods, so no method the subclass defines runs.
+# A hash container's members are kept in a list (`_Contents`): building the container again would
+# hash and compare them.
 _SOLID_READERS: dict[int, Callable[[Any], Any]] = {
     id(int): int.__index__,
     id(float): float.__float__,
@@ -4681,10 +5138,12 @@ _SOLID_READERS: dict[int, Callable[[Any], Any]] = {
     id(bytearray): lambda value: bytearray.__getitem__(value, slice(None)),
     id(tuple): lambda value: tuple(_tuple_iter(value)),
     id(list): lambda value: list(_list_iter(value)),
-    id(dict): lambda value: dict(_dict_items(value)),
-    id(set): lambda value: set(_set_iter(value)),
-    id(frozenset): lambda value: frozenset(_frozenset_iter(value)),
-    id(collections.OrderedDict): lambda value: collections.OrderedDict(_ordered_items(value)),
+    id(dict): lambda value: _Contents("dict", list(_dict_items(value))),
+    id(set): lambda value: _Contents("set", list(_set_iter(value))),
+    id(frozenset): lambda value: _Contents("frozenset", list(_frozenset_iter(value))),
+    id(collections.OrderedDict): lambda value: _Contents(
+        "OrderedDict", list(_ordered_items(value))
+    ),
     id(collections.deque): lambda value: collections.deque(
         _deque_iter(value), _DEQUE_MAXLEN(value)
     ),
@@ -4884,6 +5343,8 @@ def _admit(form: _Form, binding: str, opaque: Callable[[tuple[str, ...], Any], s
                 case _ReportKind.PROXY:
                     message = _proxy_message(_binding_text(binding, path), obj)
                     _record_refusal(message, downgradable=True)
+                case _ReportKind.HOOKED:
+                    _record_refusal(_hooked_class_message(obj), downgradable=True)
 
 
 def _binding_text(binding: str, path: tuple[str, ...]) -> str:
@@ -4983,18 +5444,34 @@ def _class_identity(cls: type[Any]) -> str:
 
     A class whose identity is being computed (`_identity_active`), met again, is `^N`, N steps
     up, so classes that reach each other end. Within one `fingerprint_pass()` a class's identity
-    is computed once; one computed inside another's is not kept, as it can hold such a step."""
+    is computed once at the top; one computed inside another's is kept (`free`) when no `^N` in
+    it points to it or above, as its text is then the same wherever it is computed, so a chain of
+    classes each holding the next costs one identity per class. Identities nest no deeper than
+    `_IDENTITY_DEPTH` (`_identifying`), however long a chain of classes is."""
     active = _identity_active.get()
     key = id(cls)
+    if not active:
+        return _memoized(
+            "class-identity", cls, lambda: _identifying(lambda: _computed_class_identity(cls))
+        )
+    scope = cast("_IdentityScope", _identity_scope.get())
     if key in active:
-        return f"^{len(active) - active.index(key)}"
-    if active:
-        return _computed_class_identity(cls, active)
-    return _memoized("class-identity", cls, lambda: _computed_class_identity(cls, active))
+        index = active.index(key)
+        scope.lows[-1] = min(scope.lows[-1], index)
+        return f"^{len(active) - index}"
+    known = scope.free.get(key)
+    if known is None and (memo := _pass_memo.get()) is not None:
+        known = memo.get(("free-class-identity", key))
+    if known is not None:
+        return cast("tuple[type[Any], str]", known)[1]
+    if len(active) >= _IDENTITY_DEPTH and key not in scope.deep:
+        raise _IdentityTooDeepError(cls)
+    return _computed_class_identity(cls)
 
 
-def _computed_class_identity(cls: type[Any], active: tuple[int, ...]) -> str:
-    token = _identity_active.set((*active, id(cls)))
+def _computed_class_identity(cls: type[Any]) -> str:
+    depth = len(_identity_active.get())
+    token = _enter_identity(cls)
     try:
         namespace = _class_namespace(cls)
         pydantic = "__pydantic_fields__" in namespace
@@ -5010,8 +5487,96 @@ def _computed_class_identity(cls: type[Any], active: tuple[int, ...]) -> str:
         ]
         parts = [_definition_ref(cls), hash_function_ast(cls), bases, entries]
     finally:
-        _identity_active.reset(token)
-    return xxhash.xxh64(json.dumps(parts).encode()).hexdigest()
+        low = _leave_identity(token)
+    identity = xxhash.xxh64(json.dumps(parts).encode()).hexdigest()
+    if low > depth:
+        scope = cast("_IdentityScope", _identity_scope.get())
+        scope.free[id(cls)] = (cls, identity)
+        if (memo := _pass_memo.get()) is not None:
+            memo[("free-class-identity", id(cls))] = (cls, identity)
+            memo.setdefault(("class-identity", id(cls)), (cls, identity))
+    return identity
+
+
+# How deep class identities nest (`_class_identity`) before one not known yet is computed first,
+# on its own (`_identifying`), so a long chain of classes (a deep `type()` MRO, classes that each
+# hold the next) never nests deeper than this.
+_IDENTITY_DEPTH = 24
+
+
+class _IdentityTooDeepError(Exception):
+    """`cls`'s identity is needed deeper than `_IDENTITY_DEPTH` and is not known yet: the
+    outermost identity being computed (`_identifying`) computes it first, then starts again."""
+
+    def __init__(self, cls: type[Any]) -> None:
+        super().__init__()
+        self.cls: type[Any] = cls
+
+
+@dataclasses.dataclass(slots=True)
+class _IdentityScope:
+    """The class identities computed under one outermost one (`_identifying`): for each identity
+    or class hash being computed, the smallest depth on `_identity_active` a `^N` inside it points
+    to (`lows`); the identities whose `^N` steps all point inside them, the same wherever they are
+    computed (`free`); and the classes computed where they are met, however deep (`deep`)."""
+
+    lows: list[int] = dataclasses.field(default_factory=list[int])
+    free: dict[int, tuple[type[Any], str]] = dataclasses.field(
+        default_factory=dict[int, tuple[type[Any], str]]
+    )
+    deep: set[int] = dataclasses.field(default_factory=set[int])
+
+
+# The scope of the class identities being computed (`_identifying`); None outside one.
+_identity_scope: contextvars.ContextVar[_IdentityScope | None] = contextvars.ContextVar(
+    "_identity_scope", default=None
+)
+
+
+def _identifying(compute: Callable[[], str]) -> str:
+    """`compute()`, the outermost class identity or class hash being computed, in a scope of its
+    own (`_IdentityScope`). An identity needed deeper than `_IDENTITY_DEPTH`
+    (`_IdentityTooDeepError`) is computed first, on its own, and kept when it is free; then
+    `compute` starts again and finds it. One that is not free, or that its own computation needs
+    again, is computed where it is met from then on. Each class is set aside at most once, so this
+    ends, and each identity has the text it has where it is met."""
+    scope = _IdentityScope()
+    token = _identity_scope.set(scope)
+    try:
+        needed = list[type[Any]]()
+        while True:
+            try:
+                if not needed:
+                    return compute()
+                first = needed[-1]
+                _computed_class_identity(first)
+                needed.pop()
+                if id(first) not in scope.free:
+                    scope.deep.add(id(first))
+            except _IdentityTooDeepError as too_deep:
+                if any(cls is too_deep.cls for cls in needed):
+                    scope.deep.add(id(too_deep.cls))
+                else:
+                    needed.append(too_deep.cls)
+    finally:
+        _identity_scope.reset(token)
+
+
+def _enter_identity(cls: type[Any]) -> contextvars.Token[tuple[int, ...]]:
+    """Put `cls` on `_identity_active` while its identity or hash is computed."""
+    cast("_IdentityScope", _identity_scope.get()).lows.append(_NO_CYCLE)
+    return _identity_active.set((*_identity_active.get(), id(cls)))
+
+
+def _leave_identity(token: contextvars.Token[tuple[int, ...]]) -> int:
+    """Take the class `token` put on `_identity_active` off it, and return the smallest depth a
+    `^N` inside its computation pointed to, which the computation around it also takes."""
+    lows = cast("_IdentityScope", _identity_scope.get()).lows
+    low = lows.pop()
+    if lows:
+        lows[-1] = min(lows[-1], low)
+    _identity_active.reset(token)
+    return low
 
 
 def _process_module_dependency(
@@ -5391,13 +5956,15 @@ def _sourceless_class_hash(cls: type) -> str:
     naming the class and the entry (`_process_sourceless_namespace`). The class is computed with
     itself on `_identity_active`, so a value that names it (an Enum member) names it by its step
     up (`^N`) in any order the hashes are asked for."""
-    active = _identity_active.get()
-    token = None if id(cls) in active else _identity_active.set((*active, id(cls)))
+    if _identity_scope.get() is None:
+        return _identifying(lambda: _sourceless_class_hash(cls))
+    if id(cls) in _identity_active.get():
+        return xxhash.xxh64(json.dumps(_sourceless_parts(cls)).encode()).hexdigest()
+    token = _enter_identity(cls)
     try:
         parts = _sourceless_parts(cls)
     finally:
-        if token is not None:
-            _identity_active.reset(token)
+        _leave_identity(token)
     return xxhash.xxh64(json.dumps(parts).encode()).hexdigest()
 
 
@@ -5962,10 +6529,11 @@ def is_user_code(obj: Any) -> bool:
     try:
         if obj is None:
             return False
-        if isinstance(obj, type) and not _hashes_by_identity(obj):
-            # The weak cache would hash the class, running its metaclass's `__hash__` and
-            # `__eq__`; the module that defines it decides instead.
-            return _is_user_class(obj)
+        if issubclass(type(obj), type):
+            # Decided from the module that defines the class (`_is_user_class`), read through
+            # `type`'s own descriptor: the weak cache would hash the class and `__module__` would
+            # be asked of its metaclass, either of which can run the metaclass's code.
+            return not (_marks_made and fingerprinted_by_name(obj)) and _is_user_class(obj)
 
         # Check cache (TypeError if obj not weakly referenceable)
         with contextlib.suppress(TypeError):

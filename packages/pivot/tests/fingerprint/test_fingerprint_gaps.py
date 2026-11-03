@@ -3876,3 +3876,661 @@ def test_a_refusal_found_on_a_cache_hit_refuses_the_stage_warm_and_fresh(
         assert result.returncode != 0, f"The {path} path should refuse: {message}"
         assert "captures non-scalar variable 'VALUE'" in message, message
         assert output.read_text() == f"{line}safe"
+
+
+# ---------------------------------------------------------------------------------------------
+# Enum values, type expressions, deep classes and values, user code the walk must not run, and a
+# StageParams `model_config` a method reads
+# ---------------------------------------------------------------------------------------------
+
+_ENUM_FROM_SETTINGS = """\
+import dataclasses
+import enum
+
+import settings
+
+
+class Choice(enum.Enum):
+    PICK = settings.VALUE
+
+
+@dataclasses.dataclass(frozen=True)
+class Holder:
+    choice: Choice = Choice.PICK
+"""
+
+_ENUM_PIPELINE = """\
+import functools
+
+from pivot import Pipeline, stage
+
+import choices
+
+
+def _value(choice, text: str) -> str:
+    return text.splitlines()[0] + choice.value
+
+
+HELD = functools.partial(_value, choices.Choice.PICK)
+
+
+@stage
+def use(text: str) -> str:
+    return {body}
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+# Where the stage meets `Choice.PICK`: held by a partial it calls, or as the class-level default
+# of a dataclass it names.
+_ENUM_BODIES = {
+    "partial-holds-the-member": "HELD(text)",
+    "default-of-a-named-dataclass": "_value(choices.Holder().choice, text)",
+}
+
+
+@pytest.mark.parametrize("body", sorted(_ENUM_BODIES))
+def test_an_edit_to_the_value_of_an_enum_member_a_value_holds_reruns_its_stage(
+    tmp_path: pathlib.Path, body: str
+) -> None:
+    """`Choice.PICK` takes its value from `settings.VALUE`. The class statement holds the
+    expression, not the value, so the member is formed with its value: an edit to `settings.py`
+    reruns the stage once, and the next run reuses it."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "choices.py": _ENUM_FROM_SETTINGS,
+            "pipeline.py": _ENUM_PIPELINE.format(body=_ENUM_BODIES[body]),
+        },
+    )
+    output = project / "data" / "t" / "use.txt"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingA"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "settings.py", '"A"', '"B"')
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The value edit should rerun"
+    assert output.read_text() == "Local Set Default Proof UsingB"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_TYPE_EXPRESSIONS_PIPELINE = """\
+import dataclasses
+import functools
+import pathlib
+import typing
+from typing import Any
+
+from pivot import Pipeline, loaders, stage
+
+
+def _take(value: Any, text: str) -> str:
+    return text.splitlines()[0]
+
+
+GENERIC = functools.partial(_take, list[int])
+OPTIONAL = functools.partial(_take, typing.Optional[str])
+UNION = functools.partial(_take, str | None)
+Made = dataclasses.make_dataclass(
+    "Made", [("items", list[str]), ("note", typing.Optional[str], None)]
+)
+Row = typing.NamedTuple("Row", [("x", list[str])])
+Rec = typing.TypedDict("Rec", {"x": list[str]})
+
+
+@dataclasses.dataclass(frozen=True)
+class TypedReader(loaders.Reader[str]):
+    schema: Any = None
+
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text().splitlines()[0]
+
+
+@stage
+def generic(text: str) -> str:
+    return GENERIC(text)
+
+
+@stage
+def optional(text: str) -> str:
+    return OPTIONAL(text)
+
+
+@stage
+def union(text: str) -> str:
+    return UNION(text)
+
+
+@stage
+def made(text: str) -> str:
+    return text.splitlines()[0] + str(len(Made(["a"]).items))
+
+
+@stage
+def row(text: str) -> str:
+    return text.splitlines()[0] + str(len(Row(["a"]).x))
+
+
+@stage
+def rec(text: str) -> str:
+    return text.splitlines()[0] + str(len(Rec(x=["a"])["x"]))
+
+
+@stage
+def configured(text: str) -> str:
+    return text
+
+
+with Pipeline("t") as pipeline:
+    for each in (generic, optional, union, made, row, rec):
+        each(pipeline.input("lines.txt", t=str))
+    configured(pipeline.input("typed.txt", format=TypedReader(list[str])))
+"""
+
+
+def test_a_type_expression_inside_a_value_runs_and_caches(tmp_path: pathlib.Path) -> None:
+    """`list[int]`, `Optional[str]` and `str | None` held by partials, the field types of a
+    `make_dataclass`, call-made `NamedTuple` and `TypedDict` class, and a loader config field
+    holding `list[str]` are formed by their origin and arguments, not refused as proxies: every
+    stage runs, and the next run reuses each."""
+    home = tmp_path / "home"
+    project = _project(tmp_path, {"pipeline.py": _TYPE_EXPRESSIONS_PIPELINE})
+    (project / "data" / "raw" / "typed.txt").write_text(_LINES)
+    stages = ("configured", "generic", "made", "optional", "rec", "row", "union")
+
+    assert _repro_statuses(project, home) == {f"t/{name}": "ran" for name in stages}
+    assert _repro_statuses(project, home) == {f"t/{name}": "cached" for name in stages}
+
+
+_DEEP = """\
+class Node:
+    def __init__(self, nxt) -> None:
+        self.nxt = nxt
+
+
+def _chain(depth: int) -> type:
+    cls = type("C0", (), {"marker": "A"})
+    for index in range(1, depth):
+        cls = type(f"C{index}", (cls,), {})
+    return cls
+
+
+def _linked(depth: int) -> object:
+    head = None
+    for _ in range(depth):
+        head = Node(head)
+    return head
+
+
+def _lists(depth: int) -> object:
+    value = []
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+def _dicts(depth: int) -> object:
+    value = {}
+    for _ in range(depth):
+        value = {"k": value}
+    return value
+
+
+DEEP_MRO = _chain(1100)
+LINKED = _linked(1000)
+LISTS = _lists(1000)
+DICTS = _dicts(1000)
+"""
+
+_DEEP_PIPELINE = """\
+import functools
+from typing import Any
+
+from pivot import Pipeline, stage
+
+import deep
+
+
+def _take(value: Any, text: str) -> str:
+    return text.splitlines()[0]
+
+
+MRO = functools.partial(_take, deep.DEEP_MRO())
+LINKED = functools.partial(_take, deep.LINKED)
+LISTS = functools.partial(_take, deep.LISTS)
+DICTS = functools.partial(_take, deep.DICTS)
+
+
+@stage
+def captured_mro(text: str) -> str:
+    return MRO(text)
+
+
+@stage
+def named_mro(text: str) -> str:
+    return text.splitlines()[0] + deep.DEEP_MRO().marker
+
+
+@stage
+def linked(text: str) -> str:
+    return LINKED(text)
+
+
+@stage
+def lists(text: str) -> str:
+    return LISTS(text)
+
+
+@stage
+def dicts(text: str) -> str:
+    return DICTS(text)
+
+
+with Pipeline("t") as pipeline:
+    for each in (captured_mro, named_mro, linked, lists, dicts):
+        each(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_classes_and_values_deeper_than_the_recursion_limit_run_and_cache(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A class made by `type()` on a chain of 1,100 bases, held as an instance or named by the
+    stage, and a linked list of 1,000 objects, lists nested 1,000 deep and dicts nested 1,000 deep,
+    each held by a partial: class identities nest no deeper than a fixed limit and values are
+    formed on an explicit stack, so each stage runs, and the next run reuses it."""
+    home = tmp_path / "home"
+    project = _project(tmp_path, {"deep.py": _DEEP, "pipeline.py": _DEEP_PIPELINE})
+    stages = ("captured_mro", "dicts", "linked", "lists", "named_mro")
+
+    assert _repro_statuses(project, home) == {f"t/{name}": "ran" for name in stages}
+    assert _repro_statuses(project, home) == {f"t/{name}": "cached" for name in stages}
+
+
+# Each hook writes its name to `hooks.log` once the module has built its values, so a hook the
+# fingerprint runs leaves the file behind.
+_HOOK_LOG = """\
+_ARMED = False
+
+
+def _ran(name):
+    if _ARMED:
+        with (pathlib.Path(__file__).parent / "hooks.log").open("a") as log:
+            log.write(name + "\\n")
+"""
+
+_HOOKS_ACCEPTED = (
+    "import functools\nimport pathlib\nimport types\n\nimport numpy\n\n"
+    + _HOOK_LOG
+    + """
+
+class Key:
+    def __hash__(self):
+        _ran("Key.__hash__")
+        return 1
+
+    def __eq__(self, other):
+        _ran("Key.__eq__")
+        return self is other
+
+
+class KeyDict(dict):
+    pass
+
+
+class KeySet(set):
+    pass
+
+
+class KeyFrozenSet(frozenset):
+    pass
+
+
+class ItemsDict(dict):
+    def items(self):
+        _ran("ItemsDict.items")
+        return dict.items(self)
+
+    def keys(self):
+        _ran("ItemsDict.keys")
+        return dict.keys(self)
+
+    def __iter__(self):
+        _ran("ItemsDict.__iter__")
+        return dict.__iter__(self)
+
+    def __getitem__(self, key):
+        _ran("ItemsDict.__getitem__")
+        return dict.__getitem__(self, key)
+
+
+class Scalar(numpy.float64):
+    @property
+    def dtype(self):
+        _ran("Scalar.dtype")
+        return numpy.dtype("float64")
+
+    def tobytes(self, order="C"):
+        _ran("Scalar.tobytes")
+        return numpy.float64.tobytes(self, order)
+
+
+@functools.lru_cache(maxsize=8)
+def cached(value):
+    return value * 2
+
+
+DICT = KeyDict({Key(): 1})
+SET = KeySet([Key(), Key()])
+FROZEN = KeyFrozenSet([Key(), Key()])
+PROXY = types.MappingProxyType(ItemsDict(a=1))
+SCALAR = Scalar(1.5)
+CACHED = cached
+_ARMED = True
+"""
+)
+
+_HOOKS_ACCEPTED_PIPELINE = """\
+import functools
+from typing import Any
+
+from pivot import Pipeline, stage
+
+import hooks
+
+
+def _tag(thing: Any, text: str) -> str:
+    return text.splitlines()[0] + type(thing).__name__
+
+
+DICT = functools.partial(_tag, hooks.DICT)
+SET = functools.partial(_tag, hooks.SET)
+FROZEN = functools.partial(_tag, hooks.FROZEN)
+PROXY = functools.partial(_tag, hooks.PROXY)
+SCALAR = functools.partial(_tag, hooks.SCALAR)
+CACHED = functools.partial(_tag, hooks.CACHED)
+
+
+@stage
+def dict_subclass(text: str) -> str:
+    return DICT(text)
+
+
+@stage
+def set_subclass(text: str) -> str:
+    return SET(text)
+
+
+@stage
+def frozenset_subclass(text: str) -> str:
+    return FROZEN(text)
+
+
+@stage
+def mapping_proxy(text: str) -> str:
+    return PROXY(text)
+
+
+@stage
+def numpy_scalar(text: str) -> str:
+    return SCALAR(text)
+
+
+@stage
+def lru_cache(text: str) -> str:
+    return CACHED(text)
+
+
+with Pipeline("t") as pipeline:
+    for each in (dict_subclass, set_subclass, frozenset_subclass, mapping_proxy, numpy_scalar,
+                 lru_cache):
+        each(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_a_value_is_formed_without_running_the_code_of_its_members_or_subclass(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Partials hold a dict, set and frozenset subclass whose members' `__hash__` and `__eq__`
+    are user code, a `MappingProxyType` over a dict subclass whose `items`, `keys`,
+    `__iter__` and `__getitem__` are, a numpy scalar subclass whose `dtype` and `tobytes` are,
+    and an `lru_cache` wrapper. Each is formed through the built-in types' own C methods and
+    descriptors and the cache's own closure. The first `repro` sends the stages to workers, which
+    pickle their values and so may run the hooks; its log is removed. After `pivot fingerprint
+    reset`, `pivot status` fingerprints the stages cold, and the next `repro` checks their cached
+    manifests: no hook runs in either (`hooks.log` is not written), and every stage is cached."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path, {"hooks.py": _HOOKS_ACCEPTED, "pipeline.py": _HOOKS_ACCEPTED_PIPELINE}
+    )
+    stages = (
+        "dict_subclass",
+        "frozenset_subclass",
+        "lru_cache",
+        "mapping_proxy",
+        "numpy_scalar",
+        "set_subclass",
+    )
+    log = project / "hooks.log"
+
+    assert _repro_statuses(project, home) == {f"t/{name}": "ran" for name in stages}
+    log.unlink(missing_ok=True)
+    for command in (("fingerprint", "reset"), ("status", "--json")):
+        result = helpers.run_pivot(project, home, *command)
+        assert result.returncode == 0, result.stdout + result.stderr
+    assert not log.exists(), f"Fingerprinting ran user code: {log.read_text().split()}"
+    assert _repro_statuses(project, home) == {f"t/{name}": "cached" for name in stages}
+    assert not log.exists(), f"A cache hit ran user code: {log.read_text().split()}"
+
+
+_HOOKS_REFUSED = (
+    "import functools\nimport pathlib\n\n"
+    + _HOOK_LOG
+    + """
+
+def _double(value):
+    return value * 2
+
+
+REPLACED = functools.lru_cache(maxsize=8)(_double)
+
+
+def _parameters():
+    _ran("cache_parameters")
+    return {"maxsize": 8, "typed": False}
+
+
+REPLACED.cache_parameters = _parameters
+
+
+class Descriptor:
+    def __get__(self, instance, owner=None):
+        _ran("Descriptor.__get__")
+        return self
+
+    def __call__(self):
+        return "d"
+
+
+class Forwards:
+    def __getattr__(self, name):
+        _ran("Forwards.__getattr__")
+        raise AttributeError(name)
+
+
+class Described:
+    DESC = Descriptor()
+
+    def unused(self) -> str:
+        return self.DESC()
+
+
+class Forwarded:
+    FWD = Forwards()
+
+    def unused(self) -> str:
+        return str(self.FWD)
+
+
+class Meta(type):
+    def __getattribute__(cls, name):
+        _ran("Meta.__getattribute__")
+        return type.__getattribute__(cls, name)
+
+
+class Hooked(metaclass=Meta):
+    def suffix(self) -> str:
+        return "A"
+
+
+_ARMED = True
+"""
+)
+
+_HOOKS_REFUSED_PIPELINE = """\
+import functools
+from typing import Any
+
+from pivot import Pipeline, stage
+
+import hooks
+
+
+def _tag(thing: Any, text: str) -> str:
+    return text
+
+
+HELD = {held}
+
+
+@stage
+def use(text: str) -> str:
+    return {body}
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+_HELD_CALL = "HELD(text)"
+# What a partial holds (or `None` when the stage names the class), the stage's body, and what
+# the refusal says. Reading each value would run user code: a replaced `cache_parameters`, a
+# descriptor's `__get__` and a class attribute's `__getattr__` that a method reads through
+# `self`, and a metaclass `__getattribute__`.
+_REFUSED_HOOKS = {
+    "replaced-cache-parameters": (
+        "functools.partial(_tag, hooks.REPLACED)",
+        _HELD_CALL,
+        "'pipeline.HELD.args[0]' keeps state Pivot cannot read (type: functools._lru_cache_wrapper)",
+    ),
+    "descriptor-read-through-self": (
+        "functools.partial(_tag, hooks.Described())",
+        _HELD_CALL,
+        "captures non-scalar variable 'hooks.Described.DESC' (type: Descriptor)",
+    ),
+    "forwarder-read-through-self": (
+        "functools.partial(_tag, hooks.Forwarded())",
+        _HELD_CALL,
+        "captures non-scalar variable 'hooks.Forwarded.FWD' (type: Forwards)",
+    ),
+    "metaclass-hook-held": (
+        "functools.partial(_tag, hooks.Hooked())",
+        _HELD_CALL,
+        "class 'hooks.Hooked' has the metaclass 'hooks.Meta'",
+    ),
+    "metaclass-hook-named": (
+        "None",
+        "text + hooks.Hooked().suffix()",
+        "class 'hooks.Hooked' has the metaclass 'hooks.Meta'",
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_REFUSED_HOOKS))
+def test_a_value_whose_reading_would_run_user_code_is_refused_by_name(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """Where a value cannot be read through C descriptors (an `lru_cache` wrapper whose
+    `cache_parameters` was replaced, a class attribute a method reads through `self` that is a
+    descriptor or answers lookups in `__getattr__`, a class whose metaclass defines
+    `__getattribute__`), the stage is refused with a message naming it, and the code is not run
+    (`hooks.log` is not written)."""
+    held, body, expected = _REFUSED_HOOKS[shape]
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "hooks.py": _HOOKS_REFUSED,
+            "pipeline.py": _HOOKS_REFUSED_PIPELINE.format(held=held, body=body),
+        },
+    )
+
+    result = helpers.run_pivot(project, home, "repro", "--json")
+    message = " ".join((result.stdout + result.stderr).split())
+    assert result.returncode != 0, f"The stage should be refused: {message}"
+    assert expected in message, message
+    log = project / "hooks.log"
+    assert not log.exists(), f"The fingerprint ran user code: {log.read_text().split()}"
+
+
+_CONFIG_PARAMS = """\
+import pydantic
+
+from pivot import StageParams
+
+import settings
+
+
+class Params(StageParams):
+    model_config = pydantic.ConfigDict(title=settings.TITLE)
+    scale: int = 2
+
+    def title(self) -> str:
+        return str(self.model_config.get("title"))
+"""
+
+_CONFIG_PARAMS_PIPELINE = """\
+from pivot import Pipeline, stage
+
+import params
+
+
+@stage
+def use(text: str, settings: params.Params = params.Params()) -> str:
+    return text.splitlines()[0] + settings.title()
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_an_edit_to_the_model_config_a_stage_params_method_reads_reruns_its_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A `StageParams` method reads `self.model_config`, whose `title` comes from
+    `settings.TITLE`. The schema hash leaves the title out, and the config is a dict, which a
+    class attribute read through `self` would refuse; it is recorded by its form instead: the stage
+    runs and caches, an edit to `settings.py` reruns it, and the next run reuses it."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'TITLE = "T1"\n',
+            "params.py": _CONFIG_PARAMS,
+            "pipeline.py": _CONFIG_PARAMS_PIPELINE,
+        },
+    )
+    output = project / "data" / "t" / "use.txt"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingT1"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "settings.py", '"T1"', '"T2"')
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The config edit should rerun"
+    assert output.read_text() == "Local Set Default Proof UsingT2"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}

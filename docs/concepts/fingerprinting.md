@@ -259,9 +259,11 @@ arguments, attributes and built-in value fields such as `OSError.filename`, an
 object by its attributes and `__slots__`, and a function or classmethod an
 object holds (a callback) with the module values it reads. A callback that reads
 its own enclosing class stops at that class. A callback whose `__wrapped__` chain
-loops is refused by name. A default whose state Pivot cannot read, such as a
-`random.Random`, a numpy `Generator` or a `threading.Lock`, refuses the stage,
-naming the field. For a field, build the value with
+loops is walked from its own code, each function on the chain once. An `Enum`
+member is hashed with its value, and a type expression such as `list[int]` or
+`str | None` by its origin and arguments. A default whose state Pivot cannot
+read, such as a `random.Random`, a numpy `Generator` or a `threading.Lock`,
+refuses the stage, naming the field. For a field, build the value with
 `dataclasses.field(default_factory=...)`; a `ClassVar` takes no factory, so
 create its value in the method that uses it; or move the value into the stage's
 `StageParams`.
@@ -270,6 +272,14 @@ A partial argument or loader config that holds a library value whose type has no
 supported value form is refused for the same reason. For example,
 `random.Random` keeps its generator state in C, so Pivot cannot safely hash it.
 Read such data from a pipeline input or move its configuration into `StageParams`.
+
+Pivot reads the values it fingerprints, and the classes they hold, through
+Python's own C-level accessors rather than through their code. Where a value
+cannot be read that way, the stage is refused by name: a class whose metaclass
+defines `__getattribute__` or `__getattr__` (reading anything of the class would
+run it), a `functools.lru_cache` wrapper whose `cache_parameters` was replaced,
+or a class attribute that a method reads through `self` and that is a
+descriptor object.
 
 An object whose `__getattr__` raises an error other than `AttributeError` for
 a name it does not have (a dict-backed config, an `AttrDict`, a lazy object)
