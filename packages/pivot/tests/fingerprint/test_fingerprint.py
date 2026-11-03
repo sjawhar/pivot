@@ -3898,13 +3898,14 @@ def test_a_class_with_no_source_holding_a_value_no_form_reads_is_refused_in_ever
     """A class `make_dataclass` made with a `random.Random` default: its hash would not show a
     change to the generator's state. Its hash never refuses (it names the value's type), and is
     kept out of the persistent cache; the walk of its class refuses each stage that names it,
-    naming the class and the entry, also a second stage after the hash is in the memory cache."""
+    naming the class and the entry, also a second stage after the hash is in the memory cache,
+    and the first stage again: no refusal outlives the scope that made it."""
     made = _random_beside("A")
 
     def names() -> object:
         return made()
 
-    for stage in ("t/first", "t/second"):
+    for stage in ("t/first", "t/second", "t/first"):
         with (
             pytest.raises(exceptions.StageDefinitionError, match="no source of its own") as raised,
             fingerprint.stage_fingerprint_scope(stage),
