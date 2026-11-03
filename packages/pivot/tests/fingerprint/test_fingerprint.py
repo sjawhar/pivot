@@ -5540,22 +5540,55 @@ def test_collecting_sources_restores_on_exception(tmp_path, monkeypatch):
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
 
     # Verify _active_source_map is None before
-    assert fingerprint._active_source_map is None
+    assert fingerprint._active_source_map.get() is None
 
     class FingerprintError(Exception):
         pass
 
     try:
         with fingerprint._collecting_sources() as source_map:
-            assert fingerprint._active_source_map is source_map
+            assert fingerprint._active_source_map.get() is source_map
             raise FingerprintError("simulated failure")
     except FingerprintError:
         pass
 
     # Must be restored to None after exception
-    assert fingerprint._active_source_map is None, (
+    assert fingerprint._active_source_map.get() is None, (
         "_active_source_map should be None after exception in _collecting_sources"
     )
+
+
+def test_collecting_sources_in_two_threads_leaves_no_map_behind():
+    """Two fingerprints collect sources at once in two threads, as the engine's worker threads
+    can: the first enters, the second enters, the first ends, the second ends. Each sees its own
+    map throughout, and neither thread nor the caller has a map active afterwards."""
+    first_in, second_in, first_out = threading.Event(), threading.Event(), threading.Event()
+    seen = dict[str, object]()
+
+    def first() -> None:
+        with fingerprint._collecting_sources() as source_map:
+            first_in.set()
+            second_in.wait(timeout=60)
+            seen["first"] = fingerprint._active_source_map.get() is source_map
+        first_out.set()
+        seen["first after"] = fingerprint._active_source_map.get()
+
+    def second() -> None:
+        first_in.wait(timeout=60)
+        with fingerprint._collecting_sources() as source_map:
+            second_in.set()
+            first_out.wait(timeout=60)
+            seen["second"] = fingerprint._active_source_map.get() is source_map
+        seen["second after"] = fingerprint._active_source_map.get()
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+
+    assert seen == {"first": True, "first after": None, "second": True, "second after": None}
+    assert fingerprint._active_source_map.get() is None
 
 
 def test_source_collector_deduplicates_files(tmp_path, monkeypatch):

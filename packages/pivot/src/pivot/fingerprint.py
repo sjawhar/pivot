@@ -226,8 +226,12 @@ _pending_manifest_writes = dict[pathlib.Path, list[tuple[bytes, bytes]]]()
 
 
 # Source files visited during a single stage's fingerprinting.
-# Maps rel_path -> content digest (`_source_digest`). Set by _collecting_sources().
-_active_source_map: dict[str, str] | None = None
+# Maps rel_path -> content digest (`_source_digest`). Set by _collecting_sources(). A context
+# variable, so a fingerprint in one thread (the engine fingerprints in worker threads, each with
+# a copy of the context) never sees, or leaves behind, another thread's map.
+_active_source_map: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "_active_source_map", default=None
+)
 
 # Stage name used for error reporting during fingerprinting.
 _current_stage_name: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -263,6 +267,10 @@ class _NodeKind(enum.Enum):
     CLASS = "class"  # a user class
     LOADER_CLASS = "loader-class"  # a pivot loader class: its `load`, `save` and `empty`
     LOADER = "loader"  # a loader a stage reads or writes through: a projection root
+
+    # A member is its own only instance, so it hashes by identity, in C: `_Walk.node` looks one
+    # up for every edge, and Enum's own `__hash__` is Python code.
+    __hash__ = object.__hash__
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -305,9 +313,10 @@ class _Walk:
     (`_expand`), from the worklist, so no node's walk recurses into another's and a cycle ends
     where it meets a node that exists. A node stores only what its own edges give, so nothing it
     stores depends on the order nodes were reached in; `_project` unions the nodes breadth-first
-    from a root. `stage_fingerprint_scope` keeps one walk for a stage's function and its loaders,
-    so code both reach is expanded once; a call outside a scope makes its own. A refusal stays in
-    the node that made it, so nothing that outlives the walk keeps one.
+    from a root. A stage function's walk is its own (`_stage_manifest`), and the loaders of a stage
+    share a second one (`_loaders_walk`), so code two of them reach is expanded once; a call outside
+    a scope makes its own. A refusal stays in the node that made it, so nothing that outlives the
+    walk keeps one.
     """
 
     __slots__ = ("nodes", "pending")
@@ -623,14 +632,12 @@ def _collecting_sources() -> Iterator[dict[str, str]]:
     Saves and restores any previously active source map, so nested calls
     (if they ever occur) don't clobber the outer collector.
     """
-    global _active_source_map
-    previous = _active_source_map
     source_map = dict[str, str]()
-    _active_source_map = source_map
+    token = _active_source_map.set(source_map)
     try:
         yield source_map
     finally:
-        _active_source_map = previous
+        _active_source_map.reset(token)
 
 
 # Memo of the last sys.modules scan: (loaded modules, project root, project module files).
@@ -1336,11 +1343,12 @@ def _stage_manifest(
 
 def _expand(node: _Node, walk: _Walk) -> None:
     """Run `node`'s own edges, once: their entries, reads, children and refusals go into the node
-    (`_record_read`, `_add_child`, `_record_refusal`), with paths relative to it, and the source
-    files of the code they hash into its `sources`."""
-    global _active_source_map
-    outer_sources = _active_source_map
-    _active_source_map = node.sources
+    (`_record_read`, `_add_child`, `_record_refusal`), with paths relative to it, and, while a
+    source map is collected (`_collecting_sources`), the source files of the code they hash into
+    its `sources`. Only a cacheable stage walk collects one, and it expands every node of its own
+    walk inside that collection; a loader's walk is never cached, so it reads no source file."""
+    outer_sources = _active_source_map.get()
+    sources_token = _active_source_map.set(None if outer_sources is None else node.sources)
     expanding_token = _expanding.set((node, walk))
     path_token = _walk_path.set(())
     try:
@@ -1356,7 +1364,7 @@ def _expand(node: _Node, walk: _Walk) -> None:
     finally:
         _walk_path.reset(path_token)
         _expanding.reset(expanding_token)
-        _active_source_map = outer_sources
+        _active_source_map.reset(sources_token)
 
 
 def _project(
@@ -1374,9 +1382,9 @@ def _project(
         node, path = queue.popleft()
         for key, value in node.entries.items():
             manifest.setdefault(key, value)
-        if _active_source_map is not None:
+        if (active_sources := _active_source_map.get()) is not None:
             for rel_path, digest in node.sources.items():
-                _active_source_map.setdefault(rel_path, digest)
+                active_sources.setdefault(rel_path, digest)
         if recording:
             reads.extend(
                 ((*path, *steps), _read_token(owner, step)) for steps, owner, step in node.reads
@@ -2481,6 +2489,9 @@ def get_loader_fingerprint(loader: "loaders.Writer[Any] | loaders.Reader[Any]") 
     root = walk.node(loader, _NodeKind.LOADER, _definition_ref(type(cast("object", loader))))
     walk.run()
     manifest = dict[str, str]()
+    if _capture_errors.get() is not None:  # a stage's scope collects its refusals already
+        _project(root, manifest)
+        return manifest
     with _collected_capture_errors():
         _project(root, manifest)
     return manifest
@@ -2496,6 +2507,8 @@ def _expand_loader(loader: Any, key: str) -> None:
     texts = list[str]()
     for name, form in _loader_config_forms(loader):
         texts.append(f"{name}={form.text}")
+        if not form.reports:
+            continue  # nothing to act on (`_admit`): a scalar field, as most loaders' are
         binding = f"{key}.{name}"
         with _walking(f"cfg:{name}"):
             _admit(form, binding, _bound_opaque_message(binding))
@@ -3849,6 +3862,8 @@ def _form(value: Any) -> _Form:
     `Generator`), is `["opaque", <type>]` and reported; no `repr` is read but for the exact value
     types whose C repr writes all of their content. No code of a user class runs, and no text is
     rewritten. `_FormBuilder` says how cycles, sets and dicts are written."""
+    if id(_type_of(value)) in _SCALAR_TYPE_IDS:
+        return _Form(json.dumps(value), ())  # the scalar row (`_FormBuilder.build`), unbuilt
     builder = _FormBuilder()
     return builder.finish(builder.build(value))
 
@@ -5139,11 +5154,11 @@ def hash_function_ast(func: Callable[..., Any]) -> str:
     stages using lambdas. Mitigation: Use named functions instead of lambdas in
     pipeline stages for stable fingerprinting.
     """
-    if _active_source_map is not None:
+    if (active_sources := _active_source_map.get()) is not None:
         info = _get_func_source_info(func)
         if info is not None:
             rel_path, digest = info
-            _active_source_map.setdefault(rel_path, digest)
+            active_sources.setdefault(rel_path, digest)
     _t = metrics.start()
     try:
         # 0. The mark decision (`_mark_decision`): an object the walk records by name gets a
