@@ -106,7 +106,7 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 35 records each value by its form over a closed type table (`_form`) and walks the code
 # in it from one node table per stage (`_Walk`), keyed as a stage that names it is keyed: there
 # are no `held:` entries, and a cache hit replays the reads of the code inside a value.
-_CACHE_SCHEMA_VERSION = 38
+_CACHE_SCHEMA_VERSION = 39
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
@@ -1123,6 +1123,8 @@ def _read_token(owner: Any, step: str) -> str:
         return "absent"
     if step in ("mc", "lc"):
         return f"config:{xxhash.xxh64(_form(value).text.encode()).hexdigest()}"
+    if step == "wr" and _is_user_class_instance(value):
+        return f"wrapped:{xxhash.xxh64(_form(value).text.encode()).hexdigest()}"
     if step.startswith("d:"):
         return _default_token(value)
     if step.startswith("ca:") and _is_user_enum_member(value):
@@ -1829,9 +1831,17 @@ def _expand_function(func: Callable[..., Any]) -> None:
     """The edges of a function node (`_Walk`): the globals and closure cells it reads, the
     defaults it takes, the classes in its type hints and the user modules its body imports.
     Every wrapper's immediate target (`wr`) takes normal user/library/value admission.
-    Looping metadata is refused; terminating C caches retain their native settings."""
-    if (message := _wrapper_loop_message(func)) is not None:
-        _record_refusal(message, downgradable=False)
+    The shared follower refuses loops and excessive depth before any chain is admitted."""
+    if _mark_decision(func) is _MarkDecision.BY_NAME:
+        return
+    chain = wrapper_chain(func, follow_partials=True)
+    next(chain)
+    try:
+        wrapped = next(chain, _UNREAD)
+        for _ in chain:
+            pass
+    except _WrapperChainError as error:
+        _record_refusal(str(error), downgradable=False)
         return
     if type(func) is _LRU_CACHE_TYPE:
         _record_read(func, "lc")
@@ -1843,22 +1853,27 @@ def _expand_function(func: Callable[..., Any]) -> None:
         _entries()[f"default:{binding}.cache_parameters"] = xxhash.xxh64(
             _form(settings).text.encode()
         ).hexdigest()
-    wrapped = _read_step(func, "wr")
     if wrapped is not _UNREAD:
         _record_read(func, "wr")
         binding = f"{_current_node().key}.__wrapped__"
         stage_name = _current_stage_name.get() or "<unknown>"
         with _walking("wr"):
-            _process_captured_value("__wrapped__", binding, wrapped, func, stage_name, chain=None)
-    tree: ast.Module | None = None
-    if is_user_code(func):
-        tree = _source_tree(func)
-        # The refusals read the source `inspect.getsource` returns, which follows a
-        # functools.wraps chain to the wrapped function, as on main, and stops at the user
-        # decorator above a mark; the body-import walk below reads the wrapper's own source.
-        check_tree = _wrapped_source_tree(func) if hasattr(func, "__wrapped__") else tree
-        if check_tree is not None:
-            _check_dynamic_access(func, check_tree)
+            if _is_user_class_instance(wrapped) and _mark_decision(wrapped) is None:
+                form = _form(wrapped)
+                _entries()[f"default:{binding}"] = xxhash.xxh64(form.text.encode()).hexdigest()
+                _admit(form, binding, _bound_opaque_message(binding))
+            else:
+                _process_captured_value(
+                    "__wrapped__", binding, wrapped, func, stage_name, chain=None
+                )
+    if not is_user_code(func):
+        return
+    tree = _source_tree(func)
+    # Definition-time refusals read the wrapped source, as on main; dependency reads and
+    # body imports use this function's own code.
+    check_tree = _wrapped_source_tree(func) if hasattr(func, "__wrapped__") else tree
+    if check_tree is not None:
+        _check_dynamic_access(func, check_tree)
     _t_closure = metrics.start()
     try:
         # Use cached result if available (getclosurevars is expensive at ~0.5ms)
@@ -2100,16 +2115,17 @@ def _user_member_value(value: Any) -> Any:
         return value
     if issubclass(type(value), functools.partial):
         return value
-    if _wrapper_loop_message(value) is not None:
-        return value
     if type(value) is types.FunctionType:
         if _written_in_user_source(value):
             return value
-        unwrapped = unwrap(value, _stop_at_mark)
+        try:
+            unwrapped = unwrap(value, _stop_at_mark)
+        except _WrapperChainError:
+            return value  # Its function node owns the named refusal.
         if fingerprinted_by_name(unwrapped):
             return unwrapped
         if unwrapped is not value and inspect.isfunction(unwrapped):
-            return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
+            return value if _written_in_user_source(unwrapped) else _UNREAD
         return _UNREAD
     if issubclass(type(value), type):
         return value if is_user_code(value) else _UNREAD
@@ -2120,11 +2136,14 @@ def _user_member_value(value: Any) -> Any:
     if _is_callable_instance(value) or _carries_instance(value):
         return value
     if callable(value):
-        unwrapped = unwrap(value, _stop_at_mark)
+        try:
+            unwrapped = unwrap(value, _stop_at_mark)
+        except _WrapperChainError:
+            return value
         if fingerprinted_by_name(unwrapped):
             return unwrapped
         if unwrapped is not value and inspect.isfunction(unwrapped):
-            return unwrapped if _written_in_user_source(unwrapped) else _UNREAD
+            return value if _written_in_user_source(unwrapped) else _UNREAD
     return _UNREAD
 
 
@@ -2805,19 +2824,21 @@ def _member_values(name: str, raw: Any) -> list[tuple[str, Any]]:
 def _member_functions(function: Any, owner: type, raw: Any) -> list[tuple[Any, type, bool]]:
     """The functions whose bodies the reachable walk reads for a member function, each with
     the class that holds the member and whether it takes the instance first: each function a
-    `functools.wraps` chain wraps (`__wrapped__`, read through `wrapper_chain`, whose loop guard
-    ends it before an object it has reached) that user source defines, and
+    `functools.wraps` chain wraps (`wrapper_chain`) that user source defines, and
     each wrapper on the chain but one that only forwards `*args` to what it wraps (it names no
     member, and receives the instance unnamed, which `_member_reads` would read as a dynamic
     use)."""
     takes_self = not isinstance(raw, staticmethod)
     functions = list[tuple[Any, type, bool]]()
-    for current in wrapper_chain(function):
-        if not inspect.isfunction(current):
-            break
-        forwards = hasattr(current, "__wrapped__") and current.__code__.co_argcount == 0
-        if not forwards and (current is function or _written_in_user_source(current)):
-            functions.append((current, owner, takes_self))
+    try:
+        for current in wrapper_chain(function):
+            if not inspect.isfunction(current):
+                break
+            forwards = hasattr(current, "__wrapped__") and current.__code__.co_argcount == 0
+            if not forwards and (current is function or _written_in_user_source(current)):
+                functions.append((current, owner, takes_self))
+    except _WrapperChainError:
+        pass  # The member's function node owns the named refusal.
     return functions
 
 
@@ -3429,9 +3450,8 @@ def _process_captured_value(
             entries[f"ext:{binding_ref}"] = _library_name(value)
             _mark_by_name(getattr(value, "__module__", None), entries)
             if (
-                type(value) is _LRU_CACHE_TYPE
-                and _mark_decision(value) is not _MarkDecision.BY_NAME
-            ):
+                type(value) is _LRU_CACHE_TYPE or _read_step(value, "wr") is not _UNREAD
+            ) and _mark_decision(value) is not _MarkDecision.BY_NAME:
                 _add_child(value, _NodeKind.FUNCTION, _callable_ref(value, binding_ref))
         case _ValueKind.LOGGER:
             return
@@ -3444,10 +3464,13 @@ def _attributes_read(func: Callable[..., Any], chain: str) -> list[str]:
 
     For `chain` "settings", `settings.AGG(...)` and `settings.Config.SCALE` give `AGG` and
     `Config`; what is read on `Config` is found from the chain "settings.Config". The source
-    read stops above a mark (`_source_object`), so a user decorator above a marked function
-    gives the attributes its own lines read.
+    read uses each Python function's own code, not the metadata chain's terminal function.
     """
-    target = _source_object(func)
+    target = (
+        func.__code__
+        if type(func) is types.FunctionType and hasattr(func, "__wrapped__")
+        else _source_object(func)
+    )
     if target is None:
         return []
     prefix = f"{chain}."
@@ -4288,7 +4311,7 @@ class _FormBuilder:
     def function(self, func: Any) -> Any:
         """A Python function: main's `["function", function_identity]`, reported for its function
         node (a user function) or its module (a library one)."""
-        if is_user_code(func):
+        if is_user_code(func) or _read_step(func, "wr") is not _UNREAD:
             self.report(_ReportKind.FUNCTION, func)
         else:
             module = getattr(func, "__module__", None)
@@ -4537,19 +4560,15 @@ class _FormBuilder:
         return self.part_rows(["cached_property"], ("cp", value.func))
 
     def cache_wrapper(self, value: Any) -> Any:
-        """A `functools.lru_cache` wrapper: the function it wraps and its cache settings, read from
-        the closure of the `cache_parameters` function `lru_cache` gave it (`_lru_cache_settings`),
-        which is not called; one whose `cache_parameters` was replaced keeps its settings where no
-        form reads them, in C, so it is opaque."""
+        """A native cache's identity and statically readable settings, reported for ordinary
+        function admission. Only the shared follower traverses its wrapper metadata. Replaced
+        `cache_parameters` keeps unreadable settings in C and makes the value opaque."""
+        self.report(_ReportKind.FUNCTION, value)
         attributes = _instance_dict(_type_of(value), value) or {}
         settings = _lru_cache_settings(attributes.get("cache_parameters"))
         if settings is None:
             return self.opaque(value)
-        return self.cache_rows(attributes.get("__wrapped__"), settings)
-
-    def cache_rows(self, wrapped: Any, settings: list[Any]) -> _Rows:
-        wrapped_form = yield ("wr", wrapped)
-        return ["wrapped", "functools._lru_cache_wrapper", wrapped_form, settings]
+        return ["wrapped", "functools._lru_cache_wrapper", self.identity(value), settings]
 
     def type_alias(self, value: Any) -> Any:
         """A known exact stdlib alias (`list[int]`, `collections.abc.Callable[[int], str]`), by its
@@ -5345,7 +5364,11 @@ def _admit(form: _Form, binding: str, opaque: Callable[[tuple[str, ...], Any], s
         with _walking(*path):
             match kind:
                 case _ReportKind.FUNCTION:
-                    _add_callable(obj, _binding_text(binding, path))
+                    binding_ref = _binding_text(binding, path)
+                    stage_name = _current_stage_name.get() or "<unknown>"
+                    _process_captured_value(
+                        binding_ref, binding_ref, obj, obj, stage_name, chain=None
+                    )
                 case _ReportKind.CLASS:
                     _add_callable(obj, in_value=True)
                 case _ReportKind.LOADER:
@@ -6290,68 +6313,41 @@ def fingerprinted_by_name(obj: Any) -> bool:
     return mark is obj
 
 
-def wrapper_chain(obj: Any, stop: Callable[[Any], bool] | None = None) -> Iterator[Any]:
-    """Yield `obj`, then each object its `__wrapped__` chain reaches, in order.
+class _WrapperChainError(ValueError):
+    """A named, non-downgradable refusal from the shared wrapper follower."""
 
-    Every step along a `__wrapped__` chain in pivot goes through this, so each path sees the
-    chain `inspect.unwrap` sees; the mark decision first asks whether a value keeps a
-    `__wrapped__` of its own (`_mark_chain`). It follows the chain as `inspect.unwrap` does: by
-    attribute access, so a `__wrapped__` kept in a slot or a property counts as one in an
-    instance `__dict__`; a class ends the chain; `stop` ends it at the first object it accepts;
-    and its loop guard, by object identity and the recursion limit, ends the chain before an
-    object it has already yielded. `inspect.unwrap` raises ValueError at a loop, and so does
-    `unwrap`; a decision about the chain (`_mark_decision`, through `_mark_chain`) takes a loop
-    as the chain's end, so a looped chain without a mark on it is decided as main decides it.
+
+def wrapper_chain(
+    obj: Any, stop: Callable[[Any], bool] | None = None, *, follow_partials: bool = False
+) -> Iterator[Any]:
+    """Yield a wrapper chain, refusing an identity loop or inspect.unwrap's depth limit.
+
+    Attribute access preserves inspect.unwrap's slot/property behavior; classes and `stop`
+    end the chain. Function admission also follows partial targets, since a metadata loop
+    can pass through one. This is the only follower: value forms report wrapper nodes rather
+    than recursively forming their metadata. The follower is pure, including its refusals.
     """
     memo = {id(obj): obj}
     limit = sys.getrecursionlimit()
     current = obj
     yield current
-    while not isinstance(current, type) and hasattr(current, "__wrapped__"):
-        if stop is not None and stop(current):
+    while not isinstance(current, type):
+        if hasattr(current, "__wrapped__"):
+            if stop is not None and stop(current):
+                return
+            below = current.__wrapped__
+        elif follow_partials and issubclass(_type_of(current), functools.partial):
+            below = current.func
+        else:
             return
-        current = current.__wrapped__
-        if id(current) in memo or len(memo) >= limit:
-            return
-        memo[id(current)] = current
-        yield current
-
-
-def unwrap(obj: Any, stop: Callable[[Any], bool] | None = None) -> Any:
-    """`inspect.unwrap(obj, stop=stop)`, through `wrapper_chain`: the last object on `obj`'s
-    `__wrapped__` chain, or the first one `stop` accepts. A loop raises ValueError, as it does
-    in `inspect.unwrap`.
-
-    It differs from `inspect.unwrap` in two pathological chains, and each fails loudly and
-    drops nothing: with a `__wrapped__` property that returns another object on each access,
-    the second test of the end (`looped`, and `stop` asked again) can raise ValueError where
-    `inspect.unwrap` returns; and on a chain longer than the recursion limit, `_stop_at_mark`
-    asked of a lower link can see a mark that `_mark_decision` asked of the top does not, and
-    the walk then raises.
-    """
-    *_, end = wrapper_chain(obj, stop)
-    looped = not isinstance(end, type) and hasattr(end, "__wrapped__")
-    if looped and (stop is None or not stop(end)):
-        raise ValueError(f"wrapper loop when unwrapping {obj!r}")
-    return end
-
-
-def _wrapper_loop_message(obj: Any) -> str | None:
-    """Name a loop in statically readable wrapper links, including partial targets.
-
-    This only inspects supported function/wrapper objects, never an arbitrary value's hooks.
-    It is pure: replay and identity construction must not report refusals.
-    """
-    if not issubclass(_type_of(obj), functools.partial) and _read_step(obj, "wr") is _UNREAD:
-        return None
-    chain = list[Any]()
-    positions = dict[int, int]()
-    current = obj
-    while issubclass(_type_of(current), (types.FunctionType, _LRU_CACHE_TYPE, functools.partial)):
-        if (position := positions.get(id(current))) is not None:
-            loop = chain[position:]
+        looped = id(below) in memo
+        if looped or len(memo) >= limit:
+            chain = list(memo.values())
+            if looped:
+                position = next(index for index, item in enumerate(chain) if item is below)
+                chain = chain[position:]
             names = list[str]()
-            for item in loop:
+            for item in chain:
                 if issubclass(_type_of(item), functools.partial):
                     attributes = _instance_dict(_type_of(item), item) or {}
                     label = attributes.get("__qualname__")
@@ -6360,21 +6356,27 @@ def _wrapper_loop_message(obj: Any) -> str | None:
                         if type(label) is str
                         else "functools.partial"
                     )
-                else:
+                elif isinstance(item, (types.FunctionType, _LRU_CACHE_TYPE)):
                     names.append(_definition_ref(item))
-            return (
-                f"__wrapped__ loop involving {', '.join(dict.fromkeys(names))}.\n"
-                "Fix: break the wrapper loop or move this value into the stage's StageParams."
+                else:
+                    names.append(_definition_ref(_type_of(item)))
+            problem = "loop" if looped else f"depth limit ({limit}) exceeded"
+            remedy = "break the wrapper loop" if looped else "shorten the wrapper chain"
+            raise _WrapperChainError(
+                f"__wrapped__ {problem} involving {', '.join(dict.fromkeys(names))}.\n"
+                + f"Fix: {remedy} or move this value into the stage's StageParams."
             )
-        positions[id(current)] = len(chain)
-        chain.append(current)
-        wrapped = _read_step(current, "wr")
-        if wrapped is _UNREAD:
-            if not issubclass(_type_of(current), functools.partial):
-                return None
-            wrapped = current.func
-        current = wrapped
-    return None
+        memo[id(below)] = below
+        current = below
+        yield current
+
+
+def unwrap(obj: Any, stop: Callable[[Any], bool] | None = None) -> Any:
+    """Return the end of `wrapper_chain`, propagating its named loop/depth refusal."""
+    end = obj
+    for current in wrapper_chain(obj, stop):
+        end = current
+    return end
 
 
 def _mark_chain(obj: Any) -> Iterator[Any]:
@@ -6564,14 +6566,14 @@ def _source_object(func: Any) -> Any:
     `_stop_at_mark`: for a user function decorator above the mark this returns the decorator's
     code object, whose own lines `inspect.getsource` reads (a code object has no
     `__wrapped__`); for the mark itself it returns None. No source read reaches a marked body.
-    A loop has no source target and returns None; the function node reports its named refusal.
+    Invalid chains have no source target; their function nodes own the named refusal.
     """
     decision = _mark_decision(func)
     if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
         return None
     try:
         target = unwrap(func, stop=_stop_at_mark)
-    except ValueError:
+    except _WrapperChainError:
         return None
     if fingerprinted_by_name(target):
         return None

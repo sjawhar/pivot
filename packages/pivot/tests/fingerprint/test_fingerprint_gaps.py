@@ -4989,3 +4989,152 @@ def test_nested_native_caches_each_retain_their_settings(tmp_path: pathlib.Path)
     reset = helpers.run_pivot(project, home, "fingerprint", "reset")
     assert reset.returncode == 0, reset.stdout + reset.stderr
     assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+_WRAPPED_CHAIN_VALUES = """\
+import sys
+import settings
+
+
+def terminal():
+    return "metadata-only"
+
+
+def wrap(target):
+    def link():
+        return "metadata-only"
+    link.__wrapped__ = target
+    return link
+
+
+TAIL = terminal
+for _ in range({depth}):
+    TAIL = wrap(TAIL)
+
+
+def first():
+    return settings.VALUE
+
+
+first.__wrapped__ = TAIL
+"""
+
+
+def test_a_wrapped_chain_past_the_depth_limit_is_refused_by_name(tmp_path: pathlib.Path) -> None:
+    """R8-B1: a terminating but over-limit chain must not hide first's module reads."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": _WRAPPED_CHAIN_VALUES.format(depth="sys.getrecursionlimit() + 20"),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()")
+            .replace("HELD = functools.partial(read, values.VALUE)", "")
+            .replace("return HELD(text)", "return values.first()"),
+        },
+    )
+
+    refused = helpers.run_pivot(project, tmp_path / "home", "repro", "--json")
+
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "values.first" in message and "__wrapped__" in message, message
+    assert "depth limit" in message and "StageParams" in message, message
+    assert not (project / "data/t/use.txt").exists(), message
+
+
+@pytest.mark.parametrize("depth", [32, 500])
+def test_a_terminating_wrapped_chain_reruns_on_a_module_value_edit(
+    tmp_path: pathlib.Path, depth: int
+) -> None:
+    """Every admitted function keeps its own reads, even before the metadata chain's end."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": _WRAPPED_CHAIN_VALUES.format(depth=depth),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()")
+            .replace("HELD = functools.partial(read, values.VALUE)", "")
+            .replace("return HELD(text)", "return values.first()"),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "A"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", 'VALUE = "A"', 'VALUE = "B"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "B"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+_HELD_NATIVE_CACHE = """\
+import functools
+import settings
+
+
+def original():
+    return settings.VALUE
+
+
+CACHED = {constructor}(original)
+CACHED.__name__ = CACHED.__qualname__ = "CACHED"
+VALUE = CACHED
+"""
+
+
+@pytest.mark.parametrize("constructor", ["functools.cache", "functools.lru_cache(maxsize=8)"])
+@pytest.mark.parametrize("unsafe", [False, True], ids=["strict", "unsafe"])
+def test_a_native_cache_metadata_loop_in_a_partial_argument_is_refused(
+    tmp_path: pathlib.Path, constructor: str, unsafe: bool
+) -> None:
+    """R8-B2: a value-cycle token must not conceal a held C cache's metadata loop."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": _HELD_NATIVE_CACHE.format(constructor=constructor)
+            + "CACHED.__wrapped__ = CACHED\n",
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+    if unsafe:
+        (project / ".pivot/config.yaml").write_text("core:\n  unsafe_fingerprinting: true\n")
+
+    refused = helpers.run_pivot(project, tmp_path / "home", "repro", "--json")
+
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "values.CACHED" in message and "__wrapped__ loop" in message, message
+    assert "StageParams" in message and "break" in message.lower(), message
+    assert not (project / "data/t/use.txt").exists(), message
+
+
+@pytest.mark.parametrize("constructor", ["functools.cache", "functools.lru_cache(maxsize=8)"])
+def test_a_native_cache_in_a_partial_argument_reruns_on_a_module_value_edit(
+    tmp_path: pathlib.Path, constructor: str
+) -> None:
+    """The held C cache without a metadata loop still admits its Python target's reads."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": _HELD_NATIVE_CACHE.format(constructor=constructor),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "A"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", 'VALUE = "A"', 'VALUE = "B"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "B"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}

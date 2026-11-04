@@ -1696,15 +1696,11 @@ def _lock_records(document: dict[str, typing.Any]) -> dict[str, typing.Any]:
     }
 
 
-def test_an_unmarked_project_gets_mains_locks_and_an_upgrade_reruns_nothing(
+def test_an_unmarked_project_keeps_mains_run_records_and_adds_cache_settings(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A project with no mark gets, entry by entry, the locks main wrote for it, so this pull
-    request changes no unmarked lock value: its manifests, its dependency hashes and its output
-    hashes are main's. Main's are 0.5.8's too, value by value, except the entries of the two
-    loader methods main changed, and except what the lock format decides (``_lock_records``). A
-    project that main ran to completion is all cached under this version, from a fresh
-    `.pivot/state.lmdb`."""
+    """Unmarked locks retain main's run records and code entries, plus native cache settings.
+    A fresh state database reuses the completed runs with those current fingerprints."""
     project = _project(tmp_path, _UPGRADE)
     first = _statuses(_run(project, "repro", "--json"))
     assert sorted(first) == sorted(f"up/{name}" for name in _LOCKS_MAIN), first
@@ -1712,7 +1708,12 @@ def test_an_unmarked_project_gets_mains_locks_and_an_upgrade_reruns_nothing(
     for name, text in _LOCKS_MAIN.items():
         main = yaml.safe_load(text)
         head = yaml.safe_load((stages / f"{name}.lock").read_text())
-        assert head["code_manifest"] == main["code_manifest"], f"{name}: manifest differs"
+        expected_manifest = main["code_manifest"] | (
+            {"default:lib.util.vocab.cache_parameters": "150b5e5dd3146f2e"}
+            if name == "split"
+            else {}
+        )
+        assert head["code_manifest"] == expected_manifest, f"{name}: manifest differs"
         assert _lock_records(head) == _lock_records(main), f"{name}: lock record differs"
         assert head["schema_version"] == main["schema_version"], f"{name}: schema version differs"
         old = yaml.safe_load(_LOCKS_0_5_8[name])
@@ -2223,10 +2224,8 @@ def test_removing_the_mark_behind_a_cache_and_a_decorator_reruns_after_a_manifes
 def test_the_replay_of_a_cache_over_a_decorator_over_the_mark_reads_what_the_walk_read(
     module_dir: pathlib.Path,
 ) -> None:
-    """A manifest-cache hit replays each read the walk recorded and compares tokens. Behind
-    `functools.cache` the walk's unwrap (step "u") stops at the user decorator above the mark,
-    and the replay stops at the same function, so each recorded read gives its recorded token
-    again while nothing changed."""
+    """A manifest-cache hit replays both immediate wrapper links through the user decorator
+    above the mark, comparing each token without reading the marked body."""
     _write(module_dir / "rk_replay_h.py", _REPLAY_HELPER)
     _write(
         module_dir / "rk_replay_s.py",
@@ -2235,7 +2234,7 @@ def test_the_replay_of_a_cache_over_a_decorator_over_the_mark_reads_what_the_wal
     stage = _fresh("rk_replay_h", "rk_replay_s").my_stage
     with fingerprint._collected_capture_errors():
         reads = fingerprint._stage_manifest(stage, recording=True)[1]
-    assert any(path[-1] == "u" for path, _ in reads), reads
+    assert any(path[-2:] == ("wr", "wr") for path, _ in reads), reads
     assert fingerprint._recorded_reads_hold(stage, [[list(path), read] for path, read in reads])
 
 
@@ -3090,17 +3089,19 @@ def test_the_mark_above_a_class_based_decorator_records_the_whole_helper_by_name
 def test_without_the_mark_a_cache_over_a_class_decorator_is_not_refused(
     module_dir: pathlib.Path, shape: str
 ) -> None:
-    """Without the mark, a library wrapper over a class-based decorator gets main's decision for
-    the same chain: it is not refused (and main does not see the class's `__call__` under the
-    cache, BET-253), which is why the refusal does not list removing the mark as a fix."""
-    decorators, verb, _edit_pair, _cls = _R5_SHAPES[shape]
+    """An unmarked class decorator has C-readable state, admitted like a bound value.
+    Its class code is tracked rather than hidden under the native cache."""
+    decorators, verb, edit_pair, _cls = _R5_SHAPES[shape]
     _write(module_dir / "rk5_deco.py", _R5_DECO)
     _write(
         module_dir / "rk5_h.py",
         _R5_HELPER.format(decorators=decorators, verb=verb).replace("@fingerprint_by_name\n", ""),
     )
     _write(module_dir / "rk5_s.py", _R5_FORMS["called"])
-    fingerprint.get_stage_fingerprint(_fresh(*_R5_MODULES).my_stage)
+    first = fingerprint.get_stage_fingerprint(_fresh(*_R5_MODULES).my_stage)
+    _edit(module_dir / "rk5_deco.py", *edit_pair)
+    second = fingerprint.get_stage_fingerprint(_fresh(*_R5_MODULES).my_stage)
+    assert second != first, "The cache must retain its class decorator's own code"
 
 
 @pytest.mark.parametrize("shape", ["cache", "lru_cache", "contextmanager"])
@@ -3629,19 +3630,19 @@ def _inspect_chain(obj: object, stop: typing.Any) -> tuple[list[object], object]
 
 @pytest.mark.parametrize("chain", list(_R7_CHAINS))
 def test_wrapper_chain_and_unwrap_read_a_chain_as_inspect_unwrap_does(chain: str) -> None:
-    """The one helper that reads `__wrapped__` chains passes the objects `inspect.unwrap`
-    passes: by attribute access (a slot or a property counts), ending at a class, at what `stop`
-    accepts, and before a repeated object or past the recursion limit. `unwrap` returns what
-    `inspect.unwrap` returns and raises ValueError where it raises."""
+    """Follow inspect.unwrap's objects and stops; both APIs refuse loops and excessive depth."""
     obj, stop = _R7_CHAINS[chain]()
     seen, end = _inspect_chain(obj, stop)
-    walked = [id(item) for item in fingerprint.wrapper_chain(obj, stop)]
-    assert walked == [id(item) for item in seen]
+    walked = list[object]()
     if end is ValueError:
-        with pytest.raises(ValueError, match="wrapper loop"):
+        with pytest.raises(ValueError, match=r"__wrapped__.*(loop|depth limit)"):
+            walked.extend(fingerprint.wrapper_chain(obj, stop))
+        with pytest.raises(ValueError, match=r"__wrapped__.*(loop|depth limit)"):
             fingerprint.unwrap(obj, stop)
     else:
+        walked.extend(fingerprint.wrapper_chain(obj, stop))
         assert fingerprint.unwrap(obj, stop) is end
+    assert [id(item) for item in walked] == [id(item) for item in seen]
 
 
 _R7_LOOP_STAGE = """\
@@ -4322,6 +4323,7 @@ def test_a_magicmock_gets_a_decision_not_an_error(
     _write(module_dir / "rk9_stage.py", _R9_FORMS[form].format(obj="MAGIC"))
     (module_dir / ".pivot").mkdir(exist_ok=True)  # the child runs there, as a project root
     env = {key: value for key, value in os.environ.items() if key != "PIVOT_UNSAFE_FINGERPRINTING"}
+    env["OPENBLAS_NUM_THREADS"] = "1"  # Keep numpy thread startup inside this child's 2 GiB cap.
     if unsafe:
         env["PIVOT_UNSAFE_FINGERPRINTING"] = "1"
     done = subprocess.run(

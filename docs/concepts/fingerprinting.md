@@ -258,12 +258,18 @@ content, including text that looks like a memory address, an exception by its
 arguments, attributes and built-in value fields such as `OSError.filename`, an
 object by its attributes and `__slots__`, and a function or classmethod an
 object holds (a callback) with the module values it reads. A callback that reads
-its own enclosing class stops at that class. A `__wrapped__` chain that loops is
-refused by name, including Python/C cache wrappers and chains through partials:
-break the loop or move the value into `StageParams`. A chain that ends is walked
-one function at a time, including each Python function's reads and each C cache
-wrapper's `maxsize` and `typed` settings, read without calling `cache_parameters`.
-A library target such as `json.dumps` is recorded by name, not walked as user code.
+its own enclosing class stops at that class. One `__wrapped__` follower handles
+helpers, globals, closure cells, partial arguments and keywords, defaults, state,
+and loader methods. It refuses a loop or a chain past `sys.getrecursionlimit()`
+by name, even with unsafe fingerprinting enabled: break the loop, shorten the
+chain, or move the value into `StageParams`. A terminating chain inside that
+limit is walked one function at a time, including each Python function's own
+code and reads and each C cache wrapper's `maxsize` and `typed` settings, read
+without calling `cache_parameters`. A library target such as `json.dumps` is
+recorded by name, not walked as user code.
+An unmarked class-based decorator under a cache is recorded as a bound value:
+its C-readable state and its class's code are tracked. A by-name mark remains
+a boundary: the walk adds no settings or body dependencies below it.
 An `Enum` member is hashed with its value, and known exact stdlib type expressions such as
 `list[int]`, `str | None` or `collections.abc.Callable[[int], str]` by their origin
 and arguments. A user subclass of `types.GenericAlias` is refused: its native
@@ -523,11 +529,10 @@ clear it, put `@fingerprint_by_name` above the class-based decorator, so Pivot
 records the whole helper by name, or replace the class with a function
 decorator built with `functools.wraps`.
 
-Without a mark below it, Pivot fingerprints a `functools.wraps` decorator as
-in earlier versions. It follows `__wrapped__` to the wrapped function, so it
-does not see what the decorator's own lines read through a module (for
-example `settings.FACTOR`), or the decorator's body when `functools.cache`
-wraps the decorator.
+Without a mark below it, Pivot fingerprints each Python function on a
+`functools.wraps` chain by its own code and reads, including module attributes
+such as `settings.FACTOR`. The same admission applies when a C cache or a
+partial holds the decorator.
 
 A stage cannot carry `@fingerprint_by_name`: Pipeline refuses a stage with
 the mark above `@stage`, below it, or below another decorator. Use
