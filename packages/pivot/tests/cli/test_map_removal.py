@@ -454,6 +454,33 @@ def test_a_changed_template_with_a_no_commit_record_removes_only_the_recorded_pa
     assert user_json.read_text() == '{"user": true}\n'
 
 
+def test_a_dropped_key_loses_both_committed_and_no_commit_output_paths(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The lock records YAML and a later no-commit run records JSON for the same output.
+    Removing the key must remove both recorded files, not just the latest path."""
+    root, home = _project(tmp_path)
+    (root / "pipeline.py").write_text(
+        _PIPELINE.replace(
+            "def cut(entry: dict[str, int]) -> dict[str, int]:",
+            "def cut(\n    entry: dict[str, int],\n"
+            + ") -> Annotated[dict[str, int], loaders.JSON[dict[str, int]]()]:",
+        )
+    )
+    _ok(helpers.run_pivot(root, home, "repro", "--no-commit"))
+    old_path = root / "data" / "p" / "cut@b.yaml"
+    new_path = root / "data" / "p" / "cut@b.json"
+    assert old_path.is_file() and new_path.is_file()
+    _write_plan(root, {"a": 1, "c": 3})
+
+    ran = _ok(helpers.run_pivot(root, home, "repro"))
+
+    assert "removed p/cut@b, whose key left the plan" in ran, ran
+    assert not old_path.exists(), "the committed output survived removal of its instance"
+    assert not new_path.exists(), "the no-commit output survived removal of its instance"
+    assert _instance_files(root, "p/cut@b") == []
+
+
 def test_a_legacy_no_commit_record_without_paths_is_reported_and_kept(
     tmp_path: pathlib.Path,
 ) -> None:

@@ -460,7 +460,8 @@ key's chain only, and a new file runs the producer and the new chain only.
   once `p/plan` writes no `b.yaml`): its outputs in the workspace, at the paths
   its lock or its `--no-commit` record records, its `nocommit:` record (in the
   current or the previous state directory), then the listings beside its
-  lock and the lock. Before it removes anything it reads `p/plan`'s listing again,
+  lock and the lock. If a later uncommitted run moved an output, both recorded
+  paths are removed. Before it removes anything it reads `p/plan`'s listing again,
   holding the lock a run writing `p/plan` holds, so a key another run brought back
   meanwhile stays. The cache keeps the objects; once no record names them,
   `pivot gc` may remove them. The run says so in its expansion line, `p/cut:

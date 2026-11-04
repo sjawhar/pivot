@@ -467,10 +467,10 @@ def _orphan_outputs(
     instance: str,
     lock_data: LockData | None,
     records: Iterable[types.NoCommitRecord],
-) -> dict[types.ArtifactIdentity, str]:
-    """Where each output of ``instance``, a mapped-stage instance whose key left the plan, lies,
-    relative to the project root: each output its lock and `nocommit:` records name, at the
-    project-relative path those records name.
+) -> dict[types.ArtifactIdentity, set[str]]:
+    """Every recorded path of each output of ``instance``, a mapped-stage instance whose key
+    left the plan, relative to the project root. A lock and a later `nocommit:` record may
+    record different paths for the same output; both belong to the instance.
 
     An older `nocommit:` record has no output paths. It proves a run wrote outputs but cannot
     prove which paths current code owns, so this refuses its removal rather than infer a current
@@ -481,39 +481,39 @@ def _orphan_outputs(
             or ``plots`` named by ``instance``.
     """
     identities = set[types.ArtifactIdentity]()
-    paths = dict[types.ArtifactIdentity, str]()
+    paths = dict[types.ArtifactIdentity, set[str]]()
     if lock_data is not None:
         identities.update(lock_data["output_hashes"])
         if "output_paths" not in lock_data:
             raise exceptions.ValidationError("its lock records outputs without their paths")
-        paths.update(lock_data["output_paths"])
+        for identity, path in lock_data["output_paths"].items():
+            paths.setdefault(identity, set[str]()).add(path)
     for record in records:
         if "output_hashes" not in record:
             continue
         if "output_paths" not in record:
             raise exceptions.ValidationError("its --no-commit record records outputs without paths")
         identities.update(types.identity_from_key(key) for key in record["output_hashes"])
-        paths.update(
-            (types.identity_from_key(identity), path)
-            for identity, path in record["output_paths"].items()
-        )
-    outputs = dict[types.ArtifactIdentity, str]()
+        for identity, path in record["output_paths"].items():
+            paths.setdefault(types.identity_from_key(identity), set[str]()).add(path)
+    outputs = dict[types.ArtifactIdentity, set[str]]()
     for identity in identities:
-        path = paths.get(identity)
+        recorded = paths.get(identity)
         if identity.producer != instance:
             continue
-        if path is None:
+        if not recorded:
             raise exceptions.ValidationError(
                 f"its record has no path for '{types.identity_key(identity)}'"
             )
-        root, _, rest = path.partition("/")
-        if root not in _OUTPUT_ROOTS or not (
-            rest == instance or rest.startswith((f"{instance}.", f"{instance}/"))
-        ):
-            raise exceptions.ValidationError(
-                f"its record has the output path '{path}', which no output of it can have"
-            )
-        outputs[identity] = path
+        for path in recorded:
+            root, _, rest = path.partition("/")
+            if root not in _OUTPUT_ROOTS or not (
+                rest == instance or rest.startswith((f"{instance}.", f"{instance}/"))
+            ):
+                raise exceptions.ValidationError(
+                    f"its record has the output path '{path}', which no output of it can have"
+                )
+        outputs[identity] = recorded
     return outputs
 
 
@@ -562,8 +562,14 @@ def _remove_orphan(template: registry.MapTemplate, instance: str, map_run: _MapR
         with service.acquire_many(requests):
             lock_data, records = read_records()
             outputs = _orphan_outputs(instance, lock_data, records.values())
-            paths = {identity: map_run.project_root / path for identity, path in outputs.items()}
-            locked = lock_data["output_hashes"] if lock_data is not None else {}
+            paths = [
+                map_run.project_root / path for recorded in outputs.values() for path in recorded
+            ]
+            committed_paths = dict[types.ArtifactIdentity, pathlib.Path]()
+            if lock_data is not None and "output_paths" in lock_data:
+                for identity, path in lock_data["output_paths"].items():
+                    if identity in outputs:
+                        committed_paths[identity] = map_run.project_root / path
             combined = types.NoCommitRecord(
                 pvt_members={
                     path: hash_
@@ -573,16 +579,18 @@ def _remove_orphan(template: registry.MapTemplate, instance: str, map_run: _MapR
             )
             claims = ownership.stage_claims(
                 map_run.project_root,
-                {path: locked[identity] for identity, path in paths.items() if identity in locked},
+                {
+                    path: lock_data["output_hashes"][identity]
+                    for identity, path in committed_paths.items()
+                    if lock_data is not None
+                },
                 combined,
                 cache_dir=files_dir,
                 listing_readers=ownership.lock_listing_readers(
-                    stage_lock, lock_data, paths, files_dir
+                    stage_lock, lock_data, committed_paths, files_dir
                 ),
             )
-            map_run.store.remove_outputs(
-                instance, list(paths.values()), claims, state_dir=state_dir
-            )
+            map_run.store.remove_outputs(instance, paths, claims, state_dir=state_dir)
             for directory in records:
                 with state_mod.StateDB(directory) as state_db:
                     state_db.apply_deferred_writes(
