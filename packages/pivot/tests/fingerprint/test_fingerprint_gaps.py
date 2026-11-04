@@ -4534,3 +4534,245 @@ def test_an_edit_to_the_model_config_a_stage_params_method_reads_reruns_its_stag
     assert _repro_statuses(project, home) == {"t/use": "ran"}, "The config edit should rerun"
     assert output.read_text() == "Local Set Default Proof UsingT2"
     assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_WRAPPED_PAIR = """\
+def first():
+    return first.__wrapped__()
+
+
+def second():
+    return "G" + settings.VALUE
+
+
+first.__wrapped__ = second
+second.__wrapped__ = first
+VALUE = first
+"""
+
+_SLOTTED_NUMPY_SCALAR = """\
+import numpy
+
+
+class Scalar(numpy.float64):
+    __slots__ = ("tag",)
+
+    def __new__(cls, value, tag):
+        item = super().__new__(cls, value)
+        item.tag = tag
+        return item
+
+    def __reduce__(self):
+        return Scalar, (float(self), self.tag)
+
+
+VALUE = Scalar(1, settings.VALUE)
+"""
+
+_ROUND_SIX_VALUE_PIPELINE = """\
+import functools
+
+from pivot import Pipeline, stage
+
+import values
+
+
+def read(value, text):
+    return {read}
+
+
+HELD = functools.partial(read, values.VALUE)
+
+
+@stage
+def use(text: str) -> str:
+    return HELD(text)
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+
+@pytest.mark.parametrize(
+    ("definition", "read", "before", "after"),
+    [
+        pytest.param(_WRAPPED_PAIR, "value()", "GA", "GB", id="wrapped-pair"),
+        pytest.param(_SLOTTED_NUMPY_SCALAR, "value.tag", "A", "B", id="numpy-slot"),
+    ],
+)
+def test_an_edit_behind_a_wrapped_cycle_or_in_a_numpy_slot_reruns_its_stage(
+    tmp_path: pathlib.Path, definition: str, read: str, before: str, after: str
+) -> None:
+    """A cache hit must follow every Python wrapper and form a scalar subclass's slots."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": "import settings\n\n" + definition,
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read=read),
+        },
+    )
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == before
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", '"A"', '"B"')
+    assert _repro_statuses(project, home, "7") == {"t/use": "ran"}
+    assert output.read_text() == after
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+@pytest.mark.parametrize("slotted", [False, True], ids=["method", "slot"])
+def test_a_user_generic_alias_subclass_is_refused_instead_of_losing_its_code_or_state(
+    tmp_path: pathlib.Path, slotted: bool
+) -> None:
+    home = tmp_path / "home"
+    definition = (
+        '    __slots__ = ("tag",)\n\n'
+        '    def __call__(self):\n        return object.__getattribute__(self, "tag")\n'
+        if slotted
+        else "    def __call__(self):\n        return settings.VALUE\n"
+    )
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": "import types\nimport settings\n\nclass Alias(types.GenericAlias):\n"
+            + definition
+            + "\nVALUE = Alias(list, (int,))\n"
+            + ("VALUE.tag = settings.VALUE\n" if slotted else ""),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+
+    refused = helpers.run_pivot(project, home, "status" if slotted else "repro")
+
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "Alias" in message and "StageParams" in message, message
+    assert "state" in message, message
+
+
+@pytest.mark.parametrize("factory", [False, True], ids=["type-call", "class-statement"])
+def test_a_long_ring_of_captured_classes_runs_and_caches(
+    tmp_path: pathlib.Path, factory: bool
+) -> None:
+    make = (
+        "def make():\n    class Made:\n        pass\n    return Made\n"
+        if factory
+        else 'def make():\n    return type("Made", (), {})\n'
+    )
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "values.py": make
+            + "\nclasses = [make() for _ in range(200)]\n"
+            + "for i, cls in enumerate(classes):\n    cls.peer = classes[(i + 1) % len(classes)]\n"
+            + "VALUE = classes[0]()\n",
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read='"safe"'),
+        },
+    )
+
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert (project / "data/t/use.txt").read_text() == "safe"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+
+
+@pytest.mark.parametrize("container", ["ordered", "subclass", "proxy"])
+def test_reading_ordered_dict_order_runs_no_user_key_hash(
+    tmp_path: pathlib.Path, container: str
+) -> None:
+    values = {
+        "ordered": "collections.OrderedDict([(Key(), 1)])",
+        "subclass": "OrderedSub([(Key(), 1)])",
+        "proxy": "types.MappingProxyType(collections.OrderedDict([(Key(), 1)]))",
+    }
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "values.py": "import collections\nimport pathlib\nimport types\n"
+            + _HOOK_LOG
+            + "\nclass Key:\n"
+            + '    def __hash__(self):\n        _ran("hash")\n        return 1\n'
+            + "\nclass OrderedSub(collections.OrderedDict):\n    pass\n"
+            + f"\nVALUE = {values[container]}\n_ARMED = True\n",
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read='"safe"'),
+        },
+    )
+
+    result = helpers.run_pivot(project, home, "status")
+
+    message = result.stdout + result.stderr
+    assert not (project / "hooks.log").exists(), message
+    assert result.returncode != 0, message
+    refused_type = "OrderedSub" if container == "subclass" else "OrderedDict"
+    assert refused_type in message and "StageParams" in message, message
+
+
+def test_a_top_level_loader_with_a_metaclass_attribute_hook_is_refused_before_class_reads(
+    tmp_path: pathlib.Path,
+) -> None:
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "values.py": "import dataclasses\nimport pathlib\nfrom pivot import loaders\n"
+            + _HOOK_LOG
+            + "\nclass Meta(type(loaders.Text)):\n"
+            + "    def __getattribute__(cls, name):\n"
+            + '        _ran("metaclass:" + name)\n'
+            + "        return type.__getattribute__(cls, name)\n"
+            + "\n@dataclasses.dataclass(frozen=True)\n"
+            + "class Reader(loaders.Text, metaclass=Meta):\n    pass\n"
+            + "\nVALUE = Reader()\n",
+            "pipeline.py": "from pivot import Pipeline, stage\nimport values\n"
+            + "\n@stage\ndef use(text: str) -> str:\n    return text\n"
+            + '\nwith Pipeline("t") as pipeline:\n'
+            + '    use(pipeline.input("lines.txt", format=values.VALUE))\n'
+            + "\nvalues._ARMED = True\n",
+        },
+    )
+
+    refused = helpers.run_pivot(project, home, "repro")
+
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "Reader" in message and "Meta" in message and "StageParams" in message, message
+    assert not (project / "hooks.log").exists(), message
+
+
+def test_schema_fingerprinting_releases_transient_models_after_its_pass(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A long-lived process must not retain a model through a cached schema or its validator."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "values.py": "import gc\nimport weakref\nimport pydantic\n"
+            + "from pivot import fingerprint\n"
+            + "\ndef retained():\n    refs = []\n"
+            + "    for i in range(3):\n"
+            + "        with fingerprint.fingerprint_pass():\n"
+            + '            model = pydantic.create_model("Transient", value=(int, i))\n'
+            + "            refs.append(weakref.ref(model))\n"
+            + "            fingerprint._schema_hash(model)\n"
+            + "        del model\n"
+            + "    gc.collect()\n"
+            + "    return str(sum(ref() is not None for ref in refs))\n",
+            "pipeline.py": "from pivot import Pipeline, stage\nimport values\n"
+            + "\n@stage\ndef use(text: str) -> str:\n    return values.retained()\n"
+            + '\nwith Pipeline("t") as pipeline:\n'
+            + '    use(pipeline.input("lines.txt", t=str))\n',
+        },
+    )
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert (project / "data/t/use.txt").read_text() == "0"

@@ -106,7 +106,7 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 35 records each value by its form over a closed type table (`_form`) and walks the code
 # in it from one node table per stage (`_Walk`), keyed as a stage that names it is keyed: there
 # are no `held:` entries, and a cache hit replays the reads of the code inside a value.
-_CACHE_SCHEMA_VERSION = 35
+_CACHE_SCHEMA_VERSION = 36
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
@@ -209,11 +209,6 @@ _get_type_hints_cache: weakref.WeakKeyDictionary[Callable[..., Any], dict[str, A
     weakref.WeakKeyDictionary()
 )
 
-# Cache for `_schema_parts` results, keyed by pydantic model class, each with the validator the
-# model had when it was computed: `model_rebuild` builds a new one, so a rebuilt model misses.
-_schema_hash_cache: weakref.WeakKeyDictionary[
-    type, tuple[object, tuple[str, list[tuple[str, "_Form"]]]]
-] = weakref.WeakKeyDictionary()
 
 # Module-level state for persistent AST hash caching.
 # Fingerprinting happens during discovery (single-threaded in coordinator process).
@@ -1837,8 +1832,9 @@ def _check_dynamic_access(obj: Any, tree: ast.Module) -> None:
 
 def _expand_function(func: Callable[..., Any]) -> None:
     """The edges of a function node (`_Walk`): the globals and closure cells it reads, the
-    defaults it takes, the classes in its type hints and the user modules its body imports, or,
-    for a C-level wrapper such as `functools.cache`, the function it wraps (`u`)."""
+    defaults it takes, the classes in its type hints and the user modules its body imports. A
+    Python wrapper adds its immediate wrapped function (`wr`); a C-level wrapper such as
+    `functools.cache` adds the function it wraps (`u`). The node table stops wrapper cycles."""
     tree: ast.Module | None = None
     if is_user_code(func):
         tree = _source_tree(func)
@@ -1870,6 +1866,13 @@ def _expand_function(func: Callable[..., Any]) -> None:
                     _add_child(unwrapped, _NodeKind.FUNCTION, _current_node().key)
         return
     metrics.end("fingerprint.getclosurevars", _t_closure)
+
+    wrapped = vars(func).get("__wrapped__")
+    if inspect.isfunction(wrapped):
+        _record_read(func, "wr")
+        if not fingerprinted_by_name(wrapped):
+            with _walking("wr"):
+                _add_callable(wrapped, f"{_current_node().key}.__wrapped__")
 
     _process_closure_values(closure_vars.globals, func, prefix="g")
     _process_closure_values(closure_vars.nonlocals, func, prefix="c")
@@ -2565,6 +2568,9 @@ def _expand_loader(loader: Any, key: str) -> None:
     (`cls`, a loader-class node: `_expand_loader_class`), and each config field (`cfg:NAME`), a
     value recorded by its form in `loader:<key>:config` (the hash of `loader_config_text`), whose
     code is walked and whose unreadable state refuses the stage (`_admit`)."""
+    if _attribute_hook(_type_of(loader)) is not None:
+        _record_refusal(_hooked_class_message(_type_of(loader)), downgradable=True)
+        return
     with _walking("cls"):
         _add_loader_class(_type_of(loader), key)
     texts = list[str]()
@@ -3854,21 +3860,17 @@ def _schema_hash(model: type[_PydanticModelProtocol]) -> str:
 def _schema_parts(
     model: type[_PydanticModelProtocol],
 ) -> tuple[str, list[tuple[str, "_Form"]]]:
-    """Hash a pydantic model's JSON schema and field defaults, with the form of each field
-    default (`_form`), once per class per process.
+    """The model's schema and live default forms, reused only within this fingerprint pass.
 
-    A field default is evaluated when the class is created, so it is a live value: a cache hit
-    reads it again through this hash. A class is created once per import, so the hash is
-    memoized by class identity, with the validator the class had (`__pydantic_validator__`, read
-    from its own namespace): `model_rebuild` builds a new one, so a model rebuilt with another
-    default misses. A class whose metaclass hashes by its own code is not a key
-    (`_hashes_by_identity`).
+    Validators and default reports can retain model classes, so none outlives the pass. The next
+    pass reads rebuilt models and changed defaults again, without a process-lifetime cache.
     """
-    keyed = _hashes_by_identity(model)
-    validator = _class_namespace(model).get("__pydantic_validator__")
-    cached = _schema_hash_cache.get(model) if keyed else None
-    if cached is not None and cached[0] is validator:
-        return cached[1]
+    return _memoized("schema-parts", model, lambda: _compute_schema_parts(model))
+
+
+def _compute_schema_parts(
+    model: type[_PydanticModelProtocol],
+) -> tuple[str, list[tuple[str, "_Form"]]]:
     from pivot import parameters
 
     schema_raw = model.model_json_schema(schema_generator=parameters.SortedSetJsonSchema)
@@ -3888,11 +3890,7 @@ def _schema_parts(
         default_hashes[field_name] = xxhash.xxh64(form.text.encode()).hexdigest()
 
     payload = {"schema": schema, "defaults": default_hashes}
-    result = (xxhash.xxh64(json.dumps(payload, sort_keys=True).encode()).hexdigest(), defaults)
-    if keyed:
-        with contextlib.suppress(TypeError):
-            _schema_hash_cache[model] = (validator, result)
-    return result
+    return (xxhash.xxh64(json.dumps(payload, sort_keys=True).encode()).hexdigest(), defaults)
 
 
 def _model_field_classes(model: Any) -> list[type]:
@@ -4432,8 +4430,9 @@ class _FormBuilder:
         return self.mapped(tag, list(_dict_items(value)), ordered=False)
 
     def ordered_mapping(self, value: Any) -> Any:
-        """An `OrderedDict`, in its own order (`OrderedDict.items`, which `move_to_end` changes)."""
-        return self.mapped("OrderedDict", list(_ordered_items(value)), ordered=True)
+        """An `OrderedDict` in its logical order, unless reading it would run key code."""
+        contents = _ordered_value(value)
+        return self.opaque(value) if contents is _UNREAD else self.contents(contents)
 
     def mapping_proxy(self, value: Any) -> Any:
         """A `MappingProxyType`, by the mapping it shows (`_proxied_mapping`): a dict's entries,
@@ -4555,11 +4554,11 @@ class _FormBuilder:
         wrapped_form = yield ("wr", wrapped)
         return ["wrapped", "functools._lru_cache_wrapper", wrapped_form, settings]
 
-    def type_alias(self, value: Any, _value_type: Any = None) -> Any:
-        """A `types.GenericAlias` (`list[int]`, `collections.abc.Callable[[int], str]`), by its
-        structure: its type, whether it is unpacked, its origin (`to`) and its arguments (`ta`),
-        each read through `GenericAlias`'s own C member, which no attribute the alias forwards to
-        its origin can shadow. A class in it is a label, as anywhere."""
+    def type_alias(self, value: Any) -> Any:
+        """An exact `types.GenericAlias` (`list[int]`, `collections.abc.Callable[[int], str]`), by
+        its native type, unpacked flag, origin (`to`) and arguments (`ta`), each read through its
+        own C member. A subclass does not take this row: its native fields omit Python state.
+        A class in the expression is a label, as anywhere."""
         return self.part_rows(
             ["alias", _definition_ref(_type_of(value)), _GENERIC_ALIAS_UNPACKED(value)],
             ("to", _GENERIC_ALIAS_ORIGIN(value)),
@@ -4648,7 +4647,10 @@ class _FormBuilder:
             state["s"] = slots
         reader = _SOLID_READERS.get(id(layout.solid))
         if reader is not None:
-            state["bv"] = yield ("bv", reader(value))
+            builtin = reader(value)
+            if builtin is _UNREAD:
+                return None
+            state["bv"] = yield ("bv", builtin)
         return state
 
     def attribute_rows(self, value: Any, value_type: type[Any]) -> _Rows:
@@ -4738,8 +4740,8 @@ class _FormBuilder:
     def numpy(self, numpy: Any, value: Any, value_type: type[Any]) -> Any:
         """A numpy array, scalar or dtype by its data, read through numpy's own C descriptors and
         methods, so no `dtype` or `tobytes` a subclass defines runs; a user subclass of a numpy
-        scalar adds its class's key, reported for its class node, and its `__dict__`. `_UNREAD`
-        for any other object."""
+        scalar adds its class's key, reported for its class node, its attributes and its slots.
+        `_UNREAD` for any other object."""
         for klass in _class_mro(value_type):
             if klass is numpy.ndarray:
                 if value_type is not numpy.ndarray:
@@ -4772,11 +4774,17 @@ class _FormBuilder:
         return [*head, built]
 
     def numpy_scalar_rows(self, value: Any, value_type: type[Any], descr: Any, data: str) -> _Rows:
+        layout = self.layout(value_type)
+        if layout.dict_descriptor is None and _class_dictoffset(value_type) != 0:
+            return self.opaque(value)
         attributes = yield from self.attribute_rows(value, value_type)
         if attributes is None:
             return self.opaque(value)
+        slots = list[Any]()
+        for label, item in _slot_values(value_type, value):
+            slots.append([label, (yield (f"sl:{label}", item))])
         self.report(_ReportKind.CLASS, value_type, "cls")
-        return ["np", self.label(value_type), descr, data, attributes]
+        return ["np", self.label(value_type), descr, data, attributes, slots]
 
 
 def _sorted_entries(entries: list[Any], ordered: bool) -> list[Any]:
@@ -4921,7 +4929,6 @@ _MRO_ROWS: dict[int, Callable[[_FormBuilder, Any, type[Any]], Any]] = {
     id(enum.Enum): _FormBuilder.enum_member,
     id(logging.Logger): _FormBuilder.logger,
     id(types.ModuleType): _FormBuilder.module_subclass,
-    id(types.GenericAlias): _FormBuilder.type_alias,
 }
 
 
@@ -5125,6 +5132,20 @@ class _Layout:
     dict_descriptor: Any
 
 
+def _ordered_value(value: Any) -> Any:
+    """List logical entries without running key code, or `_UNREAD` if that is not possible.
+
+    Even CPython's native OrderedDict key iterator hashes keys. Inspect the backing dict first,
+    whose item iterator does not hash, and allow only exact scalar keys with native hashes.
+    """
+    if any(id(_type_of(key)) not in _ORDERED_KEY_IDS for key, _ in _dict_items(value)):
+        return _UNREAD
+    return _Contents("OrderedDict", list(_native_ordered_items(value)))
+
+
+_ORDERED_KEY_IDS = _SCALAR_TYPE_IDS | {id(bytes), id(complex)}
+
+
 # How `_form` reads the value of an instance of a subclass of a built-in type (`bv`), as an exact
 # object of that type, through the type's own C methods, so no method the subclass defines runs.
 # A hash container's members are kept in a list (`_Contents`): building the container again would
@@ -5141,9 +5162,7 @@ _SOLID_READERS: dict[int, Callable[[Any], Any]] = {
     id(dict): lambda value: _Contents("dict", list(_dict_items(value))),
     id(set): lambda value: _Contents("set", list(_set_iter(value))),
     id(frozenset): lambda value: _Contents("frozenset", list(_frozenset_iter(value))),
-    id(collections.OrderedDict): lambda value: _Contents(
-        "OrderedDict", list(_ordered_items(value))
-    ),
+    id(collections.OrderedDict): _ordered_value,
     id(collections.deque): lambda value: collections.deque(
         _deque_iter(value), _DEQUE_MAXLEN(value)
     ),
@@ -5165,7 +5184,9 @@ _set_iter = cast("Callable[[Any], Iterator[Any]]", set.__iter__)
 _frozenset_iter = cast("Callable[[Any], Iterator[Any]]", frozenset.__iter__)
 _deque_iter = cast("Callable[[Any], Iterator[Any]]", collections.deque.__iter__)
 _dict_items = cast("Callable[[Any], Collection[tuple[Any, Any]]]", dict.items)
-_ordered_items = cast("Callable[[Any], Collection[tuple[Any, Any]]]", collections.OrderedDict.items)
+_native_ordered_items = cast(
+    "Callable[[Any], Collection[tuple[Any, Any]]]", collections.OrderedDict.items
+)
 
 
 def _layout(cls: type[Any]) -> _Layout:
@@ -5464,13 +5485,18 @@ def _class_identity(cls: type[Any]) -> str:
         known = memo.get(("free-class-identity", key))
     if known is not None:
         return cast("tuple[type[Any], str]", known)[1]
-    if len(active) >= _IDENTITY_DEPTH and key not in scope.deep:
+    contextual = scope.contextual.get((key, active))
+    if contextual is not None:
+        scope.lows[-1] = min(scope.lows[-1], contextual[2])
+        return contextual[1]
+    if len(active) - scope.base_depth >= _IDENTITY_DEPTH:
         raise _IdentityTooDeepError(cls)
     return _computed_class_identity(cls)
 
 
 def _computed_class_identity(cls: type[Any]) -> str:
-    depth = len(_identity_active.get())
+    active = _identity_active.get()
+    depth = len(active)
     token = _enter_identity(cls)
     try:
         namespace = _class_namespace(cls)
@@ -5489,8 +5515,9 @@ def _computed_class_identity(cls: type[Any]) -> str:
     finally:
         low = _leave_identity(token)
     identity = xxhash.xxh64(json.dumps(parts).encode()).hexdigest()
+    scope = cast("_IdentityScope", _identity_scope.get())
+    scope.contextual[(id(cls), active)] = (cls, identity, low)
     if low > depth:
-        scope = cast("_IdentityScope", _identity_scope.get())
         scope.free[id(cls)] = (cls, identity)
         if (memo := _pass_memo.get()) is not None:
             memo[("free-class-identity", id(cls))] = (cls, identity)
@@ -5498,9 +5525,8 @@ def _computed_class_identity(cls: type[Any]) -> str:
     return identity
 
 
-# How deep class identities nest (`_class_identity`) before one not known yet is computed first,
-# on its own (`_identifying`), so a long chain of classes (a deep `type()` MRO, classes that each
-# hold the next) never nests deeper than this.
+# How many class identities may nest on the Python stack before the worklist computes a
+# dependency first. Its logical ancestor path stays intact, including across a long cycle.
 _IDENTITY_DEPTH = 24
 
 
@@ -5511,20 +5537,24 @@ class _IdentityTooDeepError(Exception):
     def __init__(self, cls: type[Any]) -> None:
         super().__init__()
         self.cls: type[Any] = cls
+        self.active: tuple[int, ...] = _identity_active.get()
 
 
 @dataclasses.dataclass(slots=True)
 class _IdentityScope:
-    """The class identities computed under one outermost one (`_identifying`): for each identity
-    or class hash being computed, the smallest depth on `_identity_active` a `^N` inside it points
-    to (`lows`); the identities whose `^N` steps all point inside them, the same wherever they are
-    computed (`free`); and the classes computed where they are met, however deep (`deep`)."""
+    """One identity computation's worklist facts: the lowest logical ancestor each active result
+    refers to (`lows`), context-free identities (`free`), and results keyed by their full logical
+    ancestor path (`contextual`). `base_depth` is the ancestor prefix suspended off the Python
+    stack, so cyclic and acyclic dependencies share the same hard stack-depth bound."""
 
     lows: list[int] = dataclasses.field(default_factory=list[int])
     free: dict[int, tuple[type[Any], str]] = dataclasses.field(
         default_factory=dict[int, tuple[type[Any], str]]
     )
-    deep: set[int] = dataclasses.field(default_factory=set[int])
+    contextual: dict[tuple[int, tuple[int, ...]], tuple[type[Any], str, int]] = dataclasses.field(
+        default_factory=dict[tuple[int, tuple[int, ...]], tuple[type[Any], str, int]]
+    )
+    base_depth: int = 0
 
 
 # The scope of the class identities being computed (`_identifying`); None outside one.
@@ -5534,30 +5564,32 @@ _identity_scope: contextvars.ContextVar[_IdentityScope | None] = contextvars.Con
 
 
 def _identifying(compute: Callable[[], str]) -> str:
-    """`compute()`, the outermost class identity or class hash being computed, in a scope of its
-    own (`_IdentityScope`). An identity needed deeper than `_IDENTITY_DEPTH`
-    (`_IdentityTooDeepError`) is computed first, on its own, and kept when it is free; then
-    `compute` starts again and finds it. One that is not free, or that its own computation needs
-    again, is computed where it is met from then on. Each class is set aside at most once, so this
-    ends, and each identity has the text it has where it is met."""
+    """Run `compute`, suspending deep identity dependencies on an explicit worklist.
+
+    A suspended dependency keeps its logical ancestors: its cycle distances and lowest
+    back-reference stay the same as in recursive evaluation. Retrying its caller then reuses
+    the result only in that context, or everywhere when it is free. No cyclic dependency is
+    exempted from the stack-depth bound.
+    """
     scope = _IdentityScope()
     token = _identity_scope.set(scope)
     try:
-        needed = list[type[Any]]()
+        needed = list[_IdentityTooDeepError]()
         while True:
             try:
                 if not needed:
+                    scope.base_depth = 0
                     return compute()
                 first = needed[-1]
-                _computed_class_identity(first)
+                scope.base_depth = len(first.active)
+                active_token = _identity_active.set(first.active)
+                try:
+                    _computed_class_identity(first.cls)
+                finally:
+                    _identity_active.reset(active_token)
                 needed.pop()
-                if id(first) not in scope.free:
-                    scope.deep.add(id(first))
             except _IdentityTooDeepError as too_deep:
-                if any(cls is too_deep.cls for cls in needed):
-                    scope.deep.add(id(too_deep.cls))
-                else:
-                    needed.append(too_deep.cls)
+                needed.append(too_deep)
     finally:
         _identity_scope.reset(token)
 
