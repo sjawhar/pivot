@@ -6347,8 +6347,10 @@ def test_a_model_rebuilt_with_a_readable_default_is_accepted_in_the_next_pass(
 
 @pytest.mark.parametrize("setting", ["typed", "maxsize"])
 @pytest.mark.parametrize("holder", ["wrapped", "partial"])
-def test_a_wrapped_library_cache_retains_its_native_settings(setting: str, holder: str) -> None:
-    """Library targets remain by-name, but a C cache's own configuration still matters."""
+def test_a_cache_over_library_code_keeps_mains_by_name_settings_limit(
+    setting: str, holder: str
+) -> None:
+    """As on main, a cache over library code is external, including its native settings."""
 
     def make_stage(changed: bool) -> typing.Callable[[], str]:
         def first() -> str:
@@ -6368,4 +6370,24 @@ def test_a_wrapped_library_cache_retains_its_native_settings(setting: str, holde
 
     before = fingerprint.get_stage_fingerprint(make_stage(False))
     after = fingerprint.get_stage_fingerprint(make_stage(True))
-    assert before != after, "A library target does not make the cache's own settings by-name"
+    assert before == after, "Native settings are tracked only for caches over user code"
+
+
+def test_member_receiver_discovery_does_not_ask_a_partial_subclass_for_wrapped() -> None:
+    """Only the exact native partial synthesized for a partialmethod needs receiver traversal."""
+
+    class TrapPartial(functools.partial[str]):
+        def __getattr__(self, name: str) -> typing.Any:
+            raise AssertionError(f"receiver discovery asked the partial subclass for {name}")
+
+    def target() -> str:
+        return "safe"
+
+    class Captured:
+        member: TrapPartial = TrapPartial(target)
+
+    def stage() -> type[Captured]:
+        return Captured
+
+    manifest = fingerprint.get_stage_fingerprint(stage)
+    assert _definition_key("class", Captured) in manifest

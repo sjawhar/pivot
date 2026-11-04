@@ -5257,3 +5257,39 @@ def test_a_wrapped_method_keeps_its_receiver_class_attribute_reads(
     reset = helpers.run_pivot(project, home, "fingerprint", "reset")
     assert reset.returncode == 0, reset.stdout + reset.stderr
     assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+def test_a_partialmethod_keeps_its_receiver_class_attribute_reads(tmp_path: pathlib.Path) -> None:
+    """A partialmethod inserts self before its bound arguments when it calls the Python body."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": (
+                "import functools\nimport settings\n\n"
+                "def suffix_impl(self, prefix):\n    return prefix + self.SUFFIX\n\n"
+                "class Captured:\n    SUFFIX = settings.VALUE\n"
+                '    suffix = functools.partialmethod(suffix_impl, "x")\n\n'
+                "def read(value, text):\n    return value.suffix()\n\n"
+                "HELD = functools.partial(read, Captured())\n"
+            ),
+            "pipeline.py": (
+                "from pivot import Pipeline, stage\nimport values\n"
+                "\n@stage\ndef use(text: str) -> str:\n    return values.HELD(text)\n"
+                '\nwith Pipeline("t") as pipeline:\n'
+                '    use(pipeline.input("lines.txt", t=str))\n'
+            ),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "xA"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", 'VALUE = "A"', 'VALUE = "BB"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "xBB"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}

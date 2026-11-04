@@ -259,26 +259,29 @@ arguments, attributes and built-in value fields such as `OSError.filename`, an
 object by its attributes and `__slots__`, and a function or classmethod an
 object holds (a callback) with the module values it reads. A callback that reads
 its own enclosing class stops at that class. One `__wrapped__` follower handles
-helpers, globals, closure cells, partial arguments and keywords, defaults, state,
+user helpers, globals, closure cells, partial arguments and keywords, defaults, state,
 and loader methods. It stops at a `@fingerprint_by_name` mark and refuses a loop
 or a chain past `sys.getrecursionlimit()` above that boundary by name, even with
 unsafe fingerprinting enabled: break the loop, shorten the chain, or move the
-value into `StageParams`. A terminating chain inside that limit is walked one
-function at a time, including each Python function's own code and reads and
-the cache settings exposed by the stdlib `cache_parameters` closure, read
-without calling it. For stacked native caches, only the settings visible on
+value into `StageParams`. A terminating user chain inside that limit is walked one
+function at a time, including each Python function's own code and reads. Native cache settings
+are recorded only for caches over user code, from the stdlib `cache_parameters` closure,
+without calling it. A cache over library code is recorded by name; edits to its `typed`
+or `maxsize` do not trigger a rerun. For stacked native caches, only the settings visible on
 the outermost wrapper are recorded: CPython's `functools.update_wrapper` copies
 the inner cache's `cache_parameters`, so an edit to the outer `typed` or
 `maxsize` is not seen. Use the stage's `StageParams` for cache configuration
-that must trigger a rerun. A library helper such as `json.dumps` is recorded
-by name, not walked as user code. A library-defined function registered
-directly as a stage still tracks the project values its body reads.
+that must trigger a rerun. Library helpers and their wrappers, such as `json.dumps`, are
+recorded by name without reading their private closure state. A library-defined stage root
+still tracks the project globals, closure values and defaults its body reads; a native cache
+on that root follows its terminal Python body. User wrapper code is walked even when
+`functools.wraps` copied a library target's module metadata.
 An unmarked class-based decorator under a cache is recorded as a bound value:
 its C-readable state and its class's code are tracked. A by-name mark remains
 a boundary: the walk adds no settings or body dependencies below it.
 Class attributes read through the receiver are analyzed in each Python method
-body reached through the chain, including beneath a native cache or a forwarding
-decorator, up to a by-name mark.
+body reached through the chain, including beneath a native cache, a partialmethod or a
+forwarding decorator, up to a by-name mark.
 An `Enum` member is hashed with its value, and known exact stdlib type expressions such as
 `list[int]`, `str | None` or `collections.abc.Callable[[int], str]` by their origin
 and arguments. A user subclass of `types.GenericAlias` is refused: its native

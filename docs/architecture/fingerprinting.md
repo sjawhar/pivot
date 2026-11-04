@@ -48,15 +48,21 @@ Pivot's fingerprinting system:
 **Note:** The class AST and callable-member walk cover a class's code and the module values callable members read. Non-callable class attributes are tracked only in the direct and static receiver forms above, plus dataclass and Pydantic field defaults. A value read as `module.NAME` follows the rule it follows as a global: a library function is an `ext:` entry, a `functools.partial` is walked, and a logger is ignored.
 
 Receiver-attribute analysis reads each Python method body reached through a wrapper chain,
-including cached methods and the function beneath a forwarding decorator. It stops at a
-`@fingerprint_by_name` mark. A library-defined function registered directly as a stage keeps
-tracking the project globals, closure values and defaults its body reads; ordinary library
-helpers are still recorded by name.
+including cached methods, partialmethod targets and the function beneath a forwarding decorator.
+It stops at a `@fingerprint_by_name` mark.
+
+Library helpers and their wrappers are recorded by name without inspecting private closure
+state. A library-defined stage root keeps its globals, closure values and defaults; a native
+cache on that root follows the terminal Python body for those reads. User wrapper code is
+walked even when `functools.wraps` copied a library target's module metadata.
 
 For stacked native caches, only the settings visible on the outermost wrapper are recorded.
 CPython's `functools.update_wrapper` copies the inner cache's `cache_parameters` onto the
 outer cache, so an edit to the outer `typed` or `maxsize` is not seen. This shape remains
 accepted; put cache configuration in the stage's `StageParams` when it must trigger a rerun.
+Native cache settings are recorded only for caches over user code. A cache over library code
+(`functools.lru_cache(...)(pow)`) is recorded by name, so changes to its `typed` or `maxsize`
+do not trigger a rerun.
 
 For Pydantic models, both static defaults and `default_factory` functions are tracked:
 

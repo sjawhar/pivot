@@ -106,7 +106,7 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 35 records each value by its form over a closed type table (`_form`) and walks the code
 # in it from one node table per stage (`_Walk`), keyed as a stage that names it is keyed: there
 # are no `held:` entries, and a cache hit replays the reads of the code inside a value.
-_CACHE_SCHEMA_VERSION = 40
+_CACHE_SCHEMA_VERSION = 41
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
@@ -1004,6 +1004,8 @@ def _read_step(owner: Any, step: str) -> Any:
                 return _UNREAD if method is None else method
             case "lr":
                 return dict(_reachable_loader_members(owner)).get(arg, _UNREAD)
+            case "u":
+                return unwrap(owner, stop=_stop_at_mark)
             case "cls":
                 return cast("type[Any]", type(owner))
             case _:
@@ -1828,48 +1830,49 @@ def _check_dynamic_access(obj: Any, tree: ast.Module) -> None:
 
 
 def _expand_function(func: Callable[..., Any]) -> None:
-    """The edges of a function node (`_Walk`): the globals and closure cells it reads, the
-    defaults it takes, the classes in its type hints and the user modules its body imports.
-    Every wrapper's immediate target (`wr`) takes normal user/library/value admission.
-    The shared follower refuses loops and excessive depth before any chain is admitted."""
+    """Walk a function's globals, cells, defaults, hints and body imports.
+
+    User wrappers also own their immediate targets and native settings. Library code keeps
+    the main walk: no extra wrapper edges, and a C root walks its terminal Python body.
+    """
     if _mark_decision(func) is _MarkDecision.BY_NAME:
         return
-    chain = wrapper_chain(func, stop=fingerprinted_by_name, follow_partials=True)
-    next(chain)
-    try:
-        wrapped = next(chain, _UNREAD)
-        for _ in chain:
-            pass
-    except _WrapperChainError as error:
-        _record_refusal(str(error), downgradable=False)
-        return
-    if type(func) is _LRU_CACHE_TYPE:
-        _record_read(func, "lc")
-        settings = _read_step(func, "lc")
-        binding = _current_node().key
-        if settings is _UNREAD:
-            _admit(_form(func), binding, _bound_opaque_message(binding))
+    user_code = is_user_code(func)
+    tree: ast.Module | None = None
+    if user_code:
+        chain = wrapper_chain(func, stop=fingerprinted_by_name, follow_partials=True)
+        next(chain)
+        try:
+            wrapped = next(chain, _UNREAD)
+            for _ in chain:
+                pass
+        except _WrapperChainError as error:
+            _record_refusal(str(error), downgradable=False)
             return
-        _entries()[f"default:{binding}.cache_parameters"] = xxhash.xxh64(
-            _form(settings).text.encode()
-        ).hexdigest()
-    if wrapped is not _UNREAD:
-        _record_read(func, "wr")
-        binding = f"{_current_node().key}.__wrapped__"
-        stage_name = _current_stage_name.get() or "<unknown>"
-        with _walking("wr"):
-            if _is_user_class_instance(wrapped) and _mark_decision(wrapped) is None:
-                form = _form(wrapped)
-                _entries()[f"default:{binding}"] = xxhash.xxh64(form.text.encode()).hexdigest()
-                _admit(form, binding, _bound_opaque_message(binding))
-            else:
-                _process_captured_value(
-                    "__wrapped__", binding, wrapped, func, stage_name, chain=None
-                )
-    tree = _source_tree(func)
-    # Definition-time refusals apply to user code, as on main. A library-defined stage
-    # still owns the globals, closure values and defaults its executed body reads.
-    if is_user_code(func):
+        if type(func) is _LRU_CACHE_TYPE:
+            _record_read(func, "lc")
+            settings = _read_step(func, "lc")
+            binding = _current_node().key
+            if settings is _UNREAD:
+                _admit(_form(func), binding, _bound_opaque_message(binding))
+                return
+            _entries()[f"default:{binding}.cache_parameters"] = xxhash.xxh64(
+                _form(settings).text.encode()
+            ).hexdigest()
+        if wrapped is not _UNREAD:
+            _record_read(func, "wr")
+            binding = f"{_current_node().key}.__wrapped__"
+            stage_name = _current_stage_name.get() or "<unknown>"
+            with _walking("wr"):
+                if _is_user_class_instance(wrapped) and _mark_decision(wrapped) is None:
+                    form = _form(wrapped)
+                    _entries()[f"default:{binding}"] = xxhash.xxh64(form.text.encode()).hexdigest()
+                    _admit(form, binding, _bound_opaque_message(binding))
+                else:
+                    _process_captured_value(
+                        "__wrapped__", binding, wrapped, func, stage_name, chain=None
+                    )
+        tree = _source_tree(func)
         check_tree = _wrapped_source_tree(func) if hasattr(func, "__wrapped__") else tree
         if check_tree is not None:
             _check_dynamic_access(func, check_tree)
@@ -1882,8 +1885,17 @@ def _expand_function(func: Callable[..., Any]) -> None:
             _getclosurevars_cache[func] = closure_vars
     except (TypeError, AttributeError):
         metrics.end("fingerprint.getclosurevars", _t_closure)
-        # The immediate `wr` edge already owns the wrapped function's code and reads. Adding
-        # a second, terminal unwrap edge would give distinct functions one binding/key.
+        if not user_code:
+            try:
+                unwrapped = unwrap(func, stop=_stop_at_mark)
+            except _WrapperChainError as error:
+                _record_refusal(str(error), downgradable=False)
+                return
+            if unwrapped is not func and inspect.isfunction(unwrapped):
+                _record_read(func, "u")
+                if not fingerprinted_by_name(unwrapped):
+                    with _walking("u"):
+                        _add_child(unwrapped, _NodeKind.FUNCTION, _current_node().key)
         return
     metrics.end("fingerprint.getclosurevars", _t_closure)
 
@@ -2823,16 +2835,16 @@ def _member_values(name: str, raw: Any) -> list[tuple[str, Any]]:
 def _member_functions(function: Any, owner: type, raw: Any) -> list[tuple[Any, type, bool]]:
     """The Python bodies a member's wrapper chain reaches, with their class and receiver mode.
 
-    Follow native caches and Python wrappers up to a by-name mark. A wrapper that only
-    forwards `*args` names no member and receives the instance unnamed, which `_member_reads`
-    would read as a dynamic use, so its body is skipped here.
+    Follow native caches, partialmethod targets and Python wrappers up to a by-name mark.
+    A wrapper that only forwards `*args` names no member and receives the instance unnamed,
+    which `_member_reads` would read as a dynamic use, so its body is skipped here.
     """
     takes_self = not isinstance(raw, staticmethod)
     functions = list[tuple[Any, type, bool]]()
     try:
-        for current in wrapper_chain(function, stop=fingerprinted_by_name):
+        for current in wrapper_chain(function, stop=fingerprinted_by_name, follow_partials=True):
             if not inspect.isfunction(current):
-                if type(current) is _LRU_CACHE_TYPE:
+                if type(current) is _LRU_CACHE_TYPE or type(current) is functools.partial:
                     continue
                 break
             if fingerprinted_by_name(current):
@@ -3452,10 +3464,6 @@ def _process_captured_value(
             # hashed, but rebinding the name to another one must change the manifest.
             entries[f"ext:{binding_ref}"] = _library_name(value)
             _mark_by_name(getattr(value, "__module__", None), entries)
-            if (
-                type(value) is _LRU_CACHE_TYPE or _read_step(value, "wr") is not _UNREAD
-            ) and _mark_decision(value) is not _MarkDecision.BY_NAME:
-                _add_child(value, _NodeKind.FUNCTION, _callable_ref(value, binding_ref))
         case _ValueKind.LOGGER:
             return
         case _ValueKind.HOOKED:
@@ -4314,7 +4322,7 @@ class _FormBuilder:
     def function(self, func: Any) -> Any:
         """A Python function: main's `["function", function_identity]`, reported for its function
         node (a user function) or its module (a library one)."""
-        if is_user_code(func) or _read_step(func, "wr") is not _UNREAD:
+        if is_user_code(func):
             self.report(_ReportKind.FUNCTION, func)
         else:
             module = getattr(func, "__module__", None)
@@ -4563,9 +4571,14 @@ class _FormBuilder:
         return self.part_rows(["cached_property"], ("cp", value.func))
 
     def cache_wrapper(self, value: Any) -> Any:
-        """A native cache's identity and statically readable settings, reported for ordinary
-        function admission. Only the shared follower traverses its wrapper metadata. Replaced
-        `cache_parameters` keeps unreadable settings in C and makes the value opaque."""
+        """A user cache's identity and statically readable settings, or a library name.
+
+        Only the shared follower traverses user wrapper metadata. Replaced `cache_parameters`
+        keeps unreadable settings in C and makes a user cache opaque.
+        """
+        if not is_user_code(value):
+            self.report(_ReportKind.EXTERNAL, getattr(value, "__module__", None))
+            return ["external", _library_name(value)]
         self.report(_ReportKind.FUNCTION, value)
         attributes = _instance_dict(_type_of(value), value) or {}
         settings = _lru_cache_settings(attributes.get("cache_parameters"))
@@ -6641,6 +6654,13 @@ def _is_user_code_impl(obj: Any) -> bool:
     # records it by name and never descends into its body.
     if _recorded_by_name(obj):
         return False
+    # wraps copies the target's module, not ownership of the wrapper's Python code.
+    if (
+        type(obj) is types.FunctionType
+        and "__wrapped__" in obj.__dict__
+        and _written_in_user_source(obj)
+    ):
+        return True
 
     module = _get_module(obj)
     if module is None:
