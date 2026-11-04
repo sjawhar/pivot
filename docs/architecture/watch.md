@@ -117,14 +117,14 @@ pivot repro --watch --json
 
 | Event Type | Description |
 |------------|-------------|
-| `schema_version` | First line (version) |
+| `schema_version` | First line (version: 3, since `stages_expanded` gained `removed`) |
 | `stage_start` | Stage began execution (stage, index, total) |
 | `stage_complete` | Stage finished (stage, status, reason, duration_ms, index, total) |
-| `stages_expanded` | A mapped stage's template (`pipeline.map`) added its instances to the run (template, stages: the instance names `<template>@<key>` in key order). It comes before any of those instances starts; the `total` of later `stage_start`/`stage_complete` events counts them |
+| `stages_expanded` | A mapped stage's template (`pipeline.map`) added its instances to the run (template, stages: the instance names `<template>@<key>` in key order; removed, only when the expansion removed instances whose key left the producer's listing: their names, sorted). It comes before any of those instances starts; the `total` of later `stage_start`/`stage_complete` events counts them |
 | `engine_state_changed` | The Engine became `active` or `idle` (state) |
 | `pipeline_reloaded` | The pipeline was reloaded, or became invalid or valid again (stages, stages_added, stages_removed, stages_modified, error, seq, run_id). `error` is set while the pipeline is invalid and null once it is valid, including when it becomes valid again without a reload |
 
-Note: JsonlSink renames the engine's `stage_started` and `stage_completed` to the existing `pivot repro --json` names for backwards compatibility, forwards `stages_expanded` with only its template and stages, and forwards `pipeline_reloaded` as the Engine emits it. Log lines (on stderr) and the other engine events are not emitted in JSON mode.
+Note: JsonlSink renames the engine's `stage_started` and `stage_completed` to the existing `pivot repro --json` names for backwards compatibility, forwards `stages_expanded` with only its template, stages and removed, and forwards `pipeline_reloaded` as the Engine emits it. Log lines (on stderr) and the other engine events are not emitted in JSON mode.
 
 ## Worker Pool Management
 

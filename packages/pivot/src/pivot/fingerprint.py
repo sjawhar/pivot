@@ -4824,7 +4824,7 @@ def _lru_cache_settings(function: Any) -> list[Any] | None:
     return [_cell_value(cells["maxsize"]), _cell_value(cells["typed"])]
 
 
-_LRU_CACHE_TYPE = cast("type[Any]", functools._lru_cache_wrapper)  # pyright: ignore[reportPrivateUsage] - the C cache wrapper has no public type name
+_LRU_CACHE_TYPE: type[Any] = functools._lru_cache_wrapper  # pyright: ignore[reportPrivateUsage] - the C cache wrapper has no public type name
 
 # The code of the `cache_parameters` functions `functools.lru_cache` gives a wrapper: one where it
 # wraps a function at once (`lru_cache(f)`), one where its decorator does (`lru_cache()(f)`).

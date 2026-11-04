@@ -1,8 +1,9 @@
 """What ``pivot status`` reports for a stage mapped over a directory output (``Pipeline.map``).
 
 In a fresh process no template is expanded, so the lock, listing and restart-proof files of its
-instances belong to no registered stage. They are not orphans: a run expands the template again,
-and the removal of an instance whose key left the plan is decided at expansion (part P3).
+instances belong to no registered stage. They are not orphaned lock files: a run expands the
+template again, and removes an instance whose key left the plan at expansion; ``pivot status``
+lists such an instance as orphaned (``tests/cli/test_map_removal.py``).
 """
 
 import pathlib

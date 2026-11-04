@@ -440,7 +440,7 @@ def test_a_restart_after_a_reload_keeps_its_mapped_targets(
 def test_each_run_expands_afresh(
     set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A key that left the plan has no instance in the next run (its lock stays: part P3)."""
+    """A key that left the plan has no instance in the next run, which removes its files."""
     root = set_project_root
     _project(root, monkeypatch, {"a": 1, "b": 2})
     pipeline = _chain_pipeline(root)

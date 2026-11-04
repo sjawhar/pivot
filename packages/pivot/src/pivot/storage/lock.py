@@ -1490,6 +1490,61 @@ def stage_lock_files(stages_dir: pathlib.Path) -> dict[str, pathlib.Path]:
     return found
 
 
+def instance_files(
+    stages_dirs: Iterable[pathlib.Path], template: str
+) -> dict[str, list[pathlib.Path]]:
+    """Each instance of mapped stage ``template`` (``Pipeline.map``) that keeps a file in one of
+    ``stages_dirs``, by instance name: its locks, the listing of each directory output
+    (``listing.output_listing_path``) and its restart proofs (``restart_proof_path``), every lock
+    last. An instance is ``<template>@<key>``, its key one the variant-name rule allows and the
+    whole name one the stage-name rule allows (no lock is written under any other), so a key
+    holds no ``/`` and every such file is in the directory of ``template``'s own lock; an
+    instance of a mapped variant (``<template>@<variant>@<key>``) is that variant's, not
+    ``template``'s. A file that is not a regular one (a symlink counts as its target) is none,
+    and so is every file of a directory that cannot be listed."""
+    parent, _, base = template.rpartition("/")
+    prefix = f"{base}@"
+    found = dict[str, list[pathlib.Path]]()
+    for stages_dir in stages_dirs:
+        try:
+            entries = list(os.scandir(stages_dir / parent if parent else stages_dir))
+        except (OSError, ValueError):  # ValueError: a path holding a NUL byte
+            continue
+        for entry in entries:
+            name = entry.name
+            if not name.startswith(prefix):
+                continue
+            if name.endswith((_LOCK_SUFFIX, _RESTART_PROOF_SUFFIX)):
+                key = name[len(prefix) :].rsplit(".", 1)[0]
+            elif name.endswith(listing.SUFFIX) and "=" in name:
+                key = name[len(prefix) :].split("=", 1)[0]
+            else:
+                continue
+            instance = f"{template}@{key}"
+            try:
+                if (
+                    variant_name_error(key) is not None
+                    or stage_name_error(instance) is not None
+                    or not entry.is_file()
+                ):
+                    continue
+            except OSError:
+                continue
+            found.setdefault(instance, []).append(pathlib.Path(entry.path))
+    for files in found.values():
+        files.sort(key=lambda path: path.name.endswith(_LOCK_SUFFIX))
+    return found
+
+
+def remove_stage_files(files: Iterable[pathlib.Path]) -> None:
+    """Remove the lock, listing and restart-proof files of a stage that no longer exists, in the
+    order given (``instance_files`` puts the lock last, so a removal cut short leaves the lock,
+    which names the stage to the next removal). A file already gone is skipped."""
+    for path in files:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+
+
 class DirectoryRecord(NamedTuple):
     """A directory output one lock file records at a path (``recorded_directories``)."""
 

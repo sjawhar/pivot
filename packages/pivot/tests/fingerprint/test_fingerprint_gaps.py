@@ -4957,3 +4957,35 @@ def test_a_partial_metadata_loop_inside_a_value_is_refused(tmp_path: pathlib.Pat
     assert "CACHED" in message and "loop" in message and "StageParams" in message, message
     assert "break" in message.lower(), message
     assert not (project / "data/t/use.txt").exists()
+
+
+def test_nested_native_caches_each_retain_their_settings(tmp_path: pathlib.Path) -> None:
+    """Stacked caches copy one definition name but must not share a settings entry."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": "TYPED = False\n",
+            "values.py": (
+                "import functools\nimport settings\n\n"
+                "def first():\n"
+                '    return first.__wrapped__(x=1) + "|" + first.__wrapped__(x=1.0)\n\n'
+                "@functools.lru_cache(maxsize=0)\n"
+                "@functools.lru_cache(maxsize=None, typed=settings.TYPED)\n"
+                "def second(*, x):\n    return type(x).__name__\n\n"
+                "first.__wrapped__ = second\nVALUE = first\n"
+            ),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "int|int"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", "TYPED = False", "TYPED = True")
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "int|float"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
