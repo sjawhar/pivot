@@ -2347,10 +2347,8 @@ def test_a_captured_instance_whose_class_the_walk_refuses_refuses_the_stage():
     assert "move this value into the stage's StageParams" in message, message
 
 
-def test_a_class_method_whose_wrapped_chain_loops_is_walked_from_its_own_code():
-    """A method whose `__wrapped__` chain loops is read from its own code: a stage that names its
-    class, or captures an instance of it, is fingerprinted with the wrapper's hash, and the
-    function the wrapper calls, which its cell holds, is walked too."""
+def test_a_class_method_whose_wrapped_chain_loops_is_refused():
+    """D3: a method's metadata loop refuses both named and captured class uses."""
 
     def loops(function: typing.Callable[..., str]) -> typing.Callable[..., str]:
         @functools.wraps(function)
@@ -2373,13 +2371,12 @@ def test_a_class_method_whose_wrapped_chain_loops_is_walked_from_its_own_code():
     def names(text: str) -> str:
         return _tag(Looped(), text)
 
-    wrapper = vars(Looped)["suffix"]
-    called = wrapper.__closure__[0].cell_contents
     for stage in (captures, names):
-        manifest = fingerprint.get_stage_fingerprint(stage)
-        hashes = set(manifest.values())
-        assert fingerprint.hash_function_ast(wrapper) in hashes, manifest
-        assert fingerprint.hash_function_ast(called) in hashes, manifest
+        with pytest.raises(exceptions.StageDefinitionError) as raised:
+            fingerprint.get_stage_fingerprint(stage)
+        message = str(raised.value)
+        assert "Looped.suffix" in message and "loop" in message, message
+        assert "StageParams" in message and "break" in message.lower(), message
 
 
 def _two_partials(first: str) -> typing.Callable[[str], str]:
@@ -3246,34 +3243,34 @@ def _raise_timeout(signum: int, frame: object) -> None:
         ),
     ],
 )
-def test_a_wrapped_chain_that_loops_is_walked_from_its_own_code(loader: object, name: str):
-    """`load`, a helper it reaches, or a member the fallback to every member walks (an
-    operator on `self`) is its own `__wrapped__`. The walk reads that function from its own code
-    and ends within 10 seconds (an alarm turns a hang into a `TimeoutError`): the manifest holds
-    the function's hash, also when it is both reached and in the fallback."""
+def test_a_wrapped_chain_that_loops_is_refused(loader: object, name: str):
+    """D3: refuse reached and fallback loader members with looping metadata, without hanging."""
     previous = signal.signal(signal.SIGALRM, _raise_timeout)
     signal.setitimer(signal.ITIMER_REAL, 10)
     try:
-        with fingerprint.stage_fingerprint_scope("t/use"):
-            manifest = fingerprint.get_loader_fingerprint(loader)  # pyright: ignore[reportArgumentType]
+        with (
+            pytest.raises(exceptions.StageDefinitionError) as raised,
+            fingerprint.stage_fingerprint_scope("t/use"),
+        ):
+            fingerprint.get_loader_fingerprint(loader)  # pyright: ignore[reportArgumentType]
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
 
-    function = vars(type(loader))[name.rpartition(".")[2]]
-    assert fingerprint.hash_function_ast(function) in manifest.values(), manifest
+    message = str(raised.value)
+    assert name in message and "loop" in message, message
+    assert "StageParams" in message and "break" in message.lower(), message
 
 
-def test_each_stage_of_a_pass_whose_loader_reaches_a_looped_helper_gets_its_walk():
-    """Two stages of one fingerprint pass read the loader whose `load` reaches a helper that is
-    its own `__wrapped__`. The pass shares the member walk (`_memoized`), and each stage gets
-    the helper's hash, the second from the shared walk too."""
-    helper = vars(_LoopWrappedHelper)["helper"]
+def test_each_stage_of_a_pass_whose_loader_reaches_a_looped_helper_is_refused():
+    """D3: a shared member walk must retain the refusal for each stage in the pass."""
     with fingerprint.fingerprint_pass():
         for stage_name in ("t/first", "t/second"):
-            with fingerprint.stage_fingerprint_scope(stage_name):
-                manifest = fingerprint.get_loader_fingerprint(_LoopWrappedHelper())
-            assert fingerprint.hash_function_ast(helper) in manifest.values(), manifest
+            with (
+                pytest.raises(exceptions.StageDefinitionError, match="_LoopWrappedHelper.helper"),
+                fingerprint.stage_fingerprint_scope(stage_name),
+            ):
+                fingerprint.get_loader_fingerprint(_LoopWrappedHelper())
 
 
 def test_a_class_constant_load_reads_is_recorded_as_a_value():
@@ -3684,14 +3681,13 @@ def _reads_a_loop_callback() -> str:
     return _LoopCallbackBox().value.read()
 
 
-def test_a_callback_whose_wrapped_chain_loops_is_walked_from_its_own_code():
-    """A callback in default state whose `__wrapped__` chain loops is read from its own code:
-    the stage is fingerprinted, with the callback's hash under its wrapper key, and
-    `inspect.unwrap`'s `ValueError` never reaches the caller."""
-    manifest = fingerprint.get_stage_fingerprint(_reads_a_loop_callback)
-
-    wrappers = [key for key in manifest if key.startswith("func:") and key.endswith(".<wrapper>")]
-    assert [manifest[key] for key in wrappers] == [fingerprint.hash_function_ast(_loop_callback)]
+def test_a_callback_whose_wrapped_chain_loops_is_refused():
+    """D3: a looping callback in default state is refused by name."""
+    with pytest.raises(exceptions.StageDefinitionError) as raised:
+        fingerprint.get_stage_fingerprint(_reads_a_loop_callback)
+    message = str(raised.value)
+    assert "_loop_callback" in message and "loop" in message, message
+    assert "StageParams" in message and "break" in message.lower(), message
 
 
 _CLASS_CALLBACK_VALUE = "A"
@@ -6282,13 +6278,13 @@ def _helper_stage_calls_a_looped_cache() -> int:
     return _LOOPED_CACHE(1)
 
 
-def test_a_cache_wrapper_whose_wrapped_chain_loops_walks_the_function_it_wraps():
-    """`functools.cache` wraps a helper whose `__wrapped__` points back to the cache wrapper. The
-    walk reads the chain up to where it loops and walks the helper behind the wrapper from its own
-    code, so the global the helper reads is recorded, and nothing raises."""
-    manifest = fingerprint.get_stage_fingerprint(_helper_stage_calls_a_looped_cache)
-
-    assert manifest[_const_key("_LOOP_FACTOR")] == "3", manifest
+def test_a_cache_wrapper_whose_wrapped_chain_loops_is_refused():
+    """D3: refuse a Python/C metadata loop instead of accepting an incomplete manifest."""
+    with pytest.raises(exceptions.StageDefinitionError) as raised:
+        fingerprint.get_stage_fingerprint(_helper_stage_calls_a_looped_cache)
+    message = str(raised.value)
+    assert "_helper_looped_behind_a_cache" in message and "loop" in message, message
+    assert "StageParams" in message and "break" in message.lower(), message
 
 
 def _helper_library_enum(value: str) -> typing.Any:
@@ -6347,3 +6343,29 @@ def test_a_model_rebuilt_with_a_readable_default_is_accepted_in_the_next_pass(
         manifest = fingerprint.get_stage_fingerprint(_helper_builds_a_rebuilt_model)
 
     assert _definition_key("schema", _RebuiltDefault) in manifest, manifest
+
+
+@pytest.mark.parametrize("setting", ["typed", "maxsize"])
+@pytest.mark.parametrize("holder", ["wrapped", "partial"])
+def test_a_wrapped_library_cache_retains_its_native_settings(setting: str, holder: str) -> None:
+    """Library targets remain by-name, but a C cache's own configuration still matters."""
+
+    def make_stage(changed: bool) -> typing.Callable[[], str]:
+        def first() -> str:
+            return "safe"
+
+        cached = functools.lru_cache(
+            maxsize=0 if changed and setting == "maxsize" else None,
+            typed=changed and setting == "typed",
+        )(pow)
+        first.__wrapped__ = cached  # pyright: ignore[reportFunctionMemberAccess] - wrapper metadata under test
+        callback = first if holder == "wrapped" else functools.partial(cached)
+
+        def stage() -> str:
+            return str(callback())
+
+        return stage
+
+    before = fingerprint.get_stage_fingerprint(make_stage(False))
+    after = fingerprint.get_stage_fingerprint(make_stage(True))
+    assert before != after, "A library target does not make the cache's own settings by-name"

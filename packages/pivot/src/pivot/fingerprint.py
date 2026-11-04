@@ -106,7 +106,7 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 35 records each value by its form over a closed type table (`_form`) and walks the code
 # in it from one node table per stage (`_Walk`), keyed as a stage that names it is keyed: there
 # are no `held:` entries, and a cache hit replays the reads of the code inside a value.
-_CACHE_SCHEMA_VERSION = 37
+_CACHE_SCHEMA_VERSION = 38
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
@@ -244,7 +244,7 @@ _current_stage_name: contextvars.ContextVar[str | None] = contextvars.ContextVar
 )
 
 # Unsafe capture errors collected while recursively walking one stage's dependencies.
-_capture_errors: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+_capture_errors: contextvars.ContextVar[list["_Refusal"] | None] = contextvars.ContextVar(
     "_capture_errors", default=None
 )
 
@@ -937,7 +937,7 @@ def _type_of(value: Any) -> type[Any]:
 # annotations, `m:NAME` a callable member of a user class's own namespace, `b:INDEX` a class's
 # base, `ob:INDEX` a base its class statement names that `__bases__` does not hold
 # (`_statement_bases`), `fd:NAME` a dataclass field default, `bi:MODULE` a loaded module a function
-# body imports, `u` the function behind a C-level wrapper, `hc:INDEX` a class in type hints,
+# body imports, `lc` the native settings of a C cache wrapper, `hc:INDEX` a class in type hints,
 # `fc:INDEX` a class in a model's field annotations, `lm:NAME` a loader class's `load`, `save` or
 # `empty`, `lr:REF` a member those reach, `cfg:NAME` a loader's config field, `sd:NAME` a model's
 # field default, and `ns:NAME` an entry of the namespace of a class with no source. `hints` and
@@ -991,8 +991,10 @@ def _read_step(owner: Any, step: str) -> Any:
             case "bi":
                 module = _body_import_module(arg)
                 return _UNREAD if module is None else module
-            case "u":
-                return _unwrap_quietly(owner, _stop_at_mark)
+            case "lc":
+                attributes = _instance_dict(_type_of(owner), owner) or {}
+                settings = _lru_cache_settings(attributes.get("cache_parameters"))
+                return _UNREAD if settings is None else settings
             case "hc":
                 return _hint_classes(owner)[int(arg)]
             case "fc":
@@ -1119,7 +1121,7 @@ def _read_token(owner: Any, step: str) -> str:
     value = _read_step(owner, step)
     if value is _UNREAD:
         return "absent"
-    if step == "mc":
+    if step in ("mc", "lc"):
         return f"config:{xxhash.xxh64(_form(value).text.encode()).hexdigest()}"
     if step.startswith("d:"):
         return _default_token(value)
@@ -1428,8 +1430,11 @@ def _project(
                 ((*path, *steps), _read_token(owner, step)) for steps, owner, step in node.reads
             )
         for refusal in node.refusals:
-            message = _with_reach(refusal.message, (*path, *refusal.path))
-            _report_refusal(message, downgradable=refusal.downgradable)
+            _report_refusal(
+                refusal.message,
+                downgradable=refusal.downgradable,
+                path=(*path, *refusal.path),
+            )
         for steps, child in sorted(node.children, key=lambda edge: edge[0]):
             if id(child) not in seen:
                 seen.add(id(child))
@@ -1451,7 +1456,6 @@ _STEP_WORDS = {
     "ob": "base {} its class statement names",
     "fd": "the default of field '{}'",
     "bi": "module '{}' its body imports",
-    "u": "the function it wraps",
     "hc": "class {} of its type hints",
     "fc": "class {} of its field annotations",
     "lm": "its method '{}'",
@@ -1491,47 +1495,39 @@ _STEP_WORDS = {
 }
 
 
-_REACH_PREFIX = "Reached through: "
 # How many ways a merged refusal lists (`_merged_refusals`); the rest are counted.
 _REACHES_SHOWN = 3
 
 
-def _with_reach(message: str, path: tuple[str, ...]) -> str:
-    """`message` with a line after its first that says how the walk reached the refusal, one
-    phrase per step of `path` from the projection's root (`_STEP_WORDS`)."""
-    if not path:
-        return message
-    words = list[str]()
-    for step in path:
-        kind, _, arg = step.partition(":")
-        phrase = _STEP_WORDS.get(kind, step)
-        words.append(phrase.format(arg) if "{}" in phrase else phrase)
+def _with_reach(message: str, paths: list[tuple[str, ...]]) -> str:
+    """Render a grouped refusal once, with its first distinct reach paths in first-seen order."""
+    lines = list[str]()
+    for path in paths:
+        if not path:
+            continue
+        words = list[str]()
+        for step in path:
+            kind, _, arg = step.partition(":")
+            phrase = _STEP_WORDS.get(kind, step)
+            words.append(phrase.format(arg) if "{}" in phrase else phrase)
+        line = f"Reached through: {' -> '.join(words)}."
+        if line not in lines:
+            lines.append(line)
+    shown = lines[:_REACHES_SHOWN]
+    if len(lines) > _REACHES_SHOWN:
+        shown.append(f"Reached through {len(lines) - _REACHES_SHOWN} more paths too.")
     head, newline, rest = message.partition("\n")
-    return f"{head}\n{_REACH_PREFIX}{' -> '.join(words)}.{newline}{rest}"
+    return "\n".join([head, *shown]) + f"{newline}{rest}"
 
 
-def _merged_refusals(messages: list[str]) -> list[str]:
-    """One message per refusal, however often the walk reaches it: messages that are equal but
-    for their reach line (`_with_reach`) become one, in first-seen order, which lists the first
-    `_REACHES_SHOWN` distinct reaches and counts the rest. So one variable read by a loader's
-    `load()` and `save()`, or by one loader on two inputs, is named once."""
-    reaches = dict[str, list[str]]()
-    for message in messages:
-        head, _, rest = message.partition("\n")
-        line, newline, tail = rest.partition("\n")
-        if line.startswith(_REACH_PREFIX):
-            reaches.setdefault(f"{head}{newline}{tail}", []).append(line)
-        else:
-            reaches.setdefault(message, [])
-    merged = list[str]()
-    for body, found in reaches.items():
-        distinct = list(dict.fromkeys(found))
-        lines = distinct[:_REACHES_SHOWN]
-        if len(distinct) > _REACHES_SHOWN:
-            lines.append(f"Reached through {len(distinct) - _REACHES_SHOWN} more paths too.")
-        head, newline, rest = body.partition("\n")
-        merged.append("\n".join([head, *lines]) + f"{newline}{rest}")
-    return merged
+def _merged_refusals(refusals: list[_Refusal]) -> list[str]:
+    """Group unchanged refusal bodies and their structured paths before rendering any text."""
+    reaches = dict[str, list[tuple[str, ...]]]()
+    for refusal in refusals:
+        paths = reaches.setdefault(refusal.message, [])
+        if refusal.path not in paths:
+            paths.append(refusal.path)
+    return [_with_reach(message, paths) for message, paths in reaches.items()]
 
 
 @contextlib.contextmanager
@@ -1545,7 +1541,7 @@ def _collected_capture_errors() -> Iterator[None]:
     if _capture_errors.get() is not None:
         yield
         return
-    errors = list[str]()
+    errors = list[_Refusal]()
     token = _capture_errors.set(errors)
     try:
         yield
@@ -1574,19 +1570,18 @@ def _record_refusal(message: str, *, downgradable: bool) -> None:
     expanding[0].refusals.append(_Refusal(_walk_path.get(), message, downgradable))
 
 
-def _report_refusal(message: str, *, downgradable: bool) -> None:
-    """Add `message` to the refusals collected for the stage (`_collected_capture_errors`), or
-    raise it outside a collection; one `downgradable` is a warning under unsafe fingerprinting."""
+def _report_refusal(message: str, *, downgradable: bool, path: tuple[str, ...] = ()) -> None:
+    """Collect the refusal and its absolute path, rendering only when it is reported."""
     if downgradable and _is_unsafe_fingerprinting_enabled():
         _unsafe_capture_warning.set(True)
         if (scope := _stage_scope.get()) is not None:
             scope["unsafe"] = True
-        _logger.warning(message)
+        _logger.warning(_with_reach(message, [path]))
         return
     errors = _capture_errors.get()
     if errors is None:
-        raise exceptions.StageDefinitionError(message)
-    errors.append(message)
+        raise exceptions.StageDefinitionError(_with_reach(message, [path]))
+    errors.append(_Refusal(path, message, downgradable))
 
 
 class StageFingerprintScope(TypedDict):
@@ -1833,8 +1828,21 @@ def _check_dynamic_access(obj: Any, tree: ast.Module) -> None:
 def _expand_function(func: Callable[..., Any]) -> None:
     """The edges of a function node (`_Walk`): the globals and closure cells it reads, the
     defaults it takes, the classes in its type hints and the user modules its body imports.
-    Every wrapper's immediate target (`wr`) takes normal user/library/value admission. A C
-    wrapper also records its unwrapped target (`u`). The node table stops wrapper cycles."""
+    Every wrapper's immediate target (`wr`) takes normal user/library/value admission.
+    Looping metadata is refused; terminating C caches retain their native settings."""
+    if (message := _wrapper_loop_message(func)) is not None:
+        _record_refusal(message, downgradable=False)
+        return
+    if type(func) is _LRU_CACHE_TYPE:
+        _record_read(func, "lc")
+        settings = _read_step(func, "lc")
+        binding = _current_node().key
+        if settings is _UNREAD:
+            _admit(_form(func), binding, _bound_opaque_message(binding))
+            return
+        _entries()[f"default:{binding}.cache_parameters"] = xxhash.xxh64(
+            _form(settings).text.encode()
+        ).hexdigest()
     wrapped = _read_step(func, "wr")
     if wrapped is not _UNREAD:
         _record_read(func, "wr")
@@ -1860,20 +1868,8 @@ def _expand_function(func: Callable[..., Any]) -> None:
             _getclosurevars_cache[func] = closure_vars
     except (TypeError, AttributeError):
         metrics.end("fingerprint.getclosurevars", _t_closure)
-        # A C-level wrapper such as functools.cache or lru_cache is not a Python function, so
-        # getclosurevars rejects it. The function it wraps reads the module values, so walk
-        # that function's globals, nonlocals and defaults instead, keyed under the wrapper. The
-        # unwrap stops at a user decorator above a mark, which the walk enters, or at the mark,
-        # which it does not.
-        unwrapped = _unwrap_quietly(func, _stop_at_mark)
-        if unwrapped is not func and inspect.isfunction(unwrapped):
-            _record_read(func, "u")
-            with _walking("u"):
-                binding = f"{_current_node().key}.__wrapped__"
-                stage_name = _current_stage_name.get() or "<unknown>"
-                _process_captured_value(
-                    "__wrapped__", binding, unwrapped, func, stage_name, chain=None
-                )
+        # The immediate `wr` edge already owns the wrapped function's code and reads. Adding
+        # a second, terminal unwrap edge would give distinct functions one binding/key.
         return
     metrics.end("fingerprint.getclosurevars", _t_closure)
 
@@ -2096,18 +2092,20 @@ def _user_member_value(value: Any) -> Any:
     `@functools.cache` helper held as a class attribute, is returned, so its name is in the
     manifest. A member with a user class instance above the mark is returned too, so the walk
     refuses it rather than dropping it. Each unwrap below stops at a user decorator above a
-    mark, or at the mark (`_stop_at_mark`), and a marked object it reaches is returned; a chain
-    that loops ends before the loop (`_unwrap_quietly`), so its last function is the member.
+    mark, or at the mark (`_stop_at_mark`), and a marked object it reaches is returned. A loop
+    keeps the original member so its function node can refuse it by name.
     """
     decision = _mark_decision(value)
     if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
         return value
     if issubclass(type(value), functools.partial):
         return value
+    if _wrapper_loop_message(value) is not None:
+        return value
     if type(value) is types.FunctionType:
         if _written_in_user_source(value):
             return value
-        unwrapped = _unwrap_quietly(value, _stop_at_mark)
+        unwrapped = unwrap(value, _stop_at_mark)
         if fingerprinted_by_name(unwrapped):
             return unwrapped
         if unwrapped is not value and inspect.isfunction(unwrapped):
@@ -2122,7 +2120,7 @@ def _user_member_value(value: Any) -> Any:
     if _is_callable_instance(value) or _carries_instance(value):
         return value
     if callable(value):
-        unwrapped = _unwrap_quietly(value, _stop_at_mark)
+        unwrapped = unwrap(value, _stop_at_mark)
         if fingerprinted_by_name(unwrapped):
             return unwrapped
         if unwrapped is not value and inspect.isfunction(unwrapped):
@@ -2735,9 +2733,7 @@ def _reachable_loader_members(loader_type: type) -> list[tuple[str, Any]]:
     function, `vars(self)`, an operator, `type(self)(...)`), any member may run, so every user
     member of the class is walked (`_all_loader_members`).
 
-    A `__wrapped__` chain that loops is read up to the loop (`wrapper_chain`, `_member_functions`),
-    and each function on it is read from its own code (`_source_tree`), so the walk ends and
-    nothing on the chain is dropped.
+    A `__wrapped__` chain that loops is refused by its function node before code expansion.
     """
 
     def collect() -> list[tuple[str, Any]]:
@@ -3432,6 +3428,11 @@ def _process_captured_value(
             # hashed, but rebinding the name to another one must change the manifest.
             entries[f"ext:{binding_ref}"] = _library_name(value)
             _mark_by_name(getattr(value, "__module__", None), entries)
+            if (
+                type(value) is _LRU_CACHE_TYPE
+                and _mark_decision(value) is not _MarkDecision.BY_NAME
+            ):
+                _add_child(value, _NodeKind.FUNCTION, _callable_ref(value, binding_ref))
         case _ValueKind.LOGGER:
             return
         case _ValueKind.HOOKED:
@@ -3674,20 +3675,11 @@ def _process_partial_dependency(binding_ref: str, partial_obj: Any) -> None:
     underlying = partial_obj.func
     function_ref = f"{binding_ref}.func"
     _record_read(partial_obj, "pf")
-    kind = _value_kind(underlying)
     with _walking("pf"):
-        if kind is _ValueKind.REFUSED:
-            stage_name = _current_stage_name.get() or "<unknown>"
-            _check_non_scalar_capture(function_ref, underlying, stage_name)
-        elif kind is _ValueKind.CLASS_ABOVE_MARK:
-            _refuse_class_above_mark(underlying)
-        elif kind is _ValueKind.PARTIAL:
-            _process_partial_dependency(function_ref, underlying)
-        elif callable(underlying) and is_user_code(underlying):
-            _add_callable(underlying, function_ref)
-        elif callable(underlying):
-            entries[f"ext:{function_ref}"] = _library_name(underlying)
-            _mark_by_name(getattr(underlying, "__module__", None), entries)
+        stage_name = _current_stage_name.get() or "<unknown>"
+        _process_captured_value(
+            function_ref, function_ref, underlying, partial_obj, stage_name, chain=None
+        )
 
 
 def _resolve_annotations_individually(func: Callable[..., Any]) -> dict[str, Any]:
@@ -3735,14 +3727,12 @@ def _resolved_type_hints(func: Callable[..., Any]) -> dict[str, Any]:
             hints = dict[str, Any]()
         else:
             try:
-                # With a mark below, resolve in `func`'s own globals: by default
-                # `get_type_hints` follows `__wrapped__` to the globals at the end of the chain,
-                # and on a chain that loops (`f.__wrapped__ = f`) it never ends, so a wrapper's
-                # globals are those of the end of its chain as `wrapper_chain` reads it.
+                # Explicit globals keep typing from following wrapper metadata itself. A
+                # looping chain falls back to individual annotations; the node refuses it.
                 if marked is not None:
                     globalns = getattr(func, "__globals__", {})
                 elif hasattr(func, "__wrapped__"):
-                    globalns = getattr(_unwrap_quietly(func), "__globals__", {})
+                    globalns = getattr(unwrap(func), "__globals__", {})
                 else:
                     globalns = None
                 hints = typing.get_type_hints(func, globalns=globalns)
@@ -4508,6 +4498,8 @@ class _FormBuilder:
         return self.part_rows(["bmethod", value.__qualname__], ("ms", value.__self__))
 
     def partial(self, value: Any) -> Any:
+        if _read_step(value, "wr") is not _UNREAD:
+            self.report(_ReportKind.FUNCTION, value)
         return self.partial_rows(value.func, value.args, value.keywords)
 
     def partial_rows(self, func: Any, args: tuple[Any, ...], keywords: Mapping[str, Any]) -> _Rows:
@@ -4832,6 +4824,8 @@ def _lru_cache_settings(function: Any) -> list[Any] | None:
     return [_cell_value(cells["maxsize"]), _cell_value(cells["typed"])]
 
 
+_LRU_CACHE_TYPE = cast("type[Any]", functools._lru_cache_wrapper)  # pyright: ignore[reportPrivateUsage] - the C cache wrapper has no public type name
+
 # The code of the `cache_parameters` functions `functools.lru_cache` gives a wrapper: one where it
 # wraps a function at once (`lru_cache(f)`), one where its decorator does (`lru_cache()(f)`).
 _LRU_PARAMETERS_CODES = tuple(
@@ -4923,7 +4917,7 @@ _ROWS: dict[int, Callable[[_FormBuilder, Any], Any]] = {
     id(staticmethod): _FormBuilder.method_wrapper,
     id(property): _FormBuilder.property_row,
     id(functools.cached_property): _FormBuilder.cached_property_row,
-    id(functools._lru_cache_wrapper): _FormBuilder.cache_wrapper,  # pyright: ignore[reportPrivateUsage] - the C cache wrapper's type has no public name
+    id(_LRU_CACHE_TYPE): _FormBuilder.cache_wrapper,
     id(types.GenericAlias): _FormBuilder.type_alias,
     id(cast("type[Any]", type(Callable[..., object]))): _FormBuilder.type_alias,
     id(types.UnionType): _FormBuilder.union_alias,
@@ -6342,12 +6336,45 @@ def unwrap(obj: Any, stop: Callable[[Any], bool] | None = None) -> Any:
     return end
 
 
-def _unwrap_quietly(obj: Any, stop: Callable[[Any], bool] | None = None) -> Any:
-    """`unwrap`, but a chain that loops ends at its last object before the loop
-    (`wrapper_chain`) instead of raising: the walk reads each function on such a chain from its
-    own code, so nothing on it is dropped."""
-    *_, end = wrapper_chain(obj, stop)
-    return end
+def _wrapper_loop_message(obj: Any) -> str | None:
+    """Name a loop in statically readable wrapper links, including partial targets.
+
+    This only inspects supported function/wrapper objects, never an arbitrary value's hooks.
+    It is pure: replay and identity construction must not report refusals.
+    """
+    if not issubclass(_type_of(obj), functools.partial) and _read_step(obj, "wr") is _UNREAD:
+        return None
+    chain = list[Any]()
+    positions = dict[int, int]()
+    current = obj
+    while issubclass(_type_of(current), (types.FunctionType, _LRU_CACHE_TYPE, functools.partial)):
+        if (position := positions.get(id(current))) is not None:
+            loop = chain[position:]
+            names = list[str]()
+            for item in loop:
+                if issubclass(_type_of(item), functools.partial):
+                    attributes = _instance_dict(_type_of(item), item) or {}
+                    label = attributes.get("__qualname__")
+                    names.append(
+                        f"functools.partial '{label}'"
+                        if type(label) is str
+                        else "functools.partial"
+                    )
+                else:
+                    names.append(_definition_ref(item))
+            return (
+                f"__wrapped__ loop involving {', '.join(dict.fromkeys(names))}.\n"
+                "Fix: break the wrapper loop or move this value into the stage's StageParams."
+            )
+        positions[id(current)] = len(chain)
+        chain.append(current)
+        wrapped = _read_step(current, "wr")
+        if wrapped is _UNREAD:
+            if not issubclass(_type_of(current), functools.partial):
+                return None
+            wrapped = current.func
+        current = wrapped
+    return None
 
 
 def _mark_chain(obj: Any) -> Iterator[Any]:
@@ -6537,8 +6564,7 @@ def _source_object(func: Any) -> Any:
     `_stop_at_mark`: for a user function decorator above the mark this returns the decorator's
     code object, whose own lines `inspect.getsource` reads (a code object has no
     `__wrapped__`); for the mark itself it returns None. No source read reaches a marked body.
-    On a chain that loops (`f.__wrapped__ = f`) there is no end to read, so the read is of
-    `func`'s own code.
+    A loop has no source target and returns None; the function node reports its named refusal.
     """
     decision = _mark_decision(func)
     if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
@@ -6546,8 +6572,7 @@ def _source_object(func: Any) -> Any:
     try:
         target = unwrap(func, stop=_stop_at_mark)
     except ValueError:
-        code = getattr(func, "__code__", None)
-        return code if isinstance(code, types.CodeType) else None
+        return None
     if fingerprinted_by_name(target):
         return None
     if _stop_at_mark(target):

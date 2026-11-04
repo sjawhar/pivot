@@ -2121,14 +2121,10 @@ _LOOP_WRAPPED = {
 
 
 @pytest.mark.parametrize("looped", sorted(_LOOP_WRAPPED))
-def test_a_loader_method_whose_wrapped_chain_loops_is_walked_from_its_own_code(
+def test_a_loader_method_whose_wrapped_chain_loops_is_refused(
     tmp_path: pathlib.Path, looped: str
 ) -> None:
-    """`Inner.load`, `_suffix`, which `load` reaches, or `_suffix` as a member the fallback to
-    every member walks, is its own `__wrapped__` (its decorator sets it). The walk reads that
-    function from its own code: `pivot repro` runs the stage and ends (`helpers.run_pivot`
-    stops a run after 300 seconds), an edit to the function's body reruns it, and the next run
-    reuses the result."""
+    """D3: a loader's looping wrapper metadata refuses instead of being walked."""
     project = _project(
         tmp_path,
         {
@@ -2136,7 +2132,12 @@ def test_a_loader_method_whose_wrapped_chain_loops_is_walked_from_its_own_code(
             "pipeline.py": _HELD_INSTANCE_HEADER + _held_stage("Inner()"),
         },
     )
-    _assert_an_edit_reruns_once(project, tmp_path / "home", "inner.py")
+    refused = helpers.run_pivot(project, tmp_path / "home", "repro")
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "__wrapped__" in message and "loop" in message, message
+    assert ("Inner.load" if looped == "load" else "Inner._suffix") in message, message
+    assert "StageParams" in message and "break" in message.lower(), message
 
 
 _ROW_FACTORY = """\
@@ -3788,12 +3789,10 @@ def test_a_callback_that_reads_its_enclosing_class_runs_and_caches(
     assert _repro_statuses(project, home) == {"t/use": "cached"}
 
 
-def test_a_callback_whose_wrapped_chain_loops_runs_and_caches(
+def test_a_callback_whose_wrapped_chain_loops_is_refused(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A callback in a dataclass default has `__wrapped__` pointing to itself. The walk reads it
-    from its own code, so `repro` runs the stage, with no `ValueError` from `inspect.unwrap`, and
-    the next run reuses the result."""
+    """D3: refuse a looping callback in default state by its name, before execution."""
     home = tmp_path / "home"
     looping = _CALLBACK_CYCLE.replace(
         "def class_callback() -> str:\n    return CycleBox.marker\n",
@@ -3801,9 +3800,11 @@ def test_a_callback_whose_wrapped_chain_loops_runs_and_caches(
     )
     project = _project(tmp_path, {"cycle.py": looping, "pipeline.py": _CALLBACK_CYCLE_PIPELINE})
 
-    assert _repro_statuses(project, home) == {"t/use": "ran"}
-    assert (project / "data" / "t" / "use.txt").read_text() == "Local Set Default Proof Usingsafe"
-    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    refused = helpers.run_pivot(project, home, "repro")
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "class_callback" in message and "loop" in message, message
+    assert "StageParams" in message and "break" in message.lower(), message
 
 
 _CONFIG_HELD = """\
@@ -4594,17 +4595,9 @@ with Pipeline("t") as pipeline:
 """
 
 
-@pytest.mark.parametrize(
-    ("definition", "read", "before", "after"),
-    [
-        pytest.param(_WRAPPED_PAIR, "value()", "GA", "GB", id="wrapped-pair"),
-        pytest.param(_SLOTTED_NUMPY_SCALAR, "value.tag", "A", "B", id="numpy-slot"),
-    ],
-)
-def test_an_edit_behind_a_wrapped_cycle_or_in_a_numpy_slot_reruns_its_stage(
-    tmp_path: pathlib.Path, definition: str, read: str, before: str, after: str
-) -> None:
-    """A cache hit must follow every Python wrapper and form a scalar subclass's slots."""
+def test_an_edit_in_a_numpy_scalar_slot_reruns_its_stage(tmp_path: pathlib.Path) -> None:
+    """Form a scalar subclass's slots on a cache hit and after a reset."""
+    definition, read, before, after = _SLOTTED_NUMPY_SCALAR, "value.tag", "A", "B"
     home = tmp_path / "home"
     project = _project(
         tmp_path,
@@ -4625,6 +4618,24 @@ def test_an_edit_behind_a_wrapped_cycle_or_in_a_numpy_slot_reruns_its_stage(
     reset = helpers.run_pivot(project, home, "fingerprint", "reset")
     assert reset.returncode == 0, reset.stdout + reset.stderr
     assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+def test_a_two_function_wrapped_cycle_is_refused_by_name(tmp_path: pathlib.Path) -> None:
+    """D3: refuse both functions on a Python metadata loop, including through a partial."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": "import settings\n\n" + _WRAPPED_PAIR,
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+    refused = helpers.run_pivot(project, tmp_path / "home", "repro")
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "values.first" in message and "values.second" in message, message
+    assert "loop" in message and "StageParams" in message, message
+    assert "break" in message.lower(), message
 
 
 @pytest.mark.parametrize("slotted", [False, True], ids=["method", "slot"])
@@ -4813,14 +4824,15 @@ def test_a_stdlib_alias_or_library_wrapped_target_runs_and_caches(
     assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
 
 
-@pytest.mark.parametrize("wrapper", ["cache", "lru_cache", "partial"])
-def test_a_mixed_python_and_c_wrapper_cycle_tracks_each_function(
+@pytest.mark.parametrize("wrapper", ["cache", "lru_cache", "partial", "partial-target"])
+def test_a_mixed_python_and_c_wrapper_cycle_is_refused_by_name(
     tmp_path: pathlib.Path, wrapper: str
 ) -> None:
     constructors = {
         "cache": "functools.cache(second)",
         "lru_cache": "functools.lru_cache(maxsize=8)(second)",
         "partial": "functools.partial(second)",
+        "partial-target": "functools.partial(second)",
     }
     definition = (
         "import functools\nimport settings\n\n"
@@ -4841,12 +4853,107 @@ def test_a_mixed_python_and_c_wrapper_cycle_tracks_each_function(
             "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
         },
     )
-    output = project / "data/t/use.txt"
+    refused = helpers.run_pivot(project, home, "repro")
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "values.first" in message and "CACHED" in message, message
+    if wrapper != "partial":
+        assert "values.second" in message, message
+    assert "loop" in message and "StageParams" in message, message
+    assert "break" in message.lower(), message
 
+
+@pytest.mark.parametrize("extra_link", [False, True], ids=["two-functions", "three-functions"])
+def test_a_nonlooping_c_wrapper_keeps_each_functions_code(
+    tmp_path: pathlib.Path, extra_link: bool
+) -> None:
+    """Distinct immediate and terminal functions must not overwrite one manifest entry."""
+    definition = (
+        'import functools\n\ndef first():\n    return "A"\n\n'
+        'def second():\n    return "unused"\n\n'
+        'def third():\n    return "also unused"\n\n'
+        "CACHED = functools.cache(first)\n"
+        'CACHED.__name__ = CACHED.__qualname__ = "CACHED"\n'
+        "first.__wrapped__ = second\n" + ("second.__wrapped__ = third\n" if extra_link else "")
+    )
+    project = _project(
+        tmp_path,
+        {
+            "values.py": definition,
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()")
+            .replace("HELD = functools.partial(read, values.VALUE)", "")
+            .replace("return HELD(text)", "return values.CACHED()"),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
     assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
-    assert output.read_text() == "GA"
+    assert output.read_text() == "A"
     assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
-    _edit(project, "settings.py", '"A"', '"B"')
-    assert _repro_statuses(project, home, "7") == {"t/use": "ran"}
-    assert output.read_text() == "GB"
+    _edit(project, "values.py", 'return "A"', 'return "B"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "B"
     assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+@pytest.mark.parametrize("setting", ["typed", "maxsize"])
+def test_a_nonlooping_wrapped_cache_tracks_its_native_settings(
+    tmp_path: pathlib.Path, setting: str
+) -> None:
+    """A C wrapper reached only through metadata must retain its native configuration."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": "TYPED = False\nMAXSIZE = None\n",
+            "values.py": (
+                "import functools\nimport settings\n\n"
+                "def first():\n"
+                '    return first.__wrapped__(x=1) + "|" + first.__wrapped__(x=1.0)\n\n'
+                "def second(*, x):\n    return type(x).__name__\n\n"
+                "CACHED = functools.lru_cache(maxsize=settings.MAXSIZE, typed=settings.TYPED)(second)\n"
+                'CACHED.__name__ = CACHED.__qualname__ = "CACHED"\n'
+                "first.__wrapped__ = CACHED\nVALUE = first\n"
+            ),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "int|int"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    if setting == "typed":
+        _edit(project, "settings.py", "TYPED = False", "TYPED = True")
+    else:
+        _edit(project, "settings.py", "MAXSIZE = None", "MAXSIZE = 0")
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "int|float"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+def test_a_partial_metadata_loop_inside_a_value_is_refused(tmp_path: pathlib.Path) -> None:
+    """A partial nested in state must not lose its own wrapper metadata in the value form."""
+    project = _project(
+        tmp_path,
+        {
+            "values.py": (
+                'import functools\n\ndef first():\n    return "safe"\n\n'
+                "CACHED = functools.partial(first)\n"
+                'CACHED.__qualname__ = "CACHED"\nCACHED.__wrapped__ = CACHED\n'
+                'VALUE = {"callback": CACHED}\n'
+            ),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read='value["callback"]()'),
+        },
+    )
+    refused = helpers.run_pivot(project, tmp_path / "home", "repro")
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "CACHED" in message and "loop" in message and "StageParams" in message, message
+    assert "break" in message.lower(), message
+    assert not (project / "data/t/use.txt").exists()

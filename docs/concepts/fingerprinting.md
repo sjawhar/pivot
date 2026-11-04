@@ -258,11 +258,13 @@ content, including text that looks like a memory address, an exception by its
 arguments, attributes and built-in value fields such as `OSError.filename`, an
 object by its attributes and `__slots__`, and a function or classmethod an
 object holds (a callback) with the module values it reads. A callback that reads
-its own enclosing class stops at that class. A callback whose `__wrapped__` chain
-loops is walked from its own code, each function on the chain once. The same walk
-follows Python functions, C cache wrappers and partial wrappers; a library target
-such as `json.dumps` is recorded by name, not walked as user code. An `Enum` member
-is hashed with its value, and known exact stdlib type expressions such as
+its own enclosing class stops at that class. A `__wrapped__` chain that loops is
+refused by name, including Python/C cache wrappers and chains through partials:
+break the loop or move the value into `StageParams`. A chain that ends is walked
+one function at a time, including each Python function's reads and each C cache
+wrapper's `maxsize` and `typed` settings, read without calling `cache_parameters`.
+A library target such as `json.dumps` is recorded by name, not walked as user code.
+An `Enum` member is hashed with its value, and known exact stdlib type expressions such as
 `list[int]`, `str | None` or `collections.abc.Callable[[int], str]` by their origin
 and arguments. A user subclass of `types.GenericAlias` is refused: its native
 alias fields do not describe its Python behavior or state. A numpy scalar subclass
