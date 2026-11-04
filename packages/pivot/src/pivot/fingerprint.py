@@ -106,7 +106,7 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 35 records each value by its form over a closed type table (`_form`) and walks the code
 # in it from one node table per stage (`_Walk`), keyed as a stage that names it is keyed: there
 # are no `held:` entries, and a cache hit replays the reads of the code inside a value.
-_CACHE_SCHEMA_VERSION = 39
+_CACHE_SCHEMA_VERSION = 40
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
@@ -1834,7 +1834,7 @@ def _expand_function(func: Callable[..., Any]) -> None:
     The shared follower refuses loops and excessive depth before any chain is admitted."""
     if _mark_decision(func) is _MarkDecision.BY_NAME:
         return
-    chain = wrapper_chain(func, follow_partials=True)
+    chain = wrapper_chain(func, stop=fingerprinted_by_name, follow_partials=True)
     next(chain)
     try:
         wrapped = next(chain, _UNREAD)
@@ -1866,14 +1866,13 @@ def _expand_function(func: Callable[..., Any]) -> None:
                 _process_captured_value(
                     "__wrapped__", binding, wrapped, func, stage_name, chain=None
                 )
-    if not is_user_code(func):
-        return
     tree = _source_tree(func)
-    # Definition-time refusals read the wrapped source, as on main; dependency reads and
-    # body imports use this function's own code.
-    check_tree = _wrapped_source_tree(func) if hasattr(func, "__wrapped__") else tree
-    if check_tree is not None:
-        _check_dynamic_access(func, check_tree)
+    # Definition-time refusals apply to user code, as on main. A library-defined stage
+    # still owns the globals, closure values and defaults its executed body reads.
+    if is_user_code(func):
+        check_tree = _wrapped_source_tree(func) if hasattr(func, "__wrapped__") else tree
+        if check_tree is not None:
+            _check_dynamic_access(func, check_tree)
     _t_closure = metrics.start()
     try:
         # Use cached result if available (getclosurevars is expensive at ~0.5ms)
@@ -2822,17 +2821,21 @@ def _member_values(name: str, raw: Any) -> list[tuple[str, Any]]:
 
 
 def _member_functions(function: Any, owner: type, raw: Any) -> list[tuple[Any, type, bool]]:
-    """The functions whose bodies the reachable walk reads for a member function, each with
-    the class that holds the member and whether it takes the instance first: each function a
-    `functools.wraps` chain wraps (`wrapper_chain`) that user source defines, and
-    each wrapper on the chain but one that only forwards `*args` to what it wraps (it names no
-    member, and receives the instance unnamed, which `_member_reads` would read as a dynamic
-    use)."""
+    """The Python bodies a member's wrapper chain reaches, with their class and receiver mode.
+
+    Follow native caches and Python wrappers up to a by-name mark. A wrapper that only
+    forwards `*args` names no member and receives the instance unnamed, which `_member_reads`
+    would read as a dynamic use, so its body is skipped here.
+    """
     takes_self = not isinstance(raw, staticmethod)
     functions = list[tuple[Any, type, bool]]()
     try:
-        for current in wrapper_chain(function):
+        for current in wrapper_chain(function, stop=fingerprinted_by_name):
             if not inspect.isfunction(current):
+                if type(current) is _LRU_CACHE_TYPE:
+                    continue
+                break
+            if fingerprinted_by_name(current):
                 break
             forwards = hasattr(current, "__wrapped__") and current.__code__.co_argcount == 0
             if not forwards and (current is function or _written_in_user_source(current)):
@@ -3036,41 +3039,41 @@ def _process_instance_class_attributes(cls: type) -> None:
     seen = set[str]()
     for label, member in _user_methods(cls):
         function = member.__func__ if type(member) is types.MethodType else member
-        # A member recorded by name (`@fingerprint_by_name`) is not read: its body is the mark's.
-        if type(function) is not types.FunctionType or _recorded_by_name(function):
+        # A member recorded by name is a boundary; wrappers above it keep their own reads.
+        if _recorded_by_name(function):
             continue
-        tree = _source_tree(function)
-        if tree is None:
-            continue
-        raw = namespace.get(label)
-        reads, dynamic = _member_reads(tree, takes_self=not issubclass(type(raw), staticmethod))
-        if dynamic:
-            continue
-        for _via_super, name in reads:
-            if (
-                name in seen
-                or name.startswith("__")
-                or name in fields
-                or not _is_user_class_attribute(cls, name)
-            ):
+        for body, _owner, takes_self in _member_functions(function, cls, namespace.get(label)):
+            tree = _source_tree(body)
+            if tree is None:
                 continue
-            seen.add(name)
-            binding_ref = f"{class_ref}.{name}"
-            if name == "model_config" and _is_pydantic_model(cls):
-                _process_model_config(cls, binding_ref)
+            reads, dynamic = _member_reads(tree, takes_self=takes_self)
+            if dynamic:
                 continue
-            step = f"ca:{name}"
-            value = _read_step(cls, step)
-            if value is _UNREAD:
-                continue
-            _record_read(cls, step)
-            with _walking(step):
-                if _is_user_enum_member(value):
-                    _entries()[f"const:{binding_ref}"] = _enum_member_text(value)
-                else:
-                    _process_captured_value(
-                        binding_ref, binding_ref, value, function, stage_name, chain=None
-                    )
+            for _via_super, name in reads:
+                if (
+                    name in seen
+                    or name.startswith("__")
+                    or name in fields
+                    or not _is_user_class_attribute(cls, name)
+                ):
+                    continue
+                seen.add(name)
+                binding_ref = f"{class_ref}.{name}"
+                if name == "model_config" and _is_pydantic_model(cls):
+                    _process_model_config(cls, binding_ref)
+                    continue
+                step = f"ca:{name}"
+                value = _read_step(cls, step)
+                if value is _UNREAD:
+                    continue
+                _record_read(cls, step)
+                with _walking(step):
+                    if _is_user_enum_member(value):
+                        _entries()[f"const:{binding_ref}"] = _enum_member_text(value)
+                    else:
+                        _process_captured_value(
+                            binding_ref, binding_ref, value, body, stage_name, chain=None
+                        )
 
 
 def _is_pydantic_model(cls: type[Any]) -> bool:
@@ -4830,9 +4833,11 @@ class _Contents:
 
 
 def _lru_cache_settings(function: Any) -> list[Any] | None:
-    """The `maxsize` and `typed` of a `functools.lru_cache` wrapper, from the closure of the
-    `cache_parameters` function `lru_cache` gave it (one of `_LRU_PARAMETERS_CODES`), which is not
-    called; None when the wrapper holds another one."""
+    """The settings exposed by a stdlib `cache_parameters` closure, without calling it.
+
+    Stacked native caches can expose a copied inner closure, not their own settings.
+    Return None for an accessor not made by stdlib `lru_cache`.
+    """
     if type(function) is not types.FunctionType:
         return None
     code = function.__code__

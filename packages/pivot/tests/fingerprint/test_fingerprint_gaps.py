@@ -5138,3 +5138,122 @@ def test_a_native_cache_in_a_partial_argument_reruns_on_a_module_value_edit(
     reset = helpers.run_pivot(project, home, "fingerprint", "reset")
     assert reset.returncode == 0, reset.stdout + reset.stderr
     assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+def test_a_library_defined_stage_keeps_its_project_value_dependencies(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A library stage is a root, not an external helper admitted only by name."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "pipeline.py": (
+                "from pivot import Pipeline, stage\nimport library_stage\n"
+                "\nuse = stage(library_stage.use)\n"
+                '\nwith Pipeline("t") as pipeline:\n'
+                '    use(pipeline.input("lines.txt", t=str))\n'
+            ),
+        },
+    )
+    support = tmp_path / "support/site-packages"
+    support.mkdir(parents=True)
+    (support / "library_stage.py").write_text(
+        "import settings\n\ndef use(text: str) -> str:\n    return settings.VALUE\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", f"{project}:{support}")
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "A"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", 'VALUE = "A"', 'VALUE = "B"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "B"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+def test_a_wrapped_by_name_boundary_hides_only_the_marked_metadata_loop(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Validation stops at a mark while the Python decorator above it keeps its own code."""
+    project = _project(
+        tmp_path,
+        {
+            "values.py": (
+                "import functools\nfrom pivot import fingerprint_by_name\n\n"
+                '@fingerprint_by_name\ndef original():\n    return "A"\n\n'
+                "original.__wrapped__ = original\n\n"
+                "@functools.wraps(original)\ndef decorated():\n"
+                '    return original() + "!"\n'
+            ),
+            "pipeline.py": (
+                "from pivot import Pipeline, stage\nimport values\n"
+                "\n@stage\ndef use(text: str) -> str:\n    return values.decorated()\n"
+                '\nwith Pipeline("t") as pipeline:\n'
+                '    use(pipeline.input("lines.txt", t=str))\n'
+            ),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "A!"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "values.py", 'return "A"', 'return "B"')
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    _edit(project, "values.py", '+ "!"', '+ "?"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "B?"
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+@pytest.mark.parametrize(
+    "decorator",
+    ["functools.cache", "functools.lru_cache(maxsize=8)", "forward"],
+)
+def test_a_wrapped_method_keeps_its_receiver_class_attribute_reads(
+    tmp_path: pathlib.Path, decorator: str
+) -> None:
+    """Preserving method wrappers must not discard the executed method's self.SUFFIX read."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": (
+                "import functools\nimport settings\n\n"
+                "def forward(fn):\n"
+                "    @functools.wraps(fn)\n"
+                "    def wrapper(*args, **kwargs):\n        return fn(*args, **kwargs)\n"
+                "    return wrapper\n\n"
+                "class Captured:\n    SUFFIX = settings.VALUE\n\n"
+                f"    @{decorator}\n"
+                "    def suffix(self):\n        return self.SUFFIX\n\n"
+                'def read(value, text):\n    return "x" + value.suffix()\n\n'
+                "HELD = functools.partial(read, Captured())\n"
+            ),
+            "pipeline.py": (
+                "from pivot import Pipeline, stage\nimport values\n"
+                "\n@stage\ndef use(text: str) -> str:\n    return values.HELD(text)\n"
+                '\nwith Pipeline("t") as pipeline:\n'
+                '    use(pipeline.input("lines.txt", t=str))\n'
+            ),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "xA"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", 'VALUE = "A"', 'VALUE = "B"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "xB"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
