@@ -347,9 +347,9 @@ def test_push_dry_run_warns_for_a_legacy_cache(
         cached.parent.mkdir(parents=True)
         cached.write_text("cached\n")
         mocker.patch.object(project, "_project_root_cache", None)
-        mocker.patch.object(
-            transfer, "create_remote_from_name", return_value=(mocker.MagicMock(), "origin")
-        )
+        remote = mocker.MagicMock()
+        remote.bulk_exists = mocker.AsyncMock(return_value={_HASH: False})
+        mocker.patch.object(transfer, "create_remote_from_name", return_value=(remote, "origin"))
 
         result = runner.invoke(cli.cli, ["push", "--dry-run"])
 
@@ -370,9 +370,9 @@ def test_push_dry_run_stays_silent_for_a_current_cache(
         cached.parent.mkdir(parents=True)
         cached.write_text("cached\n")
         mocker.patch.object(project, "_project_root_cache", None)
-        mocker.patch.object(
-            transfer, "create_remote_from_name", return_value=(mocker.MagicMock(), "origin")
-        )
+        remote = mocker.MagicMock()
+        remote.bulk_exists = mocker.AsyncMock(return_value={_HASH: False})
+        mocker.patch.object(transfer, "create_remote_from_name", return_value=(remote, "origin"))
 
         result = runner.invoke(cli.cli, ["push", "--dry-run"])
 

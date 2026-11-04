@@ -494,6 +494,7 @@ def test_a_naming_step_reuses_the_layout_it_resolved_until_files_changes(
     files = cache_dir / "files"
     files.mkdir()
     monkeypatch.setattr(naming, "_STORE_LAYOUTS", dict[pathlib.Path, naming._KnownLayout]())
+    monkeypatch.setattr(naming, "_mount_generation", lambda: 0)
     resolved = list[pathlib.Path]()
     mount_root = naming._mount_root
 

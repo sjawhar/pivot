@@ -11,7 +11,7 @@ from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import cache, listing, track
 from pivot.storage import state as state_mod
-from pivot.types import Recovery, RemoteStatus, StageExplanation
+from pivot.types import Recovery, StageExplanation
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -577,51 +577,49 @@ def test_remote_status_no_remotes_configured(tmp_path: pathlib.Path, mocker: Moc
         status.get_remote_status(None, tmp_path)
 
 
-def test_remote_status_no_local_hashes(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
-    """Should return zero counts when no local cache files exist."""
-    mocker.patch.object(remote_config, "list_remotes", return_value={"origin": "s3://bucket"})
-    mocker.patch.object(
-        transfer, "create_remote_from_name", return_value=(mocker.MagicMock(), "origin")
-    )
-    mocker.patch.object(remote_config, "get_remote_url", return_value="s3://bucket/prefix")
-    mocker.patch.object(transfer, "get_local_cache_hashes", return_value=set())
+@pytest.mark.parametrize(
+    ("cached", "on_remote", "expected"),
+    [
+        pytest.param(
+            ["1111111111111111", "2222222222222222"],
+            {"2222222222222222", "3333333333333333", "4444444444444444"},
+            (1, 2),
+            id="shared",
+        ),
+        pytest.param(
+            [],
+            {"2222222222222222", "3333333333333333", "4444444444444444"},
+            (0, 3),
+            id="fresh-clone",
+        ),
+    ],
+)
+def test_remote_status_counts_what_push_and_pull_would_transfer(
+    set_project_root: pathlib.Path,
+    mocker: MockerFixture,
+    cached: list[str],
+    on_remote: set[str],
+    expected: tuple[int, int],
+) -> None:
+    """push_count is the cached objects the remote lacks; pull_count is the remote's objects
+    the cache lacks, which in a fresh clone is every object on the remote."""
+    cache_dir = set_project_root / ".pivot" / "cache"
+    for hash_ in cached:
+        path = cache.get_cache_path(cache_dir / "files", hash_)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(hash_)
+    remote = mocker.MagicMock()
+    remote.url = "s3://bucket/prefix"
+    remote.list_hashes = mocker.AsyncMock(return_value=on_remote)
+    mocker.patch.object(remote_config, "list_remotes", return_value={"origin": remote.url})
+    mocker.patch.object(transfer, "create_remote_from_name", return_value=(remote, "origin"))
+    mocker.patch.object(remote_config, "get_remote_url", return_value=remote.url)
 
-    result = status.get_remote_status(None, tmp_path)
+    result = status.get_remote_status(None, cache_dir)
 
     assert result["name"] == "origin"
     assert result["url"] == "s3://bucket/prefix"
-    assert result["push_count"] == 0
-    assert result["pull_count"] == 0
-
-
-def test_remote_status_with_local_hashes(tmp_path: pathlib.Path, mocker: MockerFixture) -> None:
-    """Should return push/pull counts from compare_status."""
-    mocker.patch.object(remote_config, "list_remotes", return_value={"origin": "s3://bucket"})
-    mocker.patch.object(
-        transfer, "create_remote_from_name", return_value=(mocker.MagicMock(), "origin")
-    )
-    mocker.patch.object(remote_config, "get_remote_url", return_value="s3://bucket/prefix")
-    mocker.patch.object(transfer, "get_local_cache_hashes", return_value={"hash1", "hash2"})
-
-    async def mock_compare_status(*args: object) -> RemoteStatus:
-        return RemoteStatus(
-            local_only={"hash1"},
-            remote_only={"hash3", "hash4", "hash5"},
-            common={"hash2"},
-        )
-
-    mocker.patch.object(transfer, "compare_status", side_effect=mock_compare_status)
-    mock_state_db = mocker.MagicMock()
-    mock_state_db.__enter__ = mocker.MagicMock(return_value=mock_state_db)
-    mock_state_db.__exit__ = mocker.MagicMock(return_value=False)
-    mocker.patch.object(state_mod, "StateDB", return_value=mock_state_db)
-
-    result = status.get_remote_status(None, tmp_path)
-
-    assert result["name"] == "origin"
-    assert result["url"] == "s3://bucket/prefix"
-    assert result["push_count"] == 1, "Should count local_only hashes"
-    assert result["pull_count"] == 3, "Should count remote_only hashes"
+    assert (result["push_count"], result["pull_count"]) == expected
 
 
 # =============================================================================

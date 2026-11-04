@@ -420,6 +420,7 @@ def modules_from_files(paths: set[str]) -> set[str]:
 
 def check_stage(
     manifest: Mapping[str, str],
+    outputs: Collection[str],
     imported: Iterable[str],
     coordinator_token: str,
     coordinator_digests: Mapping[str, str] | None,
@@ -427,9 +428,10 @@ def check_stage(
     """The user modules one stage used that it cannot trust: (edited, unreadable).
 
     A stage used a module when its manifest hashes that module's code or values (a `func:`,
-    `class:`, `const:`, `default:`, `schema:`, `partial:` or `loader:` entry, not an `ext:`
-    by-name entry), or when it imported the module while it ran (`imported`). A module another
-    stage on this worker used is not this stage's concern.
+    `class:`, `const:`, `default:`, `schema:`, `partial:` or `loader:` entry, its loaders'
+    included, which the stage's output keys `outputs` place; not an `ext:` by-name entry), or
+    when it imported the module while it ran (`imported`). A module another stage on this worker
+    used is not this stage's concern.
 
     Edited: this process holds a record for the module (path and content) that differs from
     the coordinator's, so the stage ran code its fingerprint does not describe. A different file
@@ -456,7 +458,7 @@ def check_stage(
             expected = {}
             records_stale = True
         known.update(expected)
-    used = _manifest_modules(manifest, known)
+    used = _manifest_modules(manifest, outputs, known)
     used.update(name for name in imported if name in known)
     edited = list[str]()
     unreadable = list[str]()
@@ -715,19 +717,24 @@ def _warn_unreadable(name: str, reason: str | None) -> None:
     )
 
 
-def _manifest_modules(manifest: Mapping[str, str], known: set[str]) -> set[str]:
-    """The names in `known` whose code or values a manifest entry hashes (`_CODE_KINDS`)."""
+def _manifest_modules(
+    manifest: Mapping[str, str], outputs: Collection[str], known: set[str]
+) -> set[str]:
+    """The names in `known` whose code or values a manifest entry hashes: an entry whose kind is
+    one of `_CODE_KINDS`, with the module named first in what follows the kind (up to a `:`).
+    Each entry is read as its walk keyed it (`fingerprint.manifest_entries`, which the stage's
+    output keys `outputs` place), so no dependency, output, field or stage named like a kind is
+    read as one."""
     used = set[str]()
-    for key in manifest:
-        parts = key.split(":")
-        for index, kind in enumerate(parts[:-1]):
-            if kind not in _CODE_KINDS:
-                continue
-            dotted = parts[index + 1].split(".")
-            for end in range(1, len(dotted) + 1):
-                prefix = ".".join(dotted[:end])
-                if prefix in known:
-                    used.add(prefix)
+    for entry in fingerprint.manifest_entries(manifest, outputs):
+        kind, colon, rest = entry.partition(":")
+        if not colon or kind not in _CODE_KINDS:
+            continue
+        dotted = rest.partition(":")[0].split(".")
+        for end in range(1, len(dotted) + 1):
+            prefix = ".".join(dotted[:end])
+            if prefix in known:
+                used.add(prefix)
     return used
 
 

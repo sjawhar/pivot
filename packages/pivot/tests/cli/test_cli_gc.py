@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
 import json
@@ -19,6 +20,7 @@ from pivot.storage import cache, gc, listing, lock, naming, state, track
 
 if TYPE_CHECKING:
     import pathlib
+    from collections.abc import Iterator
 
     import click.testing
 
@@ -1405,3 +1407,241 @@ def test_gc_dry_run_refuses_a_named_project_whose_configured_state_dir_is_missin
     assert result.exit_code != 0, result.output
     assert "state directory" in result.output, result.output
     assert "Would remove" not in result.output, result.output
+
+
+# =============================================================================
+# A runtime that follows a link to a directory under O_DIRECTORY | O_NOFOLLOW
+# =============================================================================
+
+
+@pytest.mark.parametrize("replaced", ["after-listing", "while-opened"])
+def test_gc_removes_nothing_through_a_prefix_link_the_runtime_follows_under_nofollow(
+    workspace: Workspace,
+    runner: click.testing.CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    replaced: str,
+) -> None:
+    """gVisor opens a link to a directory under ``O_DIRECTORY | O_NOFOLLOW`` and follows it, where
+    Linux fails with ENOTDIR. A prefix directory replaced by a link to another store's prefix after
+    the plan listed the store must not be followed: the plan would list the other store's
+    objects and record that directory's identity, and the removal, following the same link,
+    would find that identity and delete them. ``after-listing`` leaves the link there;
+    ``while-opened`` puts it there only while each open runs, so an ``lstat`` before the open
+    sees the real directory and only the identity of the opened descriptor tells them apart."""
+    prefix = workspace["object_root"] / "ab"
+    prefix.mkdir()
+    foreign = workspace["scratch"] / "other-store" / prefix.name
+    foreign.mkdir(parents=True)
+    foreign_object = foreign / "0123456789abcd"
+    foreign_object.write_text("another store's object")
+    aside = prefix.with_name("aside")
+    real_open = os.open
+    real_prefix_names = gc._prefix_names
+
+    def link_after_listing(store_fd: int) -> list[str]:
+        names = real_prefix_names(store_fd)
+        if not prefix.is_symlink():
+            prefix.rmdir()
+            prefix.symlink_to(foreign, target_is_directory=True)
+        return names
+
+    def gvisor_open(
+        path: str | os.PathLike[str], flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if not (flags & os.O_DIRECTORY and flags & os.O_NOFOLLOW):
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+        flags &= ~os.O_NOFOLLOW  # the runtime follows a link to a directory all the same
+        if replaced != "while-opened" or os.fspath(path) != prefix.name:
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+        prefix.rename(aside)
+        prefix.symlink_to(foreign, target_is_directory=True)
+        try:
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+        finally:
+            prefix.unlink()
+            aside.rename(prefix)
+
+    if replaced == "after-listing":
+        monkeypatch.setattr(gc, "_prefix_names", link_after_listing)
+    monkeypatch.setattr(os, "open", gvisor_open)
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert foreign_object.exists(), "gc removed another store's object through a prefix link"
+    assert result.exit_code == 0, result.output
+    assert "Removed 0 objects" in result.output, result.output
+
+
+def test_gc_removes_nothing_through_a_tree_directory_replaced_by_a_link_during_removal(
+    workspace: Workspace, runner: click.testing.CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A whole-directory tree's directories are read-only, so its removal makes each one
+    writable as it reaches it. Every directory it removes from must stay the one it opened: a
+    subdirectory replaced by a link to another store's directory while the removal is inside it
+    must not send an unlink there. Retrying a refused unlink by its path from the prefix
+    directory follows that link."""
+    tree = workspace["cache_dir"] / gc.TREES_DIR / "cd" / "0123456789abcd"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "sub" / "member").write_text("the tree's own copy")
+    (tree / "sub").chmod(0o555)
+    tree.chmod(0o555)
+    foreign = workspace["scratch"] / "other-store"
+    foreign.mkdir()
+    foreign_member = foreign / "member"
+    foreign_member.write_text("another store's object")
+    hook_fired = False
+    real_unlink = os.unlink
+
+    def link_the_directory_then_unlink(
+        path: str | os.PathLike[str], *, dir_fd: int | None = None
+    ) -> None:
+        nonlocal hook_fired
+        if os.fspath(path) == "member" and not (tree / "sub").is_symlink():
+            tree.chmod(0o755)
+            (tree / "sub").rename(tree / "aside")
+            (tree / "sub").symlink_to(foreign, target_is_directory=True)
+            hook_fired = True
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", link_the_directory_then_unlink)
+
+    result = _helper_run(runner, "--yes", "--grace-hours", "0")
+
+    assert hook_fired, "the test never replaced the tree directory"
+    assert foreign_member.exists(), "gc removed another store's file through a tree link"
+    assert result.exit_code == 0, result.output
+
+
+def test_gc_keeps_a_plain_tree_directory_replaced_after_its_parent_is_scanned(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tree child captured as a directory cannot be replaced with another directory before it
+    opens. The original and the replacement both stay: nothing after the parent scan decides
+    that the replacement belongs to the doomed tree."""
+    parent = tmp_path / "prefix"
+    tree = parent / "tree"
+    original = tree / "sub"
+    original_member = original / "original"
+    replacement = tree / "sub"
+    planted_member = replacement / "planted"
+    aside = tree / "aside"
+    original_member.parent.mkdir(parents=True)
+    original_member.write_text("the tree's original member")
+    tree_identity = tree.stat()
+    real_scandir = os.scandir
+    hook_fired = False
+
+    @contextlib.contextmanager
+    def scan_then_replace(
+        path: int | str | os.PathLike[str],
+    ) -> Iterator[Iterator[os.DirEntry[str]]]:
+        nonlocal hook_fired
+        with real_scandir(path) as entries:
+            yield entries
+        if (
+            not hook_fired
+            and isinstance(path, int)
+            and os.path.samestat(os.fstat(path), tree_identity)
+        ):
+            original.rename(aside)
+            replacement.mkdir()
+            planted_member.write_text("a directory planted after the scan")
+            hook_fired = True
+
+    monkeypatch.setattr(os, "scandir", scan_then_replace)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(OSError):
+            gc._remove_at(parent_fd, tree.name, is_dir=True)
+    finally:
+        os.close(parent_fd)
+
+    assert hook_fired, "the test never replaced the scanned child"
+    assert (aside / "original").exists(), "gc removed the directory it renamed aside"
+    assert planted_member.exists(), "gc removed the directory planted after the scan"
+
+
+def test_gc_refuses_a_tree_link_when_gvisor_follows_nofollow(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A nested tree directory replaced only while gVisor-style open follows a link is refused
+    before it can unlink the foreign directory's member."""
+    parent = tmp_path / "prefix"
+    tree = parent / "tree"
+    original = tree / "sub"
+    original_member = original / "original"
+    foreign = tmp_path / "foreign"
+    foreign_member = foreign / "member"
+    aside = tree / "aside"
+    original_member.parent.mkdir(parents=True)
+    original_member.write_text("the tree's original member")
+    foreign.mkdir()
+    foreign_member.write_text("another store's member")
+    real_open = os.open
+    hook_fired = False
+
+    def gvisor_open(
+        path: str | os.PathLike[str], flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        nonlocal hook_fired
+        if not (flags & os.O_DIRECTORY and flags & os.O_NOFOLLOW):
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+        flags &= ~os.O_NOFOLLOW
+        if os.fspath(path) != original.name or hook_fired:
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+        original.rename(aside)
+        original.symlink_to(foreign, target_is_directory=True)
+        hook_fired = True
+        try:
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+        finally:
+            original.unlink()
+            aside.rename(original)
+
+    monkeypatch.setattr(os, "open", gvisor_open)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(OSError):
+            gc._remove_at(parent_fd, tree.name, is_dir=True)
+    finally:
+        os.close(parent_fd)
+
+    assert hook_fired, "the test never replaced the nested tree directory during open"
+    assert foreign_member.exists(), "gc removed a foreign member through a gVisor-followed link"
+
+
+def test_gc_keeps_a_tree_recreated_with_a_reused_inode(tmp_path: pathlib.Path) -> None:
+    """A tree removed after gc records it can reuse its inode. Its change time distinguishes the
+    replacement, so gc leaves the newly created tree and what it holds."""
+    prefix = tmp_path / "prefix"
+    tree = prefix / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "sub" / "old").write_text("the doomed tree member")
+    old = tree.lstat()
+    expected = old.st_dev, old.st_ino, old.st_ctime_ns
+    (tree / "sub" / "old").unlink()
+    (tree / "sub").rmdir()
+    tree.rmdir()
+    reused = False
+    for attempt in range(1, 4001):
+        candidate = prefix / f"made-{attempt}"
+        candidate.mkdir()
+        candidate_stat = candidate.lstat()
+        if candidate_stat.st_ino == old.st_ino:
+            candidate.rename(tree)
+            reused = True
+            break
+    if not reused:
+        pytest.skip("this filesystem did not reuse the removed tree inode")
+    if tree.lstat().st_ctime_ns == old.st_ctime_ns:
+        pytest.skip("this filesystem did not distinguish the reused inode by change time")
+    planted = tree / "planted"
+    planted.write_text("a tree made after the plan")
+    prefix_fd = os.open(prefix, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(OSError):
+            gc._remove_at(prefix_fd, tree.name, is_dir=True, expected=expected)
+    finally:
+        os.close(prefix_fd)
+
+    assert planted.exists(), "gc removed a tree recreated with the doomed tree's inode"

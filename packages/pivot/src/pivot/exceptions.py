@@ -450,6 +450,28 @@ class RemoteNotConfiguredError(RemoteError):
         return "Run 'pivot config set remotes.<name> <url>' to configure a remote"
 
 
+class UnknownTargetError(RemoteError):
+    """Raised when a push, fetch or pull target is neither a stage, a stage output nor a
+    tracked path."""
+
+    targets: list[str]
+
+    def __init__(self, targets: list[str]) -> None:
+        self.targets = targets
+        quoted = ", ".join(f"'{target}'" for target in targets)
+        noun = "Target" if len(targets) == 1 else "Targets"
+        verb = "is" if len(targets) == 1 else "are"
+        super().__init__(f"{noun} {quoted} {verb} not a stage, stage output or tracked path")
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Run 'pivot list' to see stages, or 'pivot track' to track a file"
+
+    @override
+    def __reduce__(self) -> tuple[type, tuple[list[str]]]:
+        return (self.__class__, (self.targets,))
+
+
 class ConfigError(PivotError):
     """Base class for configuration errors."""
 

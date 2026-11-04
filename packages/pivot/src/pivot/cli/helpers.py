@@ -10,14 +10,14 @@ from tqdm.asyncio import tqdm as async_tqdm
 
 if TYPE_CHECKING:
     import pathlib
-    from collections.abc import Collection
+    from collections.abc import Collection, Iterable, Mapping
 
     from networkx import DiGraph
 
     from pivot.cli import CliContext
     from pivot.expansion import Expansion
     from pivot.registry import PipelineLike, RegistryStageInfo
-    from pivot.storage import track
+    from pivot.storage import listing, track
     from pivot.storage.store import WorkspaceStore
     from pivot.types import StageExplanation
 
@@ -82,14 +82,20 @@ def get_graph_stages(expanded: Collection[str] = ()) -> dict[str, RegistryStageI
 
 
 def expand_mapped_stages(
-    *, force: bool = False, allow_missing: bool = False
+    *,
+    force: bool = False,
+    allow_missing: bool = False,
+    fetched: Mapping[str, listing.DirListing] | None = None,
 ) -> tuple[Expansion, dict[str, StageExplanation]]:
     """Expand each mapped stage of the Pipeline in context whose producer is current, as a run
-    would (``status.expand_current``), and return the expansion with the explanations it read.
-    A command that lists stages calls it first, so the stages it lists hold the instances."""
+    would (``status.expand_current``, a listing the cache lacks taken from ``fetched``), and
+    return the expansion with the explanations it read. A command that lists stages calls it
+    first, so the stages it lists hold the instances."""
     from pivot import status as status_mod
 
-    return status_mod.expand_current(get_pipeline(), force=force, allow_missing=allow_missing)
+    return status_mod.expand_current(
+        get_pipeline(), force=force, allow_missing=allow_missing, fetched=fetched
+    )
 
 
 def template_target(name: str, templates: list[str]) -> str | None:
@@ -106,6 +112,21 @@ def template_target(name: str, templates: list[str]) -> str | None:
         return template
     bare = [t for t in templates if registry.template_of(name, [t.rsplit("/", 1)[-1]])]
     return bare[0] if len(bare) == 1 else None
+
+
+def templates_and_upstream(templates: Iterable[str], pipeline: PipelineLike) -> list[str]:
+    """``templates`` (``Pipeline.map``) and every template each one is mapped over,
+    transitively, each once, in the order a depth-first walk from them meets it."""
+    walked = list[str]()
+    pending = list(templates)
+    while pending:
+        current = pending.pop()
+        if current in walked:
+            continue
+        walked.append(current)
+        mapped_deps = pipeline.get_template(current)["mapped_deps"].values()
+        pending.extend(dep for dep in mapped_deps if dep is not None)
+    return walked
 
 
 def mapped_name(name: str, templates: list[str]) -> str | None:
@@ -281,15 +302,10 @@ def resolve_mapped_targets(
             else:
                 unknown.append(stage)  # an instance of a key the expansion did not add
         else:
-            pending = [template]
-            while pending:
-                current = pending.pop()
-                if current in shown:
-                    continue
-                shown.append(current)
-                mapped = pipeline.get_template(current)
-                resolved.append(mapped["source"].producer)
-                pending.extend(dep for dep in mapped["mapped_deps"].values() if dep is not None)
+            for current in templates_and_upstream([template], pipeline):
+                if current not in shown:
+                    shown.append(current)
+                    resolved.append(pipeline.get_template(current)["source"].producer)
     if unknown:
         raise exceptions.StageNotFoundError(unknown, available_stages=[*registered, *templates])
     return list(dict.fromkeys(resolved)), shown

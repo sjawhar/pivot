@@ -262,15 +262,14 @@ def test_pull_fetches_every_file_of_a_tracked_directory_input(
     tmp_path: pathlib.Path, moto_services: dict[str, str]
 ) -> None:
     """A stage's lock leaves out what .pivotignore names, but a tracked directory restores
-    whole, so `pivot pull <stage>` fetches every file of its .pvt, the ignored ones too."""
+    whole, so `pivot pull <tracked path>` fetches every file of its .pvt, the ignored ones too."""
     home, root, tracked = _helper_tracked_input_project(tmp_path)
     env = _helper_s3_remote(root, home, moto_services)
     _ok(helpers.run_pivot(root, home, "push", extra_env=env))
 
     shutil.rmtree(root / ".pivot" / "cache")
     shutil.rmtree(tracked)
-    _ok(helpers.run_pivot(root, home, "pull", "p/lane", extra_env=env))
-    _ok(helpers.run_pivot(root, home, "checkout", "data/raw/server"))
+    _ok(helpers.run_pivot(root, home, "pull", "data/raw/server", extra_env=env))
 
     assert (tracked / "__pycache__" / "grade.cpython-312.pyc").read_bytes() == b"\x00bytecode"
     assert (tracked / "grade.py").read_text() == "print('grade')\n"

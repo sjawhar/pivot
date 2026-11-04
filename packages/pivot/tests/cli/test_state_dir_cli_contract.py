@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import uuid
 from typing import TYPE_CHECKING
 
+import boto3
 import pytest
 import yaml
 
@@ -499,8 +501,10 @@ with Pipeline("test") as pipeline:
 """
 
 
-def _committed_table_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
-    """A reproduced, committed project with a remote, then a hand-edited `core.state_dir:
+def _committed_table_project(
+    tmp_path: pathlib.Path, remote: str = "s3://unused-bucket/cache"
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """A reproduced, committed project with ``remote``, then a hand-edited `core.state_dir:
     altstate` that does not exist yet."""
     home = tmp_path / "home"
     root = tmp_path / "project"
@@ -516,7 +520,7 @@ def _committed_table_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, path
     (root / "data" / "raw" / "input.txt").write_text("input\n")
     (root / "pipeline.py").write_text(_TABLE_PIPELINE)
     _ok(helpers.run_pivot(root, home, "repro"))
-    remotes = "remotes:\n  origin: s3://unused-bucket/cache\n"
+    remotes = f"remotes:\n  origin: {remote}\n"
     (root / ".pivot" / "config.yaml").write_text(remotes)
     _ok(helpers.run_cli(root, home, "git", "add", "-A"))
     _ok(helpers.run_cli(root, home, "git", "commit", "-qm", "base"))
@@ -541,16 +545,31 @@ def _marker_entries(root: pathlib.Path) -> list[pathlib.Path]:
     ids=["diff", "diff-json", "push-n", "push-n-stage", "fetch-n-stage", "pull-n-stage"],
 )
 def test_a_read_only_command_creates_no_configured_state_dir(
-    tmp_path: pathlib.Path, args: tuple[str, ...]
+    tmp_path: pathlib.Path, moto_services: dict[str, str], args: tuple[str, ...]
 ) -> None:
-    """With a hand-edited `core.state_dir` that does not exist yet, 0.5.2 creates nothing here."""
-    home, root = _committed_table_project(tmp_path)
+    """With a hand-edited `core.state_dir` that does not exist yet, 0.5.2 creates nothing here.
+    A dry run asks the remote, here an empty moto bucket, which objects it holds."""
+    bucket = f"read-only-{uuid.uuid4().hex[:8]}"
+    boto3.client(
+        "s3",
+        endpoint_url=moto_services["s3"],
+        region_name="us-east-1",
+        aws_access_key_id="x",
+        aws_secret_access_key="x",
+    ).create_bucket(Bucket=bucket)  # pyright: ignore[reportAttributeAccessIssue] - boto3 ships no stubs
+    home, root = _committed_table_project(tmp_path, f"s3://{bucket}/cache")
     table = root / "data" / "test" / "table.jsonl"
     table.unlink()
     table.write_text('{"v": 99}\n')
     marker_entries = _marker_entries(root)
+    env = {
+        "AWS_ENDPOINT_URL": moto_services["s3"],
+        "AWS_ACCESS_KEY_ID": "x",
+        "AWS_SECRET_ACCESS_KEY": "x",
+        "AWS_DEFAULT_REGION": "us-east-1",
+    }
 
-    result = helpers.run_pivot(root, home, *args)
+    result = helpers.run_pivot(root, home, *args, extra_env=env)
 
     _ok(result)
     assert not (root / "altstate").exists(), sorted((root / "altstate").rglob("*"))
@@ -711,7 +730,6 @@ def test_fetch_and_pull_download_under_an_empty_state_dir(
     tmp_path: pathlib.Path, moto_services: dict[str, str], command: str
 ) -> None:
     """0.5.2 exits 0 with `1 transferred` under a hand-edited `core.state_dir: ''`; so does the head."""
-    import boto3
     import xxhash
 
     s3 = boto3.client(

@@ -60,12 +60,12 @@ them the same way:
 ## Directory Input Hashes and `.pivotignore`
 
 - Only `WorkspaceStore.hash_artifact` passes `ignored` to `cache.hash_directory`, and only for a `pipeline.input` directory: the entries the project's `.pivotignore` names (`ignore.IgnoreFilter.member_filter`, matched by their path inside the project) are left out of that dependency hash. Outputs, tracked data, `save_to_cache`, restores and checkout comparisons hash every file; a file left out there is lost on restore.
-- A dependency on a stage's directory output is the producer's whole output hash: `explain.producer_output_hashes` reuses producer lock hashes and `sync.get_target_hashes` fetches dependency blobs from the producer's lock and listing.
+- A dependency on a stage's directory output is the producer's whole output hash: `explain.producer_output_hashes` reuses producer lock hashes.
 - A directory input's committed listing (`listing.input_listing_path`, `.pivot/stages/=inputs/<path>.listing`) holds the members its dependency hash counts, so it leaves out what `.pivotignore` names: the lock's record is the hash of those bytes, and `listing.parse` refuses any other listing for it. A tracked directory's `.pvt.listing` is the whole set, because a restore needs every file.
 - No restore reads an `=inputs` listing: it is read only by `cli/verify.py` (the cache objects a plain directory input needs), the engine's git-ignored warning and `status.py`'s orphaned-listing report. A restore takes its members from an output's listing beside the producer's lock, from a `.pvt.listing`, or from the cache object at the recorded hash (`storage/restore.py`, `WorkspaceStore.restore_from_cache`, `show/selection.py`). Keep it that way: an `=inputs` listing names only the files the dependency hash counts.
-- The listing object of a filtered input hash is written only to the cache of the machine that ran the stage (`StageLock.write`); only an untargeted `pivot push`, which sends the whole cache, sends it. So for a directory input held by tracked data, `verify --allow-missing` requires what restores that data (`verify._tracked_input_objects`: the `.pvt` listing object and files), as pull fetches it, never that object.
+- The listing object of a filtered input hash is written only to the cache of the machine that ran the stage (`StageLock.write`); only an untargeted `pivot push`, which sends the whole cache, sends it. So for a directory input held by tracked data, `verify --allow-missing` requires what restores that data (`verify._tracked_input_objects`: the `.pvt` listing object and files), as `pivot pull <tracked path>` fetches it, never that object.
 - An input hash taken from a record (a tracked directory's `.pvt`, in explain's `--allow-missing` fallback) goes through `WorkspaceStore.recorded_input_hash`, which applies `cache.filter_listing` to the whole listing: the directory the filtered walk gives the recorded tree. When that listing is missing or corrupt, the `.pvt`'s whole hash stands (at worst a false "stale"); the lock's own hash never does, since it would compare with itself.
-- `pull`/`fetch <stage>` takes a tracked input's blobs from the `.pvt` files at, under or above the input's path (`sync._tracked_blobs_for_input`), not from the lock's dependency hash, so every member of the tracked data is fetched.
+- `push`, `fetch` and `pull` of a target transfer one set, `sync.get_target_hashes`: what `pivot checkout` of that target restores, the objects a stage's lock lists under `reads`, and a mapped stage instance's producer listing, which a clone needs to expand it. A stage never names its dependencies, which are targets of their own; a tracked path names its `.pvt`'s listing object and every file in it, not the filtered hash a lock records.
 - `ignore.py` reads and matches `.pivotignore` as git does a root `.gitignore`: a port of git 2.52's `add_patterns_from_buffer`, `match_basename`, `match_pathname` and `dowild` (bytes; the literal prefix, of which wildmatch still sees the last byte, git commit 1940a02dc1; `WM_ABORT_*`; git's parent rule). Keep it a port: a regular expression backtracks where `dowild` aborts. `tests/storage/test_input_ignore_matches_git.py` checks the filtered walk, `filter_listing` and `check_ignore` against `git ls-files` on generated trees and patterns (fixed seed; `PIVOT_IGNORE_GIT_CASES` for more); with a git older than 2.52 it leaves out the patterns whose first wildcard is a `**` right after a byte that is not `/`, where older git differs.
 - The `hash:` cache holds one content hash per file, so filtered and whole walks share it; no directory hash is cached by path.
 
@@ -508,21 +508,39 @@ every view that mounts the store looks (S8). A collection resolves the layout on
 real paths, and each store directory that exists at the start is held open (`anchors`); one that
 does not stays absent for the whole collection, whatever appears at its path (no listing, no
 removal: `StoreSnapshot.anchor`). The plan lists each prefix directory through a descriptor
-opened from the held store with `O_DIRECTORY | O_NOFOLLOW` (`StoreSnapshot.open_prefix`),
-records the device and inode of that descriptor in each condemned object (`Doomed.prefix`) and
-closes it before the next prefix. `execute_plan` re-checks the snapshot before each prefix
-(`StoreSnapshot.check`: `files/` resolving elsewhere, or a store directory no longer the one
-opened, refuses), opens the prefix again the same way, requires the `fstat` of the opened
-descriptor to show the recorded device and inode (`StoreSnapshot.open_listed_prefix`; a
-mismatch refuses, naming the prefix, and nothing is removed there), removes through it
-(`gc._remove_at`: every `stat`, unlink and tree removal relative to it, never a path) and closes
-it. So no `files/` re-pointed and no store or prefix directory renamed aside and replaced (by a
-directory, a link or a mount over it) during a collection can receive a removal (RP), and a
-collection needs a fixed number of descriptors whatever `ulimit -n` is. A prefix removed and
-made again after the plan, which may reuse the removed directory's inode, holds only what was
-put in it since: the removals there reach its own entries and follow no link. Races that need
-root or FUSE (a mount made inside a dead tree while it is removed) are out of scope: whoever
-can make them can delete the objects directly. The
+opened from the held store (`StoreSnapshot.open_prefix`), records the device and inode of that
+descriptor in each condemned object (`Doomed.prefix`) and closes it before the next prefix.
+`execute_plan` re-checks the snapshot before each prefix (`StoreSnapshot.check`: `files/`
+resolving elsewhere, or a store directory no longer the one opened, refuses), opens the prefix
+again the same way, requires the `fstat` of the opened descriptor to show the recorded device
+and inode (`StoreSnapshot.open_listed_prefix`; a mismatch refuses, naming the prefix, and nothing
+is removed there), removes through it (`gc._remove_at`: every `stat`, unlink and rmdir relative
+to an open directory, never a path; a tree is emptied depth first, each of its directories
+opened from the one above it) and closes it. Every prefix directory and every directory of a
+tree being removed is opened by one function, `gc._open_directory_at`: it `lstat`s the name
+relative to the open parent and refuses anything but a directory, opens it with
+`O_DIRECTORY | O_NOFOLLOW`, and refuses the descriptor unless its `fstat` shows the device,
+inode and change time the `lstat` saw (`gc._tree_bytes` measures a tree with `os.fwalk`, which
+makes the same comparison itself). A tree root records that triple from `execute_plan` before
+its removal, and each child records it while its parent is scanned: a replacement directory does
+not receive a removal. A filesystem with only whole-second timestamps can still miss an inode
+reuse inside the same second; then the replacement is handled as a directory of the doomed tree.
+The flag alone is not enough: gVisor follows a link to a directory under `O_DIRECTORY |
+O_NOFOLLOW`, where Linux fails with ENOTDIR, so a prefix replaced by a link to another store's
+prefix after the store was listed would be listed and then emptied through the link. The `lstat`
+comparison refuses it on both kernels, and also a link put there only for the instant of the
+open. So no `files/` re-pointed and no store, prefix or tree directory renamed aside and
+replaced (by a directory, a link or a mount over it) during a collection can receive a removal
+through the replaced name, apart from a reuse the filesystem does not timestamp distinctly. A
+directory placed in a doomed tree before its parent is scanned is part of that tree; one that
+replaces a recorded directory after the scan stops the object's removal. Each prefix takes a
+fixed number of descriptors while it is listed or deletes flat objects. Removing a tree takes
+one descriptor per level of depth; if it reaches EMFILE, `execute_plan` logs that object and
+leaves its remaining tree, then continues. The markers were already removed (M5), so no partial
+tree is trusted. A prefix removed and made again after the plan, which may reuse the removed
+directory's inode, holds only what was put in it since: the removals there reach its own entries
+and follow no link. Races that need root or FUSE (a mount made inside a dead tree while it is
+removed) are out of scope: whoever can make them can delete the objects directly. The
 registration memo records the register
 root and re-registers in full when it moves (a re-pointed `files/`). The register root must be
 writable by every writer; when it is not, the writer refuses and names it.

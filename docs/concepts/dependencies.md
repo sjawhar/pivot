@@ -108,8 +108,8 @@ directory and writes `__pycache__/*.pyc` there leaves the stage cached.
 - The listing committed for a directory input
   ([Listing files](outputs.md#listing-files)) holds the files its hash counts,
   so it leaves out what `.pivotignore` names too. A tracked directory's
-  `.pvt.listing` keeps every file, and `pivot pull <stage>` fetches every one
-  of them, so `pivot checkout` restores the directory as it was.
+  `.pvt.listing` keeps every file, and `pivot pull <tracked path>` fetches
+  every one of them, so `pivot checkout` restores the directory as it was.
 - An input file you declare by name is always hashed, whatever `.pivotignore`
   says. An input directory that `.pivotignore` ignores itself (or that lies in
   a directory it ignores, such as an input under `build/`) is hashed whole,
@@ -277,8 +277,9 @@ with Pipeline("plan") as pipeline:
   not checked again, so its later loss from the remote is found by the next
   read, not by `pivot status`.
 - **Pulling.** `pivot pull <stage>` fetches the objects its lock records under
-  `reads`, as it fetches the stage's dependencies, so the stage can run again in
-  the clone.
+  `reads`, beside the stage's outputs, so the stage can run again in the clone;
+  `pivot push <stage>` sends the same objects. An untargeted `pivot pull`
+  fetches every object on the remote.
 - **A read that fails** raises `pivot.exceptions.ObjectReadError` naming the hash:
   a value that is not a content hash (16 lowercase hex characters), an object
   neither the cache nor the remote holds, or bytes that hash to something else.

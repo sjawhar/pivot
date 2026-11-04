@@ -2,6 +2,33 @@
 
 <!-- version list -->
 
+## v0.9.3 (2026-11-02)
+
+### Bug Fixes
+
+- **remote**: Make push, pull and status agree on what a target needs
+  ([#549](https://github.com/sjawhar/pivot/pull/549),
+  [`98a132f`](https://github.com/sjawhar/pivot/commit/98a132f3742483062b92eadaba36d7337f5d7e73))
+
+
+## v0.9.2 (2026-11-01)
+
+### Bug Fixes
+
+- **gc**: Refuse a directory symlink even when the runtime follows it under O_NOFOLLOW
+  ([#548](https://github.com/sjawhar/pivot/pull/548),
+  [`8223bdc`](https://github.com/sjawhar/pivot/commit/8223bdc73a2a13396d9a09906efeab55495ac554))
+
+
+## v0.9.1 (2026-11-01)
+
+### Bug Fixes
+
+- **fingerprint**: Fingerprint a loader nested in another loader's config
+  ([#547](https://github.com/sjawhar/pivot/pull/547),
+  [`ded1002`](https://github.com/sjawhar/pivot/commit/ded1002fa9d479ef2f09662374c5ef401a999d2c))
+
+
 ## v0.9.0 (2026-11-01)
 
 ### Features

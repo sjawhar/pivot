@@ -3,7 +3,9 @@ from __future__ import annotations
 import pathlib
 from typing import TYPE_CHECKING
 
-from pivot import loaders, types
+import pytest
+
+from pivot import exceptions, loaders, types
 from pivot.registry import RegistryStageInfo
 from pivot.remote import storage as remote_storage
 from pivot.remote import sync
@@ -92,42 +94,6 @@ def test_get_target_hashes_directory_output_includes_listing_and_files(
     assert result == {hashed["record"]["hash"], *file_hashes}
 
 
-def test_get_target_hashes_directory_dependency_includes_listing_and_files(
-    set_project_root: pathlib.Path,
-) -> None:
-    """A target's directory dependency names its listing object and every listed file."""
-    state_dir = set_project_root / ".pivot"
-    stages_dir = lock.get_stages_dir(state_dir)
-    dep_file_hashes = ["3333333333333333"]
-    dep_identity = types.ArtifactIdentity("upstream", None)
-    dependency = _write_lock_with_dir_output(stages_dir, dep_identity, dep_file_hashes)
-
-    output_hash = "4444444444444444"
-    lock.StageLock("my_stage", stages_dir).write(
-        LockData(
-            code_manifest={},
-            params={},
-            dep_hashes={dep_identity: dependency["record"]},
-            output_hashes={
-                types.ArtifactIdentity("my_stage", None): FileHash(hash=output_hash),
-            },
-        )
-    )
-
-    result = sync.get_target_hashes(
-        ["my_stage"],
-        state_dir,
-        include_deps=True,
-        all_stages={
-            "my_stage": _helper_stage_info(),
-            "upstream": _helper_stage_info(),
-        },
-        cache_dir=state_dir / "cache",
-    )
-
-    assert result == {output_hash, dependency["record"]["hash"], *dep_file_hashes}
-
-
 # =============================================================================
 # get_target_hashes edge cases
 # =============================================================================
@@ -142,18 +108,16 @@ def _helper_ref(producer: str, key: str | None, tag: types.ArtifactTag) -> types
     )
 
 
-def test_get_target_hashes_invalid_stage_name_falls_through(
+def test_get_target_hashes_invalid_stage_name_is_an_unknown_target(
     set_project_root: pathlib.Path,
 ) -> None:
-    """Target with invalid stage name chars (e.g. spaces) falls through to file path resolution."""
+    """Target with invalid stage name chars (e.g. spaces) falls through to file path resolution,
+    where it names no output or tracked path, so it is refused by name."""
     state_dir = set_project_root / ".pivot"
     (state_dir / "stages").mkdir(parents=True, exist_ok=True)
 
-    # "my data.csv" has a space, which is invalid for stage names.
-    # Previously this would raise ValueError from StageLock.__init__.
-    # After the fix it should fall through and end up in `unresolved`.
-    result = sync.get_target_hashes(["my data.csv"], state_dir)
-    assert result == set()
+    with pytest.raises(exceptions.UnknownTargetError, match="'my data.csv'"):
+        sync.get_target_hashes(["my data.csv"], state_dir)
 
 
 def test_get_target_hashes_excludes_noncached_outputs(set_project_root: pathlib.Path) -> None:
@@ -233,10 +197,11 @@ def test_get_target_hashes_file_target_excludes_noncached(
 # =============================================================================
 
 
-async def test_push_skips_directory_cache_paths(
+async def test_push_fails_a_directory_at_a_cache_path(
     tmp_path: pathlib.Path, mocker: MockerFixture
 ) -> None:
-    """Push should never enqueue directory paths for upload."""
+    """Push never uploads a directory at a cache key; an object the remote lacks and the cache
+    holds no regular file for fails, naming it, rather than counting as skipped."""
     cache_dir = tmp_path / "cache"
     state_dir = tmp_path / ".pivot"
     state_dir.mkdir(parents=True)
@@ -282,8 +247,10 @@ async def test_push_skips_directory_cache_paths(
     assert file_hash in uploaded_hashes, "File hash should be uploaded"
     assert dir_hash not in uploaded_hashes, "Directory hash should be skipped"
     assert result["transferred"] == 1
-    # Verify directory was counted in skipped total (skipped_non_file fix from Task 3)
-    assert result["skipped"] == 1, "Directory cache path should be counted in skipped total"
+    assert (result["skipped"], result["failed"]) == (0, 1)
+    assert result["errors"] == [
+        f"Cannot push {dir_hash}: remote 'origin' lacks it and the local cache does not hold it"
+    ]
 
 
 # =============================================================================
@@ -417,10 +384,10 @@ def test_get_target_hashes_pvt_suffix_stripped_before_lookup(
     assert result == {"1122334455667788"}, ".pvt suffix should be stripped before hash lookup"
 
 
-def test_get_target_hashes_unresolved_file_target_returns_empty(
+def test_get_target_hashes_unresolved_file_target_is_an_unknown_target(
     set_project_root: pathlib.Path,
 ) -> None:
-    """File target that matches nothing returns empty set without crashing."""
+    """A file target that matches nothing is refused, named relative to the project."""
     state_dir = set_project_root / ".pivot"
     stages_dir = lock.get_stages_dir(state_dir)
     stages_dir.mkdir(parents=True, exist_ok=True)
@@ -436,8 +403,9 @@ def test_get_target_hashes_unresolved_file_target_returns_empty(
         )
     )
 
-    result = sync.get_target_hashes(
-        [str(set_project_root / "nonexistent.csv")], state_dir, all_stages=None
-    )
+    with pytest.raises(exceptions.UnknownTargetError) as raised:
+        sync.get_target_hashes(
+            [str(set_project_root / "nonexistent.csv")], state_dir, all_stages=None
+        )
 
-    assert result == set(), "Unresolved target should return empty set, not crash"
+    assert raised.value.targets == ["nonexistent.csv"]

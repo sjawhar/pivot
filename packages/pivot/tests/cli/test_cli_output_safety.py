@@ -219,18 +219,18 @@ def test_config_set_refuses_an_invalid_url_without_echoing_its_credential(
 
 
 def test_get_remote_status_hides_the_credential_of_the_remote_url(
-    tmp_path: pathlib.Path, mocker: MockerFixture
+    set_project_root: pathlib.Path, mocker: MockerFixture
 ) -> None:
     """The remote URL that status reports is redacted at its source."""
     url = f"s3://key:{_SECRET}@bucket/prefix"
+    remote = mocker.MagicMock()
+    remote.url = url
+    remote.list_hashes = mocker.AsyncMock(return_value=set[str]())
     mocker.patch.object(remote_config, "list_remotes", return_value={"origin": url})
-    mocker.patch.object(
-        transfer, "create_remote_from_name", return_value=(mocker.MagicMock(), "origin")
-    )
+    mocker.patch.object(transfer, "create_remote_from_name", return_value=(remote, "origin"))
     mocker.patch.object(remote_config, "get_remote_url", return_value=url)
-    mocker.patch.object(transfer, "get_local_cache_hashes", return_value=set())
 
-    result = status_mod.get_remote_status(None, tmp_path)
+    result = status_mod.get_remote_status(None, set_project_root / ".pivot" / "cache")
 
     assert result["url"] == "s3://***@bucket/prefix"
 
