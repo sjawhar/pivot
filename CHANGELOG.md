@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.10.0 (2026-11-04)
+
+### Features
+
+- **map**: Remove orphaned mapped stage instances
+  ([#550](https://github.com/sjawhar/pivot/pull/550),
+  [`170a2eb`](https://github.com/sjawhar/pivot/commit/170a2ebc58ccbc93a3c6b4ae2da1f9a35162799b))
+
+
 ## v0.9.3 (2026-11-02)
 
 ### Bug Fixes
