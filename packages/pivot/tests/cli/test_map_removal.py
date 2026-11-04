@@ -431,6 +431,42 @@ def _rewrite_no_commit_record(
         )
 
 
+def test_a_no_commit_record_with_path_traversal_keeps_the_instance_and_other_files(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A corrupted record must not redirect orphan cleanup outside the instance's outputs."""
+    from pivot.storage import state
+
+    root, home = _project(tmp_path)
+    _ok(helpers.run_pivot(root, home, "repro", "--no-commit", "--force"))
+    sentinel = root / "src" / "keep.txt"
+    sentinel.parent.mkdir()
+    sentinel.write_text("not an output\n")
+    _rewrite_no_commit_record(
+        root / ".pivot",
+        "p/pack@b",
+        {"output_paths": {"p/pack@b": "data/p/pack@b/../../../src"}},
+    )
+    with state.StateDB(root / ".pivot") as state_db:
+        record = state_db.get_no_commit_record("p/pack@b")
+    assert record is not None
+    files = _instance_files(root, "p/pack@b")
+    assert files == ["p/pack@b.lock", "p/pack@b=.listing"]
+    output = _outputs(root, "p/pack@b")
+    contents = {path.name: path.read_bytes() for path in output.iterdir()}
+    _write_plan(root, {"a": 1, "c": 3})
+
+    ran = _ok(helpers.run_pivot(root, home, "repro"))
+
+    assert sentinel.read_text() == "not an output\n"
+    assert "Cannot remove 'p/pack@b', whose key left the plan" in ran, ran
+    assert _instance_files(root, "p/pack@b") == files
+    assert {path.name: path.read_bytes() for path in output.iterdir()} == contents
+    with state.StateDB(root / ".pivot") as state_db:
+        assert state_db.get_no_commit_record("p/pack@b") == record
+    assert _status_rows(root, home)["p/pack@b"] == "orphaned"
+
+
 def test_a_changed_template_with_a_no_commit_record_removes_only_the_recorded_path(
     tmp_path: pathlib.Path,
 ) -> None:

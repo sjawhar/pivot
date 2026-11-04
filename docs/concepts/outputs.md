@@ -477,7 +477,8 @@ key's chain only, and a new file runs the producer and the new chain only.
   and in a `--no-commit` run, which commits no lock. The same eligibility check
   decides what `pivot status` and the dry-run list. A `--no-commit` record from an
   older Pivot records no paths, so the run cannot prove which file it owns: it keeps
-  the instance and the record and warns. Naming such an instance (`p/cut@b`) is
+  the instance and the record and warns. The same refusal applies to a record with
+  an invalid path, such as one containing `..`. Naming such an instance (`p/cut@b`) is
   refused as any key `p/plan` has no file for. An output that holds a file someone
   tracked there (a `.pvt` the instance did not write) keeps the instance whole,
   every output of it included, and the run warns, naming the file: move the file

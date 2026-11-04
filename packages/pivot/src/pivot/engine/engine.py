@@ -29,6 +29,7 @@ from pivot import (
     fingerprint,
     ignore,
     parameters,
+    path_policy,
     project,
     registry,
     types,
@@ -507,8 +508,10 @@ def _orphan_outputs(
             )
         for path in recorded:
             root, _, rest = path.partition("/")
-            if root not in _OUTPUT_ROOTS or not (
-                rest == instance or rest.startswith((f"{instance}.", f"{instance}/"))
+            if (
+                path_policy.recorded_path_error(path) is not None
+                or root not in _OUTPUT_ROOTS
+                or not (rest == instance or rest.startswith((f"{instance}.", f"{instance}/")))
             ):
                 raise exceptions.ValidationError(
                     f"its record has the output path '{path}', which no output of it can have"
