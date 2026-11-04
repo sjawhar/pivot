@@ -38,8 +38,9 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# JSONL schema version for forward compatibility
-_JSONL_SCHEMA_VERSION = 2
+# JSONL schema version for forward compatibility. 3: `stages_expanded` names the instances the
+# expansion removed (`removed`)
+_JSONL_SCHEMA_VERSION = 3
 
 
 def _configure_oneshot_source(

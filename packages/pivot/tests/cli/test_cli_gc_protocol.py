@@ -4192,14 +4192,13 @@ with Pipeline("mp") as pipeline:
 """
 
 
-def test_the_locks_of_a_mapped_stages_instances_keep_their_objects_once_unexpanded(
+def test_an_instance_whose_key_left_the_plan_leaves_its_objects_to_a_collection(
     tmp_path: pathlib.Path,
 ) -> None:
     """A mapped stage's instances (`mp/cut@a`, `mp/cut@b`) each record their output in a lock of
-    their own. Once `b` leaves the plan, the next run no longer expands `mp/cut@b`, but its lock
-    stays, and a collection reads every lock on disk, expanded or not: a peer's `pivot gc`
-    (with one run of history, so no run-cache row keeps them) keeps both instances' objects and
-    removes only what no record names."""
+    their own. Once `b` leaves the plan, the next run removes `mp/cut@b`'s lock and output, and
+    with one run of history no run-cache row names its object either: a peer's `pivot gc` keeps
+    `mp/cut@a`'s object, which its lock names, and removes `mp/cut@b`'s."""
     shared = tmp_path / "shared-cache"
     peer = _shared_project(tmp_path / "peer", shared)
     _ok(_run(peer, "repro"))
@@ -4219,18 +4218,17 @@ def test_the_locks_of_a_mapped_stages_instances_keep_their_objects_once_unexpand
         for name, path in locks.items()
     }
     assert all(path.exists() for path in objects.values()), objects
-    b_lock = locks["cut@b.lock"].read_text()
 
     plan.write_text("a: 1\n")
     second = _ok(_run(root, "repro"))
-    assert "cut@b" not in second, f"the run still expanded mp/cut@b: {second}"
-    assert locks["cut@b.lock"].read_text() == b_lock, "the unexpanded instance's lock changed"
-    dead = _publish(shared / "files", tmp_path, "named by nothing\n")
+    assert "removed mp/cut@b, whose key left the plan" in second, second
+    assert not locks["cut@b.lock"].exists(), "the run kept mp/cut@b's lock"
+    assert not (root / "data" / "mp" / "cut@b.yaml").exists(), "the run kept mp/cut@b's output"
+    assert objects["cut@b.lock"].exists(), "the run removed a cache object"
 
     collected = _run(peer, "gc", "--yes", "--grace-hours", "0")
 
     out = collected.stdout + collected.stderr
     assert collected.returncode == 0, out
-    assert not cache.get_cache_path(shared / "files", dead).exists(), out
     assert objects["cut@a.lock"].exists(), f"gc removed mp/cut@a's output: {out}"
-    assert objects["cut@b.lock"].exists(), f"gc removed the unexpanded mp/cut@b's output: {out}"
+    assert not objects["cut@b.lock"].exists(), f"gc kept the removed mp/cut@b's output: {out}"

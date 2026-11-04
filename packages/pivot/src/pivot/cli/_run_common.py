@@ -13,7 +13,7 @@ from collections.abc import (  # noqa: TC003 - used in function signatures
     Coroutine,
     Mapping,
 )
-from typing import TYPE_CHECKING, Any, TextIO, TypedDict, cast, override
+from typing import TYPE_CHECKING, Any, NotRequired, TextIO, TypedDict, cast, override
 
 import anyio
 import click
@@ -348,9 +348,12 @@ class DryRunJsonStageOutput(TypedDict):
 
 
 class DryRunJsonOutput(TypedDict):
-    """JSON output for pivot run --dry-run --json."""
+    """JSON output for pivot run --dry-run --json. ``would_remove`` maps each instance of a
+    mapped stage that the run would remove, its key having left its producer's listing, to why;
+    absent when the run would remove none."""
 
     stages: dict[str, DryRunJsonStageOutput]
+    would_remove: NotRequired[dict[str, str]]
 
 
 # ---------------------------------------------------------------------------
@@ -404,15 +407,14 @@ class JsonlSink:
                 # All fields are JSON-serializable (strings and lists of strings)
                 self._callback(dict(event))
             case "stages_expanded":
-                self._callback(
-                    dict(
-                        StagesExpandedEvent(
-                            type=RunEventType.STAGES_EXPANDED,
-                            template=event["template"],
-                            stages=event["stages"],
-                        )
-                    )
+                expanded = StagesExpandedEvent(
+                    type=RunEventType.STAGES_EXPANDED,
+                    template=event["template"],
+                    stages=event["stages"],
                 )
+                if "removed" in event:
+                    expanded["removed"] = event["removed"]
+                self._callback(dict(expanded))
             case "engine_state_changed":
                 # Convert state enum to string for JSON serialization
                 self._callback(
