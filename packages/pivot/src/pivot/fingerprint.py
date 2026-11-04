@@ -106,7 +106,7 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 35 records each value by its form over a closed type table (`_form`) and walks the code
 # in it from one node table per stage (`_Walk`), keyed as a stage that names it is keyed: there
 # are no `held:` entries, and a cache hit replays the reads of the code inside a value.
-_CACHE_SCHEMA_VERSION = 36
+_CACHE_SCHEMA_VERSION = 37
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
@@ -1832,9 +1832,16 @@ def _check_dynamic_access(obj: Any, tree: ast.Module) -> None:
 
 def _expand_function(func: Callable[..., Any]) -> None:
     """The edges of a function node (`_Walk`): the globals and closure cells it reads, the
-    defaults it takes, the classes in its type hints and the user modules its body imports. A
-    Python wrapper adds its immediate wrapped function (`wr`); a C-level wrapper such as
-    `functools.cache` adds the function it wraps (`u`). The node table stops wrapper cycles."""
+    defaults it takes, the classes in its type hints and the user modules its body imports.
+    Every wrapper's immediate target (`wr`) takes normal user/library/value admission. A C
+    wrapper also records its unwrapped target (`u`). The node table stops wrapper cycles."""
+    wrapped = _read_step(func, "wr")
+    if wrapped is not _UNREAD:
+        _record_read(func, "wr")
+        binding = f"{_current_node().key}.__wrapped__"
+        stage_name = _current_stage_name.get() or "<unknown>"
+        with _walking("wr"):
+            _process_captured_value("__wrapped__", binding, wrapped, func, stage_name, chain=None)
     tree: ast.Module | None = None
     if is_user_code(func):
         tree = _source_tree(func)
@@ -1861,18 +1868,14 @@ def _expand_function(func: Callable[..., Any]) -> None:
         unwrapped = _unwrap_quietly(func, _stop_at_mark)
         if unwrapped is not func and inspect.isfunction(unwrapped):
             _record_read(func, "u")
-            if not fingerprinted_by_name(unwrapped):
-                with _walking("u"):
-                    _add_child(unwrapped, _NodeKind.FUNCTION, _current_node().key)
+            with _walking("u"):
+                binding = f"{_current_node().key}.__wrapped__"
+                stage_name = _current_stage_name.get() or "<unknown>"
+                _process_captured_value(
+                    "__wrapped__", binding, unwrapped, func, stage_name, chain=None
+                )
         return
     metrics.end("fingerprint.getclosurevars", _t_closure)
-
-    wrapped = vars(func).get("__wrapped__")
-    if inspect.isfunction(wrapped):
-        _record_read(func, "wr")
-        if not fingerprinted_by_name(wrapped):
-            with _walking("wr"):
-                _add_callable(wrapped, f"{_current_node().key}.__wrapped__")
 
     _process_closure_values(closure_vars.globals, func, prefix="g")
     _process_closure_values(closure_vars.nonlocals, func, prefix="c")
@@ -3658,6 +3661,8 @@ def _process_partial_dependency(binding_ref: str, partial_obj: Any) -> None:
     takes (`_value_kind`), so a method bound to an instance (`partial(Scaler(3).apply)`,
     `partial(default_rng(SEED).normal)`) or a callable instance is refused like a bare one.
     """
+    if _read_step(partial_obj, "wr") is not _UNREAD:
+        _add_child(partial_obj, _NodeKind.FUNCTION, f"{binding_ref}.<wrapper>")
     args_form, kwargs_form = _partial_forms(partial_obj)
     entries = _entries()
     entries[f"partial:{binding_ref}.args"] = xxhash.xxh64(args_form.text.encode()).hexdigest()
@@ -4555,9 +4560,9 @@ class _FormBuilder:
         return ["wrapped", "functools._lru_cache_wrapper", wrapped_form, settings]
 
     def type_alias(self, value: Any) -> Any:
-        """An exact `types.GenericAlias` (`list[int]`, `collections.abc.Callable[[int], str]`), by
-        its native type, unpacked flag, origin (`to`) and arguments (`ta`), each read through its
-        own C member. A subclass does not take this row: its native fields omit Python state.
+        """A known exact stdlib alias (`list[int]`, `collections.abc.Callable[[int], str]`), by its
+        native type, unpacked flag, origin (`to`) and arguments (`ta`), read through C members.
+        User-defined subclasses do not take this row: native fields omit their Python state.
         A class in the expression is a label, as anywhere."""
         return self.part_rows(
             ["alias", _definition_ref(_type_of(value)), _GENERIC_ALIAS_UNPACKED(value)],
@@ -4920,6 +4925,7 @@ _ROWS: dict[int, Callable[[_FormBuilder, Any], Any]] = {
     id(functools.cached_property): _FormBuilder.cached_property_row,
     id(functools._lru_cache_wrapper): _FormBuilder.cache_wrapper,  # pyright: ignore[reportPrivateUsage] - the C cache wrapper's type has no public name
     id(types.GenericAlias): _FormBuilder.type_alias,
+    id(cast("type[Any]", type(Callable[..., object]))): _FormBuilder.type_alias,
     id(types.UnionType): _FormBuilder.union_alias,
     id(_Contents): _FormBuilder.contents,
 }

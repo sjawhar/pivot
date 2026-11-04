@@ -4776,3 +4776,77 @@ def test_schema_fingerprinting_releases_transient_models_after_its_pass(
 
     assert _repro_statuses(project, home) == {"t/use": "ran"}
     assert (project / "data/t/use.txt").read_text() == "0"
+
+
+@pytest.mark.parametrize(
+    ("definition", "read", "expected"),
+    [
+        pytest.param(
+            "import collections.abc\nVALUE = collections.abc.Callable[[int], str]\n",
+            "text.splitlines()[0]",
+            "Local Set Default Proof Using",
+            id="stdlib-callable-alias",
+        ),
+        pytest.param(
+            "import json\n\ndef encode(value):\n    return json.dumps(value)\n"
+            "encode.__wrapped__ = json.dumps\nVALUE = encode\n",
+            "value(text.splitlines()[0])",
+            '"Local Set Default Proof Using"',
+            id="library-wrapped-target",
+        ),
+    ],
+)
+def test_a_stdlib_alias_or_library_wrapped_target_runs_and_caches(
+    tmp_path: pathlib.Path, definition: str, read: str, expected: str
+) -> None:
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "values.py": definition,
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read=read),
+        },
+    )
+
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert (project / "data/t/use.txt").read_text() == expected
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+
+
+@pytest.mark.parametrize("wrapper", ["cache", "lru_cache", "partial"])
+def test_a_mixed_python_and_c_wrapper_cycle_tracks_each_function(
+    tmp_path: pathlib.Path, wrapper: str
+) -> None:
+    constructors = {
+        "cache": "functools.cache(second)",
+        "lru_cache": "functools.lru_cache(maxsize=8)(second)",
+        "partial": "functools.partial(second)",
+    }
+    definition = (
+        "import functools\nimport settings\n\n"
+        "def first():\n    return first.__wrapped__()\n\n"
+        'def second():\n    return "G" + settings.VALUE\n\n'
+        f"CACHED = {constructors[wrapper]}\n"
+        'CACHED.__name__ = CACHED.__qualname__ = "CACHED"\n'
+        "first.__wrapped__ = CACHED\nsecond.__wrapped__ = first\n"
+        + ("CACHED.__wrapped__ = first\n" if wrapper == "partial" else "")
+        + "VALUE = first\n"
+    )
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": definition,
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+    output = project / "data/t/use.txt"
+
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "GA"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", '"A"', '"B"')
+    assert _repro_statuses(project, home, "7") == {"t/use": "ran"}
+    assert output.read_text() == "GB"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}

@@ -259,12 +259,14 @@ arguments, attributes and built-in value fields such as `OSError.filename`, an
 object by its attributes and `__slots__`, and a function or classmethod an
 object holds (a callback) with the module values it reads. A callback that reads
 its own enclosing class stops at that class. A callback whose `__wrapped__` chain
-loops is walked from its own code, each function on the chain once. An `Enum`
-member is hashed with its value, and an exact built-in type expression such as
-`list[int]` or `str | None` by its origin and arguments. A user subclass of
-`types.GenericAlias` is refused: its native alias fields do not describe its
-Python behavior or state. A numpy scalar subclass includes its attributes and
-slots as well as its native data. A default whose state Pivot cannot
+loops is walked from its own code, each function on the chain once. The same walk
+follows Python functions, C cache wrappers and partial wrappers; a library target
+such as `json.dumps` is recorded by name, not walked as user code. An `Enum` member
+is hashed with its value, and known exact stdlib type expressions such as
+`list[int]`, `str | None` or `collections.abc.Callable[[int], str]` by their origin
+and arguments. A user subclass of `types.GenericAlias` is refused: its native
+alias fields do not describe its Python behavior or state. A numpy scalar subclass
+includes its attributes and slots as well as its native data. A default whose state Pivot cannot
 read, such as a `random.Random`, a numpy `Generator` or a `threading.Lock`,
 refuses the stage, naming the field. For a field, build the value with
 `dataclasses.field(default_factory=...)`; a `ClassVar` takes no factory, so
