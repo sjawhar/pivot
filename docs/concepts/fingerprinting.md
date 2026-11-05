@@ -36,8 +36,11 @@ For each stage function, Pivot:
 3. **Recurses transitively** — every user-code callable found in step 2
    gets the same treatment, and *its* dependencies are merged into the
    manifest. A user class the stage reaches has its callable members walked:
-   methods, descriptors such as properties, partial members, and nested user
-   classes. A module value or helper read only inside a method
+   methods, descriptors such as properties, partial members, nested user classes,
+   and methods bound to another user class (`Holder.fn = Other.cm`). A held
+   classmethod tracks its function and its original receiver class: `cls.VALUE`
+   reads `Other.VALUE`, not `Holder.VALUE`, even through `Holder().fn()`.
+   A module value or helper read only inside a method
    (`ScopeWalk().step(...)` reading a module-level regex) is tracked. So is the
    class of an instance a `functools.partial`, a loader's config, a dataclass
    field default or a `StageParams` default holds (`partial(run, Scorer())`):

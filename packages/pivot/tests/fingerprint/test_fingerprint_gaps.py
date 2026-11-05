@@ -888,6 +888,114 @@ def test_class_member_edit_reruns_stage(tmp_path: pathlib.Path, shape: str) -> N
     assert _count(project) == expected
 
 
+_HELD_CLASSMETHOD = "class Other:\n    @classmethod\n    def cm(cls, x):\n        return x + 1\n"
+_BOUND_CLASS_MEMBER_SHAPES = {
+    "classmethod-via-instance": (
+        _HELD_CLASSMETHOD,
+        "from methods import Other\n\nclass Holder:\n    fn = Other.cm\n",
+        "Holder().fn",
+    ),
+    "classmethod-via-class": (
+        _HELD_CLASSMETHOD,
+        "from methods import Other\n\nclass Holder:\n    fn = Other.cm\n",
+        "Holder.fn",
+    ),
+    "nested-classmethod": (
+        "class Outer:\n    class Other:\n        @classmethod\n"
+        "        def cm(cls, x):\n            return x + 1\n",
+        "from methods import Outer\n\nclass Holder:\n    fn = Outer.Other.cm\n",
+        "Holder().fn",
+    ),
+    "staticmethod": (
+        "class Other:\n    @staticmethod\n    def sm(x):\n        return x + 1\n",
+        "from methods import Other\n\nclass Holder:\n    fn = staticmethod(Other.sm)\n",
+        "Holder().fn",
+    ),
+    "staticmethod-classmethod": (
+        _HELD_CLASSMETHOD,
+        "from methods import Other\n\nclass Holder:\n    fn = staticmethod(Other.cm)\n",
+        "Holder().fn",
+    ),
+    "instance-classmethod": (
+        _HELD_CLASSMETHOD,
+        "from methods import Other\n\nclass Holder:\n"
+        "    def __init__(self):\n        self.fn = Other.cm\n",
+        "Holder().fn",
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_BOUND_CLASS_MEMBER_SHAPES))
+def test_a_held_classmethods_body_edit_reruns_its_stage(tmp_path: pathlib.Path, shape: str) -> None:
+    """BET-299: a method retains its body through another class or an instance's attribute.
+
+    Editing only the defining module must invalidate the warm manifest and run cache; a
+    nested class and a static method use the same real CLI path.
+    """
+    home = tmp_path / "home"
+    methods, holder, read = _BOUND_CLASS_MEMBER_SHAPES[shape]
+    project = _project(
+        tmp_path,
+        {
+            "methods.py": methods,
+            "holder.py": holder,
+            "pipeline.py": _pipeline(
+                "from holder import Holder\n",
+                "@stage\ndef count(text: str) -> dict:\n"
+                f'    return {{"v": {read}(len(text.splitlines()))}}\n',
+            ),
+        },
+    )
+    assert _repro_statuses(project, home) == {"t/normalize": "ran", "t/count": "ran"}
+    assert _count(project) == 4
+    assert _repro_statuses(project, home) == {"t/normalize": "cached", "t/count": "cached"}
+
+    _edit(project, "methods.py", "return x + 1", "return x + 2000")
+
+    assert _repro_statuses(project, home) == {"t/normalize": "cached", "t/count": "ran"}
+    assert _count(project) == 2003
+    assert _repro_statuses(project, home) == {"t/normalize": "cached", "t/count": "cached"}
+
+
+@pytest.mark.parametrize("read", ["Holder.fn", "Holder().fn"])
+@pytest.mark.parametrize(
+    "member", ["Other.cm", "staticmethod(Other.cm)", "functools.partial(Other.cm)"]
+)
+def test_a_held_classmethod_tracks_its_bound_class_not_its_holder(
+    tmp_path: pathlib.Path, read: str, member: str
+) -> None:
+    """The method reads `Other.FACTOR`, not the unrelated mutable `Holder.FACTOR`."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "values.py": "VALUE = 1\n",
+            "methods.py": (
+                "from values import VALUE\n\nclass Other:\n    FACTOR = VALUE\n"
+                "    @classmethod\n    def cm(cls, x):\n        return x + cls.FACTOR\n"
+            ),
+            "holder.py": (
+                "import functools\nfrom methods import Other\n\nclass Holder:\n    FACTOR = []\n"
+                f"    fn = {member}\n"
+            ),
+            "pipeline.py": _pipeline(
+                "from holder import Holder\n",
+                "@stage\ndef count(text: str) -> dict:\n"
+                f'    return {{"v": {read}(len(text.splitlines()))}}\n',
+            ),
+        },
+    )
+    assert _repro_statuses(project, home) == {"t/normalize": "ran", "t/count": "ran"}
+    assert _count(project) == 4
+    assert _repro_statuses(project, home) == {"t/normalize": "cached", "t/count": "cached"}
+
+    _edit(project, "values.py", "VALUE = 1", "VALUE = 2000")
+
+    assert _repro_statuses(project, home) == {"t/normalize": "cached", "t/count": "ran"}
+    assert _count(project) == 2003
+    assert _repro_statuses(project, home) == {"t/normalize": "cached", "t/count": "cached"}
+
+
 def test_dataclass_callable_member_is_refused(tmp_path: pathlib.Path) -> None:
     home = tmp_path / "home"
     project = _project(
