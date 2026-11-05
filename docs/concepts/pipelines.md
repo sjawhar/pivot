@@ -49,6 +49,21 @@ project, otherwise the one at the project root. `--all` (on `repro`, `run`,
 `status`, `list`, `dag` and others) loads every `pipeline.py` under the project
 root, skipping `.venv`, `.git`, `__pycache__` and similar directories.
 
+Changing directories alone does not switch `pivot.executor.run()` to another project. A run
+from a different project raises `PipelineConfigError` naming the held project and current
+directory, before discovery or execution. Moving within the held project, or returning to it,
+is supported. Starting a new Python process selects another project without retaining its
+predecessor's caches or imports.
+
+An explicit discovery (`discover_pipeline(project_root=...)`) or direct load
+(`load_pipeline_from_path(...)`) can select the held project from another directory. That
+selection belongs to the import session: repeated runs in the same directory retain it;
+ending or replacing the session releases it. After the caller resets its project/import
+state, it can select the next project in the same process. A later bare directory change does
+not reuse that exception. Supplying `pipeline=` without explicit discovery also works when
+the current directory belongs to no initialized Pivot project; automatic discovery otherwise
+requires a directory inside the held project.
+
 ## Stage Names
 
 A stage's name is `<pipeline>/<function>`. The CLI takes qualified names:

@@ -404,6 +404,7 @@ class _ImportSession:
     pickle_by_value_modules: dict[str, _stdlib_types.ModuleType] = dataclasses.field(
         default_factory=dict
     )
+    selected_from: pathlib.Path | None = None
 
 
 _import_session: _ImportSession | None = None
@@ -450,7 +451,9 @@ def _close_import_session(session: _ImportSession) -> None:
         _import_session = None
 
 
-def _start_import_session(root: pathlib.Path) -> _ImportSession:
+def _start_import_session(
+    root: pathlib.Path, *, selected_from: pathlib.Path | None = None
+) -> _ImportSession:
     """Start a fresh root import session, restoring the previous session first."""
     global _import_session
     if _import_session is not None:
@@ -482,6 +485,7 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
         _install_path_hook(root),
         file_under_root,
         preexisting_pickle_by_value_modules=cloudpickle.list_registry_pickle_by_value(),
+        selected_from=selected_from,
     )
     return _import_session
 
@@ -489,6 +493,12 @@ def _start_import_session(root: pathlib.Path) -> _ImportSession:
 def import_session_root() -> pathlib.Path | None:
     """The project root of the import session the last discovery started, if it lasts."""
     return None if _import_session is None else _import_session.root
+
+
+def has_explicit_project_selection(root: pathlib.Path, cwd: pathlib.Path) -> bool:
+    """Whether the live import session explicitly selected root from this cwd."""
+    session = _import_session
+    return session is not None and session.root == root and session.selected_from == cwd
 
 
 def install_user_code_loader(root: str) -> None:
@@ -768,7 +778,10 @@ def _discover_pipeline(
             cwd = pathlib.Path.cwd().resolve()
         except OSError as e:
             raise DiscoveryError(f"Failed to resolve paths: {e}") from e
-        session = _start_import_session(root)
+        selected_from = (
+            cwd if project_root is not None or has_explicit_project_selection(root, cwd) else None
+        )
+        session = _start_import_session(root, selected_from=selected_from)
 
         if all_pipelines:
             result = _discover_all_pipelines(root, session, strict=strict_all)
@@ -822,7 +835,7 @@ def _load_pipeline_from_module(
     """Load one pipeline.py into an active session under its stable dotted module name."""
     owns_session = session is None
     if session is None:
-        session = _start_import_session(path.parent)
+        session = _start_import_session(path.parent, selected_from=pathlib.Path.cwd().resolve())
     resolved_path = path.resolve()
     module_name = _module_name_for_path(resolved_path, session.root)
     module = sys.modules.get(module_name)
@@ -1125,7 +1138,7 @@ def load_pipeline_from_path(path: pathlib.Path) -> PipelineLike | None:
     import_root = (
         project_root if resolved_path.is_relative_to(project_root) else resolved_path.parent
     )
-    session = _start_import_session(import_root)
+    session = _start_import_session(import_root, selected_from=pathlib.Path.cwd().resolve())
     loaded = False
     try:
         try:
