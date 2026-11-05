@@ -380,8 +380,9 @@ def run(
         checkout_missing: If True, restore missing tracked files from cache before running.
 
     Raises:
-        PipelineConfigError: If cwd selects another project, or discovery is requested from
-            outside the held project. Start a new Python process to run another project.
+        PipelineConfigError: If cwd is outside the held project without a live explicit
+            selection for that cwd or a supplied pipeline from an uninitialized cwd.
+            Start a new Python process to run another project.
 
     Returns:
         Dict of stage_name -> {status: "ran"|"cached"|"blocked"|"cancelled"|"failed", reason: str}
@@ -434,7 +435,10 @@ def _run_inner(
 
     project_root = project.get_project_root()
     cwd = pathlib.Path.cwd()
-    cwd_conflicts = not cwd.is_relative_to(project_root)
+    cwd_conflicts = not (
+        cwd.is_relative_to(project_root)
+        or discovery.has_explicit_project_selection(project_root, cwd)
+    )
     if cwd_conflicts and pipeline is not None:
         try:
             project.find_project_root()
