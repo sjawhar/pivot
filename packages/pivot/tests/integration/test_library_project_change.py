@@ -62,8 +62,14 @@ if __name__ == "__main__":
 """
 
 
-@pytest.mark.parametrize("supplied", ["discovered", "supplied"])
-@pytest.mark.parametrize("destination", ["project", "uninitialized"])
+@pytest.mark.parametrize(
+    ("destination", "supplied"),
+    [
+        pytest.param("project", "discovered", id="project-discovered"),
+        pytest.param("project", "supplied", id="project-supplied"),
+        pytest.param("uninitialized", "discovered", id="uninitialized-discovered"),
+    ],
+)
 def test_library_run_refuses_a_cwd_outside_its_held_project(
     tmp_path: pathlib.Path, supplied: str, destination: str
 ) -> None:
@@ -106,3 +112,40 @@ def test_library_run_refuses_a_cwd_outside_its_held_project(
     assert (first / "data" / "u" / "a.txt").read_text() == "a", output
     assert not (second / "data").exists(), output
     assert list((second / ".pivot" / "stages").rglob("*.lock")) == [], output
+
+
+def test_library_run_accepts_explicit_pipeline_outside_any_initialized_project(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An explicit selected pipeline still runs when cwd selects no competing project."""
+    home = tmp_path / "home"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    assert helpers.run_cli(first, home, "git", "init", "-q").returncode == 0
+    assert helpers.run_pivot(first, home, "init").returncode == 0
+    (first / "subdir").mkdir()
+    (first / "pipeline.py").write_text(_PIPELINE.format(name="a"))
+    caller = tmp_path / "caller.py"
+    caller.write_text(_CALLER)
+
+    ran = subprocess.run(
+        [sys.executable, str(caller), str(first), str(second), "supplied"],
+        cwd=first,
+        env=helpers.cli_env(home),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+    output = ran.stdout + ran.stderr
+    assert ran.returncode == 0, output
+    records = dict(line.split(" ", 1) for line in ran.stdout.splitlines())
+    for label, status in (("FIRST", "ran"), ("WITHIN", "cached"), ("SECOND", "ran")):
+        result = json.loads(records[label])
+        assert set(result) == {"u/a"}, output
+        assert result["u/a"]["status"] == status, output
+    assert (first / "data" / "u" / "a.txt").read_text() == "a", output
+    assert list(second.iterdir()) == [], output

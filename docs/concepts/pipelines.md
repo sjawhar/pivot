@@ -50,10 +50,13 @@ project, otherwise the one at the project root. `--all` (on `repro`, `run`,
 root, skipping `.venv`, `.git`, `__pycache__` and similar directories.
 
 When calling `pivot.executor.run()` from Python, the process holds the project it first
-resolved. Changing directories within that project is supported. A run from outside it raises
-`PipelineConfigError` naming the held project and the current directory, before discovery or
-execution, including when you pass `pipeline=`. Start a new Python process to run another
-project; changing back into the held project lets that process run it again.
+resolved. Changing directories within that project is supported. Running from another
+initialized project raises `PipelineConfigError` before discovery or execution, including
+when you pass `pipeline=`; the error names the held project and the current directory. Start a
+new Python process to run another project. An explicit `pipeline=` may run from outside the
+held project when the current directory belongs to no initialized Pivot project; automatic
+discovery still requires a directory inside the held project. Changing back into the held
+project lets that process run it again.
 
 ## Stage Names
 
