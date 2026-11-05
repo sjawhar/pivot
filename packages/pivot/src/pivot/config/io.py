@@ -354,10 +354,13 @@ def _effective_cache_dir(
             cache_dir = root / cache_dir
     cache_dir = pathlib.Path(os.path.realpath(cache_dir))
     stages_dir = state_dir / "stages"
-    if (
-        cache_dir == stages_dir
-        or cache_dir.is_relative_to(stages_dir)
-        or stages_dir.is_relative_to(cache_dir)
+    cache_name = os.fspath(cache_dir)
+    stages_name = os.fspath(stages_dir)
+    # Keep POSIX component and anchor boundaries without allocating each path's ancestors.
+    if cache_dir.anchor == stages_dir.anchor and (
+        cache_name == stages_name
+        or cache_name.startswith(os.path.join(stages_name, ""))
+        or stages_name.startswith(os.path.join(cache_name, ""))
     ):
         state_dir_mod.report_cache_stage_overlap(cache_dir, stages_dir, fallback_cache_dir)
         cache_dir = fallback_cache_dir

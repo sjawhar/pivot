@@ -419,3 +419,41 @@ def test_locate_cache_dir_resolves_an_environment_override_from_the_supplied_roo
     monkeypatch.setenv("PIVOT_CACHE_DIR", "relative-cache")
 
     assert config.locate_cache_dir(root) == root / "relative-cache"
+
+
+def test_cache_stage_overlap_does_not_enumerate_cache_path_parents(
+    project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_config(project_root, "cache:\n  dir: custom-cache\n")
+    cache_path = project_root / "custom-cache"
+    original = pathlib.Path.is_relative_to
+
+    def reject_cache_parent_walk(current: pathlib.Path, other: pathlib.Path) -> bool:
+        if current == cache_path or other == cache_path:
+            raise AssertionError("cache/stage overlap allocated the cache path's ancestor Paths")
+        return original(current, other)
+
+    monkeypatch.setattr(pathlib.Path, "is_relative_to", reject_cache_parent_walk)
+
+    assert config.locate_cache_dir() == cache_path
+
+
+@pytest.mark.parametrize(
+    ("cache_value", "fallback"),
+    [
+        ("state/stages", True),
+        ("state/stages/inside", True),
+        ("state", True),
+        ("state/stages-copy", False),
+        ("state-cache", False),
+    ],
+)
+def test_cache_stage_overlap_preserves_component_boundaries(
+    project_root: pathlib.Path, cache_value: str, fallback: bool
+) -> None:
+    _write_config(project_root, f"core:\n  state_dir: state\ncache:\n  dir: {cache_value}\n")
+
+    actual = config.locate_cache_dir()
+
+    expected = project_root / "state" / "cache" if fallback else project_root / cache_value
+    assert actual == expected
