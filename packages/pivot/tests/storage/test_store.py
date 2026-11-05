@@ -1107,3 +1107,42 @@ def test_metadata_controls_use_the_layout_captured_for_the_cache_key(
 
     assert first.parent / "projects" in controls
     assert second.parent / "projects" not in controls
+
+
+def test_metadata_overlap_does_not_enumerate_target_path_parents(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "data" / "ordinary.txt"
+    replacement = ownership.stage_output(path, "p/out")
+    original = pathlib.Path.is_relative_to
+
+    def reject_target_parent_walk(current: pathlib.Path, other: pathlib.Path) -> bool:
+        if current == path or other == path:
+            raise AssertionError("metadata containment allocated the target's ancestor Paths")
+        return original(current, other)
+
+    monkeypatch.setattr(pathlib.Path, "is_relative_to", reject_target_parent_walk)
+
+    assert ownership.control_path_refusal(tmp_path, [replacement]) is None
+
+
+@pytest.mark.parametrize(
+    ("relative", "refused"),
+    [
+        (".git", True),
+        (".git/HEAD", True),
+        (".git-copy", False),
+        (".pivot", True),
+        (".pivot-copy", False),
+        ("ordinary", False),
+        (".", True),
+    ],
+)
+def test_metadata_string_boundaries_preserve_components(
+    tmp_path: pathlib.Path, relative: str, refused: bool
+) -> None:
+    replacement = ownership.stage_output(tmp_path / relative, "p/out")
+
+    refusal = ownership.control_path_refusal(tmp_path, [replacement])
+
+    assert (refusal is not None) == refused

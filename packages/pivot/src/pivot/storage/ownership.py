@@ -789,7 +789,7 @@ def _metadata_controls(
     state_root: pathlib.Path,
     cache_root: pathlib.Path,
     layout: naming.StoreLayout,
-) -> tuple[pathlib.Path, ...]:
+) -> tuple[tuple[pathlib.Path, str, str], ...]:
     """Resolve controls once per logical/physical root, state/cache location and store layout.
 
     The physical root and layout are cache-key inputs: repointing a root or linked object store
@@ -801,9 +801,8 @@ def _metadata_controls(
         lock.get_stages_dir(state_root),
         *naming.control_paths(cache_root, layout),
     )
-    return tuple(
-        sorted({location for control in controls for location in (control, control.resolve())})
-    )
+    paths = sorted({location for control in controls for location in (control, control.resolve())})
+    return tuple((path, os.fspath(path), os.path.join(path, "")) for path in paths)
 
 
 def control_path_refusal(
@@ -837,13 +836,16 @@ def control_path_refusal(
             )
         )
         if control is None:
+            # Like _find_sidecars, compare normalized absolute strings at separator boundaries.
+            # Python 3.13's is_relative_to allocates a Path for every ancestor.
+            located = [(os.fspath(entry), os.path.join(entry, "")) for entry in locations]
             control = next(
                 (
                     item
-                    for item in protected
+                    for item, value, prefix in protected
                     if any(
-                        entry.is_relative_to(item) or item.is_relative_to(entry)
-                        for entry in locations
+                        entry == value or entry.startswith(prefix) or value.startswith(parent)
+                        for entry, parent in located
                     )
                 ),
                 None,
