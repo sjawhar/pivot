@@ -555,6 +555,16 @@ pivot checkout [TARGETS...] [OPTIONS]
 | `--only-missing` | Only restore files that don't exist on disk. For a directory, restores its missing files and empty directories; if a file differs from the target, or an extra file or directory exists, replaces the directory when every such file is pivot's own earlier output (its content is in the cache; an extra empty directory holds nothing to lose), and otherwise refuses, naming the local changes, so they are never overwritten; use `--force` to overwrite |
 | `--all` | Checkout all targets (ignore target filtering) |
 
+Checkout refuses targets that overlap the project's `.git`, `.pivot`, or Pivot-owned entries
+in the configured state and cache directories. State entries include `stages/`, `state.lmdb/`,
+`locks/`, `agent.sock`, `config.yaml.lock`, `plots/`, `secret.key`, `tui.log` and `cache/stages.cache`;
+cache entries include `files/`, `trees/`, `refs/`, `projects/`, `naming.lock` and `naming.turnstile`.
+This includes a target inside a control path, a parent that would replace it, and a path whose
+parent reaches it through a symlink. The refusal names the target and control path, exits 1
+and restores nothing, with or without `--force` or `--only-missing`. An ordinary dot-directory,
+or unrelated data beside the state or cache's own entries, can still be restored. Move tracked
+data and its `.pvt` sidecar outside control paths before retrying.
+
 Checkout summaries count restored, skipped, and missing **files**. Each file in a directory output
 counts separately.
 
