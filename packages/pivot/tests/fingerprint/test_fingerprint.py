@@ -16,9 +16,11 @@ import math
 import os
 import pathlib
 import random
+import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import types
 import typing
@@ -33,6 +35,9 @@ from pydantic import BaseModel
 import pivot_tui.stats
 from pivot import ast_utils, exceptions, fingerprint, loaders, project, stage_def
 from pivot.storage import state as state_mod
+
+# A memory address as a repr writes one (`0x7f3a1c2b9e50`): no form may hold one.
+_ADDRESS = re.compile(r"0x[0-9a-fA-F]{6,}")
 
 
 def _pending_ast_entries() -> list[fingerprint.AstHashEntry]:
@@ -494,19 +499,6 @@ def test_function_with_no_closure_vars():
     assert len(fp) == 1
 
 
-def test_fingerprint_with_visited_set():
-    """Should accept visited parameter for recursion tracking."""
-
-    def func() -> int:
-        return 42
-
-    visited = set()
-    fp = fingerprint.get_stage_fingerprint(func, visited=visited)
-
-    assert "self:func" in fp
-    assert len(visited) > 0
-
-
 def test_fingerprint_builtin_function_skipped():
     """Should not include builtin functions in manifest."""
 
@@ -583,18 +575,47 @@ def test_resolve_dotted_path_resolves_namespace():
     assert missing is None
 
 
-def test_process_class_body_dependencies_tracks_bases_and_annotations():
-    """Class body walker should track bases and annotated types."""
-    manifest = dict[str, str]()
-    visited = set[int]()
+def _names_the_annotated_class() -> type:
+    return _HelperAnnotatedClass
 
-    fingerprint._process_class_body_dependencies(_HelperAnnotatedClass, manifest, visited)
+
+def test_a_class_walk_tracks_its_bases_and_annotations():
+    """A class's walk follows its bases and the classes its annotations name, a pydantic model's
+    schema included."""
+    manifest = fingerprint.get_stage_fingerprint(_names_the_annotated_class)
 
     assert _definition_key("class", _HelperBase) in manifest
     assert _definition_key("class", _HelperFieldType) in manifest
     assert _definition_key("class", _HelperContainer.Inner) in manifest
     assert _definition_key("class", _HelperPydanticModel) in manifest
     assert _definition_key("schema", _HelperPydanticModel) in manifest
+
+
+class _RecordedBase(typing.TypedDict):
+    tag: str
+
+
+class _RecordedChild(_RecordedBase):
+    digest: str
+
+
+def _names_a_typed_dict_child() -> type:
+    return _RecordedChild
+
+
+def test_a_typed_dict_walks_the_base_its_class_statement_names():
+    """A `TypedDict` keeps only `dict` in `__bases__` and the base its statement names in
+    `__orig_bases__`: its walk reaches that base, as a class statement's walk does, and a cache
+    hit reads it again."""
+    manifest = fingerprint.get_stage_fingerprint(_names_a_typed_dict_child)
+    reads = _recording(_names_a_typed_dict_child)
+
+    key = _definition_key("class", _RecordedBase)
+    assert manifest[key] == fingerprint.hash_function_ast(_RecordedBase), manifest
+    assert any(path[-1] == "ob:0" for path, _ in reads), reads
+    assert fingerprint._recorded_reads_hold(
+        _names_a_typed_dict_child, [[list(path), token] for path, token in reads]
+    )
 
 
 # --- hash_function_ast tests ---
@@ -1406,22 +1427,19 @@ def test_strip_schema_metadata_removes_titles_and_descriptions():
     assert stripped["anyOf"][0]["type"] == "string"
 
 
-def test_hash_pydantic_schema_adds_schema_and_nested_models():
-    """Should hash model schema and discover nested models."""
-    manifest = dict[str, str]()
-    visited = set[int]()
+def _takes_the_outer_model(model: _PydanticOuterModel) -> None:
+    pass
 
-    fingerprint._hash_pydantic_schema(
-        typing.cast("type[fingerprint._PydanticModelProtocol]", _PydanticOuterModel),
-        manifest,
-        visited,
-    )
+
+def test_a_pydantic_model_walk_adds_its_schema_and_nested_models():
+    """A model in a type hint is walked as a class whose schema is its entry, and each model its
+    field annotations name is walked so too."""
+    manifest = fingerprint.get_stage_fingerprint(_takes_the_outer_model)
 
     outer_schema = _definition_key("schema", _PydanticOuterModel)
     assert outer_schema in manifest
     assert _definition_key("schema", _PydanticInnerModel) in manifest
     assert _definition_key("class", _PydanticInnerModel) in manifest
-    assert _definition_key("class", _PydanticOuterModel) not in manifest
     assert len(manifest[outer_schema]) == 16
 
 
@@ -1450,17 +1468,14 @@ def test_get_loader_fingerprint_returns_manifest():
 
 
 def test_covered_user_modules_reads_every_module_key_form():
-    """Bare `module:` keys, the `dep:`/`out:`-prefixed keys a loader's walk adds, and those under
-    the `held:<digest>:` prefix of a held loader, both count; other keys that mention a module do
-    not, nor a dependency or output named `module`, whose prefix the stage's output keys end."""
+    """Bare `module:` keys and the `dep:`/`out:`-prefixed keys a loader's walk adds count; other
+    keys that mention a module do not, nor a dependency or output named `module`, whose prefix
+    the stage's output keys end."""
     manifest = {
         "self:count": "a",
         "module:helpers": "",
         "dep:n:module:helpers.lib": "",
         "out:t/count:out:module:other.mod": "",
-        "dep:n:held:00ff:held:11ee:module:deep.held": "",
-        "held:22dd:module:top.held": "",
-        "held:33cc": "",
         "func:helpers.lib.value": "b",
         "const:module.NAME": "1",
         "dep:n:loader:helpers.myloader.Scaled:load": "c",
@@ -1472,8 +1487,6 @@ def test_covered_user_modules_reads_every_module_key_form():
         "helpers",
         "helpers.lib",
         "other.mod",
-        "deep.held",
-        "top.held",
     }
 
 
@@ -1758,20 +1771,35 @@ def _reads_a_dataclass_default(path: pathlib.Path) -> str:
     return _WithReaderDefault().reader.load(path)
 
 
-def _entries(manifest: dict[str, str]) -> set[tuple[str | None, str]]:
-    """Each entry of `manifest` as its walk keyed it: without its `held:<digest>:` prefixes."""
-    return {(fingerprint._held_entry(key), value) for key, value in manifest.items()}
+def _entries(manifest: dict[str, str]) -> set[tuple[str, str]]:
+    """Each entry of `manifest`, as a set to compare."""
+    return set(manifest.items())
+
+
+def _without_config(manifest: dict[str, str]) -> set[tuple[str, str]]:
+    """The entries of a top-level loader's manifest that the same loader, held in a value, adds
+    to its holder's: all but its config hash, which the holder's form holds."""
+    return {(key, value) for key, value in manifest.items() if not key.endswith(":config")}
 
 
 def _recording(func: typing.Callable[..., object]) -> list[tuple[tuple[str, ...], str]]:
     """The reads a cacheable walk of `func` records."""
-    reads = list[tuple[tuple[str, ...], str]]()
-    token = fingerprint._recorded_reads.set(reads)
-    try:
-        fingerprint.get_stage_fingerprint(func)
-    finally:
-        fingerprint._recorded_reads.reset(token)
-    return reads
+    with fingerprint._collected_capture_errors():
+        return fingerprint._stage_manifest(func, recording=True)[1]
+
+
+def _counting_expansions(monkeypatch: pytest.MonkeyPatch, name: str) -> list[type]:
+    """The classes each later call of `fingerprint.<name>` (an expansion that takes the class
+    first) is given, in order."""
+    walked = list[type]()
+    original = getattr(fingerprint, name)
+
+    def counting(cls: type, *args: typing.Any) -> None:
+        walked.append(cls)
+        original(cls, *args)
+
+    monkeypatch.setattr(fingerprint, name, counting)
+    return walked
 
 
 @pytest.mark.parametrize(
@@ -1792,32 +1820,36 @@ def _recording(func: typing.Callable[..., object]) -> list[tuple[tuple[str, ...]
     ],
 )
 def test_a_loader_a_loader_config_holds_gets_a_top_level_loaders_fingerprint(holder: typing.Any):
-    """Wherever the config's canonical form meets `_HeldReader()`, the holder's manifest holds
-    every entry `get_loader_fingerprint` gives a top-level `_HeldReader()`, its walk of `load`
-    and its config included, under `held:<digest>:`, with its `byname:json` at the top level.
-    No dict key or other user value enters a key."""
+    """Wherever the config's form meets `_HeldReader()`, the holder's manifest holds the entries a
+    top-level `_HeldReader()` gets from its class (its walk of `load`, its `load` hash) and its
+    `byname:json`; its config is part of the holder's form. No `held:` entry is made, and no dict
+    key or other user value enters a key."""
     manifest = fingerprint.get_loader_fingerprint(holder)
 
-    assert set(fingerprint.get_loader_fingerprint(_HeldReader()).items()) <= _entries(manifest)
+    assert _without_config(fingerprint.get_loader_fingerprint(_HeldReader())) <= _entries(manifest)
     assert manifest["byname:json"] == ""
-    assert any(key.startswith("held:") for key in manifest), manifest
+    assert not any(key.startswith("held:") for key in manifest), manifest
     assert not any("module:b" in key or ":byname:" in key for key in manifest), manifest
     stage = {f"dep:raw:{key}": item for key, item in manifest.items()}
     assert __name__ in fingerprint.covered_user_modules(stage, ())
 
 
 def test_a_held_loaders_config_class_and_inherited_code_are_its_entries():
-    """Each held loader is keyed by its class and fields: `_HeldReader("A")` and `("B")` get two
-    prefixes, a held library loader gets its own hashes, and a held loader whose `load` is
-    inherited gets that `load`'s hash and walk, as a top-level one does."""
+    """A held loader's config is in its holder's form: `(_HeldReader("A"), _HeldReader("B"))`
+    and `(_HeldReader("A"), _HeldReader("C"))` give two config hashes. A held library loader gets
+    its own hashes, and a held loader whose `load` is inherited gets that `load`'s hash and walk,
+    as a top-level one does."""
     both = fingerprint.get_loader_fingerprint(_HoldingReader((_HeldReader("A"), _HeldReader("B"))))
+    other = fingerprint.get_loader_fingerprint(_HoldingReader((_HeldReader("A"), _HeldReader("C"))))
     text = fingerprint.get_loader_fingerprint(_HoldingReader(loaders.Text()))
     inherited = fingerprint.get_loader_fingerprint(_HoldingReader(_InheritsLoad()))
 
-    configs = {key for key in both if key.endswith(_loader_key(_HeldReader(), "config"))}
-    assert len(configs) == 2, configs
-    assert set(fingerprint.get_loader_fingerprint(loaders.Text()).items()) <= _entries(text)
-    assert set(fingerprint.get_loader_fingerprint(_InheritsLoad()).items()) <= _entries(inherited)
+    config = _loader_key(_HoldingReader(None), "config")
+    assert both[config] != other[config]
+    assert _without_config(fingerprint.get_loader_fingerprint(loaders.Text())) <= _entries(text)
+    assert _without_config(fingerprint.get_loader_fingerprint(_InheritsLoad())) <= _entries(
+        inherited
+    )
     assert (
         _loader_key(_InheritsLoad(), "load"),
         fingerprint.hash_function_ast(_BaseLoad.load),
@@ -1826,7 +1858,7 @@ def test_a_held_loaders_config_class_and_inherited_code_are_its_entries():
 
 def test_a_loader_that_holds_itself_is_fingerprinted_once():
     """A loader that holds itself, directly or through another loader, is a cycle: the walk
-    stops at the loader it is fingerprinting already."""
+    stops at the loader it is fingerprinting already, and its class's entries are there once."""
     looped = _HoldingReader([])
     looped.inner.append(looped)
     first = _HoldingReader([])
@@ -1836,34 +1868,29 @@ def test_a_loader_that_holds_itself_is_fingerprinted_once():
     alone = fingerprint.get_loader_fingerprint(looped)
     pair = fingerprint.get_loader_fingerprint(first)
 
-    assert not any(key.startswith("held:") for key in alone), alone
-    assert {key.count("held:") for key in pair} == {0, 1}, pair
+    load = _loader_key(looped, "load")
+    assert load in alone, alone
+    assert load in pair, pair
+    assert not any(key.startswith("held:") for key in (*alone, *pair))
 
 
 def test_a_loader_held_many_times_is_walked_once_in_a_stage(monkeypatch: pytest.MonkeyPatch):
     """Fifty equal `_HeldReader()` in one config, and the same one in a second loader of the
-    stage: one walk of it in the stage (`stage_fingerprint_scope`)."""
-    walked = list[object]()
-    original = fingerprint.get_loader_fingerprint
-
-    def counting(loader: typing.Any) -> dict[str, str]:
-        walked.append(loader)
-        return original(loader)
-
-    monkeypatch.setattr(fingerprint, "get_loader_fingerprint", counting)
+    stage: each loader class is expanded once in the stage (`stage_fingerprint_scope`)."""
+    walked = _counting_expansions(monkeypatch, "_expand_loader_class")
     with fingerprint.stage_fingerprint_scope("t/use"):
         fingerprint.merge_loader_fingerprint(
             {}, "dep:a:", _HoldingReader(tuple(_HeldReader() for _ in range(50)))
         )
         fingerprint.merge_loader_fingerprint({}, "dep:b:", _HoldingReader(_HeldReader()))
 
-    assert [type(loader) for loader in walked] == [_HoldingReader, _HeldReader, _HoldingReader]
+    assert walked == [_HoldingReader, _HeldReader]
 
 
 def test_a_chain_of_held_loaders_grows_by_one_loader_per_level():
-    """`_HoldingReader` nested N deep around `_HeldReader()`: each manifest holds only its
-    immediate held loader's, which holds its own in turn, so the keys grow by a constant per
-    level, not exponentially."""
+    """`_HoldingReader` nested N deep around `_HeldReader()`: each loader class adds its entries
+    once, whatever the depth, so the keys grow by a constant per level (none), not
+    exponentially."""
     sizes = list[int]()
     value: typing.Any = _HeldReader()
     for _ in range(8):
@@ -1884,15 +1911,16 @@ def _make_reader(suffix: str) -> typing.Any:
 
 
 def test_two_classes_one_factory_made_are_each_fingerprinted():
-    """`_make_reader("first")` and `_make_reader("A")` share a name and a canonical form: both
-    are walked, neither overwrites the other, and editing the second's suffix changes the
-    holder's manifest."""
+    """`_make_reader("first")` and `_make_reader("A")` share a name: inside a value each is keyed
+    by its identity (`<name>@<identity8>`), so both are walked, neither overwrites the other, and
+    editing the second's suffix changes the holder's manifest."""
     first, second, edited = _make_reader("first"), _make_reader("A"), _make_reader("B")
     both = fingerprint.get_loader_fingerprint(_HoldingReader((first(), second())))
     after = fingerprint.get_loader_fingerprint(_HoldingReader((first(), edited())))
 
-    for made in (first(), second()):
-        assert set(fingerprint.get_loader_fingerprint(made).items()) <= _entries(both)
+    made = f"loader:{__name__}._make_reader.<locals>.Made@"
+    loads = {key for key in both if key.startswith(made) and key.endswith(":load")}
+    assert len(loads) == 2, both
     assert both != after
 
 
@@ -1919,7 +1947,7 @@ def test_a_loader_its_own_walk_reaches_again_is_fingerprinted_once(loader: typin
     the walk reaches that loader again while it is fingerprinting it, and stops there."""
     manifest = fingerprint.get_loader_fingerprint(loader)
 
-    assert _definition_key("class", _LoaderDefaults) in {key for key, _ in _entries(manifest)}
+    assert _definition_key("class", _LoaderDefaults) in manifest
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1954,93 +1982,1005 @@ def test_many_loaders_of_one_class_walk_the_class_once_in_a_stage(
     """Fifty `_HeldReader`s with fifty configs, held in one loader, and another in a second:
     the class's own entries (its `load`'s walk) are computed once in the stage, and each loader
     still gets them."""
-    walked = list[str]()
-    original = fingerprint._process_callable_dependency
-
-    def counting(name: str, *args: typing.Any, **kwargs: typing.Any) -> typing.Any:
-        walked.append(name)
-        return original(name, *args, **kwargs)
-
-    monkeypatch.setattr(fingerprint, "_process_callable_dependency", counting)
+    walked = _counting_expansions(monkeypatch, "_expand_loader_class")
     readers = tuple(_HeldReader(str(index)) for index in range(50))
     with fingerprint.stage_fingerprint_scope("t/use"):
         many = fingerprint.get_loader_fingerprint(_HoldingReader(readers))
         fingerprint.get_loader_fingerprint(_HoldingReader(_HeldReader("other")))
 
-    load = f"{fingerprint._definition_ref(_HeldReader)}.load"
-    assert walked.count(load) == 1, walked
+    assert walked.count(_HeldReader) == 1, walked
     own = fingerprint.get_loader_fingerprint(_HeldReader("7"))
-    assert set(own.items()) <= _entries(many)
+    assert _without_config(own) <= _entries(many)
 
 
 @pytest.mark.parametrize(
-    ("func", "path", "step", "value"),
+    ("func", "path"),
     [
         pytest.param(
-            _reads_through_a_partial,
-            ("g:_READ_THROUGH_PARTIAL",),
-            "hl",
-            _READ_THROUGH_PARTIAL,
-            id="partial",
+            _reads_through_a_partial, ("g:_READ_THROUGH_PARTIAL", "pa:0", "cls"), id="partial"
         ),
         pytest.param(
             _reads_through_a_keyword,
-            ("g:_READ_THROUGH_KEYWORD",),
-            "hl",
-            _READ_THROUGH_KEYWORD,
+            ("g:_READ_THROUGH_KEYWORD", "pk:reader", "cls"),
             id="partial-keyword",
         ),
         pytest.param(
-            _reads_a_dataclass_default,
-            ("g:_WithReaderDefault", "fd:reader"),
-            "hd",
-            dataclasses.fields(_WithReaderDefault)[0].default,
-            id="dataclass",
+            _reads_a_dataclass_default, ("g:_WithReaderDefault", "fd:reader", "cls"), id="dataclass"
         ),
     ],
 )
-def test_a_loader_a_stage_walk_holds_gets_its_fingerprint_and_one_read(
-    func: typing.Callable[..., object], path: tuple[str, ...], step: str, value: object
+def test_a_loader_a_stage_walk_holds_gets_its_fingerprint_and_its_reads(
+    func: typing.Callable[..., object], path: tuple[str, ...]
 ):
     """A global partial's argument, or a field default of a dataclass the stage uses, holds
-    `_HeldReader()`: the stage walk holds its fingerprint and records one read of the value
-    (`hl` for a partial, `hd` for a default), which a manifest cache hit takes again."""
+    `_HeldReader()`: the stage walk holds its class's entries and records the reads of its code
+    under the path through the value to its class (`pa:0`, `pk:reader`, `fd:reader`, then
+    `cls`), which a cache hit follows and takes again, as it does a named class's."""
     manifest = fingerprint.get_stage_fingerprint(func)
     reads = _recording(func)
 
-    assert set(fingerprint.get_loader_fingerprint(_HeldReader()).items()) <= _entries(manifest)
-    assert [read for read in reads if read[0][-1] in ("hl", "hd")] == [
-        ((*path, step), fingerprint._held_loaders_token(value, step))
-    ]
+    assert _without_config(fingerprint.get_loader_fingerprint(_HeldReader())) <= _entries(manifest)
+    assert ((*path, "lm:load"), fingerprint._read_token(_HeldReader, "lm:load")) in reads, reads
     assert fingerprint._recorded_reads_hold(func, [[list(p), token] for p, token in reads])
 
 
-class _HelperParams(stage_def.StageParams):
-    scale: int = 2
+class _Captured:
+    """A user class, not a pivot loader, that no walked code names: the walk meets it only as
+    the class of an instance a value holds."""
+
+    def suffix(self) -> str:
+        return "A"
+
+
+def _tag(captured: typing.Any, text: str) -> str:
+    return text + captured.suffix()
 
 
 def _take(value: object, x: int) -> int:
     return x
 
 
-_HELPER_PARAMS = _HelperParams()
-_HOLDS_A_NON_LOADER = functools.partial(_take, _Settings())
+_TAG_ARGUMENT = functools.partial(_tag, _Captured())
+_TAG_KEYWORD = functools.partial(_tag, captured=_Captured())
 
 
-def _helper_with_non_loader_instances(value: int, params: _HelperParams = _HELPER_PARAMS) -> object:
-    return (value * params.scale, _HOLDS_A_NON_LOADER, _Settings())
+def _tags_through_an_argument(text: str) -> str:
+    return _TAG_ARGUMENT(text)
 
 
-def test_an_instance_that_is_not_a_loader_adds_no_entry():
-    """A StageParams default, a partial holding a dataclass instance and a loader config holding
-    one record their class and fields as before: no `held:` entry and no read for them."""
-    manifest = fingerprint.get_stage_fingerprint(_helper_with_non_loader_instances)
-    holder = fingerprint.get_loader_fingerprint(_HoldingReader(_Settings()))
-    reads = _recording(_helper_with_non_loader_instances)
+def _tags_through_a_keyword(text: str) -> str:
+    return _TAG_KEYWORD(text=text)
 
-    assert not any(key.startswith("held:") or ":instance" in key for key in manifest), manifest
-    assert not any(key.startswith("held:") for key in holder), holder
-    assert not any(path[-1] in ("hl", "hd") for path, _token in reads), reads
+
+@dataclasses.dataclass(frozen=True)
+class _WithCapturedDefault:
+    captured: typing.Any = _Captured()
+
+
+def _tags_through_a_dataclass_default(text: str) -> str:
+    return _tag(_WithCapturedDefault().captured, text)
+
+
+class _CapturedParams(stage_def.StageParams):
+    captured: typing.Any = _Captured()
+
+
+_CAPTURED_PARAMS = _CapturedParams()
+
+
+def _tags_through_a_stageparams_default(
+    text: str, params: _CapturedParams = _CAPTURED_PARAMS
+) -> str:
+    return _tag(params.captured, text)
+
+
+def _class_walk(cls: type) -> set[tuple[str, str]]:
+    """The entries a value that holds an instance of `cls` gets for it: its hash and its walk,
+    under its key inside a value (`_class_key`), which is a stage's key for a class with source
+    that its module's name holds."""
+    walk = fingerprint._Walk()
+    key = fingerprint._class_key(cls, in_value=True)
+    root = walk.node(cls, fingerprint._NodeKind.CLASS, key)
+    walk.run()
+    manifest = {f"class:{key}": fingerprint.hash_function_ast(cls)}
+    with fingerprint._collected_capture_errors():
+        fingerprint._project(root, manifest)
+    return set(manifest.items())
+
+
+@pytest.mark.parametrize(
+    ("func", "path", "schema_read"),
+    [
+        pytest.param(
+            _tags_through_an_argument,
+            ("g:_TAG_ARGUMENT", "pa:0", "cls"),
+            None,
+            id="partial-argument",
+        ),
+        pytest.param(
+            _tags_through_a_keyword,
+            ("g:_TAG_KEYWORD", "pk:captured", "cls"),
+            None,
+            id="partial-keyword",
+        ),
+        pytest.param(
+            _tags_through_a_dataclass_default,
+            ("g:_WithCapturedDefault", "fd:captured", "cls"),
+            None,
+            id="dataclass-default",
+        ),
+        pytest.param(
+            _tags_through_a_stageparams_default,
+            ("d:params", "at:captured", "cls"),
+            ("d:params", "cls", "schema"),
+            id="stageparams-default",
+        ),
+    ],
+)
+def test_a_captured_instance_gets_its_classs_walk_and_its_reads(
+    func: typing.Callable[..., object],
+    path: tuple[str, ...],
+    schema_read: tuple[str, ...] | None,
+):
+    """A global partial's argument or keyword, the field default of a dataclass the stage
+    reads, or the StageParams default of a stage's parameter holds `_Captured()`. The stage's
+    manifest holds the walk a stage that names `_Captured` gets, under its own key, and the walk
+    records the reads of the class's code under the path through the value to its class, which
+    a manifest cache hit follows and takes again. The StageParams class of the default is read
+    too, under the first path that reaches it, by its schema hash, which holds its field
+    defaults' forms."""
+    manifest = fingerprint.get_stage_fingerprint(func)
+    reads = _recording(func)
+
+    assert _class_walk(_Captured) <= _entries(manifest)
+    assert ((*path, "m:suffix"), fingerprint._read_token(_Captured, "m:suffix")) in reads, reads
+    if schema_read is not None:
+        schema_token = fingerprint._read_token(_CapturedParams, "schema")
+        assert (schema_read, schema_token) in reads, reads
+    assert fingerprint._recorded_reads_hold(func, [[list(p), token] for p, token in reads])
+
+
+@pytest.mark.parametrize(
+    "holder",
+    [
+        pytest.param(_HoldingReader(_Captured()), id="the-field"),
+        pytest.param(_HoldingReader([1, {"k": _Captured()}]), id="in-a-container"),
+        pytest.param(_HoldingReader(_Settings(_Captured())), id="inside-a-dataclass"),
+        pytest.param(_HoldingReader(functools.partial(_tag, _Captured())), id="partial-arg"),
+    ],
+)
+def test_a_loader_config_holding_an_instance_gets_its_classs_walk(holder: typing.Any):
+    """Wherever a loader's config holds `_Captured()`, the loader's manifest holds the walk of
+    `_Captured` under its own key, and its module is covered."""
+    manifest = fingerprint.get_loader_fingerprint(holder)
+
+    assert _class_walk(_Captured) <= _entries(manifest)
+    stage = {f"dep:raw:{key}": item for key, item in manifest.items()}
+    assert __name__ in fingerprint.covered_user_modules(stage, ())
+
+
+class _Token(str):
+    """A user `str` subclass: the canonical form records its value as a plain string."""
+
+    def suffix(self) -> str:
+        return "A"
+
+
+class _BaseSuffix:
+    def suffix(self) -> str:
+        return "A"
+
+
+class _InheritsSuffix(_BaseSuffix):
+    """A user class whose method is its user base class's."""
+
+
+class _Level(enum.IntEnum):
+    """A user IntEnum: the canonical form records a member as a plain int."""
+
+    LOW = 1
+
+    def suffix(self) -> str:
+        return "A"
+
+
+_TOKEN = _Token("t")
+
+
+def _tags_a_str_default(text: str, token: str = _TOKEN) -> str:
+    return _tag(token, text)
+
+
+@pytest.mark.parametrize(
+    ("value", "cls", "method"),
+    [
+        pytest.param(_Token("t"), _Token, _Token.suffix, id="str-subclass"),
+        pytest.param(_Level.LOW, _Level, _Level.suffix, id="intenum-member"),
+        pytest.param(_InheritsSuffix(), _InheritsSuffix, _BaseSuffix.suffix, id="inherited-method"),
+    ],
+)
+def test_an_instance_the_form_records_as_a_scalar_or_by_its_base_gets_its_classs_walk(
+    value: object, cls: type, method: typing.Callable[..., str]
+):
+    """A `str` subclass and an IntEnum member, whose canonical forms are a plain string and
+    int, get their class's walk, `suffix` included; so does a class whose `suffix` its user
+    base class defines, under that base class."""
+    manifest = fingerprint.get_loader_fingerprint(_HoldingReader(value))
+
+    assert _class_walk(cls) <= _entries(manifest)
+    key = _definition_key("func", method)
+    assert (key, fingerprint.hash_function_ast(method)) in _entries(manifest), manifest
+
+
+def test_a_str_subclass_default_gets_its_classs_walk_and_its_value_token():
+    """A parameter's default that is an instance of a user `str` subclass is recorded by its
+    repr, as a `str` default is, and its class gets the walk a stage that names it gets; its
+    read token is the hash of its form, which holds its class's key and its value, so a cache
+    hit sees a new value."""
+    manifest = fingerprint.get_stage_fingerprint(_tags_a_str_default)
+    reads = dict(_recording(_tags_a_str_default))
+
+    digest = xxhash.xxh64(fingerprint._form(_TOKEN).text.encode()).hexdigest()
+    assert manifest[f"default:{fingerprint._definition_ref(_tags_a_str_default)}.token"] == "'t'"
+    assert _class_walk(_Token) <= _entries(manifest)
+    assert reads[("d:token",)] == f"default:{digest}"
+    assert fingerprint._recorded_reads_hold(
+        _tags_a_str_default, [[list(path), token] for path, token in reads.items()]
+    )
+
+
+def test_a_known_library_value_or_a_loader_adds_no_class_walk_and_an_opaque_one_is_refused():
+    """Known value rows need no class walk; a pivot loader gets its loader class's entries, not a
+    class walk; a `random.Random` has unreadable C state."""
+    library = fingerprint.get_loader_fingerprint(
+        _HoldingReader((pathlib.PurePosixPath("a"), collections.Counter("ab")))
+    )
+    loader = fingerprint.get_loader_fingerprint(_HoldingReader(_HeldReader()))
+
+    assert not any(key.startswith("class:") for key in library), library
+    held_class = _definition_key("class", _HeldReader)
+    assert not any(key == held_class or key.startswith(f"{held_class}@") for key in loader), loader
+    with pytest.raises(exceptions.StageDefinitionError, match="random.Random|cannot read"):
+        fingerprint.get_loader_fingerprint(_HoldingReader(random.Random(1)))
+
+
+_MANY_CAPTURED = functools.partial(_take, tuple(_Captured() for _ in range(10_000)))
+_ONE_CAPTURED = functools.partial(_take, _Captured())
+
+
+def _takes_many_captured(x: int) -> int:
+    return _MANY_CAPTURED(x) + _ONE_CAPTURED(x)
+
+
+def test_many_instances_of_one_class_walk_the_class_once_in_a_stage(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Ten thousand `_Captured()` in one partial and one in a second: the class is walked once
+    in the stage, and its entry is in the manifest once, under its own key, not once per
+    instance or per partial."""
+    walked = _counting_expansions(monkeypatch, "_process_user_methods")
+    with fingerprint.stage_fingerprint_scope("t/use"):
+        manifest = fingerprint.get_stage_fingerprint(_takes_many_captured)
+
+    assert walked.count(_Captured) == 1, walked
+    key = _definition_key("class", _Captured)
+    assert [entry for entry in manifest if entry.endswith(key.removeprefix("class:"))] == [key]
+
+
+def test_a_cache_hit_walks_a_captured_instances_class_again(monkeypatch: pytest.MonkeyPatch):
+    """The read the walk records for a partial holding `_Captured()` holds while the class is
+    unchanged, and not once its method changes where no source file shows it."""
+    reads: list[object] = [
+        [list(path), token] for path, token in _recording(_tags_through_an_argument)
+    ]
+    assert fingerprint._recorded_reads_hold(_tags_through_an_argument, reads)
+
+    def other(self: _Captured) -> str:
+        return "B"
+
+    monkeypatch.setattr(_Captured, "suffix", other)
+
+    assert not fingerprint._recorded_reads_hold(_tags_through_an_argument, reads)
+
+
+def _make_captured(suffix: str) -> type:
+    class Made:
+        def suffix(self) -> str:
+            return suffix
+
+    return Made
+
+
+@pytest.mark.parametrize("container", [tuple, frozenset], ids=["tuple", "set-equal-forms"])
+def test_two_classes_one_factory_made_keep_apart_in_one_value(container: type):
+    """Instances of two classes from one factory share a name: inside a value each class is
+    keyed by its identity, so each gets its own walk, also in a set (equal-looking members), and
+    editing the second one's closure changes the holder's manifest."""
+    first, second, edited = _make_captured("first"), _make_captured("A"), _make_captured("B")
+    pair = fingerprint.get_loader_fingerprint(_HoldingReader(container((first(), second()))))
+    after = fingerprint.get_loader_fingerprint(_HoldingReader(container((first(), edited()))))
+
+    for made in (first, second):
+        assert _class_walk(made) <= _entries(pair)
+    assert pair != after
+
+
+def test_an_instance_a_held_loader_holds_is_that_loaders_entry():
+    """`_Captured()` in the config of a loader that another loader holds is in the holder's form,
+    so its class's walk is in the holder's manifest, once, under its own key."""
+    manifest = fingerprint.get_loader_fingerprint(_HoldingReader(_HoldingReader(_Captured())))
+
+    assert _class_walk(_Captured) <= _entries(manifest)
+    assert not any(key.startswith("held:") for key in manifest), manifest
+
+
+_COLUMNS = ["a", "b"]
+
+
+class _ReadsAList:
+    def columns(self) -> list[str]:
+        return _COLUMNS
+
+
+_HOLDS_READS_A_LIST = functools.partial(_take, _ReadsAList())
+
+
+def _takes_one_that_reads_a_list(x: int) -> int:
+    return _HOLDS_READS_A_LIST(x)
+
+
+def test_a_captured_instance_whose_class_the_walk_refuses_refuses_the_stage():
+    """`_ReadsAList.columns` reads a list global, which the class walk refuses for a stage that
+    names the class; a stage that captures an instance of it is refused the same way. The stage
+    never names the class, so the message says how the stage reaches the value (the partial, the
+    position in it, the instance's class, the method that reads it), and still points to
+    StageParams."""
+    with pytest.raises(exceptions.StageDefinitionError) as raised:
+        fingerprint.get_stage_fingerprint(_takes_one_that_reads_a_list)
+
+    message = str(raised.value)
+    assert "captures non-scalar variable '_COLUMNS'" in message, message
+    assert (
+        "Reached through: global '_HOLDS_READS_A_LIST' -> argument 0 -> its class -> "
+        + "member 'columns' -> global '_COLUMNS'."
+    ) in message, message
+    assert "move this value into the stage's StageParams" in message, message
+
+
+def test_a_class_method_whose_wrapped_chain_loops_is_refused():
+    """D3: a method's metadata loop refuses both named and captured class uses."""
+
+    def loops(function: typing.Callable[..., str]) -> typing.Callable[..., str]:
+        @functools.wraps(function)
+        def wrapper(*args: typing.Any) -> str:
+            return function(*args)
+
+        wrapper.__wrapped__ = wrapper
+        return wrapper
+
+    class Looped:
+        @loops
+        def suffix(self) -> str:
+            return "A"
+
+    holds = functools.partial(_tag, Looped())
+
+    def captures(text: str) -> str:
+        return holds(text)
+
+    def names(text: str) -> str:
+        return _tag(Looped(), text)
+
+    for stage in (captures, names):
+        with pytest.raises(exceptions.StageDefinitionError) as raised:
+            fingerprint.get_stage_fingerprint(stage)
+        message = str(raised.value)
+        assert "Looped.suffix" in message and "loop" in message, message
+        assert "StageParams" in message and "break" in message.lower(), message
+
+
+def _two_partials(first: str) -> typing.Callable[[str], str]:
+    """A stage whose two partials hold instances of two classes one factory made."""
+    first_holds = functools.partial(_tag, _make_captured(first)())
+    second_holds = functools.partial(_tag, _make_captured("Z")())
+
+    def stage(text: str) -> str:
+        return first_holds(text) + second_holds(text)
+
+    return stage
+
+
+def _two_fields(label: str) -> typing.Callable[[str], str]:
+    """A stage reading a dataclass whose two field defaults are such instances."""
+
+    @dataclasses.dataclass(frozen=True)
+    class Pair:
+        first: typing.Any = _make_captured(label)()
+        second: typing.Any = _make_captured("Z")()
+
+    def stage(text: str) -> str:
+        return _tag(Pair().first, text) + _tag(Pair().second, text)
+
+    return stage
+
+
+def _two_params(first: str) -> typing.Callable[[str], str]:
+    """A stage calling two helpers whose StageParams defaults hold such instances."""
+
+    class FirstParams(stage_def.StageParams):
+        made: typing.Any = _make_captured(first)()
+
+    class SecondParams(stage_def.StageParams):
+        made: typing.Any = _make_captured("Z")()
+
+    first_params, second_params = FirstParams(), SecondParams()
+
+    def first_helper(text: str, params: typing.Any = first_params) -> str:
+        return _tag(params.made, text)
+
+    def second_helper(text: str, params: typing.Any = second_params) -> str:
+        return _tag(params.made, text)
+
+    def stage(text: str) -> str:
+        return first_helper(text) + second_helper(text)
+
+    return stage
+
+
+def _two_loader_partials(first: str) -> typing.Callable[[pathlib.Path], str]:
+    """A stage whose two partials hold two loaders whose classes one factory made."""
+    first_holds = functools.partial(_apply, _make_reader(first)())
+    second_holds = functools.partial(_apply, _make_reader("Z")())
+
+    def stage(path: pathlib.Path) -> str:
+        return first_holds(path) + second_holds(path)
+
+    return stage
+
+
+@pytest.mark.parametrize("shape", [_two_partials, _two_fields, _two_params, _two_loader_partials])
+def test_two_classes_one_factory_made_keep_apart_in_two_values_of_a_stage(
+    shape: typing.Callable[[str], typing.Callable[..., str]],
+):
+    """Two values of one stage (two partials, two field defaults of one dataclass, two helpers'
+    StageParams defaults) hold instances of two classes one factory made at the same position,
+    or two loaders whose classes one factory made. Each walk keeps its own key, so an edit to
+    the first class alone changes the manifest, and the second never overwrites the first."""
+    before = fingerprint.get_stage_fingerprint(shape("A"))
+    after = fingerprint.get_stage_fingerprint(shape("B"))
+
+    assert before != after
+    suffix_cells = {value for key, value in _entries(before) if key and key.endswith(".suffix")}
+    assert {"'A'", "'Z'"} <= suffix_cells, before
+
+
+def test_a_cache_hit_whose_value_became_opaque_misses_and_reports_nothing():
+    """A cache hit reads each recorded value again by its token and expands nothing. When an
+    instance a partial holds now also holds a value no form reads (`random.Random`), the
+    partial's token is new, so the hit misses, and checking it refuses and raises nothing; the
+    stage walk that follows refuses the stage."""
+    captured = _Captured()
+    holds = functools.partial(_tag, captured)
+
+    def stage(text: str) -> str:
+        return holds(text)
+
+    reads: list[object] = [[list(path), token] for path, token in _recording(stage)]
+    assert fingerprint._recorded_reads_hold(stage, reads)
+    captured.state = random.Random(1)  # pyright: ignore[reportAttributeAccessIssue] - the change under test
+
+    assert not fingerprint._recorded_reads_hold(stage, reads)
+    with pytest.raises(exceptions.StageDefinitionError, match="random.Random"):
+        fingerprint.get_stage_fingerprint(stage)
+
+
+def _read_value(thing: typing.Any) -> str:
+    return thing.value()
+
+
+def _make_partnered(label: str) -> type:
+    """A class whose `next_value` calls a partial holding an instance of its partner class,
+    bound once both exist (`_bind_partner`)."""
+    partner: typing.Any = None
+
+    class Made:
+        def value(self) -> str:
+            return label
+
+        def next_value(self) -> str:
+            return partner()
+
+    return Made
+
+
+def _bind_partner(cls: typing.Any, other: object) -> None:
+    function = cls.next_value
+    cell = function.__closure__[function.__code__.co_freevars.index("partner")]
+    cell.cell_contents = functools.partial(_read_value, other)
+
+
+def test_two_classes_one_factory_made_in_a_cycle_give_one_manifest_in_either_order():
+    """Two classes one factory made, each with a method that reaches an instance of the other,
+    held as equal forms in a set: each is walked with the memo as it stood before them, so the
+    manifest does not follow the order the set yields them in (the hash seed)."""
+    first_class, second_class = _make_partnered("A"), _make_partnered("B")
+    first, second = first_class(), second_class()
+    _bind_partner(first_class, second)
+    _bind_partner(second_class, first)
+
+    with fingerprint.stage_fingerprint_scope("t/use"):
+        forward = fingerprint.get_loader_fingerprint(_HoldingReader(_ordered(first, second)))
+    with fingerprint.stage_fingerprint_scope("t/use"):
+        backward = fingerprint.get_loader_fingerprint(_HoldingReader(_ordered(second, first)))
+
+    assert forward == backward
+    labels = {value for key, value in _entries(forward) if key and key.endswith(".value.label")}
+    assert labels == {"'A'", "'B'"}, forward
+
+
+@pytest.mark.parametrize("position", ["dataclass-default", "loader-config", "partial"])
+def test_a_captured_instance_whose_metaclass_reads_attributes_in_code_is_refused_running_no_hook(
+    position: str,
+):
+    """The class of a captured instance has a metaclass whose `__hash__` and `__eq__` raise, and
+    whose `__getattribute__` raises for `__mro__` and notes every other name it is asked. Reading
+    anything of the class (its source, its fields, its members) would run that code, so the stage
+    is refused, naming the class and its metaclass, and no hook runs: not the raising ones, and
+    no attribute is asked of the class."""
+    asked = list[str]()
+
+    class RaisingMeta(type):
+        def __hash__(cls) -> int:
+            raise RuntimeError("metaclass __hash__ ran")
+
+        def __eq__(cls, other: object) -> bool:
+            raise RuntimeError("metaclass __eq__ ran")
+
+        def __getattribute__(cls, name: str) -> typing.Any:
+            if name == "__mro__":
+                raise RuntimeError("metaclass __mro__ lookup ran")
+            asked.append(name)
+            return super().__getattribute__(name)
+
+    class Hooked(metaclass=RaisingMeta):
+        def suffix(self) -> str:
+            return "A"
+
+    @dataclasses.dataclass(frozen=True)
+    class Holder:
+        hooked: typing.Any = Hooked()
+
+    holds = functools.partial(_tag, Hooked())
+    loader = _HoldingReader(Hooked())
+
+    def through_a_default(text: str) -> str:
+        return _tag(Holder().hooked, text)
+
+    def through_a_partial(text: str) -> str:
+        return holds(text)
+
+    class_name = f"{Hooked.__module__}.{Hooked.__qualname__}"
+    asked.clear()
+    with pytest.raises(exceptions.StageDefinitionError) as refused:
+        if position == "loader-config":
+            fingerprint.get_loader_fingerprint(loader)
+        else:
+            stage = through_a_default if position == "dataclass-default" else through_a_partial
+            fingerprint.get_stage_fingerprint(stage)
+
+    message = str(refused.value)
+    assert asked == [], f"The walk asked the class for {asked}"
+    assert f"class '{class_name}'" in message, message
+    assert "RaisingMeta', whose `__getattribute__` or `__getattr__` is user code" in message, (
+        message
+    )
+
+
+class _SuffixBase:
+    def suffix(self) -> str:
+        return _BASE_SUFFIX
+
+
+_BASE_SUFFIX = "A"
+# A class with no source of its own whose `suffix` its user base defines: only the walk of the
+# members on its MRO reaches `suffix`, since no class statement names the base.
+_Dynamic = type("_Dynamic", (_SuffixBase,), {})
+_HOLDS_A_DYNAMIC = functools.partial(_tag, _Dynamic())
+
+
+def _tags_a_dynamic_instance(text: str) -> str:
+    return _HOLDS_A_DYNAMIC(text)
+
+
+def _names_the_dynamic_class(text: str) -> str:
+    return _tag(_Dynamic(), text)
+
+
+@pytest.mark.parametrize(
+    "stage", [_tags_a_dynamic_instance, _names_the_dynamic_class], ids=["captured", "named"]
+)
+def test_a_member_a_class_inherits_is_walked_for_a_captured_instance(
+    stage: typing.Callable[[str], str],
+):
+    """`_Dynamic`, made by `type()`, inherits `suffix`, which reads `_BASE_SUFFIX`, and no class
+    statement names its base: the walk of its class reaches `suffix` through the MRO, for a
+    captured instance and for a stage that names the class."""
+    manifest = fingerprint.get_stage_fingerprint(stage)
+
+    assert (f"const:{__name__}._BASE_SUFFIX", "'A'") in _entries(manifest), manifest
+
+
+class _SharedBase:
+    def shared(self) -> str:
+        return "s"
+
+
+class _FirstChild(_SharedBase):
+    def first(self) -> str:
+        return "1"
+
+
+class _SecondChild(_SharedBase):
+    def second(self) -> str:
+        return "2"
+
+
+_HOLDS_TWO_CHILDREN = functools.partial(_take, (_FirstChild(), _SecondChild()))
+
+
+def _takes_two_children(x: int) -> int:
+    return _HOLDS_TWO_CHILDREN(x)
+
+
+def test_a_user_base_two_captured_classes_share_is_walked_once():
+    """`_FirstChild` and `_SecondChild` share the user base `_SharedBase`: each class is walked
+    for its own members, and the base once, under its own key, so its member's walk is in the
+    manifest once, not once per class that inherits it."""
+    manifest = fingerprint.get_stage_fingerprint(_takes_two_children)
+
+    for member in (_SharedBase.shared, _FirstChild.first, _SecondChild.second):
+        assert _definition_key("func", member) in manifest, manifest
+
+
+def _constant(thing: object) -> str:
+    return "x"
+
+
+class _HoldsItself:
+    def suffix(self) -> str:
+        return _HOLDS_ITSELF()
+
+
+_HOLDS_ITSELF = functools.partial(_constant, _HoldsItself())
+
+
+def _tags_a_self_holding_instance(text: str) -> str:
+    return text + _HOLDS_ITSELF()
+
+
+def test_a_class_whose_member_reaches_its_own_instance_is_walked_once():
+    """`_HoldsItself.suffix` reads a partial holding an instance of `_HoldsItself`: the class
+    being walked is not walked again where its own walk reaches it, so the walk ends."""
+    manifest = fingerprint.get_stage_fingerprint(_tags_a_self_holding_instance)
+
+    assert _definition_key("func", _HoldsItself.suffix) in manifest, manifest
+
+
+class _AddressRepr:
+    """A value whose own `__repr__` writes its address."""
+
+    __slots__: tuple[str, ...] = ()
+
+    def __repr__(self) -> str:
+        return f"<_AddressRepr at {id(self):#x}>"
+
+
+class _RaisingRepr:
+    """A user class whose `__repr__` must not run while its class is walked."""
+
+    def __init__(self, label: str) -> None:
+        self.label: str = label
+
+    def __repr__(self) -> str:
+        raise RuntimeError("an unused default's repr ran")
+
+
+def test_a_class_default_is_hashed_by_its_state_without_an_address():
+    """A class-level default is hashed by what it holds, with no address and no repr run: an
+    `object()` sentinel and a `__slots__ = ()` instance by their type, a `__slots__` instance by
+    its slots, a user class with a repr of its own (one that raises, one that writes its address)
+    by its attributes and slots, and a string that looks like an address by its content."""
+    forms = {
+        name: fingerprint._form(value)
+        for name, value in {
+            "sentinel": _NO_SOURCE_MISSING,
+            "slots-1": _NoSourceBox(1),
+            "slots-2": _NoSourceBox(2),
+            "raising-repr-a": _RaisingRepr("a"),
+            "raising-repr-b": _RaisingRepr("b"),
+            "address-repr": _AddressRepr(),
+            "hex-a": "0xabcdef12",
+            "hex-b": "0x12345678",
+        }.items()
+    }
+
+    opaque = fingerprint._ReportKind.OPAQUE
+    assert not [form for form in forms.values() for _, kind, _ in form.reports if kind is opaque]
+    assert all(
+        _ADDRESS.search(form.text) is None for name, form in forms.items() if "hex" not in name
+    ), forms
+    assert forms["slots-1"].text != forms["slots-2"].text
+    assert forms["raising-repr-a"].text != forms["raising-repr-b"].text
+    assert (forms["hex-a"].text, forms["hex-b"].text) == ('"0xabcdef12"', '"0x12345678"')
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(random.Random(1), id="random"),
+        pytest.param(threading.Lock(), id="lock"),
+    ],
+)
+def test_a_class_default_whose_state_no_form_reads_refuses_the_stage(value: object):
+    """A class-level default whose state is in C cannot be hashed: a stage that names the class
+    is refused, naming the field, and the field's read token is the hash of the default's opaque
+    form, which no readable default has, so a manifest cache hit misses."""
+
+    @dataclasses.dataclass(frozen=True)
+    class Holds:
+        state: typing.Any = value
+
+    def names(x: int) -> int:
+        return x + bool(Holds().state)
+
+    with pytest.raises(exceptions.StageDefinitionError, match=r"default of field '.*Holds\.state'"):
+        fingerprint.get_stage_fingerprint(names)
+    form = fingerprint._form(value)
+    assert [kind for _, kind, _ in form.reports] == [fingerprint._ReportKind.OPAQUE]
+    digest = xxhash.xxh64(form.text.encode()).hexdigest()
+    assert fingerprint._dataclass_field_token(Holds, "state") == f"field:{digest}"
+
+
+@dataclasses.dataclass(frozen=True)
+class _WithRaisingReprDefault:
+    """Has a docstring, so `dataclasses` does not build one from the default's repr."""
+
+    value: typing.Any = _RaisingRepr("unused")
+
+
+_HOLDS_RAISING_REPR_DEFAULT = functools.partial(str, _WithRaisingReprDefault("explicit"))
+
+
+def _captures_a_raising_repr_default() -> str:
+    return _HOLDS_RAISING_REPR_DEFAULT()
+
+
+def test_an_unused_default_whose_repr_raises_does_not_stop_a_captured_stage():
+    """A partial holds an instance that overrides its class's default, a user class instance
+    whose `__repr__` raises: walking the class hashes the default by its attributes, so the
+    repr never runs and the stage is fingerprinted."""
+    manifest = fingerprint.get_stage_fingerprint(_captures_a_raising_repr_default)
+
+    key = f"default:{fingerprint._definition_ref(_WithRaisingReprDefault)}.value"
+    assert key in manifest, manifest
+
+
+_FIELD_TOKEN_MODULE = """\
+import dataclasses
+from typing import Any
+
+
+class Box:
+    __slots__ = ("x",)
+
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+
+@dataclasses.dataclass(frozen=True)
+class Defaults:
+    sentinel: Any = object()
+    box: Any = Box(1)
+"""
+
+_FIELD_TOKEN_SCRIPT = """\
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import field_token_defaults as module
+from pivot import fingerprint
+
+print(json.dumps([fingerprint._dataclass_field_token(module.Defaults, name)
+                  for name in ("sentinel", "box")]))
+"""
+
+
+def test_a_dataclass_field_token_is_the_same_in_every_interpreter(tmp_path: pathlib.Path):
+    """The read token of a field whose default is an `object()` sentinel or a `__slots__`
+    object is the hash of the default's text with no address, so two interpreters with two hash
+    seeds give one token, and a manifest cache hit in the next process is taken."""
+    (tmp_path / "field_token_defaults.py").write_text(_FIELD_TOKEN_MODULE)
+    tokens = [
+        subprocess.run(
+            [sys.executable, "-c", _FIELD_TOKEN_SCRIPT, str(tmp_path)],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONHASHSEED": seed},
+        ).stdout
+        for seed in ("1", "2")
+    ]
+
+    assert tokens[0] == tokens[1], tokens
+    assert "refused" not in tokens[0], tokens
+
+
+_UNSAFE_BASE_VALUES = ["unused"]
+
+
+class _UnsafeBase:
+    def value(self) -> str:
+        return _UNSAFE_BASE_VALUES[0]
+
+
+def _safe_value(self: object) -> str:
+    return "safe"
+
+
+# A class with no statement that overrides its base's member: its base is walked, as a class
+# statement's base is, so the base's own `value` is walked too.
+_SafeDerived = type("_SafeDerived", (_UnsafeBase,), {"value": _safe_value})
+_HOLDS_SAFE_DERIVED = functools.partial(_read_value, _SafeDerived())
+
+
+class _SafeDerivedStatement(_UnsafeBase):
+    value: typing.ClassVar[typing.Callable[[object], str]] = _safe_value
+
+
+def _captures_safe_derived() -> str:
+    return _HOLDS_SAFE_DERIVED()
+
+
+def _names_safe_derived() -> str:
+    return _SafeDerived().value()
+
+
+def _names_safe_derived_statement() -> str:
+    return _SafeDerivedStatement().value()
+
+
+@pytest.mark.parametrize(
+    "stage", [_captures_safe_derived, _names_safe_derived, _names_safe_derived_statement]
+)
+def test_a_class_without_a_statement_walks_its_base_as_a_class_statement_does(
+    stage: typing.Callable[[], str],
+):
+    """`_SafeDerived`, made by `type()`, overrides `value`, whose base version reads a list
+    global. Its base is part of its walk, as `_SafeDerivedStatement`'s is: a stage that names
+    either class, or captures an instance of `_SafeDerived`, walks the base's `value` and is
+    refused for the list it reads."""
+    with pytest.raises(exceptions.StageDefinitionError, match="'_UNSAFE_BASE_VALUES'"):
+        fingerprint.get_stage_fingerprint(stage)
+
+
+def test_walking_a_held_class_runs_no_metaclass_repr():
+    """The class of an instance a loader's config holds has a metaclass whose `__repr__` raises:
+    the class is walked without being passed to an API that formats it."""
+
+    class ReprMeta(type):
+        def __repr__(cls) -> str:
+            raise RuntimeError("metaclass __repr__ ran")
+
+    class ReprThing(metaclass=ReprMeta):
+        def value(self) -> str:
+            return "safe"
+
+    manifest = fingerprint.get_loader_fingerprint(_HoldingReader(ReprThing()))
+
+    key = f"func:{ReprThing.__module__}.{ReprThing.__qualname__}.value"
+    assert key in manifest, manifest
+
+
+def _swapped(first: str, second: str) -> typing.Callable[[str], str]:
+    """A stage whose two partials hold instances of two classes one factory made."""
+    first_holds = functools.partial(_tag, _make_captured(first)())
+    second_holds = functools.partial(_tag, _make_captured(second)())
+
+    def stage(text: str) -> str:
+        return first_holds(text) + second_holds(text)
+
+    return stage
+
+
+def test_swapping_two_captured_classes_between_two_values_changes_the_manifest():
+    """Two partials hold instances of classes one factory made with `A` and `Z`; swapping them
+    changes the stage's output, so it changes the manifest: each walk is keyed by the value that
+    holds it."""
+    before = fingerprint.get_stage_fingerprint(_swapped("A", "Z"))
+    after = fingerprint.get_stage_fingerprint(_swapped("Z", "A"))
+
+    assert before != after
+
+
+def _make_slotted(label: str) -> type:
+    class Slot:
+        __slots__: tuple[str, ...] = ()
+
+        def value(self) -> str:
+            return label
+
+    return Slot
+
+
+@dataclasses.dataclass(frozen=True)
+class _SetDefault:
+    values: typing.Any = frozenset((_make_slotted("A")(), _make_slotted("B")()))
+
+
+def _reads_a_set_default() -> str:
+    return "".join(sorted(item.value() for item in _SetDefault().values))
+
+
+def test_a_dataclass_default_holding_instances_replays_as_it_records():
+    """A dataclass default holds a set of two `__slots__` instances of classes one factory made:
+    the walk records each class's reads under its member's rank in the set (`s:0`, `s:1`), and a
+    cache hit follows those steps and takes the same reads again, in one process."""
+    recorded = _recording(_reads_a_set_default)
+    reads: list[object] = [[list(path), token] for path, token in recorded]
+
+    ranks = {
+        path[2]
+        for path, _ in recorded
+        if path[:2] == ("g:_SetDefault", "fd:values") and path[-1] == "m:value"
+    }
+    assert ranks == {"s:0", "s:1"}, reads
+    assert fingerprint._recorded_reads_hold(_reads_a_set_default, reads)
+
+
+_READER_COLUMNS = ["a", "b"]
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReadsAListReader(loaders.Reader[str]):
+    """A loader whose `load` reads a list global, which the walk refuses."""
+
+    def load(self, path: pathlib.Path) -> str:
+        return ",".join(_READER_COLUMNS)
+
+
+_HOLDS_A_LIST_READER = functools.partial(_apply, _ReadsAListReader())
+
+
+def _takes_a_list_reader(path: pathlib.Path) -> str:
+    return _HOLDS_A_LIST_READER(path)
+
+
+@pytest.mark.parametrize(
+    ("stage", "step", "name"),
+    [
+        pytest.param(
+            _takes_one_that_reads_a_list, "g:_HOLDS_READS_A_LIST", "_COLUMNS", id="held-class"
+        ),
+        pytest.param(
+            _takes_a_list_reader, "g:_HOLDS_A_LIST_READER", "_READER_COLUMNS", id="held-loader"
+        ),
+    ],
+)
+def test_a_cache_hit_check_keeps_nothing_and_the_stage_walk_refuses(
+    stage: typing.Callable[..., object], step: str, name: str
+):
+    """In one stage scope, checking a cache hit reads a partial's token, the hash of its form, and
+    expands nothing, so it refuses nothing and keeps no walk; the stage walk that follows walks
+    the class a partial holds an instance of, or the loader it holds and that loader's class,
+    and refuses the stage."""
+    with (
+        pytest.raises(exceptions.StageDefinitionError, match=f"non-scalar variable '{name}'"),
+        fingerprint.stage_fingerprint_scope("t/use"),
+    ):
+        assert fingerprint._read_token(stage, step).startswith("partial:")
+        fingerprint.get_stage_fingerprint(stage)
 
 
 _LABELS = ["a", "b"]
@@ -2303,16 +3243,13 @@ def _raise_timeout(signum: int, frame: object) -> None:
         ),
     ],
 )
-def test_a_wrapped_chain_that_loops_is_refused_not_followed_forever(loader: object, name: str):
-    """`load`, a helper it reaches, or a member the fallback to every member walks (an
-    operator on `self`) is its own `__wrapped__`. The walk refuses the stage, naming that
-    function once, also when it is both reached and in the fallback, within 10 seconds (an
-    alarm turns a hang into a `TimeoutError`)."""
+def test_a_wrapped_chain_that_loops_is_refused(loader: object, name: str):
+    """D3: refuse reached and fallback loader members with looping metadata, without hanging."""
     previous = signal.signal(signal.SIGALRM, _raise_timeout)
     signal.setitimer(signal.ITIMER_REAL, 10)
     try:
         with (
-            pytest.raises(exceptions.StageDefinitionError) as refused,
+            pytest.raises(exceptions.StageDefinitionError) as raised,
             fingerprint.stage_fingerprint_scope("t/use"),
         ):
             fingerprint.get_loader_fingerprint(loader)  # pyright: ignore[reportArgumentType]
@@ -2320,19 +3257,17 @@ def test_a_wrapped_chain_that_loops_is_refused_not_followed_forever(loader: obje
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
 
-    assert str(refused.value).count(f"'{name}' has a `__wrapped__` chain that loops") == 1, (
-        refused.value
-    )
+    message = str(raised.value)
+    assert name in message and "loop" in message, message
+    assert "StageParams" in message and "break" in message.lower(), message
 
 
 def test_each_stage_of_a_pass_whose_loader_reaches_a_looped_helper_is_refused():
-    """Two stages of one fingerprint pass read the loader whose `load` reaches a helper that is
-    its own `__wrapped__`. The pass shares the member walk (`_memoized`), and each stage is
-    refused, the second from the shared walk too."""
+    """D3: a shared member walk must retain the refusal for each stage in the pass."""
     with fingerprint.fingerprint_pass():
         for stage_name in ("t/first", "t/second"):
             with (
-                pytest.raises(exceptions.StageDefinitionError, match="helper' has a `__wrapped__`"),
+                pytest.raises(exceptions.StageDefinitionError, match="_LoopWrappedHelper.helper"),
                 fingerprint.stage_fingerprint_scope(stage_name),
             ):
                 fingerprint.get_loader_fingerprint(_LoopWrappedHelper())
@@ -2438,13 +3373,23 @@ def test_a_swap_of_two_held_loaders_with_one_form_changes_the_manifest():
     assert wrapped != rewrapped
 
 
-class _Ordered(frozenset[typing.Any]):
-    """A frozenset whose iteration order is given, as a hash seed would give one."""
+def _iteration_order(ordered: frozenset[typing.Any]) -> tuple[typing.Any, ...]:
+    """The Python-level iteration order `_ordered` gave `ordered`. The orders are kept in this
+    function's own attributes, which no fingerprint reads, so an `_Ordered`'s state is its
+    members alone."""
+    return _iteration_order.orders[id(ordered)]  # pyright: ignore[reportFunctionMemberAccess] - the store is the function's attribute
 
-    order: tuple[typing.Any, ...] = ()
+
+_iteration_order.orders = dict[int, tuple[typing.Any, ...]]()  # pyright: ignore[reportFunctionMemberAccess] - the store is the function's attribute
+
+
+class _Ordered(frozenset[typing.Any]):
+    """A frozenset whose Python-level iteration order is given, as a hash seed would give one."""
+
+    __slots__: tuple[str, ...] = ()
 
     def __iter__(self) -> collections.abc.Iterator[typing.Any]:
-        return iter(self.order)
+        return iter(_iteration_order(self))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2467,7 +3412,7 @@ class _CycleB(loaders.Reader[str]):
 
 def _ordered(*items: typing.Any) -> _Ordered:
     ordered = _Ordered(items)
-    ordered.order = items
+    _iteration_order.orders[id(ordered)] = items  # pyright: ignore[reportFunctionMemberAccess] - the store is the function's attribute
     return ordered
 
 
@@ -2484,7 +3429,7 @@ def test_a_set_of_loaders_in_a_cycle_gives_one_manifest_in_either_order():
         backward = fingerprint.get_loader_fingerprint(_HoldingReader(_ordered(b, a)))
 
     assert forward == backward
-    assert any(key.count("held:") == 2 for key in forward), forward
+    assert {_loader_key(a, "load"), _loader_key(b, "load")} <= forward.keys(), forward
 
 
 def _make_alike(tag: str) -> typing.Any:
@@ -2512,7 +3457,21 @@ def test_two_loaders_alike_in_a_cycle_give_one_manifest_in_either_order():
         backward = fingerprint.get_loader_fingerprint(_HoldingReader(_ordered(y, x)))
 
     assert forward == backward
-    assert sum(key.count("held:") == 2 for key in forward) >= 2, forward
+    loads = [key for key in forward if ".Alike@" in key and key.endswith(":load")]
+    assert len(loads) == 2, forward
+
+
+def test_instances_of_one_class_in_a_set_give_one_manifest_in_either_order():
+    """Two `_Settings` with different fields in a set: the class's walk is keyed by the first of
+    their positions in sorted order, not by the order the set yields them in, so the manifest
+    does not follow the hash seed."""
+    first, second = _Settings(1), _Settings(2)
+
+    forward = fingerprint.get_loader_fingerprint(_HoldingReader(_ordered(first, second)))
+    backward = fingerprint.get_loader_fingerprint(_HoldingReader(_ordered(second, first)))
+
+    assert forward == backward
+    assert _class_walk(_Settings) <= _entries(forward)
 
 
 def _chain(depth: int) -> typing.Any:
@@ -2613,22 +3572,357 @@ def _model_sentinel_beside(token: str) -> type:
     [
         pytest.param(_sentinel_beside, id="sentinel"),
         pytest.param(_slots_beside, id="slots"),
-        pytest.param(_random_beside, id="random"),
         pytest.param(_model_sentinel_beside, id="model-sentinel"),
     ],
 )
 def test_an_edit_beside_a_value_no_form_shows_changes_the_hash(
     make: typing.Callable[[str], type],
 ):
-    """An entry whose form shows nothing leaves the rest of the class's entries in its hash: an
-    edit to the other default (`A` to `B`, in this one module) changes it, and two classes made
-    alike hash alike."""
+    """An `object()` sentinel or a `__slots__` object leaves the rest of the class's entries in
+    its hash: an edit to the other default (`A` to `B`, in this one module) changes it, and two
+    classes made alike hash alike."""
     first = fingerprint._compute_function_hash(make("A"))
     again = fingerprint._compute_function_hash(make("A"))
     edited = fingerprint._compute_function_hash(make("B"))
 
     assert first == again, "Two classes made alike should hash alike"
     assert first != edited, "An edit to a shown entry should change the hash"
+
+
+_CALLBACK_VALUE = "A"
+
+
+class _Callback:
+    """A `__slots__` object that holds a callback its caller gives it."""
+
+    __slots__: tuple[str, ...] = ("callback",)
+
+    def __init__(self, callback: typing.Callable[[], str]) -> None:
+        self.callback: typing.Callable[[], str] = callback
+
+    def read(self) -> str:
+        return self.callback()
+
+
+@dataclasses.dataclass(frozen=True)
+class _WithCallbackDefault:
+    value: typing.Any = _Callback(lambda: _CALLBACK_VALUE)
+
+    def fresh(self) -> str:
+        return type(self)().value.read()
+
+
+def _names_a_callback_default() -> str:
+    return _WithCallbackDefault().value.read()
+
+
+def _fresh(thing: typing.Any) -> str:
+    return thing.fresh()
+
+
+_HOLDS_A_CALLBACK_HOLDER = functools.partial(_fresh, _WithCallbackDefault(None))
+
+
+def _captures_a_callback_holder() -> str:
+    return _HOLDS_A_CALLBACK_HOLDER()
+
+
+@pytest.mark.parametrize("stage", [_names_a_callback_default, _captures_a_callback_holder])
+def test_a_callback_in_an_instances_state_is_walked_with_the_globals_it_reads(
+    stage: typing.Callable[[], str],
+):
+    """A `__slots__` object in a dataclass's class-level default holds a lambda that reads
+    `_CALLBACK_VALUE`. For a stage that names the class, and for one that captures an instance
+    overriding the default, the lambda gets a stage helper's walk, so the global is in the
+    manifest."""
+    manifest = fingerprint.get_stage_fingerprint(stage)
+
+    assert f"const:{__name__}._CALLBACK_VALUE" in manifest, manifest
+
+
+def _callback_class_cycle() -> str:
+    return _CycleBox.marker
+
+
+@dataclasses.dataclass(frozen=True)
+class _CycleBox:
+    marker: typing.ClassVar[str] = "safe"
+    value: typing.Any = _Callback(_callback_class_cycle)
+
+
+def _reads_a_callback_cycle() -> str:
+    return _CycleBox().value.read()
+
+
+def test_a_callback_that_reads_the_class_holding_it_is_a_back_reference():
+    """A callback in `_CycleBox`'s default reads `_CycleBox.marker`: the enclosing class is
+    already in the held callable's dependency set, so the callback stops at the back-reference
+    instead of recursing, and the stage has a stable manifest."""
+    with fingerprint.stage_fingerprint_scope("t/use"):
+        first = fingerprint.get_stage_fingerprint(_reads_a_callback_cycle)
+        second = fingerprint.get_stage_fingerprint(_reads_a_callback_cycle)
+
+    assert first == second
+
+
+def _loop_callback() -> str:
+    return "safe"
+
+
+setattr(_loop_callback, "__wrapped__", _loop_callback)  # noqa: B010 - the loop under test
+
+
+@dataclasses.dataclass(frozen=True)
+class _LoopCallbackBox:
+    value: typing.Any = _Callback(_loop_callback)
+
+
+def _reads_a_loop_callback() -> str:
+    return _LoopCallbackBox().value.read()
+
+
+def test_a_callback_whose_wrapped_chain_loops_is_refused():
+    """D3: a looping callback in default state is refused by name."""
+    with pytest.raises(exceptions.StageDefinitionError) as raised:
+        fingerprint.get_stage_fingerprint(_reads_a_loop_callback)
+    message = str(raised.value)
+    assert "_loop_callback" in message and "loop" in message, message
+    assert "StageParams" in message and "break" in message.lower(), message
+
+
+_CLASS_CALLBACK_VALUE = "A"
+
+
+class _ClassCallback:
+    @classmethod
+    def read(cls) -> str:
+        return _CLASS_CALLBACK_VALUE
+
+
+class _DictCallback:
+    def __init__(self, callback: typing.Callable[[], str]) -> None:
+        self.callback: typing.Callable[[], str] = callback
+
+    def read(self) -> str:
+        return self.callback()
+
+
+@dataclasses.dataclass(frozen=True)
+class _WithClassMethodCallback:
+    value: typing.Any = _DictCallback(_ClassCallback.read)
+
+
+def _reads_a_classmethod_callback() -> str:
+    return _WithClassMethodCallback().value.read()
+
+
+def test_a_class_bound_method_in_state_walks_its_function_globals():
+    """A classmethod stored as a callback is normalized to its underlying function before its
+    walk, so the global it reads is in the manifest."""
+    manifest = fingerprint.get_stage_fingerprint(_reads_a_classmethod_callback)
+
+    assert f"const:{__name__}._CLASS_CALLBACK_VALUE" in manifest, manifest
+
+
+def test_bytes_and_a_path_with_identity_looking_text_are_hashed_by_value():
+    """Identity-looking text inside bytes or a path is value data, not an object's repr:
+    `b"located at 0xabcdef"`, `b"Py(0xabcdef)"`, `b"<object at 0xabcdef>"` and a path with
+    `at 0xabcdef` are accepted, not refused, and each content change changes the form."""
+    for value, other in (
+        (b"located at 0xabcdef", b"located at 0x123456"),
+        (b"Py(0xabcdef)", b"Py(0x123456)"),
+        (b"<object at 0xabcdef>", b"<object at 0x123456>"),
+        (
+            pathlib.PurePosixPath("cache/at 0xabcdef"),
+            pathlib.PurePosixPath("cache/at 0x123456"),
+        ),
+    ):
+        form = fingerprint._form(value)
+        assert not _opaque_reports(form), form
+        assert form.text != fingerprint._form(other).text
+
+
+@dataclasses.dataclass(frozen=True)
+class _RandomReader(loaders.Reader[float]):
+    rng: typing.Any
+
+    def load(self, path: pathlib.Path) -> float:
+        return self.rng.random()
+
+
+@dataclasses.dataclass(frozen=True)
+class _WithRandomReaderDefault:
+    reader: typing.Any = _RandomReader(random.Random(1))
+
+
+def _reads_a_random_reader_default() -> float:
+    return _WithRandomReaderDefault().reader.load(pathlib.Path("."))
+
+
+@pytest.mark.parametrize("recording", [False, True], ids=["walk", "recording"])
+def test_a_loader_in_a_default_whose_config_holds_unreadable_state_is_refused(recording: bool):
+    """A dataclass default is a reader whose config holds a `random.Random`. The stage is
+    refused whether or not the walk records its reads: recording first computes the field's
+    token, which keeps the loader's form, and the kept form still reports its state."""
+    with (
+        pytest.raises(exceptions.StageDefinitionError, match="_WithRandomReaderDefault.reader"),
+        fingerprint.stage_fingerprint_scope("t/use"),
+    ):
+        if recording:
+            _recording(_reads_a_random_reader_default)
+        else:
+            fingerprint.get_stage_fingerprint(_reads_a_random_reader_default)
+
+
+def _ordered_stage(order: str) -> typing.Callable[[str], str]:
+    """A stage whose partial holds instances of two classes one factory made, in `order`."""
+    made = {label: _make_captured(label) for label in "AB"}
+    holds = functools.partial(_tag_all, [made[label]() for label in order])
+
+    def stage(text: str) -> str:
+        return holds(text)
+
+    return stage
+
+
+def _tag_all(things: collections.abc.Iterable[typing.Any], text: str) -> str:
+    return text + "".join(thing.suffix() for thing in things)
+
+
+def test_an_exception_default_is_hashed_by_its_args_and_attributes():
+    """A `ValueError` default is hashed by its type, its `args` and its `__dict__`: an edit to
+    an attribute set on it changes the text, and it is not refused."""
+    first, second = ValueError("bad"), ValueError("bad")
+    first.code = 1  # pyright: ignore[reportAttributeAccessIssue] - an extra attribute is the case
+    second.code = 2  # pyright: ignore[reportAttributeAccessIssue] - an extra attribute is the case
+
+    forms = [fingerprint._form(value) for value in (first, second)]
+
+    assert not [form for form in forms if _opaque_reports(form)], forms
+    assert forms[0].text != forms[1].text
+
+
+@dataclasses.dataclass(frozen=True)
+class _LabelBase:
+    label: str = "A"
+
+
+# A class with no statement whose base is a dataclass: `_LabelSub()` takes the base's defaults.
+_LabelSub = type("_LabelSub", (_LabelBase,), {})
+_HOLDS_A_LABEL_SUB = functools.partial(str, _LabelSub())
+
+
+def _names_a_label_sub() -> str:
+    return _LabelSub().label
+
+
+def _captures_a_label_sub() -> str:
+    return _HOLDS_A_LABEL_SUB()
+
+
+@pytest.mark.parametrize("stage", [_names_a_label_sub, _captures_a_label_sub])
+def test_a_dataclass_subclass_without_a_statement_walks_its_bases_defaults(
+    stage: typing.Callable[[], str],
+):
+    """`_LabelSub`, made by `type()`, is walked for the members its MRO resolves, and its
+    dataclass defaults are resolved so too: the base's `label` default is tracked, named or
+    captured, and its read replays."""
+    manifest = fingerprint.get_stage_fingerprint(stage)
+    reads = [[list(path), token] for path, token in _recording(stage)]
+
+    key = f"default:{fingerprint._definition_ref(_LabelBase)}.label"
+    assert key in manifest, manifest
+    assert fingerprint._recorded_reads_hold(stage, typing.cast("list[object]", reads))
+
+
+def test_a_single_entry_dict_or_set_ranks_its_entry_first():
+    """A dict or set with one entry skips the sort, and its entry still gets the step a longer
+    container gives it: a dict value its key's text (`k:"k"`), a set member the rank a sort
+    gives the first one (`s:0`)."""
+    in_dict = fingerprint._form({"k": _Captured()})
+    in_set = fingerprint._form(frozenset((_Captured(),)))
+
+    assert _class_reports(in_dict, _Captured) == [('k:"k"', "cls")]
+    assert _class_reports(in_set, _Captured) == [("s:0", "cls")]
+
+
+def _opaque_reports(form: typing.Any) -> list[tuple[str, ...]]:
+    """The paths at which `form` reports a value whose state no form reads."""
+    return [path for path, kind, _ in form.reports if kind is fingerprint._ReportKind.OPAQUE]
+
+
+def _class_reports(form: typing.Any, cls: type) -> list[tuple[str, ...]]:
+    """The paths at which `form` reports user class `cls` for its class node."""
+    kind = fingerprint._ReportKind.CLASS
+    return [path for path, found, obj in form.reports if found is kind and obj is cls]
+
+
+def test_swapping_later_instances_of_two_classes_in_one_list_changes_the_manifest():
+    """`[A(), B(), A(), B()]` to `[A(), B(), B(), A()]`: the first instance of each class stays
+    at its position, but each class's walk is keyed by every position, so the manifest
+    changes."""
+    before = fingerprint.get_stage_fingerprint(_ordered_stage("ABAB"))
+    after = fingerprint.get_stage_fingerprint(_ordered_stage("ABBA"))
+
+    assert before != after
+
+
+def _equal_set_stage(labels: str) -> typing.Callable[[str], str]:
+    """A stage whose partial holds identity-distinct instances of two classes one factory made.
+    Every instance has the same canonical form and unordered rank; `labels` controls the count
+    of each class."""
+    made = {label: _make_captured(label) for label in "AB"}
+    holds = functools.partial(_tag_all, frozenset(made[label]() for label in labels))
+
+    def stage(text: str) -> str:
+        return holds(text)
+
+    return stage
+
+
+def test_replacing_a_class_at_an_equal_unordered_rank_changes_the_manifest():
+    """`frozenset([A(), A(), B()])` to `frozenset([A(), B(), B()])`: equal forms share rank
+    `s0`, but each class walk's key preserves the rank's occurrence count, so the manifest
+    changes."""
+    before = fingerprint.get_stage_fingerprint(_equal_set_stage("AAB"))
+    after = fingerprint.get_stage_fingerprint(_equal_set_stage("ABB"))
+
+    assert before != after
+
+
+def test_a_builtin_exception_filename_is_hashed_as_value_state():
+    """`FileNotFoundError.args` omits its filename. The built-in OSError descriptor state is
+    included, so two otherwise identical defaults with different filenames have different
+    forms and are not refused."""
+    first = FileNotFoundError(2, "missing", "A")
+    second = FileNotFoundError(2, "missing", "B")
+
+    forms = [fingerprint._form(value) for value in (first, second)]
+
+    assert not [form for form in forms if _opaque_reports(form)], forms
+    assert forms[0].text != forms[1].text
+
+
+def test_a_class_with_no_source_holding_a_value_no_form_reads_is_refused_in_every_stage():
+    """A class `make_dataclass` made with a `random.Random` default: its hash would not show a
+    change to the generator's state. Its hash never refuses (it names the value's type), and is
+    kept out of the persistent cache; the walk of its class refuses each stage that names it,
+    naming the class and the entry, also a second stage after the hash is in the memory cache,
+    and the first stage again: no refusal outlives the scope that made it."""
+    made = _random_beside("A")
+
+    def names() -> object:
+        return made()
+
+    for stage in ("t/first", "t/second", "t/first"):
+        with (
+            pytest.raises(exceptions.StageDefinitionError, match="no source of its own") as raised,
+            fingerprint.stage_fingerprint_scope(stage),
+        ):
+            fingerprint.get_stage_fingerprint(names)
+        assert "'__dataclass_fields__'" in str(raised.value), raised.value
+    assert fingerprint.hash_function_ast(made)
+    assert fingerprint._should_skip_persistent_cache(made)
 
 
 # A module of classes with no source, one of each kind `fingerprint._sourceless_class_hash`
@@ -2702,9 +3996,10 @@ CmBase = pydantic.create_model("CmBase", __base__=CmPlain, y=(str, "TOKEN"))
 CmSentinel = pydantic.create_model("CmSentinel", x=(object, _MISSING), y=(str, "TOKEN"))
 """
 
-# The kinds above whose form cannot show one of their values, so they are hashed with their
-# module's source too.
-_NO_SOURCE_HIDDEN = {"NtSentinel", "NtSlots", "MdSentinel", "MdRandom", "CmSentinel"}
+# The kinds above whose walk refuses, as a value no form reads makes it: a `random.Random`, whose
+# state is in C. A sentinel `object()` and a `__slots__` object are shown by their type and
+# slots. The hash of each kind, these included, never refuses.
+_NO_SOURCE_REFUSED = {"MdRandom"}
 
 _NO_SOURCE_HASH_SCRIPT = """\
 import json
@@ -2717,12 +4012,21 @@ from pivot import fingerprint
 out = {}
 for name, cls in vars(kinds_mod).items():
     if isinstance(cls, type) and cls.__module__ == "kinds_mod" and name != "Box":
-        out[name] = fingerprint._compute_function_hash(cls)
+        walk = fingerprint._Walk()
+        root = walk.node(cls, fingerprint._NodeKind.CLASS, fingerprint._class_key(cls))
+        walk.run()
+        try:
+            with fingerprint._collected_capture_errors():
+                fingerprint._project(root, {})
+            refused = False
+        except fingerprint.exceptions.StageDefinitionError:
+            refused = True
+        out[name] = [fingerprint._compute_function_hash(cls), refused]
 print(json.dumps(out))
 """
 
 
-def _no_source_hashes(directory: pathlib.Path, text: str, seed: str) -> dict[str, str]:
+def _no_source_hashes(directory: pathlib.Path, text: str, seed: str) -> dict[str, list[typing.Any]]:
     """The hash of each class of `text`, saved as module `kinds_mod`, from a new interpreter run
     under `PYTHONHASHSEED=seed`."""
     (directory / "kinds_mod.py").write_text(text)
@@ -2739,9 +4043,9 @@ def _no_source_hashes(directory: pathlib.Path, text: str, seed: str) -> dict[str
 
 def test_a_class_with_no_source_is_hashed_alike_in_every_interpreter(tmp_path: pathlib.Path):
     """For every kind of class with no source, two interpreters under different hash seeds give
-    one hash. An edit to an entry the class shows changes it; a comment edit in its module
-    changes it only for a class whose form hides a value (`_NO_SOURCE_HIDDEN`), which is hashed
-    with its module's source."""
+    one hash, and a comment edit in its module changes none. An edit to an entry the class shows
+    changes it, for every kind. The walk of a class that holds a value no form reads
+    (`_NO_SOURCE_REFUSED`) refuses, and no other kind's does."""
     (tmp_path / ".pivot").mkdir()
     original = _NO_SOURCE_KINDS_MODULE.replace("TOKEN", "A")
     first = _no_source_hashes(tmp_path, original, "1")
@@ -2751,23 +4055,22 @@ def test_a_class_with_no_source_is_hashed_alike_in_every_interpreter(tmp_path: p
 
     assert len(first) == 22, sorted(first)
     assert first == second, "Two interpreters should give each class one hash"
-    assert {name for name in first if first[name] != commented[name]} == _NO_SOURCE_HIDDEN
-    assert {name for name in first if first[name] == edited[name]} == set()
+    assert first == commented, "A comment edit should change no hash"
+    assert {name for name, (_, refused) in first.items() if refused} == _NO_SOURCE_REFUSED
+    assert not {name for name in first if first[name][0] == edited[name][0]}
 
 
-def test_a_chain_of_held_loaders_is_canonicalized_once_per_loader(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """A chain 64 deep takes twice the canonicalization of a chain 32 deep, not four times: each
-    held loader's form is kept for the call (`_form_memo`)."""
-    original = fingerprint._canonicalize_value_for_hash
+def test_a_chain_of_held_loaders_is_formed_once_per_loader(monkeypatch: pytest.MonkeyPatch):
+    """A chain 64 deep takes twice the forming of a chain 32 deep, not four times: each held
+    loader is formed once, in its holder's config form."""
+    original = fingerprint._FormBuilder.loader
     calls = [0]
 
-    def counting(value: typing.Any, active: tuple[int, ...] = ()) -> typing.Any:
+    def counting(self: typing.Any, value: typing.Any, value_type: type) -> typing.Any:
         calls[0] += 1
-        return original(value, active)
+        return original(self, value, value_type)
 
-    monkeypatch.setattr(fingerprint, "_canonicalize_value_for_hash", counting)
+    monkeypatch.setattr(fingerprint._FormBuilder, "loader", counting)
     counts = list[int]()
     for depth in (32, 64):
         calls[0] = 0
@@ -3118,14 +4421,11 @@ def test_recursive_pydantic_model_no_infinite_recursion():
 
     TreeNode.model_rebuild()
 
+    def stage(tree: TreeNode) -> None:
+        pass
+
     # Should not raise RecursionError
-    manifest = dict[str, str]()
-    visited = set[int]()
-    fingerprint._hash_pydantic_schema(
-        TreeNode,  # pyright: ignore[reportArgumentType] - Pydantic model_fields protocol mismatch in tests
-        manifest,
-        visited,
-    )
+    manifest = fingerprint.get_stage_fingerprint(stage)
     key = _definition_key("schema", TreeNode)
     assert key in manifest
     assert manifest[key] != "<pending>"
@@ -3146,16 +4446,14 @@ def test_mutual_recursive_pydantic_models():
     Parent.model_rebuild()
     Child.model_rebuild()
 
-    manifest = dict[str, str]()
-    visited = set[int]()
-    fingerprint._hash_pydantic_schema(
-        Parent,  # pyright: ignore[reportArgumentType] - Pydantic model_fields protocol mismatch in tests
-        manifest,
-        visited,
-    )
+    def stage(parent: Parent) -> None:
+        pass
+
+    manifest = fingerprint.get_stage_fingerprint(stage)
     key = _definition_key("schema", Parent)
     assert key in manifest
     assert manifest[key] != "<pending>"
+    assert _definition_key("schema", Child) in manifest
 
 
 # ==============================================================================
@@ -3175,9 +4473,7 @@ def test_user_defined_generic_origin_tracked():
     def stage(items: MyContainer[int]) -> None:
         pass
 
-    manifest = dict[str, str]()
-    visited = set[int]()
-    fingerprint._process_type_hint_dependencies(stage, manifest, visited)
+    manifest = fingerprint.get_stage_fingerprint(stage)
 
     assert _definition_key("class", MyContainer) in manifest
 
@@ -3838,6 +5134,43 @@ def test_class_attributes_a_stage_reads_are_tracked_one_by_one() -> None:
     assert not any(key.startswith(f"const:{config}.__") for key in manifest), manifest
 
 
+class _InstanceClassRead:
+    SCALE: typing.ClassVar[int] = 4
+
+    def read(self) -> int:
+        return self.SCALE
+
+
+def _reads_class_attribute_through_instance() -> int:
+    return _InstanceClassRead().read()
+
+
+def test_class_attribute_read_through_an_instance_is_tracked() -> None:
+    """A class member reading `self.SCALE` creates the same value entry as `Class.SCALE`."""
+    manifest = fingerprint.get_stage_fingerprint(_reads_class_attribute_through_instance)
+
+    key = f"const:{__name__}._InstanceClassRead.SCALE"
+    assert manifest[key] == "4", manifest
+
+
+def _return_captured_value(value: object) -> object:
+    return value
+
+
+_UNKNOWN_LIBRARY_VALUE = random.Random(1)
+_HOLDS_UNKNOWN_LIBRARY_VALUE = functools.partial(_return_captured_value, _UNKNOWN_LIBRARY_VALUE)
+
+
+def _captures_an_unknown_library_value() -> object:
+    return _HOLDS_UNKNOWN_LIBRARY_VALUE()
+
+
+def test_unknown_library_value_inside_a_partial_is_refused() -> None:
+    """A partial cannot hide an object whose type Pivot has no value-form row."""
+    with pytest.raises(exceptions.StageDefinitionError, match="random.Random|cannot read"):
+        fingerprint.get_stage_fingerprint(_captures_an_unknown_library_value)
+
+
 # ==============================================================================
 # Stage manifest cache tests
 # ==============================================================================
@@ -4216,22 +5549,55 @@ def test_collecting_sources_restores_on_exception(tmp_path, monkeypatch):
     monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
 
     # Verify _active_source_map is None before
-    assert fingerprint._active_source_map is None
+    assert fingerprint._active_source_map.get() is None
 
     class FingerprintError(Exception):
         pass
 
     try:
         with fingerprint._collecting_sources() as source_map:
-            assert fingerprint._active_source_map is source_map
+            assert fingerprint._active_source_map.get() is source_map
             raise FingerprintError("simulated failure")
     except FingerprintError:
         pass
 
     # Must be restored to None after exception
-    assert fingerprint._active_source_map is None, (
+    assert fingerprint._active_source_map.get() is None, (
         "_active_source_map should be None after exception in _collecting_sources"
     )
+
+
+def test_collecting_sources_in_two_threads_leaves_no_map_behind():
+    """Two fingerprints collect sources at once in two threads, as the engine's worker threads
+    can: the first enters, the second enters, the first ends, the second ends. Each sees its own
+    map throughout, and neither thread nor the caller has a map active afterwards."""
+    first_in, second_in, first_out = threading.Event(), threading.Event(), threading.Event()
+    seen = dict[str, object]()
+
+    def first() -> None:
+        with fingerprint._collecting_sources() as source_map:
+            first_in.set()
+            second_in.wait(timeout=60)
+            seen["first"] = fingerprint._active_source_map.get() is source_map
+        first_out.set()
+        seen["first after"] = fingerprint._active_source_map.get()
+
+    def second() -> None:
+        first_in.wait(timeout=60)
+        with fingerprint._collecting_sources() as source_map:
+            second_in.set()
+            first_out.wait(timeout=60)
+            seen["second"] = fingerprint._active_source_map.get() is source_map
+        seen["second after"] = fingerprint._active_source_map.get()
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+
+    assert seen == {"first": True, "first after": None, "second": True, "second after": None}
+    assert fingerprint._active_source_map.get() is None
 
 
 def test_source_collector_deduplicates_files(tmp_path, monkeypatch):
@@ -4802,3 +6168,226 @@ def test_function_hash_lookup_reads_the_current_projects_state_db(
     finally:
         sys.modules.pop("moved_stage", None)
         fingerprint._close_state_db()
+
+
+# ---------------------------------------------------------------------------------------------
+# The walk's worklist, cache-hit replay of value steps, wrapper loops behind a C cache, Enum
+# values and a rebuilt pydantic model
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_helper_chain_deeper_than_the_recursion_limit_is_fingerprinted(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each helper is a node of the walk, expanded from its worklist, never inside the expansion
+    of the helper that calls it, so a stage whose helpers call each other deeper than the
+    recursion limit gets an entry for each of them."""
+    depth = sys.getrecursionlimit() + 500
+    helpers = [f"def helper_{i}(x):\n    return helper_{i + 1}(x) + 1\n" for i in range(depth)]
+    helpers.append(f"def helper_{depth}(x):\n    return x\n")
+    helpers.append("def stage():\n    return helper_0(0)\n")
+    (tmp_path / "deep_helpers.py").write_text("\n\n".join(helpers))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        module = importlib.import_module("deep_helpers")
+        manifest = fingerprint.get_stage_fingerprint(module.stage)
+    finally:
+        sys.modules.pop("deep_helpers", None)
+
+    walked = [key for key in manifest if key.startswith("func:deep_helpers.helper_")]
+    assert len(walked) == depth + 1, f"{len(walked)} of {depth + 1} helpers were walked"
+
+
+_VALUE_STEPS_MODULE = """\
+import functools
+
+
+class First:
+    def __repr__(self) -> str:
+        return "z"
+
+    def suffix(self) -> str:
+        return "A"
+
+
+class Second:
+    def __repr__(self) -> str:
+        return "a"
+
+    def suffix(self) -> str:
+        return "B"
+
+
+def _count(held, x):
+    return x + len(held)
+
+
+HELD = functools.partial(_count, {held})
+
+
+def stage(x):
+    return HELD(x)
+"""
+
+
+@pytest.mark.parametrize(
+    "held",
+    [
+        pytest.param("frozenset([First(), Second()])", id="set-members"),
+        pytest.param('{"first": First(), "second": Second()}', id="dict-values"),
+    ],
+)
+def test_a_cache_hit_reaches_the_classes_inside_a_set_and_a_dict_again(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, held: str
+) -> None:
+    """A partial holds two instances in a set, ranked by their forms (`First` before `Second`,
+    though their reprs sort the other way), or as a dict's values, keyed by the keys' forms. The
+    walk records the reads of each class under the step to it (`s:RANK`, `k:KEY`), and a cache hit
+    in a new import follows the same steps to the same classes, so an unchanged value hits."""
+    monkeypatch.setattr("pivot.project._project_root_cache", tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / "value_steps.py").write_text(_VALUE_STEPS_MODULE.format(held=held))
+    writes = dict[pathlib.Path, list[tuple[bytes, bytes]]]()
+    monkeypatch.setattr(fingerprint, "_pending_manifest_writes", writes)
+    monkeypatch.setattr(fingerprint, "_try_manifest_cache_hit", lambda _stage_name, _func: None)
+    try:
+        module = importlib.import_module("value_steps")
+        fingerprint.get_stage_fingerprint_cached("v/stage", module.stage)
+        ((_key, raw),) = _pending_manifest_entries()
+        reads = json.loads(raw)["r"]
+        del sys.modules["value_steps"]
+        module = importlib.import_module("value_steps")
+
+        assert fingerprint._recorded_reads_hold(module.stage, reads), "re-import alone must hit"
+    finally:
+        sys.modules.pop("value_steps", None)
+
+
+_LOOP_FACTOR = 3
+
+
+def _helper_looped_behind_a_cache(x: int) -> int:
+    return x * _LOOP_FACTOR
+
+
+_LOOPED_CACHE = functools.cache(_helper_looped_behind_a_cache)
+_helper_looped_behind_a_cache.__wrapped__ = _LOOPED_CACHE  # pyright: ignore[reportFunctionMemberAccess] - a wrapper loop
+
+
+def _helper_stage_calls_a_looped_cache() -> int:
+    return _LOOPED_CACHE(1)
+
+
+def test_a_cache_wrapper_whose_wrapped_chain_loops_is_refused():
+    """D3: refuse a Python/C metadata loop instead of accepting an incomplete manifest."""
+    with pytest.raises(exceptions.StageDefinitionError) as raised:
+        fingerprint.get_stage_fingerprint(_helper_stage_calls_a_looped_cache)
+    message = str(raised.value)
+    assert "_helper_looped_behind_a_cache" in message and "loop" in message, message
+    assert "StageParams" in message and "break" in message.lower(), message
+
+
+def _helper_library_enum(value: str) -> typing.Any:
+    """A functional Enum that names a library module as its own, so it is a library Enum."""
+    return enum.Enum("LibraryChoice", {"PICK": value}, module="json")
+
+
+_HOLDS_LIBRARY_PICK_A = functools.partial(_tag, _helper_library_enum("A").PICK)
+_HOLDS_LIBRARY_PICK_B = functools.partial(_tag, _helper_library_enum("B").PICK)
+
+
+def _helper_stage_holds_library_pick_a(text: str) -> str:
+    return _HOLDS_LIBRARY_PICK_A(text)
+
+
+def _helper_stage_holds_library_pick_b(text: str) -> str:
+    return _HOLDS_LIBRARY_PICK_B(text)
+
+
+def test_a_library_enum_members_value_is_in_the_partials_form():
+    """Members of two library Enums of one name, with one member name and different values, give
+    different partial entries: the member is formed with its value."""
+    first = fingerprint.get_stage_fingerprint(_helper_stage_holds_library_pick_a)
+    second = fingerprint.get_stage_fingerprint(_helper_stage_holds_library_pick_b)
+
+    first_args = first[f"partial:{__name__}._HOLDS_LIBRARY_PICK_A.args"]
+    second_args = second[f"partial:{__name__}._HOLDS_LIBRARY_PICK_B.args"]
+    assert first_args != second_args, "A member's value must be in the partial's entry"
+
+
+class _RebuiltDefault(pydantic.BaseModel):
+    model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(
+        arbitrary_types_allowed=True
+    )
+    value: typing.Any = random.Random(1)
+
+
+def _helper_builds_a_rebuilt_model() -> object:
+    return _RebuiltDefault()
+
+
+def test_a_model_rebuilt_with_a_readable_default_is_accepted_in_the_next_pass(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A model's field default is a `random.Random`, whose state no form reads: the stage is
+    refused. After the default is replaced with a string and the model rebuilt, the next pass in
+    the same process accepts the stage: the schema hash kept for the model is not the one its old
+    default made."""
+    with fingerprint.fingerprint_pass(), pytest.raises(exceptions.StageDefinitionError):
+        fingerprint.get_stage_fingerprint(_helper_builds_a_rebuilt_model)
+    field = _RebuiltDefault.model_fields["value"]
+    monkeypatch.setattr(field, "default", "safe")
+    _RebuiltDefault.model_rebuild(force=True)
+
+    with fingerprint.fingerprint_pass():
+        manifest = fingerprint.get_stage_fingerprint(_helper_builds_a_rebuilt_model)
+
+    assert _definition_key("schema", _RebuiltDefault) in manifest, manifest
+
+
+@pytest.mark.parametrize("setting", ["typed", "maxsize"])
+@pytest.mark.parametrize("holder", ["wrapped", "partial"])
+def test_a_cache_over_library_code_keeps_mains_by_name_settings_limit(
+    setting: str, holder: str
+) -> None:
+    """As on main, a cache over library code is external, including its native settings."""
+
+    def make_stage(changed: bool) -> typing.Callable[[], str]:
+        def first() -> str:
+            return "safe"
+
+        cached = functools.lru_cache(
+            maxsize=0 if changed and setting == "maxsize" else None,
+            typed=changed and setting == "typed",
+        )(pow)
+        first.__wrapped__ = cached  # pyright: ignore[reportFunctionMemberAccess] - wrapper metadata under test
+        callback = first if holder == "wrapped" else functools.partial(cached)
+
+        def stage() -> str:
+            return str(callback())
+
+        return stage
+
+    before = fingerprint.get_stage_fingerprint(make_stage(False))
+    after = fingerprint.get_stage_fingerprint(make_stage(True))
+    assert before == after, "Native settings are tracked only for caches over user code"
+
+
+def test_member_receiver_discovery_does_not_ask_a_partial_subclass_for_wrapped() -> None:
+    """Only the exact native partial synthesized for a partialmethod needs receiver traversal."""
+
+    class TrapPartial(functools.partial[str]):
+        def __getattr__(self, name: str) -> typing.Any:
+            raise AssertionError(f"receiver discovery asked the partial subclass for {name}")
+
+    def target() -> str:
+        return "safe"
+
+    class Captured:
+        member: TrapPartial = TrapPartial(target)
+
+    def stage() -> type[Captured]:
+        return Captured
+
+    manifest = fingerprint.get_stage_fingerprint(stage)
+    assert _definition_key("class", Captured) in manifest

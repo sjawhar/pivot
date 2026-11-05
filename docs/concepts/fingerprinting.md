@@ -38,7 +38,20 @@ For each stage function, Pivot:
    manifest. A user class the stage reaches has its callable members walked:
    methods, descriptors such as properties, partial members, and nested user
    classes. A module value or helper read only inside a method
-   (`ScopeWalk().step(...)` reading a module-level regex) is tracked
+   (`ScopeWalk().step(...)` reading a module-level regex) is tracked. So is the
+   class of an instance a `functools.partial`, a loader's config, a dataclass
+   field default or a `StageParams` default holds (`partial(run, Scorer())`):
+   its class is walked as if the stage named it, so an edit to `Scorer.score`
+   re-runs the stage. A scalar class attribute a member reads through `self`,
+   `cls`, `type(self)`, `self.__class__`, or literal `getattr` is tracked by
+   value just as `Class.NAME` is.
+   Library value forms preserve complete values: pandas timestamps/timedeltas,
+   supported dateutil/pytz datetime zones, and numpy integers/booleans remain
+   accepted. Arbitrary user timezone implementations remain unsupported.
+   `types.DynamicClassAttribute` on a reached user class is refused by member
+   name rather than silently omitting its executable getter. Ordinary
+   `enum.property` getters are tracked like property getters; enum redirects
+   for members named `name` or `value` remain supported.
 4. **Follows imports in the function body** — a user module discovery already
    loaded is walked like a module-level dependency, together with its packages
    and a submodule a `from` import names (`import pkg.sub`, `from pkg import
@@ -244,6 +257,66 @@ else is refused. A literal default such as `cols=("a", "b")` is part of the
 function's code and is tracked with it. A default that is a pipeline input
 handle (`raw=RAW` with `RAW = pipeline.input("t.csv")`) is wired as an input
 and tracked by its content.
+
+A dataclass's class-level field default (`rng: Any = make_rng()`, a
+`ClassVar`) is evaluated when its class is created, so Pivot hashes its value
+for each stage that reaches the class: a string, `bytes` or a path by its
+content, including text that looks like a memory address, an exception by its
+arguments, attributes and built-in value fields such as `OSError.filename`, an
+object by its attributes and `__slots__`, and a function or classmethod an
+object holds (a callback) with the module values it reads. A callback that reads
+its own enclosing class stops at that class. One `__wrapped__` follower handles
+user helpers, globals, closure cells, partial arguments and keywords, defaults, state,
+and loader methods. It stops at a `@fingerprint_by_name` mark and refuses a loop
+or a chain past `sys.getrecursionlimit()` above that boundary by name, even with
+unsafe fingerprinting enabled: break the loop, shorten the chain, or move the
+value into `StageParams`. A terminating user chain inside that limit is walked one
+function at a time, including each Python function's own code and reads. Native cache settings
+are recorded only for caches over user code, from the stdlib `cache_parameters` closure,
+without calling it. A cache over library code is recorded by name; edits to its `typed`
+or `maxsize` do not trigger a rerun. For stacked native caches, only the settings visible on
+the outermost wrapper are recorded: CPython's `functools.update_wrapper` copies
+the inner cache's `cache_parameters`, so an edit to the outer `typed` or
+`maxsize` is not seen. Use the stage's `StageParams` for cache configuration
+that must trigger a rerun. Library helpers and their wrappers, such as `json.dumps`, are
+recorded by name without reading their private closure state. A library-defined stage root
+still tracks the project globals, closure values and defaults its body reads; a native cache
+on that root follows its terminal Python body. User wrapper code is walked even when
+`functools.wraps` copied a library target's module metadata.
+An unmarked class-based decorator under a cache is recorded as a bound value:
+its C-readable state and its class's code are tracked. A by-name mark remains
+a boundary: the walk adds no settings or body dependencies below it.
+Class attributes read through the receiver are analyzed in each Python method
+body reached through the chain, including beneath a native cache, a partialmethod or a
+forwarding decorator, up to a by-name mark.
+An `Enum` member is hashed with its value, and known exact stdlib type expressions such as
+`list[int]`, `str | None` or `collections.abc.Callable[[int], str]` by their origin
+and arguments. A user subclass of `types.GenericAlias` is refused: its native
+alias fields do not describe its Python behavior or state. A numpy scalar subclass
+includes its attributes and slots as well as its native data. A default whose state Pivot cannot
+read, such as a `random.Random`, a numpy `Generator` or a `threading.Lock`,
+refuses the stage, naming the field. For a field, build the value with
+`dataclasses.field(default_factory=...)`; a `ClassVar` takes no factory, so
+create its value in the method that uses it; or move the value into the stage's
+`StageParams`.
+
+A partial argument or loader config that holds a library value whose type has no
+supported value form is refused for the same reason. For example,
+`random.Random` keeps its generator state in C, so Pivot cannot safely hash it.
+Read such data from a pipeline input or move its configuration into `StageParams`.
+An `OrderedDict` keeps its logical order, including `move_to_end` changes. Its
+keys must be exact `bool`, `int`, `float`, `complex`, `str`, `bytes` or `None`
+values: Python's native ordered iterator hashes keys, so other key types are
+refused before iteration rather than running their hash code. This includes an
+`OrderedDict` subclass or a mapping proxy over one.
+
+Pivot reads the values it fingerprints, and the classes they hold, through
+Python's own C-level accessors rather than through their code. Where a value
+cannot be read that way, the stage is refused by name: a class whose metaclass
+defines `__getattribute__` or `__getattr__` (reading anything of the class would
+run it), a `functools.lru_cache` wrapper whose `cache_parameters` was replaced,
+or a class attribute that a method reads through `self` and that is a
+descriptor object.
 
 An object whose `__getattr__` raises an error other than `AttributeError` for
 a name it does not have (a dict-backed config, an `AttrDict`, a lazy object)
@@ -475,11 +548,10 @@ clear it, put `@fingerprint_by_name` above the class-based decorator, so Pivot
 records the whole helper by name, or replace the class with a function
 decorator built with `functools.wraps`.
 
-Without a mark below it, Pivot fingerprints a `functools.wraps` decorator as
-in earlier versions. It follows `__wrapped__` to the wrapped function, so it
-does not see what the decorator's own lines read through a module (for
-example `settings.FACTOR`), or the decorator's body when `functools.cache`
-wraps the decorator.
+Without a mark below it, Pivot fingerprints each Python function on a
+`functools.wraps` chain by its own code and reads, including module attributes
+such as `settings.FACTOR`. The same admission applies when a C cache or a
+partial holds the decorator.
 
 A stage cannot carry `@fingerprint_by_name`: Pipeline refuses a stage with
 the mark above `@stage`, below it, or below another decorator. Use

@@ -2095,31 +2095,27 @@ def test_an_edit_to_a_member_load_reaches_reruns_its_stage(
 _CYCLE = "def cycle(function):\n    function.__wrapped__ = function\n    return function\n"
 
 # A loader whose `load`, a helper `load` reaches, or a member the fallback to every member
-# walks (`load` applies an operator to `self`) is its own `__wrapped__`: (the inner.py text, the
-# function the refusal names).
+# walks (`load` applies an operator to `self`) is its own `__wrapped__`; each returns its "A".
 _LOOP_WRAPPED = {
     "reached-helper": (
         _REACHED_MEMBER.replace("HELPERS", _CYCLE)
         .replace("MEMBERS", '    @cycle\n    def _suffix(self) -> str:\n        return "A"\n')
-        .replace("READ", "self._suffix()"),
-        "Inner._suffix",
+        .replace("READ", "self._suffix()")
     ),
     "load": (
         _REACHED_MEMBER.replace("HELPERS", _CYCLE)
         .replace("MEMBERS", "")
-        .replace("READ", '""')
-        .replace("    def load(", "    @cycle\n    def load("),
-        "Inner.load",
+        .replace("READ", '"A"')
+        .replace("    def load(", "    @cycle\n    def load(")
     ),
     "fallback-member": (
         _REACHED_MEMBER.replace("HELPERS", _CYCLE)
         .replace(
             "MEMBERS",
             '    @cycle\n    def _suffix(self) -> str:\n        return "A"\n\n'
-            + "    def __add__(self, other: str) -> str:\n        return other\n",
+            + "    def __add__(self, other: str) -> str:\n        return other + self._suffix()\n",
         )
-        .replace("READ", '(self + "")'),
-        "Inner._suffix",
+        .replace("READ", '(self + "")')
     ),
 }
 
@@ -2128,19 +2124,20 @@ _LOOP_WRAPPED = {
 def test_a_loader_method_whose_wrapped_chain_loops_is_refused(
     tmp_path: pathlib.Path, looped: str
 ) -> None:
-    """`Inner.load`, `_suffix`, which `load` reaches, or `_suffix` as a member the fallback to
-    every member walks, is its own `__wrapped__` (its decorator sets it). `pivot repro` refuses
-    the stage, naming that function, and ends (`helpers.run_pivot` stops a run after 300
-    seconds)."""
-    inner, name = _LOOP_WRAPPED[looped]
+    """D3: a loader's looping wrapper metadata refuses instead of being walked."""
     project = _project(
-        tmp_path, {"inner.py": inner, "pipeline.py": _HELD_INSTANCE_HEADER + _held_stage("Inner()")}
+        tmp_path,
+        {
+            "inner.py": _LOOP_WRAPPED[looped],
+            "pipeline.py": _HELD_INSTANCE_HEADER + _held_stage("Inner()"),
+        },
     )
-
-    result = helpers.run_pivot(project, tmp_path / "home", "repro")
-
-    assert result.returncode != 0, result.stdout
-    assert f"'{name}' has a `__wrapped__` chain that loops" in result.stdout + result.stderr
+    refused = helpers.run_pivot(project, tmp_path / "home", "repro")
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "__wrapped__" in message and "loop" in message, message
+    assert ("Inner.load" if looped == "load" else "Inner._suffix") in message, message
+    assert "StageParams" in message and "break" in message.lower(), message
 
 
 _ROW_FACTORY = """\
@@ -2536,9 +2533,8 @@ class Box:
 """
 
 # A class with no source of its own that `Inner.load` reads, an edit to what defines it, and
-# the status a comment edit elsewhere in its module gives: `cached`, or `ran` for a class that
-# holds a value its form cannot show (an `object()` sentinel, a `__slots__` object, a
-# `random.Random`), which is then hashed with its module's source.
+# the status a comment edit elsewhere in its module gives: `cached`, also for a class that holds
+# an `object()` sentinel or a `__slots__` object, which its form shows by their type and slots.
 _SOURCELESS_KINDS = {
     "namedtuple": (
         'KIND = collections.namedtuple("Row", "left right")',
@@ -2560,24 +2556,12 @@ _SOURCELESS_KINDS = {
     "namedtuple-sentinel-default": (
         '_MISSING = object()\nKIND = collections.namedtuple("Row", "a b c", defaults=(_MISSING, "s1"))',
         ('"s1"', '"s2"'),
-        "ran",
-    ),
-    "dataclass-random-default": (
-        'KIND = dataclasses.make_dataclass("Gen", [("rng", object, dataclasses.field('
-        'default=random.Random(1))), ("y", str, dataclasses.field(default="d1"))])',
-        ('"d1"', '"d2"'),
-        "ran",
-    ),
-    "dataclass-random-seed": (
-        'KIND = dataclasses.make_dataclass("Gen", [("rng", object, dataclasses.field('
-        'default=random.Random(1))), ("y", str, dataclasses.field(default="d1"))])',
-        ("random.Random(1)", "random.Random(2)"),
-        "ran",
+        "cached",
     ),
     "namedtuple-slots-default": (
         _SLOTS_BOX + 'KIND = collections.namedtuple("Row", "a box c", defaults=(Box(1), "s1"))',
         ('"s1"', '"s2"'),
-        "ran",
+        "cached",
     ),
 }
 
@@ -2587,10 +2571,8 @@ def test_a_class_with_no_source_is_hashed_the_same_in_every_process(
     tmp_path: pathlib.Path, kind: str
 ) -> None:
     """`Inner.load` reads a class with no source of its own. Its hash is what defines it, not
-    its address, so a fresh state database reuses the result and an edit to any part of its
-    definition reruns the stage. A comment edit elsewhere in its module reuses it too, unless
-    the class holds a value its form cannot show; that class is hashed with its module's
-    source, so the edit reruns the stage."""
+    its address, so a fresh state database reuses the result, an edit to any part of its
+    definition reruns the stage, and a comment edit elsewhere in its module reuses it."""
     home = tmp_path / "home"
     definition, (old, new), after_comment = _SOURCELESS_KINDS[kind]
     project = _project(
@@ -2608,6 +2590,115 @@ def test_a_class_with_no_source_is_hashed_the_same_in_every_process(
     assert _repro_statuses(project, home) == {"t/use": "ran"}, "A definition edit should rerun"
     _edit(project, "inner.py", "from pivot import loaders\n", "from pivot import loaders  # note\n")
     assert _repro_statuses(project, home) == {"t/use": after_comment}
+
+
+def test_a_dataclass_whose_class_level_default_keeps_its_state_in_c_is_refused(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`Inner.load` reads a dataclass `make_dataclass` made, whose `rng` default is a
+    `random.Random`: its state is in C, so no hash shows a change to its seed. The stage is
+    refused, naming the field, with the fix."""
+    home = tmp_path / "home"
+    definition = (
+        'KIND = dataclasses.make_dataclass("Gen", [("rng", object, dataclasses.field('
+        'default=random.Random(1))), ("y", str, dataclasses.field(default="d1"))])'
+    )
+    project = _project(
+        tmp_path,
+        {
+            "inner.py": _SOURCELESS_LOADER.replace("DEFINITION", definition),
+            "pipeline.py": _HELD_INSTANCE_HEADER + _held_stage("Inner()"),
+        },
+    )
+
+    result = helpers.run_pivot(project, home, "repro", "--json")
+    message = " ".join((result.stdout + result.stderr).split())
+    assert result.returncode != 0, message
+    assert "the default of field 'inner.Gen.rng' keeps state pivot cannot read" in message
+    assert "default_factory" in message, message
+
+
+_SOURCELESS_FROM_SETTINGS = """\
+import collections
+import dataclasses
+import pathlib
+import random
+
+from pivot import loaders
+
+import settings
+
+DEFINITION
+
+
+@dataclasses.dataclass(frozen=True)
+class Inner(loaders.Reader[str]):
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text().splitlines()[0] + str(VIEW)
+"""
+
+
+def _sourceless_from_settings(
+    tmp_path: pathlib.Path, settings: str, definition: str, view: str
+) -> pathlib.Path:
+    """A project whose `Inner.load` reads `KIND`, a class with no source `inner.py` builds from
+    a value of `settings.py`, and writes `view` of it after the input's first line."""
+    inner = _SOURCELESS_FROM_SETTINGS.replace("DEFINITION", definition).replace("VIEW", view)
+    return _project(
+        tmp_path,
+        {
+            "settings.py": settings,
+            "inner.py": inner,
+            "pipeline.py": _HELD_INSTANCE_HEADER + _held_stage("Inner()"),
+        },
+    )
+
+
+def test_an_edit_to_a_string_a_class_with_no_source_holds_reruns_its_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`KIND`, a namedtuple with no source, takes the default `settings.HEX = "0xabcdef"`, which
+    looks like a memory address. Its form keeps the string as it is, so an edit to
+    `settings.py` alone reruns the stage with the new output, and the next run reuses it."""
+    home = tmp_path / "home"
+    project = _sourceless_from_settings(
+        tmp_path,
+        'HEX = "0xabcdef"\n',
+        'KIND = collections.namedtuple("Row", "a b", defaults=(settings.HEX,))',
+        "KIND(1).b",
+    )
+    output = project / "data" / "t" / "use.txt"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof Using0xabcdef"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "settings.py", '"0xabcdef"', '"0x123456"')
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The edit should rerun"
+    assert output.read_text() == "Local Set Default Proof Using0x123456"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+def test_a_class_with_no_source_holding_state_no_form_reads_is_refused(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`KIND`, a namedtuple with no source, takes the default `random.Random(settings.SEED)`:
+    its state is in C, so no hash of the class shows an edit to `settings.SEED`. The stage is
+    refused, naming the class, with the fix, and no output is written."""
+    home = tmp_path / "home"
+    project = _sourceless_from_settings(
+        tmp_path,
+        "SEED = 1\n",
+        'KIND = collections.namedtuple("Row", "a rng", defaults=(random.Random(settings.SEED),))',
+        "KIND(1).rng.randint(0, 9)",
+    )
+
+    result = helpers.run_pivot(project, home, "repro", "--json")
+    message = " ".join((result.stdout + result.stderr).split())
+    assert result.returncode != 0, f"The stage should be refused: {message}"
+    assert "class 'inner.Row', which has no source of its own, holds a value" in message, message
+    assert "StageParams" in message, message
+    assert not (project / "data" / "t" / "use.txt").exists()
 
 
 _MAPPED_PARTIAL_STAGES = """\
@@ -2788,3 +2879,2417 @@ def test_a_loader_from_a_sourceless_module_is_a_use_of_it_held_or_on_an_output_f
         lock = yaml.safe_load((project / ".pivot" / "stages" / "t" / f"{stage}.lock").read_text())
         marks = [key for key in lock["code_manifest"] if key.startswith("unreadable-source:")]
         assert marks == ["unreadable-source:wlib"], (stage, lock["code_manifest"])
+
+
+_THING = 'class Thing:\n    def suffix(self) -> str:\n        return "A"\n'
+
+_CAPTURED_HEADER = """\
+import dataclasses
+import functools
+import pathlib
+from typing import Any
+
+from pivot import Pipeline, StageParams, loaders, stage
+from thing import Thing
+
+
+def _tag(thing: Any, text: str) -> str:
+    return text.splitlines()[0] + thing.suffix()
+
+
+"""
+
+
+def _captured_stage(call: str, source: str = 'pipeline.input("lines.txt", t=str)') -> str:
+    return (
+        f"@stage\ndef use(text: str) -> str:\n    return {call}\n\n\n"
+        f'with Pipeline("t") as pipeline:\n    use({source})\n'
+    )
+
+
+_GLOBAL_PARTIAL = "TAG = functools.partial(_tag, {})\n\n\n" + _captured_stage("TAG(text)")
+
+# Where the stage captures `Thing()` (a module global partial's argument or keyword, a loader's
+# config field, the field default of a dataclass the stage reads, the field default of the
+# StageParams default of a helper), and the other kinds of instance a global partial holds (a
+# class whose `suffix` a base class in another module defines, a `str` subclass, an enum member,
+# a dataclass, a pydantic model): each with its files and the file that defines `suffix`. No
+# annotation names the class, so the walk reaches it only through the instance.
+_CAPTURED_INSTANCES = {
+    "global-partial": ({"pipeline.py": _GLOBAL_PARTIAL.format("Thing()")}, "thing.py"),
+    "partial-keyword": (
+        {
+            "pipeline.py": "TAG = functools.partial(_tag, thing=Thing())\n\n\n"
+            + _captured_stage("TAG(text=text)")
+        },
+        "thing.py",
+    ),
+    "loader-config-field": (
+        {
+            "pipeline.py": "@dataclasses.dataclass(frozen=True)\n"
+            "class Tagged(loaders.Reader[str]):\n    thing: Any\n\n"
+            "    def load(self, path: pathlib.Path) -> str:\n"
+            "        return _tag(self.thing, path.read_text())\n\n\n"
+            + _captured_stage("text", 'pipeline.input("lines.txt", format=Tagged(Thing()))')
+        },
+        "thing.py",
+    ),
+    "dataclass-default": (
+        {
+            "pipeline.py": "@dataclasses.dataclass(frozen=True)\n"
+            "class Settings:\n    thing: Any = Thing()\n\n\n"
+            + _captured_stage("_tag(Settings().thing, text)")
+        },
+        "thing.py",
+    ),
+    "stageparams-default": (
+        {
+            "pipeline.py": "class TagParams(StageParams):\n    thing: Any = Thing()\n\n\n"
+            "def _tag_with(text: str, params: TagParams = TagParams()) -> str:\n"
+            "    return _tag(params.thing, text)\n\n\n" + _captured_stage("_tag_with(text)")
+        },
+        "thing.py",
+    ),
+    "inherited-method": (
+        {
+            "base.py": _THING.replace("class Thing:", "class Base:"),
+            "thing.py": "from base import Base\n\n\nclass Thing(Base):\n    pass\n",
+            "pipeline.py": _GLOBAL_PARTIAL.format("Thing()"),
+        },
+        "base.py",
+    ),
+    "str-subclass": (
+        {
+            "thing.py": _THING.replace("class Thing:", "class Thing(str):"),
+            "pipeline.py": _GLOBAL_PARTIAL.format('Thing("t")'),
+        },
+        "thing.py",
+    ),
+    "enum-member": (
+        {
+            "thing.py": "import enum\n\n\n"
+            + _THING.replace("class Thing:", "class Thing(enum.Enum):\n    ONE = 1\n"),
+            "pipeline.py": _GLOBAL_PARTIAL.format("Thing.ONE"),
+        },
+        "thing.py",
+    ),
+    "dataclass-instance": (
+        {
+            "thing.py": "import dataclasses\n\n\n@dataclasses.dataclass(frozen=True)\n"
+            + _THING.replace("class Thing:", "class Thing:\n    x: int = 1\n"),
+            "pipeline.py": _GLOBAL_PARTIAL.format("Thing()"),
+        },
+        "thing.py",
+    ),
+    "pydantic-model": (
+        {
+            "thing.py": "import pydantic\n\n\n"
+            + _THING.replace("class Thing:", "class Thing(pydantic.BaseModel):\n    x: int = 1\n"),
+            "pipeline.py": _GLOBAL_PARTIAL.format("Thing()"),
+        },
+        "thing.py",
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_CAPTURED_INSTANCES))
+def test_an_edit_to_a_method_of_a_captured_instance_reruns_its_stage(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """The stage captures an instance of a user class, which is not a pivot loader, where the
+    walk only serializes it. Its class is walked as for a stage that names it, so an edit to
+    the method the stage calls alone reruns the stage, and the next run reuses the result."""
+    home = tmp_path / "home"
+    files, edited = _CAPTURED_INSTANCES[shape]
+    pipeline = _CAPTURED_HEADER + files["pipeline.py"]
+    project = _project(tmp_path, {"thing.py": _THING, **files, "pipeline.py": pipeline})
+    output = project / "data" / "t" / "use.txt"
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingA"
+    _edit(project, edited, '"A"', '"B"')
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The method edit should rerun"
+    assert output.read_text() == "Local Set Default Proof UsingB"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_NOISE_HEADER = """\
+import collections
+import dataclasses
+import datetime
+import decimal
+import enum
+import fractions
+import functools
+import pathlib
+from typing import Any
+
+import pydantic
+
+from pivot import Pipeline, stage
+
+Row = collections.namedtuple("Row", "x y")
+Gen = dataclasses.make_dataclass("Gen", [("x", int)], frozen=True)
+Mode = enum.Enum("Mode", "A B")
+Made = type("Made", (), {"x": 1})
+Model = pydantic.create_model("Model", x=(int, 1))
+
+
+def _take(value: Any, text: str) -> str:
+    return text.splitlines()[0] + str(value)[:0]
+
+"""
+
+# Instances of classes with no source of their own, and of library classes, that a global
+# partial holds.
+_UNEDITED_INSTANCES = {
+    "namedtuple": "Row(1, 2)",
+    "make_dataclass": "Gen(1)",
+    "functional_enum": "Mode.A",
+    "type_call": "Made()",
+    "create_model": "Model()",
+    "decimal": 'decimal.Decimal("1.5")',
+    "fraction": "fractions.Fraction(1, 3)",
+    "date": "datetime.date(2020, 1, 1)",
+    "path": 'pathlib.PurePosixPath("a/b")',
+}
+
+
+def test_a_captured_instance_with_no_source_or_from_a_library_reruns_nothing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Each stage calls a global partial holding an instance of a class with no source of its
+    own (hashed by what defines it) or of a library class (not walked). Under a new hash seed, a
+    comment edit in the module that defines them and a fresh state database, every stage reuses
+    its first result."""
+    home = tmp_path / "home"
+    stages = "".join(
+        f"HOLD_{name} = functools.partial(_take, {expression})\n\n\n"
+        f"@stage\ndef use_{name}(text: str) -> str:\n    return HOLD_{name}(text)\n\n\n"
+        for name, expression in _UNEDITED_INSTANCES.items()
+    )
+    calls = "".join(
+        f'    use_{name}(pipeline.input("lines.txt", t=str))\n' for name in _UNEDITED_INSTANCES
+    )
+    pipeline = _NOISE_HEADER + "\n" + stages + f'with Pipeline("t") as pipeline:\n{calls}'
+    project = _project(tmp_path, {"pipeline.py": pipeline})
+    ran = {f"t/use_{name}": "ran" for name in _UNEDITED_INSTANCES}
+    cached = dict.fromkeys(ran, "cached")
+
+    assert _repro_statuses(project, home, seed="1") == ran
+    assert _repro_statuses(project, home, seed="2") == cached, "A new hash seed should reuse it"
+    _edit(project, "pipeline.py", "\n\ndef _take(", "\n\n# A comment.\ndef _take(")
+    assert _repro_statuses(project, home, seed="3") == cached, "A comment edit should reuse it"
+    shutil.rmtree(project / ".pivot" / "state.lmdb")
+    assert _repro_statuses(project, home, seed="4") == cached, "A fresh state should reuse it"
+
+
+_OPAQUE_DEFAULTS = '''\
+import dataclasses
+from typing import Any, ClassVar
+
+_MISSING = object()
+
+
+class Slotted:
+    __slots__ = ("x",)
+
+    def __init__(self) -> None:
+        self.x = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class Sentinel:
+    """A sentinel class default the instance overrides."""
+
+    token: Any = _MISSING
+
+    def value(self) -> str:
+        return str(self.token)
+
+
+@dataclasses.dataclass(frozen=True)
+class SlotsDefault:
+    """A `__slots__` object class default the instance overrides."""
+
+    box: Any = Slotted()
+
+    def value(self) -> str:
+        return str(self.box)
+
+
+@dataclasses.dataclass(frozen=True)
+class WithClassVar:
+    """A ClassVar that holds an object; not a field of the instance."""
+
+    marker: ClassVar[Any] = object()
+    x: int = 1
+
+    def value(self) -> str:
+        return str(self.x)
+'''
+
+_OPAQUE_DEFAULTS_PIPELINE = """\
+import functools
+from typing import Any
+
+from defaults import Sentinel, SlotsDefault, WithClassVar
+from pivot import Pipeline, stage
+
+
+def _take(thing: Any, text: str) -> str:
+    return text.splitlines()[0] + thing.value()
+
+
+SENTINEL = functools.partial(_take, Sentinel("explicit"))
+SLOTS = functools.partial(_take, SlotsDefault("explicit"))
+CLASSVAR = functools.partial(_take, WithClassVar())
+
+
+@stage
+def use_sentinel(text: str) -> str:
+    return SENTINEL(text)
+
+
+@stage
+def use_slots(text: str) -> str:
+    return SLOTS(text)
+
+
+@stage
+def use_classvar(text: str) -> str:
+    return CLASSVAR(text)
+
+
+with Pipeline("t") as pipeline:
+    use_sentinel(pipeline.input("lines.txt", t=str))
+    use_slots(pipeline.input("lines.txt", t=str))
+    use_classvar(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_a_captured_dataclass_with_class_defaults_no_form_shows_reruns_nothing_new(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Each stage captures a dataclass instance whose class keeps a default no repr shows: an
+    `object()` sentinel or a `__slots__` object the instance overrides, or a `ClassVar` object.
+    The class walk hashes such a default by its type and its slots, never by its address, so the
+    same hash seed, a new one, a fresh state database and a comment edit in either module reuse
+    the result."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path, {"defaults.py": _OPAQUE_DEFAULTS, "pipeline.py": _OPAQUE_DEFAULTS_PIPELINE}
+    )
+    names = ("t/use_sentinel", "t/use_slots", "t/use_classvar")
+    ran, cached = dict.fromkeys(names, "ran"), dict.fromkeys(names, "cached")
+
+    assert _repro_statuses(project, home, seed="1") == ran
+    assert _repro_statuses(project, home, seed="1") == cached, "The same seed should reuse it"
+    assert _repro_statuses(project, home, seed="2") == cached, "A new hash seed should reuse it"
+    shutil.rmtree(project / ".pivot" / "state.lmdb")
+    assert _repro_statuses(project, home, seed="3") == cached, "A fresh state should reuse it"
+    _edit(project, "pipeline.py", "\n\ndef _take(", "\n\n# A comment.\ndef _take(")
+    assert _repro_statuses(project, home, seed="4") == cached, "A comment edit should reuse it"
+    _edit(project, "defaults.py", "import dataclasses\n", "import dataclasses  # note\n")
+    assert _repro_statuses(project, home, seed="5") == cached, "A comment edit should reuse it"
+
+
+_FACTORY_MODULE = """\
+def make(suffix: str) -> type:
+    class Made:
+        def suffix(self) -> str:
+            return suffix
+
+    return Made
+"""
+
+# The same factory made with `type()`: its classes have no source and no `<locals>` in their
+# qualified name, and its module's name does not resolve to them.
+_TYPE_FACTORY_MODULE = """\
+def _suffix_of(suffix: str):
+    def suffix_method(self) -> str:
+        return suffix
+
+    return suffix_method
+
+
+def make(suffix: str) -> type:
+    return type("Made", (), {"suffix": _suffix_of(suffix)})
+"""
+
+_TWO_HOLDERS_HEADER = """\
+import dataclasses
+import functools
+from typing import Any
+
+from factory import make
+from pivot import Pipeline, StageParams, stage
+
+
+def _take(thing: Any, text: str) -> str:
+    return text.splitlines()[0] + thing.suffix()
+
+
+First = make("A")
+Second = make("Z")
+
+
+"""
+
+# Two values of one stage that hold instances of two classes `factory.make` made, at the same
+# position in each: two partials, two field defaults of one dataclass, and two helpers'
+# StageParams defaults. The factory calls are module statements no walked code holds, so only
+# the walks of the classes see an edit to their arguments.
+_TWO_HOLDERS = {
+    "two-partials": (
+        "FIRST = functools.partial(_take, First())\n"
+        "SECOND = functools.partial(_take, Second())\n\n\n"
+        "@stage\ndef use(text: str) -> str:\n    return FIRST(text) + SECOND(text)\n"
+    ),
+    "two-fields": (
+        "@dataclasses.dataclass(frozen=True)\nclass Pair:\n"
+        "    first: Any = First()\n    second: Any = Second()\n\n\n"
+        "@stage\ndef use(text: str) -> str:\n"
+        "    return _take(Pair().first, text) + _take(Pair().second, text)\n"
+    ),
+    "two-params": (
+        "class FirstParams(StageParams):\n    made: Any = First()\n\n\n"
+        "class SecondParams(StageParams):\n    made: Any = Second()\n\n\n"
+        "def _first(text: str, params: Any = FirstParams()) -> str:\n"
+        "    return _take(params.made, text)\n\n\n"
+        "def _second(text: str, params: Any = SecondParams()) -> str:\n"
+        "    return _take(params.made, text)\n\n\n"
+        "@stage\ndef use(text: str) -> str:\n    return _first(text) + _second(text)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_TWO_HOLDERS))
+def test_an_edit_to_one_of_two_factory_classes_two_values_hold_reruns_its_stage(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """Two values of the stage hold instances of two classes one factory made, at the same
+    position in each. The first class's walk keeps its own key, so changing only the factory
+    argument that makes it reruns the stage with the new output; the second never overwrites
+    it."""
+    home = tmp_path / "home"
+    pipeline = (
+        _TWO_HOLDERS_HEADER
+        + _TWO_HOLDERS[shape]
+        + '\n\nwith Pipeline("t") as pipeline:\n    use(pipeline.input("lines.txt", t=str))\n'
+    )
+    project = _project(tmp_path, {"factory.py": _FACTORY_MODULE, "pipeline.py": pipeline})
+    output = project / "data" / "t" / "use.txt"
+    line = "Local Set Default Proof Using"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == f"{line}A{line}Z"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "pipeline.py", 'make("A")', 'make("B")')
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The edit should rerun"
+    assert output.read_text() == f"{line}B{line}Z"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+@pytest.mark.parametrize(
+    "factory", [_FACTORY_MODULE, _TYPE_FACTORY_MODULE], ids=["class-statement", "type-call"]
+)
+@pytest.mark.parametrize("shape", sorted(_TWO_HOLDERS))
+def test_swapping_two_factory_classes_between_two_values_reruns_its_stage(
+    tmp_path: pathlib.Path, shape: str, factory: str
+) -> None:
+    """Two values of the stage hold instances of two classes one factory made, with a class
+    statement or with `type()`. Swapping the factory arguments between them leaves the same two
+    classes, now held by the other value: each is keyed by its identity inside a value, so the
+    swap reruns the stage with the swapped output."""
+    home = tmp_path / "home"
+    pipeline = (
+        _TWO_HOLDERS_HEADER
+        + _TWO_HOLDERS[shape]
+        + '\n\nwith Pipeline("t") as pipeline:\n    use(pipeline.input("lines.txt", t=str))\n'
+    )
+    project = _project(tmp_path, {"factory.py": factory, "pipeline.py": pipeline})
+    output = project / "data" / "t" / "use.txt"
+    line = "Local Set Default Proof Using"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "pipeline.py", 'make("A")', 'make("Q")')
+    _edit(project, "pipeline.py", 'make("Z")', 'make("A")')
+    _edit(project, "pipeline.py", 'make("Q")', 'make("Z")')
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The swap should rerun"
+    assert output.read_text() == f"{line}Z{line}A"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_NAMED_AND_HELD = """\
+import dataclasses
+import pathlib
+from typing import Any
+
+from factory import make
+from pivot import Pipeline, loaders, stage
+
+Made = make("A")
+
+
+@dataclasses.dataclass(frozen=True)
+class Reader(loaders.Reader[str]):
+    made: Any = None
+
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text().splitlines()[0] + self.made.suffix()
+
+
+@stage
+def use(text: str) -> str:
+    return text + Made().suffix()
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", format=Reader(Made())))
+"""
+
+
+def test_a_class_the_stage_names_and_its_loader_holds_is_cached_warm_and_cold(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The stage names `Made`, a class `factory.make` made (`<locals>` in its name), and its
+    input's loader holds an instance of it. The stage and its loaders are walked apart, so the
+    loader's entries are the same whether the stage's manifest comes from the cache (warm) or
+    from a walk (cold): the stage runs once, then is cached warm, cold, and warm again."""
+    home = tmp_path / "home"
+    project = _project(tmp_path, {"factory.py": _FACTORY_MODULE, "pipeline.py": _NAMED_AND_HELD})
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert _repro_statuses(project, home) == {"t/use": "cached"}, "A warm run should reuse it"
+    shutil.rmtree(project / ".pivot" / "state.lmdb")
+    assert _repro_statuses(project, home) == {"t/use": "cached"}, "A cold run should reuse it"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}, "A warm run should reuse it"
+
+
+_DEFAULT_FROM_ELSEWHERE_PIPELINE = """\
+import functools
+from typing import Any
+
+from pivot import Pipeline, stage
+
+import defaults
+
+
+def _fresh(thing: Any, text: str) -> str:
+    return text.splitlines()[0] + thing.fresh()
+
+
+CAPTURED = functools.partial(_fresh, defaults.Box(None))
+
+
+@stage
+def named(text: str) -> str:
+    return text.splitlines()[0] + defaults.Box().fresh()
+
+
+@stage
+def captured(text: str) -> str:
+    return CAPTURED(text)
+
+
+with Pipeline("t") as pipeline:
+    named(pipeline.input("lines.txt", t=str))
+    captured(pipeline.input("lines.txt", t=str))
+"""
+
+_DEFAULT_FROM_ELSEWHERE_BOX = """\
+import dataclasses
+from typing import Any
+
+import settings
+
+
+@dataclasses.dataclass(frozen=True)
+class Box:
+    value: Any = DEFAULT
+
+    def fresh(self) -> str:
+        return str(type(self)().valueVIEW)
+"""
+
+# A dataclass whose class-level default comes from another module: a string that looks like a
+# memory address, and a `__slots__` object built from a value; each with the edit to
+# `settings.py` that changes it, and the output before and after.
+_DEFAULTS_FROM_ELSEWHERE = {
+    "hex-string": (
+        'HEX = "0xabcdef"\n',
+        {"DEFAULT": "settings.HEX", "VIEW": ""},
+        ('"0xabcdef"', '"0x123456"'),
+        ("0xabcdef", "0x123456"),
+    ),
+    "slots-object": (
+        'VALUE = 1\n\n\nclass Slotted:\n    __slots__ = ("x",)\n\n'
+        "    def __init__(self, x: int) -> None:\n        self.x = x\n",
+        {"DEFAULT": "settings.Slotted(settings.VALUE)", "VIEW": ".x"},
+        ("VALUE = 1", "VALUE = 2"),
+        ("1", "2"),
+    ),
+    "slots-callback": (
+        'VALUE = "A"\n\n\nclass Callback:\n    __slots__ = ("callback",)\n\n'
+        "    def __init__(self, callback) -> None:\n        self.callback = callback\n\n"
+        "    def read(self) -> str:\n        return self.callback()\n",
+        {"DEFAULT": "settings.Callback(lambda: settings.VALUE)", "VIEW": ".read()"},
+        ('VALUE = "A"', 'VALUE = "B"'),
+        ("A", "B"),
+    ),
+    "hex-bytes": (
+        'DATA = b"0xabcdef"\n',
+        {"DEFAULT": "settings.DATA", "VIEW": ".decode()"},
+        ('b"0xabcdef"', 'b"0x123456"'),
+        ("0xabcdef", "0x123456"),
+    ),
+    "hex-path": (
+        'import pathlib\n\nPATH = pathlib.PurePosixPath("cache/0xabcdef")\n',
+        {"DEFAULT": "settings.PATH", "VIEW": ""},
+        ('"cache/0xabcdef"', '"cache/0x123456"'),
+        ("cache/0xabcdef", "cache/0x123456"),
+    ),
+    "exception-attribute": (
+        'ERROR = ValueError("bad")\nERROR.code = "A"\n',
+        {"DEFAULT": "settings.ERROR", "VIEW": ".code"},
+        ('ERROR.code = "A"', 'ERROR.code = "B"'),
+        ("A", "B"),
+    ),
+    "identity-bytes-at": (
+        'DATA = b"located at 0xabcdef"\n',
+        {"DEFAULT": "settings.DATA", "VIEW": ".decode()"},
+        ('b"located at 0xabcdef"', 'b"located at 0x123456"'),
+        ("located at 0xabcdef", "located at 0x123456"),
+    ),
+    "identity-bytes-py": (
+        'DATA = b"Py(0xabcdef)"\n',
+        {"DEFAULT": "settings.DATA", "VIEW": ".decode()"},
+        ('b"Py(0xabcdef)"', 'b"Py(0x123456)"'),
+        ("Py(0xabcdef)", "Py(0x123456)"),
+    ),
+    "identity-bytes-object": (
+        'DATA = b"<object at 0xabcdef>"\n',
+        {"DEFAULT": "settings.DATA", "VIEW": ".decode()"},
+        ('b"<object at 0xabcdef>"', 'b"<object at 0x123456>"'),
+        ("<object at 0xabcdef>", "<object at 0x123456>"),
+    ),
+    "identity-path-at": (
+        'import pathlib\n\nPATH = pathlib.PurePosixPath("cache/at 0xabcdef")\n',
+        {"DEFAULT": "settings.PATH", "VIEW": ""},
+        ('"cache/at 0xabcdef"', '"cache/at 0x123456"'),
+        ("cache/at 0xabcdef", "cache/at 0x123456"),
+    ),
+    "classmethod-callback": (
+        'VALUE = "A"\n\n\nclass ClassCallback:\n'
+        "    @classmethod\n    def read(cls) -> str:\n        return VALUE\n\n\n"
+        "class DictCallback:\n    def __init__(self, callback) -> None:\n"
+        "        self.callback = callback\n\n    def read(self) -> str:\n        return self.callback()\n",
+        {"DEFAULT": "settings.DictCallback(settings.ClassCallback.read)", "VIEW": ".read()"},
+        ('VALUE = "A"', 'VALUE = "B"'),
+        ("A", "B"),
+    ),
+    "os-exception": (
+        'ERROR = FileNotFoundError(2, "missing", "A")\n',
+        {"DEFAULT": "settings.ERROR", "VIEW": ".filename"},
+        ('FileNotFoundError(2, "missing", "A")', 'FileNotFoundError(2, "missing", "B")'),
+        ("A", "B"),
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_DEFAULTS_FROM_ELSEWHERE))
+def test_an_edit_to_a_class_default_taken_from_another_module_reruns_its_stages(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """`defaults.Box`'s class-level default is built from `settings.py`. A stage that names the
+    class and one that captures an instance overriding the default (and reads a fresh instance's
+    default) run once and reuse their result under the same and a new hash seed; an edit to
+    `settings.py` that changes the default reruns both with the new output."""
+    home = tmp_path / "home"
+    settings_text, box_names, (old, new), (before, after) = _DEFAULTS_FROM_ELSEWHERE[shape]
+    box = _DEFAULT_FROM_ELSEWHERE_BOX
+    for name, text in box_names.items():
+        box = box.replace(name, text)
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": settings_text,
+            "defaults.py": box,
+            "pipeline.py": _DEFAULT_FROM_ELSEWHERE_PIPELINE,
+        },
+    )
+    line = "Local Set Default Proof Using"
+    stages = ("t/named", "t/captured")
+
+    assert _repro_statuses(project, home, seed="1") == dict.fromkeys(stages, "ran")
+    assert _repro_statuses(project, home, seed="1") == dict.fromkeys(stages, "cached")
+    assert _repro_statuses(project, home, seed="2") == dict.fromkeys(stages, "cached")
+    for name in ("named", "captured"):
+        assert (project / "data" / "t" / f"{name}.txt").read_text() == f"{line}{before}"
+    _edit(project, "settings.py", old, new)
+
+    assert _repro_statuses(project, home, seed="1") == dict.fromkeys(stages, "ran"), (
+        "The edit to the default should rerun"
+    )
+    for name in ("named", "captured"):
+        assert (project / "data" / "t" / f"{name}.txt").read_text() == f"{line}{after}"
+    assert _repro_statuses(project, home, seed="2") == dict.fromkeys(stages, "cached")
+
+
+_TYPE_SUBCLASS_DEFAULTS = """\
+import dataclasses
+from typing import Any
+
+import settings
+
+
+@dataclasses.dataclass(frozen=True)
+class Base:
+    marker: Any = settings.LABEL
+
+
+Derived = type("Derived", (Base,), {})
+"""
+
+_TYPE_SUBCLASS_PIPELINE = """\
+import functools
+from typing import Any
+
+from pivot import Pipeline, stage
+
+import defaults
+
+
+def _fresh(value: Any, text: str) -> str:
+    return text.splitlines()[0] + str(type(value)().marker)
+
+
+CAPTURED = functools.partial(_fresh, defaults.Derived("explicit"))
+
+
+@stage
+def captured(text: str) -> str:
+    return CAPTURED(text)
+
+
+@stage
+def named(text: str) -> str:
+    return text.splitlines()[0] + str(defaults.Derived().marker)
+
+
+with Pipeline("t") as pipeline:
+    captured(pipeline.input("lines.txt", t=str))
+    named(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_an_edit_to_the_default_a_dataclass_subclass_without_a_statement_takes_reruns(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`defaults.Derived`, made by `type()` with an empty namespace, takes the `marker` default
+    of its dataclass base, which comes from `settings.LABEL`. The walk of `Derived` resolves its
+    defaults over its MRO, so an edit to `settings.py` alone reruns the stage that names
+    `Derived` and the one that captures an instance of it, with the new output."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'LABEL = "A"\n',
+            "defaults.py": _TYPE_SUBCLASS_DEFAULTS,
+            "pipeline.py": _TYPE_SUBCLASS_PIPELINE,
+        },
+    )
+    line = "Local Set Default Proof Using"
+    stages = ("t/named", "t/captured")
+
+    assert _repro_statuses(project, home) == dict.fromkeys(stages, "ran")
+    assert _repro_statuses(project, home) == dict.fromkeys(stages, "cached")
+    _edit(project, "settings.py", '"A"', '"B"')
+
+    assert _repro_statuses(project, home) == dict.fromkeys(stages, "ran"), "The edit should rerun"
+    for name in ("named", "captured"):
+        assert (project / "data" / "t" / f"{name}.txt").read_text() == f"{line}B"
+    assert _repro_statuses(project, home) == dict.fromkeys(stages, "cached")
+
+
+_RANDOM_READER_DEFAULT = """\
+import dataclasses
+import pathlib
+import random
+from typing import Any
+
+from pivot import loaders
+
+
+@dataclasses.dataclass(frozen=True)
+class RandomReader(loaders.Reader[str]):
+    rng: Any
+
+    def load(self, path: pathlib.Path) -> str:
+        return str(self.rng.random())
+
+
+@dataclasses.dataclass(frozen=True)
+class Box:
+    reader: Any = RandomReader(random.Random(1))
+"""
+
+_RANDOM_READER_PIPELINE = """\
+from pivot import Pipeline, stage
+
+import defaults
+
+
+@stage
+def use(text: str) -> str:
+    return text.splitlines()[0] + defaults.Box().reader.load(None)
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_a_loader_in_a_default_whose_config_holds_unreadable_state_is_refused(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`defaults.Box`'s default is a reader whose config holds a `random.Random`. A run records
+    the field's read first, which keeps the loader's form for the stage; the kept form still
+    reports the generator's state, so the stage is refused, naming the field, and writes no
+    output."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {"defaults.py": _RANDOM_READER_DEFAULT, "pipeline.py": _RANDOM_READER_PIPELINE},
+    )
+
+    result = helpers.run_pivot(project, home, "repro", "--json")
+    message = " ".join((result.stdout + result.stderr).split())
+    assert result.returncode != 0, f"The stage should be refused: {message}"
+    assert "the default of field 'defaults.Box.reader' keeps state pivot cannot read" in message
+    assert not (project / "data" / "t" / "use.txt").exists()
+
+
+def test_swapping_later_instances_of_two_factory_classes_in_one_list_reruns_its_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A partial holds `[First(), Second(), First(), Second()]`, two classes one factory made.
+    Swapping the last two leaves each class's first instance where it was; each class's walk
+    is keyed by every position of its instances, so the swap reruns the stage with the new
+    output."""
+    home = tmp_path / "home"
+    pipeline = (
+        _TWO_HOLDERS_HEADER
+        + "def _take_all(things: Any, text: str) -> str:\n"
+        + '    return text.splitlines()[0] + "".join(thing.suffix() for thing in things)\n\n\n'
+        + "MANY = functools.partial(_take_all, [First(), Second(), First(), Second()])\n\n\n"
+        + "@stage\ndef use(text: str) -> str:\n    return MANY(text)\n\n\n"
+        + 'with Pipeline("t") as pipeline:\n    use(pipeline.input("lines.txt", t=str))\n'
+    )
+    project = _project(tmp_path, {"factory.py": _FACTORY_MODULE, "pipeline.py": pipeline})
+    output = project / "data" / "t" / "use.txt"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingAZAZ"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "pipeline.py", "First(), Second()])", "Second(), First()])")
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The swap should rerun"
+    assert output.read_text() == "Local Set Default Proof UsingAZZA"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+def test_replacing_a_factory_class_at_an_equal_set_rank_reruns_its_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A partial holds identity-distinct instances with equal forms in a frozenset. Changing
+    `[First, First, Second]` to `[First, Second, Second]` keeps every instance at rank `s0`.
+    The held class keys keep each rank's occurrence count, so the stage reruns with the new
+    output."""
+    home = tmp_path / "home"
+    pipeline = (
+        _TWO_HOLDERS_HEADER
+        + "def _take_all(things: Any, text: str) -> str:\n"
+        + '    return text.splitlines()[0] + "".join(sorted(thing.suffix() for thing in things))\n\n\n'
+        + "MANY = functools.partial(_take_all, frozenset((First(), First(), Second())))\n\n\n"
+        + "@stage\ndef use(text: str) -> str:\n    return MANY(text)\n\n\n"
+        + 'with Pipeline("t") as pipeline:\n    use(pipeline.input("lines.txt", t=str))\n'
+    )
+    project = _project(tmp_path, {"factory.py": _FACTORY_MODULE, "pipeline.py": pipeline})
+    output = project / "data" / "t" / "use.txt"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingAAZ"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "pipeline.py", "First(), First(), Second()", "First(), Second(), Second()")
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The multiplicity edit should rerun"
+    assert output.read_text() == "Local Set Default Proof UsingAZZ"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_CALLBACK_CYCLE = """\
+import dataclasses
+from typing import Any, ClassVar
+
+
+class Callback:
+    __slots__ = ("callback",)
+
+    def __init__(self, callback) -> None:
+        self.callback = callback
+
+    def read(self) -> str:
+        return self.callback()
+
+
+def class_callback() -> str:
+    return CycleBox.marker
+
+
+@dataclasses.dataclass(frozen=True)
+class CycleBox:
+    marker: ClassVar[str] = "safe"
+    value: Any = Callback(class_callback)
+"""
+
+_CALLBACK_CYCLE_PIPELINE = """\
+from pivot import Pipeline, stage
+
+import cycle
+
+
+@stage
+def use(text: str) -> str:
+    return text.splitlines()[0] + cycle.CycleBox().value.read()
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_a_callback_that_reads_its_enclosing_class_runs_and_caches(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A callback in a dataclass default reads that dataclass's class variable. The fingerprint
+    sees the class again as a back-reference, so `repro` runs once and caches instead of
+    recursing."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path, {"cycle.py": _CALLBACK_CYCLE, "pipeline.py": _CALLBACK_CYCLE_PIPELINE}
+    )
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert (project / "data" / "t" / "use.txt").read_text() == "Local Set Default Proof Usingsafe"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+def test_a_callback_whose_wrapped_chain_loops_is_refused(
+    tmp_path: pathlib.Path,
+) -> None:
+    """D3: refuse a looping callback in default state by its name, before execution."""
+    home = tmp_path / "home"
+    looping = _CALLBACK_CYCLE.replace(
+        "def class_callback() -> str:\n    return CycleBox.marker\n",
+        'def class_callback() -> str:\n    return "safe"\n\n\nclass_callback.__wrapped__ = class_callback\n',
+    )
+    project = _project(tmp_path, {"cycle.py": looping, "pipeline.py": _CALLBACK_CYCLE_PIPELINE})
+
+    refused = helpers.run_pivot(project, home, "repro")
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "class_callback" in message and "loop" in message, message
+    assert "StageParams" in message and "break" in message.lower(), message
+
+
+_CONFIG_HELD = """\
+import json
+import pathlib
+
+VALUE = json.loads((pathlib.Path(__file__).parent / "config.json").read_text())["v"]
+
+
+class Held:
+    def value(self) -> str:
+        return str(VALUE)
+"""
+
+_CONFIG_PIPELINE = """\
+import functools
+from typing import Any
+
+from pivot import Pipeline, stage
+
+import held
+
+
+def _read(thing: Any, text: str) -> str:
+    return text.splitlines()[0] + thing.value()
+
+
+HELD = functools.partial(_read, held.Held())
+
+
+@stage
+def use(text: str) -> str:
+    return HELD(text)
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_a_refusal_found_on_a_cache_hit_refuses_the_stage_warm_and_fresh(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A captured class's method reads `VALUE`, which `held.py` loads from `config.json`, so no
+    source edit changes it. While it is a string the stage runs and caches. Once it is a list,
+    the walk refuses it: on the warm path, where the manifest cache's check walks the class
+    again and refuses, the stage walk that follows refuses too (the refused walk left nothing
+    in a memo), and so it does on the fresh path, with no state database. The output stays the
+    one the safe value made."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "held.py": _CONFIG_HELD,
+            "config.json": '{"v": "safe"}\n',
+            "pipeline.py": _CONFIG_PIPELINE,
+        },
+    )
+    output = project / "data" / "t" / "use.txt"
+    line = "Local Set Default Proof Using"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "config.json", '"safe"', '["unsafe-A"]')
+    for path in ("warm", "fresh"):
+        if path == "fresh":
+            shutil.rmtree(project / ".pivot" / "state.lmdb")
+        result = helpers.run_pivot(project, home, "repro", "--json")
+        message = " ".join((result.stdout + result.stderr).split())
+        assert result.returncode != 0, f"The {path} path should refuse: {message}"
+        assert "captures non-scalar variable 'VALUE'" in message, message
+        assert output.read_text() == f"{line}safe"
+
+
+# ---------------------------------------------------------------------------------------------
+# Enum values, type expressions, deep classes and values, user code the walk must not run, and a
+# StageParams `model_config` a method reads
+# ---------------------------------------------------------------------------------------------
+
+_ENUM_FROM_SETTINGS = """\
+import dataclasses
+import enum
+
+import settings
+
+
+class Choice(enum.Enum):
+    PICK = settings.VALUE
+
+
+@dataclasses.dataclass(frozen=True)
+class Holder:
+    choice: Choice = Choice.PICK
+"""
+
+_ENUM_PIPELINE = """\
+import functools
+
+from pivot import Pipeline, stage
+
+import choices
+
+
+def _value(choice, text: str) -> str:
+    return text.splitlines()[0] + choice.value
+
+
+HELD = functools.partial(_value, choices.Choice.PICK)
+
+
+@stage
+def use(text: str) -> str:
+    return {body}
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+# Where the stage meets `Choice.PICK`: held by a partial it calls, or as the class-level default
+# of a dataclass it names.
+_ENUM_BODIES = {
+    "partial-holds-the-member": "HELD(text)",
+    "default-of-a-named-dataclass": "_value(choices.Holder().choice, text)",
+}
+
+
+@pytest.mark.parametrize("body", sorted(_ENUM_BODIES))
+def test_an_edit_to_the_value_of_an_enum_member_a_value_holds_reruns_its_stage(
+    tmp_path: pathlib.Path, body: str
+) -> None:
+    """`Choice.PICK` takes its value from `settings.VALUE`. The class statement holds the
+    expression, not the value, so the member is formed with its value: an edit to `settings.py`
+    reruns the stage once, and the next run reuses it."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "choices.py": _ENUM_FROM_SETTINGS,
+            "pipeline.py": _ENUM_PIPELINE.format(body=_ENUM_BODIES[body]),
+        },
+    )
+    output = project / "data" / "t" / "use.txt"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingA"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "settings.py", '"A"', '"B"')
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The value edit should rerun"
+    assert output.read_text() == "Local Set Default Proof UsingB"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_TYPE_EXPRESSIONS_PIPELINE = """\
+import dataclasses
+import functools
+import pathlib
+import typing
+from typing import Any
+
+from pivot import Pipeline, loaders, stage
+
+
+def _take(value: Any, text: str) -> str:
+    return text.splitlines()[0]
+
+
+GENERIC = functools.partial(_take, list[int])
+OPTIONAL = functools.partial(_take, typing.Optional[str])
+UNION = functools.partial(_take, str | None)
+Made = dataclasses.make_dataclass(
+    "Made", [("items", list[str]), ("note", typing.Optional[str], None)]
+)
+Row = typing.NamedTuple("Row", [("x", list[str])])
+Rec = typing.TypedDict("Rec", {"x": list[str]})
+
+
+@dataclasses.dataclass(frozen=True)
+class TypedReader(loaders.Reader[str]):
+    schema: Any = None
+
+    def load(self, path: pathlib.Path) -> str:
+        return path.read_text().splitlines()[0]
+
+
+@stage
+def generic(text: str) -> str:
+    return GENERIC(text)
+
+
+@stage
+def optional(text: str) -> str:
+    return OPTIONAL(text)
+
+
+@stage
+def union(text: str) -> str:
+    return UNION(text)
+
+
+@stage
+def made(text: str) -> str:
+    return text.splitlines()[0] + str(len(Made(["a"]).items))
+
+
+@stage
+def row(text: str) -> str:
+    return text.splitlines()[0] + str(len(Row(["a"]).x))
+
+
+@stage
+def rec(text: str) -> str:
+    return text.splitlines()[0] + str(len(Rec(x=["a"])["x"]))
+
+
+@stage
+def configured(text: str) -> str:
+    return text
+
+
+with Pipeline("t") as pipeline:
+    for each in (generic, optional, union, made, row, rec):
+        each(pipeline.input("lines.txt", t=str))
+    configured(pipeline.input("typed.txt", format=TypedReader(list[str])))
+"""
+
+
+def test_a_type_expression_inside_a_value_runs_and_caches(tmp_path: pathlib.Path) -> None:
+    """`list[int]`, `Optional[str]` and `str | None` held by partials, the field types of a
+    `make_dataclass`, call-made `NamedTuple` and `TypedDict` class, and a loader config field
+    holding `list[str]` are formed by their origin and arguments, not refused as proxies: every
+    stage runs, and the next run reuses each."""
+    home = tmp_path / "home"
+    project = _project(tmp_path, {"pipeline.py": _TYPE_EXPRESSIONS_PIPELINE})
+    (project / "data" / "raw" / "typed.txt").write_text(_LINES)
+    stages = ("configured", "generic", "made", "optional", "rec", "row", "union")
+
+    assert _repro_statuses(project, home) == {f"t/{name}": "ran" for name in stages}
+    assert _repro_statuses(project, home) == {f"t/{name}": "cached" for name in stages}
+
+
+_DEEP = """\
+class Node:
+    def __init__(self, nxt) -> None:
+        self.nxt = nxt
+
+
+def _chain(depth: int) -> type:
+    cls = type("C0", (), {"marker": "A"})
+    for index in range(1, depth):
+        cls = type(f"C{index}", (cls,), {})
+    return cls
+
+
+def _linked(depth: int) -> object:
+    head = None
+    for _ in range(depth):
+        head = Node(head)
+    return head
+
+
+def _lists(depth: int) -> object:
+    value = []
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+def _dicts(depth: int) -> object:
+    value = {}
+    for _ in range(depth):
+        value = {"k": value}
+    return value
+
+
+DEEP_MRO = _chain(1100)
+LINKED = _linked(1000)
+LISTS = _lists(1000)
+DICTS = _dicts(1000)
+"""
+
+_DEEP_PIPELINE = """\
+import functools
+from typing import Any
+
+from pivot import Pipeline, stage
+
+import deep
+
+
+def _take(value: Any, text: str) -> str:
+    return text.splitlines()[0]
+
+
+MRO = functools.partial(_take, deep.DEEP_MRO())
+LINKED = functools.partial(_take, deep.LINKED)
+LISTS = functools.partial(_take, deep.LISTS)
+DICTS = functools.partial(_take, deep.DICTS)
+
+
+@stage
+def captured_mro(text: str) -> str:
+    return MRO(text)
+
+
+@stage
+def named_mro(text: str) -> str:
+    return text.splitlines()[0] + deep.DEEP_MRO().marker
+
+
+@stage
+def linked(text: str) -> str:
+    return LINKED(text)
+
+
+@stage
+def lists(text: str) -> str:
+    return LISTS(text)
+
+
+@stage
+def dicts(text: str) -> str:
+    return DICTS(text)
+
+
+with Pipeline("t") as pipeline:
+    for each in (captured_mro, named_mro, linked, lists, dicts):
+        each(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_classes_and_values_deeper_than_the_recursion_limit_run_and_cache(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A class made by `type()` on a chain of 1,100 bases, held as an instance or named by the
+    stage, and a linked list of 1,000 objects, lists nested 1,000 deep and dicts nested 1,000 deep,
+    each held by a partial: class identities nest no deeper than a fixed limit and values are
+    formed on an explicit stack, so each stage runs, and the next run reuses it."""
+    home = tmp_path / "home"
+    project = _project(tmp_path, {"deep.py": _DEEP, "pipeline.py": _DEEP_PIPELINE})
+    stages = ("captured_mro", "dicts", "linked", "lists", "named_mro")
+
+    assert _repro_statuses(project, home) == {f"t/{name}": "ran" for name in stages}
+    assert _repro_statuses(project, home) == {f"t/{name}": "cached" for name in stages}
+
+
+# Each hook writes its name to `hooks.log` once the module has built its values, so a hook the
+# fingerprint runs leaves the file behind.
+_HOOK_LOG = """\
+_ARMED = False
+
+
+def _ran(name):
+    if _ARMED:
+        with (pathlib.Path(__file__).parent / "hooks.log").open("a") as log:
+            log.write(name + "\\n")
+"""
+
+_HOOKS_ACCEPTED = (
+    "import functools\nimport pathlib\nimport types\n\nimport numpy\n\n"
+    + _HOOK_LOG
+    + """
+
+class Key:
+    def __hash__(self):
+        _ran("Key.__hash__")
+        return 1
+
+    def __eq__(self, other):
+        _ran("Key.__eq__")
+        return self is other
+
+
+class KeyDict(dict):
+    pass
+
+
+class KeySet(set):
+    pass
+
+
+class KeyFrozenSet(frozenset):
+    pass
+
+
+class ItemsDict(dict):
+    def items(self):
+        _ran("ItemsDict.items")
+        return dict.items(self)
+
+    def keys(self):
+        _ran("ItemsDict.keys")
+        return dict.keys(self)
+
+    def __iter__(self):
+        _ran("ItemsDict.__iter__")
+        return dict.__iter__(self)
+
+    def __getitem__(self, key):
+        _ran("ItemsDict.__getitem__")
+        return dict.__getitem__(self, key)
+
+
+class Scalar(numpy.float64):
+    @property
+    def dtype(self):
+        _ran("Scalar.dtype")
+        return numpy.dtype("float64")
+
+    def tobytes(self, order="C"):
+        _ran("Scalar.tobytes")
+        return numpy.float64.tobytes(self, order)
+
+
+@functools.lru_cache(maxsize=8)
+def cached(value):
+    return value * 2
+
+
+DICT = KeyDict({Key(): 1})
+SET = KeySet([Key(), Key()])
+FROZEN = KeyFrozenSet([Key(), Key()])
+PROXY = types.MappingProxyType(ItemsDict(a=1))
+SCALAR = Scalar(1.5)
+CACHED = cached
+_ARMED = True
+"""
+)
+
+_HOOKS_ACCEPTED_PIPELINE = """\
+import functools
+from typing import Any
+
+from pivot import Pipeline, stage
+
+import hooks
+
+
+def _tag(thing: Any, text: str) -> str:
+    return text.splitlines()[0] + type(thing).__name__
+
+
+DICT = functools.partial(_tag, hooks.DICT)
+SET = functools.partial(_tag, hooks.SET)
+FROZEN = functools.partial(_tag, hooks.FROZEN)
+PROXY = functools.partial(_tag, hooks.PROXY)
+SCALAR = functools.partial(_tag, hooks.SCALAR)
+CACHED = functools.partial(_tag, hooks.CACHED)
+
+
+@stage
+def dict_subclass(text: str) -> str:
+    return DICT(text)
+
+
+@stage
+def set_subclass(text: str) -> str:
+    return SET(text)
+
+
+@stage
+def frozenset_subclass(text: str) -> str:
+    return FROZEN(text)
+
+
+@stage
+def mapping_proxy(text: str) -> str:
+    return PROXY(text)
+
+
+@stage
+def numpy_scalar(text: str) -> str:
+    return SCALAR(text)
+
+
+@stage
+def lru_cache(text: str) -> str:
+    return CACHED(text)
+
+
+with Pipeline("t") as pipeline:
+    for each in (dict_subclass, set_subclass, frozenset_subclass, mapping_proxy, numpy_scalar,
+                 lru_cache):
+        each(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_a_value_is_formed_without_running_the_code_of_its_members_or_subclass(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Partials hold a dict, set and frozenset subclass whose members' `__hash__` and `__eq__`
+    are user code, a `MappingProxyType` over a dict subclass whose `items`, `keys`,
+    `__iter__` and `__getitem__` are, a numpy scalar subclass whose `dtype` and `tobytes` are,
+    and an `lru_cache` wrapper. Each is formed through the built-in types' own C methods and
+    descriptors and the cache's own closure. The first `repro` sends the stages to workers, which
+    pickle their values and so may run the hooks; its log is removed. After `pivot fingerprint
+    reset`, `pivot status` fingerprints the stages cold, and the next `repro` checks their cached
+    manifests: no hook runs in either (`hooks.log` is not written), and every stage is cached."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path, {"hooks.py": _HOOKS_ACCEPTED, "pipeline.py": _HOOKS_ACCEPTED_PIPELINE}
+    )
+    stages = (
+        "dict_subclass",
+        "frozenset_subclass",
+        "lru_cache",
+        "mapping_proxy",
+        "numpy_scalar",
+        "set_subclass",
+    )
+    log = project / "hooks.log"
+
+    assert _repro_statuses(project, home) == {f"t/{name}": "ran" for name in stages}
+    log.unlink(missing_ok=True)
+    for command in (("fingerprint", "reset"), ("status", "--json")):
+        result = helpers.run_pivot(project, home, *command)
+        assert result.returncode == 0, result.stdout + result.stderr
+    assert not log.exists(), f"Fingerprinting ran user code: {log.read_text().split()}"
+    assert _repro_statuses(project, home) == {f"t/{name}": "cached" for name in stages}
+    assert not log.exists(), f"A cache hit ran user code: {log.read_text().split()}"
+
+
+_HOOKS_REFUSED = (
+    "import functools\nimport pathlib\n\n"
+    + _HOOK_LOG
+    + """
+
+def _double(value):
+    return value * 2
+
+
+REPLACED = functools.lru_cache(maxsize=8)(_double)
+
+
+def _parameters():
+    _ran("cache_parameters")
+    return {"maxsize": 8, "typed": False}
+
+
+REPLACED.cache_parameters = _parameters
+
+
+class Descriptor:
+    def __get__(self, instance, owner=None):
+        _ran("Descriptor.__get__")
+        return self
+
+    def __call__(self):
+        return "d"
+
+
+class Forwards:
+    def __getattr__(self, name):
+        _ran("Forwards.__getattr__")
+        raise AttributeError(name)
+
+
+class Described:
+    DESC = Descriptor()
+
+    def unused(self) -> str:
+        return self.DESC()
+
+
+class Forwarded:
+    FWD = Forwards()
+
+    def unused(self) -> str:
+        return str(self.FWD)
+
+
+class Meta(type):
+    def __getattribute__(cls, name):
+        _ran("Meta.__getattribute__")
+        return type.__getattribute__(cls, name)
+
+
+class Hooked(metaclass=Meta):
+    def suffix(self) -> str:
+        return "A"
+
+
+_ARMED = True
+"""
+)
+
+_HOOKS_REFUSED_PIPELINE = """\
+import functools
+from typing import Any
+
+from pivot import Pipeline, stage
+
+import hooks
+
+
+def _tag(thing: Any, text: str) -> str:
+    return text
+
+
+HELD = {held}
+
+
+@stage
+def use(text: str) -> str:
+    return {body}
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+_HELD_CALL = "HELD(text)"
+# What a partial holds (or `None` when the stage names the class), the stage's body, and what
+# the refusal says. Reading each value would run user code: a replaced `cache_parameters`, a
+# descriptor's `__get__` and a class attribute's `__getattr__` that a method reads through
+# `self`, and a metaclass `__getattribute__`.
+_REFUSED_HOOKS = {
+    "replaced-cache-parameters": (
+        "functools.partial(_tag, hooks.REPLACED)",
+        _HELD_CALL,
+        "'pipeline.HELD.args[0]' keeps state Pivot cannot read (type: functools._lru_cache_wrapper)",
+    ),
+    "descriptor-read-through-self": (
+        "functools.partial(_tag, hooks.Described())",
+        _HELD_CALL,
+        "captures non-scalar variable 'hooks.Described.DESC' (type: Descriptor)",
+    ),
+    "forwarder-read-through-self": (
+        "functools.partial(_tag, hooks.Forwarded())",
+        _HELD_CALL,
+        "captures non-scalar variable 'hooks.Forwarded.FWD' (type: Forwards)",
+    ),
+    "metaclass-hook-held": (
+        "functools.partial(_tag, hooks.Hooked())",
+        _HELD_CALL,
+        "class 'hooks.Hooked' has the metaclass 'hooks.Meta'",
+    ),
+    "metaclass-hook-named": (
+        "None",
+        "text + hooks.Hooked().suffix()",
+        "class 'hooks.Hooked' has the metaclass 'hooks.Meta'",
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_REFUSED_HOOKS))
+def test_a_value_whose_reading_would_run_user_code_is_refused_by_name(
+    tmp_path: pathlib.Path, shape: str
+) -> None:
+    """Where a value cannot be read through C descriptors (an `lru_cache` wrapper whose
+    `cache_parameters` was replaced, a class attribute a method reads through `self` that is a
+    descriptor or answers lookups in `__getattr__`, a class whose metaclass defines
+    `__getattribute__`), the stage is refused with a message naming it, and the code is not run
+    (`hooks.log` is not written)."""
+    held, body, expected = _REFUSED_HOOKS[shape]
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "hooks.py": _HOOKS_REFUSED,
+            "pipeline.py": _HOOKS_REFUSED_PIPELINE.format(held=held, body=body),
+        },
+    )
+
+    result = helpers.run_pivot(project, home, "repro", "--json")
+    message = " ".join((result.stdout + result.stderr).split())
+    assert result.returncode != 0, f"The stage should be refused: {message}"
+    assert expected in message, message
+    log = project / "hooks.log"
+    assert not log.exists(), f"The fingerprint ran user code: {log.read_text().split()}"
+
+
+_CONFIG_PARAMS = """\
+import pydantic
+
+from pivot import StageParams
+
+import settings
+
+
+class Params(StageParams):
+    model_config = pydantic.ConfigDict(title=settings.TITLE)
+    scale: int = 2
+
+    def title(self) -> str:
+        return str(self.model_config.get("title"))
+"""
+
+_CONFIG_PARAMS_PIPELINE = """\
+from pivot import Pipeline, stage
+
+import params
+
+
+@stage
+def use(text: str, settings: params.Params = params.Params()) -> str:
+    return text.splitlines()[0] + settings.title()
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_an_edit_to_the_model_config_a_stage_params_method_reads_reruns_its_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A `StageParams` method reads `self.model_config`, whose `title` comes from
+    `settings.TITLE`. The schema hash leaves the title out, and the config is a dict, which a
+    class attribute read through `self` would refuse; it is recorded by its form instead: the stage
+    runs and caches, an edit to `settings.py` reruns it, and the next run reuses it."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'TITLE = "T1"\n',
+            "params.py": _CONFIG_PARAMS,
+            "pipeline.py": _CONFIG_PARAMS_PIPELINE,
+        },
+    )
+    output = project / "data" / "t" / "use.txt"
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert output.read_text() == "Local Set Default Proof UsingT1"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+    _edit(project, "settings.py", '"T1"', '"T2"')
+    assert _repro_statuses(project, home) == {"t/use": "ran"}, "The config edit should rerun"
+    assert output.read_text() == "Local Set Default Proof UsingT2"
+    assert _repro_statuses(project, home) == {"t/use": "cached"}
+
+
+_WRAPPED_PAIR = """\
+def first():
+    return first.__wrapped__()
+
+
+def second():
+    return "G" + settings.VALUE
+
+
+first.__wrapped__ = second
+second.__wrapped__ = first
+VALUE = first
+"""
+
+_SLOTTED_NUMPY_SCALAR = """\
+import numpy
+
+
+class Scalar(numpy.float64):
+    __slots__ = ("tag",)
+
+    def __new__(cls, value, tag):
+        item = super().__new__(cls, value)
+        item.tag = tag
+        return item
+
+    def __reduce__(self):
+        return Scalar, (float(self), self.tag)
+
+
+VALUE = Scalar(1, settings.VALUE)
+"""
+
+_ROUND_SIX_VALUE_PIPELINE = """\
+import functools
+
+from pivot import Pipeline, stage
+
+import values
+
+
+def read(value, text):
+    return {read}
+
+
+HELD = functools.partial(read, values.VALUE)
+
+
+@stage
+def use(text: str) -> str:
+    return HELD(text)
+
+
+with Pipeline("t") as pipeline:
+    use(pipeline.input("lines.txt", t=str))
+"""
+
+
+def test_an_edit_in_a_numpy_scalar_slot_reruns_its_stage(tmp_path: pathlib.Path) -> None:
+    """Form a scalar subclass's slots on a cache hit and after a reset."""
+    definition, read, before, after = _SLOTTED_NUMPY_SCALAR, "value.tag", "A", "B"
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": "import settings\n\n" + definition,
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read=read),
+        },
+    )
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == before
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", '"A"', '"B"')
+    assert _repro_statuses(project, home, "7") == {"t/use": "ran"}
+    assert output.read_text() == after
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+def test_a_two_function_wrapped_cycle_is_refused_by_name(tmp_path: pathlib.Path) -> None:
+    """D3: refuse both functions on a Python metadata loop, including through a partial."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": "import settings\n\n" + _WRAPPED_PAIR,
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+    refused = helpers.run_pivot(project, tmp_path / "home", "repro")
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "values.first" in message and "values.second" in message, message
+    assert "loop" in message and "StageParams" in message, message
+    assert "break" in message.lower(), message
+
+
+@pytest.mark.parametrize("slotted", [False, True], ids=["method", "slot"])
+def test_a_user_generic_alias_subclass_is_refused_instead_of_losing_its_code_or_state(
+    tmp_path: pathlib.Path, slotted: bool
+) -> None:
+    home = tmp_path / "home"
+    definition = (
+        '    __slots__ = ("tag",)\n\n'
+        '    def __call__(self):\n        return object.__getattribute__(self, "tag")\n'
+        if slotted
+        else "    def __call__(self):\n        return settings.VALUE\n"
+    )
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": "import types\nimport settings\n\nclass Alias(types.GenericAlias):\n"
+            + definition
+            + "\nVALUE = Alias(list, (int,))\n"
+            + ("VALUE.tag = settings.VALUE\n" if slotted else ""),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+
+    refused = helpers.run_pivot(project, home, "status" if slotted else "repro")
+
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "Alias" in message and "StageParams" in message, message
+    assert "state" in message, message
+
+
+@pytest.mark.parametrize("factory", [False, True], ids=["type-call", "class-statement"])
+def test_a_long_ring_of_captured_classes_runs_and_caches(
+    tmp_path: pathlib.Path, factory: bool
+) -> None:
+    make = (
+        "def make():\n    class Made:\n        pass\n    return Made\n"
+        if factory
+        else 'def make():\n    return type("Made", (), {})\n'
+    )
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "values.py": make
+            + "\nclasses = [make() for _ in range(200)]\n"
+            + "for i, cls in enumerate(classes):\n    cls.peer = classes[(i + 1) % len(classes)]\n"
+            + "VALUE = classes[0]()\n",
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read='"safe"'),
+        },
+    )
+
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert (project / "data/t/use.txt").read_text() == "safe"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+
+
+@pytest.mark.parametrize("container", ["ordered", "subclass", "proxy"])
+def test_reading_ordered_dict_order_runs_no_user_key_hash(
+    tmp_path: pathlib.Path, container: str
+) -> None:
+    values = {
+        "ordered": "collections.OrderedDict([(Key(), 1)])",
+        "subclass": "OrderedSub([(Key(), 1)])",
+        "proxy": "types.MappingProxyType(collections.OrderedDict([(Key(), 1)]))",
+    }
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "values.py": "import collections\nimport pathlib\nimport types\n"
+            + _HOOK_LOG
+            + "\nclass Key:\n"
+            + '    def __hash__(self):\n        _ran("hash")\n        return 1\n'
+            + "\nclass OrderedSub(collections.OrderedDict):\n    pass\n"
+            + f"\nVALUE = {values[container]}\n_ARMED = True\n",
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read='"safe"'),
+        },
+    )
+
+    result = helpers.run_pivot(project, home, "status")
+
+    message = result.stdout + result.stderr
+    assert not (project / "hooks.log").exists(), message
+    assert result.returncode != 0, message
+    refused_type = "OrderedSub" if container == "subclass" else "OrderedDict"
+    assert refused_type in message and "StageParams" in message, message
+
+
+def test_a_top_level_loader_with_a_metaclass_attribute_hook_is_refused_before_class_reads(
+    tmp_path: pathlib.Path,
+) -> None:
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "values.py": "import dataclasses\nimport pathlib\nfrom pivot import loaders\n"
+            + _HOOK_LOG
+            + "\nclass Meta(type(loaders.Text)):\n"
+            + "    def __getattribute__(cls, name):\n"
+            + '        _ran("metaclass:" + name)\n'
+            + "        return type.__getattribute__(cls, name)\n"
+            + "\n@dataclasses.dataclass(frozen=True)\n"
+            + "class Reader(loaders.Text, metaclass=Meta):\n    pass\n"
+            + "\nVALUE = Reader()\n",
+            "pipeline.py": "from pivot import Pipeline, stage\nimport values\n"
+            + "\n@stage\ndef use(text: str) -> str:\n    return text\n"
+            + '\nwith Pipeline("t") as pipeline:\n'
+            + '    use(pipeline.input("lines.txt", format=values.VALUE))\n'
+            + "\nvalues._ARMED = True\n",
+        },
+    )
+
+    refused = helpers.run_pivot(project, home, "repro")
+
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "Reader" in message and "Meta" in message and "StageParams" in message, message
+    assert not (project / "hooks.log").exists(), message
+
+
+def test_schema_fingerprinting_releases_transient_models_after_its_pass(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A long-lived process must not retain a model through a cached schema or its validator."""
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "values.py": "import gc\nimport weakref\nimport pydantic\n"
+            + "from pivot import fingerprint\n"
+            + "\ndef retained():\n    refs = []\n"
+            + "    for i in range(3):\n"
+            + "        with fingerprint.fingerprint_pass():\n"
+            + '            model = pydantic.create_model("Transient", value=(int, i))\n'
+            + "            refs.append(weakref.ref(model))\n"
+            + "            fingerprint._schema_hash(model)\n"
+            + "        del model\n"
+            + "    gc.collect()\n"
+            + "    return str(sum(ref() is not None for ref in refs))\n",
+            "pipeline.py": "from pivot import Pipeline, stage\nimport values\n"
+            + "\n@stage\ndef use(text: str) -> str:\n    return values.retained()\n"
+            + '\nwith Pipeline("t") as pipeline:\n'
+            + '    use(pipeline.input("lines.txt", t=str))\n',
+        },
+    )
+
+    assert _repro_statuses(project, home) == {"t/use": "ran"}
+    assert (project / "data/t/use.txt").read_text() == "0"
+
+
+@pytest.mark.parametrize(
+    ("definition", "read", "expected"),
+    [
+        pytest.param(
+            "import collections.abc\nVALUE = collections.abc.Callable[[int], str]\n",
+            "text.splitlines()[0]",
+            "Local Set Default Proof Using",
+            id="stdlib-callable-alias",
+        ),
+        pytest.param(
+            "import json\n\ndef encode(value):\n    return json.dumps(value)\n"
+            "encode.__wrapped__ = json.dumps\nVALUE = encode\n",
+            "value(text.splitlines()[0])",
+            '"Local Set Default Proof Using"',
+            id="library-wrapped-target",
+        ),
+    ],
+)
+def test_a_stdlib_alias_or_library_wrapped_target_runs_and_caches(
+    tmp_path: pathlib.Path, definition: str, read: str, expected: str
+) -> None:
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "values.py": definition,
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read=read),
+        },
+    )
+
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert (project / "data/t/use.txt").read_text() == expected
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+
+
+@pytest.mark.parametrize("wrapper", ["cache", "lru_cache", "partial", "partial-target"])
+def test_a_mixed_python_and_c_wrapper_cycle_is_refused_by_name(
+    tmp_path: pathlib.Path, wrapper: str
+) -> None:
+    constructors = {
+        "cache": "functools.cache(second)",
+        "lru_cache": "functools.lru_cache(maxsize=8)(second)",
+        "partial": "functools.partial(second)",
+        "partial-target": "functools.partial(second)",
+    }
+    definition = (
+        "import functools\nimport settings\n\n"
+        "def first():\n    return first.__wrapped__()\n\n"
+        'def second():\n    return "G" + settings.VALUE\n\n'
+        f"CACHED = {constructors[wrapper]}\n"
+        'CACHED.__name__ = CACHED.__qualname__ = "CACHED"\n'
+        "first.__wrapped__ = CACHED\nsecond.__wrapped__ = first\n"
+        + ("CACHED.__wrapped__ = first\n" if wrapper == "partial" else "")
+        + "VALUE = first\n"
+    )
+    home = tmp_path / "home"
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": definition,
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+    refused = helpers.run_pivot(project, home, "repro")
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "values.first" in message and "CACHED" in message, message
+    if wrapper != "partial":
+        assert "values.second" in message, message
+    assert "loop" in message and "StageParams" in message, message
+    assert "break" in message.lower(), message
+
+
+@pytest.mark.parametrize("extra_link", [False, True], ids=["two-functions", "three-functions"])
+def test_a_nonlooping_c_wrapper_keeps_each_functions_code(
+    tmp_path: pathlib.Path, extra_link: bool
+) -> None:
+    """Distinct immediate and terminal functions must not overwrite one manifest entry."""
+    definition = (
+        'import functools\n\ndef first():\n    return "A"\n\n'
+        'def second():\n    return "unused"\n\n'
+        'def third():\n    return "also unused"\n\n'
+        "CACHED = functools.cache(first)\n"
+        'CACHED.__name__ = CACHED.__qualname__ = "CACHED"\n'
+        "first.__wrapped__ = second\n" + ("second.__wrapped__ = third\n" if extra_link else "")
+    )
+    project = _project(
+        tmp_path,
+        {
+            "values.py": definition,
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()")
+            .replace("HELD = functools.partial(read, values.VALUE)", "")
+            .replace("return HELD(text)", "return values.CACHED()"),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "A"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "values.py", 'return "A"', 'return "B"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "B"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+@pytest.mark.parametrize("setting", ["typed", "maxsize"])
+def test_a_nonlooping_wrapped_cache_tracks_its_native_settings(
+    tmp_path: pathlib.Path, setting: str
+) -> None:
+    """A C wrapper reached only through metadata must retain its native configuration."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": "TYPED = False\nMAXSIZE = None\n",
+            "values.py": (
+                "import functools\nimport settings\n\n"
+                "def first():\n"
+                '    return first.__wrapped__(x=1) + "|" + first.__wrapped__(x=1.0)\n\n'
+                "def second(*, x):\n    return type(x).__name__\n\n"
+                "CACHED = functools.lru_cache(maxsize=settings.MAXSIZE, typed=settings.TYPED)(second)\n"
+                'CACHED.__name__ = CACHED.__qualname__ = "CACHED"\n'
+                "first.__wrapped__ = CACHED\nVALUE = first\n"
+            ),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "int|int"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    if setting == "typed":
+        _edit(project, "settings.py", "TYPED = False", "TYPED = True")
+    else:
+        _edit(project, "settings.py", "MAXSIZE = None", "MAXSIZE = 0")
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "int|float"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+def test_a_partial_metadata_loop_inside_a_value_is_refused(tmp_path: pathlib.Path) -> None:
+    """A partial nested in state must not lose its own wrapper metadata in the value form."""
+    project = _project(
+        tmp_path,
+        {
+            "values.py": (
+                'import functools\n\ndef first():\n    return "safe"\n\n'
+                "CACHED = functools.partial(first)\n"
+                'CACHED.__qualname__ = "CACHED"\nCACHED.__wrapped__ = CACHED\n'
+                'VALUE = {"callback": CACHED}\n'
+            ),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read='value["callback"]()'),
+        },
+    )
+    refused = helpers.run_pivot(project, tmp_path / "home", "repro")
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "CACHED" in message and "loop" in message and "StageParams" in message, message
+    assert "break" in message.lower(), message
+    assert not (project / "data/t/use.txt").exists()
+
+
+def test_nested_native_caches_each_retain_their_settings(tmp_path: pathlib.Path) -> None:
+    """Stacked caches copy one definition name but must not share a settings entry."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": "TYPED = False\n",
+            "values.py": (
+                "import functools\nimport settings\n\n"
+                "def first():\n"
+                '    return first.__wrapped__(x=1) + "|" + first.__wrapped__(x=1.0)\n\n'
+                "@functools.lru_cache(maxsize=0)\n"
+                "@functools.lru_cache(maxsize=None, typed=settings.TYPED)\n"
+                "def second(*, x):\n    return type(x).__name__\n\n"
+                "first.__wrapped__ = second\nVALUE = first\n"
+            ),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "int|int"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", "TYPED = False", "TYPED = True")
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "int|float"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+_WRAPPED_CHAIN_VALUES = """\
+import sys
+import settings
+
+
+def terminal():
+    return "metadata-only"
+
+
+def wrap(target):
+    def link():
+        return "metadata-only"
+    link.__wrapped__ = target
+    return link
+
+
+TAIL = terminal
+for _ in range({depth}):
+    TAIL = wrap(TAIL)
+
+
+def first():
+    return settings.VALUE
+
+
+first.__wrapped__ = TAIL
+"""
+
+
+def test_a_wrapped_chain_past_the_depth_limit_is_refused_by_name(tmp_path: pathlib.Path) -> None:
+    """R8-B1: a terminating but over-limit chain must not hide first's module reads."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": _WRAPPED_CHAIN_VALUES.format(depth="sys.getrecursionlimit() + 20"),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()")
+            .replace("HELD = functools.partial(read, values.VALUE)", "")
+            .replace("return HELD(text)", "return values.first()"),
+        },
+    )
+
+    refused = helpers.run_pivot(project, tmp_path / "home", "repro", "--json")
+
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "values.first" in message and "__wrapped__" in message, message
+    assert "depth limit" in message and "StageParams" in message, message
+    assert not (project / "data/t/use.txt").exists(), message
+
+
+@pytest.mark.parametrize("depth", [32, 500])
+def test_a_terminating_wrapped_chain_reruns_on_a_module_value_edit(
+    tmp_path: pathlib.Path, depth: int
+) -> None:
+    """Every admitted function keeps its own reads, even before the metadata chain's end."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": _WRAPPED_CHAIN_VALUES.format(depth=depth),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()")
+            .replace("HELD = functools.partial(read, values.VALUE)", "")
+            .replace("return HELD(text)", "return values.first()"),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "A"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", 'VALUE = "A"', 'VALUE = "B"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "B"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+_HELD_NATIVE_CACHE = """\
+import functools
+import settings
+
+
+def original():
+    return settings.VALUE
+
+
+CACHED = {constructor}(original)
+CACHED.__name__ = CACHED.__qualname__ = "CACHED"
+VALUE = CACHED
+"""
+
+
+@pytest.mark.parametrize("constructor", ["functools.cache", "functools.lru_cache(maxsize=8)"])
+@pytest.mark.parametrize("unsafe", [False, True], ids=["strict", "unsafe"])
+def test_a_native_cache_metadata_loop_in_a_partial_argument_is_refused(
+    tmp_path: pathlib.Path, constructor: str, unsafe: bool
+) -> None:
+    """R8-B2: a value-cycle token must not conceal a held C cache's metadata loop."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": _HELD_NATIVE_CACHE.format(constructor=constructor)
+            + "CACHED.__wrapped__ = CACHED\n",
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+    if unsafe:
+        (project / ".pivot/config.yaml").write_text("core:\n  unsafe_fingerprinting: true\n")
+
+    refused = helpers.run_pivot(project, tmp_path / "home", "repro", "--json")
+
+    message = refused.stdout + refused.stderr
+    assert refused.returncode != 0, message
+    assert "values.CACHED" in message and "__wrapped__ loop" in message, message
+    assert "StageParams" in message and "break" in message.lower(), message
+    assert not (project / "data/t/use.txt").exists(), message
+
+
+@pytest.mark.parametrize("constructor", ["functools.cache", "functools.lru_cache(maxsize=8)"])
+def test_a_native_cache_in_a_partial_argument_reruns_on_a_module_value_edit(
+    tmp_path: pathlib.Path, constructor: str
+) -> None:
+    """The held C cache without a metadata loop still admits its Python target's reads."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": _HELD_NATIVE_CACHE.format(constructor=constructor),
+            "pipeline.py": _ROUND_SIX_VALUE_PIPELINE.format(read="value()"),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "A"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", 'VALUE = "A"', 'VALUE = "B"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "B"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+def test_a_library_defined_stage_keeps_its_project_value_dependencies(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A library stage is a root, not an external helper admitted only by name."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "pipeline.py": (
+                "from pivot import Pipeline, stage\nimport library_stage\n"
+                "\nuse = stage(library_stage.use)\n"
+                '\nwith Pipeline("t") as pipeline:\n'
+                '    use(pipeline.input("lines.txt", t=str))\n'
+            ),
+        },
+    )
+    support = tmp_path / "support/site-packages"
+    support.mkdir(parents=True)
+    (support / "library_stage.py").write_text(
+        "import settings\n\ndef use(text: str) -> str:\n    return settings.VALUE\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", f"{project}:{support}")
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "A"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", 'VALUE = "A"', 'VALUE = "B"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "B"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+def test_a_wrapped_by_name_boundary_hides_only_the_marked_metadata_loop(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Validation stops at a mark while the Python decorator above it keeps its own code."""
+    project = _project(
+        tmp_path,
+        {
+            "values.py": (
+                "import functools\nfrom pivot import fingerprint_by_name\n\n"
+                '@fingerprint_by_name\ndef original():\n    return "A"\n\n'
+                "original.__wrapped__ = original\n\n"
+                "@functools.wraps(original)\ndef decorated():\n"
+                '    return original() + "!"\n'
+            ),
+            "pipeline.py": (
+                "from pivot import Pipeline, stage\nimport values\n"
+                "\n@stage\ndef use(text: str) -> str:\n    return values.decorated()\n"
+                '\nwith Pipeline("t") as pipeline:\n'
+                '    use(pipeline.input("lines.txt", t=str))\n'
+            ),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "A!"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "values.py", 'return "A"', 'return "B"')
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    _edit(project, "values.py", '+ "!"', '+ "?"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "B?"
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+@pytest.mark.parametrize(
+    "decorator",
+    ["functools.cache", "functools.lru_cache(maxsize=8)", "forward"],
+)
+def test_a_wrapped_method_keeps_its_receiver_class_attribute_reads(
+    tmp_path: pathlib.Path, decorator: str
+) -> None:
+    """Preserving method wrappers must not discard the executed method's self.SUFFIX read."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": (
+                "import functools\nimport settings\n\n"
+                "def forward(fn):\n"
+                "    @functools.wraps(fn)\n"
+                "    def wrapper(*args, **kwargs):\n        return fn(*args, **kwargs)\n"
+                "    return wrapper\n\n"
+                "class Captured:\n    SUFFIX = settings.VALUE\n\n"
+                f"    @{decorator}\n"
+                "    def suffix(self):\n        return self.SUFFIX\n\n"
+                'def read(value, text):\n    return "x" + value.suffix()\n\n'
+                "HELD = functools.partial(read, Captured())\n"
+            ),
+            "pipeline.py": (
+                "from pivot import Pipeline, stage\nimport values\n"
+                "\n@stage\ndef use(text: str) -> str:\n    return values.HELD(text)\n"
+                '\nwith Pipeline("t") as pipeline:\n'
+                '    use(pipeline.input("lines.txt", t=str))\n'
+            ),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "xA"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", 'VALUE = "A"', 'VALUE = "B"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "xB"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+
+
+def test_a_partialmethod_keeps_its_receiver_class_attribute_reads(tmp_path: pathlib.Path) -> None:
+    """A partialmethod inserts self before its bound arguments when it calls the Python body."""
+    project = _project(
+        tmp_path,
+        {
+            "settings.py": 'VALUE = "A"\n',
+            "values.py": (
+                "import functools\nimport settings\n\n"
+                "def suffix_impl(self, prefix):\n    return prefix + self.SUFFIX\n\n"
+                "class Captured:\n    SUFFIX = settings.VALUE\n"
+                '    suffix = functools.partialmethod(suffix_impl, "x")\n\n'
+                "def read(value, text):\n    return value.suffix()\n\n"
+                "HELD = functools.partial(read, Captured())\n"
+            ),
+            "pipeline.py": (
+                "from pivot import Pipeline, stage\nimport values\n"
+                "\n@stage\ndef use(text: str) -> str:\n    return values.HELD(text)\n"
+                '\nwith Pipeline("t") as pipeline:\n'
+                '    use(pipeline.input("lines.txt", t=str))\n'
+            ),
+        },
+    )
+    home = tmp_path / "home"
+    output = project / "data/t/use.txt"
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "xA"
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}
+    _edit(project, "settings.py", 'VALUE = "A"', 'VALUE = "BB"')
+    assert _repro_statuses(project, home, "1") == {"t/use": "ran"}
+    assert output.read_text() == "xBB"
+    assert _repro_statuses(project, home, "7") == {"t/use": "cached"}
+    reset = helpers.run_pivot(project, home, "fingerprint", "reset")
+    assert reset.returncode == 0, reset.stdout + reset.stderr
+    assert _repro_statuses(project, home, "1") == {"t/use": "cached"}

@@ -896,38 +896,56 @@ def test_non_scalar_read_by_bound_function_is_an_error(
     assert "captures non-scalar variable 'COLS' (type: list)" in output, output
 
 
+def _scaled_output(root: pathlib.Path, stage: str) -> object:
+    """What stage `l/make` (a JSON record, saved by its loader) or `d/scale` (DataFrame rows)
+    wrote."""
+    if stage == "l/make":
+        (output,) = (root / "data/l").iterdir()
+        return json.loads(output.read_text())
+    return _helper_rows(root / "data/d/scale.jsonl")
+
+
 @pytest.mark.parametrize(
-    ("pipeline", "files", "stage", "binding"),
+    ("pipeline", "files", "stage", "before", "after"),
     [
         pytest.param(
             _TRANSFORM_LOADER_PIPELINE.replace("TRANSFORM", "Scaler()"),
             {"data/raw/t.json": "{}\n"},
             "l/make",
-            "pipeline.Transformed.transform",
+            {"a": 6},
+            {"a": 21},
             id="loader-config",
         ),
         pytest.param(
             _PARTIAL_ARGUMENT_PIPELINE.replace("BINDING", "functools.partial(apply, get=Scaler())"),
             {"data/raw/t.csv": "a\n1\n"},
             "d/scale",
-            "pipeline.BOUND.kwargs[get]",
+            [{"a": 2}],
+            [{"a": 7}],
             id="partial-argument",
         ),
     ],
 )
-def test_user_callable_instance_bound_in_config_is_an_error(
-    tmp_path: pathlib.Path, pipeline: str, files: dict[str, str], stage: str, binding: str
+def test_user_callable_instance_bound_in_config_is_walked_as_its_class(
+    tmp_path: pathlib.Path,
+    pipeline: str,
+    files: dict[str, str],
+    stage: str,
+    before: object,
+    after: object,
 ) -> None:
-    """A callable object's `__call__` reads are not walked, so it is refused like a stage read."""
+    """A callable object in a loader's config or a partial's arguments is recorded by its form,
+    and its class gets the walk a stage that names the class gets, `__call__` included, so the
+    module value `__call__` reads is tracked: an edit to it reruns the stage."""
     home = tmp_path / "home"
     root = _helper_project(tmp_path, home, {"pipeline.py": pipeline, **files})
+    _helper_ok(helpers.run_pivot(root, home, "repro"))
+    assert _scaled_output(root, stage) == before
 
-    proc = helpers.run_pivot(root, home, "repro")
+    (root / "pipeline.py").write_text(pipeline.replace("FACTOR = 2", "FACTOR = 7"))
+    rerun = _helper_ok(helpers.run_pivot(root, home, "repro"))
 
-    output = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"callable instance was accepted:\n{output}"
-    assert f"Stage '{stage}'" in output, output
-    assert f"captures non-scalar variable '{binding}' (type: Scaler)" in output, output
+    assert _scaled_output(root, stage) == after, rerun
 
 
 def test_stage_and_loader_config_refusals_are_reported_together(tmp_path: pathlib.Path) -> None:
