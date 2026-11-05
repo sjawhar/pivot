@@ -46,7 +46,7 @@ jobs:
           # set ci/untested-draft to success. The pull request's draft state is not that evidence:
           # GitHub can process a push and a ready-for-review out of order, so the ready run tests
           # the previous commit while this one gets only the skipped draft run (measured in
-          # theorem-labs/binary-equivalence-taiga at 20:01Z on 2026-10-25). Only a read that
+          # a private repository at 20:01Z on 2026-10-25). Only a read that
           # succeeds and says `success` skips; a failed read marks the head. If Tests' lint job
           # writes success after this read but before the write below, the head reads untested
           # although it was tested: a false red that a re-run of that lint job clears, never a
