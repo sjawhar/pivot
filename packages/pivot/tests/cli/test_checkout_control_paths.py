@@ -263,13 +263,13 @@ def test_repro_checkout_missing_refuses_creation_inside_control_paths(
         sidecar = root / "HEAD.pvt"
         record = track.read_pvt_file(sidecar)
         assert record is not None
-        record["path"] = "vendor/lib/.git/HEAD"
+        record["path"] = ".git/created-metadata"
         track.write_pvt_file(sidecar, record)
 
         result = runner.invoke(cli.cli, ["repro", "--checkout-missing"])
 
         assert result.exit_code == 1 and "Refusing" in result.output, result.output
-        assert not (root / "vendor" / "lib" / ".git" / "HEAD").exists(), result.output
+        assert not (root / ".git" / "created-metadata").exists(), result.output
 
 
 @pytest.mark.parametrize("control", [".git", ".pivot"])
@@ -423,12 +423,12 @@ def test_a_project_root_alias_still_protects_its_nested_repository(
         nested_git = root / "vendor" / "lib" / ".git"
         nested_git.mkdir(parents=True)
         (nested_git / "HEAD").write_text("nested metadata\n")
-        (root / "hop").symlink_to(nested_git, target_is_directory=True)
+        (root / "hop").symlink_to(nested_git.parent, target_is_directory=True)
         alias = tmp_path / "project-alias"
         alias.symlink_to(root, target_is_directory=True)
 
         refusal = ownership.control_path_refusal(
-            alias, [ownership.tracked_restore(alias / "hop" / "HEAD")]
+            alias, [ownership.tracked_restore(alias / "hop" / ".git")]
         )
 
         assert refusal is not None
@@ -493,3 +493,32 @@ def test_metadata_preflight_does_not_apply_after_its_target_path_changes(
 
         assert refusal is not None
         assert "overlaps control path '.git'" in str(refusal)
+
+
+@pytest.mark.parametrize("target", [".pivot/config.yaml", ".pivot/config.yaml.lock"])
+def test_moving_state_keeps_the_marker_configuration_and_lock_protected(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, target: str
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        configuration = root / ".pivot" / "config.yaml"
+        configuration.write_text("core:\n  state_dir: .state\n")
+        before = configuration.read_bytes()
+        _helper_sidecar(root, target)
+
+        result = runner.invoke(cli.cli, ["checkout", "--force", target])
+
+        assert result.exit_code == 1 and "Refusing" in result.output, result.output
+        assert target in result.output, result.output
+        assert configuration.read_bytes() == before
+
+
+def test_directory_name_refusal_does_not_extend_outside_the_project(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        outside = tmp_path / "outside" / ".git"
+        outside.mkdir(parents=True)
+
+        refusal = ownership.control_path_refusal(root, [ownership.destination(outside)])
+
+        assert refusal is None

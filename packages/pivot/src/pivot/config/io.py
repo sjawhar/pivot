@@ -41,6 +41,12 @@ def _config_lock_path(path: pathlib.Path) -> pathlib.Path:
     return path.with_name(f"{path.name}.lock")
 
 
+def control_paths(root: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    """The project marker's configuration and its lock, even when state lives elsewhere."""
+    path = get_local_config_path(root)
+    return path, _config_lock_path(path)
+
+
 def _load_config_raw(path: pathlib.Path) -> dict[str, Any]:
     """Load YAML config as plain dict."""
     return config_files.load_yaml(path, as_dict=True)

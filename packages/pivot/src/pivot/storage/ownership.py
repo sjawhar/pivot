@@ -33,6 +33,7 @@ import lmdb
 
 from pivot import config, exceptions, project, types
 from pivot import state_dir as state_dir_mod
+from pivot.config import io as config_io
 from pivot.storage import cache, listing, lock, naming, state, track
 
 logger = logging.getLogger(__name__)
@@ -771,15 +772,13 @@ def _restore_overlaps(
     return sorted(found.values(), key=overlap_path)
 
 
-def _reserved_control_path(path: pathlib.Path, project_root: pathlib.Path) -> pathlib.Path | None:
-    try:
-        relative = path.relative_to(project_root)
-    except ValueError:
+def _replaced_control_directory(
+    path: pathlib.Path, project_root: pathlib.Path
+) -> pathlib.Path | None:
+    """A real control-named directory the target would replace, not a file beneath one."""
+    if path.name not in {".git", ".pivot"} or not path.is_relative_to(project_root):
         return None
-    for index, part in enumerate(relative.parts):
-        if part in {".git", ".pivot"}:
-            return project_root.joinpath(*relative.parts[: index + 1])
-    return None
+    return path if not path.is_symlink() and path.is_dir() else None
 
 
 @functools.lru_cache(maxsize=64)
@@ -795,8 +794,11 @@ def _metadata_controls(
     The physical root and layout are cache-key inputs: repointing a root or linked object store
     must not reuse the controls resolved through its previous binding.
     """
+    marker_is_state = state_root.resolve() == (root / ".pivot").resolve()
     controls = (
-        *(base / name for base in {root, physical_root} for name in (".git", ".pivot")),
+        *(base / ".git" for base in {root, physical_root}),
+        *(base / ".pivot" for base in {root, physical_root} if marker_is_state),
+        *config_io.control_paths(root),
         *state_dir_mod.control_paths(state_root),
         lock.get_stages_dir(state_root),
         *naming.control_paths(cache_root, layout),
@@ -808,10 +810,10 @@ def _metadata_controls(
 def control_path_refusal(
     project_root: pathlib.Path, replacements: Iterable[Replacement]
 ) -> exceptions.OutputOwnershipError | None:
-    """Refuse project metadata, nested unowned repositories and parent-directory aliases.
+    """Refuse actual project controls and replacement of unowned control-named directories.
 
-    A stage owns control-named members of its output, not the project's actual control paths.
-    A leaf symlink is replaced rather than followed; layouts supply persistent metadata paths.
+    A tracked file beneath a nested .git/.pivot is data, unless it is in an actual control path.
+    Stage-owned members stay data. Leaf symlinks are replaced, not followed.
     """
     root = normalized(project_root)
     physical_root = root.resolve()
@@ -831,8 +833,8 @@ def control_path_refusal(
             None
             if replacement["kind"] == ReplacementKind.STAGE_OUTPUT
             else (
-                _reserved_control_path(path, root)
-                or _reserved_control_path(locations[1], physical_root)
+                _replaced_control_directory(path, root)
+                or _replaced_control_directory(locations[1], physical_root)
             )
         )
         if control is None:
@@ -855,13 +857,11 @@ def control_path_refusal(
             and replacement["kind"] != ReplacementKind.STAGE_OUTPUT
             and path.is_dir()
             and not path.is_symlink()
+            and (path.is_relative_to(root) or locations[1].is_relative_to(physical_root))
         ):
             try:
-                for parent, directories, files in path.walk(on_error=_raise_walk_error):
-                    name = next(
-                        (name for name in (*directories, *files) if name in {".git", ".pivot"}),
-                        None,
-                    )
+                for parent, directories, _files in path.walk(on_error=_raise_walk_error):
+                    name = next((name for name in directories if name in {".git", ".pivot"}), None)
                     if name is not None:
                         control = parent / name
                         break

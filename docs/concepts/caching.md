@@ -532,8 +532,11 @@ $ pivot checkout --only-missing    # restore only missing files; never overwrite
 $ pivot checkout --force           # overwrite existing data, never control paths
 ```
 
-Checkout refuses targets that overlap Git or Pivot control paths before restoring any file,
-even with `--force`; see [checkout's protected paths](../cli/index.md#pivot-checkout).
+Checkout refuses targets that overlap this project's real Git/Pivot controls, or would replace
+an in-project control-named directory, even with `--force`; see
+[checkout's protected paths](../cli/index.md#pivot-checkout). A single tracked file under a
+nested `.git`/`.pivot`, or ordinary data in the old `.pivot` marker after state moves, remains
+restorable when it is not an actual control path.
 For other targets, `--force` checks the required local cache objects before replacing an
 existing file. If any object is missing, it names the missing hash and leaves
 the workspace file unchanged.
