@@ -112,11 +112,15 @@ A path that leaves the project, including `link/../x.csv`, is refused by `checko
 
 **A `.pvt` restores its file only inside the project.** `checkout`, `pull` and
 `repro --checkout-missing` read every `.pvt` under the project root and restore the file its
-`path:` names. A `.pvt` is skipped, with a warning naming it and exit code 0, when its `path:`
-names no file (`.`, `./` or empty), holds `..`, is absolute, or names a file whose directory
-really lies outside the project, through a symlink. `pivot track` and `pivot import` write
-`path:` as the name of the file beside the `.pvt`, which is always restored; any other value
-is warned about, because `checkout x.pvt`, `get`, `update` and `push` take the file beside the
+`path:` names. Discovery refuses an unreadable or invalid `.pvt`, naming the sidecar and exiting
+non-zero; restore it from version control or repair it before retrying. A stage's own recorded
+`*.pvt` output member, or an unreadable `*.pvt` payload member listed by a tracked directory,
+is not a tracking sidecar and is left out. A valid `.pvt` is skipped, with
+a warning naming it and exit code 0, when its `path:` names no file (`.`, `./` or empty), or
+names a file whose directory really lies outside the project through a symlink.
+`pivot track` and `pivot import` write `path:` as the name of the file beside the `.pvt`, which
+is always restored; any other value is warned about, because `checkout x.pvt`, `get`, `update`
+and `push` take the file beside the
 `.pvt` while `checkout` with no target takes `path:`.
 
 ---
@@ -557,6 +561,12 @@ pivot checkout [TARGETS...] [OPTIONS]
 
 Checkout summaries count restored, skipped, and missing **files**. Each file in a directory output
 counts separately.
+
+Before publishing a restored directory, Pivot checks its staged files, content hashes,
+executable bits and empty directories against the recorded listing. A mismatch, including
+filenames collapsing on a case-insensitive filesystem, fails the restore without replacing the
+old directory. The error names the target and reports the expected and actual file counts.
+Whole-directory symlink restores use the cache tree's content-checked listing marker.
 
 A checkout that would replace an existing path holding another user's file refuses: a stage
 output that holds a tracked file or `.pvt` sidecar, or a tracked path that holds another tracked

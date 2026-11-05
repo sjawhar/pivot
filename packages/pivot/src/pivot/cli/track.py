@@ -295,12 +295,19 @@ def track(ctx: click.Context, paths: tuple[str, ...], force: bool) -> None:
     orphaned_member = member_skip.orphaned_member(
         project_root, state_dir, cache_dir, declared.stages
     )
+    own_member = member_skip.own_member_skip(project_root, declared.stages, state_dir, cache_dir)
+    content_paths = [project.normalize_path(path, base=pathlib.Path.cwd()) for path in paths]
 
-    # Discover existing .pvt files: a stage's own .pvt member of its output tracks nothing
-    existing_tracked = track_mod.discover_pvt_files(
-        project_root,
-        skip=member_skip.own_member_skip(project_root, declared.stages, state_dir, cache_dir),
-    )
+    def skip_content(pvt_path: pathlib.Path, data: track_mod.PvtData | None) -> bool:
+        return own_member(pvt_path, data) or (
+            data is None
+            and any(
+                pvt_path == path or (path.is_dir() and pvt_path.is_relative_to(path))
+                for path in content_paths
+            )
+        )
+
+    existing_tracked = track_mod.discover_pvt_files(project_root, skip=skip_content)
 
     read = list[tuple[pathlib.Path, os.stat_result, str]]()
     for path_str in paths:

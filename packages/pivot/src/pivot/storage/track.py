@@ -57,8 +57,8 @@ class PvtData(TypedDict):
     source: NotRequired[ImportSource]  # Import source metadata
 
 
-# Whether discovery leaves out a .pvt that parses (its path, its data): ``discover_pvt_files``.
-type PvtSkip = Callable[[pathlib.Path, PvtData], bool]
+# Whether discovery leaves out a .pvt (its path, its parsed data, or None if unreadable).
+type PvtSkip = Callable[[pathlib.Path, PvtData | None], bool]
 
 
 _REQUIRED_KEYS = frozenset({"path", "hash", "size"})
@@ -553,18 +553,17 @@ def _read_pvt_files(
     candidates: list[pathlib.Path], root: pathlib.Path, skip: PvtSkip | None
 ) -> dict[str, PvtData]:
     result = dict[str, PvtData]()
+    unreadable = list[tuple[pathlib.Path, str]]()
     for pvt_path in candidates:
         if not pvt_path.is_file():
             continue
         parsed = _load_pvt(pvt_path)
-        if isinstance(parsed, str):
-            logger.warning(f"Skipping {pvt_path}: {parsed}")
-            continue
-        if parsed is None:
-            logger.warning(f"Skipping invalid .pvt file: {pvt_path}")
-            continue
-        data = parsed[0]
+        data = parsed[0] if isinstance(parsed, tuple) else None
         if skip is not None and skip(pvt_path, data):
+            continue
+        if data is None:
+            reason = parsed if isinstance(parsed, str) else "invalid or unreadable tracking data"
+            unreadable.append((pvt_path, reason))
             continue
 
         data_path, warning = restore_target(pvt_path, data["path"], root)
@@ -574,6 +573,24 @@ def _read_pvt_files(
             continue
         normalized = project.normalize_path(data_path)
         result[str(normalized)] = data
+    member_names = dict[str, set[str]]()
+    for pvt_path, reason in unreadable:
+        is_member = False
+        for data_path, data in result.items():
+            directory = pathlib.Path(data_path)
+            if "nfiles" not in data or not pvt_path.is_relative_to(directory):
+                continue
+            if data_path not in member_names:
+                members = tracked_members(directory, data, config.locate_cache_dir() / "files")
+                member_names[data_path] = {entry["relpath"] for entry in members["files"]}
+            if pvt_path.relative_to(directory).as_posix() in member_names[data_path]:
+                is_member = True
+                break
+        if not is_member:
+            raise exceptions.ValidationError(
+                f"Cannot read .pvt file {pvt_path}: {reason}; restore the sidecar from version "
+                + "control or repair it before retrying"
+            )
     return result
 
 
@@ -796,8 +813,10 @@ def discover_pvt_files(root: pathlib.Path, *, skip: PvtSkip | None = None) -> di
     instead of listed; every .pvt found is read. Never writes or creates the memo: only the
     repro/run pre-flight does (``discover_pvt_files_and_update_memo``). A .pvt whose ``path:``
     names no file, or a file outside the project, is left out with a warning, so no command it
-    feeds writes there (see ``restore_target``). A .pvt ``skip`` returns True for is left out
-    too: a stage's own member of its output (``member_skip.own_member_skip``) is no tracked file.
+    feeds writes there (see ``restore_target``). ``skip`` receives None when the file cannot be
+    parsed, so a stage's own member of its output can still be left out. Unreadable .pvt files
+    listed as a tracked directory's payload are also left out. Every other unreadable or invalid
+    .pvt raises ``ValidationError`` naming the sidecar, rather than hiding its data.
     """
     mount_table = mounts.read_mounts()
     fd, memo = _open_memo(mount_table, write=False)
@@ -843,13 +862,14 @@ def discover_import_pvt_files(
     root: pathlib.Path, *, skip: PvtSkip | None = None
 ) -> dict[str, PvtData]:
     """Find all import .pvt files under root (``discover_pvt_files``). ``skip`` is asked about
-    import .pvt files alone, so one that reads more than the file (a stage's own member,
-    ``member_skip.own_member_skip``) does so only once an import is found."""
+    imports and unreadable sidecars, so a stage's own member is left out before an unreadable
+    file is refused. Valid non-import sidecars are left out without consulting ``skip``."""
 
-    def other_or_skipped(path: pathlib.Path, data: PvtData) -> bool:
-        return not is_import(data) or (skip is not None and skip(path, data))
+    def other_or_skipped(path: pathlib.Path, data: PvtData | None) -> bool:
+        return skip is not None and (data is None or is_import(data)) and skip(path, data)
 
-    return discover_pvt_files(root, skip=other_or_skipped)
+    discovered = discover_pvt_files(root, skip=other_or_skipped)
+    return {path: data for path, data in discovered.items() if is_import(data)}
 
 
 def pvt_to_hash_info(pvt_data: PvtData) -> HashInfo:

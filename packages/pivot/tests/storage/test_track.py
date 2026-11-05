@@ -359,8 +359,8 @@ def test_discover_pvt_files_empty_directory(tmp_path: pathlib.Path) -> None:
     assert result == {}
 
 
-def test_discover_pvt_files_skips_invalid(tmp_path: pathlib.Path) -> None:
-    """Invalid .pvt files are skipped."""
+def test_discover_pvt_files_refuses_invalid(tmp_path: pathlib.Path) -> None:
+    """An unreadable sidecar must not silently remove a tracked path from discovery."""
     # Valid file
     track.write_pvt_file(
         tmp_path / "valid.csv.pvt",
@@ -369,10 +369,8 @@ def test_discover_pvt_files_skips_invalid(tmp_path: pathlib.Path) -> None:
     # Invalid file
     (tmp_path / "invalid.csv.pvt").write_text("not: valid: yaml: [")
 
-    result = track.discover_pvt_files(tmp_path)
-
-    assert len(result) == 1
-    assert str(tmp_path / "valid.csv") in result
+    with pytest.raises(exceptions.ValidationError, match=r"invalid\.csv\.pvt"):
+        track.discover_pvt_files(tmp_path)
 
 
 def test_discover_pvt_files_finds_a_directory_by_its_listing_record(

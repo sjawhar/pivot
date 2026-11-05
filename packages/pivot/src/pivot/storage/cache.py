@@ -2450,6 +2450,14 @@ def _restore_directory_from_cache(
             except OSError as e:
                 logger.debug(f"chmod failed (may be NFS with root_squash): {e}")
 
+        actual = hash_directory(temp_path, cache_dir=cache_dir)
+        if actual["data"] != listing.encode(members):
+            raise exceptions.CacheRestoreError(
+                f"Cannot restore {path}: staged directory does not match its recorded listing "
+                + f"(expected {len(members['files'])} file(s), found {actual['record']['nfiles']}); "
+                + "check cache contents and filename collisions on this filesystem"
+            )
+
         _swap_in(temp_path, path, _backup_path(path, target_token), before_swap)
         if recorded is not None:
             recorded.extend(restored)

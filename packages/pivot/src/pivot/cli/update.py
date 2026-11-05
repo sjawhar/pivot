@@ -74,14 +74,14 @@ def update(targets: tuple[str, ...], rev: str | None, dry_run: bool) -> None:
     else:
         # A stage's own .pvt member of its output is no import. The command loads no pipeline,
         # so the directory outputs the stages' locks record decide; it reads no config until an
-        # import .pvt is found.
+        # import or unreadable .pvt is found.
         @functools.cache
         def own_member_skip() -> track.PvtSkip:
             return member_skip.own_member_skip(
                 root, {}, config.locate_state_dir(), config.locate_cache_dir() / "files"
             )
 
-        def skip(path: pathlib.Path, data: track.PvtData) -> bool:
+        def skip(path: pathlib.Path, data: track.PvtData | None) -> bool:
             return own_member_skip()(path, data)
 
         imports = track.discover_import_pvt_files(root, skip=skip)
