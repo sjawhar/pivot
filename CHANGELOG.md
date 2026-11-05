@@ -2,6 +2,31 @@
 
 <!-- version list -->
 
+## v0.10.2 (2026-11-05)
+
+### Bug Fixes
+
+- **discovery**: Release project selection with its import session
+  ([#552](https://github.com/sjawhar/pivot/pull/552),
+  [`df9a717`](https://github.com/sjawhar/pivot/commit/df9a717682a163e28a3c83bd4d7a2b3b79577ded))
+
+- **executor**: Preserve explicit selection from uninitialized cwd
+  ([#552](https://github.com/sjawhar/pivot/pull/552),
+  [`df9a717`](https://github.com/sjawhar/pivot/commit/df9a717682a163e28a3c83bd4d7a2b3b79577ded))
+
+- **executor**: Refuse library runs outside the held project
+  ([#552](https://github.com/sjawhar/pivot/pull/552),
+  [`df9a717`](https://github.com/sjawhar/pivot/commit/df9a717682a163e28a3c83bd4d7a2b3b79577ded))
+
+- **storage**: Preserve ownership and legacy restores while checking integrity
+  ([#555](https://github.com/sjawhar/pivot/pull/555),
+  [`080737a`](https://github.com/sjawhar/pivot/commit/080737a38379c14b65dea230c73753e4d357fe62))
+
+- **storage**: Verify directory restores and refuse unreadable sidecars
+  ([#555](https://github.com/sjawhar/pivot/pull/555),
+  [`080737a`](https://github.com/sjawhar/pivot/commit/080737a38379c14b65dea230c73753e4d357fe62))
+
+
 ## v0.10.1 (2026-11-05)
 
 ### Bug Fixes
