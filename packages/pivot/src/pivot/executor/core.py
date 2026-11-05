@@ -379,6 +379,10 @@ def run(
         no_commit: If True, skip writing lock files (faster iteration).
         checkout_missing: If True, restore missing tracked files from cache before running.
 
+    Raises:
+        PipelineConfigError: If cwd is outside the project this process holds. Start a new
+            Python process to run another project.
+
     Returns:
         Dict of stage_name -> {status: "ran"|"cached"|"blocked"|"cancelled"|"failed", reason: str}
     """
@@ -428,6 +432,14 @@ def _run_inner(
                 f"Invalid on_error mode: {on_error}. Use 'fail' or 'keep_going'"
             ) from None
 
+    project_root = project.get_project_root()
+    cwd = pathlib.Path.cwd()
+    if not cwd.is_relative_to(project_root):
+        raise exceptions.PipelineConfigError(
+            f"Cannot run from '{cwd}': this process holds project '{project_root}'. "
+            + "Start a new Python process to run another project."
+        )
+
     # Use provided pipeline or discover from project root
     if pipeline is None:
         pipeline = discovery.discover_pipeline()
@@ -440,7 +452,7 @@ def _run_inner(
         # than the project root keeps its stages' locks outside the project's state directory,
         # where no `pivot gc` reads them. One loaded before `core.state_dir` moved, the engine
         # refuses at the start of its run (`Engine._orchestrate_execution`).
-        discovery.require_project_roots(pipeline, project.get_project_root())
+        discovery.require_project_roots(pipeline, project_root)
 
     # Run async execution
     async def execute() -> dict[str, ExecutionSummary]:

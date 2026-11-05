@@ -49,6 +49,12 @@ project, otherwise the one at the project root. `--all` (on `repro`, `run`,
 `status`, `list`, `dag` and others) loads every `pipeline.py` under the project
 root, skipping `.venv`, `.git`, `__pycache__` and similar directories.
 
+When calling `pivot.executor.run()` from Python, the process holds the project it first
+resolved. Changing directories within that project is supported. A run from outside it raises
+`PipelineConfigError` naming the held project and the current directory, before discovery or
+execution, including when you pass `pipeline=`. Start a new Python process to run another
+project; changing back into the held project lets that process run it again.
+
 ## Stage Names
 
 A stage's name is `<pipeline>/<function>`. The CLI takes qualified names:
