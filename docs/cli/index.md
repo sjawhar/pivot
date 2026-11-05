@@ -564,6 +564,34 @@ pivot checkout [TARGETS...] [OPTIONS]
 | `--only-missing` | Only restore files that don't exist on disk. For a directory, restores its missing files and empty directories; if a file differs from the target, or an extra file or directory exists, replaces the directory when every such file is pivot's own earlier output (its content is in the cache; an extra empty directory holds nothing to lose), and otherwise refuses, naming the local changes, so they are never overwritten; use `--force` to overwrite |
 | `--all` | Checkout all targets (ignore target filtering) |
 
+Checkout, pull, revision get and `repro --checkout-missing` protect this project's real `.git`
+and active-state control paths. Within this project, a tracked path or user destination cannot
+replace a real directory named `.git` or `.pivot`, or a directory containing one.
+A single tracked file under a nested `.git` or `.pivot` is data and remains restorable.
+When state moves elsewhere, ordinary tracked files such as `.pivot/u.txt` remain restorable
+too; `.pivot/config.yaml` and its configuration lock stay protected. Names above the project
+root do not reserve the project's data.
+A stage's own `.git` and `.pivot` members inside its directory output are data: the stage can
+replace and restore them. This does not let an output replace actual project control paths.
+All replacements also protect persistent Pivot state and coordination entries:
+the state database, stage records, artifact locks, agent socket, configuration lock and secret
+key; cached objects and trees; and the actual store's project register, cache mounts and naming
+and collection locks. A linked cache protects its physical store's register, not just the
+configured cache directory. Parent-directory symlinks cannot bypass these checks.
+
+Checkout checks all selected targets before restoring anything and exits 1 with the target and
+control path when it refuses, with or without `--force` or `--only-missing`. Outside reserved
+directories, regenerable plot galleries, logs and completion data are not metadata claims:
+a plot-tagged output can still be restored when `core.state_dir: .` places it beside state
+entries. Other dot-directories and unrelated data beside metadata remain restorable. Choose
+a data path outside metadata and correct its `.pvt` sidecar or stage output declaration
+before retrying.
+
+Resolved control paths are cached by project, state/cache locations and shared-store layout.
+A stage swap reuses its successful metadata preflight for that same project and output path;
+it still checks the entry it removes for user-owned files. Unchecked paths and non-stage
+destinations retain the metadata and parent-alias checks.
+
 Checkout summaries count restored, skipped, and missing **files**. Each file in a directory output
 counts separately.
 

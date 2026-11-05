@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from pivot import config, exceptions, loaders, types
-from pivot.storage import cache, listing, ownership, store, track
+from pivot.storage import cache, listing, naming, ownership, store, track
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
@@ -1019,3 +1019,130 @@ def test_workspace_store_refuses_replacing_tracked_file_inside_directory_output(
     assert not output_path.is_symlink()
     assert tracked_path.read_text() == "user input"
     assert sidecar_path.exists()
+
+
+def test_metadata_layout_controls_are_built_once_for_the_same_layout(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reads = list[pathlib.Path]()
+    read_controls = naming.control_paths
+
+    def counted(cache_root: pathlib.Path, layout: naming.StoreLayout) -> tuple[pathlib.Path, ...]:
+        reads.append(cache_root)
+        return read_controls(cache_root, layout)
+
+    monkeypatch.setattr(naming, "control_paths", counted)
+    replacement = ownership.stage_output(tmp_path / "out", "p/out")
+
+    assert ownership.control_path_refusal(tmp_path, [replacement]) is None
+    assert ownership.control_path_refusal(tmp_path, [replacement]) is None
+
+    assert len(reads) == 1, "the same metadata layout was resolved again"
+
+
+@pytest.mark.parametrize("user_file_lands", [False, True])
+def test_preflighted_stage_swap_reuses_metadata_but_rechecks_user_files(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, user_file_lands: bool
+) -> None:
+    output = tmp_path / "out"
+    output.mkdir()
+    target = ownership.ForcedRestore(
+        replacement=ownership.stage_output(output, "p/out"), restored=None, claims=None
+    )
+    assert ownership.forced_restore_refusal(tmp_path, [target]) is None
+    if user_file_lands:
+        _copy_user_file(output / "user.txt")
+
+    def resolve_again(*args: object, **kwargs: object) -> None:
+        raise AssertionError("stage swap resolved metadata again after its preflight")
+
+    monkeypatch.setattr(ownership, "control_path_refusal", resolve_again)
+
+    refusal = ownership.swap_refusal(tmp_path, target, output)
+
+    if user_file_lands:
+        assert refusal is not None
+        assert "user.txt.pvt" in str(refusal)
+        assert (output / "user.txt").read_text() == "user bytes"
+    else:
+        assert refusal is None
+
+
+def test_prepare_output_checks_metadata_before_creating_its_parent(
+    tmp_path: pathlib.Path,
+) -> None:
+    metadata = tmp_path / ".git"
+    metadata.mkdir()
+    (tmp_path / "data").symlink_to(metadata, target_is_directory=True)
+    workspace = store.WorkspaceStore(tmp_path, "pipe", {})
+    ref = _helper_ref("nested/stage", None, types.ArtifactTag.DATA, loaders.Text())
+
+    with pytest.raises(exceptions.OutputOwnershipError, match="control path"):
+        workspace.prepare_output(ref)
+
+    assert list(metadata.iterdir()) == []
+
+
+def test_metadata_controls_use_the_layout_captured_for_the_cache_key(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "first" / "files"
+    second = tmp_path / "second" / "files"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    root = tmp_path / "cache"
+    root.mkdir()
+    files = root / "files"
+    files.symlink_to(first, target_is_directory=True)
+    layout = naming.store_layout(root)
+    files.unlink()
+    files.symlink_to(second, target_is_directory=True)
+
+    def resolve_again(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the captured store layout was resolved a second time")
+
+    monkeypatch.setattr(naming, "store_layout", resolve_again)
+
+    controls = naming.control_paths(root, layout)
+
+    assert first.parent / "projects" in controls
+    assert second.parent / "projects" not in controls
+
+
+def test_metadata_overlap_does_not_enumerate_target_path_parents(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "data" / "ordinary.txt"
+    replacement = ownership.stage_output(path, "p/out")
+    original = pathlib.Path.is_relative_to
+
+    def reject_target_parent_walk(current: pathlib.Path, other: pathlib.Path) -> bool:
+        if current == path or other == path:
+            raise AssertionError("metadata containment allocated the target's ancestor Paths")
+        return original(current, other)
+
+    monkeypatch.setattr(pathlib.Path, "is_relative_to", reject_target_parent_walk)
+
+    assert ownership.control_path_refusal(tmp_path, [replacement]) is None
+
+
+@pytest.mark.parametrize(
+    ("relative", "refused"),
+    [
+        (".git", True),
+        (".git/HEAD", True),
+        (".git-copy", False),
+        (".pivot", True),
+        (".pivot-copy", False),
+        ("ordinary", False),
+        (".", True),
+    ],
+)
+def test_metadata_string_boundaries_preserve_components(
+    tmp_path: pathlib.Path, relative: str, refused: bool
+) -> None:
+    replacement = ownership.stage_output(tmp_path / relative, "p/out")
+
+    refusal = ownership.control_path_refusal(tmp_path, [replacement])
+
+    assert (refusal is not None) == refused

@@ -32,7 +32,9 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict
 import lmdb
 
 from pivot import config, exceptions, project, types
-from pivot.storage import cache, listing, lock, state, track
+from pivot import state_dir as state_dir_mod
+from pivot.config import io as config_io
+from pivot.storage import cache, listing, lock, naming, state, track
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +140,9 @@ class ForcedRestore(TypedDict):
     the path holds a ``*.pvt``."""
     written: NotRequired[StageMembers]
     """The ``*.pvt`` members a stage is about to write there."""
+    metadata_checked: NotRequired[tuple[pathlib.Path, pathlib.Path]]
+    """Successful stage metadata preflight, bound to its project root and replacement path.
+    Only metadata is settled; every later check still inspects user-owned files."""
 
 
 # A path a replacement must not remove: a user ``.pvt`` sidecar, or a directory Pivot could not
@@ -767,6 +772,129 @@ def _restore_overlaps(
     return sorted(found.values(), key=overlap_path)
 
 
+def _replaced_control_directory(
+    path: pathlib.Path, project_root: pathlib.Path
+) -> pathlib.Path | None:
+    """A real control-named directory the target would replace, not a file beneath one."""
+    if path.name not in {".git", ".pivot"} or not path.is_relative_to(project_root):
+        return None
+    return path if not path.is_symlink() and path.is_dir() else None
+
+
+@functools.lru_cache(maxsize=64)
+def _metadata_controls(
+    root: pathlib.Path,
+    physical_root: pathlib.Path,
+    state_root: pathlib.Path,
+    cache_root: pathlib.Path,
+    layout: naming.StoreLayout,
+) -> tuple[tuple[pathlib.Path, str, str], ...]:
+    """Resolve controls once per logical/physical root, state/cache location and store layout.
+
+    The physical root and layout are cache-key inputs: repointing a root or linked object store
+    must not reuse the controls resolved through its previous binding.
+    """
+    marker_is_state = state_root.resolve() == (root / ".pivot").resolve()
+    controls = (
+        *(base / ".git" for base in {root, physical_root}),
+        *(base / ".pivot" for base in {root, physical_root} if marker_is_state),
+        *config_io.control_paths(root),
+        *state_dir_mod.control_paths(state_root),
+        lock.get_stages_dir(state_root),
+        *naming.control_paths(cache_root, layout),
+    )
+    paths = sorted({location for control in controls for location in (control, control.resolve())})
+    return tuple((path, os.fspath(path), os.path.join(path, "")) for path in paths)
+
+
+def control_path_refusal(
+    project_root: pathlib.Path, replacements: Iterable[Replacement]
+) -> exceptions.OutputOwnershipError | None:
+    """Refuse actual project controls and replacement of unowned control-named directories.
+
+    A tracked file beneath a nested .git/.pivot is data, unless it is in an actual control path.
+    Stage-owned members stay data. Leaf symlinks are replaced, not followed.
+    """
+    root = normalized(project_root)
+    physical_root = root.resolve()
+    state_root = state_dir_mod.locate_state_dir(root)
+    cache_root = (
+        config.locate_cache_dir(root) if (root / ".pivot").is_dir() else state_root / "cache"
+    )
+    protected = _metadata_controls(
+        root, physical_root, state_root, cache_root, naming.store_layout(cache_root)
+    )
+    refused = list[str]()
+    for replacement in replacements:
+        value = replacement["path"]
+        path = normalized(value if value.is_absolute() else root / value)
+        locations = (path, path.parent.resolve() / path.name)
+        control = (
+            None
+            if replacement["kind"] == ReplacementKind.STAGE_OUTPUT
+            else (
+                _replaced_control_directory(path, root)
+                or _replaced_control_directory(locations[1], physical_root)
+            )
+        )
+        if control is None:
+            # Like _find_sidecars, compare normalized absolute strings at separator boundaries.
+            # Python 3.13's is_relative_to allocates a Path for every ancestor.
+            located = [(os.fspath(entry), os.path.join(entry, "")) for entry in locations]
+            control = next(
+                (
+                    item
+                    for item, value, prefix in protected
+                    if any(
+                        entry == value or entry.startswith(prefix) or value.startswith(parent)
+                        for entry, parent in located
+                    )
+                ),
+                None,
+            )
+        if (
+            control is None
+            and replacement["kind"] != ReplacementKind.STAGE_OUTPUT
+            and path.is_dir()
+            and not path.is_symlink()
+            and (path.is_relative_to(root) or locations[1].is_relative_to(physical_root))
+        ):
+            try:
+                for parent, directories, _files in path.walk(on_error=_raise_walk_error):
+                    name = next((name for name in directories if name in {".git", ".pivot"}), None)
+                    if name is not None:
+                        control = parent / name
+                        break
+            except OSError as error:
+                return exceptions.OutputOwnershipError(
+                    f"Refusing to replace '{display_path(path, root)}': cannot inspect it for "
+                    + f"Git or Pivot control paths: {error}"
+                )
+        if control is not None:
+            refused.append(
+                f"  - '{display_path(path, root)}' overlaps control path '{display_path(control, root)}'"
+            )
+    if not refused:
+        return None
+    return exceptions.OutputOwnershipError(
+        "Refusing to restore Git or Pivot control paths, even with --force:\n"
+        + "\n".join(refused)
+        + "\nChoose a data path outside metadata; correct its .pvt sidecar or stage output declaration."
+    )
+
+
+def _raise_walk_error(error: OSError) -> None:
+    raise error
+
+
+def _metadata_preflighted(root: pathlib.Path, target: ForcedRestore) -> bool:
+    return (
+        target["replacement"]["kind"] == ReplacementKind.STAGE_OUTPUT
+        and "metadata_checked" in target
+        and target["metadata_checked"] == (root, target["replacement"]["path"])
+    )
+
+
 def forced_restore_refusal(
     project_root: pathlib.Path, targets: Iterable[ForcedRestore]
 ) -> exceptions.OutputOwnershipError | None:
@@ -782,6 +910,16 @@ def forced_restore_refusal(
     claims and the restored hash; a tracked path as its own restore, whose members are its own
     content (the restored hash's and its current sidecar's); a destination with none.
     """
+    root = normalized(project_root)
+    targets = tuple(targets)
+    unchecked = [target for target in targets if not _metadata_preflighted(root, target)]
+    if unchecked:
+        refusal = control_path_refusal(root, (target["replacement"] for target in unchecked))
+        if refusal is not None:
+            return refusal
+        for target in unchecked:
+            if target["replacement"]["kind"] == ReplacementKind.STAGE_OUTPUT:
+                target["metadata_checked"] = (root, target["replacement"]["path"])
     overlaps = dict[tuple[pathlib.Path, pathlib.Path], OutputOverlap]()
     for target in targets:
         path = target["replacement"]["path"]
@@ -804,7 +942,19 @@ def swap_refusal(
     file the swap removes. Each file is still named at its place under the target's path. A file
     that replaces a file or symlink is checked in place, ``entry`` being the path itself.
     """
-    overlaps = _restore_overlaps(project_root, target, entry)
+    root = normalized(project_root)
+    if not _metadata_preflighted(root, target):
+        replacement = target["replacement"]
+        refusal = control_path_refusal(
+            root,
+            (
+                replacement,
+                Replacement(path=entry, stage=replacement["stage"], kind=replacement["kind"]),
+            ),
+        )
+        if refusal is not None:
+            return refusal
+    overlaps = _restore_overlaps(root, target, entry)
     return None if not overlaps else ownership_error(project_root, overlaps)
 
 

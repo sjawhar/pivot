@@ -819,10 +819,15 @@ def restore_targets_from_revision(
     )
     # Only --force replaces an existing path; check every one before any is replaced. Each is
     # checked again just before it is replaced (`restore_file`).
-    if force:
-        refusal = ownership.forced_restore_refusal(proj_root, restores.values())
-        if refusal is not None:
-            raise refusal
+    refusal = (
+        ownership.forced_restore_refusal(proj_root, restores.values())
+        if force
+        else ownership.control_path_refusal(
+            proj_root, (target["replacement"] for target in restores.values())
+        )
+    )
+    if refusal is not None:
+        raise refusal
 
     results = list[RestoreResult]()
     # Resolves the remote and builds its backend once per call, not once per target that misses

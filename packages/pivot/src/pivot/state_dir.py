@@ -213,6 +213,14 @@ STATE_GITIGNORE_CONTENT = """\
 """
 
 
+def control_paths(state_dir: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    """Persistent state and coordination entries, not regenerable galleries or stage outputs."""
+    return tuple(
+        state_dir / name
+        for name in ("state.lmdb", "locks", "agent.sock", "config.yaml.lock", "secret.key")
+    )
+
+
 def resolve_state_dir_value(root: pathlib.Path, value: str) -> pathlib.Path:
     """Return the directory a ``core.state_dir`` value names, as the kernel will open it.
 

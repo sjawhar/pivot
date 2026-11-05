@@ -337,12 +337,17 @@ class WorkspaceStore:
         returned: ownership.StageMembers | None,
     ) -> ownership.ForcedRestore:
         """The forced-restore target for replacing ``stage``'s output at ``path``."""
-        return ownership.ForcedRestore(
+        target = ownership.ForcedRestore(
             replacement=ownership.stage_output(ownership.normalized(path), stage),
             restored=None,
             claims=None if claims is None else lambda: claims,
             written={} if returned is None else returned,
         )
+        refusal = ownership.control_path_refusal(self._project_root, [target["replacement"]])
+        if refusal is not None:
+            raise refusal
+        target["metadata_checked"] = (self._project_root, target["replacement"]["path"])
+        return target
 
     def refuse_output_replacement_at_write(
         self,
@@ -380,8 +385,9 @@ class WorkspaceStore:
             [ref], claims, None if returned is None else {ref: returned}
         )
         path = self._resolve_path(ref)
+        target = self._write_target(ref, claims, returned)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._remove_checked(self._write_target(ref, claims, returned), path, state_dir)
+        self._remove_checked(target, path, state_dir)
         if ref.tag is types.ArtifactTag.DIRECTORY:
             path.mkdir(exist_ok=True)
         return path
@@ -577,14 +583,9 @@ class WorkspaceStore:
             if members is None:
                 return False
         output_path = self._resolve_output_path(ref)
-        replacement = ownership.stage_output(
-            ownership.normalized(output_path), ref.identity.producer
-        )
-        target = ownership.ForcedRestore(
-            replacement=replacement,
-            restored=output_hash,
-            claims=None if claims is None else lambda: claims,
-        )
+        target = self._output_target(output_path, ref.identity.producer, claims, None)
+        target["restored"] = output_hash
+        replacement = target["replacement"]
         if members is not None:
             target["restored_members"] = members
         ownership.refuse_output_replacements(

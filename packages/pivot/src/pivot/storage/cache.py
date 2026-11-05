@@ -518,6 +518,26 @@ def _empty_dir_path(root: pathlib.Path, relpath: str) -> pathlib.Path:
     return target
 
 
+def validate_restore_members(path: pathlib.Path, members: listing.DirListing) -> None:
+    """Refuse listed members that an in-place restore would reach outside its directory.
+
+    Follow parents, not file leaves: an existing leaf may link to its cache object.
+    """
+    lexical_base = pathlib.Path(os.path.abspath(path))
+    resolved_base = path.resolve()
+    for entry in members["files"]:
+        relpath = entry["relpath"]
+        file_path = path / relpath
+        if not pathlib.Path(os.path.abspath(file_path)).is_relative_to(lexical_base) or not (
+            file_path.parent.resolve().is_relative_to(resolved_base)
+        ):
+            raise exceptions.SecurityValidationError(
+                f"Manifest contains path traversal: {relpath!r}"
+            )
+    for relpath in members["empty_dirs"]:
+        _empty_dir_path(path, relpath)
+
+
 def log_left_out_symlinks(path: pathlib.Path, left_out: list[pathlib.Path]) -> None:
     """Log one warning naming every symlink a directory artifact does not store."""
     absolute = path.absolute()
@@ -755,10 +775,15 @@ def resolve_cache_tree_path(cache_dir: pathlib.Path, directory_hash: str) -> pat
     return other_tree
 
 
+def tree_root(cache_dir: pathlib.Path) -> pathlib.Path:
+    """The directory holding whole-directory trees beside this object root."""
+    return cache_dir.parent / "trees"
+
+
 def tree_path(cache_dir: pathlib.Path, directory_hash: str) -> pathlib.Path:
     """Where the whole-directory SYMLINK tree of a directory lives: ``<cache root>/trees/XX/
     YYYY...``. The object at the directory's hash under ``cache_dir`` is its listing."""
-    return get_cache_path(cache_dir.parent / "trees", directory_hash)
+    return get_cache_path(tree_root(cache_dir), directory_hash)
 
 
 def cached_listing(cache_dir: pathlib.Path, record: DirHash) -> listing.DirListing | None:
@@ -2786,8 +2811,7 @@ def restore_missing_in_directory(
     this settled without a matching ``state_db`` entry, and of every file it restored, for the
     caller to save.
     """
-    lexical_base = pathlib.Path(os.path.abspath(path))
-    resolved_base = path.resolve()
+    validate_restore_members(path, members)
     cache_root = resolve_cache_root(cache_dir)
     expected_paths = set[str]()
     missing = list[tuple[DirManifestEntry, pathlib.Path, pathlib.Path]]()
@@ -2798,19 +2822,10 @@ def restore_missing_in_directory(
         relpath = entry["relpath"]
         expected_paths.add(relpath)
         file_path = path / relpath
-        lexical_path = pathlib.Path(os.path.abspath(file_path))
-        if not lexical_path.is_relative_to(lexical_base):
-            raise exceptions.SecurityValidationError(
-                f"Manifest contains path traversal: {relpath!r}"
-            )
 
         resolved_cache_path = resolve_cache_object_path(cache_dir, entry["hash"])
         file_cache_path = resolved_cache_path or get_cache_path(cache_dir, entry["hash"])
         if file_path.is_symlink():
-            if not file_path.parent.resolve().is_relative_to(resolved_base):
-                raise exceptions.SecurityValidationError(
-                    f"Manifest contains path traversal: {relpath!r}"
-                )
             if resolved_cache_path is not None and _links_to_object(
                 file_path, file_cache_path, cache_root
             ):
@@ -2834,10 +2849,6 @@ def restore_missing_in_directory(
             if file_hash != entry["hash"]:
                 changed[relpath] = file_hash
             continue
-        if not file_path.parent.resolve().is_relative_to(resolved_base):
-            raise exceptions.SecurityValidationError(
-                f"Manifest contains path traversal: {relpath!r}"
-            )
         missing.append((entry, file_path, file_cache_path))
 
     missing_dirs = [
@@ -2883,6 +2894,8 @@ def restore_missing_in_directory(
         if pending is not None:
             pending.append((file_path, staged, entry["hash"]))
     for dir_path in missing_dirs:
+        if before_write is not None:
+            before_write()
         dir_path.mkdir(parents=True, exist_ok=True)
 
     return MissingRestore(restored=len(missing), missing=0, local_changes=[], replace=False)

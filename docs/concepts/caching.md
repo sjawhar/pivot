@@ -529,10 +529,15 @@ Restore tracked files and stage outputs from cache:
 $ pivot checkout                   # restore all
 $ pivot checkout demo/train        # restore specific stage outputs
 $ pivot checkout --only-missing    # restore only missing files; never overwrite edits
-$ pivot checkout --force           # overwrite existing files
+$ pivot checkout --force           # overwrite existing data, never control paths
 ```
 
-With `--force`, Pivot checks the required local cache objects before replacing an
+Checkout refuses targets that overlap this project's real Git/Pivot controls, or would replace
+an in-project control-named directory, even with `--force`; see
+[checkout's protected paths](../cli/index.md#pivot-checkout). A single tracked file under a
+nested `.git`/`.pivot`, or ordinary data in the old `.pivot` marker after state moves, remains
+restorable when it is not an actual control path.
+For other targets, `--force` checks the required local cache objects before replacing an
 existing file. If any object is missing, it names the missing hash and leaves
 the workspace file unchanged.
 

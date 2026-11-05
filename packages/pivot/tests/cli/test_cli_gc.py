@@ -1068,7 +1068,7 @@ def test_gc_refuses_while_another_collection_holds_the_cache(
 ) -> None:
     """One collection at a time, so two never plan against each other's deletions."""
     dead = _helper_publish(workspace, "dead")
-    fd = cache.open_cache_lock(workspace["cache_dir"] / gc.GC_LOCK)
+    fd = cache.open_cache_lock(workspace["cache_dir"] / naming.GC_LOCK)
     fcntl.flock(fd, fcntl.LOCK_EX)
     try:
         result = _helper_run(runner, "--yes", "--grace-hours", "0")

@@ -57,9 +57,6 @@ logger = logging.getLogger(__name__)
 # (``cache.tree_path``), under each cache root. A tree's bytes are copies of its members, so it is
 # collected on its own; the record that names the directory keeps both it and the listing object.
 TREES_DIR = "trees"
-# Held exclusively for a whole collection, beside the register, so two collections never run on
-# one object store.
-GC_LOCK = "gc.lock"
 # Every marker file beside a whole-directory tree object, removed with the tree.
 _TREE_MARKER_SUFFIXES = cache.TREE_MARKER_SUFFIXES
 DEFAULT_GRACE_HOURS = 24.0
@@ -1562,7 +1559,7 @@ def collection_lock(snapshot: StoreSnapshot) -> Generator[None]:
             cannot be written, or ``flock`` is refused on this filesystem.
     """
     cache_dir = snapshot.cache_dir
-    path = snapshot.layout.register_root / GC_LOCK
+    path = snapshot.layout.register_root / naming.GC_LOCK
     try:
         fd = cache.open_cache_lock(path)
     except OSError as e:

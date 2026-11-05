@@ -212,11 +212,24 @@ def _restore_targets(
     files: Mapping[str, Expected],
     stage_output_paths: Mapping[str, str | None],
     claims: Mapping[str, Callable[[], ownership.StageClaims]],
+    behavior: CheckoutBehavior,
 ) -> dict[str, ownership.ForcedRestore]:
     """What restoring each file replaces, for ``ownership.forced_restore_refusal``: a stage
     output (path -> the stage, when the target named it) as that stage's output, with its claims;
-    any other path as a tracked path's own restore. A restored directory's listing is read only
-    when a check needs it (``read_restored_members``)."""
+    any other path as a tracked path's own restore. In-place directory restores validate their
+    listing before the metadata walk, so an escaping member keeps its path-traversal error.
+    """
+    if behavior is CheckoutBehavior.SKIP_EXISTING:
+        for value, expected in files.items():
+            path = pathlib.Path(value)
+            if expected.read_members is None or path.is_symlink() or not path.is_dir():
+                continue
+            try:
+                members = expected.read_members()
+            except (exceptions.ListingMissingError, exceptions.CorruptListingError):
+                # The restore reports an unavailable listing; metadata paths still refuse.
+                continue
+            cache.validate_restore_members(path, members)
     targets = dict[str, ownership.ForcedRestore]()
     for path, expected in files.items():
         target = ownership.ForcedRestore(
@@ -231,6 +244,11 @@ def _restore_targets(
         if expected.read_members is not None:
             target["read_restored_members"] = expected.read_members
         targets[path] = target
+    refusal = ownership.control_path_refusal(
+        project.get_project_root(), (target["replacement"] for target in targets.values())
+    )
+    if refusal is not None:
+        raise click.ClickException(str(refusal))
     return targets
 
 
@@ -617,7 +635,7 @@ async def _checkout_main_async(
         files, stage_output_paths = _validate_and_build_files(
             unique_targets, tracked_files, stage_outputs, cache_dir
         )
-        restore_targets = _restore_targets(files, stage_output_paths, claims)
+        restore_targets = _restore_targets(files, stage_output_paths, claims, behavior)
         if behavior is CheckoutBehavior.FORCE:
             _refuse(restore_targets.values())
         return await _checkout_files_async(
@@ -636,8 +654,8 @@ async def _checkout_main_async(
     tracked_expected = {
         path: _tracked_expected(path, pvt, cache_dir) for path, pvt in tracked_files.items()
     }
-    tracked_targets = _restore_targets(tracked_expected, {}, claims)
-    output_targets = _restore_targets(stage_outputs, dict.fromkeys(stage_outputs), claims)
+    tracked_targets = _restore_targets(tracked_expected, {}, claims, behavior)
+    output_targets = _restore_targets(stage_outputs, dict.fromkeys(stage_outputs), claims, behavior)
     if behavior is CheckoutBehavior.FORCE:
         _refuse([*tracked_targets.values(), *output_targets.values()])
     if unreadable:

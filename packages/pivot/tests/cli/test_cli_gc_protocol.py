@@ -3298,7 +3298,7 @@ def test_one_collection_at_a_time_runs_on_one_object_store(tmp_path: pathlib.Pat
     root = _shared_project(tmp_path / "project", c2, "copy")
     _ok(_run(root, "repro"))
     dead = _publish(store, tmp_path, "named by nothing\n")
-    fd = cache.open_cache_lock(naming.register_root(c1) / gc.GC_LOCK)
+    fd = cache.open_cache_lock(naming.register_root(c1) / naming.GC_LOCK)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         refused = _run(root, "gc", "--yes", "--grace-hours", "0")
