@@ -2,6 +2,83 @@
 
 <!-- version list -->
 
+## v0.10.1 (2026-11-05)
+
+### Bug Fixes
+
+- **fingerprint**: Classify wrapper targets and keep stdlib alias support
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Fingerprint the class of a captured instance
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Form Enum values and type expressions, run no value code, end deep walks
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Guard callback walks and hash bytes, paths and exception fields by value
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Hash class-level defaults by their state and key held walks by holder
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Keep captured-instance walks stable, apart, cheap and hook-free
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Preserve complete values and share deep class walks
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Preserve library-stage and wrapped receiver reads
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Record held values by one form and walk the code in them from one node table
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Refuse a class with no source that holds unreadable state
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Refuse wrapper loops and retain native cache settings
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Restore main library traversal and partialmethod reads
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Track wrapped cycles and bound cyclic identities
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Unify wrapper traversal and refuse incomplete chains
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+- **fingerprint**: Walk callbacks in state, hash value types and exceptions by content
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+### Performance Improvements
+
+- **fingerprint**: Read no source files on a cache hit, keep the source map per thread
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+### Testing
+
+- **fingerprint**: Refuse in every scope, name a class by its name in refusals, docs
+  ([#551](https://github.com/sjawhar/pivot/pull/551),
+  [`1f242fc`](https://github.com/sjawhar/pivot/commit/1f242fcfd3081161a1142dcac6ca5e2f89b54652))
+
+
 ## v0.10.0 (2026-11-04)
 
 ### Features
