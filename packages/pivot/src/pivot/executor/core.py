@@ -645,7 +645,7 @@ def verify_tracked_files(
         return
     if checkout_missing:
         refusal = ownership.control_path_refusal(
-            project_root, (pathlib.Path(path) for path in tracked_files)
+            project_root, (ownership.tracked_restore(pathlib.Path(path)) for path in tracked_files)
         )
         if refusal is not None:
             raise refusal

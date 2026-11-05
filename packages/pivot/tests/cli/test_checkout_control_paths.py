@@ -7,7 +7,7 @@ import pytest
 from conftest import isolated_pivot_dir
 from pivot import cli, config, project, types
 from pivot.remote import storage as remote_storage
-from pivot.storage import cache, track
+from pivot.storage import cache, ownership, track
 
 if TYPE_CHECKING:
     import pathlib
@@ -310,3 +310,126 @@ def test_checkout_preserves_linked_cache_physical_register(
         assert marker.is_file(), result.output
         assert marker.read_text() == "shared cache metadata\n", result.output
         assert result.exit_code == 1 and "Refusing" in result.output, result.output
+
+
+_VENDOR_PIPELINE = """\
+from typing import Annotated
+from pivot import Pipeline, directory, loaders, stage
+
+@stage
+def vendor(source: str) -> Annotated[dict[str, str], directory, loaders.Text()]:
+    return {"README.txt": source, "__CONTROL__/head.txt": source}
+
+with Pipeline("demo") as pipeline:
+    vendor(pipeline.input("input.txt"))
+"""
+
+
+@pytest.mark.parametrize("control", [".git", ".pivot"])
+@pytest.mark.parametrize("mode", ["--force", "--only-missing"])
+def test_stage_replaces_and_restores_its_own_control_named_members(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, control: str, mode: str
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / ".pivot" / "config.yaml").write_text("cache:\n  checkout_mode: [copy]\n")
+        (root / "pipeline.py").write_text(_VENDOR_PIPELINE.replace("__CONTROL__", control))
+        source = root / "data" / "raw" / "input.txt"
+        source.parent.mkdir(parents=True)
+        source.write_text("first output\n")
+        built = runner.invoke(cli.cli, ["repro"])
+        assert built.exit_code == 0, built.output
+        output = root / "data" / "demo" / "vendor"
+        assert (output / control / "head.txt").read_text() == "first output\n"
+
+        source.write_text("changed output bytes\n")
+        rebuilt = runner.invoke(cli.cli, ["repro"])
+
+        assert rebuilt.exit_code == 0, rebuilt.output
+        assert (output / control / "head.txt").read_text() == "changed output bytes\n"
+        (output / "README.txt").unlink()
+
+        restored = runner.invoke(cli.cli, ["checkout", mode, "demo/vendor"])
+
+        assert restored.exit_code == 0, restored.output
+        assert (output / "README.txt").read_text() == "changed output bytes\n"
+        assert (output / control / "head.txt").read_text() == "changed output bytes\n"
+
+
+@pytest.mark.parametrize("ancestor", [".git", ".pivot"])
+def test_checkout_keeps_data_when_a_control_named_directory_is_above_the_project(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    ancestor: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / ancestor
+    parent.mkdir()
+    with isolated_pivot_dir(runner, parent) as root:
+        monkeypatch.setattr(project, "_project_root_cache", root)
+        _helper_sidecar(root, "ordinary.txt")
+
+        result = runner.invoke(cli.cli, ["checkout", "--force", "ordinary.txt"])
+
+        assert result.exit_code == 0, result.output
+        assert (root / "ordinary.txt").read_text() == "cached replacement\n"
+
+
+def test_checkout_refuses_an_unreadable_tracked_tree_before_restoring_a_sibling(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        _helper_sidecar(root, "tree")
+        _helper_sidecar(root, "a.txt")
+        hidden = root / "tree" / "locked"
+        marker = hidden / ".git" / "HEAD"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("user metadata\n")
+        original_mode = hidden.stat().st_mode
+        hidden.chmod(0)
+        try:
+            result = runner.invoke(cli.cli, ["checkout", "--force"])
+        finally:
+            hidden.chmod(original_mode)
+
+        assert result.exit_code == 1, result.output
+        assert "cannot inspect" in result.output, result.output
+        assert "tree" in result.output, result.output
+        assert marker.read_text() == "user metadata\n"
+        assert not (root / "a.txt").exists()
+
+
+@pytest.mark.parametrize("control", [".git", ".pivot"])
+def test_a_stage_still_cannot_replace_actual_project_control_paths(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, control: str
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        target = ownership.ForcedRestore(
+            replacement=ownership.stage_output(root / control, "demo/unsafe"),
+            restored=None,
+            claims=None,
+        )
+
+        refusal = ownership.swap_refusal(root, target, root / control)
+
+        assert refusal is not None
+        assert f"overlaps control path '{control}'" in str(refusal)
+
+
+def test_a_project_root_alias_still_protects_its_nested_repository(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        nested_git = root / "vendor" / "lib" / ".git"
+        nested_git.mkdir(parents=True)
+        (nested_git / "HEAD").write_text("nested metadata\n")
+        (root / "hop").symlink_to(nested_git, target_is_directory=True)
+        alias = tmp_path / "project-alias"
+        alias.symlink_to(root, target_is_directory=True)
+
+        refusal = ownership.control_path_refusal(
+            alias, [ownership.tracked_restore(alias / "hop" / "HEAD")]
+        )
+
+        assert refusal is not None
+        assert "overlaps control path" in str(refusal)
+        assert (nested_git / "HEAD").read_text() == "nested metadata\n"

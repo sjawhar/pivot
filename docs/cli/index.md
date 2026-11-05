@@ -555,9 +555,12 @@ pivot checkout [TARGETS...] [OPTIONS]
 | `--only-missing` | Only restore files that don't exist on disk. For a directory, restores its missing files and empty directories; if a file differs from the target, or an extra file or directory exists, replaces the directory when every such file is pivot's own earlier output (its content is in the cache; an extra empty directory holds nothing to lose), and otherwise refuses, naming the local changes, so they are never overwritten; use `--force` to overwrite |
 | `--all` | Checkout all targets (ignore target filtering) |
 
-Checkout, pull, revision get and `repro --checkout-missing` refuse a `.git` or `.pivot` target
-at any depth, a path inside one, or a directory containing one. They also protect persistent
-Pivot state and coordination entries:
+Checkout, pull, revision get and `repro --checkout-missing` protect the project's `.git` and
+`.pivot`. A tracked path or user destination also cannot replace a nested `.git` or `.pivot`,
+or a directory containing one. Names above the project root do not reserve the project's data.
+A stage's own `.git` and `.pivot` members inside its directory output are data: the stage can
+replace and restore them. This does not let an output replace actual project control paths.
+All replacements also protect persistent Pivot state and coordination entries:
 the state database, stage records, artifact locks, agent socket, configuration lock and secret
 key; cached objects and trees; and the actual store's project register, cache mounts and naming
 and collection locks. A linked cache protects its physical store's register, not just the

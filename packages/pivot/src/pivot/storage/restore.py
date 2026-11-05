@@ -823,7 +823,7 @@ def restore_targets_from_revision(
         ownership.forced_restore_refusal(proj_root, restores.values())
         if force
         else ownership.control_path_refusal(
-            proj_root, (target["replacement"]["path"] for target in restores.values())
+            proj_root, (target["replacement"] for target in restores.values())
         )
     )
     if refusal is not None:

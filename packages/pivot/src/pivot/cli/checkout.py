@@ -230,11 +230,6 @@ def _restore_targets(
                 # The restore reports an unavailable listing; metadata paths still refuse.
                 continue
             cache.validate_restore_members(path, members)
-    refusal = ownership.control_path_refusal(
-        project.get_project_root(), (pathlib.Path(path) for path in files)
-    )
-    if refusal is not None:
-        raise click.ClickException(str(refusal))
     targets = dict[str, ownership.ForcedRestore]()
     for path, expected in files.items():
         target = ownership.ForcedRestore(
@@ -249,6 +244,11 @@ def _restore_targets(
         if expected.read_members is not None:
             target["read_restored_members"] = expected.read_members
         targets[path] = target
+    refusal = ownership.control_path_refusal(
+        project.get_project_root(), (target["replacement"] for target in targets.values())
+    )
+    if refusal is not None:
+        raise click.ClickException(str(refusal))
     return targets
 
 

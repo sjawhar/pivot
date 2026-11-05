@@ -700,7 +700,6 @@ class _MountWatch(NamedTuple):
     fd: int
     poller: select.poll
     pid: int
-    poll_lock: threading.Lock
 
 
 def _watch_mount_table() -> _MountWatch | None:
@@ -731,7 +730,7 @@ def _watch_mount_table() -> _MountWatch | None:
         return None
     poller = select.poll()
     poller.register(fd, select.POLLPRI)
-    return _MountWatch(fd, poller, os.getpid(), threading.Lock())
+    return _MountWatch(fd, poller, os.getpid())
 
 
 class _SharedMountWatch:
@@ -740,30 +739,38 @@ class _SharedMountWatch:
     the count when it read the table (``_mount_generation``), and a later count tells it the
     table changed."""
 
-    __slots__: tuple[str, ...] = ("generation", "watch")
+    __slots__: tuple[str, ...] = ("generation", "watch", "lock")
 
     def __init__(self) -> None:
         self.watch: _MountWatch | None = None
         self.generation: int = 0
+        self.lock: threading.Lock = threading.Lock()
 
 
 _SHARED_MOUNT_WATCH = _SharedMountWatch()
 
 
+def _reset_mount_watch_lock_after_fork() -> None:
+    _SHARED_MOUNT_WATCH.lock = threading.Lock()
+
+
+os.register_at_fork(after_in_child=_reset_mount_watch_lock_after_fork)
+
+
 def _mount_generation() -> int | None:
     """How many changes of this namespace's mount table this process's watch has seen, polling
     it now; None where there is no watch (``_watch_mount_table``), when no memo engages. Opens
-    the watch at the first call in a process. Its poll lock belongs to the watch, so a forked
-    child opens its own before taking a lock another parent thread might hold.
+    the watch at the first call in a process. Watch replacement, generation changes and polls
+    share one mutex, reset after fork before the child opens its own watch.
     """
     shared = _SHARED_MOUNT_WATCH
-    watch = shared.watch
-    if watch is None or watch.pid != os.getpid():
-        watch = shared.watch = _watch_mount_table()
-        shared.generation += 1
-        if watch is None:
-            return None
-    with watch.poll_lock:
+    with shared.lock:
+        watch = shared.watch
+        if watch is None or watch.pid != os.getpid():
+            watch = shared.watch = _watch_mount_table()
+            shared.generation += 1
+            if watch is None:
+                return None
         try:
             events = watch.poller.poll(0)
         except OSError:

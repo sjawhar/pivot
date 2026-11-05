@@ -6,6 +6,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import threading
 
 import pytest
@@ -86,6 +87,70 @@ def test_a_naming_unit_reregisters_after_the_mount_table_changes(
     _unit(cache_dir, root, state_dir)
 
     assert json.loads(entry.read_text())["mounts"] == [str(data)]
+
+
+def test_concurrent_first_mount_reads_open_one_shared_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_watch = naming._watch_mount_table
+    available = real_watch()
+    if available is None:
+        pytest.skip("this platform has no pollable procfs mount table")
+    os.close(available.fd)
+    opened = list[naming._MountWatch]()
+
+    def open_watch() -> naming._MountWatch:
+        watch = real_watch()
+        assert watch is not None
+        opened.append(watch)
+        return watch
+
+    monkeypatch.setattr(naming, "_SHARED_MOUNT_WATCH", naming._SharedMountWatch())
+    monkeypatch.setattr(naming, "_watch_mount_table", open_watch)
+    barrier = threading.Barrier(8)
+
+    def read_generation() -> int | None:
+        barrier.wait(timeout=30)
+        return naming._mount_generation()
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(read_generation) for _ in range(8)]
+            generations = [future.result(timeout=30) for future in futures]
+    finally:
+        for watch in opened:
+            os.close(watch.fd)
+
+    assert all(generation is not None for generation in generations)
+    assert len(opened) == 1, "concurrent first callers replaced the shared watch"
+
+
+def test_mount_generation_in_a_child_does_not_wait_on_its_parents_mutex() -> None:
+    source = """\
+import multiprocessing
+import sys
+from pivot.storage import naming
+
+if naming._mount_generation() is None:
+    sys.exit(77)
+shared = naming._SHARED_MOUNT_WATCH
+child = multiprocessing.get_context("fork").Process(target=naming._mount_generation)
+with shared.lock:
+    child.start()
+    try:
+        child.join(timeout=5)
+        assert child.exitcode == 0, "child waited on the inherited mount-watch mutex"
+    finally:
+        if child.is_alive():
+            child.kill()
+            child.join()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", source], text=True, capture_output=True, timeout=30, check=False
+    )
+    if result.returncode == 77:
+        pytest.skip("this platform has no pollable procfs mount table")
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_mount_generation_allows_concurrent_restore_threads(

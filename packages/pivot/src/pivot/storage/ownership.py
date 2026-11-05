@@ -768,25 +768,32 @@ def _restore_overlaps(
     return sorted(found.values(), key=overlap_path)
 
 
-def _reserved_control_path(path: pathlib.Path) -> pathlib.Path | None:
-    for index, part in enumerate(path.parts):
+def _reserved_control_path(path: pathlib.Path, project_root: pathlib.Path) -> pathlib.Path | None:
+    try:
+        relative = path.relative_to(project_root)
+    except ValueError:
+        return None
+    for index, part in enumerate(relative.parts):
         if part in {".git", ".pivot"}:
-            return pathlib.Path(*path.parts[: index + 1])
+            return project_root.joinpath(*relative.parts[: index + 1])
     return None
 
 
 def control_path_refusal(
-    project_root: pathlib.Path, paths: Iterable[pathlib.Path]
+    project_root: pathlib.Path, replacements: Iterable[Replacement]
 ) -> exceptions.OutputOwnershipError | None:
-    """Refuse metadata targets, including nested repositories and parent-directory aliases.
+    """Refuse project metadata, nested unowned repositories and parent-directory aliases.
 
-    A leaf symlink is replaced rather than followed. Metadata paths come from their layout
-    owners; regenerable galleries and logs are not metadata ownership claims.
+    A stage owns control-named members of its output, not the project's actual control paths.
+    A leaf symlink is replaced rather than followed; layouts supply persistent metadata paths.
     """
     root = normalized(project_root)
+    physical_root = root.resolve()
     state_root = state_dir_mod.locate_state_dir(root)
     cache_root = config.locate_cache_dir() if (root / ".pivot").is_dir() else state_root / "cache"
     controls = (
+        root / ".git",
+        root / ".pivot",
         *state_dir_mod.control_paths(state_root),
         lock.get_stages_dir(state_root),
         *naming.control_paths(cache_root),
@@ -795,12 +802,17 @@ def control_path_refusal(
         {location for control in controls for location in (control, control.resolve())}
     )
     refused = list[str]()
-    for value in paths:
+    for replacement in replacements:
+        value = replacement["path"]
         path = normalized(value if value.is_absolute() else root / value)
         locations = (path, path.parent.resolve() / path.name)
-        control = next(
-            (found for entry in locations if (found := _reserved_control_path(entry)) is not None),
-            None,
+        control = (
+            None
+            if replacement["kind"] == ReplacementKind.STAGE_OUTPUT
+            else (
+                _reserved_control_path(path, root)
+                or _reserved_control_path(locations[1], physical_root)
+            )
         )
         if control is None:
             control = next(
@@ -814,7 +826,12 @@ def control_path_refusal(
                 ),
                 None,
             )
-        if control is None and path.is_dir() and not path.is_symlink():
+        if (
+            control is None
+            and replacement["kind"] != ReplacementKind.STAGE_OUTPUT
+            and path.is_dir()
+            and not path.is_symlink()
+        ):
             try:
                 for parent, directories, files in path.walk(on_error=_raise_walk_error):
                     name = next(
@@ -862,9 +879,7 @@ def forced_restore_refusal(
     content (the restored hash's and its current sidecar's); a destination with none.
     """
     targets = tuple(targets)
-    refusal = control_path_refusal(
-        project_root, (target["replacement"]["path"] for target in targets)
-    )
+    refusal = control_path_refusal(project_root, (target["replacement"] for target in targets))
     if refusal is not None:
         return refusal
     overlaps = dict[tuple[pathlib.Path, pathlib.Path], OutputOverlap]()
@@ -889,7 +904,14 @@ def swap_refusal(
     file the swap removes. Each file is still named at its place under the target's path. A file
     that replaces a file or symlink is checked in place, ``entry`` being the path itself.
     """
-    refusal = control_path_refusal(project_root, (target["replacement"]["path"], entry))
+    replacement = target["replacement"]
+    refusal = control_path_refusal(
+        project_root,
+        (
+            replacement,
+            Replacement(path=entry, stage=replacement["stage"], kind=replacement["kind"]),
+        ),
+    )
     if refusal is not None:
         return refusal
     overlaps = _restore_overlaps(project_root, target, entry)
