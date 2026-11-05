@@ -2300,6 +2300,56 @@ def _restore_file_from_cache(
     return True
 
 
+def _directory_restore_mismatch(path: pathlib.Path, members: listing.DirListing) -> str | None:
+    found = set[str]()
+    found_dirs = set[str]()
+    pending = [path]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                child = pathlib.Path(entry.path)
+                relpath = str(child.relative_to(path))
+                if entry.is_dir(follow_symlinks=False):
+                    found_dirs.add(relpath)
+                    pending.append(child)
+                else:
+                    found.add(relpath)
+    expected = {entry["relpath"] for entry in members["files"]}
+    count = f"expected {len(expected)} file(s), found {len(found)}"
+    missing = expected - found
+    if missing:
+        return f"missing file {min(missing, key=os.fsencode)!r} ({count})"
+    unexpected = found - expected
+    if unexpected:
+        return f"unexpected file {min(unexpected, key=os.fsencode)!r} ({count})"
+    expected_dirs = _restored_dirs(members)
+    missing_dirs = expected_dirs - found_dirs
+    if missing_dirs:
+        return f"missing directory {min(missing_dirs, key=os.fsencode)!r}"
+    unexpected_dirs = found_dirs - expected_dirs
+    if unexpected_dirs:
+        return f"unexpected directory {min(unexpected_dirs, key=os.fsencode)!r}"
+    for entry in members["files"]:
+        member = path / entry["relpath"]
+        member_stat = member.stat()
+        if not stat.S_ISREG(member_stat.st_mode):
+            return f"file {entry['relpath']!r} is not a regular file"
+        if bool(member_stat.st_mode & stat.S_IXUSR) != entry["isexec"]:
+            return f"file {entry['relpath']!r} has a different executable bit"
+        if "size" in entry and member_stat.st_size != entry["size"]:
+            return (
+                f"file {entry['relpath']!r} has size {member_stat.st_size}, "
+                + f"expected {entry['size']}"
+            )
+        actual_hash = hash_file(member)[0]
+        if actual_hash != entry["hash"]:
+            return (
+                f"file {entry['relpath']!r} has content hash {actual_hash}, "
+                + f"expected {entry['hash']}"
+            )
+    return None
+
+
 def _restore_directory_from_cache(
     path: pathlib.Path,
     output_hash: DirHash,
@@ -2449,6 +2499,13 @@ def _restore_directory_from_cache(
                         os.chmod(item, 0o755)
             except OSError as e:
                 logger.debug(f"chmod failed (may be NFS with root_squash): {e}")
+
+        mismatch = _directory_restore_mismatch(temp_path, members)
+        if mismatch is not None:
+            raise exceptions.CacheRestoreError(
+                f"Cannot restore {path}: staged directory does not match its recorded listing: "
+                + mismatch
+            )
 
         _swap_in(temp_path, path, _backup_path(path, target_token), before_swap)
         if recorded is not None:

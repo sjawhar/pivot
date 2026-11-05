@@ -112,11 +112,20 @@ A path that leaves the project, including `link/../x.csv`, is refused by `checko
 
 **A `.pvt` restores its file only inside the project.** `checkout`, `pull` and
 `repro --checkout-missing` read every `.pvt` under the project root and restore the file its
-`path:` names. A `.pvt` is skipped, with a warning naming it and exit code 0, when its `path:`
-names no file (`.`, `./` or empty), holds `..`, is absolute, or names a file whose directory
-really lies outside the project, through a symlink. `pivot track` and `pivot import` write
-`path:` as the name of the file beside the `.pvt`, which is always restored; any other value
-is warned about, because `checkout x.pvt`, `get`, `update` and `push` take the file beside the
+`path:` names. Discovery warns about unreadable files and leaves them out. An all-target
+checkout or `verify` refuses damaged metadata in a supported schema, naming the sidecar; restore
+it from version control or use `pivot track --force <data-path>` to rebuild it from local data.
+Schemas with unknown fields remain inert, so an older Pivot can still work on unrelated paths.
+Scalar `.pvt` payloads also remain inert, including copies left beside an output by an interrupted
+worker.
+A recorded `.pvt` payload file, or a `.pvt` member listed by a tracked directory or stage output,
+is data, not a tracking sidecar. Ownership checks still refuse to overwrite a user's sidecar.
+A valid `.pvt` is skipped, with
+a warning naming it and exit code 0, when its `path:` names no file (`.`, `./` or empty), or
+names a file whose directory really lies outside the project through a symlink.
+`pivot track` and `pivot import` write `path:` as the name of the file beside the `.pvt`, which
+is always restored; any other value is warned about, because `checkout x.pvt`, `get`, `update`
+and `push` take the file beside the
 `.pvt` while `checkout` with no target takes `path:`.
 
 ---
@@ -557,6 +566,17 @@ pivot checkout [TARGETS...] [OPTIONS]
 
 Checkout summaries count restored, skipped, and missing **files**. Each file in a directory output
 counts separately.
+
+Before publishing a directory restored file by file, Pivot checks its staged filenames, content
+hashes, executable bits and directories against the recorded listing, including links restored
+from a legacy cache. A mismatch, including filenames collapsing on a case-insensitive filesystem,
+fails without replacing the old directory. The error names the first differing member and,
+for a missing or unexpected file, the expected and actual file counts. This reads every restored
+byte once, including during run-cache restoration under the cache-wide naming lock: the lock
+must keep collection from removing objects before their new references are committed.
+Whole-directory symlink restores retain the cache tree's verification marker fast path. A tree
+is content-checked when its marker is first established; an existing matching marker is trusted
+without rereading bytes. This fast path does not run the staged readback.
 
 A checkout that would replace an existing path holding another user's file refuses: a stage
 output that holds a tracked file or `.pvt` sidecar, or a tracked path that holds another tracked
