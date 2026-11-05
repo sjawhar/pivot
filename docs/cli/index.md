@@ -574,6 +574,11 @@ entries. Other dot-directories and unrelated data beside metadata remain restora
 a data path outside metadata and correct its `.pvt` sidecar or stage output declaration
 before retrying.
 
+Resolved control paths are cached by project, state/cache locations and shared-store layout.
+A stage swap reuses its successful metadata preflight for that same project and output path;
+it still checks the entry it removes for user-owned files. Unchecked paths and non-stage
+destinations retain the metadata and parent-alias checks.
+
 Checkout summaries count restored, skipped, and missing **files**. Each file in a directory output
 counts separately.
 

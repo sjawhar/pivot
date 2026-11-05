@@ -139,6 +139,9 @@ class ForcedRestore(TypedDict):
     the path holds a ``*.pvt``."""
     written: NotRequired[StageMembers]
     """The ``*.pvt`` members a stage is about to write there."""
+    metadata_checked: NotRequired[tuple[pathlib.Path, pathlib.Path]]
+    """Successful stage metadata preflight, bound to its project root and replacement path.
+    Only metadata is settled; every later check still inspects user-owned files."""
 
 
 # A path a replacement must not remove: a user ``.pvt`` sidecar, or a directory Pivot could not
@@ -779,6 +782,30 @@ def _reserved_control_path(path: pathlib.Path, project_root: pathlib.Path) -> pa
     return None
 
 
+@functools.lru_cache(maxsize=64)
+def _metadata_controls(
+    root: pathlib.Path,
+    physical_root: pathlib.Path,
+    state_root: pathlib.Path,
+    cache_root: pathlib.Path,
+    layout: naming.StoreLayout,
+) -> tuple[pathlib.Path, ...]:
+    """Resolve controls once per logical/physical root, state/cache location and store layout.
+
+    The physical root and layout are cache-key inputs: repointing a root or linked object store
+    must not reuse the controls resolved through its previous binding.
+    """
+    controls = (
+        *(base / name for base in {root, physical_root} for name in (".git", ".pivot")),
+        *state_dir_mod.control_paths(state_root),
+        lock.get_stages_dir(state_root),
+        *naming.control_paths(cache_root, layout),
+    )
+    return tuple(
+        sorted({location for control in controls for location in (control, control.resolve())})
+    )
+
+
 def control_path_refusal(
     project_root: pathlib.Path, replacements: Iterable[Replacement]
 ) -> exceptions.OutputOwnershipError | None:
@@ -790,16 +817,11 @@ def control_path_refusal(
     root = normalized(project_root)
     physical_root = root.resolve()
     state_root = state_dir_mod.locate_state_dir(root)
-    cache_root = config.locate_cache_dir() if (root / ".pivot").is_dir() else state_root / "cache"
-    controls = (
-        root / ".git",
-        root / ".pivot",
-        *state_dir_mod.control_paths(state_root),
-        lock.get_stages_dir(state_root),
-        *naming.control_paths(cache_root),
+    cache_root = (
+        config.locate_cache_dir(root) if (root / ".pivot").is_dir() else state_root / "cache"
     )
-    protected = sorted(
-        {location for control in controls for location in (control, control.resolve())}
+    protected = _metadata_controls(
+        root, physical_root, state_root, cache_root, naming.store_layout(cache_root)
     )
     refused = list[str]()
     for replacement in replacements:
@@ -863,6 +885,14 @@ def _raise_walk_error(error: OSError) -> None:
     raise error
 
 
+def _metadata_preflighted(root: pathlib.Path, target: ForcedRestore) -> bool:
+    return (
+        target["replacement"]["kind"] == ReplacementKind.STAGE_OUTPUT
+        and "metadata_checked" in target
+        and target["metadata_checked"] == (root, target["replacement"]["path"])
+    )
+
+
 def forced_restore_refusal(
     project_root: pathlib.Path, targets: Iterable[ForcedRestore]
 ) -> exceptions.OutputOwnershipError | None:
@@ -878,10 +908,16 @@ def forced_restore_refusal(
     claims and the restored hash; a tracked path as its own restore, whose members are its own
     content (the restored hash's and its current sidecar's); a destination with none.
     """
+    root = normalized(project_root)
     targets = tuple(targets)
-    refusal = control_path_refusal(project_root, (target["replacement"] for target in targets))
-    if refusal is not None:
-        return refusal
+    unchecked = [target for target in targets if not _metadata_preflighted(root, target)]
+    if unchecked:
+        refusal = control_path_refusal(root, (target["replacement"] for target in unchecked))
+        if refusal is not None:
+            return refusal
+        for target in unchecked:
+            if target["replacement"]["kind"] == ReplacementKind.STAGE_OUTPUT:
+                target["metadata_checked"] = (root, target["replacement"]["path"])
     overlaps = dict[tuple[pathlib.Path, pathlib.Path], OutputOverlap]()
     for target in targets:
         path = target["replacement"]["path"]
@@ -904,17 +940,19 @@ def swap_refusal(
     file the swap removes. Each file is still named at its place under the target's path. A file
     that replaces a file or symlink is checked in place, ``entry`` being the path itself.
     """
-    replacement = target["replacement"]
-    refusal = control_path_refusal(
-        project_root,
-        (
-            replacement,
-            Replacement(path=entry, stage=replacement["stage"], kind=replacement["kind"]),
-        ),
-    )
-    if refusal is not None:
-        return refusal
-    overlaps = _restore_overlaps(project_root, target, entry)
+    root = normalized(project_root)
+    if not _metadata_preflighted(root, target):
+        replacement = target["replacement"]
+        refusal = control_path_refusal(
+            root,
+            (
+                replacement,
+                Replacement(path=entry, stage=replacement["stage"], kind=replacement["kind"]),
+            ),
+        )
+        if refusal is not None:
+            return refusal
+    overlaps = _restore_overlaps(root, target, entry)
     return None if not overlaps else ownership_error(project_root, overlaps)
 
 

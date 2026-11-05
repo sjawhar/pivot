@@ -6,6 +6,7 @@ import pytest
 
 from conftest import isolated_pivot_dir
 from pivot import cli, config, project, types
+from pivot.config import io as config_io
 from pivot.remote import storage as remote_storage
 from pivot.storage import cache, ownership, track
 
@@ -433,3 +434,62 @@ def test_a_project_root_alias_still_protects_its_nested_repository(
         assert refusal is not None
         assert "overlaps control path" in str(refusal)
         assert (nested_git / "HEAD").read_text() == "nested metadata\n"
+
+
+def test_metadata_controls_follow_a_changed_cache_configuration(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        configuration = root / ".pivot" / "config.yaml"
+        configuration.write_text("cache:\n  dir: first\n")
+        replacement = ownership.stage_output(root / "second" / "projects", "p/out")
+        assert ownership.control_path_refusal(root, [replacement]) is None
+
+        configuration.write_text("cache:\n  dir: second\n")
+        config_io.clear_config_cache()
+
+        refusal = ownership.control_path_refusal(root, [replacement])
+        assert refusal is not None
+        assert "second/projects" in str(refusal)
+
+
+def test_metadata_controls_follow_a_repointed_object_store(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        first = root / "first" / "files"
+        second = root / "second" / "files"
+        first.mkdir(parents=True)
+        second.mkdir(parents=True)
+        logical = root / "logical"
+        logical.mkdir()
+        files = logical / "files"
+        files.symlink_to(first, target_is_directory=True)
+        (root / ".pivot" / "config.yaml").write_text("cache:\n  dir: logical\n")
+        replacement = ownership.stage_output(second.parent / "projects", "p/out")
+        assert ownership.control_path_refusal(root, [replacement]) is None
+
+        files.unlink()
+        files.symlink_to(second, target_is_directory=True)
+
+        refusal = ownership.control_path_refusal(root, [replacement])
+        assert refusal is not None
+        assert "second/projects" in str(refusal)
+
+
+def test_metadata_preflight_does_not_apply_after_its_target_path_changes(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        target = ownership.ForcedRestore(
+            replacement=ownership.stage_output(root / "ordinary", "p/out"),
+            restored=None,
+            claims=None,
+        )
+        assert ownership.forced_restore_refusal(root, [target]) is None
+        target["replacement"] = ownership.stage_output(root / ".git", "p/out")
+
+        refusal = ownership.swap_refusal(root, target, root / ".git")
+
+        assert refusal is not None
+        assert "overlaps control path '.git'" in str(refusal)

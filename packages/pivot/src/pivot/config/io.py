@@ -22,9 +22,9 @@ _merged_config_cache: models.PivotConfig | None = None
 DEFAULT_CHECKOUT_MODE_ORDER: list[models.CheckoutMode] = list(models.CheckoutMode)
 
 
-def get_local_config_path() -> pathlib.Path:
-    """Get project-level config path (.pivot/config.yaml)."""
-    return project.get_project_root() / ".pivot" / "config.yaml"
+def get_local_config_path(root: pathlib.Path | None = None) -> pathlib.Path:
+    """The supplied or current project's config path (.pivot/config.yaml)."""
+    return (project.get_project_root() if root is None else root) / ".pivot" / "config.yaml"
 
 
 def get_config_path(scope: models.ConfigScope) -> pathlib.Path:
@@ -176,6 +176,16 @@ def _default_cache_dir() -> str:
         return str(cache_dir)
 
 
+def _load_merged_config(root: pathlib.Path) -> models.PivotConfig:
+    defaults = models.PivotConfig.get_default().model_dump()
+    del defaults["cache"]["dir"]
+    global_data = load_config_file(config_files.get_global_config_path())
+    unset_nested(global_data, ["core", "state_dir"])
+    merged = deep_merge(defaults, global_data)
+    merged = deep_merge(merged, load_config_file(get_local_config_path(root)))
+    return models.PivotConfig.model_validate(merged)
+
+
 def get_merged_config() -> models.PivotConfig:
     """Load and merge configs: defaults < global < local.
 
@@ -190,23 +200,18 @@ def get_merged_config() -> models.PivotConfig:
     if _merged_config_cache is not None:
         return _merged_config_cache
 
-    defaults = models.PivotConfig.get_default().model_dump()
-    del defaults["cache"]["dir"]
-
-    global_data = load_config_file(config_files.get_global_config_path())
-    unset_nested(global_data, ["core", "state_dir"])
-    merged = deep_merge(defaults, global_data)
-
-    local_data = load_config_file(get_local_config_path())
-    merged = deep_merge(merged, local_data)
-
-    _merged_config_cache = models.PivotConfig.model_validate(merged)
+    _merged_config_cache = _load_merged_config(project.get_project_root())
     return _merged_config_cache
 
 
-def _configured_cache_dir() -> str | None:
-    """``cache.dir`` as a config file sets it, or None when unset (``get_merged_config``)."""
-    cache = get_merged_config().cache
+def _configured_cache_dir(root: pathlib.Path) -> str | None:
+    """The given project's configured cache; do not borrow another cwd's cached config."""
+    try:
+        current_root = project.get_project_root()
+    except exceptions.ProjectNotInitializedError:
+        current_root = None
+    model = get_merged_config() if root == current_root else _load_merged_config(root)
+    cache = model.cache
     return cache.dir if "dir" in cache.model_fields_set else None
 
 
@@ -327,7 +332,9 @@ def get_run_history_retention() -> int:
     return merged.core.run_history_retention
 
 
-def _effective_cache_dir() -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+def _effective_cache_dir(
+    root: pathlib.Path | None = None,
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
     """Resolve the effective cache without creating state or cache directories.
 
     ``PIVOT_CACHE_DIR``, then a configured ``cache.dir``, each as given. Unset, the cache is
@@ -335,8 +342,8 @@ def _effective_cache_dir() -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
     and never stored, so a pipeline loaded after an edit of ``core.state_dir`` keeps its cache
     objects beside its locks.
     """
-    root = project.get_project_root()
-    configured = os.environ.get("PIVOT_CACHE_DIR", "").strip() or _configured_cache_dir()
+    root = project.get_project_root() if root is None else root
+    configured = os.environ.get("PIVOT_CACHE_DIR", "").strip() or _configured_cache_dir(root)
     state_dir = state_dir_mod.state_dir_or_default(root)
     fallback_cache_dir = state_dir / "cache"
     if configured is None:
@@ -357,9 +364,9 @@ def _effective_cache_dir() -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
     return root, state_dir, cache_dir
 
 
-def locate_cache_dir() -> pathlib.Path:
-    """Return the effective cache location without creating project state."""
-    _, _, cache_dir = _effective_cache_dir()
+def locate_cache_dir(root: pathlib.Path | None = None) -> pathlib.Path:
+    """Return the supplied or current project's cache without creating project state."""
+    _, _, cache_dir = _effective_cache_dir(root)
     return cache_dir
 
 

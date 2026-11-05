@@ -255,9 +255,9 @@ def register_root(cache_root: pathlib.Path) -> pathlib.Path:
     return store_layout(cache_root).register_root
 
 
-def control_paths(cache_root: pathlib.Path) -> tuple[pathlib.Path, ...]:
-    """Cache objects and shared coordination entries at their writer-facing layout."""
-    register = store_layout(cache_root).register_root
+def control_paths(cache_root: pathlib.Path, layout: StoreLayout) -> tuple[pathlib.Path, ...]:
+    """Cache objects and coordination entries of the captured writer-facing layout."""
+    register = layout.register_root
     return (
         cache_root / OBJECTS_DIR,
         cache.tree_root(cache_root / OBJECTS_DIR),
