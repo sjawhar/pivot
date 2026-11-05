@@ -600,6 +600,7 @@ async def _checkout_main_async(
     state_dir: pathlib.Path | None = None,
     output_state_dirs: dict[str, pathlib.Path] | None = None,
     batch: state.FileHashBatch | None = None,
+    unreadable: list[tuple[pathlib.Path, str]] | None = None,
 ) -> list[RestoreOutcome]:
     """Main async checkout logic: what restoring each tracked file and stage output did.
 
@@ -639,6 +640,8 @@ async def _checkout_main_async(
     output_targets = _restore_targets(stage_outputs, dict.fromkeys(stage_outputs), claims)
     if behavior is CheckoutBehavior.FORCE:
         _refuse([*tracked_targets.values(), *output_targets.values()])
+    if unreadable:
+        track.refuse_unreadable_pvt_files(unreadable, tracked_files, cache_dir)
     combined_total = len(tracked_expected) + len(stage_outputs)
     shared_completed = 0
 
@@ -768,8 +771,9 @@ def checkout(
         stage_outputs, output_state_dirs = _get_stage_output_info(cache_dir)
 
     # Discover tracked files: a stage's own .pvt member of its output, in any pipeline, is none
+    unreadable = list[tuple[pathlib.Path, str]]()
     tracked_files = track.discover_pvt_files(
-        project_root, skip=cli_helpers.own_member_skip(cache_dir)
+        project_root, skip=cli_helpers.own_member_skip(cache_dir), unreadable=unreadable
     )
 
     state_dir = config.locate_state_dir()
@@ -794,6 +798,7 @@ def checkout(
                     state_dir=state_dir,
                     output_state_dirs=output_state_dirs,
                     batch=batch,
+                    unreadable=unreadable,
                 )
             )
     finally:

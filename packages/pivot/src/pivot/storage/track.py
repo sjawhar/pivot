@@ -550,10 +550,12 @@ def _walk(
 
 
 def _read_pvt_files(
-    candidates: list[pathlib.Path], root: pathlib.Path, skip: PvtSkip | None
+    candidates: list[pathlib.Path],
+    root: pathlib.Path,
+    skip: PvtSkip | None,
+    unreadable: list[tuple[pathlib.Path, str]] | None = None,
 ) -> dict[str, PvtData]:
     result = dict[str, PvtData]()
-    unreadable = list[tuple[pathlib.Path, str]]()
     for pvt_path in candidates:
         if not pvt_path.is_file():
             continue
@@ -563,35 +565,62 @@ def _read_pvt_files(
             continue
         if data is None:
             reason = parsed if isinstance(parsed, str) else "invalid or unreadable tracking data"
-            unreadable.append((pvt_path, reason))
+            if unreadable is not None:
+                unreadable.append((pvt_path, reason))
+            logger.warning("Skipping %s: %s", pvt_path, reason)
             continue
-
         data_path, warning = restore_target(pvt_path, data["path"], root)
         if warning is not None:
             logger.warning(warning)
-        if data_path is None:
-            continue
-        normalized = project.normalize_path(data_path)
-        result[str(normalized)] = data
+        if data_path is not None:
+            result[str(project.normalize_path(data_path))] = data
+    return result
+
+
+def refuse_unreadable_pvt_files(
+    unreadable: list[tuple[pathlib.Path, str]],
+    tracked: Mapping[str, PvtData],
+    cache_dir: pathlib.Path,
+) -> None:
+    """Refuse damaged current-format sidecars, not foreign formats or directory payloads.
+
+    Checkout calls this after ownership preflight; ordinary discovery remains permissive so
+    ownership checks and recovery can classify unreadable files before replacing anything.
+    """
     member_names = dict[str, set[str]]()
-    for pvt_path, reason in unreadable:
-        is_member = False
-        for data_path, data in result.items():
+    for path, reason in unreadable:
+        if os.fspath(path) in tracked:
+            continue
+        try:
+            with path.open() as stream:
+                raw: object = yaml.load(stream, Loader=_Loader)
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
+            current_format = True
+        else:
+            current_format = raw is None or (
+                isinstance(raw, dict)
+                and all(
+                    key in _VALID_KEYS or key in _OLD_FORMAT_KEYS
+                    for key in cast("dict[object, object]", raw)
+                )
+            )
+        if not current_format:
+            continue
+        for data_path, data in tracked.items():
             directory = pathlib.Path(data_path)
-            if "nfiles" not in data or not pvt_path.is_relative_to(directory):
+            if "nfiles" not in data or not path.is_relative_to(directory):
                 continue
             if data_path not in member_names:
-                members = tracked_members(directory, data, config.locate_cache_dir() / "files")
+                members = tracked_members(directory, data, cache_dir)
                 member_names[data_path] = {entry["relpath"] for entry in members["files"]}
-            if pvt_path.relative_to(directory).as_posix() in member_names[data_path]:
-                is_member = True
+            if path.relative_to(directory).as_posix() in member_names[data_path]:
                 break
-        if not is_member:
+        else:
+            repair_path = shlex.quote(os.fspath(get_data_path(path)))
             raise exceptions.ValidationError(
-                f"Cannot read .pvt file {pvt_path}: {reason}; restore the sidecar from version "
-                + "control or repair it before retrying"
+                f"Cannot read .pvt file {path}: {reason}; restore the sidecar from version "
+                + f"control or run `pivot track --force {repair_path}` to repair it"
             )
-    return result
 
 
 def _memo_root(root: pathlib.Path) -> str:
@@ -806,24 +835,28 @@ def _trusted_listings(memo: _Memo | None, root: pathlib.Path) -> dict[str, bytes
     return memo["dirs"] if memo is not None and memo["root"] == _memo_root(root) else {}
 
 
-def discover_pvt_files(root: pathlib.Path, *, skip: PvtSkip | None = None) -> dict[str, PvtData]:
-    """Find all .pvt files under root, return {data_path: PvtData}.
+def discover_pvt_files(
+    root: pathlib.Path,
+    *,
+    skip: PvtSkip | None = None,
+    unreadable: list[tuple[pathlib.Path, str]] | None = None,
+) -> dict[str, PvtData]:
+    """Find all readable .pvt files under root, returning {data_path: PvtData}.
 
     Finds what ``os.walk`` over the whole tree finds. Directories the memo vouches for are stat'ed
     instead of listed; every .pvt found is read. Never writes or creates the memo: only the
     repro/run pre-flight does (``discover_pvt_files_and_update_memo``). A .pvt whose ``path:``
     names no file, or a file outside the project, is left out with a warning, so no command it
-    feeds writes there (see ``restore_target``). ``skip`` receives None when the file cannot be
-    parsed, so a stage's own member of its output can still be left out. Unreadable .pvt files
-    listed as a tracked directory's payload are also left out. Every other unreadable or invalid
-    .pvt raises ``ValidationError`` naming the sidecar, rather than hiding its data.
+    feeds writes there (see ``restore_target``). ``skip`` receives None for unreadable files.
+    Those left out are warned about and optionally collected in ``unreadable``; the command's
+    ownership checks or ``refuse_unreadable_pvt_files`` decide whether they block its operation.
     """
     mount_table = mounts.read_mounts()
     fd, memo = _open_memo(mount_table, write=False)
     if fd is not None:
         os.close(fd)
     candidates, _ = _walk(root, _trusted_listings(memo, root), mount_table, record=False)
-    return _read_pvt_files(candidates, root, skip)
+    return _read_pvt_files(candidates, root, skip, unreadable)
 
 
 def discover_pvt_files_and_update_memo(
@@ -861,15 +894,15 @@ def is_import(data: PvtData) -> bool:
 def discover_import_pvt_files(
     root: pathlib.Path, *, skip: PvtSkip | None = None
 ) -> dict[str, PvtData]:
-    """Find all import .pvt files under root (``discover_pvt_files``). ``skip`` is asked about
-    imports and unreadable sidecars, so a stage's own member is left out before an unreadable
-    file is refused. Valid non-import sidecars are left out without consulting ``skip``."""
+    """Find import .pvt files, excluding non-imports before data-path keys are resolved.
+
+    ``skip`` is asked about imports and unreadable files, not valid non-import records.
+    """
 
     def other_or_skipped(path: pathlib.Path, data: PvtData | None) -> bool:
-        return skip is not None and (data is None or is_import(data)) and skip(path, data)
+        return (data is not None and not is_import(data)) or (skip is not None and skip(path, data))
 
-    discovered = discover_pvt_files(root, skip=other_or_skipped)
-    return {path: data for path, data in discovered.items() if is_import(data)}
+    return discover_pvt_files(root, skip=other_or_skipped)
 
 
 def pvt_to_hash_info(pvt_data: PvtData) -> HashInfo:

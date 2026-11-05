@@ -360,7 +360,7 @@ def test_discover_pvt_files_empty_directory(tmp_path: pathlib.Path) -> None:
 
 
 def test_discover_pvt_files_refuses_invalid(tmp_path: pathlib.Path) -> None:
-    """An unreadable sidecar must not silently remove a tracked path from discovery."""
+    """Discovery collects unreadable metadata for command-specific refusal after ownership."""
     # Valid file
     track.write_pvt_file(
         tmp_path / "valid.csv.pvt",
@@ -369,8 +369,12 @@ def test_discover_pvt_files_refuses_invalid(tmp_path: pathlib.Path) -> None:
     # Invalid file
     (tmp_path / "invalid.csv.pvt").write_text("not: valid: yaml: [")
 
+    unreadable = list[tuple[pathlib.Path, str]]()
+    tracked = track.discover_pvt_files(tmp_path, unreadable=unreadable)
+    assert len(tracked) == 1
+    assert str(tmp_path / "valid.csv") in tracked
     with pytest.raises(exceptions.ValidationError, match=r"invalid\.csv\.pvt"):
-        track.discover_pvt_files(tmp_path)
+        track.refuse_unreadable_pvt_files(unreadable, tracked, tmp_path / "cache")
 
 
 def test_discover_pvt_files_finds_a_directory_by_its_listing_record(

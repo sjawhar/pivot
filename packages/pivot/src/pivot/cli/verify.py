@@ -31,9 +31,17 @@ if TYPE_CHECKING:
 def _project_tracked_files(skip: track.PvtSkip | None) -> TrackedFiles:
     """The project's tracked files, scanned for ``.pvt`` files once, when first asked for.
     ``skip`` leaves out a stage's own ``*.pvt`` member of its output, which tracks nothing."""
-    return functools.cache(
-        functools.partial(track.discover_pvt_files, project.get_project_root(), skip=skip)
-    )
+
+    @functools.cache
+    def read() -> dict[str, track.PvtData]:
+        unreadable = list[tuple[pathlib.Path, str]]()
+        tracked = track.discover_pvt_files(
+            project.get_project_root(), skip=skip, unreadable=unreadable
+        )
+        track.refuse_unreadable_pvt_files(unreadable, tracked, config.locate_cache_dir() / "files")
+        return tracked
+
+    return read
 
 
 VerifyStatus = Literal["passed", "failed"]
