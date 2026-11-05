@@ -106,7 +106,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # Version 35 records each value by its form over a closed type table (`_form`) and walks the code
 # in it from one node table per stage (`_Walk`), keyed as a stage that names it is keyed: there
 # are no `held:` entries, and a cache hit replays the reads of the code inside a value.
-_CACHE_SCHEMA_VERSION = 41
+# Version 42 rechecks classes whose DynamicClassAttribute/enum.property members were omitted.
+_CACHE_SCHEMA_VERSION = 42
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
@@ -1377,12 +1378,15 @@ def _stage_manifest(
     """The manifest of stage function `func`: its `self:` hash and the projection of its node, in
     a walk of its own (`_loaders_walk` says why); with `recording`, also the reads that projection
     takes."""
-    walk = _Walk()
-    root = walk.node(func, _NodeKind.FUNCTION, _definition_ref(func))
-    walk.run()
-    manifest = {f"self:{getattr(func, '__name__', '<lambda>')}": hash_function_ast(func)}
-    reads = _project(root, manifest, recording=recording)
-    return manifest, reads
+    # Public callers need the same identity sharing as an engine's surrounding pass. Otherwise
+    # each ancestor's class key restarts its complete base walk, multiplying deep-MRO work.
+    with fingerprint_pass():
+        walk = _Walk()
+        root = walk.node(func, _NodeKind.FUNCTION, _definition_ref(func))
+        walk.run()
+        manifest = {f"self:{getattr(func, '__name__', '<lambda>')}": hash_function_ast(func)}
+        reads = _project(root, manifest, recording=recording)
+        return manifest, reads
 
 
 def _expand(node: _Node, walk: _Walk) -> None:
@@ -2068,7 +2072,7 @@ def _class_member_parts(name: str, raw: Any) -> list[tuple[str, Any]]:
     """Return the concrete callable values one class-dict member can execute, decided on the
     member's real type, so no `__class__` it defines is read."""
     raw_type: type[Any] = type(raw)  # pyright: ignore[reportUnknownVariableType] - any class
-    if issubclass(raw_type, property):
+    if issubclass(raw_type, property) or raw_type is enum.property:
         return [(name, raw.fget), (f"{name}.fset", raw.fset), (f"{name}.fdel", raw.fdel)]
     if issubclass(raw_type, functools.cached_property):
         return [(name, cast("functools.cached_property[Any]", raw).func)]
@@ -2121,6 +2125,10 @@ def _user_member_value(value: Any) -> Any:
     mark, or at the mark (`_stop_at_mark`), and a marked object it reaches is returned. A loop
     keeps the original member so its function node can refuse it by name.
     """
+    if issubclass(type(value), types.DynamicClassAttribute):
+        # This library descriptor holds executable code, not library-owned machinery.
+        # Keep it so ordinary capture admission refuses it by its member name.
+        return value
     decision = _mark_decision(value)
     if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
         return value
@@ -4265,14 +4273,26 @@ class _FormBuilder:
         return [type(value).__name__, repr(value)]
 
     def zoned(self, value: Any) -> Any:
-        """A `datetime` or `time`: its repr when its tzinfo is none, a `timezone` or a `ZoneInfo`,
-        whose reprs are library code; a user tzinfo's repr would be user code, so opaque."""
+        """A datetime/time with a known complete library timezone repr; user tzinfo is opaque."""
         tzinfo = value.tzinfo
         zoneinfo = sys.modules.get("zoneinfo")
+        dateutil_tz = sys.modules.get("dateutil.tz.tz")
+        pytz_tz = sys.modules.get("pytz.tzinfo")
+        pytz = sys.modules.get("pytz")
         if (
             tzinfo is None
             or type(tzinfo) is datetime.timezone
             or (zoneinfo is not None and type(tzinfo) is zoneinfo.ZoneInfo)
+            or (
+                dateutil_tz is not None
+                and (type(tzinfo) is dateutil_tz.tzutc or type(tzinfo) is dateutil_tz.tzoffset)
+            )
+            or (pytz is not None and type(tzinfo) is getattr(pytz, "_FixedOffset", None))
+            or (
+                pytz_tz is not None
+                and not is_user_code(type(tzinfo))
+                and _on_mro(_type_of(tzinfo), pytz_tz.BaseTzInfo)
+            )
         ):
             return self.repr_row(value)
         return self.opaque(value)
@@ -4469,6 +4489,8 @@ class _FormBuilder:
         method of that mapping runs."""
         shown = _proxied_mapping(value)
         if type(shown) is dict:
+            if _scalar_mapping(shown):
+                return self.repr_row(value)
             return self.mapped("mappingproxy", list(_dict_items(shown)), ordered=False)
         return self.part_rows(["mappingproxy"], ("px", shown))
 
@@ -4492,7 +4514,7 @@ class _FormBuilder:
     def deque_row(self, value: Any) -> Any:
         items = list(value)
         if _SCALAR_TYPE_IDS.issuperset(map(id, map(type, items))):
-            return ["deque", value.maxlen, items]
+            return self.repr_row(value)
         return self.deque_rows(value.maxlen, items)
 
     def deque_rows(self, maxlen: int | None, items: list[Any]) -> _Rows:
@@ -4500,11 +4522,17 @@ class _FormBuilder:
         return ["deque", maxlen, built]
 
     def chain_map(self, value: Any) -> Any:
+        maps = cast("list[Any]", value.maps)
+        if type(maps) is list and all(_scalar_mapping(item) for item in maps):
+            return self.repr_row(value)
         return self.part_rows(
-            ["ChainMap"], *((f"mp:{index}", item) for index, item in enumerate(value.maps))
+            ["ChainMap"], *((f"mp:{index}", item) for index, item in enumerate(maps))
         )
 
     def namespace(self, value: Any) -> Any:
+        attributes = _instance_dict(types.SimpleNamespace, value)
+        if _scalar_mapping(attributes):
+            return self.repr_row(value)
         return self.namespace_rows(value, _type_of(value))
 
     def namespace_rows(self, value: Any, value_type: type[Any]) -> _Rows:
@@ -4591,16 +4619,22 @@ class _FormBuilder:
         native type, unpacked flag, origin (`to`) and arguments (`ta`), read through C members.
         User-defined subclasses do not take this row: native fields omit their Python state.
         A class in the expression is a label, as anywhere."""
+        origin, args = _GENERIC_ALIAS_ORIGIN(value), _GENERIC_ALIAS_ARGS(value)
+        if type(origin) is type and not is_user_code(origin) and _library_type_arguments(args):
+            return self.repr_row(value)
         return self.part_rows(
             ["alias", _definition_ref(_type_of(value)), _GENERIC_ALIAS_UNPACKED(value)],
-            ("to", _GENERIC_ALIAS_ORIGIN(value)),
-            ("ta", _GENERIC_ALIAS_ARGS(value)),
+            ("to", origin),
+            ("ta", args),
         )
 
     def union_alias(self, value: Any) -> Any:
         """A `types.UnionType` (`str | None`), by its arguments (`ta`), read through its own C
         member."""
-        return self.part_rows(["union"], ("ta", _UNION_ARGS(value)))
+        args = _UNION_ARGS(value)
+        if _library_type_arguments(args):
+            return self.repr_row(value)
+        return self.part_rows(["union"], ("ta", args))
 
     def instance(self, value: Any) -> Any:
         """An object of a type with no exact row: the row its type's real MRO decides
@@ -4635,6 +4669,51 @@ class _FormBuilder:
         by code no form reads. A library routine or a library module's own callable export (a
         ufunc such as `numpy.log`), bound to no object whose state it may read, is named as main
         names it (`_names_a_library_callable`). Any other one is formed by its state."""
+        pandas = sys.modules.get("pandas")
+        if pandas is not None:
+            if value is pandas.NaT:
+                return self.repr_row(value)
+            if value_type is pandas.Timestamp:
+                return self.zoned(value)
+            if value_type is pandas.Timedelta:
+                return self.repr_row(value)
+        argparse = sys.modules.get("argparse")
+        if (
+            argparse is not None
+            and value_type is argparse.Namespace
+            and _scalar_mapping(_instance_dict(value_type, value))
+        ):
+            return self.repr_row(value)
+        if value_type is getattr(typing, "_GenericAlias", None) or value_type is getattr(
+            typing, "_UnionGenericAlias", None
+        ):
+            attributes = _instance_dict(value_type, value) or {}
+            args = attributes.get("__args__")
+            origin = attributes.get("__origin__")
+            library_origin = origin is vars(typing)["Union"] or (
+                type(origin) is type and not is_user_code(origin)
+            )
+            if (
+                library_origin
+                and type(args) is tuple
+                and _library_type_arguments(cast("tuple[Any, ...]", args))
+            ):
+                return self.repr_row(value)
+        fields = next(
+            (
+                namespace["_fields"]
+                for klass in _class_mro(value_type)
+                if "_fields" in (namespace := _class_namespace(klass))
+            ),
+            None,
+        )
+        if (
+            _on_mro(value_type, tuple)
+            and type(fields) is tuple
+            and _class_namespace(value_type).get("__slots__") == ()
+            and _instance_dict(value_type, value) is None
+        ):
+            return self.item_rows(_class_name(value_type), _tuple_iter(value))
         if _forwards_attributes(value_type):
             self.report(_ReportKind.PROXY, value)
             return ["proxy", _definition_ref(value_type)]
@@ -4774,6 +4853,11 @@ class _FormBuilder:
         methods, so no `dtype` or `tobytes` a subclass defines runs; a user subclass of a numpy
         scalar adds its class's key, reported for its class node, its attributes and its slots.
         `_UNREAD` for any other object."""
+        if _class_module(value_type) == "numpy" and (
+            value_type is numpy.bool_ or _on_mro(value_type, numpy.integer)
+        ):
+            # Integral/bool reprs retain the complete type and value; no dtype bits are omitted.
+            return self.repr_row(value)
         for klass in _class_mro(value_type):
             if klass is numpy.ndarray:
                 if value_type is not numpy.ndarray:
@@ -4884,8 +4968,8 @@ _UNION_ARGS = cast(
     "Callable[[Any], tuple[Any, ...]]",
     _class_namespace(cast("type", cast("object", types.UnionType)))["__args__"].__get__,
 )
-# The type of a namedtuple's field accessor (`collections._tuplegetter`), which has no public name.
-_TUPLEGETTER = _type_of(_class_namespace(typing.NamedTuple("_Fields", [("field", int)]))["field"])
+# CPython exposes this descriptor type directly: importing must not construct a probe class.
+_TUPLEGETTER = cast("type[Any]", importlib.import_module("_collections")._tuplegetter)
 _PURE_PATH_TYPES = (
     pathlib.PurePath,
     pathlib.PurePosixPath,
@@ -5101,6 +5185,18 @@ def _is_static_library_export(value: Any, value_type: type[Any]) -> bool:
         and not is_user_code(module)
         for module in candidates
     )
+
+
+def _scalar_mapping(value: Any) -> bool:
+    """An exact dict whose keys and values have complete, code-free scalar reprs."""
+    return type(value) is dict and _SCALAR_TYPE_IDS.issuperset(
+        map(id, map(type, (part for pair in _dict_items(value) for part in pair)))
+    )
+
+
+def _library_type_arguments(args: tuple[Any, ...]) -> bool:
+    """Flat library-only type arguments whose complete repr carries no user code dependency."""
+    return all(arg is Ellipsis or (type(arg) is type and not is_user_code(arg)) for arg in args)
 
 
 def _instance_route(value_type: type[Any]) -> Callable[[_FormBuilder, Any, type[Any]], Any]:

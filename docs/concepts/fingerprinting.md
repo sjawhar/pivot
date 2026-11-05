@@ -45,6 +45,13 @@ For each stage function, Pivot:
    re-runs the stage. A scalar class attribute a member reads through `self`,
    `cls`, `type(self)`, `self.__class__`, or literal `getattr` is tracked by
    value just as `Class.NAME` is.
+   Library value forms preserve complete values: pandas timestamps/timedeltas,
+   supported dateutil/pytz datetime zones, and numpy integers/booleans remain
+   accepted. Arbitrary user timezone implementations remain unsupported.
+   `types.DynamicClassAttribute` on a reached user class is refused by member
+   name rather than silently omitting its executable getter. Ordinary
+   `enum.property` getters are tracked like property getters; enum redirects
+   for members named `name` or `value` remain supported.
 4. **Follows imports in the function body** — a user module discovery already
    loaded is walked like a module-level dependency, together with its packages
    and a submodule a `from` import names (`import pkg.sub`, `from pkg import
