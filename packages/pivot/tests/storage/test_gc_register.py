@@ -1,3 +1,4 @@
+import concurrent.futures
 import fcntl
 import json
 import logging
@@ -85,6 +86,32 @@ def test_a_naming_unit_reregisters_after_the_mount_table_changes(
     _unit(cache_dir, root, state_dir)
 
     assert json.loads(entry.read_text())["mounts"] == [str(data)]
+
+
+def test_mount_generation_allows_concurrent_restore_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restores share one real poll object; simultaneous polls must serialize, not raise."""
+    watch = naming._watch_mount_table()
+    if watch is None:
+        pytest.skip("this platform has no pollable procfs mount table")
+    shared = naming._SharedMountWatch()
+    shared.watch = watch
+    monkeypatch.setattr(naming, "_SHARED_MOUNT_WATCH", shared)
+    barrier = threading.Barrier(8)
+
+    def read_generations() -> list[int | None]:
+        barrier.wait(timeout=30)
+        return [naming._mount_generation() for _ in range(400)]
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(read_generations) for _ in range(8)]
+            results = [future.result(timeout=30) for future in futures]
+    finally:
+        os.close(watch.fd)
+
+    assert all(generation is not None for readings in results for generation in readings)
 
 
 def test_a_naming_unit_reregisters_after_the_project_id_is_replaced(

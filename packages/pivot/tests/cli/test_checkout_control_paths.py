@@ -5,13 +5,17 @@ from typing import TYPE_CHECKING
 import pytest
 
 from conftest import isolated_pivot_dir
-from pivot import cli, config
+from pivot import cli, config, project, types
+from pivot.remote import storage as remote_storage
 from pivot.storage import cache, track
 
 if TYPE_CHECKING:
     import pathlib
 
     import click.testing
+    from pytest_mock import MockerFixture
+
+    from conftest import GitRepo
 
 
 def _helper_sidecar(root: pathlib.Path, target: str) -> None:
@@ -161,3 +165,148 @@ def test_checkout_keeps_data_beside_state_owned_entries(
 
         assert result.exit_code == 0, result.output
         assert (root / target).read_text() == "cached replacement\n"
+
+
+@pytest.mark.parametrize("control", [".git", ".pivot"])
+@pytest.mark.parametrize("target_form", ["all", "path", "sidecar"])
+def test_checkout_preserves_nested_control_directories(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, control: str, target_form: str
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        target = f"vendor/lib/{control}"
+        marker = root / target / "keep.txt"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("nested metadata\n")
+        _helper_sidecar(root, target)
+        targets = {"all": [], "path": [target], "sidecar": [f"{target}.pvt"]}
+
+        result = runner.invoke(cli.cli, ["checkout", "--force", *targets[target_form]])
+
+        assert marker.is_file(), result.output
+        assert marker.read_text() == "nested metadata\n", result.output
+        assert result.exit_code == 1 and "Refusing" in result.output, result.output
+
+
+_PLOT_PIPELINE = """\
+from typing import Annotated
+import pandas as pd
+from pivot import Pipeline, loaders, plot, stage
+
+@stage
+def chart() -> Annotated[pd.DataFrame, plot, loaders.CSV()]:
+    return pd.DataFrame({"x": [1]})
+
+with Pipeline("demo") as pipeline:
+    chart()
+"""
+
+
+@pytest.mark.parametrize(
+    "command", [["checkout", "--force"], ["checkout", "--only-missing"], ["pull"]]
+)
+def test_checkout_and_pull_restore_plot_outputs_with_state_at_project_root(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mocker: MockerFixture,
+    command: list[str],
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / ".pivot" / "config.yaml").write_text("core:\n  state_dir: .\n")
+        (root / "pipeline.py").write_text(_PLOT_PIPELINE)
+        built = runner.invoke(cli.cli, ["repro"])
+        assert built.exit_code == 0, built.output
+        output = root / "plots" / "demo" / "chart.csv"
+        assert output.read_text() == "x\n1\n"
+        output.unlink()
+        mocker.patch(
+            "pivot.remote.sync.create_remote_from_name",
+            autospec=True,
+            return_value=(mocker.Mock(spec=remote_storage.S3Remote), "origin"),
+        )
+        mocker.patch(
+            "pivot.remote.sync.pull",
+            autospec=True,
+            return_value=types.TransferSummary(transferred=0, skipped=0, failed=0, errors=[]),
+        )
+
+        result = runner.invoke(cli.cli, [*command, "demo/chart"])
+
+        assert result.exit_code == 0, result.output
+        assert output.read_text() == "x\n1\n", result.output
+
+
+def test_get_refuses_committed_git_sidecar(
+    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, commit = git_repo
+    (root / ".pivot").mkdir()
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    _helper_sidecar(root, ".git")
+    commit("tracked metadata sidecar")
+    before = (root / ".git" / "HEAD").read_bytes()
+
+    result = runner.invoke(cli.cli, ["get", ".git", "--force", "--rev", "HEAD"])
+
+    assert (root / ".git").is_dir(), result.output
+    assert (root / ".git" / "HEAD").read_bytes() == before, result.output
+    assert result.exit_code == 1 and "Refusing" in result.output, result.output
+
+
+def test_repro_checkout_missing_refuses_creation_inside_control_paths(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        (root / "pipeline.py").write_text(_PLOT_PIPELINE)
+        _helper_sidecar(root, "HEAD")
+        sidecar = root / "HEAD.pvt"
+        record = track.read_pvt_file(sidecar)
+        assert record is not None
+        record["path"] = "vendor/lib/.git/HEAD"
+        track.write_pvt_file(sidecar, record)
+
+        result = runner.invoke(cli.cli, ["repro", "--checkout-missing"])
+
+        assert result.exit_code == 1 and "Refusing" in result.output, result.output
+        assert not (root / "vendor" / "lib" / ".git" / "HEAD").exists(), result.output
+
+
+@pytest.mark.parametrize("control", [".git", ".pivot"])
+def test_checkout_preserves_a_directory_containing_nested_control_data(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, control: str
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        marker = root / "vendor" / "lib" / control / "keep.txt"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("nested metadata\n")
+        _helper_sidecar(root, "vendor")
+
+        result = runner.invoke(cli.cli, ["checkout", "--force", "vendor"])
+
+        assert marker.is_file(), result.output
+        assert marker.read_text() == "nested metadata\n", result.output
+        assert result.exit_code == 1 and "Refusing" in result.output, result.output
+
+
+@pytest.mark.parametrize("control", ["projects", "mounts"])
+def test_checkout_preserves_linked_cache_physical_register(
+    runner: click.testing.CliRunner, tmp_path: pathlib.Path, control: str
+) -> None:
+    with isolated_pivot_dir(runner, tmp_path) as root:
+        physical = root / "physical"
+        logical = root / "logical"
+        (physical / "files").mkdir(parents=True)
+        logical.mkdir()
+        (logical / "files").symlink_to(physical / "files", target_is_directory=True)
+        (root / ".pivot" / "config.yaml").write_text("cache:\n  dir: logical\n")
+        marker = physical / control / "keep.txt"
+        marker.parent.mkdir()
+        marker.write_text("shared cache metadata\n")
+        target = f"physical/{control}"
+        _helper_sidecar(root, target)
+
+        result = runner.invoke(cli.cli, ["checkout", "--force", target])
+
+        assert marker.is_file(), result.output
+        assert marker.read_text() == "shared cache metadata\n", result.output
+        assert result.exit_code == 1 and "Refusing" in result.output, result.output

@@ -643,6 +643,12 @@ def verify_tracked_files(
     tracked_files = track.discover_pvt_files_and_update_memo(project_root, skip=skip)
     if not tracked_files:
         return
+    if checkout_missing:
+        refusal = ownership.control_path_refusal(
+            project_root, (pathlib.Path(path) for path in tracked_files)
+        )
+        if refusal is not None:
+            raise refusal
 
     _t = metrics.start()
     missing = list[str]()

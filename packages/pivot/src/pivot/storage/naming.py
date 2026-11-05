@@ -25,6 +25,7 @@ import select
 import socket
 import stat
 import subprocess
+import threading
 import time
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 
@@ -50,6 +51,8 @@ REGISTER_DIR = "projects"
 # naming lock) → turnstile → naming; gc takes no prefix lock while it holds naming exclusive.
 NAMING_LOCK = "naming.lock"
 NAMING_TURNSTILE = "naming.turnstile"
+# Held exclusively for a whole collection, beside the register.
+GC_LOCK = "gc.lock"
 # A project's identity lives in its state database directory, which the state directory's
 # ignore file keeps out of git, so two checkouts of one repository never share it. A copy (`cp
 # -a`, a container image, a cloned disk) keeps the id; the view nonce tells it apart.
@@ -250,6 +253,20 @@ def unshared_store_problem(cache_root: pathlib.Path, layout: StoreLayout) -> str
 def register_root(cache_root: pathlib.Path) -> pathlib.Path:
     """The directory that holds ``cache_root``'s register (``store_layout``)."""
     return store_layout(cache_root).register_root
+
+
+def control_paths(cache_root: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    """Cache objects and shared coordination entries at their writer-facing layout."""
+    register = store_layout(cache_root).register_root
+    return (
+        cache_root / OBJECTS_DIR,
+        cache.tree_root(cache_root / OBJECTS_DIR),
+        cache.tree_root(register / OBJECTS_DIR),
+        register / REGISTER_DIR,
+        register / CACHE_MOUNTS_DIR,
+        register / GC_LOCK,
+        *lock_paths_in(register),
+    )
 
 
 def _mount_root(path: pathlib.Path) -> bool:
@@ -683,6 +700,7 @@ class _MountWatch(NamedTuple):
     fd: int
     poller: select.poll
     pid: int
+    poll_lock: threading.Lock
 
 
 def _watch_mount_table() -> _MountWatch | None:
@@ -713,7 +731,7 @@ def _watch_mount_table() -> _MountWatch | None:
         return None
     poller = select.poll()
     poller.register(fd, select.POLLPRI)
-    return _MountWatch(fd, poller, os.getpid())
+    return _MountWatch(fd, poller, os.getpid(), threading.Lock())
 
 
 class _SharedMountWatch:
@@ -735,7 +753,9 @@ _SHARED_MOUNT_WATCH = _SharedMountWatch()
 def _mount_generation() -> int | None:
     """How many changes of this namespace's mount table this process's watch has seen, polling
     it now; None where there is no watch (``_watch_mount_table``), when no memo engages. Opens
-    the watch at the first call in a process (a forked child opens its own)."""
+    the watch at the first call in a process. Its poll lock belongs to the watch, so a forked
+    child opens its own before taking a lock another parent thread might hold.
+    """
     shared = _SHARED_MOUNT_WATCH
     watch = shared.watch
     if watch is None or watch.pid != os.getpid():
@@ -743,16 +763,17 @@ def _mount_generation() -> int | None:
         shared.generation += 1
         if watch is None:
             return None
-    try:
-        events = watch.poller.poll(0)
-    except OSError:
-        os.close(watch.fd)
-        shared.watch = None
-        shared.generation += 1
-        return None
-    if any(event & (select.POLLPRI | select.POLLERR) for _fd, event in events):
-        shared.generation += 1
-    return shared.generation
+    with watch.poll_lock:
+        try:
+            events = watch.poller.poll(0)
+        except OSError:
+            os.close(watch.fd)
+            shared.watch = None
+            shared.generation += 1
+            return None
+        if any(event & (select.POLLPRI | select.POLLERR) for _fd, event in events):
+            shared.generation += 1
+        return shared.generation
 
 
 def mount_points(table: bytes | None) -> frozenset[str] | None:

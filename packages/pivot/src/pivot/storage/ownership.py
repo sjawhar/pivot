@@ -32,7 +32,8 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict
 import lmdb
 
 from pivot import config, exceptions, project, types
-from pivot.storage import cache, listing, lock, state, track
+from pivot import state_dir as state_dir_mod
+from pivot.storage import cache, listing, lock, naming, state, track
 
 logger = logging.getLogger(__name__)
 
@@ -767,6 +768,84 @@ def _restore_overlaps(
     return sorted(found.values(), key=overlap_path)
 
 
+def _reserved_control_path(path: pathlib.Path) -> pathlib.Path | None:
+    for index, part in enumerate(path.parts):
+        if part in {".git", ".pivot"}:
+            return pathlib.Path(*path.parts[: index + 1])
+    return None
+
+
+def control_path_refusal(
+    project_root: pathlib.Path, paths: Iterable[pathlib.Path]
+) -> exceptions.OutputOwnershipError | None:
+    """Refuse metadata targets, including nested repositories and parent-directory aliases.
+
+    A leaf symlink is replaced rather than followed. Metadata paths come from their layout
+    owners; regenerable galleries and logs are not metadata ownership claims.
+    """
+    root = normalized(project_root)
+    state_root = state_dir_mod.locate_state_dir(root)
+    cache_root = config.locate_cache_dir() if (root / ".pivot").is_dir() else state_root / "cache"
+    controls = (
+        *state_dir_mod.control_paths(state_root),
+        lock.get_stages_dir(state_root),
+        *naming.control_paths(cache_root),
+    )
+    protected = sorted(
+        {location for control in controls for location in (control, control.resolve())}
+    )
+    refused = list[str]()
+    for value in paths:
+        path = normalized(value if value.is_absolute() else root / value)
+        locations = (path, path.parent.resolve() / path.name)
+        control = next(
+            (found for entry in locations if (found := _reserved_control_path(entry)) is not None),
+            None,
+        )
+        if control is None:
+            control = next(
+                (
+                    item
+                    for item in protected
+                    if any(
+                        entry.is_relative_to(item) or item.is_relative_to(entry)
+                        for entry in locations
+                    )
+                ),
+                None,
+            )
+        if control is None and path.is_dir() and not path.is_symlink():
+            try:
+                for parent, directories, files in path.walk(on_error=_raise_walk_error):
+                    name = next(
+                        (name for name in (*directories, *files) if name in {".git", ".pivot"}),
+                        None,
+                    )
+                    if name is not None:
+                        control = parent / name
+                        break
+            except OSError as error:
+                return exceptions.OutputOwnershipError(
+                    f"Refusing to replace '{display_path(path, root)}': cannot inspect it for "
+                    + f"Git or Pivot control paths: {error}"
+                )
+        if control is not None:
+            refused.append(
+                f"  - '{display_path(path, root)}' overlaps control path '{display_path(control, root)}'"
+            )
+    if not refused:
+        return None
+    return exceptions.OutputOwnershipError(
+        "Refusing to restore Git or Pivot control paths, even with --force:\n"
+        + "\n".join(refused)
+        + "\nChoose a data path outside metadata; correct its .pvt sidecar or stage output declaration."
+    )
+
+
+def _raise_walk_error(error: OSError) -> None:
+    raise error
+
+
 def forced_restore_refusal(
     project_root: pathlib.Path, targets: Iterable[ForcedRestore]
 ) -> exceptions.OutputOwnershipError | None:
@@ -782,6 +861,12 @@ def forced_restore_refusal(
     claims and the restored hash; a tracked path as its own restore, whose members are its own
     content (the restored hash's and its current sidecar's); a destination with none.
     """
+    targets = tuple(targets)
+    refusal = control_path_refusal(
+        project_root, (target["replacement"]["path"] for target in targets)
+    )
+    if refusal is not None:
+        return refusal
     overlaps = dict[tuple[pathlib.Path, pathlib.Path], OutputOverlap]()
     for target in targets:
         path = target["replacement"]["path"]
@@ -804,6 +889,9 @@ def swap_refusal(
     file the swap removes. Each file is still named at its place under the target's path. A file
     that replaces a file or symlink is checked in place, ``entry`` being the path itself.
     """
+    refusal = control_path_refusal(project_root, (target["replacement"]["path"], entry))
+    if refusal is not None:
+        return refusal
     overlaps = _restore_overlaps(project_root, target, entry)
     return None if not overlaps else ownership_error(project_root, overlaps)
 

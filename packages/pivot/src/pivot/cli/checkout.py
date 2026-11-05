@@ -17,7 +17,7 @@ from pivot.cli import completion
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
-from pivot.storage import cache, listing, lock, naming, ownership, state, track
+from pivot.storage import cache, listing, lock, ownership, state, track
 from pivot.types import HashInfo, is_dir_hash
 
 if TYPE_CHECKING:
@@ -208,72 +208,33 @@ def _stage_claims_readers(
     return readers
 
 
-def _refuse_control_paths(paths: Iterable[str]) -> None:
-    """Refuse every checkout target that replaces or writes inside Git or Pivot metadata.
-
-    Resolve the parent, not the final entry: checkout replaces a leaf symlink rather than
-    writing through it. Configured state and cache roots may hold unrelated data beside metadata.
-    """
-    root = project.get_project_root()
-    cache_root = config.locate_cache_dir()
-    state_root = config.locate_state_dir()
-    controls = (
-        root / ".git",
-        root / ".pivot",
-        *(
-            state_root / name
-            for name in (
-                "stages",
-                "state.lmdb",
-                "locks",
-                "agent.sock",
-                "config.yaml.lock",
-                "plots",
-                "secret.key",
-                "tui.log",
-            )
-        ),
-        state_root / "cache" / "stages.cache",
-        cache_root / naming.OBJECTS_DIR,
-        cache_root / "trees",
-        cache_root / "refs",
-        cache_root / naming.REGISTER_DIR,
-        cache_root / naming.NAMING_LOCK,
-        cache_root / naming.NAMING_TURNSTILE,
-    )
-    protected = sorted({path for control in controls for path in (control, control.resolve())})
-    refused = list[str]()
-    for value in paths:
-        path = pathlib.Path(value)
-        locations = (path, path.parent.resolve() / path.name)
-        for control in protected:
-            if any(
-                entry.is_relative_to(control) or control.is_relative_to(entry)
-                for entry in locations
-            ):
-                refused.append(
-                    f"  - '{os.path.relpath(path, root)}' overlaps control path "
-                    + f"'{os.path.relpath(control, root)}'"
-                )
-                break
-    if refused:
-        raise click.ClickException(
-            "Refusing to restore Git or Pivot control paths, even with --force:\n"
-            + "\n".join(refused)
-            + "\nMove the tracked data and its .pvt sidecar outside these paths."
-        )
-
-
 def _restore_targets(
     files: Mapping[str, Expected],
     stage_output_paths: Mapping[str, str | None],
     claims: Mapping[str, Callable[[], ownership.StageClaims]],
+    behavior: CheckoutBehavior,
 ) -> dict[str, ownership.ForcedRestore]:
     """What restoring each file replaces, for ``ownership.forced_restore_refusal``: a stage
     output (path -> the stage, when the target named it) as that stage's output, with its claims;
-    any other path as a tracked path's own restore. A restored directory's listing is read only
-    when a check needs it (``read_restored_members``)."""
-    _refuse_control_paths(files)
+    any other path as a tracked path's own restore. In-place directory restores validate their
+    listing before the metadata walk, so an escaping member keeps its path-traversal error.
+    """
+    if behavior is CheckoutBehavior.SKIP_EXISTING:
+        for value, expected in files.items():
+            path = pathlib.Path(value)
+            if expected.read_members is None or path.is_symlink() or not path.is_dir():
+                continue
+            try:
+                members = expected.read_members()
+            except (exceptions.ListingMissingError, exceptions.CorruptListingError):
+                # The restore reports an unavailable listing; metadata paths still refuse.
+                continue
+            cache.validate_restore_members(path, members)
+    refusal = ownership.control_path_refusal(
+        project.get_project_root(), (pathlib.Path(path) for path in files)
+    )
+    if refusal is not None:
+        raise click.ClickException(str(refusal))
     targets = dict[str, ownership.ForcedRestore]()
     for path, expected in files.items():
         target = ownership.ForcedRestore(
@@ -673,7 +634,7 @@ async def _checkout_main_async(
         files, stage_output_paths = _validate_and_build_files(
             unique_targets, tracked_files, stage_outputs, cache_dir
         )
-        restore_targets = _restore_targets(files, stage_output_paths, claims)
+        restore_targets = _restore_targets(files, stage_output_paths, claims, behavior)
         if behavior is CheckoutBehavior.FORCE:
             _refuse(restore_targets.values())
         return await _checkout_files_async(
@@ -692,8 +653,8 @@ async def _checkout_main_async(
     tracked_expected = {
         path: _tracked_expected(path, pvt, cache_dir) for path, pvt in tracked_files.items()
     }
-    tracked_targets = _restore_targets(tracked_expected, {}, claims)
-    output_targets = _restore_targets(stage_outputs, dict.fromkeys(stage_outputs), claims)
+    tracked_targets = _restore_targets(tracked_expected, {}, claims, behavior)
+    output_targets = _restore_targets(stage_outputs, dict.fromkeys(stage_outputs), claims, behavior)
     if behavior is CheckoutBehavior.FORCE:
         _refuse([*tracked_targets.values(), *output_targets.values()])
     combined_total = len(tracked_expected) + len(stage_outputs)
