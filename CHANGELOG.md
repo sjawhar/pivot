@@ -2,6 +2,41 @@
 
 <!-- version list -->
 
+## v0.10.3 (2026-11-06)
+
+### Bug Fixes
+
+- **checkout**: Refuse to overwrite Git and Pivot metadata
+  ([#554](https://github.com/sjawhar/pivot/pull/554),
+  [`967b74c`](https://github.com/sjawhar/pivot/commit/967b74c9b55c2055e1f72149392b0e310ad8af7f))
+
+- **storage**: Preserve control-named stage output members
+  ([#554](https://github.com/sjawhar/pivot/pull/554),
+  [`967b74c`](https://github.com/sjawhar/pivot/commit/967b74c9b55c2055e1f72149392b0e310ad8af7f))
+
+- **storage**: Retain non-destructive tracked-file restoration
+  ([#554](https://github.com/sjawhar/pivot/pull/554),
+  [`967b74c`](https://github.com/sjawhar/pivot/commit/967b74c9b55c2055e1f72149392b0e310ad8af7f))
+
+- **storage**: Share metadata refusal across restore paths
+  ([#554](https://github.com/sjawhar/pivot/pull/554),
+  [`967b74c`](https://github.com/sjawhar/pivot/commit/967b74c9b55c2055e1f72149392b0e310ad8af7f))
+
+### Performance Improvements
+
+- **config**: Avoid ancestor allocation in cache overlap guard
+  ([#554](https://github.com/sjawhar/pivot/pull/554),
+  [`967b74c`](https://github.com/sjawhar/pivot/commit/967b74c9b55c2055e1f72149392b0e310ad8af7f))
+
+- **storage**: Avoid ancestor allocations in metadata overlap
+  ([#554](https://github.com/sjawhar/pivot/pull/554),
+  [`967b74c`](https://github.com/sjawhar/pivot/commit/967b74c9b55c2055e1f72149392b0e310ad8af7f))
+
+- **storage**: Reuse metadata preflight across stage swaps
+  ([#554](https://github.com/sjawhar/pivot/pull/554),
+  [`967b74c`](https://github.com/sjawhar/pivot/commit/967b74c9b55c2055e1f72149392b0e310ad8af7f))
+
+
 ## v0.10.2 (2026-11-05)
 
 ### Bug Fixes
