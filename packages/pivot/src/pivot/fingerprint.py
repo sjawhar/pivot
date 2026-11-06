@@ -107,7 +107,8 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # in it from one node table per stage (`_Walk`), keyed as a stage that names it is keyed: there
 # are no `held:` entries, and a cache hit replays the reads of the code inside a value.
 # Version 42 rechecks classes whose DynamicClassAttribute/enum.property members were omitted.
-_CACHE_SCHEMA_VERSION = 42
+# Version 43 records a held classmethod's function and its original receiver class.
+_CACHE_SCHEMA_VERSION = 43
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
@@ -2132,6 +2133,11 @@ def _user_member_value(value: Any) -> Any:
     decision = _mark_decision(value)
     if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
         return value
+    if type(value) is types.MethodType and issubclass(type(value.__self__), type):
+        function: Any = value.__func__
+        while type(function) is types.MethodType and issubclass(type(function.__self__), type):
+            function = function.__func__
+        return value if _user_member_value(function) is not _UNREAD else _UNREAD
     if issubclass(type(value), functools.partial):
         return value
     if type(value) is types.FunctionType:
@@ -3058,7 +3064,12 @@ def _process_instance_class_attributes(cls: type) -> None:
     namespace = _class_namespace(cls)
     seen = set[str]()
     for label, member in _user_methods(cls):
-        function = member.__func__ if type(member) is types.MethodType else member
+        if type(member) is types.MethodType:
+            if member.__self__ is not cls:
+                continue
+            function = member.__func__
+        else:
+            function = member
         # A member recorded by name is a boundary; wrappers above it keep their own reads.
         if _recorded_by_name(function):
             continue
@@ -3417,12 +3428,15 @@ def _process_closure_values(
     """
     stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
     owner = _current_node().key
-    for name, value in sorted(values.items()):
+    for name in sorted(values):
         if prefix == "g" and name.startswith("__"):
             continue
         binding_ref = _binding_ref(func, name) if prefix == "g" else f"{owner}.{name}"
         step = f"{prefix}:{name}"
+        value = _read_step(func, step)
         _record_read(func, step)
+        if value is _UNREAD:
+            continue
         with _walking(step):
             _process_captured_value(name, binding_ref, value, func, stage_name, chain=name)
 
@@ -3450,6 +3464,17 @@ def _process_captured_value(
         case _ValueKind.PARTIAL:
             _process_partial_dependency(binding_ref, value)
         case _ValueKind.USER:
+            if type(value) is types.MethodType:
+                _record_read(value, "ms")
+                with _walking("ms"):
+                    _process_captured_value(
+                        "__self__",
+                        f"{binding_ref}.__self__",
+                        value.__self__,
+                        func,
+                        stage_name,
+                        chain=None,
+                    )
             _add_callable(value, binding_ref)
             if isinstance(value, type) and chain is not None:
                 _process_class_reads(chain, value, func, stage_name)

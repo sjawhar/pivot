@@ -36,8 +36,11 @@ For each stage function, Pivot:
 3. **Recurses transitively** — every user-code callable found in step 2
    gets the same treatment, and *its* dependencies are merged into the
    manifest. A user class the stage reaches has its callable members walked:
-   methods, descriptors such as properties, partial members, and nested user
-   classes. A module value or helper read only inside a method
+   methods, descriptors such as properties, partial members, nested user classes,
+   and methods bound to another user class (`Holder.fn = Other.cm`). A held
+   classmethod tracks its function and its original receiver class: `cls.VALUE`
+   reads `Other.VALUE`, not `Holder.VALUE`, even through `Holder().fn()`.
+   A module value or helper read only inside a method
    (`ScopeWalk().step(...)` reading a module-level regex) is tracked. So is the
    class of an instance a `functools.partial`, a loader's config, a dataclass
    field default or a `StageParams` default holds (`partial(run, Scorer())`):
@@ -577,6 +580,11 @@ the coordinator process). Results are cached at two levels:
    source file's content hasn't changed, the cached hash is reused without
    parsing; an edit that keeps the file's mtime, size and inode is still
    seen
+
+When a manifest is rebuilt, tracked globals and closure cells are read from
+their live bindings again, not from the values an earlier walk captured.
+A deleted binding is recorded as absent and contributes no value entry,
+rather than being refused as an unsupported captured object.
 
 For a project with 125 stages, fingerprinting typically completes in under
 100ms on subsequent runs.
