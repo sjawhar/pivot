@@ -2134,7 +2134,10 @@ def _user_member_value(value: Any) -> Any:
     if decision is _MarkDecision.BY_NAME or decision is _MarkDecision.REFUSED:
         return value
     if type(value) is types.MethodType and issubclass(type(value.__self__), type):
-        return value if _user_member_value(value.__func__) is not _UNREAD else _UNREAD
+        function: Any = value.__func__
+        while type(function) is types.MethodType and issubclass(type(function.__self__), type):
+            function = function.__func__
+        return value if _user_member_value(function) is not _UNREAD else _UNREAD
     if issubclass(type(value), functools.partial):
         return value
     if type(value) is types.FunctionType:
@@ -3062,9 +3065,11 @@ def _process_instance_class_attributes(cls: type) -> None:
     seen = set[str]()
     for label, member in _user_methods(cls):
         if type(member) is types.MethodType:
-            # Its receiver is already bound, and its class is walked by capture admission.
-            continue
-        function = member
+            if member.__self__ is not cls:
+                continue
+            function = member.__func__
+        else:
+            function = member
         # A member recorded by name is a boundary; wrappers above it keep their own reads.
         if _recorded_by_name(function):
             continue
@@ -3423,11 +3428,12 @@ def _process_closure_values(
     """
     stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
     owner = _current_node().key
-    for name, value in sorted(values.items()):
+    for name in sorted(values):
         if prefix == "g" and name.startswith("__"):
             continue
         binding_ref = _binding_ref(func, name) if prefix == "g" else f"{owner}.{name}"
         step = f"{prefix}:{name}"
+        value = _read_step(func, step)
         _record_read(func, step)
         with _walking(step):
             _process_captured_value(name, binding_ref, value, func, stage_name, chain=name)

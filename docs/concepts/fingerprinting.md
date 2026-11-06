@@ -581,6 +581,9 @@ the coordinator process). Results are cached at two levels:
    parsing; an edit that keeps the file's mtime, size and inode is still
    seen
 
+When a manifest is rebuilt, tracked globals and closure cells are read from
+their live bindings again, not from the values an earlier walk captured.
+
 For a project with 125 stages, fingerprinting typically completes in under
 100ms on subsequent runs.
 
