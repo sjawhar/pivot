@@ -92,3 +92,36 @@ def test_a_cached_method_detects_a_rebound_receiver_without_a_source_edit(
         assert module.use() == 2000
         assert fingerprint._try_manifest_cache_hit("p/use", module.use) is None
         assert fingerprint.get_stage_fingerprint_cached("p/use", module.use) != first
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "VALUE = 1\n\n"
+            + "def use():\n    return VALUE\n\n"
+            + "def forget():\n    global VALUE\n    del VALUE\n",
+            id="global",
+        ),
+        pytest.param(
+            "def make():\n    value = 1\n\n"
+            + "    def use():\n        return value\n\n"
+            + "    def forget():\n        nonlocal value\n        del value\n\n"
+            + "    return use, forget\n\n"
+            + "use, forget = make()\n",
+            id="nonlocal",
+        ),
+    ],
+)
+def test_a_deleted_binding_changes_the_fingerprint_without_a_capture_refusal(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    module = _load_module(tmp_path, monkeypatch, source)
+    first = fingerprint.get_stage_fingerprint(module.use)
+    assert module.use() == 1
+
+    module.forget()
+
+    with pytest.raises(NameError):
+        module.use()
+    assert fingerprint.get_stage_fingerprint(module.use) != first

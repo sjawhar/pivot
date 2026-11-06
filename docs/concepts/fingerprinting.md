@@ -583,6 +583,8 @@ the coordinator process). Results are cached at two levels:
 
 When a manifest is rebuilt, tracked globals and closure cells are read from
 their live bindings again, not from the values an earlier walk captured.
+A deleted binding is recorded as absent and contributes no value entry,
+rather than being refused as an unsupported captured object.
 
 For a project with 125 stages, fingerprinting typically completes in under
 100ms on subsequent runs.

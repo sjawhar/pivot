@@ -3435,6 +3435,8 @@ def _process_closure_values(
         step = f"{prefix}:{name}"
         value = _read_step(func, step)
         _record_read(func, step)
+        if value is _UNREAD:
+            continue
         with _walking(step):
             _process_captured_value(name, binding_ref, value, func, stage_name, chain=name)
 
