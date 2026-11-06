@@ -2,6 +2,23 @@
 
 <!-- version list -->
 
+## v0.10.4 (2026-11-06)
+
+### Bug Fixes
+
+- **fingerprint**: Preserve own-class bound receiver reads
+  ([#562](https://github.com/sjawhar/pivot/pull/562),
+  [`0b2c343`](https://github.com/sjawhar/pivot/commit/0b2c3434dc3c230d902eb402192c6096f8292ede))
+
+- **fingerprint**: Retain absent reads without capturing the sentinel
+  ([#562](https://github.com/sjawhar/pivot/pull/562),
+  [`0b2c343`](https://github.com/sjawhar/pivot/commit/0b2c3434dc3c230d902eb402192c6096f8292ede))
+
+- **fingerprint**: Track held classmethod receivers
+  ([#562](https://github.com/sjawhar/pivot/pull/562),
+  [`0b2c343`](https://github.com/sjawhar/pivot/commit/0b2c3434dc3c230d902eb402192c6096f8292ede))
+
+
 ## v0.10.3 (2026-11-06)
 
 ### Bug Fixes
