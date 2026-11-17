@@ -2466,9 +2466,12 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
 
     A module's origin is the module this process holds, which is the code the walk saw
     (`loaded_source.check_worker_imports` refuses a worker that would import another), else where
-    a worker would import it from, predicted without importing it. No origin is found when the
-    manifest has no `byname:` entry, or when no distribution on the worker's path can give a key
-    or a refusal (`installed_distributions.needs_origins`)."""
+    a worker would import it from, predicted without importing it. Beside it goes the module's
+    file as the import located it, not resolved (the module's, else the predicted spec's): in a
+    venv uv links into its cache the origin lies in the cache, and only that file names the
+    package's directory in `site-packages`, where another distribution may put a file. No origin
+    is found when the manifest has no `byname:` entry, or when no distribution on the worker's
+    path can give a key or a refusal (`installed_distributions.needs_origins`)."""
     names = _by_name_names(manifest)
     if not names:
         return
@@ -2476,15 +2479,19 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     pivot_dirs = _pivot_dir_names()
     if not installed_distributions.needs_origins(path, pivot_dirs):
         return
-    origins = dict[str, import_origin.Origin | None]()
+    modules = dict[str, installed_distributions.ReachedModule]()
     for name in names:
         module = sys.modules.get(name)
-        origins[name] = (
-            _module_origin(module)
+        modules[name] = (
+            installed_distributions.ReachedModule(
+                _module_origin(module), import_origin.file_of_module(module)
+            )
             if isinstance(module, types.ModuleType)
-            else loaded_source.worker_origin(name)
+            else installed_distributions.ReachedModule(
+                loaded_source.worker_origin(name), loaded_source.worker_file(name)
+            )
         )
-    found = installed_distributions.distribution_keys(origins, path, pivot_dirs)
+    found = installed_distributions.distribution_keys(modules, path, pivot_dirs)
     prefix = _stage_prefix()
     for message in found.refusals:
         _report_refusal(prefix + message, downgradable=True)
@@ -6955,7 +6962,8 @@ def _by_name_hash(func: Any) -> str:
 
 def is_user_code(obj: Any) -> bool:
     """Check if object is user code (not stdlib/site-packages/builtins, nor pivot's own
-    packages: ``is_library_path``)."""
+    packages: ``is_library_file`` for a module's file, ``is_library_path`` for a namespace
+    package's directory)."""
     _t = metrics.start()
     try:
         if obj is None:
@@ -7056,10 +7064,12 @@ def is_library_file(filename: str) -> bool:
     (``is_library_path``), or an installer linked it into a library directory for a distribution
     that is not editable.
 
-    The second holds when all of these do. Its absolute path, normalised but not resolved
-    (``os.path.abspath``), is a library path. The file itself is a symbolic link once its
-    directory is resolved: uv's ``UV_LINK_MODE=symlink`` links each installed file into uv's
-    cache, where its resolved path is no library path, from a real directory of
+    The second holds when all of these do. Its path with its directory resolved and its last
+    name kept (``real``) is a library path: the file as the import found it, whatever links its
+    directory was reached through, so a library package linked into the project root, and a
+    ``sys.path`` entry that is a link to ``site-packages``, are judged in ``site-packages``.
+    That file itself is a symbolic link: uv's ``UV_LINK_MODE=symlink`` links each installed file
+    into uv's cache, where its resolved path is no library path, from a real directory of
     ``site-packages``. And the RECORDs of its site directory list it, each of a distribution
     installed in a known form that is not editable (``installed_distributions.listed_as_library``,
     on the worker's ``sys.path``). Otherwise the resolved path decides, so the rule fails closed
@@ -7072,9 +7082,9 @@ def is_library_file(filename: str) -> bool:
     if is_library_path(pathlib.Path(filename).resolve()):
         return True
     absolute = os.path.abspath(filename)
-    if not is_library_path(pathlib.Path(absolute)):
-        return False
     real = os.path.join(os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute))
+    if not is_library_path(pathlib.Path(real)):
+        return False
     return os.path.islink(real) and installed_distributions.listed_as_library(
         real, loaded_source.worker_path(), _pivot_dir_names()
     )

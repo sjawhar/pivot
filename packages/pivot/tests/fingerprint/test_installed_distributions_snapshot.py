@@ -2,16 +2,19 @@
 
 Each test makes its own venv with uv over this test environment (`tests.installed_dists`),
 installs setuptools fixtures into it (from a path, from git, a local wheel, as from a package
-index, editable) and gives each reached module's origin as plain data: which files each key
-hashes, read from disk once per process; what the scan of the path reads; the refusals of an
-install Pivot cannot read, and which reached package directories the check of an install with no
-RECORD walks, and how far, once per process. Then `fingerprint.add_distribution_keys`, which
-looks up no module's origin when no install on the path can give a key, and one fingerprint,
-through the registry, of a stage that imports its installed library only in its body. Last,
-`installed_distributions.listed_as_library` over files uv links into its cache (`--link-mode
-symlink`) and the editable layout flit's `install --symlink` makes, and
-`fingerprint.is_library_file`, which asks it only about a file linked under a library path. No
-fixture is imported into this process.
+index, editable) and gives each reached module's origin and file as its import located it as
+plain data: which files each key hashes, read from disk once per process; what the scan of the
+path reads; the refusals of an install Pivot cannot read, and which reached package directories
+the check of an install with no RECORD walks, and how far, once per process. Then
+`fingerprint.add_distribution_keys`, which looks up no module's origin when no install on the
+path can give a key, and one fingerprint, through the registry, of a stage that imports its
+installed library only in its body. Last, over files uv links into its cache (`--link-mode
+symlink`) and the editable layout flit's `install --symlink` makes:
+`installed_distributions.listed_as_library`, which reads the RECORDs of one directory and
+builds no index of the candidates; `fingerprint.is_library_file`, which asks it only about a
+file linked under a library path; and the keys of a namespace package and of a package that
+holds another install's file, which are those of a venv whose files are copies. No fixture is
+imported into this process.
 
 The CLI tests of the same decisions are in `test_installed_distributions.py` and
 `test_installed_distributions_link_mode.py`, and the pure functions on plain data in
@@ -55,9 +58,17 @@ with Pipeline("p") as pipeline:
 _LONG_MODULE = "m" * 197
 
 
-def _helper_origin(path: pathlib.Path) -> tuple[str, str]:
-    """The origin `import_origin.of_module` gives a module loaded from the file at `path`."""
-    return ("file", os.path.realpath(path))
+def _helper_module(path: pathlib.Path) -> installed_distributions.ReachedModule:
+    """What `fingerprint.add_distribution_keys` gives of a module loaded from the file at `path`:
+    the origin `import_origin.of_module` gives it, and `path`, its file as the import located
+    it."""
+    return installed_distributions.ReachedModule(("file", os.path.realpath(path)), str(path))
+
+
+def _helper_namespace(directory: pathlib.Path) -> installed_distributions.ReachedModule:
+    """What `fingerprint.add_distribution_keys` gives of a namespace package whose one directory
+    is `directory`: the origin `import_origin.of_module` gives it, and no file."""
+    return installed_distributions.ReachedModule(("namespace", os.path.realpath(directory)), None)
 
 
 def _helper_real(path: pathlib.Path) -> str:
@@ -183,12 +194,12 @@ def test_distribution_keys_hash_each_reached_git_path_and_local_archive_install_
     (wheel,) = wheels.glob("*.whl")
     installed_dists.install(venv, str(wheel))
     site = venv.site_packages
-    origins = {
-        module: _helper_origin(site / module / "__init__.py")
+    modules = {
+        module: _helper_module(site / module / "__init__.py")
         for module in ("fixlib", "fixgit", "fixwheel")
     }
 
-    found = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+    found = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
 
     entry_points = "fix_lib-0.1.dist-info/entry_points.txt"
     assert found == installed_distributions.DistributionKeys(
@@ -240,18 +251,18 @@ def test_a_pyc_file_outside_pycache_is_hashed_and_the_bytecode_pip_compiles_is_n
     assert listed == sorted(["fixlib/__init__.py", compiled, "fixlib/core.pyc"]), (
         f"pip's RECORD must list fixlib's two modules and the bytecode pip compiled: {listed}"
     )
-    origins = {"fixlib": _helper_origin(site / "fixlib" / "__init__.py")}
+    modules = {"fixlib": _helper_module(site / "fixlib" / "__init__.py")}
     hashed = {name: name for name in ("fixlib/__init__.py", "fixlib/core.pyc")}
     values = [_helper_value(site, hashed)]
 
-    intact = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+    intact = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
     _helper_change_last_byte(site / compiled)
     installed_distributions.reset()
-    compiled_changed = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+    compiled_changed = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
     _helper_change_last_byte(site / "fixlib" / "core.pyc")
     values.append(_helper_value(site, hashed))
     installed_distributions.reset()
-    core_changed = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+    core_changed = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
 
     assert values[0] != values[1], f"one byte of core.pyc must change its value: {values}"
     keyed = [
@@ -275,29 +286,29 @@ def test_distribution_keys_read_the_files_once_per_path_and_pivot_dirs_until_res
     installed_dists.install_directory(venv, source)
     site = venv.site_packages
     module = site / "fixlib" / "__init__.py"
-    origins = {"fixlib": _helper_origin(module)}
+    modules = {"fixlib": _helper_module(module)}
     path = [str(site)]
     longer_path = [*path, str(tmp_path / "missing")]
     other_dirs = [*_PIVOT_DIRS, str(tmp_path / "other")]
     files = {"fixlib/__init__.py": "fixlib/__init__.py"}
     values = list[str]()
 
-    first = installed_distributions.distribution_keys(origins, path, _PIVOT_DIRS)
+    first = installed_distributions.distribution_keys(modules, path, _PIVOT_DIRS)
     values.append(_helper_value(site, files))
     installed_dists.replace_once(module, '"value-1"', '"value-2"')
-    again = installed_distributions.distribution_keys(origins, path, _PIVOT_DIRS)
+    again = installed_distributions.distribution_keys(modules, path, _PIVOT_DIRS)
     installed_distributions.reset()
-    after_reset = installed_distributions.distribution_keys(origins, path, _PIVOT_DIRS)
+    after_reset = installed_distributions.distribution_keys(modules, path, _PIVOT_DIRS)
     values.append(_helper_value(site, files))
     installed_dists.replace_once(module, '"value-2"', '"value-3"')
-    other_path = installed_distributions.distribution_keys(origins, longer_path, _PIVOT_DIRS)
+    other_path = installed_distributions.distribution_keys(modules, longer_path, _PIVOT_DIRS)
     values.append(_helper_value(site, files))
     installed_dists.replace_once(module, '"value-3"', '"value-4"')
-    other_pivot = installed_distributions.distribution_keys(origins, longer_path, other_dirs)
+    other_pivot = installed_distributions.distribution_keys(modules, longer_path, other_dirs)
     values.append(_helper_value(site, files))
     no_module = installed_distributions.distribution_keys({}, path, _PIVOT_DIRS)
     installed_dists.replace_once(module, '"value-4"', '"value-5"')
-    kept = installed_distributions.distribution_keys(origins, longer_path, other_dirs)
+    kept = installed_distributions.distribution_keys(modules, longer_path, other_dirs)
 
     assert len(set(values)) == 4, f"each edit must change the file's value: {values}"
     keyed = [
@@ -333,12 +344,12 @@ def test_an_index_install_whose_metadata_cannot_be_read_refuses_nothing_with_no_
     (site / "idxlib-0.1.dist-info" / "METADATA").write_bytes(
         b"Metadata-Version: 2.4\nName: idx\xe9\n"
     )
-    origins = {
-        "fixedit": _helper_origin(fixedit / "fixedit" / "__init__.py"),
-        "idxlib": _helper_origin(site / "idxlib" / "__init__.py"),
+    modules = {
+        "fixedit": _helper_module(fixedit / "fixedit" / "__init__.py"),
+        "idxlib": _helper_module(site / "idxlib" / "__init__.py"),
     }
 
-    found = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+    found = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
 
     assert found == installed_distributions.DistributionKeys({}, []), found
 
@@ -374,7 +385,7 @@ def test_the_scan_skips_what_is_no_metadata_directory_and_reads_an_egg_info_dire
     path = [str(tmp_path / "missing"), f"{tmp_path}/nul\0entry", str(site), str(site), str(egg)]
 
     found = installed_distributions.distribution_keys(
-        {"fixlib": _helper_origin(site / "fixlib" / "__init__.py")}, path, _PIVOT_DIRS
+        {"fixlib": _helper_module(site / "fixlib" / "__init__.py")}, path, _PIVOT_DIRS
     )
 
     assert found == installed_distributions.DistributionKeys(
@@ -433,18 +444,18 @@ def test_a_reached_file_no_record_lists_beside_a_recordless_install_is_refused_p
     installed_dists.damage(site / "fix_lib-0.1.dist-info" / "RECORD", None)
     core = site / "company" / "__init__.py"
     py_compile.compile(str(core), cfile=str(site / "company" / "legacy.pyc"), doraise=True)
-    origins = {
-        "company": _helper_origin(core),
-        "fixlib": _helper_origin(site / "fixlib" / "__init__.py"),
-        "fixlib.helpers": _helper_origin(site / "fixlib" / "helpers.py"),
-        "fixother": _helper_origin(second / "fixother" / "__init__.py"),
-        "missing": None,
-        "nsco": ("namespace", os.path.realpath(site / "nsco")),
-        "sys": ("built-in",),
+    modules = {
+        "company": _helper_module(core),
+        "fixlib": _helper_module(site / "fixlib" / "__init__.py"),
+        "fixlib.helpers": _helper_module(site / "fixlib" / "helpers.py"),
+        "fixother": _helper_module(second / "fixother" / "__init__.py"),
+        "missing": installed_distributions.ReachedModule(None, None),
+        "nsco": _helper_namespace(site / "nsco"),
+        "sys": installed_distributions.ReachedModule(("built-in",), None),
     }
 
     found = installed_distributions.distribution_keys(
-        origins, [str(site), str(second)], _PIVOT_DIRS
+        modules, [str(site), str(second)], _PIVOT_DIRS
     )
 
     resolved = site.resolve()
@@ -501,12 +512,12 @@ def test_a_reached_package_is_not_walked_for_a_recordless_install_in_another_pat
     installed_dists.damage(other / "fixother-0.1.dist-info" / "RECORD", None)
     site = venv.site_packages
     files_under = mocker.spy(installed_distributions, "_files_under")
-    origins = {
-        "fixlib": _helper_origin(site / "fixlib" / "__init__.py"),
-        "nsco": ("namespace", os.path.realpath(site / "nsco")),
+    modules = {
+        "fixlib": _helper_module(site / "fixlib" / "__init__.py"),
+        "nsco": _helper_namespace(site / "nsco"),
     }
 
-    found = installed_distributions.distribution_keys(origins, [str(site), str(other)], _PIVOT_DIRS)
+    found = installed_distributions.distribution_keys(modules, [str(site), str(other)], _PIVOT_DIRS)
 
     hashed = {name: name for name in ("fixlib/__init__.py", "nsco/part/__init__.py")}
     assert found == installed_distributions.DistributionKeys(
@@ -562,15 +573,15 @@ def test_a_reached_package_is_walked_once_and_only_until_each_recordless_entry_h
     files_under = mocker.spy(installed_distributions, "_files_under")
     real_path = mocker.spy(installed_distributions, "_real_path")
     nsco = os.path.realpath(site / "nsco")
-    origins = {
-        "company": _helper_origin(site / "company" / "__init__.py"),
-        "nsco": ("namespace", nsco),
+    modules = {
+        "company": _helper_module(site / "company" / "__init__.py"),
+        "nsco": _helper_namespace(site / "nsco"),
     }
     path = [str(site), str(vendored)]
 
-    first = installed_distributions.distribution_keys(origins, path, _PIVOT_DIRS)
+    first = installed_distributions.distribution_keys(modules, path, _PIVOT_DIRS)
     walked_first = [call.args[0] for call in files_under.call_args_list]
-    again = installed_distributions.distribution_keys(origins, path, _PIVOT_DIRS)
+    again = installed_distributions.distribution_keys(modules, path, _PIVOT_DIRS)
 
     inner = vendored.resolve()
     unlisted_lock = (
@@ -613,11 +624,11 @@ def test_reached_and_required_installs_pivot_cannot_read_are_refused(
     installed_dists.damage(site / "fixdep-0.1.dist-info" / "RECORD", None)
     url = site / "fixurl-0.1.dist-info" / "direct_url.json"
     _helper_replace_with_directory(url)
-    origins = {
-        module: _helper_origin(site / module / "__init__.py") for module in ("fixlib", "fixurl")
+    modules = {
+        module: _helper_module(site / module / "__init__.py") for module in ("fixlib", "fixurl")
     }
 
-    found = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+    found = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
 
     resolved = site.resolve()
     unclassified = (
@@ -650,13 +661,13 @@ def test_pivots_own_distribution_gets_no_key_and_its_requirements_are_not_follow
     )
     installed_dists.install_directory(venv, own)
     site = venv.site_packages
-    origins = {"pivot": _helper_origin(site / "pivot" / "__init__.py")}
+    modules = {"pivot": _helper_module(site / "pivot" / "__init__.py")}
 
     as_pivot = installed_distributions.distribution_keys(
-        origins, [str(site)], [os.path.realpath(site / "pivot")]
+        modules, [str(site)], [os.path.realpath(site / "pivot")]
     )
     as_library = installed_distributions.distribution_keys(
-        origins, [str(site)], [str(tmp_path / "other")]
+        modules, [str(site)], [str(tmp_path / "other")]
     )
 
     assert as_pivot == installed_distributions.DistributionKeys({}, []), as_pivot
@@ -700,17 +711,17 @@ def test_a_listed_file_that_cannot_be_read_hashes_as_null_and_refuses_nothing(
     )
     installed_dists.install_directory(venv, source)
     site = venv.site_packages
-    origins = {"fixlib": _helper_origin(site / "fixlib" / "__init__.py")}
+    modules = {"fixlib": _helper_module(site / "fixlib" / "__init__.py")}
     files: dict[str, str | None] = {
         "fixlib/__init__.py": "fixlib/__init__.py",
         "fixlib/extra.py": "fixlib/extra.py",
     }
-    intact = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+    intact = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
     intact_value = _helper_value(site, files)
     damage(site / "fixlib" / "extra.py")
     installed_distributions.reset()
 
-    damaged = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+    damaged = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
 
     null_value = _helper_value(site, {**files, "fixlib/extra.py": None})
     assert intact_value != null_value, "a file hashed as null must change the value"
@@ -736,9 +747,9 @@ def test_a_record_path_holding_a_nul_character_hashes_as_null_and_refuses_nothin
     record = site / "fix_lib-0.1.dist-info" / "RECORD"
     record.write_bytes(record.read_bytes() + b"fixlib/\x00.py,,\n")
     installed_dists.damage(site / "fixdep-0.1.dist-info" / "RECORD", None)
-    origins = {"fixlib": _helper_origin(site / "fixlib" / "__init__.py")}
+    modules = {"fixlib": _helper_module(site / "fixlib" / "__init__.py")}
 
-    found = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+    found = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
 
     files = {"fixlib/\x00.py": None, "fixlib/__init__.py": "fixlib/__init__.py"}
     assert found == installed_distributions.DistributionKeys(
@@ -784,9 +795,9 @@ def test_a_listed_file_of_path_max_bytes_or_more_is_owned_and_not_refused(
     site = moved / inside
     lengths = [len(os.fsencode(f"{site}/{path}")) for path in (listed, "fixlib")]
     assert lengths[0] == path_max > lengths[1], f"only {listed} may be PATH_MAX long: {lengths}"
-    origins = {module: _helper_origin(site / file)}
+    modules = {module: _helper_module(site / file)}
 
-    found = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+    found = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
 
     files = {"fixlib/__init__.py": "fixlib/__init__.py", listed: None}
     assert found == installed_distributions.DistributionKeys(
@@ -847,12 +858,12 @@ def test_a_venv_inside_the_project_root_beside_the_projects_egg_info_gets_its_ke
     requires = importlib.metadata.Distribution.at(root / "myproj.egg-info").requires
     assert requires == ["fixdep"], f"the project's egg-info must require fixdep: {requires}"
     site = venv.site_packages
-    origins = {
-        "elsewhere": _helper_origin(tmp_path / "elsewhere.py"),
-        "fixlib": _helper_origin(site / "fixlib" / "__init__.py"),
+    modules = {
+        "elsewhere": _helper_module(tmp_path / "elsewhere.py"),
+        "fixlib": _helper_module(site / "fixlib" / "__init__.py"),
     }
 
-    found = installed_distributions.distribution_keys(origins, [str(root), str(site)], _PIVOT_DIRS)
+    found = installed_distributions.distribution_keys(modules, [str(root), str(site)], _PIVOT_DIRS)
 
     assert found == installed_distributions.DistributionKeys(
         {
@@ -888,10 +899,10 @@ def test_a_reached_module_of_an_index_egg_info_with_no_record_that_requires_a_lo
     mid = _helper_egg_info_project(
         venv, src, "mid", "fixdep", without_requires_dist=without_requires_dist
     )
-    origins = {"mid": _helper_origin(mid / "mid" / "__init__.py")}
+    modules = {"mid": _helper_module(mid / "mid" / "__init__.py")}
 
     found = installed_distributions.distribution_keys(
-        origins, [str(venv.site_packages), str(mid)], _PIVOT_DIRS
+        modules, [str(venv.site_packages), str(mid)], _PIVOT_DIRS
     )
 
     tree = mid.resolve()
@@ -924,7 +935,7 @@ def test_an_egg_info_whose_metadata_names_no_requirement_is_followed_through_its
     site = venv.site_packages
 
     found = installed_distributions.distribution_keys(
-        {"fixlib": _helper_origin(site / "fixlib" / "__init__.py")},
+        {"fixlib": _helper_module(site / "fixlib" / "__init__.py")},
         [str(site), str(mid)],
         _PIVOT_DIRS,
     )
@@ -991,7 +1002,9 @@ def test_listed_as_library_takes_a_linked_file_listed_only_by_installs_not_edita
     `direct_url.json` made `[1, 2]`: the module files of `idxlib` and `Fix_Lib` are library code,
     since only the RECORDs of a file's own entry count, and `fixbad`'s, `flitlib.py` and
     `stray.py` are not, nor is `fixlib`'s file where its link points, which no entry of the path
-    holds. Each RECORD is read once, however many files are asked about."""
+    holds. Those questions read each RECORD of the files' entry once, however many files are
+    asked about, read no requirement and build no index of the candidates. `needs_origins` then
+    builds the index, which reads the one RECORD of the other entry and none a second time."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     src = tmp_path / "src"
     wheels = tmp_path / "wheels"
@@ -1035,6 +1048,8 @@ def test_listed_as_library_takes_a_linked_file_listed_only_by_installs_not_edita
     assert unlinked == [], f"each file asked about must be a symbolic link: {unlinked}"
     installed_distributions.reset()
     read_record = mocker.spy(installed_distributions, "_read_record")
+    read_requirements = mocker.spy(installed_distributions, "_read_requirements")
+    build_index = mocker.spy(installed_distributions, "_build_index")
 
     found = {
         name: installed_distributions.listed_as_library(_helper_real(file), path, _PIVOT_DIRS)
@@ -1043,6 +1058,11 @@ def test_listed_as_library_takes_a_linked_file_listed_only_by_installs_not_edita
     found["fixlib-target"] = installed_distributions.listed_as_library(
         os.path.realpath(files["fixlib"]), path, _PIVOT_DIRS
     )
+    read_for_files = sorted(
+        os.path.basename(call.args[0].dist_info) for call in read_record.call_args_list
+    )
+    calls_for_files = (read_requirements.call_count, build_index.call_count)
+    needs_origins = installed_distributions.needs_origins(path, _PIVOT_DIRS)
 
     assert index_alone is True, "idxlib's linked file must be library code with it alone there"
     assert found == {
@@ -1053,6 +1073,17 @@ def test_listed_as_library_takes_a_linked_file_listed_only_by_installs_not_edita
         "stray": False,
         "fixlib-target": False,
     }, found
+    assert read_for_files == [
+        "fix_lib-0.1.dist-info",
+        "fixbad-0.1.dist-info",
+        installed_dists.FLIT_DIST_INFO,
+        "idxlib-0.1.dist-info",
+    ], f"each RECORD of the files' entry must be read once, and no other: {read_for_files}"
+    assert calls_for_files == (0, 0), (
+        f"no requirement may be read and no index built for a linked file: {calls_for_files}"
+    )
+    assert needs_origins is True, "Fix_Lib, installed from its path, can give a key"
+    assert build_index.call_count == 1, f"the index must be built once: {build_index.call_count}"
     read = sorted(os.path.basename(call.args[0].dist_info) for call in read_record.call_args_list)
     assert read == [
         "fix_lib-0.1.dist-info",
@@ -1060,7 +1091,7 @@ def test_listed_as_library_takes_a_linked_file_listed_only_by_installs_not_edita
         "fixbad-0.1.dist-info",
         installed_dists.FLIT_DIST_INFO,
         "idxlib-0.1.dist-info",
-    ], f"each RECORD must be read once: {read}"
+    ], f"the index must read the other entry's RECORD and no RECORD a second time: {read}"
 
 
 def test_is_library_file_asks_the_records_only_about_a_file_linked_under_a_library_path(
@@ -1167,7 +1198,7 @@ def test_a_namespace_package_uv_links_into_its_cache_gives_the_key_of_a_copied_o
 
     found = [
         installed_distributions.distribution_keys(
-            {"nsco": ("namespace", os.path.realpath(venv.site_packages / "nsco"))},
+            {"nsco": _helper_namespace(venv.site_packages / "nsco")},
             [str(venv.site_packages)],
             _PIVOT_DIRS,
         )
@@ -1177,3 +1208,79 @@ def test_a_namespace_package_uv_links_into_its_cache_gives_the_key_of_a_copied_o
     value = _helper_value(copied.site_packages, {"nsco/part/__init__.py": "nsco/part/__init__.py"})
     keyed = installed_distributions.DistributionKeys({"dist:fix-ns": value}, [])
     assert found == [keyed, keyed], found
+
+
+def test_a_file_one_install_puts_in_anothers_package_is_reached_in_a_venv_uv_links_into_its_cache(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`company-core`, whose package is `company`, installed as from a package index, and
+    `Fix_Lib`, whose one file is `company/vendor/__init__.py`, inside that package, installed
+    from its path, both into one venv with `--link-mode copy` and into another with `--link-mode
+    symlink`, where each file is a link into its own distribution's entry of uv's cache, from a
+    real directory. A stage that reaches the package `company` (the walk records the top name of
+    `import company.vendor`), whose `__init__` file the import locates in site-packages, gets
+    `dist:fix-lib` in both venvs, with one value: the package's directory is the one the import
+    searched, where `Fix_Lib`'s RECORD names its file, not the directory of the resolved
+    `__init__` file, which lies in `company-core`'s entry of the cache. Once `Fix_Lib` has lost
+    its RECORD, the stage is refused in both venvs for the file `Fix_Lib` put under the package,
+    which no RECORD lists, named where it lies in site-packages."""
+    src = tmp_path / "src"
+    company = installed_dists.write_library(src, "company-core", "company", "CORE = 1\n")
+    fixlib = installed_dists.write_setuptools_project(
+        src / "fixlib",
+        "Fix_Lib",
+        "0.1",
+        packages=["company.vendor"],
+        files={"company/vendor/__init__.py": "VENDOR = 1\n"},
+    )
+    wheels = tmp_path / "wheels"
+    link_modes = ("copy", "symlink")
+    venvs = [installed_dists.make_venv(tmp_path / link_mode) for link_mode in link_modes]
+    installed_dists.build_wheel(venvs[0], company, wheels)
+    for venv, link_mode in zip(venvs, link_modes, strict=True):
+        installed_dists.install_from_wheels(venv, wheels, "company-core", link_mode=link_mode)
+        installed_dists.install_directory(venv, fixlib, link_mode=link_mode)
+    vendor = "company/vendor/__init__.py"
+    links = [
+        [(venv.site_packages / file).is_symlink() for file in ("company/__init__.py", vendor)]
+        for venv in venvs
+    ]
+    assert links == [[False, False], [True, True]], (
+        f"the two files must be copies in the first venv and links in the second: {links}"
+    )
+
+    intact = [
+        installed_distributions.distribution_keys(
+            {"company": _helper_module(venv.site_packages / "company" / "__init__.py")},
+            [str(venv.site_packages)],
+            _PIVOT_DIRS,
+        )
+        for venv in venvs
+    ]
+    for venv in venvs:
+        installed_dists.damage(venv.site_packages / "fix_lib-0.1.dist-info" / "RECORD", None)
+    installed_distributions.reset()
+    recordless = [
+        installed_distributions.distribution_keys(
+            {"company": _helper_module(venv.site_packages / "company" / "__init__.py")},
+            [str(venv.site_packages)],
+            _PIVOT_DIRS,
+        )
+        for venv in venvs
+    ]
+
+    value = _helper_value(venvs[0].site_packages, {vendor: vendor})
+    keyed = installed_distributions.DistributionKeys({"dist:fix-lib": value}, [])
+    assert intact == [keyed, keyed], intact
+    refused = [
+        installed_distributions.DistributionKeys(
+            {},
+            [
+                installed_dists.UNLISTED_REFUSAL.format(
+                    module="company", file=vendor, site=venv.site_packages.resolve()
+                )
+            ],
+        )
+        for venv in venvs
+    ]
+    assert recordless == refused, recordless

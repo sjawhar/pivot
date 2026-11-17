@@ -15,13 +15,16 @@ PyYAML, `tests.helpers` and the `pivot` package, so the tests that use it still 
 It also holds what the test files of those keys share: the stage `STAGE` of their projects, the
 file `OUTPUT` it writes and the `pipeline.py` of a project whose stage calls installed modules
 (`pipeline`), the sources of the fixture libraries `Fix_Lib` and `fixdep`, the refusals of a
-broken install, word for word, with the start pivot gives each for `STAGE` (`STAGE_PREFIX`), and
-the layout flit's `install --symlink` gives an editable install (`flit_symlink_install`), built
-by hand since CI has no flit.
+broken install, word for word, with the start pivot gives each for `STAGE` (`STAGE_PREFIX`), the
+layout flit's `install --symlink` gives an editable install (`flit_symlink_install`), built by
+hand since CI has no flit, and the layout uv gives an install from a package index, its files
+copied or linked into a cache (`index_install_by_hand`), built by hand for the tests that start
+no process.
 """
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import hashlib
 import importlib.metadata
@@ -411,6 +414,42 @@ def flit_symlink_install(site: pathlib.Path, checkout: pathlib.Path, link: str) 
         )
     rows.append(f"{FLIT_DIST_INFO}/RECORD,,")
     (dist_info / "RECORD").write_bytes("".join(f"{row}\r\n" for row in rows).encode())
+
+
+def index_install_by_hand(
+    site: pathlib.Path, name: str, files: Mapping[str, str], *, cache: pathlib.Path | None
+) -> None:
+    """Install distribution `name` 0.1 into the site directory `site` with no installer, as uv
+    0.13.5 laid out an install from a package index on 2026-11-17: `files` (each path in `site`,
+    with its text), and `<name>-0.1.dist-info` with the wheel's METADATA and WHEEL, uv's
+    INSTALLER and REQUESTED, a RECORD of uv's rows (`sha256=` in URL-safe base64 with no padding,
+    then the size) and no `direct_url.json`. With no `cache`, every file is a copy, as
+    `--link-mode copy` leaves it. With one, each file the wheel holds (`files`, METADATA and
+    WHEEL) is a symbolic link, from a real directory of `site`, to the file under
+    `cache/<name>`, as `--link-mode symlink` links it into uv's cache of unpacked wheels, and
+    uv's own files are real."""
+    dist_info = f"{name}-0.1.dist-info"
+    wheel = {
+        **{relative: text.encode() for relative, text in files.items()},
+        f"{dist_info}/METADATA": f"Metadata-Version: 2.4\nName: {name}\nVersion: 0.1\n".encode(),
+        f"{dist_info}/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    }
+    written = {f"{dist_info}/INSTALLER": b"uv", f"{dist_info}/REQUESTED": b""}
+    rows = list[str]()
+    for relative, data in sorted({**wheel, **written}.items()):
+        path = site / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if cache is None or relative in written:
+            path.write_bytes(data)
+        else:
+            cached = cache / name / relative
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(data)
+            path.symlink_to(cached)
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+        rows.append(f"{relative},sha256={digest},{len(data)}")
+    rows.append(f"{dist_info}/RECORD,,")
+    (site / dist_info / "RECORD").write_text("".join(f"{row}\n" for row in sorted(rows)))
 
 
 def git(cwd: pathlib.Path, home: pathlib.Path, *args: str) -> str:

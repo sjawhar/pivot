@@ -4,8 +4,10 @@ distribution, called in this process on plain data: on `direct_url.json`, METADA
 on the paths a RECORD lists, on digests, on requirement graphs, on origins and on the readings
 that decide a distribution's key and its refusals, and on the install forms that decide whether a
 file linked into a site directory is library code; the resolution of a RECORD path, on a tree of
-symbolic links this test makes; and the walk of a reached package's directory, on a tree of
-files this test makes.
+symbolic links this test makes; the walk of a reached package's directory, on a tree of
+files this test makes; and `fingerprint.is_library_file`, on site directories this test lays out
+by hand as uv and flit lay them out (`tests.installed_dists`), reached through a link to a
+package's directory and through a path entry that is a link. No test starts a process.
 
 The CLI tests of the same decisions are in `test_installed_distributions.py`, and
 `distribution_keys` over real installs is in `test_installed_distributions_snapshot.py`.
@@ -15,14 +17,19 @@ import errno
 import itertools
 import os
 import pathlib
+import sys
 
 import pytest
+import pytest_mock
 import xxhash
+from tests import installed_dists
 
-from pivot import installed_distributions
+from pivot import fingerprint, installed_distributions
 
 _FORM = installed_distributions.InstallForm
 _SITE = "/home/user/venv/lib/python3.13/site-packages"
+# uv's cache of unpacked wheels, into which `--link-mode symlink` links each installed file.
+_CACHE = "/home/user/.cache/uv/archive-v0"
 
 # `direct_url.json` (PEP 610) as uv and pip write it for each install form, in their own key order
 # and spacing (uv's for a local wheel holds no hash).
@@ -511,8 +518,9 @@ def test_the_key_and_the_walk_keep_a_sourceless_packages_pyc_files_but_pycache(
     """A sourceless package: its wheel holds `pkg/__init__.pyc` and `pkg/mod.pyc` in place of
     source, and the installer compiled `pkg/__pycache__/mod.cpython-313.pyc`. Of these RECORD
     paths the key hashes exactly the two `.pyc` files outside `__pycache__`, and the walk of the
-    reached package's directory (`_files_under`), over those files on disk, gives the same two:
-    the check of a file that no RECORD lists reads the files the key would hash."""
+    reached package's directory (`_files_under`), over those files on disk, gives the same two,
+    each as the walk lists it and resolved: the check of a file that no RECORD lists reads the
+    files the key would hash."""
     for path in _SOURCELESS_PACKAGE:
         (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / path).write_bytes(b"")
@@ -522,7 +530,9 @@ def test_the_key_and_the_walk_keep_a_sourceless_packages_pyc_files_but_pycache(
 
     kept = ["pkg/__init__.pyc", "pkg/mod.pyc"]
     assert files == [(path, path) for path in kept], files
-    assert walked == [os.path.realpath(tmp_path / path) for path in kept], walked
+    assert walked == [(str(tmp_path / path), os.path.realpath(tmp_path / path)) for path in kept], (
+        walked
+    )
 
 
 def test_content_digest_and_key_value_hash_json_arrays_in_name_order() -> None:
@@ -600,44 +610,92 @@ def test_reach_meets_each_requirement_once_and_follows_none_of_a_stop() -> None:
 
 
 @pytest.mark.parametrize(
-    ("origin", "expected"),
+    ("origin", "real", "expected"),
     [
-        pytest.param(("file", f"{_SITE}/fixlib/core.py"), {"fix-lib", "fix-lib-extra"}, id="file"),
+        pytest.param(
+            ("file", f"{_SITE}/fixlib/core.py"),
+            f"{_SITE}/fixlib/core.py",
+            {"fix-lib", "fix-lib-extra"},
+            id="file",
+        ),
         pytest.param(
             ("file", f"{_SITE}/company/__init__.py"),
+            f"{_SITE}/company/__init__.py",
             {"company-core", "company-vendor"},
             id="package-init",
         ),
         pytest.param(
             ("file", f"{_SITE}/company/__init__.cpython-313-x86_64-linux-gnu.so"),
+            f"{_SITE}/company/__init__.cpython-313-x86_64-linux-gnu.so",
             {"company-core", "company-vendor"},
             id="extension-package-init",
         ),
-        pytest.param(("file", f"{_SITE}/stray.py"), set[str](), id="file-no-record-lists"),
+        pytest.param(
+            ("file", f"{_SITE}/stray.py"),
+            f"{_SITE}/stray.py",
+            set[str](),
+            id="file-no-record-lists",
+        ),
+        pytest.param(
+            ("file", f"{_CACHE}/core/linked/__init__.py"),
+            f"{_SITE}/linked/__init__.py",
+            {"linked-core", "linked-plugin"},
+            id="linked-package-init-owned-through-its-directory-in-site-packages",
+        ),
+        pytest.param(
+            ("file", f"{_CACHE}/core/linked/__init__.py"),
+            None,
+            {"linked-core"},
+            id="linked-package-init-with-no-located-file-owned-through-its-resolved-directory",
+        ),
+        pytest.param(
+            ("file", f"{_CACHE}/core/linked/core.py"),
+            f"{_SITE}/linked/core.py",
+            {"linked-core"},
+            id="linked-file-owned-by-its-resolved-path",
+        ),
+        pytest.param(
+            ("file", f"{_CACHE}/twice/twice.py"),
+            f"{_SITE}/twice.py",
+            {"twice-in-venv", "twice-in-target"},
+            id="file-linked-from-two-site-directories-owned-by-both-installs",
+        ),
         pytest.param(
             ("namespace", f"{_SITE}/nsco", "/home/user/other/nsco"),
+            None,
             {"nsco-local", "nsco-other"},
             id="namespace",
         ),
-        pytest.param(("built-in",), set[str](), id="built-in"),
-        pytest.param(("frozen",), set[str](), id="frozen"),
-        pytest.param(("no file",), set[str](), id="no-file"),
-        pytest.param(("unknown", "ImportError: boom"), set[str](), id="unknown"),
-        pytest.param(None, set[str](), id="none"),
+        pytest.param(("built-in",), None, set[str](), id="built-in"),
+        pytest.param(("frozen",), None, set[str](), id="frozen"),
+        pytest.param(("no file",), None, set[str](), id="no-file"),
+        pytest.param(("unknown", "ImportError: boom"), None, set[str](), id="unknown"),
+        pytest.param(None, None, set[str](), id="none"),
     ],
 )
 def test_owners_maps_an_origin_to_the_candidates_by_file(
-    origin: tuple[str, ...] | None, expected: set[str]
+    origin: tuple[str, ...] | None, real: str | None, expected: set[str]
 ) -> None:
-    """A file maps to every candidate whose RECORD lists it, and a package's `__init__` of any
-    suffix also to every candidate with a file under its directory; a namespace package maps to
-    every candidate with a file under one of its directories; any other origin maps to none."""
+    """A file maps to every candidate whose RECORD lists it, resolved, and a package's `__init__`
+    of any suffix also to every candidate with a file under its directory, the directory of the
+    file as the import located it (`real`); a namespace package maps to every candidate with a
+    file under one of its directories; any other origin maps to none. Where an installer links
+    each file into its cache (`linked-core`'s files, and `linked-plugin`'s `linked/plugin.py`, in
+    two cache entries), a package's `__init__` maps through its directory in the site directory
+    to each candidate that lists a file there, and, with no located file, only through the
+    directory of its resolved path, to the one candidate whose cache entry that is; a linked
+    module file maps to the candidate that lists its resolved path, and one cache entry linked
+    from two site directories (`twice.py`) to both installs, whose RECORDs resolve to it."""
     file_owners = {
         f"{_SITE}/fixlib/core.py": {"fix-lib", "fix-lib-extra"},
         f"{_SITE}/company/__init__.py": {"company-core"},
         f"{_SITE}/company/vendor.py": {"company-vendor"},
         f"{_SITE}/nsco/local/__init__.py": {"nsco-local"},
         "/home/user/other/nsco/other/__init__.py": {"nsco-other"},
+        f"{_CACHE}/core/linked/__init__.py": {"linked-core"},
+        f"{_CACHE}/core/linked/core.py": {"linked-core"},
+        f"{_CACHE}/plugin/linked/plugin.py": {"linked-plugin"},
+        f"{_CACHE}/twice/twice.py": {"twice-in-venv", "twice-in-target"},
     }
     directory_owners = {
         f"{_SITE}/fixlib": {"fix-lib", "fix-lib-extra"},
@@ -646,9 +704,12 @@ def test_owners_maps_an_origin_to_the_candidates_by_file(
         f"{_SITE}/nsco/local": {"nsco-local"},
         "/home/user/other/nsco": {"nsco-other"},
         "/home/user/other/nsco/other": {"nsco-other"},
+        f"{_CACHE}/core/linked": {"linked-core"},
+        f"{_CACHE}/plugin/linked": {"linked-plugin"},
+        f"{_SITE}/linked": {"linked-core", "linked-plugin"},
     }
 
-    found = installed_distributions.owners(origin, file_owners, directory_owners)
+    found = installed_distributions.owners(origin, real, file_owners, directory_owners)
 
     assert found == expected, found
 
@@ -938,3 +999,100 @@ def test_resolved_leaves_out_each_record_path_that_names_no_file_and_resolves_a_
     memoised = max(len(os.fsencode(directory)) for directory in real_dirs)
     assert memoised < path_max, f"the memo must hold no directory of PATH_MAX bytes: {memoised}"
     assert digests == [None, None, None], digests
+
+
+@pytest.mark.parametrize(
+    "linked",
+    [
+        pytest.param(False, id="copied"),
+        pytest.param(True, id="linked-into-a-cache"),
+    ],
+)
+def test_is_library_file_takes_a_library_file_reached_through_a_link_to_its_directory(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, linked: bool
+) -> None:
+    """`idxlib`, laid out by hand in `site-packages` as uv installs from a package index
+    (`installed_dists.index_install_by_hand`), its files copies or, as `--link-mode symlink`
+    leaves them, links into a cache from real directories. `project/idxlib` is a link to its
+    package's directory, as a library package linked into a project root, and `libs` a link to
+    `site-packages`. `fingerprint.is_library_file` takes the module's file as library code where
+    it is installed, through `project/idxlib` with `site-packages` on the path, and through
+    `libs` with `libs` on the path in its place, whether the file is a copy or a link: a linked
+    file is judged where its directory resolves, in `site-packages`, as a copy is by its resolved
+    path. A project file beside the link stays user code."""
+    site = tmp_path / "venv" / "site-packages"
+    installed_dists.index_install_by_hand(
+        site,
+        "idxlib",
+        {"idxlib/__init__.py": "LIB = 1\n"},
+        cache=tmp_path / "cache" if linked else None,
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "idxlib").symlink_to(site / "idxlib", target_is_directory=True)
+    (project / "helpers.py").write_text("HELP = 1\n")
+    libs = tmp_path / "libs"
+    libs.symlink_to(site, target_is_directory=True)
+    installed = site / "idxlib" / "__init__.py"
+    assert installed.is_symlink() is linked, f"{installed} must be a link only when linked"
+    assert not installed.parent.is_symlink(), f"{installed.parent} must be a real directory"
+
+    monkeypatch.setattr(sys, "path", [str(project), str(site)])
+    found = {
+        "in site-packages": fingerprint.is_library_file(str(installed)),
+        "through project/idxlib": fingerprint.is_library_file(
+            str(project / "idxlib" / "__init__.py")
+        ),
+        "project file": fingerprint.is_library_file(str(project / "helpers.py")),
+    }
+    monkeypatch.setattr(sys, "path", [str(project), str(libs)])
+    found["through libs"] = fingerprint.is_library_file(str(libs / "idxlib" / "__init__.py"))
+
+    assert found == {
+        "in site-packages": True,
+        "through project/idxlib": True,
+        "project file": False,
+        "through libs": True,
+    }, found
+
+
+@pytest.mark.parametrize(
+    ("link", "source", "asked"),
+    [
+        pytest.param("flitlib", "flitlib/__init__.py", False, id="package-directory"),
+        pytest.param("flitlib.py", "flitlib.py", True, id="module-file"),
+    ],
+)
+def test_is_library_file_leaves_flits_editable_link_user_code_through_a_linked_path_entry(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: pytest_mock.MockerFixture,
+    link: str,
+    source: str,
+    asked: bool,
+) -> None:
+    """`flitlib`, laid out as flit's `install --symlink` installs it
+    (`installed_dists.flit_symlink_install`): a link in `site-packages` to the checkout's package
+    directory, or to its module file, which the RECORD of an editable install lists. `libs`, a
+    link to `site-packages`, is the one entry of the path. `fingerprint.is_library_file` takes
+    the checkout's source as user code, in `site-packages` and through `libs`. A file under the
+    linked package directory is judged in the checkout, where its directory resolves, and the
+    RECORDs are not asked about it; the linked module file is judged in `site-packages`, and the
+    RECORDs are asked about it there, where the one that lists it is an editable install's."""
+    site = tmp_path / "venv" / "site-packages"
+    site.mkdir(parents=True)
+    checkout = tmp_path / "flitlib"
+    (checkout / source).parent.mkdir(parents=True, exist_ok=True)
+    (checkout / source).write_text(installed_dists.FIXLIB_ALONE)
+    installed_dists.flit_symlink_install(site, checkout, link)
+    libs = tmp_path / "libs"
+    libs.symlink_to(site, target_is_directory=True)
+    monkeypatch.setattr(sys, "path", [str(libs)])
+    listed = mocker.spy(installed_distributions, "listed_as_library")
+
+    found = [fingerprint.is_library_file(str(entry / source)) for entry in (site, libs)]
+
+    assert found == [False, False], f"flit's source must be user code in both: {found}"
+    files_asked = [call.args[0] for call in listed.call_args_list]
+    in_site = os.path.join(os.path.realpath(site), source)
+    assert files_asked == ([in_site, in_site] if asked else []), files_asked

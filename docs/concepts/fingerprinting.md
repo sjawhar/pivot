@@ -220,7 +220,7 @@ raises `StageDefinitionError`; use [StageParams](parameters.md) instead.
 | Reinstall the same files of such a library from another commit or path, with pip or uv, into another virtual environment, or with only its version changed | **No** |
 | Upgrade or downgrade a library installed from a package index | **No**, as before: Pivot records such a library by name (a stage function or a loader's `load`, `save` and `empty` that it defines is still hashed) |
 | Edit the source of a library installed editable from a directory outside the virtual environment and outside every `site-packages` directory | Yes (it is your code) |
-| Edit the source of a library that flit's `install --symlink` links into `site-packages` (an editable install) | Yes (it is your code) |
+| Edit the source of a library that flit's `install --symlink` links into `site-packages` (an editable install) | Yes (it is your code). Flit before 3.0 wrote no `direct_url.json`, so Pivot takes a module file it linked as a package-index library's and does not see the edit, where Pivot 0.10.4 saw it: reinstall with flit 3.0 or later ([Files Linked into site-packages](../architecture/fingerprinting.md#files-linked-into-site-packages)) |
 | Reinstall the same libraries with uv's `UV_LINK_MODE=symlink`, which links each installed file into uv's cache, in place of copies | **No**: Pivot takes a file linked into `site-packages` for a library that is not installed editable as that library's, as a copy ([Files Linked into site-packages](../architecture/fingerprinting.md#files-linked-into-site-packages)) |
 
 ## Surprises and Pitfalls
