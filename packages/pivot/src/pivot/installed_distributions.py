@@ -253,9 +253,9 @@ def requirement_names(metadata: bytes | OSError | None) -> Requirements:
     # Each header's name, in lower case, and the lines of its value.
     headers = list[tuple[str, list[str]]]()
     for line in _LINE_END.split(_END_OF_HEADERS.split(text, maxsplit=1)[0]):
-        # An empty line ends the headers: one that starts the file, one between lone CRs, which
-        # `_END_OF_HEADERS` does not match, or the one after the last line end of a file that is
-        # only headers.
+        # An empty line ends the headers: one that starts the file, one that `_END_OF_HEADERS`
+        # does not match because a lone CR makes it (between lone CRs, a CR LF then a lone CR, a
+        # lone CR then a CR LF), or the one after the last line end of a file that is only headers.
         if not line:
             break
         if headers and line.startswith((" ", "\t")):
