@@ -1115,6 +1115,242 @@ def test_a_stage_after_its_producer_whose_module_is_another_file_fails_the_run(
     assert not (data / output).exists()
 
 
+# Library code a stage reaches, recorded by name ------------------------------------------------
+
+# Each form names a library module in `site-packages`, which the pipeline imports, and the stage
+# reaches that module's code through the form alone: the walk hashes no library code, so the
+# `byname:` entry is how the module reaches the worker-import check and the `dist:` keys.
+_REACHED_STAGE_LIBRARY = """\
+from pivot import stage
+
+
+@stage
+def use() -> str:
+    return "made"
+"""
+_REACHED_STAGE_PIPELINE = """\
+from wi_rl_stage import use
+
+from pivot import Pipeline
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_BASE_LIBRARY = """\
+class Base:
+    def greet(self):
+        return "base"
+"""
+_REACHED_GENERIC_PIPELINE = """\
+import typing
+
+import wi_rl_generic
+from pivot import Pipeline, stage
+
+T = typing.TypeVar("T")
+
+
+class Greeter(wi_rl_generic.Base, typing.Generic[T]):
+    pass
+
+
+@stage
+def use() -> str:
+    return Greeter().greet()
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_ROW_LIBRARY = """\
+import typing
+
+
+class Row(typing.TypedDict):
+    name: str
+"""
+_REACHED_ROW_PIPELINE = """\
+import wi_rl_row
+from pivot import Pipeline, stage
+
+
+class Scored(wi_rl_row.Row):
+    score: int
+
+
+@stage
+def use() -> str:
+    return str(Scored(name="a", score=1))
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_NO_MODULE_LIBRARY = """\
+class Base:
+    __module__ = None
+
+    def greet(self):
+        return "base"
+"""
+_REACHED_NAMESPACE_LIBRARY = """\
+class Base:
+    def greet(self):
+        return "namespace"
+
+
+# The name of the package that exports it, as a library names its public classes.
+Base.__module__ = "wi_rl_ns"
+"""
+_REACHED_BASE_PIPELINE = """\
+from {module} import Base
+
+from pivot import Pipeline, stage
+
+
+class Greeter(Base):
+    pass
+
+
+@stage
+def use() -> str:
+    return Greeter().greet()
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_SETTING_LIBRARY = """\
+class Setting:
+    def __init__(self, value):
+        self.value = value
+"""
+_REACHED_ANNOTATION_PIPELINE = """\
+from wi_rl_setting import Setting
+
+from pivot import Pipeline, stage
+
+
+class Config:
+    setting: Setting
+
+    def describe(self) -> str:
+        return "config"
+
+
+@stage
+def use() -> str:
+    return Config().describe()
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_BOX_LIBRARY = """\
+import typing
+
+T = typing.TypeVar("T")
+
+
+class Box(typing.Generic[T]):
+    def __init__(self, item):
+        self.item = item
+"""
+_REACHED_HINT_PIPELINE = """\
+import typing
+
+import wi_rl_box
+from pivot import Pipeline, stage
+
+
+def describe(box: wi_rl_box.Box[int], mode: typing.Literal["short"]) -> str:
+    return mode + str(box.item)
+
+
+@stage
+def use() -> str:
+    return describe(typing.get_type_hints(describe)["box"](1), "short")
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+
+
+@pytest.mark.parametrize(
+    ("library", "pipeline", "recorded"),
+    [
+        pytest.param(
+            {"wi_rl_stage.py": _REACHED_STAGE_LIBRARY},
+            _REACHED_STAGE_PIPELINE,
+            {"byname:wi_rl_stage"},
+            id="library-stage-function",
+        ),
+        pytest.param(
+            {"wi_rl_generic.py": _REACHED_BASE_LIBRARY},
+            _REACHED_GENERIC_PIPELINE,
+            {"byname:wi_rl_generic"},
+            id="library-base-of-a-generic-class",
+        ),
+        pytest.param(
+            {"wi_rl_row.py": _REACHED_ROW_LIBRARY},
+            _REACHED_ROW_PIPELINE,
+            {"byname:wi_rl_row"},
+            id="library-base-of-a-typed-dict",
+        ),
+        pytest.param(
+            {"wi_rl_nomod.py": _REACHED_NO_MODULE_LIBRARY},
+            _REACHED_BASE_PIPELINE.format(module="wi_rl_nomod"),
+            set[str](),
+            id="library-base-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_ns/core.py": _REACHED_NAMESPACE_LIBRARY},
+            _REACHED_BASE_PIPELINE.format(module="wi_rl_ns.core"),
+            {"byname:wi_rl_ns"},
+            id="library-base-of-a-namespace-package",
+        ),
+        pytest.param(
+            {"wi_rl_setting.py": _REACHED_SETTING_LIBRARY},
+            _REACHED_ANNOTATION_PIPELINE,
+            {"byname:wi_rl_setting"},
+            id="library-class-in-a-class-body-annotation",
+        ),
+        pytest.param(
+            {"wi_rl_box.py": _REACHED_BOX_LIBRARY},
+            _REACHED_HINT_PIPELINE,
+            {"byname:typing", "byname:wi_rl_box"},
+            id="library-generic-in-a-type-hint",
+        ),
+    ],
+)
+def test_the_library_module_a_stage_reaches_is_recorded_by_name(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    library: dict[str, str],
+    pipeline: str,
+    recorded: set[str],
+) -> None:
+    """The stage reaches a library module's code through one form, and the walk records exactly
+    the `byname:` entries `recorded`: a stage function that is itself library code names its
+    module; the library base of a user generic class is named once, though its statement names it
+    too (`ob:` skips a base `__bases__` holds); the library base of a user `TypedDict`, which only
+    its statement holds, is named; a library base whose `__module__` is not a string names no
+    module; a library class that a namespace package exports under its own name names that
+    package, which has no file to place it in pivot's packages; a library class in a class-body
+    annotation is named; and a library generic in a helper's type hint is named, beside a
+    `Literal` hint, whose origin is no class, and the module `typing` the stage reads."""
+    site = tmp_path / "lib" / "site-packages"
+    for rel_path, text in library.items():
+        (site / rel_path).parent.mkdir(parents=True, exist_ok=True)
+        (site / rel_path).write_text(text)
+    monkeypatch.syspath_prepend(str(site))
+
+    walked = _walk(_discover(tmp_path, monkeypatch, {}, pipeline))
+
+    assert {key for key in walked if key.startswith("byname:")} == recorded, walked
+
+
 # The `pivot` command ----------------------------------------------------------------------------
 
 

@@ -2404,10 +2404,7 @@ def _in_pivot_packages(module: types.ModuleType) -> bool:
     file = _module_namespace(module).get("__file__")
     if not isinstance(file, str):
         return False
-    try:
-        path = pathlib.Path(file).resolve()
-    except OSError:
-        return False
+    path = pathlib.Path(file).resolve()
     return any(path.is_relative_to(directory) for directory in _PIVOT_PACKAGE_DIRS)
 
 

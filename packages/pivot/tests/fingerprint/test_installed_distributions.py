@@ -1,22 +1,36 @@
 """The decisions behind the `dist:` key of an installed distribution, checked through the `pivot`
-CLI on real installs.
+CLI on real installs, then in this process.
 
-Each test makes its own venv with uv over this test environment (`tests.installed_dists`), installs
-setuptools fixtures into it the way the decision names (from a path, from git, a local wheel, as
-from a package index, editable, by pip), and drives its own pivot project, whose stages call the
-installed code. What pivot does is read from its reports and from the stages' locks:
+Each CLI test makes its own venv with uv over this test environment (`tests.installed_dists`),
+installs setuptools fixtures into it the way the decision names (from a path, from git, a local
+wheel, as from a package index, editable, by pip), and drives its own pivot project, whose stages
+call the installed code. What pivot does is read from its reports and from the stages' locks:
 which files the key hashes, which install forms get one, how a stage reaches a distribution and
 the distributions it depends on, the refusals of a broken install and their downgrade by unsafe
 fingerprinting, and the refusal of a project file that shadows a module the stage reaches.
+
+The in-process tests, in a section of their own at the end, call `pivot.installed_distributions`:
+its pure functions on the bytes uv and pip write and on wrong and boundary inputs, and
+`distribution_keys` over real installs in a venv each test makes, with each reached module's
+origin given as plain data; and one fingerprints, through the registry, a stage that imports its
+installed library only in its body. No fixture is imported into this process.
 """
 
+import collections.abc
+import errno
 import importlib.metadata
 import json
+import os
 import pathlib
+import py_compile
 import subprocess
+import sys
 
 import pytest
+import xxhash
 from tests import installed_dists
+
+from pivot import discovery, exceptions, installed_distributions, project
 
 _STAGE = "p/make"
 _OUTPUT = pathlib.Path("data/p/make.txt")
@@ -159,12 +173,16 @@ _RECORDLESS_DEPENDENCY_REFUSAL = (
     "so Pivot cannot read its files. Pivot cannot fingerprint the installed code the stage runs, "
     "so the stage could skip a run after that code changes. Fix: reinstall 'fixdep'."
 )
-_RECORDLESS_REACHED_REFUSAL = (
-    "Module 'fixlib' ({site}/fixlib/__init__.py) lies in {site}, where distribution 'fix-lib' "
+# A reached module `{module}`, whose file `{file}` no RECORD lists, beside `Fix_Lib` with no RECORD.
+_UNLISTED_REFUSAL = (
+    "Module '{module}' ({site}/{file}) lies in {site}, where distribution 'fix-lib' "
     "({site}/fix_lib-0.1.dist-info), installed from a local directory (dir_info), has no RECORD "
     "file, and no RECORD file there lists that file. Pivot cannot tell whether the stage runs "
     "that distribution's code, so the stage could skip a run after it changes. Fix: reinstall "
     "'fix-lib'."
+)
+_RECORDLESS_REACHED_REFUSAL = _UNLISTED_REFUSAL.format(
+    module="fixlib", file="fixlib/__init__.py", site="{site}"
 )
 
 
@@ -682,3 +700,1099 @@ def test_a_project_file_shadowing_a_module_reached_through_a_base_class_is_refus
     assert ran.returncode == 0, f"`pivot repro` must run {_STAGE}:\n{shown}"
     written = (project.root / _OUTPUT).read_text()
     assert written == "installed", f"{_STAGE} must run the installed fixbase, not {written!r}"
+
+
+# In process: the module's functions on plain data and on real installs --------------------------
+
+_FORM = installed_distributions.InstallForm
+_SITE = "/home/user/venv/lib/python3.13/site-packages"
+_PIVOT_DIRS = (str(installed_dists.pivot_package_dir()),)
+
+# `direct_url.json` (PEP 610) as uv and pip write it for each install form, in their own key order
+# and spacing (uv's for a local wheel holds no hash).
+_UV_DIRECTORY_URL = b'{"url":"file:///home/user/src/fixlib","dir_info":{}}'
+_PIP_DIRECTORY_URL = b'{"dir_info": {}, "url": "file:///home/user/src/fixlib"}'
+_UV_EDITABLE_URL = b'{"url":"file:///home/user/src/fixlib","dir_info":{"editable":true}}'
+_UV_GIT_URL = (
+    b'{"url":"file:///home/user/src/fixgit","vcs_info":{"vcs":"git",'
+    b'"commit_id":"6964203a125157369c715bd7ba6b130944b8329e",'
+    b'"requested_revision":"6964203a125157369c715bd7ba6b130944b8329e"}}'
+)
+_UV_WHEEL_URL = (
+    b'{"url":"file:///home/user/wheels/fixwheel-0.1-py3-none-any.whl","archive_info":{}}'
+)
+_PIP_WHEEL_HASH = b"935cd5a593c2ac5031e455ed1aa1cdbcd43b2bb26275a8c361e59578b4203e3c"
+_PIP_WHEEL_URL = (
+    b'{"archive_info": {"hash": "sha256='
+    + _PIP_WHEEL_HASH
+    + b'", "hashes": {"sha256": "'
+    + _PIP_WHEEL_HASH
+    + b'"}}, "url": "file:///home/user/wheels/fixwheel-0.1-py3-none-any.whl"}'
+)
+
+# METADATA as setuptools writes it, its `Requires-Dist` headers with an extra, a marker and a name
+# that is not normalised.
+_SETUPTOOLS_METADATA = (
+    b"Metadata-Version: 2.4\nName: Fix_Lib\nVersion: 0.1\n"
+    b'Requires-Dist: fixdep[cli]>=1.0; python_version < "3"\n'
+    b"Requires-Dist: Other.Name__x\n"
+)
+# A header continued over lines, one of them only white space, as loky's `License` header is,
+# before the `Requires-Dist` headers, and a description after the headers that spells one more.
+_CONTINUED_METADATA = (
+    b"Metadata-Version: 2.4\nName: fix-lib\nVersion: 0.1\nLicense: BSD 3-Clause License\n"
+    b"        \n        Copyright (c) 2017.\n        All rights reserved.\n"
+    b"Requires-Dist: cloudpickle\nRequires-Dist: fixdep ; extra == 'test'\n"
+    b"\nRequires-Dist: in-the-description\n"
+)
+_CRLF_METADATA = (
+    b"Metadata-Version: 2.1\r\nName: fix-lib\r\nRequires-Dist: fixdep (>=1.0)\r\n"
+    b"\r\nRequires-Dist: in-the-description\r\n"
+)
+
+# RECORD as uv writes it, with a console script, and as pip writes it: CR LF line ends, and
+# bytecode with no hash.
+_UV_RECORD = (
+    b"../../../bin/fix-lib,sha256=v-5vszzj0FJZ29t3YnJ4yzhoyL3Na1GiXDBymD6G_K8,331\n"
+    b"fix_lib-0.1.dist-info/RECORD,,\n"
+    b"fixlib/__init__.py,sha256=Crrh4K5yghbuRJk8Wjp1X4scOH2Uf8TE9yyrDkqEIUs,6\n"
+)
+_PIP_RECORD = (
+    b"fix_lib-0.1.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4\r\n"
+    b"fix_lib-0.1.dist-info/RECORD,,\r\n"
+    b"fixlib/__init__.py,sha256=Crrh4K5yghbuRJk8Wjp1X4scOH2Uf8TE9yyrDkqEIUs,6\r\n"
+    b"fixlib/__pycache__/__init__.cpython-313.pyc,,\r\n"
+)
+
+# The refusal `decide` gives the distribution `_helper_installed` describes.
+_DECIDE_REFUSAL = (
+    f"Distribution 'fix-lib' ({_SITE}/fix_lib-0.1.dist-info), which {{how}}, {{reason}}. Pivot "
+    "cannot fingerprint the installed code the stage runs, so the stage could skip a run after "
+    "that code changes. Fix: reinstall 'fix-lib'."
+)
+_REACHES = "this stage reaches"
+_DEPENDED_ON = "a distribution this stage reaches depends on"
+_FIXLIB_RECORD = installed_distributions.Record(("fixlib/__init__.py",), "")
+_NO_RECORD = installed_distributions.Record(None, "has no RECORD file")
+_NO_METADATA = installed_distributions.Requirements(frozenset(), "has no METADATA file")
+_NO_REQUIREMENT = installed_distributions.Requirements(frozenset(), "")
+
+# A stage that imports the installed `fixlib` only in its body, which no fingerprint runs.
+_BODY_IMPORT_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def make() -> str:
+    import fixlib
+
+    return fixlib.value()
+
+
+with Pipeline("p") as pipeline:
+    make()
+"""
+
+
+def _helper_installed(
+    form: installed_distributions.InstallForm, reason: str = ""
+) -> installed_distributions.Installed:
+    """`fix-lib` in `_SITE`, installed in `form` (`reason`: why it is unclassified)."""
+    return installed_distributions.Installed(
+        dist_info=f"{_SITE}/fix_lib-0.1.dist-info",
+        site_dir=_SITE,
+        name="fix-lib",
+        classification=installed_distributions.Classification(form, reason),
+    )
+
+
+def _helper_origin(path: pathlib.Path) -> tuple[str, str]:
+    """The origin `import_origin.of_module` gives a module loaded from the file at `path`."""
+    return ("file", os.path.realpath(path))
+
+
+def _helper_value(site: pathlib.Path, files: collections.abc.Mapping[str, str | None]) -> str:
+    """The value of the key of one install in `site` whose hashed files are `files`: each name in
+    the hash with the file's path in `site`, read from disk, or None for a file that cannot be
+    read (`content_digest`, `key_value`)."""
+    return installed_distributions.key_value(
+        [
+            installed_distributions.content_digest(
+                (
+                    name,
+                    None if path is None else xxhash.xxh64((site / path).read_bytes()).hexdigest(),
+                )
+                for name, path in files.items()
+            )
+        ]
+    )
+
+
+def _helper_delete(path: pathlib.Path) -> None:
+    path.unlink()
+
+
+def _helper_replace_with_directory(path: pathlib.Path) -> None:
+    path.unlink()
+    path.mkdir()
+
+
+def _helper_replace_with_fifo(path: pathlib.Path) -> None:
+    path.unlink()
+    os.mkfifo(path)
+
+
+def _helper_replace_with_failing_read(path: pathlib.Path) -> None:
+    """Make `path` a regular file whose read fails with EIO: this process's `/proc/self/mem`,
+    read from address 0, which no process maps."""
+    path.unlink()
+    path.symlink_to("/proc/self/mem")
+
+
+def _helper_remove_read_permission(path: pathlib.Path) -> None:
+    path.chmod(0)
+
+
+@pytest.mark.parametrize(
+    ("direct_url", "form", "reason"),
+    [
+        pytest.param(None, _FORM.INDEX, "", id="none"),
+        pytest.param(_UV_DIRECTORY_URL, _FORM.LOCAL_DIRECTORY, "", id="uv-directory"),
+        pytest.param(_PIP_DIRECTORY_URL, _FORM.LOCAL_DIRECTORY, "", id="pip-directory"),
+        pytest.param(
+            _UV_DIRECTORY_URL.replace(b"{}", b'{"editable":false}'),
+            _FORM.LOCAL_DIRECTORY,
+            "",
+            id="editable-false",
+        ),
+        pytest.param(_UV_EDITABLE_URL, _FORM.EDITABLE, "", id="editable-true"),
+        pytest.param(_UV_GIT_URL, _FORM.VCS, "", id="uv-git"),
+        pytest.param(_UV_WHEEL_URL, _FORM.LOCAL_ARCHIVE, "", id="uv-local-wheel"),
+        pytest.param(_PIP_WHEEL_URL, _FORM.LOCAL_ARCHIVE, "", id="pip-local-wheel"),
+        pytest.param(
+            _PIP_WHEEL_URL.replace(b"file:///home/user/wheels", b"https://files.example.org"),
+            _FORM.REMOTE_ARCHIVE,
+            "",
+            id="https-archive",
+        ),
+        pytest.param(
+            b"[]", _FORM.UNCLASSIFIED, "its direct_url.json is not a JSON object", id="array"
+        ),
+        pytest.param(
+            _UV_DIRECTORY_URL[:-1],
+            _FORM.UNCLASSIFIED,
+            "its direct_url.json is not JSON (Expecting ',' delimiter: line 1 column 52 (char 51))",
+            id="truncated",
+        ),
+        pytest.param(
+            _UV_DIRECTORY_URL.replace(b"fixlib", b"caf\xe9"),
+            _FORM.UNCLASSIFIED,
+            "its direct_url.json is not JSON ('utf-8' codec can't decode byte 0xe9 in position "
+            + "33: invalid continuation byte)",
+            id="not-utf-8",
+        ),
+        pytest.param(
+            b'{"url":"file:///home/user/src/fixlib"}',
+            _FORM.UNCLASSIFIED,
+            "its direct_url.json names 0 of vcs_info, dir_info and archive_info, where PEP 610 "
+            + "requires exactly one",
+            id="no-form",
+        ),
+        pytest.param(
+            _UV_GIT_URL.replace(b'"vcs_info"', b'"dir_info":{},"vcs_info"'),
+            _FORM.UNCLASSIFIED,
+            "its direct_url.json names 2 of vcs_info, dir_info and archive_info, where PEP 610 "
+            + "requires exactly one",
+            id="two-forms",
+        ),
+        pytest.param(
+            _UV_DIRECTORY_URL.replace(b"{}", b"true"),
+            _FORM.UNCLASSIFIED,
+            "its direct_url.json's dir_info is not a JSON object",
+            id="dir-info-not-an-object",
+        ),
+        pytest.param(
+            b'{"archive_info":{}}',
+            _FORM.UNCLASSIFIED,
+            "its direct_url.json has archive_info and no url",
+            id="archive-without-url",
+        ),
+        pytest.param(
+            _UV_WHEEL_URL.replace(b"file:///home/user/wheels", b"https://[::1"),
+            _FORM.UNCLASSIFIED,
+            "its direct_url.json's url cannot be parsed (Invalid IPv6 URL)",
+            id="unparseable-url",
+        ),
+        pytest.param(
+            PermissionError(errno.EACCES, "Permission denied", f"{_SITE}/direct_url.json"),
+            _FORM.UNCLASSIFIED,
+            "its direct_url.json cannot be read ([Errno 13] Permission denied: "
+            + f"'{_SITE}/direct_url.json')",
+            id="unreadable",
+        ),
+    ],
+)
+def test_classify_gives_each_direct_url_json_its_install_form(
+    direct_url: bytes | OSError | None, form: installed_distributions.InstallForm, reason: str
+) -> None:
+    """Each form uv and pip write gets its form: no file is the index form, `dir_info` is a local
+    directory unless `editable` is true, `vcs_info` is version control, and `archive_info` is a
+    local archive for a `file:` URL and a remote one for another. A file that cannot be read, is
+    not JSON or not a JSON object, names no form or two, has a `dir_info` that is not an object,
+    an archive with no URL or a URL that cannot be parsed is unclassified, with that reason."""
+    classification = installed_distributions.classify(direct_url)
+
+    assert classification == installed_distributions.Classification(form, reason), classification
+
+
+@pytest.mark.parametrize(
+    ("metadata", "names", "problem"),
+    [
+        pytest.param(
+            _SETUPTOOLS_METADATA, {"fixdep", "other-name-x"}, "", id="extras-markers-unnormalised"
+        ),
+        pytest.param(
+            _CONTINUED_METADATA, {"cloudpickle", "fixdep"}, "", id="after-a-continued-header"
+        ),
+        pytest.param(_CRLF_METADATA, {"fixdep"}, "", id="crlf"),
+        pytest.param(
+            b"Metadata-Version: 2.4\nName: fixdep\nVersion: 0.1\n", set[str](), "", id="none"
+        ),
+        pytest.param(
+            b"Name: fix-lib\nVersion: 0.1\nRequires-Dist: fixdep\n",
+            set[str](),
+            "has a METADATA file with no Metadata-Version header",
+            id="no-metadata-version",
+        ),
+        pytest.param(
+            b"Metadata-Version: 2.4\nName: fix-lib\nnot a header\nRequires-Dist: fixdep\n",
+            set[str](),
+            "has a METADATA file whose headers Pivot cannot read "
+            + "([MissingHeaderBodySeparatorDefect()])",
+            id="header-defect",
+        ),
+        pytest.param(
+            b'Metadata-Version: 2.4\nName: fix-lib\nRequires-Dist: ; python_version < "3"\n',
+            set[str](),
+            "has a Requires-Dist header that names no distribution ('; python_version < \"3\"')",
+            id="no-name",
+        ),
+        pytest.param(
+            b"Metadata-Version: 2.4\nName: fix-lib\nAuthor: Jos\xe9 Doe\n",
+            set[str](),
+            "has a METADATA file that is not UTF-8 ('utf-8' codec can't decode byte 0xe9 in "
+            + "position 47: invalid continuation byte)",
+            id="not-utf-8",
+        ),
+        pytest.param(None, set[str](), "has no METADATA file", id="no-file"),
+        pytest.param(
+            PermissionError(errno.EACCES, "Permission denied", f"{_SITE}/METADATA"),
+            set[str](),
+            "has a METADATA file Pivot cannot read ([Errno 13] Permission denied: "
+            + f"'{_SITE}/METADATA')",
+            id="unreadable",
+        ),
+    ],
+)
+def test_requirement_names_reads_the_leading_name_of_each_requires_dist_header(
+    metadata: bytes | OSError | None, names: set[str], problem: str
+) -> None:
+    """Each `Requires-Dist` header gives its leading name, PEP 503 normalised, with no extra or
+    marker evaluated, after a continued header and with CR LF line ends; a description after the
+    headers is not read. A file that cannot be read, is not UTF-8, has a header defect, no
+    `Metadata-Version` or a `Requires-Dist` header that names nothing gives no names and that
+    problem."""
+    requirements = installed_distributions.requirement_names(metadata)
+
+    assert requirements == installed_distributions.Requirements(frozenset(names), problem), (
+        requirements
+    )
+
+
+@pytest.mark.parametrize(
+    ("record", "paths", "problem"),
+    [
+        pytest.param(
+            _UV_RECORD,
+            ("../../../bin/fix-lib", "fix_lib-0.1.dist-info/RECORD", "fixlib/__init__.py"),
+            "",
+            id="uv",
+        ),
+        pytest.param(
+            _PIP_RECORD,
+            (
+                "fix_lib-0.1.dist-info/INSTALLER",
+                "fix_lib-0.1.dist-info/RECORD",
+                "fixlib/__init__.py",
+                "fixlib/__pycache__/__init__.cpython-313.pyc",
+            ),
+            "",
+            id="pip-crlf",
+        ),
+        pytest.param(
+            b'"fixlib/a,b.py",sha256=abc,3\n\n,sha256=abc,3\nfixlib/__init__.py,,\n',
+            ("fixlib/a,b.py", "fixlib/__init__.py"),
+            "",
+            id="quoted-comma-and-empty-rows",
+        ),
+        pytest.param(
+            b"fixlib/caf\xe9.py,,\n",
+            None,
+            "has a RECORD file Pivot cannot read ('utf-8' codec can't decode byte 0xe9 in "
+            + "position 10: invalid continuation byte)",
+            id="not-utf-8",
+        ),
+        pytest.param(
+            b"a" * 131073,
+            None,
+            "has a RECORD file Pivot cannot read (field larger than field limit (131072))",
+            id="field-over-the-csv-limit",
+        ),
+        pytest.param(None, None, "has no RECORD file", id="no-file"),
+        pytest.param(
+            PermissionError(errno.EACCES, "Permission denied", f"{_SITE}/RECORD"),
+            None,
+            f"has a RECORD file Pivot cannot read ([Errno 13] Permission denied: '{_SITE}/RECORD')",
+            id="unreadable",
+        ),
+    ],
+)
+def test_record_paths_lists_the_first_field_of_each_row(
+    record: bytes | OSError | None, paths: tuple[str, ...] | None, problem: str
+) -> None:
+    """Each row gives its first field, a quoted one with its comma, whatever the line ends; an
+    empty line or an empty first field gives none. A file that cannot be read, is not UTF-8 or
+    that `csv` cannot read gives no paths and that problem."""
+    found = installed_distributions.record_paths(record)
+
+    assert found == installed_distributions.Record(paths, problem), found
+
+
+def test_hashed_files_keep_each_installed_file_once_but_the_installers_and_bytecode() -> None:
+    """Of a RECORD's paths, the key hashes each relative one that stays in the site directory,
+    once, under its normalised name, and the distribution's own `entry_points.txt` under one name
+    whatever its version: not an absolute path, a path that leaves the directory, the console
+    script, the other files of a `.dist-info` directory, another distribution's or a nested
+    `.dist-info` directory, nor bytecode. A directory entry is kept, to hash as a file that cannot
+    be read."""
+    paths = [
+        "../../../bin/fix-lib",
+        "/usr/lib/python3.13/site-packages/fixlib/__init__.py",
+        "fixlib/../../outside.py",
+        "fixlib/..",
+        "./fixlib/__init__.py",
+        "fixlib/__init__.py",
+        "fixlib/__init__.py",
+        "fixlib/",
+        "fixlib/data/table.csv",
+        "fixlib/__pycache__/__init__.cpython-313.pyc",
+        "fixlib/legacy.pyc",
+        "fixlib/__pycache__/notes.txt",
+        "fix_lib-0.1.dist-info/entry_points.txt",
+        "fix_lib-0.1.dist-info/METADATA",
+        "fix_lib-0.1.dist-info/RECORD",
+        "other-1.0.dist-info/entry_points.txt",
+        "fixlib/_vendor/inner-2.0.dist-info/METADATA",
+        "fixlib/_vendor/INNER-2.0.DIST-INFO/entry_points.txt",
+        "fixlib/_vendor/inner.py",
+    ]
+
+    files = installed_distributions.hashed_files(paths, "fix_lib-0.1.dist-info")
+
+    assert files == [
+        (".dist-info/entry_points.txt", "fix_lib-0.1.dist-info/entry_points.txt"),
+        ("fixlib", "fixlib"),
+        ("fixlib/__init__.py", "fixlib/__init__.py"),
+        ("fixlib/_vendor/inner.py", "fixlib/_vendor/inner.py"),
+        ("fixlib/data/table.csv", "fixlib/data/table.csv"),
+    ], files
+
+
+def test_content_digest_and_key_value_hash_json_arrays_in_name_order() -> None:
+    """A content digest is the xxh64 of the JSON array of `[name, digest]` pairs in name order,
+    null for a file that cannot be read, which no digest equals; a key's value is the xxh64 of the
+    JSON array of its installs' digests, sorted. JSON keeps a name apart from its digest."""
+    first = xxhash.xxh64(b"A = 1\n").hexdigest()
+    second = xxhash.xxh64(b"B = 1\n").hexdigest()
+
+    digest = installed_distributions.content_digest(
+        [("fixlib/b.py", second), ("fixlib/a.py", first)]
+    )
+    missing = installed_distributions.content_digest([("fixlib/a.py", None)])
+    others = {
+        installed_distributions.content_digest([("fixlib/a.py", text)])
+        for text in ("null", "", first)
+    }
+    value = installed_distributions.key_value([second, first])
+
+    stream = f'[["fixlib/a.py","{first}"],["fixlib/b.py","{second}"]]'
+    assert digest == xxhash.xxh64(stream.encode()).hexdigest(), digest
+    assert missing == xxhash.xxh64(b'[["fixlib/a.py",null]]').hexdigest(), missing
+    assert missing not in others and len(others) == 3, (missing, others)
+    assert installed_distributions.content_digest([("ab", "c")]) != (
+        installed_distributions.content_digest([("a", "bc")])
+    ), "a name and its digest must stay apart"
+    ordered = sorted([first, second])
+    assert value == xxhash.xxh64(f'["{ordered[0]}","{ordered[1]}"]'.encode()).hexdigest(), value
+
+
+def test_candidates_are_the_seeds_and_every_distribution_that_requires_one() -> None:
+    """Each distribution that requires a seed, directly or through others, is a candidate, through
+    a cycle too; one that only a candidate requires is not."""
+    requires = {
+        "fix-lib": {"fix-egg", "requests"},
+        "fix-egg": {"fixdep"},
+        "fixdep": set[str](),
+        "requests": {"urllib3"},
+        "urllib3": set[str](),
+        "cycle-a": {"cycle-b"},
+        "cycle-b": {"cycle-a", "fixdep"},
+    }
+
+    found = installed_distributions.candidates(["fixdep"], requires)
+
+    assert found == {"fixdep", "fix-egg", "fix-lib", "cycle-a", "cycle-b"}, found
+
+
+def test_reach_meets_each_requirement_once_and_follows_none_of_a_stop() -> None:
+    """The closure meets each distribution once, in the order met, so a cycle ends; a stop
+    (pivot's own distribution) is met, but its requirements are not followed."""
+    requires = {
+        "fix-lib": ("fix-egg",),
+        "fix-egg": ("fixdep", "fix-lib"),
+        "fixdep": (),
+        "pivot": ("pivot-only",),
+        "pivot-only": (),
+    }
+
+    assert installed_distributions.reach(["fix-lib"], requires, ()) == [
+        "fix-lib",
+        "fix-egg",
+        "fixdep",
+    ]
+    assert installed_distributions.reach(["fix-lib"], requires, ("fix-egg",)) == [
+        "fix-lib",
+        "fix-egg",
+    ]
+    assert installed_distributions.reach(["pivot", "fix-lib"], requires, ("pivot",)) == [
+        "pivot",
+        "fix-lib",
+        "fix-egg",
+        "fixdep",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        pytest.param(("file", f"{_SITE}/fixlib/core.py"), {"fix-lib", "fix-lib-extra"}, id="file"),
+        pytest.param(
+            ("file", f"{_SITE}/company/__init__.py"),
+            {"company-core", "company-vendor"},
+            id="package-init",
+        ),
+        pytest.param(
+            ("file", f"{_SITE}/company/__init__.cpython-313-x86_64-linux-gnu.so"),
+            {"company-core", "company-vendor"},
+            id="extension-package-init",
+        ),
+        pytest.param(("file", f"{_SITE}/stray.py"), set[str](), id="file-no-record-lists"),
+        pytest.param(
+            ("namespace", f"{_SITE}/nsco", "/home/user/other/nsco"),
+            {"nsco-local", "nsco-other"},
+            id="namespace",
+        ),
+        pytest.param(("built-in",), set[str](), id="built-in"),
+        pytest.param(("frozen",), set[str](), id="frozen"),
+        pytest.param(("no file",), set[str](), id="no-file"),
+        pytest.param(("unknown", "ImportError: boom"), set[str](), id="unknown"),
+        pytest.param(None, set[str](), id="none"),
+    ],
+)
+def test_owners_maps_an_origin_to_the_candidates_by_file(
+    origin: tuple[str, ...] | None, expected: set[str]
+) -> None:
+    """A file maps to every candidate whose RECORD lists it, and a package's `__init__` of any
+    suffix also to every candidate with a file under its directory; a namespace package maps to
+    every candidate with a file under one of its directories; any other origin maps to none."""
+    file_owners = {
+        f"{_SITE}/fixlib/core.py": {"fix-lib", "fix-lib-extra"},
+        f"{_SITE}/company/__init__.py": {"company-core"},
+        f"{_SITE}/company/vendor.py": {"company-vendor"},
+        f"{_SITE}/nsco/local/__init__.py": {"nsco-local"},
+        "/home/user/other/nsco/other/__init__.py": {"nsco-other"},
+    }
+    directory_owners = {
+        f"{_SITE}/fixlib": {"fix-lib", "fix-lib-extra"},
+        f"{_SITE}/company": {"company-core", "company-vendor"},
+        f"{_SITE}/nsco": {"nsco-local"},
+        f"{_SITE}/nsco/local": {"nsco-local"},
+        "/home/user/other/nsco": {"nsco-other"},
+        "/home/user/other/nsco/other": {"nsco-other"},
+    }
+
+    found = installed_distributions.owners(origin, file_owners, directory_owners)
+
+    assert found == expected, found
+
+
+@pytest.mark.parametrize(
+    ("installed", "record", "requirements", "pivot_own", "owner", "decision"),
+    [
+        pytest.param(
+            _helper_installed(_FORM.UNCLASSIFIED, "its direct_url.json is not a JSON object"),
+            _NO_RECORD,
+            _NO_METADATA,
+            True,
+            True,
+            installed_distributions.Decision(keyed=False, refusal=""),
+            id="pivots-own-first",
+        ),
+        pytest.param(
+            _helper_installed(_FORM.UNCLASSIFIED, "its direct_url.json is not a JSON object"),
+            _FIXLIB_RECORD,
+            _NO_METADATA,
+            False,
+            True,
+            installed_distributions.Decision(
+                keyed=False,
+                refusal=_DECIDE_REFUSAL.format(
+                    how=_REACHES,
+                    reason="is installed in a form Pivot cannot classify: its direct_url.json "
+                    + "is not a JSON object",
+                ),
+            ),
+            id="unclassified-before-requirements",
+        ),
+        pytest.param(
+            _helper_installed(_FORM.VCS),
+            _NO_RECORD,
+            _NO_METADATA,
+            False,
+            False,
+            installed_distributions.Decision(
+                keyed=False,
+                refusal=_DECIDE_REFUSAL.format(
+                    how=_DEPENDED_ON,
+                    reason="is installed from version control (vcs_info) and has no RECORD file, "
+                    + "so Pivot cannot read its files",
+                ),
+            ),
+            id="keyed-without-record-before-requirements",
+        ),
+        pytest.param(
+            _helper_installed(_FORM.LOCAL_ARCHIVE),
+            _FIXLIB_RECORD,
+            _NO_METADATA,
+            False,
+            True,
+            installed_distributions.Decision(
+                keyed=True,
+                refusal=_DECIDE_REFUSAL.format(
+                    how=_REACHES,
+                    reason="has no METADATA file, so Pivot cannot tell what it depends on",
+                ),
+            ),
+            id="keyed-requirements-unreadable",
+        ),
+        pytest.param(
+            _helper_installed(_FORM.INDEX),
+            _NO_RECORD,
+            _NO_METADATA,
+            False,
+            False,
+            installed_distributions.Decision(
+                keyed=False,
+                refusal=_DECIDE_REFUSAL.format(
+                    how=_DEPENDED_ON,
+                    reason="has no METADATA file, so Pivot cannot tell what it depends on",
+                ),
+            ),
+            id="index-requirements-unreadable",
+        ),
+        pytest.param(
+            _helper_installed(_FORM.LOCAL_DIRECTORY),
+            _FIXLIB_RECORD,
+            installed_distributions.Requirements(frozenset({"fixdep"}), ""),
+            False,
+            True,
+            installed_distributions.Decision(keyed=True, refusal=""),
+            id="keyed",
+        ),
+        pytest.param(
+            _helper_installed(_FORM.INDEX),
+            _NO_RECORD,
+            _NO_REQUIREMENT,
+            False,
+            False,
+            installed_distributions.Decision(keyed=False, refusal=""),
+            id="index-without-record",
+        ),
+        pytest.param(
+            _helper_installed(_FORM.EDITABLE),
+            _FIXLIB_RECORD,
+            _NO_REQUIREMENT,
+            False,
+            True,
+            installed_distributions.Decision(keyed=False, refusal=""),
+            id="editable",
+        ),
+        pytest.param(
+            _helper_installed(_FORM.REMOTE_ARCHIVE),
+            _FIXLIB_RECORD,
+            _NO_REQUIREMENT,
+            False,
+            True,
+            installed_distributions.Decision(keyed=False, refusal=""),
+            id="remote-archive",
+        ),
+    ],
+)
+def test_decide_gives_a_key_and_refusals_in_their_order(
+    installed: installed_distributions.Installed,
+    record: installed_distributions.Record,
+    requirements: installed_distributions.Requirements,
+    pivot_own: bool,
+    owner: bool,
+    decision: installed_distributions.Decision,
+) -> None:
+    """Pivot's own distribution gives nothing, whatever its defects; then an unclassified one is
+    refused, then one of a keyed form with no RECORD, then one whose requirements cannot be read,
+    each refusal naming the distribution, its `.dist-info` directory, how the stage meets it, the
+    reason and the fix. A distribution of a keyed form with a RECORD gets a key, refused or not;
+    an index, editable or remote-archive one gets none."""
+    found = installed_distributions.decide(
+        installed, record, requirements, pivot_own=pivot_own, owner=owner
+    )
+
+    assert found == decision, found
+
+
+def test_distribution_keys_hash_each_reached_git_path_and_local_archive_install_from_disk(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Over real installs in one venv: `Fix_Lib` from its path (with a console script, requiring
+    `fixdep`), `fixdep` from its path, `fixgit` from git and `fixwheel` from a wheel file. The
+    stage reaches `fixlib`, `fixgit` and `fixwheel`. Each of the four gets a key, `fixdep` through
+    the requirement, whose value hashes the install's module files and, for `Fix_Lib`, its
+    `entry_points.txt`, read from disk, and not its console script or the installer's files."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    src = tmp_path / "src"
+    fixlib = installed_dists.write_library(
+        src,
+        "Fix_Lib",
+        "fixlib",
+        _FIXLIB,
+        dependencies=("fixdep",),
+        scripts={"fix-lib": "fixlib:main"},
+    )
+    fixgit = installed_dists.write_library(src, "fixgit", "fixgit", _FIXLIB_ALONE)
+    fixwheel = installed_dists.write_library(src, "fixwheel", "fixwheel", _FIXLIB_ALONE)
+    wheels = tmp_path / "wheels"
+    installed_dists.install_directory(
+        venv, installed_dists.write_library(src, "fixdep", "fixdep", _FIXDEP)
+    )
+    installed_dists.install_directory(venv, fixlib)
+    installed_dists.install(
+        venv, installed_dists.init_git_requirement(fixgit, tmp_path / "home", "fixgit")
+    )
+    installed_dists.build_wheel(venv, fixwheel, wheels)
+    (wheel,) = wheels.glob("*.whl")
+    installed_dists.install(venv, str(wheel))
+    site = venv.site_packages
+    origins = {
+        module: _helper_origin(site / module / "__init__.py")
+        for module in ("fixlib", "fixgit", "fixwheel")
+    }
+
+    found = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+
+    entry_points = "fix_lib-0.1.dist-info/entry_points.txt"
+    assert found == installed_distributions.DistributionKeys(
+        {
+            "dist:fix-lib": _helper_value(
+                site,
+                {
+                    ".dist-info/entry_points.txt": entry_points,
+                    "fixlib/__init__.py": "fixlib/__init__.py",
+                },
+            ),
+            "dist:fixdep": _helper_value(site, {"fixdep/__init__.py": "fixdep/__init__.py"}),
+            "dist:fixgit": _helper_value(site, {"fixgit/__init__.py": "fixgit/__init__.py"}),
+            "dist:fixwheel": _helper_value(site, {"fixwheel/__init__.py": "fixwheel/__init__.py"}),
+        },
+        [],
+    ), found
+
+
+def test_distribution_keys_read_the_files_once_per_path_and_pivot_dirs_until_reset(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The installed files are read once per process for one path and one set of pivot's
+    directories: after an edit in place, a second call gives the value of the first. `reset`
+    forgets them, and so do another path and other pivot directories; a call with no module
+    reads nothing and keeps them."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    source = installed_dists.write_library(tmp_path / "src", "Fix_Lib", "fixlib", _FIXLIB_ALONE)
+    installed_dists.install_directory(venv, source)
+    site = venv.site_packages
+    module = site / "fixlib" / "__init__.py"
+    origins = {"fixlib": _helper_origin(module)}
+    path = [str(site)]
+    longer_path = [*path, str(tmp_path / "missing")]
+    other_dirs = [*_PIVOT_DIRS, str(tmp_path / "other")]
+    files = {"fixlib/__init__.py": "fixlib/__init__.py"}
+    values = list[str]()
+
+    first = installed_distributions.distribution_keys(origins, path, _PIVOT_DIRS)
+    values.append(_helper_value(site, files))
+    installed_dists.replace_once(module, '"value-1"', '"value-2"')
+    again = installed_distributions.distribution_keys(origins, path, _PIVOT_DIRS)
+    installed_distributions.reset()
+    after_reset = installed_distributions.distribution_keys(origins, path, _PIVOT_DIRS)
+    values.append(_helper_value(site, files))
+    installed_dists.replace_once(module, '"value-2"', '"value-3"')
+    other_path = installed_distributions.distribution_keys(origins, longer_path, _PIVOT_DIRS)
+    values.append(_helper_value(site, files))
+    installed_dists.replace_once(module, '"value-3"', '"value-4"')
+    other_pivot = installed_distributions.distribution_keys(origins, longer_path, other_dirs)
+    values.append(_helper_value(site, files))
+    no_module = installed_distributions.distribution_keys({}, path, _PIVOT_DIRS)
+    installed_dists.replace_once(module, '"value-4"', '"value-5"')
+    kept = installed_distributions.distribution_keys(origins, longer_path, other_dirs)
+
+    assert len(set(values)) == 4, f"each edit must change the file's value: {values}"
+    keyed = [
+        installed_distributions.DistributionKeys({"dist:fix-lib": value}, []) for value in values
+    ]
+    found = [first, again, after_reset, other_path, other_pivot, no_module, kept]
+    assert found == [
+        keyed[0],
+        keyed[0],
+        keyed[1],
+        keyed[2],
+        keyed[3],
+        installed_distributions.DistributionKeys({}, []),
+        keyed[3],
+    ], found
+
+
+def test_an_index_install_whose_metadata_cannot_be_read_refuses_nothing_with_no_keyed_install(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With only an index install and an editable one on the path, no requirement is read: the
+    reached `idxlib`, whose METADATA is not UTF-8, refuses nothing, and neither it nor the reached
+    editable `fixedit` gets a key."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    src = tmp_path / "src"
+    idxlib = installed_dists.write_library(src, "idxlib", "idxlib", _FIXLIB_ALONE)
+    fixedit = installed_dists.write_library(src, "fixedit", "fixedit", _FIXLIB_ALONE)
+    wheels = tmp_path / "wheels"
+    installed_dists.build_wheel(venv, idxlib, wheels)
+    installed_dists.install_from_wheels(venv, wheels, "idxlib")
+    installed_dists.install_directory(venv, fixedit, editable=True)
+    site = venv.site_packages
+    (site / "idxlib-0.1.dist-info" / "METADATA").write_bytes(
+        b"Metadata-Version: 2.4\nName: idx\xe9\n"
+    )
+    origins = {
+        "fixedit": _helper_origin(fixedit / "fixedit" / "__init__.py"),
+        "idxlib": _helper_origin(site / "idxlib" / "__init__.py"),
+    }
+
+    found = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+
+    assert found == installed_distributions.DistributionKeys({}, []), found
+
+
+def test_the_scan_skips_what_is_no_metadata_directory_and_reads_an_egg_info_directory(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The path holds a missing directory, an entry with a NUL character, the venv's
+    site-packages twice, and the source tree of `Fix_Egg`, whose setuptools build left
+    `Fix_Egg.egg-info` there with a PKG-INFO and no METADATA. Site-packages also holds a file
+    named `*.dist-info` and a symbolic link named `*.dist-info` that points to itself. The reached
+    `Fix_Lib` requires `Fix_Egg`, which requires `fixdep`: the keys are those of `Fix_Lib` and
+    `fixdep`, and nothing is refused."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    src = tmp_path / "src"
+    fixlib = installed_dists.write_library(
+        src, "Fix_Lib", "fixlib", _FIXLIB_ALONE, dependencies=("fix-egg",)
+    )
+    egg = installed_dists.write_library(
+        src, "Fix_Egg", "fixegg", _FIXLIB_ALONE, dependencies=("fixdep",)
+    )
+    installed_dists.install_directory(
+        venv, installed_dists.write_library(src, "fixdep", "fixdep", _FIXDEP)
+    )
+    installed_dists.install_directory(venv, fixlib)
+    installed_dists.build_wheel(venv, egg, tmp_path / "wheels")
+    (egg_info,) = egg.glob("*.egg-info")
+    held = sorted(child.name for child in egg_info.iterdir())
+    assert "PKG-INFO" in held and "METADATA" not in held, f"{egg_info} holds {held}"
+    site = venv.site_packages
+    (site / "notes-1.0.dist-info").write_text("a file, not a metadata directory\n")
+    (site / "loop-1.0.dist-info").symlink_to("loop-1.0.dist-info")
+    path = [str(tmp_path / "missing"), f"{tmp_path}/nul\0entry", str(site), str(site), str(egg)]
+
+    found = installed_distributions.distribution_keys(
+        {"fixlib": _helper_origin(site / "fixlib" / "__init__.py")}, path, _PIVOT_DIRS
+    )
+
+    assert found == installed_distributions.DistributionKeys(
+        {
+            "dist:fix-lib": _helper_value(site, {"fixlib/__init__.py": "fixlib/__init__.py"}),
+            "dist:fixdep": _helper_value(site, {"fixdep/__init__.py": "fixdep/__init__.py"}),
+        },
+        [],
+    ), found
+
+
+def test_a_reached_file_no_record_lists_beside_a_recordless_install_is_refused_per_module(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`Fix_Lib`, installed from its path with packages `fixlib`, `company.vendor` and the
+    namespace portion `nsco.part`, has lost its RECORD; `company-core`, installed as from an
+    index, holds `company/__init__.py`, beside which Python left bytecode; `fixother` is installed
+    from its path into a second directory on the path. Each reached module with a file that no
+    RECORD in site-packages lists is refused once, naming the first such file: `fixlib`'s and
+    `fixlib.helpers`' own files, and under the package `company` and the namespace `nsco` the
+    file `Fix_Lib` put there, not the bytecode. `fixother`, outside that directory, gets its key;
+    a built-in module and a module nothing finds give nothing."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    src = tmp_path / "src"
+    fixlib = installed_dists.write_setuptools_project(
+        src / "fixlib",
+        "Fix_Lib",
+        "0.1",
+        packages=["fixlib", "company.vendor", "nsco.part"],
+        files={
+            "fixlib/__init__.py": _FIXLIB_ALONE,
+            "fixlib/helpers.py": "HELP = 1\n",
+            "company/vendor/__init__.py": "VENDOR = 1\n",
+            "nsco/part/__init__.py": "PART = 1\n",
+        },
+    )
+    company = installed_dists.write_setuptools_project(
+        src / "company",
+        "company-core",
+        "0.1",
+        packages=["company"],
+        files={"company/__init__.py": "CORE = 1\n"},
+    )
+    fixother = installed_dists.write_library(src, "fixother", "fixother", _FIXLIB_ALONE)
+    wheels = tmp_path / "wheels"
+    second = tmp_path / "second"
+    installed_dists.install_directory(venv, fixlib)
+    installed_dists.build_wheel(venv, company, wheels)
+    installed_dists.install_from_wheels(venv, wheels, "company-core")
+    installed_dists.install(venv, "--target", str(second), str(fixother))
+    site = venv.site_packages
+    _helper_damage(site / "fix_lib-0.1.dist-info" / "RECORD", None)
+    core = site / "company" / "__init__.py"
+    py_compile.compile(str(core), doraise=True)
+    py_compile.compile(str(core), cfile=str(site / "company" / "legacy.pyc"), doraise=True)
+    origins = {
+        "company": _helper_origin(core),
+        "fixlib": _helper_origin(site / "fixlib" / "__init__.py"),
+        "fixlib.helpers": _helper_origin(site / "fixlib" / "helpers.py"),
+        "fixother": _helper_origin(second / "fixother" / "__init__.py"),
+        "missing": None,
+        "nsco": ("namespace", os.path.realpath(site / "nsco")),
+        "sys": ("built-in",),
+    }
+
+    found = installed_distributions.distribution_keys(
+        origins, [str(site), str(second)], _PIVOT_DIRS
+    )
+
+    resolved = site.resolve()
+    refused = [
+        ("company", "company/vendor/__init__.py"),
+        ("fixlib", "fixlib/__init__.py"),
+        ("fixlib.helpers", "fixlib/helpers.py"),
+        ("nsco", "nsco/part/__init__.py"),
+    ]
+    assert found == installed_distributions.DistributionKeys(
+        {"dist:fixother": _helper_value(second, {"fixother/__init__.py": "fixother/__init__.py"})},
+        sorted(
+            _UNLISTED_REFUSAL.format(module=module, file=file, site=resolved)
+            for module, file in refused
+        ),
+    ), found
+
+
+def test_reached_and_required_installs_pivot_cannot_read_are_refused(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The stage reaches `Fix_Lib` and `fixurl`, installed from their paths; `Fix_Lib` requires
+    `fixdep`, whose RECORD is deleted, and `fixurl`'s `direct_url.json` is a directory. `fixurl`
+    is refused as unclassified, with the error of reading the file, and `fixdep` for its missing
+    RECORD; `Fix_Lib` gets its key."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    fixlib, fixdep = _helper_fixlib_and_fixdep(tmp_path / "src")
+    fixurl = installed_dists.write_library(tmp_path / "src", "fixurl", "fixurl", _FIXLIB_ALONE)
+    installed_dists.install(venv, str(fixlib), str(fixdep), str(fixurl))
+    site = venv.site_packages
+    _helper_damage(site / "fixdep-0.1.dist-info" / "RECORD", None)
+    url = site / "fixurl-0.1.dist-info" / "direct_url.json"
+    _helper_replace_with_directory(url)
+    origins = {
+        module: _helper_origin(site / module / "__init__.py") for module in ("fixlib", "fixurl")
+    }
+
+    found = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+
+    resolved = site.resolve()
+    unclassified = (
+        f"Distribution 'fixurl' ({resolved}/fixurl-0.1.dist-info), which this stage reaches, is "
+        f"installed in a form Pivot cannot classify: its direct_url.json cannot be read ([Errno "
+        f"21] Is a directory: '{resolved}/fixurl-0.1.dist-info/direct_url.json'). Pivot cannot "
+        "fingerprint the installed code the stage runs, so the stage could skip a run after that "
+        "code changes. Fix: reinstall 'fixurl'."
+    )
+    assert found == installed_distributions.DistributionKeys(
+        {"dist:fix-lib": _helper_value(site, {"fixlib/__init__.py": "fixlib/__init__.py"})},
+        sorted([_RECORDLESS_DEPENDENCY_REFUSAL.format(site=resolved), unclassified]),
+    ), found
+
+
+def test_pivots_own_distribution_gets_no_key_and_its_requirements_are_not_followed(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A distribution `pivot`, installed from its path, requires `fixdep`, installed from its
+    path. With its package directory among pivot's directories, the reached `pivot` gives no key
+    and its requirement is not followed; with other pivot directories it is a library like any
+    other, and both get keys."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    src = tmp_path / "src"
+    own = installed_dists.write_library(
+        src, "pivot", "pivot", "VERSION = 1\n", dependencies=("fixdep",)
+    )
+    installed_dists.install_directory(
+        venv, installed_dists.write_library(src, "fixdep", "fixdep", _FIXDEP)
+    )
+    installed_dists.install_directory(venv, own)
+    site = venv.site_packages
+    origins = {"pivot": _helper_origin(site / "pivot" / "__init__.py")}
+
+    as_pivot = installed_distributions.distribution_keys(
+        origins, [str(site)], [os.path.realpath(site / "pivot")]
+    )
+    as_library = installed_distributions.distribution_keys(
+        origins, [str(site)], [str(tmp_path / "other")]
+    )
+
+    assert as_pivot == installed_distributions.DistributionKeys({}, []), as_pivot
+    assert as_library == installed_distributions.DistributionKeys(
+        {
+            "dist:fixdep": _helper_value(site, {"fixdep/__init__.py": "fixdep/__init__.py"}),
+            "dist:pivot": _helper_value(site, {"pivot/__init__.py": "pivot/__init__.py"}),
+        },
+        [],
+    ), as_library
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        pytest.param(_helper_delete, id="missing"),
+        pytest.param(_helper_replace_with_directory, id="directory"),
+        pytest.param(_helper_replace_with_fifo, id="fifo"),
+        pytest.param(_helper_replace_with_failing_read, id="read-fails"),
+        # Permissions stop a user who is not root from reading a file; root reads it.
+        *(
+            [pytest.param(_helper_remove_read_permission, id="no-read-permission")]
+            if os.geteuid() != 0
+            else []
+        ),
+    ],
+)
+def test_a_listed_file_that_cannot_be_read_hashes_as_null_and_refuses_nothing(
+    tmp_path: pathlib.Path, damage: collections.abc.Callable[[pathlib.Path], None]
+) -> None:
+    """`fixlib/extra.py`, which `Fix_Lib`'s RECORD lists, deleted, made a directory or a FIFO
+    (which an open without O_NONBLOCK would wait on), a file whose read fails, or a file the user
+    may not read: it is hashed as null, so the value changes, and nothing is refused."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    source = installed_dists.write_library(
+        tmp_path / "src",
+        "Fix_Lib",
+        "fixlib",
+        _FIXLIB_ALONE,
+        files={"fixlib/extra.py": "EXTRA = 1\n"},
+    )
+    installed_dists.install_directory(venv, source)
+    site = venv.site_packages
+    origins = {"fixlib": _helper_origin(site / "fixlib" / "__init__.py")}
+    files: dict[str, str | None] = {
+        "fixlib/__init__.py": "fixlib/__init__.py",
+        "fixlib/extra.py": "fixlib/extra.py",
+    }
+    intact = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+    intact_value = _helper_value(site, files)
+    damage(site / "fixlib" / "extra.py")
+    installed_distributions.reset()
+
+    damaged = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+
+    null_value = _helper_value(site, {**files, "fixlib/extra.py": None})
+    assert intact_value != null_value, "a file hashed as null must change the value"
+    assert [intact, damaged] == [
+        installed_distributions.DistributionKeys({"dist:fix-lib": intact_value}, []),
+        installed_distributions.DistributionKeys({"dist:fix-lib": null_value}, []),
+    ], [intact, damaged]
+
+
+def test_a_record_path_holding_a_nul_character_hashes_as_null_and_refuses_nothing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`Fix_Lib`'s RECORD gains a row whose path holds a NUL character, as a RECORD that lost
+    bytes to a crash can, and `fixdep`, beside it, has lost its RECORD, so every RECORD of the
+    directory is read for the reached `fixlib`. The path names no file on disk: it owns none, it
+    is hashed as null, and nothing is refused."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    src = tmp_path / "src"
+    fixlib = installed_dists.write_library(src, "Fix_Lib", "fixlib", _FIXLIB_ALONE)
+    fixdep = installed_dists.write_library(src, "fixdep", "fixdep", _FIXDEP)
+    installed_dists.install(venv, str(fixlib), str(fixdep))
+    site = venv.site_packages
+    record = site / "fix_lib-0.1.dist-info" / "RECORD"
+    record.write_bytes(record.read_bytes() + b"fixlib/\x00.py,,\n")
+    _helper_damage(site / "fixdep-0.1.dist-info" / "RECORD", None)
+    origins = {"fixlib": _helper_origin(site / "fixlib" / "__init__.py")}
+
+    found = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+
+    files = {"fixlib/\x00.py": None, "fixlib/__init__.py": "fixlib/__init__.py"}
+    assert found == installed_distributions.DistributionKeys(
+        {"dist:fix-lib": _helper_value(site, files)}, []
+    ), found
+
+
+def test_a_refusal_of_a_reached_install_fails_the_fingerprint_through_the_registry(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`Fix_Lib`, whose `direct_url.json` is not a JSON object, is installed in a site directory
+    on this process's path, and the stage imports its `fixlib` in its body, which no fingerprint
+    runs. The registry's fingerprint of the stage fails with the refusal, which names the
+    distribution, and `fixlib` was not imported."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    source = installed_dists.write_library(tmp_path / "src", "Fix_Lib", "fixlib", _FIXLIB_ALONE)
+    installed_dists.install_directory(venv, source)
+    _helper_damage(venv.site_packages / "fix_lib-0.1.dist-info" / "direct_url.json", "[]")
+    monkeypatch.syspath_prepend(str(venv.site_packages))
+    root = tmp_path / "project"
+    for directory in (".git", ".pivot"):
+        (root / directory).mkdir(parents=True)
+    (root / "pipeline.py").write_text(_BODY_IMPORT_PIPELINE)
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    pipeline = discovery.discover_pipeline(project_root=root)
+    assert pipeline is not None, "the project must define a pipeline"
+
+    with pytest.raises(exceptions.PivotError) as raised:
+        pipeline.ensure_fingerprint(_STAGE)
+
+    refusal = _UNCLASSIFIED_REFUSAL.format(site=venv.site_packages.resolve())
+    assert str(raised.value) == f"Stage '{_STAGE}': fingerprinting failed: {refusal}", raised.value
+    assert "fixlib" not in sys.modules, "fingerprinting must not import the stage's library"

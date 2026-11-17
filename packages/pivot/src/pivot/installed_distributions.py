@@ -624,15 +624,15 @@ def _scan(path: Sequence[str]) -> tuple[Installed, ...]:
     """Every distribution on `path`, in the order `importlib.metadata` finds them: each
     directory on it in order, and in each its `*.dist-info` and `*.egg-info` directories in
     listing order, named from the directory's name as `importlib.metadata` names them. An entry
-    that Pivot cannot list as a directory (a zip archive, a missing or unreadable directory) adds
-    none: pip and uv install a distribution into a directory."""
+    that Pivot cannot list as a directory (a zip archive, a missing or unreadable directory, a
+    path with a NUL character) adds none: pip and uv install a distribution into a directory."""
     seen = set[str]()
     found = list[Installed]()
     for entry in path:
         try:
             with os.scandir(entry or ".") as children:
                 names = [child.name for child in children if _is_metadata_directory(child)]
-        except OSError:
+        except (OSError, ValueError):  # ValueError: a NUL character in the path
             continue
         site_dir = os.path.realpath(entry or ".")
         for name in names:
@@ -680,9 +680,11 @@ def _read_record(installed: Installed) -> Record:
 
 
 def _resolved(installed: Installed, paths: Iterable[str]) -> Iterator[str]:
-    """Each path a RECORD lists, located in the distribution's site directory and resolved."""
+    """Each path a RECORD lists, located in the distribution's site directory and resolved; a path
+    that holds a NUL character, which `os.path.realpath` refuses, names no file and is left out."""
     for path in paths:
-        yield os.path.realpath(os.path.join(installed.site_dir, path))
+        if "\0" not in path:
+            yield os.path.realpath(os.path.join(installed.site_dir, path))
 
 
 def _ancestors(path: str) -> Iterator[str]:
@@ -711,21 +713,23 @@ def _files_under(directory: str) -> Iterator[str]:
 
 def _file_digest(path: str) -> str | None:
     """The xxh64 hex of the bytes of the file at `path`, read from disk; None when it is missing,
-    cannot be read or is not a regular file (a directory, or a FIFO, which opening without
-    O_NONBLOCK would wait on)."""
+    cannot be read, has a NUL character in its path, or is not a regular file (a directory, or a
+    FIFO, which opening without O_NONBLOCK would wait on). The descriptor is closed on every
+    path."""
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except (OSError, ValueError):  # ValueError: a NUL character in the path
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        hasher = xxhash.xxh64()
+        while chunk := os.read(descriptor, _CHUNK_SIZE):
+            hasher.update(chunk)
     except OSError:
         return None
-    with os.fdopen(descriptor, "rb") as file:
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                return None
-            hasher = xxhash.xxh64()
-            while chunk := file.read(_CHUNK_SIZE):
-                hasher.update(chunk)
-        except OSError:
-            return None
+    finally:
+        os.close(descriptor)
     return hasher.hexdigest()
 
 
