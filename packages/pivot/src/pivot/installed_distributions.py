@@ -334,13 +334,18 @@ def content_digest(files: Iterable[tuple[str, str | None]]) -> str:
     `[name, xxh64 hex of its bytes]` in name order, null in place of the digest of a file that is
     missing or cannot be read. JSON keeps each name and digest apart from the next."""
     ordered = sorted(files, key=lambda file: file[0])
-    return xxhash.xxh64(json.dumps(ordered, separators=(",", ":")).encode()).hexdigest()
+    return _json_digest(ordered)
 
 
 def key_value(digests: Iterable[str]) -> str:
     """The value of a key from the `content_digest` of each reached install of its name: two
     installs of one name on the path, both reached, give one key."""
-    return xxhash.xxh64(json.dumps(sorted(digests), separators=(",", ":")).encode()).hexdigest()
+    return _json_digest(sorted(digests))
+
+
+def _json_digest(value: object) -> str:
+    """The xxh64 hex of `value` written as compact JSON."""
+    return xxhash.xxh64(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
 
 
 def candidates(seeds: Iterable[str], requires: Mapping[str, Collection[str]]) -> frozenset[str]:
@@ -615,7 +620,7 @@ class _Snapshot:
         if key not in self._unlisted_refusals:
             files, directories = _reached_paths(origin)
             first = dict[str, str]()  # site directory -> its first file that no RECORD lists
-            self._find_unlisted(files, set(index.recordless), first)
+            self._find_unlisted(files, set(index.recordless), first, index.records)
             for directory in directories:
                 above = self._site_dir(directory)
                 pending = {
@@ -625,7 +630,9 @@ class _Snapshot:
                     and (site_dir in (above, directory) or directory in _ancestors(site_dir))
                 }
                 if pending:
-                    self._find_unlisted(_files_under(directory, self._real_dirs), pending, first)
+                    self._find_unlisted(
+                        _files_under(directory, self._real_dirs), pending, first, index.records
+                    )
             self._unlisted_refusals[key] = tuple(
                 _unlisted_refusal(
                     module, file, index.installed[distribution], index.records[distribution]
@@ -636,14 +643,19 @@ class _Snapshot:
         return self._unlisted_refusals[key]
 
     def _find_unlisted(
-        self, files: Iterable[str], pending: set[str], first: dict[str, str]
+        self,
+        files: Iterable[str],
+        pending: set[str],
+        first: dict[str, str],
+        records: Mapping[str, Record],
     ) -> None:
         """Put in `first`, for each site directory of `pending`, the first of the resolved `files`
-        that lies in it (`_site_dir`) and that no RECORD there lists, and take that directory out
-        of `pending`; once `pending` is empty, read no more of `files`."""
+        that lies in it (`_site_dir`) and that no RECORD there lists (`_listed_in`, with `records`
+        the candidates' RECORDs), and take that directory out of `pending`; once `pending` is
+        empty, read no more of `files`."""
         for file in files:
             site_dir = self._site_dir(file)
-            if site_dir in pending and file not in self._listed_in(site_dir):
+            if site_dir in pending and file not in self._listed_in(site_dir, records):
                 first[site_dir] = file
                 pending.remove(site_dir)
                 if not pending:
@@ -654,14 +666,17 @@ class _Snapshot:
         or None when none holds it: the entry an import of the file's module searches."""
         return next((up for up in _ancestors(file) if up in self._site_dirs), None)
 
-    def _listed_in(self, site_dir: str) -> frozenset[str]:
-        """Every resolved file that a RECORD of a distribution in `site_dir` lists."""
+    def _listed_in(self, site_dir: str, records: Mapping[str, Record]) -> frozenset[str]:
+        """Every resolved file that a RECORD of a distribution in `site_dir` lists: a candidate's
+        RECORD as `records` holds it, which the index read, and another's read now."""
         if site_dir not in self._listed:
             listed = set[str]()
             for installed in self._installed:
                 if installed.site_dir == site_dir:
-                    paths = _read_record(installed).paths or ()
-                    listed.update(_resolved(installed, paths, self._real_dirs))
+                    record = records.get(installed.dist_info)
+                    if record is None:
+                        record = _read_record(installed)
+                    listed.update(_resolved(installed, record.paths or (), self._real_dirs))
             self._listed[site_dir] = frozenset(listed)
         return self._listed[site_dir]
 

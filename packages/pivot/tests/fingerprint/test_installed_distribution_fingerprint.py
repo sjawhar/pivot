@@ -21,23 +21,6 @@ from tests import installed_dists
 
 _IDXLIB = 'def value():\n    return "idx-{version}"\n'
 
-# The project of tests 1 to 6: its stage writes `<module>.value()` and names nothing else of
-# the library, nor anything of the library's dependency.
-_PIPELINE = """\
-import {module}
-
-from pivot import Pipeline, stage
-
-
-@stage
-def make() -> str:
-    return {module}.value()
-
-
-with Pipeline("p") as pipeline:
-    make()
-"""
-
 # The project of test 7: its stage reads one module of pivot's by name and no other library.
 _PIVOT_PIPELINE = """\
 from pivot import Pipeline, names, stage
@@ -78,10 +61,10 @@ def test_a_changed_byte_in_a_function_the_stage_calls_reruns_the_stage(
     on `dist:fix-lib`, reruns and writes the new value, and its lock records a new value."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     fixlib, fixdep = installed_dists.write_fixlib_and_fixdep(tmp_path / "src", console_script=True)
-    project = installed_dists.make_project_in(tmp_path, venv, _PIPELINE.format(module="fixlib"))
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
     installed_dists.install_directory(venv, fixdep)
     installed_dists.install_directory(venv, fixlib)
-    installed_dists.ran_then_cached(project, "value-1:base-1")
+    installed_dists.assert_ran_then_cached(project, "value-1:base-1")
     before = installed_dists.lock_manifest(project, installed_dists.STAGE).get("dist:fix-lib")
 
     installed_dists.replace_once(fixlib / "fixlib" / "__init__.py", '"value-1:"', '"value-2:"')
@@ -106,10 +89,10 @@ def test_a_reinstall_with_the_same_files_marks_nothing(tmp_path: pathlib.Path) -
     tree. Nothing is marked, and the lock holds `dist:fix-lib` with the value it held before."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     fixlib, fixdep = installed_dists.write_fixlib_and_fixdep(tmp_path / "src", console_script=True)
-    project = installed_dists.make_project_in(tmp_path, venv, _PIPELINE.format(module="fixlib"))
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
     installed_dists.install_directory(venv, fixdep)
     installed_dists.install_directory(venv, fixlib)
-    installed_dists.ran_then_cached(project, "value-1:base-1")
+    installed_dists.assert_ran_then_cached(project, "value-1:base-1")
     before = installed_dists.lock_manifest(project, installed_dists.STAGE).get("dist:fix-lib")
 
     installed_dists.install_directory(venv, fixlib, reinstall=True)
@@ -128,7 +111,7 @@ def test_a_git_reinstall_at_another_commit_with_the_same_files_marks_nothing(
     `dist:fix-lib` with the value it held before."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     fixlib, fixdep = installed_dists.write_fixlib_and_fixdep(tmp_path / "src", console_script=True)
-    project = installed_dists.make_project_in(tmp_path, venv, _PIPELINE.format(module="fixlib"))
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
     notes = fixlib / "NOTES.txt"
     notes.write_text("C1\n")
     installed_dists.git(fixlib, project.home, "init", "-q")
@@ -137,17 +120,11 @@ def test_a_git_reinstall_at_another_commit_with_the_same_files_marks_nothing(
     commit_2 = installed_dists.commit_all(fixlib, project.home, "C2")
     installed_dists.install_directory(venv, fixdep)
     installed_dists.install(venv, installed_dists.git_requirement("Fix_Lib", fixlib, commit_1))
-    installed_dists.ran_then_cached(project, "value-1:base-1")
+    installed_dists.assert_ran_then_cached(project, "value-1:base-1")
     before = installed_dists.lock_manifest(project, installed_dists.STAGE).get("dist:fix-lib")
 
-    installed_dists.install(
-        venv, installed_dists.git_requirement("Fix_Lib", fixlib, commit_2), reinstall=True
-    )
+    installed_dists.reinstall_from_commit(venv, "Fix_Lib", fixlib, commit_2, "C2")
 
-    url = installed_dists.direct_url(venv, "Fix_Lib")
-    assert url is not None and url["vcs_info"]["commit_id"] == commit_2, (
-        f"Fix_Lib must now be installed from C2 {commit_2}: direct_url.json is {url!r}"
-    )
     installed_dists.assert_marks_nothing(project, installed_dists.STAGE)
     after = installed_dists.lock_manifest(project, installed_dists.STAGE)
     assert "dist:fix-lib" in after, f"the lock must hold dist:fix-lib: {after}"
@@ -162,10 +139,10 @@ def test_a_changed_byte_in_a_dependency_of_the_called_library_reruns_the_stage(
     `fixdep`, is stale on `dist:fixdep` alone, reruns and writes the new value."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     fixlib, fixdep = installed_dists.write_fixlib_and_fixdep(tmp_path / "src", console_script=True)
-    project = installed_dists.make_project_in(tmp_path, venv, _PIPELINE.format(module="fixlib"))
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
     installed_dists.install_directory(venv, fixdep)
     installed_dists.install_directory(venv, fixlib)
-    installed_dists.ran_then_cached(project, "value-1:base-1")
+    installed_dists.assert_ran_then_cached(project, "value-1:base-1")
     before = installed_dists.lock_manifest(project, installed_dists.STAGE).get("dist:fixdep")
 
     installed_dists.replace_once(fixdep / "fixdep" / "__init__.py", '"base-1"', '"base-2"')
@@ -196,9 +173,9 @@ def test_a_package_index_bump_behaves_as_before(tmp_path: pathlib.Path) -> None:
             files={"idxlib/__init__.py": _IDXLIB.format(version=version)},
         )
         installed_dists.build_wheel(venv, source, wheels)
-    project = installed_dists.make_project_in(tmp_path, venv, _PIPELINE.format(module="idxlib"))
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("idxlib"))
     installed_dists.install_from_wheels(venv, wheels, "idxlib==1.0")
-    installed_dists.ran_then_cached(project, "idx-1.0")
+    installed_dists.assert_ran_then_cached(project, "idx-1.0")
 
     installed_dists.install_from_wheels(venv, wheels, "idxlib==1.1")
 
@@ -218,11 +195,11 @@ def test_an_editable_install_adds_no_key(tmp_path: pathlib.Path) -> None:
     venv = installed_dists.make_venv(tmp_path / "venv")
     fixlib, fixdep = installed_dists.write_fixlib_and_fixdep(tmp_path / "src", console_script=True)
     wheels = tmp_path / "wheels"
-    project = installed_dists.make_project_in(tmp_path, venv, _PIPELINE.format(module="fixlib"))
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
     installed_dists.build_wheel(venv, fixdep, wheels)
     installed_dists.install_from_wheels(venv, wheels, "fixdep")
     installed_dists.install_directory(venv, fixlib, editable=True)
-    installed_dists.ran_then_cached(project, "value-1:base-1")
+    installed_dists.assert_ran_then_cached(project, "value-1:base-1")
 
     installed_dists.replace_once(fixlib / "fixlib" / "__init__.py", '"value-1:"', '"value-2:"')
 
@@ -260,16 +237,10 @@ def test_a_reinstall_of_pivot_itself_from_another_commit_changes_no_stage(
     assert imported == expected, (
         f"the venv must import the pivot it installed, {expected}, not {imported}"
     )
-    installed_dists.ran_then_cached(project, "make")
+    installed_dists.assert_ran_then_cached(project, "make")
 
-    installed_dists.install(
-        venv, installed_dists.git_requirement("pivot", repo, commit_b), reinstall=True
-    )
+    installed_dists.reinstall_from_commit(venv, "pivot", repo, commit_b, "B")
 
-    url = installed_dists.direct_url(venv, "pivot")
-    assert url is not None and url["vcs_info"]["commit_id"] == commit_b, (
-        f"pivot must now be installed from B {commit_b}: direct_url.json is {url!r}"
-    )
     installed_dists.assert_marks_nothing(project, installed_dists.STAGE)
     manifest = installed_dists.lock_manifest(project, installed_dists.STAGE)
     assert installed_dists.dist_keys(manifest) == [], f"the lock must hold no dist: key: {manifest}"

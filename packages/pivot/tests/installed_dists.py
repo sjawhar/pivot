@@ -12,9 +12,10 @@ fixtures it builds with build isolation. This module imports only the standard l
 PyYAML, `tests.helpers` and the `pivot` package, so the tests that use it still collect when
 `packages/pivot/src` is pivot 0.10.4's.
 
-It also holds what the test files of those keys share: the stage `STAGE` of their projects and
-the file `OUTPUT` it writes, the sources of the fixture libraries `Fix_Lib` and `fixdep`, and the
-refusals of a broken install, word for word.
+It also holds what the test files of those keys share: the stage `STAGE` of their projects, the
+file `OUTPUT` it writes and the `pipeline.py` of a project whose stage calls installed modules
+(`pipeline`), the sources of the fixture libraries `Fix_Lib` and `fixdep`, and the refusals of a
+broken install, word for word.
 """
 
 from __future__ import annotations
@@ -48,11 +49,38 @@ _PIVOT_MAIN = "from pivot.cli import _console_main; _console_main()"
 STAGE = "p/make"
 OUTPUT = pathlib.Path("data/p/make.txt")
 
+# The `pipeline.py` that `pipeline` writes: `{imports}` imports the modules whose `value()`s
+# `{expression}` joins.
+_PIPELINE = """\
+{imports}
+
+from pivot import Pipeline, stage
+
+
+@stage
+def make() -> str:
+    return {expression}
+
+
+with Pipeline("p") as pipeline:
+    make()
+"""
+
+
+def pipeline(*modules: str) -> str:
+    """The `pipeline.py` of a project whose stage `STAGE` imports each of `modules` and writes
+    their `value()`s joined, and names nothing else of them."""
+    return _PIPELINE.format(
+        imports="\n".join(f"import {module}" for module in modules),
+        expression=" + ".join(f"{module}.value()" for module in modules),
+    )
+
+
 # The source of `fixdep`'s module, and of `Fix_Lib`'s module `fixlib`, whose `value()` adds
 # `fixdep.base()` to a literal and whose `main()` a console script can run
 # (`write_fixlib_and_fixdep`).
 FIXDEP = 'def base():\n    return "base-1"\n'
-FIXLIB = """\
+_FIXLIB = """\
 import fixdep
 
 
@@ -113,26 +141,6 @@ class Project:
     venv: Venv
 
 
-def uv() -> str:
-    """The uv executable: the one `PIVOT_TEST_UV` names, else the `uv` on PATH. The test fails
-    when neither names an executable file."""
-    found = os.environ.get("PIVOT_TEST_UV") or shutil.which("uv")
-    if found is None or not (pathlib.Path(found).is_file() and os.access(found, os.X_OK)):
-        pytest.fail(
-            "these tests need uv: set PIVOT_TEST_UV to the uv executable or put uv on PATH "
-            + f"(PIVOT_TEST_UV is {os.environ.get('PIVOT_TEST_UV')!r}, uv on PATH is "
-            + f"{shutil.which('uv')!r})",
-            pytrace=False,
-        )
-    return found
-
-
-def run_uv(cwd: pathlib.Path, *args: str) -> str:
-    """Run `uv <args>` in `cwd` with `helpers.clean_env()`; the test fails unless it exits 0.
-    Returns what it printed."""
-    return _run_checked(cwd, [uv(), *args])
-
-
 def make_venv(venv: pathlib.Path, *, seed: bool = False) -> Venv:
     """Make a venv at `venv` (`_new_venv`; `seed`: with pip, `uv venv --seed`) whose
     site-packages holds a `.pth` file that adds this test environment's purelib directory to
@@ -149,7 +157,7 @@ def make_standalone_venv(venv: pathlib.Path, *specs: str) -> Venv:
     `specs` into it with `uv pip install`, from the package index and with build isolation, so it
     needs network access; the test fails unless the install succeeds."""
     made = _new_venv(venv, seed=False)
-    run_uv(venv.parent, "pip", "install", "--python", str(made.python), *specs)
+    _run_uv(venv.parent, "pip", "install", "--python", str(made.python), *specs)
     return made
 
 
@@ -224,27 +232,18 @@ def write_fixlib_and_fixdep(
     root: pathlib.Path, *, console_script: bool = False
 ) -> tuple[pathlib.Path, pathlib.Path]:
     """Write under `root` the projects (`write_library`) of `Fix_Lib` (module `fixlib` of
-    `FIXLIB`, requires `fixdep`; `console_script`: with the console script `fix-lib`, which runs
+    `_FIXLIB`, requires `fixdep`; `console_script`: with the console script `fix-lib`, which runs
     `fixlib:main`) and `fixdep` (module `fixdep` of `FIXDEP`); returns their directories."""
     fixlib = write_library(
         root,
         "Fix_Lib",
         "fixlib",
-        FIXLIB,
+        _FIXLIB,
         dependencies=("fixdep",),
         scripts={"fix-lib": "fixlib:main"} if console_script else None,
     )
     fixdep = write_library(root, "fixdep", "fixdep", FIXDEP)
     return fixlib, fixdep
-
-
-def remove_build_outputs(source: pathlib.Path) -> None:
-    """Delete what a setuptools build leaves in the project at `source` (`build/` and each
-    `*.egg-info` directory), so that its next build starts from a clean tree and no file of an
-    earlier build reaches a RECORD."""
-    for leftover in [source / "build", *source.glob("*.egg-info")]:
-        if leftover.exists():
-            shutil.rmtree(leftover)
 
 
 def replace_once(path: pathlib.Path, old: str, new: str) -> None:
@@ -267,7 +266,7 @@ def damage(path: pathlib.Path, text: str | None) -> None:
 def install(venv: Venv, *spec: str, reinstall: bool = False) -> str:
     """`uv pip install --offline --python <venv>/bin/python --no-build-isolation --no-deps
     [--reinstall] <spec>`; the test fails unless it succeeds. Returns what uv printed."""
-    return run_uv(
+    return _run_uv(
         venv.python.parent,
         "pip",
         "install",
@@ -285,8 +284,8 @@ def install_directory(
     venv: Venv, source: pathlib.Path, *, reinstall: bool = False, editable: bool = False
 ) -> str:
     """Install the project at `source` from its path (`editable`: with `-e`), after deleting what
-    an earlier build left in it (`remove_build_outputs`)."""
-    remove_build_outputs(source)
+    an earlier build left in it (`_remove_build_outputs`)."""
+    _remove_build_outputs(source)
     return install(venv, *(["-e"] if editable else []), str(source), reinstall=reinstall)
 
 
@@ -294,8 +293,8 @@ def build_wheel(venv: Venv, source: pathlib.Path, wheels: pathlib.Path) -> str:
     """Build a wheel of the project at `source` into the directory `wheels` with `uv build
     --offline --no-build-isolation --wheel` on the venv's interpreter, after deleting what an
     earlier build left in it."""
-    remove_build_outputs(source)
-    return run_uv(
+    _remove_build_outputs(source)
+    return _run_uv(
         source.parent,
         "build",
         "--offline",
@@ -320,7 +319,7 @@ def pip_install_directory(venv: Venv, source: pathlib.Path) -> str:
     install --no-index --no-build-isolation --no-deps`; the venv needs pip, `make_venv(...,
     seed=True)`), after deleting what an earlier build left in it; the test fails unless it
     succeeds. Returns what pip printed."""
-    remove_build_outputs(source)
+    _remove_build_outputs(source)
     return _run_checked(
         venv.python.parent,
         [
@@ -398,20 +397,29 @@ def direct_url(venv: Venv, name: str) -> dict[str, Any] | None:
     return None if text is None else json.loads(text)
 
 
-def make_project(root: pathlib.Path, home: pathlib.Path, venv: Venv, pipeline: str) -> Project:
-    """`git init -q` and `pivot init` a new project at `root`, then write `pipeline` as its
-    `pipeline.py`."""
-    root.mkdir(parents=True)
-    project = Project(root=root, home=home, venv=venv)
-    git(root, home, "init", "-q")
-    pivot_ok(project, "init")
-    (root / "pipeline.py").write_text(pipeline)
-    return project
+def reinstall_from_commit(
+    venv: Venv, name: str, repo: pathlib.Path, commit: str, label: str
+) -> None:
+    """Reinstall distribution `name` from `commit`, which a failure calls `label`, of the local git
+    repository `repo` (`git_requirement`); the test fails unless its `direct_url.json` then names
+    that commit."""
+    install(venv, git_requirement(name, repo, commit), reinstall=True)
+    url = direct_url(venv, name)
+    assert url is not None and url["vcs_info"]["commit_id"] == commit, (
+        f"{name} must now be installed from {label} {commit}: direct_url.json is {url!r}"
+    )
 
 
 def make_project_in(tmp_path: pathlib.Path, venv: Venv, pipeline: str) -> Project:
-    """The project `make_project` makes at `tmp_path/project`, with `tmp_path/home` as `HOME`."""
-    return make_project(tmp_path / "project", tmp_path / "home", venv, pipeline)
+    """`git init -q` and `pivot init` a new project at `tmp_path/project`, with `tmp_path/home` as
+    `HOME`, then write `pipeline` as its `pipeline.py`."""
+    root = tmp_path / "project"
+    root.mkdir(parents=True)
+    project = Project(root=root, home=tmp_path / "home", venv=venv)
+    git(root, project.home, "init", "-q")
+    pivot_ok(project, "init")
+    (root / "pipeline.py").write_text(pipeline)
+    return project
 
 
 def run_pivot(project: Project, *args: str) -> subprocess.CompletedProcess[str]:
@@ -526,7 +534,7 @@ def assert_runs_and_writes(project: Project, output: str, command: str = "`pivot
     return shown
 
 
-def ran_then_cached(project: Project, output: str) -> None:
+def assert_ran_then_cached(project: Project, output: str) -> None:
     """The first `pivot repro` runs `STAGE`, which writes `output` (`assert_runs_and_writes`);
     `pivot status --json` then reports it `cached`."""
     assert_runs_and_writes(project, output, "the first `pivot repro`")
@@ -589,7 +597,7 @@ def shown(ran: subprocess.CompletedProcess[str]) -> str:
 def _new_venv(venv: pathlib.Path, *, seed: bool) -> Venv:
     """Make a venv at `venv` with `uv venv --python <this interpreter>` (`seed`: with pip, `uv
     venv --seed`)."""
-    run_uv(
+    _run_uv(
         venv.parent, "venv", *(["--seed"] if seed else []), "--python", sys.executable, str(venv)
     )
     python = venv / "bin" / "python"
@@ -623,6 +631,35 @@ def _parsed(text: str, ran: subprocess.CompletedProcess[str]) -> Any:
         return json.loads(text)
     except json.JSONDecodeError as error:
         pytest.fail(f"pivot printed {text!r}, which is not JSON ({error}):\n{shown(ran)}")
+
+
+def _remove_build_outputs(source: pathlib.Path) -> None:
+    """Delete what a setuptools build leaves in the project at `source` (`build/` and each
+    `*.egg-info` directory), so that its next build starts from a clean tree and no file of an
+    earlier build reaches a RECORD."""
+    for leftover in [source / "build", *source.glob("*.egg-info")]:
+        if leftover.exists():
+            shutil.rmtree(leftover)
+
+
+def _uv() -> str:
+    """The uv executable: the one `PIVOT_TEST_UV` names, else the `uv` on PATH. The test fails
+    when neither names an executable file."""
+    found = os.environ.get("PIVOT_TEST_UV") or shutil.which("uv")
+    if found is None or not (pathlib.Path(found).is_file() and os.access(found, os.X_OK)):
+        pytest.fail(
+            "these tests need uv: set PIVOT_TEST_UV to the uv executable or put uv on PATH "
+            + f"(PIVOT_TEST_UV is {os.environ.get('PIVOT_TEST_UV')!r}, uv on PATH is "
+            + f"{shutil.which('uv')!r})",
+            pytrace=False,
+        )
+    return found
+
+
+def _run_uv(cwd: pathlib.Path, *args: str) -> str:
+    """Run `uv <args>` in `cwd` with `helpers.clean_env()`; the test fails unless it exits 0.
+    Returns what it printed."""
+    return _run_checked(cwd, [_uv(), *args])
 
 
 def _run_checked(cwd: pathlib.Path, command: Sequence[str]) -> str:

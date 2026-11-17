@@ -27,23 +27,6 @@ _UNSAFE_CONFIG = "core:\n  unsafe_fingerprinting: true\n"
 # Each refusal of a broken install, and its warning under unsafe fingerprinting, ends with this.
 _REFUSAL_FIX = "Fix: reinstall"
 
-# A project whose stage writes the concatenated `value()` of each module it imports and names
-# nothing else of them.
-_PIPELINE = """\
-{imports}
-
-from pivot import Pipeline, stage
-
-
-@stage
-def make() -> str:
-    return {expression}
-
-
-with Pipeline("p") as pipeline:
-    make()
-"""
-
 # Item (e): `p/mid` calls an index-installed library, `p/chain` the first of three git installs.
 _CLOSURE_PIPELINE = """\
 import fixa
@@ -133,14 +116,6 @@ _RECORDLESS_REACHED_REFUSAL = installed_dists.UNLISTED_REFUSAL.format(
 )
 
 
-def _helper_pipeline(*modules: str) -> str:
-    """The project whose stage imports each of `modules` and writes their `value()`s joined."""
-    return _PIPELINE.format(
-        imports="\n".join(f"import {module}" for module in modules),
-        expression=" + ".join(f"{module}.value()" for module in modules),
-    )
-
-
 def _helper_flat(text: str) -> str:
     """`text` with each run of white space made one space, as a wrapped message reads."""
     return " ".join(text.split())
@@ -214,7 +189,7 @@ def test_installs_by_uv_and_by_pip_in_two_venvs_give_one_value(tmp_path: pathlib
     assert uv_script != pip_script, "the two console scripts must differ, each naming its venv"
     installers = (uv_dist.read_text("INSTALLER"), pip_dist.read_text("INSTALLER"))
     assert installers == ("uv", "pip\n"), f"the installers must be uv and pip: {installers}"
-    project = installed_dists.make_project_in(tmp_path, by_uv, _helper_pipeline("fixlib"))
+    project = installed_dists.make_project_in(tmp_path, by_uv, installed_dists.pipeline("fixlib"))
     manifest = _helper_ran(project, "value-1")
     assert installed_dists.dist_keys(manifest) == ["dist:fix-lib"], f"the lock: {manifest}"
 
@@ -238,7 +213,7 @@ def test_a_byte_edited_in_place_in_an_installed_file_changes_the_value(
         tmp_path / "src", "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE
     )
     installed_dists.install_directory(venv, source)
-    project = installed_dists.make_project_in(tmp_path, venv, _helper_pipeline("fixlib"))
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
     _helper_ran(project, "value-1")
 
     installed_dists.replace_once(
@@ -265,7 +240,7 @@ def test_a_reinstall_changing_an_entry_point_changes_the_value_and_one_of_the_ve
         scripts={"fix-lib": "fixlib:main"},
     )
     installed_dists.install_directory(venv, source)
-    project = installed_dists.make_project_in(tmp_path, venv, _helper_pipeline("fixlib"))
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
     _helper_ran(project, "value-1")
 
     installed_dists.replace_once(source / "pyproject.toml", '"fixlib:main"', '"fixlib:value"')
@@ -304,7 +279,7 @@ def test_a_local_wheel_gets_a_key_and_an_archive_from_an_https_url_gets_none(
     assert url is not None and "archive_info" in url and url["url"].startswith("file:"), (
         f"a wheel file's install must record archive_info with a file: URL: {url!r}"
     )
-    project = installed_dists.make_project_in(tmp_path, venv, _helper_pipeline("fixwheel"))
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixwheel"))
     manifest = _helper_ran(project, "value-1")
     assert installed_dists.dist_keys(manifest) == ["dist:fixwheel"], f"the lock: {manifest}"
 
@@ -387,7 +362,7 @@ def test_a_requirement_installed_editable_gets_no_key(tmp_path: pathlib.Path) ->
     assert url is not None and url["dir_info"] == {"editable": True}, (
         f"fixdep must be installed editable: direct_url.json is {url!r}"
     )
-    project = installed_dists.make_project_in(tmp_path, venv, _helper_pipeline("fixlib"))
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
 
     manifest = _helper_ran(project, "value-1:base-1")
 
@@ -424,7 +399,7 @@ def test_a_namespace_package_shared_with_an_index_distribution_gives_the_local_k
         f"{namespace} must be a namespace package of the two parts"
     )
     project = installed_dists.make_project_in(
-        tmp_path, venv, _helper_pipeline("nsco.local_part", "nsco.index_part")
+        tmp_path, venv, installed_dists.pipeline("nsco.local_part", "nsco.index_part")
     )
 
     manifest = _helper_ran(project, "localindex")
@@ -452,7 +427,7 @@ def test_a_requirement_behind_a_false_marker_still_adds_its_key(tmp_path: pathli
     installed_dists.install_directory(venv, fixlib)
     requires = installed_dists.installed(venv, "Fix_Lib").requires
     assert requires == [requirement], f"Fix_Lib's METADATA must require {requirement!r}: {requires}"
-    project = installed_dists.make_project_in(tmp_path, venv, _helper_pipeline("fixlib"))
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
 
     manifest = _helper_ran(project, "value-1")
 
@@ -499,7 +474,7 @@ def test_a_broken_install_the_stage_needs_is_refused_and_unsafe_fingerprinting_w
     fixlib, fixdep = installed_dists.write_fixlib_and_fixdep(tmp_path / "src")
     installed_dists.install_directory(venv, fixdep)
     installed_dists.install_directory(venv, fixlib)
-    project = installed_dists.make_project_in(tmp_path, venv, _helper_pipeline("fixlib"))
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
     installed_dists.damage(venv.site_packages / damaged, text)
     expected = refusal.format(site=venv.site_packages.resolve())
 
@@ -538,7 +513,7 @@ def test_defects_of_unreached_installs_refuse_nothing_and_a_deleted_listed_file_
     installed_dists.install(venv, *(str(source) for source in sources))
     installed_dists.damage(venv.site_packages / "brokenurl-0.1.dist-info" / "direct_url.json", "[]")
     installed_dists.damage(venv.site_packages / "norecord-0.1.dist-info" / "RECORD", None)
-    project = installed_dists.make_project_in(tmp_path, venv, _helper_pipeline("fixlib"))
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
     manifest = _helper_ran(project, "value-1")
     assert installed_dists.dist_keys(manifest) == ["dist:fix-lib"], f"the lock: {manifest}"
     installed_dists.lock_path(project, installed_dists.STAGE).unlink()
@@ -575,7 +550,7 @@ def test_two_installs_of_one_name_both_reached_give_one_key_that_each_changes(
     )
     assert len(list(found)) == 2, "two distributions named fix-lib must be installed"
     project = installed_dists.make_project_in(
-        tmp_path, venv, _helper_pipeline("fixlib_one", "fixlib_two")
+        tmp_path, venv, installed_dists.pipeline("fixlib_one", "fixlib_two")
     )
     before = _helper_ran(project, "one-1two-1")
     assert installed_dists.dist_keys(before) == ["dist:fix-lib"], f"the lock: {before}"

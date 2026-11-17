@@ -406,7 +406,7 @@ def test_an_upgrade_from_0_10_4_reruns_only_stages_that_reach_a_git_or_local_pat
     installed_dists.install_from_wheels(released, wheels, "upidx")
     version = installed_dists.installed(released, "pivot").version
     assert version == "0.10.4", f"the first venv must hold pivot 0.10.4, not {version}"
-    old = installed_dists.make_project(tmp_path / "project", home, released, _UPGRADE_PIPELINE)
+    old = installed_dists.make_project_in(tmp_path, released, _UPGRADE_PIPELINE)
     ran, shown = installed_dists.repro_statuses(old)
     assert ran == dict.fromkeys(_UPGRADE_OUTPUTS, "ran"), f"0.10.4 must run every stage:\n{shown}"
     written = {

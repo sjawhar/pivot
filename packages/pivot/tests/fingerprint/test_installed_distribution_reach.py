@@ -294,18 +294,12 @@ def test_a_library_reached_through_one_form_reruns_the_stage_after_a_one_byte_re
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
     installed_dists.install(venv, installed_dists.init_git_requirement(source, project.home, name))
-    installed_dists.ran_then_cached(project, outputs[0])
+    installed_dists.assert_ran_then_cached(project, outputs[0])
     installed_dists.replace_once(source / name / "__init__.py", *edit)
     commit = installed_dists.commit_all(source, project.home, "C2")
 
-    installed_dists.install(
-        venv, installed_dists.git_requirement(name, source, commit), reinstall=True
-    )
+    installed_dists.reinstall_from_commit(venv, name, source, commit, "C2")
 
-    url = installed_dists.direct_url(venv, name)
-    assert url is not None and url["vcs_info"]["commit_id"] == commit, (
-        f"{name} must now be installed from C2 {commit}: direct_url.json is {url!r}"
-    )
     module = (venv.site_packages / name / "__init__.py").read_text()
     assert module == library.replace(*edit), f"the reinstall must change {edit}: {module!r}"
     installed_dists.assert_stale_on(project, installed_dists.STAGE, f"dist:{name}")

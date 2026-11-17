@@ -391,8 +391,8 @@ _identity_active: contextvars.ContextVar[tuple[int, ...]] = contextvars.ContextV
 # Per-pass memo, keyed by kind and object id, for function identities (`function_identity`),
 # type-hint classes (`_hint_parts`), user-class members (`_user_methods`), mark decisions
 # (`_mark_decision`), class identities (`_class_identity`), the parts of classes with no source
-# (`_sourceless_parts`) and whether a module is pivot's own (`_reached_library_module`), and by
-# file name for source file digests (`_source_digest`).
+# (`_sourceless_parts`), whether a module is pivot's own (`_reached_library_module`) and a loaded
+# module's origin (`_module_origin`), and by file name for source file digests (`_source_digest`).
 # Set only inside `fingerprint_pass()`; a reload, a mutated cell or an edit is seen by the next
 # pass.
 _pass_memo: contextvars.ContextVar[dict[tuple[str, int | str], Any] | None] = (
@@ -2441,8 +2441,14 @@ def by_name_modules(manifest: Mapping[str, str], outputs: Collection[str]) -> se
     user modules it covers (`covered_user_modules`, which the stage's output keys `outputs` place)
     and the `byname:` entries, its loaders' included."""
     names = covered_user_modules(manifest, outputs)
-    names.update(name for key in manifest if (name := _by_name_entry(key)) is not None)
+    names.update(_by_name_names(manifest))
     return names
+
+
+def _by_name_names(manifest: Mapping[str, str]) -> list[str]:
+    """The module each `byname:` entry of `manifest` names (`_by_name_entry`), in manifest
+    order."""
+    return [name for key in manifest if (name := _by_name_entry(key)) is not None]
 
 
 def add_distribution_keys(manifest: dict[str, str]) -> None:
@@ -2456,7 +2462,7 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     a worker would import it from, predicted without importing it. No origin is found when the
     manifest has no `byname:` entry, or when no distribution on the worker's path can give a key
     or a refusal (`installed_distributions.needs_origins`)."""
-    names = [name for key in manifest if (name := _by_name_entry(key)) is not None]
+    names = _by_name_names(manifest)
     if not names:
         return
     path = loaded_source.worker_path()
@@ -2467,7 +2473,7 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     for name in names:
         module = sys.modules.get(name)
         origins[name] = (
-            import_origin.of_module(module)
+            _module_origin(module)
             if isinstance(module, types.ModuleType)
             else loaded_source.worker_origin(name)
         )
@@ -2475,6 +2481,12 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     for message in found.refusals:
         _report_refusal(message, downgradable=True)
     manifest.update(found.keys)
+
+
+def _module_origin(module: types.ModuleType) -> import_origin.Origin:
+    """`import_origin.of_module(module)`, found once per module object within one
+    `fingerprint_pass()`."""
+    return _memoized("module-origin", module, lambda: import_origin.of_module(module))
 
 
 def without_by_name(manifest: Mapping[str, str]) -> dict[str, str]:
@@ -3980,38 +3992,38 @@ def _hint_parts(func: Callable[..., Any]) -> _HintParts:
     def collect() -> _HintParts:
         parts = _HintParts(classes=[], modules=[])
         for hint in _resolved_type_hints(func).values():
-            _collect_hint_classes(hint, parts.classes, parts.modules)
+            _collect_hint_classes(hint, parts)
         return parts
 
     return _memoized("hints", func, collect)
 
 
-def _collect_hint_classes(hint: Any, found: list[type], modules: list[str]) -> None:
-    """Add the user classes in one type hint to `found`, and the module of each library class in
-    it to `modules` unless the walk does not record it (`_reached_library_module`), recursing into
-    generics. A class is decided on its real type first, so no metaclass attribute hook runs
-    (`typing.get_origin` would read its `__class__`)."""
+def _collect_hint_classes(hint: Any, parts: _HintParts) -> None:
+    """Add the user classes in one type hint to `parts.classes`, and the module of each library
+    class in it to `parts.modules` unless the walk does not record it (`_reached_library_module`),
+    recursing into generics. A class is decided on its real type first, so no metaclass attribute
+    hook runs (`typing.get_origin` would read its `__class__`)."""
     if hint is type(None):
         return
     if issubclass(type(hint), type):
-        _collect_hint_class(hint, found, modules)
+        _collect_hint_class(hint, parts)
         return
     origin = typing.get_origin(hint)
     if origin is not None:
         # A generic's origin is a class of the hint too (MyGeneric[int] -> MyGeneric)
         if issubclass(type(origin), type):
-            _collect_hint_class(origin, found, modules)
+            _collect_hint_class(origin, parts)
         for arg in typing.get_args(hint):
-            _collect_hint_classes(arg, found, modules)
+            _collect_hint_classes(arg, parts)
 
 
-def _collect_hint_class(cls: type[Any], found: list[type], modules: list[str]) -> None:
-    """Add class `cls` of a type hint to `found` when it is user code, else its module to
-    `modules` when the walk records it (`_collect_hint_classes`)."""
+def _collect_hint_class(cls: type[Any], parts: _HintParts) -> None:
+    """Add class `cls` of a type hint to `parts.classes` when it is user code, else its module to
+    `parts.modules` when the walk records it (`_collect_hint_classes`)."""
     if is_user_code(cls):
-        found.append(cls)
+        parts.classes.append(cls)
     elif (name := _reached_library_module(cls)) is not None:
-        modules.append(name)
+        parts.modules.append(name)
 
 
 def _process_type_hint_dependencies(func: Callable[..., Any]) -> None:
