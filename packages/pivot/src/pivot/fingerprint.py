@@ -108,7 +108,11 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # are no `held:` entries, and a cache hit replays the reads of the code inside a value.
 # Version 42 rechecks classes whose DynamicClassAttribute/enum.property members were omitted.
 # Version 43 records a held classmethod's function and its original receiver class.
-_CACHE_SCHEMA_VERSION = 43
+# Version 44 records by name (`byname:` entries) the library module a stage reaches through a
+# library base class, a class in a type hint or a class-body annotation, a library class, instance,
+# enum member or exception inside a value, a library loader class, a library stage function, and a
+# library callable whose `__module__` is not a string; not builtins, the standard library or pivot.
+_CACHE_SCHEMA_VERSION = 44
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
@@ -367,9 +371,10 @@ _identity_active: contextvars.ContextVar[tuple[int, ...]] = contextvars.ContextV
 
 
 # Per-pass memo, keyed by kind and object id, for function identities (`function_identity`),
-# type-hint classes (`_hint_classes`), user-class members (`_user_methods`), mark decisions
-# (`_mark_decision`), class identities (`_class_identity`) and the parts of classes with no source
-# (`_sourceless_parts`), and by file name for source file digests (`_source_digest`).
+# type-hint classes (`_hint_parts`), user-class members (`_user_methods`), mark decisions
+# (`_mark_decision`), class identities (`_class_identity`), the parts of classes with no source
+# (`_sourceless_parts`) and whether a module is pivot's own (`_reached_library_module`), and by
+# file name for source file digests (`_source_digest`).
 # Set only inside `fingerprint_pass()`; a reload, a mutated cell or an edit is seen by the next
 # pass.
 _pass_memo: contextvars.ContextVar[dict[tuple[str, int | str], Any] | None] = (
@@ -1114,7 +1119,8 @@ def _read_token(owner: Any, step: str) -> str:
     the key of each class in it, so a cache hit forms it again and walks no code in it.
     """
     if step == "hints":
-        return "|".join(_value_token(cls) for cls in _hint_classes(owner))
+        library = (f"byname:{name}" for name in _hint_library_modules(owner))
+        return "|".join([*(_value_token(cls) for cls in _hint_classes(owner)), *library])
     if step == "schema":
         if not hasattr(owner, "model_json_schema"):
             return "absent"
@@ -1377,8 +1383,9 @@ def _stage_manifest(
     func: Callable[..., Any], *, recording: bool
 ) -> tuple[dict[str, str], list[tuple[tuple[str, ...], str]]]:
     """The manifest of stage function `func`: its `self:` hash and the projection of its node, in
-    a walk of its own (`_loaders_walk` says why); with `recording`, also the reads that projection
-    takes."""
+    a walk of its own (`_loaders_walk` says why), and, for a stage function defined in a library
+    module, that module by name (`_reached_library_module`); with `recording`, also the reads
+    that projection takes."""
     # Public callers need the same identity sharing as an engine's surrounding pass. Otherwise
     # each ancestor's class key restarts its complete base walk, multiplying deep-MRO work.
     with fingerprint_pass():
@@ -1387,6 +1394,12 @@ def _stage_manifest(
         walk.run()
         manifest = {f"self:{getattr(func, '__name__', '<lambda>')}": hash_function_ast(func)}
         reads = _project(root, manifest, recording=recording)
+        # Decided by its module, not `is_user_code(func)`: a user function the walk records by
+        # name for a mark (`_recorded_by_name`) is not library code.
+        module = _get_module(func)
+        if module is not None and not is_user_code(module):
+            # Its body is hashed (`self:`), the rest of its module is not: a worker imports it.
+            _mark_by_name(_reached_library_module(getattr(func, "__module__", None)), manifest)
         return manifest, reads
 
 
@@ -1941,7 +1954,9 @@ def _expand_class(cls: type) -> None:
     that `__bases__` does not hold (`ob:INDEX`, a `TypedDict`'s), every callable member of its own
     namespace (`m:`), each class attribute a member reads through its receiver (`ca:`), its own
     dataclass field defaults (`fd:`), a pydantic model's schema and field defaults (`schema`,
-    `fc:`, `sd:`), and for a class with no source the values its namespace holds (`ns:`).
+    `fc:`, `sd:`), and for a class with no source the values its namespace holds (`ns:`). A
+    library base, whose code is not walked, is read too, and its module recorded by name
+    (`_reached_library_module`).
 
     Every class's bases are its edges, a class statement's or a `type()` class's alike, and its
     members are its own namespace's: a member it inherits is its base's, walked once under the
@@ -1954,19 +1969,26 @@ def _expand_class(cls: type) -> None:
         if tree is not None:
             _check_dynamic_access(cls, tree)
     _process_class_body_dependencies(cls)
+    entries = _entries()
     bases = _class_bases(cls)
     for index, base in enumerate(bases):
-        if base is object or not is_user_code(base):
+        if base is object:
             continue
         step = f"b:{index}"
         _record_read(cls, step)
+        if not is_user_code(base):
+            _mark_by_name(_reached_library_module(_class_module(base)), entries)
+            continue
         with _walking(step):
             _add_callable(base, in_value=True)
     for index, base in enumerate(_statement_bases(cls)):
-        if any(base is known for known in bases) or not is_user_code(base):
+        if any(base is known for known in bases):
             continue
         step = f"ob:{index}"
         _record_read(cls, step)
+        if not is_user_code(base):
+            _mark_by_name(_reached_library_module(_class_module(base)), entries)
+            continue
         with _walking(step):
             _add_callable(base, in_value=True)
     _process_user_methods(cls)
@@ -2334,13 +2356,52 @@ def covered_user_modules(manifest: Mapping[str, str], outputs: Collection[str]) 
 
 def _mark_by_name(module_name: object, manifest: dict[str, str]) -> None:
     """Record that a stage's worker imports module `module_name` by name to run code the walk
-    does not hash: a library module read as a global or imported in a function body, or the
-    module that defines a callable recorded by name (`ext:`). `loaded_source.check_worker_imports`
-    compares each with the module the worker would import, and the manifest cache re-checks
-    where each resolves (`_try_manifest_cache_hit`). A lock does not record these entries
-    (`without_by_name`)."""
+    does not hash: a library module read as a global or imported in a function body, the module
+    that defines a callable recorded by name (`ext:`), or a library module the stage reaches by a
+    class, a hint, a loader, a value or its own function (`_reached_library_module`).
+    `loaded_source.check_worker_imports` compares each with the module the worker would import,
+    and the manifest cache re-checks where each resolves (`_try_manifest_cache_hit`). A lock does
+    not record these entries (`without_by_name`)."""
     if isinstance(module_name, str) and module_name:
         manifest.setdefault(f"byname:{module_name}", "")
+
+
+def _reached_library_module(module_name: object) -> str | None:
+    """The name of the library module `module_name` for its `byname:` entry (`_mark_by_name`), at
+    each place where a stage reaches library code that no other entry names: a library base
+    class, a library class in a type hint or a class-body annotation, a library class, instance,
+    enum member or exception inside a value, a library loader class, a stage function that is
+    library code, and a library callable whose `__module__` is not a string (found by
+    `_library_module`). None for a name that is not a string, for builtins and every other
+    standard-library module (its top-level name is in `sys.stdlib_module_names`), and for a
+    loaded module whose file lies in one of pivot's own packages (`_PIVOT_PACKAGE_DIRS`): no
+    installed distribution of the user's comes from either, and a stage's `int` hints and
+    `StageParams` base add no entry. A module that is not loaded has no file to decide by, so its
+    name is kept."""
+    if not isinstance(module_name, str) or not module_name:
+        return None
+    if module_name.partition(".")[0] in sys.stdlib_module_names:
+        return None
+    module = sys.modules.get(module_name)
+    if isinstance(module, types.ModuleType) and _memoized(
+        "pivot-module", module, lambda: _in_pivot_packages(module)
+    ):
+        return None
+    return module_name
+
+
+def _in_pivot_packages(module: types.ModuleType) -> bool:
+    """Whether `module`'s file, resolved, lies in one of pivot's own packages
+    (`_PIVOT_PACKAGE_DIRS`), read through the module's namespace, so no code of a module subclass
+    runs."""
+    file = _module_namespace(module).get("__file__")
+    if not isinstance(file, str):
+        return False
+    try:
+        path = pathlib.Path(file).resolve()
+    except OSError:
+        return False
+    return any(path.is_relative_to(directory) for directory in _PIVOT_PACKAGE_DIRS)
 
 
 def _by_name_entry(key: str) -> str | None:
@@ -2472,7 +2533,8 @@ def _names_submodule(module: types.ModuleType, attribute: str) -> bool:
 
 def _process_class_body_dependencies(cls: type) -> None:
     """Add an edge to each user class a class statement's annotations name (`n:NAME`, or
-    `np:DOTTED` for `pkg.Type`), read in the namespace of the class's module. Its bases are its
+    `np:DOTTED` for `pkg.Type`), read in the namespace of the class's module, and record by name
+    the module of each library class they name (`_reached_library_module`). Its bases are its
     `b:` edges (`_expand_class`), the classes `__bases__` holds, not the names its statement
     wrote."""
     try:
@@ -2497,20 +2559,28 @@ def _process_class_body_dependencies(cls: type) -> None:
         if isinstance(stmt, ast.AnnAssign):
             _collect_annotation_names(stmt.annotation, names, dotted_refs)
 
+    entries = _entries()
     for name in sorted(names):
         _record_read(cls, f"n:{name}")
         if name not in ns:
             continue
         value = ns[name]
-        if issubclass(type(value), type) and is_user_code(value):
-            with _walking(f"n:{name}"):
-                _add_callable(value)
+        if not issubclass(type(value), type):
+            continue
+        if not is_user_code(value):
+            _mark_by_name(_reached_library_module(_class_module(value)), entries)
+            continue
+        with _walking(f"n:{name}"):
+            _add_callable(value)
 
     for parts in dotted_refs:
         step = f"np:{'.'.join(parts)}"
         _record_read(cls, step)
         resolved = _resolve_dotted_path(parts, ns)
-        if not issubclass(type(resolved), type) or not is_user_code(resolved):
+        if not issubclass(type(resolved), type):
+            continue
+        if not is_user_code(resolved):
+            _mark_by_name(_reached_library_module(_class_module(resolved)), entries)
             continue
         with _walking(step):
             _add_callable(resolved)
@@ -2635,7 +2705,9 @@ def _expand_loader_class(loader_type: type[Any], key: str) -> None:
     and `empty` (`lm:NAME`) and of the members they reach (`lr:REF`,
     `_reachable_loader_members`), and the hashes of its `load`, `save` and overridden `empty`
     (`loader:<key>:load`, `:save`, `:empty`). A member the class itself defines is keyed under
-    the node's key."""
+    the node's key. The module of each library class on its MRO, a library loader class's own
+    included, is recorded by name (`_reached_library_module`): the code those classes' methods
+    call is not walked."""
     from pivot import loaders as loaders_module
 
     stage_name = _current_stage_name.get() or _class_qualname(loader_type)
@@ -2654,10 +2726,14 @@ def _expand_loader_class(loader_type: type[Any], key: str) -> None:
         with _walking(step):
             _process_captured_value(binding, binding, member, loader_type, stage_name, chain=None)
 
+    entries = _entries()
+    for klass in _class_mro(loader_type):
+        if not is_user_code(klass):
+            _mark_by_name(_reached_library_module(_class_module(klass)), entries)
+
     # Use each method definition rather than a temporary bound method so the
     # weak AST hash cache retains the entry across loader fingerprint calls.
     methods = cast("Any", loader_type)
-    entries = _entries()
     if _on_mro(loader_type, loaders_module.Writer):
         entries[f"loader:{key}:save"] = hash_function_ast(_method_function(methods.save))
 
@@ -3496,7 +3572,13 @@ def _process_captured_value(
             # A library function or class is named by where it is defined; its code is not
             # hashed, but rebinding the name to another one must change the manifest.
             entries[f"ext:{binding_ref}"] = _library_name(value)
-            _mark_by_name(getattr(value, "__module__", None), entries)
+            module_name = getattr(value, "__module__", None)
+            if isinstance(module_name, str):
+                _mark_by_name(module_name, entries)
+            elif (exporter := _library_module(value)) is not None:
+                # No `__module__` names where it is defined (scipy.special's ufuncs): the library
+                # module that binds it under its own name is the one a worker imports.
+                _mark_by_name(_reached_library_module(exporter.__name__), entries)
         case _ValueKind.LOGGER:
             return
         case _ValueKind.HOOKED:
@@ -3815,45 +3897,70 @@ def _resolved_type_hints(func: Callable[..., Any]) -> dict[str, Any]:
 
 def _hint_classes(func: Callable[..., Any]) -> list[type]:
     """Return each user class in `func`'s type hints, including the origin of a generic
-    (`MyContainer[int]`). Within one `fingerprint_pass()` each function's hints are collected
-    once.
-    """
+    (`MyContainer[int]`): the first part of `_hint_parts`."""
+    return _hint_parts(func)[0]
 
-    def collect() -> list[type]:
+
+def _hint_library_modules(func: Callable[..., Any]) -> list[str]:
+    """The module of each library class in `func`'s type hints that the walk records by name: the
+    second part of `_hint_parts`."""
+    return _hint_parts(func)[1]
+
+
+def _hint_parts(func: Callable[..., Any]) -> tuple[list[type], list[str]]:
+    """The user classes in `func`'s type hints and the modules of the library classes in them that
+    the walk records by name (`_collect_hint_classes`). Within one `fingerprint_pass()` each
+    function's hints are collected once."""
+
+    def collect() -> tuple[list[type], list[str]]:
         found = list[type]()
+        modules = list[str]()
         for hint in _resolved_type_hints(func).values():
-            _collect_hint_classes(hint, found)
-        return found
+            _collect_hint_classes(hint, found, modules)
+        return found, modules
 
     return _memoized("hints", func, collect)
 
 
-def _collect_hint_classes(hint: Any, found: list[type]) -> None:
-    """Add the user classes in one type hint to `found`, recursing into generics. A class is
-    decided on its real type first, so no metaclass attribute hook runs (`typing.get_origin`
-    would read its `__class__`)."""
+def _collect_hint_classes(hint: Any, found: list[type], modules: list[str]) -> None:
+    """Add the user classes in one type hint to `found`, and the module of each library class in
+    it to `modules` unless the walk does not record it (`_reached_library_module`), recursing into
+    generics. A class is decided on its real type first, so no metaclass attribute hook runs
+    (`typing.get_origin` would read its `__class__`)."""
     if hint is type(None):
         return
     if issubclass(type(hint), type):
-        if is_user_code(hint):
-            found.append(cast("type[Any]", hint))
+        _collect_hint_class(hint, found, modules)
         return
     origin = typing.get_origin(hint)
     if origin is not None:
-        # Track user-defined generic classes (e.g., MyGeneric[int] -> hash MyGeneric)
-        if issubclass(type(origin), type) and is_user_code(origin):
-            found.append(cast("type[Any]", origin))
+        # A generic's origin is a class of the hint too (MyGeneric[int] -> MyGeneric)
+        if issubclass(type(origin), type):
+            _collect_hint_class(origin, found, modules)
         for arg in typing.get_args(hint):
-            _collect_hint_classes(arg, found)
+            _collect_hint_classes(arg, found, modules)
+
+
+def _collect_hint_class(cls: type[Any], found: list[type], modules: list[str]) -> None:
+    """Add class `cls` of a type hint to `found` when it is user code, else its module to
+    `modules` when the walk records it (`_collect_hint_classes`)."""
+    if is_user_code(cls):
+        found.append(cls)
+    elif (name := _reached_library_module(_class_module(cls))) is not None:
+        modules.append(name)
 
 
 def _process_type_hint_dependencies(func: Callable[..., Any]) -> None:
-    """Add an edge to each user class in `func`'s type hints (`hc:INDEX`); a pydantic model's
-    schema and field defaults are its class node's (`_process_model_schema`)."""
+    """Add an edge to each user class in `func`'s type hints (`hc:INDEX`), and record by name the
+    module of each library class in them (`_hint_library_modules`); a pydantic model's schema and
+    field defaults are its class node's (`_process_model_schema`)."""
     _record_read(func, "hints")
     for index, hint_class in enumerate(_hint_classes(func)):
         with _walking(f"hc:{index}"):
             _add_callable(hint_class)
+    entries = _entries()
+    for module_name in _hint_library_modules(func):
+        _mark_by_name(module_name, entries)
 
 
 def _strip_schema_metadata(schema: dict[str, Any]) -> dict[str, Any]:
@@ -4267,6 +4374,12 @@ class _FormBuilder:
             self.report(_ReportKind.EXTERNAL, module)
         return ["external", _library_name(value)]
 
+    def library_class(self, cls: type[Any], *steps: str) -> None:
+        """Report the module of library class `cls`, at `steps`, when the walk records it by name
+        (`_reached_library_module`): a worker imports it to run the class's code."""
+        if (name := _reached_library_module(_class_module(cls))) is not None:
+            self.report(_ReportKind.EXTERNAL, name, *steps)
+
     def opaque(self, value: Any) -> Any:
         self.report(_ReportKind.OPAQUE, value)
         return ["opaque", _definition_ref(type(value))]
@@ -4334,12 +4447,14 @@ class _FormBuilder:
     def class_label(self, cls: type[Any]) -> Any:
         """A class: a user class by its key (`label`), reported for its class node, or, when its
         metaclass answers attribute reads with user code, `hooked`; a library class by
-        `type.__repr__`, which runs no metaclass code (main's text)."""
+        `type.__repr__`, which runs no metaclass code (main's text), its module reported
+        (`library_class`)."""
         if is_user_code(cls):
             if _attribute_hook(cls) is not None:
                 return self.hooked(cls)
             self.report(_ReportKind.CLASS, cls)
             return ["class", self.label(cls)]
+        self.library_class(cls)
         return [_class_name(type(cls)), type.__repr__(cls)]
 
     def module(self, module: Any) -> Any:
@@ -4748,8 +4863,8 @@ class _FormBuilder:
 
     def state(self, tag: str, value: Any, value_type: type[Any], *, user: bool) -> Any:
         """An instance by its state (`field_rows`): a user class by its key, reported for its class
-        node at `cls`; a library class by its definition name. Opaque when its layout holds state
-        no descriptor shows (`_layout`)."""
+        node at `cls`; a library class by its definition name, its module reported at `cls`
+        (`library_class`). Opaque when its layout holds state no descriptor shows (`_layout`)."""
         layout = self.layout(value_type)
         if not layout.readable:
             return self.opaque(value)
@@ -4762,6 +4877,7 @@ class _FormBuilder:
         if fields is None:
             return self.opaque(value)
         if not user:
+            self.library_class(value_type, "cls")
             return [tag, _definition_ref(value_type), fields]
         self.report(_ReportKind.CLASS, value_type, "cls")
         return [tag, self.label(value_type), fields]
@@ -4836,6 +4952,8 @@ class _FormBuilder:
         user = is_user_code(value_type)
         if user:
             self.report(_ReportKind.CLASS, value_type, "cls")
+        else:
+            self.library_class(value_type, "cls")
         state = dict[str, Any]()
         state["args"] = yield ("ea", _exception_args(value))
         found = _exception_fields(value_type, value)
@@ -4853,14 +4971,16 @@ class _FormBuilder:
 
     def enum_member(self, value: Any, value_type: type[Any]) -> Any:
         """An Enum member: its class (a user Enum's by its key, reported for its class node; a
-        library Enum's by its definition name), its name and its value's form (`ev`). A value is
-        not in a class statement's syntax tree (`PICK = settings.VALUE`), so it is formed."""
+        library Enum's by its definition name, its module reported: `library_class`), its name and
+        its value's form (`ev`). A value is not in a class statement's syntax tree (`PICK =
+        settings.VALUE`), so it is formed."""
         attributes = _instance_dict(value_type, value) or {}
         name = attributes.get("_name_")
         if is_user_code(value_type):
             self.report(_ReportKind.CLASS, value_type, "cls")
             label = self.label(value_type)
         else:
+            self.library_class(value_type, "cls")
             label = _definition_ref(value_type)
         head = ["enum", label, name if type(name) is str else None]
         return self.part_rows(head, ("ev", attributes.get("_value_")))
