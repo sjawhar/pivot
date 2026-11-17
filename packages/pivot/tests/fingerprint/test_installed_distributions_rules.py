@@ -2,7 +2,8 @@
 distribution, called in this process on plain data: on `direct_url.json`, METADATA,
 `requires.txt` and RECORD as uv, pip and setuptools write them and on wrong and boundary inputs,
 on the paths a RECORD lists, on digests, on requirement graphs, on origins and on the readings
-that decide a distribution's key and its refusals; the resolution of a RECORD path, on a tree of
+that decide a distribution's key and its refusals, and on the install forms that decide whether a
+file linked into a site directory is library code; the resolution of a RECORD path, on a tree of
 symbolic links this test makes; and the walk of a reached package's directory, on a tree of
 files this test makes.
 
@@ -782,6 +783,34 @@ def test_decide_gives_a_key_and_refusals_in_their_order(
     )
 
     assert found == decision, found
+
+
+@pytest.mark.parametrize(
+    ("forms", "library"),
+    [
+        pytest.param([], False, id="no-distribution"),
+        pytest.param([_FORM.INDEX], True, id="index"),
+        pytest.param([_FORM.VCS], True, id="vcs"),
+        pytest.param([_FORM.LOCAL_DIRECTORY], True, id="local-directory"),
+        pytest.param([_FORM.LOCAL_ARCHIVE], True, id="local-archive"),
+        pytest.param([_FORM.REMOTE_ARCHIVE], True, id="remote-archive"),
+        pytest.param([_FORM.EDITABLE], False, id="editable"),
+        pytest.param([_FORM.UNCLASSIFIED], False, id="unclassified"),
+        pytest.param([_FORM.INDEX, _FORM.VCS], True, id="two-not-editable"),
+        pytest.param([_FORM.INDEX, _FORM.EDITABLE], False, id="one-editable-of-two"),
+        pytest.param([_FORM.UNCLASSIFIED, _FORM.LOCAL_DIRECTORY], False, id="one-unclassified"),
+    ],
+)
+def test_owned_by_libraries_takes_a_linked_file_listed_only_by_known_forms_not_editable(
+    forms: list[installed_distributions.InstallForm], library: bool
+) -> None:
+    """A file linked into a site directory is library code by the RECORDs that list it when at
+    least one distribution lists it and each one that does is installed from an index, version
+    control, a local directory, a local archive or a remote archive; one editable or unclassified
+    distribution among them, or none, leaves the file to its resolved path."""
+    found = installed_distributions.owned_by_libraries(forms)
+
+    assert found is library, f"forms {forms} must give {library}, not {found}"
 
 
 def test_a_record_path_resolves_to_what_realpath_gives(tmp_path: pathlib.Path) -> None:

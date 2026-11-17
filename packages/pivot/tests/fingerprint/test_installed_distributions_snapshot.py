@@ -7,11 +7,15 @@ hashes, read from disk once per process; what the scan of the path reads; the re
 install Pivot cannot read, and which reached package directories the check of an install with no
 RECORD walks, and how far, once per process. Then `fingerprint.add_distribution_keys`, which
 looks up no module's origin when no install on the path can give a key, and one fingerprint,
-through the registry, of a stage that imports its installed library only in its body. No fixture
-is imported into this process.
+through the registry, of a stage that imports its installed library only in its body. Last,
+`installed_distributions.listed_as_library` over files uv links into its cache (`--link-mode
+symlink`) and the editable layout flit's `install --symlink` makes, and
+`fingerprint.is_library_file`, which asks it only about a file linked under a library path. No
+fixture is imported into this process.
 
-The CLI tests of the same decisions are in `test_installed_distributions.py`, and the pure
-functions on plain data in `test_installed_distributions_rules.py`.
+The CLI tests of the same decisions are in `test_installed_distributions.py` and
+`test_installed_distributions_link_mode.py`, and the pure functions on plain data in
+`test_installed_distributions_rules.py`.
 """
 
 import collections.abc
@@ -54,6 +58,12 @@ _LONG_MODULE = "m" * 197
 def _helper_origin(path: pathlib.Path) -> tuple[str, str]:
     """The origin `import_origin.of_module` gives a module loaded from the file at `path`."""
     return ("file", os.path.realpath(path))
+
+
+def _helper_real(path: pathlib.Path) -> str:
+    """`path` with its directory resolved and its last name kept: the form in which
+    `fingerprint.is_library_file` asks `listed_as_library` about a file."""
+    return os.path.join(os.path.realpath(path.parent), path.name)
 
 
 def _helper_value(site: pathlib.Path, files: collections.abc.Mapping[str, str | None]) -> str:
@@ -967,3 +977,203 @@ def test_no_origin_is_found_when_no_install_on_the_path_can_give_a_key(
     assert with_keyed == {**stage, "dist:fix-lib": value}, with_keyed
     calls = [of_module.call_args_list, worker_origin.call_args_list]
     assert calls == [[mocker.call(sys.modules["json"])], [mocker.call("fixlib")]], calls
+
+
+def test_listed_as_library_takes_a_linked_file_listed_only_by_installs_not_editable(
+    tmp_path: pathlib.Path, mocker: pytest_mock.MockerFixture
+) -> None:
+    """Over real installs that uv links into its cache (`--link-mode symlink`). With only
+    `idxlib`, installed as from a package index, on the path, its module file is library code.
+    Then, with `Fix_Lib` from its path, with a console script, whose RECORD row leaves the site
+    directory, `fixbad` from its path with its `direct_url.json` made `[1, 2]` (unclassified),
+    `flitlib` as flit's `install --symlink` links an editable module file, and a link `stray.py`
+    that no RECORD lists, and with another entry on the path that holds `Fix_Lib` too, its
+    `direct_url.json` made `[1, 2]`: the module files of `idxlib` and `Fix_Lib` are library code,
+    since only the RECORDs of a file's own entry count, and `fixbad`'s, `flitlib.py` and
+    `stray.py` are not, nor is `fixlib`'s file where its link points, which no entry of the path
+    holds. Each RECORD is read once, however many files are asked about."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    src = tmp_path / "src"
+    wheels = tmp_path / "wheels"
+    installed_dists.build_wheel(
+        venv,
+        installed_dists.write_library(src, "idxlib", "idxlib", installed_dists.FIXLIB_ALONE),
+        wheels,
+    )
+    installed_dists.install_from_wheels(venv, wheels, "idxlib", link_mode="symlink")
+    site = venv.site_packages
+    path = [str(site)]
+    index_alone = installed_distributions.listed_as_library(
+        _helper_real(site / "idxlib" / "__init__.py"), path, _PIVOT_DIRS
+    )
+    fixlib = installed_dists.write_library(
+        src, "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE, scripts={"fix-lib": "fixlib:main"}
+    )
+    fixbad = installed_dists.write_library(src, "fixbad", "fixbad", installed_dists.FIXLIB_ALONE)
+    installed_dists.install_directory(venv, fixlib, link_mode="symlink")
+    installed_dists.install_directory(venv, fixbad, link_mode="symlink")
+    installed_dists.damage(site / "fixbad-0.1.dist-info" / "direct_url.json", "[1, 2]")
+    other = tmp_path / "other"
+    installed_dists.install(venv, "--target", str(other), str(fixlib))
+    installed_dists.damage(other / "fix_lib-0.1.dist-info" / "direct_url.json", "[1, 2]")
+    path = [str(site), str(other)]
+    checkout = tmp_path / "flitlib"
+    checkout.mkdir()
+    (checkout / "flitlib.py").write_text(installed_dists.FIXLIB_ALONE)
+    installed_dists.flit_symlink_install(site, checkout, "flitlib.py")
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "elsewhere" / "stray.py").write_text("STRAY = 1\n")
+    (site / "stray.py").symlink_to(tmp_path / "elsewhere" / "stray.py")
+    files = {
+        "idxlib": site / "idxlib" / "__init__.py",
+        "fixlib": site / "fixlib" / "__init__.py",
+        "fixbad": site / "fixbad" / "__init__.py",
+        "flitlib": site / "flitlib.py",
+        "stray": site / "stray.py",
+    }
+    unlinked = sorted(name for name, file in files.items() if not file.is_symlink())
+    assert unlinked == [], f"each file asked about must be a symbolic link: {unlinked}"
+    installed_distributions.reset()
+    read_record = mocker.spy(installed_distributions, "_read_record")
+
+    found = {
+        name: installed_distributions.listed_as_library(_helper_real(file), path, _PIVOT_DIRS)
+        for name, file in files.items()
+    }
+    found["fixlib-target"] = installed_distributions.listed_as_library(
+        os.path.realpath(files["fixlib"]), path, _PIVOT_DIRS
+    )
+
+    assert index_alone is True, "idxlib's linked file must be library code with it alone there"
+    assert found == {
+        "idxlib": True,
+        "fixlib": True,
+        "fixbad": False,
+        "flitlib": False,
+        "stray": False,
+        "fixlib-target": False,
+    }, found
+    read = sorted(os.path.basename(call.args[0].dist_info) for call in read_record.call_args_list)
+    assert read == [
+        "fix_lib-0.1.dist-info",
+        "fix_lib-0.1.dist-info",
+        "fixbad-0.1.dist-info",
+        installed_dists.FLIT_DIST_INFO,
+        "idxlib-0.1.dist-info",
+    ], f"each RECORD must be read once: {read}"
+
+
+def test_is_library_file_asks_the_records_only_about_a_file_linked_under_a_library_path(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: pytest_mock.MockerFixture
+) -> None:
+    """`fixcopy` installed from its path with `--link-mode copy`, `fixlink` with `--link-mode
+    symlink`, `flitlib` as flit's `install --symlink` links a package's directory, and `fixtarget`
+    with `--link-mode symlink` into `--target` directory `target`, not named site-packages. The
+    venv is reached through a symbolic link to its directory, and the worker's path is its
+    site-packages, so reached, and `target`. `fingerprint.is_library_file` takes `fixcopy`'s file
+    as library code by its resolved path, and `fixlink`'s, a link into uv's cache, by the RECORDs
+    of its site directory; it takes as user code `flitlib`'s `__init__.py`, which is no link (its
+    directory is) and resolves into the checkout, `fixtarget`'s file, a link whose path is no
+    library path, and a project file; and a code object compiled from each is user source
+    (`_is_user_source_file`) exactly where the file is user code. It asks the RECORDs only about
+    `fixlink`'s file, with its directory resolved, which the scan's resolved entry of the path
+    holds."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    src = tmp_path / "src"
+    fixcopy = installed_dists.write_library(src, "fixcopy", "fixcopy", installed_dists.FIXLIB_ALONE)
+    fixlink = installed_dists.write_library(src, "fixlink", "fixlink", installed_dists.FIXLIB_ALONE)
+    fixtarget = installed_dists.write_library(
+        src, "fixtarget", "fixtarget", installed_dists.FIXLIB_ALONE
+    )
+    installed_dists.install_directory(venv, fixcopy, link_mode="copy")
+    installed_dists.install_directory(venv, fixlink, link_mode="symlink")
+    target = tmp_path / "target"
+    installed_dists.install(venv, "--target", str(target), str(fixtarget), link_mode="symlink")
+    (tmp_path / "venv-link").symlink_to(tmp_path / "venv")
+    site = tmp_path / "venv-link" / venv.site_packages.relative_to(tmp_path / "venv")
+    checkout = tmp_path / "flitlib"
+    (checkout / "flitlib").mkdir(parents=True)
+    (checkout / "flitlib" / "__init__.py").write_text(installed_dists.FIXLIB_ALONE)
+    installed_dists.flit_symlink_install(site, checkout, "flitlib")
+    project_file = tmp_path / "project" / "helpers.py"
+    project_file.parent.mkdir()
+    project_file.write_text("HELP = 1\n")
+    files = {
+        "fixcopy": site / "fixcopy" / "__init__.py",
+        "fixlink": site / "fixlink" / "__init__.py",
+        "flitlib": site / "flitlib" / "__init__.py",
+        "fixtarget": target / "fixtarget" / "__init__.py",
+        "project": project_file,
+    }
+    links = {name: file.is_symlink() for name, file in files.items()}
+    assert links == {
+        "fixcopy": False,
+        "fixlink": True,
+        "flitlib": False,
+        "fixtarget": True,
+        "project": False,
+    }, links
+    monkeypatch.setattr(sys, "path", [str(site), str(target)])
+    listed = mocker.spy(installed_distributions, "listed_as_library")
+
+    found = {name: fingerprint.is_library_file(str(file)) for name, file in files.items()}
+    user_source = {
+        name: fingerprint._is_user_source_file(str(file)) for name, file in files.items()
+    }
+
+    assert found == {
+        "fixcopy": True,
+        "fixlink": True,
+        "flitlib": False,
+        "fixtarget": False,
+        "project": False,
+    }, found
+    assert user_source == {
+        "fixcopy": False,
+        "fixlink": False,
+        "flitlib": True,
+        "fixtarget": True,
+        "project": True,
+    }, user_source
+    asked = [call.args[0] for call in listed.call_args_list]
+    real = os.path.join(os.path.realpath(venv.site_packages / "fixlink"), "__init__.py")
+    assert asked == [real], f"only fixlink's file may be asked about, as {real}: {asked}"
+
+
+def test_a_namespace_package_uv_links_into_its_cache_gives_the_key_of_a_copied_one(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`Fix_Ns`, whose one package is the namespace portion `nsco.part`, installed from its path
+    into one venv with `--link-mode copy` and into another with `--link-mode symlink`, where each
+    of its files is a link into uv's cache from a real directory. A stage that reaches the
+    namespace package `nsco`, whose origin names its directory in site-packages, gets
+    `dist:fix-ns` in both, with one value."""
+    source = installed_dists.write_setuptools_project(
+        tmp_path / "src" / "fixns",
+        "Fix_Ns",
+        "0.1",
+        packages=["nsco.part"],
+        files={"nsco/part/__init__.py": "PART = 1\n"},
+    )
+    copied = installed_dists.make_venv(tmp_path / "copy")
+    linked = installed_dists.make_venv(tmp_path / "symlink")
+    installed_dists.install_directory(copied, source, link_mode="copy")
+    installed_dists.install_directory(linked, source, link_mode="symlink")
+    links = [
+        (venv.site_packages / "nsco" / "part" / "__init__.py").is_symlink()
+        for venv in (copied, linked)
+    ]
+    assert links == [False, True], f"nsco/part/__init__.py must be a copy, then a link: {links}"
+
+    found = [
+        installed_distributions.distribution_keys(
+            {"nsco": ("namespace", os.path.realpath(venv.site_packages / "nsco"))},
+            [str(venv.site_packages)],
+            _PIVOT_DIRS,
+        )
+        for venv in (copied, linked)
+    ]
+
+    value = _helper_value(copied.site_packages, {"nsco/part/__init__.py": "nsco/part/__init__.py"})
+    keyed = installed_distributions.DistributionKeys({"dist:fix-ns": value}, [])
+    assert found == [keyed, keyed], found

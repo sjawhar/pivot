@@ -14,13 +14,16 @@ PyYAML, `tests.helpers` and the `pivot` package, so the tests that use it still 
 
 It also holds what the test files of those keys share: the stage `STAGE` of their projects, the
 file `OUTPUT` it writes and the `pipeline.py` of a project whose stage calls installed modules
-(`pipeline`), the sources of the fixture libraries `Fix_Lib` and `fixdep`, and the refusals of a
-broken install, word for word, with the start pivot gives each for `STAGE` (`STAGE_PREFIX`).
+(`pipeline`), the sources of the fixture libraries `Fix_Lib` and `fixdep`, the refusals of a
+broken install, word for word, with the start pivot gives each for `STAGE` (`STAGE_PREFIX`), and
+the layout flit's `install --symlink` gives an editable install (`flit_symlink_install`), built
+by hand since CI has no flit.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -125,6 +128,14 @@ UNLISTED_REFUSAL = (
 # How pivot starts each of those refusals of `STAGE`, and the warning unsafe fingerprinting gives
 # in its place, as it starts every refusal it can downgrade: with the stage's name.
 STAGE_PREFIX = f"Stage '{STAGE}': "
+
+# The `.dist-info` directory of the `flitlib` that `flit_symlink_install` installs, and the
+# METADATA flit 4.2.0 wrote in it.
+FLIT_DIST_INFO = "flitlib-1.0.dist-info"
+_FLIT_METADATA = (
+    b"Metadata-Version: 2.5\nName: flitlib\nVersion: 1.0\nSummary: A tiny flit package\n"
+    + b"Import-Name: flitlib\n"
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -278,9 +289,11 @@ def damage(path: pathlib.Path, text: str | None) -> None:
         path.write_text(text)
 
 
-def install(venv: Venv, *spec: str, reinstall: bool = False) -> str:
+def install(venv: Venv, *spec: str, reinstall: bool = False, link_mode: str | None = None) -> str:
     """`uv pip install --offline --python <venv>/bin/python --no-build-isolation --no-deps
-    [--reinstall] <spec>`; the test fails unless it succeeds. Returns what uv printed."""
+    [--reinstall] [--link-mode <link_mode>] <spec>`; the test fails unless it succeeds. Returns
+    what uv printed. With no `link_mode`, uv links the files as `UV_LINK_MODE` says, else as it
+    does by default: the pod that runs the tests by hand sets `copy`, CI sets nothing."""
     return _run_uv(
         venv.python.parent,
         "pip",
@@ -291,17 +304,30 @@ def install(venv: Venv, *spec: str, reinstall: bool = False) -> str:
         "--no-build-isolation",
         "--no-deps",
         *(["--reinstall"] if reinstall else []),
+        *(["--link-mode", link_mode] if link_mode is not None else []),
         *spec,
     )
 
 
 def install_directory(
-    venv: Venv, source: pathlib.Path, *, reinstall: bool = False, editable: bool = False
+    venv: Venv,
+    source: pathlib.Path,
+    *,
+    reinstall: bool = False,
+    editable: bool = False,
+    link_mode: str | None = None,
 ) -> str:
-    """Install the project at `source` from its path (`editable`: with `-e`), after deleting what
-    an earlier build left in it (`_remove_build_outputs`)."""
+    """Install the project at `source` from its path (`editable`: with `-e`; `link_mode`: as
+    `install` takes it), after deleting what an earlier build left in it
+    (`_remove_build_outputs`)."""
     _remove_build_outputs(source)
-    return install(venv, *(["-e"] if editable else []), str(source), reinstall=reinstall)
+    return install(
+        venv,
+        *(["-e"] if editable else []),
+        str(source),
+        reinstall=reinstall,
+        link_mode=link_mode,
+    )
 
 
 def build_wheel(venv: Venv, source: pathlib.Path, wheels: pathlib.Path) -> str:
@@ -323,10 +349,15 @@ def build_wheel(venv: Venv, source: pathlib.Path, wheels: pathlib.Path) -> str:
     )
 
 
-def install_from_wheels(venv: Venv, wheels: pathlib.Path, requirement: str) -> str:
+def install_from_wheels(
+    venv: Venv, wheels: pathlib.Path, requirement: str, *, link_mode: str | None = None
+) -> str:
     """Install `requirement` from the wheels in `wheels` as from a package index
-    (`--no-index --find-links`), which writes no `direct_url.json`."""
-    return install(venv, "--no-index", "--find-links", str(wheels), requirement)
+    (`--no-index --find-links`), which writes no `direct_url.json` (`link_mode`: as `install`
+    takes it)."""
+    return install(
+        venv, "--no-index", "--find-links", str(wheels), requirement, link_mode=link_mode
+    )
 
 
 def pip_install_directory(venv: Venv, source: pathlib.Path) -> str:
@@ -350,6 +381,36 @@ def pip_install_directory(venv: Venv, source: pathlib.Path) -> str:
             str(source),
         ],
     )
+
+
+def flit_symlink_install(site: pathlib.Path, checkout: pathlib.Path, link: str) -> None:
+    """Install `flitlib` 1.0 from the checkout at `checkout` into the site directory `site` as
+    flit 4.2.0's `flit install --symlink` did on 2026-11-17 (a flit_core project `flitlib` with
+    one package `flitlib`, or one module `flitlib.py`): `site/<link>` a symbolic link to
+    `checkout/<link>` (the package's directory, or the module's file), and `FLIT_DIST_INFO`
+    beside it with flit's INSTALLER, METADATA, REQUESTED, a `direct_url.json` that names the
+    checkout and says editable, and a RECORD, its rows ended by CR LF and with flit's hex
+    `sha256=` digests, that lists the link, not the files under it. flit lists a package's link
+    first and a module's after the metadata files; no reader depends on the order, which is a
+    package's here. The test writes the checkout's files."""
+    (site / link).symlink_to(checkout / link)
+    dist_info = site / FLIT_DIST_INFO
+    dist_info.mkdir()
+    direct_url = {"url": checkout.as_uri(), "dir_info": {"editable": True}}
+    files = {
+        "INSTALLER": b"flit",
+        "METADATA": _FLIT_METADATA,
+        "REQUESTED": b"",
+        "direct_url.json": json.dumps(direct_url).encode(),
+    }
+    rows = [f"{link},,"]
+    for name, data in files.items():
+        (dist_info / name).write_bytes(data)
+        rows.append(
+            f"{FLIT_DIST_INFO}/{name},sha256={hashlib.sha256(data).hexdigest()},{len(data)}"
+        )
+    rows.append(f"{FLIT_DIST_INFO}/RECORD,,")
+    (dist_info / "RECORD").write_bytes("".join(f"{row}\r\n" for row in rows).encode())
 
 
 def git(cwd: pathlib.Path, home: pathlib.Path, *args: str) -> str:

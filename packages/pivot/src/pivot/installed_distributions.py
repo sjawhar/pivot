@@ -10,15 +10,20 @@ makes the stage stale, and a reinstall of the same files from another commit, pa
 environment changes nothing. Package-index, remote-archive and editable distributions and pivot's
 own get no key.
 
+It also tells `fingerprint.is_library_file` whether a file that an installer linked into a site
+directory, as uv's `--link-mode symlink` links each file into its cache, is library code by the
+RECORDs there (`listed_as_library`): some list it, and each that does is installed in a known form
+that is not editable (`owned_by_libraries`).
+
 A leaf: it imports nothing of pivot's at run time, so `fingerprint` imports it and no import cycle
 forms. It takes plain data (the reached modules' origins, the worker's `sys.path`, pivot's package
 directories) and returns plain data (the keys and the refusal messages). Each decision on what a
 distribution's files say (`classify`, `requirement_names`, `requires_txt_names`, `record_paths`,
-`hashed_files`, `content_digest`, `key_value`, `candidates`, `reach`, `owners`, `decide`) is a
-public function of plain data. What reads the disk is private: the scan of the path, the index of
-the candidates, the digest of a keyed distribution's files, and the refusal of a reached file that
-no RECORD lists, which reads the RECORDs of a site directory and the files under a package
-(`_Snapshot`).
+`hashed_files`, `content_digest`, `key_value`, `candidates`, `reach`, `owners`, `decide`,
+`owned_by_libraries`) is a public function of plain data. What reads the disk is private: the scan
+of the path, the index of the candidates, the digest of a keyed distribution's files, the refusal
+of a reached file that no RECORD lists, which reads the RECORDs of a site directory and the files
+under a package, and the index of the paths the RECORDs of a site directory list (`_Snapshot`).
 
 What it reads, once per process for one worker path, so a reinstall while Pivot runs is seen at the
 next start: the metadata directories on the path and each `direct_url.json`; only when one of them
@@ -28,16 +33,20 @@ directory's `requires.txt` when its metadata has none); RECORD only for the cand
 distributions, each distribution whose requirements cannot be read, and every distribution that
 requires one of them, directly or through others); every RECORD of a site directory only when a
 candidate there has no RECORD and a stage reaches a file whose site directory it is (the deepest
-entry of the path that holds the file); the files under the directory of a reached package or
-namespace package only when such a site directory is the deepest entry of the path above that
-directory or lies at or under it, and only until each such site directory has a file there that
-no RECORD lists, once for each reached module and origin; and the files of a keyed distribution
-only when a stage reaches it. Each path a RECORD lists that can name a file (`_resolved`), and each
-file under such a directory, is resolved to the path `os.path.realpath` gives: a RECORD path of
-PATH_MAX bytes or more in its site directory by `realpath` alone, and every other path a name at
-a time from the nearest directory above it already resolved (a site directory, or one resolved
-for an earlier path): one `os.path.islink` for each new name, and `realpath` only for a name that
-is a symbolic link, empty, `.` or `..` (`_real_path`).
+entry of the path that holds the file), and, apart from that, when `listed_as_library` is first
+asked about a file whose site directory it is; the files under the directory of a reached
+package or namespace package only when such a site directory is the deepest entry of the path
+above that directory or lies at or under it, and only until each such site directory has a file
+there that no RECORD lists, once for each reached module and origin; and the files of a keyed
+distribution only when a stage reaches it. Each path a RECORD lists that can name a file is
+resolved for the index of the candidates and for the refusal of a reached file that no RECORD
+lists (`_resolved`), and so is each file under such a directory, to the path `os.path.realpath`
+gives: a RECORD path of PATH_MAX bytes or more in its site directory by `realpath` alone, and
+every other path a name at a time from the nearest directory above it already resolved (a site
+directory, or one resolved for an earlier path): one `os.path.islink` for each new name, and
+`realpath` only for a name that is a symbolic link, empty, `.` or `..` (`_real_path`).
+`listed_as_library` resolves no RECORD path: it compares each as written, normalised, with the
+file's path in its site directory.
 """
 
 from __future__ import annotations
@@ -112,6 +121,19 @@ _KEYED_FORMS = frozenset({InstallForm.VCS, InstallForm.LOCAL_DIRECTORY, InstallF
 # The forms that make a distribution a candidate by itself: the keyed forms, and the unclassified
 # form, which may be one of them.
 _SEED_FORMS = _KEYED_FORMS | {InstallForm.UNCLASSIFIED}
+
+# The forms of a distribution whose RECORD can make a file it lists library code wherever a link
+# there points (`owned_by_libraries`): each known form but the editable one. Named one by one, so
+# a form added later leaves such a file to its resolved path.
+_LIBRARY_FORMS = frozenset(
+    {
+        InstallForm.INDEX,
+        InstallForm.VCS,
+        InstallForm.LOCAL_DIRECTORY,
+        InstallForm.LOCAL_ARCHIVE,
+        InstallForm.REMOTE_ARCHIVE,
+    }
+)
 
 # The `direct_url.json` fields that name a form; PEP 610 requires exactly one.
 _FORM_FIELDS = ("vcs_info", "dir_info", "archive_info")
@@ -351,12 +373,10 @@ def hashed_files(paths: Iterable[str], dist_info_name: str) -> list[tuple[str, s
     own_entry_points = posixpath.join(dist_info_name, "entry_points.txt")
     kept = dict[str, str]()
     for path in paths:
-        if posixpath.isabs(path):
+        normal = _inside(path)
+        if normal is None:
             continue
-        normal = posixpath.normpath(path)
         parts = normal.split("/")
-        if parts[0] in (".", ".."):
-            continue
         if normal == own_entry_points:
             kept[_OWN_ENTRY_POINTS] = normal
         elif not (
@@ -364,6 +384,16 @@ def hashed_files(paths: Iterable[str], dist_info_name: str) -> list[tuple[str, s
         ):
             kept[normal] = normal
     return sorted(kept.items())
+
+
+def _inside(path: str) -> str | None:
+    """A RECORD path normalised (`posixpath.normpath`), when it stays inside the directory that
+    holds the `.dist-info` directory; None for an absolute path, and for one that, normalised, is
+    that directory or leaves it (a console script's `../../../bin/<name>`)."""
+    if posixpath.isabs(path):
+        return None
+    normal = posixpath.normpath(path)
+    return None if normal.split("/")[0] in (".", "..") else normal
 
 
 def content_digest(files: Iterable[tuple[str, str | None]]) -> str:
@@ -430,7 +460,7 @@ def owners(
     whose RECORD lists one of the files the origin covers, and every candidate with a file under
     one of the directories it covers (`_reached_paths`). `file_owners` maps each resolved file a
     candidate's RECORD lists to those candidates, and `directory_owners` each directory above
-    such a file."""
+    such a file, or above a path the RECORD lists, as it names it (`_build_index`)."""
     files, directories = _reached_paths(origin)
     found = set[str]()
     for file in files:
@@ -504,6 +534,16 @@ def _unlisted_refusal(module: str, file: str, installed: Installed, record: Reco
     )
 
 
+def owned_by_libraries(forms: Collection[InstallForm]) -> bool:
+    """Whether a file linked into a site directory is library code by the distributions there
+    whose RECORDs list it, given each one's install form (`forms`, one for each): at least one
+    lists it, and every one is installed in a known form that is not editable
+    (`_LIBRARY_FORMS`). An editable or unclassified one, or none, leaves the file to its resolved
+    path (`fingerprint.is_library_file`): flit's `install --symlink` links a module file of a
+    checkout into a site directory as an editable install, which stays user code."""
+    return bool(forms) and all(form in _LIBRARY_FORMS for form in forms)
+
+
 def needs_origins(path: Sequence[str], pivot_dirs: Collection[str]) -> bool:
     """Whether a stage's modules can give a key or a refusal with `path` as the worker's
     `sys.path` and `pivot_dirs` as pivot's own resolved package directories: False when no
@@ -531,6 +571,21 @@ def distribution_keys(
         return DistributionKeys({}, [])
     with _lock:
         return _snapshot_of(path, pivot_dirs).keys_for(origins)
+
+
+def listed_as_library(file: str, path: Sequence[str], pivot_dirs: Collection[str]) -> bool:
+    """Whether `file`, an absolute path whose directory is resolved and whose last name is not,
+    is library code by the RECORDs of its site directory (`owned_by_libraries`), with `path` as
+    the worker's `sys.path` and `pivot_dirs` as pivot's own resolved package directories. Its site
+    directory is the deepest entry of the path that the scan listed and that holds it; the
+    distributions there whose RECORD lists it are those with a row whose path, normalised, is
+    `file`'s path relative to that directory. No RECORD path is resolved: in a venv uv links into
+    its cache, every listed file is a link. A file that no entry of the path holds is listed by
+    none. Reads as `distribution_keys` does, once per process for one `path` and `pivot_dirs`,
+    and every RECORD of a site directory once."""
+    with _lock:
+        listing = _snapshot_of(path, pivot_dirs).listed_by(file)
+    return owned_by_libraries([installed.classification.form for installed in listing])
 
 
 def reset() -> None:
@@ -575,8 +630,9 @@ class _Scan(NamedTuple):
 class _Snapshot:
     """What one process read of the distributions on one worker path: the distributions and the
     index of the candidates when it is made, and, each when first needed, the files a site
-    directory's RECORDs list, the refusals of a reached module with a file that no RECORD lists,
-    and the digest of a keyed distribution's files."""
+    directory's RECORDs list, resolved, and the paths they list, as written, the refusals of a
+    reached module with a file that no RECORD lists, and the digest of a keyed distribution's
+    files."""
 
     def __init__(self, path: tuple[str, ...], pivot_dirs: frozenset[str]) -> None:
         self.path: tuple[str, ...] = path  # the worker's `sys.path`
@@ -591,6 +647,9 @@ class _Snapshot:
         self.index: _Index | None = _build_index(scan.installed, pivot_dirs, self._real_dirs)
         # Site directory -> every resolved file that a RECORD of a distribution there lists.
         self._listed: dict[str, frozenset[str]] = {}
+        # Site directory -> each path a RECORD there lists, normalised, -> the distributions whose
+        # RECORD lists it (`_record_index`).
+        self._record_indexes: dict[str, dict[str, tuple[Installed, ...]]] = {}
         self._digests: dict[str, str] = {}  # `dist_info` -> its `content_digest`
         # (module, origin) -> `_unlisted`'s refusals for that reached module.
         self._unlisted_refusals: dict[tuple[str, import_origin.Origin | None], tuple[str, ...]] = {}
@@ -657,7 +716,7 @@ class _Snapshot:
         if key not in self._unlisted_refusals:
             files, directories = _reached_paths(origin)
             first = dict[str, str]()  # site directory -> its first file that no RECORD lists
-            self._find_unlisted(files, set(index.recordless), first, index.records)
+            self._find_unlisted(files, set(index.recordless), first)
             for directory in directories:
                 above = self._site_dir(directory)
                 pending = {
@@ -667,9 +726,7 @@ class _Snapshot:
                     and (site_dir in (above, directory) or directory in _ancestors(site_dir))
                 }
                 if pending:
-                    self._find_unlisted(
-                        _files_under(directory, self._real_dirs), pending, first, index.records
-                    )
+                    self._find_unlisted(_files_under(directory, self._real_dirs), pending, first)
             self._unlisted_refusals[key] = tuple(
                 _unlisted_refusal(
                     module, file, index.installed[distribution], index.records[distribution]
@@ -680,42 +737,67 @@ class _Snapshot:
         return self._unlisted_refusals[key]
 
     def _find_unlisted(
-        self,
-        files: Iterable[str],
-        pending: set[str],
-        first: dict[str, str],
-        records: Mapping[str, Record],
+        self, files: Iterable[str], pending: set[str], first: dict[str, str]
     ) -> None:
         """Put in `first`, for each site directory of `pending`, the first of the resolved `files`
-        that lies in it (`_site_dir`) and that no RECORD there lists (`_listed_in`, with `records`
-        the candidates' RECORDs), and take that directory out of `pending`; once `pending` is
-        empty, read no more of `files`."""
+        that lies in it (`_site_dir`) and that no RECORD there lists (`_listed_in`), and take that
+        directory out of `pending`; once `pending` is empty, read no more of `files`."""
         for file in files:
             site_dir = self._site_dir(file)
-            if site_dir in pending and file not in self._listed_in(site_dir, records):
+            if site_dir in pending and file not in self._listed_in(site_dir):
                 first[site_dir] = file
                 pending.remove(site_dir)
                 if not pending:
                     return
 
+    def listed_by(self, file: str) -> tuple[Installed, ...]:
+        """The distributions whose RECORD lists `file`, a path whose directory is resolved, in its
+        site directory (`_site_dir`): those of that directory with a RECORD path that, normalised,
+        is `file`'s path relative to it (`_record_index`). No distribution when no entry of the
+        path holds `file`."""
+        site_dir = self._site_dir(file)
+        if site_dir is None:
+            return ()
+        return self._record_index(site_dir).get(os.path.relpath(file, site_dir), ())
+
     def _site_dir(self, file: str) -> str | None:
-        """The deepest entry of the path that the scan listed and that holds the resolved `file`,
-        or None when none holds it: the entry an import of the file's module searches."""
+        """The deepest entry of the path that the scan listed and that holds `file`, a path whose
+        directory is resolved, or None when none holds it: the entry an import of the file's
+        module searches."""
         return next((up for up in _ancestors(file) if up in self._site_dirs), None)
 
-    def _listed_in(self, site_dir: str, records: Mapping[str, Record]) -> frozenset[str]:
-        """Every resolved file that a RECORD of a distribution in `site_dir` lists: a candidate's
-        RECORD as `records` holds it, which the index read, and another's read now."""
+    def _listed_in(self, site_dir: str) -> frozenset[str]:
+        """Every resolved file that a RECORD of a distribution in `site_dir` lists (`_record`)."""
         if site_dir not in self._listed:
             listed = set[str]()
             for installed in self._installed:
                 if installed.site_dir == site_dir:
-                    record = records.get(installed.dist_info)
-                    if record is None:
-                        record = _read_record(installed)
-                    listed.update(_resolved(installed, record.paths or (), self._real_dirs))
+                    paths = self._record(installed).paths or ()
+                    listed.update(_resolved(installed, paths, self._real_dirs))
             self._listed[site_dir] = frozenset(listed)
         return self._listed[site_dir]
+
+    def _record_index(self, site_dir: str) -> dict[str, tuple[Installed, ...]]:
+        """Each path that a RECORD of a distribution in `site_dir` lists (`_record`) inside it,
+        normalised (`_inside`) and not resolved, with the distributions whose RECORD lists it,
+        each once."""
+        if site_dir not in self._record_indexes:
+            listing = dict[str, dict[str, Installed]]()
+            for installed in self._installed:
+                if installed.site_dir == site_dir:
+                    for path in self._record(installed).paths or ():
+                        normal = _inside(path)
+                        if normal is not None:
+                            listing.setdefault(normal, {})[installed.dist_info] = installed
+            self._record_indexes[site_dir] = {
+                path: tuple(found.values()) for path, found in listing.items()
+            }
+        return self._record_indexes[site_dir]
+
+    def _record(self, installed: Installed) -> Record:
+        """A distribution's RECORD: a candidate's as the index read it, another's read now."""
+        record = None if self.index is None else self.index.records.get(installed.dist_info)
+        return _read_record(installed) if record is None else record
 
 
 def _build_index(
@@ -723,7 +805,10 @@ def _build_index(
 ) -> _Index | None:
     """The candidates and their ownership, or None when no distribution on the path is of a seed
     form (`_SEED_FORMS`): then no stage gets a key or a refusal, and no requirement or RECORD is
-    read. Each RECORD path is resolved by `_resolved`, with `real_dirs` as `_real_path`'s memo."""
+    read. Each RECORD path is resolved by `_resolved`, with `real_dirs` as `_real_path`'s memo. A
+    candidate owns each file its RECORD lists, resolved, and each directory above such a file or
+    above a path its RECORD lists inside its site directory, named as the RECORD names it
+    (`_listed_directories`)."""
     seeds_by_form = [
         entry.dist_info for entry in installed if entry.classification.form in _SEED_FORMS
     ]
@@ -755,6 +840,7 @@ def _build_index(
         for file in _resolved(entry, paths, real_dirs):
             file_owners.setdefault(file, set()).add(dist_info)
             directories.update(_ancestors(file))
+        directories.update(_listed_directories(entry.site_dir, paths))
         for directory in directories:
             directory_owners.setdefault(directory, set()).add(dist_info)
         if not pivot_dirs.isdisjoint(directories):
@@ -933,6 +1019,20 @@ def _ancestors(path: str) -> Iterator[str]:
     while parent != path:
         yield parent
         path, parent = parent, os.path.dirname(parent)
+
+
+def _listed_directories(site_dir: str, paths: Iterable[str]) -> Iterator[str]:
+    """Each directory above each of `paths`, the paths a RECORD in `site_dir` lists, that stays
+    inside `site_dir` (`_inside`), named as the RECORD names it under `site_dir`, not resolved.
+    Where an installer links each file into its cache from a real directory of `site_dir` (uv's
+    symlink link mode), the directories above a listed file, resolved, lie in the cache, while a
+    namespace package's origin names its directories in `site_dir`, resolved: these directories
+    let the distribution own the namespace package there, as it does where its files are copies,
+    whose resolved directories they are."""
+    for path in paths:
+        normal = _inside(path)
+        if normal is not None:
+            yield from _ancestors(os.path.join(site_dir, normal))
 
 
 def _is_package_init(path: str) -> bool:

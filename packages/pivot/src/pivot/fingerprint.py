@@ -119,6 +119,9 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # library base class, a class in a type hint or a class-body annotation, a library class, instance,
 # enum member or exception inside a value, a library loader class, a library stage function, and a
 # library callable whose `__module__` is not a string; not builtins, the standard library or pivot.
+# It also takes a file that an installer linked into site-packages for a distribution that is not
+# editable, as uv's symlink link mode links each file into its cache, as library code
+# (`is_library_file`), where version 43 walked it as user code.
 _CACHE_SCHEMA_VERSION = 44
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
@@ -2143,12 +2146,13 @@ def _class_member_parts(name: str, raw: Any) -> list[tuple[str, Any]]:
 
 @functools.lru_cache(maxsize=4096)
 def _is_user_source_file(filename: str) -> bool:
-    """Whether a code object's filename is a real source file outside library directories."""
+    """Whether a code object's filename is a real source file that is not library code
+    (`is_library_file`)."""
     try:
         path = pathlib.Path(filename).resolve()
     except OSError:
         return False
-    return path.is_file() and not is_library_path(path)
+    return path.is_file() and not is_library_file(filename)
 
 
 def _written_in_user_source(function: types.FunctionType) -> bool:
@@ -2469,7 +2473,7 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     if not names:
         return
     path = loaded_source.worker_path()
-    pivot_dirs = [str(directory) for directory in _PIVOT_PACKAGE_DIRS]
+    pivot_dirs = _pivot_dir_names()
     if not installed_distributions.needs_origins(path, pivot_dirs):
         return
     origins = dict[str, import_origin.Origin | None]()
@@ -2502,9 +2506,11 @@ def without_by_name(manifest: Mapping[str, str]) -> dict[str, str]:
 
 
 def _is_library_spec(spec: importlib.machinery.ModuleSpec) -> bool:
-    """Whether a top-level module's spec locates library code (`is_library_path`), or no file."""
+    """Whether a top-level module's spec locates library code, or no file: its origin by
+    `is_library_file`, and the directories of a namespace package by `is_library_path`, resolved,
+    since uv's symlink link mode keeps a site directory's directories real and links only files."""
     if spec.has_location and spec.origin is not None:
-        return is_library_path(pathlib.Path(spec.origin).resolve())
+        return is_library_file(spec.origin)
     locations = list(spec.submodule_search_locations or ())
     if not locations:
         return True
@@ -7016,7 +7022,9 @@ def _is_user_code_impl(obj: Any) -> bool:
     # A namespace package (PEP 420) has a __path__ but no __file__. It is a library's when one of
     # its directories is in site-packages or dist-packages or in pivot's own packages. A directory
     # under the interpreter's prefix alone, as pip's checkout of a `pip install -e git+...`
-    # package in `<venv>/src`, leaves a namespace the user shares with it user code.
+    # package in `<venv>/src`, leaves a namespace the user shares with it user code. A directory
+    # is judged resolved, not by `is_library_file`'s rule for a linked file: uv's symlink link
+    # mode links each installed file and keeps the directories real.
     if not hasattr(module, "__file__") or module.__file__ is None:
         if not hasattr(module, "__path__"):
             return True  # No __file__ and no __path__: user code (exec/notebook/interactive)
@@ -7028,7 +7036,7 @@ def _is_user_code_impl(obj: Any) -> bool:
                 return False
         return True
 
-    return not is_library_path(pathlib.Path(module.__file__).resolve())
+    return not is_library_file(module.__file__)
 
 
 def is_library_path(path: pathlib.Path) -> bool:
@@ -7039,6 +7047,43 @@ def is_library_path(path: pathlib.Path) -> bool:
     if any(part in _SITE_PACKAGE_PATHS for part in path.parts):
         return True
     return any(path.is_relative_to(prefix) for prefix in (*_STDLIB_PATHS, *_PIVOT_PACKAGE_DIRS))
+
+
+@functools.lru_cache(maxsize=4096)
+def is_library_file(filename: str) -> bool:
+    """Whether the file ``filename`` (a module's ``__file__``, a spec's origin, a code object's
+    file) holds library code, not user code: its resolved path is a library path
+    (``is_library_path``), or an installer linked it into a library directory for a distribution
+    that is not editable.
+
+    The second holds when all of these do. Its absolute path, normalised but not resolved
+    (``os.path.abspath``), is a library path. The file itself is a symbolic link once its
+    directory is resolved: uv's ``UV_LINK_MODE=symlink`` links each installed file into uv's
+    cache, where its resolved path is no library path, from a real directory of
+    ``site-packages``. And the RECORDs of its site directory list it, each of a distribution
+    installed in a known form that is not editable (``installed_distributions.listed_as_library``,
+    on the worker's ``sys.path``). Otherwise the resolved path decides, so the rule fails closed
+    toward user code: a file of an editable install (flit's ``install --symlink`` links a module
+    file, or a package's directory, which resolves the directory away from ``site-packages``),
+    and a link that no RECORD lists, stay user code where they point outside every library path.
+
+    Decided once per file name per process, as ``_is_user_source_file`` is. Raises ``OSError``
+    when the path cannot be resolved."""
+    if is_library_path(pathlib.Path(filename).resolve()):
+        return True
+    absolute = os.path.abspath(filename)
+    if not is_library_path(pathlib.Path(absolute)):
+        return False
+    real = os.path.join(os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute))
+    return os.path.islink(real) and installed_distributions.listed_as_library(
+        real, loaded_source.worker_path(), _pivot_dir_names()
+    )
+
+
+def _pivot_dir_names() -> list[str]:
+    """Pivot's own package directories (``_PIVOT_PACKAGE_DIRS``), as ``installed_distributions``
+    takes them."""
+    return [str(directory) for directory in _PIVOT_PACKAGE_DIRS]
 
 
 def _get_module(obj: Any) -> types.ModuleType | None:
