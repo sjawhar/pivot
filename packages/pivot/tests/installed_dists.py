@@ -141,6 +141,31 @@ def write_setuptools_project(
     return root
 
 
+def write_library(
+    root: pathlib.Path,
+    name: str,
+    module: str,
+    source: str,
+    *,
+    version: str = "0.1",
+    dependencies: Sequence[str] = (),
+    scripts: Mapping[str, str] | None = None,
+    files: Mapping[str, str] | None = None,
+) -> pathlib.Path:
+    """Write at `root/<module>` the setuptools project (`write_setuptools_project`) of
+    distribution `name`, whose package `module` has `source` as its `__init__.py`, with `files`
+    beside it. Returns the project's directory."""
+    return write_setuptools_project(
+        root / module,
+        name,
+        version,
+        packages=[module],
+        files={f"{module}/__init__.py": source, **(files or {})},
+        dependencies=dependencies,
+        scripts=scripts,
+    )
+
+
 def remove_build_outputs(source: pathlib.Path) -> None:
     """Delete what a setuptools build leaves in the project at `source` (`build/` and each
     `*.egg-info` directory), so that its next build starts from a clean tree and no file of an
@@ -264,6 +289,14 @@ def git_requirement(name: str, repo: pathlib.Path, commit: str) -> str:
     return f"{name} @ git+{repo.as_uri()}@{commit}"
 
 
+def init_git_requirement(source: pathlib.Path, home: pathlib.Path, name: str) -> str:
+    """Make the project at `source` a git repository of one commit, `C1`; the requirement that
+    installs distribution `name` from that commit (`git_requirement`)."""
+    git(source, home, "init", "-q")
+    commit = commit_all(source, home, "C1")
+    return git_requirement(name, source, commit)
+
+
 def installed(venv: Venv, name: str) -> importlib.metadata.Distribution:
     """The one distribution called `name` (as `importlib.metadata` matches names) in the venv's
     site-packages; the test fails when it holds none or more than one."""
@@ -369,6 +402,35 @@ def code_changes(project: Project, stage: str) -> tuple[list[str], str]:
     ran = pivot_ok(project, "status", "--explain", "--json")
     keys = [change["key"] for change in _stage_entry(ran, stage)["code_changes"]]
     return keys, shown(ran)
+
+
+def ran_then_cached(project: Project, stage: str, output_path: pathlib.Path, output: str) -> None:
+    """`pivot repro` runs `stage`, which writes `output` to `output_path` (relative to the
+    project's root); `pivot status --json` then reports it `cached`."""
+    status, shown = repro_status(project, stage)
+    assert status == "ran", f"the first `pivot repro` must run {stage}:\n{shown}"
+    written = (project.root / output_path).read_text()
+    assert written == output, f"{stage} must write {output!r}, not {written!r}"
+    status, shown = stage_status(project, stage)
+    assert status == "cached", f"`pivot status` must report {stage} cached after a run:\n{shown}"
+
+
+def assert_stale_on(project: Project, stage: str, key: str) -> None:
+    """`pivot status --json` reports `stage` stale, and `pivot status --explain --json` names
+    exactly one code change of it, `key`."""
+    status, shown = stage_status(project, stage)
+    assert status == "stale", f"`pivot status` must report {stage} stale on {key}:\n{shown}"
+    keys, shown = code_changes(project, stage)
+    assert keys == [key], f"`pivot status --explain` must name exactly {key} changed:\n{shown}"
+
+
+def assert_marks_nothing(project: Project, stage: str) -> None:
+    """`pivot status --json` reports `stage` cached, and `pivot status --explain --json` names no
+    code change of it."""
+    status, shown = stage_status(project, stage)
+    assert status == "cached", f"`pivot status` must report {stage} cached:\n{shown}"
+    keys, shown = code_changes(project, stage)
+    assert keys == [], f"`pivot status --explain` must name no code change:\n{shown}"
 
 
 def lock_path(project: Project, stage: str) -> pathlib.Path:

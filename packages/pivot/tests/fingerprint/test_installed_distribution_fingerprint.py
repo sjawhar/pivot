@@ -109,31 +109,6 @@ def _helper_project(
     return installed_dists.make_project(tmp_path / "project", tmp_path / "home", venv, pipeline)
 
 
-def _helper_ran_then_cached(project: installed_dists.Project, output: str) -> None:
-    """`pivot repro` runs the stage, which writes `output`; `pivot status --json` then reports it
-    `cached`."""
-    status, shown = installed_dists.repro_status(project, _STAGE)
-    assert status == "ran", f"the first `pivot repro` must run {_STAGE}:\n{shown}"
-    written = (project.root / _OUTPUT).read_text()
-    assert written == output, f"{_STAGE} must write {output!r}, not {written!r}"
-    status, shown = installed_dists.stage_status(project, _STAGE)
-    assert status == "cached", f"`pivot status` must report {_STAGE} cached after a run:\n{shown}"
-
-
-def _helper_assert_stale_on(project: installed_dists.Project, key: str) -> None:
-    status, shown = installed_dists.stage_status(project, _STAGE)
-    assert status == "stale", f"`pivot status` must report {_STAGE} stale on {key}:\n{shown}"
-    keys, shown = installed_dists.code_changes(project, _STAGE)
-    assert keys == [key], f"`pivot status --explain` must name exactly {key} changed:\n{shown}"
-
-
-def _helper_assert_marks_nothing(project: installed_dists.Project) -> None:
-    status, shown = installed_dists.stage_status(project, _STAGE)
-    assert status == "cached", f"`pivot status` must report {_STAGE} cached:\n{shown}"
-    keys, shown = installed_dists.code_changes(project, _STAGE)
-    assert keys == [], f"`pivot status --explain` must name no code change:\n{shown}"
-
-
 def test_a_changed_byte_in_a_function_the_stage_calls_reruns_the_stage(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -145,13 +120,13 @@ def test_a_changed_byte_in_a_function_the_stage_calls_reruns_the_stage(
     project = _helper_project(tmp_path, venv, _PIPELINE.format(module="fixlib"))
     installed_dists.install_directory(venv, fixdep)
     installed_dists.install_directory(venv, fixlib)
-    _helper_ran_then_cached(project, "value-1:base-1")
+    installed_dists.ran_then_cached(project, _STAGE, _OUTPUT, "value-1:base-1")
     before = installed_dists.lock_manifest(project, _STAGE).get("dist:fix-lib")
 
     installed_dists.replace_once(fixlib / "fixlib" / "__init__.py", '"value-1:"', '"value-2:"')
     installed_dists.install_directory(venv, fixlib, reinstall=True)
 
-    _helper_assert_stale_on(project, "dist:fix-lib")
+    installed_dists.assert_stale_on(project, _STAGE, "dist:fix-lib")
     status, shown = installed_dists.repro_status(project, _STAGE)
     assert status == "ran", f"`pivot repro` must rerun {_STAGE}:\n{shown}"
     written = (project.root / _OUTPUT).read_text()
@@ -176,12 +151,12 @@ def test_a_reinstall_with_the_same_files_marks_nothing(tmp_path: pathlib.Path) -
     project = _helper_project(tmp_path, venv, _PIPELINE.format(module="fixlib"))
     installed_dists.install_directory(venv, fixdep)
     installed_dists.install_directory(venv, fixlib)
-    _helper_ran_then_cached(project, "value-1:base-1")
+    installed_dists.ran_then_cached(project, _STAGE, _OUTPUT, "value-1:base-1")
     before = installed_dists.lock_manifest(project, _STAGE).get("dist:fix-lib")
 
     installed_dists.install_directory(venv, fixlib, reinstall=True)
 
-    _helper_assert_marks_nothing(project)
+    installed_dists.assert_marks_nothing(project, _STAGE)
     after = installed_dists.lock_manifest(project, _STAGE)
     assert "dist:fix-lib" in after, f"the lock must hold dist:fix-lib: {after}"
     assert after["dist:fix-lib"] == before, f"dist:fix-lib must stay {before!r}: {after}"
@@ -204,7 +179,7 @@ def test_a_git_reinstall_at_another_commit_with_the_same_files_marks_nothing(
     commit_2 = installed_dists.commit_all(fixlib, project.home, "C2")
     installed_dists.install_directory(venv, fixdep)
     installed_dists.install(venv, installed_dists.git_requirement("Fix_Lib", fixlib, commit_1))
-    _helper_ran_then_cached(project, "value-1:base-1")
+    installed_dists.ran_then_cached(project, _STAGE, _OUTPUT, "value-1:base-1")
     before = installed_dists.lock_manifest(project, _STAGE).get("dist:fix-lib")
 
     installed_dists.install(
@@ -215,7 +190,7 @@ def test_a_git_reinstall_at_another_commit_with_the_same_files_marks_nothing(
     assert url is not None and url["vcs_info"]["commit_id"] == commit_2, (
         f"Fix_Lib must now be installed from C2 {commit_2}: direct_url.json is {url!r}"
     )
-    _helper_assert_marks_nothing(project)
+    installed_dists.assert_marks_nothing(project, _STAGE)
     after = installed_dists.lock_manifest(project, _STAGE)
     assert "dist:fix-lib" in after, f"the lock must hold dist:fix-lib: {after}"
     assert after["dist:fix-lib"] == before, f"dist:fix-lib must stay {before!r}: {after}"
@@ -232,13 +207,13 @@ def test_a_changed_byte_in_a_dependency_of_the_called_library_reruns_the_stage(
     project = _helper_project(tmp_path, venv, _PIPELINE.format(module="fixlib"))
     installed_dists.install_directory(venv, fixdep)
     installed_dists.install_directory(venv, fixlib)
-    _helper_ran_then_cached(project, "value-1:base-1")
+    installed_dists.ran_then_cached(project, _STAGE, _OUTPUT, "value-1:base-1")
     before = installed_dists.lock_manifest(project, _STAGE).get("dist:fixdep")
 
     installed_dists.replace_once(fixdep / "fixdep" / "__init__.py", '"base-1"', '"base-2"')
     installed_dists.install_directory(venv, fixdep, reinstall=True)
 
-    _helper_assert_stale_on(project, "dist:fixdep")
+    installed_dists.assert_stale_on(project, _STAGE, "dist:fixdep")
     status, shown = installed_dists.repro_status(project, _STAGE)
     assert status == "ran", f"`pivot repro` must rerun {_STAGE}:\n{shown}"
     written = (project.root / _OUTPUT).read_text()
@@ -268,7 +243,7 @@ def test_a_package_index_bump_behaves_as_before(tmp_path: pathlib.Path) -> None:
         installed_dists.build_wheel(venv, source, wheels)
     project = _helper_project(tmp_path, venv, _PIPELINE.format(module="idxlib"))
     installed_dists.install_from_wheels(venv, wheels, "idxlib==1.0")
-    _helper_ran_then_cached(project, "idx-1.0")
+    installed_dists.ran_then_cached(project, _STAGE, _OUTPUT, "idx-1.0")
 
     installed_dists.install_from_wheels(venv, wheels, "idxlib==1.1")
 
@@ -276,7 +251,7 @@ def test_a_package_index_bump_behaves_as_before(tmp_path: pathlib.Path) -> None:
     assert version == "1.1", f"idxlib 1.1 must now be installed, not {version}"
     url = installed_dists.direct_url(venv, "idxlib")
     assert url is None, f"an index install writes no direct_url.json; this one holds {url!r}"
-    _helper_assert_marks_nothing(project)
+    installed_dists.assert_marks_nothing(project, _STAGE)
     manifest = installed_dists.lock_manifest(project, _STAGE)
     assert installed_dists.dist_keys(manifest) == [], f"the lock must hold no dist: key: {manifest}"
 
@@ -292,11 +267,11 @@ def test_an_editable_install_adds_no_key(tmp_path: pathlib.Path) -> None:
     installed_dists.build_wheel(venv, fixdep, wheels)
     installed_dists.install_from_wheels(venv, wheels, "fixdep")
     installed_dists.install_directory(venv, fixlib, editable=True)
-    _helper_ran_then_cached(project, "value-1:base-1")
+    installed_dists.ran_then_cached(project, _STAGE, _OUTPUT, "value-1:base-1")
 
     installed_dists.replace_once(fixlib / "fixlib" / "__init__.py", '"value-1:"', '"value-2:"')
 
-    _helper_assert_stale_on(project, "func:fixlib.value")
+    installed_dists.assert_stale_on(project, _STAGE, "func:fixlib.value")
     manifest = installed_dists.lock_manifest(project, _STAGE)
     assert installed_dists.dist_keys(manifest) == [], f"the lock must hold no dist: key: {manifest}"
 
@@ -330,7 +305,7 @@ def test_a_reinstall_of_pivot_itself_from_another_commit_changes_no_stage(
     assert imported == expected, (
         f"the venv must import the pivot it installed, {expected}, not {imported}"
     )
-    _helper_ran_then_cached(project, "make")
+    installed_dists.ran_then_cached(project, _STAGE, _OUTPUT, "make")
 
     installed_dists.install(
         venv, installed_dists.git_requirement("pivot", repo, commit_b), reinstall=True
@@ -340,6 +315,6 @@ def test_a_reinstall_of_pivot_itself_from_another_commit_changes_no_stage(
     assert url is not None and url["vcs_info"]["commit_id"] == commit_b, (
         f"pivot must now be installed from B {commit_b}: direct_url.json is {url!r}"
     )
-    _helper_assert_marks_nothing(project)
+    installed_dists.assert_marks_nothing(project, _STAGE)
     manifest = installed_dists.lock_manifest(project, _STAGE)
     assert installed_dists.dist_keys(manifest) == [], f"the lock must hold no dist: key: {manifest}"

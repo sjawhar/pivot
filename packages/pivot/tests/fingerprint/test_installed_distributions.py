@@ -168,35 +168,13 @@ _RECORDLESS_REACHED_REFUSAL = (
 )
 
 
-def _helper_library(
-    root: pathlib.Path,
-    name: str,
-    module: str,
-    source: str,
-    *,
-    version: str = "0.1",
-    dependencies: tuple[str, ...] = (),
-    scripts: dict[str, str] | None = None,
-    files: dict[str, str] | None = None,
-) -> pathlib.Path:
-    """Write at `root/<module>` the setuptools project of distribution `name`, whose package
-    `module` has `source` as its `__init__.py`, with `files` beside it."""
-    return installed_dists.write_setuptools_project(
-        root / module,
-        name,
-        version,
-        packages=[module],
-        files={f"{module}/__init__.py": source, **(files or {})},
-        dependencies=dependencies,
-        scripts=scripts,
-    )
-
-
 def _helper_fixlib_and_fixdep(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
     """Write under `root` the projects of `Fix_Lib` (module `fixlib`, requires `fixdep`) and
     `fixdep`; returns their directories."""
-    fixlib = _helper_library(root, "Fix_Lib", "fixlib", _FIXLIB, dependencies=("fixdep",))
-    fixdep = _helper_library(root, "fixdep", "fixdep", _FIXDEP)
+    fixlib = installed_dists.write_library(
+        root, "Fix_Lib", "fixlib", _FIXLIB, dependencies=("fixdep",)
+    )
+    fixdep = installed_dists.write_library(root, "fixdep", "fixdep", _FIXDEP)
     return fixlib, fixdep
 
 
@@ -212,14 +190,6 @@ def _helper_project(
     tmp_path: pathlib.Path, venv: installed_dists.Venv, pipeline: str
 ) -> installed_dists.Project:
     return installed_dists.make_project(tmp_path / "project", tmp_path / "home", venv, pipeline)
-
-
-def _helper_git_requirement(source: pathlib.Path, home: pathlib.Path, name: str) -> str:
-    """Make the project at `source` a git repository of one commit; the requirement that installs
-    `name` from that commit."""
-    installed_dists.git(source, home, "init", "-q")
-    commit = installed_dists.commit_all(source, home, "C1")
-    return installed_dists.git_requirement(name, source, commit)
 
 
 def _helper_damage(path: pathlib.Path, text: str | None) -> None:
@@ -281,7 +251,7 @@ def test_installs_by_uv_and_by_pip_in_two_venvs_give_one_value(tmp_path: pathlib
     pip into a second venv at another path. Their RECORDs differ: each lists its console script,
     whose first line names its own venv, and pip's lists bytecode. The lock that the first venv's
     pivot writes is current for the second venv's pivot: `dist:fix-lib` has one value."""
-    source = _helper_library(
+    source = installed_dists.write_library(
         tmp_path / "src", "Fix_Lib", "fixlib", _FIXLIB_ALONE, scripts={"fix-lib": "fixlib:main"}
     )
     by_uv = installed_dists.make_venv(tmp_path / "uv-venv")
@@ -323,7 +293,7 @@ def test_a_byte_edited_in_place_in_an_installed_file_changes_the_value(
     `fixlib/__init__.py` with no reinstall, makes the stage stale on `dist:fix-lib`: the key
     hashes the files read from disk, not the hashes RECORD holds."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    source = _helper_library(tmp_path / "src", "Fix_Lib", "fixlib", _FIXLIB_ALONE)
+    source = installed_dists.write_library(tmp_path / "src", "Fix_Lib", "fixlib", _FIXLIB_ALONE)
     installed_dists.install_directory(venv, source)
     project = _helper_project(tmp_path, venv, _helper_pipeline("fixlib"))
     _helper_ran(project, "value-1")
@@ -344,7 +314,7 @@ def test_a_reinstall_changing_an_entry_point_changes_the_value_and_one_of_the_ve
     changes only the files of its `.dist-info` directory and that directory's name: nothing is
     marked."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    source = _helper_library(
+    source = installed_dists.write_library(
         tmp_path / "src", "Fix_Lib", "fixlib", _FIXLIB_ALONE, scripts={"fix-lib": "fixlib:main"}
     )
     installed_dists.install_directory(venv, source)
@@ -376,7 +346,7 @@ def test_a_local_wheel_gets_a_key_and_an_archive_from_an_https_url_gets_none(
     `file:` URL, and the stage's lock holds `dist:fixwheel`. The same `direct_url.json` with the
     URL of a remote archive (`https:`) gives no key."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    source = _helper_library(tmp_path / "src", "fixwheel", "fixwheel", _FIXLIB_ALONE)
+    source = installed_dists.write_library(tmp_path / "src", "fixwheel", "fixwheel", _FIXLIB_ALONE)
     wheels = tmp_path / "wheels"
     installed_dists.build_wheel(venv, source, wheels)
     (wheel,) = wheels.glob("*.whl")
@@ -405,29 +375,29 @@ def test_the_closure_follows_an_index_install_and_a_chain_of_git_installs_with_a
     and `fixa` (a cycle): `p/chain` gets the key of each of the three, and the run ends."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     src = tmp_path / "src"
-    fixdep = _helper_library(src, "fixdep", "fixdep", _FIXDEP)
-    idxmid = _helper_library(
+    fixdep = installed_dists.write_library(src, "fixdep", "fixdep", _FIXDEP)
+    idxmid = installed_dists.write_library(
         src,
         "idxmid",
         "idxmid",
         'import fixdep\n\n\ndef value():\n    return "mid:" + fixdep.base()\n',
         dependencies=("fixdep",),
     )
-    fixa = _helper_library(
+    fixa = installed_dists.write_library(
         src,
         "fixa",
         "fixa",
         'import fixb\n\n\ndef value():\n    return "a:" + fixb.value()\n',
         dependencies=("fixb",),
     )
-    fixb = _helper_library(
+    fixb = installed_dists.write_library(
         src,
         "fixb",
         "fixb",
         'import fixc\n\n\ndef value():\n    return "b:" + fixc.value()\n',
         dependencies=("fixc", "fixa"),
     )
-    fixc = _helper_library(src, "fixc", "fixc", 'def value():\n    return "c"\n')
+    fixc = installed_dists.write_library(src, "fixc", "fixc", 'def value():\n    return "c"\n')
     wheels = tmp_path / "wheels"
     project = _helper_project(tmp_path, venv, _CLOSURE_PIPELINE)
     installed_dists.install_directory(venv, fixdep)
@@ -436,7 +406,7 @@ def test_the_closure_follows_an_index_install_and_a_chain_of_git_installs_with_a
     installed_dists.install(
         venv,
         *(
-            _helper_git_requirement(source, project.home, name)
+            installed_dists.init_git_requirement(source, project.home, name)
             for source, name in ((fixa, "fixa"), (fixb, "fixb"), (fixc, "fixc"))
         ),
     )
@@ -519,10 +489,10 @@ def test_a_requirement_behind_a_false_marker_still_adds_its_key(tmp_path: pathli
     `dist:fixdep` beside `dist:fix-lib`."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     requirement = 'fixdep; python_version < "3"'
-    fixlib = _helper_library(
+    fixlib = installed_dists.write_library(
         tmp_path / "src", "Fix_Lib", "fixlib", _FIXLIB_ALONE, dependencies=(requirement,)
     )
-    fixdep = _helper_library(tmp_path / "src", "fixdep", "fixdep", _FIXDEP)
+    fixdep = installed_dists.write_library(tmp_path / "src", "fixdep", "fixdep", _FIXDEP)
     installed_dists.install_directory(venv, fixdep)
     installed_dists.install_directory(venv, fixlib)
     requires = installed_dists.installed(venv, "Fix_Lib").requires
@@ -598,11 +568,11 @@ def test_defects_of_unreached_installs_refuse_nothing_and_a_deleted_listed_file_
     venv = installed_dists.make_venv(tmp_path / "venv")
     src = tmp_path / "src"
     sources = [
-        _helper_library(
+        installed_dists.write_library(
             src, "Fix_Lib", "fixlib", _FIXLIB_ALONE, files={"fixlib/extra.py": "EXTRA = 1\n"}
         ),
-        _helper_library(src, "brokenurl", "brokenurl", _FIXLIB_ALONE),
-        _helper_library(src, "norecord", "norecord", _FIXLIB_ALONE),
+        installed_dists.write_library(src, "brokenurl", "brokenurl", _FIXLIB_ALONE),
+        installed_dists.write_library(src, "norecord", "norecord", _FIXLIB_ALONE),
     ]
     installed_dists.install(venv, *(str(source) for source in sources))
     _helper_damage(venv.site_packages / "brokenurl-0.1.dist-info" / "direct_url.json", "[]")
@@ -627,10 +597,10 @@ def test_two_installs_of_one_name_both_reached_give_one_key_that_each_changes(
     stage calls both. The lock holds one key, `dist:fix-lib`, and a byte edited in place in either
     install changes its value and nothing else."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    one = _helper_library(
+    one = installed_dists.write_library(
         tmp_path / "src", "Fix_Lib", "fixlib_one", 'def value():\n    return "one-1"\n'
     )
-    two = _helper_library(
+    two = installed_dists.write_library(
         tmp_path / "src", "fix.lib", "fixlib_two", 'def value():\n    return "two-1"\n'
     )
     second = tmp_path / "second" / "site-packages"
@@ -666,7 +636,7 @@ def test_a_no_fingerprint_stage_gets_the_key_of_its_output_loaders_distribution(
     """(j) A `@no_fingerprint` stage whose output loader class comes from `fixloader`, installed
     from its path: the lock holds `dist:fixloader`."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    source = _helper_library(tmp_path / "src", "fixloader", "fixloader", _LOADER)
+    source = installed_dists.write_library(tmp_path / "src", "fixloader", "fixloader", _LOADER)
     installed_dists.install_directory(venv, source)
     project = _helper_project(tmp_path, venv, _NO_FINGERPRINT_PIPELINE)
 
@@ -688,7 +658,7 @@ def test_a_project_file_shadowing_a_module_reached_through_a_base_class_is_refus
     worker-import message naming the module and both files. With `fixbase.py` removed, the same
     command runs the stage."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    source = _helper_library(tmp_path / "src", "fixbase", "fixbase", _FIXBASE)
+    source = installed_dists.write_library(tmp_path / "src", "fixbase", "fixbase", _FIXBASE)
     installed_dists.install_directory(venv, source)
     project = _helper_project(tmp_path, venv, _BASE_CLASS_PIPELINE)
     shadow = project.root / "fixbase.py"
