@@ -11,6 +11,10 @@ a venv without that `.pth` file, into which uv installs a released pivot from th
 fixtures it builds with build isolation. This module imports only the standard library, pytest,
 PyYAML, `tests.helpers` and the `pivot` package, so the tests that use it still collect when
 `packages/pivot/src` is pivot 0.10.4's.
+
+It also holds what the test files of those keys share: the stage `STAGE` of their projects and
+the file `OUTPUT` it writes, the sources of the fixture libraries `Fix_Lib` and `fixdep`, and the
+refusals of a broken install, word for word.
 """
 
 from __future__ import annotations
@@ -38,6 +42,58 @@ if TYPE_CHECKING:
 
 # The code `python -c` runs to start pivot's CLI, as the `pivot` console script does.
 _PIVOT_MAIN = "from pivot.cli import _console_main; _console_main()"
+
+# The stage of most projects the tests make, `make` in `Pipeline("p")` of `pipeline.py`, and the
+# file, relative to the project's root, that it writes.
+STAGE = "p/make"
+OUTPUT = pathlib.Path("data/p/make.txt")
+
+# The source of `fixdep`'s module, and of `Fix_Lib`'s module `fixlib`, whose `value()` adds
+# `fixdep.base()` to a literal and whose `main()` a console script can run
+# (`write_fixlib_and_fixdep`).
+FIXDEP = 'def base():\n    return "base-1"\n'
+FIXLIB = """\
+import fixdep
+
+
+def value():
+    return "value-1:" + fixdep.base()
+
+
+def main():
+    print(value())
+"""
+# A `fixlib` that imports nothing.
+FIXLIB_ALONE = """\
+def value():
+    return "value-1"
+
+
+def main():
+    print(value())
+"""
+
+# The refusals of a broken install, word for word, `{site}` the venv's resolved site-packages.
+UNCLASSIFIED_REFUSAL = (
+    "Distribution 'fix-lib' ({site}/fix_lib-0.1.dist-info), which this stage reaches, is "
+    "installed in a form Pivot cannot classify: its direct_url.json is not a JSON object. Pivot "
+    "cannot fingerprint the installed code the stage runs, so the stage could skip a run after "
+    "that code changes. Fix: reinstall 'fix-lib'."
+)
+RECORDLESS_DEPENDENCY_REFUSAL = (
+    "Distribution 'fixdep' ({site}/fixdep-0.1.dist-info), which a distribution this stage "
+    "reaches depends on, is installed from a local directory (dir_info) and has no RECORD file, "
+    "so Pivot cannot read its files. Pivot cannot fingerprint the installed code the stage runs, "
+    "so the stage could skip a run after that code changes. Fix: reinstall 'fixdep'."
+)
+# A reached module `{module}`, whose file `{file}` no RECORD lists, beside `Fix_Lib` with no RECORD.
+UNLISTED_REFUSAL = (
+    "Module '{module}' ({site}/{file}) lies in {site}, where distribution 'fix-lib' "
+    "({site}/fix_lib-0.1.dist-info), installed from a local directory (dir_info), has no RECORD "
+    "file, and no RECORD file there lists that file. Pivot cannot tell whether the stage runs "
+    "that distribution's code, so the stage could skip a run after it changes. Fix: reinstall "
+    "'fix-lib'."
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -164,6 +220,24 @@ def write_library(
     )
 
 
+def write_fixlib_and_fixdep(
+    root: pathlib.Path, *, console_script: bool = False
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Write under `root` the projects (`write_library`) of `Fix_Lib` (module `fixlib` of
+    `FIXLIB`, requires `fixdep`; `console_script`: with the console script `fix-lib`, which runs
+    `fixlib:main`) and `fixdep` (module `fixdep` of `FIXDEP`); returns their directories."""
+    fixlib = write_library(
+        root,
+        "Fix_Lib",
+        "fixlib",
+        FIXLIB,
+        dependencies=("fixdep",),
+        scripts={"fix-lib": "fixlib:main"} if console_script else None,
+    )
+    fixdep = write_library(root, "fixdep", "fixdep", FIXDEP)
+    return fixlib, fixdep
+
+
 def remove_build_outputs(source: pathlib.Path) -> None:
     """Delete what a setuptools build leaves in the project at `source` (`build/` and each
     `*.egg-info` directory), so that its next build starts from a clean tree and no file of an
@@ -179,6 +253,15 @@ def replace_once(path: pathlib.Path, old: str, new: str) -> None:
     text = path.read_text()
     assert text.count(old) == 1, f"{path} must hold {old!r} once:\n{text}"
     path.write_text(text.replace(old, new))
+
+
+def damage(path: pathlib.Path, text: str | None) -> None:
+    """Write `text` over the installed file at `path`, or delete it when `text` is None."""
+    assert path.is_file(), f"{path} must be installed before the test damages it"
+    if text is None:
+        path.unlink()
+    else:
+        path.write_text(text)
 
 
 def install(venv: Venv, *spec: str, reinstall: bool = False) -> str:
@@ -326,6 +409,11 @@ def make_project(root: pathlib.Path, home: pathlib.Path, venv: Venv, pipeline: s
     return project
 
 
+def make_project_in(tmp_path: pathlib.Path, venv: Venv, pipeline: str) -> Project:
+    """The project `make_project` makes at `tmp_path/project`, with `tmp_path/home` as `HOME`."""
+    return make_project(tmp_path / "project", tmp_path / "home", venv, pipeline)
+
+
 def run_pivot(project: Project, *args: str) -> subprocess.CompletedProcess[str]:
     """Run the venv's `pivot <args>` in the project; the exit code is not checked."""
     return helpers.run_cli(
@@ -428,15 +516,22 @@ def code_changes(project: Project, stage: str) -> tuple[list[str], str]:
     return changes[stage], output
 
 
-def ran_then_cached(project: Project, stage: str, output_path: pathlib.Path, output: str) -> None:
-    """`pivot repro` runs `stage`, which writes `output` to `output_path` (relative to the
-    project's root); `pivot status --json` then reports it `cached`."""
-    status, shown = repro_status(project, stage)
-    assert status == "ran", f"the first `pivot repro` must run {stage}:\n{shown}"
-    written = (project.root / output_path).read_text()
-    assert written == output, f"{stage} must write {output!r}, not {written!r}"
-    status, shown = stage_status(project, stage)
-    assert status == "cached", f"`pivot status` must report {stage} cached after a run:\n{shown}"
+def assert_runs_and_writes(project: Project, output: str, command: str = "`pivot repro`") -> str:
+    """`pivot repro --json` (`repro_status`), which `command` names in a failure, runs `STAGE`,
+    which writes `output` to `OUTPUT`; returns the command's output."""
+    status, shown = repro_status(project, STAGE)
+    assert status == "ran", f"{command} must run {STAGE}:\n{shown}"
+    written = (project.root / OUTPUT).read_text()
+    assert written == output, f"{STAGE} must write {output!r}, not {written!r}"
+    return shown
+
+
+def ran_then_cached(project: Project, output: str) -> None:
+    """The first `pivot repro` runs `STAGE`, which writes `output` (`assert_runs_and_writes`);
+    `pivot status --json` then reports it `cached`."""
+    assert_runs_and_writes(project, output, "the first `pivot repro`")
+    status, shown = stage_status(project, STAGE)
+    assert status == "cached", f"`pivot status` must report {STAGE} cached after a run:\n{shown}"
 
 
 def assert_stale_on(project: Project, stage: str, key: str) -> None:

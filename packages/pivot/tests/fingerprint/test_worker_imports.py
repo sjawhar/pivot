@@ -31,7 +31,7 @@ import pytest
 import yaml
 from tests import helpers
 
-from pivot import discovery, exceptions, executor, fingerprint, loaded_source, project
+from pivot import discovery, exceptions, executor, fingerprint, loaded_source
 
 if TYPE_CHECKING:
     import types
@@ -88,21 +88,6 @@ def _walk(pipeline: PipelineLike) -> dict[str, str]:
     return fingerprint.get_stage_fingerprint(pipeline.get_stage("p/use")["func"])
 
 
-def _discover(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, files: dict[str, str], pipeline: str
-) -> PipelineLike:
-    root = tmp_path / "project"
-    for rel_path, text in {**files, "pipeline.py": pipeline}.items():
-        (root / rel_path).parent.mkdir(parents=True, exist_ok=True)
-        (root / rel_path).write_text(text)
-    (root / ".git").mkdir(exist_ok=True)
-    (root / ".pivot").mkdir(exist_ok=True)
-    monkeypatch.setattr(project, "_project_root_cache", root)
-    loaded = discovery.discover_pipeline(project_root=root)
-    assert loaded is not None
-    return loaded
-
-
 @pytest.fixture
 def hold_modules() -> Generator[Callable[[], None]]:
     """For a test that calls `check_worker_imports` itself: a call takes what `sys.modules` holds
@@ -140,7 +125,7 @@ def test_a_module_the_program_holds_from_another_file_fails_the_stages_fingerpri
     returns it. A worker would import the root's `wi_a` (a namespace directory there is the only
     `wi_a` on its path). The fingerprint fails, naming both."""
     _held("wi_a", tmp_path / held_file, monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path, monkeypatch, {root_file: _PLAIN}, _pipeline("import wi_a", "wi_a.plain()")
     )
 
@@ -185,7 +170,7 @@ def test_a_submodule_the_program_holds_from_another_file_fails_the_stages_finger
     files = {"wi_pkg": "program/wi_pkg/__init__.py", "wi_pkg.sub": "program/wi_pkg/sub.py"}
     for name in held:
         _held(name, tmp_path / files[name], monkeypatch)
-    pipeline = _discover(tmp_path, monkeypatch, _SUB_FILES, _pipeline(imports, call))
+    pipeline = helpers.discover_project(tmp_path, monkeypatch, _SUB_FILES, _pipeline(imports, call))
 
     with pytest.raises(exceptions.PivotError, match=r"module 'wi_pkg\.sub' is .+sub\.py"):
         pipeline.ensure_fingerprint("p/use")
@@ -198,7 +183,7 @@ def test_a_submodule_the_program_holds_under_a_project_package_goes_to_the_worke
     which discovery sends by value with its submodules: the worker runs the program's `sub` that
     the fingerprint describes, and imports nothing by that name."""
     _held("wi_pkg.sub", tmp_path / "program" / "wi_pkg" / "sub.py", monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path, monkeypatch, _SUB_FILES, _pipeline("from wi_pkg import sub", "sub.plain()")
     )
 
@@ -220,7 +205,9 @@ def test_a_library_the_program_holds_with_a_project_modules_name_fails_the_stage
     project's `wi_lib.py` in its place."""
     held = tmp_path / "lib" / "site-packages" / "wi_lib.py"
     _held("wi_lib", held, monkeypatch)
-    pipeline = _discover(tmp_path, monkeypatch, {"wi_lib.py": _PLAIN}, _pipeline(imports, call))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {"wi_lib.py": _PLAIN}, _pipeline(imports, call)
+    )
 
     with pytest.raises(exceptions.PivotError, match=f"module 'wi_lib' is {_resolved(held)}"):
         pipeline.ensure_fingerprint("p/use")
@@ -239,7 +226,9 @@ def test_a_library_the_program_holds_and_a_stage_imports_in_its_body_fails_the_f
     on its path and gets the project's `wi_lib.py`, not the library the program holds."""
     held = tmp_path / "lib" / "site-packages" / "wi_lib.py"
     _held("wi_lib", held, monkeypatch)
-    pipeline = _discover(tmp_path, monkeypatch, {"wi_lib.py": _PLAIN}, _BODY_IMPORT_PIPELINE)
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {"wi_lib.py": _PLAIN}, _BODY_IMPORT_PIPELINE
+    )
 
     with pytest.raises(exceptions.PivotError, match=f"module 'wi_lib' is {_resolved(held)}"):
         pipeline.ensure_fingerprint("p/use")
@@ -252,7 +241,7 @@ def test_a_partial_over_a_library_callable_the_program_holds_fails_the_fingerpri
     with `plain` by name, so the worker imports `wi_lib`, the project's file in its place."""
     held = tmp_path / "lib" / "site-packages" / "wi_lib.py"
     _held("wi_lib", held, monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_lib.py": _PLAIN},
@@ -275,7 +264,7 @@ def test_a_library_submodule_a_stage_imports_from_a_project_package_is_recorded_
     site = tmp_path / "lib" / "site-packages" / "wi_up"
     site.mkdir(parents=True)
     (site / "sub.py").write_text(_PLAIN)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_up/__init__.py": f"__path__.append({str(site)!r})\n"},
@@ -297,7 +286,9 @@ def test_a_library_module_read_as_a_global_is_recorded_by_name_outside_the_lock(
     site = tmp_path / "lib" / "site-packages"
     _held("wi_lib", site / "wi_lib.py", monkeypatch)
     monkeypatch.syspath_prepend(str(site))
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_lib", "wi_lib.plain()"))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_lib", "wi_lib.plain()")
+    )
 
     recorded = pipeline.ensure_fingerprint("p/use")
     walked = _walk(pipeline)
@@ -316,7 +307,7 @@ def test_a_namespace_child_the_program_holds_from_a_library_fails_the_stages_fin
     site = tmp_path / "lib" / "site-packages"
     _held_namespace("wi_shared", site / "wi_shared", monkeypatch)
     _held("wi_shared.library", site / "wi_shared" / "library.py", monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_shared/library.py": _PLAIN},
@@ -339,7 +330,9 @@ def test_a_pipeline_fingerprinted_after_a_later_discovery_found_nothing_is_still
     (tmp_path / "other").mkdir()
     (tmp_path / "other" / "wi_late.py").write_text(_PLAIN)
     monkeypatch.syspath_prepend(str(tmp_path / "other"))
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_late", "wi_late.plain()"))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_late", "wi_late.plain()")
+    )
     (tmp_path / "empty").mkdir()
     assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
 
@@ -357,7 +350,9 @@ def test_a_module_the_program_holds_from_the_projects_file_fingerprints(
     """The program imported the project's own `wi_own.py`: a worker gets the same code."""
     confirm = mocker.spy(loaded_source, "_confirm")
     _held("wi_own", tmp_path / "project" / "wi_own.py", monkeypatch)
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_own", "wi_own.plain()"))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_own", "wi_own.plain()")
+    )
 
     assert "module:wi_own" in pipeline.ensure_fingerprint("p/use")
     assert confirm.call_count == 0
@@ -369,7 +364,7 @@ def test_a_built_in_module_a_root_file_names_needs_no_new_interpreter(
     """`time` is built into the interpreter: a root `time.py` cannot shadow it, in a worker or
     here, so the prediction says so without starting an interpreter."""
     confirm = mocker.spy(loaded_source, "_confirm")
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"time.py": _PLAIN},
@@ -389,7 +384,7 @@ def test_a_library_submodule_a_worker_imports_from_the_same_file_needs_no_new_in
     agrees without starting an interpreter."""
     assert pathlib.Path(email.mime.text.__file__).name == "text.py"
     confirm = mocker.spy(loaded_source, "_confirm")
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {},
@@ -408,7 +403,7 @@ def test_a_frozen_module_needs_no_new_interpreter(
     """`os` is frozen into this interpreter (as in a release build): the frozen importer, which
     comes before any file, finds it in a worker as here."""
     confirm = mocker.spy(loaded_source, "_confirm")
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import os", "os.sep"))
+    pipeline = helpers.discover_project(tmp_path, monkeypatch, {}, _pipeline("import os", "os.sep"))
 
     pipeline.ensure_fingerprint("p/use")
     assert "byname:os" in _walk(pipeline)
@@ -453,7 +448,7 @@ def test_a_module_a_startup_finder_before_path_finder_serves_needs_no_new_interp
     monkeypatch.delitem(sys.modules, "wi_front", raising=False)
     importlib.import_module("wi_front")
     confirm = mocker.spy(loaded_source, "_confirm")
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_front.py": _PLAIN},
@@ -475,7 +470,9 @@ def test_a_module_the_program_reaches_through_a_symlink_is_its_real_file(
     (tmp_path / "link").symlink_to(program, target_is_directory=True)
     _held("wi_link", tmp_path / "link" / "wi_link.py", monkeypatch)
     monkeypatch.syspath_prepend(str(program))
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_link", "wi_link.plain()"))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_link", "wi_link.plain()")
+    )
 
     assert "module:wi_link" in pipeline.ensure_fingerprint("p/use")
     assert confirm.call_count == 0
@@ -490,7 +487,9 @@ def test_a_held_module_replaced_during_the_session_is_not_the_programs(
     program = tmp_path / "program"
     _held("wi_swap", program / "wi_swap.py", monkeypatch)
     monkeypatch.syspath_prepend(str(program))
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_swap", "wi_swap.plain()"))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_swap", "wi_swap.plain()")
+    )
     _held("wi_swap", tmp_path / "other" / "wi_swap.py", monkeypatch)
 
     assert "module:wi_swap" in pipeline.ensure_fingerprint("p/use")
@@ -602,7 +601,7 @@ def test_a_loaders_module_named_by_name_is_compared(
     _held("wi_loader", held_file, monkeypatch)
     returns = "Annotated[str, OUTPUT]" if field is None else "Fields"
     value = "raw" if field is None else f"{{{field!r}: raw}}"
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_loader.py": _PLAIN},
@@ -665,7 +664,7 @@ def test_the_module_of_a_loader_another_loader_holds_is_compared(
     by name, so the module the held loader's walk covers is compared like one the stage reads."""
     held = tmp_path / "program" / "wi_inst.py"
     _held("wi_inst", held, monkeypatch, _INNER_LOADER)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path, monkeypatch, {"wi_inst.py": _INNER_LOADER}, _LOADER_HOLDS_AN_INSTANCE
     )
 
@@ -745,7 +744,9 @@ def test_a_path_object_in_sys_path_is_skipped_as_the_import_system_skips_it(
     (tmp_path / "other").mkdir()
     (tmp_path / "other" / "wi_pobj.py").write_text(_PLAIN)
     monkeypatch.setattr(sys, "path", [program, str(tmp_path / "other"), *sys.path])
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_pobj", "wi_pobj.plain()"))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_pobj", "wi_pobj.plain()")
+    )
 
     other = _resolved(tmp_path / "other" / "wi_pobj.py")
     with pytest.raises(exceptions.PivotError, match=f"would import {other}"):
@@ -781,7 +782,7 @@ def test_a_confirmation_that_cannot_run_fails_on_the_prediction(
     confirmation did not run."""
     monkeypatch.setattr(loaded_source, "_CONFIRM_PROGRAM", "raise SystemExit(3)\n")
     _held("wi_fail", tmp_path / "program" / "wi_fail.py", monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_fail.py": _PLAIN},
@@ -832,7 +833,7 @@ def test_a_module_every_interpreter_imports_at_startup_is_the_one_its_worker_run
         "PYTHONPATH", os.pathsep.join([str(startup), os.environ.get("PYTHONPATH", "")])
     )
     confirm = mocker.spy(loaded_source, "_confirm")
-    _discover(
+    helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_startup.py": _PLAIN},
@@ -853,7 +854,7 @@ def test_a_module_from_another_file_fails_the_run_before_a_worker_runs_it(
     """The run fails at fingerprinting: no worker runs the project's file under a fingerprint of
     the program's."""
     _held("wi_run", tmp_path / "program" / "wi_run.py", monkeypatch)
-    _discover(
+    helpers.discover_project(
         tmp_path, monkeypatch, {"wi_run.py": _PLAIN}, _pipeline("import wi_run", "wi_run.plain()")
     )
 
@@ -884,7 +885,7 @@ def test_the_suspects_of_a_session_are_confirmed_in_one_interpreter(
         f"@stage\ndef use_{name}() -> str:\n    return {name}.plain()\n\n\n" for name in names
     )
     calls = "".join(f"    use_{name}()\n" for name in names)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {f"{name}.py": _PLAIN for name in names},
@@ -908,7 +909,7 @@ def test_the_check_is_reported_with_the_stages_other_refusals(
     """The stage reads a module-level list and the program's `wi_ag`: one error names both, as
     every fingerprinting refusal of a stage is reported together."""
     _held("wi_ag", tmp_path / "program" / "wi_ag.py", monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_ag.py": _PLAIN},
@@ -934,7 +935,7 @@ def test_a_relative_startup_path_names_a_directory_under_the_working_directory(
     _held("wi_rel", startup / "wi_rel.py", monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["startup", os.environ.get("PYTHONPATH", "")]))
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path, monkeypatch, {"wi_rel.py": _PLAIN}, _pipeline("import wi_rel", "wi_rel.plain()")
     )
 
@@ -948,7 +949,7 @@ def test_a_module_a_worker_imports_before_it_gets_its_path_is_the_one_it_uses(
     `sys.path` with the root first, so the root's `uuid.py` is not what the stage uses there.
     The confirming interpreter starts the same way, so nothing fails."""
     assert pathlib.Path(uuid.__file__).name == "uuid.py"
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"uuid.py": _PLAIN},
@@ -994,7 +995,7 @@ def test_an_expanded_instance_whose_module_is_another_file_fails_as_a_static_sta
     same refusal: an instance is fingerprinted as any stage is."""
     held = tmp_path / "program" / "wi_mp.py"
     _held("wi_mp", held, monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path, monkeypatch, {"wi_mp.py": _PLAIN, **_PLAN}, _mapped_pipeline("wi_mp")
     )
     assert pipeline.expand_template("p/cut", [("a", "a.yaml")]) == ["p/cut@a"]
@@ -1017,7 +1018,7 @@ def test_an_expanded_instance_records_its_by_name_modules_outside_the_lock(
     site = tmp_path / "lib" / "site-packages"
     _held("wi_ml", site / "wi_ml.py", monkeypatch)
     monkeypatch.syspath_prepend(str(site))
-    pipeline = _discover(tmp_path, monkeypatch, _PLAN, _mapped_pipeline("wi_ml"))
+    pipeline = helpers.discover_project(tmp_path, monkeypatch, _PLAN, _mapped_pipeline("wi_ml"))
     pipeline.expand_template("p/cut", [("a", "a.yaml")])
 
     walked = fingerprint.get_stage_fingerprint(pipeline.get_stage("p/cut@a")["func"])
@@ -1073,7 +1074,7 @@ def test_an_expanded_instances_output_loader_module_is_compared(
     check reads them only when the instance's output keys are the ones passed (#546)."""
     held = tmp_path / "program" / "wi_mq.py"
     _held("wi_mq", held, monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path, monkeypatch, {"wi_mq.py": _PLAIN, **_PLAN}, _MAPPED_OUTPUT_LOADER
     )
     assert pipeline.expand_template("p/cut", [("a", "a.yaml")]) == ["p/cut@a"]
@@ -1098,7 +1099,7 @@ def test_a_stage_after_its_producer_whose_module_is_another_file_fails_the_run(
     static `p/use` or the instance `p/cut@a` the run adds, and fails at its fingerprint the same
     way: no worker runs the root's `wi_mr` under a fingerprint of the program's."""
     _held("wi_mr", tmp_path / "program" / "wi_mr.py", monkeypatch)
-    _discover(
+    helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_mr.py": _PLAIN, **_PLAN},
@@ -1533,7 +1534,7 @@ def test_the_library_module_a_stage_reaches_is_recorded_by_name(
         (site / rel_path).write_text(text)
     monkeypatch.syspath_prepend(str(site))
 
-    walked = _walk(_discover(tmp_path, monkeypatch, {}, pipeline))
+    walked = _walk(helpers.discover_project(tmp_path, monkeypatch, {}, pipeline))
 
     assert {key for key in walked if key.startswith("byname:")} == recorded, walked
 

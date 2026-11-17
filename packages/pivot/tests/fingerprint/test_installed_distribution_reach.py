@@ -1,8 +1,8 @@
 """The `dist:` key of a library a stage reaches without reading the library's module, or a
-callable of it that names its module, as a global: one test per form of that reach, checked
-through the `pivot` CLI on git installs.
+callable of it that names its module, as a global: one parametrised case per form of that reach,
+checked through the `pivot` CLI on git installs.
 
-Each test makes its own venv with uv over this test environment (`tests.installed_dists`) and
+Each case makes its own venv with uv over this test environment (`tests.installed_dists`) and
 installs one library from commit C1 of its git repository (`git+file://...@<commit>`, so its
 `direct_url.json` has `vcs_info`). Its own pivot project has one stage, `p/make`, that reaches the
 library through one form alone: the base class of a user class, the type hint of a user function,
@@ -13,18 +13,18 @@ reached module: a literal in a module-level helper that the reached code calls, 
 function, a comment. `pivot status --json` reports the stage `stale`, `pivot status --explain
 --json` names exactly the library's `dist:` key changed, and `pivot repro` runs the stage again.
 
-The file runs pivot only through its CLI and imports nothing but `pathlib` and
+The file runs pivot only through its CLI and imports nothing but `pathlib`, `pytest` and
 `tests.installed_dists`.
 """
 
 import pathlib
 
+import pytest
 from tests import installed_dists
 
-_STAGE = "p/make"
-_OUTPUT = pathlib.Path("data/p/make.txt")
-
-# The base class form: the stage builds a user class whose base is the library's `Base`.
+# The base class form: the stage builds `Greeter`, a user class whose base is the library's
+# `Base`, and calls the method `Greeter` inherits from it; C2 changes the literal of `_greeting`,
+# the module-level helper that method calls.
 _BASE_LIBRARY = """\
 def _greeting():
     return "base-1"
@@ -53,9 +53,10 @@ with Pipeline("p") as pipeline:
     make()
 """
 
-# The type hint form: the stage calls a user function whose parameter hint is the library's
-# `Label`, and builds that argument with the class the hint names, as a framework that reads
-# hints does.
+# The type hint form: the stage calls `describe`, a user function whose parameter hint is the
+# library's `Label`, and nothing else of the library: it builds that argument with the class it
+# reads back from the hint (`typing.get_type_hints`), as a framework that reads hints does. C2
+# changes the literal of `_prefix`, the module-level helper `Label` calls.
 _HINT_LIBRARY = """\
 def _prefix():
     return "hint-1"
@@ -86,8 +87,9 @@ with Pipeline("p") as pipeline:
     make()
 """
 
-# The value form: the stage reads a partial whose keyword argument is an instance of the library's
-# `Marker`.
+# The value form: the stage reads `RENDER`, a partial of a user function whose keyword argument is
+# an instance of the library's `Marker`, on which the user function calls `apply`; C2 changes the
+# literal of `_mark`, the module-level helper `apply` calls.
 _VALUE_LIBRARY = """\
 def _mark():
     return "value-1"
@@ -121,7 +123,9 @@ with Pipeline("p") as pipeline:
     make()
 """
 
-# The loader form: the stage's input is read by the library's pivot loader `Tagged`.
+# The loader form: the stage's input is read by the library's pivot loader `Tagged`; C2 changes the
+# literal of `_tag`, the module-level helper its `load` calls, which leaves the syntax tree of
+# `load` as it was.
 _LOADER_LIBRARY = """\
 import dataclasses
 import pathlib
@@ -154,8 +158,10 @@ with Pipeline("p") as pipeline:
 """
 _LOADER_INPUTS = {"data/raw/words.txt": "x"}
 
-# The stage function form: the stage is the library's own `make`, which reads no global and whose
-# only hint is `str`.
+# The stage function form: the stage is the library's own `make`, which reads no global, calls
+# nothing and whose only hint is `str`. C2 changes one byte of a comment in its module, which
+# leaves the syntax tree of `make` as it was, so what the stage writes cannot change: it writes the
+# same value when it runs again.
 _STAGE_LIBRARY = """\
 from pivot import stage
 
@@ -176,7 +182,9 @@ with Pipeline("p") as pipeline:
 """
 
 # The form of a callable whose `__module__` is not a string: the stage reads, as a global, the
-# library's function `value`, whose `__module__` the library sets to None.
+# library's module-level function `value`, whose `__module__` the library sets to None, so no
+# `__module__` names the module that binds it; C2 changes the literal of `_suffix`, the
+# module-level helper `value` calls.
 _NO_MODULE_LIBRARY = """\
 def _suffix():
     return "nomod-1"
@@ -204,14 +212,73 @@ with Pipeline("p") as pipeline:
 """
 
 
-def _helper_assert_reinstall_reruns(
+@pytest.mark.parametrize(
+    ("name", "library", "edit", "pipeline", "outputs", "inputs"),
+    [
+        pytest.param(
+            "reachbase",
+            _BASE_LIBRARY,
+            ('"base-1"', '"base-2"'),
+            _BASE_PIPELINE,
+            ("base-1", "base-2"),
+            dict[str, str](),
+            id="base-class",
+        ),
+        pytest.param(
+            "reachhint",
+            _HINT_LIBRARY,
+            ('"hint-1"', '"hint-2"'),
+            _HINT_PIPELINE,
+            ("hint-1:x", "hint-2:x"),
+            dict[str, str](),
+            id="type-hint",
+        ),
+        pytest.param(
+            "reachvalue",
+            _VALUE_LIBRARY,
+            ('"value-1"', '"value-2"'),
+            _VALUE_PIPELINE,
+            ("value-1:x", "value-2:x"),
+            dict[str, str](),
+            id="instance-in-a-value",
+        ),
+        pytest.param(
+            "reachloader",
+            _LOADER_LIBRARY,
+            ('"loader-1:"', '"loader-2:"'),
+            _LOADER_PIPELINE,
+            ("loader-1:x", "loader-2:x"),
+            _LOADER_INPUTS,
+            id="pivot-loader",
+        ),
+        pytest.param(
+            "reachstage",
+            _STAGE_LIBRARY,
+            ("# Revision 1", "# Revision 2"),
+            _STAGE_PIPELINE,
+            ("made", "made"),
+            dict[str, str](),
+            id="library-stage-function",
+        ),
+        pytest.param(
+            "reachnomod",
+            _NO_MODULE_LIBRARY,
+            ('"nomod-1"', '"nomod-2"'),
+            _NO_MODULE_PIPELINE,
+            ("x:nomod-1", "x:nomod-2"),
+            dict[str, str](),
+            id="function-whose-module-is-none",
+        ),
+    ],
+)
+def test_a_library_reached_through_one_form_reruns_the_stage_after_a_one_byte_reinstall(
     tmp_path: pathlib.Path,
     name: str,
     library: str,
     edit: tuple[str, str],
     pipeline: str,
     outputs: tuple[str, str],
-    inputs: dict[str, str] | None = None,
+    inputs: dict[str, str],
 ) -> None:
     """Distribution `name`, whose package `name` has `library` as its `__init__.py`, installed from
     commit C1 of its git repository, and C2 replacing `edit[0]` with `edit[1]` in that file. In a
@@ -221,13 +288,13 @@ def _helper_assert_reinstall_reruns(
     repro` runs it again, which writes `outputs[1]`."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     source = installed_dists.write_library(tmp_path / "src", name, name, library)
-    project = installed_dists.make_project(tmp_path / "project", tmp_path / "home", venv, pipeline)
-    for relative, text in (inputs or {}).items():
+    project = installed_dists.make_project_in(tmp_path, venv, pipeline)
+    for relative, text in inputs.items():
         path = project.root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
     installed_dists.install(venv, installed_dists.init_git_requirement(source, project.home, name))
-    installed_dists.ran_then_cached(project, _STAGE, _OUTPUT, outputs[0])
+    installed_dists.ran_then_cached(project, outputs[0])
     installed_dists.replace_once(source / name / "__init__.py", *edit)
     commit = installed_dists.commit_all(source, project.home, "C2")
 
@@ -241,99 +308,5 @@ def _helper_assert_reinstall_reruns(
     )
     module = (venv.site_packages / name / "__init__.py").read_text()
     assert module == library.replace(*edit), f"the reinstall must change {edit}: {module!r}"
-    installed_dists.assert_stale_on(project, _STAGE, f"dist:{name}")
-    status, shown = installed_dists.repro_status(project, _STAGE)
-    assert status == "ran", f"`pivot repro` must run {_STAGE} again:\n{shown}"
-    written = (project.root / _OUTPUT).read_text()
-    assert written == outputs[1], f"the rerun must write {outputs[1]!r}, not {written!r}"
-
-
-def test_a_library_base_class_of_a_user_class_reaches_the_library(tmp_path: pathlib.Path) -> None:
-    """The stage builds `Greeter`, a user class whose base is `reachbase.Base`, and calls the
-    method `Greeter` inherits from it; C2 changes the literal of `_greeting`, the module-level
-    helper that method calls."""
-    _helper_assert_reinstall_reruns(
-        tmp_path,
-        "reachbase",
-        _BASE_LIBRARY,
-        ('"base-1"', '"base-2"'),
-        _BASE_PIPELINE,
-        ("base-1", "base-2"),
-    )
-
-
-def test_a_library_class_in_a_type_hint_reaches_the_library(tmp_path: pathlib.Path) -> None:
-    """The stage calls `describe`, a user function whose parameter hint is `reachhint.Label`, and
-    nothing else of the library: it builds the argument with the class it reads back from that
-    hint (`typing.get_type_hints`). C2 changes the literal of `_prefix`, the module-level helper
-    `Label` calls."""
-    _helper_assert_reinstall_reruns(
-        tmp_path,
-        "reachhint",
-        _HINT_LIBRARY,
-        ('"hint-1"', '"hint-2"'),
-        _HINT_PIPELINE,
-        ("hint-1:x", "hint-2:x"),
-    )
-
-
-def test_a_library_instance_inside_a_value_reaches_the_library(tmp_path: pathlib.Path) -> None:
-    """The stage reads `RENDER`, a partial of a user function whose keyword argument is a
-    `reachvalue.Marker` instance, on which the user function calls `apply`; C2 changes the literal
-    of `_mark`, the module-level helper `apply` calls."""
-    _helper_assert_reinstall_reruns(
-        tmp_path,
-        "reachvalue",
-        _VALUE_LIBRARY,
-        ('"value-1"', '"value-2"'),
-        _VALUE_PIPELINE,
-        ("value-1:x", "value-2:x"),
-    )
-
-
-def test_a_library_pivot_loader_reaches_the_library(tmp_path: pathlib.Path) -> None:
-    """The stage's input is read by `reachloader.Tagged`, a pivot loader the library defines; C2
-    changes the literal of `_tag`, the module-level helper its `load` calls, which leaves the
-    syntax tree of `load` as it was."""
-    _helper_assert_reinstall_reruns(
-        tmp_path,
-        "reachloader",
-        _LOADER_LIBRARY,
-        ('"loader-1:"', '"loader-2:"'),
-        _LOADER_PIPELINE,
-        ("loader-1:x", "loader-2:x"),
-        _LOADER_INPUTS,
-    )
-
-
-def test_a_stage_function_defined_in_the_library_reaches_the_library(
-    tmp_path: pathlib.Path,
-) -> None:
-    """The stage is `reachstage.make`, which reads no global, calls nothing and whose only hint is
-    `str`. C2 changes one byte of a comment in its module, which leaves the syntax tree of `make`
-    as it was, so what the stage writes cannot change: it writes the same value when it runs
-    again."""
-    _helper_assert_reinstall_reruns(
-        tmp_path,
-        "reachstage",
-        _STAGE_LIBRARY,
-        ("# Revision 1", "# Revision 2"),
-        _STAGE_PIPELINE,
-        ("made", "made"),
-    )
-
-
-def test_a_library_function_whose_module_attribute_is_none_reaches_the_library(
-    tmp_path: pathlib.Path,
-) -> None:
-    """The stage reads, as a global, `value`, a module-level function of `reachnomod` whose
-    `__module__` the library sets to None, so no `__module__` names the module that binds it; C2
-    changes the literal of `_suffix`, the module-level helper `value` calls."""
-    _helper_assert_reinstall_reruns(
-        tmp_path,
-        "reachnomod",
-        _NO_MODULE_LIBRARY,
-        ('"nomod-1"', '"nomod-2"'),
-        _NO_MODULE_PIPELINE,
-        ("x:nomod-1", "x:nomod-2"),
-    )
+    installed_dists.assert_stale_on(project, installed_dists.STAGE, f"dist:{name}")
+    installed_dists.assert_runs_and_writes(project, outputs[1], "the second `pivot repro`")
