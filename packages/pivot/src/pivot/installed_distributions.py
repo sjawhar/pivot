@@ -32,11 +32,11 @@ entry of the path that holds the file); the files under the directory of a reach
 namespace package only when such a site directory is the deepest entry of the path above that
 directory or lies at or under it, and only until each such site directory has a file there that
 no RECORD lists, once for each reached module and origin; and the files of a keyed distribution
-only when a stage reaches it. Each path a RECORD lists, and each file under such a directory, is
-resolved to the path `os.path.realpath` gives, a name at a time from the nearest directory above
-it already resolved (a site directory, a directory the walk lists, or one resolved for an earlier
-path): one `os.path.islink` for each new name, and `realpath` only for a name that is a symbolic
-link, empty, `.` or `..` (`_real_path`).
+only when a stage reaches it. Each path a RECORD lists that can name a file (`_resolved`), and each
+file under such a directory, is resolved to the path `os.path.realpath` gives, a name at a time
+from the nearest directory above it already resolved (a site directory, or one resolved for an
+earlier path): one `os.path.islink` for each new name, and `realpath` only for a name that is a
+symbolic link, empty, `.` or `..` (`_real_path`).
 """
 
 from __future__ import annotations
@@ -80,6 +80,10 @@ _END_OF_HEADERS = re.compile(r"\r?\n\r?\n")
 
 # The names in a path that `os.path.realpath` reads specially: an empty one, `.` and `..`.
 _SPECIAL_NAMES = ("", os.curdir, os.pardir)
+
+# PATH_MAX: `os.lstat` refuses a path of this many bytes or more as too long (ENAMETOOLONG), as the
+# limit counts the NUL that ends a path in C (4096 on Linux, which looks up a path of 4095 bytes).
+_PATH_MAX = os.pathconf("/", "PC_PATH_MAX")
 
 
 class InstallForm(enum.Enum):
@@ -552,8 +556,7 @@ class _Snapshot:
         scan = _scan(path)
         self._installed: tuple[Installed, ...] = scan.installed
         self._site_dirs: frozenset[str] = scan.site_dirs
-        # Each directory's real path (`_real_dir`); a site directory is resolved already, and
-        # `_files_under` adds each directory it walks.
+        # Each directory's real path (`_real_dir`); a site directory is resolved already.
         self._real_dirs: dict[str, str] = {site_dir: site_dir for site_dir in scan.site_dirs}
         # None when no distribution on the path is of a seed form: then no stage gets a key or a
         # refusal, and no requirement or RECORD is read.
@@ -692,7 +695,7 @@ def _build_index(
 ) -> _Index | None:
     """The candidates and their ownership, or None when no distribution on the path is of a seed
     form (`_SEED_FORMS`): then no stage gets a key or a refusal, and no requirement or RECORD is
-    read. Each RECORD path is resolved with `real_dirs` as `_real_path`'s memo."""
+    read. Each RECORD path is resolved by `_resolved`, with `real_dirs` as `_real_path`'s memo."""
     seeds_by_form = [
         entry.dist_info for entry in installed if entry.classification.form in _SEED_FORMS
     ]
@@ -814,19 +817,32 @@ def _resolved(
     installed: Installed, paths: Iterable[str], real_dirs: dict[str, str]
 ) -> Iterator[str]:
     """Each path a RECORD lists, located in the distribution's site directory and resolved
-    (`_real_path`, with `real_dirs` as its memo); a path that holds a NUL character, which
-    `os.path.realpath` refuses, names no file and is left out."""
+    (`_real_path`, with `real_dirs` as its memo). A path names no file and is left out when it
+    holds a NUL character or a name the filesystem encoding cannot encode, for which
+    `os.path.realpath` raises a `ValueError`, or when, located and encoded, it is `_PATH_MAX`
+    bytes or longer, which `os.lstat` refuses. So each path given to `_real_path` from here, and
+    each directory above it that `_real_dir` memoises, is shorter than `_PATH_MAX` bytes, however
+    many names a RECORD row holds."""
     for path in paths:
-        if "\0" not in path:
-            yield _real_path(os.path.join(installed.site_dir, path), real_dirs)
+        located = os.path.join(installed.site_dir, path)
+        try:
+            encoded = os.fsencode(located)
+        except UnicodeEncodeError:
+            continue
+        if b"\0" not in encoded and len(encoded) < _PATH_MAX:
+            yield _real_path(located, real_dirs)
 
 
 def _real_path(path: str, real_dirs: dict[str, str]) -> str:
-    """`os.path.realpath(path)`, equal to it for every absolute path with no NUL character (each
-    path this module resolves is one: `realpath` refuses a NUL, and the memo does not follow the
-    working directory a relative path depends on), found with one `os.path.islink` once
-    `real_dirs` holds the real path of the directory that holds `path` (`_real_dir` finds and
-    memoises it).
+    """`os.path.realpath(path)`, equal to it for every absolute path with no NUL character whose
+    names the filesystem encoding can encode, found with one `os.path.islink` once `real_dirs`
+    holds the real path of the directory that holds `path` (`_real_dir` finds and memoises it).
+    The memo does not follow the working directory a relative path depends on, and for a NUL or
+    a name the encoding cannot encode `realpath` raises a `ValueError`, which `os.path.islink`
+    takes as no link. Each path this module resolves is one: `_resolved` leaves out every other
+    RECORD path, and `_files_under` joins the names `os.walk` lists, which it decoded with
+    surrogateescape and so can encode back, to the directory of an origin, which `import_origin`
+    gives resolved by `realpath`.
 
     `realpath` resolves a path a name at a time from the left, so before it reads the last name
     it holds the real path of the directory that name is in, and it then takes the name as it is
@@ -845,8 +861,8 @@ def _real_dir(directory: str, real_dirs: dict[str, str]) -> str:
     holds, or to the nearest whose last name `realpath` reads specially (`_SPECIAL_NAMES`; the
     root's is empty), which `realpath` resolves; then each name below it costs one
     `os.path.islink` (`_real_child`), so a directory below one already resolved costs one. A
-    loop, not a recursion: a RECORD path is text a distribution wrote, with any number of
-    names."""
+    loop, not a recursion: a path shorter than `_PATH_MAX` bytes can hold some 2,000 names on
+    Linux, twice Python's default recursion limit."""
     walked = list[tuple[str, str]]()  # (a directory, its last name), from `directory` up
     head = directory
     while head not in real_dirs:
@@ -893,11 +909,6 @@ def _files_under(directory: str, real_dirs: dict[str, str]) -> Iterator[str]:
     `real_dirs` as its memo), but bytecode (`.pyc` files, `__pycache__`), as `os.walk` lists
     them: a subdirectory it cannot list, or a symbolic link to one, adds none."""
     for root, directories, files in os.walk(directory):
-        # `root` is its own real path, so the memo takes it unresolved: `directory` is real, as
-        # `import_origin` resolves an origin (`os.path.realpath`), and `os.walk` lists only a
-        # directory it could open and enters no symbolic link to a directory, so each directory
-        # it lists under a real one is real.
-        real_dirs[root] = root
         directories[:] = [name for name in directories if name != "__pycache__"]
         for name in files:
             if not name.endswith(".pyc"):
@@ -906,12 +917,12 @@ def _files_under(directory: str, real_dirs: dict[str, str]) -> Iterator[str]:
 
 def _file_digest(path: str) -> str | None:
     """The xxh64 hex of the bytes of the file at `path`, read from disk; None when it is missing,
-    cannot be read, has a NUL character in its path, or is not a regular file (a directory, or a
-    FIFO, which opening without O_NONBLOCK would wait on). The descriptor is closed on every
-    path."""
+    cannot be read, has a NUL character or a name the filesystem encoding cannot encode in its
+    path, or is not a regular file (a directory, or a FIFO, which opening without O_NONBLOCK would
+    wait on). The descriptor is closed on every path."""
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    except (OSError, ValueError):  # ValueError: a NUL character in the path
+    except (OSError, ValueError):  # ValueError: a NUL character, or an unencodable name
         return None
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
