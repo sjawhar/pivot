@@ -2,8 +2,8 @@
 distribution, called in this process on plain data: on `direct_url.json`, METADATA,
 `requires.txt` and RECORD as uv, pip and setuptools write them and on wrong and boundary inputs,
 on the paths a RECORD lists, on digests, on requirement graphs, on origins and on the readings
-that decide a distribution's key and its refusals; and the walk that resolves a RECORD path, on a
-tree of symbolic links this test makes.
+that decide a distribution's key and its refusals; and the resolution of a RECORD path, on a tree
+of symbolic links this test makes.
 
 The CLI tests of the same decisions are in `test_installed_distributions.py`, and
 `distribution_keys` over real installs is in `test_installed_distributions_snapshot.py`.
@@ -685,12 +685,13 @@ def test_decide_gives_a_key_and_refusals_in_their_order(
 
 
 def test_a_record_path_resolves_to_what_realpath_gives(tmp_path: pathlib.Path) -> None:
-    """A RECORD path is resolved by walking only the names below the nearest directory already
-    resolved, and gives what `os.path.realpath` gives, the first time and again from the memo:
-    under a package directory that is a symbolic link, for a file that is a symbolic link, by an
-    absolute target or by a relative one through `..`, a dangling link, a link to itself, a missing
-    directory, a name under a regular file, a `..`, a `.`, a trailing slash, doubled slashes, a
-    console script's `../../../bin` path and the root."""
+    """A RECORD path is resolved from the real path of the directory that holds it, memoised, and
+    gives what `os.path.realpath` gives, the first time and again from the memo: under a package
+    directory that is a symbolic link, for a file that is a symbolic link, by an absolute target
+    or by a relative one through `..`, a dangling link, a link to itself, a loop of two links
+    crossed by `..` (`a -> b`, `b -> a`, `a/../b/z.py`), a missing directory, a name under a
+    regular file, a `..`, a `.`, a trailing slash, doubled slashes, a console script's
+    `../../../bin` path and the root."""
     package = tmp_path / "elsewhere" / "fixlib"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("")
@@ -705,6 +706,8 @@ def test_a_record_path_resolves_to_what_realpath_gives(tmp_path: pathlib.Path) -
     (site / "plain.py").write_text("")
     (site / "dangling.py").symlink_to(tmp_path / "missing.py")
     (site / "loop.py").symlink_to("loop.py")
+    (site / "a").symlink_to("b")
+    (site / "b").symlink_to("a")
     paths = [
         f"{site}/fixlib/__init__.py",
         f"{site}/fixlib/core.py",
@@ -713,6 +716,8 @@ def test_a_record_path_resolves_to_what_realpath_gives(tmp_path: pathlib.Path) -
         f"{site}/loop.py",
         f"{site}/missing/module.py",
         f"{site}/plain.py/under-a-file",
+        f"{site}/a/../b/z.py",
+        f"{site}/b/../a/z.py",
         f"{site}/fixlib/../plain.py",
         f"{site}/./plain.py",
         f"{site}/fixlib/",
@@ -727,5 +732,9 @@ def test_a_record_path_resolves_to_what_realpath_gives(tmp_path: pathlib.Path) -
 
     expected = [os.path.realpath(path) for path in paths]
     assert expected[1:3] == [str(target.resolve())] * 2, f"the links must resolve: {expected}"
-    assert first == expected, f"the first walk must give realpath's paths:\n{first}\n{expected}"
+    loop = expected[paths.index(f"{site}/a/../b/z.py")]
+    assert loop == f"{site.resolve()}/a/z.py", f"realpath must stop the loop at its link: {loop}"
+    assert first == expected, (
+        f"the first resolution must give realpath's paths:\n{first}\n{expected}"
+    )
     assert again == expected, f"the memo must give realpath's paths:\n{again}\n{expected}"

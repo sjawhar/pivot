@@ -4,10 +4,11 @@ Each test makes its own venv with uv over this test environment (`tests.installe
 installs setuptools fixtures into it (from a path, from git, a local wheel, as from a package
 index, editable) and gives each reached module's origin as plain data: which files each key
 hashes, read from disk once per process; what the scan of the path reads; the refusals of an
-install Pivot cannot read. Then `fingerprint.add_distribution_keys`, which looks up no module's
-origin when no install on the path can give a key, and one fingerprint, through the registry, of
-a stage that imports its installed library only in its body. No fixture is imported into this
-process.
+install Pivot cannot read, and which reached package directories the check of an install with no
+RECORD walks, and how far, once per process. Then `fingerprint.add_distribution_keys`, which
+looks up no module's origin when no install on the path can give a key, and one fingerprint,
+through the registry, of a stage that imports its installed library only in its body. No fixture
+is imported into this process.
 
 The CLI tests of the same decisions are in `test_installed_distributions.py`, and the pure
 functions on plain data in `test_installed_distributions_rules.py`.
@@ -379,6 +380,139 @@ def test_a_reached_file_no_record_lists_beside_a_recordless_install_is_refused_p
             for module, file in refused
         ),
     ), found
+
+
+@pytest.mark.parametrize(
+    "holds_the_venv",
+    [
+        pytest.param(False, id="beside-the-venv"),
+        pytest.param(True, id="holding-the-venv"),
+    ],
+)
+def test_a_reached_package_is_not_walked_for_a_recordless_install_in_another_path_entry(
+    tmp_path: pathlib.Path, mocker: pytest_mock.MockerFixture, holds_the_venv: bool
+) -> None:
+    """`Fix_Lib`, installed from its path with the package `fixlib` and the namespace portion
+    `nsco.part`, is reached through both. `fixother`, installed from its path into another
+    directory on the path, beside the venv or holding it, has lost its RECORD. Every file under
+    `fixlib` and `nsco` lies in the venv's site-packages, the deepest entry of the path above
+    each, which holds no install without a RECORD, and no entry lies under either: neither
+    directory is walked, `Fix_Lib` gets its key and nothing is refused."""
+    other = tmp_path / "other"
+    other.mkdir()
+    venv = installed_dists.make_venv((other if holds_the_venv else tmp_path) / "venv")
+    src = tmp_path / "src"
+    fixlib = installed_dists.write_setuptools_project(
+        src / "fixlib",
+        "Fix_Lib",
+        "0.1",
+        packages=["fixlib", "nsco.part"],
+        files={
+            "fixlib/__init__.py": installed_dists.FIXLIB_ALONE,
+            "nsco/part/__init__.py": "PART = 1\n",
+        },
+    )
+    fixother = installed_dists.write_library(
+        src, "fixother", "fixother", installed_dists.FIXLIB_ALONE
+    )
+    installed_dists.install_directory(venv, fixlib)
+    installed_dists.install(venv, "--target", str(other), str(fixother))
+    installed_dists.damage(other / "fixother-0.1.dist-info" / "RECORD", None)
+    site = venv.site_packages
+    files_under = mocker.spy(installed_distributions, "_files_under")
+    origins = {
+        "fixlib": _helper_origin(site / "fixlib" / "__init__.py"),
+        "nsco": ("namespace", os.path.realpath(site / "nsco")),
+    }
+
+    found = installed_distributions.distribution_keys(origins, [str(site), str(other)], _PIVOT_DIRS)
+
+    hashed = {name: name for name in ("fixlib/__init__.py", "nsco/part/__init__.py")}
+    assert found == installed_distributions.DistributionKeys(
+        {"dist:fix-lib": _helper_value(site, hashed)}, []
+    ), found
+    walked = [call.args[0] for call in files_under.call_args_list]
+    assert walked == [], f"no reached directory may be walked: {walked}"
+
+
+def test_a_reached_package_is_walked_once_and_only_until_each_recordless_entry_has_its_file(
+    tmp_path: pathlib.Path, mocker: pytest_mock.MockerFixture
+) -> None:
+    """`Fix_Lib`, installed from its path with the namespace portion `nsco.part`, has lost its
+    RECORD, and a stray `nsco/stray.py` lies beside `nsco/part`. `company-core`, installed as
+    from an index, holds `company/__init__.py`, and its directory `company/vendored` is on the
+    path too, with `fixother`, installed there from its path, which has lost its RECORD. The walk
+    of the reached package `company`, whose own file a RECORD lists, finds uv's `.lock`, the one
+    file at the top of `company/vendored`, an entry of the path under `company`. The walk of the
+    reached namespace `nsco` stops at `stray.py`, the one file at its top, which no RECORD lists,
+    and resolves nothing under `part`. Each module is refused once, and a second call gives the
+    same refusals and walks nothing again."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    src = tmp_path / "src"
+    fixlib = installed_dists.write_setuptools_project(
+        src / "fixlib",
+        "Fix_Lib",
+        "0.1",
+        packages=["nsco.part"],
+        files={"nsco/part/__init__.py": "PART = 1\n"},
+    )
+    company = installed_dists.write_setuptools_project(
+        src / "company",
+        "company-core",
+        "0.1",
+        packages=["company"],
+        files={"company/__init__.py": "CORE = 1\n"},
+    )
+    fixother = installed_dists.write_library(
+        src, "fixother", "fixother", installed_dists.FIXLIB_ALONE
+    )
+    wheels = tmp_path / "wheels"
+    installed_dists.install_directory(venv, fixlib)
+    installed_dists.build_wheel(venv, company, wheels)
+    installed_dists.install_from_wheels(venv, wheels, "company-core")
+    site = venv.site_packages
+    vendored = site / "company" / "vendored"
+    installed_dists.install(venv, "--target", str(vendored), str(fixother))
+    installed_dists.damage(site / "fix_lib-0.1.dist-info" / "RECORD", None)
+    installed_dists.damage(vendored / "fixother-0.1.dist-info" / "RECORD", None)
+    (site / "nsco" / "stray.py").write_text("STRAY = 1\n")
+    top_files = sorted(child.name for child in vendored.iterdir() if child.is_file())
+    assert top_files == [".lock"], f"uv must leave .lock alone at the top of {vendored}"
+    files_under = mocker.spy(installed_distributions, "_files_under")
+    real_path = mocker.spy(installed_distributions, "_real_path")
+    nsco = os.path.realpath(site / "nsco")
+    origins = {
+        "company": _helper_origin(site / "company" / "__init__.py"),
+        "nsco": ("namespace", nsco),
+    }
+    path = [str(site), str(vendored)]
+
+    first = installed_distributions.distribution_keys(origins, path, _PIVOT_DIRS)
+    walked_first = [call.args[0] for call in files_under.call_args_list]
+    again = installed_distributions.distribution_keys(origins, path, _PIVOT_DIRS)
+
+    inner = vendored.resolve()
+    unlisted_lock = (
+        f"Module 'company' ({inner}/.lock) lies in {inner}, where distribution 'fixother' "
+        f"({inner}/fixother-0.1.dist-info), installed from a local directory (dir_info), has no "
+        "RECORD file, and no RECORD file there lists that file. Pivot cannot tell whether the "
+        "stage runs that distribution's code, so the stage could skip a run after it changes. "
+        "Fix: reinstall 'fixother'."
+    )
+    unlisted_stray = installed_dists.UNLISTED_REFUSAL.format(
+        module="nsco", file="nsco/stray.py", site=site.resolve()
+    )
+    expected = installed_distributions.DistributionKeys({}, sorted([unlisted_lock, unlisted_stray]))
+    assert [first, again] == [expected, expected], [first, again]
+    assert walked_first == [os.path.realpath(site / "company"), nsco], walked_first
+    walked = [call.args[0] for call in files_under.call_args_list]
+    assert walked == walked_first, f"a second call must walk nothing: {walked}"
+    under_nsco = [
+        call.args[0]
+        for call in real_path.call_args_list
+        if pathlib.Path(call.args[0]).is_relative_to(nsco)
+    ]
+    assert under_nsco == [f"{nsco}/stray.py"], f"the walk must stop at stray.py: {under_nsco}"
 
 
 def test_reached_and_required_installs_pivot_cannot_read_are_refused(

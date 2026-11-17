@@ -28,9 +28,13 @@ directory's `requires.txt` when its metadata has none); RECORD only for the cand
 distributions, each distribution whose requirements cannot be read, and every distribution that
 requires one of them, directly or through others); every RECORD of a site directory only when a
 candidate there has no RECORD and a stage reaches a file whose site directory it is (the deepest
-entry of the path that holds the file); and the files of a keyed distribution only when a stage
-reaches it. Each path a RECORD lists is resolved with one `os.path.islink` for each name below
-the nearest directory already resolved (`_real_path`).
+entry of the path that holds the file); the files under the directory of a reached package or
+namespace package only when such a site directory is the deepest entry of the path above that
+directory or lies at or under it, and only until each such site directory has a file there that
+no RECORD lists, once for each reached module; and the files of a keyed distribution only when a
+stage reaches it. Each path a RECORD lists, and each file under such a directory, is resolved
+with one `os.path.islink` once the real path of the directory that holds it is known, which
+`os.path.realpath` finds once for each directory (`_real_path`).
 """
 
 from __future__ import annotations
@@ -40,7 +44,6 @@ import dataclasses
 import email.parser
 import email.policy
 import enum
-import itertools
 import json
 import os
 import posixpath
@@ -234,15 +237,7 @@ def requirement_names(metadata: bytes | OSError | None) -> Requirements:
         )
     if "Metadata-Version" not in headers:
         return Requirements(frozenset(), "has a METADATA file with no Metadata-Version header")
-    names = set[str]()
-    for value in headers.get_all("Requires-Dist") or []:
-        match = _REQUIREMENT_NAME.match(value.strip())
-        if match is None:
-            return Requirements(
-                frozenset(), f"has a Requires-Dist header that names no distribution ({value!r})"
-            )
-        names.add(_normalize(match.group()))
-    return Requirements(frozenset(names), "")
+    return _leading_names(headers.get_all("Requires-Dist") or [], "a Requires-Dist header")
 
 
 def requires_txt_names(requires: bytes | OSError | None) -> Requirements:
@@ -265,15 +260,25 @@ def requires_txt_names(requires: bytes | OSError | None) -> Requirements:
         text = requires.decode("utf-8")
     except UnicodeDecodeError as exc:
         return Requirements(frozenset(), f"has a requires.txt file that is not UTF-8 ({exc})")
-    names = set[str]()
+    requirements = list[str]()
     for line in text.splitlines():
         value = line.strip()
         if not value or value.startswith("#") or (value.startswith("[") and value.endswith("]")):
             continue
-        match = _REQUIREMENT_NAME.match(value)
+        requirements.append(value)
+    return _leading_names(requirements, "a requires.txt line")
+
+
+def _leading_names(requirements: Iterable[str], what: str) -> Requirements:
+    """The PEP 503 names that `requirements` start with, each read as its leading PEP 508 name once
+    stripped, or no names and a problem naming the first that starts with no name, as `what` (`a
+    Requires-Dist header`, `a requires.txt line`)."""
+    names = set[str]()
+    for requirement in requirements:
+        match = _REQUIREMENT_NAME.match(requirement.strip())
         if match is None:
             return Requirements(
-                frozenset(), f"has a requires.txt line that names no distribution ({value!r})"
+                frozenset(), f"has {what} that names no distribution ({requirement!r})"
             )
         names.add(_normalize(match.group()))
     return Requirements(frozenset(names), "")
@@ -528,7 +533,8 @@ class _Scan(NamedTuple):
 class _Snapshot:
     """What one process read of the distributions on one worker path: the distributions and the
     index of the candidates when it is made, and, each when first needed, the files a site
-    directory's RECORDs list and the digest of a keyed distribution's files."""
+    directory's RECORDs list, the refusals of a reached module with a file that no RECORD lists,
+    and the digest of a keyed distribution's files."""
 
     def __init__(self, path: tuple[str, ...], pivot_dirs: frozenset[str]) -> None:
         self.path: tuple[str, ...] = path  # the worker's `sys.path`
@@ -544,6 +550,8 @@ class _Snapshot:
         # Site directory -> every resolved file that a RECORD of a distribution there lists.
         self._listed: dict[str, frozenset[str]] = {}
         self._digests: dict[str, str] = {}  # `dist_info` -> its `content_digest`
+        # (module, origin) -> `_unlisted`'s refusals for that reached module.
+        self._unlisted_refusals: dict[tuple[str, import_origin.Origin | None], tuple[str, ...]] = {}
 
     def keys_for(self, origins: Mapping[str, import_origin.Origin | None]) -> DistributionKeys:
         index = self.index
@@ -587,32 +595,59 @@ class _Snapshot:
 
     def _unlisted(
         self, module: str, origin: import_origin.Origin | None, index: _Index
-    ) -> list[str]:
+    ) -> tuple[str, ...]:
         """The refusals for a reached module with a file that no RECORD in its site directory
         lists, where that directory holds a candidate with no RECORD (`_Index.recordless`), which
         owns no file, so Pivot cannot tell whether the module is that candidate's: one for each
-        such candidate, naming the first such file of that directory. The files are those the
-        origin covers (`_reached_paths`): the module's own file, and every file under the
-        directory of a package's `__init__` file or of a namespace package, but bytecode, since
-        such a candidate may hold a submodule. A file's site directory is the deepest entry of
-        the path that the scan listed and that holds it (`_site_dir`)."""
-        files, directories = _reached_paths(origin)
-        under = (_files_under(directory, self._real_dirs) for directory in directories)
-        refusals = list[str]()
-        seen = set[str]()
-        for file in itertools.chain(files, *under):
-            site_dir = self._site_dir(file)
-            if site_dir is None or site_dir not in index.recordless or site_dir in seen:
-                continue
-            if file in self._listed_in(site_dir):
-                continue
-            seen.add(site_dir)
-            for distribution in index.recordless[site_dir]:
-                installed = index.installed[distribution]
-                refusals.append(
-                    _unlisted_refusal(module, file, installed, index.records[distribution])
+        such candidate, naming the first such file of that directory. Found once for each module
+        and origin.
+
+        The files are those the origin covers (`_reached_paths`): the module's own file, and the
+        files under the directory of a package's `__init__` file or of a namespace package, but
+        bytecode, since such a candidate may hold a submodule. A file's site directory is the
+        deepest entry of the path that the scan listed and that holds it (`_site_dir`). A
+        directory is walked only for the site directories with such a candidate that can hold a
+        file under it other than through a symbolic link (the deepest entry of the path above the
+        directory, and each entry at or under it), and only until each of them has its file. So a
+        file under the directory that is a symbolic link into another site directory with such a
+        candidate is not checked."""
+        key = (module, origin)
+        if key not in self._unlisted_refusals:
+            files, directories = _reached_paths(origin)
+            first = dict[str, str]()  # site directory -> its first file that no RECORD lists
+            self._find_unlisted(files, set(index.recordless), first)
+            for directory in directories:
+                above = self._site_dir(directory)
+                pending = {
+                    site_dir
+                    for site_dir in index.recordless
+                    if site_dir not in first
+                    and (site_dir in (above, directory) or directory in _ancestors(site_dir))
+                }
+                if pending:
+                    self._find_unlisted(_files_under(directory, self._real_dirs), pending, first)
+            self._unlisted_refusals[key] = tuple(
+                _unlisted_refusal(
+                    module, file, index.installed[distribution], index.records[distribution]
                 )
-        return refusals
+                for site_dir, file in first.items()
+                for distribution in index.recordless[site_dir]
+            )
+        return self._unlisted_refusals[key]
+
+    def _find_unlisted(
+        self, files: Iterable[str], pending: set[str], first: dict[str, str]
+    ) -> None:
+        """Put in `first`, for each site directory of `pending`, the first of the resolved `files`
+        that lies in it (`_site_dir`) and that no RECORD there lists, and take that directory out
+        of `pending`; once `pending` is empty, read no more of `files`."""
+        for file in files:
+            site_dir = self._site_dir(file)
+            if site_dir in pending and file not in self._listed_in(site_dir):
+                first[site_dir] = file
+                pending.remove(site_dir)
+                if not pending:
+                    return
 
     def _site_dir(self, file: str) -> str | None:
         """The deepest entry of the path that the scan listed and that holds the resolved `file`,
@@ -766,35 +801,20 @@ def _resolved(
 
 
 def _real_path(path: str, real_dirs: dict[str, str]) -> str:
-    """`os.path.realpath(path)`, equal to it for every path, found with one `os.path.islink` for
-    each name below the nearest directory whose real path `real_dirs` holds.
+    """`os.path.realpath(path)`, equal to it for every path, found with one `os.path.islink` once
+    `real_dirs` holds the real path of the directory that holds `path`.
 
-    `realpath` walks a path a name at a time: it joins each name to the real path of the
-    directory above and follows the joined path only when it is a symbolic link. So does this,
-    starting from the real path of the nearest directory above `path` that `real_dirs` holds, or
-    of the nearest whose own name `realpath` reads specially (empty, `.` or `..`), which
-    `realpath` finds; it then memoises in `real_dirs` the real path of each directory it walked
-    through, so a second file of a directory costs one `islink`."""
-    walked = list[tuple[str, str]]()  # (a path, its last name), from `path` up
-    head = path
-    while True:
-        parent, name = os.path.split(head)
-        if name in ("", os.curdir, os.pardir):
-            real = os.path.realpath(head)
-            break
-        walked.append((head, name))
-        if parent in real_dirs:
-            real = real_dirs[parent]
-            break
-        head = parent
-    # `real` is now the real path of the directory that holds the last path walked.
-    for index in range(len(walked) - 1, -1, -1):
-        walked_path, name = walked[index]
-        joined = os.path.join(real, name)
-        real = os.path.realpath(joined) if os.path.islink(joined) else joined
-        if index:  # a directory above `path`
-            real_dirs[walked_path] = real
-    return real
+    `realpath` resolves the directory a path's last name is in before it reads that name, then
+    takes the name as it is unless the name is a symbolic link or one it reads specially (empty,
+    `.` or `..`). So this joins the last name to the directory's real path (`realpath`, memoised
+    in `real_dirs`), and gives `realpath` of the whole path for such a name or a link."""
+    directory, name = os.path.split(path)
+    if name in ("", os.curdir, os.pardir):
+        return os.path.realpath(path)
+    if directory not in real_dirs:
+        real_dirs[directory] = os.path.realpath(directory)
+    joined = os.path.join(real_dirs[directory], name)
+    return os.path.realpath(path) if os.path.islink(joined) else joined
 
 
 def _ancestors(path: str) -> Iterator[str]:
@@ -845,9 +865,7 @@ def _file_digest(path: str) -> str | None:
 
 
 # One process's snapshot of the distributions on the worker's path (`_snapshot_of`), which `reset`
-# forgets. A process fingerprints a stage on the thread that asks for it, and two can ask at once
-# (the comment on `fingerprint._hash_function_ast_cache` lists them: the main thread, anyio worker
-# threads, the engine's event loop, a watch reload's daemon thread, an RPC request's thread), so
-# `_lock` guards it.
+# forgets. A process fingerprints a stage on the thread that asks for it, and two threads can ask
+# at once (the comment on `fingerprint._hash_function_ast_cache` lists them), so `_lock` guards it.
 _lock = threading.Lock()
 _snapshot: _Snapshot | None = None
