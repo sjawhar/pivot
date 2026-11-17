@@ -3,12 +3,12 @@ over this test environment, setuptools projects installed into it, and what the 
 venv runs reports.
 
 The venv's site-packages holds a `.pth` file that adds this test environment's purelib directory,
-so pivot, its dependencies and setuptools are importable there and every install runs offline
-without build isolation. Pivot runs as `<venv>/bin/python -P -c "<_console_main>"` through
-`helpers.run_cli`: `-P` keeps the working directory off `sys.path`, as the `pivot` console script
-does. This module imports only the standard library, pytest, PyYAML, `tests.helpers` and the
-`pivot` package, so the tests that use it still collect when `packages/pivot/src` is pivot
-0.10.4's.
+so pivot, its dependencies and setuptools are importable there and every install of a fixture,
+by uv or by the venv's own pip, runs offline without build isolation. Pivot runs as
+`<venv>/bin/python -P -c "<_console_main>"` through `helpers.run_cli`: `-P` keeps the working
+directory off `sys.path`, as the `pivot` console script does. This module imports only the
+standard library, pytest, PyYAML, `tests.helpers` and the `pivot` package, so the tests that use
+it still collect when `packages/pivot/src` is pivot 0.10.4's.
 """
 
 from __future__ import annotations
@@ -72,25 +72,16 @@ def uv() -> str:
 def run_uv(cwd: pathlib.Path, *args: str) -> str:
     """Run `uv <args>` in `cwd` with `helpers.clean_env()`; the test fails unless it exits 0.
     Returns what it printed."""
-    command = [uv(), *args]
-    ran = subprocess.run(
-        command,
-        cwd=cwd,
-        env=helpers.clean_env(),
-        capture_output=True,
-        text=True,
-        timeout=600,
-        check=False,
+    return _run_checked(cwd, [uv(), *args])
+
+
+def make_venv(venv: pathlib.Path, *, seed: bool = False) -> Venv:
+    """Make a venv at `venv` with `uv venv --python <this interpreter>` (`seed`: with pip, `uv
+    venv --seed`), whose site-packages holds a `.pth` file that adds this test environment's
+    purelib directory to `sys.path` after it."""
+    run_uv(
+        venv.parent, "venv", *(["--seed"] if seed else []), "--python", sys.executable, str(venv)
     )
-    output = ran.stdout + ran.stderr
-    assert ran.returncode == 0, f"`{shlex.join(command)}` exited {ran.returncode}:\n{output}"
-    return output
-
-
-def make_venv(venv: pathlib.Path) -> Venv:
-    """Make a venv at `venv` with `uv venv --python <this interpreter>`, whose site-packages holds
-    a `.pth` file that adds this test environment's purelib directory to `sys.path` after it."""
-    run_uv(venv.parent, "venv", "--python", sys.executable, str(venv))
     python = venv / "bin" / "python"
     ran = subprocess.run(
         [str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
@@ -159,6 +150,14 @@ def remove_build_outputs(source: pathlib.Path) -> None:
             shutil.rmtree(leftover)
 
 
+def replace_once(path: pathlib.Path, old: str, new: str) -> None:
+    """Replace the one occurrence of `old` in the file at `path` with `new`; the test fails when
+    the file does not hold `old` exactly once."""
+    text = path.read_text()
+    assert text.count(old) == 1, f"{path} must hold {old!r} once:\n{text}"
+    path.write_text(text.replace(old, new))
+
+
 def install(venv: Venv, *spec: str, reinstall: bool = False) -> str:
     """`uv pip install --offline --python <venv>/bin/python --no-build-isolation --no-deps
     [--reinstall] <spec>`; the test fails unless it succeeds. Returns what uv printed."""
@@ -210,6 +209,29 @@ def install_from_wheels(venv: Venv, wheels: pathlib.Path, requirement: str) -> s
     return install(venv, "--no-index", "--find-links", str(wheels), requirement)
 
 
+def pip_install_directory(venv: Venv, source: pathlib.Path) -> str:
+    """Install the project at `source` from its path with the venv's own pip (`python -m pip
+    install --no-index --no-build-isolation --no-deps`; the venv needs pip, `make_venv(...,
+    seed=True)`), after deleting what an earlier build left in it; the test fails unless it
+    succeeds. Returns what pip printed."""
+    remove_build_outputs(source)
+    return _run_checked(
+        venv.python.parent,
+        [
+            str(venv.python),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-cache-dir",
+            "--no-index",
+            "--no-build-isolation",
+            "--no-deps",
+            str(source),
+        ],
+    )
+
+
 def git(cwd: pathlib.Path, home: pathlib.Path, *args: str) -> str:
     """Run `git <args>` in `cwd` as `helpers.run_cli` runs a command, with a fixed author and no
     signing; the test fails unless it exits 0. Returns its standard output."""
@@ -225,7 +247,7 @@ def git(cwd: pathlib.Path, home: pathlib.Path, *args: str) -> str:
         "commit.gpgsign=false",
         *args,
     )
-    assert ran.returncode == 0, f"git {shlex.join(args)} exited {ran.returncode}:\n{_shown(ran)}"
+    assert ran.returncode == 0, f"git {shlex.join(args)} exited {ran.returncode}:\n{shown(ran)}"
     return ran.stdout
 
 
@@ -280,10 +302,28 @@ def run_pivot(project: Project, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def run_pivot_holding(
+    project: Project, module: str, *args: str
+) -> subprocess.CompletedProcess[str]:
+    """Run the venv's `pivot <args>` in the project from a program that imports `module` before
+    it starts pivot's CLI (`python -P -c "import <module>; <_console_main>"`), so the program
+    holds the module `-P` lets it find, the installed one, when pivot's import session starts;
+    the exit code is not checked."""
+    return helpers.run_cli(
+        project.root,
+        project.home,
+        str(project.venv.python),
+        "-P",
+        "-c",
+        f"import {module}; {_PIVOT_MAIN}",
+        *args,
+    )
+
+
 def pivot_ok(project: Project, *args: str) -> subprocess.CompletedProcess[str]:
     """Run the venv's `pivot <args>` in the project; the test fails unless it exits 0."""
     ran = run_pivot(project, *args)
-    assert ran.returncode == 0, f"pivot {shlex.join(args)} exited {ran.returncode}:\n{_shown(ran)}"
+    assert ran.returncode == 0, f"pivot {shlex.join(args)} exited {ran.returncode}:\n{shown(ran)}"
     return ran
 
 
@@ -298,7 +338,7 @@ def module_file(project: Project, module: str) -> pathlib.Path:
         "-c",
         f"import {module}; print({module}.__file__)",
     )
-    assert ran.returncode == 0, f"the venv cannot import {module}:\n{_shown(ran)}"
+    assert ran.returncode == 0, f"the venv cannot import {module}:\n{shown(ran)}"
     return pathlib.Path(ran.stdout.strip()).resolve()
 
 
@@ -313,14 +353,14 @@ def repro_status(project: Project, stage: str) -> tuple[str, str]:
         and (event := _parsed(line, ran))["type"] == "stage_complete"
         and event["stage"] == stage
     ]
-    assert len(statuses) == 1, f"pivot repro must complete {stage} once:\n{_shown(ran)}"
-    return statuses[0], _shown(ran)
+    assert len(statuses) == 1, f"pivot repro must complete {stage} once:\n{shown(ran)}"
+    return statuses[0], shown(ran)
 
 
 def stage_status(project: Project, stage: str) -> tuple[str, str]:
     """`stage`'s status in `pivot status --json`, and the command's output."""
     ran = pivot_ok(project, "status", "--json")
-    return _stage_entry(ran, stage)["status"], _shown(ran)
+    return _stage_entry(ran, stage)["status"], shown(ran)
 
 
 def code_changes(project: Project, stage: str) -> tuple[list[str], str]:
@@ -328,13 +368,17 @@ def code_changes(project: Project, stage: str) -> tuple[list[str], str]:
     order it reports them, and the command's output."""
     ran = pivot_ok(project, "status", "--explain", "--json")
     keys = [change["key"] for change in _stage_entry(ran, stage)["code_changes"]]
-    return keys, _shown(ran)
+    return keys, shown(ran)
+
+
+def lock_path(project: Project, stage: str) -> pathlib.Path:
+    """The lock of `stage`, named `<pipeline>/<stage>`: `.pivot/stages/<pipeline>/<stage>.lock`."""
+    return project.root / ".pivot" / "stages" / f"{stage}.lock"
 
 
 def lock_manifest(project: Project, stage: str) -> dict[str, str]:
-    """The `code_manifest` of `stage`'s lock, `.pivot/stages/<pipeline>/<stage>.lock`, for a
-    `stage` named `<pipeline>/<stage>`."""
-    path = project.root / ".pivot" / "stages" / f"{stage}.lock"
+    """The `code_manifest` of `stage`'s lock (`lock_path`)."""
+    path = lock_path(project, stage)
     document = yaml.safe_load(path.read_text())
     assert isinstance(document, dict) and "code_manifest" in document, f"{path}: {document!r}"
     manifest = document["code_manifest"]
@@ -344,6 +388,11 @@ def lock_manifest(project: Project, stage: str) -> dict[str, str]:
     return manifest
 
 
+def dist_keys(manifest: Mapping[str, str]) -> list[str]:
+    """The `dist:` keys of a code manifest, sorted."""
+    return sorted(key for key in manifest if key.startswith("dist:"))
+
+
 def pivot_package_dir() -> pathlib.Path:
     """The directory of the `pivot` package that this test process imported."""
     file = pivot.__file__
@@ -351,11 +400,16 @@ def pivot_package_dir() -> pathlib.Path:
     return pathlib.Path(file).resolve().parent
 
 
+def shown(ran: subprocess.CompletedProcess[str]) -> str:
+    """A command's standard output and standard error, for an assertion message."""
+    return f"stdout:\n{ran.stdout}\nstderr:\n{ran.stderr}"
+
+
 def _stage_entry(ran: subprocess.CompletedProcess[str], stage: str) -> dict[str, Any]:
     """`stage`'s one entry in the `stages` of the JSON document a `pivot status --json` printed."""
     document = _parsed(ran.stdout, ran)
     entries = [entry for entry in document["stages"] if entry["name"] == stage]
-    assert len(entries) == 1, f"pivot status must report {stage} once:\n{_shown(ran)}"
+    assert len(entries) == 1, f"pivot status must report {stage} once:\n{shown(ran)}"
     return entries[0]
 
 
@@ -365,9 +419,21 @@ def _parsed(text: str, ran: subprocess.CompletedProcess[str]) -> Any:
     try:
         return json.loads(text)
     except json.JSONDecodeError as error:
-        pytest.fail(f"pivot printed {text!r}, which is not JSON ({error}):\n{_shown(ran)}")
+        pytest.fail(f"pivot printed {text!r}, which is not JSON ({error}):\n{shown(ran)}")
 
 
-def _shown(ran: subprocess.CompletedProcess[str]) -> str:
-    """A command's standard output and standard error, for an assertion message."""
-    return f"stdout:\n{ran.stdout}\nstderr:\n{ran.stderr}"
+def _run_checked(cwd: pathlib.Path, command: Sequence[str]) -> str:
+    """Run `command` in `cwd` with `helpers.clean_env()`; the test fails unless it exits 0.
+    Returns what it printed."""
+    ran = subprocess.run(
+        command,
+        cwd=cwd,
+        env=helpers.clean_env(),
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    output = ran.stdout + ran.stderr
+    assert ran.returncode == 0, f"`{shlex.join(command)}` exited {ran.returncode}:\n{output}"
+    return output

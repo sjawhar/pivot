@@ -109,13 +109,6 @@ def _helper_project(
     return installed_dists.make_project(tmp_path / "project", tmp_path / "home", venv, pipeline)
 
 
-def _helper_replace(path: pathlib.Path, old: str, new: str) -> None:
-    """Replace the one occurrence of `old` in the file at `path` with `new`."""
-    text = path.read_text()
-    assert text.count(old) == 1, f"{path} must hold {old!r} once:\n{text}"
-    path.write_text(text.replace(old, new))
-
-
 def _helper_ran_then_cached(project: installed_dists.Project, output: str) -> None:
     """`pivot repro` runs the stage, which writes `output`; `pivot status --json` then reports it
     `cached`."""
@@ -141,10 +134,6 @@ def _helper_assert_marks_nothing(project: installed_dists.Project) -> None:
     assert keys == [], f"`pivot status --explain` must name no code change:\n{shown}"
 
 
-def _helper_dist_keys(manifest: dict[str, str]) -> list[str]:
-    return [key for key in manifest if key.startswith("dist:")]
-
-
 def test_a_changed_byte_in_a_function_the_stage_calls_reruns_the_stage(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -159,7 +148,7 @@ def test_a_changed_byte_in_a_function_the_stage_calls_reruns_the_stage(
     _helper_ran_then_cached(project, "value-1:base-1")
     before = installed_dists.lock_manifest(project, _STAGE).get("dist:fix-lib")
 
-    _helper_replace(fixlib / "fixlib" / "__init__.py", '"value-1:"', '"value-2:"')
+    installed_dists.replace_once(fixlib / "fixlib" / "__init__.py", '"value-1:"', '"value-2:"')
     installed_dists.install_directory(venv, fixlib, reinstall=True)
 
     _helper_assert_stale_on(project, "dist:fix-lib")
@@ -246,7 +235,7 @@ def test_a_changed_byte_in_a_dependency_of_the_called_library_reruns_the_stage(
     _helper_ran_then_cached(project, "value-1:base-1")
     before = installed_dists.lock_manifest(project, _STAGE).get("dist:fixdep")
 
-    _helper_replace(fixdep / "fixdep" / "__init__.py", '"base-1"', '"base-2"')
+    installed_dists.replace_once(fixdep / "fixdep" / "__init__.py", '"base-1"', '"base-2"')
     installed_dists.install_directory(venv, fixdep, reinstall=True)
 
     _helper_assert_stale_on(project, "dist:fixdep")
@@ -289,7 +278,7 @@ def test_a_package_index_bump_behaves_as_before(tmp_path: pathlib.Path) -> None:
     assert url is None, f"an index install writes no direct_url.json; this one holds {url!r}"
     _helper_assert_marks_nothing(project)
     manifest = installed_dists.lock_manifest(project, _STAGE)
-    assert _helper_dist_keys(manifest) == [], f"the lock must hold no dist: key: {manifest}"
+    assert installed_dists.dist_keys(manifest) == [], f"the lock must hold no dist: key: {manifest}"
 
 
 def test_an_editable_install_adds_no_key(tmp_path: pathlib.Path) -> None:
@@ -305,11 +294,11 @@ def test_an_editable_install_adds_no_key(tmp_path: pathlib.Path) -> None:
     installed_dists.install_directory(venv, fixlib, editable=True)
     _helper_ran_then_cached(project, "value-1:base-1")
 
-    _helper_replace(fixlib / "fixlib" / "__init__.py", '"value-1:"', '"value-2:"')
+    installed_dists.replace_once(fixlib / "fixlib" / "__init__.py", '"value-1:"', '"value-2:"')
 
     _helper_assert_stale_on(project, "func:fixlib.value")
     manifest = installed_dists.lock_manifest(project, _STAGE)
-    assert _helper_dist_keys(manifest) == [], f"the lock must hold no dist: key: {manifest}"
+    assert installed_dists.dist_keys(manifest) == [], f"the lock must hold no dist: key: {manifest}"
 
 
 def test_a_reinstall_of_pivot_itself_from_another_commit_changes_no_stage(
@@ -353,4 +342,4 @@ def test_a_reinstall_of_pivot_itself_from_another_commit_changes_no_stage(
     )
     _helper_assert_marks_nothing(project)
     manifest = installed_dists.lock_manifest(project, _STAGE)
-    assert _helper_dist_keys(manifest) == [], f"the lock must hold no dist: key: {manifest}"
+    assert installed_dists.dist_keys(manifest) == [], f"the lock must hold no dist: key: {manifest}"
