@@ -43,7 +43,14 @@ from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
 import xxhash
 
-from pivot import ast_utils, exceptions, loaded_source, metrics
+from pivot import (
+    ast_utils,
+    exceptions,
+    import_origin,
+    installed_distributions,
+    loaded_source,
+    metrics,
+)
 
 if TYPE_CHECKING:
     import pydantic.json_schema
@@ -2421,6 +2428,34 @@ def by_name_modules(manifest: Mapping[str, str], outputs: Collection[str]) -> se
     names = covered_user_modules(manifest, outputs)
     names.update(name for key in manifest if (name := _by_name_entry(key)) is not None)
     return names
+
+
+def add_distribution_keys(manifest: dict[str, str]) -> None:
+    """Add to a stage's merged `manifest` the `dist:` keys of the distributions its `byname:`
+    modules (the stage's and its loaders') come from, and of those they depend on
+    (`installed_distributions.distribution_keys`), and report each refusal it finds with the
+    stage's others: unsafe fingerprinting downgrades it to a warning.
+
+    A module's origin is the module this process holds, which is the code the walk saw
+    (`loaded_source.check_worker_imports` refuses a worker that would import another), else where
+    a worker would import it from, predicted without importing it."""
+    origins = dict[str, import_origin.Origin | None]()
+    for key in manifest:
+        name = _by_name_entry(key)
+        if name is None:
+            continue
+        module = sys.modules.get(name)
+        origins[name] = (
+            import_origin.of_module(module)
+            if isinstance(module, types.ModuleType)
+            else loaded_source.worker_origin(name)
+        )
+    found = installed_distributions.distribution_keys(
+        origins, loaded_source.worker_path(), [str(directory) for directory in _PIVOT_PACKAGE_DIRS]
+    )
+    for message in found.refusals:
+        _report_refusal(message, downgradable=True)
+    manifest.update(found.keys)
 
 
 def without_by_name(manifest: Mapping[str, str]) -> dict[str, str]:
