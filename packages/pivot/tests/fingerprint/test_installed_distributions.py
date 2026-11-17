@@ -489,6 +489,42 @@ def test_a_broken_install_the_stage_needs_is_refused_and_unsafe_fingerprinting_w
     _helper_assert_runs_with_warning(project, expected, "with the lock deleted, `pivot repro`")
 
 
+@pytest.mark.parametrize(
+    ("damaged", "text"),
+    [
+        pytest.param("fix_lib-0.1.dist-info/direct_url.json", "[]", id="reached-unclassified"),
+        pytest.param("fixdep-0.1.dist-info/RECORD", None, id="dependency-without-record"),
+        pytest.param("fix_lib-0.1.dist-info/RECORD", None, id="reached-without-record"),
+    ],
+)
+def test_the_unsafe_warning_of_a_broken_install_names_the_stage_it_lets_run(
+    tmp_path: pathlib.Path, damaged: str, text: str | None
+) -> None:
+    """(h) The warning that `core.unsafe_fingerprinting` gives in place of each refusal of a
+    broken install names the stage it lets run, as the warning of every other downgraded refusal
+    does (`Stage '<name>': ...`). Only the `fingerprinting failed` error that wraps a refusal
+    names the stage; a warning has no such wrapper, so a project whose stages reach one broken
+    install would print one identical warning per stage and not say which stages ran code Pivot
+    could not fingerprint, results the run cache keeps out. `pivot repro --json` writes its events
+    to stdout and, to stderr, only the `Discovered` line and the warnings."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    fixlib, fixdep = installed_dists.write_fixlib_and_fixdep(tmp_path / "src")
+    installed_dists.install_directory(venv, fixdep)
+    installed_dists.install_directory(venv, fixlib)
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
+    installed_dists.damage(venv.site_packages / damaged, text)
+    (project.root / ".pivot" / "config.yaml").write_text(_UNSAFE_CONFIG)
+
+    warned = _helper_flat(installed_dists.pivot_ok(project, "repro", "--json").stderr)
+
+    assert _REFUSAL_FIX in warned, (
+        f"unsafe `pivot repro` must warn of the broken install:\n{warned}"
+    )
+    assert f"'{installed_dists.STAGE}'" in warned, (
+        f"the warning must name the stage it lets run, {installed_dists.STAGE}:\n{warned}"
+    )
+
+
 def test_defects_of_unreached_installs_refuse_nothing_and_a_deleted_listed_file_changes_the_value(
     tmp_path: pathlib.Path,
 ) -> None:
