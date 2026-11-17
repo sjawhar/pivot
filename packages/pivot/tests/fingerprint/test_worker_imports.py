@@ -1170,11 +1170,11 @@ class Row(typing.TypedDict):
     name: str
 """
 _REACHED_ROW_PIPELINE = """\
-import wi_rl_row
+import {module}
 from pivot import Pipeline, stage
 
 
-class Scored(wi_rl_row.Row):
+class Scored({module}.Row):
     score: int
 
 
@@ -1225,14 +1225,14 @@ class Setting:
     def __init__(self, value):
         self.value = value
 """
+_REACHED_NO_MODULE_SETTING_LIBRARY = f"{_REACHED_SETTING_LIBRARY}\n\nSetting.__module__ = None\n"
 _REACHED_ANNOTATION_PIPELINE = """\
-from wi_rl_setting import Setting
-
+{imports}
 from pivot import Pipeline, stage
 
 
 class Config:
-    setting: Setting
+    setting: {annotation}
 
     def describe(self) -> str:
         return "config"
@@ -1259,17 +1259,139 @@ class Box(typing.Generic[T]):
 _REACHED_HINT_PIPELINE = """\
 import typing
 
-import wi_rl_box
+import {module}
 from pivot import Pipeline, stage
 
 
-def describe(box: wi_rl_box.Box[int], mode: typing.Literal["short"]) -> str:
+def describe(box: {module}.Box[int], mode: typing.Literal["short"]) -> str:
     return mode + str(box.item)
 
 
 @stage
 def use() -> str:
     return describe(typing.get_type_hints(describe)["box"](1), "short")
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_MARKER_LIBRARY = """\
+class Marker:
+    __module__ = None
+
+    def apply(self, text):
+        return "marked:" + text
+"""
+_REACHED_VALUE_PIPELINE = """\
+import functools
+
+from wi_rl_marker import Marker
+
+from pivot import Pipeline, stage
+
+
+def render(text, marker):
+    return marker.apply(text)
+
+
+RENDER = functools.partial(render, marker=Marker())
+
+
+@stage
+def use() -> str:
+    return RENDER("x")
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_LOADER_LIBRARY = """\
+import dataclasses
+import pathlib
+
+from pivot import loaders
+
+
+@dataclasses.dataclass(frozen=True)
+class Tagged(loaders.Reader[str]):
+    __module__ = None
+
+    def load(self, path: pathlib.Path) -> str:
+        return "tagged:" + str(path)
+"""
+_REACHED_LOADER_PIPELINE = """\
+import functools
+
+from wi_rl_loader import Tagged
+
+from pivot import Pipeline, stage
+
+
+def read(name, loader):
+    return loader.load(name)
+
+
+READ = functools.partial(read, loader=Tagged())
+
+
+@stage
+def use() -> str:
+    return READ("raw.txt")
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+# Each library binds, as `shout`, a callable whose `__module__` is None: a function, a callable
+# instance (as scipy.special binds its ufuncs) and a `functools.cache` wrapper.
+_REACHED_FUNCTION_LIBRARY = """\
+def shout(text):
+    return text.upper()
+
+
+shout.__module__ = None
+"""
+_REACHED_CALLABLE_INSTANCE_LIBRARY = """\
+class _Shout:
+    def __init__(self):
+        self.__name__ = "shout"
+        self.__module__ = None
+
+    def __call__(self, text):
+        return text.upper()
+
+
+shout = _Shout()
+"""
+_REACHED_CACHED_FUNCTION_LIBRARY = """\
+import functools
+
+
+@functools.cache
+def shout(text):
+    return text.upper()
+
+
+shout.__module__ = None
+"""
+_REACHED_CALLABLE_PIPELINE = """\
+import functools
+
+from {module} import shout
+
+from pivot import Pipeline, stage
+
+
+def render(text, transform):
+    return transform(text)
+
+
+RENDER = functools.partial(render, transform=shout)
+
+
+@stage
+def use() -> str:
+    return RENDER("x")
 
 
 with Pipeline("p") as pipeline:
@@ -1294,15 +1416,21 @@ with Pipeline("p") as pipeline:
         ),
         pytest.param(
             {"wi_rl_row.py": _REACHED_ROW_LIBRARY},
-            _REACHED_ROW_PIPELINE,
+            _REACHED_ROW_PIPELINE.format(module="wi_rl_row"),
             {"byname:wi_rl_row"},
             id="library-base-of-a-typed-dict",
         ),
         pytest.param(
             {"wi_rl_nomod.py": _REACHED_NO_MODULE_LIBRARY},
             _REACHED_BASE_PIPELINE.format(module="wi_rl_nomod"),
-            set[str](),
+            {"byname:wi_rl_nomod"},
             id="library-base-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_nomod_row.py": f"{_REACHED_ROW_LIBRARY}\n\nRow.__module__ = None\n"},
+            _REACHED_ROW_PIPELINE.format(module="wi_rl_nomod_row"),
+            {"byname:wi_rl_nomod_row"},
+            id="library-base-of-a-typed-dict-whose-module-is-not-a-string",
         ),
         pytest.param(
             {"wi_rl_ns/core.py": _REACHED_NAMESPACE_LIBRARY},
@@ -1312,15 +1440,69 @@ with Pipeline("p") as pipeline:
         ),
         pytest.param(
             {"wi_rl_setting.py": _REACHED_SETTING_LIBRARY},
-            _REACHED_ANNOTATION_PIPELINE,
+            _REACHED_ANNOTATION_PIPELINE.format(
+                imports="from wi_rl_setting import Setting", annotation="Setting"
+            ),
             {"byname:wi_rl_setting"},
             id="library-class-in-a-class-body-annotation",
         ),
         pytest.param(
+            {"wi_rl_nomod_setting.py": _REACHED_NO_MODULE_SETTING_LIBRARY},
+            _REACHED_ANNOTATION_PIPELINE.format(
+                imports="from wi_rl_nomod_setting import Setting", annotation="Setting"
+            ),
+            {"byname:wi_rl_nomod_setting"},
+            id="library-class-in-a-class-body-annotation-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_nomod_dotted.py": _REACHED_NO_MODULE_SETTING_LIBRARY},
+            _REACHED_ANNOTATION_PIPELINE.format(
+                imports="import wi_rl_nomod_dotted", annotation="wi_rl_nomod_dotted.Setting"
+            ),
+            {"byname:wi_rl_nomod_dotted"},
+            id="library-class-in-a-dotted-class-body-annotation-whose-module-is-not-a-string",
+        ),
+        pytest.param(
             {"wi_rl_box.py": _REACHED_BOX_LIBRARY},
-            _REACHED_HINT_PIPELINE,
+            _REACHED_HINT_PIPELINE.format(module="wi_rl_box"),
             {"byname:typing", "byname:wi_rl_box"},
             id="library-generic-in-a-type-hint",
+        ),
+        pytest.param(
+            {"wi_rl_nomod_box.py": f"{_REACHED_BOX_LIBRARY}\n\nBox.__module__ = None\n"},
+            _REACHED_HINT_PIPELINE.format(module="wi_rl_nomod_box"),
+            {"byname:typing", "byname:wi_rl_nomod_box"},
+            id="library-generic-in-a-type-hint-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_marker.py": _REACHED_MARKER_LIBRARY},
+            _REACHED_VALUE_PIPELINE,
+            {"byname:wi_rl_marker"},
+            id="library-instance-inside-a-value-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_loader.py": _REACHED_LOADER_LIBRARY},
+            _REACHED_LOADER_PIPELINE,
+            {"byname:wi_rl_loader"},
+            id="library-loader-inside-a-value-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_nomod_function.py": _REACHED_FUNCTION_LIBRARY},
+            _REACHED_CALLABLE_PIPELINE.format(module="wi_rl_nomod_function"),
+            {"byname:wi_rl_nomod_function"},
+            id="library-function-inside-a-value-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_nomod_callable.py": _REACHED_CALLABLE_INSTANCE_LIBRARY},
+            _REACHED_CALLABLE_PIPELINE.format(module="wi_rl_nomod_callable"),
+            {"byname:wi_rl_nomod_callable"},
+            id="library-callable-instance-inside-a-value-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_nomod_cached.py": _REACHED_CACHED_FUNCTION_LIBRARY},
+            _REACHED_CALLABLE_PIPELINE.format(module="wi_rl_nomod_cached"),
+            {"byname:wi_rl_nomod_cached"},
+            id="library-cached-function-inside-a-value-whose-module-is-not-a-string",
         ),
     ],
 )
@@ -1335,11 +1517,16 @@ def test_the_library_module_a_stage_reaches_is_recorded_by_name(
     the `byname:` entries `recorded`: a stage function that is itself library code names its
     module; the library base of a user generic class is named once, though its statement names it
     too (`ob:` skips a base `__bases__` holds); the library base of a user `TypedDict`, which only
-    its statement holds, is named; a library base whose `__module__` is not a string names no
-    module; a library class that a namespace package exports under its own name names that
-    package, which has no file to place it in pivot's packages; a library class in a class-body
-    annotation is named; and a library generic in a helper's type hint is named, beside a
-    `Literal` hint, whose origin is no class, and the module `typing` the stage reads."""
+    its statement holds, is named; a library class that a namespace package exports under its own
+    name names that package, which has no file to place it in pivot's packages; a library class in
+    a class-body annotation is named; and a library generic in a helper's type hint is named,
+    beside a `Literal` hint, whose origin is no class, and the module `typing` the stage reads.
+    A library class whose `__module__` is None, set in its class body or after it, names the
+    library module that binds it under its own name, reached as a base, a `TypedDict` base, a
+    class-body annotation by name or by dotted name, a type hint's generic, the class of an
+    instance a partial holds, and a pivot loader a partial holds; so do a library function, a
+    library callable instance and a library `functools.cache` wrapper whose `__module__` is None,
+    when a partial holds one."""
     site = tmp_path / "lib" / "site-packages"
     for rel_path, text in library.items():
         (site / rel_path).parent.mkdir(parents=True, exist_ok=True)

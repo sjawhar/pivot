@@ -1406,7 +1406,8 @@ def _stage_manifest(
         module = _get_module(func)
         if module is not None and not is_user_code(module):
             # Its body is hashed (`self:`), the rest of its module is not: a worker imports it.
-            _mark_by_name(_reached_library_module(getattr(func, "__module__", None)), manifest)
+            module_name = getattr(func, "__module__", None)
+            _mark_by_name(_reached_library_module(func, module_name), manifest)
         return manifest, reads
 
 
@@ -1984,7 +1985,7 @@ def _expand_class(cls: type) -> None:
         step = f"b:{index}"
         _record_read(cls, step)
         if not is_user_code(base):
-            _mark_by_name(_reached_library_module(_class_module(base)), entries)
+            _mark_by_name(_reached_library_module(base, _class_module(base)), entries)
             continue
         with _walking(step):
             _add_callable(base, in_value=True)
@@ -1994,7 +1995,7 @@ def _expand_class(cls: type) -> None:
         step = f"ob:{index}"
         _record_read(cls, step)
         if not is_user_code(base):
-            _mark_by_name(_reached_library_module(_class_module(base)), entries)
+            _mark_by_name(_reached_library_module(base, _class_module(base)), entries)
             continue
         with _walking(step):
             _add_callable(base, in_value=True)
@@ -2373,18 +2374,24 @@ def _mark_by_name(module_name: object, manifest: dict[str, str]) -> None:
         manifest.setdefault(f"byname:{module_name}", "")
 
 
-def _reached_library_module(module_name: object) -> str | None:
-    """The name of the library module `module_name` for its `byname:` entry (`_mark_by_name`), at
-    each place where a stage reaches library code that no other entry names: a library base
-    class, a library class in a type hint or a class-body annotation, a library class, instance,
-    enum member or exception inside a value, a library loader class, a stage function that is
-    library code, and a library callable whose `__module__` is not a string (found by
-    `_library_module`). None for a name that is not a string, for builtins and every other
-    standard-library module (its top-level name is in `sys.stdlib_module_names`), and for a
-    loaded module whose file lies in one of pivot's own packages (`_PIVOT_PACKAGE_DIRS`): no
-    installed distribution of the user's comes from either, and a stage's `int` hints and
-    `StageParams` base add no entry. A module that is not loaded has no file to decide by, so its
-    name is kept."""
+def _reached_library_module(value: object, module_name: object) -> str | None:
+    """The name of the library module whose code a stage reaches through `value`, for its
+    `byname:` entry (`_mark_by_name`), at each place where a stage reaches library code that no
+    other entry names: a library base class, a library class in a type hint or a class-body
+    annotation, a library class, instance, enum member or exception inside a value, a library
+    loader class, a stage function that is library code, and a library callable whose `__module__`
+    is not a string. `module_name` is the module the site read from `value` (`_class_module` for a
+    class, `__module__` for a callable). When it is not a string (a class body that sets
+    `__module__` to None), the module named is the library module that binds `value` under its own
+    name (`_library_module`); a value that no loaded library module binds so gives None, and
+    records nothing. None also for builtins and every other standard-library module (its
+    top-level name is in `sys.stdlib_module_names`), and for a loaded module whose file lies in one
+    of pivot's own packages (`_PIVOT_PACKAGE_DIRS`): no installed distribution of the user's comes
+    from either, and a stage's `int` hints and `StageParams` base add no entry. A module that is
+    not loaded has no file to decide by, so its name is kept."""
+    if not isinstance(module_name, str):
+        exporter = _library_module(value)
+        module_name = exporter.__name__ if exporter is not None else None
     if not isinstance(module_name, str) or not module_name:
         return None
     if module_name.partition(".")[0] in sys.stdlib_module_names:
@@ -2600,7 +2607,7 @@ def _process_class_body_dependencies(cls: type) -> None:
         if not issubclass(type(value), type):
             continue
         if not is_user_code(value):
-            _mark_by_name(_reached_library_module(_class_module(value)), entries)
+            _mark_by_name(_reached_library_module(value, _class_module(value)), entries)
             continue
         with _walking(f"n:{name}"):
             _add_callable(value)
@@ -2612,7 +2619,7 @@ def _process_class_body_dependencies(cls: type) -> None:
         if not issubclass(type(resolved), type):
             continue
         if not is_user_code(resolved):
-            _mark_by_name(_reached_library_module(_class_module(resolved)), entries)
+            _mark_by_name(_reached_library_module(resolved, _class_module(resolved)), entries)
             continue
         with _walking(step):
             _add_callable(resolved)
@@ -2761,7 +2768,7 @@ def _expand_loader_class(loader_type: type[Any], key: str) -> None:
     entries = _entries()
     for klass in _class_mro(loader_type):
         if not is_user_code(klass):
-            _mark_by_name(_reached_library_module(_class_module(klass)), entries)
+            _mark_by_name(_reached_library_module(klass, _class_module(klass)), entries)
 
     # Use each method definition rather than a temporary bound method so the
     # weak AST hash cache retains the entry across loader fingerprint calls.
@@ -3451,13 +3458,18 @@ def _library_module(value: Any) -> types.ModuleType | None:
     """Return the non-user module that binds `value` under its own `__name__`, if any.
 
     The module named by `__module__` is checked. An object without one (scipy.special's ufuncs,
-    such as `expit`) is looked up in every loaded module; `np.frompyfunc` products stay
-    refused because no module binds their generated names.
+    such as `expit`, or a class whose class body sets `__module__` to None) is looked up in every
+    loaded module; `np.frompyfunc` products stay refused because no module binds their generated
+    names. A class's `__name__` and `__module__` are read through `type`'s own descriptors
+    (`_class_name`, `_class_module`), so no code of its metaclass runs.
     """
-    name = _attribute_or_none(value, "__name__")
+    if issubclass(type(value), type):
+        name, module_name = _class_name(value), _class_module(value)
+    else:
+        name = _attribute_or_none(value, "__name__")
+        module_name = getattr(value, "__module__", None)
     if not isinstance(name, str):
         return None
-    module_name = getattr(value, "__module__", None)
     candidates: list[types.ModuleType | None]
     if isinstance(module_name, str):
         candidates = [sys.modules.get(module_name)]
@@ -3607,10 +3619,10 @@ def _process_captured_value(
             module_name = getattr(value, "__module__", None)
             if isinstance(module_name, str):
                 _mark_by_name(module_name, entries)
-            elif (exporter := _library_module(value)) is not None:
+            else:
                 # No `__module__` names where it is defined (scipy.special's ufuncs): the library
                 # module that binds it under its own name is the one a worker imports.
-                _mark_by_name(_reached_library_module(exporter.__name__), entries)
+                _mark_by_name(_reached_library_module(value, module_name), entries)
         case _ValueKind.LOGGER:
             return
         case _ValueKind.HOOKED:
@@ -3978,7 +3990,7 @@ def _collect_hint_class(cls: type[Any], found: list[type], modules: list[str]) -
     `modules` when the walk records it (`_collect_hint_classes`)."""
     if is_user_code(cls):
         found.append(cls)
-    elif (name := _reached_library_module(_class_module(cls))) is not None:
+    elif (name := _reached_library_module(cls, _class_module(cls))) is not None:
         modules.append(name)
 
 
@@ -4400,16 +4412,26 @@ class _FormBuilder:
 
     def external(self, value: Any) -> Any:
         """A library callable, by where it is defined (`_library_name`); its module is reported,
-        for the worker imports it by name."""
+        for the worker imports it by name: its `__module__` when that is loaded, else, when it is
+        not a string, the library module that binds it (`reached_module`)."""
         module = _attribute_or_none(value, "__module__")
-        if type(module) is str and isinstance(sys.modules.get(module), types.ModuleType):
-            self.report(_ReportKind.EXTERNAL, module)
+        if type(module) is str:
+            if isinstance(sys.modules.get(module), types.ModuleType):
+                self.report(_ReportKind.EXTERNAL, module)
+        else:
+            self.reached_module(value, module)
         return ["external", _library_name(value)]
 
     def library_class(self, cls: type[Any], *steps: str) -> None:
         """Report the module of library class `cls`, at `steps`, when the walk records it by name
-        (`_reached_library_module`): a worker imports it to run the class's code."""
-        if (name := _reached_library_module(_class_module(cls))) is not None:
+        (`reached_module`): a worker imports it to run the class's code."""
+        self.reached_module(cls, _class_module(cls), *steps)
+
+    def reached_module(self, value: Any, module_name: object, *steps: str) -> None:
+        """Report, at `steps`, the library module whose code `value` runs, `module_name` being the
+        module read from `value`, when the walk records it by name (`_reached_library_module`): a
+        worker imports it by name."""
+        if (name := _reached_library_module(value, module_name)) is not None:
             self.report(_ReportKind.EXTERNAL, name, *steps)
 
     def opaque(self, value: Any) -> Any:
@@ -4513,13 +4535,18 @@ class _FormBuilder:
 
     def function(self, func: Any) -> Any:
         """A Python function: main's `["function", function_identity]`, reported for its function
-        node (a user function) or its module (a library one)."""
+        node (a user function) or its module (a library one: its `__module__` when that is
+        loaded, else, when it is not a string, the library module that binds it,
+        `reached_module`)."""
         if is_user_code(func):
             self.report(_ReportKind.FUNCTION, func)
         else:
             module = getattr(func, "__module__", None)
-            if type(module) is str and isinstance(sys.modules.get(module), types.ModuleType):
-                self.report(_ReportKind.EXTERNAL, module)
+            if type(module) is str:
+                if isinstance(sys.modules.get(module), types.ModuleType):
+                    self.report(_ReportKind.EXTERNAL, module)
+            else:
+                self.reached_module(func, module)
         return ["function", self.identity(func)]
 
     def identity(self, func: Any) -> FunctionIdentity:
@@ -4771,13 +4798,19 @@ class _FormBuilder:
         return self.part_rows(["cached_property"], ("cp", value.func))
 
     def cache_wrapper(self, value: Any) -> Any:
-        """A user cache's identity and statically readable settings, or a library name.
+        """A user cache's identity and statically readable settings, or a library name, its module
+        reported: its `__module__`, else, when that is not a string, the library module that binds
+        it (`reached_module`).
 
         Only the shared follower traverses user wrapper metadata. Replaced `cache_parameters`
         keeps unreadable settings in C and makes a user cache opaque.
         """
         if not is_user_code(value):
-            self.report(_ReportKind.EXTERNAL, getattr(value, "__module__", None))
+            module = getattr(value, "__module__", None)
+            if type(module) is str:
+                self.report(_ReportKind.EXTERNAL, module)
+            else:
+                self.reached_module(value, module)
             return ["external", _library_name(value)]
         self.report(_ReportKind.FUNCTION, value)
         attributes = _instance_dict(_type_of(value), value) or {}
