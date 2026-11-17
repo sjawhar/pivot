@@ -1,9 +1,11 @@
 """Red tests from the PR #523 tester gate (head 282d7462): each pins one defect found by driving
-the installed `pivot` CLI; and an upgrade from a released pivot's run cache.
+the installed `pivot` CLI; an upgrade from a released pivot's run cache; and an upgrade from the
+locks pivot 0.10.4 wrote for stages that reach installed libraries.
 
-D1 and the run-cache upgrade need uv (``PIVOT_TEST_UV``, as CI names it, else on PATH) and
-network access to PyPI: they run released pivots (0.5.10 and 0.5.9 share main's lock reader;
-0.5.2 the one before) against a project this pivot wrote, or that 0.5.10 wrote.
+D1 and the two upgrades need uv (``PIVOT_TEST_UV``, as CI names it, else on PATH) and network
+access to PyPI: they run released pivots (0.5.10 and 0.5.9 share main's lock reader; 0.5.2 the
+one before; 0.10.4 the release before the `dist:` keys) against a project this pivot wrote, or
+that a released pivot wrote.
 """
 
 from __future__ import annotations
@@ -17,6 +19,8 @@ import sys
 
 import pytest
 import yaml
+
+from tests import installed_dists
 
 _PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
 _REPO = pathlib.Path(__file__).resolve().parents[4]
@@ -283,3 +287,174 @@ def test_a_run_cache_entry_an_older_pivot_filed_restores_after_an_upgrade(tmp_pa
     assert (split["status"], split["reason"]) == ("cached", "unchanged (run cache)"), split
     assert {path.name: path.read_bytes() for path in (root / _PARTS).iterdir()} == first_parts
     assert "Verification passed" in _ok(_run(root, _PIVOT, "verify"))
+
+
+# =============================================================================
+# An upgrade from 0.10.4 reruns only a stage that reaches a git or local-path library
+# =============================================================================
+
+# The libraries of the upgraded project: `uppath` installed from its directory, `upgit` from a
+# commit of its git repository, `upidx` from a wheel as from a package index.
+_UPPATH = """\
+def value():
+    return "path-1"
+"""
+_UPGIT = """\
+def _greeting():
+    return "git-1"
+
+
+class Base:
+    def greet(self):
+        return _greeting()
+"""
+_UPIDX = """\
+def label():
+    return "index-label"
+
+
+def _greeting():
+    return "index-1"
+
+
+class Base:
+    def greet(self):
+        return _greeting()
+"""
+
+# `p/plain` calls the standard library and `upidx.label`, read as a global; `p/path_global` calls
+# `uppath.value`, read as a global; `p/git_base` and `p/index_base` each build a user class whose
+# base is a library's `Base`, the one form by which they reach that library.
+_UPGRADE_PIPELINE = """\
+import json
+
+import upgit
+import upidx
+import uppath
+
+from pivot import Pipeline, stage
+
+
+class GitGreeter(upgit.Base):
+    pass
+
+
+class IndexGreeter(upidx.Base):
+    pass
+
+
+@stage
+def plain() -> str:
+    return json.dumps([upidx.label()])
+
+
+@stage
+def path_global() -> str:
+    return uppath.value()
+
+
+@stage
+def git_base() -> str:
+    return GitGreeter().greet()
+
+
+@stage
+def index_base() -> str:
+    return IndexGreeter().greet()
+
+
+with Pipeline("p") as pipeline:
+    plain()
+    path_global()
+    git_base()
+    index_base()
+"""
+
+# What each stage of `_UPGRADE_PIPELINE` writes to `data/<stage>.txt`.
+_UPGRADE_OUTPUTS = {
+    "p/plain": '["index-label"]',
+    "p/path_global": "path-1",
+    "p/git_base": "git-1",
+    "p/index_base": "index-1",
+}
+
+
+def test_an_upgrade_from_0_10_4_reruns_only_stages_that_reach_a_git_or_local_path_library(
+    tmp_path: pathlib.Path,
+):
+    """Pivot 0.10.4 from PyPI, in a venv that holds the three libraries, runs the project's four
+    stages and writes their locks. This pivot reads them from a second venv that holds the same
+    libraries: `p/plain`, which reaches no git or local-path library, and `p/index_base`, which
+    reaches the index library only through a base class, are cached with no code change (a
+    `byname:` entry never reaches a lock); `p/path_global` and `p/git_base` are stale, each on its
+    library's `dist:` key alone. This pivot's `pivot repro` runs those two only, and then every
+    stage is cached."""
+    home = tmp_path / "home"
+    src = tmp_path / "src"
+    head = installed_dists.make_venv(tmp_path / "venv-head")
+    uppath = installed_dists.write_library(src, "uppath", "uppath", _UPPATH)
+    upgit_requirement = installed_dists.init_git_requirement(
+        installed_dists.write_library(src, "upgit", "upgit", _UPGIT), home, "upgit"
+    )
+    wheels = tmp_path / "wheels"
+    installed_dists.build_wheel(
+        head, installed_dists.write_library(src, "upidx", "upidx", _UPIDX), wheels
+    )
+    released = installed_dists.make_standalone_venv(
+        tmp_path / "venv-0.10.4", "pivot==0.10.4", str(uppath), upgit_requirement
+    )
+    installed_dists.install_from_wheels(released, wheels, "upidx")
+    version = installed_dists.installed(released, "pivot").version
+    assert version == "0.10.4", f"the first venv must hold pivot 0.10.4, not {version}"
+    old = installed_dists.make_project(tmp_path / "project", home, released, _UPGRADE_PIPELINE)
+    ran, shown = installed_dists.repro_statuses(old)
+    assert ran == dict.fromkeys(_UPGRADE_OUTPUTS, "ran"), f"0.10.4 must run every stage:\n{shown}"
+    written = {
+        stage: (old.root / "data" / f"{stage}.txt").read_text() for stage in _UPGRADE_OUTPUTS
+    }
+    assert written == _UPGRADE_OUTPUTS, f"each stage must write what its library returns: {written}"
+    installed_dists.install_directory(head, uppath)
+    installed_dists.install(head, upgit_requirement)
+    installed_dists.install_from_wheels(head, wheels, "upidx")
+    path_url, git_url = (installed_dists.direct_url(head, name) for name in ("uppath", "upgit"))
+    # PEP 610: a `dir_info` without `editable: true` is a path install that is not editable.
+    assert path_url is not None and path_url["dir_info"].get("editable") is not True, (
+        f"uppath must be installed from its path, not editable: direct_url.json is {path_url!r}"
+    )
+    assert git_url is not None and git_url["vcs_info"]["vcs"] == "git", (
+        f"upgit must be installed from git: direct_url.json is {git_url!r}"
+    )
+    assert installed_dists.direct_url(head, "upidx") is None, "upidx must be an index install"
+    new = installed_dists.Project(root=old.root, home=home, venv=head)
+
+    statuses, status_shown = installed_dists.stage_statuses(new)
+    changes, explain_shown = installed_dists.stage_code_changes(new)
+
+    assert (statuses, changes) == (
+        {
+            "p/plain": "cached",
+            "p/path_global": "stale",
+            "p/git_base": "stale",
+            "p/index_base": "cached",
+        },
+        {
+            "p/plain": [],
+            "p/path_global": ["dist:uppath"],
+            "p/git_base": ["dist:upgit"],
+            "p/index_base": [],
+        },
+    ), (
+        "this pivot must read the locks 0.10.4 wrote as stale only for a stage that reaches a git "
+        + f"or local-path library, on its `dist:` key alone:\n{status_shown}\n{explain_shown}"
+    )
+    reran, shown = installed_dists.repro_statuses(new)
+    assert reran == {
+        "p/plain": "cached",
+        "p/path_global": "ran",
+        "p/git_base": "ran",
+        "p/index_base": "cached",
+    }, f"this pivot's `pivot repro` must run p/path_global and p/git_base only:\n{shown}"
+    settled, shown = installed_dists.stage_statuses(new)
+    assert settled == dict.fromkeys(_UPGRADE_OUTPUTS, "cached"), (
+        f"`pivot status` must report every stage cached after the run:\n{shown}"
+    )

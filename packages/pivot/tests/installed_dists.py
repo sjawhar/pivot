@@ -6,9 +6,11 @@ The venv's site-packages holds a `.pth` file that adds this test environment's p
 so pivot, its dependencies and setuptools are importable there and every install of a fixture,
 by uv or by the venv's own pip, runs offline without build isolation. Pivot runs as
 `<venv>/bin/python -P -c "<_console_main>"` through `helpers.run_cli`: `-P` keeps the working
-directory off `sys.path`, as the `pivot` console script does. This module imports only the
-standard library, pytest, PyYAML, `tests.helpers` and the `pivot` package, so the tests that use
-it still collect when `packages/pivot/src` is pivot 0.10.4's.
+directory off `sys.path`, as the `pivot` console script does. `make_standalone_venv` makes instead
+a venv without that `.pth` file, into which uv installs a released pivot from the package index and
+fixtures it builds with build isolation. This module imports only the standard library, pytest,
+PyYAML, `tests.helpers` and the `pivot` package, so the tests that use it still collect when
+`packages/pivot/src` is pivot 0.10.4's.
 """
 
 from __future__ import annotations
@@ -76,27 +78,23 @@ def run_uv(cwd: pathlib.Path, *args: str) -> str:
 
 
 def make_venv(venv: pathlib.Path, *, seed: bool = False) -> Venv:
-    """Make a venv at `venv` with `uv venv --python <this interpreter>` (`seed`: with pip, `uv
-    venv --seed`), whose site-packages holds a `.pth` file that adds this test environment's
-    purelib directory to `sys.path` after it."""
-    run_uv(
-        venv.parent, "venv", *(["--seed"] if seed else []), "--python", sys.executable, str(venv)
-    )
-    python = venv / "bin" / "python"
-    ran = subprocess.run(
-        [str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
-        env=helpers.clean_env(),
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert ran.returncode == 0, f"{python} could not name its purelib:\n{ran.stdout}{ran.stderr}"
-    site_packages = pathlib.Path(ran.stdout.strip())
-    (site_packages / "_parent.pth").write_text(
+    """Make a venv at `venv` (`_new_venv`; `seed`: with pip, `uv venv --seed`) whose
+    site-packages holds a `.pth` file that adds this test environment's purelib directory to
+    `sys.path` after it."""
+    made = _new_venv(venv, seed=seed)
+    (made.site_packages / "_parent.pth").write_text(
         f"import site; site.addsitedir({sysconfig.get_path('purelib')!r})\n"
     )
-    return Venv(python=python, site_packages=site_packages)
+    return made
+
+
+def make_standalone_venv(venv: pathlib.Path, *specs: str) -> Venv:
+    """Make a venv at `venv` (`_new_venv`) that does not see this test environment, and install
+    `specs` into it with `uv pip install`, from the package index and with build isolation, so it
+    needs network access; the test fails unless the install succeeds."""
+    made = _new_venv(venv, seed=False)
+    run_uv(venv.parent, "pip", "install", "--python", str(made.python), *specs)
+    return made
 
 
 def write_setuptools_project(
@@ -375,33 +373,59 @@ def module_file(project: Project, module: str) -> pathlib.Path:
     return pathlib.Path(ran.stdout.strip()).resolve()
 
 
-def repro_status(project: Project, stage: str) -> tuple[str, str]:
-    """What `pivot repro --json` did to `stage` (`ran`, `cached`, ...), from its one
-    `stage_complete` event, and the command's output."""
+def repro_statuses(project: Project) -> tuple[dict[str, str], str]:
+    """What one `pivot repro --json` did to each stage (`ran`, `cached`, ...), by the stage's
+    name, from the stage's one `stage_complete` event, and the command's output."""
     ran = pivot_ok(project, "repro", "--json")
-    statuses = [
-        event["status"]
+    completed = [
+        (event["stage"], event["status"])
         for line in ran.stdout.splitlines()
-        if line.startswith("{")
-        and (event := _parsed(line, ran))["type"] == "stage_complete"
-        and event["stage"] == stage
+        if line.startswith("{") and (event := _parsed(line, ran))["type"] == "stage_complete"
     ]
-    assert len(statuses) == 1, f"pivot repro must complete {stage} once:\n{shown(ran)}"
-    return statuses[0], shown(ran)
+    statuses = dict(completed)
+    assert len(statuses) == len(completed), (
+        f"pivot repro must complete each stage once:\n{shown(ran)}"
+    )
+    return statuses, shown(ran)
+
+
+def repro_status(project: Project, stage: str) -> tuple[str, str]:
+    """What `pivot repro --json` did to `stage` (`repro_statuses`), and the command's output."""
+    statuses, output = repro_statuses(project)
+    assert stage in statuses, f"pivot repro must complete {stage} once:\n{output}"
+    return statuses[stage], output
+
+
+def stage_statuses(project: Project) -> tuple[dict[str, str], str]:
+    """Each stage's status in one `pivot status --json`, by the stage's name, and the command's
+    output."""
+    entries, output = _stage_entries(project, "status", "--json")
+    return {name: entry["status"] for name, entry in entries.items()}, output
 
 
 def stage_status(project: Project, stage: str) -> tuple[str, str]:
-    """`stage`'s status in `pivot status --json`, and the command's output."""
-    ran = pivot_ok(project, "status", "--json")
-    return _stage_entry(ran, stage)["status"], shown(ran)
+    """`stage`'s status in `pivot status --json` (`stage_statuses`), and the command's output."""
+    statuses, output = stage_statuses(project)
+    assert stage in statuses, f"pivot status must report {stage} once:\n{output}"
+    return statuses[stage], output
+
+
+def stage_code_changes(project: Project) -> tuple[dict[str, list[str]], str]:
+    """The key of each of each stage's `code_changes` in one `pivot status --explain --json`, in
+    the order it reports them, by the stage's name, and the command's output."""
+    entries, output = _stage_entries(project, "status", "--explain", "--json")
+    changes = {
+        name: [change["key"] for change in entry["code_changes"]] for name, entry in entries.items()
+    }
+    return changes, output
 
 
 def code_changes(project: Project, stage: str) -> tuple[list[str], str]:
-    """The key of each of `stage`'s `code_changes` in `pivot status --explain --json`, in the
-    order it reports them, and the command's output."""
-    ran = pivot_ok(project, "status", "--explain", "--json")
-    keys = [change["key"] for change in _stage_entry(ran, stage)["code_changes"]]
-    return keys, shown(ran)
+    """The key of each of `stage`'s `code_changes` in `pivot status --explain --json`
+    (`stage_code_changes`), in the order it reports them, and the command's output."""
+    changes, output = stage_code_changes(project)
+    assert stage in changes, f"pivot status must report {stage} once:\n{output}"
+    return changes[stage], output
 
 
 def ran_then_cached(project: Project, stage: str, output_path: pathlib.Path, output: str) -> None:
@@ -467,12 +491,34 @@ def shown(ran: subprocess.CompletedProcess[str]) -> str:
     return f"stdout:\n{ran.stdout}\nstderr:\n{ran.stderr}"
 
 
-def _stage_entry(ran: subprocess.CompletedProcess[str], stage: str) -> dict[str, Any]:
-    """`stage`'s one entry in the `stages` of the JSON document a `pivot status --json` printed."""
-    document = _parsed(ran.stdout, ran)
-    entries = [entry for entry in document["stages"] if entry["name"] == stage]
-    assert len(entries) == 1, f"pivot status must report {stage} once:\n{shown(ran)}"
-    return entries[0]
+def _new_venv(venv: pathlib.Path, *, seed: bool) -> Venv:
+    """Make a venv at `venv` with `uv venv --python <this interpreter>` (`seed`: with pip, `uv
+    venv --seed`)."""
+    run_uv(
+        venv.parent, "venv", *(["--seed"] if seed else []), "--python", sys.executable, str(venv)
+    )
+    python = venv / "bin" / "python"
+    ran = subprocess.run(
+        [str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+        env=helpers.clean_env(),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert ran.returncode == 0, f"{python} could not name its purelib:\n{ran.stdout}{ran.stderr}"
+    return Venv(python=python, site_packages=pathlib.Path(ran.stdout.strip()))
+
+
+def _stage_entries(project: Project, *args: str) -> tuple[dict[str, dict[str, Any]], str]:
+    """Run `pivot <args>`, a form of `pivot status --json`, in the project; each stage's one entry
+    in the `stages` of the JSON document it printed, by the stage's name, and the command's
+    output."""
+    ran = pivot_ok(project, *args)
+    stages = _parsed(ran.stdout, ran)["stages"]
+    entries = {entry["name"]: entry for entry in stages}
+    assert len(entries) == len(stages), f"pivot status must report each stage once:\n{shown(ran)}"
+    return entries, shown(ran)
 
 
 def _parsed(text: str, ran: subprocess.CompletedProcess[str]) -> Any:
