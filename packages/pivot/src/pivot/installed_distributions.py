@@ -33,10 +33,11 @@ namespace package only when such a site directory is the deepest entry of the pa
 directory or lies at or under it, and only until each such site directory has a file there that
 no RECORD lists, once for each reached module and origin; and the files of a keyed distribution
 only when a stage reaches it. Each path a RECORD lists that can name a file (`_resolved`), and each
-file under such a directory, is resolved to the path `os.path.realpath` gives, a name at a time
-from the nearest directory above it already resolved (a site directory, or one resolved for an
-earlier path): one `os.path.islink` for each new name, and `realpath` only for a name that is a
-symbolic link, empty, `.` or `..` (`_real_path`).
+file under such a directory, is resolved to the path `os.path.realpath` gives: a RECORD path of
+PATH_MAX bytes or more in its site directory by `realpath` alone, and every other path a name at
+a time from the nearest directory above it already resolved (a site directory, or one resolved
+for an earlier path): one `os.path.islink` for each new name, and `realpath` only for a name that
+is a symbolic link, empty, `.` or `..` (`_real_path`).
 """
 
 from __future__ import annotations
@@ -816,21 +817,29 @@ def _read_record(installed: Installed) -> Record:
 def _resolved(
     installed: Installed, paths: Iterable[str], real_dirs: dict[str, str]
 ) -> Iterator[str]:
-    """Each path a RECORD lists, located in the distribution's site directory and resolved
-    (`_real_path`, with `real_dirs` as its memo). A path names no file and is left out when it
-    holds a NUL character or a name the filesystem encoding cannot encode, for which
-    `os.path.realpath` raises a `ValueError`, or when, located and encoded, it is `_PATH_MAX`
-    bytes or longer, which `os.lstat` refuses. So each path given to `_real_path` from here, and
-    each directory above it that `_real_dir` memoises, is shorter than `_PATH_MAX` bytes, however
-    many names a RECORD row holds."""
+    """Each path a RECORD lists, located in the distribution's site directory and resolved to the
+    path `os.path.realpath` gives. A path that holds a NUL character or a name the filesystem
+    encoding cannot encode names no file and is left out: `realpath` raises a `ValueError` for
+    it. One shorter than `_PATH_MAX` bytes, located and encoded, is resolved by `_real_path`, with
+    `real_dirs` as its memo. A longer one can still name a file (a long name in a directory
+    shorter than that, which `os.walk` lists and which can be a module's origin, as
+    `import_origin` resolves it by `realpath` too), and is resolved by `realpath` alone, which
+    takes a name that `os.lstat` refuses as too long for one that is no link and keeps nothing
+    from one call to the next. So each path given to `_real_path` from here, and each directory
+    above it that `_real_dir` memoises, is shorter than `_PATH_MAX` bytes, and a row costs memory
+    linear in its length, however many names it holds."""
     for path in paths:
         located = os.path.join(installed.site_dir, path)
         try:
             encoded = os.fsencode(located)
         except UnicodeEncodeError:
             continue
-        if b"\0" not in encoded and len(encoded) < _PATH_MAX:
+        if b"\0" in encoded:
+            continue
+        if len(encoded) < _PATH_MAX:
             yield _real_path(located, real_dirs)
+        else:
+            yield os.path.realpath(located)
 
 
 def _real_path(path: str, real_dirs: dict[str, str]) -> str:

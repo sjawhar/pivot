@@ -46,6 +46,9 @@ with Pipeline("p") as pipeline:
     make()
 """
 
+# A module name of 197 letters: its file, with `.py`, has a name of 200 bytes.
+_LONG_MODULE = "m" * 197
+
 
 def _helper_origin(path: pathlib.Path) -> tuple[str, str]:
     """The origin `import_origin.of_module` gives a module loaded from the file at `path`."""
@@ -92,6 +95,13 @@ def _helper_replace_with_failing_read(path: pathlib.Path) -> None:
 
 def _helper_remove_read_permission(path: pathlib.Path) -> None:
     path.chmod(0)
+
+
+def _helper_padding(length: int) -> pathlib.Path:
+    """A relative path of `length` bytes: names of 254 letters, then one of 1 to 255 letters
+    (NAME_MAX, the most bytes one name can hold)."""
+    full, last = divmod(length - 1, 255)
+    return pathlib.Path(*["d" * 254] * full, "d" * (last + 1))
 
 
 def _helper_egg_info_project(
@@ -660,6 +670,54 @@ def test_a_record_path_holding_a_nul_character_hashes_as_null_and_refuses_nothin
     found = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
 
     files = {"fixlib/\x00.py": None, "fixlib/__init__.py": "fixlib/__init__.py"}
+    assert found == installed_distributions.DistributionKeys(
+        {"dist:fix-lib": _helper_value(site, files)}, []
+    ), found
+
+
+@pytest.mark.parametrize(
+    ("module", "file"),
+    [
+        pytest.param("fixlib", "fixlib/__init__.py", id="package-walked"),
+        pytest.param(f"fixlib.{_LONG_MODULE}", f"fixlib/{_LONG_MODULE}.py", id="module-own-file"),
+    ],
+)
+def test_a_listed_file_of_path_max_bytes_or_more_is_owned_and_not_refused(
+    tmp_path: pathlib.Path, module: str, file: str
+) -> None:
+    """`Fix_Lib`, installed from its path with the module `fixlib.<197 letters>`, and `fixdep`,
+    which has lost its RECORD, lie in a venv that then moves into a directory so deep that the
+    module's file, which `Fix_Lib`'s RECORD lists, is PATH_MAX bytes long in site-packages: a
+    name of 200 bytes in a directory shorter than PATH_MAX, as a moved tree can leave it. The
+    reached package `fixlib`, whose directory is walked for `fixdep` and holds that file, and the
+    reached module whose own file it is, are not refused for a file that no RECORD lists:
+    `Fix_Lib` owns the file and gets its key, which hashes the file as null, as `os.open` refuses
+    a path of PATH_MAX bytes."""
+    path_max = os.pathconf("/", "PC_PATH_MAX")
+    root = tmp_path.resolve()
+    venv = installed_dists.make_venv(root / "venv")
+    src = root / "src"
+    listed = f"fixlib/{_LONG_MODULE}.py"
+    fixlib = installed_dists.write_library(
+        src, "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE, files={listed: "LONG = 1\n"}
+    )
+    fixdep = installed_dists.write_library(src, "fixdep", "fixdep", installed_dists.FIXDEP)
+    installed_dists.install(venv, str(fixlib), str(fixdep))
+    installed_dists.damage(venv.site_packages / "fixdep-0.1.dist-info" / "RECORD", None)
+    inside = venv.site_packages.relative_to(root / "venv")
+    tail = f"/venv/{inside}/{listed}"  # the file's path below the padding
+    padding = _helper_padding(path_max - len(os.fsencode(f"{root}/")) - len(os.fsencode(tail)))
+    moved = root / padding / "venv"
+    moved.parent.mkdir(parents=True)
+    (root / "venv").rename(moved)
+    site = moved / inside
+    lengths = [len(os.fsencode(f"{site}/{path}")) for path in (listed, "fixlib")]
+    assert lengths[0] == path_max > lengths[1], f"only {listed} may be PATH_MAX long: {lengths}"
+    origins = {module: _helper_origin(site / file)}
+
+    found = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+
+    files = {"fixlib/__init__.py": "fixlib/__init__.py", listed: None}
     assert found == installed_distributions.DistributionKeys(
         {"dist:fix-lib": _helper_value(site, files)}, []
     ), found

@@ -101,12 +101,12 @@ _NO_REQUIREMENT = installed_distributions.Requirements(frozenset(), "")
 
 
 def _helper_installed(
-    form: installed_distributions.InstallForm, reason: str = ""
+    form: installed_distributions.InstallForm, reason: str = "", site_dir: str = _SITE
 ) -> installed_distributions.Installed:
-    """`fix-lib` in `_SITE`, installed in `form` (`reason`: why it is unclassified)."""
+    """`fix-lib` in `site_dir`, installed in `form` (`reason`: why it is unclassified)."""
     return installed_distributions.Installed(
-        dist_info=f"{_SITE}/fix_lib-0.1.dist-info",
-        site_dir=_SITE,
+        dist_info=f"{site_dir}/fix_lib-0.1.dist-info",
+        site_dir=site_dir,
         name="fix-lib",
         classification=installed_distributions.Classification(form, reason),
     )
@@ -123,12 +123,12 @@ def _helper_mismatches(
     ]
 
 
-def _helper_record_path(site: pathlib.Path, length: int) -> str:
-    """A RECORD path under `fixlib/` whose path in `site` is `length` bytes long: directories of
+def _helper_record_path(site: pathlib.Path, length: int, top: str = "fixlib") -> str:
+    """A RECORD path under `top/` whose path in `site` is `length` bytes long: directories of
     one letter, then a file name of one or two letters."""
-    rest = length - len(os.fsencode(f"{site}/fixlib/"))
+    rest = length - len(os.fsencode(f"{site}/{top}/"))
     directories = (rest - 1) // 2
-    return "fixlib/" + "d/" * directories + "m" * (rest - 2 * directories)
+    return f"{top}/" + "d/" * directories + "m" * (rest - 2 * directories)
 
 
 @pytest.mark.parametrize(
@@ -787,34 +787,45 @@ def test_a_record_path_resolves_to_what_realpath_gives(tmp_path: pathlib.Path) -
     )
 
 
-def test_resolved_leaves_out_each_record_path_that_names_no_file(tmp_path: pathlib.Path) -> None:
+def test_resolved_leaves_out_each_record_path_that_names_no_file_and_resolves_a_long_one(
+    tmp_path: pathlib.Path,
+) -> None:
     """A RECORD path that holds a NUL character, or a name the filesystem encoding cannot encode,
-    for both of which `os.path.realpath` raises a `ValueError`, or that is PATH_MAX bytes long in
-    its site directory, which `os.lstat` refuses as too long, names no file: `_resolved` leaves
-    each out and resolves the installed `fixlib/__init__.py` and a path one byte shorter than
-    PATH_MAX. The name is a lone surrogate, which the filesystem encoding cannot encode under any
-    locale (its error handler, surrogateescape, encodes only U+DC80 to U+DCFF); in use it is a
-    non-ASCII name under an ASCII locale. `_file_digest`, which reads a keyed distribution's
-    RECORD paths as they are, gives each left-out path no digest."""
+    for both of which `os.path.realpath` raises a `ValueError`, names no file: `_resolved` leaves
+    each out. It resolves to what `realpath` gives the installed `fixlib/__init__.py`, a path one
+    byte shorter than PATH_MAX in its site directory, one PATH_MAX bytes long through `linked`, a
+    link to `fixlib`, which `os.lstat` refuses as too long but which can name a file (a long name
+    in a shorter directory), and one twice that long; the memo it fills holds no directory of
+    PATH_MAX bytes or more. The name is a lone surrogate, which the filesystem encoding cannot
+    encode under any locale (its error handler, surrogateescape, encodes only U+DC80 to U+DCFF);
+    in use it is a non-ASCII name under an ASCII locale. `_file_digest`, which reads a keyed
+    distribution's RECORD paths as they are, gives each left-out path, and the one PATH_MAX bytes
+    long, no digest."""
     site = tmp_path.resolve() / "site"
     (site / "fixlib").mkdir(parents=True)
     (site / "fixlib" / "__init__.py").write_text("")
-    installed = installed_distributions.Installed(
-        dist_info=f"{site}/fix_lib-0.1.dist-info",
-        site_dir=str(site),
-        name="fix-lib",
-        classification=installed_distributions.Classification(_FORM.LOCAL_DIRECTORY, ""),
-    )
+    (site / "linked").symlink_to("fixlib", target_is_directory=True)
+    installed = _helper_installed(_FORM.LOCAL_DIRECTORY, site_dir=str(site))
     path_max = os.pathconf("/", "PC_PATH_MAX")
-    too_long = _helper_record_path(site, path_max)
+    too_long = _helper_record_path(site, path_max, "linked")
     longest = _helper_record_path(site, path_max - 1)
-    left_out = ["fixlib/\0.py", "fixlib/\ud800.py", too_long]
-    lengths = [len(os.fsencode(f"{site}/{path}")) for path in (too_long, longest)]
-    assert lengths == [path_max, path_max - 1], f"the long paths must be built to length: {lengths}"
-    paths = [*left_out[:2], "fixlib/__init__.py", too_long, longest]
+    twice = _helper_record_path(site, 2 * path_max)
+    lengths = [len(os.fsencode(f"{site}/{path}")) for path in (too_long, longest, twice)]
+    assert lengths == [path_max, path_max - 1, 2 * path_max], (
+        f"the long paths must be built to length: {lengths}"
+    )
+    left_out = ["fixlib/\0.py", "fixlib/\ud800.py"]
+    kept = ["fixlib/__init__.py", too_long, longest, twice]
+    real_dirs = dict[str, str]()
 
-    found = list(installed_distributions._resolved(installed, paths, dict[str, str]()))
-    digests = [installed_distributions._file_digest(f"{site}/{path}") for path in left_out]
+    found = list(installed_distributions._resolved(installed, [*left_out, *kept], real_dirs))
+    digests = [
+        installed_distributions._file_digest(f"{site}/{path}") for path in [*left_out, too_long]
+    ]
 
-    assert found == [f"{site}/fixlib/__init__.py", f"{site}/{longest}"], found
+    through_link = f"{site}/fixlib/{too_long.removeprefix('linked/')}"
+    assert os.path.realpath(f"{site}/{too_long}") == through_link, "realpath must follow linked"
+    assert found == [os.path.realpath(f"{site}/{path}") for path in kept], found
+    memoised = max(len(os.fsencode(directory)) for directory in real_dirs)
+    assert memoised < path_max, f"the memo must hold no directory of PATH_MAX bytes: {memoised}"
     assert digests == [None, None, None], digests
