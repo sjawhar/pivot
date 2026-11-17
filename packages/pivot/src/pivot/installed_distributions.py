@@ -31,10 +31,12 @@ candidate there has no RECORD and a stage reaches a file whose site directory it
 entry of the path that holds the file); the files under the directory of a reached package or
 namespace package only when such a site directory is the deepest entry of the path above that
 directory or lies at or under it, and only until each such site directory has a file there that
-no RECORD lists, once for each reached module; and the files of a keyed distribution only when a
-stage reaches it. Each path a RECORD lists, and each file under such a directory, is resolved
-with one `os.path.islink` once the real path of the directory that holds it is known, which
-`os.path.realpath` finds once for each directory (`_real_path`).
+no RECORD lists, once for each reached module and origin; and the files of a keyed distribution
+only when a stage reaches it. Each path a RECORD lists, and each file under such a directory, is
+resolved to the path `os.path.realpath` gives, a name at a time from the nearest directory above
+it already resolved (a site directory, a directory the walk lists, or one resolved for an earlier
+path): one `os.path.islink` for each new name, and `realpath` only for a name that is a symbolic
+link, empty, `.` or `..` (`_real_path`).
 """
 
 from __future__ import annotations
@@ -75,6 +77,9 @@ _REQUIREMENT_NAME = re.compile(r"[A-Z0-9](?:[A-Z0-9._-]*[A-Z0-9])?", re.IGNORECA
 
 # The empty line that ends a metadata file's headers.
 _END_OF_HEADERS = re.compile(r"\r?\n\r?\n")
+
+# The names in a path that `os.path.realpath` reads specially: an empty one, `.` and `..`.
+_SPECIAL_NAMES = ("", os.curdir, os.pardir)
 
 
 class InstallForm(enum.Enum):
@@ -547,7 +552,8 @@ class _Snapshot:
         scan = _scan(path)
         self._installed: tuple[Installed, ...] = scan.installed
         self._site_dirs: frozenset[str] = scan.site_dirs
-        # Each directory's real path (`_real_path`); a site directory is resolved already.
+        # Each directory's real path (`_real_dir`); a site directory is resolved already, and
+        # `_files_under` adds each directory it walks.
         self._real_dirs: dict[str, str] = {site_dir: site_dir for site_dir in scan.site_dirs}
         # None when no distribution on the path is of a seed form: then no stage gets a key or a
         # refusal, and no requirement or RECORD is read.
@@ -816,19 +822,55 @@ def _resolved(
 
 
 def _real_path(path: str, real_dirs: dict[str, str]) -> str:
-    """`os.path.realpath(path)`, equal to it for every path, found with one `os.path.islink` once
-    `real_dirs` holds the real path of the directory that holds `path`.
+    """`os.path.realpath(path)`, equal to it for every absolute path with no NUL character (each
+    path this module resolves is one: `realpath` refuses a NUL, and the memo does not follow the
+    working directory a relative path depends on), found with one `os.path.islink` once
+    `real_dirs` holds the real path of the directory that holds `path` (`_real_dir` finds and
+    memoises it).
 
-    `realpath` resolves the directory a path's last name is in before it reads that name, then
-    takes the name as it is unless the name is a symbolic link or one it reads specially (empty,
-    `.` or `..`). So this joins the last name to the directory's real path (`realpath`, memoised
-    in `real_dirs`), and gives `realpath` of the whole path for such a name or a link."""
+    `realpath` resolves a path a name at a time from the left, so before it reads the last name
+    it holds the real path of the directory that name is in, and it then takes the name as it is
+    unless the name is a symbolic link or one it reads specially (`_SPECIAL_NAMES`). So this joins
+    the last name to the directory's real path, and gives `realpath` the whole path for such a
+    name or a link (`_real_child`)."""
     directory, name = os.path.split(path)
-    if name in ("", os.curdir, os.pardir):
+    if name in _SPECIAL_NAMES:
         return os.path.realpath(path)
-    if directory not in real_dirs:
-        real_dirs[directory] = os.path.realpath(directory)
-    joined = os.path.join(real_dirs[directory], name)
+    return _real_child(path, name, _real_dir(directory, real_dirs))
+
+
+def _real_dir(directory: str, real_dirs: dict[str, str]) -> str:
+    """`os.path.realpath(directory)`, memoised in `real_dirs` (a directory -> its real path), with
+    every directory walked to find it. The walk goes up to the nearest directory that `real_dirs`
+    holds, or to the nearest whose last name `realpath` reads specially (`_SPECIAL_NAMES`; the
+    root's is empty), which `realpath` resolves; then each name below it costs one
+    `os.path.islink` (`_real_child`), so a directory below one already resolved costs one. A
+    loop, not a recursion: a RECORD path is text a distribution wrote, with any number of
+    names."""
+    walked = list[tuple[str, str]]()  # (a directory, its last name), from `directory` up
+    head = directory
+    while head not in real_dirs:
+        parent, name = os.path.split(head)
+        if name in _SPECIAL_NAMES:
+            real_dirs[head] = os.path.realpath(head)
+            break
+        walked.append((head, name))
+        head = parent
+    real = real_dirs[head]
+    for below, name in reversed(walked):
+        real = _real_child(below, name, real)
+        real_dirs[below] = real
+    return real
+
+
+def _real_child(path: str, name: str, real_parent: str) -> str:
+    """`os.path.realpath(path)`, for a `path` whose last name, `name`, is not special
+    (`_SPECIAL_NAMES`), from `real_parent`, the real path of the directory that holds it: the
+    name joined to `real_parent`, or `realpath(path)` when that joined path is a symbolic link.
+    Not `realpath` of the joined path: `realpath` keeps what each link it met earlier in `path`
+    resolved to, and across a loop of links that differs from resolving the link alone (with
+    `a -> b` and `b -> a` side by side, `realpath` gives `a` for `a/../b`, and `b` for `b`)."""
+    joined = os.path.join(real_parent, name)
     return os.path.realpath(path) if os.path.islink(joined) else joined
 
 
@@ -847,10 +889,15 @@ def _is_package_init(path: str) -> bool:
 
 
 def _files_under(directory: str, real_dirs: dict[str, str]) -> Iterator[str]:
-    """Each file under `directory`, resolved (`_real_path`, with `real_dirs` as its memo), but
-    bytecode (`.pyc` files, `__pycache__`), as `os.walk` lists them: a subdirectory it cannot
-    list, or a symbolic link to one, adds none."""
+    """Each file under `directory`, a reached origin's directory, resolved (`_real_path`, with
+    `real_dirs` as its memo), but bytecode (`.pyc` files, `__pycache__`), as `os.walk` lists
+    them: a subdirectory it cannot list, or a symbolic link to one, adds none."""
     for root, directories, files in os.walk(directory):
+        # `root` is its own real path, so the memo takes it unresolved: `directory` is real, as
+        # `import_origin` resolves an origin (`os.path.realpath`), and `os.walk` lists only a
+        # directory it could open and enters no symbolic link to a directory, so each directory
+        # it lists under a real one is real.
+        real_dirs[root] = root
         directories[:] = [name for name in directories if name != "__pycache__"]
         for name in files:
             if not name.endswith(".pyc"):

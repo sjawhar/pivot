@@ -10,6 +10,7 @@ The CLI tests of the same decisions are in `test_installed_distributions.py`, an
 """
 
 import errno
+import itertools
 import os
 import pathlib
 
@@ -109,6 +110,17 @@ def _helper_installed(
         name="fix-lib",
         classification=installed_distributions.Classification(form, reason),
     )
+
+
+def _helper_mismatches(
+    paths: list[str], found: list[str], expected: list[str]
+) -> list[tuple[str, str, str]]:
+    """Each of `paths` whose resolution in `found` is not the one in `expected`, with both."""
+    return [
+        (path, got, want)
+        for path, got, want in zip(paths, found, expected, strict=True)
+        if got != want
+    ]
 
 
 @pytest.mark.parametrize(
@@ -685,13 +697,20 @@ def test_decide_gives_a_key_and_refusals_in_their_order(
 
 
 def test_a_record_path_resolves_to_what_realpath_gives(tmp_path: pathlib.Path) -> None:
-    """A RECORD path is resolved from the real path of the directory that holds it, memoised, and
-    gives what `os.path.realpath` gives, the first time and again from the memo: under a package
-    directory that is a symbolic link, for a file that is a symbolic link, by an absolute target
-    or by a relative one through `..`, a dangling link, a link to itself, a loop of two links
-    crossed by `..` (`a -> b`, `b -> a`, `a/../b/z.py`), a missing directory, a name under a
-    regular file, a `..`, a `.`, a trailing slash, doubled slashes, a console script's
-    `../../../bin` path and the root."""
+    """A RECORD path is resolved a name at a time from the real path of the nearest directory
+    above it already resolved, memoised, and gives what `os.path.realpath` gives, from an empty
+    memo, from the memo it fills and from that memo filled: under a package directory that is a
+    symbolic link, for a file that is a symbolic link, by an absolute target or by a relative one
+    through `..`, a dangling link, a link to itself, a loop of two links crossed by `..`
+    (`a -> b`, `b -> a`, `a/../b/z.py`), a missing directory, a name under a regular file, a
+    `..`, a `.`, a trailing slash, doubled slashes, a console script's `../../../bin` path and the
+    root; and every path of one to three names under the site directory, each name one of its
+    links (`fixlib` to a directory, `core.py` to a file, `dangling.py`, `loop.py` to itself, `a`,
+    `b`, `into`, which points into the loop, and `through`, which crosses the loop and leaves it
+    by `..`), `..`, `.` or an empty name. After `through`, `realpath` resolves `b` by what it
+    learnt of the loop, as after `a/..`, so the real path of a directory that is a link must be
+    `realpath` of the directory's own path, not of its name joined to the real path of the
+    directory above."""
     package = tmp_path / "elsewhere" / "fixlib"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("")
@@ -704,11 +723,14 @@ def test_a_record_path_resolves_to_what_realpath_gives(tmp_path: pathlib.Path) -
     site.mkdir()
     (site / "fixlib").symlink_to(package, target_is_directory=True)
     (site / "plain.py").write_text("")
+    (site / "core.py").symlink_to(pathlib.Path("..", "other", "core.py"))
     (site / "dangling.py").symlink_to(tmp_path / "missing.py")
     (site / "loop.py").symlink_to("loop.py")
     (site / "a").symlink_to("b")
     (site / "b").symlink_to("a")
-    paths = [
+    (site / "into").symlink_to("a")
+    (site / "through").symlink_to(pathlib.Path("a", os.pardir))
+    named = [
         f"{site}/fixlib/__init__.py",
         f"{site}/fixlib/core.py",
         f"{site}/fixlib/relative.py",
@@ -725,16 +747,33 @@ def test_a_record_path_resolves_to_what_realpath_gives(tmp_path: pathlib.Path) -
         f"{site}/../../../bin/fix-lib",
         "/",
     ]
+    links = ["fixlib", "core.py", "dangling.py", "loop.py", "a", "b", "into", "through"]
+    names = [*links, os.pardir, os.curdir, ""]
+    paths = named + [
+        "/".join([str(site), *parts])
+        for count in (1, 2, 3)
+        for parts in itertools.product(names, repeat=count)
+    ]
     real_dirs = dict[str, str]()
 
+    fresh = [installed_distributions._real_path(path, dict[str, str]()) for path in paths]
     first = [installed_distributions._real_path(path, real_dirs) for path in paths]
     again = [installed_distributions._real_path(path, real_dirs) for path in paths]
 
     expected = [os.path.realpath(path) for path in paths]
-    assert expected[1:3] == [str(target.resolve())] * 2, f"the links must resolve: {expected}"
+    assert expected[1:3] == [str(target.resolve())] * 2, f"the links must resolve: {expected[:3]}"
     loop = expected[paths.index(f"{site}/a/../b/z.py")]
     assert loop == f"{site.resolve()}/a/z.py", f"realpath must stop the loop at its link: {loop}"
-    assert first == expected, (
-        f"the first resolution must give realpath's paths:\n{first}\n{expected}"
+    through = expected[paths.index(f"{site}/through/b/core.py")]
+    assert through == f"{site.resolve()}/a/core.py", (
+        f"realpath must resolve b by the loop that through crossed: {through}"
     )
-    assert again == expected, f"the memo must give realpath's paths:\n{again}\n{expected}"
+    assert _helper_mismatches(paths, fresh, expected) == [], (
+        "an empty memo must give realpath's paths"
+    )
+    assert _helper_mismatches(paths, first, expected) == [], (
+        "the memo being filled must give realpath's paths"
+    )
+    assert _helper_mismatches(paths, again, expected) == [], (
+        "the filled memo must give realpath's paths"
+    )

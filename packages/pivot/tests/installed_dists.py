@@ -410,15 +410,15 @@ def reinstall_from_commit(
     )
 
 
-def make_project_in(tmp_path: pathlib.Path, venv: Venv, pipeline: str) -> Project:
+def make_project_in(tmp_path: pathlib.Path, venv: Venv, pipeline_text: str) -> Project:
     """`git init -q` and `pivot init` a new project at `tmp_path/project`, with `tmp_path/home` as
-    `HOME`, then write `pipeline` as its `pipeline.py`."""
+    `HOME`, then write `pipeline_text` as its `pipeline.py`."""
     root = tmp_path / "project"
     root.mkdir(parents=True)
     project = Project(root=root, home=tmp_path / "home", venv=venv)
     git(root, project.home, "init", "-q")
     pivot_ok(project, "init")
-    (root / "pipeline.py").write_text(pipeline)
+    (root / "pipeline.py").write_text(pipeline_text)
     return project
 
 
