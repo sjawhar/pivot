@@ -241,6 +241,50 @@ def test_classify_gives_each_direct_url_json_its_install_form(
         ),
         pytest.param(_CRLF_METADATA, {"fixdep"}, "", id="crlf"),
         pytest.param(
+            b"Metadata-Version: 2.1\rName: fix-lib\rRequires-Dist: fixdep (>=1.0)\r"
+            + b"\rRequires-Dist: in-the-description\r",
+            {"fixdep"},
+            "",
+            id="lone-cr",
+        ),
+        pytest.param(
+            b"Metadata-Version: 2.4\nName: fix-lib\nRequires-Dist: fixdep\n\t(>=1.0) otherdep\n",
+            {"fixdep"},
+            "",
+            id="continued-requires-dist",
+        ),
+        pytest.param(
+            b"Metadata-Version: 2.1\r\nName: fix-lib\r\nRequires-Dist: fixdep\r\n (>=1.0)\r\n"
+            + b"Requires-Dist: otherdep\r\n",
+            {"fixdep", "otherdep"},
+            "",
+            id="continued-requires-dist-crlf",
+        ),
+        pytest.param(
+            b"Metadata-Version: 2.4\nName: fix-lib\nRequires-Dist:\n  fixdep\n",
+            {"fixdep"},
+            "",
+            id="name-on-the-continuation-line",
+        ),
+        pytest.param(
+            b"metadata-version: 2.4\nname: fix-lib\nrequires-dist: fixdep\n",
+            {"fixdep"},
+            "",
+            id="lower-case-names",
+        ),
+        pytest.param(
+            b"Metadata-Version: 2.4\nName: fix-lib\n\nRequires-Dist: fixdep\n",
+            set[str](),
+            "",
+            id="requires-dist-in-the-description",
+        ),
+        pytest.param(
+            b"Metadata-Version: 2.4\nName: fix-lib\nSummary: one\x0ctwo\nRequires-Dist: fixdep\n",
+            {"fixdep"},
+            "",
+            id="form-feed-in-a-value",
+        ),
+        pytest.param(
             b"Metadata-Version: 2.4\nName: fixdep\nVersion: 0.1\n", set[str](), "", id="none"
         ),
         pytest.param(
@@ -252,9 +296,16 @@ def test_classify_gives_each_direct_url_json_its_install_form(
         pytest.param(
             b"Metadata-Version: 2.4\nName: fix-lib\nnot a header\nRequires-Dist: fixdep\n",
             set[str](),
-            "has a METADATA file whose headers Pivot cannot read "
-            + "([MissingHeaderBodySeparatorDefect()])",
-            id="header-defect",
+            "has a METADATA file whose headers Pivot cannot read (a line that is neither a "
+            + "header nor the continuation of one: 'not a header')",
+            id="non-header-line",
+        ),
+        pytest.param(
+            b" Metadata-Version: 2.4\nName: fix-lib\nRequires-Dist: fixdep\n",
+            set[str](),
+            "has a METADATA file whose headers Pivot cannot read (a line that is neither a "
+            + "header nor the continuation of one: ' Metadata-Version: 2.4')",
+            id="first-line-a-continuation",
         ),
         pytest.param(
             b'Metadata-Version: 2.4\nName: fix-lib\nRequires-Dist: ; python_version < "3"\n',
@@ -282,9 +333,12 @@ def test_classify_gives_each_direct_url_json_its_install_form(
 def test_requirement_names_reads_the_leading_name_of_each_requires_dist_header(
     metadata: bytes | OSError | None, names: set[str], problem: str
 ) -> None:
-    """Each `Requires-Dist` header gives its leading name, PEP 503 normalised, with no extra or
-    marker evaluated, after a continued header and with CR LF line ends; a description after the
-    headers is not read. A file that cannot be read, is not UTF-8, has a header defect, no
+    """Each `Requires-Dist` header, its name in any case, gives its leading name, PEP 503
+    normalised, with no extra or marker evaluated: after a continued header, from the first line
+    of a continued one (or the next, when the first has none), with CR LF or lone CR line ends,
+    and with a form feed inside a value, which ends no line; a description after the headers is
+    not read. A file that cannot be read, is not UTF-8, has a line in its headers that is neither
+    a header nor the continuation of one (a first line that starts with a space included), has no
     `Metadata-Version` or a `Requires-Dist` header that names nothing gives no names and that
     problem."""
     requirements = installed_distributions.requirement_names(metadata)

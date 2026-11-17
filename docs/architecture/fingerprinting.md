@@ -608,13 +608,15 @@ refused for the first of these that holds:
    its size limit): Pivot cannot tell its files. A distribution a stage reaches owns a module
    through its RECORD, so this refuses one that a reached distribution requires.
 3. Its requirements cannot be read: its METADATA, or its PKG-INFO where it has no METADATA (an
-   `.egg-info` directory), is missing, cannot be read, is not UTF-8, has headers Python's `email`
-   parser reads with a defect (a line that is not a header ends them early), has no
-   `Metadata-Version` header, or has a `Requires-Dist` header that names no distribution; or,
-   for an `.egg-info` directory whose metadata has no `Requires-Dist` header, its `requires.txt`
-   cannot be read, is not UTF-8, or has a line that is not blank, a comment or a section header
-   and names no distribution. Pivot cannot tell what it depends on. This holds for a
-   package-index distribution the stage needs too.
+   `.egg-info` directory), is missing, cannot be read, is not UTF-8, has a line in its headers
+   (up to the first empty line, each line ended by CR LF, CR or LF) that is neither a header
+   (`<name>:<value>`, as Python's `email` parser reads one) nor the continuation of one (a line
+   that starts with a space or a tab, after a header), has no `Metadata-Version` header, or has a
+   `Requires-Dist` header that names no distribution; or, for an `.egg-info` directory whose
+   metadata has no `Requires-Dist` header, its `requires.txt` cannot be read, is not UTF-8, or
+   has a line that is not blank, a comment or a section header and names no distribution. Pivot
+   cannot tell what it depends on. This holds for a package-index distribution the stage needs
+   too.
 
 Pivot also refuses the stage, with a message naming the module, its file and the distribution,
 when a module the stage reaches has a file that no RECORD in that file's directory of the

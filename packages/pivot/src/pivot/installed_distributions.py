@@ -44,8 +44,6 @@ from __future__ import annotations
 
 import csv
 import dataclasses
-import email.parser
-import email.policy
 import enum
 import json
 import os
@@ -78,6 +76,14 @@ _REQUIREMENT_NAME = re.compile(r"[A-Z0-9](?:[A-Z0-9._-]*[A-Z0-9])?", re.IGNORECA
 
 # The empty line that ends a metadata file's headers.
 _END_OF_HEADERS = re.compile(r"\r?\n\r?\n")
+
+# A line end in a metadata file's headers, as `email` reads one: CR LF, CR or LF, not each
+# character `str.splitlines` breaks at (`\x0b`, `\x0c`, `\x1c`, ...).
+_LINE_END = re.compile(r"\r\n|\r|\n")
+
+# A header line: its name, of the characters `email` allows in one (printable ASCII but the
+# colon), and its value after the colon and any spaces and tabs.
+_HEADER = re.compile(r"([\x21-\x39\x3b-\x7e]+):[ \t]*(.*)")
 
 # The names in a path that `os.path.realpath` reads specially: an empty one, `.` and `..`.
 _SPECIAL_NAMES = ("", os.curdir, os.pardir)
@@ -222,14 +228,20 @@ def requirement_names(metadata: bytes | OSError | None) -> Requirements:
     """The PEP 503 names that a metadata file's `Requires-Dist` headers start with: its bytes,
     None when the distribution has none, or the error that reading it raised.
 
-    Only the headers are read, up to the first empty line, as `importlib.metadata` reads them
-    (`email`), and only each requirement's leading PEP 508 name: markers and extras are not
-    evaluated, so a requirement behind a false marker or an extra is followed too. A file that
-    cannot be read, whose headers `email` reads with a defect (a line that is not a header ends
-    them early), that has no `Metadata-Version` header (not metadata), or that has a
-    `Requires-Dist` header that does not start with a name gives no names and a problem: Pivot
-    cannot tell what the distribution depends on. So no names and no problem means the file has
-    no `Requires-Dist` header."""
+    Only the headers are read, up to the first empty line, as `importlib.metadata` reads them with
+    `email`'s parser, read here by hand since importing `email.parser` and `email.policy` adds
+    some 20 modules to the start of every worker, which imports this module: a line ends at CR LF,
+    CR or LF; one that starts with a space or a tab continues the header before it; every other
+    line is a header, `<name>:<value>`, its name of printable ASCII characters but the colon,
+    compared without case. A continued header's value is its first line's followed by each
+    continuation line, so a requirement's name is read from its first line, or from the next when
+    the first holds none. Only each requirement's leading PEP 508 name is read: markers and extras
+    are not evaluated, so a requirement behind a false marker or an extra is followed too. A file
+    that cannot be read, is not UTF-8, has a line in its headers that is neither a header nor the
+    continuation of one (a first line that starts with a space or a tab is not one), has no
+    `Metadata-Version` header (not metadata), or has a `Requires-Dist` header that does not start
+    with a name gives no names and a problem: Pivot cannot tell what the distribution depends on.
+    So no names and no problem means the file has no `Requires-Dist` header."""
     if metadata is None:
         return Requirements(frozenset(), "has no METADATA file")
     if isinstance(metadata, OSError):
@@ -238,16 +250,31 @@ def requirement_names(metadata: bytes | OSError | None) -> Requirements:
         text = metadata.decode("utf-8")
     except UnicodeDecodeError as exc:
         return Requirements(frozenset(), f"has a METADATA file that is not UTF-8 ({exc})")
-    headers = email.parser.HeaderParser(policy=email.policy.compat32).parsestr(
-        _END_OF_HEADERS.split(text, maxsplit=1)[0]
-    )
-    if headers.defects:
-        return Requirements(
-            frozenset(), f"has a METADATA file whose headers Pivot cannot read ({headers.defects})"
-        )
-    if "Metadata-Version" not in headers:
+    # Each header's name, in lower case, and the lines of its value.
+    headers = list[tuple[str, list[str]]]()
+    for line in _LINE_END.split(_END_OF_HEADERS.split(text, maxsplit=1)[0]):
+        # An empty line ends the headers: one that starts the file, one between lone CRs, which
+        # `_END_OF_HEADERS` does not match, or the one after the last line end of a file that is
+        # only headers.
+        if not line:
+            break
+        if headers and line.startswith((" ", "\t")):
+            headers[-1][1].append(line)
+            continue
+        header = _HEADER.fullmatch(line)
+        if header is None:
+            return Requirements(
+                frozenset(),
+                "has a METADATA file whose headers Pivot cannot read (a line that is neither a "
+                + f"header nor the continuation of one: {line!r})",
+            )
+        headers.append((header[1].lower(), [header[2]]))
+    if all(name != "metadata-version" for name, _ in headers):
         return Requirements(frozenset(), "has a METADATA file with no Metadata-Version header")
-    return _leading_names(headers.get_all("Requires-Dist") or [], "a Requires-Dist header")
+    return _leading_names(
+        ("\n".join(lines) for name, lines in headers if name == "requires-dist"),
+        "a Requires-Dist header",
+    )
 
 
 def requires_txt_names(requires: bytes | OSError | None) -> Requirements:

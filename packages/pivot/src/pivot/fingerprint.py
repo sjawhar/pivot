@@ -391,8 +391,8 @@ _identity_active: contextvars.ContextVar[tuple[int, ...]] = contextvars.ContextV
 # Per-pass memo, keyed by kind and object id, for function identities (`function_identity`),
 # type-hint classes (`_hint_parts`), user-class members (`_user_methods`), mark decisions
 # (`_mark_decision`), class identities (`_class_identity`), the parts of classes with no source
-# (`_sourceless_parts`), whether a module is pivot's own (`_reached_library_module`) and a loaded
-# module's origin (`_module_origin`), and by file name for source file digests (`_source_digest`).
+# (`_sourceless_parts`) and a loaded module's origin (`_module_origin`), and by file name for
+# source file digests (`_source_digest`).
 # Set only inside `fingerprint_pass()`; a reload, a mutated cell or an edit is seen by the next
 # pass.
 _pass_memo: contextvars.ContextVar[dict[tuple[str, int | str], Any] | None] = (
@@ -2408,20 +2408,21 @@ def _reached_library_module(value: object) -> str | None:
     if module_name.partition(".")[0] in sys.stdlib_module_names:
         return None
     module = sys.modules.get(module_name)
-    if isinstance(module, types.ModuleType) and _memoized(
-        "pivot-module", module, lambda: _in_pivot_packages(module)
-    ):
+    if not isinstance(module, types.ModuleType):
+        return module_name
+    # Read through the module's namespace, so no code of a module subclass runs.
+    file = _module_namespace(module).get("__file__")
+    if isinstance(file, str) and _in_pivot_packages(file):
         return None
     return module_name
 
 
-def _in_pivot_packages(module: types.ModuleType) -> bool:
-    """Whether `module`'s file, resolved, lies in one of pivot's own packages
-    (`_PIVOT_PACKAGE_DIRS`), read through the module's namespace, so no code of a module subclass
-    runs."""
-    file = _module_namespace(module).get("__file__")
-    if not isinstance(file, str):
-        return False
+@functools.lru_cache(maxsize=4096)
+def _in_pivot_packages(file: str) -> bool:
+    """Whether a module's `file`, resolved, lies in one of pivot's own packages
+    (`_PIVOT_PACKAGE_DIRS`): decided once per file name per process, as `_is_user_source_file`
+    decides, since every stage with a pivot loader reaches that loader's module again, inside a
+    `fingerprint_pass()` or not."""
     path = pathlib.Path(file).resolve()
     return any(path.is_relative_to(directory) for directory in _PIVOT_PACKAGE_DIRS)
 
