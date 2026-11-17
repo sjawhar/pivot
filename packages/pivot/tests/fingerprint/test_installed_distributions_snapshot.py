@@ -16,6 +16,7 @@ functions on plain data in `test_installed_distributions_rules.py`.
 
 import collections.abc
 import importlib.metadata
+import importlib.util
 import os
 import pathlib
 import py_compile
@@ -95,6 +96,12 @@ def _helper_replace_with_failing_read(path: pathlib.Path) -> None:
 
 def _helper_remove_read_permission(path: pathlib.Path) -> None:
     path.chmod(0)
+
+
+def _helper_change_last_byte(path: pathlib.Path) -> None:
+    """Change one byte of the file at `path`, its last, to another value."""
+    data = path.read_bytes()
+    path.write_bytes(data[:-1] + bytes([data[-1] ^ 0xFF]))
 
 
 def _helper_padding(length: int) -> pathlib.Path:
@@ -189,6 +196,59 @@ def test_distribution_keys_hash_each_reached_git_path_and_local_archive_install_
         },
         [],
     ), found
+
+
+def test_a_pyc_file_outside_pycache_is_hashed_and_the_bytecode_pip_compiles_is_not(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`Fix_Lib`'s module `fixlib.core` ships as bytecode alone: its wheel holds `fixlib/core.pyc`
+    and no `core.py`. pip installs it from its path, compiles `fixlib/__init__.py` into
+    `__pycache__`, and lists both `.pyc` files in its RECORD. The key hashes `fixlib/__init__.py`
+    and `fixlib/core.pyc`, read from disk: one byte of the bytecode pip compiled changed changes
+    nothing, and one byte of `core.pyc` changed changes the value, so a change to a sourceless
+    module is seen."""
+    venv = installed_dists.make_venv(tmp_path / "venv", seed=True)
+    source = installed_dists.write_library(
+        tmp_path / "src",
+        "Fix_Lib",
+        "fixlib",
+        installed_dists.FIXLIB_ALONE,
+        files={"fixlib/core.py": "CORE = 1\n"},
+        package_data=["*.pyc"],
+    )
+    core_source = source / "fixlib" / "core.py"
+    py_compile.compile(str(core_source), cfile=str(source / "fixlib" / "core.pyc"), doraise=True)
+    core_source.unlink()
+    installed_dists.pip_install_directory(venv, source)
+    site = venv.site_packages
+    compiled = importlib.util.cache_from_source("fixlib/__init__.py")
+    listed = sorted(
+        str(path)
+        for path in installed_dists.installed(venv, "Fix_Lib").files or []
+        if str(path).startswith("fixlib/")
+    )
+    assert listed == sorted(["fixlib/__init__.py", compiled, "fixlib/core.pyc"]), (
+        f"pip's RECORD must list fixlib's two modules and the bytecode pip compiled: {listed}"
+    )
+    origins = {"fixlib": _helper_origin(site / "fixlib" / "__init__.py")}
+    hashed = {name: name for name in ("fixlib/__init__.py", "fixlib/core.pyc")}
+    values = [_helper_value(site, hashed)]
+
+    intact = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+    _helper_change_last_byte(site / compiled)
+    installed_distributions.reset()
+    compiled_changed = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+    _helper_change_last_byte(site / "fixlib" / "core.pyc")
+    values.append(_helper_value(site, hashed))
+    installed_distributions.reset()
+    core_changed = installed_distributions.distribution_keys(origins, [str(site)], _PIVOT_DIRS)
+
+    assert values[0] != values[1], f"one byte of core.pyc must change its value: {values}"
+    keyed = [
+        installed_distributions.DistributionKeys({"dist:fix-lib": value}, []) for value in values
+    ]
+    found = [intact, compiled_changed, core_changed]
+    assert found == [keyed[0], keyed[0], keyed[1]], found
 
 
 def test_distribution_keys_read_the_files_once_per_path_and_pivot_dirs_until_reset(
@@ -321,12 +381,14 @@ def test_a_reached_file_no_record_lists_beside_a_recordless_install_is_refused_p
 ) -> None:
     """`Fix_Lib`, installed from its path with packages `fixlib`, `company.vendor` and the
     namespace portion `nsco.part`, has lost its RECORD; `company-core`, installed as from an
-    index, holds `company/__init__.py`, beside which Python left bytecode; `fixother` is installed
-    from its path into a second directory on the path. Each reached module with a file that no
-    RECORD in site-packages lists is refused once, naming the first such file: `fixlib`'s and
-    `fixlib.helpers`' own files, and under the package `company` and the namespace `nsco` the
-    file `Fix_Lib` put there, not the bytecode. `fixother`, outside that directory, gets its key;
-    a built-in module and a module nothing finds give nothing."""
+    index, holds `company/__init__.py`, beside which Python left bytecode outside `__pycache__`
+    (`legacy.pyc`, as `compileall -b` writes it); `fixother` is installed from its path into a
+    second directory on the path. Each reached module with a file that no RECORD in site-packages
+    lists is refused once, naming the first such file: `fixlib`'s and `fixlib.helpers`' own files,
+    under the package `company` that bytecode, which the walk reads as any file outside
+    `__pycache__`, at the top of the package before its subpackage `vendor`, and under the
+    namespace `nsco` the file `Fix_Lib` put there. `fixother`, outside that directory, gets its
+    key; a built-in module and a module nothing finds give nothing."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     src = tmp_path / "src"
     fixlib = installed_dists.write_setuptools_project(
@@ -360,7 +422,6 @@ def test_a_reached_file_no_record_lists_beside_a_recordless_install_is_refused_p
     site = venv.site_packages
     installed_dists.damage(site / "fix_lib-0.1.dist-info" / "RECORD", None)
     core = site / "company" / "__init__.py"
-    py_compile.compile(str(core), doraise=True)
     py_compile.compile(str(core), cfile=str(site / "company" / "legacy.pyc"), doraise=True)
     origins = {
         "company": _helper_origin(core),
@@ -378,7 +439,7 @@ def test_a_reached_file_no_record_lists_beside_a_recordless_install_is_refused_p
 
     resolved = site.resolve()
     refused = [
-        ("company", "company/vendor/__init__.py"),
+        ("company", "company/legacy.pyc"),
         ("fixlib", "fixlib/__init__.py"),
         ("fixlib.helpers", "fixlib/helpers.py"),
         ("nsco", "nsco/part/__init__.py"),
@@ -729,7 +790,8 @@ def test_a_refusal_of_a_reached_install_fails_the_fingerprint_through_the_regist
     """`Fix_Lib`, whose `direct_url.json` is not a JSON object, is installed in a site directory
     on this process's path, and the stage imports its `fixlib` in its body, which no fingerprint
     runs. The registry's fingerprint of the stage fails with the refusal, which names the
-    distribution, and `fixlib` was not imported."""
+    distribution after the stage's name, wrapped as every refusal is (`fingerprinting failed`, so
+    the stage is named twice, as for a non-scalar capture), and `fixlib` was not imported."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     source = installed_dists.write_library(
         tmp_path / "src", "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE
@@ -744,7 +806,8 @@ def test_a_refusal_of_a_reached_install_fails_the_fingerprint_through_the_regist
 
     refusal = installed_dists.UNCLASSIFIED_REFUSAL.format(site=venv.site_packages.resolve())
     assert str(raised.value) == (
-        f"Stage '{installed_dists.STAGE}': fingerprinting failed: {refusal}"
+        f"Stage '{installed_dists.STAGE}': fingerprinting failed: "
+        + f"{installed_dists.STAGE_PREFIX}{refusal}"
     ), raised.value
     assert "fixlib" not in sys.modules, "fingerprinting must not import the stage's library"
 

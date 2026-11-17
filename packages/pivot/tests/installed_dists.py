@@ -15,7 +15,7 @@ PyYAML, `tests.helpers` and the `pivot` package, so the tests that use it still 
 It also holds what the test files of those keys share: the stage `STAGE` of their projects, the
 file `OUTPUT` it writes and the `pipeline.py` of a project whose stage calls installed modules
 (`pipeline`), the sources of the fixture libraries `Fix_Lib` and `fixdep`, and the refusals of a
-broken install, word for word.
+broken install, word for word, with the start pivot gives each for `STAGE` (`STAGE_PREFIX`).
 """
 
 from __future__ import annotations
@@ -122,6 +122,9 @@ UNLISTED_REFUSAL = (
     "that distribution's code, so the stage could skip a run after it changes. Fix: reinstall "
     "'fix-lib'."
 )
+# How pivot starts each of those refusals of `STAGE`, and the warning unsafe fingerprinting gives
+# in its place, as it starts every refusal it can downgrade: with the stage's name.
+STAGE_PREFIX = f"Stage '{STAGE}': "
 
 
 @dataclasses.dataclass(frozen=True)
@@ -170,10 +173,12 @@ def write_setuptools_project(
     files: Mapping[str, str],
     dependencies: Sequence[str] = (),
     scripts: Mapping[str, str] | None = None,
+    package_data: Mapping[str, Sequence[str]] | None = None,
 ) -> pathlib.Path:
     """Write at `root` a setuptools project: `files` (each path relative to `root`, with its text)
     and a `pyproject.toml` for distribution `name` at `version` that names its import `packages`,
-    its `dependencies` and its console `scripts` (command, then `module:function`). Returns
+    its `dependencies`, its console `scripts` (command, then `module:function`) and, for each
+    package of `package_data`, the glob patterns of the other files its wheel holds. Returns
     `root`."""
     # A JSON string, or array of strings, that `json.dumps` writes is also valid TOML.
     lines = [
@@ -194,6 +199,13 @@ def write_setuptools_project(
         )
         lines.append("")
     lines.extend(["[tool.setuptools]", f"packages = {json.dumps(list(packages))}", ""])
+    if package_data:
+        lines.append("[tool.setuptools.package-data]")
+        lines.extend(
+            f"{json.dumps(package)} = {json.dumps(list(patterns))}"
+            for package, patterns in package_data.items()
+        )
+        lines.append("")
     root.mkdir(parents=True)
     (root / "pyproject.toml").write_text("\n".join(lines))
     for relative, text in files.items():
@@ -213,10 +225,12 @@ def write_library(
     dependencies: Sequence[str] = (),
     scripts: Mapping[str, str] | None = None,
     files: Mapping[str, str] | None = None,
+    package_data: Sequence[str] = (),
 ) -> pathlib.Path:
     """Write at `root/<module>` the setuptools project (`write_setuptools_project`) of
     distribution `name`, whose package `module` has `source` as its `__init__.py`, with `files`
-    beside it. Returns the project's directory."""
+    beside it, and whose wheel also holds the files of `module` that the glob patterns
+    `package_data` match. Returns the project's directory."""
     return write_setuptools_project(
         root / module,
         name,
@@ -225,6 +239,7 @@ def write_library(
         files={f"{module}/__init__.py": source, **(files or {})},
         dependencies=dependencies,
         scripts=scripts,
+        package_data={module: package_data} if package_data else None,
     )
 
 

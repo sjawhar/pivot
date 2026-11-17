@@ -344,8 +344,10 @@ def hashed_files(paths: Iterable[str], dist_info_name: str) -> list[tuple[str, s
     Kept: each relative path that, normalised (`posixpath.normpath`), stays inside the directory
     that holds the `.dist-info` directory `dist_info_name`. Left out: every path in a
     `*.dist-info` directory but the distribution's own `entry_points.txt` (hashed under one name
-    whatever the version in its directory's name), every `.pyc` file and every path with a
-    `__pycache__` part. A path listed twice is hashed once."""
+    whatever the version in its directory's name), and every path with a `__pycache__` part,
+    which the installer compiles (pip lists the bytecode it writes). A `.pyc` file outside
+    `__pycache__` came from the wheel, the code of a sourceless module, and is kept. A path listed
+    twice is hashed once."""
     own_entry_points = posixpath.join(dist_info_name, "entry_points.txt")
     kept = dict[str, str]()
     for path in paths:
@@ -358,9 +360,7 @@ def hashed_files(paths: Iterable[str], dist_info_name: str) -> list[tuple[str, s
         if normal == own_entry_points:
             kept[_OWN_ENTRY_POINTS] = normal
         elif not (
-            any(part.lower().endswith(".dist-info") for part in parts)
-            or normal.endswith(".pyc")
-            or "__pycache__" in parts
+            any(part.lower().endswith(".dist-info") for part in parts) or "__pycache__" in parts
         ):
             kept[normal] = normal
     return sorted(kept.items())
@@ -644,15 +644,15 @@ class _Snapshot:
         such candidate, naming the first such file of that directory. Found once for each module
         and origin.
 
-        The files are those the origin covers (`_reached_paths`): the module's own file, and the
-        files under the directory of a package's `__init__` file or of a namespace package, but
-        bytecode, since such a candidate may hold a submodule. A file's site directory is the
-        deepest entry of the path that the scan listed and that holds it (`_site_dir`). A
-        directory is walked only for the site directories with such a candidate that can hold a
-        file under it other than through a symbolic link (the deepest entry of the path above the
-        directory, and each entry at or under it), and only until each of them has its file. So a
-        file under the directory that is a symbolic link into another site directory with such a
-        candidate is not checked."""
+        The files are those the origin covers (`_reached_paths`): the module's own file, and, since
+        such a candidate may hold a submodule, the files under the directory of a package's
+        `__init__` file or of a namespace package but those under a `__pycache__` directory
+        (`_files_under`). A file's site directory is the deepest entry of the path that the scan
+        listed and that holds it (`_site_dir`). A directory is walked only for the site
+        directories with such a candidate that can hold a file under it other than through a
+        symbolic link (the deepest entry of the path above the directory, and each entry at or
+        under it), and only until each of them has its file. So a file under the directory that is
+        a symbolic link into another site directory with such a candidate is not checked."""
         key = (module, origin)
         if key not in self._unlisted_refusals:
             files, directories = _reached_paths(origin)
@@ -943,13 +943,13 @@ def _is_package_init(path: str) -> bool:
 
 def _files_under(directory: str, real_dirs: dict[str, str]) -> Iterator[str]:
     """Each file under `directory`, a reached origin's directory, resolved (`_real_path`, with
-    `real_dirs` as its memo), but bytecode (`.pyc` files, `__pycache__`), as `os.walk` lists
-    them: a subdirectory it cannot list, or a symbolic link to one, adds none."""
+    `real_dirs` as its memo), as `os.walk` lists them, but those under a `__pycache__` directory,
+    which `hashed_files` leaves out too: a `.pyc` file outside one is a file like any other. A
+    subdirectory it cannot list, or a symbolic link to one, adds none."""
     for root, directories, files in os.walk(directory):
         directories[:] = [name for name in directories if name != "__pycache__"]
         for name in files:
-            if not name.endswith(".pyc"):
-                yield _real_path(os.path.join(root, name), real_dirs)
+            yield _real_path(os.path.join(root, name), real_dirs)
 
 
 def _file_digest(path: str) -> str | None:

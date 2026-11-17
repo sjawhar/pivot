@@ -2456,7 +2456,9 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     """Add to a stage's merged `manifest` the `dist:` keys of the distributions its `byname:`
     modules (the stage's and its loaders') come from, and of those they depend on
     (`installed_distributions.distribution_keys`), and report each refusal it finds with the
-    stage's others: unsafe fingerprinting downgrades it to a warning.
+    stage's others, its message started with the stage's name (`_stage_prefix`), as the other
+    downgradable refusals start theirs: unsafe fingerprinting downgrades it to a warning, which
+    then names the stage it lets run.
 
     A module's origin is the module this process holds, which is the code the walk saw
     (`loaded_source.check_worker_imports` refuses a worker that would import another), else where
@@ -2479,8 +2481,9 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
             else loaded_source.worker_origin(name)
         )
     found = installed_distributions.distribution_keys(origins, path, pivot_dirs)
+    prefix = _stage_prefix()
     for message in found.refusals:
-        _report_refusal(message, downgradable=True)
+        _report_refusal(prefix + message, downgradable=True)
     manifest.update(found.keys)
 
 
@@ -3327,14 +3330,21 @@ def _check_non_scalar_capture(
 _SUPPRESSION = "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
 
 
+def _stage_prefix() -> str:
+    """`Stage '<name>': `, which starts the message of a refusal unsafe fingerprinting can
+    downgrade, so the warning it becomes names the stage it lets run: the stage that
+    `stage_fingerprint_scope` names (`_current_stage_name`), or `<unknown>` outside one."""
+    return f"Stage '{_current_stage_name.get() or '<unknown>'}': "
+
+
 def _field_opaque_message(binding: str) -> Callable[[tuple[str, ...], Any], str]:
     """The refusal of a value whose state no form reads (`_admit`) inside the class-level default
     of field `binding` (a dataclass field, a `ClassVar`, a pydantic model's field)."""
 
     def message(_path: tuple[str, ...], value: Any) -> str:
-        stage_name = _current_stage_name.get() or "<unknown>"
         return (
-            f"Stage '{stage_name}': the default of field '{binding}' keeps state pivot cannot "
+            _stage_prefix()
+            + f"the default of field '{binding}' keeps state pivot cannot "
             + f"read (type: {_definition_ref(type(value))}).\n"
             + "Pivot hashes a class-level default by its value, its attributes and its slots; "
             + "this one keeps its state elsewhere (in C), so a change to it would go unseen, which "
@@ -3353,9 +3363,9 @@ def _bound_opaque_message(binding: str) -> Callable[[tuple[str, ...], Any], str]
     partial's arguments, a loader's config field, a `StageParams` default."""
 
     def message(path: tuple[str, ...], value: Any) -> str:
-        stage_name = _current_stage_name.get() or "<unknown>"
         return (
-            f"Stage '{stage_name}': bound value '{_binding_text(binding, path)}' keeps state Pivot "
+            _stage_prefix()
+            + f"bound value '{_binding_text(binding, path)}' keeps state Pivot "
             + f"cannot read (type: {_definition_ref(type(value))}).\n"
             + "Pivot fingerprints a value through its attributes, its slots and the value types "
             + "it knows; this value keeps its state outside them (in C), so a change to it could "
@@ -3373,9 +3383,9 @@ def _sourceless_opaque_message(ref: str, name: str) -> Callable[[tuple[str, ...]
     namespace of class `ref`, which has no source of its own."""
 
     def message(_path: tuple[str, ...], value: Any) -> str:
-        stage_name = _current_stage_name.get() or "<unknown>"
         return (
-            f"Stage '{stage_name}': class '{ref}', which has no source of its own, holds a value "
+            _stage_prefix()
+            + f"class '{ref}', which has no source of its own, holds a value "
             + f"whose state pivot cannot read in '{name}' (type: {_definition_ref(type(value))}).\n"
             + "Pivot hashes such a class by what defines it; this value keeps its state elsewhere "
             + "(in C), so a change to it would go unseen, which can cause silent wrong outputs.\n"
@@ -5360,11 +5370,11 @@ def _read_attribute_hook(meta: type[Any]) -> type[Any] | None:
 def _hooked_class_message(cls: type[Any]) -> str:
     """The refusal of class `cls`, whose metaclass answers attribute reads with user code
     (`_attribute_hook`)."""
-    stage_name = _current_stage_name.get() or "<unknown>"
     hook = _attribute_hook(cls)
     meta = _definition_ref(hook) if hook is not None else "?"
     return (
-        f"Stage '{stage_name}': class '{_definition_ref(cls)}' has the metaclass '{meta}', whose "
+        _stage_prefix()
+        + f"class '{_definition_ref(cls)}' has the metaclass '{meta}', whose "
         + "`__getattribute__` or `__getattr__` is user code, so reading the class runs it.\n"
         + "Pivot reads a class through `type`'s own descriptors and runs none of its code; this "
         + "class answers attribute reads with code, so what it holds could change unseen, which "
@@ -5377,9 +5387,9 @@ def _hooked_class_message(cls: type[Any]) -> str:
 
 def _proxy_message(binding: str, value: Any) -> str:
     """The refusal of library instance `value`, a proxy (`_forwards_attributes`), at `binding`."""
-    stage_name = _current_stage_name.get() or "<unknown>"
     return (
-        f"Stage '{stage_name}': value '{binding}' is a proxy (type: "
+        _stage_prefix()
+        + f"value '{binding}' is a proxy (type: "
         + f"{_definition_ref(type(value))}) whose class computes its attributes (`__getattr__` "
         + "or `__getattribute__`).\n"
         + "Pivot reads a value through its state and runs none of its code, so what the proxy "

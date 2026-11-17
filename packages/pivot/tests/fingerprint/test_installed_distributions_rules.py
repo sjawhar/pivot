@@ -2,8 +2,9 @@
 distribution, called in this process on plain data: on `direct_url.json`, METADATA,
 `requires.txt` and RECORD as uv, pip and setuptools write them and on wrong and boundary inputs,
 on the paths a RECORD lists, on digests, on requirement graphs, on origins and on the readings
-that decide a distribution's key and its refusals; and the resolution of a RECORD path, on a tree
-of symbolic links this test makes.
+that decide a distribution's key and its refusals; the resolution of a RECORD path, on a tree of
+symbolic links this test makes; and the walk of a reached package's directory, on a tree of
+files this test makes.
 
 The CLI tests of the same decisions are in `test_installed_distributions.py`, and
 `distribution_keys` over real installs is in `test_installed_distributions_snapshot.py`.
@@ -98,6 +99,9 @@ _FIXLIB_RECORD = installed_distributions.Record(("fixlib/__init__.py",), "")
 _NO_RECORD = installed_distributions.Record(None, "has no RECORD file")
 _NO_METADATA = installed_distributions.Requirements(frozenset(), "has no METADATA file")
 _NO_REQUIREMENT = installed_distributions.Requirements(frozenset(), "")
+# A sourceless package as its wheel holds it, bytecode in place of source, with the bytecode an
+# installer compiled from it.
+_SOURCELESS_PACKAGE = ("pkg/__init__.pyc", "pkg/mod.pyc", "pkg/__pycache__/mod.cpython-313.pyc")
 
 
 def _helper_installed(
@@ -458,12 +462,13 @@ def test_record_paths_lists_the_first_field_of_each_row(
     assert found == installed_distributions.Record(paths, problem), found
 
 
-def test_hashed_files_keep_each_installed_file_once_but_the_installers_and_bytecode() -> None:
+def test_hashed_files_keep_each_installed_file_once_but_the_installers_and_pycache() -> None:
     """Of a RECORD's paths, the key hashes each relative one that stays in the site directory,
     once, under its normalised name, and the distribution's own `entry_points.txt` under one name
     whatever its version: not an absolute path, a path that leaves the directory, the console
     script, the other files of a `.dist-info` directory, another distribution's or a nested
-    `.dist-info` directory, nor bytecode. A directory entry is kept, to hash as a file that cannot
+    `.dist-info` directory, nor a path under `__pycache__`, which the installer compiles. A `.pyc`
+    file outside `__pycache__` is kept, and so is a directory entry, to hash as a file that cannot
     be read."""
     paths = [
         "../../../bin/fix-lib",
@@ -495,7 +500,28 @@ def test_hashed_files_keep_each_installed_file_once_but_the_installers_and_bytec
         ("fixlib/__init__.py", "fixlib/__init__.py"),
         ("fixlib/_vendor/inner.py", "fixlib/_vendor/inner.py"),
         ("fixlib/data/table.csv", "fixlib/data/table.csv"),
+        ("fixlib/legacy.pyc", "fixlib/legacy.pyc"),
     ], files
+
+
+def test_the_key_and_the_walk_keep_a_sourceless_packages_pyc_files_but_pycache(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A sourceless package: its wheel holds `pkg/__init__.pyc` and `pkg/mod.pyc` in place of
+    source, and the installer compiled `pkg/__pycache__/mod.cpython-313.pyc`. Of these RECORD
+    paths the key hashes exactly the two `.pyc` files outside `__pycache__`, and the walk of the
+    reached package's directory (`_files_under`), over those files on disk, gives the same two:
+    the check of a file that no RECORD lists reads the files the key would hash."""
+    for path in _SOURCELESS_PACKAGE:
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_bytes(b"")
+
+    files = installed_distributions.hashed_files(_SOURCELESS_PACKAGE, "pkg-0.1.dist-info")
+    walked = sorted(installed_distributions._files_under(str(tmp_path / "pkg"), dict[str, str]()))
+
+    kept = ["pkg/__init__.pyc", "pkg/mod.pyc"]
+    assert files == [(path, path) for path in kept], files
+    assert walked == [os.path.realpath(tmp_path / path) for path in kept], walked
 
 
 def test_content_digest_and_key_value_hash_json_arrays_in_name_order() -> None:

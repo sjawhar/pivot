@@ -567,13 +567,14 @@ inside the directory that holds its `.dist-info` directory, each read from disk,
 RECORD's hashes, so a byte edited in place in `site-packages` changes it. It leaves out every
 file of a `.dist-info` directory but the distribution's own `entry_points.txt`, which decides
 which plugin code runs (others of them differ by installer or build backend, and `METADATA`
-carries the version), and every `.pyc` file and every path with a `__pycache__` part (pip lists
-the bytecode it writes). A file listed twice is hashed once. So the same files installed from
-another commit or path, by pip or by uv, into another virtual environment, give the same value,
-and a reinstall that changes only the version changes nothing. A listed file that is missing or
-cannot be read (deleted, a directory, a FIFO, no read permission) is hashed as `null`: the value
-changes and nothing is refused. Two installs of one name on the path that a stage both reaches
-give one key, whose value covers both.
+carries the version), and every path with a `__pycache__` part, which the installer compiles
+(pip lists the bytecode it writes). A `.pyc` file outside `__pycache__` came from the wheel, so
+it is hashed, and a change to a sourceless module is seen. A file listed twice is hashed once.
+So the same files installed from another commit or path, by pip or by uv, into another virtual
+environment, give the same value, and a reinstall that changes only the version changes
+nothing. A listed file that is missing or cannot be read (deleted, a directory, a FIFO, no read
+permission) is hashed as `null`: the value changes and nothing is refused. Two installs of one
+name on the path that a stage both reaches give one key, whose value covers both.
 
 Limits:
 
@@ -590,12 +591,13 @@ Limits:
 | One library installed from git on one machine and from a package index on another | The first machine's lock has a `dist:` key for it and the second's has none, so each machine reads the other's lock as stale (before this key, both had only `byname:` entries, which a lock leaves out) |
 
 Refusals: when Pivot cannot tell which installed code a stage runs, it refuses the stage with a
-message that names the distribution, its `.dist-info` directory, the reason and the fix
-(reinstall it). It looks only when at least one distribution on the worker's `sys.path` is
-installed from git, a local path or a local archive, or has a `direct_url.json` Pivot cannot
-classify, and only at the distributions a stage needs: each one it reaches and each one those
-require, directly or through others. Pivot's own distribution refuses nothing. Each other is
-refused for the first of these that holds:
+message that starts with the stage's name (`Stage '<name>': `, as every refusal that unsafe
+fingerprinting can downgrade starts) and names the distribution, its `.dist-info` directory, the
+reason and the fix (reinstall it). It looks only when at least one distribution on the worker's
+`sys.path` is installed from git, a local path or a local archive, or has a `direct_url.json`
+Pivot cannot classify, and only at the distributions a stage needs: each one it reaches and each
+one those require, directly or through others. Pivot's own distribution refuses nothing. Each
+other is refused for the first of these that holds:
 
 1. Its `direct_url.json` cannot be read, is not JSON, is nested deeper than Python's JSON parser
    recurses, is not a JSON object, names none or more than one of `vcs_info`, `dir_info` and
@@ -618,28 +620,29 @@ refused for the first of these that holds:
    cannot tell what it depends on. This holds for a package-index distribution the stage needs
    too.
 
-Pivot also refuses the stage, with a message naming the module, its file and the distribution,
-when a module the stage reaches has a file that no RECORD in that file's directory of the
-worker's `sys.path` lists, while a distribution in that directory has no RECORD Pivot can read
-and is one Pivot looks at: one installed from git, a local path or a local archive, one it cannot
-classify, one whose requirements it cannot read, or one that requires such a distribution,
-directly or through others, of any install form (a package-index `.egg-info` directory, which
-never has a RECORD, included). Such a distribution owns no file, so Pivot cannot tell whether the
-module is that distribution's. A file's directory is the deepest entry of the worker's
-`sys.path` that holds it: so a setuptools project's own `<name>.egg-info`, in the project root
-first on `sys.path`, refuses nothing for a module in the site-packages of a `.venv` inside that
-root, which is a deeper entry. The files checked are the module's own and, for a package's
-`__init__` file or a namespace package, the files under its directories but bytecode. Pivot walks
-such a directory only when the deepest entry of `sys.path` above it, or an entry at or under it,
-holds such a distribution, and stops once it has found, in each of those entries, a file that no
-RECORD lists; so a file under the directory that is a symbolic link into another entry that holds
-such a distribution is not checked. Each process runs the check once for each module and origin.
-Only for this check does Pivot read every RECORD of a directory.
+Pivot also refuses the stage, with a message naming, after the stage's name, the module, its
+file and the distribution, when a module the stage reaches has a file that no RECORD in that
+file's directory of the worker's `sys.path` lists, while a distribution in that directory has no
+RECORD Pivot can read and is one Pivot looks at: one installed from git, a local path or a local
+archive, one it cannot classify, one whose requirements it cannot read, or one that requires
+such a distribution, directly or through others, of any install form (a package-index
+`.egg-info` directory, which never has a RECORD, included). Such a distribution owns no file, so
+Pivot cannot tell whether the module is that distribution's. A file's directory is the deepest
+entry of the worker's `sys.path` that holds it: so a setuptools project's own `<name>.egg-info`,
+in the project root first on `sys.path`, refuses nothing for a module in the site-packages of a
+`.venv` inside that root, which is a deeper entry. The files checked are the module's own and,
+for a package's `__init__` file or a namespace package, the files under its directories but
+those under a `__pycache__` directory, which the key leaves out too (a `.pyc` file outside one is
+checked). Pivot walks such a directory only when the deepest entry of `sys.path` above it, or an
+entry at or under it, holds such a distribution, and stops once it has found, in each of those
+entries, a file that no RECORD lists; so a file under the directory that is a symbolic link into
+another entry that holds such a distribution is not checked. Each process runs the check once for
+each module and origin. Only for this check does Pivot read every RECORD of a directory.
 
 `core.unsafe_fingerprinting` (or `PIVOT_UNSAFE_FINGERPRINTING=1`) turns each of these refusals
-into a warning with the same message, and the stage's result is kept out of the run cache, as
-for the other refusals it downgrades; they are reported with the stage's other refusals. A
-distribution no stage needs refuses nothing.
+into a warning with the same message, so the warning names the stage it lets run, and the
+stage's result is kept out of the run cache, as for the other refusals it downgrades; they are
+reported with the stage's other refusals. A distribution no stage needs refuses nothing.
 
 ### Module-Level Instances
 
