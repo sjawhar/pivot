@@ -27,10 +27,19 @@ import subprocess
 import sys
 
 import pytest
+import pytest_mock
 import xxhash
 from tests import installed_dists
 
-from pivot import discovery, exceptions, installed_distributions, project
+from pivot import (
+    discovery,
+    exceptions,
+    fingerprint,
+    import_origin,
+    installed_distributions,
+    loaded_source,
+    project,
+)
 
 _STAGE = "p/make"
 _OUTPUT = pathlib.Path("data/p/make.txt")
@@ -749,6 +758,14 @@ _CRLF_METADATA = (
     b"Metadata-Version: 2.1\r\nName: fix-lib\r\nRequires-Dist: fixdep (>=1.0)\r\n"
     b"\r\nRequires-Dist: in-the-description\r\n"
 )
+# `requires.txt` as setuptools 80 writes it into an `.egg-info` directory for `dependencies =
+# ["fixdep>=1.0", "Other.Name__x", 'legacy; python_version < "3"']` and the extras `cli =
+# ["click"]` and `win = ['pywin32; sys_platform == "win32"']`: a section for a marker, one for each
+# extra, and one for an extra with a marker.
+_SETUPTOOLS_REQUIRES_TXT = (
+    b'fixdep>=1.0\nOther.Name__x\n\n[:python_version < "3"]\nlegacy\n\n[cli]\nclick\n\n[win]\n\n'
+    b'[win:sys_platform == "win32"]\npywin32\n'
+)
 
 # RECORD as uv writes it, with a console script, and as pip writes it: CR LF line ends, and
 # bytecode with no hash.
@@ -853,6 +870,43 @@ def _helper_remove_read_permission(path: pathlib.Path) -> None:
     path.chmod(0)
 
 
+def _helper_egg_info_project(
+    venv: installed_dists.Venv,
+    root: pathlib.Path,
+    name: str,
+    requirement: str,
+    *,
+    without_requires_dist: bool,
+) -> pathlib.Path:
+    """Write at `root/<name>` the setuptools project of distribution `name` (package `name`), which
+    requires `requirement`, and build it, which leaves `<name>.egg-info` beside the package with
+    a PKG-INFO, which names `requirement` in a `Requires-Dist` header, and a `requires.txt`, which
+    names it too. `without_requires_dist`: the header is removed from PKG-INFO, which leaves the
+    requirement in `requires.txt` alone, where `importlib.metadata` reads it then. Returns the
+    project's directory, a source tree to put on the path."""
+    source = installed_dists.write_library(
+        root, name, name, _FIXLIB_ALONE, dependencies=(requirement,)
+    )
+    installed_dists.build_wheel(venv, source, root / f"{name}-wheels")
+    egg_info = source / f"{name}.egg-info"
+    pkg_info = egg_info / "PKG-INFO"
+    if without_requires_dist:
+        lines = pkg_info.read_text().splitlines(keepends=True)
+        pkg_info.write_text(
+            "".join(line for line in lines if not line.startswith("Requires-Dist:"))
+        )
+    headers = importlib.metadata.Distribution.at(egg_info).metadata.get_all("Requires-Dist")
+    requires = importlib.metadata.Distribution.at(egg_info).requires
+    assert (headers, requires) == (
+        None if without_requires_dist else [requirement],
+        [requirement],
+    ), (
+        f"{egg_info} must name {requirement!r} in requires.txt and, unless the header is removed, "
+        + f"in PKG-INFO: headers {headers}, requires {requires}"
+    )
+    return source
+
+
 @pytest.mark.parametrize(
     ("direct_url", "form", "reason"),
     [
@@ -922,6 +976,13 @@ def _helper_remove_read_permission(path: pathlib.Path) -> None:
             _FORM.UNCLASSIFIED,
             "its direct_url.json's url cannot be parsed (Invalid IPv6 URL)",
             id="unparseable-url",
+        ),
+        pytest.param(
+            b"[" * 100_000 + b"]" * 100_000,
+            _FORM.UNCLASSIFIED,
+            "its direct_url.json is nested too deeply to parse (maximum recursion depth exceeded "
+            + "while decoding a JSON array from a unicode string)",
+            id="nested-deeper-than-the-parser-recurses",
         ),
         pytest.param(
             PermissionError(errno.EACCES, "Permission denied", f"{_SITE}/direct_url.json"),
@@ -1003,6 +1064,57 @@ def test_requirement_names_reads_the_leading_name_of_each_requires_dist_header(
     `Metadata-Version` or a `Requires-Dist` header that names nothing gives no names and that
     problem."""
     requirements = installed_distributions.requirement_names(metadata)
+
+    assert requirements == installed_distributions.Requirements(frozenset(names), problem), (
+        requirements
+    )
+
+
+@pytest.mark.parametrize(
+    ("requires", "names", "problem"),
+    [
+        pytest.param(
+            _SETUPTOOLS_REQUIRES_TXT,
+            {"fixdep", "other-name-x", "click", "legacy", "pywin32"},
+            "",
+            id="setuptools-sections",
+        ),
+        pytest.param(
+            b"# pinned by hand\r\n\r\n   fixdep (>=1.0)  \r\n", {"fixdep"}, "", id="comment-crlf"
+        ),
+        pytest.param(b"", set[str](), "", id="empty"),
+        pytest.param(None, set[str](), "", id="no-file"),
+        pytest.param(
+            b"fixdep\n[cli\nclick\n",
+            set[str](),
+            "has a requires.txt line that names no distribution ('[cli')",
+            id="unclosed-section-header",
+        ),
+        pytest.param(
+            b"fixdep\ncaf\xe9\n",
+            set[str](),
+            "has a requires.txt file that is not UTF-8 ('utf-8' codec can't decode byte 0xe9 in "
+            + "position 10: invalid continuation byte)",
+            id="not-utf-8",
+        ),
+        pytest.param(
+            PermissionError(errno.EACCES, "Permission denied", f"{_SITE}/requires.txt"),
+            set[str](),
+            "has a requires.txt file Pivot cannot read ([Errno 13] Permission denied: "
+            + f"'{_SITE}/requires.txt')",
+            id="unreadable",
+        ),
+    ],
+)
+def test_requires_txt_names_reads_the_leading_name_of_each_requirement_line(
+    requires: bytes | OSError | None, names: set[str], problem: str
+) -> None:
+    """Each requirement line of an `.egg-info` directory's `requires.txt` gives its leading name,
+    PEP 503 normalised, those under an `[extra]`, `[:marker]` or `[extra:marker]` section header
+    too, with no extra or marker evaluated; a blank line, a comment and a section header give
+    none, whatever the line ends. No file, or an empty one, requires nothing. A file that cannot
+    be read, is not UTF-8 or has a line that names nothing gives no names and that problem."""
+    requirements = installed_distributions.requires_txt_names(requires)
 
     assert requirements == installed_distributions.Requirements(frozenset(names), problem), (
         requirements
@@ -1796,3 +1908,205 @@ def test_a_refusal_of_a_reached_install_fails_the_fingerprint_through_the_regist
     refusal = _UNCLASSIFIED_REFUSAL.format(site=venv.site_packages.resolve())
     assert str(raised.value) == f"Stage '{_STAGE}': fingerprinting failed: {refusal}", raised.value
     assert "fixlib" not in sys.modules, "fingerprinting must not import the stage's library"
+
+
+def test_a_venv_inside_the_project_root_beside_the_projects_egg_info_gets_its_keys(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The project root, first on the path, is a setuptools project `myproj` that requires
+    `fixdep`; its build left `myproj.egg-info` there, with no RECORD. The venv lies inside the root
+    (`<root>/.venv`), with `Fix_Lib` and its requirement `fixdep` installed from their paths. The
+    reached `fixlib` lies in the venv's site-packages, the deepest entry of the path that holds
+    its file, which holds no distribution without a RECORD: the keys are those of `Fix_Lib` and
+    `fixdep`, and nothing is refused. A module whose file lies outside every entry of the path
+    gives nothing."""
+    root = installed_dists.write_setuptools_project(
+        tmp_path / "project",
+        "myproj",
+        "0.1",
+        packages=["myproj"],
+        files={"myproj/__init__.py": "VALUE = 1\n"},
+        dependencies=["fixdep"],
+    )
+    venv = installed_dists.make_venv(root / ".venv")
+    fixlib, fixdep = _helper_fixlib_and_fixdep(tmp_path / "src")
+    installed_dists.install(venv, str(fixlib), str(fixdep))
+    installed_dists.build_wheel(venv, root, tmp_path / "wheels")
+    requires = importlib.metadata.Distribution.at(root / "myproj.egg-info").requires
+    assert requires == ["fixdep"], f"the project's egg-info must require fixdep: {requires}"
+    site = venv.site_packages
+    origins = {
+        "elsewhere": _helper_origin(tmp_path / "elsewhere.py"),
+        "fixlib": _helper_origin(site / "fixlib" / "__init__.py"),
+    }
+
+    found = installed_distributions.distribution_keys(origins, [str(root), str(site)], _PIVOT_DIRS)
+
+    assert found == installed_distributions.DistributionKeys(
+        {
+            "dist:fix-lib": _helper_value(site, {"fixlib/__init__.py": "fixlib/__init__.py"}),
+            "dist:fixdep": _helper_value(site, {"fixdep/__init__.py": "fixdep/__init__.py"}),
+        },
+        [],
+    ), found
+
+
+@pytest.mark.parametrize(
+    "without_requires_dist",
+    [
+        pytest.param(False, id="requirement-in-pkg-info"),
+        pytest.param(True, id="requirement-in-requires-txt-alone"),
+    ],
+)
+def test_a_reached_module_of_an_index_egg_info_with_no_record_that_requires_a_local_install_is_refused(
+    tmp_path: pathlib.Path, without_requires_dist: bool
+) -> None:
+    """The source tree of `mid`, on the path after the venv's site-packages, holds the package
+    `mid` and the `mid.egg-info` its setuptools build left, with no RECORD and no
+    `direct_url.json` (the package-index form), which requires `fixdep`, installed from its path,
+    in a `Requires-Dist` header of its PKG-INFO, or in its `requires.txt` alone. The stage reaches
+    `mid`, whose file no RECORD lists: `mid` owns no file, so Pivot cannot tell that the stage
+    runs it and depends on `fixdep`, and refuses the stage, naming the module, its file and
+    `mid`."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    src = tmp_path / "src"
+    installed_dists.install_directory(
+        venv, installed_dists.write_library(src, "fixdep", "fixdep", _FIXDEP)
+    )
+    mid = _helper_egg_info_project(
+        venv, src, "mid", "fixdep", without_requires_dist=without_requires_dist
+    )
+    origins = {"mid": _helper_origin(mid / "mid" / "__init__.py")}
+
+    found = installed_distributions.distribution_keys(
+        origins, [str(venv.site_packages), str(mid)], _PIVOT_DIRS
+    )
+
+    tree = mid.resolve()
+    refusal = (
+        f"Module 'mid' ({tree}/mid/__init__.py) lies in {tree}, where distribution 'mid' "
+        f"({tree}/mid.egg-info), installed with no direct_url.json, as from a package index, has "
+        "no RECORD file, and no RECORD file there lists that file. Pivot cannot tell whether the "
+        "stage runs that distribution's code, so the stage could skip a run after it changes. "
+        "Fix: reinstall 'mid'."
+    )
+    assert found == installed_distributions.DistributionKeys({}, [refusal]), found
+
+
+def test_an_egg_info_whose_metadata_names_no_requirement_is_followed_through_its_requires_txt(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The reached `Fix_Lib`, installed from its path, requires `mid`, whose source tree, on the
+    path, holds the `mid.egg-info` its setuptools build left; its PKG-INFO has no `Requires-Dist`
+    header, and its `requires.txt` names `fixdep`, installed from its path. The closure meets
+    `mid` by name and follows its `requires.txt`, as `importlib.metadata` does: the keys are those
+    of `Fix_Lib` and `fixdep`, and nothing is refused."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    src = tmp_path / "src"
+    fixlib = installed_dists.write_library(
+        src, "Fix_Lib", "fixlib", _FIXLIB_ALONE, dependencies=("mid",)
+    )
+    fixdep = installed_dists.write_library(src, "fixdep", "fixdep", _FIXDEP)
+    installed_dists.install(venv, str(fixlib), str(fixdep))
+    mid = _helper_egg_info_project(venv, src, "mid", "fixdep", without_requires_dist=True)
+    site = venv.site_packages
+
+    found = installed_distributions.distribution_keys(
+        {"fixlib": _helper_origin(site / "fixlib" / "__init__.py")},
+        [str(site), str(mid)],
+        _PIVOT_DIRS,
+    )
+
+    assert found == installed_distributions.DistributionKeys(
+        {
+            "dist:fix-lib": _helper_value(site, {"fixlib/__init__.py": "fixlib/__init__.py"}),
+            "dist:fixdep": _helper_value(site, {"fixdep/__init__.py": "fixdep/__init__.py"}),
+        },
+        [],
+    ), found
+
+
+def test_a_record_path_resolves_to_what_realpath_gives(tmp_path: pathlib.Path) -> None:
+    """A RECORD path is resolved by walking only the names below the nearest directory already
+    resolved, and gives what `os.path.realpath` gives, the first time and again from the memo:
+    under a package directory that is a symbolic link, for a file that is a symbolic link, by an
+    absolute target or by a relative one through `..`, a dangling link, a link to itself, a missing
+    directory, a name under a regular file, a `..`, a `.`, a trailing slash, doubled slashes, a
+    console script's `../../../bin` path and the root."""
+    package = tmp_path / "elsewhere" / "fixlib"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    target = tmp_path / "other" / "core.py"
+    target.parent.mkdir()
+    target.write_text("")
+    (package / "core.py").symlink_to(target)
+    (package / "relative.py").symlink_to(pathlib.Path("..", "..", "other", "core.py"))
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "fixlib").symlink_to(package, target_is_directory=True)
+    (site / "plain.py").write_text("")
+    (site / "dangling.py").symlink_to(tmp_path / "missing.py")
+    (site / "loop.py").symlink_to("loop.py")
+    paths = [
+        f"{site}/fixlib/__init__.py",
+        f"{site}/fixlib/core.py",
+        f"{site}/fixlib/relative.py",
+        f"{site}/dangling.py",
+        f"{site}/loop.py",
+        f"{site}/missing/module.py",
+        f"{site}/plain.py/under-a-file",
+        f"{site}/fixlib/../plain.py",
+        f"{site}/./plain.py",
+        f"{site}/fixlib/",
+        f"{site}//fixlib//core.py",
+        f"{site}/../../../bin/fix-lib",
+        "/",
+    ]
+    real_dirs = dict[str, str]()
+
+    first = [installed_distributions._real_path(path, real_dirs) for path in paths]
+    again = [installed_distributions._real_path(path, real_dirs) for path in paths]
+
+    expected = [os.path.realpath(path) for path in paths]
+    assert expected[1:3] == [str(target.resolve())] * 2, f"the links must resolve: {expected}"
+    assert first == expected, f"the first walk must give realpath's paths:\n{first}\n{expected}"
+    assert again == expected, f"the memo must give realpath's paths:\n{again}\n{expected}"
+
+
+def test_no_origin_is_found_when_no_install_on_the_path_can_give_a_key(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: pytest_mock.MockerFixture
+) -> None:
+    """With only `idxlib`, installed as from a package index, on the worker's path,
+    `fingerprint.add_distribution_keys` finds the origin of none of the stage's `byname:`
+    modules, neither of `json`, which this process holds, nor of `fixlib`, which it does not, and
+    adds nothing. With `Fix_Lib` installed from its path there too, it finds the origin of each
+    once and adds `dist:fix-lib`."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    src = tmp_path / "src"
+    wheels = tmp_path / "wheels"
+    installed_dists.build_wheel(
+        venv, installed_dists.write_library(src, "idxlib", "idxlib", _FIXLIB_ALONE), wheels
+    )
+    installed_dists.install_from_wheels(venv, wheels, "idxlib")
+    site = venv.site_packages
+    monkeypatch.setattr(sys, "path", [str(site)])
+    of_module = mocker.spy(import_origin, "of_module")
+    worker_origin = mocker.spy(loaded_source, "worker_origin")
+    stage = {"self:make": "1", "byname:json": "", "byname:fixlib": ""}
+    without_keyed = dict(stage)
+
+    fingerprint.add_distribution_keys(without_keyed)
+    calls_without_keyed = [of_module.call_args_list[:], worker_origin.call_args_list[:]]
+    installed_dists.install_directory(
+        venv, installed_dists.write_library(src, "Fix_Lib", "fixlib", _FIXLIB_ALONE)
+    )
+    installed_distributions.reset()
+    with_keyed = dict(stage)
+    fingerprint.add_distribution_keys(with_keyed)
+
+    assert without_keyed == stage, f"nothing may be added: {without_keyed}"
+    assert calls_without_keyed == [[], []], f"no origin may be found: {calls_without_keyed}"
+    value = _helper_value(site, {"fixlib/__init__.py": "fixlib/__init__.py"})
+    assert with_keyed == {**stage, "dist:fix-lib": value}, with_keyed
+    calls = [of_module.call_args_list, worker_origin.call_args_list]
+    assert calls == [[mocker.call(sys.modules["json"])], [mocker.call("fixlib")]], calls

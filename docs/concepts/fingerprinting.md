@@ -398,6 +398,16 @@ while Pivot runs is not seen by that process, so `pivot repro --watch`, with
 or without `--serve`, sees it when Pivot starts again. The next process reads
 the new files, and a stage whose library changed reruns once.
 
+Pivot hashes such a library's files as they are on each machine, so three cases
+give a key that differs from machine to machine or from commit to commit. A
+library with compiled extensions has files whose names carry the platform and
+whose bytes differ by platform and build, so its key differs between machines.
+A library whose build writes a version file that holds the commit
+(setuptools-scm, hatch-vcs) gets a new key at every commit, so every stage that
+uses it reruns at every commit. A library installed from git on one machine and
+from a package index on another gets a key on the first and none on the second,
+so each machine reads the other's lock as stale.
+
 A user module whose source Pivot cannot read (a sourceless `.pyc`, or a module
 from a loader that gives no source) is never trusted: Pivot cannot tell which
 code a worker holds. A stage that uses it warns once per run ("uses user
@@ -607,7 +617,9 @@ Results are cached at two levels:
 
 The `dist:` keys are not cached in StateDB: Pivot reads the installed files of
 each library installed from git or a local path once per process, when a stage
-first reaches it.
+first reaches it. When no library on the workers' `sys.path` is installed that
+way, and none has a `direct_url.json` Pivot cannot classify, Pivot does not look
+up where a stage's library modules come from at all.
 
 When a manifest is rebuilt, tracked globals and closure cells are read from
 their live bindings again, not from the values an earlier walk captured.

@@ -1021,7 +1021,7 @@ def _read_step(owner: Any, step: str) -> Any:
                 settings = _lru_cache_settings(attributes.get("cache_parameters"))
                 return _UNREAD if settings is None else settings
             case "hc":
-                return _hint_classes(owner)[int(arg)]
+                return _hint_parts(owner).classes[int(arg)]
             case "fc":
                 return _model_field_classes(owner)[int(arg)]
             case "lm":
@@ -1137,8 +1137,9 @@ def _read_token(owner: Any, step: str) -> str:
     the key of each class in it, so a cache hit forms it again and walks no code in it.
     """
     if step == "hints":
-        library = (f"byname:{name}" for name in _hint_library_modules(owner))
-        return "|".join([*(_value_token(cls) for cls in _hint_classes(owner)), *library])
+        parts = _hint_parts(owner)
+        library = (f"byname:{name}" for name in parts.modules)
+        return "|".join([*(_value_token(cls) for cls in parts.classes), *library])
     if step == "schema":
         if not hasattr(owner, "model_json_schema"):
             return "absent"
@@ -1417,8 +1418,7 @@ def _stage_manifest(
         module = _get_module(func)
         if module is not None and not is_user_code(module):
             # Its body is hashed (`self:`), the rest of its module is not: a worker imports it.
-            module_name = getattr(func, "__module__", None)
-            _mark_by_name(_reached_library_module(func, module_name), manifest)
+            _mark_by_name(_reached_library_module(func), manifest)
         return manifest, reads
 
 
@@ -1996,7 +1996,7 @@ def _expand_class(cls: type) -> None:
         step = f"b:{index}"
         _record_read(cls, step)
         if not is_user_code(base):
-            _mark_by_name(_reached_library_module(base, _class_module(base)), entries)
+            _mark_by_name(_reached_library_module(base), entries)
             continue
         with _walking(step):
             _add_callable(base, in_value=True)
@@ -2006,7 +2006,7 @@ def _expand_class(cls: type) -> None:
         step = f"ob:{index}"
         _record_read(cls, step)
         if not is_user_code(base):
-            _mark_by_name(_reached_library_module(base, _class_module(base)), entries)
+            _mark_by_name(_reached_library_module(base), entries)
             continue
         with _walking(step):
             _add_callable(base, in_value=True)
@@ -2385,21 +2385,21 @@ def _mark_by_name(module_name: object, manifest: dict[str, str]) -> None:
         manifest.setdefault(f"byname:{module_name}", "")
 
 
-def _reached_library_module(value: object, module_name: object) -> str | None:
+def _reached_library_module(value: object) -> str | None:
     """The name of the library module whose code a stage reaches through `value`, for its
     `byname:` entry (`_mark_by_name`), at each place where a stage reaches library code that no
     other entry names: a library base class, a library class in a type hint or a class-body
     annotation, a library class, instance, enum member or exception inside a value, a library
     loader class, a stage function that is library code, and a library callable whose `__module__`
-    is not a string. `module_name` is the module the site read from `value` (`_class_module` for a
-    class, `__module__` for a callable). When it is not a string (a class body that sets
-    `__module__` to None), the module named is the library module that binds `value` under its own
-    name (`_library_module`); a value that no loaded library module binds so gives None, and
-    records nothing. None also for builtins and every other standard-library module (its
-    top-level name is in `sys.stdlib_module_names`), and for a loaded module whose file lies in one
-    of pivot's own packages (`_PIVOT_PACKAGE_DIRS`): no installed distribution of the user's comes
-    from either, and a stage's `int` hints and `StageParams` base add no entry. A module that is
-    not loaded has no file to decide by, so its name is kept."""
+    is not a string. The module named is the one `value` declares (`_declared_module`). When that
+    is not a string (a class body that sets `__module__` to None), it is the library module that
+    binds `value` under its own name (`_library_module`); a value that no loaded library module
+    binds so gives None, and records nothing. None also for builtins and every other
+    standard-library module (its top-level name is in `sys.stdlib_module_names`), and for a loaded
+    module whose file lies in one of pivot's own packages (`_PIVOT_PACKAGE_DIRS`): no installed
+    distribution of the user's comes from either, and a stage's `int` hints and `StageParams` base
+    add no entry. A module that is not loaded has no file to decide by, so its name is kept."""
+    module_name = _declared_module(value)
     if not isinstance(module_name, str):
         exporter = _library_module(value)
         module_name = exporter.__name__ if exporter is not None else None
@@ -2453,21 +2453,25 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
 
     A module's origin is the module this process holds, which is the code the walk saw
     (`loaded_source.check_worker_imports` refuses a worker that would import another), else where
-    a worker would import it from, predicted without importing it."""
+    a worker would import it from, predicted without importing it. No origin is found when the
+    manifest has no `byname:` entry, or when no distribution on the worker's path can give a key
+    or a refusal (`installed_distributions.needs_origins`)."""
+    names = [name for key in manifest if (name := _by_name_entry(key)) is not None]
+    if not names:
+        return
+    path = loaded_source.worker_path()
+    pivot_dirs = [str(directory) for directory in _PIVOT_PACKAGE_DIRS]
+    if not installed_distributions.needs_origins(path, pivot_dirs):
+        return
     origins = dict[str, import_origin.Origin | None]()
-    for key in manifest:
-        name = _by_name_entry(key)
-        if name is None:
-            continue
+    for name in names:
         module = sys.modules.get(name)
         origins[name] = (
             import_origin.of_module(module)
             if isinstance(module, types.ModuleType)
             else loaded_source.worker_origin(name)
         )
-    found = installed_distributions.distribution_keys(
-        origins, loaded_source.worker_path(), [str(directory) for directory in _PIVOT_PACKAGE_DIRS]
-    )
+    found = installed_distributions.distribution_keys(origins, path, pivot_dirs)
     for message in found.refusals:
         _report_refusal(message, downgradable=True)
     manifest.update(found.keys)
@@ -2618,7 +2622,7 @@ def _process_class_body_dependencies(cls: type) -> None:
         if not issubclass(type(value), type):
             continue
         if not is_user_code(value):
-            _mark_by_name(_reached_library_module(value, _class_module(value)), entries)
+            _mark_by_name(_reached_library_module(value), entries)
             continue
         with _walking(f"n:{name}"):
             _add_callable(value)
@@ -2630,7 +2634,7 @@ def _process_class_body_dependencies(cls: type) -> None:
         if not issubclass(type(resolved), type):
             continue
         if not is_user_code(resolved):
-            _mark_by_name(_reached_library_module(resolved, _class_module(resolved)), entries)
+            _mark_by_name(_reached_library_module(resolved), entries)
             continue
         with _walking(step):
             _add_callable(resolved)
@@ -2779,7 +2783,7 @@ def _expand_loader_class(loader_type: type[Any], key: str) -> None:
     entries = _entries()
     for klass in _class_mro(loader_type):
         if not is_user_code(klass):
-            _mark_by_name(_reached_library_module(klass, _class_module(klass)), entries)
+            _mark_by_name(_reached_library_module(klass), entries)
 
     # Use each method definition rather than a temporary bound method so the
     # weak AST hash cache retains the entry across loader fingerprint calls.
@@ -3465,22 +3469,31 @@ def _is_library_export(value: Any) -> bool:
     return _library_module(value) is not None
 
 
+def _declared_module(value: Any) -> object:
+    """The module `value` says defines it, its `__module__`: a class's read through `type`'s own
+    descriptor (`_class_module`), so no code of its metaclass runs; another value's looked up
+    (`_attribute_or_none`), None without one."""
+    if issubclass(type(value), type):
+        return _class_module(value)
+    return _attribute_or_none(value, "__module__")
+
+
 def _library_module(value: Any) -> types.ModuleType | None:
     """Return the non-user module that binds `value` under its own `__name__`, if any.
 
-    The module named by `__module__` is checked. An object without one (scipy.special's ufuncs,
-    such as `expit`, or a class whose class body sets `__module__` to None) is looked up in every
-    loaded module; `np.frompyfunc` products stay refused because no module binds their generated
-    names. A class's `__name__` and `__module__` are read through `type`'s own descriptors
-    (`_class_name`, `_class_module`), so no code of its metaclass runs.
+    The module `value` declares (`_declared_module`) is checked. An object without one
+    (scipy.special's ufuncs, such as `expit`, or a class whose class body sets `__module__` to
+    None) is looked up in every loaded module; `np.frompyfunc` products stay refused because no
+    module binds their generated names. A class's `__name__` is read through `type`'s own
+    descriptor (`_class_name`), so no code of its metaclass runs.
     """
     if issubclass(type(value), type):
-        name, module_name = _class_name(value), _class_module(value)
+        name = _class_name(value)
     else:
         name = _attribute_or_none(value, "__name__")
-        module_name = getattr(value, "__module__", None)
     if not isinstance(name, str):
         return None
+    module_name = _declared_module(value)
     candidates: list[types.ModuleType | None]
     if isinstance(module_name, str):
         candidates = [sys.modules.get(module_name)]
@@ -3633,7 +3646,7 @@ def _process_captured_value(
             else:
                 # No `__module__` names where it is defined (scipy.special's ufuncs): the library
                 # module that binds it under its own name is the one a worker imports.
-                _mark_by_name(_reached_library_module(value, module_name), entries)
+                _mark_by_name(_reached_library_module(value), entries)
         case _ValueKind.LOGGER:
             return
         case _ValueKind.HOOKED:
@@ -3950,29 +3963,25 @@ def _resolved_type_hints(func: Callable[..., Any]) -> dict[str, Any]:
     return hints
 
 
-def _hint_classes(func: Callable[..., Any]) -> list[type]:
-    """Return each user class in `func`'s type hints, including the origin of a generic
-    (`MyContainer[int]`): the first part of `_hint_parts`."""
-    return _hint_parts(func)[0]
+class _HintParts(typing.NamedTuple):
+    """What a function's type hints name (`_hint_parts`)."""
+
+    # Each user class in them, the origin of a generic (`MyContainer[int]`) included.
+    classes: list[type]
+    # The module of each library class in them that the walk records by name.
+    modules: list[str]
 
 
-def _hint_library_modules(func: Callable[..., Any]) -> list[str]:
-    """The module of each library class in `func`'s type hints that the walk records by name: the
-    second part of `_hint_parts`."""
-    return _hint_parts(func)[1]
-
-
-def _hint_parts(func: Callable[..., Any]) -> tuple[list[type], list[str]]:
+def _hint_parts(func: Callable[..., Any]) -> _HintParts:
     """The user classes in `func`'s type hints and the modules of the library classes in them that
     the walk records by name (`_collect_hint_classes`). Within one `fingerprint_pass()` each
     function's hints are collected once."""
 
-    def collect() -> tuple[list[type], list[str]]:
-        found = list[type]()
-        modules = list[str]()
+    def collect() -> _HintParts:
+        parts = _HintParts(classes=[], modules=[])
         for hint in _resolved_type_hints(func).values():
-            _collect_hint_classes(hint, found, modules)
-        return found, modules
+            _collect_hint_classes(hint, parts.classes, parts.modules)
+        return parts
 
     return _memoized("hints", func, collect)
 
@@ -4001,20 +4010,21 @@ def _collect_hint_class(cls: type[Any], found: list[type], modules: list[str]) -
     `modules` when the walk records it (`_collect_hint_classes`)."""
     if is_user_code(cls):
         found.append(cls)
-    elif (name := _reached_library_module(cls, _class_module(cls))) is not None:
+    elif (name := _reached_library_module(cls)) is not None:
         modules.append(name)
 
 
 def _process_type_hint_dependencies(func: Callable[..., Any]) -> None:
     """Add an edge to each user class in `func`'s type hints (`hc:INDEX`), and record by name the
-    module of each library class in them (`_hint_library_modules`); a pydantic model's schema and
-    field defaults are its class node's (`_process_model_schema`)."""
+    module of each library class in them (`_hint_parts`); a pydantic model's schema and field
+    defaults are its class node's (`_process_model_schema`)."""
     _record_read(func, "hints")
-    for index, hint_class in enumerate(_hint_classes(func)):
+    parts = _hint_parts(func)
+    for index, hint_class in enumerate(parts.classes):
         with _walking(f"hc:{index}"):
             _add_callable(hint_class)
     entries = _entries()
-    for module_name in _hint_library_modules(func):
+    for module_name in parts.modules:
         _mark_by_name(module_name, entries)
 
 
@@ -4422,27 +4432,26 @@ class _FormBuilder:
         return None
 
     def external(self, value: Any) -> Any:
-        """A library callable, by where it is defined (`_library_name`); its module is reported,
-        for the worker imports it by name: its `__module__` when that is loaded, else, when it is
-        not a string, the library module that binds it (`reached_module`)."""
+        """A library callable, by where it is defined (`_library_name`), its module reported
+        (`callable_module`)."""
+        self.callable_module(value)
+        return ["external", _library_name(value)]
+
+    def callable_module(self, value: Any) -> None:
+        """Report the module of library callable `value`, for the worker imports it by name: its
+        `__module__` when that names a loaded module, else, when it is not a string, the library
+        module that binds it (`reached_module`)."""
         module = _attribute_or_none(value, "__module__")
         if type(module) is str:
             if isinstance(sys.modules.get(module), types.ModuleType):
                 self.report(_ReportKind.EXTERNAL, module)
         else:
-            self.reached_module(value, module)
-        return ["external", _library_name(value)]
+            self.reached_module(value)
 
-    def library_class(self, cls: type[Any], *steps: str) -> None:
-        """Report the module of library class `cls`, at `steps`, when the walk records it by name
-        (`reached_module`): a worker imports it to run the class's code."""
-        self.reached_module(cls, _class_module(cls), *steps)
-
-    def reached_module(self, value: Any, module_name: object, *steps: str) -> None:
-        """Report, at `steps`, the library module whose code `value` runs, `module_name` being the
-        module read from `value`, when the walk records it by name (`_reached_library_module`): a
-        worker imports it by name."""
-        if (name := _reached_library_module(value, module_name)) is not None:
+    def reached_module(self, value: Any, *steps: str) -> None:
+        """Report, at `steps`, the library module whose code `value` runs, when the walk records
+        it by name (`_reached_library_module`): a worker imports it by name."""
+        if (name := _reached_library_module(value)) is not None:
             self.report(_ReportKind.EXTERNAL, name, *steps)
 
     def opaque(self, value: Any) -> Any:
@@ -4513,13 +4522,13 @@ class _FormBuilder:
         """A class: a user class by its key (`label`), reported for its class node, or, when its
         metaclass answers attribute reads with user code, `hooked`; a library class by
         `type.__repr__`, which runs no metaclass code (main's text), its module reported
-        (`library_class`)."""
+        (`reached_module`)."""
         if is_user_code(cls):
             if _attribute_hook(cls) is not None:
                 return self.hooked(cls)
             self.report(_ReportKind.CLASS, cls)
             return ["class", self.label(cls)]
-        self.library_class(cls)
+        self.reached_module(cls)
         return [_class_name(type(cls)), type.__repr__(cls)]
 
     def module(self, module: Any) -> Any:
@@ -4546,18 +4555,11 @@ class _FormBuilder:
 
     def function(self, func: Any) -> Any:
         """A Python function: main's `["function", function_identity]`, reported for its function
-        node (a user function) or its module (a library one: its `__module__` when that is
-        loaded, else, when it is not a string, the library module that binds it,
-        `reached_module`)."""
+        node (a user function) or its module (a library one, `callable_module`)."""
         if is_user_code(func):
             self.report(_ReportKind.FUNCTION, func)
         else:
-            module = getattr(func, "__module__", None)
-            if type(module) is str:
-                if isinstance(sys.modules.get(module), types.ModuleType):
-                    self.report(_ReportKind.EXTERNAL, module)
-            else:
-                self.reached_module(func, module)
+            self.callable_module(func)
         return ["function", self.identity(func)]
 
     def identity(self, func: Any) -> FunctionIdentity:
@@ -4821,7 +4823,7 @@ class _FormBuilder:
             if type(module) is str:
                 self.report(_ReportKind.EXTERNAL, module)
             else:
-                self.reached_module(value, module)
+                self.reached_module(value)
             return ["external", _library_name(value)]
         self.report(_ReportKind.FUNCTION, value)
         attributes = _instance_dict(_type_of(value), value) or {}
@@ -4940,7 +4942,7 @@ class _FormBuilder:
     def state(self, tag: str, value: Any, value_type: type[Any], *, user: bool) -> Any:
         """An instance by its state (`field_rows`): a user class by its key, reported for its class
         node at `cls`; a library class by its definition name, its module reported at `cls`
-        (`library_class`). Opaque when its layout holds state no descriptor shows (`_layout`)."""
+        (`reached_module`). Opaque when its layout holds state no descriptor shows (`_layout`)."""
         layout = self.layout(value_type)
         if not layout.readable:
             return self.opaque(value)
@@ -4953,7 +4955,7 @@ class _FormBuilder:
         if fields is None:
             return self.opaque(value)
         if not user:
-            self.library_class(value_type, "cls")
+            self.reached_module(value_type, "cls")
             return [tag, _definition_ref(value_type), fields]
         self.report(_ReportKind.CLASS, value_type, "cls")
         return [tag, self.label(value_type), fields]
@@ -5029,7 +5031,7 @@ class _FormBuilder:
         if user:
             self.report(_ReportKind.CLASS, value_type, "cls")
         else:
-            self.library_class(value_type, "cls")
+            self.reached_module(value_type, "cls")
         state = dict[str, Any]()
         state["args"] = yield ("ea", _exception_args(value))
         found = _exception_fields(value_type, value)
@@ -5047,7 +5049,7 @@ class _FormBuilder:
 
     def enum_member(self, value: Any, value_type: type[Any]) -> Any:
         """An Enum member: its class (a user Enum's by its key, reported for its class node; a
-        library Enum's by its definition name, its module reported: `library_class`), its name and
+        library Enum's by its definition name, its module reported: `reached_module`), its name and
         its value's form (`ev`). A value is not in a class statement's syntax tree (`PICK =
         settings.VALUE`), so it is formed."""
         attributes = _instance_dict(value_type, value) or {}
@@ -5056,7 +5058,7 @@ class _FormBuilder:
             self.report(_ReportKind.CLASS, value_type, "cls")
             label = self.label(value_type)
         else:
-            self.library_class(value_type, "cls")
+            self.reached_module(value_type, "cls")
             label = _definition_ref(value_type)
         head = ["enum", label, name if type(name) is str else None]
         return self.part_rows(head, ("ev", attributes.get("_value_")))

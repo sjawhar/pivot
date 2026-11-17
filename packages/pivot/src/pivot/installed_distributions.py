@@ -12,16 +12,25 @@ own get no key.
 
 A leaf: it imports nothing of pivot's at run time, so `fingerprint` imports it and no import cycle
 forms. It takes plain data (the reached modules' origins, the worker's `sys.path`, pivot's package
-directories) and returns plain data (the keys and the refusal messages). Each decision but the one
-that lists a package's files on disk (`_unlisted_files`) is a public function of plain data.
+directories) and returns plain data (the keys and the refusal messages). Each decision on what a
+distribution's files say (`classify`, `requirement_names`, `requires_txt_names`, `record_paths`,
+`hashed_files`, `content_digest`, `key_value`, `candidates`, `reach`, `owners`, `decide`) is a
+public function of plain data. What reads the disk is private: the scan of the path, the index of
+the candidates, the digest of a keyed distribution's files, and the refusal of a reached file that
+no RECORD lists, which reads the RECORDs of a site directory and the files under a package
+(`_Snapshot`).
 
 What it reads, once per process for one worker path, so a reinstall while Pivot runs is seen at the
 next start: the metadata directories on the path and each `direct_url.json`; only when one of them
 is installed from version control, a local directory or a local archive, or cannot be classified,
-the `Requires-Dist` headers of every distribution; RECORD only for the candidates (those
-distributions and every distribution that requires one, directly or through others), and every
-RECORD of a site directory where a candidate has none; and the files of a keyed distribution only
-when a stage reaches it.
+the requirements of every distribution (its `Requires-Dist` headers, and an `.egg-info`
+directory's `requires.txt` when its metadata has none); RECORD only for the candidates (those
+distributions, each distribution whose requirements cannot be read, and every distribution that
+requires one of them, directly or through others); every RECORD of a site directory only when a
+candidate there has no RECORD and a stage reaches a file whose site directory it is (the deepest
+entry of the path that holds the file); and the files of a keyed distribution only when a stage
+reaches it. Each path a RECORD lists is resolved with one `os.path.islink` for each name below
+the nearest directory already resolved (`_real_path`).
 """
 
 from __future__ import annotations
@@ -31,6 +40,7 @@ import dataclasses
 import email.parser
 import email.policy
 import enum
+import itertools
 import json
 import os
 import posixpath
@@ -43,12 +53,12 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 import xxhash
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
+    from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 
     from pivot import import_origin
 
 # The prefix of every key this module makes.
-KEY_PREFIX = "dist:"
+_KEY_PREFIX = "dist:"
 
 # How much of a file is read at a time to hash it.
 _CHUNK_SIZE = 1024 * 1024
@@ -78,7 +88,11 @@ class InstallForm(enum.Enum):
 
 
 # The forms whose distributions get a key.
-KEYED_FORMS = frozenset({InstallForm.VCS, InstallForm.LOCAL_DIRECTORY, InstallForm.LOCAL_ARCHIVE})
+_KEYED_FORMS = frozenset({InstallForm.VCS, InstallForm.LOCAL_DIRECTORY, InstallForm.LOCAL_ARCHIVE})
+
+# The forms that make a distribution a candidate by itself: the keyed forms, and the unclassified
+# form, which may be one of them.
+_SEED_FORMS = _KEYED_FORMS | {InstallForm.UNCLASSIFIED}
 
 # The `direct_url.json` fields that name a form; PEP 610 requires exactly one.
 _FORM_FIELDS = ("vcs_info", "dir_info", "archive_info")
@@ -92,8 +106,8 @@ class Classification(NamedTuple):
 
 
 class Requirements(NamedTuple):
-    """The PEP 503 names a distribution's `Requires-Dist` headers name, and why they cannot be read
-    (empty when they were read)."""
+    """The PEP 503 names a distribution's requirements name, and why they cannot be read (empty
+    when they were read)."""
 
     names: frozenset[str]
     problem: str
@@ -132,7 +146,7 @@ class Installed:
     classification: Classification
 
 
-def normalize(name: str) -> str:
+def _normalize(name: str) -> str:
     """`name` normalised as PEP 503 says: lower case, each run of `-`, `_` and `.` made one `-`."""
     return re.sub(r"[-_.]+", "-", name).lower()
 
@@ -144,8 +158,9 @@ def classify(direct_url: bytes | OSError | None) -> Classification:
     `vcs_info`, `dir_info` whose `editable` is not `true`, and `archive_info` whose `url` has the
     scheme `file` get a key. No `direct_url.json` (an index or a `--find-links` install),
     `dir_info` with `editable` true and `archive_info` with another scheme get none. A file that
-    cannot be read, is not a JSON object, or names none or more than one of the three forms is
-    unclassified: a stage that reaches it is refused (`decide`)."""
+    cannot be read, is not JSON, is nested deeper than the JSON parser recurses, is not a JSON
+    object, or names none or more than one of the three forms is unclassified: a stage that
+    reaches it is refused (`decide`)."""
     if direct_url is None:
         return Classification(InstallForm.INDEX, "")
     if isinstance(direct_url, OSError):
@@ -154,6 +169,8 @@ def classify(direct_url: bytes | OSError | None) -> Classification:
         data: object = json.loads(direct_url)
     except ValueError as exc:  # also a UnicodeDecodeError
         return _unclassified(f"its direct_url.json is not JSON ({exc})")
+    except RecursionError as exc:  # `[[[...`, nested deeper than the parser's recursion limit
+        return _unclassified(f"its direct_url.json is nested too deeply to parse ({exc})")
     if not isinstance(data, dict):
         return _unclassified("its direct_url.json is not a JSON object")
     fields = cast("dict[str, object]", data)
@@ -198,7 +215,8 @@ def requirement_names(metadata: bytes | OSError | None) -> Requirements:
     cannot be read, whose headers `email` reads with a defect (a line that is not a header ends
     them early), that has no `Metadata-Version` header (not metadata), or that has a
     `Requires-Dist` header that does not start with a name gives no names and a problem: Pivot
-    cannot tell what the distribution depends on."""
+    cannot tell what the distribution depends on. So no names and no problem means the file has
+    no `Requires-Dist` header."""
     if metadata is None:
         return Requirements(frozenset(), "has no METADATA file")
     if isinstance(metadata, OSError):
@@ -223,7 +241,41 @@ def requirement_names(metadata: bytes | OSError | None) -> Requirements:
             return Requirements(
                 frozenset(), f"has a Requires-Dist header that names no distribution ({value!r})"
             )
-        names.add(normalize(match.group()))
+        names.add(_normalize(match.group()))
+    return Requirements(frozenset(names), "")
+
+
+def requires_txt_names(requires: bytes | OSError | None) -> Requirements:
+    """The PEP 503 names that the requirement lines of an `.egg-info` directory's `requires.txt`
+    start with, which `importlib.metadata` reads when the directory's metadata has no
+    `Requires-Dist` header: its bytes, None when the directory has none, or the error that
+    reading it raised.
+
+    Every line is a requirement but a blank one, a comment (`#`) and a section header (`[extra]`,
+    `[:marker]`, `[extra:marker]`), as `importlib.metadata` reads the file; the lines under a
+    section header are requirements too. As for `Requires-Dist`, only each requirement's leading
+    PEP 508 name is read: no extra or marker is evaluated. No file gives no names and no problem:
+    the distribution requires nothing. A file that cannot be read, is not UTF-8, or has a
+    requirement line that does not start with a name gives no names and a problem."""
+    if requires is None:
+        return Requirements(frozenset(), "")
+    if isinstance(requires, OSError):
+        return Requirements(frozenset(), f"has a requires.txt file Pivot cannot read ({requires})")
+    try:
+        text = requires.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return Requirements(frozenset(), f"has a requires.txt file that is not UTF-8 ({exc})")
+    names = set[str]()
+    for line in text.splitlines():
+        value = line.strip()
+        if not value or value.startswith("#") or (value.startswith("[") and value.endswith("]")):
+            continue
+        match = _REQUIREMENT_NAME.match(value)
+        if match is None:
+            return Requirements(
+                frozenset(), f"has a requires.txt line that names no distribution ({value!r})"
+            )
+        names.add(_normalize(match.group()))
     return Requirements(frozenset(names), "")
 
 
@@ -327,28 +379,32 @@ def owners(
     file_owners: Mapping[str, Collection[str]],
     directory_owners: Mapping[str, Collection[str]],
 ) -> set[str]:
-    """The candidates a reached module's origin maps to, by file, never by name.
+    """The candidates a reached module's origin maps to, by file, never by name: every candidate
+    whose RECORD lists one of the files the origin covers, and every candidate with a file under
+    one of the directories it covers (`_reached_paths`). `file_owners` maps each resolved file a
+    candidate's RECORD lists to those candidates, and `directory_owners` each directory above
+    such a file."""
+    files, directories = _reached_paths(origin)
+    found = set[str]()
+    for file in files:
+        found.update(file_owners.get(file, ()))
+    for directory in directories:
+        found.update(directory_owners.get(directory, ()))
+    return found
 
-    `file_owners` maps each resolved file a candidate's RECORD lists to those candidates, and
-    `directory_owners` each directory above such a file. A `("file", path)` origin maps to every
-    candidate whose RECORD lists the file, and, for a package's `__init__` file, every candidate
-    with a file under the package's directory (the walk records only the top name of `import a.b`).
-    A `("namespace", *directories)` origin maps to every candidate with a file under one of them.
-    Any other origin (built-in, frozen, no file, unknown, None) maps to none."""
+
+def _reached_paths(origin: import_origin.Origin | None) -> tuple[list[str], list[str]]:
+    """The files and the directories a reached module's origin covers. A `("file", path)` origin
+    covers its file, and, for a package's `__init__` file, the package's directory too (the walk
+    records only the top name of `import a.b`). A `("namespace", *directories)` origin covers its
+    directories. Any other origin (built-in, frozen, no file, unknown, None) covers nothing."""
     match origin:
         case ("file", path):
-            found = set(file_owners.get(path, ()))
-            if _is_package_init(path):
-                found.update(directory_owners.get(os.path.dirname(path), ()))
-            return found
+            return [path], [os.path.dirname(path)] if _is_package_init(path) else []
         case ("namespace", *directories):
-            return {
-                distribution
-                for directory in directories
-                for distribution in directory_owners.get(directory, ())
-            }
+            return [], directories
         case _:
-            return set()
+            return [], []
 
 
 def decide(
@@ -370,10 +426,10 @@ def decide(
     if pivot_own:
         return Decision(keyed=False, refusal="")
     form = installed.classification.form
-    keyed = form in KEYED_FORMS and record.paths is not None
+    keyed = form in _KEYED_FORMS and record.paths is not None
     if form is InstallForm.UNCLASSIFIED:
         reason = f"is installed {form.value}: {installed.classification.reason}"
-    elif form in KEYED_FORMS and record.paths is None:
+    elif form in _KEYED_FORMS and record.paths is None:
         reason = f"is installed {form.value} and {record.problem}, so Pivot cannot read its files"
     elif requirements.problem:
         reason = f"{requirements.problem}, so Pivot cannot tell what it depends on"
@@ -401,6 +457,17 @@ def _unlisted_refusal(module: str, file: str, installed: Installed, record: Reco
     )
 
 
+def needs_origins(path: Sequence[str], pivot_dirs: Collection[str]) -> bool:
+    """Whether a stage's modules can give a key or a refusal with `path` as the worker's
+    `sys.path` and `pivot_dirs` as pivot's own resolved package directories: False when no
+    distribution on the path is installed from version control, a local directory or a local
+    archive, or unclassified, so the caller need not find its modules' origins. Reads the
+    distributions as `distribution_keys` does, once per process for one `path` and
+    `pivot_dirs`."""
+    with _lock:
+        return _snapshot_of(path, pivot_dirs).index is not None
+
+
 def distribution_keys(
     origins: Mapping[str, import_origin.Origin | None],
     path: Sequence[str],
@@ -411,16 +478,12 @@ def distribution_keys(
     own resolved package directories, and the messages of the stage's refusals.
 
     No module, no read. The installed distributions are read once per process for one `path` and
-    `pivot_dirs` (`reset` forgets them), under a lock, since stages are fingerprinted in anyio
-    worker threads."""
-    global _snapshot
+    `pivot_dirs` (`reset` forgets them), under a lock, since two threads of one process can
+    fingerprint stages at once."""
     if not origins:
         return DistributionKeys({}, [])
-    key = (tuple(path), frozenset(pivot_dirs))
     with _lock:
-        if _snapshot is None or _snapshot.key != key:
-            _snapshot = _Snapshot(key)
-        return _snapshot.keys_for(origins)
+        return _snapshot_of(path, pivot_dirs).keys_for(origins)
 
 
 def reset() -> None:
@@ -428,6 +491,16 @@ def reset() -> None:
     global _snapshot
     with _lock:
         _snapshot = None
+
+
+def _snapshot_of(path: Sequence[str], pivot_dirs: Collection[str]) -> _Snapshot:
+    """The snapshot of `path` and `pivot_dirs`: the last one, when it read them, else a new one.
+    The caller holds `_lock`."""
+    global _snapshot
+    path_key, dirs_key = tuple(path), frozenset(pivot_dirs)
+    if _snapshot is None or (_snapshot.path, _snapshot.pivot_dirs) != (path_key, dirs_key):
+        _snapshot = _Snapshot(path_key, dirs_key)
+    return _snapshot
 
 
 @dataclasses.dataclass(frozen=True)
@@ -441,24 +514,39 @@ class _Index:
     pivot_own: frozenset[str]  # the candidates with a RECORD file in one of pivot's directories
     file_owners: Mapping[str, frozenset[str]]
     directory_owners: Mapping[str, frozenset[str]]
-    recordless: Mapping[str, tuple[str, ...]]  # each site directory's candidates with no RECORD
+    # Each site directory's candidates with no RECORD, which own no file.
+    recordless: Mapping[str, tuple[str, ...]]
+
+
+class _Scan(NamedTuple):
+    """What a scan of the worker's path found."""
+
+    installed: tuple[Installed, ...]  # every distribution, in the order found
+    site_dirs: frozenset[str]  # each entry of the path that could be listed, resolved
 
 
 class _Snapshot:
-    """What one process read of the distributions on one worker path, each part when first
-    needed."""
+    """What one process read of the distributions on one worker path: the distributions and the
+    index of the candidates when it is made, and, each when first needed, the files a site
+    directory's RECORDs list and the digest of a keyed distribution's files."""
 
-    def __init__(self, key: tuple[tuple[str, ...], frozenset[str]]) -> None:
-        self.key: tuple[tuple[str, ...], frozenset[str]] = key  # the worker path, pivot's dirs
-        self._installed: tuple[Installed, ...] = _scan(key[0])
-        self._index: _Index | None = None
-        self._indexed: bool = False
+    def __init__(self, path: tuple[str, ...], pivot_dirs: frozenset[str]) -> None:
+        self.path: tuple[str, ...] = path  # the worker's `sys.path`
+        self.pivot_dirs: frozenset[str] = pivot_dirs  # pivot's own package directories
+        scan = _scan(path)
+        self._installed: tuple[Installed, ...] = scan.installed
+        self._site_dirs: frozenset[str] = scan.site_dirs
+        # Each directory's real path (`_real_path`); a site directory is resolved already.
+        self._real_dirs: dict[str, str] = {site_dir: site_dir for site_dir in scan.site_dirs}
+        # None when no distribution on the path is of a seed form: then no stage gets a key or a
+        # refusal, and no requirement or RECORD is read.
+        self.index: _Index | None = _build_index(scan.installed, pivot_dirs, self._real_dirs)
         # Site directory -> every resolved file that a RECORD of a distribution there lists.
         self._listed: dict[str, frozenset[str]] = {}
         self._digests: dict[str, str] = {}  # `dist_info` -> its `content_digest`
 
     def keys_for(self, origins: Mapping[str, import_origin.Origin | None]) -> DistributionKeys:
-        index = self._get_index()
+        index = self.index
         if index is None:
             return DistributionKeys({}, [])
         refusals = set[str]()
@@ -482,14 +570,8 @@ class _Snapshot:
                 refusals.add(decision.refusal)
             if decision.keyed:
                 digests.setdefault(installed.name, []).append(self._digest(installed, index))
-        keys = {f"{KEY_PREFIX}{name}": key_value(digests[name]) for name in sorted(digests)}
+        keys = {f"{_KEY_PREFIX}{name}": key_value(digests[name]) for name in sorted(digests)}
         return DistributionKeys(keys, sorted(refusals))
-
-    def _get_index(self) -> _Index | None:
-        if not self._indexed:
-            self._index = _build_index(self._installed, self.key[1])
-            self._indexed = True
-        return self._index
 
     def _digest(self, installed: Installed, index: _Index) -> str:
         """The `content_digest` of a keyed distribution's files, read from disk once."""
@@ -506,18 +588,36 @@ class _Snapshot:
     def _unlisted(
         self, module: str, origin: import_origin.Origin | None, index: _Index
     ) -> list[str]:
-        """The refusals for a reached module with a file in a site directory where a candidate
-        has no RECORD, while no RECORD there lists the file: its own file, and, for a package's
-        `__init__` file or a namespace package, every file under its directories, since the walk
-        records only the top name of `import a.b` and such a candidate may hold a submodule."""
+        """The refusals for a reached module with a file that no RECORD in its site directory
+        lists, where that directory holds a candidate with no RECORD (`_Index.recordless`), which
+        owns no file, so Pivot cannot tell whether the module is that candidate's: one for each
+        such candidate, naming the first such file of that directory. The files are those the
+        origin covers (`_reached_paths`): the module's own file, and every file under the
+        directory of a package's `__init__` file or of a namespace package, but bytecode, since
+        such a candidate may hold a submodule. A file's site directory is the deepest entry of
+        the path that the scan listed and that holds it (`_site_dir`)."""
+        files, directories = _reached_paths(origin)
+        under = (_files_under(directory, self._real_dirs) for directory in directories)
         refusals = list[str]()
-        for site_dir, file in _unlisted_files(origin, index.recordless, self._listed_in):
+        seen = set[str]()
+        for file in itertools.chain(files, *under):
+            site_dir = self._site_dir(file)
+            if site_dir is None or site_dir not in index.recordless or site_dir in seen:
+                continue
+            if file in self._listed_in(site_dir):
+                continue
+            seen.add(site_dir)
             for distribution in index.recordless[site_dir]:
                 installed = index.installed[distribution]
                 refusals.append(
                     _unlisted_refusal(module, file, installed, index.records[distribution])
                 )
         return refusals
+
+    def _site_dir(self, file: str) -> str | None:
+        """The deepest entry of the path that the scan listed and that holds the resolved `file`,
+        or None when none holds it: the entry an import of the file's module searches."""
+        return next((up for up in _ancestors(file) if up in self._site_dirs), None)
 
     def _listed_in(self, site_dir: str) -> frozenset[str]:
         """Every resolved file that a RECORD of a distribution in `site_dir` lists."""
@@ -526,51 +626,19 @@ class _Snapshot:
             for installed in self._installed:
                 if installed.site_dir == site_dir:
                     paths = _read_record(installed).paths or ()
-                    listed.update(_resolved(installed, paths))
+                    listed.update(_resolved(installed, paths, self._real_dirs))
             self._listed[site_dir] = frozenset(listed)
         return self._listed[site_dir]
 
 
-def _unlisted_files(
-    origin: import_origin.Origin | None,
-    recordless: Collection[str],
-    listed_in: Callable[[str], frozenset[str]],
-) -> Iterator[tuple[str, str]]:
-    """Each `(site directory, file)` where a reached module's file lies in a site directory of
-    `recordless` while no RECORD there lists it (`listed_in`), the first such file for each site
-    directory: the module's own file, and every file under the directory of a package's
-    `__init__` file or of a namespace package (`owners` counts those as reached), but bytecode."""
-    match origin:
-        case ("file", path):
-            files = [path]
-            directories = [os.path.dirname(path)] if _is_package_init(path) else []
-        case ("namespace", *names):
-            files = list[str]()
-            directories = names
-        case _:
-            return
-    seen = set[str]()
-    for top in [*files, *directories]:
-        site_dir = next((up for up in _ancestors(top) if up in recordless), None)
-        if site_dir is None or site_dir in seen:
-            continue
-        listed = listed_in(site_dir)
-        reached = _files_under(top) if top in directories else iter((top,))
-        found = next((file for file in reached if file not in listed), None)
-        if found is not None:
-            seen.add(site_dir)
-            yield site_dir, found
-
-
-def _build_index(installed: Sequence[Installed], pivot_dirs: frozenset[str]) -> _Index | None:
-    """The candidates and their ownership, or None when no distribution on the path is installed
-    from version control, a local directory or a local archive, or unclassified: then no stage
-    gets a key or a refusal, and no requirement or RECORD is read."""
+def _build_index(
+    installed: Sequence[Installed], pivot_dirs: frozenset[str], real_dirs: dict[str, str]
+) -> _Index | None:
+    """The candidates and their ownership, or None when no distribution on the path is of a seed
+    form (`_SEED_FORMS`): then no stage gets a key or a refusal, and no requirement or RECORD is
+    read. Each RECORD path is resolved with `real_dirs` as `_real_path`'s memo."""
     seeds_by_form = [
-        entry.dist_info
-        for entry in installed
-        if entry.classification.form in KEYED_FORMS
-        or entry.classification.form is InstallForm.UNCLASSIFIED
+        entry.dist_info for entry in installed if entry.classification.form in _SEED_FORMS
     ]
     if not seeds_by_form:
         return None
@@ -597,7 +665,7 @@ def _build_index(installed: Sequence[Installed], pivot_dirs: frozenset[str]) -> 
             recordless.setdefault(entry.site_dir, []).append(dist_info)
             continue
         directories = set[str]()
-        for file in _resolved(entry, paths):
+        for file in _resolved(entry, paths, real_dirs):
             file_owners.setdefault(file, set()).add(dist_info)
             directories.update(_ancestors(file))
         for directory in directories:
@@ -620,14 +688,16 @@ def _build_index(installed: Sequence[Installed], pivot_dirs: frozenset[str]) -> 
     )
 
 
-def _scan(path: Sequence[str]) -> tuple[Installed, ...]:
+def _scan(path: Sequence[str]) -> _Scan:
     """Every distribution on `path`, in the order `importlib.metadata` finds them: each
     directory on it in order, and in each its `*.dist-info` and `*.egg-info` directories in
-    listing order, named from the directory's name as `importlib.metadata` names them. An entry
-    that Pivot cannot list as a directory (a zip archive, a missing or unreadable directory, a
-    path with a NUL character) adds none: pip and uv install a distribution into a directory."""
+    listing order, named from the directory's name as `importlib.metadata` names them; and each
+    entry it listed. An entry that Pivot cannot list as a directory (a zip archive, a missing or
+    unreadable directory, a path with a NUL character) adds none: pip and uv install a
+    distribution into a directory."""
     seen = set[str]()
     found = list[Installed]()
+    site_dirs = set[str]()
     for entry in path:
         try:
             with os.scandir(entry or ".") as children:
@@ -635,6 +705,7 @@ def _scan(path: Sequence[str]) -> tuple[Installed, ...]:
         except (OSError, ValueError):  # ValueError: a NUL character in the path
             continue
         site_dir = os.path.realpath(entry or ".")
+        site_dirs.add(site_dir)
         for name in names:
             dist_info = os.path.join(site_dir, name)
             if dist_info in seen:
@@ -642,8 +713,8 @@ def _scan(path: Sequence[str]) -> tuple[Installed, ...]:
             seen.add(dist_info)
             stem = name.lower().rpartition(".")[0].partition("-")[0]
             classification = classify(_read(os.path.join(dist_info, "direct_url.json")))
-            found.append(Installed(dist_info, site_dir, normalize(stem), classification))
-    return tuple(found)
+            found.append(Installed(dist_info, site_dir, _normalize(stem), classification))
+    return _Scan(tuple(found), frozenset(site_dirs))
 
 
 def _is_metadata_directory(child: os.DirEntry[str]) -> bool:
@@ -667,24 +738,63 @@ def _read(path: str) -> bytes | OSError | None:
 
 
 def _read_requirements(installed: Installed) -> Requirements:
-    """A distribution's requirements from its METADATA, or from PKG-INFO when it has no METADATA
-    (an `.egg-info` directory), the file `importlib.metadata` reads as its metadata."""
+    """A distribution's requirements, read as `importlib.metadata` reads them: the `Requires-Dist`
+    headers of its METADATA, or of its PKG-INFO when it has no METADATA (an `.egg-info`
+    directory), and for an `.egg-info` directory whose metadata has none, its `requires.txt`."""
     metadata = _read(os.path.join(installed.dist_info, "METADATA"))
     if metadata is None:
         metadata = _read(os.path.join(installed.dist_info, "PKG-INFO"))
-    return requirement_names(metadata)
+    found = requirement_names(metadata)
+    if found.names or found.problem or not installed.dist_info.lower().endswith(".egg-info"):
+        return found
+    return requires_txt_names(_read(os.path.join(installed.dist_info, "requires.txt")))
 
 
 def _read_record(installed: Installed) -> Record:
     return record_paths(_read(os.path.join(installed.dist_info, "RECORD")))
 
 
-def _resolved(installed: Installed, paths: Iterable[str]) -> Iterator[str]:
-    """Each path a RECORD lists, located in the distribution's site directory and resolved; a path
-    that holds a NUL character, which `os.path.realpath` refuses, names no file and is left out."""
+def _resolved(
+    installed: Installed, paths: Iterable[str], real_dirs: dict[str, str]
+) -> Iterator[str]:
+    """Each path a RECORD lists, located in the distribution's site directory and resolved
+    (`_real_path`, with `real_dirs` as its memo); a path that holds a NUL character, which
+    `os.path.realpath` refuses, names no file and is left out."""
     for path in paths:
         if "\0" not in path:
-            yield os.path.realpath(os.path.join(installed.site_dir, path))
+            yield _real_path(os.path.join(installed.site_dir, path), real_dirs)
+
+
+def _real_path(path: str, real_dirs: dict[str, str]) -> str:
+    """`os.path.realpath(path)`, equal to it for every path, found with one `os.path.islink` for
+    each name below the nearest directory whose real path `real_dirs` holds.
+
+    `realpath` walks a path a name at a time: it joins each name to the real path of the
+    directory above and follows the joined path only when it is a symbolic link. So does this,
+    starting from the real path of the nearest directory above `path` that `real_dirs` holds, or
+    of the nearest whose own name `realpath` reads specially (empty, `.` or `..`), which
+    `realpath` finds; it then memoises in `real_dirs` the real path of each directory it walked
+    through, so a second file of a directory costs one `islink`."""
+    walked = list[tuple[str, str]]()  # (a path, its last name), from `path` up
+    head = path
+    while True:
+        parent, name = os.path.split(head)
+        if name in ("", os.curdir, os.pardir):
+            real = os.path.realpath(head)
+            break
+        walked.append((head, name))
+        if parent in real_dirs:
+            real = real_dirs[parent]
+            break
+        head = parent
+    # `real` is now the real path of the directory that holds the last path walked.
+    for index in range(len(walked) - 1, -1, -1):
+        walked_path, name = walked[index]
+        joined = os.path.join(real, name)
+        real = os.path.realpath(joined) if os.path.islink(joined) else joined
+        if index:  # a directory above `path`
+            real_dirs[walked_path] = real
+    return real
 
 
 def _ancestors(path: str) -> Iterator[str]:
@@ -701,14 +811,15 @@ def _is_package_init(path: str) -> bool:
     return os.path.basename(path).partition(".")[0] == "__init__"
 
 
-def _files_under(directory: str) -> Iterator[str]:
-    """Each file under `directory`, resolved, but bytecode (`.pyc` files, `__pycache__`), as
-    `os.walk` lists them: a subdirectory it cannot list, or a symbolic link to one, adds none."""
+def _files_under(directory: str, real_dirs: dict[str, str]) -> Iterator[str]:
+    """Each file under `directory`, resolved (`_real_path`, with `real_dirs` as its memo), but
+    bytecode (`.pyc` files, `__pycache__`), as `os.walk` lists them: a subdirectory it cannot
+    list, or a symbolic link to one, adds none."""
     for root, directories, files in os.walk(directory):
         directories[:] = [name for name in directories if name != "__pycache__"]
         for name in files:
             if not name.endswith(".pyc"):
-                yield os.path.realpath(os.path.join(root, name))
+                yield _real_path(os.path.join(root, name), real_dirs)
 
 
 def _file_digest(path: str) -> str | None:
@@ -733,7 +844,10 @@ def _file_digest(path: str) -> str | None:
     return hasher.hexdigest()
 
 
-# One process's snapshot of the distributions on the worker's path (`distribution_keys`), which
-# `reset` forgets. Fingerprints run in anyio worker threads, so `_lock` guards it.
+# One process's snapshot of the distributions on the worker's path (`_snapshot_of`), which `reset`
+# forgets. A process fingerprints a stage on the thread that asks for it, and two can ask at once
+# (the comment on `fingerprint._hash_function_ast_cache` lists them: the main thread, anyio worker
+# threads, the engine's event loop, a watch reload's daemon thread, an RPC request's thread), so
+# `_lock` guards it.
 _lock = threading.Lock()
 _snapshot: _Snapshot | None = None

@@ -536,9 +536,11 @@ stage's manifest is whole (the walk or its manifest-cache hit, the call-site wir
 loader's entries) and the worker-import check has run; a `@no_fingerprint` stage gets keys too,
 from its loaders' `byname:` entries. For each `byname:` module it takes the origin of the module
 this process holds (`import_origin.of_module`), or else of the module a worker would import
-(`loaded_source.worker_origin`), found without importing it. The keys join the manifest before
-the lock leaves out the `byname:` entries (`fingerprint.without_by_name`), so the lock records
-them.
+(`loaded_source.worker_origin`), found without importing it; it looks up no origin when no
+distribution on the worker's `sys.path` is installed from git, a local path or a local archive,
+or has a `direct_url.json` Pivot cannot classify (`installed_distributions.needs_origins`). The
+keys join the manifest before the lock leaves out the `byname:` entries
+(`fingerprint.without_by_name`), so the lock records them.
 
 **Which distributions.** `installed_distributions` lists the `*.dist-info` and `*.egg-info`
 directories of each directory on the worker's `sys.path`, in order, as `importlib.metadata`
@@ -547,8 +549,10 @@ module's file belongs to every distribution whose RECORD lists it, compared as r
 package's `__init__` file also to every distribution with a file under the package's directory;
 a namespace package to every distribution with a file under one of its directories; a built-in
 or frozen module, one with no file and one nothing finds, to none. From each owner Pivot follows
-`Requires-Dist` transitively, through package-index distributions too, each name resolving to
-the first installed distribution of that PEP 503 name on the path; a cycle ends. Each
+its requirements transitively, through package-index distributions too: the `Requires-Dist`
+headers of its metadata, or, for an `.egg-info` directory whose metadata has none, the
+requirement lines of its `requires.txt`, as `importlib.metadata` reads them. Each name resolves
+to the first installed distribution of that PEP 503 name on the path; a cycle ends. Each
 distribution met gets the key `dist:<name>` when it has a RECORD and its `direct_url.json` (PEP
 610) has `vcs_info` (any version control system), `dir_info` whose `editable` is not `true`, or
 `archive_info` whose `url` has the scheme `file` (a local wheel or sdist). A distribution with no
@@ -576,11 +580,14 @@ Limits:
 | Limit | What happens |
 |-------|--------------|
 | Files a distribution installs outside the directory that holds its `.dist-info` directory: console scripts, data files, headers, and a platlib directory apart from purelib | Not hashed: RECORD lists them with a path that leaves that directory, and a console script's first line names its own virtual environment. A change to them alone reruns nothing |
-| Markers and extras of `Requires-Dist` | Not evaluated: only each requirement's leading name is read, so a requirement behind a false marker or an extra that names an installed git or local distribution still adds its key. That can rerun a stage when a library it never imports changes; it never hides a change |
+| Markers and extras of a requirement (`Requires-Dist`, or a `requires.txt` line, whose `[extra]` and `[:marker]` section headers are not evaluated either) | Not evaluated: only each requirement's leading name is read, so a requirement behind a false marker or an extra that names an installed git or local distribution still adds its key. That can rerun a stage when a library it never imports changes; it never hides a change |
 | A package or namespace package that a stage reads by its name (`import company.vendor` binds `company`) | Every git or local distribution with a file under its directories gives its key, though the stage may use only one of them |
 | A reinstall while a Pivot process runs | Pivot reads the installed distributions, and each keyed distribution's files, once per process for one worker `sys.path` (again when that path changes), so the running process keeps the values it read: `pivot repro --watch`, with or without `--serve`, sees a reinstall when Pivot starts again. The next process reads the new files, and a stage that reaches a changed one reruns once |
 | An editable install | No key. Its source is user code when it lies outside the interpreter's prefix and outside every `site-packages` or `dist-packages` directory, and the walk hashes it as it hashes the project's code. pip's checkout of a `pip install -e git+…` package, in `<venv>/src`, lies under the interpreter's prefix, so it is library code with no key, recorded by name as a package-index library is: a change to its files is seen only where the walk hashes library code (a stage function it defines, a loader's `load`, `save` and `empty`) |
 | A distribution in a zip archive on `sys.path`, or behind any entry Pivot cannot list as a directory | Not read: it owns no module and gets no key. pip and uv install into a directory |
+| A git or local library with compiled extensions | Its extension modules have platform-tagged names (`*.cpython-313-x86_64-linux-gnu.so`) and bytes that differ by platform, compiler and build, so its `dist:` value differs between machines, and can differ when the same commit is built again: a lock written on one machine reads stale on another |
+| A version file that setuptools-scm or hatch-vcs writes into the installed package | It holds the commit (or a version made from it), so every new commit of the library changes the key, and every stage that reaches the library reruns, whatever else changed |
+| One library installed from git on one machine and from a package index on another | The first machine's lock has a `dist:` key for it and the second's has none, so each machine reads the other's lock as stale (before this key, both had only `byname:` entries, which a lock leaves out) |
 
 Refusals: when Pivot cannot tell which installed code a stage runs, it refuses the stage with a
 message that names the distribution, its `.dist-info` directory, the reason and the fix
@@ -590,28 +597,38 @@ classify, and only at the distributions a stage needs: each one it reaches and e
 require, directly or through others. Pivot's own distribution refuses nothing. Each other is
 refused for the first of these that holds:
 
-1. Its `direct_url.json` cannot be read, is not JSON, is not a JSON object, names none or more
-   than one of `vcs_info`, `dir_info` and `archive_info`, has a `dir_info` that is not a JSON
-   object, has `archive_info` and no `url`, or has a `url` that cannot be parsed: Pivot cannot
-   classify it, so it cannot tell whether to hash its files.
+1. Its `direct_url.json` cannot be read, is not JSON, is nested deeper than Python's JSON parser
+   recurses, is not a JSON object, names none or more than one of `vcs_info`, `dir_info` and
+   `archive_info`, has a `dir_info` that is not a JSON object, has `archive_info` and no `url`, or
+   has a `url` that cannot be parsed: Pivot cannot classify it, so it cannot tell whether to hash
+   its files. Such a file anywhere on the path refuses only the stages that need its
+   distribution.
 2. It is installed from git, a local path or a local archive, and its RECORD is missing, cannot
    be read, is not UTF-8, or has a row Python's `csv` module cannot read (such as a field over
    its size limit): Pivot cannot tell its files. A distribution a stage reaches owns a module
    through its RECORD, so this refuses one that a reached distribution requires.
-3. Its METADATA, or its PKG-INFO where it has no METADATA (an `.egg-info` directory), is
-   missing, cannot be read, is not UTF-8, has headers Python's `email` parser reads with a defect
-   (a line that is not a header ends them early), has no `Metadata-Version` header, or has a
-   `Requires-Dist` header that names no distribution: Pivot cannot tell what it depends on. This
-   holds for a package-index distribution the stage needs too.
+3. Its requirements cannot be read: its METADATA, or its PKG-INFO where it has no METADATA (an
+   `.egg-info` directory), is missing, cannot be read, is not UTF-8, has headers Python's `email`
+   parser reads with a defect (a line that is not a header ends them early), has no
+   `Metadata-Version` header, or has a `Requires-Dist` header that names no distribution; or,
+   for an `.egg-info` directory whose metadata has no `Requires-Dist` header, its `requires.txt`
+   cannot be read, is not UTF-8, or has a line that is not blank, a comment or a section header
+   and names no distribution. Pivot cannot tell what it depends on. This holds for a
+   package-index distribution the stage needs too.
 
 Pivot also refuses the stage, with a message naming the module, its file and the distribution,
-when a module the stage reaches has a file that no RECORD in its directory of the worker's
-`sys.path` lists, while a distribution in that directory has no RECORD Pivot can read and is
-installed from git, a local path or a local archive, cannot be classified, has requirements
-Pivot cannot read, or requires such a distribution, directly or through others. The files
-checked are the module's own and, for a package's `__init__` file or a namespace package, each
-file under its directories but bytecode. Pivot cannot tell whether the module is that
-distribution's. Only for this check does Pivot read every RECORD of a directory.
+when a module the stage reaches has a file that no RECORD in that file's directory of the
+worker's `sys.path` lists, while a distribution in that directory has no RECORD Pivot can read
+and is one Pivot looks at: one installed from git, a local path or a local archive, one it cannot
+classify, one whose requirements it cannot read, or one that requires such a distribution,
+directly or through others, of any install form (a package-index `.egg-info` directory, which
+never has a RECORD, included). Such a distribution owns no file, so Pivot cannot tell whether the
+module is that distribution's. A file's directory is the deepest entry of the worker's
+`sys.path` that holds it: so a setuptools project's own `<name>.egg-info`, in the project root
+first on `sys.path`, refuses nothing for a module in the site-packages of a `.venv` inside that
+root, which is a deeper entry. The files checked are the module's own and, for a package's
+`__init__` file or a namespace package, each file under its directories but bytecode. Only for
+this check does Pivot read every RECORD of a directory.
 
 `core.unsafe_fingerprinting` (or `PIVOT_UNSAFE_FINGERPRINTING=1`) turns each of these refusals
 into a warning with the same message, and the stage's result is kept out of the run cache, as
@@ -718,7 +735,7 @@ Fingerprinting uses several `WeakKeyDictionary` caches to avoid repeated expensi
 
 These caches use weak references, so entries are automatically cleaned up when functions are garbage collected. They have no lock. Stages are fingerprinted in the `pivot` process, never in a worker (each worker process has its own memory), on the thread that asks: `pivot status` and `pivot commit` on their main thread, the engine's skip check and watched startup snapshot in anyio worker threads (`anyio.to_thread.run_sync`), a stage that the skip check did not fingerprint (under `--force`, or with no lock yet) on the engine's event loop when it is sent to a worker (`executor.core.prepare_worker_info`), a watch reload in a daemon thread; each of these asks for one stage at a time. An engine that serves RPC (`pivot repro --tui`, `pivot repro --watch --serve`, `pivot run --tui`) is the exception: it fingerprints for an `explain` request on its event loop (`engine.stage_queries.explain`) and for a `commit` request in a worker thread, waiting only for the startup snapshot and a reload (`Engine.wait_for_fingerprints`), so either can fingerprint while a run's skip check, or the other request, fingerprints on another thread, and the two share these caches.
 
-The `dist:` keys are not in the manifest cache (`sm:`): `registry._compute_fingerprint` adds them after `fingerprint.get_stage_fingerprint_cached` returns, on a hit and a miss alike, because a reinstall to the same path changes no source file, read or by-name origin that a hit re-checks. What they need is read once per process by `installed_distributions`, under a lock, for one worker `sys.path` and one set of pivot's package directories: the metadata directories on the path and each `direct_url.json`; only when one of them is installed from git, a local path or a local archive, or cannot be classified, every distribution's `Requires-Dist` headers; RECORD only for the distributions that can give a key or a refusal (those, each one whose requirements cannot be read, and each one that requires one of them, directly or through others); every RECORD of a directory only for the refusal check of [Libraries Installed from Git or a Local Path](#libraries-installed-from-git-or-a-local-path); and a keyed distribution's files only when a stage first reaches it. A manifest with no `byname:` entry reads nothing.
+The `dist:` keys are not in the manifest cache (`sm:`): `registry._compute_fingerprint` adds them after `fingerprint.get_stage_fingerprint_cached` returns, on a hit and a miss alike, because a reinstall to the same path changes no source file, read or by-name origin that a hit re-checks. What they need is read once per process by `installed_distributions`, under a lock, for one worker `sys.path` and one set of pivot's package directories: the metadata directories on the path and each `direct_url.json`; only when one of them is installed from git, a local path or a local archive, or cannot be classified, every distribution's requirements (its `Requires-Dist` headers, and an `.egg-info` directory's `requires.txt` when its metadata has none); RECORD only for the distributions that can give a key or a refusal (those, each one whose requirements cannot be read, and each one that requires one of them, directly or through others); every RECORD of a directory only for the refusal check of [Libraries Installed from Git or a Local Path](#libraries-installed-from-git-or-a-local-path); and a keyed distribution's files only when a stage first reaches it. Each path a RECORD lists is resolved to the path `os.path.realpath` gives, but with one `os.path.islink` for each name below the nearest directory already resolved, so the second file of a directory costs one `islink` where `realpath` checks every directory above it again. A manifest with no `byname:` entry reads nothing, and on a path with no distribution installed from git, a local path or a local archive, and none Pivot cannot classify, `fingerprint.add_distribution_keys` looks up no module's origin.
 
 ## Manifest Key Prefixes
 
