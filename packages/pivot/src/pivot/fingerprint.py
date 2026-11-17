@@ -201,8 +201,18 @@ _PIVOT_PACKAGE_DIRS = (pathlib.Path(__file__).resolve().parent, *_pivot_tui_dirs
 # Cache for hash_function_ast results using weak references.
 # This avoids repeated AST parsing for the same function during fingerprinting
 # while ensuring stale entries are automatically cleaned up when functions are GC'd.
-# Note: WeakKeyDictionary is not thread-safe. Fingerprinting runs single-threaded
-# per process (multiprocessing uses separate memory spaces), so this is safe.
+# Note: this cache, the caches below and the persistent-cache state after them have no lock.
+# Stages are fingerprinted in the process that runs the pipeline, never in a worker (a worker is
+# a process of its own, with its own memory). There a stage is fingerprinted on the thread that
+# asks for it: `pivot status` and `pivot commit` on their main thread, the engine's skip check
+# and watched startup snapshot in anyio worker threads, a stage the skip check did not
+# fingerprint (`--force`, no lock yet) on the engine's event loop as it is sent to a worker
+# (`executor.core.prepare_worker_info`), a watch reload in a daemon thread. Those ask for one
+# stage at a time. An engine that serves RPC (`pivot repro --tui`, `pivot repro --watch
+# --serve`, `pivot run --tui`) does not: it fingerprints for an `explain` request on its event
+# loop and for a `commit` request in a worker thread, waiting only for the startup snapshot and a
+# reload (`Engine.wait_for_fingerprints`), so either can run while a run's skip check, or the
+# other request, fingerprints on another thread, and both use these caches at once.
 _hash_function_ast_cache: weakref.WeakKeyDictionary[Callable[..., Any], str] = (
     weakref.WeakKeyDictionary()
 )
@@ -223,11 +233,12 @@ _get_type_hints_cache: weakref.WeakKeyDictionary[Callable[..., Any], dict[str, A
 )
 
 
-# Module-level state for persistent AST hash caching.
-# Fingerprinting happens during discovery (single-threaded in coordinator process).
-# Workers (via ProcessPoolExecutor) have their own memory space and don't share this
-# state - any pending writes in workers are lost, which is fine since workers use
-# readonly StateDB and fingerprinting should complete during discovery.
+# Module-level state for persistent AST hash caching, in the process that fingerprints stages,
+# with no lock (the comment on `_hash_function_ast_cache` says when two threads fingerprint at
+# once). Workers (via ProcessPoolExecutor) have their own memory space and don't share this
+# state - any pending writes in workers are lost, which is fine since workers use readonly
+# StateDB and a stage's fingerprint is computed before its worker gets the stage
+# (`executor.core.prepare_worker_info`).
 _state_db: "StateDB | None" = None
 _state_db_init_attempted: bool = False
 # The state directory `_state_db` belongs to: the producing directory of its last lookup.
@@ -500,8 +511,8 @@ def _get_state_db() -> "StateDB | None":
     it was opened for. One that fails to open is not tried again until the directory changes
     or the caches flush (graceful degradation).
 
-    Not thread-safe, but fingerprinting runs single-threaded per process
-    (see comment at line 33). Workers use separate memory spaces.
+    Not thread-safe: nothing guards this state, and two threads of one process can fingerprint at
+    once (see the comment on `_hash_function_ast_cache`). Workers use separate memory spaces.
     """
     global _state_db, _state_db_init_attempted, _state_db_dir
     state_dir = _producing_state_dir()

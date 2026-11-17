@@ -39,8 +39,10 @@ Pivot's fingerprinting system:
 | Closure variables | Yes (value) | `getclosurevars()` nonlocals checked like module-level values, keyed under the binding the closure was reached through, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep their own values |
 | Default arguments | Yes (value) | `__defaults__`/`__kwdefaults__` checked like module-level values; a literal default is covered by the AST hash |
 | `functools.partial` | Yes | Bound args + underlying function; functions and classes in bound args walked like stage helpers |
-| Library functions and classes | Yes (name) | A global, closure cell, default or partial holding `np.mean` records `ext:<binding>` → `numpy.mean`, so rebinding it to `np.median` reruns the stage; library code itself is not hashed |
-| Library modules | Yes (name, not in the lock) | A library module read as a global (`np` in `np.mean(x)`) or imported in a function body, and the module that defines each library callable, is recorded by the walk as `byname:<module>`, which the worker-import check and the manifest cache read. The stage fingerprint a lock records leaves these entries out (`fingerprint.without_by_name`), so locks written before they existed stay current. Its attributes and code are not read |
+| Library functions and classes | Yes (name) | A global, closure cell, default or partial holding `np.mean` records `ext:<binding>` → `numpy.mean`, so rebinding it to `np.median` reruns the stage; the walk does not hash the callable's code (when it comes from a library installed from git, a local path or a local archive, the library's installed files are hashed: see the `dist:` row below) |
+| Library modules | Yes (name, not in the lock) | A library module read as a global (`np` in `np.mean(x)`) or imported in a function body, and the module that defines each library callable, is recorded by the walk as `byname:<module>`, which the worker-import check and the manifest cache read. So is the module of the library code a stage reaches where no other entry names it (`fingerprint._reached_library_module`): a library base class of a user class, a library class in a type hint or a class-body annotation, a library class, instance, enum member or exception inside a value (a partial, a default, a loader's config), each library class on a pivot loader class's MRO, a stage function that is library code, and a library callable whose `__module__` is not a string (recorded as the library module that binds it under its own name). At those places a standard-library module (`builtins` included) and a module in one of pivot's own packages are not recorded. The worker-import check covers these entries too, so a project file that shadows such a module is refused as one that shadows a module read as a global is. The stage fingerprint a lock records leaves these entries out (`fingerprint.without_by_name`), so locks written before they existed stay current. Its attributes and code are not read |
+| Libraries installed from git, a local path or a local archive | Yes (installed files, `dist:<name>`) | Each distribution that owns the module of one of the stage's `byname:` entries (a loader's included) and whose `direct_url.json` (PEP 610) has `vcs_info`, `dir_info` without `editable: true`, or `archive_info` with a `file:` URL (a local wheel or sdist), and each such distribution a reached one requires, directly or through others, gives the stage's manifest a `dist:<name>` key: a hash of the distribution's own installed files, read from disk. The lock records it, so a change to those files reruns the stage, and a reinstall of the same files from another commit, path, installer or virtual environment reruns nothing. See [Libraries Installed from Git or a Local Path](#libraries-installed-from-git-or-a-local-path) |
+| Libraries from a package index or a remote archive; editable installs; pivot | No key | A distribution with no `direct_url.json` (a package-index or `--find-links` install), with `archive_info` and a URL whose scheme is not `file`, or with `dir_info` and `editable: true` gets no `dist:` key, so a version bump of a package-index library reruns what it reran before this key existed: only a change to an entry the walk records for it (an `ext:` definition name, the `self:` hash of a stage function it defines, a loader's `load`, `save` and `empty`). Nor does pivot's own distribution (one with a RECORD file in one of pivot's package directories) get a key, and its requirements are not followed. An editable install whose source lies outside the interpreter's prefix and outside every `site-packages` or `dist-packages` directory is user code, walked like the project's own |
 | Secrets outside a stage's params | Yes (digest) | A `SecretStr`, `SecretBytes` or `Secret[T]` in a `StageParams` default on a helper, a loader config field or a partial argument hashes as its keyed `hmac:` digest, the one the lock file records (`parameters.secret_digest`), so changing it reruns the stage without its value in any manifest |
 | Class attributes a stage reads | Yes (value) | `Cls.NAME` read directly on a user class, through a user module (`settings.Config.SCALE`), or from a user class member through `self.NAME`, `cls.NAME`, `type(self).NAME`, `self.__class__.NAME`, or literal `getattr` follows the module-level rule. The value is the one the class body holds, read from the namespace of the nearest class on the real MRO that holds it, so no descriptor `__get__` and no metaclass code runs. Scalars, exact tuples and frozensets of scalars, and compiled regexes are recorded; mutable or nested values (a dataclass's or a `StageParams` class's `ClassVar` list or dict too) and instances, a descriptor object included, are refused; a plain function is walked; and a member of a user Enum is recorded by name and value. A pydantic or `StageParams` class read directly is covered by its schema hash, field defaults included; its `model_config`, read through `self` by a method, is recorded by its form (`default:<class>.model_config`), since the schema leaves parts of it out (`title`). Attributes a library base or the language defines, and descriptors (property, classmethod, staticmethod), are left to the class Abstract Syntax Tree (AST) hash. |
 | Other class-level and module reads | No | Not tracked: `Outer.Inner.X`, a `ClassVar` on a `StageParams` class read as `Params.NAME` (through `self` it follows the row above), a module read through a local alias (`s = settings; s.SCALE`) or through the object a dynamic import returns (`load("settings").SCALE`), a literal `getattr(settings, "SCALE")`, and a module held in a class attribute (`Holder.lib.SCALE`). Put such configuration in the stage's `StageParams`. |
@@ -247,7 +249,7 @@ a thread native code starts outside `_thread`. Each has a remedy:
 | A package resource read through `importlib.resources` (`files(helpers).joinpath("table.txt")`) | It is data, not code: declare it with `pipeline.input` |
 | A module created without a source file (CPython's `pyexpat.errors`, Cython's `_cython_3_3_0`) | It has no source to fingerprint; a change to it is a change to the library or interpreter that created it |
 | `pivot repro --no-commit`, then `pivot commit` of outputs edited by hand since that run | `pivot commit` records them against the static fingerprint, the "trust me" path. Outputs the run wrote, unchanged since, are recorded with the manifest the run kept in StateDB (`nocommit:<stage>`), its mark included, so the stage still reruns |
-| A result cached by an earlier Pivot version | If its static fingerprint is unchanged, it may be reused, from its lock, which Pivot reads as it is, or from its run-cache entry, which Pivot finds under the key that version filed it under (unmarked, with each directory the stage reads whole hashed from its listing the way that version hashed it: `worker.older_pivot_input_hash`, `listing.legacy_digest`). `_CACHE_SCHEMA_VERSION` keys only the fingerprint caches in state.lmdb, not the lock or run cache. A stage whose static walk reaches a user class method or a user module gains entries in its manifest, so it reruns once as Code changed after the upgrade. That accepted one-time rerun writes the current manifest; later runs reuse it until code or inputs change. Run `pivot repro --force <stage>` once to re-check a stage you know imports dynamically. Upgrading from 0.5.6 or earlier, every stage with outputs reruns once as Code changed, because each output's tag (`out:<key>:tag`) joined the manifest; that run is checked, so it marks a stage that imports dynamically |
+| A result cached by an earlier Pivot version | If its static fingerprint is unchanged, it may be reused, from its lock, which Pivot reads as it is, or from its run-cache entry, which Pivot finds under the key that version filed it under (unmarked, with each directory the stage reads whole hashed from its listing the way that version hashed it: `worker.older_pivot_input_hash`, `listing.legacy_digest`). `_CACHE_SCHEMA_VERSION` keys only the fingerprint caches in state.lmdb, not the lock or run cache. A stage whose static walk reaches a user class method or a user module gains entries in its manifest, so it reruns once as Code changed after the upgrade. That accepted one-time rerun writes the current manifest; later runs reuse it until code or inputs change. Run `pivot repro --force <stage>` once to re-check a stage you know imports dynamically. Upgrading from 0.10.4, a stage that reaches a library installed from git, a local path or a local archive gains that library's `dist:` key, so it reruns once as Code changed, and a stage that reaches none keeps its lock. The same upgrade moves `_CACHE_SCHEMA_VERSION` from 43 to 44, so each stage's manifest is computed once more instead of read from the manifest cache; that reruns nothing, because the `byname:` entries the new version records never reach a lock. Upgrading from 0.5.6 or earlier, every stage with outputs reruns once as Code changed, because each output's tag (`out:<key>:tag`) joined the manifest; that run is checked, so it marks a stage that imports dynamically |
 
 ### Code Edited After Discovery
 
@@ -522,6 +524,100 @@ in the watch or server process, so its edit is loaded when pivot starts again. U
 worker that imports the module after the edit (a fresh worker, or one a reload started) runs the
 edit: the stages that use the module are marked on every run, and rerun, until pivot restarts.
 
+### Libraries Installed from Git or a Local Path
+
+The walk records library code by name (`byname:`, `ext:`) and does not hash it, but for a
+stage function a library defines (`self:`) and a loader's `load`, `save` and `empty`
+(`loader:`). A library installed from git or from a local path can change with no new version,
+so for such a distribution Pivot also hashes the files it installed.
+
+**Where.** `registry._compute_fingerprint` calls `fingerprint.add_distribution_keys` once the
+stage's manifest is whole (the walk or its manifest-cache hit, the call-site wiring and every
+loader's entries) and the worker-import check has run; a `@no_fingerprint` stage gets keys too,
+from its loaders' `byname:` entries. For each `byname:` module it takes the origin of the module
+this process holds (`import_origin.of_module`), or else of the module a worker would import
+(`loaded_source.worker_origin`), found without importing it. The keys join the manifest before
+the lock leaves out the `byname:` entries (`fingerprint.without_by_name`), so the lock records
+them.
+
+**Which distributions.** `installed_distributions` lists the `*.dist-info` and `*.egg-info`
+directories of each directory on the worker's `sys.path`, in order, as `importlib.metadata`
+finds them, and maps each module to the distributions that own it by file, never by name: a
+module's file belongs to every distribution whose RECORD lists it, compared as resolved paths; a
+package's `__init__` file also to every distribution with a file under the package's directory;
+a namespace package to every distribution with a file under one of its directories; a built-in
+or frozen module, one with no file and one nothing finds, to none. From each owner Pivot follows
+`Requires-Dist` transitively, through package-index distributions too, each name resolving to
+the first installed distribution of that PEP 503 name on the path; a cycle ends. Each
+distribution met gets the key `dist:<name>` when it has a RECORD and its `direct_url.json` (PEP
+610) has `vcs_info` (any version control system), `dir_info` whose `editable` is not `true`, or
+`archive_info` whose `url` has the scheme `file` (a local wheel or sdist). A distribution with no
+`direct_url.json` (a package-index or `--find-links` install), with `dir_info` and
+`editable: true` (`pip install -e`, `uv pip install -e`), or with `archive_info` and another URL
+scheme (a remote archive) gets none. Nor does pivot's own distribution (one with a RECORD file in
+one of pivot's package directories, `fingerprint._PIVOT_PACKAGE_DIRS`), whose requirements are
+not followed.
+
+**Which files.** The key hashes the files the distribution's RECORD lists that stay, normalised,
+inside the directory that holds its `.dist-info` directory, each read from disk, not taken from
+RECORD's hashes, so a byte edited in place in `site-packages` changes it. It leaves out every
+file of a `.dist-info` directory but the distribution's own `entry_points.txt`, which decides
+which plugin code runs (others of them differ by installer or build backend, and `METADATA`
+carries the version), and every `.pyc` file and every path with a `__pycache__` part (pip lists
+the bytecode it writes). A file listed twice is hashed once. So the same files installed from
+another commit or path, by pip or by uv, into another virtual environment, give the same value,
+and a reinstall that changes only the version changes nothing. A listed file that is missing or
+cannot be read (deleted, a directory, a FIFO, no read permission) is hashed as `null`: the value
+changes and nothing is refused. Two installs of one name on the path that a stage both reaches
+give one key, whose value covers both.
+
+Limits:
+
+| Limit | What happens |
+|-------|--------------|
+| Files a distribution installs outside the directory that holds its `.dist-info` directory: console scripts, data files, headers, and a platlib directory apart from purelib | Not hashed: RECORD lists them with a path that leaves that directory, and a console script's first line names its own virtual environment. A change to them alone reruns nothing |
+| Markers and extras of `Requires-Dist` | Not evaluated: only each requirement's leading name is read, so a requirement behind a false marker or an extra that names an installed git or local distribution still adds its key. That can rerun a stage when a library it never imports changes; it never hides a change |
+| A package or namespace package that a stage reads by its name (`import company.vendor` binds `company`) | Every git or local distribution with a file under its directories gives its key, though the stage may use only one of them |
+| A reinstall while a Pivot process runs | Pivot reads the installed distributions, and each keyed distribution's files, once per process for one worker `sys.path` (again when that path changes), so the running process keeps the values it read: `pivot repro --watch`, with or without `--serve`, sees a reinstall when Pivot starts again. The next process reads the new files, and a stage that reaches a changed one reruns once |
+| An editable install | No key. Its source is user code when it lies outside the interpreter's prefix and outside every `site-packages` or `dist-packages` directory, and the walk hashes it as it hashes the project's code. pip's checkout of a `pip install -e git+…` package, in `<venv>/src`, lies under the interpreter's prefix, so it is library code with no key, recorded by name as a package-index library is: a change to its files is seen only where the walk hashes library code (a stage function it defines, a loader's `load`, `save` and `empty`) |
+| A distribution in a zip archive on `sys.path`, or behind any entry Pivot cannot list as a directory | Not read: it owns no module and gets no key. pip and uv install into a directory |
+
+Refusals: when Pivot cannot tell which installed code a stage runs, it refuses the stage with a
+message that names the distribution, its `.dist-info` directory, the reason and the fix
+(reinstall it). It looks only when at least one distribution on the worker's `sys.path` is
+installed from git, a local path or a local archive, or has a `direct_url.json` Pivot cannot
+classify, and only at the distributions a stage needs: each one it reaches and each one those
+require, directly or through others. Pivot's own distribution refuses nothing. Each other is
+refused for the first of these that holds:
+
+1. Its `direct_url.json` cannot be read, is not JSON, is not a JSON object, names none or more
+   than one of `vcs_info`, `dir_info` and `archive_info`, has a `dir_info` that is not a JSON
+   object, has `archive_info` and no `url`, or has a `url` that cannot be parsed: Pivot cannot
+   classify it, so it cannot tell whether to hash its files.
+2. It is installed from git, a local path or a local archive, and its RECORD is missing, cannot
+   be read, is not UTF-8, or has a row Python's `csv` module cannot read (such as a field over
+   its size limit): Pivot cannot tell its files. A distribution a stage reaches owns a module
+   through its RECORD, so this refuses one that a reached distribution requires.
+3. Its METADATA, or its PKG-INFO where it has no METADATA (an `.egg-info` directory), is
+   missing, cannot be read, is not UTF-8, has headers Python's `email` parser reads with a defect
+   (a line that is not a header ends them early), has no `Metadata-Version` header, or has a
+   `Requires-Dist` header that names no distribution: Pivot cannot tell what it depends on. This
+   holds for a package-index distribution the stage needs too.
+
+Pivot also refuses the stage, with a message naming the module, its file and the distribution,
+when a module the stage reaches has a file that no RECORD in its directory of the worker's
+`sys.path` lists, while a distribution in that directory has no RECORD Pivot can read and is
+installed from git, a local path or a local archive, cannot be classified, has requirements
+Pivot cannot read, or requires such a distribution, directly or through others. The files
+checked are the module's own and, for a package's `__init__` file or a namespace package, each
+file under its directories but bytecode. Pivot cannot tell whether the module is that
+distribution's. Only for this check does Pivot read every RECORD of a directory.
+
+`core.unsafe_fingerprinting` (or `PIVOT_UNSAFE_FINGERPRINTING=1`) turns each of these refusals
+into a warning with the same message, and the stage's result is kept out of the run cache, as
+for the other refusals it downgrades; they are reported with the stage's other refusals. A
+distribution no stage needs refuses nothing.
+
 ### Module-Level Instances
 
 ```python
@@ -620,7 +716,9 @@ Fingerprinting uses several `WeakKeyDictionary` caches to avoid repeated expensi
 | `_get_type_hints_cache` | Type hints per function | `get_type_hints()` is expensive |
 | `_module_attr_cache` | Module attribute usage per function | Avoids re-parsing AST for `module.attr` patterns |
 
-These caches use weak references, so entries are automatically cleaned up when functions are garbage collected. The caches are not thread-safe, but fingerprinting runs single-threaded per process (multiprocessing uses separate memory spaces).
+These caches use weak references, so entries are automatically cleaned up when functions are garbage collected. They have no lock. Stages are fingerprinted in the `pivot` process, never in a worker (each worker process has its own memory), on the thread that asks: `pivot status` and `pivot commit` on their main thread, the engine's skip check and watched startup snapshot in anyio worker threads (`anyio.to_thread.run_sync`), a stage that the skip check did not fingerprint (under `--force`, or with no lock yet) on the engine's event loop when it is sent to a worker (`executor.core.prepare_worker_info`), a watch reload in a daemon thread; each of these asks for one stage at a time. An engine that serves RPC (`pivot repro --tui`, `pivot repro --watch --serve`, `pivot run --tui`) is the exception: it fingerprints for an `explain` request on its event loop (`engine.stage_queries.explain`) and for a `commit` request in a worker thread, waiting only for the startup snapshot and a reload (`Engine.wait_for_fingerprints`), so either can fingerprint while a run's skip check, or the other request, fingerprints on another thread, and the two share these caches.
+
+The `dist:` keys are not in the manifest cache (`sm:`): `registry._compute_fingerprint` adds them after `fingerprint.get_stage_fingerprint_cached` returns, on a hit and a miss alike, because a reinstall to the same path changes no source file, read or by-name origin that a hit re-checks. What they need is read once per process by `installed_distributions`, under a lock, for one worker `sys.path` and one set of pivot's package directories: the metadata directories on the path and each `direct_url.json`; only when one of them is installed from git, a local path or a local archive, or cannot be classified, every distribution's `Requires-Dist` headers; RECORD only for the distributions that can give a key or a refusal (those, each one whose requirements cannot be read, and each one that requires one of them, directly or through others); every RECORD of a directory only for the refusal check of [Libraries Installed from Git or a Local Path](#libraries-installed-from-git-or-a-local-path); and a keyed distribution's files only when a stage first reaches it. A manifest with no `byname:` entry reads nothing.
 
 ## Manifest Key Prefixes
 
@@ -635,8 +733,9 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 | `default:` | Default argument values that the AST does not record | `default:myproject.stages.scale.factor` |
 | `wire:` | Call-site artifact wiring: parameter bindings, collection kind/order, input paths | `wire:left` → `raw-a`, `wire:items` → `{"kind":"list","identities":["a","b"]}`, `wire:file:path` → `old.txt` |
 | `partial:` | `functools.partial` bound arguments | `partial:myproject.stage.bound.args` |
-| `ext:` | A library function or class a stage reads, named by its definition (its code is not hashed) | `ext:myproject.stages.agg` → `numpy.mean` |
-| `byname:` | A module a stage's worker imports by name to run code the walk does not hash: a library module read as a global or imported in a function body, and the module that defines each `ext:` callable. Compared with the module the worker would import (`loaded_source.check_worker_imports`), and re-resolved on a manifest cache hit. A loader's `byname:` entries join the stage's own without the `dep:`/`out:` prefix (`fingerprint.merge_loader_fingerprint`), so only a key that starts with `byname:` is one, and a dependency or output named `byname` keeps its entries. Recorded by the walk and the manifest cache only: a lock leaves it out (`fingerprint.without_by_name`) | `byname:numpy` |
+| `ext:` | A library function or class a stage reads, named by its definition (the walk does not hash its code) | `ext:myproject.stages.agg` → `numpy.mean` |
+| `byname:` | A module a stage's worker imports by name to run code the walk does not hash: a library module read as a global or imported in a function body, the module that defines each `ext:` callable, and the module of the library code a stage reaches through a base class, a type hint or class-body annotation, a value, a pivot loader class, its own stage function, or a callable whose `__module__` is not a string (see [What Gets Tracked](#what-gets-tracked)). Compared with the module the worker would import (`loaded_source.check_worker_imports`), and re-resolved on a manifest cache hit. A loader's `byname:` entries join the stage's own without the `dep:`/`out:` prefix (`fingerprint.merge_loader_fingerprint`), so only a key that starts with `byname:` is one, and a dependency or output named `byname` keeps its entries. Its modules are the ones `dist:` keys come from. Recorded by the walk and the manifest cache only: a lock leaves it out (`fingerprint.without_by_name`) | `byname:numpy` |
+| `dist:` | `dist:<name>`: the installed files of a distribution installed from git, a local path or a local archive, not editable, that owns the module of a `byname:` entry, or that such a distribution requires, directly or through others. `<name>` is the PEP 503 name (lower case, each run of `-`, `_` and `.` made one `-`) read from its `.dist-info` directory's name. The value is the xxh64 hex of the compact JSON array, sorted, of the content digest of each install of that name that gives the stage this key; a content digest is the xxh64 hex of the compact JSON array, in path order, of `[path, digest]` for each hashed file, `digest` being the xxh64 hex of the file's bytes read from disk, or `null` for a file that is missing or cannot be read, and the distribution's own `entry_points.txt` being named `.dist-info/entry_points.txt` (`installed_distributions.content_digest`, `key_value`). Added after the manifest cache and recorded in the lock: see [Libraries Installed from Git or a Local Path](#libraries-installed-from-git-or-a-local-path) | `dist:fix-lib` |
 | `loader:` | Loader class methods and config | `loader:pivot.loaders.CSV:load` |
 | `schema:` | Pydantic model JSON schema | `schema:myproject.params.TrainParams` |
 | `builtin:` | Built-in types (for deterministic hashing) | `builtin:list` |

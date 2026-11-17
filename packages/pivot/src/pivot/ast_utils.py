@@ -10,8 +10,9 @@ from pivot import loaded_source
 
 # Cache for extract_module_attr_usage results using weak references.
 # This avoids repeated AST parsing for the same function when processing module dependencies.
-# Note: WeakKeyDictionary is not thread-safe. Fingerprinting runs single-threaded
-# per process (multiprocessing uses separate memory spaces), so this is safe.
+# Note: WeakKeyDictionary has no lock, and two threads of one process can fingerprint at once
+# (an engine that serves RPC; see the comment on `fingerprint._hash_function_ast_cache`).
+# Workers are separate processes and share none of it.
 _module_attr_cache: weakref.WeakKeyDictionary[
     Callable[..., Any] | types.CodeType, list[tuple[str, str]]
 ] = weakref.WeakKeyDictionary()

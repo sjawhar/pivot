@@ -18,8 +18,9 @@ logical keys to hashes:
 | `const:<module>.<name>` | Immutable module-level values, read as a global or as `module.NAME`; a helper read as `module.helper` is a `func:` entry, a library function an `ext:` entry |
 | `const:<module>.<qualname>.<name>` | Immutable values in a closure cell, keyed under the function that holds the cell, so two closures from one factory (`h2 = make(2)`, `h5 = make(5)`) keep their own values |
 | `default:<module>.<qualname>.<parameter>` | Default argument values the AST does not record |
-| `ext:<module>.<name>` | Library functions and classes a stage reads (`agg = np.mean`), recorded by name (`numpy.mean`); library code is not hashed |
-| `byname:<module>` | A module the stage's worker imports by name and whose code is not hashed: a library module the stage reads as a global (`np.mean(x)` with `import numpy as np`) or imports in its body, and the module that defines each `ext:` callable. Pivot checks it is the module the worker will import ([Same module in the worker](#same-module-in-the-worker)); the lock file does not record it |
+| `ext:<module>.<name>` | Library functions and classes a stage reads (`agg = np.mean`), recorded by name (`numpy.mean`); Pivot does not hash their code (a library installed from git or a local path is hashed by its installed files instead: `dist:`) |
+| `byname:<module>` | A module the stage's worker imports by name and whose code is not hashed: a library module the stage reads as a global (`np.mean(x)` with `import numpy as np`) or imports in its body, the module that defines each `ext:` callable, and the library module of a base class of your class, of a class in a type hint or a class annotation, of a class, instance, enum member or exception inside a value (a partial, a default, a loader's config), of a pivot loader class, of a stage function that a library defines, and of a library callable whose `__module__` is not a string. In those places Pivot records no standard-library module and none of its own. Pivot checks it is the module the worker will import ([Same module in the worker](#same-module-in-the-worker)); the lock file does not record it |
+| `dist:<name>` | The installed files of a library installed from git, from a local directory or from a local wheel or sdist, not editable, that owns one of the stage's `byname:` modules, and of each library installed that way that such a library depends on, directly or through other libraries. `<name>` is the library's distribution name in lower case, each run of `-`, `_` and `.` made one `-` (PEP 503): `Fix_Lib` gives `dist:fix-lib`. The lock file records it. See [Libraries Installed from Git or a Local Path](../architecture/fingerprinting.md#libraries-installed-from-git-or-a-local-path) |
 | `schema:<module>.<qualname>` | Pydantic model JSON schemas |
 | `wire:<parameter>` | Call-site artifact wiring: a direct identity, or a collection's kind and ordered identities; input path bindings use `wire:<parameter>:path` or `:paths` |
 | `dep:…:loader:<module>.<class>:…`, `out:…:loader:<module>.<class>:…`, `out:…:tag` | Reader/Writer method ASTs and config for each input and output, plus each output's placement and write semantics |
@@ -178,7 +179,12 @@ and a thread native code starts outside `_thread`:
   writes
   the current manifest; later runs reuse it until code or inputs change. Run
   `pivot repro --force <stage>` once to re-check a stage you know imports
-  dynamically. Upgrading from 0.5.6 or earlier, every stage with outputs reruns
+  dynamically. Upgrading from 0.10.4, a stage that reaches a library installed
+  from git, a local directory or a local wheel or sdist gains that library's
+  `dist:` key, so it reruns once as Code changed, and a stage that reaches none
+  keeps its lock; the fingerprint caches' schema goes from 43 to 44, so Pivot
+  computes each stage's manifest once more, which reruns nothing. Upgrading
+  from 0.5.6 or earlier, every stage with outputs reruns
   once as Code changed, because each output's tag (`out:<key>:tag`) joined the
   manifest; that run is checked, so it marks a stage that imports dynamically.
 
@@ -209,6 +215,11 @@ raises `StageDefinitionError`; use [StageParams](parameters.md) instead.
 | Add/remove comments | **No** |
 | Change whitespace/formatting | **No** |
 | Change an unused import | **No** |
+| Change a library installed from git, a local directory or a local wheel or sdist that your stage uses, or a library installed that way that it depends on, and reinstall it | Yes |
+| Edit such a library's installed files in place (in `site-packages`) | Yes |
+| Reinstall the same files of such a library from another commit or path, with pip or uv, into another virtual environment, or with only its version changed | **No** |
+| Upgrade or downgrade a library installed from a package index | **No**, as before: Pivot records such a library by name (a stage function or a loader's `load`, `save` and `empty` that it defines is still hashed) |
+| Edit the source of a library installed editable from a directory outside the virtual environment and outside every `site-packages` directory | Yes (it is your code) |
 
 ## Surprises and Pitfalls
 
@@ -379,6 +390,13 @@ loads an edit under the project root again. A module outside the root is loaded
 once by the watch or server process, so its edit is loaded when Pivot starts
 again; until then a worker that imports it after the edit runs the edit, and
 the stages that use it warn and rerun on every run.
+
+A library installed from git, a local directory or a local wheel or sdist is
+read once per Pivot process (and again if the workers' `sys.path` changes):
+Pivot hashes its installed files when a stage first reaches it. A reinstall
+while Pivot runs is not seen by that process, so `pivot repro --watch`, with
+or without `--serve`, sees it when Pivot starts again. The next process reads
+the new files, and a stage whose library changed reruns once.
 
 A user module whose source Pivot cannot read (a sourceless `.pyc`, or a module
 from a loader that gives no source) is never trusted: Pivot cannot tell which
@@ -570,8 +588,14 @@ output, Pivot does not see the change.
 
 ## Performance
 
-Fingerprinting runs once during pipeline discovery (single-threaded, in
-the coordinator process). Results are cached at two levels:
+Pivot fingerprints a stage the first time it needs the stage's fingerprint,
+and keeps it while that pipeline stays loaded, in the `pivot` process, never
+in a worker: `pivot repro` when the stage is ready to run, `pivot status` for
+each stage it reports, and a watch for every stage before its first run and
+again after each reload. It fingerprints one stage at a time, except in an
+engine that serves RPC (`--tui`, `--serve`), where a client's `explain` or
+`commit` request can fingerprint while a run fingerprints its next stage.
+Results are cached at two levels:
 
 1. **In-memory** — `WeakKeyDictionary` cache avoids re-parsing the same
    function within a single process
@@ -580,6 +604,10 @@ the coordinator process). Results are cached at two levels:
    source file's content hasn't changed, the cached hash is reused without
    parsing; an edit that keeps the file's mtime, size and inode is still
    seen
+
+The `dist:` keys are not cached in StateDB: Pivot reads the installed files of
+each library installed from git or a local path once per process, when a stage
+first reaches it.
 
 When a manifest is rebuilt, tracked globals and closure cells are read from
 their live bindings again, not from the values an earlier walk captured.
