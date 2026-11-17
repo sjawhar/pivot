@@ -826,8 +826,9 @@ def _resolved(
     `import_origin` resolves it by `realpath` too), and is resolved by `realpath` alone, which
     takes a name that `os.lstat` refuses as too long for one that is no link and keeps nothing
     from one call to the next. So each path given to `_real_path` from here, and each directory
-    above it that `_real_dir` memoises, is shorter than `_PATH_MAX` bytes, and a row costs memory
-    linear in its length, however many names it holds."""
+    above it that `_real_dir` memoises, is shorter than `_PATH_MAX` bytes. The index still keeps
+    every directory above each listed file (`_build_index`), so one row costs memory of the order
+    of its names times its length; only installed metadata, which Pivot trusts, bounds it."""
     for path in paths:
         located = os.path.join(installed.site_dir, path)
         try:
