@@ -33,12 +33,10 @@ def of_module(module: types.ModuleType) -> Origin:
     if file is not None:
         return ("file", os.path.realpath(file))
     spec = getattr(module, "__spec__", None)
-    if (
-        isinstance(spec, importlib.machinery.ModuleSpec)
-        and not spec.has_location
-        and spec.origin in _BUILTIN_OR_FROZEN
+    if isinstance(spec, importlib.machinery.ModuleSpec) and (
+        (origin := _built_in_or_frozen(spec)) is not None
     ):
-        return (spec.origin,)
+        return origin
     path = getattr(module, "__path__", None)
     if path is not None:
         return _namespace(path)
@@ -51,7 +49,7 @@ def file_of_module(module: types.ModuleType) -> str | None:
     `of_module` resolves it into a `("file", ...)` origin."""
     spec = getattr(module, "__spec__", None)
     if isinstance(spec, importlib.machinery.ModuleSpec):
-        if not spec.has_location and spec.origin in _BUILTIN_OR_FROZEN:
+        if _built_in_or_frozen(spec) is not None:
             return None
         if (file := file_of_spec(spec)) is not None:
             return file
@@ -64,8 +62,8 @@ def of_spec(spec: importlib.machinery.ModuleSpec) -> Origin:
     file = file_of_spec(spec)
     if file is not None:
         return ("file", os.path.realpath(file))
-    if not spec.has_location and spec.origin in _BUILTIN_OR_FROZEN:
-        return (spec.origin,)
+    if (origin := _built_in_or_frozen(spec)) is not None:
+        return origin
     if spec.submodule_search_locations is not None:
         return _namespace(spec.submodule_search_locations)
     return NO_FILE
@@ -76,6 +74,14 @@ def file_of_spec(spec: importlib.machinery.ModuleSpec) -> str | None:
     resolved: its origin when it has a location; else None. `of_spec` resolves it into a
     `("file", ...)` origin."""
     return spec.origin if spec.has_location and isinstance(spec.origin, str) else None
+
+
+def _built_in_or_frozen(spec: importlib.machinery.ModuleSpec) -> Origin | None:
+    """The origin of a built-in or frozen module's `spec`, one with no location whose origin is
+    `built-in` or `frozen`: `("built-in",)` or `("frozen",)`; None for any other spec."""
+    if not spec.has_location and spec.origin in _BUILTIN_OR_FROZEN:
+        return (spec.origin,)
+    return None
 
 
 def describe(origin: Origin) -> str:

@@ -535,10 +535,11 @@ so for such a distribution Pivot also hashes the files it installed.
 stage's manifest is whole (the walk or its manifest-cache hit, the call-site wiring and every
 loader's entries) and the worker-import check has run; a `@no_fingerprint` stage gets keys too,
 from its loaders' `byname:` entries. For each `byname:` module it takes the origin of the module
-this process holds (`import_origin.of_module`), or else of the module a worker would import
-(`loaded_source.worker_origin`), found without importing it, and beside it the module's file as
-the import located it, not resolved (`import_origin.file_of_module`,
-`loaded_source.worker_file`); it looks up neither when no distribution on the worker's
+this process holds (`import_origin.of_module`), or else of the module a worker would import,
+found without importing it, and beside it the module's file as the import located it, its
+directory resolved and its last name kept (`import_origin.file_of_module`,
+`fingerprint.with_real_directory`); `loaded_source.worker_spec` predicts both at once for a
+module this process does not hold. It looks up neither when no distribution on the worker's
 `sys.path` is installed from git, a local path or a local archive, or has a `direct_url.json`
 Pivot cannot classify (`installed_distributions.needs_origins`). The keys join the manifest
 before the lock leaves out the `byname:` entries (`fingerprint.without_by_name`), so the lock
@@ -628,25 +629,32 @@ other is refused for the first of these that holds:
 
 Pivot also refuses the stage, with a message naming, after the stage's name, the module, its
 file and the distribution, when a module the stage reaches has a file that no RECORD in that
-file's directory of the worker's `sys.path` lists, while a distribution in that directory has no
-RECORD Pivot can read and is one Pivot looks at: one installed from git, a local path or a local
-archive, one it cannot classify, one whose requirements it cannot read, or one that requires
-such a distribution, directly or through others, of any install form (a package-index
-`.egg-info` directory, which never has a RECORD, included). Such a distribution owns no file, so
-Pivot cannot tell whether the module is that distribution's. A file's directory is the deepest
-entry of the worker's `sys.path` that holds it where the import found it (a module's own file as
-the import located it, a file under a package where it lies in the package's directory), not
-where a link resolves to, and a RECORD there lists the file when one of its paths resolves to
-the file's resolved path: so a setuptools project's own `<name>.egg-info`,
-in the project root first on `sys.path`, refuses nothing for a module in the site-packages of a
-`.venv` inside that root, which is a deeper entry. The files checked are the module's own and,
-for a package's `__init__` file or a namespace package, the files under its directories but
-those under a `__pycache__` directory, which the key leaves out too (a `.pyc` file outside one is
-checked). Pivot walks such a directory only when the deepest entry of `sys.path` above it, or an
-entry at or under it, holds such a distribution, and stops once it has found, in each of those
-entries, a file that no RECORD lists; it enters no subdirectory that is a symbolic link, so a
-file under one is not checked. Each process runs the check once for each module. Besides the
-question about a linked file below, only this check reads every RECORD of a directory.
+file's directories of the worker's `sys.path` lists, while a distribution in one of those
+directories has no RECORD Pivot can read and is one Pivot looks at: one installed from git, a
+local path or a local archive, one it cannot classify, one whose requirements it cannot read, or
+one that requires such a distribution, directly or through others, of any install form (a
+package-index `.egg-info` directory, which never has a RECORD, included). Such a distribution
+owns no file, so Pivot cannot tell whether the module is that distribution's. A file's
+directories are the deepest entry of the worker's `sys.path` that holds it where the import
+found it (a module's own file as the import located it, its directory resolved; a file under a
+package where it lies in the package's directory), and the deepest entry that holds its
+resolved path, where a link points; a RECORD in either lists the file when one of its paths
+resolves to the file's resolved path. So a module file linked from one entry into another that
+holds such a distribution is refused as the file it points to would be, while a file linked from
+an entry that holds one into an entry whose RECORD lists the file is not; where an installer
+links each file into its cache, no entry holds the resolved path, and the file is judged where
+it lies. And a setuptools project's own `<name>.egg-info`, in the project root first on
+`sys.path`, refuses nothing for a module in the site-packages of a `.venv` inside that root,
+which is a deeper entry. The files checked are the module's own and, for a package's `__init__`
+file or a namespace package, the files under its directories but those under a `__pycache__`
+directory, which the key leaves out too (a `.pyc` file outside one is checked). Pivot walks such
+a directory only when the deepest entry of `sys.path` above it, or an entry at or under it,
+holds such a distribution, and stops once it has found, in each of those entries, a file that no
+RECORD lists. The walk enters no subdirectory that is a symbolic link, so a file under one is
+not checked, and a file under the directory that is a symbolic link into an entry other than
+those, which holds such a distribution, is not checked there. Each process runs the check once
+for each module. Besides the question about a linked file below, only this check reads every
+RECORD of a directory.
 
 `core.unsafe_fingerprinting` (or `PIVOT_UNSAFE_FINGERPRINTING=1`) turns each of these refusals
 into a warning with the same message, so the warning names the stage it lets run, and the

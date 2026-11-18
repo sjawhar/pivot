@@ -4,27 +4,26 @@ distribution, called in this process on plain data: on `direct_url.json`, METADA
 on the paths a RECORD lists, on digests, on requirement graphs, on origins and on the readings
 that decide a distribution's key and its refusals, and on the install forms that decide whether a
 file linked into a site directory is library code; the resolution of a RECORD path, on a tree of
-symbolic links this test makes; the walk of a reached package's directory, on a tree of
-files this test makes; and `fingerprint.is_library_file`, on site directories this test lays out
-by hand as uv and flit lay them out (`tests.installed_dists`), reached through a link to a
-package's directory and through a path entry that is a link. No test starts a process.
+symbolic links this test makes; and the walk of a reached package's directory, on a tree of
+files this test makes. No test starts a process.
 
-The CLI tests of the same decisions are in `test_installed_distributions.py`, and
-`distribution_keys` over real installs is in `test_installed_distributions_snapshot.py`.
+The CLI tests of the same decisions are in `test_installed_distributions.py`, `distribution_keys`
+over real installs is in `test_installed_distributions_snapshot.py`, the refusal of a reached
+file linked from one entry of the path into another in
+`test_installed_distributions_unlisted.py`, and `fingerprint.is_library_file` on site
+directories laid out by hand in `test_is_library_file.py`.
 """
 
 import errno
 import itertools
 import os
 import pathlib
-import sys
 
 import pytest
-import pytest_mock
 import xxhash
 from tests import installed_dists
 
-from pivot import fingerprint, installed_distributions
+from pivot import installed_distributions
 
 _FORM = installed_distributions.InstallForm
 _SITE = "/home/user/venv/lib/python3.13/site-packages"
@@ -32,15 +31,10 @@ _SITE = "/home/user/venv/lib/python3.13/site-packages"
 _CACHE = "/home/user/.cache/uv/archive-v0"
 
 # `direct_url.json` (PEP 610) as uv and pip write it for each install form, in their own key order
-# and spacing (uv's for a local wheel holds no hash).
-_UV_DIRECTORY_URL = b'{"url":"file:///home/user/src/fixlib","dir_info":{}}'
+# and spacing (uv's for a local wheel holds no hash); uv's for a local directory and for git are
+# `installed_dists.UV_DIRECTORY_URL` and `installed_dists.UV_GIT_URL`.
 _PIP_DIRECTORY_URL = b'{"dir_info": {}, "url": "file:///home/user/src/fixlib"}'
 _UV_EDITABLE_URL = b'{"url":"file:///home/user/src/fixlib","dir_info":{"editable":true}}'
-_UV_GIT_URL = (
-    b'{"url":"file:///home/user/src/fixgit","vcs_info":{"vcs":"git",'
-    b'"commit_id":"6964203a125157369c715bd7ba6b130944b8329e",'
-    b'"requested_revision":"6964203a125157369c715bd7ba6b130944b8329e"}}'
-)
 _UV_WHEEL_URL = (
     b'{"url":"file:///home/user/wheels/fixwheel-0.1-py3-none-any.whl","archive_info":{}}'
 )
@@ -147,16 +141,18 @@ def _helper_record_path(site: pathlib.Path, length: int, top: str = "fixlib") ->
     ("direct_url", "form", "reason"),
     [
         pytest.param(None, _FORM.INDEX, "", id="none"),
-        pytest.param(_UV_DIRECTORY_URL, _FORM.LOCAL_DIRECTORY, "", id="uv-directory"),
+        pytest.param(
+            installed_dists.UV_DIRECTORY_URL, _FORM.LOCAL_DIRECTORY, "", id="uv-directory"
+        ),
         pytest.param(_PIP_DIRECTORY_URL, _FORM.LOCAL_DIRECTORY, "", id="pip-directory"),
         pytest.param(
-            _UV_DIRECTORY_URL.replace(b"{}", b'{"editable":false}'),
+            installed_dists.UV_DIRECTORY_URL.replace(b"{}", b'{"editable":false}'),
             _FORM.LOCAL_DIRECTORY,
             "",
             id="editable-false",
         ),
         pytest.param(_UV_EDITABLE_URL, _FORM.EDITABLE, "", id="editable-true"),
-        pytest.param(_UV_GIT_URL, _FORM.VCS, "", id="uv-git"),
+        pytest.param(installed_dists.UV_GIT_URL, _FORM.VCS, "", id="uv-git"),
         pytest.param(_UV_WHEEL_URL, _FORM.LOCAL_ARCHIVE, "", id="uv-local-wheel"),
         pytest.param(_PIP_WHEEL_URL, _FORM.LOCAL_ARCHIVE, "", id="pip-local-wheel"),
         pytest.param(
@@ -169,13 +165,13 @@ def _helper_record_path(site: pathlib.Path, length: int, top: str = "fixlib") ->
             b"[]", _FORM.UNCLASSIFIED, "its direct_url.json is not a JSON object", id="array"
         ),
         pytest.param(
-            _UV_DIRECTORY_URL[:-1],
+            installed_dists.UV_DIRECTORY_URL[:-1],
             _FORM.UNCLASSIFIED,
             "its direct_url.json is not JSON (Expecting ',' delimiter: line 1 column 52 (char 51))",
             id="truncated",
         ),
         pytest.param(
-            _UV_DIRECTORY_URL.replace(b"fixlib", b"caf\xe9"),
+            installed_dists.UV_DIRECTORY_URL.replace(b"fixlib", b"caf\xe9"),
             _FORM.UNCLASSIFIED,
             "its direct_url.json is not JSON ('utf-8' codec can't decode byte 0xe9 in position "
             + "33: invalid continuation byte)",
@@ -189,14 +185,14 @@ def _helper_record_path(site: pathlib.Path, length: int, top: str = "fixlib") ->
             id="no-form",
         ),
         pytest.param(
-            _UV_GIT_URL.replace(b'"vcs_info"', b'"dir_info":{},"vcs_info"'),
+            installed_dists.UV_GIT_URL.replace(b'"vcs_info"', b'"dir_info":{},"vcs_info"'),
             _FORM.UNCLASSIFIED,
             "its direct_url.json names 2 of vcs_info, dir_info and archive_info, where PEP 610 "
             + "requires exactly one",
             id="two-forms",
         ),
         pytest.param(
-            _UV_DIRECTORY_URL.replace(b"{}", b"true"),
+            installed_dists.UV_DIRECTORY_URL.replace(b"{}", b"true"),
             _FORM.UNCLASSIFIED,
             "its direct_url.json's dir_info is not a JSON object",
             id="dir-info-not-an-object",
@@ -643,12 +639,6 @@ def test_reach_meets_each_requirement_once_and_follows_none_of_a_stop() -> None:
             id="linked-package-init-owned-through-its-directory-in-site-packages",
         ),
         pytest.param(
-            ("file", f"{_CACHE}/core/linked/__init__.py"),
-            None,
-            {"linked-core"},
-            id="linked-package-init-with-no-located-file-owned-through-its-resolved-directory",
-        ),
-        pytest.param(
             ("file", f"{_CACHE}/core/linked/core.py"),
             f"{_SITE}/linked/core.py",
             {"linked-core"},
@@ -682,10 +672,10 @@ def test_owners_maps_an_origin_to_the_candidates_by_file(
     file under one of its directories; any other origin maps to none. Where an installer links
     each file into its cache (`linked-core`'s files, and `linked-plugin`'s `linked/plugin.py`, in
     two cache entries), a package's `__init__` maps through its directory in the site directory
-    to each candidate that lists a file there, and, with no located file, only through the
-    directory of its resolved path, to the one candidate whose cache entry that is; a linked
-    module file maps to the candidate that lists its resolved path, and one cache entry linked
-    from two site directories (`twice.py`) to both installs, whose RECORDs resolve to it."""
+    to each candidate that lists a file there, not through the directory of its resolved path,
+    which only the candidate whose cache entry that is owns; a linked module file maps to the
+    candidate that lists its resolved path, and one cache entry linked from two site directories
+    (`twice.py`) to both installs, whose RECORDs resolve to it."""
     file_owners = {
         f"{_SITE}/fixlib/core.py": {"fix-lib", "fix-lib-extra"},
         f"{_SITE}/company/__init__.py": {"company-core"},
@@ -999,100 +989,3 @@ def test_resolved_leaves_out_each_record_path_that_names_no_file_and_resolves_a_
     memoised = max(len(os.fsencode(directory)) for directory in real_dirs)
     assert memoised < path_max, f"the memo must hold no directory of PATH_MAX bytes: {memoised}"
     assert digests == [None, None, None], digests
-
-
-@pytest.mark.parametrize(
-    "linked",
-    [
-        pytest.param(False, id="copied"),
-        pytest.param(True, id="linked-into-a-cache"),
-    ],
-)
-def test_is_library_file_takes_a_library_file_reached_through_a_link_to_its_directory(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, linked: bool
-) -> None:
-    """`idxlib`, laid out by hand in `site-packages` as uv installs from a package index
-    (`installed_dists.index_install_by_hand`), its files copies or, as `--link-mode symlink`
-    leaves them, links into a cache from real directories. `project/idxlib` is a link to its
-    package's directory, as a library package linked into a project root, and `libs` a link to
-    `site-packages`. `fingerprint.is_library_file` takes the module's file as library code where
-    it is installed, through `project/idxlib` with `site-packages` on the path, and through
-    `libs` with `libs` on the path in its place, whether the file is a copy or a link: a linked
-    file is judged where its directory resolves, in `site-packages`, as a copy is by its resolved
-    path. A project file beside the link stays user code."""
-    site = tmp_path / "venv" / "site-packages"
-    installed_dists.index_install_by_hand(
-        site,
-        "idxlib",
-        {"idxlib/__init__.py": "LIB = 1\n"},
-        cache=tmp_path / "cache" if linked else None,
-    )
-    project = tmp_path / "project"
-    project.mkdir()
-    (project / "idxlib").symlink_to(site / "idxlib", target_is_directory=True)
-    (project / "helpers.py").write_text("HELP = 1\n")
-    libs = tmp_path / "libs"
-    libs.symlink_to(site, target_is_directory=True)
-    installed = site / "idxlib" / "__init__.py"
-    assert installed.is_symlink() is linked, f"{installed} must be a link only when linked"
-    assert not installed.parent.is_symlink(), f"{installed.parent} must be a real directory"
-
-    monkeypatch.setattr(sys, "path", [str(project), str(site)])
-    found = {
-        "in site-packages": fingerprint.is_library_file(str(installed)),
-        "through project/idxlib": fingerprint.is_library_file(
-            str(project / "idxlib" / "__init__.py")
-        ),
-        "project file": fingerprint.is_library_file(str(project / "helpers.py")),
-    }
-    monkeypatch.setattr(sys, "path", [str(project), str(libs)])
-    found["through libs"] = fingerprint.is_library_file(str(libs / "idxlib" / "__init__.py"))
-
-    assert found == {
-        "in site-packages": True,
-        "through project/idxlib": True,
-        "project file": False,
-        "through libs": True,
-    }, found
-
-
-@pytest.mark.parametrize(
-    ("link", "source", "asked"),
-    [
-        pytest.param("flitlib", "flitlib/__init__.py", False, id="package-directory"),
-        pytest.param("flitlib.py", "flitlib.py", True, id="module-file"),
-    ],
-)
-def test_is_library_file_leaves_flits_editable_link_user_code_through_a_linked_path_entry(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-    mocker: pytest_mock.MockerFixture,
-    link: str,
-    source: str,
-    asked: bool,
-) -> None:
-    """`flitlib`, laid out as flit's `install --symlink` installs it
-    (`installed_dists.flit_symlink_install`): a link in `site-packages` to the checkout's package
-    directory, or to its module file, which the RECORD of an editable install lists. `libs`, a
-    link to `site-packages`, is the one entry of the path. `fingerprint.is_library_file` takes
-    the checkout's source as user code, in `site-packages` and through `libs`. A file under the
-    linked package directory is judged in the checkout, where its directory resolves, and the
-    RECORDs are not asked about it; the linked module file is judged in `site-packages`, and the
-    RECORDs are asked about it there, where the one that lists it is an editable install's."""
-    site = tmp_path / "venv" / "site-packages"
-    site.mkdir(parents=True)
-    checkout = tmp_path / "flitlib"
-    (checkout / source).parent.mkdir(parents=True, exist_ok=True)
-    (checkout / source).write_text(installed_dists.FIXLIB_ALONE)
-    installed_dists.flit_symlink_install(site, checkout, link)
-    libs = tmp_path / "libs"
-    libs.symlink_to(site, target_is_directory=True)
-    monkeypatch.setattr(sys, "path", [str(libs)])
-    listed = mocker.spy(installed_distributions, "listed_as_library")
-
-    found = [fingerprint.is_library_file(str(entry / source)) for entry in (site, libs)]
-
-    assert found == [False, False], f"flit's source must be user code in both: {found}"
-    files_asked = [call.args[0] for call in listed.call_args_list]
-    in_site = os.path.join(os.path.realpath(site), source)
-    assert files_asked == ([in_site, in_site] if asked else []), files_asked

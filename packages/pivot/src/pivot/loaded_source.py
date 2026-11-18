@@ -84,6 +84,17 @@ class _Loaded(NamedTuple):
     reason: str | None = None
 
 
+class WorkerSpec(NamedTuple):
+    """What a worker would import for a module name, predicted in this process without importing
+    it (`worker_spec`): where it comes from (`origin`, `import_origin.of_spec`, which resolves a
+    file; None when nothing would find it, `("unknown", why)` when a finder raised), and the file
+    as the import would locate it, not resolved (`file`, `import_origin.file_of_spec`; None when
+    nothing would find the module, a finder raised, or it would come from no file)."""
+
+    origin: import_origin.Origin | None
+    file: str | None
+
+
 # Every recorded module with source, by the name its code carries and by its resolved path.
 _by_file = dict[str, _Loaded]()
 # Every recorded user module, unreadable ones included, by module name.
@@ -102,12 +113,10 @@ _sent_token: str | None = None
 _unseen = set[str]()
 # The unreadable modules whose reason this process has logged (`check_stage`).
 _warned = set[str]()
-# What a worker imports for each module name (`worker_origin`), with the file as the import would
-# locate it (`worker_file`), by name, `sys.path` and the working directory (a relative entry names
-# a directory under it); `prune` forgets them when the session ends.
-_worker_origins = dict[
-    tuple[str, tuple[object, ...], str], tuple[import_origin.Origin | None, str | None]
-]()
+# What a worker imports for each module name, and the file as the import would locate it
+# (`worker_spec`), by name, `sys.path` and the working directory (a relative entry names a
+# directory under it); `prune` forgets them when the session ends.
+_worker_specs = dict[tuple[str, tuple[object, ...], str], WorkerSpec]()
 # What a new interpreter started as a worker starts reported for each module name (`_confirm`),
 # by name, the worker's `sys.path` and the working directory; `prune` forgets them.
 _confirmed = dict[tuple[str, tuple[str, ...], str], import_origin.Origin | None]()
@@ -317,7 +326,7 @@ def prune() -> None:
             del linecache.cache[loaded.filename]
         _token = None
     _unseen.clear()
-    _worker_origins.clear()
+    _worker_specs.clear()
     _confirmed.clear()
     _confirmed_held.clear()
 
@@ -621,36 +630,27 @@ def worker_path() -> list[str]:
 
 
 def worker_origin(name: str) -> import_origin.Origin | None:
-    """Where a worker would import module `name` from, predicted in this process without
-    importing it (`import_origin.find_spec` on `worker_path()`): None when nothing would find it,
-    `("unknown", why)` when a finder raised. A worker started earlier from a warm pool keeps the
+    """Where a worker would import module `name` from (`worker_spec`)."""
+    return worker_spec(name).origin
+
+
+def worker_spec(name: str) -> WorkerSpec:
+    """What a worker would import for module `name` and from which file, predicted in this
+    process without importing it (`import_origin.find_spec` on `worker_path()`), found once per
+    name, `sys.path` and working directory. A worker started earlier from a warm pool keeps the
     `sys.path` and working directory it started with."""
-    return _worker_spec(name)[0]
-
-
-def worker_file(name: str) -> str | None:
-    """The file a worker would import module `name` from, as the import would locate it, not
-    resolved (`import_origin.file_of_spec`), predicted as `worker_origin` predicts its origin,
-    which resolves it: None when nothing would find the module, a finder raised, or the module
-    would come from no file."""
-    return _worker_spec(name)[1]
-
-
-def _worker_spec(name: str) -> tuple[import_origin.Origin | None, str | None]:
-    """`worker_origin(name)` and `worker_file(name)`, found once per name, `sys.path` and working
-    directory."""
     key = (name, tuple(sys.path), os.getcwd())
-    if key in _worker_origins:
-        return _worker_origins[key]
-    found: tuple[import_origin.Origin | None, str | None] = (None, None)
+    if key in _worker_specs:
+        return _worker_specs[key]
+    found = WorkerSpec(None, None)
     try:
         spec = import_origin.find_spec(name, worker_path())
     except Exception as exc:  # noqa: BLE001 - a finder's error leaves the origin unknown
-        found = (("unknown", f"{type(exc).__name__}: {exc}"), None)
+        found = WorkerSpec(("unknown", f"{type(exc).__name__}: {exc}"), None)
     else:
         if spec is not None:
-            found = (import_origin.of_spec(spec), import_origin.file_of_spec(spec))
-    _worker_origins[key] = found
+            found = WorkerSpec(import_origin.of_spec(spec), import_origin.file_of_spec(spec))
+    _worker_specs[key] = found
     return found
 
 

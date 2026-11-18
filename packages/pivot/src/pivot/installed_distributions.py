@@ -17,14 +17,15 @@ that is not editable (`owned_by_libraries`).
 
 A leaf: it imports nothing of pivot's at run time, so `fingerprint` imports it and no import cycle
 forms. It takes plain data (each reached module's origin and its file as the import located it,
-`ReachedModule`; the worker's `sys.path`; pivot's package directories) and returns plain data (the
-keys and the refusal messages). Each decision on what a distribution's files say (`classify`,
-`requirement_names`, `requires_txt_names`, `record_paths`, `hashed_files`, `content_digest`,
-`key_value`, `candidates`, `reach`, `owners`, `decide`, `owned_by_libraries`) is a public function
-of plain data. What reads the disk is private: the scan of the path, the index of the candidates,
-the digest of a keyed distribution's files, the refusal of a reached file that no RECORD lists,
-which reads the RECORDs of a site directory and the files under a package, and the index of the
-paths the RECORDs of a site directory list (`_Snapshot`).
+its directory resolved, `ReachedModule`; the worker's `sys.path`; pivot's package directories)
+and returns plain data (the keys and the refusal messages). Each decision on what a
+distribution's files say (`classify`, `requirement_names`, `requires_txt_names`, `record_paths`,
+`hashed_files`, `content_digest`, `key_value`, `candidates`, `reach`, `owners`, `decide`,
+`owned_by_libraries`) is a public function of plain data. What reads the disk is private: the
+scan of the path, the index of the candidates, the digest of a keyed distribution's files, the
+refusal of a reached file that no RECORD lists, which reads the RECORDs of a site directory and
+the files under a package, and the index of the paths the RECORDs of a site directory list
+(`_Snapshot`).
 
 What it reads, once per process for one worker path, so a reinstall while Pivot runs is seen at the
 next start: the metadata directories on the path and each `direct_url.json`; when a stage's keys
@@ -34,23 +35,24 @@ be classified, the requirements of every distribution (its `Requires-Dist` heade
 `.egg-info` directory's `requires.txt` when its metadata has none) and RECORD for the candidates
 (those distributions, each distribution whose requirements cannot be read, and every distribution
 that requires one of them, directly or through others); every RECORD of a site directory only when
-a candidate there has no RECORD and a stage reaches a file whose site directory it is (the deepest
-entry of the path that holds the file), and, apart from that, when `listed_as_library` is first
-asked about a file whose site directory it is; the files under the directory of a reached
-package or namespace package only when such a site directory is the deepest entry of the path
-above that directory or lies at or under it, and only until each such site directory has a file
-there that no RECORD lists, once for each reached module; and the files of a keyed distribution
-only when a stage reaches it. Each RECORD is read once, whichever of these needs it first. A
-process that asks only `listed_as_library`, as a worker's import recorder does, reads no
-requirement and builds no index of the candidates. Each path a RECORD lists that can name a file
-is resolved for the index of the candidates and for the refusal of a reached file that no RECORD
-lists (`_resolved`), and so is each file under such a directory, to the path `os.path.realpath`
-gives: a RECORD path of PATH_MAX bytes or more in its site directory by `realpath` alone, and
-every other path a name at a time from the nearest directory above it already resolved (a site
-directory, or one resolved for an earlier path): one `os.path.islink` for each new name, and
-`realpath` only for a name that is a symbolic link, empty, `.` or `..` (`_real_path`).
-`listed_as_library` resolves no RECORD path: it compares each as written, normalised, with the
-file's path in its site directory.
+a stage reaches a file that lies in it (the deepest entry of the path that holds the file where
+the import found it or the walk listed it, or that holds the file's resolved path) while a
+candidate there, or in the other such entry of the file, has no RECORD, and, apart from that,
+when `listed_as_library` is first asked about a file whose site directory it is; the files under
+the directory of a reached package or namespace package only when such a site directory is the
+deepest entry of the path above that directory or lies at or under it, and only until each such
+site directory has a file there that no RECORD lists, once for each reached module; and the
+files of a keyed distribution only when a stage reaches it. Each RECORD is read once, whichever
+of these needs it first. A process that asks only `listed_as_library`, as a worker's import
+recorder does, reads no requirement and builds no index of the candidates. Each path a RECORD
+lists that can name a file is resolved for the index of the candidates and for the refusal of a
+reached file that no RECORD lists (`_resolved`), and so is each file under such a directory, to
+the path `os.path.realpath` gives: a RECORD path of PATH_MAX bytes or more in its site directory
+by `realpath` alone, and every other path a name at a time from the nearest directory above it
+already resolved (a site directory, or one resolved for an earlier path): one `os.path.islink`
+for each new name, and `realpath` only for a name that is a symbolic link, empty, `.` or `..`
+(`_real_path`). `listed_as_library` resolves no RECORD path: it compares each as written,
+normalised, with the file's path in its site directory.
 """
 
 from __future__ import annotations
@@ -183,13 +185,15 @@ class DistributionKeys(NamedTuple):
 
 class ReachedModule(NamedTuple):
     """A module a stage reaches by name: where it comes from (`origin`, as `import_origin` gives
-    it: a file's path resolved), and its file as the import located it (`located`: its spec's
-    origin or `__file__`, not resolved; None when it has none). In a venv whose installer links
-    each file into its cache from a real directory (uv's `--link-mode symlink`), the resolved
-    path lies in the cache, and only the located one names the directory the import searched."""
+    it: a file's path resolved), and its file as the import located it, made absolute, its
+    directory resolved and its last name kept (`real`: `fingerprint.with_real_directory` of its
+    spec's origin or `__file__`), which a `("file", ...)` origin requires; None when it has none.
+    In a venv whose installer links each file into its cache from a real directory (uv's
+    `--link-mode symlink`), the resolved path lies in the cache, and only `real` names the
+    directory the import searched."""
 
     origin: import_origin.Origin | None
-    located: str | None
+    real: str | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -476,10 +480,10 @@ def owners(
     """The candidates a reached module maps to, by file, never by name: every candidate whose
     RECORD lists the file its origin covers, resolved, and every candidate with a file under one
     of the directories it covers (`_reached_paths`, with `real` the module's file as the import
-    located it, its directory resolved and its last name kept, or None). `file_owners` maps each
-    resolved file a candidate's RECORD lists to those candidates, and `directory_owners` each
-    directory above such a file, or above a path the RECORD lists, as it names it
-    (`_build_index`)."""
+    located it, its directory resolved and its last name kept, which a `("file", ...)` origin
+    requires, or None). `file_owners` maps each resolved file a candidate's RECORD lists to those
+    candidates, and `directory_owners` each directory above such a file, or above a path the
+    RECORD lists, as it names it (`_build_index`)."""
     files, directories = _reached_paths(origin, real)
     found = set[str]()
     for _, file in files:
@@ -494,19 +498,22 @@ def _reached_paths(
 ) -> tuple[list[tuple[str, str]], list[str]]:
     """The files and the directories a reached module covers. A `("file", path)` origin covers
     its file, as the pair of where the import found it and `path`, resolved: where is `real`, the
-    module's file as the import located it with its directory resolved and its last name kept
-    (`path` when None). For a package's `__init__` file it also covers the package's directory,
-    the directory of `real`, as the import searched it (the walk records only the top name of
-    `import a.b`). Where an installer links each file into its cache from a real directory of a
-    site directory (uv's symlink link mode), `path` and the directory above it lie in the cache,
-    while `real` and its directory lie in the site directory, where each distribution with a file
-    in the package lists its own (`_listed_directories`), as where the files are copies. A
-    `("namespace", *directories)` origin covers its directories, which `import_origin` resolves.
-    Any other origin (built-in, frozen, no file, unknown, None) covers nothing."""
+    module's file as the import located it with its directory resolved and its last name kept,
+    which such an origin requires (`ReachedModule`): an `AssertionError` when it is None. For a
+    package's `__init__` file it also covers the package's directory, the directory of `real`, as
+    the import searched it (the walk records only the top name of `import a.b`). Where an
+    installer links each file into its cache from a real directory of a site directory (uv's
+    symlink link mode), `path` and the directory above it lie in the cache, while `real` and its
+    directory lie in the site directory, where each distribution with a file in the package lists
+    its own (`_listed_directories`), as where the files are copies. A `("namespace",
+    *directories)` origin covers its directories, which `import_origin` resolves. Any other
+    origin (built-in, frozen, no file, unknown, None) covers nothing."""
     match origin:
         case ("file", path):
-            where = path if real is None else real
-            return [(where, path)], [os.path.dirname(where)] if _is_package_init(where) else []
+            assert real is not None, (
+                f"a file origin ({path}) comes with its file as the import located it, but has none"
+            )
+            return [(real, path)], [os.path.dirname(real)] if _is_package_init(real) else []
         case ("namespace", *directories):
             return [], directories
         case _:
@@ -552,7 +559,8 @@ def decide(
 
 def _unlisted_refusal(module: str, file: str, installed: Installed, record: Record) -> str:
     """The refusal for a reached module whose `file` lies in the site directory of a candidate
-    with no RECORD (`installed`, `record`) while no RECORD in that directory lists the file:
+    with no RECORD (`installed`, `record`) while no RECORD in that directory, nor in the other
+    one the file lies in, where found or resolved (`_Snapshot._find_unlisted`), lists the file:
     Pivot cannot tell whether the module is that distribution's."""
     return (
         f"Module '{module}' ({file}) lies in {installed.site_dir}, where distribution "
@@ -590,8 +598,9 @@ def distribution_keys(
     pivot_dirs: Collection[str],
 ) -> DistributionKeys:
     """The `dist:` keys of a stage that reaches `modules` (each name's origin and file as its
-    import located it), with `path` as the worker's `sys.path` and `pivot_dirs` as pivot's own
-    resolved package directories, and the messages of the stage's refusals.
+    import located it, its directory resolved), with `path` as the worker's `sys.path` and
+    `pivot_dirs` as pivot's own resolved package directories, and the messages of the stage's
+    refusals.
 
     No module, no read. The installed distributions are read once per process for one `path` and
     `pivot_dirs` (`reset` forgets them), under a lock, since two threads of one process can
@@ -642,7 +651,6 @@ class _Index:
     installed: Mapping[str, Installed]  # every distribution, by `dist_info`
     requirements: Mapping[str, Requirements]  # every distribution's
     requires: Mapping[str, frozenset[str]]  # each candidate's requirements, resolved to candidates
-    records: Mapping[str, Record]  # each candidate's
     pivot_own: frozenset[str]  # the candidates with a RECORD file in one of pivot's directories
     file_owners: Mapping[str, frozenset[str]]
     directory_owners: Mapping[str, frozenset[str]]
@@ -673,9 +681,6 @@ class _Snapshot:
         # Each directory's real path (`_real_dir`); a site directory is resolved already.
         self._real_dirs: dict[str, str] = {site_dir: site_dir for site_dir in scan.site_dirs}
         self._records: dict[str, Record] = {}  # `dist_info` -> its RECORD (`_record`)
-        # A reached module's file as its import located it, absolute, -> that file with its
-        # directory resolved (`_real_file`).
-        self._real_files: dict[str, str] = {}
         # Site directory -> every resolved file that a RECORD of a distribution there lists.
         self._listed: dict[str, frozenset[str]] = {}
         # Site directory -> each path a RECORD there lists, normalised, -> the distributions whose
@@ -700,18 +705,17 @@ class _Snapshot:
         reached = dict[str, None]()
         for name in sorted(modules):
             module = modules[name]
-            real = self._real_file(module.located)
-            found = owners(module.origin, real, index.file_owners, index.directory_owners)
+            found = owners(module.origin, module.real, index.file_owners, index.directory_owners)
             for distribution in sorted(found):
                 reached[distribution] = None
             if index.recordless:
-                refusals.update(self._unlisted(name, module, real, index))
+                refusals.update(self._unlisted(name, module, index))
         digests = dict[str, list[str]]()
         for distribution in reach(reached, index.requires, index.pivot_own):
             installed = index.installed[distribution]
             decision = decide(
                 installed,
-                index.records[distribution],
+                self._record(installed),
                 index.requirements[distribution],
                 pivot_own=distribution in index.pivot_own,
                 owner=distribution in reached,
@@ -719,26 +723,14 @@ class _Snapshot:
             if decision.refusal:
                 refusals.add(decision.refusal)
             if decision.keyed:
-                digests.setdefault(installed.name, []).append(self._digest(installed, index))
+                digests.setdefault(installed.name, []).append(self._digest(installed))
         keys = {f"{_KEY_PREFIX}{name}": key_value(digests[name]) for name in sorted(digests)}
         return DistributionKeys(keys, sorted(refusals))
 
-    def _real_file(self, located: str | None) -> str | None:
-        """A reached module's file as its import `located` it, made absolute, with its directory
-        resolved and its last name kept, as `fingerprint.is_library_file` names a file, found
-        once for each such path; None for None."""
-        if located is None:
-            return None
-        absolute = os.path.abspath(located)
-        if absolute not in self._real_files:
-            directory, name = os.path.split(absolute)
-            self._real_files[absolute] = os.path.join(os.path.realpath(directory), name)
-        return self._real_files[absolute]
-
-    def _digest(self, installed: Installed, index: _Index) -> str:
+    def _digest(self, installed: Installed) -> str:
         """The `content_digest` of a keyed distribution's files, read from disk once."""
         if installed.dist_info not in self._digests:
-            paths = index.records[installed.dist_info].paths
+            paths = self._record(installed).paths
             assert paths is not None, "decide keys only a distribution with a RECORD"
             files = hashed_files(paths, os.path.basename(installed.dist_info))
             self._digests[installed.dist_info] = content_digest(
@@ -747,30 +739,32 @@ class _Snapshot:
             )
         return self._digests[installed.dist_info]
 
-    def _unlisted(
-        self, name: str, module: ReachedModule, real: str | None, index: _Index
-    ) -> tuple[str, ...]:
-        """The refusals for reached module `name` with a file that no RECORD in its site directory
-        lists, where that directory holds a candidate with no RECORD (`_Index.recordless`), which
-        owns no file, so Pivot cannot tell whether the module is that candidate's: one for each
-        such candidate, naming the first such file of that directory. Found once for each module.
+    def _unlisted(self, name: str, module: ReachedModule, index: _Index) -> tuple[str, ...]:
+        """The refusals for reached module `name` with a file that no RECORD in its site
+        directories lists, where one of them holds a candidate with no RECORD
+        (`_Index.recordless`), which owns no file, so Pivot cannot tell whether the module is that
+        candidate's: one for each such candidate, naming the first such file of that directory.
+        Found once for each module.
 
-        The files are those the module covers (`_reached_paths`, with `real` its file as
-        `_real_file` gives it): the module's own file, and, since such a candidate may hold a
-        submodule, the files under the directory of a package's `__init__` file or of a namespace
-        package but those under a `__pycache__` directory (`_files_under`). A file's site
-        directory is the deepest entry of the path that the scan listed and that holds the file
-        where the import found it or the walk listed it (`_site_dir`), and a RECORD there lists
-        the file when one of its paths resolves to the file's resolved path (`_listed_in`): in a
-        venv whose installer links each file into its cache, the first lies in the site directory
-        and the second in the cache, as a resolved RECORD path does. A directory is walked only
-        for the site directories with such a candidate that can hold a file under it (the deepest
-        entry of the path above the directory, and each entry at or under it), and only until
-        each of them has its file. The walk enters no directory that is a symbolic link, so a
-        file under such a link is not checked."""
+        The files are those the module covers (`_reached_paths`, with `ReachedModule.real`): the
+        module's own file, and, since such a candidate may hold a submodule, the files under the
+        directory of a package's `__init__` file or of a namespace package but those under a
+        `__pycache__` directory (`_files_under`). A file's site directories are the deepest entry
+        of the path that the scan listed and that holds the file where the import found it or
+        the walk listed it, and the deepest that holds its resolved path (`_site_dir`), and a
+        RECORD of either lists the file when one of its paths resolves to the file's resolved
+        path (`_find_unlisted`): in a venv whose installer links each file into its cache, no
+        entry holds the resolved path, which lies in the cache, as a resolved RECORD path does,
+        and a file linked into another entry of the path lies in both. A directory is walked only
+        for the site directories with such a candidate that can hold a file under it other than
+        through a symbolic link (the deepest entry of the path above the directory, and each
+        entry at or under it), and only until each of them has its file. The walk enters no
+        directory that is a symbolic link, so a file under such a link is not checked, and a file
+        under the directory that is a symbolic link into any other entry with such a candidate is
+        not checked there."""
         key = (name, module)
         if key not in self._unlisted_refusals:
-            files, directories = _reached_paths(module.origin, real)
+            files, directories = _reached_paths(module.origin, module.real)
             first = dict[str, str]()  # site directory -> its first file that no RECORD lists
             self._find_unlisted(files, set(index.recordless), first)
             for directory in directories:
@@ -785,7 +779,10 @@ class _Snapshot:
                     self._find_unlisted(_files_under(directory, self._real_dirs), pending, first)
             self._unlisted_refusals[key] = tuple(
                 _unlisted_refusal(
-                    name, file, index.installed[distribution], index.records[distribution]
+                    name,
+                    file,
+                    index.installed[distribution],
+                    self._record(index.installed[distribution]),
                 )
                 for site_dir, file in first.items()
                 for distribution in index.recordless[site_dir]
@@ -797,16 +794,24 @@ class _Snapshot:
     ) -> None:
         """Put in `first`, for each site directory of `pending`, the first of `files` (each the
         pair of where the import found it or the walk listed it, a path whose directory is
-        resolved, and its resolved path) that lies in it where found (`_site_dir`) and that no
-        RECORD there lists resolved (`_listed_in`), named where found, and take that directory
-        out of `pending`; once `pending` is empty, read no more of `files`."""
+        resolved, and its resolved path) that lies in it, where found or resolved (`_site_dir`),
+        while no RECORD of a site directory the file lies in, pending or not, lists it resolved
+        (`_listed_in`), named as it lies there (where found, when both lie there), and take that
+        directory out of `pending`; once `pending` is empty, read no more of `files`."""
         for where, resolved in files:
-            site_dir = self._site_dir(where)
-            if site_dir in pending and resolved not in self._listed_in(site_dir):
-                first[site_dir] = where
+            lies_in = dict[str, str]()  # site directory -> the file's path that lies in it
+            for path in (resolved, where):
+                site_dir = self._site_dir(path)
+                if site_dir is not None:
+                    lies_in[site_dir] = path
+            unlisted = [site_dir for site_dir in lies_in if site_dir in pending]
+            if not unlisted or any(resolved in self._listed_in(site_dir) for site_dir in lies_in):
+                continue
+            for site_dir in unlisted:
+                first[site_dir] = lies_in[site_dir]
                 pending.remove(site_dir)
-                if not pending:
-                    return
+            if not pending:
+                return
 
     def listed_by(self, file: str) -> tuple[Installed, ...]:
         """The distributions whose RECORD lists `file`, a path whose directory is resolved, in its
@@ -853,9 +858,10 @@ class _Snapshot:
         return self._record_indexes[site_dir]
 
     def _record(self, installed: Installed) -> Record:
-        """A distribution's RECORD (`_read_record`), read once, whether the index of the
-        candidates (`_build_index`), the refusal of a file that no RECORD lists (`_listed_in`) or
-        the question about a linked file (`_record_index`) asks for it first."""
+        """A distribution's RECORD (`_read_record`), read once, whichever asks for it first: the
+        index of the candidates (`_build_index`), a candidate's decision, digest or refusal
+        (`keys_for`, `_digest`, `_unlisted`), the refusal of a file that no RECORD lists
+        (`_listed_in`) or the question about a linked file (`_record_index`)."""
         if installed.dist_info not in self._records:
             self._records[installed.dist_info] = _read_record(installed)
         return self._records[installed.dist_info]
@@ -916,7 +922,6 @@ def _build_index(
         requires={
             dist_info: resolved[dist_info] & found_candidates for dist_info in found_candidates
         },
-        records=records,
         pivot_own=frozenset(pivot_own),
         file_owners={file: frozenset(found) for file, found in file_owners.items()},
         directory_owners={
@@ -1030,7 +1035,7 @@ def _real_path(path: str, real_dirs: dict[str, str]) -> str:
     takes as no link. Each path this module resolves is one: `_resolved` leaves out every other
     RECORD path, and `_files_under` joins the names `os.walk` lists, which it decoded with
     surrogateescape and so can encode back, to a reached module's directory, which `realpath`
-    resolved (`_Snapshot._real_file`, or `import_origin` for a namespace package).
+    resolved (`ReachedModule.real`, or `import_origin` for a namespace package).
 
     `realpath` resolves a path a name at a time from the left, so before it reads the last name
     it holds the real path of the directory that name is in, and it then takes the name as it is

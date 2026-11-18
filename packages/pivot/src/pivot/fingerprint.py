@@ -394,8 +394,8 @@ _identity_active: contextvars.ContextVar[tuple[int, ...]] = contextvars.ContextV
 # Per-pass memo, keyed by kind and object id, for function identities (`function_identity`),
 # type-hint classes (`_hint_parts`), user-class members (`_user_methods`), mark decisions
 # (`_mark_decision`), class identities (`_class_identity`), the parts of classes with no source
-# (`_sourceless_parts`) and a loaded module's origin (`_module_origin`), and by file name for
-# source file digests (`_source_digest`).
+# (`_sourceless_parts`) and a loaded module's origin and file (`_reached_module`), and by file
+# name for source file digests (`_source_digest`).
 # Set only inside `fingerprint_pass()`; a reload, a mutated cell or an edit is seen by the next
 # pass.
 _pass_memo: contextvars.ContextVar[dict[tuple[str, int | str], Any] | None] = (
@@ -2466,12 +2466,14 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
 
     A module's origin is the module this process holds, which is the code the walk saw
     (`loaded_source.check_worker_imports` refuses a worker that would import another), else where
-    a worker would import it from, predicted without importing it. Beside it goes the module's
-    file as the import located it, not resolved (the module's, else the predicted spec's): in a
-    venv uv links into its cache the origin lies in the cache, and only that file names the
-    package's directory in `site-packages`, where another distribution may put a file. No origin
-    is found when the manifest has no `byname:` entry, or when no distribution on the worker's
-    path can give a key or a refusal (`installed_distributions.needs_origins`)."""
+    a worker would import it from, predicted without importing it (`loaded_source.worker_spec`,
+    which gives the origin and the file at once). Beside it goes the module's file as the import
+    located it, its directory resolved and its last name kept (`with_real_directory`; the
+    module's, else the predicted spec's): in a venv uv links into its cache the origin lies in
+    the cache, and only that file names the package's directory in `site-packages`, where another
+    distribution may put a file. No origin is found when the manifest has no `byname:` entry, or
+    when no distribution on the worker's path can give a key or a refusal
+    (`installed_distributions.needs_origins`)."""
     names = _by_name_names(manifest)
     if not names:
         return
@@ -2482,15 +2484,13 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     modules = dict[str, installed_distributions.ReachedModule]()
     for name in names:
         module = sys.modules.get(name)
-        modules[name] = (
-            installed_distributions.ReachedModule(
-                _module_origin(module), import_origin.file_of_module(module)
+        if isinstance(module, types.ModuleType):
+            modules[name] = _reached_module(module)
+        else:
+            spec = loaded_source.worker_spec(name)
+            modules[name] = installed_distributions.ReachedModule(
+                spec.origin, None if spec.file is None else with_real_directory(spec.file)
             )
-            if isinstance(module, types.ModuleType)
-            else installed_distributions.ReachedModule(
-                loaded_source.worker_origin(name), loaded_source.worker_file(name)
-            )
-        )
     found = installed_distributions.distribution_keys(modules, path, pivot_dirs)
     prefix = _stage_prefix()
     for message in found.refusals:
@@ -2498,10 +2498,19 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     manifest.update(found.keys)
 
 
-def _module_origin(module: types.ModuleType) -> import_origin.Origin:
-    """`import_origin.of_module(module)`, found once per module object within one
-    `fingerprint_pass()`."""
-    return _memoized("module-origin", module, lambda: import_origin.of_module(module))
+def _reached_module(module: types.ModuleType) -> installed_distributions.ReachedModule:
+    """What `installed_distributions` takes of a module this process holds: its origin
+    (`import_origin.of_module`) and its file as its import located it, with its directory
+    resolved (`import_origin.file_of_module`, `with_real_directory`), found once per module
+    object within one `fingerprint_pass()`."""
+
+    def read() -> installed_distributions.ReachedModule:
+        file = import_origin.file_of_module(module)
+        return installed_distributions.ReachedModule(
+            import_origin.of_module(module), None if file is None else with_real_directory(file)
+        )
+
+    return _memoized("reached-module", module, read)
 
 
 def without_by_name(manifest: Mapping[str, str]) -> dict[str, str]:
@@ -6962,8 +6971,8 @@ def _by_name_hash(func: Any) -> str:
 
 def is_user_code(obj: Any) -> bool:
     """Check if object is user code (not stdlib/site-packages/builtins, nor pivot's own
-    packages: ``is_library_file`` for a module's file, ``is_library_path`` for a namespace
-    package's directory)."""
+    packages: ``is_library_file`` for a module's file, and for a namespace package its
+    directories' site-packages, dist-packages or pivot-package parts)."""
     _t = metrics.start()
     try:
         if obj is None:
@@ -7065,29 +7074,39 @@ def is_library_file(filename: str) -> bool:
     that is not editable.
 
     The second holds when all of these do. Its path with its directory resolved and its last
-    name kept (``real``) is a library path: the file as the import found it, whatever links its
-    directory was reached through, so a library package linked into the project root, and a
-    ``sys.path`` entry that is a link to ``site-packages``, are judged in ``site-packages``.
-    That file itself is a symbolic link: uv's ``UV_LINK_MODE=symlink`` links each installed file
-    into uv's cache, where its resolved path is no library path, from a real directory of
-    ``site-packages``. And the RECORDs of its site directory list it, each of a distribution
-    installed in a known form that is not editable (``installed_distributions.listed_as_library``,
-    on the worker's ``sys.path``). Otherwise the resolved path decides, so the rule fails closed
-    toward user code: a file of an editable install (flit's ``install --symlink`` links a module
-    file, or a package's directory, which resolves the directory away from ``site-packages``),
-    and a link that no RECORD lists, stay user code where they point outside every library path.
+    name kept (``with_real_directory``) is a library path: the file as the import found it,
+    whatever links its directory was reached through, so a library package linked into the
+    project root, and a ``sys.path`` entry that is a link to ``site-packages``, are judged in
+    ``site-packages``. That file itself is a symbolic link: uv's ``UV_LINK_MODE=symlink`` links
+    each installed file into uv's cache, where its resolved path is no library path, from a real
+    directory of ``site-packages``. And the RECORDs of its site directory list it, each of a
+    distribution installed in a known form that is not editable
+    (``installed_distributions.listed_as_library``, on the worker's ``sys.path``). Otherwise the
+    resolved path decides, so the rule fails closed toward user code: a file of an editable
+    install (flit's ``install --symlink`` links a module file, or a package's directory, which
+    resolves the directory away from ``site-packages``), and a link that no RECORD lists, stay
+    user code where they point outside every library path.
 
     Decided once per file name per process, as ``_is_user_source_file`` is. Raises ``OSError``
     when the path cannot be resolved."""
     if is_library_path(pathlib.Path(filename).resolve()):
         return True
-    absolute = os.path.abspath(filename)
-    real = os.path.join(os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute))
+    real = with_real_directory(filename)
     if not is_library_path(pathlib.Path(real)):
         return False
     return os.path.islink(real) and installed_distributions.listed_as_library(
         real, loaded_source.worker_path(), _pivot_dir_names()
     )
+
+
+def with_real_directory(filename: str) -> str:
+    """The file ``filename`` made absolute, its directory resolved and its last name kept: the
+    file as the import found it, whatever links its directory was reached through, and, where
+    the file is itself a link, not where that link points. ``is_library_file`` judges a linked
+    file by it, and ``installed_distributions.ReachedModule`` carries it (``real``) to name the
+    package directory the import searched and the site directory a module's file lies in."""
+    absolute = os.path.abspath(filename)
+    return os.path.join(os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute))
 
 
 def _pivot_dir_names() -> list[str]:

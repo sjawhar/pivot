@@ -140,6 +140,14 @@ _FLIT_METADATA = (
     + b"Import-Name: flitlib\n"
 )
 
+# `direct_url.json` (PEP 610) as uv 0.13.5 writes it for a local directory and a git install.
+UV_DIRECTORY_URL = b'{"url":"file:///home/user/src/fixlib","dir_info":{}}'
+UV_GIT_URL = (
+    b'{"url":"file:///home/user/src/fixgit","vcs_info":{"vcs":"git",'
+    b'"commit_id":"6964203a125157369c715bd7ba6b130944b8329e",'
+    b'"requested_revision":"6964203a125157369c715bd7ba6b130944b8329e"}}'
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class Venv:

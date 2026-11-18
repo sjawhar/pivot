@@ -61,8 +61,10 @@ _LONG_MODULE = "m" * 197
 def _helper_module(path: pathlib.Path) -> installed_distributions.ReachedModule:
     """What `fingerprint.add_distribution_keys` gives of a module loaded from the file at `path`:
     the origin `import_origin.of_module` gives it, and `path`, its file as the import located
-    it."""
-    return installed_distributions.ReachedModule(("file", os.path.realpath(path)), str(path))
+    it, with its directory resolved (`_helper_real`)."""
+    return installed_distributions.ReachedModule(
+        ("file", os.path.realpath(path)), _helper_real(path)
+    )
 
 
 def _helper_namespace(directory: pathlib.Path) -> installed_distributions.ReachedModule:
@@ -72,9 +74,11 @@ def _helper_namespace(directory: pathlib.Path) -> installed_distributions.Reache
 
 
 def _helper_real(path: pathlib.Path) -> str:
-    """`path` with its directory resolved and its last name kept: the form in which
-    `fingerprint.is_library_file` asks `listed_as_library` about a file."""
-    return os.path.join(os.path.realpath(path.parent), path.name)
+    """`path` with its directory resolved and its last name kept
+    (`fingerprint.with_real_directory`): the form in which `fingerprint.is_library_file` asks
+    `listed_as_library` about a file, and `fingerprint.add_distribution_keys` gives a module's
+    file."""
+    return fingerprint.with_real_directory(str(path))
 
 
 def _helper_value(site: pathlib.Path, files: collections.abc.Mapping[str, str | None]) -> str:
@@ -969,12 +973,12 @@ def test_no_origin_is_found_when_no_install_on_the_path_can_give_a_key(
     site = venv.site_packages
     monkeypatch.setattr(sys, "path", [str(site)])
     of_module = mocker.spy(import_origin, "of_module")
-    worker_origin = mocker.spy(loaded_source, "worker_origin")
+    worker_spec = mocker.spy(loaded_source, "worker_spec")
     stage = {"self:make": "1", "byname:json": "", "byname:fixlib": ""}
     without_keyed = dict(stage)
 
     fingerprint.add_distribution_keys(without_keyed)
-    calls_without_keyed = [of_module.call_args_list[:], worker_origin.call_args_list[:]]
+    calls_without_keyed = [of_module.call_args_list[:], worker_spec.call_args_list[:]]
     installed_dists.install_directory(
         venv, installed_dists.write_library(src, "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE)
     )
@@ -986,7 +990,7 @@ def test_no_origin_is_found_when_no_install_on_the_path_can_give_a_key(
     assert calls_without_keyed == [[], []], f"no origin may be found: {calls_without_keyed}"
     value = _helper_value(site, {"fixlib/__init__.py": "fixlib/__init__.py"})
     assert with_keyed == {**stage, "dist:fix-lib": value}, with_keyed
-    calls = [of_module.call_args_list, worker_origin.call_args_list]
+    calls = [of_module.call_args_list, worker_spec.call_args_list]
     assert calls == [[mocker.call(sys.modules["json"])], [mocker.call("fixlib")]], calls
 
 
