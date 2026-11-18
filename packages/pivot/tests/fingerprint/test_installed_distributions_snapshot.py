@@ -10,11 +10,13 @@ the check of an install with no RECORD walks, and how far, once per process. The
 path can give a key, and one fingerprint, through the registry, of a stage that imports its
 installed library only in its body. Last, over files uv links into its cache (`--link-mode
 symlink`) and the editable layouts uv and flit's `install --symlink` make:
-`installed_distributions.linked_by_editable`, which reads only the RECORDs of one directory's
+`installed_distributions.listed_by_editable`, which reads only the RECORDs of one directory's
 editable installs and builds no index of the candidates; `fingerprint.is_library_file`, which
-asks it only about a file linked under a library path; and the keys of a namespace package and
-of a package that holds another install's file, which are those of a venv whose files are
-copies. No fixture is imported into this process.
+asks it only about a file linked under a library path; the keys of a namespace package and of a
+package that holds another install's file, which are those of a venv whose files are copies; and
+the keys and refusals of a module file linked by hand from the project root into
+`site-packages`, laid out by hand with that file copied or linked into a cache, each module given
+as `fingerprint.reached_module_of` gives it. No fixture is imported into this process.
 
 The CLI tests of the same decisions are in `test_installed_distributions.py` and
 `test_installed_distributions_link_mode.py`, and the pure functions on plain data in
@@ -66,9 +68,9 @@ def _helper_namespace(directory: pathlib.Path) -> installed_distributions.Reache
 
 def _helper_real(path: pathlib.Path) -> str:
     """`path` with its directory resolved and its last name kept
-    (`fingerprint.with_real_directory`): the form in which `fingerprint.is_library_file` asks
-    `linked_by_editable` about a file, and `fingerprint.add_distribution_keys` gives a module's
-    file."""
+    (`fingerprint.with_real_directory`): for a file in a site directory, the file
+    `fingerprint.judged_file` gives, in which form `fingerprint.is_library_file` asks
+    `listed_by_editable` about it and `fingerprint.add_distribution_keys` gives a module's file."""
     return fingerprint.with_real_directory(str(path))
 
 
@@ -162,6 +164,56 @@ def _helper_egg_info_project(
         + f"in PKG-INFO: headers {headers}, requires {requires}"
     )
     return source
+
+
+# The two layouts of a site directory laid out by hand that a test compares: its installed files
+# copies, as `--link-mode copy` leaves them, and links into a cache, as `--link-mode symlink` does.
+_LAYOUTS = ("copied", "linked-into-a-cache")
+
+
+def _helper_install_by_hand(
+    root: pathlib.Path,
+    layout: str,
+    name: str,
+    files: collections.abc.Mapping[str, str],
+    direct_url: bytes | None,
+) -> pathlib.Path:
+    """Install distribution `name` 0.1 by hand into `root/venv/site-packages` as uv installs one
+    from a package index (`installed_dists.index_install_by_hand`), its files copies in the
+    `copied` layout and links into `root/cache` in the `linked-into-a-cache` one, with
+    `direct_url` written as its `direct_url.json`, a file, as uv writes it, when given (for a git
+    install, `installed_dists.UV_GIT_URL`). Returns the site directory."""
+    site = root / "venv" / "site-packages"
+    cache = None if layout == "copied" else root / "cache"
+    installed_dists.index_install_by_hand(site, name, files, cache=cache)
+    if direct_url is not None:
+        (site / f"{name}-0.1.dist-info" / "direct_url.json").write_bytes(direct_url)
+    return site
+
+
+def _helper_link_into_project(
+    root: pathlib.Path, site: pathlib.Path, name: str, layout: str
+) -> pathlib.Path:
+    """`root/project/<name>`, a link made by hand to `site/<name>`, which is a copy in the
+    `copied` layout and a link into the cache in the other (the test fails otherwise). Returns the
+    project's root."""
+    project = root / "project"
+    project.mkdir(exist_ok=True)
+    (project / name).symlink_to(site / name)
+    linked = (site / name).is_symlink()
+    assert linked == (layout != "copied"), f"{site / name} in the {layout} layout: link {linked}"
+    return project
+
+
+def _helper_written_site(
+    found: installed_distributions.DistributionKeys, site: pathlib.Path
+) -> installed_distributions.DistributionKeys:
+    """`found` with the resolved path of the site directory `site` written `{site}` in each
+    refusal, so two layouts laid out in two directories compare."""
+    real = str(site.resolve())
+    return installed_distributions.DistributionKeys(
+        found.keys, [refusal.replace(real, "{site}") for refusal in found.refusals]
+    )
 
 
 def test_distribution_keys_hash_each_reached_git_path_and_local_archive_install_from_disk(
@@ -988,7 +1040,7 @@ def test_no_origin_is_found_when_no_install_on_the_path_can_give_a_key(
     assert calls == [[mocker.call(sys.modules["json"])], [mocker.call("fixlib")]], calls
 
 
-def test_linked_by_editable_reads_only_the_records_of_editable_installs_that_list_a_linked_file(
+def test_listed_by_editable_reads_only_the_records_of_editable_installs_that_list_a_linked_file(
     tmp_path: pathlib.Path, mocker: pytest_mock.MockerFixture
 ) -> None:
     """Over real installs that uv links into its cache (`--link-mode symlink`): `idxlib`,
@@ -1061,10 +1113,10 @@ def test_linked_by_editable_reads_only_the_records_of_editable_installs_that_lis
     build_index = mocker.spy(installed_distributions, "_build_index")
 
     found = {
-        name: installed_distributions.linked_by_editable(_helper_real(file), path, _PIVOT_DIRS)
+        name: installed_distributions.listed_by_editable(_helper_real(file), path, _PIVOT_DIRS)
         for name, file in files.items()
     }
-    found["fixlib-target"] = installed_distributions.linked_by_editable(
+    found["fixlib-target"] = installed_distributions.listed_by_editable(
         os.path.realpath(files["fixlib"]), path, _PIVOT_DIRS
     )
     real_tmp = os.path.realpath(tmp_path)
@@ -1171,7 +1223,7 @@ def test_is_library_file_asks_the_records_only_about_a_file_linked_under_a_libra
         "stray": True,
     }, links
     monkeypatch.setattr(sys, "path", [str(site), str(target)])
-    asked_editable = mocker.spy(installed_distributions, "linked_by_editable")
+    asked_editable = mocker.spy(installed_distributions, "listed_by_editable")
 
     found = {name: fingerprint.is_library_file(str(file)) for name, file in files.items()}
     user_source = {
@@ -1324,3 +1376,117 @@ def test_a_file_one_install_puts_in_anothers_package_is_reached_in_a_venv_uv_lin
         for venv in venvs
     ]
     assert recordless == refused, recordless
+
+
+def test_a_project_file_linked_to_a_recordless_git_install_is_refused_as_in_a_copied_venv(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`gitmod`, installed by hand into `site-packages` as uv installs from git, in each layout
+    (its `gitmod.py` copied, or linked into a cache), has lost its RECORD; `project/gitmod.py` is a
+    link made by hand to `site-packages/gitmod.py`, and the path is the project root, then
+    `site-packages`. The stage reaches `gitmod` through the project file, as
+    `fingerprint.reached_module_of` gives it. Both layouts refuse it with one refusal, naming the
+    module's file in `site-packages`: where the file is a copy, the project file's resolved path
+    lies there; where it is a link, its resolved path lies in the cache, outside every entry of
+    the path, and only the file Pivot judged it by (`fingerprint.judged_file`, where the link
+    from the project reaches `site-packages`) lies in `site-packages`. With the project file as
+    the import found it in its place, the linked layout would refuse nothing."""
+    found = dict[str, installed_distributions.DistributionKeys]()
+    for layout in _LAYOUTS:
+        root = tmp_path / layout
+        site = _helper_install_by_hand(
+            root, layout, "gitmod", {"gitmod.py": "VALUE = 1\n"}, installed_dists.UV_GIT_URL
+        )
+        installed_dists.damage(site / "gitmod-0.1.dist-info" / "RECORD", None)
+        project = _helper_link_into_project(root, site, "gitmod.py", layout)
+        keys = installed_distributions.distribution_keys(
+            {"gitmod": installed_dists.module_loaded_from(project / "gitmod.py")},
+            [str(project), str(site)],
+            _PIVOT_DIRS,
+        )
+        found[layout] = _helper_written_site(keys, site)
+
+    refusal = (
+        "Module 'gitmod' ({site}/gitmod.py) lies in {site}, where distribution 'gitmod' "
+        "({site}/gitmod-0.1.dist-info), installed from version control (vcs_info), has no RECORD "
+        "file, and no RECORD file there lists that file. Pivot cannot tell whether the stage runs "
+        "that distribution's code, so the stage could skip a run after it changes. Fix: reinstall "
+        "'gitmod'."
+    )
+    refused = installed_distributions.DistributionKeys({}, [refusal])
+    assert found == {"copied": refused, "linked-into-a-cache": refused}, found
+
+
+def test_a_project_file_linked_to_an_index_file_beside_a_recordless_egg_info_refuses_nothing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """In each layout (the installed files copied, or linked into a cache), `site-packages` holds
+    `idxmod`, installed by hand as from a package index, whose RECORD lists `mod.py`, and
+    `gitlib`, installed by hand as from git, with its RECORD. The project root, first on the path,
+    holds `myproj.egg-info`, laid out as a setuptools build leaves it, with no RECORD, which
+    requires `gitlib` (a `Requires-Dist` header and `requires.txt`), and `project/mod.py`, a link
+    made by hand to `site-packages/mod.py`. The stage reaches `mod` through the project file, as
+    `fingerprint.reached_module_of` gives it. Neither layout refuses it, and both give the same
+    keys, none: `idxmod`'s RECORD in `site-packages` lists the file Pivot judged the module by
+    (`fingerprint.judged_file`), which lies in `site-packages` in both. With the project file as
+    the import found it in its place, the linked layout, whose resolved path lies in the cache
+    outside every entry of the path, would find the file only in the project root, which no
+    RECORD there lists beside `myproj`, and would refuse the stage."""
+    found = dict[str, installed_distributions.DistributionKeys]()
+    for layout in _LAYOUTS:
+        root = tmp_path / layout
+        site = _helper_install_by_hand(root, layout, "idxmod", {"mod.py": "MOD = 1\n"}, None)
+        _helper_install_by_hand(
+            root, layout, "gitlib", {"gitlib.py": "LIB = 1\n"}, installed_dists.UV_GIT_URL
+        )
+        project = _helper_link_into_project(root, site, "mod.py", layout)
+        egg_info = project / "myproj.egg-info"
+        egg_info.mkdir()
+        (egg_info / "PKG-INFO").write_text(
+            "Metadata-Version: 2.4\nName: myproj\nVersion: 0.1\nRequires-Dist: gitlib\n"
+        )
+        (egg_info / "requires.txt").write_text("gitlib\n")
+        requires = importlib.metadata.Distribution.at(egg_info).requires
+        assert requires == ["gitlib"], f"{egg_info} must require gitlib: {requires}"
+        found[layout] = installed_distributions.distribution_keys(
+            {"mod": installed_dists.module_loaded_from(project / "mod.py")},
+            [str(project), str(site)],
+            _PIVOT_DIRS,
+        )
+
+    nothing = installed_distributions.DistributionKeys({}, [])
+    assert found == {"copied": nothing, "linked-into-a-cache": nothing}, found
+
+
+def test_a_project_file_linked_to_a_git_installed_module_gets_its_key_as_in_a_copied_venv(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`gitmod`, installed by hand into `site-packages` as uv installs from git, with its RECORD,
+    in each layout (its `gitmod.py` copied, or linked into a cache); `project/gitmod.py` is a link
+    made by hand to `site-packages/gitmod.py`, and the path is the project root, then
+    `site-packages`. In both layouts `fingerprint.is_library_file` takes the project file as
+    library code, so a stage that imports it reaches `gitmod` by name, and that module gives the
+    key of `gitmod`, with one value in both. Where the file is a link into the cache, the project
+    file is library code only because Pivot follows its link to `site-packages/gitmod.py`."""
+    library = dict[str, bool]()
+    found = dict[str, installed_distributions.DistributionKeys]()
+    for layout in _LAYOUTS:
+        root = tmp_path / layout
+        site = _helper_install_by_hand(
+            root, layout, "gitmod", {"gitmod.py": "VALUE = 1\n"}, installed_dists.UV_GIT_URL
+        )
+        project = _helper_link_into_project(root, site, "gitmod.py", layout)
+        path = [str(project), str(site)]
+        monkeypatch.setattr(sys, "path", path)
+        library[layout] = fingerprint.is_library_file(str(project / "gitmod.py"))
+        found[layout] = installed_distributions.distribution_keys(
+            {"gitmod": installed_dists.module_loaded_from(project / "gitmod.py")},
+            path,
+            _PIVOT_DIRS,
+        )
+
+    assert library == {"copied": True, "linked-into-a-cache": True}, library
+    copied_site = tmp_path / "copied" / "venv" / "site-packages"
+    value = _helper_value(copied_site, {"gitmod.py": "gitmod.py"})
+    keyed = installed_distributions.DistributionKeys({"dist:gitmod": value}, [])
+    assert found == {"copied": keyed, "linked-into-a-cache": keyed}, found

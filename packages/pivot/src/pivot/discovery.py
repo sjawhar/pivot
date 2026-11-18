@@ -86,8 +86,8 @@ class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
     A library's file (``fingerprint.is_library_file``: its resolved path is a library's, pivot's
     own packages included, as a library package symlinked into the project root; or a file linked
     into ``site-packages`` that no editable distribution's RECORD lists, as uv's symlink link mode
-    links each file into its cache, or a link to such a file) loads as CPython loads it, and its
-    bytecode is left alone.
+    links each file into its cache, or a file whose chain of links reaches such a file) loads as
+    CPython loads it, and its bytecode is left alone.
 
     Every other file's code comes from source bytes this loader read, and it records those bytes
     (``loaded_source.record``): a stage's fingerprint describes that code, which a worker receives

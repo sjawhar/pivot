@@ -128,8 +128,9 @@ _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
-# The most symbolic links `is_library_file` follows from a file to a library path: Linux's limit on
-# the links one path lookup follows (MAXSYMLINKS, 40). A file whose chain needs more is user code.
+# The most symbolic links `judged_file` follows from a file to a library path: Linux's limit on
+# the links one path lookup follows (MAXSYMLINKS, 40). A file whose chain needs more is judged
+# where the import found it.
 _MAX_LINK_HOPS = 40
 
 # Type alias for AST hash cache entry tuple.
@@ -2471,12 +2472,12 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     A module's origin is the module this process holds, which is the code the walk saw
     (`loaded_source.check_worker_imports` refuses a worker that would import another), else where
     a worker would import it from, predicted without importing it (`loaded_source.worker_spec`,
-    which gives the origin and the file at once). Beside it goes the module's file as the import
-    located it, its directory resolved and its last name kept (`with_real_directory`; the
-    module's, else the predicted spec's): in a venv uv links into its cache the origin lies in
-    the cache, and only that file names the package's directory in `site-packages`, where another
-    distribution may put a file. No origin is found when the manifest has no `byname:` entry, or
-    when no distribution on the worker's path can give a key or a refusal
+    which gives the origin and the file at once). Beside it goes the file Pivot judges the
+    module's file by (`judged_file` of the module's file as its import located it, else of the
+    predicted spec's): in a venv uv links into its cache the origin lies in the cache, and only
+    that file names the site directory and the package's directory where `is_library_file`
+    decided, where another distribution may put a file. No origin is found when the manifest has
+    no `byname:` entry, or when no distribution on the worker's path can give a key or a refusal
     (`installed_distributions.needs_origins`)."""
     names = _by_name_names(manifest)
     if not names:
@@ -2518,11 +2519,14 @@ def reached_module_of(
 ) -> installed_distributions.ReachedModule:
     """What `installed_distributions` takes of a module a stage reaches by name, whose origin is
     `origin` and whose file, as its import located it or would locate it, is `file`: that origin,
-    and that file with its directory resolved and its last name kept (`with_real_directory`),
-    None when it has none. The one builder of both a module this process holds (`_held_module`)
-    and one a worker would import (`loaded_source.worker_spec`)."""
+    and the file Pivot judges `file` by (`judged_file`), None when it has none, so the keys and
+    the refusals name the site directory and the package directory where `is_library_file`
+    decided. For a file whose path with its directory resolved is a library path already (every
+    file of a venv, copied or linked into uv's cache), that is `with_real_directory(file)`. The
+    one builder of both a module this process holds (`_held_module`) and one a worker would
+    import (`loaded_source.worker_spec`)."""
     return installed_distributions.ReachedModule(
-        origin, None if file is None else with_real_directory(file)
+        origin, None if file is None else judged_file(file)
     )
 
 
@@ -7086,45 +7090,63 @@ def is_library_file(filename: str) -> bool:
 
     1. Its resolved path is a library path (``is_library_path``): library code. A file of a
        copied venv is decided here.
-    2. Else Pivot follows the file's chain of symbolic links one link at a time, from its path
-       with its directory resolved and its last name kept (``with_real_directory``: the file as
-       the import found it, whatever links its directory was reached through) to the file each
-       link names, its directory resolved and its last name kept (``_link_hop``), and decides at
-       the first of them that is a library path: library code, recorded by name, keyed and
-       refused as the same file copied there would be, unless the RECORD of an editable
-       distribution in that file's site directory lists it
-       (``installed_distributions.linked_by_editable``, on the worker's ``sys.path``). Then the
-       resolved path decides, as in pivot 0.10.4: user code.
-    3. A file of the chain that is no library path and no symbolic link Pivot can read, before
-       one that is a library path, makes the file user code, and so does a chain that reaches no
-       library path within ``_MAX_LINK_HOPS`` links (a loop of links among them).
+    2. Else the file Pivot judges it by (``judged_file``: its path with its directory resolved
+       and its last name kept, or the first file of its chain of symbolic links that is a
+       library path) is a library path: library code, recorded by name, keyed and refused as the
+       same file copied there would be, unless the RECORD of an editable distribution in that
+       file's site directory lists it (``installed_distributions.listed_by_editable``, on the
+       worker's ``sys.path``). Then the resolved path decides, as in pivot 0.10.4: user code.
+    3. Else user code: the chain meets a file that is no library path and no link before one that
+       is a library path, or reaches no library path within ``_MAX_LINK_HOPS`` links.
 
     So a file that uv's ``UV_LINK_MODE=symlink`` links into its cache from a real directory of
     ``site-packages``, a library package linked into the project root, a ``sys.path`` entry that
     is a link to ``site-packages``, and a module file linked by hand into the project root to a
     file of ``site-packages`` are each judged in ``site-packages``, as where the files there are
-    copies; a link there that no editable distribution's RECORD lists (one that no RECORD lists,
-    or that only a RECORD-less, unclassified or non-editable distribution owns) is library code.
-    flit's ``install --symlink`` links a checkout's module file into ``site-packages``, with a
-    RECORD of an editable install that lists it: user code by rule 2; it links a package's
-    directory too, whose files are judged in the checkout, where that directory resolves, and are
-    user code by rule 3.
+    copies. A link there that no editable distribution's RECORD lists is library code, as a
+    copied file there is: one that no RECORD lists, one of an editable install whose RECORD is
+    lost or that Pivot cannot read, and one that only a distribution Pivot cannot classify, or
+    one that is not editable, lists. flit's ``install --symlink`` links a checkout's module file
+    into ``site-packages``, with a RECORD of an editable install that lists it: user code by
+    rule 2, also through a project file linked to it; it links a package's directory too, whose
+    files are judged in the checkout, where that directory resolves: user code by rule 3.
 
     Decided once per file name per process, as ``_is_user_source_file`` is. Raises ``OSError``
     when the path cannot be resolved."""
     if is_library_path(pathlib.Path(filename).resolve()):
         return True
-    hop = with_real_directory(filename)
-    links = 0
+    judged = judged_file(filename)
+    if not is_library_path(pathlib.Path(judged)):
+        return False
+    return not installed_distributions.listed_by_editable(
+        judged, loaded_source.worker_path(), _pivot_dir_names()
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def judged_file(filename: str) -> str:
+    """The file Pivot judges the file ``filename`` by (``is_library_file``), which
+    ``reached_module_of`` gives ``installed_distributions`` to name the site directory and the
+    package directory of a module: the file as the import found it (``with_real_directory``)
+    when its resolved path is a library path, so a copied venv's files follow no link. Else
+    Pivot follows the chain of symbolic links from that file one link at a time to the file each
+    link names (``_link_hop``), and gives the first file of the chain that is a library path; the
+    file as the import found it when the chain meets a file that is no library path and no link
+    Pivot can read, or reaches no library path within ``_MAX_LINK_HOPS`` links (a loop of links
+    among them). For a file whose own path with its directory resolved is a library path already
+    (every file of a venv, copied or linked into uv's cache), that is the file as the import
+    found it. Decided once per file name per process. Raises ``OSError`` when the path cannot be
+    resolved."""
+    found = with_real_directory(filename)
+    if is_library_path(pathlib.Path(filename).resolve()):
+        return found
+    hop, links = found, 0
     while not is_library_path(pathlib.Path(hop)):
         target = _link_hop(hop) if links < _MAX_LINK_HOPS else None
         if target is None:
-            return False
-        hop = target
-        links += 1
-    return not installed_distributions.linked_by_editable(
-        hop, loaded_source.worker_path(), _pivot_dir_names()
-    )
+            return found
+        hop, links = target, links + 1
+    return hop
 
 
 def _link_hop(link: str) -> str | None:
@@ -7145,10 +7167,8 @@ def _link_hop(link: str) -> str | None:
 def with_real_directory(filename: str) -> str:
     """The file ``filename`` made absolute, its directory resolved and its last name kept: the
     file as the import found it, whatever links its directory was reached through, and, where
-    the file is itself a link, not where that link points. ``is_library_file`` starts the chain
-    of links it follows from it, and ``installed_distributions.ReachedModule`` carries it
-    (``real``) to name the package directory the import searched and the site directory a
-    module's file lies in."""
+    the file is itself a link, not where that link points. ``judged_file`` starts the chain of
+    links it follows from it."""
     absolute = os.path.abspath(filename)
     return os.path.join(os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute))
 

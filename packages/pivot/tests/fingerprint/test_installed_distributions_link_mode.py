@@ -79,17 +79,37 @@ _UNCLASSIFIED_DEPENDENCY_REFUSAL = (
 
 def _helper_linked_project(
     root: pathlib.Path, sources: tuple[pathlib.Path, ...], link_mode: str, pipeline_text: str
-) -> tuple[installed_dists.Project, bool]:
+) -> installed_dists.Project:
     """Make a venv at `root/venv`, install the projects at `sources` into it from their paths in
     that order with uv's `link_mode`, and make a project at `root/project` whose pipeline is
-    `pipeline_text`. Returns the project, and whether `fixlib`'s installed module file is a
-    symbolic link."""
+    `pipeline_text`. The test fails unless `fixlib`'s installed module file is a symbolic link
+    exactly when `link_mode` is `symlink`."""
     root.mkdir()
     venv = installed_dists.make_venv(root / "venv")
     for source in sources:
         installed_dists.install_directory(venv, source, link_mode=link_mode)
     linked = (venv.site_packages / "fixlib" / "__init__.py").is_symlink()
-    return installed_dists.make_project_in(root, venv, pipeline_text), linked
+    assert linked == (link_mode == "symlink"), (
+        f"fixlib/__init__.py must be a link only with --link-mode symlink: {link_mode} {linked}"
+    )
+    return installed_dists.make_project_in(root, venv, pipeline_text)
+
+
+def _helper_assert_same_lock(
+    copied: installed_dists.Project, linked: installed_dists.Project, dist_keys: list[str]
+) -> None:
+    """The lock of `STAGE` in the copied venv's project `copied` holds exactly the `dist:` keys
+    `dist_keys`, and the lock in the linked venv's project `linked` records the same code
+    manifest."""
+    copied_manifest = installed_dists.lock_manifest(copied, installed_dists.STAGE)
+    linked_manifest = installed_dists.lock_manifest(linked, installed_dists.STAGE)
+    assert installed_dists.dist_keys(copied_manifest) == dist_keys, (
+        f"the copied venv's lock must hold the dist: keys {dist_keys}: {copied_manifest}"
+    )
+    assert linked_manifest == copied_manifest, (
+        f"the linked venv's lock must equal the copied one's:\nlinked {linked_manifest}\n"
+        + f"copied {copied_manifest}"
+    )
 
 
 def test_a_venv_uv_links_into_its_cache_fingerprints_as_one_it_copied_into(
@@ -111,30 +131,13 @@ def test_a_venv_uv_links_into_its_cache_fingerprints_as_one_it_copied_into(
     )
     fixlate = installed_dists.write_library(src, "fixlate", "fixlate", _FIXLATE)
     sources = (fixdep, fixlib, fixlate)
-    copied, copied_linked = _helper_linked_project(
-        tmp_path / "copy", sources, "copy", _METACLASS_PIPELINE
-    )
-    linked, linked_linked = _helper_linked_project(
-        tmp_path / "symlink", sources, "symlink", _METACLASS_PIPELINE
-    )
-    assert (copied_linked, linked_linked) == (False, True), (
-        "fixlib/__init__.py must be a copy in the first venv and a link in the second: "
-        + f"links {(copied_linked, linked_linked)}"
-    )
+    copied = _helper_linked_project(tmp_path / "copy", sources, "copy", _METACLASS_PIPELINE)
+    linked = _helper_linked_project(tmp_path / "symlink", sources, "symlink", _METACLASS_PIPELINE)
 
     installed_dists.assert_ran_then_cached(copied, "value-1:base-1:thing:late")
     installed_dists.assert_ran_then_cached(linked, "value-1:base-1:thing:late")
 
-    copied_manifest = installed_dists.lock_manifest(copied, installed_dists.STAGE)
-    linked_manifest = installed_dists.lock_manifest(linked, installed_dists.STAGE)
-    dist_keys = installed_dists.dist_keys(copied_manifest)
-    assert dist_keys == ["dist:fix-lib", "dist:fixdep", "dist:fixlate"], (
-        f"the copied venv's lock must hold the dist: keys of the three: {copied_manifest}"
-    )
-    assert linked_manifest == copied_manifest, (
-        f"the linked venv's lock must equal the copied one's:\nlinked {linked_manifest}\n"
-        + f"copied {copied_manifest}"
-    )
+    _helper_assert_same_lock(copied, linked, ["dist:fix-lib", "dist:fixdep", "dist:fixlate"])
 
     for source in sources:
         installed_dists.install_directory(copied.venv, source, reinstall=True, link_mode="symlink")
@@ -206,11 +209,8 @@ def test_a_linked_library_whose_record_is_lost_runs_with_the_copied_ones_warning
     projects = dict[str, installed_dists.Project]()
     warnings = dict[str, str]()
     for link_mode in ("copy", "symlink"):
-        project, linked = _helper_linked_project(
+        project = _helper_linked_project(
             tmp_path / link_mode, (source,), link_mode, installed_dists.pipeline("fixlib")
-        )
-        assert linked == (link_mode == "symlink"), (
-            f"fixlib/__init__.py must be a link only with --link-mode symlink: {link_mode} {linked}"
         )
         site = project.venv.site_packages
         installed_dists.damage(site / "fix_lib-0.1.dist-info" / "RECORD", None)
@@ -306,15 +306,18 @@ def test_a_broken_install_refuses_the_stage_with_one_error_in_a_copied_and_a_lin
     relative to site-packages, overwritten with `text` or deleted): the reached `Fix_Lib`'s
     `direct_url.json` made `[]`, which is no JSON object; `fixdep`'s RECORD deleted; `fixdep`'s
     `direct_url.json` made `[]`. The copied venv refuses the stage with `refusal`, after the
-    stage's name (`STAGE_PREFIX`), and the linked venv refuses it with the same `Error:` line."""
+    stage's name (`STAGE_PREFIX`), and the linked venv refuses it with the same `Error:` line.
+    Only `reached-unclassified` depends on `fingerprint.is_library_file` taking as library code a
+    linked module that only the RECORD of a distribution Pivot cannot classify lists.
+    The two `dependency-` cases guard the parity of the two venvs on a path the narrowed rule
+    does not decide: the reached module is a link that `Fix_Lib`'s own RECORD, of a distribution
+    that is not editable, lists, and the refusal comes from the dependency closure of `Fix_Lib`
+    (`installed_distributions.reach`)."""
     fixlib, fixdep = installed_dists.write_fixlib_and_fixdep(tmp_path / "src")
     refusals = dict[str, str]()
     for link_mode in ("copy", "symlink"):
-        project, linked = _helper_linked_project(
+        project = _helper_linked_project(
             tmp_path / link_mode, (fixdep, fixlib), link_mode, installed_dists.pipeline("fixlib")
-        )
-        assert linked == (link_mode == "symlink"), (
-            f"fixlib/__init__.py must be a link only with --link-mode symlink: {link_mode} {linked}"
         )
         installed_dists.damage(project.venv.site_packages / damaged, text)
         refusals[link_mode] = _helper_refusal(project, project.venv.site_packages)
@@ -343,13 +346,10 @@ def test_a_linked_module_its_record_does_not_list_is_library_code_as_a_copied_on
     source = installed_dists.write_library(
         tmp_path / "src", "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE
     )
-    manifests = dict[str, dict[str, str]]()
+    projects = dict[str, installed_dists.Project]()
     for link_mode in ("copy", "symlink"):
-        project, linked = _helper_linked_project(
+        project = _helper_linked_project(
             tmp_path / link_mode, (source,), link_mode, installed_dists.pipeline("fixlib")
-        )
-        assert linked == (link_mode == "symlink"), (
-            f"fixlib/__init__.py must be a link only with --link-mode symlink: {link_mode} {linked}"
         )
         record = project.venv.site_packages / "fix_lib-0.1.dist-info" / "RECORD"
         rows = record.read_text().splitlines(keepends=True)
@@ -357,15 +357,9 @@ def test_a_linked_module_its_record_does_not_list_is_library_code_as_a_copied_on
         assert len(kept) == len(rows) - 1, f"{record} must list fixlib/__init__.py once: {rows}"
         installed_dists.damage(record, "".join(kept))
         installed_dists.assert_ran_then_cached(project, "value-1")
-        manifests[link_mode] = installed_dists.lock_manifest(project, installed_dists.STAGE)
+        projects[link_mode] = project
 
-    assert installed_dists.dist_keys(manifests["copy"]) == [], (
-        f"the copied venv's lock must hold no dist: key: {manifests['copy']}"
-    )
-    assert manifests["symlink"] == manifests["copy"], (
-        f"the linked venv's lock must equal the copied one's:\nlinked {manifests['symlink']}\n"
-        + f"copied {manifests['copy']}"
-    )
+    _helper_assert_same_lock(projects["copy"], projects["symlink"], [])
 
 
 def test_an_editable_install_whose_finder_uv_links_into_its_cache_reruns_as_a_copied_one(
@@ -379,7 +373,10 @@ def test_an_editable_install_whose_finder_uv_links_into_its_cache_reruns_as_a_co
     0.10.4: `pivot repro` runs the stage in both, refusing nothing, and the two locks record the
     same code manifest, which holds no `dist:` key. After one byte of the checkout's source
     changes, the stage is stale on `func:fixlib.value` alone in both, and `pivot repro` runs it
-    in both and writes the new value."""
+    in both and writes the new value. This guards the parity of the two venvs on a path that
+    `fingerprint.is_library_file`'s rule for links does not decide: the checkout's files are no
+    links, and no stage reaches the finder module, the module file the editable install's RECORD
+    lists that uv links into its cache."""
     source = installed_dists.write_library(
         tmp_path / "src", "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE
     )
@@ -401,17 +398,7 @@ def test_an_editable_install_whose_finder_uv_links_into_its_cache_reruns_as_a_co
             root, venv, installed_dists.pipeline("fixlib")
         )
         installed_dists.assert_ran_then_cached(projects[link_mode], "value-1")
-    manifests = {
-        link_mode: installed_dists.lock_manifest(project, installed_dists.STAGE)
-        for link_mode, project in projects.items()
-    }
-    assert installed_dists.dist_keys(manifests["copy"]) == [], (
-        f"the copied venv's lock must hold no dist: key: {manifests['copy']}"
-    )
-    assert manifests["symlink"] == manifests["copy"], (
-        f"the linked venv's lock must equal the copied one's:\nlinked {manifests['symlink']}\n"
-        + f"copied {manifests['copy']}"
-    )
+    _helper_assert_same_lock(projects["copy"], projects["symlink"], [])
 
     installed_dists.replace_once(source / "fixlib" / "__init__.py", '"value-1"', '"value-2"')
 

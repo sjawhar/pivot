@@ -11,18 +11,18 @@ commit, path, installer or environment changes nothing. Package-index, remote-ar
 editable distributions and pivot's own get no key.
 
 It also tells `fingerprint.is_library_file` whether the RECORD of an editable distribution lists a
-file linked into a site directory (`linked_by_editable`): such a file keeps the decision of its
+file linked into a site directory (`listed_by_editable`): such a file keeps the decision of its
 resolved path, as flit's `install --symlink` links a checkout's module file there, and every
 other file linked there, as uv's `--link-mode symlink` links each installed file into its cache,
 is library code, as the same file copied would be.
 
 A leaf: it imports nothing of pivot's at run time, so `fingerprint` imports it and no import cycle
-forms. It takes plain data (each reached module's origin and its file as the import located it,
-its directory resolved, `ReachedModule`; the worker's `sys.path`; pivot's package directories)
-and returns plain data (the keys, the refusal messages, and whether an editable distribution's
-RECORD lists a file). Each decision on what a distribution's files say (`classify`,
-`requirement_names`, `requires_txt_names`, `record_paths`, `hashed_files`, `content_digest`,
-`key_value`, `candidates`, `reach`, `owners`, `decide`) is a public function of plain data. What
+forms. It takes plain data (each reached module's origin and the file Pivot judged its file by,
+`ReachedModule`; the worker's `sys.path`; pivot's package directories) and returns plain data
+(the keys, the refusal messages, and whether an editable distribution's RECORD lists a file).
+Each decision on what a distribution's files say (`classify`, `requirement_names`,
+`requires_txt_names`, `record_paths`, `hashed_files`, `content_digest`, `key_value`,
+`candidates`, `reach`, `owners`, `decide`) is a public function of plain data. What
 reads the disk is private: the scan of the path, the index of the candidates, the digest of a
 keyed distribution's files, the refusal of a reached file that no RECORD lists, which reads the
 RECORDs of a site directory and the files under a package, and the paths the RECORDs of a site
@@ -37,22 +37,22 @@ be classified, the requirements of every distribution (its `Requires-Dist` heade
 (those distributions, each distribution whose requirements cannot be read, and every distribution
 that requires one of them, directly or through others); every RECORD of a site directory only when
 a stage reaches a file that lies in it (the deepest entry of the path that holds the file where
-the import found it or the walk listed it, or that holds the file's resolved path) while a
+Pivot judged it or the walk listed it, or that holds the file's resolved path) while a
 candidate there, or in the other such entry of the file, has no RECORD; the RECORD of each
-editable distribution of a site directory, and no other, when `linked_by_editable` is first asked
+editable distribution of a site directory, and no other, when `listed_by_editable` is first asked
 about a file whose site directory it is; the files under the directory of a reached package or
 namespace package only when such a site directory is the deepest entry of the path above that
 directory or lies at or under it, and only until each such site directory has a file there that
 no RECORD lists, once for each reached module; and the files of a keyed distribution only when a
 stage reaches it. Each RECORD is read once, whichever of these needs it first. A process that asks
-only `linked_by_editable`, as a worker's import recorder does, reads no requirement and builds no
+only `listed_by_editable`, as a worker's import recorder does, reads no requirement and builds no
 index of the candidates. Each path a RECORD lists that can name a file is resolved for the index
 of the candidates and for the refusal of a reached file that no RECORD lists (`_resolved`), and so
 is each file under such a directory, to the path `os.path.realpath` gives: a RECORD path of
 PATH_MAX bytes or more in its site directory by `realpath` alone, and every other path a name at a
 time from the nearest directory above it already resolved (a site directory, or one resolved for
 an earlier path): one `os.path.islink` for each new name, and `realpath` only for a name that is a
-symbolic link, empty, `.` or `..` (`_real_path`). `linked_by_editable` resolves no RECORD path:
+symbolic link, empty, `.` or `..` (`_real_path`). `listed_by_editable` resolves no RECORD path:
 it compares each as written, normalised, with the file's path in its site directory.
 """
 
@@ -173,12 +173,14 @@ class DistributionKeys(NamedTuple):
 
 class ReachedModule(NamedTuple):
     """A module a stage reaches by name: where it comes from (`origin`, as `import_origin` gives
-    it: a file's path resolved), and its file as the import located it, made absolute, its
-    directory resolved and its last name kept (`real`: `fingerprint.with_real_directory` of its
-    spec's origin or `__file__`), which a `("file", ...)` origin requires; None when it has none.
-    In a venv whose installer links each file into its cache from a real directory (uv's
-    `--link-mode symlink`), the resolved path lies in the cache, and only `real` names the
-    directory the import searched."""
+    it: a file's path resolved), and the file Pivot judged its file by (`real`:
+    `fingerprint.judged_file` of its spec's origin or `__file__`), which a `("file", ...)` origin
+    requires; None when it has none. That is the file as the import located it, made absolute,
+    its directory resolved and its last name kept, or, for a link outside every library path, the
+    first file of its chain of links that is a library path: the file `fingerprint.is_library_file`
+    decided at. In a venv whose installer links each file into its cache from a real directory
+    (uv's `--link-mode symlink`), the resolved path lies in the cache, and only `real` names the
+    site directory and the directory the import searched."""
 
     origin: import_origin.Origin | None
     real: str | None
@@ -467,11 +469,11 @@ def owners(
 ) -> set[str]:
     """The candidates a reached module maps to, by file, never by name: every candidate whose
     RECORD lists the file its origin covers, resolved, and every candidate with a file under one
-    of the directories it covers (`_reached_paths`, with `real` the module's file as the import
-    located it, its directory resolved and its last name kept, which a `("file", ...)` origin
-    requires, or None). `file_owners` maps each resolved file a candidate's RECORD lists to those
-    candidates, and `directory_owners` each directory above such a file, or above a path the
-    RECORD lists, as it names it (`_build_index`)."""
+    of the directories it covers (`_reached_paths`, with `real` the file Pivot judged the
+    module's file by, which a `("file", ...)` origin requires, or None). `file_owners` maps each
+    resolved file a candidate's RECORD lists to those candidates, and `directory_owners` each
+    directory above such a file, or above a path the RECORD lists, as it names it
+    (`_build_index`)."""
     files, directories = _reached_paths(origin, real)
     found = set[str]()
     for _, file in files:
@@ -485,11 +487,11 @@ def _reached_paths(
     origin: import_origin.Origin | None, real: str | None
 ) -> tuple[list[tuple[str, str]], list[str]]:
     """The files and the directories a reached module covers. A `("file", path)` origin covers
-    its file, as the pair of where the import found it and `path`, resolved: where is `real`, the
-    module's file as the import located it with its directory resolved and its last name kept,
-    which such an origin requires (`ReachedModule`): an `AssertionError` when it is None. For a
-    package's `__init__` file it also covers the package's directory, the directory of `real`, as
-    the import searched it (the walk records only the top name of `import a.b`). Where an
+    its file, as the pair of where Pivot judged it and `path`, resolved: where is `real`, the file
+    Pivot judged the module's file by (`ReachedModule`), which such an origin requires: an
+    `AssertionError` when it is None. For a package's `__init__` file it also covers the
+    package's directory, the directory of `real`, as the import searched it, or as the chain of
+    links Pivot followed reached it (the walk records only the top name of `import a.b`). Where an
     installer links each file into its cache from a real directory of a site directory (uv's
     symlink link mode), `path` and the directory above it lie in the cache, while `real` and its
     directory lie in the site directory, where each distribution with a file in the package lists
@@ -575,8 +577,8 @@ def distribution_keys(
     path: Sequence[str],
     pivot_dirs: Collection[str],
 ) -> DistributionKeys:
-    """The `dist:` keys of a stage that reaches `modules` (each name's origin and file as its
-    import located it, its directory resolved), with `path` as the worker's `sys.path` and
+    """The `dist:` keys of a stage that reaches `modules` (each name's origin and the file Pivot
+    judged its file by, `ReachedModule`), with `path` as the worker's `sys.path` and
     `pivot_dirs` as pivot's own resolved package directories, and the messages of the stage's
     refusals.
 
@@ -589,7 +591,7 @@ def distribution_keys(
         return _snapshot_of(path, pivot_dirs).keys_for(modules)
 
 
-def linked_by_editable(file: str, path: Sequence[str], pivot_dirs: Collection[str]) -> bool:
+def listed_by_editable(file: str, path: Sequence[str], pivot_dirs: Collection[str]) -> bool:
     """Whether the RECORD of an editable distribution (`InstallForm.EDITABLE`) in the site
     directory of `file`, an absolute path whose directory is resolved and whose last name is not,
     lists it, with `path` as the worker's `sys.path` and `pivot_dirs` as pivot's own resolved
@@ -603,7 +605,7 @@ def linked_by_editable(file: str, path: Sequence[str], pivot_dirs: Collection[st
     distribution of the file's site directory once, and no other RECORD; it reads no requirement
     and builds no index of the candidates, which a worker never needs."""
     with _lock:
-        return _snapshot_of(path, pivot_dirs).linked_by_editable(file)
+        return _snapshot_of(path, pivot_dirs).listed_by_editable(file)
 
 
 def reset() -> None:
@@ -729,19 +731,20 @@ class _Snapshot:
         module's own file, and, since such a candidate may hold a submodule, the files under the
         directory of a package's `__init__` file or of a namespace package but those under a
         `__pycache__` directory (`_files_under`). A file's site directories are the deepest entry
-        of the path that the scan listed and that holds the file where the import found it or
-        the walk listed it, and the deepest that holds its resolved path (`_site_dir`), and a
-        RECORD of either lists the file when one of its paths resolves to the file's resolved
-        path (`_find_unlisted`): in a venv whose installer links each file into its cache, where
-        that cache lies outside every entry of the path, no entry holds the resolved path, which
-        lies in the cache, as a resolved RECORD path does, and where the cache lies inside an entry
-        (under a project root on the path), that entry holds the resolved path too. A file linked
-        into another entry of the path lies in both. A directory is walked only for the site
-        directories with such a candidate that can hold a file under it other than through a
-        symbolic link (the deepest entry of the path above the directory, and each entry at or
-        under it), and only until each of them has its file. The walk enters no directory that is
-        a symbolic link, so a file under such a link is not checked, and a file under the directory
-        that is a symbolic link into any other entry with such a candidate is not checked there."""
+        of the path that the scan listed and that holds the file where Pivot judged it
+        (`ReachedModule.real`) or the walk listed it, and the deepest that holds its resolved
+        path (`_site_dir`), and a RECORD of either lists the file when one of its paths resolves
+        to the file's resolved path (`_find_unlisted`): in a venv whose installer links each file
+        into its cache, where that cache lies outside every entry of the path, no entry holds the
+        resolved path, which lies in the cache, as a resolved RECORD path does, and where the
+        cache lies inside an entry (under a project root on the path), that entry holds the
+        resolved path too. A file linked into another entry of the path lies in both. A directory
+        is walked only for the site directories with such a candidate that can hold a file under
+        it other than through a symbolic link (the deepest entry of the path above the directory,
+        and each entry at or under it), and only until each of them has its file. The walk enters
+        no directory that is a symbolic link, so a file under such a link is not checked, and a
+        file under the directory that is a symbolic link into any other entry with such a
+        candidate is not checked there."""
         key = (name, module)
         if key not in self._unlisted_refusals:
             files, directories = _reached_paths(module.origin, module.real)
@@ -773,15 +776,15 @@ class _Snapshot:
         self, files: Iterable[tuple[str, str]], pending: set[str], first: dict[str, str]
     ) -> None:
         """Put in `first`, for each site directory of `pending`, the first of `files` (each the
-        pair of where the import found it or the walk listed it, a path whose directory is
-        resolved, and its resolved path) that lies in it, where found or resolved (`_site_dir`),
-        while no RECORD of a site directory the file lies in, pending or not, lists it resolved
+        pair of where Pivot judged it or the walk listed it, a path whose directory is resolved,
+        and its resolved path) that lies in it, where found or resolved (`_site_dir`), while no
+        RECORD of a site directory the file lies in, pending or not, lists it resolved
         (`_listed_in`), named as it lies there (where found, when both lie there), and take that
         directory out of `pending`; once `pending` is empty, read no more of `files`."""
         for where, resolved in files:
             lies_in = dict[str, str]()  # site directory -> the file's path that lies in it
             # The resolved path first, then where found, which wins in a site directory both lie
-            # in: the refusal names the file where the import found it or the walk listed it.
+            # in: the refusal names the file where Pivot judged it or the walk listed it.
             for path in (resolved, where):
                 site_dir = self._site_dir(path)
                 if site_dir is not None:
@@ -795,7 +798,7 @@ class _Snapshot:
             if not pending:
                 return
 
-    def linked_by_editable(self, file: str) -> bool:
+    def listed_by_editable(self, file: str) -> bool:
         """Whether the RECORD of an editable distribution in the site directory of `file`, a
         path whose directory is resolved (`_site_dir`), lists `file`: a RECORD path that,
         normalised, is `file`'s path relative to that directory (`_editable_listing`). False

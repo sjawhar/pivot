@@ -1,11 +1,12 @@
 """`fingerprint.is_library_file`, called in this process on site directories this test lays out by
 hand as uv and flit lay them out (`tests.installed_dists`): a library package linked into a
-project root, a path entry that is a link to `site-packages`, flit's editable links to a
-checkout, and chains of links made by hand from a project file (to a file of `site-packages`,
-copied or linked into a cache, to an editable install's link there, to a file outside every
-library path, a loop, and chains of 40 and 41 links). No test starts a process.
+project root, a path entry that is a link to `site-packages`, flit's editable links to a checkout,
+with the editable install's RECORD kept or lost (a stated limit), and chains of links made by hand
+from a project file (to a file of `site-packages`, copied or linked into a cache, to an editable
+install's link there, to a file outside every library path, a loop, and chains of 40 and 41
+links). No test starts a process.
 
-`installed_distributions.linked_by_editable` and `fingerprint.is_library_file` over real installs
+`installed_distributions.listed_by_editable` and `fingerprint.is_library_file` over real installs
 that uv links into its cache are in `test_installed_distributions_snapshot.py`, and the pure
 functions of `pivot.installed_distributions` in `test_installed_distributions_rules.py`.
 """
@@ -19,6 +20,31 @@ import pytest_mock
 from tests import installed_dists
 
 from pivot import fingerprint, installed_distributions
+
+
+def _helper_site(root: pathlib.Path) -> pathlib.Path:
+    """`root/venv/site-packages`, made empty: a library path by its name."""
+    site = root / "venv" / "site-packages"
+    site.mkdir(parents=True)
+    return site
+
+
+def _helper_cache_link(root: pathlib.Path, site: pathlib.Path, name: str) -> pathlib.Path:
+    """`site/<name>`, a symbolic link to `root/cache/<name>`, as `--link-mode symlink` links a
+    file into uv's cache, that no RECORD lists."""
+    cache = root / "cache"
+    cache.mkdir()
+    (cache / name).write_text("MOD = 1\n")
+    (site / name).symlink_to(cache / name)
+    return site / name
+
+
+def _helper_project_link(root: pathlib.Path, name: str, target: pathlib.Path) -> pathlib.Path:
+    """`root/project/<name>`, a symbolic link made by hand to `target`."""
+    project = root / "project"
+    project.mkdir(exist_ok=True)
+    (project / name).symlink_to(target)
+    return project / name
 
 
 @pytest.mark.parametrize(
@@ -99,8 +125,7 @@ def test_is_library_file_leaves_flits_editable_link_user_code_through_a_linked_p
     linked package directory is judged in the checkout, where its directory resolves, and the
     RECORDs are not asked about it; the linked module file is judged in `site-packages`, and the
     RECORDs are asked about it there, where the one that lists it is an editable install's."""
-    site = tmp_path / "venv" / "site-packages"
-    site.mkdir(parents=True)
+    site = _helper_site(tmp_path)
     checkout = tmp_path / "flitlib"
     (checkout / source).parent.mkdir(parents=True, exist_ok=True)
     (checkout / source).write_text(installed_dists.FIXLIB_ALONE)
@@ -108,7 +133,7 @@ def test_is_library_file_leaves_flits_editable_link_user_code_through_a_linked_p
     libs = tmp_path / "libs"
     libs.symlink_to(site, target_is_directory=True)
     monkeypatch.setattr(sys, "path", [str(libs)])
-    asked_editable = mocker.spy(installed_distributions, "linked_by_editable")
+    asked_editable = mocker.spy(installed_distributions, "listed_by_editable")
 
     found = [fingerprint.is_library_file(str(entry / source)) for entry in (site, libs)]
 
@@ -118,56 +143,69 @@ def test_is_library_file_leaves_flits_editable_link_user_code_through_a_linked_p
     assert files_asked == ([in_site, in_site] if asked else []), files_asked
 
 
-def _helper_site(root: pathlib.Path) -> pathlib.Path:
-    """`root/venv/site-packages`, made empty: a library path by its name."""
-    site = root / "venv" / "site-packages"
-    site.mkdir(parents=True)
-    return site
-
-
-def _helper_cache_link(root: pathlib.Path, site: pathlib.Path, name: str) -> pathlib.Path:
-    """`site/<name>`, a symbolic link to `root/cache/<name>`, as `--link-mode symlink` links a
-    file into uv's cache, that no RECORD lists."""
-    cache = root / "cache"
-    cache.mkdir()
-    (cache / name).write_text("MOD = 1\n")
-    (site / name).symlink_to(cache / name)
-    return site / name
-
-
-def _helper_project_link(root: pathlib.Path, name: str, target: pathlib.Path) -> pathlib.Path:
-    """`root/project/<name>`, a symbolic link made by hand to `target`."""
-    project = root / "project"
-    project.mkdir(exist_ok=True)
-    (project / name).symlink_to(target)
-    return project / name
-
-
-def test_is_library_file_judges_a_project_file_linked_into_site_packages_as_in_a_copied_venv(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("record", "library"),
+    [
+        pytest.param("kept", False, id="record-kept"),
+        pytest.param("lost", True, id="record-lost"),
+    ],
+)
+def test_is_library_file_takes_a_link_of_an_editable_install_whose_record_is_lost_as_library_code(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, record: str, library: bool
 ) -> None:
-    """`project/mod.py`, a link made by hand to `mod.py` in `site-packages`, which is a copy in
-    one layout, as `--link-mode copy` leaves a file, and in another a link into a cache that no
-    RECORD lists, as `--link-mode symlink` leaves one. `fingerprint.is_library_file` takes the
-    project file as library code in both: in the copied layout its resolved path lies in
-    `site-packages`; in the linked one its resolved path lies in the cache, and Pivot follows its
-    link to `site-packages/mod.py`, a link under a library path that no editable install's RECORD
-    lists, and decides there, as a copied venv decides."""
-    resolved_in_site = dict[str, bool]()
-    found = dict[str, bool]()
-    for layout in ("copied", "linked"):
-        site = _helper_site(tmp_path / layout)
-        if layout == "copied":
-            (site / "mod.py").write_text("MOD = 1\n")
-        else:
-            _helper_cache_link(tmp_path / layout, site, "mod.py")
-        linked = _helper_project_link(tmp_path / layout, "mod.py", site / "mod.py")
-        monkeypatch.setattr(sys, "path", [str(linked.parent), str(site)])
-        resolved_in_site[layout] = "site-packages" in pathlib.Path(os.path.realpath(linked)).parts
-        found[layout] = fingerprint.is_library_file(str(linked))
+    """A stated limit (`docs/architecture/fingerprinting.md`, "Files Linked into site-packages"):
+    `flitlib.py`, linked into `site-packages` to a checkout's module file as flit's `install
+    --symlink` links it (`installed_dists.flit_symlink_install`), with the editable install's
+    RECORD kept or deleted. Kept, that RECORD lists the link, and `fingerprint.is_library_file`
+    takes the file as user code, by its resolved path in the checkout; lost, no editable install's
+    RECORD lists it, and it is library code, as a link of a distribution that has lost its RECORD
+    is, so an edit to the checkout reruns nothing until the install is repaired."""
+    site = _helper_site(tmp_path)
+    checkout = tmp_path / "flitlib"
+    checkout.mkdir()
+    (checkout / "flitlib.py").write_text(installed_dists.FIXLIB_ALONE)
+    installed_dists.flit_symlink_install(site, checkout, "flitlib.py")
+    if record == "lost":
+        installed_dists.damage(site / installed_dists.FLIT_DIST_INFO / "RECORD", None)
+    monkeypatch.setattr(sys, "path", [str(site)])
 
-    assert resolved_in_site == {"copied": True, "linked": False}, resolved_in_site
-    assert found == {"copied": True, "linked": True}, found
+    found = fingerprint.is_library_file(str(site / "flitlib.py"))
+
+    assert found is library, f"with its RECORD {record}, flitlib.py must give {library}: {found}"
+
+
+@pytest.mark.parametrize(
+    ("layout", "resolved_in_site"),
+    [
+        pytest.param("copied", True, id="copied"),
+        pytest.param("linked-into-a-cache", False, id="linked-into-a-cache"),
+    ],
+)
+def test_is_library_file_judges_a_project_file_linked_into_site_packages_as_in_a_copied_venv(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, layout: str, resolved_in_site: bool
+) -> None:
+    """`project/mod.py`, a link made by hand to `mod.py` in `site-packages`, which is a copy, as
+    `--link-mode copy` leaves a file, or a link into a cache that no RECORD lists, as `--link-mode
+    symlink` leaves one. `fingerprint.is_library_file` takes the project file as library code in
+    both: where `mod.py` is a copy, the project file's resolved path lies in `site-packages`;
+    where it is a link, the project file's resolved path lies in the cache, and Pivot follows the
+    project file's link to `site-packages/mod.py` (`fingerprint.judged_file`), a link under a
+    library path that no editable install's RECORD lists, and decides there."""
+    site = _helper_site(tmp_path)
+    if layout == "copied":
+        (site / "mod.py").write_text("MOD = 1\n")
+    else:
+        _helper_cache_link(tmp_path, site, "mod.py")
+    linked = _helper_project_link(tmp_path, "mod.py", site / "mod.py")
+    monkeypatch.setattr(sys, "path", [str(linked.parent), str(site)])
+    in_site = "site-packages" in pathlib.Path(os.path.realpath(linked)).parts
+    assert in_site is resolved_in_site, (
+        f"{linked} must resolve into site-packages only in the copied layout: {in_site}"
+    )
+
+    found = fingerprint.is_library_file(str(linked))
+
+    assert found is True, f"the {layout} layout's project file must be library code: {found}"
 
 
 def test_is_library_file_leaves_a_project_file_linked_to_an_editable_installs_link_user_code(
@@ -186,7 +224,7 @@ def test_is_library_file_leaves_a_project_file_linked_to_an_editable_installs_li
     installed_dists.flit_symlink_install(site, checkout, "flitlib.py")
     linked = _helper_project_link(tmp_path, "flitlib.py", site / "flitlib.py")
     monkeypatch.setattr(sys, "path", [str(linked.parent), str(site)])
-    asked_editable = mocker.spy(installed_distributions, "linked_by_editable")
+    asked_editable = mocker.spy(installed_distributions, "listed_by_editable")
 
     found = [fingerprint.is_library_file(str(file)) for file in (linked, site / "flitlib.py")]
 
@@ -207,7 +245,7 @@ def test_is_library_file_takes_a_project_file_linked_outside_every_library_path_
     (shared / "helpers.py").write_text("HELP = 1\n")
     linked = _helper_project_link(tmp_path, "helpers.py", shared / "helpers.py")
     monkeypatch.setattr(sys, "path", [str(linked.parent), str(shared)])
-    asked_editable = mocker.spy(installed_distributions, "linked_by_editable")
+    asked_editable = mocker.spy(installed_distributions, "listed_by_editable")
 
     found = fingerprint.is_library_file(str(linked))
 
