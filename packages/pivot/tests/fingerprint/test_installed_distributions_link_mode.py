@@ -309,9 +309,10 @@ def test_a_broken_install_refuses_the_stage_with_one_error_in_a_copied_and_a_lin
     stage's name (`STAGE_PREFIX`), and the linked venv refuses it with the same `Error:` line.
     Only `reached-unclassified` depends on `fingerprint.is_library_file` taking as library code a
     linked module that only the RECORD of a distribution Pivot cannot classify lists.
-    The two `dependency-` cases guard the parity of the two venvs on a path the narrowed rule
-    does not decide: the reached module is a link that `Fix_Lib`'s own RECORD, of a distribution
-    that is not editable, lists, and the refusal comes from the dependency closure of `Fix_Lib`
+    The two `dependency-` cases guard the parity of the two venvs on a path that the
+    `listed_by_editable` exemption of `fingerprint.is_library_file`'s rule does not decide: the
+    reached module is a link that `Fix_Lib`'s own RECORD, of a distribution that is not editable,
+    lists, and the refusal comes from the dependency closure of `Fix_Lib`
     (`installed_distributions.reach`)."""
     fixlib, fixdep = installed_dists.write_fixlib_and_fixdep(tmp_path / "src")
     refusals = dict[str, str]()

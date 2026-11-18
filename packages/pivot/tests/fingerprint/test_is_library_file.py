@@ -175,14 +175,14 @@ def test_is_library_file_takes_a_link_of_an_editable_install_whose_record_is_los
 
 
 @pytest.mark.parametrize(
-    ("layout", "resolved_in_site"),
+    "layout",
     [
-        pytest.param("copied", True, id="copied"),
-        pytest.param("linked-into-a-cache", False, id="linked-into-a-cache"),
+        pytest.param("copied", id="copied"),
+        pytest.param("linked-into-a-cache", id="linked-into-a-cache"),
     ],
 )
 def test_is_library_file_judges_a_project_file_linked_into_site_packages_as_in_a_copied_venv(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, layout: str, resolved_in_site: bool
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, layout: str
 ) -> None:
     """`project/mod.py`, a link made by hand to `mod.py` in `site-packages`, which is a copy, as
     `--link-mode copy` leaves a file, or a link into a cache that no RECORD lists, as `--link-mode
@@ -199,7 +199,7 @@ def test_is_library_file_judges_a_project_file_linked_into_site_packages_as_in_a
     linked = _helper_project_link(tmp_path, "mod.py", site / "mod.py")
     monkeypatch.setattr(sys, "path", [str(linked.parent), str(site)])
     in_site = "site-packages" in pathlib.Path(os.path.realpath(linked)).parts
-    assert in_site is resolved_in_site, (
+    assert in_site is (layout == "copied"), (
         f"{linked} must resolve into site-packages only in the copied layout: {in_site}"
     )
 

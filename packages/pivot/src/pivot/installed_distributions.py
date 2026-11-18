@@ -176,11 +176,11 @@ class ReachedModule(NamedTuple):
     it: a file's path resolved), and the file Pivot judged its file by (`real`:
     `fingerprint.judged_file` of its spec's origin or `__file__`), which a `("file", ...)` origin
     requires; None when it has none. That is the file as the import located it, made absolute,
-    its directory resolved and its last name kept, or, for a link outside every library path, the
-    first file of its chain of links that is a library path: the file `fingerprint.is_library_file`
-    decided at. In a venv whose installer links each file into its cache from a real directory
-    (uv's `--link-mode symlink`), the resolved path lies in the cache, and only `real` names the
-    site directory and the directory the import searched."""
+    its directory resolved and its last name kept, or, where that is outside every library path
+    and a link, the first file of its chain of links that is a library path, in a venv whose
+    files are copies as in one uv links into its cache. In a venv whose installer links each file
+    into its cache from a real directory (uv's `--link-mode symlink`), the resolved path lies in
+    the cache, and only `real` names the site directory and the directory the import searched."""
 
     origin: import_origin.Origin | None
     real: str | None
@@ -501,7 +501,8 @@ def _reached_paths(
     match origin:
         case ("file", path):
             assert real is not None, (
-                f"a file origin ({path}) comes with its file as the import located it, but has none"
+                f"a file origin ({path}) comes with the file Pivot judged it by (judged_file), "
+                + "but has none"
             )
             return [(real, path)], [os.path.dirname(real)] if _is_package_init(real) else []
         case ("namespace", *directories):

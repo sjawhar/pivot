@@ -679,7 +679,7 @@ class whose metaclass is pydantic's `ModelMetaclass`, whose `__getattribute__` i
 user code. So `fingerprint.is_library_file` decides a file in this order:
 
 1. Its resolved path is a library path: library code. A copied environment's files are decided
-   here, and Pivot follows no link for them.
+   here.
 2. Else Pivot follows the file's chain of symbolic links one link at a time, from the file as the
    import found it (its path with its directory resolved, whatever links its directory was
    reached through, and its last name kept) to the file each link names (the link's target,
@@ -699,9 +699,13 @@ user code. So `fingerprint.is_library_file` decides a file in this order:
 
 The keys and the refusals of
 [Libraries Installed from Git or a Local Path](#libraries-installed-from-git-or-a-local-path)
-use the file Pivot judged a module's file by: `fingerprint.reached_module_of` gives it to
+use the file Pivot judges a module's file by, found by the chain of rule 2 for every file, also
+one that rule 1 decides (`fingerprint.judged_file`): `fingerprint.reached_module_of` gives it to
 `installed_distributions` beside the module's origin, so the site directory and the package
-directory they name are those where `is_library_file` decided. Such a virtual environment so
+directory they name are those where the chain reaches a library path, in a copied environment
+as in a linked one. A file whose own path, its directory resolved, is a library path already, as
+every file of a virtual environment is, is its own judged file: Pivot follows no link for it.
+Such a virtual environment so
 fingerprints as one whose files uv copied, and gives the same `dist:` keys and the same
 refusals. A distribution owns each directory above each path its RECORD lists inside its site
 directory, named as the RECORD names it, besides each directory above the file that path
@@ -723,10 +727,13 @@ library package linked into the project root (`mylib -> .venv/lib/python3.13/sit
 an entry of `sys.path` that is a link to `site-packages`, and a module file linked by hand into
 the project root to a file of `site-packages` (`mod.py -> .venv/lib/python3.13/site-packages/mod.py`)
 are judged in `site-packages` too, as their resolved paths are where the files are copies, and
-give the keys and the refusals of a copied environment (`test_installed_distributions_snapshot.py`:
-a git library that has lost its RECORD refuses the stage naming the module's file in
-`site-packages`; a project's own `.egg-info` with no RECORD refuses nothing for a module file an
-index library's RECORD lists there; a git library's module gives its key). A project file linked
+their keys and refusals name `site-packages` in both environments
+(`test_installed_distributions_snapshot.py`: a git library that has lost its RECORD refuses the
+stage once, naming the module's file in `site-packages`, also beside a project's own `.egg-info`
+with no RECORD; that `.egg-info` refuses nothing for a module file there, which an index
+library's RECORD lists or which no RECORD lists; a project package whose files are linked to the
+files of a git library's package gives the key of each git library with a file in that package
+in `site-packages`). A project file linked
 to a file outside every library path, and a loop of links, are user code by rule 3
 (`test_is_library_file.py`). flit's `install --symlink` (flit 4.2.0) links a checkout's module
 file, or its package's directory, into `site-packages`, with a `direct_url.json` that says

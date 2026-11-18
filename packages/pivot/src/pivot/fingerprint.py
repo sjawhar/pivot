@@ -7127,19 +7127,18 @@ def is_library_file(filename: str) -> bool:
 def judged_file(filename: str) -> str:
     """The file Pivot judges the file ``filename`` by (``is_library_file``), which
     ``reached_module_of`` gives ``installed_distributions`` to name the site directory and the
-    package directory of a module: the file as the import found it (``with_real_directory``)
-    when its resolved path is a library path, so a copied venv's files follow no link. Else
-    Pivot follows the chain of symbolic links from that file one link at a time to the file each
-    link names (``_link_hop``), and gives the first file of the chain that is a library path; the
-    file as the import found it when the chain meets a file that is no library path and no link
-    Pivot can read, or reaches no library path within ``_MAX_LINK_HOPS`` links (a loop of links
-    among them). For a file whose own path with its directory resolved is a library path already
-    (every file of a venv, copied or linked into uv's cache), that is the file as the import
-    found it. Decided once per file name per process. Raises ``OSError`` when the path cannot be
-    resolved."""
+    package directory of a module. Pivot starts from the file as the import found it
+    (``with_real_directory``), follows its chain of symbolic links one link at a time to the file
+    each link names (``_link_hop``), and gives the first file of the chain that is a library
+    path, whatever the resolved path is, so a project file linked by hand to a file of
+    ``site-packages`` is judged there both where that file is a copy and where it is a link into
+    uv's cache. It gives the file as the import found it when the chain meets a file that is no
+    library path and no link Pivot can read, or reaches no library path within
+    ``_MAX_LINK_HOPS`` links (a loop of links among them). For a file whose own path with its
+    directory resolved is a library path already (every file of a venv, copied or linked into
+    uv's cache), that is the file as the import found it: Pivot follows no link. Decided once per
+    file name per process."""
     found = with_real_directory(filename)
-    if is_library_path(pathlib.Path(filename).resolve()):
-        return found
     hop, links = found, 0
     while not is_library_path(pathlib.Path(hop)):
         target = _link_hop(hop) if links < _MAX_LINK_HOPS else None

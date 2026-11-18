@@ -3,9 +3,11 @@
 test lays out by hand: a module file linked from one entry of the path into another that holds
 such an install, a module file linked to another file of the entry that holds one, a project
 file linked into such an install's package, and a project file, beside such an install, linked
-to a file an index install's RECORD lists. A file lies in the entry where the import finds it
-and in the one it resolves into, and a RECORD of either lists it; where both are one entry, the
-refusal names the file where the import found it. No test starts a process.
+to a file an index install's RECORD lists. A file lies in the entry where Pivot judges it
+(`fingerprint.judged_file`: where the import finds it, or, for a project file linked into
+`site-packages`, where its link reaches) and in the one it resolves into, and a RECORD of either
+lists it; where both are one entry, the refusal names the file where Pivot judged it. No test
+starts a process.
 
 The pure functions of `pivot.installed_distributions` are in
 `test_installed_distributions_rules.py`, and the same check over real installs in
