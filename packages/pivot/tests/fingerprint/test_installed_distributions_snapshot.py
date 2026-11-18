@@ -9,12 +9,12 @@ the check of an install with no RECORD walks, and how far, once per process. The
 `fingerprint.add_distribution_keys`, which looks up no module's origin when no install on the
 path can give a key, and one fingerprint, through the registry, of a stage that imports its
 installed library only in its body. Last, over files uv links into its cache (`--link-mode
-symlink`) and the editable layout flit's `install --symlink` makes:
-`installed_distributions.listed_as_library`, which reads the RECORDs of one directory and
-builds no index of the candidates; `fingerprint.is_library_file`, which asks it only about a
-file linked under a library path; and the keys of a namespace package and of a package that
-holds another install's file, which are those of a venv whose files are copies. No fixture is
-imported into this process.
+symlink`) and the editable layouts uv and flit's `install --symlink` make:
+`installed_distributions.linked_by_editable`, which reads only the RECORDs of one directory's
+editable installs and builds no index of the candidates; `fingerprint.is_library_file`, which
+asks it only about a file linked under a library path; and the keys of a namespace package and
+of a package that holds another install's file, which are those of a venv whose files are
+copies. No fixture is imported into this process.
 
 The CLI tests of the same decisions are in `test_installed_distributions.py` and
 `test_installed_distributions_link_mode.py`, and the pure functions on plain data in
@@ -67,7 +67,7 @@ def _helper_namespace(directory: pathlib.Path) -> installed_distributions.Reache
 def _helper_real(path: pathlib.Path) -> str:
     """`path` with its directory resolved and its last name kept
     (`fingerprint.with_real_directory`): the form in which `fingerprint.is_library_file` asks
-    `listed_as_library` about a file, and `fingerprint.add_distribution_keys` gives a module's
+    `linked_by_editable` about a file, and `fingerprint.add_distribution_keys` gives a module's
     file."""
     return fingerprint.with_real_directory(str(path))
 
@@ -988,21 +988,24 @@ def test_no_origin_is_found_when_no_install_on_the_path_can_give_a_key(
     assert calls == [[mocker.call(sys.modules["json"])], [mocker.call("fixlib")]], calls
 
 
-def test_listed_as_library_takes_a_linked_file_listed_only_by_installs_not_editable(
+def test_linked_by_editable_reads_only_the_records_of_editable_installs_that_list_a_linked_file(
     tmp_path: pathlib.Path, mocker: pytest_mock.MockerFixture
 ) -> None:
-    """Over real installs that uv links into its cache (`--link-mode symlink`). With only
-    `idxlib`, installed as from a package index, on the path, its module file is library code.
-    Then, with `Fix_Lib` from its path, with a console script, whose RECORD row leaves the site
-    directory, `fixbad` from its path with its `direct_url.json` made `[1, 2]` (unclassified),
-    `flitlib` as flit's `install --symlink` links an editable module file, and a link `stray.py`
-    that no RECORD lists, and with another entry on the path that holds `Fix_Lib` too, its
-    `direct_url.json` made `[1, 2]`: the module files of `idxlib` and `Fix_Lib` are library code,
-    since only the RECORDs of a file's own entry count, and `fixbad`'s, `flitlib.py` and
-    `stray.py` are not, nor is `fixlib`'s file where its link points, which no entry of the path
-    holds. Those questions read each RECORD of the files' entry once, however many files are
-    asked about, read no requirement and build no index of the candidates. `needs_origins` then
-    builds the index, which reads the one RECORD of the other entry and none a second time."""
+    """Over real installs that uv links into its cache (`--link-mode symlink`): `idxlib`,
+    installed as from a package index; `Fix_Lib` from its path, with a console script, whose
+    RECORD row leaves the site directory; `fixbad` from its path with its `direct_url.json` made
+    `[1, 2]` (unclassified); `fixedit` installed editable, with a console script too, whose
+    setuptools finder module uv links into its cache; `flitlib` as flit's `install --symlink`
+    links an editable module file; a link `stray.py` that no RECORD there lists; and another
+    entry on the path that holds `Fix_Lib` too, its `direct_url.json` made `[1, 2]`, and a
+    `stray.py` that flit links there as an editable module file. Only an editable install's RECORD
+    in a file's own entry lists it: `fixedit`'s finder module, `flitlib.py` and the other entry's
+    `stray.py`; no other linked file, not site-packages' `stray.py`, whose path only the other
+    entry's editable RECORD names, nor `fixlib`'s file where its link points, which no entry of
+    the path holds. Those questions read the RECORD of each editable install of the files' entries
+    once, however many files are asked about, and no other RECORD; they read no requirement and
+    build no index of the candidates. `needs_origins` then builds the index, which reads the
+    RECORDs of the candidates, of both entries, and none a second time."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     src = tmp_path / "src"
     wheels = tmp_path / "wheels"
@@ -1013,16 +1016,16 @@ def test_listed_as_library_takes_a_linked_file_listed_only_by_installs_not_edita
     )
     installed_dists.install_from_wheels(venv, wheels, "idxlib", link_mode="symlink")
     site = venv.site_packages
-    path = [str(site)]
-    index_alone = installed_distributions.listed_as_library(
-        _helper_real(site / "idxlib" / "__init__.py"), path, _PIVOT_DIRS
-    )
     fixlib = installed_dists.write_library(
         src, "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE, scripts={"fix-lib": "fixlib:main"}
     )
     fixbad = installed_dists.write_library(src, "fixbad", "fixbad", installed_dists.FIXLIB_ALONE)
+    fixedit = installed_dists.write_library(
+        src, "fixedit", "fixedit", installed_dists.FIXLIB_ALONE, scripts={"fixedit": "fixedit:main"}
+    )
     installed_dists.install_directory(venv, fixlib, link_mode="symlink")
     installed_dists.install_directory(venv, fixbad, link_mode="symlink")
+    installed_dists.install_directory(venv, fixedit, editable=True, link_mode="symlink")
     installed_dists.damage(site / "fixbad-0.1.dist-info" / "direct_url.json", "[1, 2]")
     other = tmp_path / "other"
     installed_dists.install(venv, "--target", str(other), str(fixlib))
@@ -1035,12 +1038,20 @@ def test_listed_as_library_takes_a_linked_file_listed_only_by_installs_not_edita
     (tmp_path / "elsewhere").mkdir()
     (tmp_path / "elsewhere" / "stray.py").write_text("STRAY = 1\n")
     (site / "stray.py").symlink_to(tmp_path / "elsewhere" / "stray.py")
+    other_checkout = tmp_path / "otherflit"
+    other_checkout.mkdir()
+    (other_checkout / "stray.py").write_text("STRAY = 2\n")
+    installed_dists.flit_symlink_install(other, other_checkout, "stray.py")
+    finders = sorted(site.glob("__editable___fixedit_*_finder.py"))
+    assert len(finders) == 1, f"setuptools must write one finder module for fixedit: {finders}"
     files = {
         "idxlib": site / "idxlib" / "__init__.py",
         "fixlib": site / "fixlib" / "__init__.py",
         "fixbad": site / "fixbad" / "__init__.py",
+        "fixedit-finder": finders[0],
         "flitlib": site / "flitlib.py",
         "stray": site / "stray.py",
+        "other-stray": other / "stray.py",
     }
     unlinked = sorted(name for name, file in files.items() if not file.is_symlink())
     assert unlinked == [], f"each file asked about must be a symbolic link: {unlinked}"
@@ -1050,62 +1061,76 @@ def test_listed_as_library_takes_a_linked_file_listed_only_by_installs_not_edita
     build_index = mocker.spy(installed_distributions, "_build_index")
 
     found = {
-        name: installed_distributions.listed_as_library(_helper_real(file), path, _PIVOT_DIRS)
+        name: installed_distributions.linked_by_editable(_helper_real(file), path, _PIVOT_DIRS)
         for name, file in files.items()
     }
-    found["fixlib-target"] = installed_distributions.listed_as_library(
+    found["fixlib-target"] = installed_distributions.linked_by_editable(
         os.path.realpath(files["fixlib"]), path, _PIVOT_DIRS
     )
+    real_tmp = os.path.realpath(tmp_path)
     read_for_files = sorted(
-        os.path.basename(call.args[0].dist_info) for call in read_record.call_args_list
+        os.path.relpath(call.args[0].dist_info, real_tmp) for call in read_record.call_args_list
     )
     calls_for_files = (read_requirements.call_count, build_index.call_count)
     needs_origins = installed_distributions.needs_origins(path, _PIVOT_DIRS)
 
-    assert index_alone is True, "idxlib's linked file must be library code with it alone there"
     assert found == {
-        "idxlib": True,
-        "fixlib": True,
+        "idxlib": False,
+        "fixlib": False,
         "fixbad": False,
-        "flitlib": False,
+        "fixedit-finder": True,
+        "flitlib": True,
         "stray": False,
+        "other-stray": True,
         "fixlib-target": False,
     }, found
-    assert read_for_files == [
-        "fix_lib-0.1.dist-info",
-        "fixbad-0.1.dist-info",
-        installed_dists.FLIT_DIST_INFO,
-        "idxlib-0.1.dist-info",
-    ], f"each RECORD of the files' entry must be read once, and no other: {read_for_files}"
+    in_site = os.path.relpath(os.path.realpath(site), real_tmp)
+    assert read_for_files == sorted(
+        [
+            f"{in_site}/fixedit-0.1.dist-info",
+            f"{in_site}/{installed_dists.FLIT_DIST_INFO}",
+            f"other/{installed_dists.FLIT_DIST_INFO}",
+        ]
+    ), (
+        "only the RECORD of each editable install of the files' entries may be read, once: "
+        + f"{read_for_files}"
+    )
     assert calls_for_files == (0, 0), (
         f"no requirement may be read and no index built for a linked file: {calls_for_files}"
     )
     assert needs_origins is True, "Fix_Lib, installed from its path, can give a key"
     assert build_index.call_count == 1, f"the index must be built once: {build_index.call_count}"
-    read = sorted(os.path.basename(call.args[0].dist_info) for call in read_record.call_args_list)
-    assert read == [
-        "fix_lib-0.1.dist-info",
-        "fix_lib-0.1.dist-info",
-        "fixbad-0.1.dist-info",
-        installed_dists.FLIT_DIST_INFO,
-        "idxlib-0.1.dist-info",
-    ], f"the index must read the other entry's RECORD and no RECORD a second time: {read}"
+    read = sorted(
+        os.path.relpath(call.args[0].dist_info, real_tmp) for call in read_record.call_args_list
+    )
+    assert read == sorted(
+        [
+            f"{in_site}/fix_lib-0.1.dist-info",
+            f"{in_site}/fixbad-0.1.dist-info",
+            f"{in_site}/fixedit-0.1.dist-info",
+            f"{in_site}/{installed_dists.FLIT_DIST_INFO}",
+            "other/fix_lib-0.1.dist-info",
+            f"other/{installed_dists.FLIT_DIST_INFO}",
+        ]
+    ), f"the index must read each candidate's RECORD and no RECORD a second time: {read}"
 
 
 def test_is_library_file_asks_the_records_only_about_a_file_linked_under_a_library_path(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mocker: pytest_mock.MockerFixture
 ) -> None:
     """`fixcopy` installed from its path with `--link-mode copy`, `fixlink` with `--link-mode
-    symlink`, `flitlib` as flit's `install --symlink` links a package's directory, and `fixtarget`
-    with `--link-mode symlink` into `--target` directory `target`, not named site-packages. The
-    venv is reached through a symbolic link to its directory, and the worker's path is its
-    site-packages, so reached, and `target`. `fingerprint.is_library_file` takes `fixcopy`'s file
-    as library code by its resolved path, and `fixlink`'s, a link into uv's cache, by the RECORDs
-    of its site directory; it takes as user code `flitlib`'s `__init__.py`, which is no link (its
-    directory is) and resolves into the checkout, `fixtarget`'s file, a link whose path is no
-    library path, and a project file; and a code object compiled from each is user source
-    (`_is_user_source_file`) exactly where the file is user code. It asks the RECORDs only about
-    `fixlink`'s file, with its directory resolved, which the scan's resolved entry of the path
+    symlink`, `flitlib` as flit's `install --symlink` links a package's directory, `fixtarget`
+    with `--link-mode symlink` into `--target` directory `target`, not named site-packages, and
+    `stray.py`, a link made by hand in site-packages to a project file. The venv is reached
+    through a symbolic link to its directory, and the worker's path is its site-packages, so
+    reached, and `target`. `fingerprint.is_library_file` takes `fixcopy`'s file as library code by
+    its resolved path, and `fixlink`'s, a link into uv's cache, and `stray.py` as library code,
+    since no editable install's RECORD in their site directory lists them, as copies there would
+    be; it takes as user code `flitlib`'s `__init__.py`, which is no link (its directory is) and
+    resolves into the checkout, `fixtarget`'s file, a link whose path is no library path, and the
+    project file; and a code object compiled from each is user source (`_is_user_source_file`)
+    exactly where the file is user code. It asks the RECORDs only about `fixlink`'s file and
+    `stray.py`, with their directory resolved, which the scan's resolved entry of the path
     holds."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     src = tmp_path / "src"
@@ -1127,12 +1152,14 @@ def test_is_library_file_asks_the_records_only_about_a_file_linked_under_a_libra
     project_file = tmp_path / "project" / "helpers.py"
     project_file.parent.mkdir()
     project_file.write_text("HELP = 1\n")
+    (site / "stray.py").symlink_to(project_file)
     files = {
         "fixcopy": site / "fixcopy" / "__init__.py",
         "fixlink": site / "fixlink" / "__init__.py",
         "flitlib": site / "flitlib" / "__init__.py",
         "fixtarget": target / "fixtarget" / "__init__.py",
         "project": project_file,
+        "stray": site / "stray.py",
     }
     links = {name: file.is_symlink() for name, file in files.items()}
     assert links == {
@@ -1141,9 +1168,10 @@ def test_is_library_file_asks_the_records_only_about_a_file_linked_under_a_libra
         "flitlib": False,
         "fixtarget": True,
         "project": False,
+        "stray": True,
     }, links
     monkeypatch.setattr(sys, "path", [str(site), str(target)])
-    listed = mocker.spy(installed_distributions, "listed_as_library")
+    asked_editable = mocker.spy(installed_distributions, "linked_by_editable")
 
     found = {name: fingerprint.is_library_file(str(file)) for name, file in files.items()}
     user_source = {
@@ -1156,6 +1184,7 @@ def test_is_library_file_asks_the_records_only_about_a_file_linked_under_a_libra
         "flitlib": False,
         "fixtarget": False,
         "project": False,
+        "stray": True,
     }, found
     assert user_source == {
         "fixcopy": False,
@@ -1163,10 +1192,15 @@ def test_is_library_file_asks_the_records_only_about_a_file_linked_under_a_libra
         "flitlib": True,
         "fixtarget": True,
         "project": True,
+        "stray": False,
     }, user_source
-    asked = [call.args[0] for call in listed.call_args_list]
-    real = os.path.join(os.path.realpath(venv.site_packages / "fixlink"), "__init__.py")
-    assert asked == [real], f"only fixlink's file may be asked about, as {real}: {asked}"
+    asked = [call.args[0] for call in asked_editable.call_args_list]
+    real_site = os.path.realpath(venv.site_packages)
+    expected = [
+        os.path.join(real_site, "fixlink", "__init__.py"),
+        os.path.join(real_site, "stray.py"),
+    ]
+    assert asked == expected, f"only fixlink's file and stray.py may be asked about: {asked}"
 
 
 def test_a_namespace_package_uv_links_into_its_cache_gives_the_key_of_a_copied_one(

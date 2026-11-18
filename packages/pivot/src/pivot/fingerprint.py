@@ -119,14 +119,18 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # library base class, a class in a type hint or a class-body annotation, a library class, instance,
 # enum member or exception inside a value, a library loader class, a library stage function, and a
 # library callable whose `__module__` is not a string; not builtins, the standard library or pivot.
-# It also takes a file that an installer linked into site-packages for a distribution that is not
-# editable, as uv's symlink link mode links each file into its cache, as library code
-# (`is_library_file`), where version 43 walked it as user code.
+# It also takes a file linked into site-packages that no editable distribution's RECORD lists, as
+# uv's symlink link mode links each file into its cache, and a link to such a file, as library
+# code (`is_library_file`), where version 43 walked it as user code.
 _CACHE_SCHEMA_VERSION = 44
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
+
+# The most symbolic links `is_library_file` follows from a file to a library path: Linux's limit on
+# the links one path lookup follows (MAXSYMLINKS, 40). A file whose chain needs more is user code.
+_MAX_LINK_HOPS = 40
 
 # Type alias for AST hash cache entry tuple.
 # Format: (rel_path, source_digest, qualname, py_version, schema_version, hash_hex)
@@ -7078,42 +7082,73 @@ def is_library_path(path: pathlib.Path) -> bool:
 @functools.lru_cache(maxsize=4096)
 def is_library_file(filename: str) -> bool:
     """Whether the file ``filename`` (a module's ``__file__``, a spec's origin, a code object's
-    file) holds library code, not user code: its resolved path is a library path
-    (``is_library_path``), or an installer linked it into a library directory for a distribution
-    that is not editable.
+    file) holds library code, not user code, decided in this order:
 
-    The second holds when all of these do. Its path with its directory resolved and its last
-    name kept (``with_real_directory``) is a library path: the file as the import found it,
-    whatever links its directory was reached through, so a library package linked into the
-    project root, and a ``sys.path`` entry that is a link to ``site-packages``, are judged in
-    ``site-packages``. That file itself is a symbolic link: uv's ``UV_LINK_MODE=symlink`` links
-    each installed file into uv's cache, where its resolved path is no library path, from a real
-    directory of ``site-packages``. And the RECORDs of its site directory list it, each of a
-    distribution installed in a known form that is not editable
-    (``installed_distributions.listed_as_library``, on the worker's ``sys.path``). Otherwise the
-    resolved path decides, so the rule fails closed toward user code: a file of an editable
-    install (flit's ``install --symlink`` links a module file, or a package's directory, which
-    resolves the directory away from ``site-packages``), and a link that no RECORD lists, stay
-    user code where they point outside every library path.
+    1. Its resolved path is a library path (``is_library_path``): library code. A file of a
+       copied venv is decided here.
+    2. Else Pivot follows the file's chain of symbolic links one link at a time, from its path
+       with its directory resolved and its last name kept (``with_real_directory``: the file as
+       the import found it, whatever links its directory was reached through) to the file each
+       link names, its directory resolved and its last name kept (``_link_hop``), and decides at
+       the first of them that is a library path: library code, recorded by name, keyed and
+       refused as the same file copied there would be, unless the RECORD of an editable
+       distribution in that file's site directory lists it
+       (``installed_distributions.linked_by_editable``, on the worker's ``sys.path``). Then the
+       resolved path decides, as in pivot 0.10.4: user code.
+    3. A file of the chain that is no library path and no symbolic link Pivot can read, before
+       one that is a library path, makes the file user code, and so does a chain that reaches no
+       library path within ``_MAX_LINK_HOPS`` links (a loop of links among them).
+
+    So a file that uv's ``UV_LINK_MODE=symlink`` links into its cache from a real directory of
+    ``site-packages``, a library package linked into the project root, a ``sys.path`` entry that
+    is a link to ``site-packages``, and a module file linked by hand into the project root to a
+    file of ``site-packages`` are each judged in ``site-packages``, as where the files there are
+    copies; a link there that no editable distribution's RECORD lists (one that no RECORD lists,
+    or that only a RECORD-less, unclassified or non-editable distribution owns) is library code.
+    flit's ``install --symlink`` links a checkout's module file into ``site-packages``, with a
+    RECORD of an editable install that lists it: user code by rule 2; it links a package's
+    directory too, whose files are judged in the checkout, where that directory resolves, and are
+    user code by rule 3.
 
     Decided once per file name per process, as ``_is_user_source_file`` is. Raises ``OSError``
     when the path cannot be resolved."""
     if is_library_path(pathlib.Path(filename).resolve()):
         return True
-    real = with_real_directory(filename)
-    if not is_library_path(pathlib.Path(real)):
-        return False
-    return os.path.islink(real) and installed_distributions.listed_as_library(
-        real, loaded_source.worker_path(), _pivot_dir_names()
+    hop = with_real_directory(filename)
+    links = 0
+    while not is_library_path(pathlib.Path(hop)):
+        target = _link_hop(hop) if links < _MAX_LINK_HOPS else None
+        if target is None:
+            return False
+        hop = target
+        links += 1
+    return not installed_distributions.linked_by_editable(
+        hop, loaded_source.worker_path(), _pivot_dir_names()
     )
+
+
+def _link_hop(link: str) -> str | None:
+    """The file the symbolic link ``link``, a path whose directory is resolved, names: its target,
+    joined to the link's directory when relative, with its directory resolved by
+    ``os.path.realpath`` and its last name kept, as ``with_real_directory`` gives a file
+    (``realpath`` resolves a ``..`` after a link in the target as the kernel does, where
+    ``os.path.abspath`` would drop the name before it). None when ``link`` is no symbolic link
+    Pivot can read: not a link (``os.readlink`` raises ``EINVAL``), missing, or unreadable."""
+    try:
+        target = os.readlink(link)
+    except OSError:
+        return None
+    joined = os.path.join(os.path.dirname(link), target)
+    return os.path.join(os.path.realpath(os.path.dirname(joined)), os.path.basename(joined))
 
 
 def with_real_directory(filename: str) -> str:
     """The file ``filename`` made absolute, its directory resolved and its last name kept: the
     file as the import found it, whatever links its directory was reached through, and, where
-    the file is itself a link, not where that link points. ``is_library_file`` judges a linked
-    file by it, and ``installed_distributions.ReachedModule`` carries it (``real``) to name the
-    package directory the import searched and the site directory a module's file lies in."""
+    the file is itself a link, not where that link points. ``is_library_file`` starts the chain
+    of links it follows from it, and ``installed_distributions.ReachedModule`` carries it
+    (``real``) to name the package directory the import searched and the site directory a
+    module's file lies in."""
     absolute = os.path.abspath(filename)
     return os.path.join(os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute))
 

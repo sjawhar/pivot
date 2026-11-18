@@ -655,8 +655,7 @@ holds such a distribution, and stops once it has found, in each of those entries
 RECORD lists. The walk enters no subdirectory that is a symbolic link, so a file under one is
 not checked, and a file under the directory that is a symbolic link into an entry other than
 those, which holds such a distribution, is not checked there. Each process runs the check once
-for each module. Besides the question about a linked file below, only this check reads every
-RECORD of a directory.
+for each module. Only this check reads every RECORD of a directory.
 
 `core.unsafe_fingerprinting` (or `PIVOT_UNSAFE_FINGERPRINTING=1`) turns each of these refusals
 into a warning with the same message, so the warning names the stage it lets run, and the
@@ -672,60 +671,73 @@ with `UV_LINK_MODE=symlink` (`uv pip install --link-mode symlink`) holds each in
 symbolic link into uv's cache, inside real directories, so every resolved path there lies in the
 cache and every library would be user code: the walk would hash pydantic's source and refuse a
 class whose metaclass is pydantic's `ModelMetaclass`, whose `__getattribute__` it would take as
-user code. So `fingerprint.is_library_file` also takes a file as library code when all of these
-hold:
+user code. So `fingerprint.is_library_file` decides a file in this order:
 
-1. Its path with its directory resolved and its last name kept is a library path: the file as
-   the import found it, whatever links its directory was reached through.
-2. That file is itself a symbolic link.
-3. Its directory lies in an entry of the worker's `sys.path` (the deepest that holds it), and the
-   RECORD of a distribution there lists the file's path relative to that entry, compared as the
-   RECORD writes it, normalised, never resolved (`installed_distributions.listed_as_library`).
-4. Each distribution there whose RECORD lists it is installed from a package index, version
-   control, a local directory, a local archive or a remote archive (`direct_url.json`, PEP 610),
-   not editable.
+1. Its resolved path is a library path: library code. A copied environment's files are decided
+   here, and Pivot follows no link for them.
+2. Else Pivot follows the file's chain of symbolic links one link at a time, from the file as the
+   import found it (its path with its directory resolved, whatever links its directory was
+   reached through, and its last name kept) to the file each link names (the link's target,
+   joined to the link's directory when relative, its directory resolved and its last name kept),
+   and decides at the first file of the chain that is a library path: library code, as the same
+   file copied there would be, unless the RECORD of an editable distribution (`direct_url.json`,
+   PEP 610, with `dir_info` and `editable: true`) in that file's site directory lists it. Its site
+   directory is the deepest entry of the worker's `sys.path` that holds it, and the RECORD lists
+   it when one of its paths, compared as the RECORD writes it, normalised, never resolved, is the
+   file's path relative to that entry (`installed_distributions.linked_by_editable`). A file that
+   such an editable distribution's RECORD lists keeps the decision of its resolved path, as in
+   pivot 0.10.4: user code.
+3. A file of the chain that is no library path and no symbolic link, reached before one that is a
+   library path, makes the file user code, and so does a chain that reaches no library path
+   within 40 links, the most that a Linux path lookup follows (a loop of links among them).
 
 Such a virtual environment so fingerprints as one whose files uv copied, and gives the same
-`dist:` keys: a distribution owns each directory above each path its RECORD lists inside its site
-directory, named as the RECORD names it, besides each directory above the file that path resolves
-to, so a namespace package, whose directories stay in `site-packages`, keeps its owner there, and
-so does a regular package, whose directory Pivot takes from its `__init__` file as the import
-located it, not from that file's resolved path in the cache. A second distribution that puts a
-file inside another's package (`pkg/contrib/extra.py`, where an index library holds
-`pkg/__init__.py`) is so reached through `pkg` as in a copied environment, and refuses the stage
-as there once it has lost its RECORD. By rule 1 a library package linked into the project root
-(`mylib -> .venv/lib/python3.13/site-packages/mylib`), and an entry of `sys.path` that is a link
-to `site-packages`, are judged in `site-packages` too, as their resolved paths are where the
-files are copies. Any other file keeps the decision of its resolved path, so the rule fails
-closed toward user code: a file that an editable or unclassified distribution's RECORD lists, or
-that no RECORD lists. flit's `install --symlink` (flit 4.2.0) links a checkout's module file, or
-its package's directory, into `site-packages`, with a `direct_url.json` that says editable and a
-RECORD that lists the link; its code stays user code, walked as the project's own, as in pivot
-0.10.4, so an edit to the checkout reruns the stage (`test_installed_distributions_link_mode.py`):
-the module file by rule 4, and a file under the linked package directory by rule 1, since that
-directory resolves into the checkout. A directory (a namespace package's, an entry of `sys.path`)
-is judged by its resolved path alone: uv keeps directories real. The decision is made once per
-file name per process, and the RECORDs of a directory are read for it once, only for a file that
-is such a link, so a virtual environment whose files are copies or hard links reads nothing more;
-a worker, whose import recorder asks only this question, reads no requirement and builds no
-index of the distributions that can give a key.
-
-A distribution with no RECORD in such a virtual environment is tracked differently from one in a
-copied virtual environment. No RECORD lists its linked files, so each keeps the decision of its
-resolved path, in uv's cache: user code, which the walk hashes as it hashes the project's. A stage
-that reaches it runs, refused by nothing, and an edit to a function of it that the stage calls
-makes the stage stale on that function's `func:` entry
-(`test_installed_distributions_link_mode.py`), where in a copied virtual environment the check
-above refuses the stage. A file that such a distribution puts inside another distribution's
-package is still checked when the stage reaches that package by name: no RECORD lists it where
-it lies in `site-packages`, so the check above refuses the stage, as in a copied virtual
-environment.
+`dist:` keys and the same refusals. A distribution owns each directory above each path its RECORD
+lists inside its site directory, named as the RECORD names it, besides each directory above the
+file that path resolves to, so a namespace package, whose directories stay in `site-packages`,
+keeps its owner there, and so does a regular package, whose directory Pivot takes from its
+`__init__` file as the import located it, not from that file's resolved path in the cache. A
+second distribution that puts a file inside another's package (`pkg/contrib/extra.py`, where an
+index library holds `pkg/__init__.py`) is so reached through `pkg` as in a copied environment,
+and refuses the stage as there once it has lost its RECORD. A linked file that no RECORD lists,
+or that only a distribution with no RECORD, one Pivot cannot classify or one that is not editable
+lists, is library code by rule 2, so the checks of
+[Libraries Installed from Git or a Local Path](#libraries-installed-from-git-or-a-local-path)
+judge it as they judge the copied file (`test_installed_distributions_link_mode.py`): a reached
+distribution that has lost its RECORD refuses the stage with the message that names the module's
+file where it lies in `site-packages`, one whose `direct_url.json` Pivot cannot classify refuses
+it naming the distribution, as does a dependency of either kind, and under
+`core.unsafe_fingerprinting` each refusal is the copied environment's warning. By rule 2 a
+library package linked into the project root (`mylib -> .venv/lib/python3.13/site-packages/mylib`),
+an entry of `sys.path` that is a link to `site-packages`, and a module file linked by hand into
+the project root to a file of `site-packages` (`mod.py -> .venv/lib/python3.13/site-packages/mod.py`)
+are judged in `site-packages` too, as their resolved paths are where the files are copies, while a
+project file linked to a file outside every library path, and a loop of links, are user code by
+rule 3 (`test_is_library_file.py`). flit's `install --symlink` (flit 4.2.0) links a checkout's
+module file, or its package's directory, into `site-packages`, with a `direct_url.json` that says
+editable and a RECORD that lists the link; its code stays user code, walked as the project's own,
+as in pivot 0.10.4, so an edit to the checkout reruns the stage: the module file by rule 2, since
+an editable install's RECORD lists it, and a file under the linked package directory by rule 3,
+since that directory resolves into the checkout, where the file is no link.
+`uv pip install -e --link-mode symlink` of a setuptools project links the `.pth` file and the
+finder module that setuptools writes into uv's cache, and
+the editable install's RECORD lists both: the finder module is user code by rule 2, where its copy
+in a copied environment is library code by rule 1, and the checkout it imports is user code by
+its resolved path in both; a stage that imports the editable package does not reach the finder
+module, so the two environments give one lock (`test_installed_distributions_link_mode.py`). A
+directory (a namespace package's, an entry of `sys.path`) is judged by its resolved path alone:
+uv keeps directories real. The decision is made once per file name per process: each file of the
+chain costs one `os.readlink`, and for a file whose chain reaches a library path Pivot reads, once,
+the RECORD of each editable distribution of that path's site directory and no other, so a virtual
+environment whose files are copies or hard links reads nothing more, and one with no editable
+distribution reads no RECORD for it; a worker, whose import recorder asks only this question,
+reads no requirement and builds no index of the distributions that can give a key.
 
 Limits:
 
 | Limit | What happens |
 |-------|--------------|
-| A distribution with no `direct_url.json` is read as a package-index install, which is not editable. So a linked file that such a distribution's RECORD lists is an index library's: a module file that flit before 3.0 linked with `install --symlink` (flit wrote no `direct_url.json`, PEP 610, before 3.0), or a file of an index library that was replaced by hand with a link to a file elsewhere | The linked file is library code, recorded by name, so an edit to the file it points to reruns nothing. Pivot 0.10.4 resolved the link and walked its target as user code, so that edit reran the stage. Pivot reads no second sign of an editable install. A package directory that flit links is not affected: its files resolve into the checkout (rule 1). Fix: reinstall with a tool that writes `direct_url.json` (flit 3.0 or later, `pip install -e`, `uv pip install -e`) |
+| A file linked into `site-packages` that no editable distribution's RECORD lists: a link made by hand to a user's file (a new name, or in place of a library's file), a link that only a distribution with no RECORD, one Pivot cannot classify or one that is not editable lists, and a module file that flit before 3.0 linked with `install --symlink` (flit wrote no `direct_url.json`, PEP 610, before 3.0, so its distribution reads as a package-index install, which is not editable); also when the stage reaches it through a link to it (rule 2) | The linked file is library code, recorded by name and refused as a copied file would be (rule 2), so an edit to the file it points to reruns nothing. Pivot 0.10.4 resolved the link and walked its target as user code, so that edit reran the stage. Pivot reads no second sign of an editable install. A package directory that flit links is not affected: its files resolve into the checkout (rule 3). Fix: reinstall with a tool that writes `direct_url.json` (flit 3.0 or later, `pip install -e`, `uv pip install -e`), or install a user's code editable in place of a link made by hand |
 | One entry of uv's cache linked from two entries of `sys.path`: the same wheel installed with `--link-mode symlink` into a virtual environment and into the environment it sees through `--system-site-packages`, or into a `--target` directory | The RECORDs of both installs resolve to the same files, so both own a module the stage reaches in either (a file is owned by its resolved path, a package's directory by where the import searched). For a git or local library the key's value then covers both installs, where copied files give the value of the one the stage imports, and a second install Pivot cannot read (a `direct_url.json` it cannot classify, requirements it cannot read) refuses the stage. That adds reruns and refusals only: no change is hidden |
 | uv's cache inside an entry of `sys.path`: `UV_CACHE_DIR` under the project root, which is on `sys.path`, for a virtual environment that uv builds with `--link-mode symlink` | A linked file's resolved path, in the cache, then lies in that entry too, so the check above judges the file there as well as where the import found it. Where that entry holds a distribution with no RECORD that Pivot looks at (a project's own `.egg-info` that requires a git library), a file the check covers that no RECORD lists (one of a distribution that has lost its RECORD) refuses the stage, named as it lies in the cache; with the cache outside every entry, that distribution refuses nothing for it. That fails closed: it adds a refusal only, for an install that is already broken, and hides no change |
 
@@ -829,7 +841,7 @@ Fingerprinting uses several `WeakKeyDictionary` caches to avoid repeated expensi
 
 These caches use weak references, so entries are automatically cleaned up when functions are garbage collected. They have no lock. Stages are fingerprinted in the `pivot` process, never in a worker (each worker process has its own memory), on the thread that asks: `pivot status` and `pivot commit` on their main thread, the engine's skip check and watched startup snapshot in anyio worker threads (`anyio.to_thread.run_sync`), a stage that the skip check did not fingerprint (under `--force`, or with no lock yet) on the engine's event loop when it is sent to a worker (`executor.core.prepare_worker_info`), a watch reload in a daemon thread; each of these asks for one stage at a time. An engine that serves RPC (`pivot repro --tui`, `pivot repro --watch --serve`, `pivot run --tui`) is the exception: it fingerprints for an `explain` request on its event loop (`engine.stage_queries.explain`) and for a `commit` request in a worker thread, waiting only for the startup snapshot and a reload (`Engine.wait_for_fingerprints`), so either can fingerprint while a run's skip check, or the other request, fingerprints on another thread, and the two share these caches.
 
-The `dist:` keys are not in the manifest cache (`sm:`): `registry._compute_fingerprint` adds them after `fingerprint.get_stage_fingerprint_cached` returns, on a hit and a miss alike, because a reinstall to the same path changes no source file, read or by-name origin that a hit re-checks. What they need is read once per process by `installed_distributions`, under a lock, for one worker `sys.path` and one set of pivot's package directories: the metadata directories on the path and each `direct_url.json`; when a stage's keys are first asked for, and only when one of those distributions is installed from git, a local path or a local archive, or cannot be classified, every distribution's requirements (its `Requires-Dist` headers, and an `.egg-info` directory's `requires.txt` when its metadata has none) and RECORD for the distributions that can give a key or a refusal (those, each one whose requirements cannot be read, and each one that requires one of them, directly or through others); every RECORD of a directory, and the files under a reached package's or namespace package's directory, only for the refusal check of [Libraries Installed from Git or a Local Path](#libraries-installed-from-git-or-a-local-path), when that section says; every RECORD of a directory, its paths not resolved, once, when `fingerprint.is_library_file` first asks about a file linked there ([Files Linked into site-packages](#files-linked-into-site-packages)); and a keyed distribution's files only when a stage first reaches it. Each RECORD is read once, whichever of these needs it first. A process that asks only about linked files, as a worker does while it imports, reads no requirement and builds no index of those distributions. Each path a RECORD lists for a key or a refusal, and each file under such a directory, is resolved to the path `os.path.realpath` gives, a name at a time from the nearest directory above it already resolved (an entry of the path, or one resolved for an earlier path): each new name, of a directory or of the file, costs one `os.path.islink`, and only a name that is a symbolic link, or is empty, `.` or `..`, is given to `realpath`, with the path up to it. The exception is a RECORD path of PATH_MAX bytes or more in its directory: it is given to `realpath` whole, which keeps nothing from one path to the next; the index still keeps every directory above each listed file, so one RECORD row costs memory of the order of its names times its length, bounded only by installed metadata, which Pivot trusts. Such a path can still name a file, a long name in a shorter directory (as a venv moved into a deep directory leaves it), which the walk lists and which can be a module's origin: it owns that file, and that file is not refused as one that no RECORD lists; its digest, where it is hashed, is `null` when `os.open` refuses the path as that long, so a change to its bytes changes no key. A RECORD path that can name no file (one with a NUL character or a name the filesystem encoding cannot encode) is not resolved: it owns no file, and its digest, where it is hashed, is `null`, as a missing file's is. A manifest with no `byname:` entry reads nothing, and on a path with no distribution installed from git, a local path or a local archive, and none Pivot cannot classify, `fingerprint.add_distribution_keys` looks up no module's origin.
+The `dist:` keys are not in the manifest cache (`sm:`): `registry._compute_fingerprint` adds them after `fingerprint.get_stage_fingerprint_cached` returns, on a hit and a miss alike, because a reinstall to the same path changes no source file, read or by-name origin that a hit re-checks. What they need is read once per process by `installed_distributions`, under a lock, for one worker `sys.path` and one set of pivot's package directories: the metadata directories on the path and each `direct_url.json`; when a stage's keys are first asked for, and only when one of those distributions is installed from git, a local path or a local archive, or cannot be classified, every distribution's requirements (its `Requires-Dist` headers, and an `.egg-info` directory's `requires.txt` when its metadata has none) and RECORD for the distributions that can give a key or a refusal (those, each one whose requirements cannot be read, and each one that requires one of them, directly or through others); every RECORD of a directory, and the files under a reached package's or namespace package's directory, only for the refusal check of [Libraries Installed from Git or a Local Path](#libraries-installed-from-git-or-a-local-path), when that section says; the RECORD of each editable distribution of a directory, its paths not resolved, and no other RECORD, once, when `fingerprint.is_library_file` first asks about a file linked there ([Files Linked into site-packages](#files-linked-into-site-packages)); and a keyed distribution's files only when a stage first reaches it. Each RECORD is read once, whichever of these needs it first. A process that asks only about linked files, as a worker does while it imports, reads no requirement and builds no index of those distributions. Each path a RECORD lists for a key or a refusal, and each file under such a directory, is resolved to the path `os.path.realpath` gives, a name at a time from the nearest directory above it already resolved (an entry of the path, or one resolved for an earlier path): each new name, of a directory or of the file, costs one `os.path.islink`, and only a name that is a symbolic link, or is empty, `.` or `..`, is given to `realpath`, with the path up to it. The exception is a RECORD path of PATH_MAX bytes or more in its directory: it is given to `realpath` whole, which keeps nothing from one path to the next; the index still keeps every directory above each listed file, so one RECORD row costs memory of the order of its names times its length, bounded only by installed metadata, which Pivot trusts. Such a path can still name a file, a long name in a shorter directory (as a venv moved into a deep directory leaves it), which the walk lists and which can be a module's origin: it owns that file, and that file is not refused as one that no RECORD lists; its digest, where it is hashed, is `null` when `os.open` refuses the path as that long, so a change to its bytes changes no key. A RECORD path that can name no file (one with a NUL character or a name the filesystem encoding cannot encode) is not resolved: it owns no file, and its digest, where it is hashed, is `null`, as a missing file's is. A manifest with no `byname:` entry reads nothing, and on a path with no distribution installed from git, a local path or a local archive, and none Pivot cannot classify, `fingerprint.add_distribution_keys` looks up no module's origin.
 
 ## Manifest Key Prefixes
 

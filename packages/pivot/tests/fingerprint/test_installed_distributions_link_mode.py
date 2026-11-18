@@ -2,15 +2,17 @@
 
 uv's `--link-mode symlink` (`UV_LINK_MODE=symlink`) installs each file of a distribution as a link
 into uv's cache, inside real directories of `site-packages`: such a venv fingerprints as one whose
-files uv copied, and gives the same `dist:` keys (`fingerprint.is_library_file`). flit's
-`install --symlink` links a checkout's package directory, or its module file, into
-`site-packages` as an editable install: its code stays user code, as in pivot 0.10.4, so an edit
-to it reruns the stage.
+files uv copied, and gives the same `dist:` keys, refusals and warnings
+(`fingerprint.is_library_file`: a link there is library code unless an editable install's RECORD
+lists it). An editable install's code stays user code, as in pivot 0.10.4, so an edit to it reruns
+the stage: flit's `install --symlink` links a checkout's package directory, or its module file,
+into `site-packages`, and uv links the `.pth` file and the finder module that setuptools writes
+for an editable install into its cache.
 
 Each test makes its venvs with uv over this test environment (`tests.installed_dists`) and its own
 pivot project in each. A test that installs with uv passes the link mode to uv itself (the pod
 that runs the tests by hand sets `UV_LINK_MODE=copy`, CI sets nothing). The flit test builds
-flit's layout by hand, as flit 4.2.0 wrote it, since CI has no flit; it imports nothing that
+flit's layout by hand, as flit 4.2.0 wrote it, since CI has no flit. The file imports nothing that
 pivot 0.10.4 lacks, and so runs with `packages/pivot/src` at that release too.
 """
 
@@ -65,20 +67,29 @@ with Pipeline("p") as pipeline:
     make()
 """
 
+# The refusal of `fixdep`, which `Fix_Lib` requires, when its `direct_url.json` is no JSON object,
+# word for word, `{site}` the venv's resolved site-packages.
+_UNCLASSIFIED_DEPENDENCY_REFUSAL = (
+    "Distribution 'fixdep' ({site}/fixdep-0.1.dist-info), which a distribution this stage "
+    "reaches depends on, is installed in a form Pivot cannot classify: its direct_url.json is "
+    "not a JSON object. Pivot cannot fingerprint the installed code the stage runs, so the stage "
+    "could skip a run after that code changes. Fix: reinstall 'fixdep'."
+)
+
 
 def _helper_linked_project(
-    root: pathlib.Path, sources: tuple[pathlib.Path, ...], link_mode: str
+    root: pathlib.Path, sources: tuple[pathlib.Path, ...], link_mode: str, pipeline_text: str
 ) -> tuple[installed_dists.Project, bool]:
     """Make a venv at `root/venv`, install the projects at `sources` into it from their paths in
     that order with uv's `link_mode`, and make a project at `root/project` whose pipeline is
-    `_METACLASS_PIPELINE`. Returns the project, and whether `fixlib`'s installed module file is a
+    `pipeline_text`. Returns the project, and whether `fixlib`'s installed module file is a
     symbolic link."""
     root.mkdir()
     venv = installed_dists.make_venv(root / "venv")
     for source in sources:
         installed_dists.install_directory(venv, source, link_mode=link_mode)
     linked = (venv.site_packages / "fixlib" / "__init__.py").is_symlink()
-    return installed_dists.make_project_in(root, venv, _METACLASS_PIPELINE), linked
+    return installed_dists.make_project_in(root, venv, pipeline_text), linked
 
 
 def test_a_venv_uv_links_into_its_cache_fingerprints_as_one_it_copied_into(
@@ -100,8 +111,12 @@ def test_a_venv_uv_links_into_its_cache_fingerprints_as_one_it_copied_into(
     )
     fixlate = installed_dists.write_library(src, "fixlate", "fixlate", _FIXLATE)
     sources = (fixdep, fixlib, fixlate)
-    copied, copied_linked = _helper_linked_project(tmp_path / "copy", sources, "copy")
-    linked, linked_linked = _helper_linked_project(tmp_path / "symlink", sources, "symlink")
+    copied, copied_linked = _helper_linked_project(
+        tmp_path / "copy", sources, "copy", _METACLASS_PIPELINE
+    )
+    linked, linked_linked = _helper_linked_project(
+        tmp_path / "symlink", sources, "symlink", _METACLASS_PIPELINE
+    )
     assert (copied_linked, linked_linked) == (False, True), (
         "fixlib/__init__.py must be a copy in the first venv and a link in the second: "
         + f"links {(copied_linked, linked_linked)}"
@@ -158,32 +173,60 @@ def test_an_edit_to_the_checkout_flit_links_into_site_packages_reruns_the_stage(
     installed_dists.assert_runs_and_writes(project, "value-2", "the second `pivot repro`")
 
 
-def test_a_linked_library_whose_record_is_lost_is_walked_as_user_code(
+def _helper_unsafe_warning(project: installed_dists.Project, command: str) -> str:
+    """`pivot repro --json`, which `command` names in a failure, runs `STAGE` in `project`, which
+    writes `value-1` (`installed_dists.assert_runs_and_writes`), and gives one warning, its line
+    started with the stage's name (`STAGE_PREFIX`), as unsafe fingerprinting starts each warning
+    it gives in place of a refusal; returns that line with the venv's resolved site-packages
+    written `{site}`."""
+    shown = installed_dists.assert_runs_and_writes(project, "value-1", command)
+    warnings = [
+        line for line in shown.splitlines() if line.startswith(installed_dists.STAGE_PREFIX)
+    ]
+    assert len(warnings) == 1, (
+        f"{command} must give one warning that names {installed_dists.STAGE}:\n{shown}"
+    )
+    return warnings[0].replace(str(project.venv.site_packages.resolve()), "{site}")
+
+
+def test_a_linked_library_whose_record_is_lost_runs_with_the_copied_ones_warning_when_unsafe(
     tmp_path: pathlib.Path,
 ) -> None:
-    """`Fix_Lib`, installed from its path with `--link-mode symlink`, has lost its RECORD, so no
-    RECORD lists its module file, a link into uv's cache, and the file keeps the decision of its
-    resolved path: user code, which the walk hashes. `pivot repro` runs the stage, refusing
-    nothing; after one byte of the linked file changes (written through the link, into uv's cache
-    entry of this test's own build), the stage is stale on `func:fixlib.value` alone, and `pivot
-    repro` runs it and writes the new value. In a copied venv the stage is refused instead, as
-    `test_a_broken_install_the_stage_needs_is_refused_and_unsafe_fingerprinting_warns`
-    (`reached-without-record`) in `test_installed_distributions.py` checks."""
-    venv = installed_dists.make_venv(tmp_path / "venv")
+    """`Fix_Lib` installed from its path into one venv with `--link-mode copy` and into another
+    with `--link-mode symlink`, each with its own project and the same pipeline, each with its
+    RECORD lost, and `core.unsafe_fingerprinting` set in each project (`pivot config set`). The
+    linked venv's refusal turns into a warning as the copied venv's does: `pivot repro` runs the
+    stage in both, and both give the same warning, the refusal of a reached file that no RECORD
+    lists beside `Fix_Lib`, which has none. In the linked venv, with the lock deleted, the next
+    `pivot repro` runs the stage again, with the same warning: the run cache keeps no result that
+    unsafe fingerprinting let run, where it would restore one."""
     source = installed_dists.write_library(
         tmp_path / "src", "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE
     )
-    installed_dists.install_directory(venv, source, link_mode="symlink")
-    module = venv.site_packages / "fixlib" / "__init__.py"
-    assert module.is_symlink(), f"{module} must be a link into uv's cache"
-    installed_dists.damage(venv.site_packages / "fix_lib-0.1.dist-info" / "RECORD", None)
-    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
-    installed_dists.assert_ran_then_cached(project, "value-1")
+    projects = dict[str, installed_dists.Project]()
+    warnings = dict[str, str]()
+    for link_mode in ("copy", "symlink"):
+        project, linked = _helper_linked_project(
+            tmp_path / link_mode, (source,), link_mode, installed_dists.pipeline("fixlib")
+        )
+        assert linked == (link_mode == "symlink"), (
+            f"fixlib/__init__.py must be a link only with --link-mode symlink: {link_mode} {linked}"
+        )
+        site = project.venv.site_packages
+        installed_dists.damage(site / "fix_lib-0.1.dist-info" / "RECORD", None)
+        installed_dists.pivot_ok(project, "config", "set", "core.unsafe_fingerprinting", "true")
+        projects[link_mode] = project
+        warnings[link_mode] = _helper_unsafe_warning(project, f"unsafe `pivot repro` ({link_mode})")
+    installed_dists.lock_path(projects["symlink"], installed_dists.STAGE).unlink()
+    again = _helper_unsafe_warning(projects["symlink"], "with the lock deleted, `pivot repro`")
 
-    installed_dists.replace_once(module, '"value-1"', '"value-2"')
-
-    installed_dists.assert_stale_on(project, installed_dists.STAGE, "func:fixlib.value")
-    installed_dists.assert_runs_and_writes(project, "value-2", "the second `pivot repro`")
+    expected = installed_dists.STAGE_PREFIX + installed_dists.UNLISTED_REFUSAL.format(
+        module="fixlib", file="fixlib/__init__.py", site="{site}"
+    )
+    assert warnings == {"copy": expected, "symlink": expected}, (
+        f"both venvs must warn with:\n{expected}\n{warnings}"
+    )
+    assert again == expected, f"the run with the lock deleted must warn with:\n{expected}\n{again}"
 
 
 def _helper_refusal(project: installed_dists.Project, site: pathlib.Path) -> str:
@@ -229,3 +272,149 @@ def test_a_linked_library_whose_record_is_lost_is_refused_as_a_copied_one_is(
         f"the linked venv must refuse as the copied one does:\nlinked {refusals['symlink']}\n"
         + f"copied {refusals['copy']}"
     )
+
+
+@pytest.mark.parametrize(
+    ("damaged", "text", "refusal"),
+    [
+        pytest.param(
+            "fix_lib-0.1.dist-info/direct_url.json",
+            "[]",
+            installed_dists.UNCLASSIFIED_REFUSAL,
+            id="reached-unclassified",
+        ),
+        pytest.param(
+            "fixdep-0.1.dist-info/RECORD",
+            None,
+            installed_dists.RECORDLESS_DEPENDENCY_REFUSAL,
+            id="dependency-without-record",
+        ),
+        pytest.param(
+            "fixdep-0.1.dist-info/direct_url.json",
+            "[]",
+            _UNCLASSIFIED_DEPENDENCY_REFUSAL,
+            id="dependency-unclassified",
+        ),
+    ],
+)
+def test_a_broken_install_refuses_the_stage_with_one_error_in_a_copied_and_a_linked_venv(
+    tmp_path: pathlib.Path, damaged: str, text: str | None, refusal: str
+) -> None:
+    """`Fix_Lib`, which the stage calls, and its requirement `fixdep`, installed from their paths
+    into one venv with `--link-mode copy` and into another with `--link-mode symlink`, each with
+    its own project and the same pipeline, then one installed file damaged in each (`damaged`,
+    relative to site-packages, overwritten with `text` or deleted): the reached `Fix_Lib`'s
+    `direct_url.json` made `[]`, which is no JSON object; `fixdep`'s RECORD deleted; `fixdep`'s
+    `direct_url.json` made `[]`. The copied venv refuses the stage with `refusal`, after the
+    stage's name (`STAGE_PREFIX`), and the linked venv refuses it with the same `Error:` line."""
+    fixlib, fixdep = installed_dists.write_fixlib_and_fixdep(tmp_path / "src")
+    refusals = dict[str, str]()
+    for link_mode in ("copy", "symlink"):
+        project, linked = _helper_linked_project(
+            tmp_path / link_mode, (fixdep, fixlib), link_mode, installed_dists.pipeline("fixlib")
+        )
+        assert linked == (link_mode == "symlink"), (
+            f"fixlib/__init__.py must be a link only with --link-mode symlink: {link_mode} {linked}"
+        )
+        installed_dists.damage(project.venv.site_packages / damaged, text)
+        refusals[link_mode] = _helper_refusal(project, project.venv.site_packages)
+
+    expected = installed_dists.STAGE_PREFIX + refusal
+    assert refusals["copy"].endswith(expected), (
+        f"the copied venv must refuse with:\n{expected}\n{refusals['copy']}"
+    )
+    assert refusals["symlink"] == refusals["copy"], (
+        f"the linked venv must refuse as the copied one does:\nlinked {refusals['symlink']}\n"
+        + f"copied {refusals['copy']}"
+    )
+
+
+def test_a_linked_module_its_record_does_not_list_is_library_code_as_a_copied_one_is(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`Fix_Lib` installed from its path into one venv with `--link-mode copy` and into another
+    with `--link-mode symlink`, each with its own project and the same pipeline, and in each the
+    row of `fixlib/__init__.py` taken out of its RECORD, which it keeps, so no distribution on the
+    path lacks a RECORD. In both venvs the module file is library code that no RECORD lists:
+    `pivot repro` runs the stage, refusing nothing, and the two locks record the same code
+    manifest, which holds no `dist:` key, since no distribution owns the module. Walked as user
+    code where its link points, the linked module would put its `func:` entries in the linked
+    venv's lock alone."""
+    source = installed_dists.write_library(
+        tmp_path / "src", "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE
+    )
+    manifests = dict[str, dict[str, str]]()
+    for link_mode in ("copy", "symlink"):
+        project, linked = _helper_linked_project(
+            tmp_path / link_mode, (source,), link_mode, installed_dists.pipeline("fixlib")
+        )
+        assert linked == (link_mode == "symlink"), (
+            f"fixlib/__init__.py must be a link only with --link-mode symlink: {link_mode} {linked}"
+        )
+        record = project.venv.site_packages / "fix_lib-0.1.dist-info" / "RECORD"
+        rows = record.read_text().splitlines(keepends=True)
+        kept = [row for row in rows if not row.startswith("fixlib/__init__.py,")]
+        assert len(kept) == len(rows) - 1, f"{record} must list fixlib/__init__.py once: {rows}"
+        installed_dists.damage(record, "".join(kept))
+        installed_dists.assert_ran_then_cached(project, "value-1")
+        manifests[link_mode] = installed_dists.lock_manifest(project, installed_dists.STAGE)
+
+    assert installed_dists.dist_keys(manifests["copy"]) == [], (
+        f"the copied venv's lock must hold no dist: key: {manifests['copy']}"
+    )
+    assert manifests["symlink"] == manifests["copy"], (
+        f"the linked venv's lock must equal the copied one's:\nlinked {manifests['symlink']}\n"
+        + f"copied {manifests['copy']}"
+    )
+
+
+def test_an_editable_install_whose_finder_uv_links_into_its_cache_reruns_as_a_copied_one(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`Fix_Lib` installed editable (`-e`) from one checkout into one venv with `--link-mode
+    copy` and into another with `--link-mode symlink`, each with its own project and the same
+    pipeline. setuptools writes a finder module, which imports `fixlib` from the checkout, and a
+    `.pth` file that installs it; the editable install's RECORD lists both, and in the second venv
+    uv links both into its cache. The checkout's code is user code in both venvs, as in pivot
+    0.10.4: `pivot repro` runs the stage in both, refusing nothing, and the two locks record the
+    same code manifest, which holds no `dist:` key. After one byte of the checkout's source
+    changes, the stage is stale on `func:fixlib.value` alone in both, and `pivot repro` runs it
+    in both and writes the new value."""
+    source = installed_dists.write_library(
+        tmp_path / "src", "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE
+    )
+    projects = dict[str, installed_dists.Project]()
+    for link_mode in ("copy", "symlink"):
+        root = tmp_path / link_mode
+        root.mkdir()
+        venv = installed_dists.make_venv(root / "venv")
+        installed_dists.install_directory(venv, source, editable=True, link_mode=link_mode)
+        installed = sorted(venv.site_packages.glob("__editable__*"))
+        kinds = sorted(path.suffix for path in installed)
+        assert kinds == [".pth", ".py"], f"setuptools must write a .pth and a finder: {installed}"
+        links = [path.is_symlink() for path in installed]
+        assert links == [link_mode == "symlink"] * 2, (
+            f"uv must link the .pth and the finder only with --link-mode symlink: {link_mode} "
+            + f"{dict(zip(installed, links, strict=True))}"
+        )
+        projects[link_mode] = installed_dists.make_project_in(
+            root, venv, installed_dists.pipeline("fixlib")
+        )
+        installed_dists.assert_ran_then_cached(projects[link_mode], "value-1")
+    manifests = {
+        link_mode: installed_dists.lock_manifest(project, installed_dists.STAGE)
+        for link_mode, project in projects.items()
+    }
+    assert installed_dists.dist_keys(manifests["copy"]) == [], (
+        f"the copied venv's lock must hold no dist: key: {manifests['copy']}"
+    )
+    assert manifests["symlink"] == manifests["copy"], (
+        f"the linked venv's lock must equal the copied one's:\nlinked {manifests['symlink']}\n"
+        + f"copied {manifests['copy']}"
+    )
+
+    installed_dists.replace_once(source / "fixlib" / "__init__.py", '"value-1"', '"value-2"')
+
+    for project in projects.values():
+        installed_dists.assert_stale_on(project, installed_dists.STAGE, "func:fixlib.value")
+        installed_dists.assert_runs_and_writes(project, "value-2", "the second `pivot repro`")

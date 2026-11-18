@@ -10,22 +10,23 @@ disk, so a change to them makes the stage stale, and a reinstall of the same fil
 commit, path, installer or environment changes nothing. Package-index, remote-archive and
 editable distributions and pivot's own get no key.
 
-It also tells `fingerprint.is_library_file` whether a file that an installer linked into a site
-directory, as uv's `--link-mode symlink` links each file into its cache, is library code by the
-RECORDs there (`listed_as_library`): some list it, and each that does is installed in a known form
-that is not editable (`owned_by_libraries`).
+It also tells `fingerprint.is_library_file` whether the RECORD of an editable distribution lists a
+file linked into a site directory (`linked_by_editable`): such a file keeps the decision of its
+resolved path, as flit's `install --symlink` links a checkout's module file there, and every
+other file linked there, as uv's `--link-mode symlink` links each installed file into its cache,
+is library code, as the same file copied would be.
 
 A leaf: it imports nothing of pivot's at run time, so `fingerprint` imports it and no import cycle
 forms. It takes plain data (each reached module's origin and its file as the import located it,
 its directory resolved, `ReachedModule`; the worker's `sys.path`; pivot's package directories)
-and returns plain data (the keys and the refusal messages). Each decision on what a
-distribution's files say (`classify`, `requirement_names`, `requires_txt_names`, `record_paths`,
-`hashed_files`, `content_digest`, `key_value`, `candidates`, `reach`, `owners`, `decide`,
-`owned_by_libraries`) is a public function of plain data. What reads the disk is private: the
-scan of the path, the index of the candidates, the digest of a keyed distribution's files, the
-refusal of a reached file that no RECORD lists, which reads the RECORDs of a site directory and
-the files under a package, and the index of the paths the RECORDs of a site directory list
-(`_Snapshot`).
+and returns plain data (the keys, the refusal messages, and whether an editable distribution's
+RECORD lists a file). Each decision on what a distribution's files say (`classify`,
+`requirement_names`, `requires_txt_names`, `record_paths`, `hashed_files`, `content_digest`,
+`key_value`, `candidates`, `reach`, `owners`, `decide`) is a public function of plain data. What
+reads the disk is private: the scan of the path, the index of the candidates, the digest of a
+keyed distribution's files, the refusal of a reached file that no RECORD lists, which reads the
+RECORDs of a site directory and the files under a package, and the paths the RECORDs of a site
+directory's editable distributions list (`_Snapshot`).
 
 What it reads, once per process for one worker path, so a reinstall while Pivot runs is seen at the
 next start: the metadata directories on the path and each `direct_url.json`; when a stage's keys
@@ -37,22 +38,22 @@ be classified, the requirements of every distribution (its `Requires-Dist` heade
 that requires one of them, directly or through others); every RECORD of a site directory only when
 a stage reaches a file that lies in it (the deepest entry of the path that holds the file where
 the import found it or the walk listed it, or that holds the file's resolved path) while a
-candidate there, or in the other such entry of the file, has no RECORD, and, apart from that,
-when `listed_as_library` is first asked about a file whose site directory it is; the files under
-the directory of a reached package or namespace package only when such a site directory is the
-deepest entry of the path above that directory or lies at or under it, and only until each such
-site directory has a file there that no RECORD lists, once for each reached module; and the
-files of a keyed distribution only when a stage reaches it. Each RECORD is read once, whichever
-of these needs it first. A process that asks only `listed_as_library`, as a worker's import
-recorder does, reads no requirement and builds no index of the candidates. Each path a RECORD
-lists that can name a file is resolved for the index of the candidates and for the refusal of a
-reached file that no RECORD lists (`_resolved`), and so is each file under such a directory, to
-the path `os.path.realpath` gives: a RECORD path of PATH_MAX bytes or more in its site directory
-by `realpath` alone, and every other path a name at a time from the nearest directory above it
-already resolved (a site directory, or one resolved for an earlier path): one `os.path.islink`
-for each new name, and `realpath` only for a name that is a symbolic link, empty, `.` or `..`
-(`_real_path`). `listed_as_library` resolves no RECORD path: it compares each as written,
-normalised, with the file's path in its site directory.
+candidate there, or in the other such entry of the file, has no RECORD; the RECORD of each
+editable distribution of a site directory, and no other, when `linked_by_editable` is first asked
+about a file whose site directory it is; the files under the directory of a reached package or
+namespace package only when such a site directory is the deepest entry of the path above that
+directory or lies at or under it, and only until each such site directory has a file there that
+no RECORD lists, once for each reached module; and the files of a keyed distribution only when a
+stage reaches it. Each RECORD is read once, whichever of these needs it first. A process that asks
+only `linked_by_editable`, as a worker's import recorder does, reads no requirement and builds no
+index of the candidates. Each path a RECORD lists that can name a file is resolved for the index
+of the candidates and for the refusal of a reached file that no RECORD lists (`_resolved`), and so
+is each file under such a directory, to the path `os.path.realpath` gives: a RECORD path of
+PATH_MAX bytes or more in its site directory by `realpath` alone, and every other path a name at a
+time from the nearest directory above it already resolved (a site directory, or one resolved for
+an earlier path): one `os.path.islink` for each new name, and `realpath` only for a name that is a
+symbolic link, empty, `.` or `..` (`_real_path`). `linked_by_editable` resolves no RECORD path:
+it compares each as written, normalised, with the file's path in its site directory.
 """
 
 from __future__ import annotations
@@ -128,19 +129,6 @@ _KEYED_FORMS = frozenset({InstallForm.VCS, InstallForm.LOCAL_DIRECTORY, InstallF
 # The forms that make a distribution a candidate by itself: the keyed forms, and the unclassified
 # form, which may be one of them.
 _SEED_FORMS = _KEYED_FORMS | {InstallForm.UNCLASSIFIED}
-
-# The forms of a distribution whose RECORD can make a file it lists library code wherever a link
-# there points (`owned_by_libraries`): each known form but the editable one. Named one by one, so
-# a form added later leaves such a file to its resolved path.
-_LIBRARY_FORMS = frozenset(
-    {
-        InstallForm.INDEX,
-        InstallForm.VCS,
-        InstallForm.LOCAL_DIRECTORY,
-        InstallForm.LOCAL_ARCHIVE,
-        InstallForm.REMOTE_ARCHIVE,
-    }
-)
 
 # The `direct_url.json` fields that name a form; PEP 610 requires exactly one.
 _FORM_FIELDS = ("vcs_info", "dir_info", "archive_info")
@@ -571,16 +559,6 @@ def _unlisted_refusal(module: str, file: str, installed: Installed, record: Reco
     )
 
 
-def owned_by_libraries(forms: Collection[InstallForm]) -> bool:
-    """Whether a file linked into a site directory is library code by the distributions there
-    whose RECORDs list it, given each one's install form (`forms`, one for each): at least one
-    lists it, and every one is installed in a known form that is not editable
-    (`_LIBRARY_FORMS`). An editable or unclassified one, or none, leaves the file to its resolved
-    path (`fingerprint.is_library_file`): flit's `install --symlink` links a module file of a
-    checkout into a site directory as an editable install, which stays user code."""
-    return bool(forms) and all(form in _LIBRARY_FORMS for form in forms)
-
-
 def needs_origins(path: Sequence[str], pivot_dirs: Collection[str]) -> bool:
     """Whether a stage's modules can give a key or a refusal with `path` as the worker's
     `sys.path` and `pivot_dirs` as pivot's own resolved package directories: False when no
@@ -611,20 +589,21 @@ def distribution_keys(
         return _snapshot_of(path, pivot_dirs).keys_for(modules)
 
 
-def listed_as_library(file: str, path: Sequence[str], pivot_dirs: Collection[str]) -> bool:
-    """Whether `file`, an absolute path whose directory is resolved and whose last name is not,
-    is library code by the RECORDs of its site directory (`owned_by_libraries`), with `path` as
-    the worker's `sys.path` and `pivot_dirs` as pivot's own resolved package directories. Its site
-    directory is the deepest entry of the path that the scan listed and that holds it; the
-    distributions there whose RECORD lists it are those with a row whose path, normalised, is
-    `file`'s path relative to that directory. No RECORD path is resolved: in a venv uv links into
-    its cache, every listed file is a link. A file that no entry of the path holds is listed by
-    none. Scans the path as `distribution_keys` does, once per process for one `path` and
-    `pivot_dirs`, and reads every RECORD of the file's site directory once; it reads no
-    requirement and builds no index of the candidates, which a worker never needs."""
+def linked_by_editable(file: str, path: Sequence[str], pivot_dirs: Collection[str]) -> bool:
+    """Whether the RECORD of an editable distribution (`InstallForm.EDITABLE`) in the site
+    directory of `file`, an absolute path whose directory is resolved and whose last name is not,
+    lists it, with `path` as the worker's `sys.path` and `pivot_dirs` as pivot's own resolved
+    package directories. Its site directory is the deepest entry of the path that the scan listed
+    and that holds it; a RECORD lists it with a row whose path, normalised, is `file`'s path
+    relative to that directory. No RECORD path is resolved: in a venv uv links into its cache,
+    every listed file is a link. False for a file that no entry of the path holds, for one that
+    only the RECORD of a distribution of another form lists, and for one whose editable
+    distribution has no RECORD Pivot can read. Scans the path as `distribution_keys` does,
+    once per process for one `path` and `pivot_dirs`, and reads the RECORD of each editable
+    distribution of the file's site directory once, and no other RECORD; it reads no requirement
+    and builds no index of the candidates, which a worker never needs."""
     with _lock:
-        listing = _snapshot_of(path, pivot_dirs).listed_by(file)
-    return owned_by_libraries([installed.classification.form for installed in listing])
+        return _snapshot_of(path, pivot_dirs).linked_by_editable(file)
 
 
 def reset() -> None:
@@ -668,9 +647,9 @@ class _Scan(NamedTuple):
 class _Snapshot:
     """What one process read of the distributions on one worker path: the distributions when it
     is made, and, each when first needed, the index of the candidates, each distribution's
-    RECORD, the files a site directory's RECORDs list, resolved, and the paths they list, as
-    written, the refusals of a reached module with a file that no RECORD lists, and the digest of
-    a keyed distribution's files."""
+    RECORD, the files a site directory's RECORDs list, resolved, and the paths its editable
+    distributions' RECORDs list, as written, the refusals of a reached module with a file that no
+    RECORD lists, and the digest of a keyed distribution's files."""
 
     def __init__(self, path: tuple[str, ...], pivot_dirs: frozenset[str]) -> None:
         self.path: tuple[str, ...] = path  # the worker's `sys.path`
@@ -683,9 +662,9 @@ class _Snapshot:
         self._records: dict[str, Record] = {}  # `dist_info` -> its RECORD (`_record`)
         # Site directory -> every resolved file that a RECORD of a distribution there lists.
         self._listed: dict[str, frozenset[str]] = {}
-        # Site directory -> each path a RECORD there lists, normalised, -> the distributions whose
-        # RECORD lists it (`_record_index`).
-        self._record_indexes: dict[str, dict[str, tuple[Installed, ...]]] = {}
+        # Site directory -> each path that the RECORD of an editable distribution there lists,
+        # normalised (`_editable_listing`).
+        self._editable_listings: dict[str, frozenset[str]] = {}
         self._digests: dict[str, str] = {}  # `dist_info` -> its `content_digest`
         # (name, module) -> `_unlisted`'s refusals for that reached module.
         self._unlisted_refusals: dict[tuple[str, ReachedModule], tuple[str, ...]] = {}
@@ -816,15 +795,15 @@ class _Snapshot:
             if not pending:
                 return
 
-    def listed_by(self, file: str) -> tuple[Installed, ...]:
-        """The distributions whose RECORD lists `file`, a path whose directory is resolved, in its
-        site directory (`_site_dir`): those of that directory with a RECORD path that, normalised,
-        is `file`'s path relative to it (`_record_index`). No distribution when no entry of the
-        path holds `file`."""
+    def linked_by_editable(self, file: str) -> bool:
+        """Whether the RECORD of an editable distribution in the site directory of `file`, a
+        path whose directory is resolved (`_site_dir`), lists `file`: a RECORD path that,
+        normalised, is `file`'s path relative to that directory (`_editable_listing`). False
+        when no entry of the path holds `file`."""
         site_dir = self._site_dir(file)
         if site_dir is None:
-            return ()
-        return self._record_index(site_dir).get(os.path.relpath(file, site_dir), ())
+            return False
+        return os.path.relpath(file, site_dir) in self._editable_listing(site_dir)
 
     def _site_dir(self, file: str) -> str | None:
         """The deepest entry of the path that the scan listed and that holds `file`, a path whose
@@ -843,28 +822,29 @@ class _Snapshot:
             self._listed[site_dir] = frozenset(listed)
         return self._listed[site_dir]
 
-    def _record_index(self, site_dir: str) -> dict[str, tuple[Installed, ...]]:
-        """Each path that a RECORD of a distribution in `site_dir` lists (`_record`) inside it,
-        normalised (`_inside`) and not resolved, with the distributions whose RECORD lists it,
-        each once."""
-        if site_dir not in self._record_indexes:
-            listing = dict[str, dict[str, Installed]]()
+    def _editable_listing(self, site_dir: str) -> frozenset[str]:
+        """Each path that the RECORD (`_record`) of an editable distribution in `site_dir` lists
+        inside it, normalised (`_inside`) and not resolved; no other distribution's RECORD is
+        read. An editable distribution with no RECORD Pivot can read lists none."""
+        if site_dir not in self._editable_listings:
+            listed = set[str]()
             for installed in self._installed:
-                if installed.site_dir == site_dir:
+                if (
+                    installed.site_dir == site_dir
+                    and installed.classification.form is InstallForm.EDITABLE
+                ):
                     for path in self._record(installed).paths or ():
                         normal = _inside(path)
                         if normal is not None:
-                            listing.setdefault(normal, {})[installed.dist_info] = installed
-            self._record_indexes[site_dir] = {
-                path: tuple(found.values()) for path, found in listing.items()
-            }
-        return self._record_indexes[site_dir]
+                            listed.add(normal)
+            self._editable_listings[site_dir] = frozenset(listed)
+        return self._editable_listings[site_dir]
 
     def _record(self, installed: Installed) -> Record:
         """A distribution's RECORD (`_read_record`), read once, whichever asks for it first: the
         index of the candidates (`_build_index`), a candidate's decision, digest or refusal
         (`keys_for`, `_digest`, `_unlisted`), the refusal of a file that no RECORD lists
-        (`_listed_in`) or the question about a linked file (`_record_index`)."""
+        (`_listed_in`) or the question about a linked file (`_editable_listing`)."""
         if installed.dist_info not in self._records:
             self._records[installed.dist_info] = _read_record(installed)
         return self._records[installed.dist_info]
